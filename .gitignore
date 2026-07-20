@@ -37,3 +37,12 @@ profiler/build/wasm/embed.tracy
 examples/ToyPathTracer/Windows/TestCpu
 examples/ToyPathTracer/Windows/x64
 *.user
+
+# Local SQLite exporter build and capture artifacts.
+/build-sqliteexport*/
+/*.tracy
+/*.sqlite
+/*.sqlite-*
+/*.log
+/*.verify.json
+/*.analysis.*.md

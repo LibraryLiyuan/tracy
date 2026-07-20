@@ -32,6 +32,7 @@ namespace tracy
 
 class FileRead;
 class FileWrite;
+class SqliteExporter;
 
 namespace EventType
 {
@@ -97,6 +98,8 @@ struct LoadProgress
 
 class Worker
 {
+    friend class SqliteExporter;
+
 public:
     struct ImportEventTimeline
     {
@@ -284,6 +287,7 @@ private:
         FrameData* framesBase;
         Vector<GpuCtxData*> gpuData;
         Vector<short_ptr<MessageData>> messages;
+        unordered_flat_map<const MessageData*, uint64_t> exportOriginalMessagePointers;
         StringDiscovery<PlotData*> plots;
         Vector<ThreadData*> threads;
         Vector<ZoneExtra> zoneExtra;
@@ -302,6 +306,7 @@ private:
 
         unordered_flat_map<uint64_t, const char*> strings;
         Vector<const char*> stringData;
+        std::vector<uint64_t> exportOriginalStringPointers;
         unordered_flat_map<charutil::StringKey, uint32_t, charutil::StringKey::Hasher, charutil::StringKey::Comparator> stringMap;
         unordered_flat_map<uint64_t, const char*> threadNames;
         unordered_flat_map<uint64_t, std::pair<const char*, const char*>> externalNames;
@@ -367,6 +372,7 @@ private:
         Vector<Vector<short_ptr<ZoneEvent>>> zoneVectorCache;
 
         Vector<short_ptr<FrameImage>> frameImage;
+        std::vector<uint8_t> exportFrameImageDictionary;
         Vector<StringRef> appInfo;
 
         CrashEvent crashEvent;

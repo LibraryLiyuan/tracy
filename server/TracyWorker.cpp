@@ -728,6 +728,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     f.Read( sz );
     m_data.stringMap.reserve( sz );
+    m_data.exportOriginalStringPointers.resize( sz );
 
     if( !m_allowStringModification )
     {
@@ -738,6 +739,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     {
         uint64_t ptr, ssz;
         f.Read2( ptr, ssz );
+        m_data.exportOriginalStringPointers[i] = ptr;
         auto dst = m_slab.Alloc<char>( ssz+1 );
         f.Read( dst, ssz );
         dst[ssz] = '\0';
@@ -974,6 +976,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             f.Read3( msgdata->ref, msgdata->color, msgdata->callstack );
             m_data.messages[i] = msgdata;
             msgMap.emplace( ptr, msgdata );
+            m_data.exportOriginalMessagePointers.emplace( msgdata, ptr );
         }
     }
     else
@@ -1311,6 +1314,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( dsz );
         auto dict = new char[dsz];
         f.Read( dict, dsz );
+        m_data.exportFrameImageDictionary.assign(
+            reinterpret_cast<const uint8_t*>( dict ),
+            reinterpret_cast<const uint8_t*>( dict ) + dsz );
         cdict = ZSTD_createCDict( dict, dsz, 3 );
         m_texcomp.SetDict( ZSTD_createDDict( dict, dsz ) );
         delete[] dict;

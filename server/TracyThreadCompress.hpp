@@ -13,9 +13,12 @@ namespace tracy
 
 class FileRead;
 class FileWrite;
+class SqliteExporter;
 
 class ThreadCompress
 {
+    friend class SqliteExporter;
+
 public:
     ThreadCompress();
 
