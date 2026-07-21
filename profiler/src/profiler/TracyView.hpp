@@ -208,6 +208,94 @@ private:
         Inactive
     };
 
+    enum class MemoryFrameScope : uint8_t
+    {
+        SinglePool,
+        AllGpuD3D12Pools
+    };
+
+    enum class MemoryFrameTab : uint8_t
+    {
+        ActiveAtStart,
+        ActiveAtEnd,
+        AllocatedInFrame,
+        FreedInFrame,
+        AllTransitions
+    };
+
+    enum class MemoryFrameMapping : uint8_t
+    {
+        None,
+        Valid,
+        BetweenFrames,
+        OutsideRange
+    };
+
+    struct MemoryEventRef
+    {
+        uint64_t pool = 0;
+        size_t index = 0;
+    };
+
+    struct MemoryFramePoolSummary
+    {
+        uint64_t pool = 0;
+        uint64_t startBytes = 0;
+        uint64_t allocatedBytes = 0;
+        uint64_t freedBytes = 0;
+        uint64_t endBytes = 0;
+        uint64_t peakBytes = 0;
+        uint64_t startCount = 0;
+        uint64_t allocatedCount = 0;
+        uint64_t freedCount = 0;
+        uint64_t endCount = 0;
+        uint64_t peakCount = 0;
+    };
+
+    struct MemoryFramePoolStamp
+    {
+        uint64_t pool = 0;
+        size_t allocations = 0;
+        size_t frees = 0;
+    };
+
+    struct MemoryFrameSnapshot
+    {
+        bool valid = false;
+        bool consistent = true;
+        bool possibleCaptureBaseline = false;
+        int64_t begin = 0;
+        int64_t end = 0;
+        MemoryFramePoolSummary total;
+        std::vector<MemoryFramePoolSummary> pools;
+        std::vector<MemoryFramePoolStamp> stamps;
+        std::vector<MemoryEventRef> activeAtStart;
+        std::vector<MemoryEventRef> activeAtEnd;
+        std::vector<MemoryEventRef> allocated;
+        std::vector<MemoryEventRef> freed;
+        std::vector<MemoryEventRef> transitions;
+    };
+
+    struct MemoryFrameSelection
+    {
+        bool active = false;
+        bool syncFromPlot = true;
+        bool dirty = true;
+        bool forceTabSelection = true;
+        bool triggerActive = false;
+        bool triggerNamedMemory = false;
+        const FrameData* frameSet = nullptr;
+        int frameIndex = -1;
+        uint64_t frameNumberInput = 0;
+        int64_t triggerTime = -1;
+        uint64_t triggerPlot = 0;
+        double triggerValue = 0;
+        double triggerChange = 0;
+        MemoryFrameScope scope = MemoryFrameScope::SinglePool;
+        MemoryFrameTab tab = MemoryFrameTab::ActiveAtEnd;
+        MemoryFrameMapping mapping = MemoryFrameMapping::None;
+    };
+
     struct KeyboardNavigation
     {
         enum Direction
@@ -274,6 +362,9 @@ private:
     void DrawStatistics();
     void DrawSamplesStatistics(Vector<SymList>& data, int64_t timeRange, AccumulationMode accumulationMode);
     void DrawMemory();
+    void DrawMemoryFrameInspector();
+    void DrawMemoryFrameSummary();
+    void DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRef>& data, MemoryFrameTab tab );
     void DrawAllocList();
     void DrawCompare();
     void DrawCallstackWindow();
@@ -301,6 +392,18 @@ private:
     void BuildFlameGraph( const Worker& worker, std::vector<FlameGraphItem>& data, const Vector<SampleData>& samples );
 
     void ListMemData( std::vector<const MemEvent*>& vec, const std::function<void(const MemEvent*)>& DrawAddress, int64_t startTime = -1, uint64_t pool = 0 );
+    bool IsGpuD3D12MemoryPool( uint64_t pool ) const;
+    bool IsMemoryFramePlot( const PlotData& plot ) const;
+    const char* GetMemoryPoolName( uint64_t pool ) const;
+    std::vector<uint64_t> GetMemoryFramePools() const;
+    size_t GetMemoryFrameCount( const FrameData& frameSet ) const;
+    MemoryFrameMapping FindMemoryFrameAtTime( const FrameData& frameSet, int64_t time, int& frameIndex ) const;
+    bool SelectMemoryFrame( const FrameData* frameSet, int frameIndex );
+    void SelectMemoryFrameAtTime( int64_t time );
+    void InspectMemoryPlot( const PlotData& plot, size_t item );
+    bool MemoryFrameSnapshotNeedsRebuild() const;
+    void RebuildMemoryFrameSnapshot();
+    void DrawMemoryIdentifier( uint64_t pool, const MemEvent& event ) const;
 
     unordered_flat_map<uint32_t, MemPathData> GetCallstackPaths( const MemData& mem, MemRange memRange ) const;
     unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeBottomUp( const MemData& mem ) const;
@@ -853,12 +956,15 @@ private:
 
     struct {
         bool show = false;
+        bool focus = false;
         char pattern[1024] = {};
         uint64_t ptrFind = 0;
         uint64_t pool = 0;
         bool showAllocList = false;
         std::vector<size_t> allocList;
         Range range;
+        MemoryFrameSelection frame;
+        MemoryFrameSnapshot frameSnapshot;
     } m_memInfo;
 
     struct {

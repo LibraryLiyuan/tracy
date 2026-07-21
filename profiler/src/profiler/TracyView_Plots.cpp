@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <cmath>
 
 #include "TracyColor.hpp"
 #include "TracyImGui.hpp"
@@ -248,6 +249,47 @@ bool View::DrawPlot( const TimelineContext& ctx, PlotData& plot, const std::vect
                 }
             }
         }
+
+        if( hover && IsMemoryFramePlot( plot ) && !plot.data.empty() &&
+            ImGui::IsMouseHoveringRect( ImVec2( wpos.x, yPos ), ImVec2( wpos.x + w, yPos + PlotHeight ) ) )
+        {
+            const auto mouse = ImGui::GetMousePos();
+            const auto mouseTime = int64_t( ctx.vStart + ( mouse.x - wpos.x ) * ctx.nspx );
+            auto nearest = std::lower_bound( plot.data.begin(), plot.data.end(), mouseTime, [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs; } );
+            if( nearest == plot.data.end() )
+            {
+                --nearest;
+            }
+            else if( nearest != plot.data.begin() )
+            {
+                const auto previous = nearest - 1;
+                if( std::abs( previous->time.Val() - mouseTime ) <= std::abs( nearest->time.Val() - mouseTime ) ) nearest = previous;
+            }
+
+            const auto item = size_t( std::distance( plot.data.begin(), nearest ) );
+            const auto itemX = float( ( nearest->time.Val() - ctx.vStart ) * pxns );
+            draw->AddLine( ImVec2( wpos.x + itemX, yPos ), ImVec2( wpos.x + itemX, yPos + PlotHeight ), 0x99FFFFFF );
+
+            // Named memory points already have a detailed allocation tooltip.
+            // Aggregate GPU plots need this tooltip to expose the frame link.
+            if( plot.type != PlotType::Memory || std::abs( itemX - ( mouse.x - wpos.x ) ) > 2.f )
+            {
+                ImGui::BeginTooltip();
+                TextFocused( "Plot:", plot.type == PlotType::Memory ? GetMemoryPoolName( plot.name ) : m_worker.GetString( plot.name ) );
+                TextFocused( "Nearest change:", TimeToStringExact( nearest->time.Val() ) );
+                TextFocused( "Value:", FormatPlotValue( nearest->val, plot.format ) );
+                if( item != 0 ) TextFocused( "Change:", FormatPlotValue( nearest->val - plot.data[item-1].val, plot.format ) );
+                ImGui::Separator();
+                TextDisabledUnformatted( "Click to inspect memory for the containing frame" );
+                ImGui::EndTooltip();
+            }
+
+            if( IsMouseClickReleased( ImGuiMouseButton_Left ) )
+            {
+                InspectMemoryPlot( plot, item );
+                ConsumeMouseEvents( ImGuiMouseButton_Left );
+            }
+        }
     }
     else
     {
@@ -326,9 +368,9 @@ void View::DrawPlotPoint( const ImVec2& wpos, float x, float y, int offset, uint
                 if( ev )
                 {
                     ImGui::Separator();
-                    TextDisabledUnformatted( "Address:" );
+                    TextDisabledUnformatted( IsGpuD3D12MemoryPool( name ) ? "Logical allocation ID:" : "Address:" );
                     ImGui::SameLine();
-                    ImGui::Text( "0x%" PRIx64, ev->Ptr() );
+                    DrawMemoryIdentifier( name, *ev );
                     TextFocused( "Appeared at", TimeToStringExact( ev->TimeAlloc() ) );
                     if( change > 0 )
                     {
@@ -378,6 +420,11 @@ void View::DrawPlotPoint( const ImVec2& wpos, float x, float y, int offset, uint
                     }
                 }
             }
+        }
+        if( type == PlotType::Memory )
+        {
+            ImGui::Separator();
+            TextDisabledUnformatted( "Click to inspect memory for the containing frame" );
         }
         ImGui::EndTooltip();
     }
