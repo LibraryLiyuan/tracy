@@ -66,6 +66,7 @@
 
 #define TracyPlot(x,y)
 #define TracyPlotConfig(x,y,z,w,a)
+#define TracyPlotConfigCurrentConnection(x,y,z,w,a)
 
 #define TracyMessage(x,y)
 #define TracyMessageL(x)
@@ -211,6 +212,7 @@
 
 #define TracyPlot( name, val ) tracy::Profiler::PlotData( name, val )
 #define TracyPlotConfig( name, type, step, fill, color ) tracy::Profiler::ConfigurePlot( name, type, step, fill, color )
+#define TracyPlotConfigCurrentConnection( name, type, step, fill, color ) tracy::Profiler::ConfigurePlotCurrentConnection( name, type, step, fill, color )
 
 #define TracyAppInfo( txt, size ) tracy::Profiler::MessageAppInfo( txt, size )
 

@@ -270,10 +270,44 @@ public:
         return p.m_serialQueue.prepare_next();
     }
 
+    static tracy_force_inline QueueItem* QueueSerialForConnection( uint64_t connectionId )
+    {
+        auto& p = GetProfiler();
+        p.m_serialLock.lock();
+#ifdef TRACY_ON_DEMAND
+        if( !p.IsConnected() || p.ConnectionId() != connectionId )
+        {
+            p.m_serialLock.unlock();
+            return nullptr;
+        }
+#else
+        (void)connectionId;
+#endif
+        return p.m_serialQueue.prepare_next();
+    }
+
     static tracy_force_inline QueueItem* QueueSerialCallstack( void* ptr )
     {
         auto& p = GetProfiler();
         p.m_serialLock.lock();
+        p.SendCallstackSerial( ptr );
+        return p.m_serialQueue.prepare_next();
+    }
+
+    static tracy_force_inline QueueItem* QueueSerialCallstackForConnection( void* ptr, uint64_t connectionId )
+    {
+        auto& p = GetProfiler();
+        p.m_serialLock.lock();
+#ifdef TRACY_ON_DEMAND
+        if( !p.IsConnected() || p.ConnectionId() != connectionId )
+        {
+            p.m_serialLock.unlock();
+            tracy_free_fast( ptr );
+            return nullptr;
+        }
+#else
+        (void)connectionId;
+#endif
         p.SendCallstackSerial( ptr );
         return p.m_serialQueue.prepare_next();
     }
@@ -390,6 +424,20 @@ public:
         GetProfiler().DeferItem( *item );
 #endif
 
+        TracyLfqCommit;
+    }
+
+    static tracy_force_inline void ConfigurePlotCurrentConnection( const char* name, PlotFormatType type, bool step, bool fill, uint32_t color )
+    {
+#ifdef TRACY_ON_DEMAND
+        if( !GetProfiler().IsConnected() ) return;
+#endif
+        TracyLfqPrepare( QueueType::PlotConfig );
+        MemWrite( &item->plotConfig.name, (uint64_t)name );
+        MemWrite( &item->plotConfig.type, (uint8_t)type );
+        MemWrite( &item->plotConfig.step, (uint8_t)step );
+        MemWrite( &item->plotConfig.fill, (uint8_t)fill );
+        MemWrite( &item->plotConfig.color, color );
         TracyLfqCommit;
     }
 
@@ -645,6 +693,72 @@ public:
         {
             MemFreeNamed( ptr, secure, name );
         }
+    }
+
+    static tracy_force_inline bool MemAllocNamedForConnection( uint64_t connectionId, const void* ptr, size_t size, int32_t depth, bool secure, const char* name )
+    {
+        if( secure && !ProfilerAvailable() ) return false;
+#ifdef TRACY_ON_DEMAND
+        auto& profiler = GetProfiler();
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId ) return false;
+#else
+        auto& profiler = GetProfiler();
+        (void)connectionId;
+#endif
+        const auto thread = GetThreadHandle();
+        void* callstack = nullptr;
+        if( depth > 0 && has_callstack() )
+        {
+            callstack = Callstack( depth );
+        }
+
+        profiler.m_serialLock.lock();
+#ifdef TRACY_ON_DEMAND
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId )
+        {
+            profiler.m_serialLock.unlock();
+            if( callstack ) tracy_free_fast( callstack );
+            return false;
+        }
+#endif
+        if( callstack ) SendCallstackSerial( callstack );
+        SendMemName( name );
+        SendMemAlloc( callstack ? QueueType::MemAllocCallstackNamed : QueueType::MemAllocNamed, thread, ptr, size );
+        profiler.m_serialLock.unlock();
+        return true;
+    }
+
+    static tracy_force_inline bool MemFreeNamedForConnection( uint64_t connectionId, const void* ptr, int32_t depth, bool secure, const char* name )
+    {
+        if( secure && !ProfilerAvailable() ) return false;
+#ifdef TRACY_ON_DEMAND
+        auto& profiler = GetProfiler();
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId ) return false;
+#else
+        auto& profiler = GetProfiler();
+        (void)connectionId;
+#endif
+        const auto thread = GetThreadHandle();
+        void* callstack = nullptr;
+        if( depth > 0 && has_callstack() )
+        {
+            callstack = Callstack( depth );
+        }
+
+        profiler.m_serialLock.lock();
+#ifdef TRACY_ON_DEMAND
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId )
+        {
+            profiler.m_serialLock.unlock();
+            if( callstack ) tracy_free_fast( callstack );
+            return false;
+        }
+#endif
+        if( callstack ) SendCallstackSerial( callstack );
+        SendMemName( name );
+        SendMemFree( callstack ? QueueType::MemFreeCallstackNamed : QueueType::MemFreeNamed, thread, ptr );
+        profiler.m_serialLock.unlock();
+        return true;
     }
 
     static tracy_force_inline void MemDiscard( const char* name, bool secure )
