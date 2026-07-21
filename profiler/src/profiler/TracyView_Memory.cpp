@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <inttypes.h>
 #include <limits>
@@ -534,6 +535,921 @@ void View::DrawMemoryIdentifier( uint64_t pool, const MemEvent& event ) const
     }
 }
 
+static bool GpuMemoryTextStartsWith( const std::string& text, const char* prefix )
+{
+    return text.compare( 0, strlen( prefix ), prefix ) == 0;
+}
+
+static std::string GpuMemoryTextField( const std::string& line, const char* key )
+{
+    const std::string pattern = std::string( "|" ) + key + "=";
+    const auto begin = line.find( pattern );
+    if( begin == std::string::npos ) return {};
+    const auto valueBegin = begin + pattern.size();
+    const auto valueEnd = line.find( '|', valueBegin );
+    return line.substr( valueBegin, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueBegin );
+}
+
+static uint64_t GpuMemoryTextUnsigned( const std::string& line, const char* key, int base = 10 )
+{
+    const auto value = GpuMemoryTextField( line, key );
+    if( value.empty() ) return 0;
+    return strtoull( value.c_str(), nullptr, base );
+}
+
+static int GpuMemoryTextSigned( const std::string& line, const char* key )
+{
+    const auto value = GpuMemoryTextField( line, key );
+    if( value.empty() ) return 0;
+    return int( strtol( value.c_str(), nullptr, 10 ) );
+}
+
+size_t View::GetGpuMemoryAllocationCount() const
+{
+    size_t count = 0;
+    for( const auto& v : m_worker.GetMemNameMap() )
+    {
+        if( IsGpuD3D12MemoryPool( v.first ) ) count += v.second->data.size();
+    }
+    return count;
+}
+
+bool View::GpuMemoryAttributionNeedsRebuild() const
+{
+    const auto& cache = m_memInfo.gpuAttribution;
+    return !cache.ready ||
+        cache.pendingCpuZones ||
+        cache.pendingGpuZones ||
+        cache.zoneCount != m_worker.GetZoneCount() ||
+        cache.gpuZoneCount != m_worker.GetGpuZoneCount() ||
+        cache.allocationCount != GetGpuMemoryAllocationCount() ||
+        cache.gpuZonesReady != m_worker.AreGpuSourceLocationZonesReady();
+}
+
+void View::EnsureGpuMemoryAttribution()
+{
+    if( !GpuMemoryAttributionNeedsRebuild() ) return;
+    auto& cache = m_memInfo.gpuAttribution;
+    const auto now = ImGui::GetTime();
+    if( now < cache.nextRebuildTime ) return;
+    cache.nextRebuildTime = now + 0.5;
+    RebuildGpuMemoryAttribution();
+}
+
+void View::RebuildGpuMemoryAttribution()
+{
+    auto& cache = m_memInfo.gpuAttribution;
+    const auto zoneCount = m_worker.GetZoneCount();
+    const auto gpuZoneCount = m_worker.GetGpuZoneCount();
+    const auto allocationCount = GetGpuMemoryAllocationCount();
+    const auto gpuZonesReady = m_worker.AreGpuSourceLocationZonesReady();
+    const auto nextRebuildTime = cache.nextRebuildTime;
+
+    const bool reset = !cache.ready || cache.zoneCount > zoneCount || cache.gpuZoneCount > gpuZoneCount || cache.allocationCount > allocationCount;
+    if( reset )
+    {
+        cache = GpuMemoryAttributionCache {};
+        cache.nextRebuildTime = nextRebuildTime;
+    }
+
+    cache.zoneCount = zoneCount;
+    cache.gpuZoneCount = gpuZoneCount;
+    cache.allocationCount = allocationCount;
+    cache.gpuZonesReady = gpuZonesReady;
+
+    if( !m_worker.AreSourceLocationZonesReady() )
+    {
+        cache.ready = false;
+        return;
+    }
+
+    const auto firstNewRequestScope = cache.requestScopes.size();
+    const auto firstNewPass = cache.passes.size();
+    cache.pendingCpuZones = false;
+    cache.pendingGpuZones = false;
+
+    const auto& sourceLocationZones = m_worker.GetSourceLocationZones();
+    for( const auto& sourceEntry : sourceLocationZones )
+    {
+        const auto& sourceLocation = m_worker.GetSourceLocation( sourceEntry.first );
+        const auto sourceName = m_worker.GetZoneName( sourceLocation );
+        const bool requestMarker = sourceName && strcmp( sourceName, "GTMEM Request Scope" ) == 0;
+        const bool passMarker = sourceName && strcmp( sourceName, "GTMEM Pass Relations" ) == 0;
+        if( !requestMarker && !passMarker ) continue;
+
+        cache.protocolPresent = true;
+        auto& processedZoneCount = cache.processedCpuZonesBySource[sourceEntry.first];
+        if( processedZoneCount > sourceEntry.second.zones.size() ) processedZoneCount = 0;
+        for( size_t zoneIndex=processedZoneCount; zoneIndex<sourceEntry.second.zones.size(); zoneIndex++ )
+        {
+            const auto& zoneThread = sourceEntry.second.zones[zoneIndex];
+            const auto zone = zoneThread.Zone();
+            if( !zone )
+            {
+                processedZoneCount = zoneIndex + 1;
+                continue;
+            }
+            if( zone->End() < 0 )
+            {
+                cache.pendingCpuZones = true;
+                break;
+            }
+            processedZoneCount = zoneIndex + 1;
+            if( !m_worker.HasZoneExtra( *zone ) ) continue;
+            const auto& extra = m_worker.GetZoneExtra( *zone );
+            if( !extra.text.Active() ) continue;
+            const auto zoneText = m_worker.GetString( extra.text );
+            if( !zoneText ) continue;
+
+            const std::string text( zoneText );
+            if( requestMarker )
+            {
+                const auto lineEnd = text.find( '\n' );
+                const auto line = text.substr( 0, lineEnd );
+                if( !GpuMemoryTextStartsWith( line, "GTMEM1|SCOPE|" ) ) continue;
+
+                GpuMemoryRequestScope scope;
+                scope.labelId = GpuMemoryTextUnsigned( line, "label" );
+                scope.frame = GpuMemoryTextUnsigned( line, "frame" );
+                scope.thread = m_worker.DecompressThread( zoneThread.Thread() );
+                scope.start = zone->Start();
+                scope.end = m_worker.GetZoneEnd( *zone );
+                const auto scopeName = m_worker.GetZoneName( *zone );
+                scope.name = scopeName ? scopeName : "";
+                scope.zone = zone;
+                const auto scopeIndex = cache.requestScopes.size();
+                cache.requestScopes.emplace_back( std::move( scope ) );
+                const auto& storedScope = cache.requestScopes.back();
+                if( storedScope.labelId != 0 ) cache.requestScopeByLabel[storedScope.labelId] = scopeIndex;
+                cache.requestScopesByThread[storedScope.thread].emplace_back( scopeIndex );
+                continue;
+            }
+
+            GpuMemoryPass pass;
+            pass.thread = m_worker.DecompressThread( zoneThread.Thread() );
+            pass.start = zone->Start();
+            pass.end = m_worker.GetZoneEnd( *zone );
+            const auto passName = m_worker.GetZoneName( *zone );
+            pass.name = passName ? passName : "";
+            pass.relationZone = zone;
+            bool headerFound = false;
+            uint32_t parsedChunks = 0;
+
+            size_t cursor = 0;
+            while( cursor <= text.size() )
+            {
+                const auto lineEnd = text.find( '\n', cursor );
+                const auto line = text.substr( cursor, lineEnd == std::string::npos ? std::string::npos : lineEnd - cursor );
+                if( GpuMemoryTextStartsWith( line, "GTMEM1|PASS|" ) )
+                {
+                    pass.passId = GpuMemoryTextUnsigned( line, "pass" );
+                    pass.labelId = GpuMemoryTextUnsigned( line, "label" );
+                    pass.frame = GpuMemoryTextUnsigned( line, "frame" );
+                    pass.level = GpuMemoryTextSigned( line, "level" );
+                    pass.ordinal = GpuMemoryTextUnsigned( line, "ordinal" );
+                    pass.operations = GpuMemoryTextField( line, "ops" );
+                    pass.commandCount = uint32_t( GpuMemoryTextUnsigned( line, "commands" ) );
+                    pass.emittedUseCount = uint32_t( GpuMemoryTextUnsigned( line, "uses" ) );
+                    pass.totalUseCount = uint32_t( GpuMemoryTextUnsigned( line, "total" ) );
+                    pass.expectedChunks = uint32_t( GpuMemoryTextUnsigned( line, "chunks" ) );
+                    pass.untrackedReferences = uint32_t( GpuMemoryTextUnsigned( line, "untracked" ) );
+                    pass.truncated = GpuMemoryTextUnsigned( line, "truncated" ) != 0;
+                    pass.droppedUses = uint32_t( GpuMemoryTextUnsigned( line, "dropped" ) );
+                    headerFound = pass.passId != 0;
+                }
+                else if( GpuMemoryTextStartsWith( line, "GTMEM1|USE|" ) )
+                {
+                    const auto relationPassId = GpuMemoryTextUnsigned( line, "pass" );
+                    const auto data = GpuMemoryTextField( line, "data" );
+                    if( relationPassId != 0 && ( pass.passId == 0 || relationPassId == pass.passId ) )
+                    {
+                        parsedChunks++;
+                        size_t entryCursor = 0;
+                        while( entryCursor < data.size() )
+                        {
+                            const auto entryEnd = data.find( ',', entryCursor );
+                            const auto entry = data.substr( entryCursor, entryEnd == std::string::npos ? std::string::npos : entryEnd - entryCursor );
+                            const auto firstColon = entry.find( ':' );
+                            const auto secondColon = firstColon == std::string::npos ? std::string::npos : entry.find( ':', firstColon + 1 );
+                            if( firstColon != std::string::npos && secondColon != std::string::npos && secondColon > firstColon + 1 )
+                            {
+                                GpuMemoryPassUse use;
+                                use.allocationId = strtoull( entry.substr( 0, firstColon ).c_str(), nullptr, 10 );
+                                use.kind = entry[firstColon + 1];
+                                use.usageMask = uint32_t( strtoul( entry.substr( secondColon + 1 ).c_str(), nullptr, 16 ) );
+                                if( use.allocationId != 0 ) pass.uses.emplace_back( use );
+                            }
+                            if( entryEnd == std::string::npos ) break;
+                            entryCursor = entryEnd + 1;
+                        }
+                    }
+                }
+
+                if( lineEnd == std::string::npos ) break;
+                cursor = lineEnd + 1;
+            }
+
+            pass.complete = headerFound && parsedChunks == pass.expectedChunks && pass.uses.size() == pass.emittedUseCount;
+            if( headerFound ) cache.passes.emplace_back( std::move( pass ) );
+        }
+    }
+
+    for( const auto& memoryEntry : m_worker.GetMemNameMap() )
+    {
+        const auto pool = memoryEntry.first;
+        if( !IsGpuD3D12MemoryPool( pool ) ) continue;
+        const auto& memory = *memoryEntry.second;
+        auto& processedAllocationCount = cache.processedAllocationsByPool[pool];
+        if( processedAllocationCount > memory.data.size() ) processedAllocationCount = 0;
+        for( size_t i=processedAllocationCount; i<memory.data.size(); i++ )
+        {
+            const auto& event = memory.data[i];
+            const auto allocationId = event.Ptr();
+            if( allocationId == 0 ) continue;
+            cache.allocationById[allocationId] = MemoryEventRef { pool, i };
+
+            const auto thread = m_worker.DecompressThread( event.ThreadAlloc() );
+            const auto threadIt = cache.requestScopesByThread.find( thread );
+            if( threadIt == cache.requestScopesByThread.end() ) continue;
+            const auto allocationTime = event.TimeAlloc();
+            const auto& indices = threadIt->second;
+            auto scopeIt = std::upper_bound( indices.begin(), indices.end(), allocationTime, [&cache]( int64_t time, size_t index ) {
+                return time < cache.requestScopes[index].start;
+            } );
+            while( scopeIt != indices.begin() )
+            {
+                --scopeIt;
+                const auto& scope = cache.requestScopes[*scopeIt];
+                if( scope.start <= allocationTime && scope.end >= allocationTime )
+                {
+                    cache.requestLabelByAllocation[allocationId] = scope.labelId;
+                    break;
+                }
+                if( scope.end < allocationTime ) break;
+            }
+        }
+        processedAllocationCount = memory.data.size();
+    }
+
+    for( size_t scopeIndex=firstNewRequestScope; scopeIndex<cache.requestScopes.size(); scopeIndex++ )
+    {
+        const auto& scope = cache.requestScopes[scopeIndex];
+        for( const auto& allocation : cache.allocationById )
+        {
+            if( cache.requestLabelByAllocation.find( allocation.first ) != cache.requestLabelByAllocation.end() ) continue;
+            const auto& ref = allocation.second;
+            const auto& event = m_worker.GetMemoryNamed( ref.pool ).data[ref.index];
+            if( m_worker.DecompressThread( event.ThreadAlloc() ) != scope.thread ) continue;
+            if( event.TimeAlloc() >= scope.start && event.TimeAlloc() <= scope.end ) cache.requestLabelByAllocation[allocation.first] = scope.labelId;
+        }
+    }
+
+    for( size_t i=firstNewPass; i<cache.passes.size(); i++ )
+    {
+        const auto& pass = cache.passes[i];
+        cache.passById[pass.passId] = i;
+        for( const auto& use : pass.uses ) cache.passesByAllocation[use.allocationId].emplace_back( i );
+    }
+
+    if( cache.gpuZonesReady )
+    {
+        unordered_flat_set<std::string> updatedGpuNames;
+        for( const auto& sourceEntry : m_worker.GetGpuSourceLocationZones() )
+        {
+            auto& processedZoneCount = cache.processedGpuZonesBySource[sourceEntry.first];
+            if( processedZoneCount > sourceEntry.second.zones.size() ) processedZoneCount = 0;
+            for( size_t zoneIndex=processedZoneCount; zoneIndex<sourceEntry.second.zones.size(); zoneIndex++ )
+            {
+                const auto& zoneThread = sourceEntry.second.zones[zoneIndex];
+                const auto zone = zoneThread.Zone();
+                if( !zone )
+                {
+                    processedZoneCount = zoneIndex + 1;
+                    continue;
+                }
+                if( zone->GpuEnd() < 0 )
+                {
+                    cache.pendingGpuZones = true;
+                    break;
+                }
+                processedZoneCount = zoneIndex + 1;
+                const auto name = m_worker.GetZoneName( *zone );
+                if( !name ) continue;
+                const auto thread = zone->Thread() != 0 ? m_worker.DecompressThread( zone->Thread() ) : m_worker.DecompressThread( zoneThread.Thread() );
+                auto& candidates = cache.gpuZonesByName[name];
+                const GpuMemoryGpuZoneCandidate candidate { zone, thread, zone->CpuStart() };
+                const auto insertionPoint = std::lower_bound( candidates.begin(), candidates.end(), candidate.cpuStart, []( const auto& lhs, int64_t cpuStart ) {
+                    return lhs.cpuStart < cpuStart;
+                } );
+                candidates.insert( insertionPoint, candidate );
+                updatedGpuNames.emplace( name );
+            }
+        }
+
+        for( const auto& name : updatedGpuNames )
+        {
+            const auto pendingIt = cache.pendingGpuPassesByName.find( name );
+            if( pendingIt == cache.pendingGpuPassesByName.end() ) continue;
+            auto& pending = pendingIt->second;
+            size_t write = 0;
+            for( const auto passIndex : pending )
+            {
+                if( !TryPairGpuMemoryPass( passIndex ) ) pending[write++] = passIndex;
+            }
+            pending.resize( write );
+        }
+    }
+
+    for( size_t passIndex=firstNewPass; passIndex<cache.passes.size(); passIndex++ )
+    {
+        if( !TryPairGpuMemoryPass( passIndex ) ) cache.pendingGpuPassesByName[cache.passes[passIndex].name].emplace_back( passIndex );
+    }
+
+    cache.ready = true;
+}
+
+bool View::TryPairGpuMemoryPass( size_t passIndex )
+{
+    auto& cache = m_memInfo.gpuAttribution;
+    auto& pass = cache.passes[passIndex];
+    const auto candidatesIt = cache.gpuZonesByName.find( pass.name );
+    if( candidatesIt == cache.gpuZonesByName.end() ) return false;
+
+    const auto& candidates = candidatesIt->second;
+    auto candidateIt = std::lower_bound( candidates.begin(), candidates.end(), pass.start, []( const auto& lhs, int64_t cpuStart ) {
+        return lhs.cpuStart < cpuStart;
+    } );
+    const GpuMemoryGpuZoneCandidate* match = nullptr;
+    uint32_t matchCount = 0;
+    while( candidateIt != candidates.end() && candidateIt->cpuStart <= pass.end )
+    {
+        if( candidateIt->thread == pass.thread )
+        {
+            match = &*candidateIt;
+            matchCount++;
+        }
+        ++candidateIt;
+    }
+
+    if( matchCount == 1 )
+    {
+        pass.gpuZone = match->zone;
+        pass.gpuThread = match->thread;
+        return true;
+    }
+    if( matchCount > 1 )
+    {
+        pass.gpuPairAmbiguous = true;
+        return true;
+    }
+    return false;
+}
+
+std::string View::FormatGpuMemoryUsage( uint32_t usageMask ) const
+{
+    std::string text;
+    auto append = [&text]( const char* value ) {
+        if( !text.empty() ) text += ", ";
+        text += value;
+    };
+
+    const bool read = ( usageMask & ( 1u << 0 ) ) != 0;
+    const bool write = ( usageMask & ( 1u << 1 ) ) != 0;
+    if( read && write ) append( "Read/Write" );
+    else if( read ) append( "Read" );
+    else if( write ) append( "Write" );
+    if( usageMask & ( 1u << 2 ) ) append( "Copy" );
+    if( usageMask & ( 1u << 3 ) ) append( "Resolve" );
+    if( usageMask & ( 1u << 4 ) ) append( "Uniform" );
+    if( usageMask & ( 1u << 5 ) ) append( "Indirect" );
+    if( usageMask & ( 1u << 6 ) ) append( "Texel" );
+    if( usageMask & ( 1u << 7 ) ) append( "Storage" );
+    if( usageMask & ( 1u << 8 ) ) append( "Vertex" );
+    if( usageMask & ( 1u << 9 ) ) append( "Index" );
+    if( usageMask & ( 1u << 10 ) ) append( "Sampled" );
+    if( usageMask & ( 1u << 11 ) ) append( "Color attachment" );
+    if( usageMask & ( 1u << 12 ) ) append( "Depth attachment" );
+    if( usageMask & ( 1u << 13 ) ) append( "Special attachment" );
+    if( usageMask & ( 1u << 14 ) ) append( "General" );
+    if( usageMask & ( 1u << 15 ) ) append( "Acceleration structure" );
+    return text.empty() ? "-" : text;
+}
+
+bool View::DrawGpuMemoryPassLink( const GpuMemoryPass& pass, int& widgetId )
+{
+    ImGui::PushID( widgetId++ );
+    const bool selected = pass.gpuZone ? m_gpuInfoWindow == pass.gpuZone : m_zoneInfoWindow == pass.relationZone;
+    const bool clicked = ImGui::Selectable( pass.name.c_str(), selected );
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+    if( clicked )
+    {
+        if( pass.gpuZone ) ShowZoneInfo( *pass.gpuZone, pass.gpuThread );
+        else if( pass.relationZone ) ShowZoneInfo( *pass.relationZone );
+    }
+    if( hovered )
+    {
+        if( pass.gpuZone )
+        {
+            m_gpuHighlight = pass.gpuZone;
+            ZoneTooltip( *pass.gpuZone );
+            if( IsMouseClicked( 2 ) ) ZoomToZone( *pass.gpuZone );
+        }
+        else if( pass.relationZone )
+        {
+            m_zoneHighlight = pass.relationZone;
+            ZoneTooltip( *pass.relationZone );
+            if( IsMouseClicked( 2 ) ) ZoomToZone( *pass.relationZone );
+        }
+    }
+    return clicked;
+}
+
+void View::DrawGpuMemoryPassesForSelectedFrame()
+{
+    EnsureGpuMemoryAttribution();
+    auto& cache = m_memInfo.gpuAttribution;
+    if( !cache.ready )
+    {
+        TextDisabledUnformatted( "Pass attribution is being indexed..." );
+        return;
+    }
+    if( !cache.protocolPresent )
+    {
+        TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "No GTMEM1 pass relations in this capture. Use a pass-attribution Godot build with allocation/full D3D12 memory mode." );
+        return;
+    }
+
+    const auto& snapshot = m_memInfo.frameSnapshot;
+    std::vector<size_t> framePasses;
+    framePasses.reserve( cache.passes.size() );
+    unordered_flat_map<uint64_t, uint32_t> framePassCountByLabel;
+    for( size_t i=0; i<cache.passes.size(); i++ )
+    {
+        const auto& pass = cache.passes[i];
+        if( pass.start >= snapshot.begin && pass.start < snapshot.end )
+        {
+            framePasses.emplace_back( i );
+            if( pass.labelId != 0 ) framePassCountByLabel[pass.labelId]++;
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted( ICON_FA_DIAGRAM_PROJECT " Passes in frame" );
+    if( framePasses.empty() )
+    {
+        TextDisabledUnformatted( "No GTMEM1 pass relation zone starts in the selected frame." );
+        return;
+    }
+
+    unordered_flat_set<uint64_t> uniqueAllocations;
+    uint64_t uniqueBytes = 0;
+    uint64_t relationCount = 0;
+    uint64_t untrackedReferences = 0;
+    uint32_t linkedAllocations = 0;
+    uint32_t gpuPairs = 0;
+    uint32_t ambiguousGpuPairs = 0;
+    uint32_t incompletePasses = 0;
+    uint32_t truncatedPasses = 0;
+    for( const auto passIndex : framePasses )
+    {
+        const auto& pass = cache.passes[passIndex];
+        if( pass.gpuZone ) gpuPairs++;
+        if( pass.gpuPairAmbiguous ) ambiguousGpuPairs++;
+        if( !pass.complete ) incompletePasses++;
+        if( pass.truncated ) truncatedPasses++;
+        relationCount += pass.uses.size();
+        untrackedReferences += pass.untrackedReferences;
+        for( const auto& use : pass.uses )
+        {
+            if( !uniqueAllocations.emplace( use.allocationId ).second ) continue;
+            const auto allocation = cache.allocationById.find( use.allocationId );
+            if( allocation != cache.allocationById.end() )
+            {
+                const auto& ref = allocation->second;
+                uniqueBytes += m_worker.GetMemoryNamed( ref.pool ).data[ref.index].Size();
+                linkedAllocations++;
+            }
+        }
+    }
+
+    ImGui::Text( "%s pass(es) | %s/%s linked allocation(s) | %s relation(s) | %s unique referenced bytes",
+        RealToString( framePasses.size() ), RealToString( linkedAllocations ), RealToString( uniqueAllocations.size() ), RealToString( relationCount ), MemSizeToString( uniqueBytes ) );
+    ImGui::Text( "%s uniquely paired GPU zone(s) | %s CPU fallback(s) | %s ambiguous | %s untracked reference(s) | %s truncated pass(es)",
+        RealToString( gpuPairs ), RealToString( framePasses.size() - gpuPairs - ambiguousGpuPairs ), RealToString( ambiguousGpuPairs ), RealToString( untrackedReferences ), RealToString( truncatedPasses ) );
+    if( incompletePasses != 0 )
+    {
+        TextColoredUnformatted( ImVec4( 1.f, 0.4f, 0.3f, 1.f ), "One or more relation payloads are incomplete; affected rows are marked below." );
+    }
+    TextDisabledUnformatted( "Referenced bytes are a per-pass resource set, not exclusive ownership. Do not sum pass rows; use the unique union above." );
+    TextDisabledUnformatted( "History begins when the capture connects. Request origins and earlier pass uses for replayed baseline allocations may be unavailable." );
+
+    const auto height = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( framePasses.size() + 2, 16 );
+    const auto flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY;
+    if( !ImGui::BeginTable( "##gpuMemoryFramePasses", 14, flags, ImVec2( 0, height ) ) ) return;
+    ImGui::TableSetupScrollFreeze( 1, 1 );
+    ImGui::TableSetupColumn( "Pass", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, 280 );
+    ImGui::TableSetupColumn( "Level", ImGuiTableColumnFlags_WidthFixed, 55 );
+    ImGui::TableSetupColumn( "Operations", ImGuiTableColumnFlags_WidthFixed, 110 );
+    ImGui::TableSetupColumn( "Resources", ImGuiTableColumnFlags_WidthFixed, 100 );
+    ImGui::TableSetupColumn( "Textures", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 150 );
+    ImGui::TableSetupColumn( "Buffers", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 150 );
+    ImGui::TableSetupColumn( "Read-only bytes", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 115 );
+    ImGui::TableSetupColumn( "Write/RW bytes", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultHide, 115 );
+    ImGui::TableSetupColumn( "Referenced bytes", ImGuiTableColumnFlags_WidthFixed, 120 );
+    ImGui::TableSetupColumn( "First-use bytes", ImGuiTableColumnFlags_WidthFixed, 110 );
+    ImGui::TableSetupColumn( "Request allocations / bytes", ImGuiTableColumnFlags_WidthFixed, 175 );
+    ImGui::TableSetupColumn( "GPU duration", ImGuiTableColumnFlags_WidthFixed, 110 );
+    ImGui::TableSetupColumn( "Untracked refs", ImGuiTableColumnFlags_WidthFixed, 100 );
+    ImGui::TableSetupColumn( "Quality", ImGuiTableColumnFlags_WidthFixed, 130 );
+    ImGui::TableHeadersRow();
+
+    int widgetId = 0;
+    for( const auto passIndex : framePasses )
+    {
+        const auto& pass = cache.passes[passIndex];
+        uint64_t referencedBytes = 0;
+        uint64_t firstUseBytes = 0;
+        uint64_t requestScopeBytes = 0;
+        uint64_t textureBytes = 0;
+        uint64_t bufferBytes = 0;
+        uint64_t readOnlyBytes = 0;
+        uint64_t writeBytes = 0;
+        uint32_t textureCount = 0;
+        uint32_t bufferCount = 0;
+        uint32_t requestScopeAllocations = 0;
+        for( const auto& use : pass.uses )
+        {
+            const auto allocation = cache.allocationById.find( use.allocationId );
+            if( allocation == cache.allocationById.end() ) continue;
+            const auto& ref = allocation->second;
+            const auto size = m_worker.GetMemoryNamed( ref.pool ).data[ref.index].Size();
+            referencedBytes += size;
+            if( use.kind == 'T' )
+            {
+                textureCount++;
+                textureBytes += size;
+            }
+            else if( use.kind == 'B' )
+            {
+                bufferCount++;
+                bufferBytes += size;
+            }
+            if( ( use.usageMask & ( 1u << 1 ) ) != 0 ) writeBytes += size;
+            else if( ( use.usageMask & ( 1u << 0 ) ) != 0 ) readOnlyBytes += size;
+
+            const auto history = cache.passesByAllocation.find( use.allocationId );
+            if( history != cache.passesByAllocation.end() && !history->second.empty() && history->second.front() == passIndex ) firstUseBytes += size;
+            const auto request = cache.requestLabelByAllocation.find( use.allocationId );
+            if( request != cache.requestLabelByAllocation.end() && request->second == pass.labelId )
+            {
+                requestScopeAllocations++;
+                requestScopeBytes += size;
+            }
+        }
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        if( DrawGpuMemoryPassLink( pass, widgetId ) ) cache.selectedPassId = pass.passId;
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( RealToString( pass.level ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( pass.operations.empty() ? "-" : pass.operations.c_str() );
+        ImGui::TableNextColumn();
+        if( pass.truncated ) ImGui::Text( "%s / %s", RealToString( pass.emittedUseCount ), RealToString( pass.totalUseCount ) );
+        else ImGui::TextUnformatted( RealToString( pass.uses.size() ) );
+        ImGui::TableNextColumn();
+        ImGui::Text( "%s / %s", RealToString( textureCount ), MemSizeToString( textureBytes ) );
+        ImGui::TableNextColumn();
+        ImGui::Text( "%s / %s", RealToString( bufferCount ), MemSizeToString( bufferBytes ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( MemSizeToString( readOnlyBytes ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( MemSizeToString( writeBytes ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( MemSizeToString( referencedBytes ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( MemSizeToString( firstUseBytes ) );
+        ImGui::TableNextColumn();
+        if( requestScopeAllocations == 0 ) TextDisabledUnformatted( "-" );
+        else if( framePassCountByLabel[pass.labelId] > 1 ) ImGui::Text( "%s / %s (shared)", RealToString( requestScopeAllocations ), MemSizeToString( requestScopeBytes ) );
+        else ImGui::Text( "%s / %s", RealToString( requestScopeAllocations ), MemSizeToString( requestScopeBytes ) );
+        ImGui::TableNextColumn();
+        if( pass.gpuZone && pass.gpuZone->GpuEnd() >= 0 ) ImGui::TextUnformatted( TimeToString( pass.gpuZone->GpuEnd() - pass.gpuZone->GpuStart() ) );
+        else if( pass.gpuPairAmbiguous ) TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Ambiguous" );
+        else TextDisabledUnformatted( "CPU relation" );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( RealToString( pass.untrackedReferences ) );
+        ImGui::TableNextColumn();
+        if( !pass.complete ) TextColoredUnformatted( ImVec4( 1.f, 0.3f, 0.2f, 1.f ), "Incomplete" );
+        else if( pass.truncated ) ImGui::Text( "Truncated (%s)", RealToString( pass.droppedUses ) );
+        else if( pass.gpuPairAmbiguous ) TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Exact; GPU ambiguous" );
+        else TextColoredUnformatted( ImVec4( 0.5f, 1.f, 0.5f, 1.f ), "Exact relation" );
+    }
+    ImGui::EndTable();
+
+    if( cache.selectedPassId != 0 )
+    {
+        const auto selected = cache.passById.find( cache.selectedPassId );
+        if( selected == cache.passById.end() || cache.passes[selected->second].start < snapshot.begin || cache.passes[selected->second].start >= snapshot.end )
+        {
+            cache.selectedPassId = 0;
+        }
+        else
+        {
+            DrawGpuMemoryPassDetails( cache.passes[selected->second], widgetId );
+        }
+    }
+}
+
+void View::DrawGpuMemoryPassDetails( const GpuMemoryPass& pass, int& widgetId )
+{
+    auto& cache = m_memInfo.gpuAttribution;
+    const auto& selection = m_memInfo.frame;
+    const auto& snapshot = m_memInfo.frameSnapshot;
+
+    uint64_t referencedBytes = 0;
+    uint64_t firstUseBytes = 0;
+    for( const auto& use : pass.uses )
+    {
+        const auto allocation = cache.allocationById.find( use.allocationId );
+        if( allocation == cache.allocationById.end() ) continue;
+        const auto& ref = allocation->second;
+        const auto size = m_worker.GetMemoryNamed( ref.pool ).data[ref.index].Size();
+        referencedBytes += size;
+        const auto history = cache.passesByAllocation.find( use.allocationId );
+        if( history != cache.passesByAllocation.end() && !history->second.empty() && cache.passes[history->second.front()].passId == pass.passId ) firstUseBytes += size;
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Text( ICON_FA_DIAGRAM_PROJECT " Pass details: %s", pass.name.c_str() );
+    ImGui::SameLine();
+    if( ImGui::SmallButton( ICON_FA_XMARK " Close##gpuMemoryPassDetails" ) )
+    {
+        cache.selectedPassId = 0;
+        return;
+    }
+    ImGui::Text( "Pass ID: %" PRIu64 " | Request label: %" PRIu64 " | Godot frame: %" PRIu64 " | Level: %d | Operations: %s",
+        pass.passId, pass.labelId, pass.frame, pass.level, pass.operations.empty() ? "-" : pass.operations.c_str() );
+    if( pass.gpuZone && pass.gpuZone->GpuEnd() >= 0 )
+    {
+        ImGui::Text( "GPU duration: %s | Tracked resources: %s | Referenced bytes: %s | First-use bytes: %s",
+            TimeToString( pass.gpuZone->GpuEnd() - pass.gpuZone->GpuStart() ), RealToString( pass.uses.size() ), MemSizeToString( referencedBytes ), MemSizeToString( firstUseBytes ) );
+    }
+    else
+    {
+        ImGui::Text( "GPU duration: %s | Tracked resources: %s | Referenced bytes: %s | First-use bytes: %s",
+            pass.gpuPairAmbiguous ? "Ambiguous GPU link" : "CPU relation fallback", RealToString( pass.uses.size() ), MemSizeToString( referencedBytes ), MemSizeToString( firstUseBytes ) );
+    }
+    ImGui::Text( "Untracked references: %s | Emitted/total resources: %s/%s | Payload: %s",
+        RealToString( pass.untrackedReferences ), RealToString( pass.emittedUseCount ), RealToString( pass.totalUseCount ), pass.complete ? ( pass.truncated ? "Complete, truncated" : "Complete" ) : "Incomplete" );
+    TextDisabledUnformatted( "Select an allocation ID below to open its normal Memory allocation detail window." );
+
+    const auto height = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( pass.uses.size() + 2, 16 );
+    const auto flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY;
+    if( !ImGui::BeginTable( "##gpuMemoryPassResources", 12, flags, ImVec2( 0, height ) ) ) return;
+    ImGui::TableSetupScrollFreeze( 2, 1 );
+    ImGui::TableSetupColumn( "Logical allocation ID", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, 150 );
+    ImGui::TableSetupColumn( "Pool", ImGuiTableColumnFlags_WidthFixed, 240 );
+    ImGui::TableSetupColumn( "Kind", ImGuiTableColumnFlags_WidthFixed, 70 );
+    ImGui::TableSetupColumn( "Size", ImGuiTableColumnFlags_WidthFixed, 100 );
+    ImGui::TableSetupColumn( "State in frame", ImGuiTableColumnFlags_WidthFixed, 120 );
+    ImGui::TableSetupColumn( "Usage", ImGuiTableColumnFlags_WidthFixed, 230 );
+    ImGui::TableSetupColumn( "Alloc frame", ImGuiTableColumnFlags_WidthFixed, 90 );
+    ImGui::TableSetupColumn( "Free frame", ImGuiTableColumnFlags_WidthFixed, 90 );
+    ImGui::TableSetupColumn( "Request scope", ImGuiTableColumnFlags_WidthFixed, 250 );
+    ImGui::TableSetupColumn( "First use", ImGuiTableColumnFlags_WidthFixed, 250 );
+    ImGui::TableSetupColumn( "Last use", ImGuiTableColumnFlags_WidthFixed, 250 );
+    ImGui::TableSetupColumn( "Alloc call stack", ImGuiTableColumnFlags_WidthFixed, 110 );
+    ImGui::TableHeadersRow();
+
+    ImGuiListClipper clipper;
+    clipper.Begin( int( pass.uses.size() ) );
+    while( clipper.Step() )
+    {
+        for( int row=clipper.DisplayStart; row<clipper.DisplayEnd; row++ )
+        {
+            const auto& use = pass.uses[row];
+            const auto allocation = cache.allocationById.find( use.allocationId );
+            const bool mapped = allocation != cache.allocationById.end();
+            const MemoryEventRef ref = mapped ? allocation->second : MemoryEventRef {};
+            const MemEvent* event = mapped ? &m_worker.GetMemoryNamed( ref.pool ).data[ref.index] : nullptr;
+
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID( widgetId++ );
+            if( mapped )
+            {
+                if( ImGui::Selectable( RealToString( use.allocationId ), m_memoryAllocInfoPool == ref.pool && m_memoryAllocInfoWindow == int64_t( ref.index ) ) )
+                {
+                    m_memoryAllocInfoPool = ref.pool;
+                    m_memoryAllocInfoWindow = int64_t( ref.index );
+                }
+            }
+            else
+            {
+                ImGui::TextUnformatted( RealToString( use.allocationId ) );
+            }
+            ImGui::PopID();
+
+            ImGui::TableNextColumn();
+            if( mapped ) ImGui::TextUnformatted( GetMemoryPoolName( ref.pool ) );
+            else TextDisabledUnformatted( "Unmapped" );
+
+            ImGui::TableNextColumn();
+            const char* kind = use.kind == 'T' ? "Texture" : use.kind == 'B' ? "Buffer" : use.kind == 'A' ? "AS" : "Unknown";
+            ImGui::TextUnformatted( kind );
+
+            ImGui::TableNextColumn();
+            if( event ) ImGui::TextUnformatted( MemSizeToString( event->Size() ) );
+            else TextDisabledUnformatted( "-" );
+
+            ImGui::TableNextColumn();
+            if( event )
+            {
+                const auto ta = event->TimeAlloc();
+                const auto tf = event->TimeFree();
+                if( ta >= snapshot.end ) TextDisabledUnformatted( "Not allocated yet" );
+                else if( tf >= 0 && tf < snapshot.begin ) TextDisabledUnformatted( "Freed before frame" );
+                else if( ta >= snapshot.begin && tf >= 0 && tf < snapshot.end ) ImGui::TextUnformatted( "Transient" );
+                else if( ta >= snapshot.begin ) ImGui::TextUnformatted( "Allocated in frame" );
+                else if( tf >= snapshot.begin && tf < snapshot.end ) ImGui::TextUnformatted( "Freed in frame" );
+                else TextColoredUnformatted( ImVec4( 0.6f, 1.f, 0.6f, 1.f ), "Active" );
+            }
+            else TextDisabledUnformatted( "-" );
+
+            ImGui::TableNextColumn();
+            const auto usage = FormatGpuMemoryUsage( use.usageMask );
+            ImGui::TextUnformatted( usage.c_str() );
+
+            int allocFrame = -1;
+            int freeFrame = -1;
+            const bool hasAllocFrame = event && selection.frameSet && FindMemoryFrameAtTime( *selection.frameSet, event->TimeAlloc(), allocFrame ) == MemoryFrameMapping::Valid;
+            const bool hasFreeFrame = event && event->TimeFree() >= 0 && selection.frameSet && FindMemoryFrameAtTime( *selection.frameSet, event->TimeFree(), freeFrame ) == MemoryFrameMapping::Valid;
+            ImGui::TableNextColumn();
+            if( hasAllocFrame ) ImGui::TextUnformatted( RealToString( GetFrameNumber( *selection.frameSet, allocFrame ) ) );
+            else TextDisabledUnformatted( "-" );
+            ImGui::TableNextColumn();
+            if( event && event->TimeFree() < 0 ) TextColoredUnformatted( ImVec4( 0.6f, 1.f, 0.6f, 1.f ), "Active" );
+            else if( hasFreeFrame ) ImGui::TextUnformatted( RealToString( GetFrameNumber( *selection.frameSet, freeFrame ) ) );
+            else TextDisabledUnformatted( "-" );
+
+            const GpuMemoryRequestScope* requestScope = nullptr;
+            const auto requestLabel = cache.requestLabelByAllocation.find( use.allocationId );
+            if( requestLabel != cache.requestLabelByAllocation.end() )
+            {
+                const auto scope = cache.requestScopeByLabel.find( requestLabel->second );
+                if( scope != cache.requestScopeByLabel.end() ) requestScope = &cache.requestScopes[scope->second];
+            }
+            ImGui::TableNextColumn();
+            if( requestScope )
+            {
+                ImGui::PushID( widgetId++ );
+                const bool selected = ImGui::Selectable( requestScope->name.c_str(), m_zoneInfoWindow == requestScope->zone );
+                const bool hovered = ImGui::IsItemHovered();
+                ImGui::PopID();
+                if( selected ) ShowZoneInfo( *requestScope->zone );
+                if( hovered )
+                {
+                    m_zoneHighlight = requestScope->zone;
+                    ZoneTooltip( *requestScope->zone );
+                    if( IsMouseClicked( 2 ) ) ZoomToZone( *requestScope->zone );
+                }
+            }
+            else TextDisabledUnformatted( "Unknown / baseline" );
+
+            const auto history = cache.passesByAllocation.find( use.allocationId );
+            const bool hasHistory = history != cache.passesByAllocation.end() && !history->second.empty();
+            ImGui::TableNextColumn();
+            if( hasHistory ) DrawGpuMemoryPassLink( cache.passes[history->second.front()], widgetId );
+            else TextDisabledUnformatted( "-" );
+            ImGui::TableNextColumn();
+            if( hasHistory ) DrawGpuMemoryPassLink( cache.passes[history->second.back()], widgetId );
+            else TextDisabledUnformatted( "-" );
+
+            ImGui::TableNextColumn();
+            if( event && event->CsAlloc() != 0 ) SmallCallstackButton( "alloc", event->CsAlloc(), widgetId );
+            else TextDisabledUnformatted( "-" );
+        }
+    }
+    ImGui::EndTable();
+}
+
+void View::DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widgetId )
+{
+    EnsureGpuMemoryAttribution();
+    const auto& cache = m_memInfo.gpuAttribution;
+    ImGui::Separator();
+    ImGui::TextUnformatted( ICON_FA_DIAGRAM_PROJECT " GPU pass attribution" );
+    if( !cache.ready )
+    {
+        TextDisabledUnformatted( "Pass attribution is being indexed..." );
+        return;
+    }
+    if( !cache.protocolPresent )
+    {
+        TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "No GTMEM1 relation metadata is present in this capture." );
+        return;
+    }
+
+    const GpuMemoryRequestScope* requestScope = nullptr;
+    const auto requestLabel = cache.requestLabelByAllocation.find( allocationId );
+    if( requestLabel != cache.requestLabelByAllocation.end() )
+    {
+        const auto scope = cache.requestScopeByLabel.find( requestLabel->second );
+        if( scope != cache.requestScopeByLabel.end() ) requestScope = &cache.requestScopes[scope->second];
+    }
+
+    ImGui::TextUnformatted( "Request scope:" );
+    ImGui::SameLine();
+    if( requestScope )
+    {
+        ImGui::PushID( widgetId++ );
+        const bool selected = ImGui::Selectable( requestScope->name.c_str(), m_zoneInfoWindow == requestScope->zone, 0, ImVec2( 0, 0 ) );
+        const bool hovered = ImGui::IsItemHovered();
+        ImGui::PopID();
+        if( selected ) ShowZoneInfo( *requestScope->zone );
+        if( hovered )
+        {
+            m_zoneHighlight = requestScope->zone;
+            ZoneTooltip( *requestScope->zone );
+            if( IsMouseClicked( 2 ) ) ZoomToZone( *requestScope->zone );
+        }
+    }
+    else
+    {
+        TextDisabledUnformatted( "Unknown (pre-existing, replayed, or allocated outside a labeled request scope)" );
+    }
+
+    const auto history = cache.passesByAllocation.find( allocationId );
+    if( history == cache.passesByAllocation.end() || history->second.empty() )
+    {
+        TextDisabledUnformatted( "No captured pass references this allocation." );
+        return;
+    }
+
+    ImGui::Text( "Pass count: %s", RealToString( history->second.size() ) );
+    const auto& firstPass = cache.passes[history->second.front()];
+    const auto& lastPass = cache.passes[history->second.back()];
+    ImGui::Text( "First use: %s", firstPass.name.c_str() );
+    ImGui::Text( "Last use: %s", lastPass.name.c_str() );
+    if( requestScope && requestScope->labelId != firstPass.labelId )
+    {
+        TextDisabledUnformatted( "The request scope and first-use pass differ; this is expected for persistent or prepared resources." );
+    }
+
+    const auto height = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( history->second.size() + 2, 14 );
+    const auto flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
+        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY;
+    if( !ImGui::BeginTable( "##gpuMemoryAllocationPassHistory", 6, flags, ImVec2( 680, height ) ) ) return;
+    ImGui::TableSetupScrollFreeze( 1, 1 );
+    ImGui::TableSetupColumn( "Pass", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHide, 280 );
+    ImGui::TableSetupColumn( "Frame", ImGuiTableColumnFlags_WidthFixed, 75 );
+    ImGui::TableSetupColumn( "Operations", ImGuiTableColumnFlags_WidthFixed, 100 );
+    ImGui::TableSetupColumn( "Access", ImGuiTableColumnFlags_WidthFixed, 220 );
+    ImGui::TableSetupColumn( "GPU duration", ImGuiTableColumnFlags_WidthFixed, 100 );
+    ImGui::TableSetupColumn( "Relation", ImGuiTableColumnFlags_WidthFixed, 105 );
+    ImGui::TableHeadersRow();
+
+    for( const auto passIndex : history->second )
+    {
+        const auto& pass = cache.passes[passIndex];
+        uint32_t usageMask = 0;
+        for( const auto& use : pass.uses )
+        {
+            if( use.allocationId == allocationId )
+            {
+                usageMask = use.usageMask;
+                break;
+            }
+        }
+
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        DrawGpuMemoryPassLink( pass, widgetId );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( RealToString( pass.frame ) );
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted( pass.operations.empty() ? "-" : pass.operations.c_str() );
+        ImGui::TableNextColumn();
+        const auto usage = FormatGpuMemoryUsage( usageMask );
+        ImGui::TextUnformatted( usage.c_str() );
+        ImGui::TableNextColumn();
+        if( pass.gpuZone && pass.gpuZone->GpuEnd() >= 0 ) ImGui::TextUnformatted( TimeToString( pass.gpuZone->GpuEnd() - pass.gpuZone->GpuStart() ) );
+        else if( pass.gpuPairAmbiguous ) TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Ambiguous" );
+        else TextDisabledUnformatted( "-" );
+        ImGui::TableNextColumn();
+        if( !pass.complete ) TextColoredUnformatted( ImVec4( 1.f, 0.3f, 0.2f, 1.f ), "Incomplete" );
+        else if( pass.gpuPairAmbiguous ) TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Ambiguous" );
+        else ImGui::TextUnformatted( pass.gpuZone ? "GPU paired" : "CPU fallback" );
+    }
+    ImGui::EndTable();
+}
+
 void View::DrawMemoryFrameSummary()
 {
     const auto& snapshot = m_memInfo.frameSnapshot;
@@ -636,6 +1552,9 @@ void View::DrawMemoryFrameInspector()
     }
     if( !selection.active ) return;
 
+    const bool gpuScope = selection.scope == MemoryFrameScope::AllGpuD3D12Pools || IsGpuD3D12MemoryPool( m_memInfo.pool );
+    if( gpuScope ) EnsureGpuMemoryAttribution();
+
     const auto gpuPools = [&]() {
         const auto oldScope = selection.scope;
         selection.scope = MemoryFrameScope::AllGpuD3D12Pools;
@@ -737,7 +1656,15 @@ void View::DrawMemoryFrameInspector()
         }
         if( !selection.triggerNamedMemory )
         {
-            TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Aggregate GPU values are correlated with same-frame named allocations; they are not fully attributable to those allocations." );
+            const auto& attribution = m_memInfo.gpuAttribution;
+            if( gpuScope && attribution.ready && attribution.protocolPresent )
+            {
+                TextColoredUnformatted( ImVec4( 0.5f, 1.f, 0.5f, 1.f ), "Exact GTMEM1 pass-resource relations are available for named D3D12 allocations." );
+            }
+            else
+            {
+                TextColoredUnformatted( ImVec4( 1.f, 0.8f, 0.2f, 1.f ), "Aggregate GPU values are correlated with same-frame named allocations; they are not fully attributable to those allocations." );
+            }
         }
     }
 
@@ -768,6 +1695,7 @@ void View::DrawMemoryFrameInspector()
     }
 
     DrawMemoryFrameSummary();
+    if( gpuScope ) DrawGpuMemoryPassesForSelectedFrame();
     const auto requestedTab = selection.tab;
     const bool forceTabSelection = selection.forceTabSelection;
     selection.forceTabSelection = false;
@@ -818,10 +1746,12 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
     const auto& selection = m_memInfo.frame;
     const auto& snapshot = m_memInfo.frameSnapshot;
     const bool logicalIdentifier = selection.scope == MemoryFrameScope::AllGpuD3D12Pools || IsGpuD3D12MemoryPool( m_memInfo.pool );
+    if( logicalIdentifier ) EnsureGpuMemoryAttribution();
+    const auto& attribution = m_memInfo.gpuAttribution;
     const auto tableHeight = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( data.size() + 2, 18 );
     const auto flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY;
-    if( !ImGui::BeginTable( id, 15, flags, ImVec2( 0, tableHeight ) ) ) return;
+    if( !ImGui::BeginTable( id, logicalIdentifier ? 22 : 15, flags, ImVec2( 0, tableHeight ) ) ) return;
 
     ImGui::TableSetupScrollFreeze( 2, 1 );
     ImGui::TableSetupColumn( "Pool", ImGuiTableColumnFlags_WidthFixed, 250 );
@@ -839,6 +1769,16 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
     ImGui::TableSetupColumn( "Zone free", ImGuiTableColumnFlags_WidthFixed, 180 );
     ImGui::TableSetupColumn( "Alloc call stack", ImGuiTableColumnFlags_WidthFixed, 110 );
     ImGui::TableSetupColumn( "Free call stack", ImGuiTableColumnFlags_WidthFixed, 110 );
+    if( logicalIdentifier )
+    {
+        ImGui::TableSetupColumn( "Request scope", ImGuiTableColumnFlags_WidthFixed, 250 );
+        ImGui::TableSetupColumn( "Attribution", ImGuiTableColumnFlags_WidthFixed, 130 );
+        ImGui::TableSetupColumn( "First use", ImGuiTableColumnFlags_WidthFixed, 250 );
+        ImGui::TableSetupColumn( "Last use", ImGuiTableColumnFlags_WidthFixed, 250 );
+        ImGui::TableSetupColumn( "Uses this frame", ImGuiTableColumnFlags_WidthFixed, 105 );
+        ImGui::TableSetupColumn( "Access this frame", ImGuiTableColumnFlags_WidthFixed, 220 );
+        ImGui::TableSetupColumn( "Pass count", ImGuiTableColumnFlags_WidthFixed, 90 );
+    }
     ImGui::TableHeadersRow();
 
     int widgetId = 0;
@@ -1042,6 +1982,94 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
             ImGui::TableNextColumn();
             if( event.csFree.Val() == 0 ) TextDisabledUnformatted( "-" );
             else SmallCallstackButton( "free", event.csFree.Val(), widgetId );
+
+            if( logicalIdentifier )
+            {
+                const GpuMemoryRequestScope* requestScope = nullptr;
+                const auto requestLabel = attribution.requestLabelByAllocation.find( event.Ptr() );
+                if( requestLabel != attribution.requestLabelByAllocation.end() )
+                {
+                    const auto scope = attribution.requestScopeByLabel.find( requestLabel->second );
+                    if( scope != attribution.requestScopeByLabel.end() ) requestScope = &attribution.requestScopes[scope->second];
+                }
+
+                const auto passHistory = attribution.passesByAllocation.find( event.Ptr() );
+                const bool hasPassHistory = passHistory != attribution.passesByAllocation.end() && !passHistory->second.empty();
+
+                ImGui::TableNextColumn();
+                if( !attribution.ready ) TextDisabledUnformatted( "Indexing..." );
+                else if( !attribution.protocolPresent ) TextDisabledUnformatted( "N/A" );
+                else if( requestScope )
+                {
+                    ImGui::PushID( widgetId++ );
+                    const bool selected = ImGui::Selectable( requestScope->name.c_str(), m_zoneInfoWindow == requestScope->zone );
+                    const bool hovered = ImGui::IsItemHovered();
+                    ImGui::PopID();
+                    if( selected ) ShowZoneInfo( *requestScope->zone );
+                    if( hovered )
+                    {
+                        m_zoneHighlight = requestScope->zone;
+                        ZoneTooltip( *requestScope->zone );
+                        if( IsMouseClicked( 2 ) ) ZoomToZone( *requestScope->zone );
+                    }
+                }
+                else TextDisabledUnformatted( "Unknown" );
+
+                ImGui::TableNextColumn();
+                if( !attribution.ready ) TextDisabledUnformatted( "Indexing..." );
+                else if( !attribution.protocolPresent ) TextDisabledUnformatted( "N/A" );
+                else if( requestScope && hasPassHistory )
+                {
+                    bool complete = true;
+                    for( const auto passIndex : passHistory->second ) complete &= attribution.passes[passIndex].complete;
+                    if( complete ) TextColoredUnformatted( ImVec4( 0.5f, 1.f, 0.5f, 1.f ), "Request + uses" );
+                    else TextColoredUnformatted( ImVec4( 1.f, 0.5f, 0.3f, 1.f ), "Partial relation" );
+                }
+                else if( hasPassHistory ) ImGui::TextUnformatted( "Uses only" );
+                else if( requestScope ) ImGui::TextUnformatted( "Request only" );
+                else TextDisabledUnformatted( "Unattributed" );
+
+                ImGui::TableNextColumn();
+                if( attribution.ready && attribution.protocolPresent && hasPassHistory ) DrawGpuMemoryPassLink( attribution.passes[passHistory->second.front()], widgetId );
+                else TextDisabledUnformatted( "-" );
+
+                ImGui::TableNextColumn();
+                if( attribution.ready && attribution.protocolPresent && hasPassHistory ) DrawGpuMemoryPassLink( attribution.passes[passHistory->second.back()], widgetId );
+                else TextDisabledUnformatted( "-" );
+
+                uint32_t usesInFrame = 0;
+                uint32_t frameUsageMask = 0;
+                if( hasPassHistory )
+                {
+                    for( const auto passIndex : passHistory->second )
+                    {
+                        const auto& pass = attribution.passes[passIndex];
+                        if( pass.start < snapshot.begin || pass.start >= snapshot.end ) continue;
+                        usesInFrame++;
+                        for( const auto& use : pass.uses )
+                        {
+                            if( use.allocationId == event.Ptr() ) frameUsageMask |= use.usageMask;
+                        }
+                    }
+                }
+
+                ImGui::TableNextColumn();
+                if( attribution.ready && attribution.protocolPresent ) ImGui::TextUnformatted( RealToString( usesInFrame ) );
+                else TextDisabledUnformatted( "-" );
+
+                ImGui::TableNextColumn();
+                if( attribution.ready && attribution.protocolPresent )
+                {
+                    const auto usage = FormatGpuMemoryUsage( frameUsageMask );
+                    ImGui::TextUnformatted( usage.c_str() );
+                }
+                else TextDisabledUnformatted( "-" );
+
+                ImGui::TableNextColumn();
+                if( attribution.ready && attribution.protocolPresent && hasPassHistory ) ImGui::TextUnformatted( RealToString( passHistory->second.size() ) );
+                else if( attribution.ready && attribution.protocolPresent ) ImGui::TextUnformatted( "0" );
+                else TextDisabledUnformatted( "-" );
+            }
         }
     }
     ImGui::EndTable();
@@ -1513,6 +2541,8 @@ void View::DrawMemoryAllocWindow()
             }
             TextFocused( "Duration:", TimeToString( ev.TimeFree() - ev.TimeAlloc() ) );
         }
+
+        if( IsGpuD3D12MemoryPool( m_memoryAllocInfoPool ) ) DrawGpuMemoryAllocationAttribution( ev.Ptr(), idx );
 
         bool sep = false;
         auto zoneAlloc = FindZoneAtTime( tidAlloc, ev.TimeAlloc() );

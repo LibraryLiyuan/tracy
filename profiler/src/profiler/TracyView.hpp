@@ -276,6 +276,85 @@ private:
         std::vector<MemoryEventRef> transitions;
     };
 
+    struct GpuMemoryRequestScope
+    {
+        uint64_t labelId = 0;
+        uint64_t frame = 0;
+        uint64_t thread = 0;
+        int64_t start = 0;
+        int64_t end = 0;
+        std::string name;
+        const ZoneEvent* zone = nullptr;
+    };
+
+    struct GpuMemoryPassUse
+    {
+        uint64_t allocationId = 0;
+        uint32_t usageMask = 0;
+        char kind = 'U';
+    };
+
+    struct GpuMemoryPass
+    {
+        uint64_t passId = 0;
+        uint64_t labelId = 0;
+        uint64_t frame = 0;
+        uint64_t ordinal = 0;
+        uint64_t thread = 0;
+        uint64_t gpuThread = 0;
+        int64_t start = 0;
+        int64_t end = 0;
+        int level = -1;
+        uint32_t commandCount = 0;
+        uint32_t emittedUseCount = 0;
+        uint32_t totalUseCount = 0;
+        uint32_t expectedChunks = 0;
+        uint32_t untrackedReferences = 0;
+        uint32_t droppedUses = 0;
+        bool truncated = false;
+        bool complete = false;
+        bool gpuPairAmbiguous = false;
+        std::string name;
+        std::string operations;
+        std::vector<GpuMemoryPassUse> uses;
+        const ZoneEvent* relationZone = nullptr;
+        const GpuEvent* gpuZone = nullptr;
+    };
+
+    struct GpuMemoryGpuZoneCandidate
+    {
+        const GpuEvent* zone = nullptr;
+        uint64_t thread = 0;
+        int64_t cpuStart = 0;
+    };
+
+    struct GpuMemoryAttributionCache
+    {
+        bool ready = false;
+        bool protocolPresent = false;
+        bool gpuZonesReady = false;
+        bool pendingCpuZones = false;
+        bool pendingGpuZones = false;
+        uint64_t zoneCount = 0;
+        uint64_t gpuZoneCount = 0;
+        uint64_t selectedPassId = 0;
+        size_t allocationCount = 0;
+        double nextRebuildTime = 0;
+        std::vector<GpuMemoryRequestScope> requestScopes;
+        std::vector<GpuMemoryPass> passes;
+        unordered_flat_map<int16_t, size_t> processedCpuZonesBySource;
+        unordered_flat_map<int16_t, size_t> processedGpuZonesBySource;
+        unordered_flat_map<uint64_t, size_t> processedAllocationsByPool;
+        unordered_flat_map<uint64_t, size_t> requestScopeByLabel;
+        unordered_flat_map<uint64_t, std::vector<size_t>> requestScopesByThread;
+        unordered_flat_map<uint64_t, size_t> passById;
+        unordered_flat_map<uint64_t, MemoryEventRef> allocationById;
+        unordered_flat_map<uint64_t, uint64_t> requestLabelByAllocation;
+        unordered_flat_map<uint64_t, std::vector<size_t>> passesByAllocation;
+        unordered_flat_map<std::string, std::vector<GpuMemoryGpuZoneCandidate>> gpuZonesByName;
+        unordered_flat_map<std::string, std::vector<size_t>> pendingGpuPassesByName;
+    };
+
     struct MemoryFrameSelection
     {
         bool active = false;
@@ -404,6 +483,16 @@ private:
     bool MemoryFrameSnapshotNeedsRebuild() const;
     void RebuildMemoryFrameSnapshot();
     void DrawMemoryIdentifier( uint64_t pool, const MemEvent& event ) const;
+    size_t GetGpuMemoryAllocationCount() const;
+    bool GpuMemoryAttributionNeedsRebuild() const;
+    void EnsureGpuMemoryAttribution();
+    void RebuildGpuMemoryAttribution();
+    bool TryPairGpuMemoryPass( size_t passIndex );
+    void DrawGpuMemoryPassesForSelectedFrame();
+    void DrawGpuMemoryPassDetails( const GpuMemoryPass& pass, int& widgetId );
+    void DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widgetId );
+    bool DrawGpuMemoryPassLink( const GpuMemoryPass& pass, int& widgetId );
+    std::string FormatGpuMemoryUsage( uint32_t usageMask ) const;
 
     unordered_flat_map<uint32_t, MemPathData> GetCallstackPaths( const MemData& mem, MemRange memRange ) const;
     unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeBottomUp( const MemData& mem ) const;
@@ -965,6 +1054,7 @@ private:
         Range range;
         MemoryFrameSelection frame;
         MemoryFrameSnapshot frameSnapshot;
+        GpuMemoryAttributionCache gpuAttribution;
     } m_memInfo;
 
     struct {
