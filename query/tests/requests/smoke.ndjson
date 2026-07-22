@@ -1,0 +1,4 @@
+{"protocol":"tracy-query/1","id":"capabilities-smoke","method":"system.capabilities","params":{}}
+{"protocol":"tracy-query/1","id":"frames-smoke","method":"frame.outliers","params":{"limit":3}}
+{"protocol":"tracy-query/1","id":"memory-smoke","method":"memory.pools","params":{}}
+{"protocol":"tracy-query/1","id":"zones-smoke","method":"zone.cpu.search","params":{"limit":5,"fields":["name","duration_ns","thread_ref"]}}

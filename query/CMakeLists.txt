@@ -21,7 +21,30 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
+
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json TRACY_QUERY_SCHEMA_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json TRACY_QUERY_COVERAGE_JSON)
+configure_file(src/TracyEmbeddedData.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp @ONLY)
+
+add_library(TracyQueryProtocol STATIC
+    src/TracyQueryService.cpp
+    src/TracyQueryService.hpp
+    src/TracySessionManager.cpp
+    src/TracySessionManager.hpp
+    src/TracyEmbeddedData.hpp
+    ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp
+)
+target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis nlohmann_json::nlohmann_json)
+target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
+
+add_executable(tracy-query src/main.cpp)
+target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
+set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT tracy-query)
+
+install(TARGETS tracy-query DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
 if(BUILD_TESTING)
@@ -32,4 +55,17 @@ if(BUILD_TESTING)
         TRACY_QUERY_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json"
     )
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)
+    add_test(NAME tracy-query-version COMMAND tracy-query --version)
+    add_test(NAME tracy-query-doctor COMMAND tracy-query --doctor)
+
+    if(DEFINED ENV{TRACY_ACCEPTANCE_TRACE_ROOT})
+        set(TRACY_ACCEPTANCE_TRACE "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Fresh1.tracy")
+        if(EXISTS "${TRACY_ACCEPTANCE_TRACE}")
+            add_test(NAME tracy-query-worker-smoke COMMAND tracy-query
+                --allow-root "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}"
+                --trace "${TRACY_ACCEPTANCE_TRACE}"
+                --request "${CMAKE_CURRENT_LIST_DIR}/tests/requests/overview.json"
+            )
+        endif()
+    endif()
 endif()

@@ -55,6 +55,130 @@ struct Capability
     std::vector<std::string> methods;
 };
 
+struct TraceCountsDto
+{
+    uint64_t frames = 0;
+    uint64_t frameSets = 0;
+    uint64_t cpuZones = 0;
+    uint64_t gpuZones = 0;
+    uint64_t threads = 0;
+    uint64_t locks = 0;
+    uint64_t plots = 0;
+    uint64_t messages = 0;
+    uint64_t memoryEvents = 0;
+    uint64_t memoryPools = 0;
+    uint64_t contextSwitches = 0;
+    uint64_t callstackPayloads = 0;
+    uint64_t callstackFrames = 0;
+    uint64_t samples = 0;
+    uint64_t hardwareSamples = 0;
+    uint64_t symbols = 0;
+    uint64_t symbolCodeBytes = 0;
+    uint64_t sourceLocations = 0;
+    uint64_t sourceCacheFiles = 0;
+    uint64_t sourceCacheBytes = 0;
+    uint64_t frameImages = 0;
+};
+
+struct TraceInfoDto
+{
+    std::string fingerprint;
+    std::string captureName;
+    std::string captureProgram;
+    std::string hostInfo;
+    uint64_t captureTime = 0;
+    uint64_t executableTime = 0;
+    uint64_t processId = 0;
+    int traceVersion = 0;
+    int64_t resolution = 0;
+    int64_t firstTimeNs = 0;
+    int64_t lastTimeNs = 0;
+    int64_t loadTimeNs = 0;
+    uint32_t cpuId = 0;
+    std::string cpuManufacturer;
+    bool hasCrash = false;
+    bool samplesInconsistent = false;
+    TraceCountsDto counts;
+    std::vector<std::string> appInfo;
+};
+
+struct ThreadDto
+{
+    std::string ref;
+    uint64_t nativeId = 0;
+    uint64_t processId = 0;
+    std::string name;
+    bool fiber = false;
+    uint64_t zoneCount = 0;
+    uint64_t messageCount = 0;
+    uint64_t sampleCount = 0;
+    uint64_t contextSwitchCount = 0;
+    int64_t runningTimeNs = 0;
+    uint32_t migrations = 0;
+};
+
+struct FrameSetDto
+{
+    std::string ref;
+    size_t index = 0;
+    std::string name;
+    bool continuous = false;
+    size_t frameCount = 0;
+    size_t completeFrameCount = 0;
+};
+
+struct GpuContextDto
+{
+    std::string ref;
+    size_t index = 0;
+    std::string name;
+    std::string threadRef;
+    uint64_t zoneCount = 0;
+    double period = 0;
+    bool calibrated = false;
+    uint8_t type = 0;
+};
+
+struct MemoryPoolDto
+{
+    std::string ref;
+    uint64_t nativeNameId = 0;
+    std::string name;
+    uint64_t eventCount = 0;
+    uint64_t activeCount = 0;
+    uint64_t activeBytes = 0;
+    uint64_t low = 0;
+    uint64_t high = 0;
+    bool gpuD3D12 = false;
+};
+
+struct PlotDto
+{
+    std::string ref;
+    size_t index = 0;
+    std::string name;
+    uint8_t type = 0;
+    uint8_t format = 0;
+    uint64_t pointCount = 0;
+    double min = 0;
+    double max = 0;
+    double sum = 0;
+};
+
+struct LockDto
+{
+    std::string ref;
+    uint32_t nativeId = 0;
+    std::string name;
+    std::string sourceLocationRef;
+    uint64_t eventCount = 0;
+    uint64_t threadCount = 0;
+    bool valid = false;
+    bool contended = false;
+    int64_t announceNs = 0;
+    std::optional<int64_t> terminateNs;
+};
+
 struct SourceLocationDto
 {
     std::string ref;
@@ -81,6 +205,10 @@ struct CpuZoneDto
     std::string ref;
     std::string threadRef;
     std::string sourceLocationRef;
+    std::string name;
+    std::string function;
+    std::string file;
+    uint32_t line = 0;
     std::optional<std::string> parentRef;
     int64_t startNs = 0;
     std::optional<int64_t> endNs;
@@ -94,6 +222,10 @@ struct GpuZoneDto
     std::string contextRef;
     std::string threadRef;
     std::string sourceLocationRef;
+    std::string name;
+    std::string function;
+    std::string file;
+    uint32_t line = 0;
     std::optional<std::string> parentRef;
     int64_t gpuStartNs = 0;
     std::optional<int64_t> gpuEndNs;
@@ -180,6 +312,13 @@ public:
 
     virtual std::vector<Capability> GetCapabilities() const = 0;
     virtual TraceReadView AcquireReadView() const = 0;
+    virtual TraceInfoDto GetTraceInfo() const = 0;
+    virtual std::vector<ThreadDto> GetThreads() const = 0;
+    virtual std::vector<FrameSetDto> GetFrameSets() const = 0;
+    virtual std::vector<GpuContextDto> GetGpuContexts() const = 0;
+    virtual std::vector<MemoryPoolDto> GetMemoryPools() const = 0;
+    virtual std::vector<PlotDto> GetPlotList() const = 0;
+    virtual std::vector<LockDto> GetLocks() const = 0;
 
     virtual std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const = 0;
     virtual std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const = 0;

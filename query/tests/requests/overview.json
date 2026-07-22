@@ -1,0 +1,6 @@
+{
+  "protocol": "tracy-query/1",
+  "id": "overview-smoke",
+  "method": "trace.overview",
+  "params": {}
+}
