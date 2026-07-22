@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://tracy-profiler.dev/schema/tracy-query-v1.schema.json",
+  "title": "Tracy Query Protocol v1",
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/$defs/request" },
+    { "$ref": "#/$defs/success" },
+    { "$ref": "#/$defs/failure" }
+  ],
+  "$defs": {
+    "decimal64": { "type": "string", "pattern": "^-?[0-9]+$" },
+    "hex64": { "type": "string", "pattern": "^0x[0-9a-fA-F]+$" },
+    "opaqueRef": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "id", "method"],
+      "properties": {
+        "protocol": { "const": "tracy-query/1" },
+        "id": { "type": ["string", "number"] },
+        "method": { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$" },
+        "params": { "type": "object", "default": {} }
+      }
+    },
+    "trace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "fingerprint", "source_kind", "state", "revision", "watermark_ns", "complete"],
+      "properties": {
+        "id": { "$ref": "#/$defs/opaqueRef" },
+        "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "source_kind": { "enum": ["snapshot", "segment"] },
+        "state": { "enum": ["queued", "loading", "indexing", "ready", "failed", "closing", "closed"] },
+        "revision": { "$ref": "#/$defs/decimal64" },
+        "watermark_ns": { "$ref": "#/$defs/decimal64" },
+        "complete": { "type": "boolean" }
+      }
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "returned", "next_cursor", "truncated"],
+      "properties": {
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "returned": { "type": "integer", "minimum": 0, "maximum": 1000 },
+        "next_cursor": { "type": ["string", "null"] },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "success": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "schema_version", "id", "ok", "data", "warnings"],
+      "properties": {
+        "protocol": { "const": "tracy-query/1" },
+        "schema_version": { "const": "1.0.0" },
+        "id": { "type": ["string", "number", "null"] },
+        "ok": { "const": true },
+        "trace": { "$ref": "#/$defs/trace" },
+        "data": {},
+        "page": { "$ref": "#/$defs/page" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "errorCode": {
+      "enum": [
+        "INVALID_REQUEST", "METHOD_NOT_FOUND", "INVALID_PARAMS", "PATH_NOT_ALLOWED",
+        "TRACE_NOT_FOUND", "TRACE_OPEN_FAILED", "UNSUPPORTED_TRACE_VERSION", "CORRUPT_TRACE",
+        "TRACE_LOADING", "TRACE_NOT_READY", "TRACE_CLOSED", "CAPABILITY_UNAVAILABLE",
+        "ENTITY_NOT_FOUND", "INDEX_NOT_READY", "STALE_CURSOR", "RESOURCE_LIMIT",
+        "CANCELLED", "INCOMPLETE_DATA", "INTERNAL_ERROR"
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "schema_version", "id", "ok", "error"],
+      "properties": {
+        "protocol": { "const": "tracy-query/1" },
+        "schema_version": { "const": "1.0.0" },
+        "id": { "type": ["string", "number", "null"] },
+        "ok": { "const": false },
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "retryable", "details"],
+          "properties": {
+            "code": { "$ref": "#/$defs/errorCode" },
+            "message": { "type": "string" },
+            "retryable": { "type": "boolean" },
+            "details": { "type": "object" }
+          }
+        }
+      }
+    }
+  }
+}
