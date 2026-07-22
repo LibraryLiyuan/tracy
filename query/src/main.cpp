@@ -1,4 +1,5 @@
 #include "TracyEmbeddedData.hpp"
+#include "TracyMcpServer.hpp"
 #include "TracyQueryService.hpp"
 #include "TracySessionManager.hpp"
 
@@ -249,8 +250,10 @@ int main( int argc, char** argv )
         if( args.batch ) return RunBatch( args );
         if( args.mcp )
         {
-            std::cerr << "MCP transport is added in milestone 3; this build already supports JSON and NDJSON.\n";
-            return 4;
+            SessionManager sessions( args.allowRoots );
+            QueryService service( sessions );
+            McpServer server( sessions, service, args.allowSourceRoots );
+            return server.Run( std::cin, std::cout );
         }
         return 1;
     }

@@ -29,6 +29,10 @@ file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json TRACY_QUERY_COVERAGE
 configure_file(src/TracyEmbeddedData.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp @ONLY)
 
 add_library(TracyQueryProtocol STATIC
+    src/TracyMcpServer.cpp
+    src/TracyMcpServer.hpp
+    src/TracyPng.cpp
+    src/TracyPng.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySessionManager.cpp
@@ -37,6 +41,7 @@ add_library(TracyQueryProtocol STATIC
     ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp
 )
 target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
 target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis nlohmann_json::nlohmann_json)
 target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
 
@@ -55,17 +60,28 @@ if(BUILD_TESTING)
         TRACY_QUERY_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json"
     )
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)
+
+    add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
+    target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
+    add_test(NAME tracy-query-mcp-transcript COMMAND tracy-query-mcp-transcript-tests)
+
     add_test(NAME tracy-query-version COMMAND tracy-query --version)
     add_test(NAME tracy-query-doctor COMMAND tracy-query --doctor)
 
-    if(DEFINED ENV{TRACY_ACCEPTANCE_TRACE_ROOT})
-        set(TRACY_ACCEPTANCE_TRACE "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Fresh1.tracy")
+    set(TRACY_ACCEPTANCE_TRACE_ROOT "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}" CACHE PATH "Directory containing local Tracy acceptance captures")
+    if(TRACY_ACCEPTANCE_TRACE_ROOT)
+        set(TRACY_ACCEPTANCE_TRACE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Fresh1.tracy")
         if(EXISTS "${TRACY_ACCEPTANCE_TRACE}")
             add_test(NAME tracy-query-worker-smoke COMMAND tracy-query
-                --allow-root "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}"
+                --allow-root "${TRACY_ACCEPTANCE_TRACE_ROOT}"
                 --trace "${TRACY_ACCEPTANCE_TRACE}"
                 --request "${CMAKE_CURRENT_LIST_DIR}/tests/requests/overview.json"
             )
+
+            add_executable(tracy-query-mcp-worker-integration-tests tests/McpWorkerIntegrationTests.cpp)
+            target_link_libraries(tracy-query-mcp-worker-integration-tests PRIVATE TracyQueryProtocol)
+            target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE TRACY_ACCEPTANCE_TRACE="${TRACY_ACCEPTANCE_TRACE}")
+            add_test(NAME tracy-query-mcp-worker-integration COMMAND tracy-query-mcp-worker-integration-tests)
         endif()
     endif()
 endif()

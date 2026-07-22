@@ -214,6 +214,12 @@ public:
             return lhs.first != rhs.first ? lhs.first < rhs.first : lhs.second < rhs.second;
         } );
         for( size_t index = 0; index < pools.size(); index++ ) memoryPoolIndex.emplace( pools[index].second, index );
+
+        for( const auto& [sourcePath, block] : worker->GetSourceFileCache() ) sourceFiles.emplace_back( sourcePath );
+        std::sort( sourceFiles.begin(), sourceFiles.end(), []( const auto* lhs, const auto* rhs ) { return std::strcmp( lhs, rhs ) < 0; } );
+
+        for( const auto& [address, symbol] : worker->GetSymbolMap() ) symbols.emplace_back( address );
+        std::sort( symbols.begin(), symbols.end() );
     }
 
     std::filesystem::path path;
@@ -225,6 +231,8 @@ public:
     std::unordered_map<const ZoneEvent*, size_t> cpuLookup;
     std::unordered_map<const GpuEvent*, size_t> gpuLookup;
     std::unordered_map<uint64_t, size_t> memoryPoolIndex;
+    std::vector<const char*> sourceFiles;
+    std::vector<uint64_t> symbols;
     mutable std::mutex readMutex;
 };
 
@@ -346,6 +354,91 @@ std::vector<int64_t> WorkerTraceSource::GetFrameDurations( size_t frameSetIndex 
     const size_t count = worker.GetFullFrameCount( *set );
     result.reserve( count );
     for( size_t index = 0; index < count; index++ ) result.emplace_back( worker.GetFrameTime( *set, index ) );
+    return result;
+}
+
+std::vector<SourceResourceDto> WorkerTraceSource::GetSourceResources() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<SourceResourceDto> result;
+    result.reserve( m_impl->sourceFiles.size() );
+    for( size_t index = 0; index < m_impl->sourceFiles.size(); index++ )
+    {
+        const auto* path = m_impl->sourceFiles[index];
+        const auto block = m_impl->worker->GetSourceFileFromCache( path );
+        result.push_back( { index, m_impl->MakeRef( "source-file", index ), path, block.len } );
+    }
+    return result;
+}
+
+std::vector<SymbolResourceDto> WorkerTraceSource::GetSymbolResources() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<SymbolResourceDto> result;
+    for( const auto address : m_impl->symbols )
+    {
+        const auto* symbol = m_impl->worker->GetSymbolData( address );
+        if( !symbol ) continue;
+        uint32_t codeLength = 0;
+        if( m_impl->worker->HasSymbolCode( address ) ) m_impl->worker->GetSymbolCode( address, codeLength );
+        result.push_back( {
+            address, m_impl->MakeRef( "symbol", address ), Safe( m_impl->worker->GetString( symbol->name ) ),
+            Safe( m_impl->worker->GetString( symbol->file ) ), symbol->line, codeLength
+        } );
+    }
+    return result;
+}
+
+std::vector<FrameImageMetadataDto> WorkerTraceSource::GetFrameImageResources() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<FrameImageMetadataDto> result;
+    const auto& images = m_impl->worker->GetFrameImages();
+    result.reserve( images.size() );
+    for( size_t index = 0; index < images.size(); index++ )
+    {
+        const auto* image = images[index].get();
+        result.push_back( { index, m_impl->MakeRef( "frame-image", index ), image->w, image->h, image->flip != 0, image->frameRef } );
+    }
+    return result;
+}
+
+SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( sourceId >= m_impl->sourceFiles.size() ) throw std::out_of_range( "source resource was not found" );
+    const auto* path = m_impl->sourceFiles[sourceId];
+    const auto block = m_impl->worker->GetSourceFileFromCache( path );
+    const size_t size = std::min( size_t( block.len ), maxBytes );
+    return { m_impl->MakeRef( "source-file", sourceId ), path, std::string( block.data, size ), true, size < block.len };
+}
+
+SymbolCodeDto WorkerTraceSource::ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->worker->HasSymbolCode( symbolId ) ) throw std::out_of_range( "symbol code resource was not found" );
+    uint32_t length = 0;
+    const char* code = m_impl->worker->GetSymbolCode( symbolId, length );
+    const size_t size = std::min( size_t( length ), maxBytes );
+    SymbolCodeDto result { m_impl->MakeRef( "symbol", symbolId ), Hex( symbolId ), {}, size < length };
+    result.bytes.assign( reinterpret_cast<const uint8_t*>( code ), reinterpret_cast<const uint8_t*>( code ) + size );
+    return result;
+}
+
+FrameImageDto WorkerTraceSource::ReadFrameImage( size_t imageId, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& images = m_impl->worker->GetFrameImages();
+    if( imageId >= images.size() ) throw std::out_of_range( "frame image resource was not found" );
+    const auto* image = images[imageId].get();
+    const size_t outputSize = size_t( image->w ) * image->h * 4;
+    if( image->w > 4096 || image->h > 4096 || outputSize > maxBytes ) throw std::runtime_error( "decoded frame image exceeds resource budget" );
+    FrameImageDto result;
+    result.ref = m_impl->MakeRef( "frame-image", imageId );
+    result.width = image->w;
+    result.height = image->h;
+    result.flipped = image->flip != 0;
+    DecodeBc1( reinterpret_cast<const uint8_t*>( m_impl->worker->UnpackFrameImage( *image ) ), image->w, image->h, result.rgba );
     return result;
 }
 
@@ -834,55 +927,33 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
 
 std::vector<SourceTextDto> WorkerTraceSource::ResolveSources( const std::vector<std::string>& sourceRefs, size_t maxBytes ) const
 {
-    std::lock_guard lock( m_impl->readMutex );
     std::vector<SourceTextDto> result;
-    for( const auto& [path, block] : m_impl->worker->GetSourceFileCache() )
+    const auto resources = GetSourceResources();
+    for( const auto& resource : resources )
     {
-        const auto ref = m_impl->MakeRef( "source-file", std::hash<std::string_view>{}( path ) );
-        if( std::find( sourceRefs.begin(), sourceRefs.end(), ref ) == sourceRefs.end() ) continue;
-        const size_t size = std::min( size_t( block.len ), maxBytes );
-        result.push_back( { ref, path, std::string( block.data, size ), true, size < block.len } );
+        if( std::find( sourceRefs.begin(), sourceRefs.end(), resource.ref ) != sourceRefs.end() ) result.emplace_back( ReadEmbeddedSource( resource.id, maxBytes ) );
     }
     return result;
 }
 
 std::vector<SymbolCodeDto> WorkerTraceSource::ResolveSymbols( const std::vector<std::string>& symbolRefs, size_t maxBytes ) const
 {
-    std::lock_guard lock( m_impl->readMutex );
     std::vector<SymbolCodeDto> result;
-    for( const auto& [address, symbol] : m_impl->worker->GetSymbolMap() )
+    const auto resources = GetSymbolResources();
+    for( const auto& resource : resources )
     {
-        const auto ref = m_impl->MakeRef( "symbol", address );
-        if( std::find( symbolRefs.begin(), symbolRefs.end(), ref ) == symbolRefs.end() || !m_impl->worker->HasSymbolCode( address ) ) continue;
-        uint32_t length = 0;
-        const char* code = m_impl->worker->GetSymbolCode( address, length );
-        const size_t size = std::min( size_t( length ), maxBytes );
-        SymbolCodeDto dto { ref, Hex( address ), {}, size < length };
-        dto.bytes.assign( reinterpret_cast<const uint8_t*>( code ), reinterpret_cast<const uint8_t*>( code ) + size );
-        result.emplace_back( std::move( dto ) );
+        if( resource.codeBytes != 0 && std::find( symbolRefs.begin(), symbolRefs.end(), resource.ref ) != symbolRefs.end() ) result.emplace_back( ReadSymbolCode( resource.id, maxBytes ) );
     }
     return result;
 }
 
 std::vector<FrameImageDto> WorkerTraceSource::ResolveFrameImages( const std::vector<std::string>& imageRefs, size_t maxBytes ) const
 {
-    std::lock_guard lock( m_impl->readMutex );
     std::vector<FrameImageDto> result;
-    const auto& images = m_impl->worker->GetFrameImages();
-    for( size_t index = 0; index < images.size(); index++ )
+    const auto resources = GetFrameImageResources();
+    for( const auto& resource : resources )
     {
-        const auto ref = m_impl->MakeRef( "frame-image", index );
-        if( std::find( imageRefs.begin(), imageRefs.end(), ref ) == imageRefs.end() ) continue;
-        const auto* image = images[index].get();
-        const size_t outputSize = size_t( image->w ) * image->h * 4;
-        if( outputSize > maxBytes ) throw std::runtime_error( "decoded frame image exceeds resource budget" );
-        FrameImageDto dto;
-        dto.ref = ref;
-        dto.width = image->w;
-        dto.height = image->h;
-        dto.flipped = image->flip != 0;
-        DecodeBc1( reinterpret_cast<const uint8_t*>( m_impl->worker->UnpackFrameImage( *image ) ), image->w, image->h, dto.rgba );
-        result.emplace_back( std::move( dto ) );
+        if( std::find( imageRefs.begin(), imageRefs.end(), resource.ref ) != imageRefs.end() ) result.emplace_back( ReadFrameImage( resource.id, maxBytes ) );
     }
     return result;
 }

@@ -305,6 +305,34 @@ struct FrameImageDto
     std::vector<uint8_t> rgba;
 };
 
+struct SourceResourceDto
+{
+    size_t id = 0;
+    std::string ref;
+    std::string path;
+    uint64_t bytes = 0;
+};
+
+struct SymbolResourceDto
+{
+    uint64_t id = 0;
+    std::string ref;
+    std::string name;
+    std::string file;
+    uint32_t line = 0;
+    uint64_t codeBytes = 0;
+};
+
+struct FrameImageMetadataDto
+{
+    size_t id = 0;
+    std::string ref;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool flipped = false;
+    uint32_t frameRef = 0;
+};
+
 class TraceSource
 {
 public:

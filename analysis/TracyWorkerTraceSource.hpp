@@ -76,6 +76,12 @@ public:
     const std::string& Fingerprint() const;
     std::vector<FrameDto> GetFramesForSet( size_t frameSetIndex, size_t offset, size_t limit ) const;
     std::vector<int64_t> GetFrameDurations( size_t frameSetIndex ) const;
+    std::vector<SourceResourceDto> GetSourceResources() const;
+    std::vector<SymbolResourceDto> GetSymbolResources() const;
+    std::vector<FrameImageMetadataDto> GetFrameImageResources() const;
+    SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const;
+    SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const;
+    FrameImageDto ReadFrameImage( size_t imageId, size_t maxBytes ) const;
 
 private:
     class Impl;
