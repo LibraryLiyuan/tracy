@@ -41,7 +41,7 @@
 | --- | --- | --- |
 | Godot | `feature-tracy` | `2d3e26b53196a505ea066c14d5e98134bcf586f3` |
 | TPS demo | `feature-tracy-demo` | `cddb00ba98c95bf15dea277066a617bdca7b7506` |
-| Tracy | `feature-StructuredData` | `3e010a7b02e4c96d33ab854b9b29153acd6d0b69`，之后可附带纯文档提交 |
+| Tracy | `feature-StructuredData` | `e570b399fe9999588292e5464205d8782d72715d`（Source Compare 截断语义修复；之后可附带纯文档提交） |
 
 任何一项源码、编译选项、PDB、GPU 驱动或 trace 文件变化，都必须新建验收记录，不能沿用本文的具体数值。
 
@@ -51,7 +51,7 @@
 | --- | ---: | --- |
 | `godot.windows.editor.x86_64.tracy_ai_full.exe` | 174,082,560 | `BBC317AAA3577C0E7549DF1A5F87E5F5C21FAD3164CC50E40437503EFAA23C3E` |
 | `tracy-capture.exe` | 10,681,856 | `EC83014B5B874A91F0D4A9FFE423CE27BA611E3B0CF46291D4C244D26C39C8A5` |
-| `tracy-query.exe` | 12,111,360 | `287A184AA9F5F90B6D85BFDF3D02759F5DFDE96C95E64DD6E23AEC0BEBDAE1E9` |
+| `tracy-query.exe` | 12,117,504 | `40F4173BB5C65E39D728C9A133B2CE05DBA66B5EAC025717C2B88D5522517E76` |
 | 自定义 `tracy-profiler.exe` | 26,559,488 | `99AF547C207B58D68AD30C4412F1F2E9955DB6FC730E96AF12F07AD936C6F9F4` |
 | 原始发行版 `windows-0.13.1\tracy-profiler.exe` | 26,412,032 | `1C7D6321E602B6A0B94A0897B70183AB62D4D56543C10ACD9BFC1B0424B48A78` |
 
@@ -954,3 +954,147 @@ Random evidence refs reviewed:
 可用于性能 baseline/stress 比较: YES / NO
 遗留问题:
 ```
+
+## 11. 2026-07-23 管理员全量自动验收记录
+
+本节记录已经实际完成的录制和自动验收，不是待执行模板。三次录制均通过 UAC 提升后的 PowerShell 启动 Godot 和原生 `tracy-capture.exe`，并使用同一 Godot/TPS 源码、同一 seed、同一窗口、同一 FPS 上限和未缩放的 `PhaseScale=1.0`。
+
+### 11.1 Trace 身份与场景
+
+| 场景 | 文件 | 字节 | SHA-256 / Query fingerprint |
+| --- | --- | ---: | --- |
+| coverage | `TPS-coverage-full-001.tracy` | 286,236,330 | `015c0ffbd897425cb20e402d70ee1a3f592a1e07eb0a452b0880e6dfa00ee3a5` |
+| baseline | `TPS-baseline-full-001.tracy` | 295,433,125 | `b60242033fda62619eec452e6e70e7a1034268457b63cbccdae3a5c519b8409f` |
+| stress | `TPS-stress-full-001.tracy` | 277,590,226 | `a495bdd6ba62c09bd421356397d474b9a35898dae05db4dde0fdb5b0044f7391` |
+
+固定条件：
+
+| 字段 | coverage | baseline | stress |
+| --- | ---: | ---: | ---: |
+| Scenario intensity | 2 | 1 | 3 |
+| Seed | 424242 | 424242 | 424242 |
+| PhaseScale | 1.0 | 1.0 | 1.0 |
+| 分辨率 | 1280×720 | 1280×720 | 1280×720 |
+| Max FPS | 120 | 120 | 120 |
+| `capture_window` marker | 1 | 1 | 1 |
+| `scenario_complete` marker | 1 | 1 | 1 |
+| `capture_exit` marker | 1 | 1 | 1 |
+| `scenario_failed` marker | 0 | 0 | 0 |
+
+Producer 完成证据：
+
+| 工作负载 | coverage | baseline | stress |
+| --- | ---: | ---: | ---: |
+| Memory blocks | 24 | 8 | 48 |
+| Memory bytes | 12,582,912 | 2,097,152 | 50,331,648 |
+| Physics operations | 20 | 8 | 36 |
+| Resource completed / requested | 9 / 9 | 5 / 5 | 14 / 14 |
+| Resource errors / pending | 0 / 0 | 0 / 0 | 0 / 0 |
+| Shader operations | 16 | 8 | 24 |
+| Enemy groups | 4 | 4 | 4 |
+
+三个文件分别运行 `--doctor --trace`，JSON Schema、domain coverage、field coverage、MCP coverage、statistics 和 trace loader 均为 `ok`。
+
+### 11.2 全域数据计数
+
+以下计数来自同一个 `tracy-query.exe` 对三个已保存 trace 的结构化读取。
+
+| 数据域 | coverage | baseline | stress |
+| --- | ---: | ---: | ---: |
+| CPU zones | 887,204 | 893,694 | 883,606 |
+| GPU zones | 73,707 | 74,692 | 72,794 |
+| Frames（全部 frame sets） | 11,246 | 12,126 | 10,909 |
+| Frame sets | 3 | 3 | 3 |
+| Context switches | 733,738 | 794,865 | 760,143 |
+| User samples | 2,004,590 | 2,185,774 | 1,927,314 |
+| Ghost zones | 21,132,915 | 22,911,848 | 18,785,736 |
+| Kernel samples | 851,526 | 922,827 | 898,826 |
+| Locks / lock events | 2 / 176,928 | 2 / 183,387 | 2 / 176,787 |
+| Memory pools / events | 8 / 20,003,967 | 8 / 20,031,475 | 8 / 20,187,986 |
+| Frame images | 136 | 136 | 134 |
+| Messages | 177 | 139 | 238 |
+| Plot series / points | 61 / 846,146 | 61 / 872,495 | 61 / 842,211 |
+| Source cache files / bytes | 972 / 35,404,652 | 1,125 / 38,650,889 | 829 / 34,885,475 |
+| Symbols | 53,596 | 73,732 | 20,978 |
+| Threads | 3,402 | 3,991 | 3,569 |
+| Hardware samples | 0 | 0 | 0 |
+
+`system.capabilities` 报告 23 个数据域。除 `hardware_sample` 外，实际存在的域均为 `present=true`、`queryable=true`；四个 hardware-sample 查询明确返回 `CAPABILITY_UNAVAILABLE`，没有用空数组伪装成功。管理员权限不能凭空生成 CPU PMU/hardware sample；是否采集该域必须由平台、Tracy 采样后端和运行条件共同支持。
+
+### 11.3 Frame 分布
+
+这里使用名为 `Frames` 的固定 frame set，不使用容易被窗口切换或 VSync 状态改变污染的辅助 frame set。
+
+| 统计 | coverage | baseline | stress | stress − baseline |
+| --- | ---: | ---: | ---: | ---: |
+| Count | 4,085 | 4,089 | 4,037 | -52 |
+| Median ns | 8,333,177 | 8,333,192 | 8,333,226 | +34 |
+| P95 ns | 32,840,722.8 | 31,935,855.4 | 31,980,374.4 | +44,519.0 |
+| P99 ns | 42,131,371.28 | 39,630,901.12 | 43,215,985.64 | +3,585,084.52 |
+| Mean ns | 15,770,517.87 | 15,239,220.89 | 15,873,660.47 | +634,439.58 |
+| Max ns | 3,047,688,855 | 1,773,899,951 | 2,762,556,537 | +988,656,586 |
+
+这一轮的直接观察：
+
+- Median 基本不变；
+- P95 增加约 0.14%；
+- P99 增加约 9.05%；
+- Mean 增加约 4.16%，但 mean/max 会明显受 capture 启停、窗口/VSync 切换和单次长尾影响；
+- 当前只有每种强度一个 run，因此这些数值用于证明 compare 数据链完整，不能单独作为最终性能回归结论。正式性能结论至少需要固定环境、多次重复录制、剔除预热/边界帧，并报告分布与置信区间。
+
+### 11.4 Validation
+
+三个 trace 均返回：
+
+- `valid=true`；
+- 15 个 validation checks；
+- 0 个 error；
+- 3 类 finding。
+
+| Finding | coverage | baseline | stress | 解释 |
+| --- | ---: | ---: | ---: | --- |
+| Incomplete CPU zones | 32 | 32 | 32 | capture 边界仍在运行的 zone，保留为 incomplete，不猜测结束时间 |
+| GTMEM1 missing GPU-zone boundary | 62 | 151 | 63 | 已保存 Pass 中缺少可精确配对的 GPU 边界，按歧义/缺失状态返回 |
+| Hardware sample unavailable | 1 类 | 1 类 | 1 类 | trace 未包含 PMU hardware sample，capability 明确 unavailable |
+
+coverage trace 还完成了 72,594 个 GTMEM1 Pass 的归因扫描。未完成或缺失 GPU 配对的 Pass 没有被伪造为 exact。
+
+### 11.5 真实 MCP 双 Trace Compare
+
+修复后的 `tracy-query.exe --mcp` 同时打开 baseline 与 stress；加载严格串行，两份 trace 都经历 `loading → indexing → ready`。从进程启动、加载两份大 trace、执行四个异步 job 到关闭 session，总墙钟时间为 28.2 秒。
+
+| Compare | 匹配/结果 | 计算时间 |
+| --- | ---: | ---: |
+| Frames | 3 个 frame sets | 0.005 s |
+| CPU zones | 851 个匹配键，返回变化量最大的 5 项 | 17.206 s |
+| GPU zones | 270 个匹配键，返回变化量最大的 5 项 | 0.557 s |
+| Source | confirmed changed 0；inconclusive 5；baseline-only 5；candidate-only 5 | 0.116 s |
+
+Source Compare 在这轮验收中发现并修复了一个语义问题：
+
+- 旧实现会把“两侧前 64 KiB 相同、但两侧都被响应预算截断”的大源码文件误报为 `changed`；
+- 提交 `e570b399f` 后，确定内容或字节数不同才进入 `changed`；
+- 相同 bounded prefix 但未读取完整尾部的文件进入 `inconclusive`，reason 为 `bounded_prefix_equal`；
+- 本轮 5 个 inconclusive 文件各自已比较 65,536 字节，文件总长度为 70,595–160,078 字节；
+- 同一 Godot 构建最终得到 `changed=0`，避免 ChatGPT 把预算截断误判为源码变化。
+
+CPU Zone Top-N 主要被单次资源加载事件主导，例如 `menu.tscn`、`door.gd`。这是按绝对 mean/P95 delta 排序的正确结果，但不等于稳定态热点结论；人工复核时必须同时看 count、frame/time range 和 steady-state filter。GPU Top-N 中也存在只出现一次的动态 label，应同样检查 `presence` 和 count。
+
+### 11.6 最终自动测试状态
+
+| 验收项 | 结果 |
+| --- | --- |
+| Release 增量构建 | PASS |
+| CTest | 7 / 7 PASS，12.06 s |
+| Public Query registry | 98 methods |
+| 单 trace 真实矩阵 | 95 次；91 success + 4 个预期 `CAPABILITY_UNAVAILABLE`；0 unexpected |
+| 单 trace 最大普通响应 | 65,316 bytes，低于 8 MiB 上限 |
+| MCP catalog | 12 / 12 tools；3 resource templates |
+| MCP progress / cancellation | PASS |
+| MCP validation job | 15 checks；3 findings；PASS |
+| MCP frames / zones / source compare | PASS |
+| Source resource | 13,282 chars；PASS |
+| Frame-image PNG resource | Base64 39,952 chars；PASS |
+| 修复后真实 baseline/stress compare | PASS；指纹、job、关闭流程均验证 |
+
+自动化阶段至此完成。下一阶段是使用本文 `QG-001..QG-033`，在自定义 `tracy-profiler.exe` 中对同一 SHA-256 trace 做 GUI—Query 全量人工校验。人工校验应先使用 `TPS-coverage-full-001.tracy` 验证域覆盖，再使用 baseline/stress 验证 Compare；任何差异都必须保存 GUI 截图、Query request/response、实体 ref 和单位换算。
