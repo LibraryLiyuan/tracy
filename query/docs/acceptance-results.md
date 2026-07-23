@@ -9,17 +9,35 @@ This file records the Windows x64 Release acceptance run performed on 2026-07-22
 - Generator/toolchain: Visual Studio 18 2026 x64, MSVC 19.51.36248.0, MSBuild 18.7.8, and CMake 4.3.1-msvc1.
 - Dependency downloads were resolved from `C:\CodeProjects\GodotProjects\tracy-profiler-frame-memory-build\.cpm-cache`; that older build tree was not used for binary acceptance.
 - Formal Query and Profiler builds use `-DGIT_REV=HEAD`; the original worktree and packaged Profiler are kept untouched until the final fast-forward.
+- The formal `a7813c11` baseline Profiler was 26,539,008 bytes with SHA-256 `BADB83C4392FBB595258F9EF873C3528E69DBB1E7E1D7EC36C39766F5534B3C2`.
 
 ## Automated and build gates
 
 - Query Release build: passed.
-- Query CTest: 7/7 passed in 11.95 seconds after the final MCP error/pagination hardening.
+- Query CTest: 7/7 passed in 12.33 seconds from the committed final HEAD after MCP error/pagination hardening.
 - The MCP Worker integration test covered Fresh, Connect, and Reconnect frame/zone/source comparisons, asynchronous validation/job retrieval, resources, and corrupt-trace rejection.
 - Profiler Release build against the same `TracyAnalysis` and `TracyServer` sources: passed.
 - Capture Release build: passed; its no-argument usage path exited with the expected nonzero status.
-- Csvexport Release build: passed; `--help` exited successfully and an actual Fresh1 export completed successfully in 70.46 ms with output discarded.
+- Csvexport Release build: passed; `--help` exited successfully and an actual Fresh1 export completed successfully in 73.25 ms with output discarded.
 - Original packaged `windows-0.13.1\tracy-profiler.exe` SHA-256 remained `1C7D6321E602B6A0B94A0897B70183AB62D4D56543C10ACD9BFC1B0424B48A78`.
 - `git diff --check`: passed; only the repository's existing LF/CRLF conversion notices were emitted.
+
+Final Windows artifacts:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `tracy-query.exe` | 11,970,560 | `CC0F36025FC874792A970CB8625DF755828ABF14C569D17283C87EB32167E60D` |
+| `tracy-profiler.exe` (`GitRef=b5bab281`) | 26,558,976 | `9B015F990C599E36E3D194AAC7B228BF65057A63EB7B7ED754A8ADE8F88D654C` |
+| `tracy-capture.exe` | 10,698,752 | `D75034A9A8A179BB23A86396E78D0ADCE84D6D3DC5719D1577824D7BB3DD4360` |
+| `tracy-csvexport.exe` | 10,579,456 | `2CF5EB240988419B4578C316937FC08DC272E4929241516E18AD2AC371FD6C1C` |
+
+## Profiler visual regression
+
+The formal Profiler loaded `Test-GPU-Reconnect-1.tracy` directly from its native file argument, displayed 986 frames and the expected GPU/CPU/memory plots, and opened the shared frame-memory inspector without an error.
+
+`Test-GPUMemory-Fresh1.tracy` exposed all six named D3D12 pools. Selecting `GPU D3D12 Default Textures` showed logical allocation IDs, 95 active allocations and 177.59 MiB. At frame 7,574 (internal index 610), the shared snapshot reported 177.59 MiB/95 allocations at both frame start and end, zero allocations/frees during the frame, and populated the allocation-detail table.
+
+None of the nine available positive local captures contains persisted GTMEM1 relation records. Both Query (`CAPABILITY_UNAVAILABLE`) and the Profiler (`No GTMEM1 pass relations in this capture`) report that absence explicitly rather than inventing attribution. Deterministic request/pass/use pairing, incomplete passes, usage masks and ambiguity states are covered by the shared-analysis and `FakeTraceSource` contract tests; a future capture produced by a pass-attribution-enabled Godot build is still required for real-data GTMEM1 visual characterization.
 
 ## Real trace loader matrix
 
