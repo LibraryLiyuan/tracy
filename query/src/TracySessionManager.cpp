@@ -1,5 +1,7 @@
 #include "TracySessionManager.hpp"
 
+#include "TracyWorkerTraceSource.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <sstream>
@@ -49,7 +51,7 @@ struct SessionManager::Session
     bool closePending = false;
     std::string errorCode;
     std::string errorMessage;
-    std::shared_ptr<analysis::WorkerTraceSource> source;
+    std::shared_ptr<analysis::TraceSource> source;
 };
 
 const char* ToString( SessionErrorCode code )
@@ -70,8 +72,9 @@ const char* ToString( SessionErrorCode code )
     return "INTERNAL_ERROR";
 }
 
-SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions )
+SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions, SourceLoader sourceLoader )
     : m_maxSessions( maxSessions )
+    , m_sourceLoader( std::move( sourceLoader ) )
 {
     if( allowRoots.empty() ) allowRoots.emplace_back( std::filesystem::current_path() );
     for( const auto& root : allowRoots )
@@ -86,6 +89,12 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
     }
     std::sort( m_allowRoots.begin(), m_allowRoots.end() );
     m_allowRoots.erase( std::unique( m_allowRoots.begin(), m_allowRoots.end() ), m_allowRoots.end() );
+    if( !m_sourceLoader )
+    {
+        m_sourceLoader = []( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
+            return analysis::WorkerTraceSource::Open( path, std::move( callback ) );
+        };
+    }
     m_loader = std::jthread( [this]( std::stop_token token ) { LoaderLoop( token ); } );
 }
 
@@ -138,10 +147,33 @@ TraceSessionSnapshot SessionManager::Open( const std::filesystem::path& requeste
 
 TraceSessionSnapshot SessionManager::SnapshotLocked( const Session& session ) const
 {
-    return {
-        session.id, session.path, session.fingerprint, analysis::TraceSourceKind::Snapshot, session.state,
-        session.revision, session.watermarkNs, session.complete, session.closePending, session.errorCode, session.errorMessage
-    };
+    TraceSessionSnapshot result;
+    result.id = session.id;
+    result.path = session.path;
+    result.fingerprint = session.fingerprint;
+    result.sourceKind = analysis::TraceSourceKind::Snapshot;
+    result.state = session.state;
+    result.revision = session.revision;
+    result.watermarkNs = session.watermarkNs;
+    result.complete = session.complete;
+    result.closePending = session.closePending;
+    result.errorCode = session.errorCode;
+    result.errorMessage = session.errorMessage;
+    if( session.state == analysis::TraceSourceState::Loading )
+    {
+        const auto progress = analysis::WorkerTraceSource::GetLoadProgress();
+        result.loadStage = progress.stage;
+        result.loadCompleted = progress.completed;
+        result.loadTotal = progress.total;
+        result.loadSubCompleted = progress.subCompleted;
+        result.loadSubTotal = progress.subTotal;
+    }
+    else if( session.state == analysis::TraceSourceState::Indexing )
+    {
+        result.loadStage = "analysis_indexes";
+        result.loadCompleted = result.loadTotal = 1;
+    }
+    return result;
 }
 
 std::shared_ptr<SessionManager::Session> SessionManager::FindLocked( const std::string& id ) const
@@ -195,7 +227,7 @@ TraceSessionSnapshot SessionManager::WaitReady( const std::string& id, std::chro
     return SnapshotLocked( *session );
 }
 
-std::shared_ptr<analysis::WorkerTraceSource> SessionManager::GetReadySource( const std::string& id ) const
+std::shared_ptr<analysis::TraceSource> SessionManager::GetReadySource( const std::string& id ) const
 {
     std::lock_guard lock( m_mutex );
     const auto session = FindLocked( id );
@@ -246,7 +278,7 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
 
         try
         {
-            auto source = analysis::WorkerTraceSource::Open( session->path, [this, weak = std::weak_ptr<Session>( session )]( auto state ) {
+            auto source = m_sourceLoader( session->path, [this, weak = std::weak_ptr<Session>( session )]( auto state ) {
                 if( const auto locked = weak.lock() ) UpdateState( locked, state );
             } );
             std::lock_guard lock( m_mutex );
@@ -258,8 +290,8 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
             }
             else
             {
-                session->source = std::shared_ptr<analysis::WorkerTraceSource>( std::move( source ) );
-                session->fingerprint = session->source->Fingerprint();
+                session->source = std::shared_ptr<analysis::TraceSource>( std::move( source ) );
+                session->fingerprint = session->source->GetTraceInfo().fingerprint;
                 const auto view = session->source->AcquireReadView();
                 session->watermarkNs = view.watermarkNs;
                 session->complete = view.complete;

@@ -53,16 +53,30 @@ install(TARGETS tracy-query DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
 if(BUILD_TESTING)
+    function(tracy_query_enable_assertions target)
+        # Keep assertions active in Release test builds and avoid LTCG for the
+        # deliberately large Worker integration translation unit. MSVC 19.5x
+        # can otherwise ICE while optimizing the bundled zstd templates.
+        set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION FALSE)
+        if(MSVC)
+            target_compile_options(${target} PRIVATE /UNDEBUG /GL-)
+        else()
+            target_compile_options(${target} PRIVATE -UNDEBUG)
+        endif()
+    endfunction()
+
     add_executable(tracy-query-contract-tests tests/ProtocolTests.cpp)
-    target_link_libraries(tracy-query-contract-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    target_link_libraries(tracy-query-contract-tests PRIVATE TracyQueryProtocol)
     target_compile_definitions(tracy-query-contract-tests PRIVATE
         TRACY_QUERY_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json"
         TRACY_QUERY_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json"
     )
+    tracy_query_enable_assertions(tracy-query-contract-tests)
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)
 
     add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-mcp-transcript-tests)
     add_test(NAME tracy-query-mcp-transcript COMMAND tracy-query-mcp-transcript-tests)
 
     add_test(NAME tracy-query-version COMMAND tracy-query --version)
@@ -77,10 +91,38 @@ if(BUILD_TESTING)
                 --trace "${TRACY_ACCEPTANCE_TRACE}"
                 --request "${CMAKE_CURRENT_LIST_DIR}/tests/requests/overview.json"
             )
+            add_test(NAME tracy-query-worker-memory-frame COMMAND tracy-query
+                --allow-root "${TRACY_ACCEPTANCE_TRACE_ROOT}"
+                --trace "${TRACY_ACCEPTANCE_TRACE}"
+                --request "${CMAKE_CURRENT_LIST_DIR}/tests/requests/memory-frame.json"
+            )
 
             add_executable(tracy-query-mcp-worker-integration-tests tests/McpWorkerIntegrationTests.cpp)
             target_link_libraries(tracy-query-mcp-worker-integration-tests PRIVATE TracyQueryProtocol)
+            tracy_query_enable_assertions(tracy-query-mcp-worker-integration-tests)
             target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE TRACY_ACCEPTANCE_TRACE="${TRACY_ACCEPTANCE_TRACE}")
+            set(TRACY_ACCEPTANCE_COMPARE_TRACE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Fresh2.tracy")
+            if(EXISTS "${TRACY_ACCEPTANCE_COMPARE_TRACE}")
+                target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE TRACY_ACCEPTANCE_COMPARE_TRACE="${TRACY_ACCEPTANCE_COMPARE_TRACE}")
+            endif()
+            set(TRACY_ACCEPTANCE_CONNECT_BASELINE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Connect1.tracy")
+            set(TRACY_ACCEPTANCE_CONNECT_CANDIDATE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Connect2.tracy")
+            if(EXISTS "${TRACY_ACCEPTANCE_CONNECT_BASELINE}" AND EXISTS "${TRACY_ACCEPTANCE_CONNECT_CANDIDATE}")
+                target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE
+                    TRACY_ACCEPTANCE_CONNECT_BASELINE="${TRACY_ACCEPTANCE_CONNECT_BASELINE}"
+                    TRACY_ACCEPTANCE_CONNECT_CANDIDATE="${TRACY_ACCEPTANCE_CONNECT_CANDIDATE}")
+            endif()
+            set(TRACY_ACCEPTANCE_RECONNECT_BASELINE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPU-Reconnect-1.tracy")
+            set(TRACY_ACCEPTANCE_RECONNECT_CANDIDATE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPU-Reconnect-2.tracy")
+            if(EXISTS "${TRACY_ACCEPTANCE_RECONNECT_BASELINE}" AND EXISTS "${TRACY_ACCEPTANCE_RECONNECT_CANDIDATE}")
+                target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE
+                    TRACY_ACCEPTANCE_RECONNECT_BASELINE="${TRACY_ACCEPTANCE_RECONNECT_BASELINE}"
+                    TRACY_ACCEPTANCE_RECONNECT_CANDIDATE="${TRACY_ACCEPTANCE_RECONNECT_CANDIDATE}")
+            endif()
+            set(TRACY_ACCEPTANCE_CORRUPT_TRACE "${TRACY_ACCEPTANCE_TRACE_ROOT}/Test-GPUMemory-Startup.tracy")
+            if(EXISTS "${TRACY_ACCEPTANCE_CORRUPT_TRACE}")
+                target_compile_definitions(tracy-query-mcp-worker-integration-tests PRIVATE TRACY_ACCEPTANCE_CORRUPT_TRACE="${TRACY_ACCEPTANCE_CORRUPT_TRACE}")
+            endif()
             add_test(NAME tracy-query-mcp-worker-integration COMMAND tracy-query-mcp-worker-integration-tests)
         endif()
     endif()

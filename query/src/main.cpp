@@ -32,6 +32,7 @@ struct Arguments
     std::optional<std::string> batch;
     std::vector<std::filesystem::path> allowRoots;
     std::vector<std::filesystem::path> allowSourceRoots;
+    size_t analysisCacheMiB = 512;
 };
 
 void Usage()
@@ -44,7 +45,7 @@ void Usage()
         << "  tracy-query --doctor [--trace file.tracy] [--allow-root path]\n"
         << "  tracy-query --trace file.tracy --request request.json|- [--allow-root path]\n"
         << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--allow-root path]\n"
-        << "  tracy-query --mcp [--allow-root path] [--allow-source-root path]\n";
+        << "  tracy-query --mcp [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
 }
 
 Arguments ParseArguments( int argc, char** argv )
@@ -66,6 +67,12 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--batch" ) result.batch = value( "--batch" );
         else if( option == "--allow-root" ) result.allowRoots.emplace_back( value( "--allow-root" ) );
         else if( option == "--allow-source-root" ) result.allowSourceRoots.emplace_back( value( "--allow-source-root" ) );
+        else if( option == "--analysis-cache-mib" )
+        {
+            const auto parsed = std::stoull( value( "--analysis-cache-mib" ) );
+            if( parsed > 65536 ) throw std::runtime_error( "--analysis-cache-mib must be between 0 and 65536" );
+            result.analysisCacheMiB = size_t( parsed );
+        }
         else if( option == "--help" || option == "-h" )
         {
             Usage();
@@ -131,7 +138,7 @@ std::optional<std::string> OpenDefaultTrace( SessionManager& sessions, const std
 int RunSingle( const Arguments& args )
 {
     SessionManager sessions( args.allowRoots );
-    QueryService service( sessions );
+    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
     if( args.trace && !trace )
@@ -148,7 +155,7 @@ int RunSingle( const Arguments& args )
 int RunBatch( const Arguments& args )
 {
     SessionManager sessions( args.allowRoots );
-    QueryService service( sessions );
+    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
     if( args.trace && !trace )
@@ -188,6 +195,7 @@ int RunDoctor( const Arguments& args )
         { "program", "tracy-query" },
         { "version", std::to_string( tracy::Version::Major ) + '.' + std::to_string( tracy::Version::Minor ) + '.' + std::to_string( tracy::Version::Patch ) },
         { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
+        { "analysis_cache_bytes", std::to_string( args.analysisCacheMiB * 1024 * 1024 ) },
         { "checks", {
             { "json_schema", json::parse( QuerySchemaJson ).is_object() ? "ok" : "failed" },
             { "coverage_manifest", json::parse( QueryCoverageJson ).is_object() ? "ok" : "failed" },
@@ -251,7 +259,7 @@ int main( int argc, char** argv )
         if( args.mcp )
         {
             SessionManager sessions( args.allowRoots );
-            QueryService service( sessions );
+            QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
             McpServer server( sessions, service, args.allowSourceRoots );
             return server.Run( std::cin, std::cout );
         }

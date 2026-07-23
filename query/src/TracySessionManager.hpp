@@ -1,7 +1,7 @@
 #ifndef __TRACYSESSIONMANAGER_HPP__
 #define __TRACYSESSIONMANAGER_HPP__
 
-#include "TracyWorkerTraceSource.hpp"
+#include "TracyTraceSource.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -60,12 +60,20 @@ struct TraceSessionSnapshot
     bool closePending = false;
     std::string errorCode;
     std::string errorMessage;
+    std::string loadStage;
+    uint64_t loadCompleted = 0;
+    uint64_t loadTotal = 0;
+    uint64_t loadSubCompleted = 0;
+    uint64_t loadSubTotal = 0;
 };
 
 class SessionManager
 {
 public:
-    explicit SessionManager( std::vector<std::filesystem::path> allowRoots = {}, size_t maxSessions = 2 );
+    using StateCallback = std::function<void( analysis::TraceSourceState )>;
+    using SourceLoader = std::function<std::unique_ptr<analysis::TraceSource>( const std::filesystem::path&, StateCallback )>;
+
+    explicit SessionManager( std::vector<std::filesystem::path> allowRoots = {}, size_t maxSessions = 2, SourceLoader sourceLoader = {} );
     ~SessionManager();
 
     SessionManager( const SessionManager& ) = delete;
@@ -77,7 +85,7 @@ public:
     TraceSessionSnapshot Close( const std::string& id );
     TraceSessionSnapshot WaitReady( const std::string& id, std::chrono::milliseconds timeout );
 
-    std::shared_ptr<analysis::WorkerTraceSource> GetReadySource( const std::string& id ) const;
+    std::shared_ptr<analysis::TraceSource> GetReadySource( const std::string& id ) const;
     std::filesystem::path ResolveTracePath( const std::filesystem::path& path ) const;
     const std::vector<std::filesystem::path>& AllowRoots() const { return m_allowRoots; }
 
@@ -96,6 +104,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Session>> m_sessions;
     std::deque<std::shared_ptr<Session>> m_queue;
     uint64_t m_nextSession = 1;
+    SourceLoader m_sourceLoader;
     std::jthread m_loader;
 };
 
