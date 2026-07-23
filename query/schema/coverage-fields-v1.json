@@ -1,0 +1,529 @@
+{
+  "schema_version": "1.0.0",
+  "trace_format": "Tracy 0.9.0-0.13.1",
+  "coverage_level": "field",
+  "status": "partial",
+  "source_audit": [
+    "server/TracyWorker.cpp Worker::Write and matching load paths",
+    "server/TracyEvent.hpp persisted event structures",
+    "server/TracyWorker.hpp public getters",
+    "profiler/src GUI consumers",
+    "analysis/TracyTraceSource.hpp DTOs",
+    "analysis/TracyWorkerTraceSource.cpp adapter"
+  ],
+  "classifications": {
+    "persisted_semantic": "Must be losslessly queryable.",
+    "derived_semantic": "Must be queryable or reproducible by the shared analysis core.",
+    "storage_identity": "Expose only when required to preserve a relationship or raw identity.",
+    "runtime_only": "Not present in a completed saved trace; report unavailable instead of fabricating it.",
+    "internal_cache": "Implementation state, pointers, synchronization, staging, or reconstructible indexes; intentionally excluded."
+  },
+  "entities": [
+    {
+      "entity": "trace.metadata",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "trace_version",
+        "resolution",
+        "timer_multiplier",
+        "last_time",
+        "frame_offset",
+        "process_id",
+        "sampling_period",
+        "cpu_architecture",
+        "cpu_id",
+        "cpu_manufacturer",
+        "on_demand",
+        "capture_name",
+        "capture_program",
+        "capture_time",
+        "executable_time",
+        "host_info"
+      ],
+      "query_fields": [
+        "trace_version",
+        "resolution",
+        "last_time_ns",
+        "process_id",
+        "cpu_architecture",
+        "cpu_id",
+        "cpu_manufacturer",
+        "capture_name",
+        "capture_program",
+        "capture_time",
+        "executable_time",
+        "host_info"
+      ],
+      "unmapped_fields": ["timer_multiplier", "frame_offset", "sampling_period", "on_demand"],
+      "methods": ["trace.info", "trace.overview"],
+      "status": "partial"
+    },
+    {
+      "entity": "cpu.topology",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["package_id", "die_id", "core_id", "hardware_thread_id"],
+      "query_fields": ["package_id", "die_id", "core_id", "hardware_thread_id"],
+      "unmapped_fields": [],
+      "methods": ["cpu.topology"],
+      "status": "complete"
+    },
+    {
+      "entity": "trace.crash",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["thread", "time", "message", "callstack"],
+      "query_fields": ["thread_ref", "time_ns", "message", "callstack_ref"],
+      "unmapped_fields": [],
+      "methods": ["trace.crash"],
+      "status": "complete"
+    },
+    {
+      "entity": "frame.set",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["name", "continuous", "frame_count"],
+      "query_fields": ["ref", "name", "continuous", "frame_count", "complete_frame_count"],
+      "unmapped_fields": [],
+      "methods": ["frame.sets"],
+      "status": "complete"
+    },
+    {
+      "entity": "frame.event",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["start", "end", "frame_image_index"],
+      "query_fields": ["ref", "frame_set_ref", "index", "begin_ns", "end_ns", "image_ref", "complete"],
+      "unmapped_fields": [],
+      "methods": ["frame.list", "frame.get", "frame.range_mapping"],
+      "status": "complete"
+    },
+    {
+      "entity": "thread",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "native_id",
+        "local_name",
+        "external_process_name",
+        "external_thread_name",
+        "process_id",
+        "zone_count",
+        "kernel_sample_count",
+        "is_fiber",
+        "group_hint",
+        "message_membership",
+        "running_time",
+        "running_regions",
+        "migrations"
+      ],
+      "query_fields": [
+        "ref",
+        "native_id",
+        "name",
+        "process_id",
+        "zone_count",
+        "is_fiber",
+        "message_count",
+        "sample_count",
+        "context_switch_count",
+        "running_time_ns",
+        "migrations"
+      ],
+      "unmapped_fields": [
+        "external_process_name",
+        "external_thread_name",
+        "kernel_sample_count",
+        "group_hint",
+        "running_regions"
+      ],
+      "methods": ["thread.list", "thread.get", "thread.statistics"],
+      "status": "partial"
+    },
+    {
+      "entity": "source.location",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["native_id", "name", "function", "file", "line", "color", "cpu_zone_count", "gpu_zone_count"],
+      "query_fields": ["ref", "name", "function", "file", "line", "color", "cpu_zone_count", "gpu_zone_count"],
+      "unmapped_fields": [],
+      "methods": ["source.locations", "source.statistics"],
+      "status": "complete"
+    },
+    {
+      "entity": "zone.cpu",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "start",
+        "end",
+        "source_location",
+        "child_relationship",
+        "extra_index",
+        "extra_callstack",
+        "extra_text",
+        "extra_name",
+        "extra_color",
+        "thread"
+      ],
+      "query_fields": [
+        "ref",
+        "thread_ref",
+        "source_location_ref",
+        "name",
+        "function",
+        "file",
+        "line",
+        "parent_ref",
+        "start_ns",
+        "end_ns",
+        "callstack_ref",
+        "child_count",
+        "complete"
+      ],
+      "unmapped_fields": ["extra_index", "extra_text", "extra_color"],
+      "methods": ["zone.cpu.search", "zone.cpu.get", "zone.cpu.tree"],
+      "status": "partial"
+    },
+    {
+      "entity": "message",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["time", "text", "thread", "color", "callstack"],
+      "query_fields": ["ref", "time_ns", "text", "thread_ref", "color", "callstack_ref"],
+      "unmapped_fields": [],
+      "methods": ["message.search", "message.get"],
+      "status": "complete"
+    },
+    {
+      "entity": "lock",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "native_id",
+        "custom_name",
+        "source_location",
+        "lock_type",
+        "valid",
+        "announce_time",
+        "terminate_time",
+        "thread_list",
+        "timeline_time",
+        "timeline_source_location",
+        "timeline_thread",
+        "timeline_event_type"
+      ],
+      "query_fields": [
+        "ref",
+        "native_id",
+        "name",
+        "source_location_ref",
+        "valid",
+        "announce_ns",
+        "terminate_ns",
+        "event_count",
+        "thread_count",
+        "timeline"
+      ],
+      "unmapped_fields": ["lock_type"],
+      "methods": ["lock.list", "lock.get", "lock.timeline"],
+      "status": "partial"
+    },
+    {
+      "entity": "sample",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["thread", "time", "callstack", "context_switch_sample_kind", "thread_kernel_sample_count"],
+      "query_fields": ["ref", "thread_ref", "time_ns", "callstack_ref", "kind"],
+      "unmapped_fields": ["thread_kernel_sample_count"],
+      "methods": ["sample.list", "sample.flamegraph", "sample.symbol_statistics"],
+      "status": "partial"
+    },
+    {
+      "entity": "gpu.context",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "thread",
+        "has_calibration",
+        "zone_count",
+        "period",
+        "context_type",
+        "name",
+        "overflow",
+        "note_name_time",
+        "note_name",
+        "note_type",
+        "note_time",
+        "note_value",
+        "thread_timelines"
+      ],
+      "query_fields": ["ref", "thread_ref", "zone_count", "period", "type", "name", "calibrated"],
+      "unmapped_fields": ["overflow", "note_name_time", "note_name", "note_type", "note_time", "note_value"],
+      "methods": ["zone.gpu.contexts"],
+      "status": "partial"
+    },
+    {
+      "entity": "zone.gpu",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "cpu_start",
+        "cpu_end",
+        "gpu_start",
+        "gpu_end",
+        "source_location",
+        "thread",
+        "child_relationship",
+        "callstack",
+        "query_id",
+        "context"
+      ],
+      "query_fields": [
+        "ref",
+        "context_ref",
+        "thread_ref",
+        "source_location_ref",
+        "name",
+        "cpu_start_ns",
+        "cpu_end_ns",
+        "gpu_start_ns",
+        "gpu_end_ns",
+        "parent_ref",
+        "callstack_ref",
+        "child_count",
+        "complete"
+      ],
+      "unmapped_fields": ["query_id"],
+      "methods": ["zone.gpu.search", "zone.gpu.get", "zone.gpu.tree"],
+      "status": "partial"
+    },
+    {
+      "entity": "plot",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["type", "format", "show_steps", "fill", "color", "name", "min", "max", "sum", "point_time", "point_value"],
+      "query_fields": ["ref", "type", "format", "name", "min", "max", "sum", "point_count", "points"],
+      "unmapped_fields": ["show_steps", "fill", "color"],
+      "methods": ["plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics"],
+      "status": "partial"
+    },
+    {
+      "entity": "memory.pool",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["native_name_id", "resolved_name", "active_count", "free_count", "high_address", "low_address", "usage", "event_count"],
+      "query_fields": ["ref", "native_name_id", "name", "active_count", "active_bytes", "high", "low", "event_count"],
+      "unmapped_fields": ["free_count", "persisted_usage"],
+      "methods": ["memory.pools", "memory.gpu.pools"],
+      "status": "partial"
+    },
+    {
+      "entity": "memory.event",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "pool",
+        "address",
+        "size",
+        "allocation_callstack",
+        "free_callstack",
+        "allocation_time",
+        "free_time",
+        "allocation_thread",
+        "free_thread"
+      ],
+      "query_fields": [
+        "ref",
+        "pool_ref",
+        "address",
+        "size",
+        "allocation_callstack_ref",
+        "free_callstack_ref",
+        "allocation_ns",
+        "free_ns",
+        "allocation_thread_ref",
+        "free_thread_ref",
+        "allocation_zone_ref",
+        "free_zone_ref",
+        "complete"
+      ],
+      "unmapped_fields": [],
+      "methods": ["memory.events", "memory.get", "memory.active_at_time"],
+      "status": "complete"
+    },
+    {
+      "entity": "callstack.payload",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["callstack_id", "frame_ids", "frame_order"],
+      "query_fields": ["callstack_ref", "frame_refs", "depth"],
+      "unmapped_fields": [],
+      "methods": ["callstack.resolve", "callstack.frames", "callstack.batch"],
+      "status": "complete"
+    },
+    {
+      "entity": "callstack.frame",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["frame_id", "image_name", "name", "file", "line", "symbol_address"],
+      "query_fields": ["ref", "name", "file", "line", "address", "symbol_address", "inline", "depth"],
+      "unmapped_fields": ["image_name"],
+      "methods": ["callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch"],
+      "status": "partial"
+    },
+    {
+      "entity": "trace.app_info",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["ordered_text_entries"],
+      "query_fields": ["app_info"],
+      "unmapped_fields": [],
+      "methods": ["trace.app_info", "trace.overview"],
+      "status": "complete"
+    },
+    {
+      "entity": "frame.image",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["width", "height", "flip", "bc1_pixels", "frame_event_relationship"],
+      "query_fields": ["ref", "width", "height", "flipped", "png_resource", "frame_index"],
+      "unmapped_fields": ["raw_bc1_resource", "opaque_frame_ref"],
+      "methods": ["frame_image.list", "frame_image.metadata", "frame_image.resource"],
+      "status": "partial"
+    },
+    {
+      "entity": "context_switch.thread",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["thread", "wakeup", "start", "end", "cpu", "wakeup_cpu", "reason", "state", "next_thread"],
+      "query_fields": ["ref", "thread_ref", "wakeup_ns", "start_ns", "end_ns", "cpu", "wakeup_cpu", "reason_code", "state_code"],
+      "unmapped_fields": ["reason_name", "state_name", "next_thread_ref"],
+      "methods": ["context_switch.range", "context_switch.thread"],
+      "status": "partial"
+    },
+    {
+      "entity": "context_switch.cpu",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["cpu", "start", "end", "thread"],
+      "query_fields": ["cpu", "start_ns", "end_ns", "thread_ref"],
+      "unmapped_fields": [],
+      "methods": ["cpu.timeline"],
+      "status": "complete"
+    },
+    {
+      "entity": "context_switch.thread_stats",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["thread", "running_time", "running_regions", "migrations"],
+      "query_fields": ["thread_ref", "running_time_ns", "running_regions", "migrations"],
+      "unmapped_fields": [],
+      "methods": ["thread.statistics", "thread.migration", "context_switch.statistics"],
+      "status": "complete"
+    },
+    {
+      "entity": "symbol",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["address", "name", "file", "line", "image_name", "call_file", "call_line", "is_inline", "size"],
+      "query_fields": ["ref", "address", "name", "file", "line", "size", "has_code", "sample_statistics"],
+      "unmapped_fields": ["image_name", "call_file", "call_line", "is_inline"],
+      "methods": ["symbol.search", "symbol.get", "symbol.address"],
+      "status": "partial"
+    },
+    {
+      "entity": "symbol.code",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["symbol_address", "byte_length", "bytes"],
+      "query_fields": ["ref", "address", "bytes", "truncated"],
+      "unmapped_fields": ["complete_chunked_resource"],
+      "methods": ["symbol.raw_code", "symbol.disassembly"],
+      "status": "partial"
+    },
+    {
+      "entity": "symbol.address_map",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["code_address", "symbol_address"],
+      "query_fields": ["address", "symbol_ref"],
+      "unmapped_fields": [],
+      "methods": ["symbol.address"],
+      "status": "complete"
+    },
+    {
+      "entity": "hardware_sample",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "address",
+        "cycle_event_times",
+        "retired_event_times",
+        "cache_reference_event_times",
+        "cache_miss_event_times",
+        "branch_retired_event_times",
+        "branch_miss_event_times"
+      ],
+      "query_fields": [
+        "ref",
+        "address",
+        "cycle_count",
+        "retired_count",
+        "cache_reference_count",
+        "cache_miss_count",
+        "branch_retired_count",
+        "branch_miss_count"
+      ],
+      "unmapped_fields": [
+        "cycle_event_times",
+        "retired_event_times",
+        "cache_reference_event_times",
+        "cache_miss_event_times",
+        "branch_retired_event_times",
+        "branch_miss_event_times"
+      ],
+      "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.capabilities"],
+      "status": "partial"
+    },
+    {
+      "entity": "source.file",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["path_bytes", "content_length", "content_bytes"],
+      "query_fields": ["ref", "path", "bytes", "bounded_text_resource"],
+      "unmapped_fields": ["complete_chunked_resource", "raw_path_bytes"],
+      "methods": ["source.embedded", "source.lines"],
+      "status": "partial"
+    }
+  ],
+  "non_persisted": [
+    {
+      "field": "fiber_to_thread_map",
+      "classification": "runtime_only",
+      "reason": "Worker::DataBlock contains the live map, but Worker::Write does not persist it."
+    },
+    {
+      "field": "per_sample_kernel_user_classification",
+      "classification": "runtime_only",
+      "reason": "Only the per-thread kernel sample count and ordered samples are persisted."
+    },
+    {
+      "field": "gpu_live_calibration_state",
+      "classification": "runtime_only",
+      "members": ["timeDiff", "calibratedGpuTime", "calibratedCpuTime", "calibrationMod", "lastGpuTime", "overflowMul"],
+      "reason": "Worker::Write persists the calibration flag, period, type, overflow and notes, but not these live calibration members."
+    }
+  ],
+  "internal_exclusions": [
+    {
+      "area": "synchronization",
+      "members": ["mainThreadWantsLock", "lockCv", "lock"],
+      "classification": "internal_cache",
+      "reason": "Worker synchronization, not capture data."
+    },
+    {
+      "area": "indexes_and_caches",
+      "members": [
+        "sourceLocationPayloadMap",
+        "revFrameMap",
+        "revParentFrameMap",
+        "zoneVectorCache",
+        "threadDataLast",
+        "ctxSwitchLast",
+        "sourceLocationZonesReady",
+        "gpuSourceLocationZonesReady",
+        "ctxUsageReady"
+      ],
+      "classification": "internal_cache",
+      "reason": "Reconstructible indexes and lookup caches."
+    },
+    {
+      "area": "staging_and_live_transport",
+      "members": [
+        "stacks",
+        "pendingSample",
+        "pendingWakeUp",
+        "query arrays",
+        "network queues",
+        "frame image staging",
+        "pending symbols"
+      ],
+      "classification": "internal_cache",
+      "reason": "Live or load-time staging state is not part of a completed saved capture."
+    }
+  ]
+}

@@ -22,6 +22,10 @@
 #  error TRACY_QUERY_COVERAGE_PATH must be defined
 #endif
 
+#ifndef TRACY_QUERY_FIELD_COVERAGE_PATH
+#  error TRACY_QUERY_FIELD_COVERAGE_PATH must be defined
+#endif
+
 static nlohmann::json LoadJson( const char* path )
 {
     std::ifstream stream( path, std::ios::binary );
@@ -104,6 +108,9 @@ int main()
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
     assert( coverage.at( "domains" ).size() == 23 );
+    assert( coverage.at( "coverage_level" ) == "domain" );
+    assert( coverage.at( "domain_status" ) == "complete" );
+    assert( coverage.at( "field_status" ) == "partial" );
     for( const auto& domain : coverage.at( "domains" ) )
     {
         assert( domain.at( "domain" ).is_string() );
@@ -112,6 +119,31 @@ int main()
         assert( domain.at( "status" ) == "complete" );
         assert( !domain.at( "tests" ).empty() );
     }
+
+    const auto fieldCoverage = LoadJson( TRACY_QUERY_FIELD_COVERAGE_PATH );
+    assert( fieldCoverage.at( "coverage_level" ) == "field" );
+    assert( fieldCoverage.at( "status" ) == "partial" );
+    assert( fieldCoverage.at( "entities" ).size() >= 25 );
+    std::set<std::string> fieldEntities;
+    size_t mappedFields = 0;
+    size_t unmappedFields = 0;
+    for( const auto& entity : fieldCoverage.at( "entities" ) )
+    {
+        assert( fieldEntities.emplace( entity.at( "entity" ).get<std::string>() ).second );
+        assert( entity.at( "persisted_fields" ).is_array() );
+        assert( entity.at( "query_fields" ).is_array() );
+        assert( entity.at( "unmapped_fields" ).is_array() );
+        assert( entity.at( "methods" ).is_array() );
+        assert( entity.at( "status" ) == ( entity.at( "unmapped_fields" ).empty() ? "complete" : "partial" ) );
+        mappedFields += entity.at( "query_fields" ).size();
+        unmappedFields += entity.at( "unmapped_fields" ).size();
+    }
+    assert( mappedFields > 100 );
+    assert( unmappedFields > 0 );
+    assert( fieldEntities.contains( "zone.cpu" ) );
+    assert( fieldEntities.contains( "gpu.context" ) );
+    assert( fieldEntities.contains( "hardware_sample" ) );
+    assert( fieldCoverage.at( "non_persisted" ).size() >= 3 );
 
     using tracy::analysis::ComputeStatistics;
     const auto stats = ComputeStatistics( std::vector<int64_t>{ 1, 2, 3, 4, 100 } );

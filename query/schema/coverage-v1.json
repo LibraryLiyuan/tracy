@@ -1,8 +1,12 @@
 {
   "schema_version": "1.0.0",
   "trace_format": "Tracy 0.9.0-0.13.1",
+  "coverage_level": "domain",
+  "domain_status": "complete",
+  "field_status": "partial",
+  "field_manifest": "coverage-fields-v1.json",
   "source_audit": ["Worker::DataBlock", "TracyWorker.cpp serialization", "profiler GUI modules", "csvexport", "feature-GPUMemory"],
-  "completion_rule": "complete means the persisted domain has a stable DTO/query mapping, capability semantics, bounded output, and deterministic contract or Worker integration coverage; GUI control state is intentionally excluded",
+  "completion_rule": "domain complete means the persisted domain has a stable DTO/query mapping, capability semantics, bounded output, and deterministic contract or Worker integration coverage; it does not assert lossless field or MCP completeness; GUI control state is intentionally excluded",
   "domains": [
     { "domain": "system", "worker_data": ["trace version", "build flags"], "methods": ["system.capabilities", "system.describe", "system.schema"], "status": "complete", "tests": ["schema snapshot", "MCP transcript", "doctor"] },
     { "domain": "trace", "worker_data": ["capture metadata", "appInfo", "crashEvent", "global counts"], "methods": ["trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash"], "status": "complete", "tests": ["FakeTraceSource", "Worker smoke", "MCP Worker integration"] },

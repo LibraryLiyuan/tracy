@@ -70,6 +70,7 @@ if(BUILD_TESTING)
     target_compile_definitions(tracy-query-contract-tests PRIVATE
         TRACY_QUERY_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json"
         TRACY_QUERY_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json"
+        TRACY_QUERY_FIELD_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json"
     )
     tracy_query_enable_assertions(tracy-query-contract-tests)
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)

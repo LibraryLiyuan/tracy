@@ -32,6 +32,7 @@ Trace loading is asynchronous under MCP. At most two sessions are retained, and 
 ## Contracts and documentation
 
 - [Protocol v1](docs/protocol-v1.md)
+- [Completeness contract](docs/completeness.md)
 - [MCP and ChatGPT desktop setup](docs/chatgpt-mcp.md)
 - [Security and privacy boundary](docs/security.md)
 - [Analysis workflow and examples](docs/analysis-workflow.md)
@@ -39,5 +40,11 @@ Trace loading is asynchronous under MCP. At most two sessions are retained, and 
 - [Latest local acceptance results](docs/acceptance-results.md)
 - [JSON envelope schema](schema/tracy-query-v1.schema.json)
 - [Persisted-domain coverage manifest](schema/coverage-v1.json)
+- [Persisted-field coverage ledger](schema/coverage-fields-v1.json)
 
-The implementation supports all persisted data domains enumerated in the coverage manifest. Capability absence is explicit: a missing domain is reported as `present=false`, and a query against it returns `CAPABILITY_UNAVAILABLE` instead of an ambiguous empty result.
+The implementation supports all persisted data domains enumerated in the domain
+manifest. Domain completeness is not the same as field or MCP completeness;
+the separate field ledger records every persisted semantic field and the
+remaining lossless-query work. Capability absence is explicit: a missing
+domain is reported as `present=false`, and a query against it returns
+`CAPABILITY_UNAVAILABLE` instead of an ambiguous empty result.
