@@ -48,15 +48,19 @@
         "cpu_architecture",
         "cpu_id",
         "cpu_manufacturer",
+        "timer_multiplier",
+        "frame_offset",
+        "sampling_period_ns",
+        "on_demand",
         "capture_name",
         "capture_program",
         "capture_time",
         "executable_time",
         "host_info"
       ],
-      "unmapped_fields": ["timer_multiplier", "frame_offset", "sampling_period", "on_demand"],
+      "unmapped_fields": [],
       "methods": ["trace.info", "trace.overview"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "cpu.topology",
@@ -123,17 +127,16 @@
         "sample_count",
         "context_switch_count",
         "running_time_ns",
-        "migrations"
-      ],
-      "unmapped_fields": [
+        "running_regions",
         "external_process_name",
         "external_thread_name",
         "kernel_sample_count",
         "group_hint",
-        "running_regions"
+        "migrations"
       ],
+      "unmapped_fields": [],
       "methods": ["thread.list", "thread.get", "thread.statistics"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "source.location",
@@ -170,13 +173,18 @@
         "parent_ref",
         "start_ns",
         "end_ns",
+        "extra_index",
+        "extra_name",
+        "extra_text",
+        "extra_color",
+        "extra_valid",
         "callstack_ref",
         "child_count",
         "complete"
       ],
-      "unmapped_fields": ["extra_index", "extra_text", "extra_color"],
+      "unmapped_fields": [],
       "methods": ["zone.cpu.search", "zone.cpu.get", "zone.cpu.tree"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "message",
@@ -209,6 +217,8 @@
         "native_id",
         "name",
         "source_location_ref",
+        "lock_type",
+        "lock_type_name",
         "valid",
         "announce_ns",
         "terminate_ns",
@@ -216,18 +226,18 @@
         "thread_count",
         "timeline"
       ],
-      "unmapped_fields": ["lock_type"],
+      "unmapped_fields": [],
       "methods": ["lock.list", "lock.get", "lock.timeline"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "sample",
       "classification": "persisted_semantic",
       "persisted_fields": ["thread", "time", "callstack", "context_switch_sample_kind", "thread_kernel_sample_count"],
-      "query_fields": ["ref", "thread_ref", "time_ns", "callstack_ref", "kind"],
-      "unmapped_fields": ["thread_kernel_sample_count"],
-      "methods": ["sample.list", "sample.flamegraph", "sample.symbol_statistics"],
-      "status": "partial"
+      "query_fields": ["ref", "thread_ref", "time_ns", "callstack_ref", "kind", "thread_kernel_sample_count_via_thread"],
+      "unmapped_fields": [],
+      "methods": ["sample.list", "sample.flamegraph", "sample.symbol_statistics", "thread.get"],
+      "status": "complete"
     },
     {
       "entity": "gpu.context",
@@ -247,10 +257,22 @@
         "note_value",
         "thread_timelines"
       ],
-      "query_fields": ["ref", "thread_ref", "zone_count", "period", "type", "name", "calibrated"],
-      "unmapped_fields": ["overflow", "note_name_time", "note_name", "note_type", "note_time", "note_value"],
+      "query_fields": [
+        "ref",
+        "thread_ref",
+        "zone_count",
+        "period",
+        "type",
+        "type_name",
+        "name",
+        "calibrated",
+        "overflow",
+        "note_names",
+        "notes"
+      ],
+      "unmapped_fields": [],
       "methods": ["zone.gpu.contexts"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "zone.gpu",
@@ -279,30 +301,31 @@
         "gpu_end_ns",
         "parent_ref",
         "callstack_ref",
+        "query_id",
         "child_count",
         "complete"
       ],
-      "unmapped_fields": ["query_id"],
+      "unmapped_fields": [],
       "methods": ["zone.gpu.search", "zone.gpu.get", "zone.gpu.tree"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "plot",
       "classification": "persisted_semantic",
       "persisted_fields": ["type", "format", "show_steps", "fill", "color", "name", "min", "max", "sum", "point_time", "point_value"],
-      "query_fields": ["ref", "type", "format", "name", "min", "max", "sum", "point_count", "points"],
-      "unmapped_fields": ["show_steps", "fill", "color"],
+      "query_fields": ["ref", "type", "format", "show_steps", "fill", "color", "name", "min", "max", "sum", "point_count", "points"],
+      "unmapped_fields": [],
       "methods": ["plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "memory.pool",
       "classification": "persisted_semantic",
       "persisted_fields": ["native_name_id", "resolved_name", "active_count", "free_count", "high_address", "low_address", "usage", "event_count"],
-      "query_fields": ["ref", "native_name_id", "name", "active_count", "active_bytes", "high", "low", "event_count"],
-      "unmapped_fields": ["free_count", "persisted_usage"],
+      "query_fields": ["ref", "native_name_id", "name", "active_count", "active_bytes", "free_count", "persisted_usage_bytes", "high", "low", "event_count"],
+      "unmapped_fields": [],
       "methods": ["memory.pools", "memory.gpu.pools"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "memory.event",
@@ -350,10 +373,10 @@
       "entity": "callstack.frame",
       "classification": "persisted_semantic",
       "persisted_fields": ["frame_id", "image_name", "name", "file", "line", "symbol_address"],
-      "query_fields": ["ref", "name", "file", "line", "address", "symbol_address", "inline", "depth"],
-      "unmapped_fields": ["image_name"],
+      "query_fields": ["ref", "name", "file", "line", "image_name", "address", "symbol_address", "inline", "depth"],
+      "unmapped_fields": [],
       "methods": ["callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "trace.app_info",
@@ -377,10 +400,10 @@
       "entity": "context_switch.thread",
       "classification": "persisted_semantic",
       "persisted_fields": ["thread", "wakeup", "start", "end", "cpu", "wakeup_cpu", "reason", "state", "next_thread"],
-      "query_fields": ["ref", "thread_ref", "wakeup_ns", "start_ns", "end_ns", "cpu", "wakeup_cpu", "reason_code", "state_code"],
-      "unmapped_fields": ["reason_name", "state_name", "next_thread_ref"],
+      "query_fields": ["ref", "thread_ref", "wakeup_ns", "start_ns", "end_ns", "cpu", "wakeup_cpu", "reason_code", "reason_name", "state_code", "state_name", "related_thread_index", "next_thread_ref"],
+      "unmapped_fields": [],
       "methods": ["context_switch.range", "context_switch.thread"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "context_switch.cpu",
@@ -404,10 +427,10 @@
       "entity": "symbol",
       "classification": "persisted_semantic",
       "persisted_fields": ["address", "name", "file", "line", "image_name", "call_file", "call_line", "is_inline", "size"],
-      "query_fields": ["ref", "address", "name", "file", "line", "size", "has_code", "sample_statistics"],
-      "unmapped_fields": ["image_name", "call_file", "call_line", "is_inline"],
+      "query_fields": ["ref", "address", "name", "file", "line", "image_name", "call_file", "call_line", "is_inline", "size", "has_code", "sample_statistics"],
+      "unmapped_fields": [],
       "methods": ["symbol.search", "symbol.get", "symbol.address"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "symbol.code",

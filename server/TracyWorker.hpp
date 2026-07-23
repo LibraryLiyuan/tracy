@@ -474,6 +474,7 @@ public:
     uint64_t GetExecutableTime() const { return m_executableTime; }
     const std::string& GetHostInfo() const { return m_hostInfo; }
     int64_t GetResolution() const { return m_resolution; }
+    double GetTimerMultiplier() const { return m_timerMul; }
     uint64_t GetPid() const { return m_pid; };
     CpuArchitecture GetCpuArch() const { return m_data.cpuArch; }
     uint32_t GetCpuId() const { return m_data.cpuId; }
@@ -554,6 +555,7 @@ public:
     int GetCpuDataCpuCount() const { return m_data.cpuDataCount; }
     uint64_t GetPidFromTid( uint64_t tid ) const;
     const unordered_flat_map<uint64_t, CpuThreadData>& GetCpuThreadData() const { return m_data.cpuThreadData; }
+    bool HasExternalName( uint64_t id ) const { return m_data.externalNames.find( id ) != m_data.externalNames.end(); }
     const unordered_flat_map<const char*, MemoryBlock, charutil::Hasher, charutil::Comparator>& GetSourceFileCache() const { return m_data.sourceFileCache; }
     uint64_t GetSourceFileCacheCount() const { return m_data.sourceFileCache.size(); }
     uint64_t GetSourceFileCacheSize() const;

@@ -261,6 +261,82 @@ int main()
         }
     }
 
+    const auto traceFields = service.Execute( Request( requestId++, "trace.info", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( traceFields.at( "timer_multiplier" ) == 0.5 );
+    assert( traceFields.at( "frame_offset" ) == "17" );
+    assert( traceFields.at( "sampling_period_ns" ) == "1000" );
+    assert( traceFields.at( "on_demand" ) == true );
+
+    const auto threadFields = service.Execute( Request( requestId++, "thread.get", {
+        { "trace_id", candidateId }, { "ref", "fake:thread:1" }
+    } ) ).at( "data" );
+    assert( threadFields.at( "external_process_name" ) == "FakeProcess" );
+    assert( threadFields.at( "external_thread_name" ) == "FakeExternalThread" );
+    assert( threadFields.at( "kernel_sample_count" ) == "3" );
+    assert( threadFields.at( "group_hint" ) == -7 );
+    assert( threadFields.at( "running_regions" ) == 4 );
+
+    const auto cpuZoneFields = service.Execute( Request( requestId++, "zone.cpu.get", {
+        { "trace_id", candidateId }, { "ref", "fake:cpu-zone:0" }
+    } ) ).at( "data" );
+    assert( cpuZoneFields.at( "extra_index" ) == 3 );
+    assert( cpuZoneFields.at( "extra_name" ) == "Update" );
+    assert( cpuZoneFields.at( "extra_text" ) == "phase=simulation" );
+    assert( cpuZoneFields.at( "extra_color" ) == 0x112233 );
+
+    const auto gpuContextFields = service.Execute( Request( requestId++, "zone.gpu.contexts", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "contexts" )[0];
+    assert( gpuContextFields.at( "type_name" ) == "direct3d12" );
+    assert( gpuContextFields.at( "overflow" ) == "9" );
+    assert( gpuContextFields.at( "note_names" )[0].at( "time_ns" ) == "21" );
+    assert( gpuContextFields.at( "notes" )[0].at( "query_id" ) == 5 );
+
+    const auto gpuZoneFields = service.Execute( Request( requestId++, "zone.gpu.get", {
+        { "trace_id", candidateId }, { "ref", "fake:gpu-zone:0" }
+    } ) ).at( "data" );
+    assert( gpuZoneFields.at( "query_id" ) == 5 );
+
+    const auto contextFields = service.Execute( Request( requestId++, "context_switch.range", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "context_switches" )[0];
+    assert( contextFields.at( "reason_name" ) == "wr_mutex" );
+    assert( contextFields.at( "state_name" ) == "waiting" );
+    assert( contextFields.at( "next_thread_ref" ) == "fake:thread:1" );
+
+    const auto memoryPoolFields = service.Execute( Request( requestId++, "memory.pools", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "pools" )[0];
+    assert( memoryPoolFields.at( "native_name_id" ) == "1" );
+    assert( memoryPoolFields.at( "free_count" ) == "2" );
+    assert( memoryPoolFields.at( "persisted_usage_bytes" ) == "64" );
+
+    const auto lockFields = service.Execute( Request( requestId++, "lock.get", {
+        { "trace_id", candidateId }, { "ref", "fake:lock:1" }
+    } ) ).at( "data" );
+    assert( lockFields.at( "type" ) == 1 );
+    assert( lockFields.at( "type_name" ) == "shared_lockable" );
+
+    const auto plotFields = service.Execute( Request( requestId++, "plot.list", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "plots" )[0];
+    assert( plotFields.at( "show_steps" ) == true );
+    assert( plotFields.at( "fill" ) == 2 );
+    assert( plotFields.at( "color" ) == 0x123456 );
+
+    const auto symbolFields = service.Execute( Request( requestId++, "symbol.get", {
+        { "trace_id", candidateId }, { "ref", "fake:symbol:1" }
+    } ) ).at( "data" );
+    assert( symbolFields.at( "image_name" ) == "fake.dll" );
+    assert( symbolFields.at( "call_file" ) == "caller.cpp" );
+    assert( symbolFields.at( "call_line" ) == 12 );
+    assert( symbolFields.at( "inline" ) == true );
+
+    const auto callstackFields = service.Execute( Request( requestId++, "callstack.frames", {
+        { "trace_id", candidateId }, { "callstack", "1" }
+    } ) ).at( "data" ).at( "frames" )[0];
+    assert( callstackFields.at( "image_name" ) == "fake.dll" );
+
     const auto projected = service.Execute( Request( requestId++, "zone.cpu.search", {
         { "trace_id", candidateId }, { "fields", nlohmann::json::array( { "name" } ) }, { "filter", { { "mode", "prefix" }, { "text", "up" }, { "case_sensitive", false } } }
     } ) );

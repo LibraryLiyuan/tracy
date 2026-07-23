@@ -48,6 +48,114 @@ const char* CpuArchitectureName( CpuArchitecture value )
     return "unknown";
 }
 
+const char* GpuContextTypeName( GpuContextType value )
+{
+    switch( value )
+    {
+    case GpuContextType::Invalid: return "invalid";
+    case GpuContextType::OpenGl: return "opengl";
+    case GpuContextType::Vulkan: return "vulkan";
+    case GpuContextType::OpenCL: return "opencl";
+    case GpuContextType::Direct3D12: return "direct3d12";
+    case GpuContextType::Direct3D11: return "direct3d11";
+    case GpuContextType::Metal: return "metal";
+    case GpuContextType::Custom: return "custom";
+    case GpuContextType::CUDA: return "cuda";
+    case GpuContextType::Rocprof: return "rocprof";
+    }
+    return "unknown";
+}
+
+const char* LockTypeName( LockType value )
+{
+    switch( value )
+    {
+    case LockType::Lockable: return "lockable";
+    case LockType::SharedLockable: return "shared_lockable";
+    }
+    return "unknown";
+}
+
+const char* ContextSwitchReasonName( int8_t value )
+{
+    switch( value )
+    {
+    case ContextSwitchData::Wakeup: return "wakeup";
+    case ContextSwitchData::Fiber: return "fiber";
+    case ContextSwitchData::NoState: return "no_state";
+    case ContextSwitchData::Win32_Executive: return "executive";
+    case ContextSwitchData::Win32_FreePage: return "free_page";
+    case ContextSwitchData::Win32_PageIn: return "page_in";
+    case ContextSwitchData::Win32_PoolAllocation: return "pool_allocation";
+    case ContextSwitchData::Win32_DelayExecution: return "delay_execution";
+    case ContextSwitchData::Win32_Suspended: return "suspended";
+    case ContextSwitchData::Win32_UserRequest: return "user_request";
+    case ContextSwitchData::Win32_WrExecutive: return "wr_executive";
+    case ContextSwitchData::Win32_WrFreePage: return "wr_free_page";
+    case ContextSwitchData::Win32_WrPageIn: return "wr_page_in";
+    case ContextSwitchData::Win32_WrPoolAllocation: return "wr_pool_allocation";
+    case ContextSwitchData::Win32_WrDelayExecution: return "wr_delay_execution";
+    case ContextSwitchData::Win32_WrSuspended: return "wr_suspended";
+    case ContextSwitchData::Win32_WrUserRequest: return "wr_user_request";
+    case ContextSwitchData::Win32_WrEventPair: return "wr_event_pair";
+    case ContextSwitchData::Win32_WrQueue: return "wr_queue";
+    case ContextSwitchData::Win32_WrLpcReceive: return "wr_lpc_receive";
+    case ContextSwitchData::Win32_WrLpcReply: return "wr_lpc_reply";
+    case ContextSwitchData::Win32_WrVirtualMemory: return "wr_virtual_memory";
+    case ContextSwitchData::Win32_WrPageOut: return "wr_page_out";
+    case ContextSwitchData::Win32_WrRendezvous: return "wr_rendezvous";
+    case ContextSwitchData::Win32_WrKeyedEvent: return "wr_keyed_event";
+    case ContextSwitchData::Win32_WrTerminated: return "wr_terminated";
+    case ContextSwitchData::Win32_WrProcessInSwap: return "wr_process_in_swap";
+    case ContextSwitchData::Win32_WrCpuRateControl: return "wr_cpu_rate_control";
+    case ContextSwitchData::Win32_WrCalloutStack: return "wr_callout_stack";
+    case ContextSwitchData::Win32_WrKernel: return "wr_kernel";
+    case ContextSwitchData::Win32_WrResource: return "wr_resource";
+    case ContextSwitchData::Win32_WrPushLock: return "wr_push_lock";
+    case ContextSwitchData::Win32_WrMutex: return "wr_mutex";
+    case ContextSwitchData::Win32_WrQuantumEnd: return "wr_quantum_end";
+    case ContextSwitchData::Win32_WrDispatchInt: return "wr_dispatch_interrupt";
+    case ContextSwitchData::Win32_WrPreempted: return "wr_preempted";
+    case ContextSwitchData::Win32_WrYieldExecution: return "wr_yield_execution";
+    case ContextSwitchData::Win32_WrFastMutex: return "wr_fast_mutex";
+    case ContextSwitchData::Win32_WrGuardedMutex: return "wr_guarded_mutex";
+    case ContextSwitchData::Win32_WrRundown: return "wr_rundown";
+    case ContextSwitchData::Win32_WrAlertByThreadId: return "wr_alert_by_thread_id";
+    case ContextSwitchData::Win32_WrDeferredPreempt: return "wr_deferred_preempt";
+    case ContextSwitchData::Win32_WrPhysicalFault: return "wr_physical_fault";
+    case ContextSwitchData::Win32_WrIoRing: return "wr_io_ring";
+    case ContextSwitchData::Win32_WrMdlCache: return "wr_mdl_cache";
+    case ContextSwitchData::Win32_WrRcu: return "wr_rcu";
+    }
+    return "unknown";
+}
+
+const char* ContextSwitchStateName( int8_t value )
+{
+    switch( value )
+    {
+    case 0: return "initialized";
+    case 1: return "ready";
+    case 2: return "running";
+    case 3: return "standby";
+    case 4: return "terminated";
+    case 5: return "waiting";
+    case 6: return "transition";
+    case 7: return "deferred_ready";
+    case 101: return "disk_sleep";
+    case 102: return "idle";
+    case 103: return "run_queue";
+    case 104: return "sleeping";
+    case 105: return "stopped";
+    case 106: return "tracing_stop";
+    case 107: return "paging";
+    case 108: return "dead";
+    case 109: return "zombie";
+    case 110: return "parked";
+    }
+    return "unknown";
+}
+
 template<typename F>
 void ForEachCpuZone( const Vector<short_ptr<ZoneEvent>>& zones, F&& callback )
 {
@@ -254,19 +362,27 @@ public:
         dto.ref = MakeRef( "cpu-zone", entry.index );
         dto.threadRef = MakeRef( "thread", entry.thread );
         dto.sourceLocationRef = source.ref;
+        dto.extraIndex = zone->extra;
         const char* zoneName = nullptr;
         if( worker->HasZoneExtra( *zone ) )
         {
             if( worker->HasValidZoneExtra( *zone ) )
             {
                 const auto& extra = worker->GetZoneExtra( *zone );
+                dto.extraColor = extra.color.Val();
                 if( extra.name.Active() )
                 {
                     zoneName = worker->TryGetString( extra.name );
+                    dto.extraName = Safe( zoneName );
                     dto.nameResolved = zoneName != nullptr;
                 }
+                if( extra.text.Active() ) dto.extraText = Safe( worker->TryGetString( extra.text ) );
             }
-            else dto.nameResolved = false;
+            else
+            {
+                dto.extraValid = false;
+                dto.nameResolved = false;
+            }
         }
         if( !zoneName )
         {
@@ -321,6 +437,7 @@ public:
         dto.callstack = zone->callstack.Val();
         if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
         dto.complete = zone->GpuEnd() >= 0 && zone->CpuEnd() >= 0;
+        dto.queryId = zone->query_id;
         return dto;
     }
 
@@ -924,6 +1041,10 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     result.cpuId = worker.GetCpuId();
     result.cpuManufacturer = Safe( worker.GetCpuManufacturer() );
     result.cpuArchitecture = CpuArchitectureName( worker.GetCpuArch() );
+    result.timerMultiplier = worker.GetTimerMultiplier();
+    result.frameOffset = worker.GetFrameOffset();
+    result.samplingPeriodNs = worker.GetSamplingPeriod();
+    result.onDemand = worker.IsOnDemand();
     const auto& crash = worker.GetCrashEvent();
     result.hasCrash = crash.thread != 0 || crash.time != 0 || crash.message != 0 || crash.callstack != 0;
     result.samplesInconsistent = worker.AreSamplesInconsistent();
@@ -988,18 +1109,27 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
         dto.nativeId = threadId;
         dto.processId = worker.GetPidFromTid( threadId );
         dto.name = Safe( worker.GetThreadName( threadId ) );
+        if( worker.HasExternalName( threadId ) )
+        {
+            const auto external = worker.GetExternalName( threadId );
+            dto.externalProcessName = Safe( external.first );
+            dto.externalThreadName = Safe( external.second );
+        }
         if( thread )
         {
             dto.fiber = thread->isFiber != 0;
             dto.zoneCount = thread->count;
             dto.messageCount = thread->messages.size();
             dto.sampleCount = thread->samples.size();
+            dto.kernelSampleCount = thread->kernelSampleCnt;
+            dto.groupHint = thread->groupHint;
         }
         if( const auto* context = worker.GetContextSwitchData( threadId ) ) dto.contextSwitchCount = context->v.size();
         const auto cpu = worker.GetCpuThreadData().find( threadId );
         if( cpu != worker.GetCpuThreadData().end() )
         {
             dto.runningTimeNs = cpu->second.runningTime;
+            dto.runningRegions = cpu->second.runningRegions;
             dto.migrations = cpu->second.migrations;
         }
         result.emplace_back( std::move( dto ) );
@@ -1037,12 +1167,30 @@ std::vector<GpuContextDto> WorkerTraceSource::GetGpuContexts() const
     for( size_t i = 0; i < contexts.size(); i++ )
     {
         const auto* context = contexts[i];
-        result.push_back( {
-            m_impl->MakeRef( "gpu-context", i ), i,
-            context->name.Active() ? Safe( worker.TryGetString( context->name ) ) : "GPU context " + std::to_string( i ),
-            m_impl->MakeRef( "thread", context->thread ), context->count, context->period,
-            context->hasCalibration, uint8_t( context->type )
+        GpuContextDto dto;
+        dto.ref = m_impl->MakeRef( "gpu-context", i );
+        dto.index = i;
+        dto.name = context->name.Active() ? Safe( worker.TryGetString( context->name ) ) : "GPU context " + std::to_string( i );
+        dto.threadRef = m_impl->MakeRef( "thread", context->thread );
+        dto.zoneCount = context->count;
+        dto.period = context->period;
+        dto.calibrated = context->hasCalibration;
+        dto.type = uint8_t( context->type );
+        dto.typeName = GpuContextTypeName( context->type );
+        dto.overflow = context->overflow;
+        dto.noteNames.reserve( context->noteNames.size() );
+        for( const auto& [time, name] : context->noteNames ) dto.noteNames.push_back( { time, Safe( worker.TryGetString( name ) ) } );
+        std::sort( dto.noteNames.begin(), dto.noteNames.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.name < rhs.name;
         } );
+        for( const auto& [queryId, notes] : context->notes )
+        {
+            for( const auto& [time, value] : notes ) dto.notes.push_back( { queryId, time, value } );
+        }
+        std::sort( dto.notes.begin(), dto.notes.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.queryId != rhs.queryId ? lhs.queryId < rhs.queryId : lhs.timeNs < rhs.timeNs;
+        } );
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }
@@ -1056,12 +1204,19 @@ std::vector<MemoryPoolDto> WorkerTraceSource::GetMemoryPools() const
     for( const auto& [nameId, memory] : worker.GetMemNameMap() )
     {
         const std::string name = nameId == 0 ? "Default allocator" : Safe( worker.GetString( nameId ) );
-        result.push_back( {
-            m_impl->MakeRef( "memory-pool", m_impl->memoryPoolIndex.at( nameId ) ), nameId, name, memory->data.size(), memory->active.size(), memory->usage,
-            memory->low == std::numeric_limits<uint64_t>::max() ? 0 : memory->low,
-            memory->high == std::numeric_limits<uint64_t>::min() ? 0 : memory->high,
-            IsGpuD3D12PoolName( name )
-        } );
+        MemoryPoolDto dto;
+        dto.ref = m_impl->MakeRef( "memory-pool", m_impl->memoryPoolIndex.at( nameId ) );
+        dto.nativeNameId = nameId;
+        dto.name = name;
+        dto.eventCount = memory->data.size();
+        dto.activeCount = memory->active.size();
+        dto.activeBytes = memory->usage;
+        dto.low = memory->low == std::numeric_limits<uint64_t>::max() ? 0 : memory->low;
+        dto.high = memory->high == std::numeric_limits<uint64_t>::min() ? 0 : memory->high;
+        dto.gpuD3D12 = IsGpuD3D12PoolName( name );
+        dto.freeCount = memory->frees.size();
+        dto.persistedUsageBytes = memory->usage;
+        result.emplace_back( std::move( dto ) );
     }
     std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.name < rhs.name; } );
     return result;
@@ -1077,7 +1232,20 @@ std::vector<PlotDto> WorkerTraceSource::GetPlotList() const
     for( size_t i = 0; i < plots.size(); i++ )
     {
         const auto* plot = plots[i];
-        result.push_back( { m_impl->MakeRef( "plot", i ), i, Safe( worker.TryGetString( plot->name ) ), uint8_t( plot->type ), uint8_t( plot->format ), plot->data.size(), plot->min, plot->max, plot->sum } );
+        PlotDto dto;
+        dto.ref = m_impl->MakeRef( "plot", i );
+        dto.index = i;
+        dto.name = Safe( worker.TryGetString( plot->name ) );
+        dto.type = uint8_t( plot->type );
+        dto.format = uint8_t( plot->format );
+        dto.pointCount = plot->data.size();
+        dto.min = plot->min;
+        dto.max = plot->max;
+        dto.sum = plot->sum;
+        dto.showSteps = plot->showSteps != 0;
+        dto.fill = plot->fill;
+        dto.color = plot->color;
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }
@@ -1092,10 +1260,20 @@ std::vector<LockDto> WorkerTraceSource::GetLocks() const
     {
         const auto source = m_impl->SourceLocation( value->srcloc );
         const std::string name = value->customName.Active() ? Safe( worker.TryGetString( value->customName ) ) : source.name.empty() ? source.function : source.name;
-        result.push_back( {
-            m_impl->MakeRef( "lock", id ), id, name, source.ref, value->timeline.size(), value->threadList.size(), value->valid,
-            value->isContended, value->timeAnnounce, value->timeTerminate < 0 ? std::nullopt : std::optional<int64_t>( value->timeTerminate )
-        } );
+        LockDto dto;
+        dto.ref = m_impl->MakeRef( "lock", id );
+        dto.nativeId = id;
+        dto.name = name;
+        dto.sourceLocationRef = source.ref;
+        dto.eventCount = value->timeline.size();
+        dto.threadCount = value->threadList.size();
+        dto.valid = value->valid;
+        dto.contended = value->isContended;
+        dto.announceNs = value->timeAnnounce;
+        if( value->timeTerminate >= 0 ) dto.terminateNs = value->timeTerminate;
+        dto.type = uint8_t( value->type );
+        dto.typeName = LockTypeName( value->type );
+        result.emplace_back( std::move( dto ) );
     }
     std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.nativeId < rhs.nativeId; } );
     return result;
@@ -1391,6 +1569,10 @@ std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const 
             dto.reason = int8_t( event.Reason() );
             dto.state = event.State();
             dto.complete = event.IsEndValid();
+            dto.reasonName = ContextSwitchReasonName( dto.reason );
+            dto.stateName = ContextSwitchStateName( dto.state );
+            dto.relatedThreadIndex = event.Thread();
+            if( dto.relatedThreadIndex != 0 ) dto.relatedThreadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( dto.relatedThreadIndex ) );
             result.emplace_back( std::move( dto ) );
             if( result.size() >= range.limit ) return result;
         }
@@ -1581,6 +1763,10 @@ std::vector<SymbolDto> WorkerTraceSource::GetSymbols() const
         dto.name = Safe( m_impl->worker->TryGetString( symbol->name ) );
         dto.file = Safe( m_impl->worker->TryGetString( symbol->file ) );
         dto.line = symbol->line;
+        if( symbol->imageName.Active() ) dto.imageName = Safe( m_impl->worker->TryGetString( symbol->imageName ) );
+        if( symbol->callFile.Active() ) dto.callFile = Safe( m_impl->worker->TryGetString( symbol->callFile ) );
+        dto.callLine = symbol->callLine;
+        dto.inlineFrame = symbol->isInline != 0;
         dto.size = uint32_t( symbol->size.Val() );
 #ifndef TRACY_NO_STATISTICS
         if( const auto* stats = m_impl->worker->GetSymbolStats( address ) )
@@ -1628,13 +1814,15 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
                 depth++;
                 continue;
             }
+            std::optional<std::string> imageName;
+            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
             for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
             {
                 const auto& frame = frameData->data[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
                 } );
                 depth++;
             }
@@ -1668,13 +1856,15 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveParentCallstacks( const
                 depth++;
                 continue;
             }
+            std::optional<std::string> imageName;
+            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
             for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
             {
                 const auto& frame = frameData->data[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
                 } );
                 depth++;
             }

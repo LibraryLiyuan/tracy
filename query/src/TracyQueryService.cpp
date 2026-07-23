@@ -222,6 +222,8 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
         { "first_time_ns", Decimal( value.firstTimeNs ) }, { "last_time_ns", Decimal( value.lastTimeNs ) },
         { "load_time_ns", Decimal( value.loadTimeNs ) }, { "cpu_id", value.cpuId }, { "cpu_manufacturer", value.cpuManufacturer },
         { "cpu_architecture", value.cpuArchitecture },
+        { "timer_multiplier", value.timerMultiplier }, { "frame_offset", Decimal( value.frameOffset ) },
+        { "sampling_period_ns", Decimal( value.samplingPeriodNs ) }, { "on_demand", value.onDemand },
         { "has_crash", value.hasCrash }, { "samples_inconsistent", value.samplesInconsistent },
         { "counts", CountsJson( value.counts ) }, { "app_info", value.appInfo }, { "trust", "untrusted_trace_data" }
     };
@@ -253,7 +255,13 @@ json ThreadJson( const analysis::ThreadDto& value )
         { "name", value.name }, { "fiber", value.fiber }, { "zone_count", Decimal( value.zoneCount ) },
         { "message_count", Decimal( value.messageCount ) }, { "sample_count", Decimal( value.sampleCount ) },
         { "context_switch_count", Decimal( value.contextSwitchCount ) }, { "running_time_ns", Decimal( value.runningTimeNs ) },
-        { "migrations", value.migrations }, { "trust", "untrusted_trace_data" }
+        { "running_regions", value.runningRegions ? json( *value.runningRegions ) : json( nullptr ) },
+        { "migrations", value.migrations },
+        { "external_process_name", value.externalProcessName ? json( *value.externalProcessName ) : json( nullptr ) },
+        { "external_thread_name", value.externalThreadName ? json( *value.externalThreadName ) : json( nullptr ) },
+        { "kernel_sample_count", value.kernelSampleCount ? json( Decimal( *value.kernelSampleCount ) ) : json( nullptr ) },
+        { "group_hint", value.groupHint ? json( *value.groupHint ) : json( nullptr ) },
+        { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -288,6 +296,10 @@ json CpuZoneJson( const analysis::CpuZoneDto& value )
         { "running_regions", Decimal( value.runningRegions ) }, { "child_count", value.childCount },
         { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
+        { "extra_index", value.extraIndex }, { "extra_valid", value.extraValid },
+        { "extra_name", value.extraName ? json( *value.extraName ) : json( nullptr ) },
+        { "extra_text", value.extraText ? json( *value.extraText ) : json( nullptr ) },
+        { "extra_color", value.extraColor },
         { "complete", value.complete }, { "name_resolved", value.nameResolved }, { "trust", "untrusted_trace_data" }
     };
 }
@@ -304,7 +316,7 @@ json GpuZoneJson( const analysis::GpuZoneDto& value )
         { "cpu_start_ns", Decimal( value.cpuStartNs ) }, { "cpu_end_ns", value.cpuEndNs ? json( Decimal( *value.cpuEndNs ) ) : json( nullptr ) },
         { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
-        { "complete", value.complete }, { "trust", "untrusted_trace_data" }
+        { "query_id", value.queryId }, { "complete", value.complete }, { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -315,7 +327,12 @@ json ContextSwitchJson( const analysis::ContextSwitchDto& value )
         { "end_ns", value.endNs ? json( Decimal( *value.endNs ) ) : json( nullptr ) },
         { "duration_ns", value.endNs ? json( Decimal( *value.endNs - value.startNs ) ) : json( nullptr ) },
         { "wakeup_ns", value.wakeupNs ? json( Decimal( *value.wakeupNs ) ) : json( nullptr ) },
-        { "cpu", value.cpu }, { "wakeup_cpu", value.wakeupCpu }, { "reason", value.reason }, { "state", value.state }, { "complete", value.complete }
+        { "cpu", value.cpu }, { "wakeup_cpu", value.wakeupCpu },
+        { "reason", value.reason }, { "reason_name", value.reasonName },
+        { "state", value.state }, { "state_name", value.stateName },
+        { "related_thread_index", value.relatedThreadIndex },
+        { "next_thread_ref", value.relatedThreadRef ? json( *value.relatedThreadRef ) : json( nullptr ) },
+        { "complete", value.complete }
     };
 }
 
@@ -345,7 +362,8 @@ json CallstackFrameJson( const analysis::CallstackFrameDto& value )
     return {
         { "ref", value.ref }, { "name", value.name }, { "file", value.file }, { "line", value.line },
         { "address", value.address }, { "symbol_address", value.symbolAddress }, { "inline", value.inlineFrame },
-        { "callstack", Decimal( uint64_t( value.callstack ) ) }, { "depth", value.depth }, { "trust", "untrusted_trace_data" }
+        { "callstack", Decimal( uint64_t( value.callstack ) ) }, { "depth", value.depth },
+        { "image_name", value.imageName ? json( *value.imageName ) : json( nullptr ) }, { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -384,6 +402,9 @@ json SymbolJson( const analysis::SymbolDto& value )
         { "ref", value.ref }, { "address", value.address }, { "name", value.name }, { "file", value.file }, { "line", value.line },
         { "size_bytes", Decimal( value.size ) }, { "inclusive_samples", value.inclusiveSamples },
         { "exclusive_samples", value.exclusiveSamples }, { "child_samples", Decimal( value.childSamples ) },
+        { "image_name", value.imageName ? json( *value.imageName ) : json( nullptr ) },
+        { "call_file", value.callFile ? json( *value.callFile ) : json( nullptr ) },
+        { "call_line", value.callLine }, { "inline", value.inlineFrame },
         { "has_code", value.hasCode }, { "trust", "untrusted_trace_data" }
     };
 }
@@ -399,8 +420,10 @@ json SourceLocationJson( const analysis::SourceLocationDto& value )
 json MemoryPoolJson( const analysis::MemoryPoolDto& value )
 {
     return {
-        { "ref", value.ref }, { "name", value.name }, { "event_count", Decimal( value.eventCount ) },
+        { "ref", value.ref }, { "native_name_id", Decimal( value.nativeNameId ) }, { "name", value.name },
+        { "event_count", Decimal( value.eventCount ) }, { "free_count", Decimal( value.freeCount ) },
         { "active_count", Decimal( value.activeCount ) }, { "active_bytes", Decimal( value.activeBytes ) },
+        { "persisted_usage_bytes", Decimal( value.persistedUsageBytes ) },
         { "low", "0x" + Hex16( value.low ) }, { "high", "0x" + Hex16( value.high ) },
         { "gpu_d3d12", value.gpuD3D12 }, { "identifier_semantics", value.gpuD3D12 ? "logical_allocation_id" : "address" }, { "trust", "untrusted_trace_data" }
     };
@@ -1273,9 +1296,19 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         for( size_t index = begin; index < end; index++ )
         {
             const auto& value = sourceContexts[index];
+            json noteNames = json::array();
+            for( const auto& note : value.noteNames ) noteNames.push_back( {
+                { "time_ns", Decimal( note.timeNs ) }, { "name", note.name }, { "trust", "untrusted_trace_data" }
+            } );
+            json notes = json::array();
+            for( const auto& note : value.notes ) notes.push_back( {
+                { "query_id", note.queryId }, { "time_ns", Decimal( note.timeNs ) }, { "value", note.value }
+            } );
             contexts.push_back( {
                 { "ref", value.ref }, { "index", value.index }, { "name", value.name }, { "thread_ref", value.threadRef },
-                { "zone_count", Decimal( value.zoneCount ) }, { "period", value.period }, { "calibrated", value.calibrated }, { "type", value.type }
+                { "zone_count", Decimal( value.zoneCount ) }, { "period", value.period }, { "calibrated", value.calibrated },
+                { "type", value.type }, { "type_name", value.typeName }, { "overflow", Decimal( value.overflow ) },
+                { "note_names", std::move( noteNames ) }, { "notes", std::move( notes ) }
             } );
         }
         const auto cursor = NextCursor( page, method, trace, end - begin, end < sourceContexts.size() );
@@ -1716,6 +1749,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             locks.push_back( {
             { "ref", value.ref }, { "native_id", value.nativeId }, { "name", value.name }, { "source_location_ref", value.sourceLocationRef },
             { "event_count", Decimal( value.eventCount ) }, { "thread_count", Decimal( value.threadCount ) },
+            { "type", value.type }, { "type_name", value.typeName },
             { "valid", value.valid }, { "contended", value.contended }, { "announce_ns", Decimal( value.announceNs ) },
             { "terminate_ns", value.terminateNs ? json( Decimal( *value.terminateNs ) ) : json( nullptr ) }, { "trust", "untrusted_trace_data" }
             } );
@@ -1794,6 +1828,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json plots = json::array();
         for( size_t index = begin; index < end; index++ ) { const auto& value = sourcePlots[index]; plots.push_back( {
             { "ref", value.ref }, { "index", value.index }, { "name", value.name }, { "type", value.type }, { "format", value.format },
+            { "show_steps", value.showSteps }, { "fill", value.fill }, { "color", value.color },
             { "point_count", Decimal( value.pointCount ) }, { "min", value.min }, { "max", value.max }, { "sum", value.sum }, { "trust", "untrusted_trace_data" }
         } ); }
         const auto cursor = NextCursor( page, method, trace, end - begin, end < sourcePlots.size() );

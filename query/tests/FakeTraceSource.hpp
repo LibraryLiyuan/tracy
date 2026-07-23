@@ -43,6 +43,10 @@ public:
         value.fingerprint = std::string( 64, 'f' );
         value.firstTimeNs = 0;
         value.lastTimeNs = 100;
+        value.timerMultiplier = 0.5;
+        value.frameOffset = 17;
+        value.samplingPeriodNs = 1000;
+        value.onDemand = true;
         value.counts.frames = value.counts.frameSets = value.counts.gpuZones = 1;
         value.counts.cpuZones = 2;
         value.counts.threads = value.counts.locks = value.counts.plots = value.counts.messages = 1;
@@ -54,17 +58,40 @@ public:
 
     std::vector<analysis::ThreadDto> GetThreads() const override
     {
-        analysis::ThreadDto value; value.ref = MakeEntityRef( "thread", 1 ); value.nativeId = 1; value.name = "Main"; value.zoneCount = 2; return { value };
+        analysis::ThreadDto value;
+        value.ref = MakeEntityRef( "thread", 1 ); value.nativeId = 1; value.name = "Main"; value.zoneCount = 2;
+        value.externalProcessName = "FakeProcess"; value.externalThreadName = "FakeExternalThread";
+        value.kernelSampleCount = 3; value.groupHint = -7; value.runningRegions = 4;
+        return { value };
     }
     std::vector<analysis::FrameSetDto> GetFrameSets() const override { return { { MakeEntityRef( "frame-set", 0 ), 0, "Frames", true, 1, 1 } }; }
-    std::vector<analysis::GpuContextDto> GetGpuContexts() const override { return { { MakeEntityRef( "gpu-context", 0 ), 0, "GPU", MakeEntityRef( "thread", 1 ), 1, 1.0, true, 0 } }; }
-    std::vector<analysis::MemoryPoolDto> GetMemoryPools() const override { return { { MakeEntityRef( "memory-pool", 0 ), 1, "GPU D3D12 Fake", 1, 1, 64, 7, 7, true } }; }
-    std::vector<analysis::PlotDto> GetPlotList() const override { return { { MakeEntityRef( "plot", 0 ), 0, "Load", 0, 0, 1, 1, 1, 1 } }; }
-    std::vector<analysis::LockDto> GetLocks() const override { return { { MakeEntityRef( "lock", 1 ), 1, "Mutex", MakeEntityRef( "source", 1 ), 1, 1, true, true, 1, 99 } }; }
+    std::vector<analysis::GpuContextDto> GetGpuContexts() const override
+    {
+        analysis::GpuContextDto value;
+        value.ref = MakeEntityRef( "gpu-context", 0 ); value.name = "GPU"; value.threadRef = MakeEntityRef( "thread", 1 );
+        value.zoneCount = 1; value.period = 1.0; value.calibrated = true; value.type = 4; value.typeName = "direct3d12";
+        value.overflow = 9; value.noteNames = { { 21, "Timestamp" } }; value.notes = { { 5, 22, 1.25 } };
+        return { value };
+    }
+    std::vector<analysis::MemoryPoolDto> GetMemoryPools() const override
+    {
+        analysis::MemoryPoolDto value { MakeEntityRef( "memory-pool", 0 ), 1, "GPU D3D12 Fake", 1, 1, 64, 7, 7, true };
+        value.freeCount = 2; value.persistedUsageBytes = 64; return { value };
+    }
+    std::vector<analysis::PlotDto> GetPlotList() const override
+    {
+        analysis::PlotDto value { MakeEntityRef( "plot", 0 ), 0, "Load", 0, 0, 1, 1, 1, 1 };
+        value.showSteps = true; value.fill = 2; value.color = 0x123456; return { value };
+    }
+    std::vector<analysis::LockDto> GetLocks() const override
+    {
+        analysis::LockDto value { MakeEntityRef( "lock", 1 ), 1, "Mutex", MakeEntityRef( "source", 1 ), 1, 1, true, true, 1, 99 };
+        value.type = 1; value.typeName = "shared_lockable"; return { value };
+    }
 
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
     {
-        analysis::CpuZoneDto update; update.ref = MakeEntityRef( "cpu-zone", 0 ); update.threadRef = MakeEntityRef( "thread", 1 ); update.sourceLocationRef = MakeEntityRef( "source", 1 ); update.name = "Update"; update.startNs = 10; update.endNs = 40; update.selfTimeNs = 30; update.callstack = 1; update.callstackRef = MakeEntityRef( "callstack", 1 );
+        analysis::CpuZoneDto update; update.ref = MakeEntityRef( "cpu-zone", 0 ); update.threadRef = MakeEntityRef( "thread", 1 ); update.sourceLocationRef = MakeEntityRef( "source", 1 ); update.name = "Update"; update.startNs = 10; update.endNs = 40; update.selfTimeNs = 30; update.callstack = 1; update.callstackRef = MakeEntityRef( "callstack", 1 ); update.extraIndex = 3; update.extraName = "Update"; update.extraText = "phase=simulation"; update.extraColor = 0x112233;
         analysis::CpuZoneDto render = update; render.ref = MakeEntityRef( "cpu-zone", 1 ); render.name = "Render"; render.startNs = 40; render.endNs = 60; render.selfTimeNs = 20;
         std::vector<analysis::CpuZoneDto> values = { std::move( update ), std::move( render ) };
         values.erase( std::remove_if( values.begin(), values.end(), [&]( const auto& value ) { return range.endNs <= value.startNs || range.startNs >= value.endNs.value_or( value.startNs ); } ), values.end() );
@@ -73,7 +100,7 @@ public:
     std::vector<analysis::GpuZoneDto> ScanGpuZones( const analysis::ScanRange& range ) const override
     {
         if( range.endNs <= 20 || range.startNs >= 50 ) return {};
-        analysis::GpuZoneDto value; value.ref = MakeEntityRef( "gpu-zone", 0 ); value.contextRef = MakeEntityRef( "gpu-context", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.sourceLocationRef = MakeEntityRef( "source", 1 ); value.name = "Render"; value.gpuStartNs = 20; value.gpuEndNs = 50; value.cpuStartNs = 15; value.cpuEndNs = 45; value.selfTimeNs = 30; value.complete = true; return Page( { value }, range );
+        analysis::GpuZoneDto value; value.ref = MakeEntityRef( "gpu-zone", 0 ); value.contextRef = MakeEntityRef( "gpu-context", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.sourceLocationRef = MakeEntityRef( "source", 1 ); value.name = "Render"; value.gpuStartNs = 20; value.gpuEndNs = 50; value.cpuStartNs = 15; value.cpuEndNs = 45; value.selfTimeNs = 30; value.complete = true; value.queryId = 5; return Page( { value }, range );
     }
     std::vector<analysis::FrameDto> ScanFrames( const analysis::ScanRange& range ) const override { return Page( GetFramesForSet( 0, 0, 1 ), range ); }
     std::vector<analysis::MemoryEventDto> ScanMemoryEvents( const analysis::ScanRange& range ) const override
@@ -92,15 +119,15 @@ public:
     analysis::CrashDto GetCrash() const override { analysis::CrashDto value; value.present = true; value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 90; value.message = "fake crash"; return value; }
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override { return { { 0, 0, 0, 0 } }; }
     std::vector<analysis::CpuUsagePointDto> GetCpuUsage() const override { return { { MakeEntityRef( "cpu-usage", 0 ), 30, 1, 0 } }; }
-    std::vector<analysis::ContextSwitchDto> ScanContextSwitchEvents( const analysis::ScanRange& range ) const override { analysis::ContextSwitchDto value; value.ref = MakeEntityRef( "context-switch", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.startNs = 5; value.endNs = 45; return Page( { value }, range ); }
+    std::vector<analysis::ContextSwitchDto> ScanContextSwitchEvents( const analysis::ScanRange& range ) const override { analysis::ContextSwitchDto value; value.ref = MakeEntityRef( "context-switch", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.startNs = 5; value.endNs = 45; value.reason = 29; value.reasonName = "wr_mutex"; value.state = 5; value.stateName = "waiting"; value.relatedThreadIndex = 1; value.relatedThreadRef = MakeEntityRef( "thread", 1 ); return Page( { value }, range ); }
     std::vector<analysis::SampleDto> ScanSampleEvents( const analysis::ScanRange& range ) const override { analysis::SampleDto value; value.ref = MakeEntityRef( "sample", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 30; value.callstack = 1; value.callstackRef = MakeEntityRef( "callstack", 1 ); return Page( { value }, range ); }
     std::vector<analysis::GhostZoneDto> ScanGhostZones( const analysis::ScanRange& range ) const override { analysis::GhostZoneDto value; value.ref = MakeEntityRef( "ghost-zone", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.startNs = 20; value.endNs = 30; value.name = "ghost"; return Page( { value }, range ); }
     std::vector<analysis::HardwareSampleDto> GetHardwareSamples() const override { return { { MakeEntityRef( "hardware-sample", 1 ), "0x1", 1, 1, 1, 1, 1, 1 } }; }
     std::vector<analysis::LockEventDto> ScanLockEvents( const analysis::ScanRange& range ) const override { analysis::LockEventDto value; value.ref = MakeEntityRef( "lock-event", 0 ); value.lockRef = MakeEntityRef( "lock", 1 ); value.timeNs = 20; value.threadRef = MakeEntityRef( "thread", 1 ); value.type = "wait"; return Page( { value }, range ); }
-    std::vector<analysis::SymbolDto> GetSymbols() const override { return { { MakeEntityRef( "symbol", 1 ), "0x1", "FakeSymbol", "fake.cpp", 1, 1, 1, 1, 0, true } }; }
+    std::vector<analysis::SymbolDto> GetSymbols() const override { return { { MakeEntityRef( "symbol", 1 ), "0x1", "FakeSymbol", "fake.cpp", 1, 1, 1, 1, 0, true, "fake.dll", "caller.cpp", 12, true } }; }
     std::vector<analysis::SourceLocationDto> GetSourceLocations() const override { return { { MakeEntityRef( "source", 1 ), "Fake", "Fake", "fake.cpp", 1, 0 } }; }
 
-    std::vector<analysis::CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override { if( callstacks.empty() || maxDepth == 0 ) return {}; return { { MakeEntityRef( "callstack-frame", 1 ), "FakeSymbol", "fake.cpp", 1, "0x1", "0x1", false, callstacks.front(), 0 } }; }
+    std::vector<analysis::CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override { if( callstacks.empty() || maxDepth == 0 ) return {}; return { { MakeEntityRef( "callstack-frame", 1 ), "FakeSymbol", "fake.cpp", 1, "0x1", "0x1", false, callstacks.front(), 0, "fake.dll" } }; }
     std::vector<analysis::CallstackFrameDto> ResolveParentCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override { return ResolveCallstacks( callstacks, maxDepth ); }
     std::vector<analysis::SourceTextDto> ResolveSources( const std::vector<std::string>& refs, size_t maxBytes ) const override { if( refs.empty() || maxBytes == 0 ) return {}; return { { refs.front(), "fake.cpp", "void Fake() {}\n", true, false } }; }
     std::vector<analysis::SymbolCodeDto> ResolveSymbols( const std::vector<std::string>& refs, size_t maxBytes ) const override { if( refs.empty() || maxBytes == 0 ) return {}; return { { refs.front(), "0x1", { 0x90 }, false } }; }

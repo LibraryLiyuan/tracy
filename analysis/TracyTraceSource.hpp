@@ -110,6 +110,10 @@ struct TraceInfoDto
     bool samplesInconsistent = false;
     TraceCountsDto counts;
     std::vector<std::string> appInfo;
+    double timerMultiplier = 1;
+    uint64_t frameOffset = 0;
+    int64_t samplingPeriodNs = 0;
+    bool onDemand = false;
 };
 
 struct ThreadDto
@@ -125,6 +129,11 @@ struct ThreadDto
     uint64_t contextSwitchCount = 0;
     int64_t runningTimeNs = 0;
     uint32_t migrations = 0;
+    std::optional<std::string> externalProcessName;
+    std::optional<std::string> externalThreadName;
+    std::optional<uint64_t> kernelSampleCount;
+    std::optional<int32_t> groupHint;
+    std::optional<uint32_t> runningRegions;
 };
 
 struct FrameSetDto
@@ -147,6 +156,24 @@ struct GpuContextDto
     double period = 0;
     bool calibrated = false;
     uint8_t type = 0;
+    std::string typeName;
+    uint64_t overflow = 0;
+
+    struct NoteName
+    {
+        int64_t timeNs = 0;
+        std::string name;
+    };
+
+    struct Note
+    {
+        uint16_t queryId = 0;
+        int64_t timeNs = 0;
+        double value = 0;
+    };
+
+    std::vector<NoteName> noteNames;
+    std::vector<Note> notes;
 };
 
 struct MemoryPoolDto
@@ -160,6 +187,8 @@ struct MemoryPoolDto
     uint64_t low = 0;
     uint64_t high = 0;
     bool gpuD3D12 = false;
+    uint64_t freeCount = 0;
+    uint64_t persistedUsageBytes = 0;
 };
 
 struct PlotDto
@@ -173,6 +202,9 @@ struct PlotDto
     double min = 0;
     double max = 0;
     double sum = 0;
+    bool showSteps = false;
+    uint8_t fill = 0;
+    uint32_t color = 0;
 };
 
 struct LockDto
@@ -187,6 +219,8 @@ struct LockDto
     bool contended = false;
     int64_t announceNs = 0;
     std::optional<int64_t> terminateNs;
+    uint8_t type = 0;
+    std::string typeName;
 };
 
 struct SourceLocationDto
@@ -230,6 +264,11 @@ struct CpuZoneDto
     uint64_t runningRegions = 0;
     bool complete = true;
     bool nameResolved = true;
+    uint32_t extraIndex = 0;
+    bool extraValid = true;
+    std::optional<std::string> extraName;
+    std::optional<std::string> extraText;
+    uint32_t extraColor = 0;
 };
 
 struct GpuZoneDto
@@ -252,6 +291,7 @@ struct GpuZoneDto
     uint32_t childCount = 0;
     std::optional<int64_t> selfTimeNs;
     bool complete = true;
+    uint16_t queryId = 0;
 };
 
 struct CrashDto
@@ -292,6 +332,10 @@ struct ContextSwitchDto
     int8_t reason = 0;
     int8_t state = 0;
     bool complete = true;
+    std::string reasonName;
+    std::string stateName;
+    uint16_t relatedThreadIndex = 0;
+    std::optional<std::string> relatedThreadRef;
 };
 
 struct SampleDto
@@ -356,6 +400,10 @@ struct SymbolDto
     uint32_t exclusiveSamples = 0;
     uint64_t childSamples = 0;
     bool hasCode = false;
+    std::optional<std::string> imageName;
+    std::optional<std::string> callFile;
+    uint32_t callLine = 0;
+    bool inlineFrame = false;
 };
 
 struct MemoryEventDto
@@ -407,6 +455,7 @@ struct CallstackFrameDto
     bool inlineFrame = false;
     uint32_t callstack = 0;
     size_t depth = 0;
+    std::optional<std::string> imageName;
 };
 
 struct SourceTextDto
