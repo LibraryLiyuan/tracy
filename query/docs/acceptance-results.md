@@ -37,7 +37,7 @@ The formal Profiler loaded `Test-GPU-Reconnect-1.tracy` directly from its native
 
 `Test-GPUMemory-Fresh1.tracy` exposed all six named D3D12 pools. Selecting `GPU D3D12 Default Textures` showed logical allocation IDs, 95 active allocations and 177.59 MiB. At frame 7,574 (internal index 610), the shared snapshot reported 177.59 MiB/95 allocations at both frame start and end, zero allocations/frees during the frame, and populated the allocation-detail table.
 
-None of the nine available positive local captures contains persisted GTMEM1 relation records. Both Query (`CAPABILITY_UNAVAILABLE`) and the Profiler (`No GTMEM1 pass relations in this capture`) report that absence explicitly rather than inventing attribution. Deterministic request/pass/use pairing, incomplete passes, usage masks and ambiguity states are covered by the shared-analysis and `FakeTraceSource` contract tests; a future capture produced by a pass-attribution-enabled Godot build is still required for real-data GTMEM1 visual characterization.
+None of the ten available positive local captures contains persisted GTMEM1 relation records. Both Query (`CAPABILITY_UNAVAILABLE`) and the Profiler (`No GTMEM1 pass relations in this capture`) report that absence explicitly rather than inventing attribution. Deterministic request/pass/use pairing, incomplete passes, usage masks and ambiguity states are covered by the shared-analysis and `FakeTraceSource` contract tests; a future capture produced by a pass-attribution-enabled Godot build is still required for real-data GTMEM1 visual characterization.
 
 ## Real trace loader matrix
 
