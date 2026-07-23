@@ -55,20 +55,61 @@ int main()
     assert( invalidTool["result"]["isError"] == true );
     assert( invalidTool["result"]["structuredContent"]["error"]["code"] == "TRACE_NOT_FOUND" );
 
+    const auto invalidToolArguments = server.HandleRequest( Request( 61, "tools/call", {
+        { "name", "tracy_compare" }, { "arguments", { { "kind", "unsupported" } } }
+    } ) );
+    assert( !invalidToolArguments.contains( "error" ) );
+    assert( invalidToolArguments["result"]["isError"] == true );
+    assert( invalidToolArguments["result"]["structuredContent"]["error"]["code"] == "INVALID_PARAMS" );
+
+    const auto unknownTool = server.HandleRequest( Request( 62, "tools/call", {
+        { "name", "tracy_unknown" }, { "arguments", json::object() }
+    } ) );
+    assert( !unknownTool.contains( "error" ) );
+    assert( unknownTool["result"]["isError"] == true );
+    assert( unknownTool["result"]["structuredContent"]["error"]["code"] == "METHOD_NOT_FOUND" );
+
+    assert( server.HandleRequest( { { "jsonrpc", "2.0" }, { "method", "notifications/cancelled" }, { "params", { { "requestId", 60 } } } } ).is_null() );
+    const auto cancelled = server.HandleRequest( Request( 60, "tools/call", {
+        { "name", "tracy_describe" }, { "arguments", json::object() }
+    } ) );
+    assert( cancelled["result"]["isError"] == true );
+    assert( cancelled["result"]["structuredContent"]["error"]["code"] == "CANCELLED" );
+
+    json deep = json::object();
+    json* cursor = &deep;
+    for( size_t depth = 0; depth < 70; depth++ )
+    {
+        ( *cursor )["child"] = json::object();
+        cursor = &( *cursor )["child"];
+    }
+    const auto rejectedDepth = server.HandleRequest( Request( 9, "tools/call", {
+        { "name", "tracy_describe" }, { "arguments", std::move( deep ) }
+    } ) );
+    assert( rejectedDepth["error"]["code"] == -32600 );
+
     std::stringstream input;
     input << R"({"jsonrpc":"2.0","id":7,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})" << '\n';
     input << R"({"jsonrpc":"2.0","method":"notifications/initialized","params":{}})" << '\n';
     input << R"({"jsonrpc":"2.0","id":8,"method":"ping","params":{}})" << '\n';
+    input << R"({"jsonrpc":"2.0","id":9,"method":"logging/setLevel","params":{"level":"info"}})" << '\n';
+    input << R"({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"tracy_describe","arguments":{},"_meta":{"progressToken":"progress-1"}}})" << '\n';
     input << "{malformed" << '\n';
+    input << std::string( tracy::query::MaximumRequestBytes + 1, 'x' ) << '\n';
     std::stringstream output;
     assert( server.Run( input, output ) == 0 );
 
     std::vector<json> messages;
     std::string line;
     while( std::getline( output, line ) ) messages.emplace_back( json::parse( line ) );
-    assert( messages.size() == 3 );
+    assert( messages.size() == 7 );
     assert( messages[0]["result"]["protocolVersion"] == "2025-06-18" );
     assert( messages[1]["result"].is_object() );
-    assert( messages[2]["error"]["code"] == -32700 );
+    assert( messages[2]["result"].is_object() );
+    assert( messages[3]["method"] == "notifications/progress" );
+    assert( messages[3]["params"]["progressToken"] == "progress-1" );
+    assert( messages[4]["result"]["isError"] == false );
+    assert( messages[5]["error"]["code"] == -32700 );
+    assert( messages[6]["error"]["code"] == -32600 );
     return 0;
 }
