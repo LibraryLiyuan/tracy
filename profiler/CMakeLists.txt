@@ -31,6 +31,7 @@ endif()
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
 include(ExternalProject)
 ExternalProject_Add(embed
@@ -241,6 +242,7 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE
     TracyServer
+    TracyAnalysis
     TracyImGui
     Threads::Threads
     nlohmann_json::nlohmann_json

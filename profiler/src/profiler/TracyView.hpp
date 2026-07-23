@@ -19,6 +19,7 @@
 #include "TracyConfig.hpp"
 #include "TracyDecayValue.hpp"
 #include "TracyMarkdown.hpp"
+#include "TracyMemoryAnalysis.hpp"
 #include "TracySourceContents.hpp"
 #include "TracyTimelineController.hpp"
 #include "TracyUserData.hpp"
@@ -231,26 +232,8 @@ private:
         OutsideRange
     };
 
-    struct MemoryEventRef
-    {
-        uint64_t pool = 0;
-        size_t index = 0;
-    };
-
-    struct MemoryFramePoolSummary
-    {
-        uint64_t pool = 0;
-        uint64_t startBytes = 0;
-        uint64_t allocatedBytes = 0;
-        uint64_t freedBytes = 0;
-        uint64_t endBytes = 0;
-        uint64_t peakBytes = 0;
-        uint64_t startCount = 0;
-        uint64_t allocatedCount = 0;
-        uint64_t freedCount = 0;
-        uint64_t endCount = 0;
-        uint64_t peakCount = 0;
-    };
+    using MemoryEventRef = analysis::MemoryEventKey;
+    using MemoryFramePoolSummary = analysis::MemoryFramePoolSummary;
 
     struct MemoryFramePoolStamp
     {
@@ -259,73 +242,20 @@ private:
         size_t frees = 0;
     };
 
-    struct MemoryFrameSnapshot
-    {
-        bool valid = false;
-        bool consistent = true;
-        bool possibleCaptureBaseline = false;
-        int64_t begin = 0;
-        int64_t end = 0;
-        MemoryFramePoolSummary total;
-        std::vector<MemoryFramePoolSummary> pools;
-        std::vector<MemoryFramePoolStamp> stamps;
-        std::vector<MemoryEventRef> activeAtStart;
-        std::vector<MemoryEventRef> activeAtEnd;
-        std::vector<MemoryEventRef> allocated;
-        std::vector<MemoryEventRef> freed;
-        std::vector<MemoryEventRef> transitions;
-    };
+    using MemoryFrameSnapshot = analysis::MemoryFrameSnapshot;
 
-    struct GpuMemoryRequestScope
+    struct GpuMemoryRequestScope : analysis::GpuMemoryRequestScope
     {
-        uint64_t labelId = 0;
-        uint64_t frame = 0;
-        uint64_t thread = 0;
-        int64_t start = 0;
-        int64_t end = 0;
-        std::string name;
         const ZoneEvent* zone = nullptr;
     };
 
-    struct GpuMemoryPassUse
-    {
-        uint64_t allocationId = 0;
-        uint32_t usageMask = 0;
-        char kind = 'U';
-    };
+    using GpuMemoryPassUse = analysis::GpuMemoryPassUse;
 
-    struct GpuMemoryPass
+    struct GpuMemoryPass : analysis::GpuMemoryPass
     {
-        uint64_t passId = 0;
-        uint64_t labelId = 0;
-        uint64_t frame = 0;
-        uint64_t ordinal = 0;
-        uint64_t thread = 0;
-        uint64_t gpuThread = 0;
-        int64_t start = 0;
-        int64_t end = 0;
-        int level = -1;
-        uint32_t commandCount = 0;
-        uint32_t emittedUseCount = 0;
-        uint32_t totalUseCount = 0;
-        uint32_t expectedChunks = 0;
-        uint32_t untrackedReferences = 0;
-        uint32_t droppedUses = 0;
-        bool truncated = false;
-        bool complete = false;
         bool gpuPairAmbiguous = false;
-        std::string name;
-        std::string operations;
-        std::vector<GpuMemoryPassUse> uses;
         const ZoneEvent* relationZone = nullptr;
         const GpuEvent* gpuZone = nullptr;
-    };
-
-    struct GpuMemoryGpuZoneCandidate
-    {
-        const GpuEvent* zone = nullptr;
-        uint64_t thread = 0;
-        int64_t cpuStart = 0;
     };
 
     struct GpuMemoryAttributionCache
@@ -342,17 +272,11 @@ private:
         double nextRebuildTime = 0;
         std::vector<GpuMemoryRequestScope> requestScopes;
         std::vector<GpuMemoryPass> passes;
-        unordered_flat_map<int16_t, size_t> processedCpuZonesBySource;
-        unordered_flat_map<int16_t, size_t> processedGpuZonesBySource;
-        unordered_flat_map<uint64_t, size_t> processedAllocationsByPool;
         unordered_flat_map<uint64_t, size_t> requestScopeByLabel;
-        unordered_flat_map<uint64_t, std::vector<size_t>> requestScopesByThread;
         unordered_flat_map<uint64_t, size_t> passById;
         unordered_flat_map<uint64_t, MemoryEventRef> allocationById;
         unordered_flat_map<uint64_t, uint64_t> requestLabelByAllocation;
         unordered_flat_map<uint64_t, std::vector<size_t>> passesByAllocation;
-        unordered_flat_map<std::string, std::vector<GpuMemoryGpuZoneCandidate>> gpuZonesByName;
-        unordered_flat_map<std::string, std::vector<size_t>> pendingGpuPassesByName;
     };
 
     struct MemoryFrameSelection
@@ -487,7 +411,6 @@ private:
     bool GpuMemoryAttributionNeedsRebuild() const;
     void EnsureGpuMemoryAttribution();
     void RebuildGpuMemoryAttribution();
-    bool TryPairGpuMemoryPass( size_t passIndex );
     void DrawGpuMemoryPassesForSelectedFrame();
     void DrawGpuMemoryPassDetails( const GpuMemoryPass& pass, int& widgetId );
     void DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widgetId );
@@ -1054,6 +977,7 @@ private:
         Range range;
         MemoryFrameSelection frame;
         MemoryFrameSnapshot frameSnapshot;
+        std::vector<MemoryFramePoolStamp> frameSnapshotStamps;
         GpuMemoryAttributionCache gpuAttribution;
     } m_memInfo;
 

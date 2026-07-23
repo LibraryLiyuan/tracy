@@ -4,11 +4,16 @@
 #include "TracyFileRead.hpp"
 #include "TracyWorker.hpp"
 
+#include <capstone.h>
+
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
+#include <map>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -28,6 +33,19 @@ std::string Hex( uint64_t value )
 std::string Safe( const char* value )
 {
     return value ? value : "";
+}
+
+const char* CpuArchitectureName( CpuArchitecture value )
+{
+    switch( value )
+    {
+    case CpuArchX86: return "x86";
+    case CpuArchX64: return "x86_64";
+    case CpuArchArm32: return "arm";
+    case CpuArchArm64: return "aarch64";
+    case CpuArchUnknown: break;
+    }
+    return "unknown";
 }
 
 template<typename F>
@@ -155,17 +173,193 @@ public:
         return out.str();
     }
 
+    std::optional<uint64_t> ParseRef( std::string_view ref, std::string_view kind ) const
+    {
+        const std::string prefix = "tracy:v1:" + fingerprint.substr( 0, 16 ) + ':' + std::string( kind ) + ':';
+        if( !ref.starts_with( prefix ) ) return std::nullopt;
+        uint64_t value = 0;
+        const auto begin = ref.data() + prefix.size();
+        const auto end = ref.data() + ref.size();
+        const auto parsed = std::from_chars( begin, end, value, 16 );
+        if( parsed.ec != std::errc() || parsed.ptr != end ) return std::nullopt;
+        return value;
+    }
+
     SourceLocationDto SourceLocation( int16_t id ) const
     {
         const auto& source = worker->GetSourceLocation( id );
         return {
             MakeRef( "source", uint16_t( id ) ),
-            Safe( source.name.active ? worker->GetString( source.name ) : nullptr ),
-            Safe( worker->GetString( source.function ) ),
-            Safe( worker->GetString( source.file ) ),
+            Safe( source.name.active ? worker->TryGetString( source.name ) : nullptr ),
+            Safe( worker->TryGetString( source.function ) ),
+            Safe( worker->TryGetString( source.file ) ),
             source.line,
             source.color
         };
+    }
+
+    int64_t CpuChildTime( const ZoneEvent& zone ) const
+    {
+        int64_t time = 0;
+        if( !zone.HasChildren() ) return time;
+        ForEachCpuZone( worker->GetZoneChildren( zone.Child() ), [&]( const ZoneEvent* child ) {
+            const auto end = worker->GetZoneEnd( *child );
+            if( end >= child->Start() ) time += end - child->Start();
+        } );
+        return time;
+    }
+
+    int64_t GpuChildTime( const GpuEvent& zone ) const
+    {
+        int64_t time = 0;
+        if( zone.Child() < 0 ) return time;
+        ForEachGpuZone( worker->GetGpuChildren( zone.Child() ), [&]( const GpuEvent* child ) {
+            const auto end = worker->GetZoneEnd( *child );
+            if( end >= child->GpuStart() ) time += end - child->GpuStart();
+        } );
+        return time;
+    }
+
+    std::pair<std::optional<int64_t>, uint64_t> CpuRunningTime( uint64_t thread, const ZoneEvent& zone ) const
+    {
+        const auto* context = worker->GetContextSwitchData( thread );
+        if( !context || !zone.IsEndValid() ) return { std::nullopt, 0 };
+        int64_t running = 0;
+        uint64_t regions = 0;
+        const int64_t begin = zone.Start();
+        const int64_t end = zone.End();
+        for( const auto& event : context->v )
+        {
+            if( !event.IsEndValid() ) continue;
+            if( event.End() <= begin ) continue;
+            if( event.Start() >= end ) break;
+            const auto overlapBegin = std::max( begin, event.Start() );
+            const auto overlapEnd = std::min( end, event.End() );
+            if( overlapEnd > overlapBegin )
+            {
+                running += overlapEnd - overlapBegin;
+                regions++;
+            }
+        }
+        return regions == 0 ? std::pair<std::optional<int64_t>, uint64_t> { std::nullopt, 0 } : std::pair<std::optional<int64_t>, uint64_t> { running, regions };
+    }
+
+    CpuZoneDto CpuDto( size_t index ) const
+    {
+        const auto& entry = cpuZones.at( index );
+        const auto* zone = entry.zone;
+        const auto& sourceData = worker->GetSourceLocation( zone->SrcLoc() );
+        const auto source = SourceLocation( zone->SrcLoc() );
+        CpuZoneDto dto;
+        dto.ref = MakeRef( "cpu-zone", entry.index );
+        dto.threadRef = MakeRef( "thread", entry.thread );
+        dto.sourceLocationRef = source.ref;
+        const char* zoneName = nullptr;
+        if( worker->HasZoneExtra( *zone ) )
+        {
+            if( worker->HasValidZoneExtra( *zone ) )
+            {
+                const auto& extra = worker->GetZoneExtra( *zone );
+                if( extra.name.Active() )
+                {
+                    zoneName = worker->TryGetString( extra.name );
+                    dto.nameResolved = zoneName != nullptr;
+                }
+            }
+            else dto.nameResolved = false;
+        }
+        if( !zoneName )
+        {
+            zoneName = sourceData.name.active ? worker->TryGetString( sourceData.name ) : worker->TryGetString( sourceData.function );
+            if( !zoneName ) dto.nameResolved = false;
+        }
+        dto.name = Safe( zoneName );
+        dto.function = source.function;
+        dto.file = source.file;
+        dto.line = source.line;
+        if( entry.parent ) dto.parentRef = MakeRef( "cpu-zone", *entry.parent );
+        dto.startNs = zone->Start();
+        dto.complete = zone->IsEndValid();
+        if( dto.complete )
+        {
+            dto.endNs = zone->End();
+            dto.selfTimeNs = std::max<int64_t>( 0, zone->End() - zone->Start() - CpuChildTime( *zone ) );
+            const auto running = CpuRunningTime( entry.thread, *zone );
+            dto.runningTimeNs = running.first;
+            dto.runningRegions = running.second;
+        }
+        if( zone->HasChildren() ) dto.childCount = uint32_t( worker->GetZoneChildren( zone->Child() ).size() );
+        if( worker->HasValidZoneExtra( *zone ) ) dto.callstack = worker->GetZoneExtra( *zone ).callstack.Val();
+        if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
+        return dto;
+    }
+
+    GpuZoneDto GpuDto( size_t index ) const
+    {
+        const auto& entry = gpuZones.at( index );
+        const auto* zone = entry.zone;
+        const auto source = SourceLocation( zone->SrcLoc() );
+        GpuZoneDto dto;
+        dto.ref = MakeRef( "gpu-zone", entry.index );
+        dto.contextRef = MakeRef( "gpu-context", entry.context );
+        dto.threadRef = MakeRef( "thread", entry.thread );
+        dto.sourceLocationRef = source.ref;
+        dto.name = source.name.empty() ? source.function : source.name;
+        dto.function = source.function;
+        dto.file = source.file;
+        dto.line = source.line;
+        if( entry.parent ) dto.parentRef = MakeRef( "gpu-zone", *entry.parent );
+        dto.gpuStartNs = zone->GpuStart();
+        if( zone->GpuEnd() >= 0 )
+        {
+            dto.gpuEndNs = zone->GpuEnd();
+            dto.selfTimeNs = std::max<int64_t>( 0, zone->GpuEnd() - zone->GpuStart() - GpuChildTime( *zone ) );
+        }
+        dto.cpuStartNs = zone->CpuStart();
+        if( zone->CpuEnd() >= 0 ) dto.cpuEndNs = zone->CpuEnd();
+        if( zone->Child() >= 0 ) dto.childCount = uint32_t( worker->GetGpuChildren( zone->Child() ).size() );
+        dto.callstack = zone->callstack.Val();
+        if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
+        dto.complete = zone->GpuEnd() >= 0 && zone->CpuEnd() >= 0;
+        return dto;
+    }
+
+    std::optional<MemoryEventDto> MemoryDto( const MemoryEventKey& key ) const
+    {
+        const auto poolIndex = memoryPoolIndex.find( key.pool );
+        if( poolIndex == memoryPoolIndex.end() ) return std::nullopt;
+        const auto& memory = worker->GetMemoryNamed( key.pool );
+        if( key.index >= memory.data.size() ) return std::nullopt;
+        const auto& event = memory.data[key.index];
+        MemoryEventDto dto;
+        dto.ref = MakeRef( "memory-event", ( uint64_t( poolIndex->second ) << 40 ) | key.index );
+        dto.poolRef = MakeRef( "memory-pool", poolIndex->second );
+        const auto poolName = key.pool == 0 ? std::string( "Default allocator" ) : Safe( worker->GetString( key.pool ) );
+        dto.address = IsGpuD3D12PoolName( poolName ) ? std::to_string( event.Ptr() ) : Hex( event.Ptr() ); dto.size = event.Size(); dto.allocationNs = event.TimeAlloc();
+        if( event.TimeFree() >= 0 ) dto.freeNs = event.TimeFree();
+        dto.allocationThreadRef = MakeRef( "thread", worker->DecompressThread( event.ThreadAlloc() ) );
+        if( event.TimeFree() >= 0 ) dto.freeThreadRef = MakeRef( "thread", worker->DecompressThread( event.ThreadFree() ) );
+        dto.allocationCallstack = event.CsAlloc(); dto.freeCallstack = event.csFree.Val(); dto.complete = event.TimeFree() >= 0;
+        if( dto.allocationCallstack != 0 ) dto.allocationCallstackRef = MakeRef( "callstack", dto.allocationCallstack );
+        if( dto.freeCallstack != 0 ) dto.freeCallstackRef = MakeRef( "callstack", dto.freeCallstack );
+        if( const auto zone = FindCpuZoneAtTime( worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc() ) ) dto.allocationZoneRef = MakeRef( "cpu-zone", *zone );
+        if( event.TimeFree() >= 0 ) if( const auto zone = FindCpuZoneAtTime( worker->DecompressThread( event.ThreadFree() ), event.TimeFree() ) ) dto.freeZoneRef = MakeRef( "cpu-zone", *zone );
+        return dto;
+    }
+
+    std::optional<size_t> FindCpuZoneAtTime( uint64_t thread, int64_t time ) const
+    {
+        const auto found = cpuZonesByThread.find( thread );
+        if( found == cpuZonesByThread.end() ) return std::nullopt;
+        const auto& indices = found->second;
+        auto it = std::upper_bound( indices.begin(), indices.end(), time, [&]( int64_t value, size_t index ) { return value < cpuZones[index].zone->Start(); } );
+        while( it != indices.begin() )
+        {
+            --it;
+            const auto* zone = cpuZones[*it].zone;
+            if( zone->Start() <= time && worker->GetZoneEnd( *zone ) >= time ) return *it;
+        }
+        return std::nullopt;
     }
 
     void IndexCpuVector( const Vector<short_ptr<ZoneEvent>>& zones, uint64_t thread, std::optional<size_t> parent )
@@ -174,6 +368,7 @@ public:
             const size_t index = cpuZones.size();
             cpuZones.push_back( { zone, thread, index, parent } );
             cpuLookup.emplace( zone, index );
+            cpuZonesByThread[thread].emplace_back( index );
             if( zone->HasChildren() ) IndexCpuVector( worker->GetZoneChildren( zone->Child() ), thread, index );
         } );
     }
@@ -194,6 +389,9 @@ public:
         for( const auto thread : worker->GetThreadData() ) threads.push_back( thread );
         std::sort( threads.begin(), threads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
         for( const auto* thread : threads ) IndexCpuVector( thread->timeline, thread->id, std::nullopt );
+        for( auto& [thread, indices] : cpuZonesByThread ) std::sort( indices.begin(), indices.end(), [&]( size_t lhs, size_t rhs ) {
+            return cpuZones[lhs].zone->Start() != cpuZones[rhs].zone->Start() ? cpuZones[lhs].zone->Start() < cpuZones[rhs].zone->Start() : lhs < rhs;
+        } );
 
         const auto& contexts = worker->GetGpuData();
         for( size_t contextIndex = 0; contextIndex < contexts.size(); contextIndex++ )
@@ -213,7 +411,11 @@ public:
         std::sort( pools.begin(), pools.end(), []( const auto& lhs, const auto& rhs ) {
             return lhs.first != rhs.first ? lhs.first < rhs.first : lhs.second < rhs.second;
         } );
-        for( size_t index = 0; index < pools.size(); index++ ) memoryPoolIndex.emplace( pools[index].second, index );
+        for( size_t index = 0; index < pools.size(); index++ )
+        {
+            memoryPoolIndex.emplace( pools[index].second, index );
+            memoryPools.emplace_back( pools[index].second );
+        }
 
         for( const auto& [sourcePath, block] : worker->GetSourceFileCache() ) sourceFiles.emplace_back( sourcePath );
         std::sort( sourceFiles.begin(), sourceFiles.end(), []( const auto* lhs, const auto* rhs ) { return std::strcmp( lhs, rhs ) < 0; } );
@@ -229,8 +431,10 @@ public:
     std::vector<CpuEntry> cpuZones;
     std::vector<GpuEntry> gpuZones;
     std::unordered_map<const ZoneEvent*, size_t> cpuLookup;
+    std::unordered_map<uint64_t, std::vector<size_t>> cpuZonesByThread;
     std::unordered_map<const GpuEvent*, size_t> gpuLookup;
     std::unordered_map<uint64_t, size_t> memoryPoolIndex;
+    std::vector<uint64_t> memoryPools;
     std::vector<const char*> sourceFiles;
     std::vector<uint64_t> symbols;
     mutable std::mutex readMutex;
@@ -251,6 +455,21 @@ const char* ToString( TraceLoadErrorCode code )
     return "internal";
 }
 
+WorkerLoadProgress WorkerTraceSource::GetLoadProgress()
+{
+    const auto& value = Worker::GetLoadProgress();
+    static constexpr const char* stages[] = {
+        "initialization", "locks", "messages", "zones", "gpu_zones", "plots", "memory", "callstacks", "frame_images", "context_switches", "context_switches_per_cpu",
+        "thread_pid_map", "cpu_thread_data", "symbols", "symbol_code", "hardware_samples", "source_cache"
+    };
+    const auto stage = value.progress.load( std::memory_order_relaxed );
+    return {
+        stage < sizeof( stages ) / sizeof( stages[0] ) ? stages[stage] : "unknown",
+        stage, value.total.load( std::memory_order_relaxed ),
+        value.subProgress.load( std::memory_order_relaxed ), value.subTotal.load( std::memory_order_relaxed )
+    };
+}
+
 std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback )
 {
     auto impl = std::make_unique<Impl>( path );
@@ -263,8 +482,8 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         impl->file.reset( FileRead::Open( path.string().c_str() ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
         impl->worker = std::make_unique<Worker>( *impl->file, EventType::All, true, false );
-        if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+        if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         impl->BuildIndexes();
         if( stateCallback ) stateCallback( TraceSourceState::Ready );
         return std::unique_ptr<WorkerTraceSource>( new WorkerTraceSource( std::move( impl ) ) );
@@ -280,6 +499,14 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
     catch( const LoadFailure& error )
     {
         throw TraceLoadError( TraceLoadErrorCode::Corrupt, error.msg );
+    }
+    catch( const NotTracyDump& )
+    {
+        throw TraceLoadError( TraceLoadErrorCode::Corrupt, "file does not contain a valid Tracy stream header" );
+    }
+    catch( const FileReadError& )
+    {
+        throw TraceLoadError( TraceLoadErrorCode::Corrupt, "trace ended before all declared records could be read" );
     }
     catch( const std::bad_alloc& )
     {
@@ -382,8 +609,8 @@ std::vector<SymbolResourceDto> WorkerTraceSource::GetSymbolResources() const
         uint32_t codeLength = 0;
         if( m_impl->worker->HasSymbolCode( address ) ) m_impl->worker->GetSymbolCode( address, codeLength );
         result.push_back( {
-            address, m_impl->MakeRef( "symbol", address ), Safe( m_impl->worker->GetString( symbol->name ) ),
-            Safe( m_impl->worker->GetString( symbol->file ) ), symbol->line, codeLength
+            address, m_impl->MakeRef( "symbol", address ), Safe( m_impl->worker->TryGetString( symbol->name ) ),
+            Safe( m_impl->worker->TryGetString( symbol->file ) ), symbol->line, codeLength
         } );
     }
     return result;
@@ -401,6 +628,199 @@ std::vector<FrameImageMetadataDto> WorkerTraceSource::GetFrameImageResources() c
         result.push_back( { index, m_impl->MakeRef( "frame-image", index ), image->w, image->h, image->flip != 0, image->frameRef } );
     }
     return result;
+}
+
+std::optional<CpuZoneDto> WorkerTraceSource::GetCpuZone( std::string_view ref ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto index = m_impl->ParseRef( ref, "cpu-zone" );
+    if( !index || *index >= m_impl->cpuZones.size() ) return std::nullopt;
+    return m_impl->CpuDto( size_t( *index ) );
+}
+
+std::optional<GpuZoneDto> WorkerTraceSource::GetGpuZone( std::string_view ref ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto index = m_impl->ParseRef( ref, "gpu-zone" );
+    if( !index || *index >= m_impl->gpuZones.size() ) return std::nullopt;
+    return m_impl->GpuDto( size_t( *index ) );
+}
+
+std::vector<CpuZoneDto> WorkerTraceSource::GetCpuZoneChildren( std::string_view ref, size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<CpuZoneDto> result;
+    const auto index = m_impl->ParseRef( ref, "cpu-zone" );
+    if( !index || *index >= m_impl->cpuZones.size() ) return result;
+    const auto* zone = m_impl->cpuZones[size_t( *index )].zone;
+    if( !zone->HasChildren() ) return result;
+    size_t position = 0;
+    ForEachCpuZone( m_impl->worker->GetZoneChildren( zone->Child() ), [&]( const ZoneEvent* child ) {
+        if( position++ < offset || result.size() >= limit ) return;
+        const auto found = m_impl->cpuLookup.find( child );
+        if( found != m_impl->cpuLookup.end() ) result.emplace_back( m_impl->CpuDto( found->second ) );
+    } );
+    return result;
+}
+
+std::vector<GpuZoneDto> WorkerTraceSource::GetGpuZoneChildren( std::string_view ref, size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<GpuZoneDto> result;
+    const auto index = m_impl->ParseRef( ref, "gpu-zone" );
+    if( !index || *index >= m_impl->gpuZones.size() ) return result;
+    const auto* zone = m_impl->gpuZones[size_t( *index )].zone;
+    if( zone->Child() < 0 ) return result;
+    size_t position = 0;
+    ForEachGpuZone( m_impl->worker->GetGpuChildren( zone->Child() ), [&]( const GpuEvent* child ) {
+        if( position++ < offset || result.size() >= limit ) return;
+        const auto found = m_impl->gpuLookup.find( child );
+        if( found != m_impl->gpuLookup.end() ) result.emplace_back( m_impl->GpuDto( found->second ) );
+    } );
+    return result;
+}
+
+MemoryFrameSnapshot WorkerTraceSource::GetMemoryFrameSnapshot( size_t frameSetIndex, size_t frameIndex, const std::vector<std::string>& poolRefs, bool allGpuD3D12Pools ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& frameSets = m_impl->worker->GetFrames();
+    if( frameSetIndex >= frameSets.size() ) return {};
+    const auto* frameSet = frameSets[frameSetIndex];
+    if( frameIndex >= m_impl->worker->GetFullFrameCount( *frameSet ) ) return {};
+
+    std::vector<uint64_t> pools;
+    if( allGpuD3D12Pools )
+    {
+        for( const auto pool : m_impl->memoryPools )
+        {
+            const auto name = pool == 0 ? std::string( "Default allocator" ) : Safe( m_impl->worker->GetString( pool ) );
+            if( IsGpuD3D12PoolName( name ) ) pools.emplace_back( pool );
+        }
+    }
+    else if( !poolRefs.empty() )
+    {
+        for( const auto& ref : poolRefs )
+        {
+            const auto index = m_impl->ParseRef( ref, "memory-pool" );
+            if( index && *index < m_impl->memoryPools.size() ) pools.emplace_back( m_impl->memoryPools[size_t( *index )] );
+        }
+    }
+    else pools = m_impl->memoryPools;
+
+    std::vector<MemoryEventInput> events;
+    for( const auto pool : pools )
+    {
+        const auto& memory = m_impl->worker->GetMemoryNamed( pool );
+        events.reserve( events.size() + memory.data.size() );
+        for( size_t index = 0; index < memory.data.size(); index++ )
+        {
+            const auto& event = memory.data[index];
+            MemoryEventInput input;
+            input.key = { pool, index }; input.identifier = event.Ptr(); input.size = event.Size(); input.allocationNs = event.TimeAlloc();
+            if( event.TimeFree() >= 0 ) input.freeNs = event.TimeFree();
+            input.allocationThread = m_impl->worker->DecompressThread( event.ThreadAlloc() );
+            if( event.TimeFree() >= 0 ) input.freeThread = m_impl->worker->DecompressThread( event.ThreadFree() );
+            input.allocationCallstack = event.CsAlloc(); input.freeCallstack = event.csFree.Val();
+            events.emplace_back( input );
+        }
+    }
+    const auto begin = m_impl->worker->GetFrameBegin( *frameSet, frameIndex );
+    const auto end = m_impl->worker->GetFrameEnd( *frameSet, frameIndex );
+    constexpr int64_t BaselineWindow = 100 * 1000 * 1000;
+    const bool possibleBaseline = m_impl->worker->IsOnDemand() && begin <= m_impl->worker->GetFirstTime() + BaselineWindow && end > m_impl->worker->GetFirstTime();
+    return BuildMemoryFrameSnapshot( begin, end, pools, events, possibleBaseline );
+}
+
+std::optional<MemoryEventDto> WorkerTraceSource::GetMemoryEvent( const MemoryEventKey& key ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->MemoryDto( key );
+}
+
+std::optional<std::string> WorkerTraceSource::GetMemoryPoolRef( uint64_t internalPoolKey ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto found = m_impl->memoryPoolIndex.find( internalPoolKey );
+    if( found == m_impl->memoryPoolIndex.end() ) return std::nullopt;
+    return m_impl->MakeRef( "memory-pool", found->second );
+}
+
+std::optional<std::string> WorkerTraceSource::GetCpuZoneRef( uint64_t internalZoneIndex ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( internalZoneIndex >= m_impl->cpuZones.size() ) return std::nullopt;
+    return m_impl->MakeRef( "cpu-zone", internalZoneIndex );
+}
+
+std::optional<std::string> WorkerTraceSource::GetGpuZoneRef( uint64_t internalZoneIndex ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( internalZoneIndex >= m_impl->gpuZones.size() ) return std::nullopt;
+    return m_impl->MakeRef( "gpu-zone", internalZoneIndex );
+}
+
+std::string WorkerTraceSource::MakeEntityRef( std::string_view kind, uint64_t id ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const std::string value( kind );
+    return m_impl->MakeRef( value.c_str(), id );
+}
+
+std::optional<uint64_t> WorkerTraceSource::ParseEntityRef( std::string_view ref, std::string_view kind ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->ParseRef( ref, kind );
+}
+
+GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<GpuMemoryCpuZoneInput> cpuInputs;
+    for( const auto& entry : m_impl->cpuZones )
+    {
+        const auto* zone = entry.zone;
+        if( !zone->IsEndValid() ) continue;
+        const auto& location = m_impl->worker->GetSourceLocation( zone->SrcLoc() );
+        const auto marker = Safe( location.name.active ? m_impl->worker->TryGetString( location.name ) : m_impl->worker->TryGetString( location.function ) );
+        if( marker != GpuMemoryRequestMarker && marker != GpuMemoryPassMarker ) continue;
+        if( !m_impl->worker->HasValidZoneExtra( *zone ) ) continue;
+        const auto& extra = m_impl->worker->GetZoneExtra( *zone );
+        if( !extra.text.Active() ) continue;
+        const auto* text = m_impl->worker->TryGetString( extra.text );
+        if( !text ) continue;
+        const auto* displayName = extra.name.Active() ? m_impl->worker->TryGetString( extra.name ) : nullptr;
+        if( !displayName ) displayName = marker.c_str();
+        cpuInputs.push_back( {
+            entry.index, marker, Safe( displayName ), text,
+            entry.thread, zone->Start(), m_impl->worker->GetZoneEnd( *zone )
+        } );
+    }
+
+    std::vector<GpuMemoryGpuZoneInput> gpuInputs;
+    gpuInputs.reserve( m_impl->gpuZones.size() );
+    for( const auto& entry : m_impl->gpuZones )
+    {
+        const auto* zone = entry.zone;
+        if( zone->GpuEnd() < 0 ) continue;
+        const auto thread = zone->Thread() != 0 ? m_impl->worker->DecompressThread( zone->Thread() ) : entry.thread;
+        const auto source = m_impl->SourceLocation( zone->SrcLoc() );
+        gpuInputs.push_back( { entry.index, source.name.empty() ? source.function : source.name, thread, zone->CpuStart(), zone->GpuStart(), zone->GpuEnd() } );
+    }
+
+    std::vector<GpuMemoryAllocationInput> allocations;
+    for( const auto pool : m_impl->memoryPools )
+    {
+        const auto name = pool == 0 ? std::string( "Default allocator" ) : Safe( m_impl->worker->GetString( pool ) );
+        if( !IsGpuD3D12PoolName( name ) ) continue;
+        const auto& memory = m_impl->worker->GetMemoryNamed( pool );
+        for( size_t index = 0; index < memory.data.size(); index++ )
+        {
+            const auto& event = memory.data[index];
+            if( event.Ptr() == 0 ) continue;
+            allocations.push_back( { { pool, index }, event.Ptr(), event.Size(), m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc() } );
+        }
+    }
+    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations );
 }
 
 SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
@@ -453,27 +873,34 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
     auto capability = []( std::string domain, bool present, bool indexed, std::vector<std::string> methods, std::string reason = {} ) {
+        if( reason.empty() ) reason = present ? "available in the persisted snapshot" : "data is absent from the persisted snapshot";
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
     };
+    const bool hasCpu = !GetCpuTopology().empty() || info.counts.contextSwitches != 0;
     return {
+        capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
         capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash" } ),
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
-        capability( "cpu", info.counts.contextSwitches != 0, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, info.counts.contextSwitches ? "" : "trace contains no scheduling data" ),
+        capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
         capability( "frame", info.counts.frameSets != 0, true, { "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping" } ),
         capability( "frame_image", info.counts.frameImages != 0, true, { "frame_image.list", "frame_image.metadata", "frame_image.resource" } ),
+        capability( "timeline", info.counts.cpuZones != 0 || info.counts.gpuZones != 0 || info.counts.frames != 0 || info.counts.messages != 0 || info.counts.plots != 0 || info.counts.locks != 0 || info.counts.contextSwitches != 0, true, { "timeline.slice" } ),
         capability( "zone.cpu", info.counts.cpuZones != 0, true, { "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph" } ),
-        capability( "zone.gpu", info.counts.gpuZones != 0, true, { "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.statistics", "zone.gpu.flamegraph" } ),
-        capability( "callstack", info.counts.callstackPayloads != 0, true, { "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch" } ),
-        capability( "sample", info.counts.samples != 0, true, { "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph" } ),
+        capability( "zone.gpu", info.counts.gpuZones != 0, true, { "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph" } ),
+        capability( "callstack", info.counts.callstackPayloads != 0 || info.counts.parentCallstackPayloads != 0, true, { "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch" } ),
+        capability( "sample", info.counts.samples != 0 || info.counts.contextSwitchSamples != 0 || info.counts.ghostZones != 0, true, { "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph" } ),
         capability( "hardware_sample", info.counts.hardwareSamples != 0, true, { "hardware_sample.address", "hardware_sample.counts", "hardware_sample.capabilities" } ),
         capability( "symbol", info.counts.symbols != 0, true, { "symbol.search", "symbol.get", "symbol.address", "symbol.raw_code", "symbol.disassembly" } ),
-        capability( "source", info.counts.sourceLocations != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines" } ),
-        capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
+        capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines" } ),
+        capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution" } ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
-        capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } )
+        capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
+        capability( "statistics", true, true, { "statistics.describe", "statistics.compute" } ),
+        capability( "compare", true, true, { "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
+        capability( "validation", true, true, { "validation.run" } )
     };
 }
 
@@ -496,6 +923,7 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     result.loadTimeNs = worker.GetLoadTime();
     result.cpuId = worker.GetCpuId();
     result.cpuManufacturer = Safe( worker.GetCpuManufacturer() );
+    result.cpuArchitecture = CpuArchitectureName( worker.GetCpuArch() );
     const auto& crash = worker.GetCrashEvent();
     result.hasCrash = crash.thread != 0 || crash.time != 0 || crash.message != 0 || crash.callstack != 0;
     result.samplesInconsistent = worker.AreSamplesInconsistent();
@@ -505,7 +933,12 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     for( const auto* frames : worker.GetFrames() ) counts.frames += worker.GetFrameCount( *frames );
     counts.cpuZones = worker.GetZoneCount();
     counts.gpuZones = worker.GetGpuZoneCount();
-    counts.threads = worker.GetThreadData().size();
+    {
+        std::set<uint64_t> threads;
+        for( const auto* thread : worker.GetThreadData() ) threads.emplace( thread->id );
+        for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.emplace( thread );
+        counts.threads = threads.size();
+    }
     counts.locks = worker.GetLockCount();
     counts.plots = worker.GetPlotCount();
     counts.messages = worker.GetMessages().size();
@@ -513,8 +946,21 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     for( const auto& [name, memory] : worker.GetMemNameMap() ) counts.memoryEvents += memory->data.size();
     counts.contextSwitches = worker.GetContextSwitchCount();
     counts.callstackPayloads = worker.GetCallstackPayloadCount();
+#ifndef TRACY_NO_STATISTICS
+    counts.parentCallstackPayloads = worker.GetCallstackParentPayloadCount();
+#endif
     counts.callstackFrames = worker.GetCallstackFrameCount();
+#ifndef TRACY_NO_STATISTICS
+    counts.parentCallstackFrames = worker.GetCallstackParentFrameCount();
+#endif
     counts.samples = worker.GetCallstackSampleCount();
+#ifndef TRACY_NO_STATISTICS
+    counts.contextSwitchSamples = worker.GetContextSwitchSampleCount();
+    for( const auto* thread : worker.GetThreadData() ) counts.kernelSamples += thread->kernelSampleCnt;
+    counts.ghostZones = worker.GetGhostZonesCount();
+    counts.childSampleSymbols = worker.GetChildSamplesCountSyms();
+    counts.childSamples = worker.GetChildSamplesCountFull();
+#endif
     counts.hardwareSamples = worker.GetHwSampleCount();
     counts.symbols = worker.GetSymbolsCount();
     counts.symbolCodeBytes = worker.GetSymbolCodeSize();
@@ -531,20 +977,26 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
     std::lock_guard lock( m_impl->readMutex );
     std::vector<ThreadDto> result;
     auto& worker = *m_impl->worker;
-    result.reserve( worker.GetThreadData().size() );
-    for( const auto* thread : worker.GetThreadData() )
+    std::map<uint64_t, const ThreadData*> threads;
+    for( const auto* thread : worker.GetThreadData() ) threads.emplace( thread->id, thread );
+    for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.try_emplace( thread, nullptr );
+    result.reserve( threads.size() );
+    for( const auto& [threadId, thread] : threads )
     {
         ThreadDto dto;
-        dto.ref = m_impl->MakeRef( "thread", thread->id );
-        dto.nativeId = thread->id;
-        dto.processId = worker.GetPidFromTid( thread->id );
-        dto.name = Safe( worker.GetThreadName( thread->id ) );
-        dto.fiber = thread->isFiber != 0;
-        dto.zoneCount = thread->count;
-        dto.messageCount = thread->messages.size();
-        dto.sampleCount = thread->samples.size();
-        if( const auto* context = worker.GetContextSwitchData( thread->id ) ) dto.contextSwitchCount = context->v.size();
-        const auto cpu = worker.GetCpuThreadData().find( thread->id );
+        dto.ref = m_impl->MakeRef( "thread", threadId );
+        dto.nativeId = threadId;
+        dto.processId = worker.GetPidFromTid( threadId );
+        dto.name = Safe( worker.GetThreadName( threadId ) );
+        if( thread )
+        {
+            dto.fiber = thread->isFiber != 0;
+            dto.zoneCount = thread->count;
+            dto.messageCount = thread->messages.size();
+            dto.sampleCount = thread->samples.size();
+        }
+        if( const auto* context = worker.GetContextSwitchData( threadId ) ) dto.contextSwitchCount = context->v.size();
+        const auto cpu = worker.GetCpuThreadData().find( threadId );
         if( cpu != worker.GetCpuThreadData().end() )
         {
             dto.runningTimeNs = cpu->second.runningTime;
@@ -569,7 +1021,7 @@ std::vector<FrameSetDto> WorkerTraceSource::GetFrameSets() const
         std::string name;
         if( frameSet->name == 0 ) name = "Frames";
         else if( frameSet->name >> 63 ) name = "Vsync " + std::to_string( uint32_t( frameSet->name ) );
-        else name = Safe( worker.GetString( frameSet->name ) );
+        else name = Safe( worker.TryGetString( frameSet->name ) );
         result.push_back( { m_impl->MakeRef( "frame-set", i ), i, std::move( name ), frameSet->continuous != 0, worker.GetFrameCount( *frameSet ), worker.GetFullFrameCount( *frameSet ) } );
     }
     return result;
@@ -587,7 +1039,7 @@ std::vector<GpuContextDto> WorkerTraceSource::GetGpuContexts() const
         const auto* context = contexts[i];
         result.push_back( {
             m_impl->MakeRef( "gpu-context", i ), i,
-            context->name.Active() ? Safe( worker.GetString( context->name ) ) : "GPU context " + std::to_string( i ),
+            context->name.Active() ? Safe( worker.TryGetString( context->name ) ) : "GPU context " + std::to_string( i ),
             m_impl->MakeRef( "thread", context->thread ), context->count, context->period,
             context->hasCalibration, uint8_t( context->type )
         } );
@@ -608,7 +1060,7 @@ std::vector<MemoryPoolDto> WorkerTraceSource::GetMemoryPools() const
             m_impl->MakeRef( "memory-pool", m_impl->memoryPoolIndex.at( nameId ) ), nameId, name, memory->data.size(), memory->active.size(), memory->usage,
             memory->low == std::numeric_limits<uint64_t>::max() ? 0 : memory->low,
             memory->high == std::numeric_limits<uint64_t>::min() ? 0 : memory->high,
-            name.rfind( "GPU D3D12 ", 0 ) == 0
+            IsGpuD3D12PoolName( name )
         } );
     }
     std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.name < rhs.name; } );
@@ -625,7 +1077,7 @@ std::vector<PlotDto> WorkerTraceSource::GetPlotList() const
     for( size_t i = 0; i < plots.size(); i++ )
     {
         const auto* plot = plots[i];
-        result.push_back( { m_impl->MakeRef( "plot", i ), i, Safe( worker.GetString( plot->name ) ), uint8_t( plot->type ), uint8_t( plot->format ), plot->data.size(), plot->min, plot->max, plot->sum } );
+        result.push_back( { m_impl->MakeRef( "plot", i ), i, Safe( worker.TryGetString( plot->name ) ), uint8_t( plot->type ), uint8_t( plot->format ), plot->data.size(), plot->min, plot->max, plot->sum } );
     }
     return result;
 }
@@ -639,7 +1091,7 @@ std::vector<LockDto> WorkerTraceSource::GetLocks() const
     for( const auto& [id, value] : worker.GetLockMap() )
     {
         const auto source = m_impl->SourceLocation( value->srcloc );
-        const std::string name = value->customName.Active() ? Safe( worker.GetString( value->customName ) ) : source.name.empty() ? source.function : source.name;
+        const std::string name = value->customName.Active() ? Safe( worker.TryGetString( value->customName ) ) : source.name.empty() ? source.function : source.name;
         result.push_back( {
             m_impl->MakeRef( "lock", id ), id, name, source.ref, value->timeline.size(), value->threadList.size(), value->valid,
             value->isContended, value->timeAnnounce, value->timeTerminate < 0 ? std::nullopt : std::optional<int64_t>( value->timeTerminate )
@@ -660,21 +1112,7 @@ std::vector<CpuZoneDto> WorkerTraceSource::ScanCpuZones( const ScanRange& range 
         const int64_t end = zone->IsEndValid() ? zone->End() : zone->Start();
         if( !Intersects( zone->Start(), end, range ) ) continue;
         if( skipped++ < range.offset ) continue;
-        const auto source = m_impl->SourceLocation( zone->SrcLoc() );
-        CpuZoneDto dto;
-        dto.ref = m_impl->MakeRef( "cpu-zone", entry.index );
-        dto.threadRef = m_impl->MakeRef( "thread", entry.thread );
-        dto.sourceLocationRef = source.ref;
-        dto.name = Safe( m_impl->worker->GetZoneName( *zone ) );
-        dto.function = source.function;
-        dto.file = source.file;
-        dto.line = source.line;
-        if( entry.parent ) dto.parentRef = m_impl->MakeRef( "cpu-zone", *entry.parent );
-        dto.startNs = zone->Start();
-        if( zone->IsEndValid() ) dto.endNs = zone->End();
-        dto.complete = zone->IsEndValid();
-        if( m_impl->worker->HasZoneExtra( *zone ) ) dto.callstack = m_impl->worker->GetZoneExtra( *zone ).callstack.Val();
-        result.emplace_back( std::move( dto ) );
+        result.emplace_back( m_impl->CpuDto( entry.index ) );
         if( result.size() >= range.limit ) break;
     }
     return result;
@@ -691,24 +1129,7 @@ std::vector<GpuZoneDto> WorkerTraceSource::ScanGpuZones( const ScanRange& range 
         const int64_t end = zone->GpuEnd() >= 0 ? zone->GpuEnd() : zone->GpuStart();
         if( !Intersects( zone->GpuStart(), end, range ) ) continue;
         if( skipped++ < range.offset ) continue;
-        const auto source = m_impl->SourceLocation( zone->SrcLoc() );
-        GpuZoneDto dto;
-        dto.ref = m_impl->MakeRef( "gpu-zone", entry.index );
-        dto.contextRef = m_impl->MakeRef( "gpu-context", entry.context );
-        dto.threadRef = m_impl->MakeRef( "thread", entry.thread );
-        dto.sourceLocationRef = source.ref;
-        dto.name = Safe( m_impl->worker->GetZoneName( *zone ) );
-        dto.function = source.function;
-        dto.file = source.file;
-        dto.line = source.line;
-        if( entry.parent ) dto.parentRef = m_impl->MakeRef( "gpu-zone", *entry.parent );
-        dto.gpuStartNs = zone->GpuStart();
-        if( zone->GpuEnd() >= 0 ) dto.gpuEndNs = zone->GpuEnd();
-        dto.cpuStartNs = zone->CpuStart();
-        if( zone->CpuEnd() >= 0 ) dto.cpuEndNs = zone->CpuEnd();
-        dto.callstack = zone->callstack.Val();
-        dto.complete = zone->GpuEnd() >= 0 && zone->CpuEnd() >= 0;
-        result.emplace_back( std::move( dto ) );
+        result.emplace_back( m_impl->GpuDto( entry.index ) );
         if( result.size() >= range.limit ) break;
     }
     return result;
@@ -777,19 +1198,7 @@ std::vector<MemoryEventDto> WorkerTraceSource::ScanMemoryEvents( const ScanRange
             const int64_t end = event.TimeFree() >= 0 ? event.TimeFree() : m_impl->worker->GetLastTime();
             if( !Intersects( event.TimeAlloc(), end, range ) ) continue;
             if( skipped++ < range.offset ) continue;
-            MemoryEventDto dto;
-            dto.ref = m_impl->MakeRef( "memory-event", ( uint64_t( poolIndex ) << 40 ) | eventIndex );
-            dto.poolRef = m_impl->MakeRef( "memory-pool", m_impl->memoryPoolIndex.at( poolId ) );
-            dto.address = Hex( event.Ptr() );
-            dto.size = event.Size();
-            dto.allocationNs = event.TimeAlloc();
-            if( event.TimeFree() >= 0 ) dto.freeNs = event.TimeFree();
-            dto.allocationThreadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( event.ThreadAlloc() ) );
-            if( event.TimeFree() >= 0 ) dto.freeThreadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( event.ThreadFree() ) );
-            dto.allocationCallstack = event.CsAlloc();
-            dto.freeCallstack = event.csFree.Val();
-            dto.complete = event.TimeFree() >= 0;
-            result.emplace_back( std::move( dto ) );
+            if( auto dto = m_impl->MemoryDto( { poolId, eventIndex } ) ) result.emplace_back( std::move( *dto ) );
             if( result.size() >= range.limit ) return result;
         }
     }
@@ -807,11 +1216,15 @@ std::vector<MessageDto> WorkerTraceSource::ScanMessages( const ScanRange& range 
         const auto* message = messages[index].get();
         if( message->time < range.startNs || message->time >= range.endNs ) continue;
         if( skipped++ < range.offset ) continue;
-        result.push_back( {
-            m_impl->MakeRef( "message", index ),
-            m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( message->thread ) ),
-            message->time, Safe( m_impl->worker->GetString( message->ref ) ), message->color, message->callstack.Val()
-        } );
+        MessageDto dto;
+        dto.ref = m_impl->MakeRef( "message", index );
+        dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( message->thread ) );
+        dto.timeNs = message->time;
+        dto.text = Safe( m_impl->worker->TryGetString( message->ref ) );
+        dto.color = message->color;
+        dto.callstack = message->callstack.Val();
+        if( dto.callstack != 0 ) dto.callstackRef = m_impl->MakeRef( "callstack", dto.callstack );
+        result.emplace_back( std::move( dto ) );
         if( result.size() >= range.limit ) break;
     }
     return result;
@@ -855,17 +1268,23 @@ std::vector<std::string> WorkerTraceSource::ScanContextSwitches( const ScanRange
     std::vector<std::string> result;
     size_t skipped = 0;
     auto& worker = *m_impl->worker;
-    for( const auto* thread : worker.GetThreadData() )
+    std::vector<uint64_t> threads;
+    threads.reserve( worker.GetContextSwitchMap().size() );
+    for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.emplace_back( thread );
+    std::sort( threads.begin(), threads.end() );
+    uint64_t ordinal = 0;
+    for( const auto thread : threads )
     {
-        const auto* data = worker.GetContextSwitchData( thread->id );
+        const auto* data = worker.GetContextSwitchData( thread );
         if( !data ) continue;
         for( size_t index = 0; index < data->v.size(); index++ )
         {
             const auto& event = data->v[index];
+            const auto currentOrdinal = ordinal++;
             const int64_t end = event.IsEndValid() ? event.End() : event.Start();
             if( !Intersects( event.Start(), end, range ) ) continue;
             if( skipped++ < range.offset ) continue;
-            result.emplace_back( m_impl->MakeRef( "context-switch", ( thread->id << 24 ) ^ index ) );
+            result.emplace_back( m_impl->MakeRef( "context-switch", currentOrdinal ) );
             if( result.size() >= range.limit ) return result;
         }
     }
@@ -891,6 +1310,304 @@ std::vector<std::string> WorkerTraceSource::ScanSamples( const ScanRange& range 
     return result;
 }
 
+CrashDto WorkerTraceSource::GetCrash() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& crash = m_impl->worker->GetCrashEvent();
+    CrashDto result;
+    result.present = crash.thread != 0 || crash.time != 0 || crash.message != 0 || crash.callstack != 0;
+    if( !result.present ) return result;
+    result.threadRef = m_impl->MakeRef( "thread", crash.thread );
+    result.timeNs = crash.time;
+    result.message = crash.message == 0 ? "" : Safe( m_impl->worker->GetString( crash.message ) );
+    result.callstack = crash.callstack;
+    if( result.callstack != 0 ) result.callstackRef = m_impl->MakeRef( "callstack", result.callstack );
+    return result;
+}
+
+std::vector<CpuTopologyDto> WorkerTraceSource::GetCpuTopology() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<CpuTopologyDto> result;
+    for( const auto& [package, dies] : m_impl->worker->GetCpuTopology() )
+    {
+        for( const auto& [die, cores] : dies )
+        {
+            for( const auto& [core, cpus] : cores )
+            {
+                for( const auto cpu : cpus ) result.push_back( { cpu, package, die, core } );
+            }
+        }
+    }
+    std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.cpu < rhs.cpu; } );
+    return result;
+}
+
+std::vector<CpuUsagePointDto> WorkerTraceSource::GetCpuUsage() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<CpuUsagePointDto> result;
+#ifndef TRACY_NO_STATISTICS
+    if( !m_impl->worker->IsCpuUsageReady() ) return result;
+    const auto& usage = m_impl->worker->GetCpuUsage();
+    result.reserve( usage.size() );
+    for( size_t index = 0; index < usage.size(); index++ )
+    {
+        const auto& point = usage[index];
+        result.push_back( { m_impl->MakeRef( "cpu-usage", index ), point.Time(), point.Own(), point.Other() } );
+    }
+#endif
+    return result;
+}
+
+std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const ScanRange& range ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<uint64_t> threads;
+    for( const auto& [thread, data] : m_impl->worker->GetContextSwitchMap() ) threads.emplace_back( thread );
+    std::sort( threads.begin(), threads.end() );
+
+    std::vector<ContextSwitchDto> result;
+    size_t skipped = 0;
+    uint64_t ordinal = 0;
+    for( const auto thread : threads )
+    {
+        const auto* data = m_impl->worker->GetContextSwitchData( thread );
+        if( !data ) continue;
+        for( const auto& event : data->v )
+        {
+            const auto currentOrdinal = ordinal++;
+            const int64_t end = event.IsEndValid() ? event.End() : event.Start();
+            if( !Intersects( event.Start(), end, range ) ) continue;
+            if( skipped++ < range.offset ) continue;
+            ContextSwitchDto dto;
+            dto.ref = m_impl->MakeRef( "context-switch", currentOrdinal );
+            dto.threadRef = m_impl->MakeRef( "thread", thread );
+            dto.startNs = event.Start();
+            if( event.IsEndValid() ) dto.endNs = event.End();
+            if( event.WakeupVal() >= 0 ) dto.wakeupNs = event.WakeupVal();
+            dto.cpu = event.Cpu();
+            dto.wakeupCpu = event.WakeupCpu();
+            dto.reason = int8_t( event.Reason() );
+            dto.state = event.State();
+            dto.complete = event.IsEndValid();
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+    }
+    return result;
+}
+
+std::vector<SampleDto> WorkerTraceSource::ScanSampleEvents( const ScanRange& range ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<const ThreadData*> threads;
+    for( const auto* thread : m_impl->worker->GetThreadData() ) threads.emplace_back( thread );
+    std::sort( threads.begin(), threads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
+
+    std::vector<SampleDto> result;
+    size_t skipped = 0;
+    uint64_t ordinal = 0;
+    for( const auto* thread : threads )
+    {
+        for( const auto& sample : thread->samples )
+        {
+            const auto currentOrdinal = ordinal++;
+            if( sample.time.Val() < range.startNs || sample.time.Val() >= range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            SampleDto dto;
+            dto.ref = m_impl->MakeRef( "sample", currentOrdinal );
+            dto.threadRef = m_impl->MakeRef( "thread", thread->id );
+            dto.timeNs = sample.time.Val();
+            dto.callstack = sample.callstack.Val();
+            if( dto.callstack != 0 ) dto.callstackRef = m_impl->MakeRef( "callstack", dto.callstack );
+            dto.kind = "sample";
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+#ifndef TRACY_NO_STATISTICS
+        for( const auto& sample : thread->ctxSwitchSamples )
+        {
+            const auto currentOrdinal = ordinal++;
+            if( sample.time.Val() < range.startNs || sample.time.Val() >= range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            SampleDto dto;
+            dto.ref = m_impl->MakeRef( "context-switch-sample", currentOrdinal );
+            dto.threadRef = m_impl->MakeRef( "thread", thread->id );
+            dto.timeNs = sample.time.Val();
+            dto.callstack = sample.callstack.Val();
+            if( dto.callstack != 0 ) dto.callstackRef = m_impl->MakeRef( "callstack", dto.callstack );
+            dto.kind = "context_switch";
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+#endif
+    }
+    return result;
+}
+
+std::vector<GhostZoneDto> WorkerTraceSource::ScanGhostZones( const ScanRange& range ) const
+{
+#ifdef TRACY_NO_STATISTICS
+    (void)range;
+    return {};
+#else
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<const ThreadData*> threads;
+    for( const auto* thread : m_impl->worker->GetThreadData() ) threads.emplace_back( thread );
+    std::sort( threads.begin(), threads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
+
+    std::vector<GhostZoneDto> result;
+    size_t skipped = 0;
+    uint64_t ordinal = 0;
+    std::function<void( const Vector<GhostZone>&, const ThreadData&, uint32_t, std::optional<uint64_t> )> visit;
+    visit = [&]( const Vector<GhostZone>& zones, const ThreadData& thread, uint32_t depth, std::optional<uint64_t> parentOrdinal ) {
+        for( const auto& zone : zones )
+        {
+            const auto currentOrdinal = ordinal++;
+            const bool intersects = Intersects( zone.start.Val(), zone.end.Val(), range );
+            if( intersects && skipped++ >= range.offset && result.size() < range.limit )
+            {
+                const auto& key = m_impl->worker->GetGhostFrame( zone.frame );
+                const auto* frame = m_impl->worker->GetCallstackFrame( key.frame );
+                GhostZoneDto dto;
+                dto.ref = m_impl->MakeRef( "ghost-zone", currentOrdinal );
+                dto.threadRef = m_impl->MakeRef( "thread", thread.id );
+                if( parentOrdinal ) dto.parentRef = m_impl->MakeRef( "ghost-zone", *parentOrdinal );
+                dto.startNs = zone.start.Val();
+                dto.endNs = zone.end.Val();
+                dto.address = Hex( m_impl->worker->GetCanonicalPointer( key.frame ) );
+                dto.depth = depth;
+                dto.inlineFrame = frame && key.inlineFrame + 1 < frame->size;
+                if( frame && key.inlineFrame < frame->size )
+                {
+                    const auto& symbol = frame->data[key.inlineFrame];
+                    dto.name = Safe( m_impl->worker->TryGetString( symbol.name ) );
+                    dto.file = Safe( m_impl->worker->TryGetString( symbol.file ) );
+                    dto.line = symbol.line;
+                }
+                if( zone.child >= 0 ) dto.childCount = uint32_t( m_impl->worker->GetGhostChildren( zone.child ).size() );
+                result.emplace_back( std::move( dto ) );
+            }
+            if( zone.child >= 0 ) visit( m_impl->worker->GetGhostChildren( zone.child ), thread, depth + 1, currentOrdinal );
+        }
+    };
+    for( const auto* thread : threads )
+    {
+        visit( thread->ghostZones, *thread, 0, std::nullopt );
+        if( result.size() >= range.limit ) break;
+    }
+    return result;
+#endif
+}
+
+std::vector<HardwareSampleDto> WorkerTraceSource::GetHardwareSamples() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<HardwareSampleDto> result;
+    result.reserve( m_impl->worker->GetHwSamples().size() );
+    for( const auto& [address, data] : m_impl->worker->GetHwSamples() )
+    {
+        result.push_back( {
+            m_impl->MakeRef( "hardware-sample", address ), Hex( address ),
+            data.cycles.size(), data.retired.size(), data.cacheRef.size(), data.cacheMiss.size(), data.branchRetired.size(), data.branchMiss.size()
+        } );
+    }
+    std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.address < rhs.address; } );
+    return result;
+}
+
+std::vector<LockEventDto> WorkerTraceSource::ScanLockEvents( const ScanRange& range ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<std::pair<uint32_t, const LockMap*>> locks;
+    for( const auto& [id, value] : m_impl->worker->GetLockMap() ) locks.emplace_back( id, value );
+    std::sort( locks.begin(), locks.end(), []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; } );
+    const auto typeName = []( LockEvent::Type type ) {
+        switch( type )
+        {
+        case LockEvent::Type::Wait: return "wait";
+        case LockEvent::Type::Obtain: return "obtain";
+        case LockEvent::Type::Release: return "release";
+        case LockEvent::Type::WaitShared: return "wait_shared";
+        case LockEvent::Type::ObtainShared: return "obtain_shared";
+        case LockEvent::Type::ReleaseShared: return "release_shared";
+        }
+        return "unknown";
+    };
+
+    std::vector<LockEventDto> result;
+    size_t skipped = 0;
+    uint64_t ordinal = 0;
+    for( const auto& [lockId, lock] : locks )
+    {
+        for( const auto& item : lock->timeline )
+        {
+            const auto currentOrdinal = ordinal++;
+            const auto* event = item.ptr.get();
+            if( event->Time() < range.startNs || event->Time() >= range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            LockEventDto dto;
+            dto.ref = m_impl->MakeRef( "lock-event", currentOrdinal );
+            dto.lockRef = m_impl->MakeRef( "lock", lockId );
+            dto.timeNs = event->Time();
+            if( event->thread < lock->threadList.size() ) dto.threadRef = m_impl->MakeRef( "thread", lock->threadList[event->thread] );
+            dto.type = typeName( event->type );
+            if( item.lockCount != 0 && item.lockingThread < lock->threadList.size() ) dto.ownerThreadRef = m_impl->MakeRef( "thread", lock->threadList[item.lockingThread] );
+            dto.lockCount = item.lockCount;
+            for( size_t bit = 0; bit < lock->threadList.size() && bit < 64; bit++ )
+            {
+                if( item.waitList & ( uint64_t( 1 ) << bit ) ) dto.waiterThreadRefs.emplace_back( m_impl->MakeRef( "thread", lock->threadList[bit] ) );
+            }
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+    }
+    return result;
+}
+
+std::vector<SymbolDto> WorkerTraceSource::GetSymbols() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<SymbolDto> result;
+    result.reserve( m_impl->symbols.size() );
+    for( const auto address : m_impl->symbols )
+    {
+        const auto* symbol = m_impl->worker->GetSymbolData( address );
+        if( !symbol ) continue;
+        SymbolDto dto;
+        dto.ref = m_impl->MakeRef( "symbol", address );
+        dto.address = Hex( address );
+        dto.name = Safe( m_impl->worker->TryGetString( symbol->name ) );
+        dto.file = Safe( m_impl->worker->TryGetString( symbol->file ) );
+        dto.line = symbol->line;
+        dto.size = uint32_t( symbol->size.Val() );
+#ifndef TRACY_NO_STATISTICS
+        if( const auto* stats = m_impl->worker->GetSymbolStats( address ) )
+        {
+            dto.inclusiveSamples = stats->incl;
+            dto.exclusiveSamples = stats->excl;
+        }
+        if( const auto* children = m_impl->worker->GetChildSamples( address ) ) dto.childSamples = children->size();
+#endif
+        dto.hasCode = m_impl->worker->HasSymbolCode( address );
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+std::vector<SourceLocationDto> WorkerTraceSource::GetSourceLocations() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<SourceLocationDto> result;
+    result.reserve( m_impl->worker->GetSrcLocCount() );
+    // Index zero is Tracy's static-source sentinel. GetSourceLocation( 0 ) assumes a
+    // real expanded entry and therefore must never be used for enumeration.
+    for( size_t index = 1; index < m_impl->worker->GetStaticSourceLocationCount(); index++ ) result.emplace_back( m_impl->SourceLocation( int16_t( index ) ) );
+    for( size_t index = 0; index < m_impl->worker->GetDynamicSourceLocationCount(); index++ ) result.emplace_back( m_impl->SourceLocation( -int16_t( index + 1 ) ) );
+    return result;
+}
+
 std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -907,7 +1624,8 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
             const auto* frameData = worker.GetCallstackFrame( entry );
             if( !frameData )
             {
-                result.push_back( { m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth++ ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false } );
+                result.push_back( { m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
+                depth++;
                 continue;
             }
             for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
@@ -915,13 +1633,94 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
                 const auto& frame = frameData->data[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
-                    Safe( worker.GetString( frame.name ) ), Safe( worker.GetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size
+                    Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth
                 } );
                 depth++;
             }
         }
     }
+    return result;
+}
+
+std::vector<CallstackFrameDto> WorkerTraceSource::ResolveParentCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const
+{
+#ifdef TRACY_NO_STATISTICS
+    (void)callstacks;
+    (void)maxDepth;
+    return {};
+#else
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<CallstackFrameDto> result;
+    auto& worker = *m_impl->worker;
+    for( const auto callstack : callstacks )
+    {
+        if( callstack >= worker.GetCallstackParentPayloadCount() ) continue;
+        const auto& entries = worker.GetParentCallstack( callstack );
+        size_t depth = 0;
+        for( const auto& entry : entries )
+        {
+            if( depth >= maxDepth ) break;
+            const auto* frameData = entry.custom ? worker.GetParentCallstackFrame( entry ) : worker.GetCallstackFrame( entry );
+            if( !frameData )
+            {
+                result.push_back( { m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
+                depth++;
+                continue;
+            }
+            for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
+            {
+                const auto& frame = frameData->data[frameIndex];
+                result.push_back( {
+                    m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
+                    Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth
+                } );
+                depth++;
+            }
+        }
+    }
+    return result;
+#endif
+}
+
+std::vector<DisassemblyInstructionDto> WorkerTraceSource::DisassembleSymbol( std::string_view symbolRef, size_t maxBytes, size_t maxInstructions ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto symbol = m_impl->ParseRef( symbolRef, "symbol" );
+    if( !symbol || !m_impl->worker->HasSymbolCode( *symbol ) ) return {};
+
+    csh handle = 0;
+    cs_err status = CS_ERR_ARCH;
+    switch( m_impl->worker->GetCpuArch() )
+    {
+    case CpuArchX86: status = cs_open( CS_ARCH_X86, CS_MODE_32, &handle ); break;
+    case CpuArchX64: status = cs_open( CS_ARCH_X86, CS_MODE_64, &handle ); break;
+    case CpuArchArm32: status = cs_open( CS_ARCH_ARM, CS_MODE_ARM, &handle ); break;
+    case CpuArchArm64: status = cs_open( CS_ARCH_AARCH64, CS_MODE_ARM, &handle ); break;
+    case CpuArchUnknown: return {};
+    }
+    if( status != CS_ERR_OK ) return {};
+
+    uint32_t persistedBytes = 0;
+    const auto* code = reinterpret_cast<const uint8_t*>( m_impl->worker->GetSymbolCode( *symbol, persistedBytes ) );
+    const auto bytes = std::min( size_t( persistedBytes ), maxBytes );
+    cs_insn* instructions = nullptr;
+    const auto count = cs_disasm( handle, code, bytes, *symbol, maxInstructions, &instructions );
+    std::vector<DisassemblyInstructionDto> result;
+    result.reserve( count );
+    for( size_t index = 0; index < count; index++ )
+    {
+        const auto& instruction = instructions[index];
+        std::ostringstream encoded;
+        for( size_t byte = 0; byte < instruction.size; byte++ ) encoded << std::hex << std::setw( 2 ) << std::setfill( '0' ) << unsigned( instruction.bytes[byte] );
+        result.push_back( {
+            m_impl->MakeRef( "instruction", instruction.address ), Hex( instruction.address ), encoded.str(),
+            instruction.mnemonic, instruction.op_str, instruction.size
+        } );
+    }
+    if( instructions ) cs_free( instructions, count );
+    cs_close( &handle );
     return result;
 }
 

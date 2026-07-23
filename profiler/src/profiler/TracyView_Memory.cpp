@@ -178,7 +178,7 @@ bool View::IsGpuD3D12MemoryPool( uint64_t pool ) const
 {
     if( pool == 0 ) return false;
     const auto name = m_worker.GetString( pool );
-    return name && strncmp( name, "GPU D3D12 ", 10 ) == 0;
+    return name && analysis::IsGpuD3D12PoolName( name );
 }
 
 bool View::IsMemoryFramePlot( const PlotData& plot ) const
@@ -322,12 +322,12 @@ bool View::MemoryFrameSnapshotNeedsRebuild() const
     if( !snapshot.valid ) return true;
 
     const auto pools = GetMemoryFramePools();
-    if( pools.size() != snapshot.stamps.size() ) return true;
+    if( pools.size() != m_memInfo.frameSnapshotStamps.size() ) return true;
     for( size_t i=0; i<pools.size(); i++ )
     {
-        if( pools[i] != snapshot.stamps[i].pool ) return true;
+        if( pools[i] != m_memInfo.frameSnapshotStamps[i].pool ) return true;
         const auto& mem = m_worker.GetMemoryNamed( pools[i] );
-        if( mem.data.size() != snapshot.stamps[i].allocations || mem.frees.size() != snapshot.stamps[i].frees ) return true;
+        if( mem.data.size() != m_memInfo.frameSnapshotStamps[i].allocations || mem.frees.size() != m_memInfo.frameSnapshotStamps[i].frees ) return true;
     }
 
     const auto frameSet = selection.frameSet;
@@ -340,187 +340,48 @@ void View::RebuildMemoryFrameSnapshot()
     auto& selection = m_memInfo.frame;
     auto& snapshot = m_memInfo.frameSnapshot;
     snapshot = MemoryFrameSnapshot {};
+    m_memInfo.frameSnapshotStamps.clear();
     selection.dirty = false;
 
     if( selection.mapping != MemoryFrameMapping::Valid || !selection.frameSet || selection.frameIndex < 0 ) return;
     const auto count = GetMemoryFrameCount( *selection.frameSet );
     if( size_t( selection.frameIndex ) >= count ) return;
 
-    snapshot.begin = m_worker.GetFrameBegin( *selection.frameSet, selection.frameIndex );
-    snapshot.end = m_worker.GetFrameEnd( *selection.frameSet, selection.frameIndex );
-    if( snapshot.end <= snapshot.begin ) return;
-    snapshot.valid = true;
-
+    const auto begin = m_worker.GetFrameBegin( *selection.frameSet, selection.frameIndex );
+    const auto end = m_worker.GetFrameEnd( *selection.frameSet, selection.frameIndex );
+    if( end <= begin ) return;
+    bool possibleCaptureBaseline = false;
     if( m_worker.IsOnDemand() )
     {
         constexpr int64_t BaselineWindow = 100 * 1000 * 1000;
         const auto firstTime = m_worker.GetFirstTime();
-        snapshot.possibleCaptureBaseline = snapshot.begin <= firstTime + BaselineWindow && snapshot.end > firstTime;
+        possibleCaptureBaseline = begin <= firstTime + BaselineWindow && end > firstTime;
     }
 
-    struct TimelineEvent
-    {
-        int64_t time;
-        uint64_t size;
-        size_t summary;
-        bool allocation;
-    };
-    std::vector<TimelineEvent> timeline;
-
     const auto pools = GetMemoryFramePools();
-    snapshot.pools.reserve( pools.size() );
-    snapshot.stamps.reserve( pools.size() );
+    std::vector<analysis::MemoryEventInput> events;
     for( const auto pool : pools )
     {
         const auto& mem = m_worker.GetMemoryNamed( pool );
-        const auto summaryIndex = snapshot.pools.size();
-        MemoryFramePoolSummary summary;
-        summary.pool = pool;
-
-        snapshot.stamps.emplace_back( MemoryFramePoolStamp { pool, mem.data.size(), mem.frees.size() } );
-        const auto dataEnd = std::lower_bound( mem.data.begin(), mem.data.end(), snapshot.end, []( const auto& lhs, int64_t rhs ) { return lhs.TimeAlloc() < rhs; } );
-        for( auto it = mem.data.begin(); it != dataEnd; ++it )
+        m_memInfo.frameSnapshotStamps.emplace_back( MemoryFramePoolStamp { pool, mem.data.size(), mem.frees.size() } );
+        events.reserve( events.size() + mem.data.size() );
+        for( size_t index=0; index<mem.data.size(); index++ )
         {
-            const auto index = size_t( std::distance( mem.data.begin(), it ) );
-            const auto ta = it->TimeAlloc();
-            const auto tf = it->TimeFree();
-            const auto size = it->Size();
-            const bool activeAtStart = ta < snapshot.begin && ( tf < 0 || tf >= snapshot.begin );
-            const bool allocated = ta >= snapshot.begin;
-            const bool freed = tf >= snapshot.begin && tf < snapshot.end;
-            const bool activeAtEnd = tf < 0 || tf >= snapshot.end;
-
-            if( activeAtStart )
-            {
-                summary.startBytes += size;
-                summary.startCount++;
-                snapshot.activeAtStart.emplace_back( MemoryEventRef { pool, index } );
-            }
-            if( allocated )
-            {
-                summary.allocatedBytes += size;
-                summary.allocatedCount++;
-                snapshot.allocated.emplace_back( MemoryEventRef { pool, index } );
-                timeline.emplace_back( TimelineEvent { ta, size, summaryIndex, true } );
-            }
-            if( freed )
-            {
-                summary.freedBytes += size;
-                summary.freedCount++;
-                snapshot.freed.emplace_back( MemoryEventRef { pool, index } );
-                timeline.emplace_back( TimelineEvent { tf, size, summaryIndex, false } );
-            }
-            if( activeAtEnd )
-            {
-                summary.endBytes += size;
-                summary.endCount++;
-                snapshot.activeAtEnd.emplace_back( MemoryEventRef { pool, index } );
-            }
-            if( allocated || freed ) snapshot.transitions.emplace_back( MemoryEventRef { pool, index } );
+            const auto& event = mem.data[index];
+            analysis::MemoryEventInput input;
+            input.key = { pool, index };
+            input.identifier = event.Ptr();
+            input.size = event.Size();
+            input.allocationNs = event.TimeAlloc();
+            if( event.TimeFree() >= 0 ) input.freeNs = event.TimeFree();
+            input.allocationThread = m_worker.DecompressThread( event.ThreadAlloc() );
+            if( event.TimeFree() >= 0 ) input.freeThread = m_worker.DecompressThread( event.ThreadFree() );
+            input.allocationCallstack = event.CsAlloc();
+            input.freeCallstack = event.csFree.Val();
+            events.emplace_back( input );
         }
-
-        summary.peakBytes = summary.startBytes;
-        summary.peakCount = summary.startCount;
-        snapshot.total.startBytes += summary.startBytes;
-        snapshot.total.allocatedBytes += summary.allocatedBytes;
-        snapshot.total.freedBytes += summary.freedBytes;
-        snapshot.total.endBytes += summary.endBytes;
-        snapshot.total.startCount += summary.startCount;
-        snapshot.total.allocatedCount += summary.allocatedCount;
-        snapshot.total.freedCount += summary.freedCount;
-        snapshot.total.endCount += summary.endCount;
-        snapshot.pools.emplace_back( summary );
     }
-
-    snapshot.total.peakBytes = snapshot.total.startBytes;
-    snapshot.total.peakCount = snapshot.total.startCount;
-    std::vector<uint64_t> currentBytes( snapshot.pools.size() );
-    std::vector<uint64_t> currentCount( snapshot.pools.size() );
-    for( size_t i=0; i<snapshot.pools.size(); i++ )
-    {
-        currentBytes[i] = snapshot.pools[i].startBytes;
-        currentCount[i] = snapshot.pools[i].startCount;
-    }
-    uint64_t totalBytes = snapshot.total.startBytes;
-    uint64_t totalCount = snapshot.total.startCount;
-
-    std::sort( timeline.begin(), timeline.end(), []( const auto& lhs, const auto& rhs ) {
-        if( lhs.time != rhs.time ) return lhs.time < rhs.time;
-        if( lhs.allocation != rhs.allocation ) return !lhs.allocation;
-        return lhs.summary < rhs.summary;
-    } );
-    for( const auto& event : timeline )
-    {
-        if( event.allocation )
-        {
-            currentBytes[event.summary] += event.size;
-            currentCount[event.summary]++;
-            totalBytes += event.size;
-            totalCount++;
-        }
-        else
-        {
-            if( currentBytes[event.summary] < event.size || currentCount[event.summary] == 0 || totalBytes < event.size || totalCount == 0 )
-            {
-                snapshot.consistent = false;
-                currentBytes[event.summary] = currentBytes[event.summary] < event.size ? 0 : currentBytes[event.summary] - event.size;
-                currentCount[event.summary] = currentCount[event.summary] == 0 ? 0 : currentCount[event.summary] - 1;
-                totalBytes = totalBytes < event.size ? 0 : totalBytes - event.size;
-                totalCount = totalCount == 0 ? 0 : totalCount - 1;
-            }
-            else
-            {
-                currentBytes[event.summary] -= event.size;
-                currentCount[event.summary]--;
-                totalBytes -= event.size;
-                totalCount--;
-            }
-        }
-        auto& summary = snapshot.pools[event.summary];
-        summary.peakBytes = std::max( summary.peakBytes, currentBytes[event.summary] );
-        summary.peakCount = std::max( summary.peakCount, currentCount[event.summary] );
-        snapshot.total.peakBytes = std::max( snapshot.total.peakBytes, totalBytes );
-        snapshot.total.peakCount = std::max( snapshot.total.peakCount, totalCount );
-    }
-
-    auto validate = [&snapshot]( const MemoryFramePoolSummary& summary ) {
-        const bool bytesOk = summary.startBytes + summary.allocatedBytes >= summary.freedBytes && summary.startBytes + summary.allocatedBytes - summary.freedBytes == summary.endBytes;
-        const bool countOk = summary.startCount + summary.allocatedCount >= summary.freedCount && summary.startCount + summary.allocatedCount - summary.freedCount == summary.endCount;
-        const bool peakOk = summary.peakBytes >= summary.startBytes && summary.peakBytes >= summary.endBytes && summary.peakCount >= summary.startCount && summary.peakCount >= summary.endCount;
-        snapshot.consistent &= bytesOk && countOk && peakOk;
-        assert( bytesOk && countOk && peakOk );
-    };
-    for( const auto& summary : snapshot.pools ) validate( summary );
-    validate( snapshot.total );
-
-    auto allocOrder = [this]( const MemoryEventRef& lhs, const MemoryEventRef& rhs ) {
-        const auto& le = m_worker.GetMemoryNamed( lhs.pool ).data[lhs.index];
-        const auto& re = m_worker.GetMemoryNamed( rhs.pool ).data[rhs.index];
-        if( le.TimeAlloc() != re.TimeAlloc() ) return le.TimeAlloc() < re.TimeAlloc();
-        if( lhs.pool != rhs.pool ) return lhs.pool < rhs.pool;
-        return lhs.index < rhs.index;
-    };
-    auto freeOrder = [this]( const MemoryEventRef& lhs, const MemoryEventRef& rhs ) {
-        const auto& le = m_worker.GetMemoryNamed( lhs.pool ).data[lhs.index];
-        const auto& re = m_worker.GetMemoryNamed( rhs.pool ).data[rhs.index];
-        if( le.TimeFree() != re.TimeFree() ) return le.TimeFree() < re.TimeFree();
-        if( lhs.pool != rhs.pool ) return lhs.pool < rhs.pool;
-        return lhs.index < rhs.index;
-    };
-    auto transitionOrder = [this, &snapshot]( const MemoryEventRef& lhs, const MemoryEventRef& rhs ) {
-        const auto& le = m_worker.GetMemoryNamed( lhs.pool ).data[lhs.index];
-        const auto& re = m_worker.GetMemoryNamed( rhs.pool ).data[rhs.index];
-        const auto lt = le.TimeAlloc() >= snapshot.begin ? le.TimeAlloc() : le.TimeFree();
-        const auto rt = re.TimeAlloc() >= snapshot.begin ? re.TimeAlloc() : re.TimeFree();
-        if( lt != rt ) return lt < rt;
-        if( lhs.pool != rhs.pool ) return lhs.pool < rhs.pool;
-        return lhs.index < rhs.index;
-    };
-    std::sort( snapshot.activeAtStart.begin(), snapshot.activeAtStart.end(), allocOrder );
-    std::sort( snapshot.activeAtEnd.begin(), snapshot.activeAtEnd.end(), allocOrder );
-    std::sort( snapshot.allocated.begin(), snapshot.allocated.end(), allocOrder );
-    std::sort( snapshot.freed.begin(), snapshot.freed.end(), freeOrder );
-    std::sort( snapshot.transitions.begin(), snapshot.transitions.end(), transitionOrder );
+    snapshot = analysis::BuildMemoryFrameSnapshot( begin, end, pools, events, possibleCaptureBaseline );
 }
 
 void View::DrawMemoryIdentifier( uint64_t pool, const MemEvent& event ) const
@@ -533,35 +394,6 @@ void View::DrawMemoryIdentifier( uint64_t pool, const MemEvent& event ) const
     {
         ImGui::Text( "0x%" PRIx64, event.Ptr() );
     }
-}
-
-static bool GpuMemoryTextStartsWith( const std::string& text, const char* prefix )
-{
-    return text.compare( 0, strlen( prefix ), prefix ) == 0;
-}
-
-static std::string GpuMemoryTextField( const std::string& line, const char* key )
-{
-    const std::string pattern = std::string( "|" ) + key + "=";
-    const auto begin = line.find( pattern );
-    if( begin == std::string::npos ) return {};
-    const auto valueBegin = begin + pattern.size();
-    const auto valueEnd = line.find( '|', valueBegin );
-    return line.substr( valueBegin, valueEnd == std::string::npos ? std::string::npos : valueEnd - valueBegin );
-}
-
-static uint64_t GpuMemoryTextUnsigned( const std::string& line, const char* key, int base = 10 )
-{
-    const auto value = GpuMemoryTextField( line, key );
-    if( value.empty() ) return 0;
-    return strtoull( value.c_str(), nullptr, base );
-}
-
-static int GpuMemoryTextSigned( const std::string& line, const char* key )
-{
-    const auto value = GpuMemoryTextField( line, key );
-    if( value.empty() ) return 0;
-    return int( strtol( value.c_str(), nullptr, 10 ) );
 }
 
 size_t View::GetGpuMemoryAllocationCount() const
@@ -599,23 +431,15 @@ void View::EnsureGpuMemoryAttribution()
 void View::RebuildGpuMemoryAttribution()
 {
     auto& cache = m_memInfo.gpuAttribution;
-    const auto zoneCount = m_worker.GetZoneCount();
-    const auto gpuZoneCount = m_worker.GetGpuZoneCount();
-    const auto allocationCount = GetGpuMemoryAllocationCount();
-    const auto gpuZonesReady = m_worker.AreGpuSourceLocationZonesReady();
     const auto nextRebuildTime = cache.nextRebuildTime;
-
-    const bool reset = !cache.ready || cache.zoneCount > zoneCount || cache.gpuZoneCount > gpuZoneCount || cache.allocationCount > allocationCount;
-    if( reset )
-    {
-        cache = GpuMemoryAttributionCache {};
-        cache.nextRebuildTime = nextRebuildTime;
-    }
-
-    cache.zoneCount = zoneCount;
-    cache.gpuZoneCount = gpuZoneCount;
-    cache.allocationCount = allocationCount;
-    cache.gpuZonesReady = gpuZonesReady;
+    const auto selectedPassId = cache.selectedPassId;
+    cache = GpuMemoryAttributionCache {};
+    cache.nextRebuildTime = nextRebuildTime;
+    cache.selectedPassId = selectedPassId;
+    cache.zoneCount = m_worker.GetZoneCount();
+    cache.gpuZoneCount = m_worker.GetGpuZoneCount();
+    cache.allocationCount = GetGpuMemoryAllocationCount();
+    cache.gpuZonesReady = m_worker.AreGpuSourceLocationZonesReady();
 
     if( !m_worker.AreSourceLocationZonesReady() )
     {
@@ -623,316 +447,108 @@ void View::RebuildGpuMemoryAttribution()
         return;
     }
 
-    const auto firstNewRequestScope = cache.requestScopes.size();
-    const auto firstNewPass = cache.passes.size();
-    cache.pendingCpuZones = false;
-    cache.pendingGpuZones = false;
-
-    const auto& sourceLocationZones = m_worker.GetSourceLocationZones();
-    for( const auto& sourceEntry : sourceLocationZones )
+    std::vector<analysis::GpuMemoryCpuZoneInput> cpuInputs;
+    std::vector<const ZoneEvent*> cpuZonePointers;
+    for( const auto& sourceEntry : m_worker.GetSourceLocationZones() )
     {
         const auto& sourceLocation = m_worker.GetSourceLocation( sourceEntry.first );
-        const auto sourceName = m_worker.GetZoneName( sourceLocation );
-        const bool requestMarker = sourceName && strcmp( sourceName, "GTMEM Request Scope" ) == 0;
-        const bool passMarker = sourceName && strcmp( sourceName, "GTMEM Pass Relations" ) == 0;
-        if( !requestMarker && !passMarker ) continue;
-
-        cache.protocolPresent = true;
-        auto& processedZoneCount = cache.processedCpuZonesBySource[sourceEntry.first];
-        if( processedZoneCount > sourceEntry.second.zones.size() ) processedZoneCount = 0;
-        for( size_t zoneIndex=processedZoneCount; zoneIndex<sourceEntry.second.zones.size(); zoneIndex++ )
+        const auto markerNamePtr = m_worker.GetZoneName( sourceLocation );
+        const std::string markerName = markerNamePtr ? markerNamePtr : "";
+        if( markerName != analysis::GpuMemoryRequestMarker && markerName != analysis::GpuMemoryPassMarker ) continue;
+        for( const auto& zoneThread : sourceEntry.second.zones )
         {
-            const auto& zoneThread = sourceEntry.second.zones[zoneIndex];
             const auto zone = zoneThread.Zone();
-            if( !zone )
-            {
-                processedZoneCount = zoneIndex + 1;
-                continue;
-            }
-            if( zone->End() < 0 )
-            {
-                cache.pendingCpuZones = true;
-                break;
-            }
-            processedZoneCount = zoneIndex + 1;
+            if( !zone ) continue;
+            if( zone->End() < 0 ) { cache.pendingCpuZones = true; continue; }
             if( !m_worker.HasZoneExtra( *zone ) ) continue;
             const auto& extra = m_worker.GetZoneExtra( *zone );
             if( !extra.text.Active() ) continue;
-            const auto zoneText = m_worker.GetString( extra.text );
-            if( !zoneText ) continue;
-
-            const std::string text( zoneText );
-            if( requestMarker )
-            {
-                const auto lineEnd = text.find( '\n' );
-                const auto line = text.substr( 0, lineEnd );
-                if( !GpuMemoryTextStartsWith( line, "GTMEM1|SCOPE|" ) ) continue;
-
-                GpuMemoryRequestScope scope;
-                scope.labelId = GpuMemoryTextUnsigned( line, "label" );
-                scope.frame = GpuMemoryTextUnsigned( line, "frame" );
-                scope.thread = m_worker.DecompressThread( zoneThread.Thread() );
-                scope.start = zone->Start();
-                scope.end = m_worker.GetZoneEnd( *zone );
-                const auto scopeName = m_worker.GetZoneName( *zone );
-                scope.name = scopeName ? scopeName : "";
-                scope.zone = zone;
-                const auto scopeIndex = cache.requestScopes.size();
-                cache.requestScopes.emplace_back( std::move( scope ) );
-                const auto& storedScope = cache.requestScopes.back();
-                if( storedScope.labelId != 0 ) cache.requestScopeByLabel[storedScope.labelId] = scopeIndex;
-                cache.requestScopesByThread[storedScope.thread].emplace_back( scopeIndex );
-                continue;
-            }
-
-            GpuMemoryPass pass;
-            pass.thread = m_worker.DecompressThread( zoneThread.Thread() );
-            pass.start = zone->Start();
-            pass.end = m_worker.GetZoneEnd( *zone );
-            const auto passName = m_worker.GetZoneName( *zone );
-            pass.name = passName ? passName : "";
-            pass.relationZone = zone;
-            bool headerFound = false;
-            uint32_t parsedChunks = 0;
-
-            size_t cursor = 0;
-            while( cursor <= text.size() )
-            {
-                const auto lineEnd = text.find( '\n', cursor );
-                const auto line = text.substr( cursor, lineEnd == std::string::npos ? std::string::npos : lineEnd - cursor );
-                if( GpuMemoryTextStartsWith( line, "GTMEM1|PASS|" ) )
-                {
-                    pass.passId = GpuMemoryTextUnsigned( line, "pass" );
-                    pass.labelId = GpuMemoryTextUnsigned( line, "label" );
-                    pass.frame = GpuMemoryTextUnsigned( line, "frame" );
-                    pass.level = GpuMemoryTextSigned( line, "level" );
-                    pass.ordinal = GpuMemoryTextUnsigned( line, "ordinal" );
-                    pass.operations = GpuMemoryTextField( line, "ops" );
-                    pass.commandCount = uint32_t( GpuMemoryTextUnsigned( line, "commands" ) );
-                    pass.emittedUseCount = uint32_t( GpuMemoryTextUnsigned( line, "uses" ) );
-                    pass.totalUseCount = uint32_t( GpuMemoryTextUnsigned( line, "total" ) );
-                    pass.expectedChunks = uint32_t( GpuMemoryTextUnsigned( line, "chunks" ) );
-                    pass.untrackedReferences = uint32_t( GpuMemoryTextUnsigned( line, "untracked" ) );
-                    pass.truncated = GpuMemoryTextUnsigned( line, "truncated" ) != 0;
-                    pass.droppedUses = uint32_t( GpuMemoryTextUnsigned( line, "dropped" ) );
-                    headerFound = pass.passId != 0;
-                }
-                else if( GpuMemoryTextStartsWith( line, "GTMEM1|USE|" ) )
-                {
-                    const auto relationPassId = GpuMemoryTextUnsigned( line, "pass" );
-                    const auto data = GpuMemoryTextField( line, "data" );
-                    if( relationPassId != 0 && ( pass.passId == 0 || relationPassId == pass.passId ) )
-                    {
-                        parsedChunks++;
-                        size_t entryCursor = 0;
-                        while( entryCursor < data.size() )
-                        {
-                            const auto entryEnd = data.find( ',', entryCursor );
-                            const auto entry = data.substr( entryCursor, entryEnd == std::string::npos ? std::string::npos : entryEnd - entryCursor );
-                            const auto firstColon = entry.find( ':' );
-                            const auto secondColon = firstColon == std::string::npos ? std::string::npos : entry.find( ':', firstColon + 1 );
-                            if( firstColon != std::string::npos && secondColon != std::string::npos && secondColon > firstColon + 1 )
-                            {
-                                GpuMemoryPassUse use;
-                                use.allocationId = strtoull( entry.substr( 0, firstColon ).c_str(), nullptr, 10 );
-                                use.kind = entry[firstColon + 1];
-                                use.usageMask = uint32_t( strtoul( entry.substr( secondColon + 1 ).c_str(), nullptr, 16 ) );
-                                if( use.allocationId != 0 ) pass.uses.emplace_back( use );
-                            }
-                            if( entryEnd == std::string::npos ) break;
-                            entryCursor = entryEnd + 1;
-                        }
-                    }
-                }
-
-                if( lineEnd == std::string::npos ) break;
-                cursor = lineEnd + 1;
-            }
-
-            pass.complete = headerFound && parsedChunks == pass.expectedChunks && pass.uses.size() == pass.emittedUseCount;
-            if( headerFound ) cache.passes.emplace_back( std::move( pass ) );
+            const auto text = m_worker.GetString( extra.text );
+            if( !text ) continue;
+            const auto zoneName = m_worker.GetZoneName( *zone );
+            const auto index = cpuZonePointers.size();
+            cpuZonePointers.emplace_back( zone );
+            cpuInputs.push_back( {
+                index, markerName, zoneName ? zoneName : "", text,
+                m_worker.DecompressThread( zoneThread.Thread() ), zone->Start(), m_worker.GetZoneEnd( *zone )
+            } );
         }
     }
 
+    std::vector<analysis::GpuMemoryGpuZoneInput> gpuInputs;
+    std::vector<const GpuEvent*> gpuZonePointers;
+    if( cache.gpuZonesReady )
+    {
+        for( const auto& sourceEntry : m_worker.GetGpuSourceLocationZones() )
+        {
+            for( const auto& zoneThread : sourceEntry.second.zones )
+            {
+                const auto zone = zoneThread.Zone();
+                if( !zone ) continue;
+                if( zone->GpuEnd() < 0 ) { cache.pendingGpuZones = true; continue; }
+                const auto name = m_worker.GetZoneName( *zone );
+                if( !name ) continue;
+                const auto thread = zone->Thread() != 0 ? m_worker.DecompressThread( zone->Thread() ) : m_worker.DecompressThread( zoneThread.Thread() );
+                const auto index = gpuZonePointers.size();
+                gpuZonePointers.emplace_back( zone );
+                gpuInputs.push_back( { index, name, thread, zone->CpuStart(), zone->GpuStart(), zone->GpuEnd() } );
+            }
+        }
+    }
+
+    std::vector<analysis::GpuMemoryAllocationInput> allocationInputs;
     for( const auto& memoryEntry : m_worker.GetMemNameMap() )
     {
         const auto pool = memoryEntry.first;
         if( !IsGpuD3D12MemoryPool( pool ) ) continue;
         const auto& memory = *memoryEntry.second;
-        auto& processedAllocationCount = cache.processedAllocationsByPool[pool];
-        if( processedAllocationCount > memory.data.size() ) processedAllocationCount = 0;
-        for( size_t i=processedAllocationCount; i<memory.data.size(); i++ )
+        for( size_t index=0; index<memory.data.size(); index++ )
         {
-            const auto& event = memory.data[i];
-            const auto allocationId = event.Ptr();
-            if( allocationId == 0 ) continue;
-            cache.allocationById[allocationId] = MemoryEventRef { pool, i };
-
-            const auto thread = m_worker.DecompressThread( event.ThreadAlloc() );
-            const auto threadIt = cache.requestScopesByThread.find( thread );
-            if( threadIt == cache.requestScopesByThread.end() ) continue;
-            const auto allocationTime = event.TimeAlloc();
-            const auto& indices = threadIt->second;
-            auto scopeIt = std::upper_bound( indices.begin(), indices.end(), allocationTime, [&cache]( int64_t time, size_t index ) {
-                return time < cache.requestScopes[index].start;
-            } );
-            while( scopeIt != indices.begin() )
-            {
-                --scopeIt;
-                const auto& scope = cache.requestScopes[*scopeIt];
-                if( scope.start <= allocationTime && scope.end >= allocationTime )
-                {
-                    cache.requestLabelByAllocation[allocationId] = scope.labelId;
-                    break;
-                }
-                if( scope.end < allocationTime ) break;
-            }
-        }
-        processedAllocationCount = memory.data.size();
-    }
-
-    for( size_t scopeIndex=firstNewRequestScope; scopeIndex<cache.requestScopes.size(); scopeIndex++ )
-    {
-        const auto& scope = cache.requestScopes[scopeIndex];
-        for( const auto& allocation : cache.allocationById )
-        {
-            if( cache.requestLabelByAllocation.find( allocation.first ) != cache.requestLabelByAllocation.end() ) continue;
-            const auto& ref = allocation.second;
-            const auto& event = m_worker.GetMemoryNamed( ref.pool ).data[ref.index];
-            if( m_worker.DecompressThread( event.ThreadAlloc() ) != scope.thread ) continue;
-            if( event.TimeAlloc() >= scope.start && event.TimeAlloc() <= scope.end ) cache.requestLabelByAllocation[allocation.first] = scope.labelId;
+            const auto& event = memory.data[index];
+            if( event.Ptr() == 0 ) continue;
+            allocationInputs.push_back( { { pool, index }, event.Ptr(), event.Size(), m_worker.DecompressThread( event.ThreadAlloc() ), event.TimeAlloc() } );
         }
     }
 
-    for( size_t i=firstNewPass; i<cache.passes.size(); i++ )
+    const auto attribution = analysis::BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocationInputs );
+    cache.protocolPresent = attribution.protocolPresent;
+    cache.requestScopes.reserve( attribution.requestScopes.size() );
+    for( size_t index=0; index<attribution.requestScopes.size(); index++ )
     {
-        const auto& pass = cache.passes[i];
-        cache.passById[pass.passId] = i;
-        for( const auto& use : pass.uses ) cache.passesByAllocation[use.allocationId].emplace_back( i );
+        GpuMemoryRequestScope scope;
+        static_cast<analysis::GpuMemoryRequestScope&>( scope ) = attribution.requestScopes[index];
+        if( scope.cpuZoneIndex < cpuZonePointers.size() ) scope.zone = cpuZonePointers[scope.cpuZoneIndex];
+        const auto scopeIndex = cache.requestScopes.size();
+        cache.requestScopes.emplace_back( std::move( scope ) );
+        if( cache.requestScopes.back().labelId != 0 ) cache.requestScopeByLabel[cache.requestScopes.back().labelId] = scopeIndex;
     }
 
-    if( cache.gpuZonesReady )
+    cache.passes.reserve( attribution.passes.size() );
+    for( size_t index=0; index<attribution.passes.size(); index++ )
     {
-        unordered_flat_set<std::string> updatedGpuNames;
-        for( const auto& sourceEntry : m_worker.GetGpuSourceLocationZones() )
-        {
-            auto& processedZoneCount = cache.processedGpuZonesBySource[sourceEntry.first];
-            if( processedZoneCount > sourceEntry.second.zones.size() ) processedZoneCount = 0;
-            for( size_t zoneIndex=processedZoneCount; zoneIndex<sourceEntry.second.zones.size(); zoneIndex++ )
-            {
-                const auto& zoneThread = sourceEntry.second.zones[zoneIndex];
-                const auto zone = zoneThread.Zone();
-                if( !zone )
-                {
-                    processedZoneCount = zoneIndex + 1;
-                    continue;
-                }
-                if( zone->GpuEnd() < 0 )
-                {
-                    cache.pendingGpuZones = true;
-                    break;
-                }
-                processedZoneCount = zoneIndex + 1;
-                const auto name = m_worker.GetZoneName( *zone );
-                if( !name ) continue;
-                const auto thread = zone->Thread() != 0 ? m_worker.DecompressThread( zone->Thread() ) : m_worker.DecompressThread( zoneThread.Thread() );
-                auto& candidates = cache.gpuZonesByName[name];
-                const GpuMemoryGpuZoneCandidate candidate { zone, thread, zone->CpuStart() };
-                const auto insertionPoint = std::lower_bound( candidates.begin(), candidates.end(), candidate.cpuStart, []( const auto& lhs, int64_t cpuStart ) {
-                    return lhs.cpuStart < cpuStart;
-                } );
-                candidates.insert( insertionPoint, candidate );
-                updatedGpuNames.emplace( name );
-            }
-        }
-
-        for( const auto& name : updatedGpuNames )
-        {
-            const auto pendingIt = cache.pendingGpuPassesByName.find( name );
-            if( pendingIt == cache.pendingGpuPassesByName.end() ) continue;
-            auto& pending = pendingIt->second;
-            size_t write = 0;
-            for( const auto passIndex : pending )
-            {
-                if( !TryPairGpuMemoryPass( passIndex ) ) pending[write++] = passIndex;
-            }
-            pending.resize( write );
-        }
+        GpuMemoryPass pass;
+        static_cast<analysis::GpuMemoryPass&>( pass ) = attribution.passes[index];
+        if( pass.cpuZoneIndex < cpuZonePointers.size() ) pass.relationZone = cpuZonePointers[pass.cpuZoneIndex];
+        if( pass.gpuZoneIndex && *pass.gpuZoneIndex < gpuZonePointers.size() ) pass.gpuZone = gpuZonePointers[*pass.gpuZoneIndex];
+        pass.gpuPairAmbiguous = pass.gpuPairing == analysis::GpuZonePairing::Ambiguous;
+        const auto passIndex = cache.passes.size();
+        cache.passById[pass.passId] = passIndex;
+        for( const auto& use : pass.uses ) cache.passesByAllocation[use.allocationId].emplace_back( passIndex );
+        cache.passes.emplace_back( std::move( pass ) );
     }
-
-    for( size_t passIndex=firstNewPass; passIndex<cache.passes.size(); passIndex++ )
+    for( const auto& allocation : attribution.allocations )
     {
-        if( !TryPairGpuMemoryPass( passIndex ) ) cache.pendingGpuPassesByName[cache.passes[passIndex].name].emplace_back( passIndex );
+        cache.allocationById[allocation.allocation.allocationId] = MemoryEventRef { allocation.allocation.key.pool, allocation.allocation.key.index };
+        if( allocation.requestLabelId ) cache.requestLabelByAllocation[allocation.allocation.allocationId] = *allocation.requestLabelId;
     }
-
+    if( cache.selectedPassId != 0 && cache.passById.find( cache.selectedPassId ) == cache.passById.end() ) cache.selectedPassId = 0;
     cache.ready = true;
-}
-
-bool View::TryPairGpuMemoryPass( size_t passIndex )
-{
-    auto& cache = m_memInfo.gpuAttribution;
-    auto& pass = cache.passes[passIndex];
-    const auto candidatesIt = cache.gpuZonesByName.find( pass.name );
-    if( candidatesIt == cache.gpuZonesByName.end() ) return false;
-
-    const auto& candidates = candidatesIt->second;
-    auto candidateIt = std::lower_bound( candidates.begin(), candidates.end(), pass.start, []( const auto& lhs, int64_t cpuStart ) {
-        return lhs.cpuStart < cpuStart;
-    } );
-    const GpuMemoryGpuZoneCandidate* match = nullptr;
-    uint32_t matchCount = 0;
-    while( candidateIt != candidates.end() && candidateIt->cpuStart <= pass.end )
-    {
-        if( candidateIt->thread == pass.thread )
-        {
-            match = &*candidateIt;
-            matchCount++;
-        }
-        ++candidateIt;
-    }
-
-    if( matchCount == 1 )
-    {
-        pass.gpuZone = match->zone;
-        pass.gpuThread = match->thread;
-        return true;
-    }
-    if( matchCount > 1 )
-    {
-        pass.gpuPairAmbiguous = true;
-        return true;
-    }
-    return false;
+    return;
 }
 
 std::string View::FormatGpuMemoryUsage( uint32_t usageMask ) const
 {
-    std::string text;
-    auto append = [&text]( const char* value ) {
-        if( !text.empty() ) text += ", ";
-        text += value;
-    };
-
-    const bool read = ( usageMask & ( 1u << 0 ) ) != 0;
-    const bool write = ( usageMask & ( 1u << 1 ) ) != 0;
-    if( read && write ) append( "Read/Write" );
-    else if( read ) append( "Read" );
-    else if( write ) append( "Write" );
-    if( usageMask & ( 1u << 2 ) ) append( "Copy" );
-    if( usageMask & ( 1u << 3 ) ) append( "Resolve" );
-    if( usageMask & ( 1u << 4 ) ) append( "Uniform" );
-    if( usageMask & ( 1u << 5 ) ) append( "Indirect" );
-    if( usageMask & ( 1u << 6 ) ) append( "Texel" );
-    if( usageMask & ( 1u << 7 ) ) append( "Storage" );
-    if( usageMask & ( 1u << 8 ) ) append( "Vertex" );
-    if( usageMask & ( 1u << 9 ) ) append( "Index" );
-    if( usageMask & ( 1u << 10 ) ) append( "Sampled" );
-    if( usageMask & ( 1u << 11 ) ) append( "Color attachment" );
-    if( usageMask & ( 1u << 12 ) ) append( "Depth attachment" );
-    if( usageMask & ( 1u << 13 ) ) append( "Special attachment" );
-    if( usageMask & ( 1u << 14 ) ) append( "General" );
-    if( usageMask & ( 1u << 15 ) ) append( "Acceleration structure" );
-    return text.empty() ? "-" : text;
+    return analysis::FormatGpuMemoryUsage( usageMask );
 }
 
 bool View::DrawGpuMemoryPassLink( const GpuMemoryPass& pass, int& widgetId )
