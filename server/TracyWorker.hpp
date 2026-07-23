@@ -84,7 +84,13 @@ struct LoadProgress
         CallStacks,
         FrameImages,
         ContextSwitches,
-        ContextSwitchesPerCpu
+        ContextSwitchesPerCpu,
+        ThreadPidMap,
+        CpuThreadData,
+        Symbols,
+        SymbolCode,
+        HardwareSamples,
+        SourceCache
     };
 
     LoadProgress() : total( 0 ), progress( 0 ), subTotal( 0 ), subProgress( 0 ) {}
@@ -543,6 +549,7 @@ public:
         if( m_data.ctxSwitchLast.first == thread ) return m_data.ctxSwitchLast.second;
         return GetContextSwitchDataImpl( thread );
     }
+    const unordered_flat_map<uint64_t, ContextSwitch*>& GetContextSwitchMap() const { return m_data.ctxSwitch; }
     const CpuData* GetCpuData() const { return m_data.cpuData; }
     int GetCpuDataCpuCount() const { return m_data.cpuDataCount; }
     uint64_t GetPidFromTid( uint64_t tid ) const;
@@ -552,6 +559,7 @@ public:
     uint64_t GetSourceFileCacheSize() const;
     MemoryBlock GetSourceFileFromCache( const char* file ) const;
     HwSampleData* GetHwSampleData( uint64_t addr );
+    const unordered_flat_map<uint64_t, HwSampleData>& GetHwSamples() const { return m_data.hwSamples; }
 
     int64_t GetFrameTime( const FrameData& fd, size_t idx ) const;
     int64_t GetFrameBegin( const FrameData& fd, size_t idx ) const;
@@ -608,10 +616,28 @@ public:
     const char* GetString( uint64_t ptr ) const;
     const char* GetString( const StringRef& ref ) const;
     const char* GetString( const StringIdx& idx ) const;
+    tracy_force_inline const char* TryGetString( const StringRef& ref ) const
+    {
+        if( !ref.active ) return nullptr;
+        if( ref.isidx )
+        {
+            return ref.str < m_data.stringData.size() ? m_data.stringData[ref.str] : nullptr;
+        }
+        const auto it = m_data.strings.find( ref.str );
+        return it != m_data.strings.end() ? it->second : nullptr;
+    }
+    tracy_force_inline const char* TryGetString( const StringIdx& idx ) const
+    {
+        if( !idx.Active() ) return nullptr;
+        const auto value = idx.Idx();
+        return value < m_data.stringData.size() ? m_data.stringData[value] : nullptr;
+    }
     const char* GetThreadName( uint64_t id ) const;
     bool IsThreadLocal( uint64_t id );
     bool IsThreadFiber( uint64_t id );
     const SourceLocation& GetSourceLocation( int16_t srcloc ) const;
+    size_t GetStaticSourceLocationCount() const { return m_data.sourceLocationExpand.size(); }
+    size_t GetDynamicSourceLocationCount() const { return m_data.sourceLocationPayload.size(); }
     std::pair<const char*, const char*> GetExternalName( uint64_t id ) const;
 
     const char* GetZoneName( const SourceLocation& srcloc ) const;
@@ -627,6 +653,7 @@ public:
 #endif
 
     tracy_force_inline const bool HasZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0; }
+    tracy_force_inline const bool HasValidZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0 && ev.extra < m_data.zoneExtra.size(); }
     tracy_force_inline const ZoneExtra& GetZoneExtra( const ZoneEvent& ev ) const { return m_data.zoneExtra[ev.extra]; }
 
     std::vector<int16_t> GetMatchingSourceLocation( const char* query, bool ignoreCase ) const;

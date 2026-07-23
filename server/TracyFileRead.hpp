@@ -108,6 +108,7 @@ class FileRead
 
         bool inputReady = false;
         bool exit = false;
+        bool exhausted = false;
         alignas(64) std::atomic<bool> outputReady;
 
         std::mutex signalLock;
@@ -138,7 +139,7 @@ public:
 
     tracy_force_inline void Read( void* ptr, size_t size )
     {
-        if( size <= FileBufSize - m_offset )
+        if( size <= m_bufSize - m_offset )
         {
             ReadSmall( ptr, size );
         }
@@ -150,7 +151,7 @@ public:
 
     tracy_force_inline void Skip( size_t size )
     {
-        if( size <= FileBufSize - m_offset )
+        if( size <= m_bufSize - m_offset )
         {
             m_offset += size;
         }
@@ -163,7 +164,7 @@ public:
     template<class T>
     tracy_force_inline void Read( T& v )
     {
-        if( sizeof( T ) <= FileBufSize - m_offset )
+        if( sizeof( T ) <= m_bufSize - m_offset )
         {
             memcpy( &v, m_buf + m_offset, sizeof( T ) );
             m_offset += sizeof( T );
@@ -179,7 +180,7 @@ public:
     template<class T, class U>
     tracy_force_inline void Read2( T& v0, U& v1 )
     {
-        if( sizeof( T ) + sizeof( U ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -197,7 +198,7 @@ public:
     template<class T, class U, class V>
     tracy_force_inline void Read3( T& v0, U& v1, V& v2 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -217,7 +218,7 @@ public:
     template<class T, class U, class V, class W>
     tracy_force_inline void Read4( T& v0, U& v1, V& v2, W& v3 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -239,7 +240,7 @@ public:
     template<class T, class U, class V, class W, class X>
     tracy_force_inline void Read5( T& v0, U& v1, V& v2, W& v3, X& v4 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -263,7 +264,7 @@ public:
     template<class T, class U, class V, class W, class X, class Y>
     tracy_force_inline void Read6( T& v0, U& v1, V& v2, W& v3, X& v4, Y& v5 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -289,7 +290,7 @@ public:
     template<class T, class U, class V, class W, class X, class Y, class Z>
     tracy_force_inline void Read7( T& v0, U& v1, V& v2, W& v3, X& v4, Y& v5, Z& v6 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -317,7 +318,7 @@ public:
     template<class T, class U, class V, class W, class X, class Y, class Z, class A>
     tracy_force_inline void Read8( T& v0, U& v1, V& v2, W& v3, X& v4, Y& v5, Z& v6, A& v7 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -347,7 +348,7 @@ public:
     template<class T, class U, class V, class W, class X, class Y, class Z, class A, class B>
     tracy_force_inline void Read9( T& v0, U& v1, V& v2, W& v3, X& v4, Y& v5, Z& v6, A& v7, B& v8 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) + sizeof( B ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) + sizeof( B ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -379,7 +380,7 @@ public:
     template<class T, class U, class V, class W, class X, class Y, class Z, class A, class B, class C>
     tracy_force_inline void Read10( T& v0, U& v1, V& v2, W& v3, X& v4, Y& v5, Z& v6, A& v7, B& v8, C& v9 )
     {
-        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) + sizeof( B ) + sizeof( C ) <= FileBufSize - m_offset )
+        if( sizeof( T ) + sizeof( U ) + sizeof( V ) + sizeof( W ) + sizeof( X ) + sizeof( Y ) + sizeof( Z ) + sizeof( A ) + sizeof( B ) + sizeof( C ) <= m_bufSize - m_offset )
         {
             memcpy( &v0, m_buf + m_offset, sizeof( T ) );
             memcpy( &v1, m_buf + m_offset + sizeof( T ), sizeof( U ) );
@@ -416,6 +417,7 @@ private:
     FileRead( FILE* f, const char* fn )
         : m_data( nullptr )
         , m_offset( 0 )
+        , m_bufSize( 0 )
         , m_streamId( 0 )
         , m_filename( fn )
     {
@@ -495,9 +497,11 @@ private:
 
     tracy_force_inline uint32_t ReadBlockSize()
     {
+        if( m_dataOffset > m_dataSize || m_dataSize - m_dataOffset < sizeof( uint32_t ) ) throw FileReadError();
         uint32_t sz;
         memcpy( &sz, m_data + m_dataOffset, sizeof( sz ) );
         m_dataOffset += sizeof( sz );
+        if( sz > m_dataSize - m_dataOffset ) throw FileReadError();
         return sz;
     }
 
@@ -529,16 +533,16 @@ private:
         do
         {
             size_t sz;
-            if( m_offset == FileBufSize )
+            if( m_offset == m_bufSize )
             {
-                sz = std::min<size_t>( size, FileBufSize );
                 GetNextDataBlock();
+                sz = std::min<size_t>( size, m_bufSize );
                 memcpy( dst, m_buf, sz );
                 m_offset = sz;
             }
             else
             {
-                sz = std::min( size, FileBufSize - m_offset );
+                sz = std::min( size, m_bufSize - m_offset );
                 memcpy( dst, m_buf + m_offset, sz );
                 m_offset += sz;
             }
@@ -553,8 +557,8 @@ private:
     {
         while( size > 0 )
         {
-            if( m_offset == FileBufSize ) GetNextDataBlock();
-            const auto sz = std::min( size, FileBufSize - m_offset );
+            if( m_offset == m_bufSize ) GetNextDataBlock();
+            const auto sz = std::min( size, m_bufSize - m_offset );
             m_offset += sz;
             size -= sz;
         }
@@ -563,9 +567,11 @@ private:
     void GetNextDataBlock()
     {
         auto& hnd = *m_streams[m_streamId];
+        if( hnd.exhausted ) throw FileReadError();
         while( hnd.outputReady.load( std::memory_order_acquire ) == false ) { YieldThread(); }
         hnd.outputReady.store( false, std::memory_order_relaxed );
         m_buf = hnd.stream.GetBuffer();
+        m_bufSize = hnd.stream.GetSize();
         m_offset = 0;
 
         if( m_dataOffset < m_dataSize )
@@ -579,6 +585,10 @@ private:
             lock.unlock();
             m_dataOffset += sz;
         }
+        else
+        {
+            hnd.exhausted = true;
+        }
 
         m_streamId = ( m_streamId + 1 ) % m_streams.size();
     }
@@ -588,6 +598,7 @@ private:
     uint64_t m_dataSize;
     uint64_t m_dataOffset;
     size_t m_offset;
+    size_t m_bufSize;
     int m_streamId;
 
     std::string m_filename;

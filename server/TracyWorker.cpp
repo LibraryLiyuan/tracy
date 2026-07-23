@@ -578,7 +578,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
     m_traceVersion = fileVer;
 
-    s_loadProgress.total.store( 11, std::memory_order_relaxed );
+    s_loadProgress.total.store( 17, std::memory_order_relaxed );
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::Initialization, std::memory_order_relaxed );
     f.Read8( m_resolution, m_timerMul, m_data.lastTime, m_data.frameOffset, m_pid, m_samplingPeriod, m_data.cpuArch, m_data.cpuId );
@@ -1551,28 +1551,42 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
     }
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::ThreadPidMap, std::memory_order_relaxed );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t tid, pid;
         f.Read2( tid, pid );
         m_data.tidToPid.emplace( tid, pid );
+        s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
     }
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::CpuThreadData, std::memory_order_relaxed );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t tid;
         CpuThreadData data;
         f.Read2( tid, data );
         m_data.cpuThreadData.emplace( tid, data );
+        s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
     }
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::Symbols, std::memory_order_relaxed );
     f.Read( sz );
     m_data.symbolLoc.reserve_exact( sz, m_slab );
     f.Read( sz );
     m_data.symbolLocInline.reserve_exact( sz, m_slab );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     m_data.symbolMap.reserve( sz );
     int symIdx = 0;
     int symInlineIdx = 0;
@@ -1593,6 +1607,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         {
             m_data.symbolLoc[symIdx++] = SymbolLocation { symAddr, size.Val() };
         }
+        s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
     }
 
 #ifdef __EMSCRIPTEN__
@@ -1603,7 +1618,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     ppqsort::sort( ppqsort::execution::par, m_data.symbolLocInline.begin(), m_data.symbolLocInline.end() );
 #endif
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::SymbolCode, std::memory_order_relaxed );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     if( eventMask & EventType::SymbolCode )
     {
         uint64_t ssz = 0;
@@ -1617,6 +1636,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             auto ptr = (char*)m_slab.AllocBig( len );
             f.Read( ptr, len );
             m_data.symbolCode.emplace( symAddr, MemoryBlock { ptr, len } );
+            s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
         }
         m_data.symbolCodeSize = ssz;
     }
@@ -1628,6 +1648,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint32_t len;
             f.Read2( symAddr, len );
             f.Skip( len );
+            s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
         }
     }
 
@@ -1640,7 +1661,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         m_data.codeSymbolMap.emplace( v1, v2 );
     }
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::HardwareSamples, std::memory_order_relaxed );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     m_data.hwSamples.reserve( sz );
     for( uint64_t i=0; i<sz; i++ )
     {
@@ -1653,9 +1678,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         ReadHwSampleVec( f, data.cacheMiss, m_slab );
         if( ReadHwSampleVec( f, data.branchRetired, m_slab ) != 0 ) m_data.hasBranchRetirement = true;
         ReadHwSampleVec( f, data.branchMiss, m_slab );
+        s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
     }
 
+    s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+    s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+    s_loadProgress.progress.store( LoadProgress::SourceCache, std::memory_order_relaxed );
     f.Read( sz );
+    s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     if( eventMask & EventType::SourceCache )
     {
         m_data.sourceFileCache.reserve( sz );
@@ -1670,6 +1700,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             auto data = (char*)m_slab.AllocBig( len );
             f.Read( data, len );
             m_data.sourceFileCache.emplace( key, MemoryBlock { data, len } );
+            s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
         }
     }
     else
@@ -1679,6 +1710,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint32_t s32;
             f.Read( s32 );
             f.Skip( s32 );
+            s_loadProgress.subProgress.store( i + 1, std::memory_order_relaxed );
             f.Read( s32 );
             f.Skip( s32 );
         }
