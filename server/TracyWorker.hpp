@@ -19,6 +19,7 @@
 #include "../public/common/TracySocket.hpp"
 #include "tracy_robin_hood.h"
 #include "TracyEvent.hpp"
+#include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
 #include "TracyStringDiscovery.hpp"
@@ -461,7 +462,7 @@ public:
         NUM_FAILURES
     };
 
-    Worker( const char* addr, uint16_t port, int64_t memoryLimit );
+    Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false);
     ~Worker();
@@ -702,8 +703,9 @@ public:
     bool IsOnDemand() const { return m_onDemand; }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
     void Disconnect();
-    bool WasDisconnectIssued() const { return m_disconnect; }
+    bool WasDisconnectIssued() const { return m_disconnect.load( std::memory_order_relaxed ); }
     int64_t GetMemoryLimit() const { return m_memoryLimit; }
+    bool DidProtocolObserverFail() const { return m_protocolObserverFailed.load( std::memory_order_relaxed ); }
 
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
@@ -746,10 +748,14 @@ private:
     void Network();
     void Exec();
     void Query( ServerQuery type, uint64_t data, uint32_t extra = 0 );
-    void QueryTerminate();
+    bool QueryTerminate();
     void QuerySourceFile( const char* fn, const char* image );
     void QueryDataTransfer( const void* ptr, size_t size );
     void QueryCallstackFrame( uint64_t addr );
+    bool ObserveProtocol( ProtocolDirection direction, ProtocolChunk chunk, std::span<const ProtocolDataSpan> data );
+    bool SendProtocol( const void* data, int size, ProtocolChunk chunk );
+    void NotifyProtocolClose( ProtocolCloseReason reason );
+    void FinishProtocol( ProtocolCloseReason reason );
 
     tracy_force_inline bool DispatchProcess( const QueueItem& ev, const char*& ptr );
     tracy_force_inline bool Process( const QueueItem& ev );
@@ -1035,6 +1041,10 @@ private:
     Socket m_sock;
     std::string m_addr;
     uint16_t m_port;
+    ProtocolObserver* m_protocolObserver = nullptr;
+    std::atomic<bool> m_protocolObserverFailed { false };
+    std::atomic<bool> m_protocolObserverClosed { false };
+    std::atomic<bool> m_protocolTransportError { false };
 
     std::thread m_thread;
     std::thread m_threadNet;
@@ -1056,7 +1066,7 @@ private:
     int64_t m_samplingPeriod;
     bool m_terminate = false;
     bool m_crashed = false;
-    bool m_disconnect = false;
+    std::atomic<bool> m_disconnect { false };
     void* m_stream;     // LZ4_streamDecode_t*
     char* m_buffer;
     int m_bufferOffset;
@@ -1149,6 +1159,10 @@ private:
     int m_netWriteCnt = 0;
     std::mutex m_netWriteLock;
     std::condition_variable m_netWriteCv;
+
+    bool m_networkStopped = false;
+    std::mutex m_networkStopLock;
+    std::condition_variable m_networkStopCv;
 
 #ifdef TRACY_NO_STATISTICS
     Vector<ZoneEvent*> m_zoneEventPool;

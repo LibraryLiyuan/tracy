@@ -6,7 +6,10 @@
 #endif
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
+#include <cwctype>
+#include <filesystem>
 #include <inttypes.h>
 #include <mutex>
 #include <signal.h>
@@ -23,6 +26,7 @@
 #include "../../server/TracyPrint.hpp"
 #include "../../server/TracySysUtil.hpp"
 #include "../../server/TracyWorker.hpp"
+#include "../../stream/src/TracyStreamProtocol.hpp"
 
 #ifdef _WIN32
 #  include "../../getopt/getopt.h"
@@ -92,8 +96,33 @@ void AnsiPrintf( const char* ansiEscape, const char* format, ... ) {
 
 [[noreturn]] void Usage()
 {
-    printf( "Usage: capture -o output.tracy [-a address] [-p port] [-f] [-s seconds] [-m memlimit]\n" );
+    printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit]\n" );
     exit( 1 );
+}
+
+std::filesystem::path NormalizeOutputPath( const char* value )
+{
+    std::error_code ec;
+    auto result = std::filesystem::weakly_canonical( std::filesystem::path( value ), ec );
+    if( ec )
+    {
+        ec.clear();
+        result = std::filesystem::absolute( std::filesystem::path( value ), ec );
+        if( ec ) result = std::filesystem::path( value );
+        result = result.lexically_normal();
+    }
+#ifdef _WIN32
+    auto native = result.native();
+    std::transform( native.begin(), native.end(), native.begin(), []( wchar_t ch ) { return std::towlower( ch ); } );
+    return std::filesystem::path( std::move( native ) );
+#else
+    return result;
+#endif
+}
+
+bool SameOutputPath( const char* lhs, const char* rhs )
+{
+    return NormalizeOutputPath( lhs ) == NormalizeOutputPath( rhs );
 }
 
 int main( int argc, char** argv )
@@ -111,12 +140,13 @@ int main( int argc, char** argv )
     bool overwrite = false;
     const char* address = "127.0.0.1";
     const char* output = nullptr;
+    const char* journalOutput = nullptr;
     int port = 8086;
     int seconds = -1;
     int64_t memoryLimit = -1;
 
     int c;
-    while( ( c = getopt( argc, argv, "a:o:p:fs:m:" ) ) != -1 )
+    while( ( c = getopt( argc, argv, "a:o:j:p:fs:m:" ) ) != -1 )
     {
         switch( c )
         {
@@ -125,6 +155,9 @@ int main( int argc, char** argv )
             break;
         case 'o':
             output = optarg;
+            break;
+        case 'j':
+            journalOutput = optarg;
             break;
         case 'p':
             port = atoi( optarg );
@@ -144,27 +177,65 @@ int main( int argc, char** argv )
         }
     }
 
-    if( !address || !output ) Usage();
-
-    struct stat st;
-    if( stat( output, &st ) == 0 && !overwrite )
+    if( !journalOutput )
     {
-        printf( "Output file %s already exists! Use -f to force overwrite.\n", output );
+        const auto journalFromEnvironment = getenv( "TRACY_STREAM_OUTPUT" );
+        if( journalFromEnvironment && journalFromEnvironment[0] != '\0' ) journalOutput = journalFromEnvironment;
+    }
+
+    if( !address || address[0] == '\0' || ( !output && !journalOutput ) ) Usage();
+    if( port < 1 || port > 65535 )
+    {
+        printf( "Port must be between 1 and 65535.\n" );
+        return 4;
+    }
+    if( seconds < -1 )
+    {
+        printf( "Capture duration must be -1 or a non-negative number of seconds.\n" );
+        return 4;
+    }
+    if( output && journalOutput && SameOutputPath( output, journalOutput ) )
+    {
+        printf( "Snapshot and journal outputs must use different paths.\n" );
         return 4;
     }
 
-    FILE* test = fopen( output, "wb" );
-    if( !test )
+    if( output )
     {
-        printf( "Cannot open output file %s for writing!\n", output );
-        return 5;
+        struct stat st;
+        if( stat( output, &st ) == 0 && !overwrite )
+        {
+            printf( "Output file %s already exists! Use -f to force overwrite.\n", output );
+            return 4;
+        }
+
+        FILE* test = fopen( output, "wb" );
+        if( !test )
+        {
+            printf( "Cannot open output file %s for writing!\n", output );
+            return 5;
+        }
+        fclose( test );
+        unlink( output );
     }
-    fclose( test );
-    unlink( output );
+
+    std::unique_ptr<tracy::stream::StreamProtocolObserver> protocolObserver;
+    if( journalOutput )
+    {
+        tracy::stream::ProtocolJournalOptions journalOptions;
+        std::string journalError;
+        protocolObserver = tracy::stream::StreamProtocolObserver::CreateFileJournal( journalOutput, address, uint16_t( port ), tracy::ProtocolVersion, overwrite, journalOptions, journalError );
+        if( !protocolObserver )
+        {
+            printf( "Cannot create stream journal %s: %s\n", journalOutput, journalError.c_str() );
+            return 5;
+        }
+        printf( "Streaming protocol journal to %s\n", journalOutput );
+    }
 
     printf( "Connecting to %s:%i...", address, port );
     fflush( stdout );
-    tracy::Worker worker( address, port, memoryLimit );
+    tracy::Worker worker( address, port, memoryLimit, protocolObserver.get() );
     while( !worker.HasData() )
     {
         const auto handshake = worker.GetHandshakeStatus();
@@ -264,6 +335,10 @@ int main( int argc, char** argv )
         }
     }
     const auto t1 = std::chrono::high_resolution_clock::now();
+    while( worker.IsConnected() )
+    {
+        std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+    }
 
     const auto& failure = worker.GetFailureType();
     if( failure != tracy::Worker::Failure::None )
@@ -342,23 +417,40 @@ int main( int argc, char** argv )
         }
     }
 
-    printf( "\nFrames: %" PRIu64 "\nTime span: %s\nZones: %s\nElapsed time: %s\nSaving trace...",
+    printf( "\nFrames: %" PRIu64 "\nTime span: %s\nZones: %s\nElapsed time: %s\n",
         worker.GetFrameCount( *worker.GetFramesBase() ), tracy::TimeToString( worker.GetLastTime() - firstTime ), tracy::RealToString( worker.GetZoneCount() ),
         tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count() ) );
-    fflush( stdout );
-    auto f = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open( output, tracy::FileCompression::Zstd, 3, 4 ) );
-    if( f )
+    if( protocolObserver )
     {
-        worker.Write( *f, false );
-        AnsiPrintf( ANSI_GREEN ANSI_BOLD, " done!\n" );
-        f->Finish();
-        const auto stats = f->GetCompressionStatistics();
-        printf( "Trace size %s (%.2f%% ratio)\n", tracy::MemSizeToString( stats.second ), 100.f * stats.second / stats.first );
-    }
-    else
-    {
-        AnsiPrintf( ANSI_RED ANSI_BOLD, " failed!\n");
+        const std::string committedText = tracy::MemSizeToString( protocolObserver->CommittedSize() );
+        const std::string durableText = tracy::MemSizeToString( protocolObserver->DurableSize() );
+        printf( "Stream journal: %s committed, %s durable, %" PRIu64 " client bytes, %" PRIu64 " server bytes\n",
+            committedText.c_str(), durableText.c_str(),
+            protocolObserver->ClientBytes(), protocolObserver->ServerBytes() );
+        if( protocolObserver->Failed() )
+        {
+            AnsiPrintf( ANSI_RED ANSI_BOLD, "Stream journal failed: %s\n", protocolObserver->LastError().c_str() );
+        }
     }
 
-    return 0;
+    if( output )
+    {
+        printf( "Saving trace..." );
+        fflush( stdout );
+        auto f = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open( output, tracy::FileCompression::Zstd, 3, 4 ) );
+        if( f )
+        {
+            worker.Write( *f, false );
+            AnsiPrintf( ANSI_GREEN ANSI_BOLD, " done!\n" );
+            f->Finish();
+            const auto stats = f->GetCompressionStatistics();
+            printf( "Trace size %s (%.2f%% ratio)\n", tracy::MemSizeToString( stats.second ), 100.f * stats.second / stats.first );
+        }
+        else
+        {
+            AnsiPrintf( ANSI_RED ANSI_BOLD, " failed!\n");
+        }
+    }
+
+    return protocolObserver && protocolObserver->Failed() ? 6 : 0;
 }

@@ -14,15 +14,19 @@ project(
 )
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
-include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server_vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
 
 set(PROGRAM_FILES
     src/capture.cpp
 )
 
 add_executable(${PROJECT_NAME} ${PROGRAM_FILES} ${COMMON_FILES} ${SERVER_FILES})
-target_link_libraries(${PROJECT_NAME} PRIVATE TracyServer TracyGetOpt)
+target_link_libraries(${PROJECT_NAME} PRIVATE TracyServer TracyStreamCore TracyGetOpt)
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 
-install(TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
+add_executable(tracy-stream-convert src/stream-convert.cpp)
+target_link_libraries(tracy-stream-convert PRIVATE TracyServer TracyStreamCore)
+
+install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL_BINDIR})

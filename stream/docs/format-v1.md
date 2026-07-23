@@ -1,0 +1,154 @@
+# `.tracy-stream` journal format v1
+
+Status: implementation contract for `feature-stream`.
+
+## Goals and non-goals
+
+The journal is an append-only, crash-recoverable transcript of one Tracy TCP
+session. It is designed for continuous disk writing, a bounded-memory recorder,
+offline replay/conversion, and a live reader that only consumes committed
+records.
+
+Version 1 deliberately does not claim seamless reconnect or exactly-once
+delivery. One TCP connection is one session. A reconnect creates a new session
+identifier and a new journal. TCP backpressure is the v1 flow-control mechanism.
+The sequence field and bidirectional records reserve room for a later
+application-level ACK/retransmit protocol.
+
+This file is not the normal `.tracy` snapshot format. A completed journal must
+be replayed or converted before existing snapshot-only tools consume it.
+
+## Encoding
+
+All integers are unsigned little-endian. Persisted structures are serialized
+field-by-field; native C/C++ structure layout is never written. Unknown flag
+bits must be ignored. Unknown record types may be skipped after their integrity
+checks pass.
+
+### File header (64 bytes)
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | ASCII magic `TRCSTRM1` |
+| 8 | 2 | major version (`1`) |
+| 10 | 2 | header size (`64`) |
+| 12 | 4 | file flags |
+| 16 | 4 | Tracy wire protocol version |
+| 20 | 4 | reserved, zero |
+| 24 | 16 | opaque session identifier |
+| 40 | 8 | creation time, Unix nanoseconds |
+| 48 | 4 | CRC32C of all 64 bytes with this field zeroed |
+| 52 | 12 | reserved, zero |
+
+An invalid file header has no recoverable journal prefix.
+
+### Record header (48 bytes)
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII magic `TSR1` |
+| 4 | 2 | header size (`48`) |
+| 6 | 2 | record type |
+| 8 | 4 | record flags |
+| 12 | 4 | reserved, zero |
+| 16 | 8 | sequence, beginning at 1 and increasing by 1 |
+| 24 | 8 | monotonic nanoseconds relative to recorder start |
+| 32 | 8 | payload size |
+| 40 | 4 | payload CRC32C |
+| 44 | 4 | header CRC32C with this field zeroed |
+
+### Payload
+
+The payload has exactly `payload size` bytes. Version 1 writers cap a payload at
+64 MiB by default. Readers must impose a configured cap before allocation or
+streaming.
+
+### Commit trailer (32 bytes)
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII magic `TCM1` |
+| 4 | 2 | trailer size (`32`) |
+| 6 | 2 | trailer version (`1`) |
+| 8 | 8 | repeated sequence |
+| 16 | 8 | total record size, including header and trailer |
+| 24 | 4 | CRC32C of record header, payload, and trailer bytes 0–23 |
+| 28 | 4 | trailer CRC32C with this field zeroed |
+
+A record becomes committed only when the complete, valid trailer follows its
+header and payload. A reader scans from byte 64 and stops at the first
+truncated, corrupt, oversized, or out-of-sequence record. The bytes before that
+record are the valid recovery prefix. Readers never resynchronize past an
+invalid record because doing so could expose causally incomplete protocol data.
+
+## Record types
+
+| Value | Name | Payload |
+| ---: | --- | --- |
+| 1 | `SessionBegin` | Versioned recorder/session metadata |
+| 2 | `ClientToServer` | Exact TCP bytes received from the Tracy client |
+| 3 | `ServerToClient` | Exact TCP bytes sent by the recorder, including server queries |
+| 4 | `Checkpoint` | Versioned checkpoint metadata; may mark a durable boundary |
+| 5 | `SessionEnd` | Versioned terminal reason and counters |
+| 6 | `Diagnostic` | Versioned non-protocol diagnostic data |
+
+Wire records preserve exact bytes. Flags distinguish handshake bytes,
+compressed frames, and server-query packets. This matters because Tracy is a
+bidirectional protocol: the server requests source locations, strings, call
+stacks, frame images, and other definitions while capture is in progress.
+
+### Versioned metadata payloads
+
+`SessionBegin` starts with a 24-byte little-endian payload header:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 2 | payload version (`1`) |
+| 2 | 2 | fixed header size (`24`) |
+| 4 | 4 | Tracy protocol version |
+| 8 | 2 | TCP port |
+| 10 | 2 | reserved |
+| 12 | 4 | UTF-8 address byte count |
+| 16 | 8 | reserved |
+| 24 | variable | address bytes, without a terminator |
+
+`Checkpoint` has a 24-byte payload: version and size at offsets 0 and 2,
+reserved bytes 4–7, cumulative client bytes at offset 8, and cumulative server
+bytes at offset 16.
+
+`SessionEnd` has a 32-byte payload: version and size at offsets 0 and 2, a
+`ProtocolCloseReason` value at offset 4, cumulative client and server bytes at
+offsets 8 and 16, and eight reserved bytes. Version 1 reason values distinguish
+clean capture completion, local shutdown, peer disconnect, handshake failures,
+memory limit, instrumentation failure, recorder failure, and transport error.
+
+## Visibility and durability
+
+The writer reports three monotonically increasing offsets:
+
+- **Committed**: complete records have been passed to the file sink.
+- **Published**: buffered I/O has been flushed, so another process can observe
+  the committed prefix.
+- **Durable**: the published prefix has crossed an OS durability barrier
+  (`FlushFileBuffers` on Windows, `fsync` on POSIX).
+
+Live readers may temporarily see a partial tail and must wait for more bytes.
+Recovery after termination accepts the longest valid prefix present on disk.
+Truncating an invalid tail is an explicit operation, never an implicit read.
+The repair path verifies the observed file size again through the writable
+handle and durably flushes the truncation before reporting success.
+
+## Reliability semantics
+
+- A disk error or zero-progress short write poisons the writer and ends capture
+  with an explicit failure.
+- Ordinary short writes are retried until the requested buffer is complete.
+- Backpressure is bounded: the recorder stops reading the socket while disk
+  buffers are unavailable, allowing TCP flow control to reach the producer.
+- A clean end appends `SessionEnd` and performs a durable flush.
+- A missing `SessionEnd` is an incomplete but recoverable session, not a corrupt
+  one.
+- Immutable live views fingerprint their exact committed prefix and revalidate
+  it before and after reads; a partial tail does not advance the revision.
+- Version 1 makes no guarantee for data that the producer had not yet delivered
+  over TCP when either side failed.

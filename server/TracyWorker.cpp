@@ -10,6 +10,7 @@
 #  include <alloca.h>
 #endif
 
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <math.h>
@@ -255,9 +256,10 @@ static bool IsQueryPrio( ServerQuery type )
 
 LoadProgress Worker::s_loadProgress;
 
-Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit )
+Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver )
     : m_addr( addr )
     , m_port( port )
+    , m_protocolObserver( protocolObserver )
     , m_hasData( false )
     , m_stream( LZ4_createStreamDecode() )
     , m_buffer( new char[TargetFrameSize*3 + 1] )
@@ -1967,6 +1969,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 Worker::~Worker()
 {
     Shutdown();
+    m_netWriteCv.notify_one();
 
     if( m_threadNet.joinable() ) m_threadNet.join();
     if( m_thread.joinable() ) m_thread.join();
@@ -2718,6 +2721,54 @@ const unordered_flat_map<CallstackFrameId, uint32_t, Worker::CallstackFrameIdHas
 }
 #endif
 
+bool Worker::ObserveProtocol( ProtocolDirection direction, ProtocolChunk chunk, std::span<const ProtocolDataSpan> data )
+{
+    if( !m_protocolObserver ) return true;
+    if( m_protocolObserver->OnProtocolData( direction, chunk, data ) ) return true;
+    m_protocolObserverFailed.store( true, std::memory_order_relaxed );
+    return false;
+}
+
+bool Worker::SendProtocol( const void* data, int size, ProtocolChunk chunk )
+{
+    if( size < 0 )
+    {
+        m_protocolTransportError.store( true, std::memory_order_relaxed );
+        return false;
+    }
+    const ProtocolDataSpan span { data, size_t( size ) };
+    if( !ObserveProtocol( ProtocolDirection::ServerToClient, chunk, std::span<const ProtocolDataSpan>( &span, 1 ) ) ) return false;
+    if( m_sock.Send( data, size ) == size ) return true;
+    m_protocolTransportError.store( true, std::memory_order_relaxed );
+    return false;
+}
+
+void Worker::NotifyProtocolClose( ProtocolCloseReason reason )
+{
+    if( !m_protocolObserver || m_protocolObserverClosed.exchange( true, std::memory_order_relaxed ) ) return;
+    if( !m_protocolObserver->OnProtocolClose( reason ) )
+    {
+        m_protocolObserverFailed.store( true, std::memory_order_relaxed );
+    }
+}
+
+void Worker::FinishProtocol( ProtocolCloseReason reason )
+{
+    Shutdown();
+    m_netWriteCv.notify_one();
+    {
+        std::unique_lock<std::mutex> lock( m_networkStopLock );
+        m_networkStopCv.wait( lock, [this] { return m_networkStopped; } );
+    }
+
+    // Network() is now unable to publish another causal input record.  The
+    // terminal record can therefore be written without racing an in-flight
+    // observer callback.
+    NotifyProtocolClose( reason );
+    if( m_sock.IsValid() ) m_sock.Close();
+    m_connected.store( false, std::memory_order_relaxed );
+}
+
 void Worker::Network()
 {
     auto ShouldExit = [this] { return m_shutdown.load( std::memory_order_relaxed ); };
@@ -2735,12 +2786,28 @@ void Worker::Network()
         auto buf = m_buffer + m_bufferOffset;
         lz4sz_t lz4sz;
         if( !m_sock.Read( &lz4sz, sizeof( lz4sz ), 10, ShouldExit ) ) goto close;
+        if( lz4sz == 0 || lz4sz > LZ4Size )
+        {
+            m_protocolTransportError.store( true, std::memory_order_relaxed );
+            goto close;
+        }
         if( !m_sock.Read( lz4buf.get(), lz4sz, 10, ShouldExit ) ) goto close;
+        {
+            const std::array<ProtocolDataSpan, 2> spans = {
+                ProtocolDataSpan { &lz4sz, sizeof( lz4sz ) },
+                ProtocolDataSpan { lz4buf.get(), size_t( lz4sz ) }
+            };
+            if( !ObserveProtocol( ProtocolDirection::ClientToServer, ProtocolChunk::CompressedFrame, spans ) ) goto close;
+        }
         auto bb = m_bytes.load( std::memory_order_relaxed );
         m_bytes.store( bb + sizeof( lz4sz ) + lz4sz, std::memory_order_relaxed );
 
         auto sz = LZ4_decompress_safe_continue( (LZ4_streamDecode_t*)m_stream, lz4buf.get(), buf, lz4sz, TargetFrameSize );
-        assert( sz >= 0 );
+        if( sz < 0 )
+        {
+            m_protocolTransportError.store( true, std::memory_order_relaxed );
+            goto close;
+        }
         bb = m_decBytes.load( std::memory_order_relaxed );
         m_decBytes.store( bb + sz, std::memory_order_relaxed );
 
@@ -2755,32 +2822,67 @@ void Worker::Network()
     }
 
 close:
-    std::lock_guard<std::mutex> lock( m_netReadLock );
-    m_netRead.push_back( NetBuffer { -1 } );
-    m_netReadCv.notify_one();
+    {
+        std::lock_guard<std::mutex> lock( m_netReadLock );
+        m_netRead.push_back( NetBuffer { -1 } );
+        m_netReadCv.notify_one();
+    }
+    {
+        std::lock_guard<std::mutex> lock( m_networkStopLock );
+        m_networkStopped = true;
+    }
+    m_networkStopCv.notify_all();
 }
 
 void Worker::Exec()
 {
     auto ShouldExit = [this] { return m_shutdown.load( std::memory_order_relaxed ); };
+    auto closeReason = ProtocolCloseReason::LocalShutdown;
 
     for(;;)
     {
-        if( m_shutdown.load( std::memory_order_relaxed ) ) { m_netWriteCv.notify_one(); return; };
+        if( m_shutdown.load( std::memory_order_relaxed ) )
+        {
+            FinishProtocol( ProtocolCloseReason::LocalShutdown );
+            return;
+        }
         if( m_sock.Connect( m_addr.c_str(), m_port ) ) break;
         std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
     }
+    if( m_shutdown.load( std::memory_order_relaxed ) )
+    {
+        FinishProtocol( ProtocolCloseReason::LocalShutdown );
+        return;
+    }
 
     std::chrono::time_point<std::chrono::high_resolution_clock> t0;
-
-    m_sock.Send( HandshakeShibboleth, HandshakeShibbolethSize );
     uint32_t protocolVersion = ProtocolVersion;
-    m_sock.Send( &protocolVersion, sizeof( protocolVersion ) );
+
+    if( !SendProtocol( HandshakeShibboleth, HandshakeShibbolethSize, ProtocolChunk::Handshake ) )
+    {
+        closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+        goto close;
+    }
+    if( !SendProtocol( &protocolVersion, sizeof( protocolVersion ), ProtocolChunk::Handshake ) )
+    {
+        closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+        goto close;
+    }
     HandshakeStatus handshake;
     if( !m_sock.Read( &handshake, sizeof( handshake ), 10, ShouldExit ) )
     {
         m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
+        closeReason = ProtocolCloseReason::HandshakeDropped;
         goto close;
+    }
+    {
+        const ProtocolDataSpan span { &handshake, sizeof( handshake ) };
+        if( !ObserveProtocol( ProtocolDirection::ClientToServer, ProtocolChunk::Handshake, std::span<const ProtocolDataSpan>( &span, 1 ) ) )
+        {
+            closeReason = ProtocolCloseReason::RecorderFailure;
+            m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
+            goto close;
+        }
     }
     m_handshake.store( handshake, std::memory_order_relaxed );
     switch( handshake )
@@ -2788,8 +2890,13 @@ void Worker::Exec()
     case HandshakeWelcome:
         break;
     case HandshakeProtocolMismatch:
+        closeReason = ProtocolCloseReason::ProtocolMismatch;
+        goto close;
     case HandshakeNotAvailable:
+        closeReason = ProtocolCloseReason::NotAvailable;
+        goto close;
     default:
+        closeReason = ProtocolCloseReason::HandshakeDropped;
         goto close;
     }
 
@@ -2809,7 +2916,17 @@ void Worker::Exec()
         if( !m_sock.Read( &welcome, sizeof( welcome ), 10, ShouldExit ) )
         {
             m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
+            closeReason = ProtocolCloseReason::HandshakeDropped;
             goto close;
+        }
+        {
+            const ProtocolDataSpan span { &welcome, sizeof( welcome ) };
+            if( !ObserveProtocol( ProtocolDirection::ClientToServer, ProtocolChunk::Handshake, std::span<const ProtocolDataSpan>( &span, 1 ) ) )
+            {
+                closeReason = ProtocolCloseReason::RecorderFailure;
+                m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
+                goto close;
+            }
         }
         m_timerMul = welcome.timerMul;
         m_data.baseTime = welcome.initBegin;
@@ -2850,6 +2967,14 @@ void Worker::Exec()
             if( !m_sock.Read( &onDemand, sizeof( onDemand ), 10, ShouldExit ) )
             {
                 m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
+                closeReason = ProtocolCloseReason::HandshakeDropped;
+                goto close;
+            }
+            const ProtocolDataSpan span { &onDemand, sizeof( onDemand ) };
+            if( !ObserveProtocol( ProtocolDirection::ClientToServer, ProtocolChunk::Handshake, std::span<const ProtocolDataSpan>( &span, 1 ) ) )
+            {
+                closeReason = ProtocolCloseReason::RecorderFailure;
+                m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
                 goto close;
             }
             m_data.frameOffset = onDemand.frames;
@@ -2872,9 +2997,28 @@ void Worker::Exec()
 
     for(;;)
     {
-        if( m_shutdown.load( std::memory_order_relaxed ) || ( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit ) )
+        if( m_shutdown.load( std::memory_order_relaxed ) )
         {
-            QueryTerminate();
+            closeReason = m_disconnect.load( std::memory_order_relaxed ) ? ProtocolCloseReason::CaptureComplete : ProtocolCloseReason::LocalShutdown;
+            if( !QueryTerminate() )
+                closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+            goto close;
+        }
+        if( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit )
+        {
+            closeReason = ProtocolCloseReason::MemoryLimit;
+            if( !QueryTerminate() )
+                closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+            goto close;
+        }
+        if( m_protocolObserverFailed.load( std::memory_order_relaxed ) )
+        {
+            closeReason = ProtocolCloseReason::RecorderFailure;
+            goto close;
+        }
+        if( m_protocolTransportError.load( std::memory_order_relaxed ) )
+        {
+            closeReason = ProtocolCloseReason::TransportError;
             goto close;
         }
 
@@ -2885,7 +3029,16 @@ void Worker::Exec()
             netbuf = m_netRead.front();
             m_netRead.erase( m_netRead.begin() );
         }
-        if( netbuf.bufferOffset < 0 ) goto close;
+        if( netbuf.bufferOffset < 0 )
+        {
+            if( m_protocolObserverFailed.load( std::memory_order_relaxed ) )
+                closeReason = ProtocolCloseReason::RecorderFailure;
+            else if( m_protocolTransportError.load( std::memory_order_relaxed ) )
+                closeReason = ProtocolCloseReason::TransportError;
+            else
+                closeReason = ProtocolCloseReason::PeerDisconnected;
+            goto close;
+        }
 
         const char* ptr = m_buffer + netbuf.bufferOffset;
         const char* end = ptr + netbuf.size;
@@ -2906,7 +3059,9 @@ void Worker::Exec()
                 if( !DispatchProcess( *ev, ptr ) )
                 {
                     if( m_failure != Failure::None ) HandleFailure( ptr, end );
-                    QueryTerminate();
+                    closeReason = ProtocolCloseReason::InstrumentationFailure;
+                    if( !QueryTerminate() )
+                        closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
                     goto close;
                 }
             }
@@ -2920,7 +3075,11 @@ void Worker::Exec()
             if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueuePrio.empty() )
             {
                 const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueuePrio.size() );
-                m_sock.Send( m_serverQueryQueuePrio.data(), toSend * ServerQueryPacketSize );
+                if( !SendProtocol( m_serverQueryQueuePrio.data(), int( toSend * ServerQueryPacketSize ), ProtocolChunk::ServerQuery ) )
+                {
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                    goto close;
+                }
                 m_serverQuerySpaceLeft -= toSend;
                 if( toSend == m_serverQueryQueuePrio.size() )
                 {
@@ -2934,7 +3093,11 @@ void Worker::Exec()
             if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueue.empty() )
             {
                 const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueue.size() );
-                m_sock.Send( m_serverQueryQueue.data(), toSend * ServerQueryPacketSize );
+                if( !SendProtocol( m_serverQueryQueue.data(), int( toSend * ServerQueryPacketSize ), ProtocolChunk::ServerQuery ) )
+                {
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                    goto close;
+                }
                 m_serverQuerySpaceLeft -= toSend;
                 if( toSend == m_serverQueryQueue.size() )
                 {
@@ -2967,7 +3130,7 @@ void Worker::Exec()
             {
                 continue;
             }
-            if( !m_crashed && !m_disconnect )
+            if( !m_crashed && !m_disconnect.load( std::memory_order_relaxed ) )
             {
                 bool done = true;
                 for( auto& v : m_data.threads )
@@ -2980,17 +3143,17 @@ void Worker::Exec()
                 }
                 if( !done ) continue;
             }
-            QueryTerminate();
+            if( !QueryTerminate() )
+                closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
             UpdateMbps( 0 );
+            if( closeReason != ProtocolCloseReason::RecorderFailure && closeReason != ProtocolCloseReason::TransportError )
+                closeReason = ProtocolCloseReason::CaptureComplete;
             break;
         }
     }
 
 close:
-    Shutdown();
-    m_netWriteCv.notify_one();
-    m_sock.Close();
-    m_connected.store( false, std::memory_order_relaxed );
+    FinishProtocol( closeReason );
 }
 
 void Worker::UpdateMbps( int64_t td )
@@ -3062,7 +3225,7 @@ void Worker::HandleFailure( const char* ptr, const char* end )
         if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueuePrio.empty() )
         {
             const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueuePrio.size() );
-            m_sock.Send( m_serverQueryQueuePrio.data(), toSend * ServerQueryPacketSize );
+            if( !SendProtocol( m_serverQueryQueuePrio.data(), int( toSend * ServerQueryPacketSize ), ProtocolChunk::ServerQuery ) ) return;
             m_serverQuerySpaceLeft -= toSend;
             if( toSend == m_serverQueryQueuePrio.size() )
             {
@@ -3076,7 +3239,7 @@ void Worker::HandleFailure( const char* ptr, const char* end )
         if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueue.empty() )
         {
             const auto toSend = std::min( m_serverQuerySpaceLeft, m_serverQueryQueue.size() );
-            m_sock.Send( m_serverQueryQueue.data(), toSend * ServerQueryPacketSize );
+            if( !SendProtocol( m_serverQueryQueue.data(), int( toSend * ServerQueryPacketSize ), ProtocolChunk::ServerQuery ) ) return;
             m_serverQuerySpaceLeft -= toSend;
             if( toSend == m_serverQueryQueue.size() )
             {
@@ -3204,7 +3367,7 @@ void Worker::Query( ServerQuery type, uint64_t data, uint32_t extra )
     if( m_serverQuerySpaceLeft > 0 && m_serverQueryQueuePrio.empty() && m_serverQueryQueue.empty() )
     {
         m_serverQuerySpaceLeft--;
-        m_sock.Send( &query, ServerQueryPacketSize );
+        SendProtocol( &query, ServerQueryPacketSize, ProtocolChunk::ServerQuery );
     }
     else if( IsQueryPrio( type ) )
     {
@@ -3216,10 +3379,10 @@ void Worker::Query( ServerQuery type, uint64_t data, uint32_t extra )
     }
 }
 
-void Worker::QueryTerminate()
+bool Worker::QueryTerminate()
 {
     ServerQueryPacket query { ServerQueryTerminate, 0, 0 };
-    m_sock.Send( &query, ServerQueryPacketSize );
+    return SendProtocol( &query, ServerQueryPacketSize, ProtocolChunk::ServerQuery );
 }
 
 void Worker::QuerySourceFile( const char* fn, const char* image )
@@ -7884,8 +8047,8 @@ void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint6
 void Worker::Disconnect()
 {
     //Query( ServerQueryDisconnect, 0 );
+    m_disconnect.store( true, std::memory_order_relaxed );
     Shutdown();
-    m_disconnect = true;
 }
 
 static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec )
