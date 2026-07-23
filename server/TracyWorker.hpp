@@ -556,6 +556,9 @@ public:
     uint64_t GetPidFromTid( uint64_t tid ) const;
     const unordered_flat_map<uint64_t, CpuThreadData>& GetCpuThreadData() const { return m_data.cpuThreadData; }
     bool HasExternalName( uint64_t id ) const { return m_data.externalNames.find( id ) != m_data.externalNames.end(); }
+    const unordered_flat_map<uint64_t, const char*>& GetThreadNameMap() const { return m_data.threadNames; }
+    const unordered_flat_map<uint64_t, std::pair<const char*, const char*>>& GetExternalNameMap() const { return m_data.externalNames; }
+    const unordered_flat_map<uint64_t, uint64_t>& GetTidToPidMap() const { return m_data.tidToPid; }
     const unordered_flat_map<const char*, MemoryBlock, charutil::Hasher, charutil::Comparator>& GetSourceFileCache() const { return m_data.sourceFileCache; }
     uint64_t GetSourceFileCacheCount() const { return m_data.sourceFileCache.size(); }
     uint64_t GetSourceFileCacheSize() const;
@@ -661,6 +664,7 @@ public:
     std::vector<int16_t> GetMatchingSourceLocation( const char* query, bool ignoreCase ) const;
 
     const unordered_flat_map<uint64_t, SymbolData>& GetSymbolMap() const { return m_data.symbolMap; }
+    const unordered_flat_map<uint64_t, uint64_t>& GetCodeSymbolMap() const { return m_data.codeSymbolMap; }
 
 #ifndef TRACY_NO_STATISTICS
     SourceLocationZones& GetZonesForSourceLocation( int16_t srcloc );
@@ -703,6 +707,7 @@ public:
 
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
+    int64_t GetLegacyQueueDelay() const { return m_legacyQueueDelay; }
     uint8_t GetHandshakeStatus() const { return m_handshake.load( std::memory_order_relaxed ); }
     int64_t GetSamplingPeriod() const { return m_samplingPeriod; }
     bool AreSamplesInconsistent() const { return m_inconsistentSamples; }
@@ -1102,6 +1107,7 @@ private:
     MbpsBlock m_mbpsData;
 
     int m_traceVersion;
+    int64_t m_legacyQueueDelay = 0;
     std::atomic<uint8_t> m_handshake { 0 };
 
     static LoadProgress s_loadProgress;

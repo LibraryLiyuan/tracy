@@ -81,11 +81,15 @@ public:
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override;
+    std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
     std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& range ) const override;
     std::vector<HardwareSampleDto> GetHardwareSamples() const override;
+    std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const override;
     std::vector<LockEventDto> ScanLockEvents( const ScanRange& range ) const override;
     std::vector<SymbolDto> GetSymbols() const override;
+    std::vector<SymbolAddressMappingDto> GetSymbolAddressMappings( size_t offset, size_t limit ) const override;
+    std::optional<SymbolAddressMappingDto> ResolveSymbolAddress( uint64_t address ) const override;
     std::vector<SourceLocationDto> GetSourceLocations() const override;
 
     std::vector<CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override;
@@ -114,9 +118,12 @@ public:
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
     SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
+    BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;
+    BinaryResourceChunkDto ReadSymbolCodeBytes( uint64_t symbolId, size_t offset, size_t maxBytes ) const override;
     std::vector<DisassemblyInstructionDto> DisassembleSymbol( std::string_view symbolRef, size_t maxBytes, size_t maxInstructions ) const override;
     FrameImageDto ReadFrameImage( size_t imageId, size_t maxBytes ) const override;
+    BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
     class Impl;

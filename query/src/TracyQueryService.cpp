@@ -34,6 +34,38 @@ bool JsonDepthAllowed( const json& value, size_t depth = 0 )
 std::string Decimal( uint64_t value ) { return std::to_string( value ); }
 std::string Decimal( int64_t value ) { return std::to_string( value ); }
 
+uint64_t UnsignedParameter( const json& params, const char* name, uint64_t defaultValue, uint64_t maximum )
+{
+    if( !params.contains( name ) ) return defaultValue;
+    const auto& value = params[name];
+    uint64_t parsed = 0;
+    if( value.is_string() )
+    {
+        const auto text = value.get<std::string>();
+        const auto result = std::from_chars( text.data(), text.data() + text.size(), parsed, 10 );
+        if( result.ec != std::errc() || result.ptr != text.data() + text.size() ) throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be an unsigned decimal string or integer" );
+    }
+    else if( value.is_number_unsigned() ) parsed = value.get<uint64_t>();
+    else if( value.is_number_integer() )
+    {
+        const auto signedValue = value.get<int64_t>();
+        if( signedValue < 0 ) throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be non-negative" );
+        parsed = uint64_t( signedValue );
+    }
+    else throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be an unsigned decimal string or integer" );
+    if( parsed > maximum ) throw QueryError( "INVALID_PARAMS", std::string( name ) + " exceeds the allowed maximum" );
+    return parsed;
+}
+
+uint64_t HexAddress( const std::string& value )
+{
+    if( value.size() < 3 || value[0] != '0' || ( value[1] != 'x' && value[1] != 'X' ) ) throw QueryError( "INVALID_PARAMS", "address must be a 0x-prefixed hexadecimal string" );
+    uint64_t result = 0;
+    const auto parsed = std::from_chars( value.data() + 2, value.data() + value.size(), result, 16 );
+    if( parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() ) throw QueryError( "INVALID_PARAMS", "address must be a 0x-prefixed hexadecimal string" );
+    return result;
+}
+
 std::string Lower( std::string value )
 {
     std::transform( value.begin(), value.end(), value.begin(), []( unsigned char c ) { return char( std::tolower( c ) ); } );
@@ -103,6 +135,27 @@ std::string Base64UrlDecode( const std::string& input )
         }
     }
     return output;
+}
+
+std::string Base64UrlEncode( const std::vector<uint8_t>& input )
+{
+    if( input.empty() ) return {};
+    return Base64UrlEncode( std::string( reinterpret_cast<const char*>( input.data() ), input.size() ) );
+}
+
+json BinaryChunkJson( const analysis::BinaryResourceChunkDto& value )
+{
+    const auto nextOffset = value.offset + value.bytes.size();
+    return {
+        { "ref", value.ref },
+        { "offset_bytes", Decimal( value.offset ) },
+        { "returned_bytes", Decimal( value.bytes.size() ) },
+        { "total_bytes", Decimal( value.totalBytes ) },
+        { "data_base64url", Base64UrlEncode( value.bytes ) },
+        { "next_offset_bytes", value.eof ? json( nullptr ) : json( Decimal( nextOffset ) ) },
+        { "eof", value.eof },
+        { "trust", "untrusted_trace_data" }
+    };
 }
 
 std::vector<std::string> Split( const std::string& value, char separator )
@@ -213,6 +266,14 @@ json CountsJson( const analysis::TraceCountsDto& value )
     };
 }
 
+json FieldAvailabilityJson( const analysis::FieldAvailabilityDto& value )
+{
+    return {
+        { "available", value.available },
+        { "reason", value.available || value.reason.empty() ? json( nullptr ) : json( value.reason ) }
+    };
+}
+
 json TraceInfoJson( const analysis::TraceInfoDto& value )
 {
     return {
@@ -224,6 +285,8 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
         { "cpu_architecture", value.cpuArchitecture },
         { "timer_multiplier", value.timerMultiplier }, { "frame_offset", Decimal( value.frameOffset ) },
         { "sampling_period_ns", Decimal( value.samplingPeriodNs ) }, { "on_demand", value.onDemand },
+        { "legacy_queue_delay_ns", value.legacyQueueDelayNs ? json( Decimal( *value.legacyQueueDelayNs ) ) : json( nullptr ) },
+        { "field_availability", { { "legacy_queue_delay_ns", FieldAvailabilityJson( value.legacyQueueDelayAvailability ) } } },
         { "has_crash", value.hasCrash }, { "samples_inconsistent", value.samplesInconsistent },
         { "counts", CountsJson( value.counts ) }, { "app_info", value.appInfo }, { "trust", "untrusted_trace_data" }
     };
@@ -259,8 +322,10 @@ json ThreadJson( const analysis::ThreadDto& value )
         { "migrations", value.migrations },
         { "external_process_name", value.externalProcessName ? json( *value.externalProcessName ) : json( nullptr ) },
         { "external_thread_name", value.externalThreadName ? json( *value.externalThreadName ) : json( nullptr ) },
+        { "local_name", value.localName ? json( *value.localName ) : json( nullptr ) },
         { "kernel_sample_count", value.kernelSampleCount ? json( Decimal( *value.kernelSampleCount ) ) : json( nullptr ) },
         { "group_hint", value.groupHint ? json( *value.groupHint ) : json( nullptr ) },
+        { "field_availability", { { "group_hint", FieldAvailabilityJson( value.groupHintAvailability ) } } },
         { "trust", "untrusted_trace_data" }
     };
 }
@@ -316,7 +381,9 @@ json GpuZoneJson( const analysis::GpuZoneDto& value )
         { "cpu_start_ns", Decimal( value.cpuStartNs ) }, { "cpu_end_ns", value.cpuEndNs ? json( Decimal( *value.cpuEndNs ) ) : json( nullptr ) },
         { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
-        { "query_id", value.queryId }, { "complete", value.complete }, { "trust", "untrusted_trace_data" }
+        { "query_id", value.queryIdAvailability.available ? json( value.queryId ) : json( nullptr ) },
+        { "field_availability", { { "query_id", FieldAvailabilityJson( value.queryIdAvailability ) } } },
+        { "complete", value.complete }, { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -327,12 +394,23 @@ json ContextSwitchJson( const analysis::ContextSwitchDto& value )
         { "end_ns", value.endNs ? json( Decimal( *value.endNs ) ) : json( nullptr ) },
         { "duration_ns", value.endNs ? json( Decimal( *value.endNs - value.startNs ) ) : json( nullptr ) },
         { "wakeup_ns", value.wakeupNs ? json( Decimal( *value.wakeupNs ) ) : json( nullptr ) },
-        { "cpu", value.cpu }, { "wakeup_cpu", value.wakeupCpu },
+        { "cpu", value.cpu }, { "wakeup_cpu", value.wakeupCpuAvailability.available ? json( value.wakeupCpu ) : json( nullptr ) },
+        { "field_availability", { { "wakeup_cpu", FieldAvailabilityJson( value.wakeupCpuAvailability ) } } },
         { "reason", value.reason }, { "reason_name", value.reasonName },
         { "state", value.state }, { "state_name", value.stateName },
         { "related_thread_index", value.relatedThreadIndex },
         { "next_thread_ref", value.relatedThreadRef ? json( *value.relatedThreadRef ) : json( nullptr ) },
         { "complete", value.complete }
+    };
+}
+
+json CpuContextSwitchJson( const analysis::CpuContextSwitchDto& value )
+{
+    return {
+        { "ref", value.ref }, { "cpu", value.cpu }, { "start_ns", Decimal( value.startNs ) },
+        { "end_ns", value.endNs ? json( Decimal( *value.endNs ) ) : json( nullptr ) },
+        { "duration_ns", value.endNs ? json( Decimal( *value.endNs - value.startNs ) ) : json( nullptr ) },
+        { "raw_thread_index", value.rawThreadIndex }, { "thread_ref", value.threadRef }, { "complete", value.complete }
     };
 }
 
@@ -391,6 +469,7 @@ json LockEventJson( const analysis::LockEventDto& value )
     return {
         { "ref", value.ref }, { "lock_ref", value.lockRef }, { "time_ns", Decimal( value.timeNs ) },
         { "thread_ref", value.threadRef }, { "type", value.type },
+        { "source_location_ref", value.sourceLocationRef },
         { "owner_thread_ref", value.ownerThreadRef ? json( *value.ownerThreadRef ) : json( nullptr ) },
         { "lock_count", value.lockCount }, { "waiter_thread_refs", value.waiterThreadRefs }
     };
@@ -413,7 +492,8 @@ json SourceLocationJson( const analysis::SourceLocationDto& value )
 {
     return {
         { "ref", value.ref }, { "name", value.name }, { "function", value.function }, { "file", value.file },
-        { "line", value.line }, { "color", value.color }, { "trust", "untrusted_trace_data" }
+        { "line", value.line }, { "color", value.color }, { "native_id", value.nativeId }, { "dynamic", value.dynamic },
+        { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -424,6 +504,7 @@ json MemoryPoolJson( const analysis::MemoryPoolDto& value )
         { "event_count", Decimal( value.eventCount ) }, { "free_count", Decimal( value.freeCount ) },
         { "active_count", Decimal( value.activeCount ) }, { "active_bytes", Decimal( value.activeBytes ) },
         { "persisted_usage_bytes", Decimal( value.persistedUsageBytes ) },
+        { "stored_name_id", Decimal( value.storedNameId ) }, { "stored_name", value.storedName },
         { "low", "0x" + Hex16( value.low ) }, { "high", "0x" + Hex16( value.high ) },
         { "gpu_d3d12", value.gpuD3D12 }, { "identifier_semantics", value.gpuD3D12 ? "logical_allocation_id" : "address" }, { "trust", "untrusted_trace_data" }
     };
@@ -621,15 +702,15 @@ json DescribeData( const json& selection = json::object() )
             "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash",
             "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
             "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
-            "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource",
+            "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
             "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
             "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
             "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
             "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
             "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
-            "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.capabilities",
-            "symbol.search", "symbol.get", "symbol.address", "symbol.raw_code", "symbol.disassembly",
-            "source.locations", "source.statistics", "source.embedded", "source.lines",
+            "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
+            "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
+            "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
             "timeline.slice", "statistics.describe", "statistics.compute", "compare.zones", "compare.frames", "compare.source", "validation.run"
         } }
     };
@@ -652,14 +733,14 @@ json DescribeData( const json& selection = json::object() )
         if( method == "trace.open" ) required.emplace_back( "path" );
         else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
         else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" ) || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" ||
-            method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" ) required.emplace_back( "ref" );
+        if( ( method.ends_with( ".get" ) && method != "frame.get" ) || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+            method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
         if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
         if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
         if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
         if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) required.emplace_back( "thread_ref" );
         if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) required.emplace_back( "plot_ref" );
-        if( method == "hardware_sample.address" || method == "symbol.address" ) required.emplace_back( "address" );
+        if( method == "hardware_sample.address" || method == "hardware_sample.events" || method == "symbol.address" ) required.emplace_back( "address" );
         if( method == "callstack.frames" || method == "callstack.parent" ) required.emplace_back( "callstack" );
         if( method == "callstack.resolve" || method == "callstack.batch" ) required.emplace_back( "callstacks" );
         if( method == "statistics.compute" ) required.emplace_back( "values_ns" );
@@ -1107,7 +1188,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "cpu.topology" )
     {
         json topology = json::array();
-        for( const auto& value : source->GetCpuTopology() ) topology.push_back( { { "cpu", value.cpu }, { "package", value.package }, { "die", value.die }, { "core", value.core } } );
+        for( const auto& value : source->GetCpuTopology() ) topology.push_back( {
+            { "cpu", value.cpu }, { "package", value.package },
+            { "die", value.dieAvailability.available ? json( value.die ) : json( nullptr ) }, { "core", value.core },
+            { "field_availability", { { "die", FieldAvailabilityJson( value.dieAvailability ) } } }
+        } );
         return Success( id, { { "logical_cpus", std::move( topology ) } }, trace );
     }
     if( method == "cpu.usage" )
@@ -1124,7 +1209,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto cursor = NextCursor( page, method, trace, points.size(), end < usage.size() );
         return Success( id, { { "points", std::move( points ) } }, trace, PageJson( page, end - begin, cursor ) );
     }
-    if( method == "context_switch.range" || method == "context_switch.thread" || method == "cpu.timeline" )
+    if( method == "cpu.timeline" )
+    {
+        const auto page = ParsePage( params, method, trace );
+        const auto cpuFilter = params.contains( "cpu" ) ? std::optional<unsigned>( params["cpu"].get<unsigned>() ) : std::nullopt;
+        auto [events, hasMore] = ScanFiltered<analysis::CpuContextSwitchDto>( *source, params, page,
+            []( const auto& item, const auto& range ) { return item.ScanCpuContextSwitchEvents( range ); },
+            [&]( const auto& event ) { return !cpuFilter || event.cpu == *cpuFilter; }, CpuContextSwitchJson );
+        const auto returned = events.size();
+        const auto cursor = NextCursor( page, method, trace, events.size(), hasMore );
+        return Success( id, { { "segments", std::move( events ) } }, trace, PageJson( page, returned, cursor ) );
+    }
+    if( method == "context_switch.range" || method == "context_switch.thread" )
     {
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
@@ -1253,24 +1349,43 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
         return Success( id, { { "frames", std::move( values ) }, { "range", { { "start_ns", Decimal( range.startNs ) }, { "end_ns", Decimal( range.endNs ) } } } }, trace, PageJson( page, frames.size(), cursor ) );
     }
-    if( method == "frame_image.list" || method == "frame_image.metadata" || method == "frame_image.resource" )
+    if( method == "frame_image.list" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" )
     {
         const auto page = ParsePage( params, method, trace );
         const auto images = source->GetFrameImageResources();
-        if( method == "frame_image.metadata" || method == "frame_image.resource" )
+        if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" )
         {
             if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
             const auto ref = params["ref"].get<std::string>();
             const auto found = std::find_if( images.begin(), images.end(), [&]( const auto& item ) { return item.ref == ref; } );
             if( found == images.end() ) throw QueryError( "ENTITY_NOT_FOUND", "frame image ref was not found" );
-            return Success( id, { { "ref", found->ref }, { "width", found->width }, { "height", found->height }, { "flipped", found->flipped }, { "frame_ref", found->frameRef }, { "resource_uri", "tracy://trace/" + trace.id + "/frame-image/" + std::to_string( found->id ) }, { "mime_type", "image/png" } }, trace );
+            if( method == "frame_image.raw" )
+            {
+                const auto offset = size_t( UnsignedParameter( params, "offset_bytes", 0, std::numeric_limits<size_t>::max() ) );
+                const auto maxBytes = size_t( UnsignedParameter( params, "max_bytes", 65536, 1024 * 1024 ) );
+                if( maxBytes == 0 ) throw QueryError( "INVALID_PARAMS", "max_bytes must be between 1 and 1048576" );
+                auto data = BinaryChunkJson( source->ReadFrameImageBc1( found->id, offset, maxBytes ) );
+                data["format"] = "bc1_dxt1";
+                data["width"] = found->width;
+                data["height"] = found->height;
+                data["flipped"] = found->flipped;
+                return Success( id, std::move( data ), trace );
+            }
+            return Success( id, {
+                { "ref", found->ref }, { "width", found->width }, { "height", found->height }, { "flipped", found->flipped },
+                { "raw_frame_index", found->rawFrameIndex }, { "frame_ref", found->frameRef ? json( *found->frameRef ) : json( nullptr ) },
+                { "raw_bc1_bytes", Decimal( found->rawBc1Bytes ) },
+                { "resource_uri", "tracy://trace/" + trace.id + "/frame-image/" + std::to_string( found->id ) }, { "mime_type", "image/png" }
+            }, trace );
         }
         const size_t begin = std::min( page.offset, images.size() );
         const size_t end = std::min( begin + page.limit, images.size() );
         json values = json::array();
         for( size_t index = begin; index < end; index++ ) values.push_back( {
             { "ref", images[index].ref }, { "width", images[index].width }, { "height", images[index].height },
-            { "flipped", images[index].flipped }, { "frame_ref", images[index].frameRef },
+            { "flipped", images[index].flipped }, { "raw_frame_index", images[index].rawFrameIndex },
+            { "frame_ref", images[index].frameRef ? json( *images[index].frameRef ) : json( nullptr ) },
+            { "raw_bc1_bytes", Decimal( images[index].rawBc1Bytes ) },
             { "resource_uri", "tracy://trace/" + trace.id + "/frame-image/" + std::to_string( images[index].id ) }
         } );
         const auto cursor = NextCursor( page, method, trace, values.size(), end < images.size() );
@@ -1306,9 +1421,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             } );
             contexts.push_back( {
                 { "ref", value.ref }, { "index", value.index }, { "name", value.name }, { "thread_ref", value.threadRef },
+                { "custom_name", value.customName ? json( *value.customName ) : json( nullptr ) },
                 { "zone_count", Decimal( value.zoneCount ) }, { "period", value.period }, { "calibrated", value.calibrated },
                 { "type", value.type }, { "type_name", value.typeName }, { "overflow", Decimal( value.overflow ) },
-                { "note_names", std::move( noteNames ) }, { "notes", std::move( notes ) }
+                { "note_names", std::move( noteNames ) }, { "notes", std::move( notes ) },
+                { "field_availability", { { "notes", FieldAvailabilityJson( value.notesAvailability ) } } }
             } );
         }
         const auto cursor = NextCursor( page, method, trace, end - begin, end < sourceContexts.size() );
@@ -1748,6 +1865,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !requestedRef.empty() && value.ref != requestedRef ) continue;
             locks.push_back( {
             { "ref", value.ref }, { "native_id", value.nativeId }, { "name", value.name }, { "source_location_ref", value.sourceLocationRef },
+            { "custom_name", value.customName ? json( *value.customName ) : json( nullptr ) },
             { "event_count", Decimal( value.eventCount ) }, { "thread_count", Decimal( value.threadCount ) },
             { "type", value.type }, { "type_name", value.typeName },
             { "valid", value.valid }, { "contended", value.contended }, { "announce_ns", Decimal( value.announceNs ) },
@@ -2000,8 +2118,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         return Success( id, { { "direction", direction }, { "sample_kind", kind }, { "paths", std::move( output ) }, { "unique_callstacks", counts.size() } }, trace );
     }
-    if( method == "sample.symbol_statistics" || method == "symbol.search" || method == "symbol.get" || method == "symbol.address" )
+    if( method == "sample.symbol_statistics" || method == "symbol.search" || method == "symbol.get" || method == "symbol.address" || method == "symbol.address_map" )
     {
+        if( method == "symbol.address_map" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            auto mappings = source->GetSymbolAddressMappings( page.offset, page.limit + 1 );
+            const bool hasMore = mappings.size() > page.limit;
+            if( hasMore ) mappings.pop_back();
+            json values = json::array();
+            for( const auto& mapping : mappings ) values.push_back( {
+                { "ref", mapping.ref }, { "address", mapping.address }, { "symbol_ref", mapping.symbolRef },
+                { "symbol_address", mapping.symbolAddress }, { "offset_bytes", Decimal( uint64_t( mapping.offset ) ) }, { "inline_mapping", mapping.inlineMapping }
+            } );
+            const auto returned = mappings.size();
+            const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
+            return Success( id, { { "mappings", std::move( values ) } }, trace, PageJson( page, returned, cursor ) );
+        }
         auto symbols = source->GetSymbols();
         if( method == "symbol.get" )
         {
@@ -2014,10 +2147,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "symbol.address" )
         {
             if( !params.contains( "address" ) || !params["address"].is_string() ) throw QueryError( "INVALID_PARAMS", "address is required as 0x-prefixed hexadecimal string" );
-            const auto address = Lower( params["address"].get<std::string>() );
-            const auto found = std::find_if( symbols.begin(), symbols.end(), [&]( const auto& symbol ) { return Lower( symbol.address ) == address; } );
-            if( found == symbols.end() ) throw QueryError( "ENTITY_NOT_FOUND", "symbol address was not found" );
-            return Success( id, SymbolJson( *found ), trace );
+            const auto address = params["address"].get<std::string>();
+            const auto mapping = source->ResolveSymbolAddress( HexAddress( address ) );
+            if( !mapping ) throw QueryError( "ENTITY_NOT_FOUND", "symbol address was not found" );
+            const auto found = std::find_if( symbols.begin(), symbols.end(), [&]( const auto& symbol ) { return symbol.ref == mapping->symbolRef; } );
+            if( found == symbols.end() ) throw QueryError( "ENTITY_NOT_FOUND", "resolved symbol metadata was not found" );
+            auto data = SymbolJson( *found );
+            data["query_address"] = mapping->address;
+            data["address_mapping_ref"] = mapping->ref;
+            data["offset_bytes"] = Decimal( uint64_t( mapping->offset ) );
+            data["inline_mapping"] = mapping->inlineMapping;
+            return Success( id, std::move( data ), trace );
         }
         symbols.erase( std::remove_if( symbols.begin(), symbols.end(), [&]( const auto& symbol ) {
             return method == "symbol.search" && !TextMatches( symbol.name + " " + symbol.file, params );
@@ -2049,7 +2189,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto resources = source->GetSymbolResources();
         const auto found = std::find_if( resources.begin(), resources.end(), [&]( const auto& value ) { return value.ref == ref; } );
         if( found == resources.end() || found->codeBytes == 0 ) throw QueryError( "CAPABILITY_UNAVAILABLE", "symbol has no persisted machine code" );
-        const auto maxBytes = params.value( "max_bytes", size_t( 65536 ) );
+        const auto maxBytes = size_t( UnsignedParameter( params, "max_bytes", 65536, 1024 * 1024 ) );
         if( maxBytes < 1 || maxBytes > 1024 * 1024 ) throw QueryError( "INVALID_PARAMS", "max_bytes must be between 1 and 1048576" );
         if( method == "symbol.disassembly" )
         {
@@ -2069,11 +2209,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "truncated", instructions.size() == maxInstructions || found->codeBytes > maxBytes }
             }, trace );
         }
-        return Success( id, {
-            { "symbol_ref", found->ref }, { "code_bytes", Decimal( found->codeBytes ) },
-            { "resource_uri", "tracy://trace/" + trace.id + "/symbol-code/" + Hex16( found->id ) },
-            { "representation", "bounded hexadecimal resource" }
-        }, trace );
+        const auto offset = size_t( UnsignedParameter( params, "offset_bytes", 0, std::numeric_limits<size_t>::max() ) );
+        auto data = BinaryChunkJson( source->ReadSymbolCodeBytes( found->id, offset, maxBytes ) );
+        data["symbol_ref"] = found->ref;
+        data["address"] = "0x" + Hex16( found->id );
+        data["representation"] = "base64url machine-code chunk";
+        data["resource_uri"] = "tracy://trace/" + trace.id + "/symbol-code/" + Hex16( found->id );
+        return Success( id, std::move( data ), trace );
     }
     if( method == "hardware_sample.capabilities" )
     {
@@ -2107,6 +2249,31 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "hardware_sample.address" ) return Success( id, std::move( output.front() ), trace );
         const auto cursor = NextCursor( page, method, trace, end - begin, end < values.size() );
         return Success( id, { { "addresses", std::move( output ) } }, trace, PageJson( page, end - begin, cursor ) );
+    }
+    if( method == "hardware_sample.events" )
+    {
+        if( !params.contains( "address" ) || !params["address"].is_string() ) throw QueryError( "INVALID_PARAMS", "address is required" );
+        const auto addressText = params["address"].get<std::string>();
+        const auto address = HexAddress( addressText );
+        const auto summaries = source->GetHardwareSamples();
+        if( std::none_of( summaries.begin(), summaries.end(), [&]( const auto& item ) { return Lower( item.address ) == Lower( addressText ); } ) )
+        {
+            throw QueryError( "ENTITY_NOT_FOUND", "hardware sample address was not found" );
+        }
+        const auto kind = params.value( "kind", std::string( "all" ) );
+        static const std::set<std::string> kinds = { "all", "cycles", "retired", "cache_references", "cache_misses", "branch_retired", "branch_misses" };
+        if( !kinds.contains( kind ) ) throw QueryError( "INVALID_PARAMS", "kind is not a supported hardware sample event type" );
+        const auto page = ParsePage( params, method, trace );
+        auto events = source->GetHardwareSampleEvents( address, kind, page.offset, page.limit + 1 );
+        const bool hasMore = events.size() > page.limit;
+        if( hasMore ) events.pop_back();
+        json output = json::array();
+        for( const auto& event : events ) output.push_back( {
+            { "ref", event.ref }, { "address", event.address }, { "kind", event.kind },
+            { "event_index", event.eventIndex }, { "time_ns", Decimal( event.timeNs ) }
+        } );
+        const auto cursor = NextCursor( page, method, trace, output.size(), hasMore );
+        return Success( id, { { "events", std::move( output ) } }, trace, PageJson( page, events.size(), cursor ) );
     }
     if( method == "source.locations" )
     {
@@ -2183,10 +2350,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json values = json::array();
         for( size_t index = begin; index < end; index++ ) values.push_back( {
             { "ref", resources[index].ref }, { "path", resources[index].path }, { "bytes", Decimal( resources[index].bytes ) },
+            { "path_base64url", Base64UrlEncode( resources[index].pathBytes ) },
             { "resource_uri", "tracy://trace/" + trace.id + "/source/" + std::to_string( resources[index].id ) }, { "trust", "untrusted_trace_data" }
         } );
         const auto cursor = NextCursor( page, method, trace, values.size(), end < resources.size() );
         return Success( id, { { "files", std::move( values ) } }, trace, PageJson( page, end - begin, cursor ) );
+    }
+    if( method == "source.raw" )
+    {
+        if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+        const auto ref = params["ref"].get<std::string>();
+        const auto resources = source->GetSourceResources();
+        auto found = std::find_if( resources.begin(), resources.end(), [&]( const auto& value ) { return value.ref == ref; } );
+        if( found == resources.end() )
+        {
+            const auto locations = source->GetSourceLocations();
+            const auto location = std::find_if( locations.begin(), locations.end(), [&]( const auto& value ) { return value.ref == ref; } );
+            if( location != locations.end() ) found = std::find_if( resources.begin(), resources.end(), [&]( const auto& value ) { return value.path == location->file; } );
+        }
+        if( found == resources.end() ) throw QueryError( "CAPABILITY_UNAVAILABLE", "source is not embedded in the trace" );
+        const auto offset = size_t( UnsignedParameter( params, "offset_bytes", 0, std::numeric_limits<size_t>::max() ) );
+        const auto maxBytes = size_t( UnsignedParameter( params, "max_bytes", 65536, 1024 * 1024 ) );
+        if( maxBytes == 0 ) throw QueryError( "INVALID_PARAMS", "max_bytes must be between 1 and 1048576" );
+        auto data = BinaryChunkJson( source->ReadEmbeddedSourceBytes( found->id, offset, maxBytes ) );
+        data["path"] = found->path;
+        data["path_base64url"] = Base64UrlEncode( found->pathBytes );
+        data["representation"] = "base64url source byte chunk";
+        return Success( id, std::move( data ), trace );
     }
     if( method == "source.lines" )
     {

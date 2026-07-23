@@ -2,7 +2,7 @@
   "schema_version": "1.0.0",
   "trace_format": "Tracy 0.9.0-0.13.1",
   "coverage_level": "field",
-  "status": "partial",
+  "status": "complete",
   "source_audit": [
     "server/TracyWorker.cpp Worker::Write and matching load paths",
     "server/TracyEvent.hpp persisted event structures",
@@ -38,7 +38,8 @@
         "capture_program",
         "capture_time",
         "executable_time",
-        "host_info"
+        "host_info",
+        "legacy_queue_delay_pre_0_12_3"
       ],
       "query_fields": [
         "trace_version",
@@ -56,7 +57,9 @@
         "capture_program",
         "capture_time",
         "executable_time",
-        "host_info"
+        "host_info",
+        "legacy_queue_delay_ns",
+        "field_availability.legacy_queue_delay_ns"
       ],
       "unmapped_fields": [],
       "methods": ["trace.info", "trace.overview"],
@@ -66,7 +69,7 @@
       "entity": "cpu.topology",
       "classification": "persisted_semantic",
       "persisted_fields": ["package_id", "die_id", "core_id", "hardware_thread_id"],
-      "query_fields": ["package_id", "die_id", "core_id", "hardware_thread_id"],
+      "query_fields": ["package_id", "die_id", "core_id", "hardware_thread_id", "field_availability.die_id"],
       "unmapped_fields": [],
       "methods": ["cpu.topology"],
       "status": "complete"
@@ -120,6 +123,7 @@
         "ref",
         "native_id",
         "name",
+        "local_name",
         "process_id",
         "zone_count",
         "is_fiber",
@@ -132,6 +136,7 @@
         "external_thread_name",
         "kernel_sample_count",
         "group_hint",
+        "field_availability.group_hint",
         "migrations"
       ],
       "unmapped_fields": [],
@@ -142,7 +147,7 @@
       "entity": "source.location",
       "classification": "persisted_semantic",
       "persisted_fields": ["native_id", "name", "function", "file", "line", "color", "cpu_zone_count", "gpu_zone_count"],
-      "query_fields": ["ref", "name", "function", "file", "line", "color", "cpu_zone_count", "gpu_zone_count"],
+      "query_fields": ["ref", "native_id", "dynamic", "name", "function", "file", "line", "color", "cpu_zone_count", "gpu_zone_count"],
       "unmapped_fields": [],
       "methods": ["source.locations", "source.statistics"],
       "status": "complete"
@@ -216,6 +221,7 @@
         "ref",
         "native_id",
         "name",
+        "custom_name",
         "source_location_ref",
         "lock_type",
         "lock_type_name",
@@ -224,7 +230,8 @@
         "terminate_ns",
         "event_count",
         "thread_count",
-        "timeline"
+        "timeline",
+        "timeline_source_location_ref"
       ],
       "unmapped_fields": [],
       "methods": ["lock.list", "lock.get", "lock.timeline"],
@@ -265,10 +272,12 @@
         "type",
         "type_name",
         "name",
+        "custom_name",
         "calibrated",
         "overflow",
         "note_names",
-        "notes"
+        "notes",
+        "field_availability.notes"
       ],
       "unmapped_fields": [],
       "methods": ["zone.gpu.contexts"],
@@ -302,6 +311,7 @@
         "parent_ref",
         "callstack_ref",
         "query_id",
+        "field_availability.query_id",
         "child_count",
         "complete"
       ],
@@ -321,8 +331,8 @@
     {
       "entity": "memory.pool",
       "classification": "persisted_semantic",
-      "persisted_fields": ["native_name_id", "resolved_name", "active_count", "free_count", "high_address", "low_address", "usage", "event_count"],
-      "query_fields": ["ref", "native_name_id", "name", "active_count", "active_bytes", "free_count", "persisted_usage_bytes", "high", "low", "event_count"],
+      "persisted_fields": ["map_name_id", "resolved_name", "active_count", "free_count", "high_address", "low_address", "usage", "stored_name_id", "stored_name", "event_count"],
+      "query_fields": ["ref", "native_name_id", "name", "active_count", "active_bytes", "free_count", "persisted_usage_bytes", "stored_name_id", "stored_name", "high", "low", "event_count"],
       "unmapped_fields": [],
       "methods": ["memory.pools", "memory.gpu.pools"],
       "status": "complete"
@@ -391,16 +401,16 @@
       "entity": "frame.image",
       "classification": "persisted_semantic",
       "persisted_fields": ["width", "height", "flip", "bc1_pixels", "frame_event_relationship"],
-      "query_fields": ["ref", "width", "height", "flipped", "png_resource", "frame_index"],
-      "unmapped_fields": ["raw_bc1_resource", "opaque_frame_ref"],
-      "methods": ["frame_image.list", "frame_image.metadata", "frame_image.resource"],
-      "status": "partial"
+      "query_fields": ["ref", "width", "height", "flipped", "raw_frame_index", "frame_ref", "raw_bc1_bytes", "png_resource", "raw_bc1_offset", "raw_bc1_chunk", "raw_bc1_next_offset", "raw_bc1_eof"],
+      "unmapped_fields": [],
+      "methods": ["frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw"],
+      "status": "complete"
     },
     {
       "entity": "context_switch.thread",
       "classification": "persisted_semantic",
       "persisted_fields": ["thread", "wakeup", "start", "end", "cpu", "wakeup_cpu", "reason", "state", "next_thread"],
-      "query_fields": ["ref", "thread_ref", "wakeup_ns", "start_ns", "end_ns", "cpu", "wakeup_cpu", "reason_code", "reason_name", "state_code", "state_name", "related_thread_index", "next_thread_ref"],
+      "query_fields": ["ref", "thread_ref", "wakeup_ns", "start_ns", "end_ns", "cpu", "wakeup_cpu", "field_availability.wakeup_cpu", "reason_code", "reason_name", "state_code", "state_name", "related_thread_index", "next_thread_ref"],
       "unmapped_fields": [],
       "methods": ["context_switch.range", "context_switch.thread"],
       "status": "complete"
@@ -409,7 +419,7 @@
       "entity": "context_switch.cpu",
       "classification": "persisted_semantic",
       "persisted_fields": ["cpu", "start", "end", "thread"],
-      "query_fields": ["cpu", "start_ns", "end_ns", "thread_ref"],
+      "query_fields": ["ref", "cpu", "start_ns", "end_ns", "raw_thread_index", "thread_ref", "complete"],
       "unmapped_fields": [],
       "methods": ["cpu.timeline"],
       "status": "complete"
@@ -436,18 +446,18 @@
       "entity": "symbol.code",
       "classification": "persisted_semantic",
       "persisted_fields": ["symbol_address", "byte_length", "bytes"],
-      "query_fields": ["ref", "address", "bytes", "truncated"],
-      "unmapped_fields": ["complete_chunked_resource"],
+      "query_fields": ["ref", "address", "offset_bytes", "returned_bytes", "total_bytes", "data_base64url", "next_offset_bytes", "eof"],
+      "unmapped_fields": [],
       "methods": ["symbol.raw_code", "symbol.disassembly"],
-      "status": "partial"
+      "status": "complete"
     },
     {
       "entity": "symbol.address_map",
       "classification": "persisted_semantic",
       "persisted_fields": ["code_address", "symbol_address"],
-      "query_fields": ["address", "symbol_ref"],
+      "query_fields": ["ref", "address", "symbol_ref", "symbol_address", "offset_bytes", "inline_mapping"],
       "unmapped_fields": [],
-      "methods": ["symbol.address"],
+      "methods": ["symbol.address", "symbol.address_map"],
       "status": "complete"
     },
     {
@@ -470,27 +480,24 @@
         "cache_reference_count",
         "cache_miss_count",
         "branch_retired_count",
-        "branch_miss_count"
+        "branch_miss_count",
+        "event_ref",
+        "event_kind",
+        "event_index",
+        "event_time_ns"
       ],
-      "unmapped_fields": [
-        "cycle_event_times",
-        "retired_event_times",
-        "cache_reference_event_times",
-        "cache_miss_event_times",
-        "branch_retired_event_times",
-        "branch_miss_event_times"
-      ],
-      "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.capabilities"],
-      "status": "partial"
+      "unmapped_fields": [],
+      "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities"],
+      "status": "complete"
     },
     {
       "entity": "source.file",
       "classification": "persisted_semantic",
       "persisted_fields": ["path_bytes", "content_length", "content_bytes"],
-      "query_fields": ["ref", "path", "bytes", "bounded_text_resource"],
-      "unmapped_fields": ["complete_chunked_resource", "raw_path_bytes"],
-      "methods": ["source.embedded", "source.lines"],
-      "status": "partial"
+      "query_fields": ["ref", "path", "path_base64url", "bytes", "bounded_text_resource", "raw_offset_bytes", "raw_returned_bytes", "raw_total_bytes", "raw_data_base64url", "raw_next_offset_bytes", "raw_eof"],
+      "unmapped_fields": [],
+      "methods": ["source.embedded", "source.lines", "source.raw"],
+      "status": "complete"
     }
   ],
   "non_persisted": [
@@ -509,6 +516,11 @@
       "classification": "runtime_only",
       "members": ["timeDiff", "calibratedGpuTime", "calibratedCpuTime", "calibrationMod", "lastGpuTime", "overflowMul"],
       "reason": "Worker::Write persists the calibration flag, period, type, overflow and notes, but not these live calibration members."
+    },
+    {
+      "field": "parent_callstack_payload_and_frames",
+      "classification": "runtime_only",
+      "reason": "Parent callstacks are assembled while processing live callstack tree responses. Worker::Write does not persist parentCallstackPayload, parentCallstackMap, or parentCallstackFrameMap; saved traces therefore report this capability as unavailable when those containers are absent."
     }
   ],
   "internal_exclusions": [
@@ -521,7 +533,6 @@
     {
       "area": "indexes_and_caches",
       "members": [
-        "sourceLocationPayloadMap",
         "revFrameMap",
         "revParentFrameMap",
         "zoneVectorCache",
@@ -533,6 +544,19 @@
       ],
       "classification": "internal_cache",
       "reason": "Reconstructible indexes and lookup caches."
+    },
+    {
+      "area": "serialization_identity_tables",
+      "members": [
+        "stringData",
+        "stringMap",
+        "threadCompression",
+        "threadExpand",
+        "sourceLocationPayloadMap",
+        "frameImageCompressionDictionary"
+      ],
+      "classification": "storage_identity",
+      "reason": "Encoding and deduplication tables are resolved into their semantic strings, native thread IDs, source-location records, or decompressed BC1 bytes. Their container order, addresses, and compression bytes do not carry additional capture semantics."
     },
     {
       "area": "staging_and_live_transport",

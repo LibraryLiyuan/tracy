@@ -569,7 +569,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         if( fileVer < FileVersion( 0, 12, 3 ) )
         {
-            f.Skip( 8 );    // m_delay
+            f.Read( m_legacyQueueDelay );
         }
     }
     else

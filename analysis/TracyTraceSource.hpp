@@ -57,6 +57,12 @@ struct Capability
     std::vector<std::string> methods;
 };
 
+struct FieldAvailabilityDto
+{
+    bool available = true;
+    std::string reason;
+};
+
 struct TraceCountsDto
 {
     uint64_t frames = 0;
@@ -114,6 +120,8 @@ struct TraceInfoDto
     uint64_t frameOffset = 0;
     int64_t samplingPeriodNs = 0;
     bool onDemand = false;
+    std::optional<int64_t> legacyQueueDelayNs;
+    FieldAvailabilityDto legacyQueueDelayAvailability;
 };
 
 struct ThreadDto
@@ -134,6 +142,8 @@ struct ThreadDto
     std::optional<uint64_t> kernelSampleCount;
     std::optional<int32_t> groupHint;
     std::optional<uint32_t> runningRegions;
+    std::optional<std::string> localName;
+    FieldAvailabilityDto groupHintAvailability;
 };
 
 struct FrameSetDto
@@ -174,6 +184,8 @@ struct GpuContextDto
 
     std::vector<NoteName> noteNames;
     std::vector<Note> notes;
+    std::optional<std::string> customName;
+    FieldAvailabilityDto notesAvailability;
 };
 
 struct MemoryPoolDto
@@ -189,6 +201,8 @@ struct MemoryPoolDto
     bool gpuD3D12 = false;
     uint64_t freeCount = 0;
     uint64_t persistedUsageBytes = 0;
+    uint64_t storedNameId = 0;
+    std::string storedName;
 };
 
 struct PlotDto
@@ -221,6 +235,7 @@ struct LockDto
     std::optional<int64_t> terminateNs;
     uint8_t type = 0;
     std::string typeName;
+    std::optional<std::string> customName;
 };
 
 struct SourceLocationDto
@@ -231,6 +246,8 @@ struct SourceLocationDto
     std::string file;
     uint32_t line = 0;
     uint32_t color = 0;
+    int32_t nativeId = 0;
+    bool dynamic = false;
 };
 
 struct FrameDto
@@ -292,6 +309,7 @@ struct GpuZoneDto
     std::optional<int64_t> selfTimeNs;
     bool complete = true;
     uint16_t queryId = 0;
+    FieldAvailabilityDto queryIdAvailability;
 };
 
 struct CrashDto
@@ -310,6 +328,7 @@ struct CpuTopologyDto
     uint32_t package = 0;
     uint32_t die = 0;
     uint32_t core = 0;
+    FieldAvailabilityDto dieAvailability;
 };
 
 struct CpuUsagePointDto
@@ -336,6 +355,18 @@ struct ContextSwitchDto
     std::string stateName;
     uint16_t relatedThreadIndex = 0;
     std::optional<std::string> relatedThreadRef;
+    FieldAvailabilityDto wakeupCpuAvailability;
+};
+
+struct CpuContextSwitchDto
+{
+    std::string ref;
+    uint32_t cpu = 0;
+    int64_t startNs = 0;
+    std::optional<int64_t> endNs;
+    uint16_t rawThreadIndex = 0;
+    std::string threadRef;
+    bool complete = true;
 };
 
 struct SampleDto
@@ -376,6 +407,15 @@ struct HardwareSampleDto
     uint64_t branchMisses = 0;
 };
 
+struct HardwareSampleEventDto
+{
+    std::string ref;
+    std::string address;
+    std::string kind;
+    uint64_t eventIndex = 0;
+    int64_t timeNs = 0;
+};
+
 struct LockEventDto
 {
     std::string ref;
@@ -386,6 +426,7 @@ struct LockEventDto
     std::optional<std::string> ownerThreadRef;
     uint32_t lockCount = 0;
     std::vector<std::string> waiterThreadRefs;
+    std::string sourceLocationRef;
 };
 
 struct SymbolDto
@@ -404,6 +445,16 @@ struct SymbolDto
     std::optional<std::string> callFile;
     uint32_t callLine = 0;
     bool inlineFrame = false;
+};
+
+struct SymbolAddressMappingDto
+{
+    std::string ref;
+    std::string address;
+    std::string symbolRef;
+    std::string symbolAddress;
+    uint32_t offset = 0;
+    bool inlineMapping = false;
 };
 
 struct MemoryEventDto
@@ -500,6 +551,7 @@ struct SourceResourceDto
     std::string ref;
     std::string path;
     uint64_t bytes = 0;
+    std::vector<uint8_t> pathBytes;
 };
 
 struct SymbolResourceDto
@@ -519,7 +571,18 @@ struct FrameImageMetadataDto
     uint32_t width = 0;
     uint32_t height = 0;
     bool flipped = false;
-    uint32_t frameRef = 0;
+    uint32_t rawFrameIndex = 0;
+    std::optional<std::string> frameRef;
+    uint64_t rawBc1Bytes = 0;
+};
+
+struct BinaryResourceChunkDto
+{
+    std::string ref;
+    uint64_t offset = 0;
+    uint64_t totalBytes = 0;
+    std::vector<uint8_t> bytes;
+    bool eof = true;
 };
 
 class TraceSource
@@ -552,11 +615,15 @@ public:
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }
     virtual std::vector<CpuUsagePointDto> GetCpuUsage() const { return {}; }
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
+    virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
+    virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }
     virtual std::vector<LockEventDto> ScanLockEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SymbolDto> GetSymbols() const { return {}; }
+    virtual std::vector<SymbolAddressMappingDto> GetSymbolAddressMappings( size_t, size_t ) const { return {}; }
+    virtual std::optional<SymbolAddressMappingDto> ResolveSymbolAddress( uint64_t ) const { return std::nullopt; }
     virtual std::vector<SourceLocationDto> GetSourceLocations() const { return {}; }
 
     virtual std::vector<CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const = 0;
@@ -585,9 +652,12 @@ public:
     virtual std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const = 0;
     virtual GpuMemoryAttribution GetGpuMemoryAttribution() const = 0;
     virtual SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const = 0;
+    virtual BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const = 0;
     virtual SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const = 0;
+    virtual BinaryResourceChunkDto ReadSymbolCodeBytes( uint64_t symbolId, size_t offset, size_t maxBytes ) const = 0;
     virtual std::vector<DisassemblyInstructionDto> DisassembleSymbol( std::string_view symbolRef, size_t maxBytes, size_t maxInstructions ) const = 0;
     virtual FrameImageDto ReadFrameImage( size_t imageId, size_t maxBytes ) const = 0;
+    virtual BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const = 0;
 };
 
 const char* ToString( TraceSourceKind value );

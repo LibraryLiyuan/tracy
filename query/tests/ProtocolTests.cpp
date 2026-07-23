@@ -47,7 +47,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) params["thread_ref"] = "fake:thread:1";
     if( method == "frame.get" ) params["ref"] = "fake:frame:0";
     if( method == "frame.range_mapping" || method == "timeline.slice" ) { params["start_ns"] = "0"; params["end_ns"] = "100"; }
-    if( method == "frame_image.metadata" || method == "frame_image.resource" ) params["ref"] = "fake:frame-image:0";
+    if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) params["ref"] = "fake:frame-image:0";
     if( method == "zone.cpu.get" || method == "zone.cpu.tree" ) params["ref"] = "fake:cpu-zone:0";
     if( method == "zone.gpu.get" || method == "zone.gpu.tree" ) params["ref"] = "fake:gpu-zone:0";
     if( method == "memory.get" ) params["ref"] = "fake:memory-event:0";
@@ -61,8 +61,8 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "callstack.resolve" || method == "callstack.batch" ) params["callstacks"] = json::array( { "1" } );
     if( method == "callstack.frames" || method == "callstack.parent" ) params["callstack"] = "1";
     if( method == "symbol.get" || method == "symbol.raw_code" || method == "symbol.disassembly" ) params["ref"] = "fake:symbol:1";
-    if( method == "symbol.address" || method == "hardware_sample.address" ) params["address"] = "0x1";
-    if( method == "source.lines" ) params["ref"] = "fake:source-file:0";
+    if( method == "symbol.address" || method == "hardware_sample.address" || method == "hardware_sample.events" ) params["address"] = "0x1";
+    if( method == "source.lines" || method == "source.raw" ) params["ref"] = "fake:source-file:0";
     if( method == "statistics.compute" ) params["values_ns"] = json::array( { "1", "2", "3" } );
     if( method.rfind( "compare.", 0 ) == 0 ) params["baseline_trace_id"] = baselineId;
     return params;
@@ -110,7 +110,7 @@ int main()
     assert( coverage.at( "domains" ).size() == 23 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
-    assert( coverage.at( "field_status" ) == "partial" );
+    assert( coverage.at( "field_status" ) == "complete" );
     for( const auto& domain : coverage.at( "domains" ) )
     {
         assert( domain.at( "domain" ).is_string() );
@@ -122,7 +122,7 @@ int main()
 
     const auto fieldCoverage = LoadJson( TRACY_QUERY_FIELD_COVERAGE_PATH );
     assert( fieldCoverage.at( "coverage_level" ) == "field" );
-    assert( fieldCoverage.at( "status" ) == "partial" );
+    assert( fieldCoverage.at( "status" ) == "complete" );
     assert( fieldCoverage.at( "entities" ).size() >= 25 );
     std::set<std::string> fieldEntities;
     size_t mappedFields = 0;
@@ -139,7 +139,7 @@ int main()
         unmappedFields += entity.at( "unmapped_fields" ).size();
     }
     assert( mappedFields > 100 );
-    assert( unmappedFields > 0 );
+    assert( unmappedFields == 0 );
     assert( fieldEntities.contains( "zone.cpu" ) );
     assert( fieldEntities.contains( "gpu.context" ) );
     assert( fieldEntities.contains( "hardware_sample" ) );
@@ -196,13 +196,16 @@ int main()
     ScanRange entire;
     assert( fake.ScanCpuZones( entire ).size() == 2 && fake.ScanGpuZones( entire ).size() == 1 && fake.ScanFrames( entire ).size() == 1 );
     assert( fake.ScanMemoryEvents( entire ).size() == 1 && fake.ScanMessages( entire ).size() == 1 && fake.ScanPlots( entire ).size() == 1 );
-    assert( fake.ScanContextSwitchEvents( entire ).size() == 1 && fake.ScanSampleEvents( entire ).size() == 1 && fake.ScanGhostZones( entire ).size() == 1 );
+    assert( fake.ScanContextSwitchEvents( entire ).size() == 1 && fake.ScanCpuContextSwitchEvents( entire ).size() == 1 && fake.ScanSampleEvents( entire ).size() == 1 && fake.ScanGhostZones( entire ).size() == 1 );
     assert( fake.ScanLockEvents( entire ).size() == 1 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 );
     assert( fake.ResolveCallstacks( { 1 }, 1 ).size() == 1 && fake.ResolveParentCallstacks( { 1 }, 1 ).size() == 1 );
     assert( fake.GetSourceResources().size() == 1 && fake.GetSymbolResources().size() == 1 && fake.GetFrameImageResources().size() == 1 );
     assert( fake.GetMemoryFrameSnapshot( 0, 0, {}, false ).valid );
     assert( fake.GetMemoryEvent( { 1, 0 } ).has_value() && fake.GetGpuMemoryAttribution().allocations.size() == 1 );
     assert( fake.ReadEmbeddedSource( 0, 64 ).embedded && fake.ReadSymbolCode( 1, 64 ).bytes.size() == 1 && fake.ReadFrameImage( 0, 64 ).rgba.size() == 4 );
+    assert( fake.ReadEmbeddedSourceBytes( 0, 0, 64 ).bytes.size() == 3 && fake.ReadSymbolCodeBytes( 1, 0, 64 ).bytes.size() == 1 && fake.ReadFrameImageBc1( 0, 0, 64 ).bytes.size() == 8 );
+    assert( fake.GetHardwareSampleEvents( 1, "all", 0, 1 ).front().timeNs == 33 );
+    assert( fake.GetSymbolAddressMappings( 0, 1 ).size() == 1 && fake.ResolveSymbolAddress( 1 ).has_value() );
     assert( fake.ParseEntityRef( fake.MakeEntityRef( "cpu-zone", 7 ), "cpu-zone" ) == 7 );
     ScanRange before; before.endNs = 10; assert( fake.ScanCpuZones( before ).empty() );
     ScanRange after; after.startNs = 60; assert( fake.ScanCpuZones( after ).empty() );
@@ -210,9 +213,9 @@ int main()
 
     TemporaryTraceFiles files;
     tracy::query::SessionManager sessions( { files.root }, 2,
-        []( const std::filesystem::path&, tracy::query::SessionManager::StateCallback callback ) -> std::unique_ptr<tracy::analysis::TraceSource> {
+        []( const std::filesystem::path& path, tracy::query::SessionManager::StateCallback callback ) -> std::unique_ptr<tracy::analysis::TraceSource> {
             callback( tracy::analysis::TraceSourceState::Indexing );
-            return std::make_unique<tracy::query::test::FakeTraceSource>();
+            return std::make_unique<tracy::query::test::FakeTraceSource>( path.filename() == "baseline.tracy" );
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
 
@@ -266,14 +269,18 @@ int main()
     assert( traceFields.at( "frame_offset" ) == "17" );
     assert( traceFields.at( "sampling_period_ns" ) == "1000" );
     assert( traceFields.at( "on_demand" ) == true );
+    assert( traceFields.at( "legacy_queue_delay_ns" ).is_null() );
+    assert( traceFields.at( "field_availability" ).at( "legacy_queue_delay_ns" ).at( "available" ) == false );
 
     const auto threadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", candidateId }, { "ref", "fake:thread:1" }
     } ) ).at( "data" );
     assert( threadFields.at( "external_process_name" ) == "FakeProcess" );
     assert( threadFields.at( "external_thread_name" ) == "FakeExternalThread" );
+    assert( threadFields.at( "local_name" ) == "FakeLocalThread" );
     assert( threadFields.at( "kernel_sample_count" ) == "3" );
     assert( threadFields.at( "group_hint" ) == -7 );
+    assert( threadFields.at( "field_availability" ).at( "group_hint" ).at( "available" ) == true );
     assert( threadFields.at( "running_regions" ) == 4 );
 
     const auto cpuZoneFields = service.Execute( Request( requestId++, "zone.cpu.get", {
@@ -288,14 +295,17 @@ int main()
         { "trace_id", candidateId }
     } ) ).at( "data" ).at( "contexts" )[0];
     assert( gpuContextFields.at( "type_name" ) == "direct3d12" );
+    assert( gpuContextFields.at( "custom_name" ) == "GPU" );
     assert( gpuContextFields.at( "overflow" ) == "9" );
     assert( gpuContextFields.at( "note_names" )[0].at( "time_ns" ) == "21" );
     assert( gpuContextFields.at( "notes" )[0].at( "query_id" ) == 5 );
+    assert( gpuContextFields.at( "field_availability" ).at( "notes" ).at( "available" ) == true );
 
     const auto gpuZoneFields = service.Execute( Request( requestId++, "zone.gpu.get", {
         { "trace_id", candidateId }, { "ref", "fake:gpu-zone:0" }
     } ) ).at( "data" );
     assert( gpuZoneFields.at( "query_id" ) == 5 );
+    assert( gpuZoneFields.at( "field_availability" ).at( "query_id" ).at( "available" ) == true );
 
     const auto contextFields = service.Execute( Request( requestId++, "context_switch.range", {
         { "trace_id", candidateId }
@@ -303,6 +313,7 @@ int main()
     assert( contextFields.at( "reason_name" ) == "wr_mutex" );
     assert( contextFields.at( "state_name" ) == "waiting" );
     assert( contextFields.at( "next_thread_ref" ) == "fake:thread:1" );
+    assert( contextFields.at( "field_availability" ).at( "wakeup_cpu" ).at( "available" ) == true );
 
     const auto memoryPoolFields = service.Execute( Request( requestId++, "memory.pools", {
         { "trace_id", candidateId }
@@ -310,12 +321,15 @@ int main()
     assert( memoryPoolFields.at( "native_name_id" ) == "1" );
     assert( memoryPoolFields.at( "free_count" ) == "2" );
     assert( memoryPoolFields.at( "persisted_usage_bytes" ) == "64" );
+    assert( memoryPoolFields.at( "stored_name_id" ) == "1" );
+    assert( memoryPoolFields.at( "stored_name" ) == "GPU D3D12 Fake" );
 
     const auto lockFields = service.Execute( Request( requestId++, "lock.get", {
         { "trace_id", candidateId }, { "ref", "fake:lock:1" }
     } ) ).at( "data" );
     assert( lockFields.at( "type" ) == 1 );
     assert( lockFields.at( "type_name" ) == "shared_lockable" );
+    assert( lockFields.at( "custom_name" ) == "Mutex" );
 
     const auto plotFields = service.Execute( Request( requestId++, "plot.list", {
         { "trace_id", candidateId }
@@ -336,6 +350,99 @@ int main()
         { "trace_id", candidateId }, { "callstack", "1" }
     } ) ).at( "data" ).at( "frames" )[0];
     assert( callstackFields.at( "image_name" ) == "fake.dll" );
+
+    const auto sourceLocationFields = service.Execute( Request( requestId++, "source.locations", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "source_locations" )[0];
+    assert( sourceLocationFields.at( "native_id" ) == 1 );
+    assert( sourceLocationFields.at( "dynamic" ) == false );
+
+    const auto cpuTimelineFields = service.Execute( Request( requestId++, "cpu.timeline", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "segments" )[0];
+    assert( cpuTimelineFields.at( "raw_thread_index" ) == 1 );
+    assert( cpuTimelineFields.at( "thread_ref" ) == "fake:thread:1" );
+
+    const auto hardwareEventFields = service.Execute( Request( requestId++, "hardware_sample.events", {
+        { "trace_id", candidateId }, { "address", "0x1" }, { "kind", "cycles" }
+    } ) ).at( "data" ).at( "events" )[0];
+    assert( hardwareEventFields.at( "event_index" ) == 0 );
+    assert( hardwareEventFields.at( "time_ns" ) == "33" );
+
+    const auto symbolAddressFields = service.Execute( Request( requestId++, "symbol.address", {
+        { "trace_id", candidateId }, { "address", "0x1" }
+    } ) ).at( "data" );
+    assert( symbolAddressFields.at( "address_mapping_ref" ) == "fake:symbol-address:1" );
+    assert( symbolAddressFields.at( "inline_mapping" ) == true );
+
+    const auto symbolMapFields = service.Execute( Request( requestId++, "symbol.address_map", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" ).at( "mappings" )[0];
+    assert( symbolMapFields.at( "symbol_ref" ) == "fake:symbol:1" );
+
+    const auto sourceRawFields = service.Execute( Request( requestId++, "source.raw", {
+        { "trace_id", candidateId }, { "ref", "fake:source-file:0" }
+    } ) ).at( "data" );
+    assert( sourceRawFields.at( "data_base64url" ) == "Zm9v" );
+    assert( sourceRawFields.at( "eof" ) == true );
+
+    const auto symbolRawFields = service.Execute( Request( requestId++, "symbol.raw_code", {
+        { "trace_id", candidateId }, { "ref", "fake:symbol:1" }
+    } ) ).at( "data" );
+    assert( symbolRawFields.at( "data_base64url" ) == "kA" );
+
+    const auto frameRawFields = service.Execute( Request( requestId++, "frame_image.raw", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-image:0" }
+    } ) ).at( "data" );
+    assert( frameRawFields.at( "data_base64url" ) == "AQIDBAUGBwg" );
+    assert( frameRawFields.at( "format" ) == "bc1_dxt1" );
+
+    const auto frameMetadataFields = service.Execute( Request( requestId++, "frame_image.metadata", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-image:0" }
+    } ) ).at( "data" );
+    assert( frameMetadataFields.at( "raw_frame_index" ) == 0 );
+    assert( frameMetadataFields.at( "frame_ref" ) == "fake:frame:0" );
+
+    const auto lockTimelineFields = service.Execute( Request( requestId++, "lock.timeline", {
+        { "trace_id", candidateId }, { "lock_ref", "fake:lock:1" }
+    } ) ).at( "data" ).at( "events" )[0];
+    assert( lockTimelineFields.at( "source_location_ref" ) == "fake:source:1" );
+
+    const auto legacyTraceFields = service.Execute( Request( requestId++, "trace.info", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" );
+    assert( legacyTraceFields.at( "legacy_queue_delay_ns" ) == "42" );
+    assert( legacyTraceFields.at( "field_availability" ).at( "legacy_queue_delay_ns" ).at( "available" ) == true );
+
+    const auto legacyThreadFields = service.Execute( Request( requestId++, "thread.get", {
+        { "trace_id", baselineId }, { "ref", "fake:thread:1" }
+    } ) ).at( "data" );
+    assert( legacyThreadFields.at( "group_hint" ).is_null() );
+    assert( legacyThreadFields.at( "field_availability" ).at( "group_hint" ).at( "available" ) == false );
+
+    const auto legacyTopologyFields = service.Execute( Request( requestId++, "cpu.topology", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" ).at( "logical_cpus" )[0];
+    assert( legacyTopologyFields.at( "die" ).is_null() );
+    assert( legacyTopologyFields.at( "field_availability" ).at( "die" ).at( "available" ) == false );
+
+    const auto legacyGpuContextFields = service.Execute( Request( requestId++, "zone.gpu.contexts", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" ).at( "contexts" )[0];
+    assert( legacyGpuContextFields.at( "notes" ).empty() );
+    assert( legacyGpuContextFields.at( "field_availability" ).at( "notes" ).at( "available" ) == false );
+
+    const auto legacyGpuZoneFields = service.Execute( Request( requestId++, "zone.gpu.get", {
+        { "trace_id", baselineId }, { "ref", "fake:gpu-zone:0" }
+    } ) ).at( "data" );
+    assert( legacyGpuZoneFields.at( "query_id" ).is_null() );
+    assert( legacyGpuZoneFields.at( "field_availability" ).at( "query_id" ).at( "available" ) == false );
+
+    const auto legacyContextFields = service.Execute( Request( requestId++, "context_switch.range", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" ).at( "context_switches" )[0];
+    assert( legacyContextFields.at( "wakeup_cpu" ).is_null() );
+    assert( legacyContextFields.at( "field_availability" ).at( "wakeup_cpu" ).at( "available" ) == false );
 
     const auto projected = service.Execute( Request( requestId++, "zone.cpu.search", {
         { "trace_id", candidateId }, { "fields", nlohmann::json::array( { "name" } ) }, { "filter", { { "mode", "prefix" }, { "text", "up" }, { "case_sensitive", false } } }

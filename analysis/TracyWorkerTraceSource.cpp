@@ -1,6 +1,7 @@
 #include "TracyWorkerTraceSource.hpp"
 
 #include "TracyHash.hpp"
+#include "TracyFileHeader.hpp"
 #include "TracyFileRead.hpp"
 #include "TracyWorker.hpp"
 
@@ -186,7 +187,22 @@ void ForEachGpuZone( const Vector<short_ptr<GpuEvent>>& zones, F&& callback )
 
 bool Intersects( int64_t begin, int64_t end, const ScanRange& range )
 {
-    return begin < range.endNs && end >= range.startNs;
+    return begin < range.endNs && end > range.startNs;
+}
+
+BinaryResourceChunkDto BinaryChunk( std::string ref, const uint8_t* data, size_t totalBytes, size_t offset, size_t maxBytes )
+{
+    BinaryResourceChunkDto result;
+    result.ref = std::move( ref );
+    result.offset = offset;
+    result.totalBytes = totalBytes;
+    if( offset < totalBytes )
+    {
+        const auto size = std::min( maxBytes, totalBytes - offset );
+        result.bytes.assign( data + offset, data + offset + size );
+    }
+    result.eof = offset >= totalBytes || result.bytes.size() >= totalBytes - offset;
+    return result;
 }
 
 uint8_t Expand5( uint16_t value )
@@ -302,7 +318,9 @@ public:
             Safe( worker->TryGetString( source.function ) ),
             Safe( worker->TryGetString( source.file ) ),
             source.line,
-            source.color
+            source.color,
+            id,
+            id < 0
         };
     }
 
@@ -438,6 +456,8 @@ public:
         if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
         dto.complete = zone->GpuEnd() >= 0 && zone->CpuEnd() >= 0;
         dto.queryId = zone->query_id;
+        dto.queryIdAvailability.available = worker->GetTraceVersion() >= FileVersion( 0, 12, 4 );
+        if( !dto.queryIdAvailability.available ) dto.queryIdAvailability.reason = "gpu query IDs were not persisted before Tracy 0.12.4";
         return dto;
     }
 
@@ -710,7 +730,10 @@ std::vector<SourceResourceDto> WorkerTraceSource::GetSourceResources() const
     {
         const auto* path = m_impl->sourceFiles[index];
         const auto block = m_impl->worker->GetSourceFileFromCache( path );
-        result.push_back( { index, m_impl->MakeRef( "source-file", index ), path, block.len } );
+        SourceResourceDto dto { index, m_impl->MakeRef( "source-file", index ), path, block.len };
+        const auto pathLength = std::strlen( path );
+        dto.pathBytes.assign( reinterpret_cast<const uint8_t*>( path ), reinterpret_cast<const uint8_t*>( path ) + pathLength );
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }
@@ -742,7 +765,17 @@ std::vector<FrameImageMetadataDto> WorkerTraceSource::GetFrameImageResources() c
     for( size_t index = 0; index < images.size(); index++ )
     {
         const auto* image = images[index].get();
-        result.push_back( { index, m_impl->MakeRef( "frame-image", index ), image->w, image->h, image->flip != 0, image->frameRef } );
+        FrameImageMetadataDto dto;
+        dto.id = index;
+        dto.ref = m_impl->MakeRef( "frame-image", index );
+        dto.width = image->w;
+        dto.height = image->h;
+        dto.flipped = image->flip != 0;
+        dto.rawFrameIndex = image->frameRef;
+        const auto* frameSet = m_impl->worker->GetFramesBase();
+        if( frameSet && image->frameRef < m_impl->worker->GetFrameCount( *frameSet ) ) dto.frameRef = m_impl->MakeRef( "frame", image->frameRef );
+        dto.rawBc1Bytes = uint64_t( image->w ) * image->h / 2;
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }
@@ -950,6 +983,16 @@ SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t max
     return { m_impl->MakeRef( "source-file", sourceId ), path, std::string( block.data, size ), true, size < block.len };
 }
 
+BinaryResourceChunkDto WorkerTraceSource::ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( sourceId >= m_impl->sourceFiles.size() ) throw std::out_of_range( "source resource was not found" );
+    const auto block = m_impl->worker->GetSourceFileFromCache( m_impl->sourceFiles[sourceId] );
+    return BinaryChunk(
+        m_impl->MakeRef( "source-file", sourceId ),
+        reinterpret_cast<const uint8_t*>( block.data ), block.len, offset, maxBytes );
+}
+
 SymbolCodeDto WorkerTraceSource::ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -960,6 +1003,15 @@ SymbolCodeDto WorkerTraceSource::ReadSymbolCode( uint64_t symbolId, size_t maxBy
     SymbolCodeDto result { m_impl->MakeRef( "symbol", symbolId ), Hex( symbolId ), {}, size < length };
     result.bytes.assign( reinterpret_cast<const uint8_t*>( code ), reinterpret_cast<const uint8_t*>( code ) + size );
     return result;
+}
+
+BinaryResourceChunkDto WorkerTraceSource::ReadSymbolCodeBytes( uint64_t symbolId, size_t offset, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->worker->HasSymbolCode( symbolId ) ) throw std::out_of_range( "symbol code resource was not found" );
+    uint32_t length = 0;
+    const auto* code = reinterpret_cast<const uint8_t*>( m_impl->worker->GetSymbolCode( symbolId, length ) );
+    return BinaryChunk( m_impl->MakeRef( "symbol", symbolId ), code, length, offset, maxBytes );
 }
 
 FrameImageDto WorkerTraceSource::ReadFrameImage( size_t imageId, size_t maxBytes ) const
@@ -977,6 +1029,17 @@ FrameImageDto WorkerTraceSource::ReadFrameImage( size_t imageId, size_t maxBytes
     result.flipped = image->flip != 0;
     DecodeBc1( reinterpret_cast<const uint8_t*>( m_impl->worker->UnpackFrameImage( *image ) ), image->w, image->h, result.rgba );
     return result;
+}
+
+BinaryResourceChunkDto WorkerTraceSource::ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& images = m_impl->worker->GetFrameImages();
+    if( imageId >= images.size() ) throw std::out_of_range( "frame image resource was not found" );
+    const auto* image = images[imageId].get();
+    const size_t bytes = size_t( image->w ) * image->h / 2;
+    const auto* bc1 = reinterpret_cast<const uint8_t*>( m_impl->worker->UnpackFrameImage( *image ) );
+    return BinaryChunk( m_impl->MakeRef( "frame-image", imageId ), bc1, bytes, offset, maxBytes );
 }
 
 TraceReadView WorkerTraceSource::AcquireReadView() const
@@ -1001,15 +1064,15 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
         capability( "frame", info.counts.frameSets != 0, true, { "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping" } ),
-        capability( "frame_image", info.counts.frameImages != 0, true, { "frame_image.list", "frame_image.metadata", "frame_image.resource" } ),
+        capability( "frame_image", info.counts.frameImages != 0, true, { "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw" } ),
         capability( "timeline", info.counts.cpuZones != 0 || info.counts.gpuZones != 0 || info.counts.frames != 0 || info.counts.messages != 0 || info.counts.plots != 0 || info.counts.locks != 0 || info.counts.contextSwitches != 0, true, { "timeline.slice" } ),
         capability( "zone.cpu", info.counts.cpuZones != 0, true, { "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph" } ),
         capability( "zone.gpu", info.counts.gpuZones != 0, true, { "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph" } ),
         capability( "callstack", info.counts.callstackPayloads != 0 || info.counts.parentCallstackPayloads != 0, true, { "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch" } ),
         capability( "sample", info.counts.samples != 0 || info.counts.contextSwitchSamples != 0 || info.counts.ghostZones != 0, true, { "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph" } ),
-        capability( "hardware_sample", info.counts.hardwareSamples != 0, true, { "hardware_sample.address", "hardware_sample.counts", "hardware_sample.capabilities" } ),
-        capability( "symbol", info.counts.symbols != 0, true, { "symbol.search", "symbol.get", "symbol.address", "symbol.raw_code", "symbol.disassembly" } ),
-        capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines" } ),
+        capability( "hardware_sample", info.counts.hardwareSamples != 0, true, { "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities" } ),
+        capability( "symbol", info.counts.symbols != 0, true, { "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly" } ),
+        capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw" } ),
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution" } ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
@@ -1045,6 +1108,9 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     result.frameOffset = worker.GetFrameOffset();
     result.samplingPeriodNs = worker.GetSamplingPeriod();
     result.onDemand = worker.IsOnDemand();
+    result.legacyQueueDelayAvailability.available = worker.GetTraceVersion() < FileVersion( 0, 12, 3 );
+    if( result.legacyQueueDelayAvailability.available ) result.legacyQueueDelayNs = worker.GetLegacyQueueDelay();
+    else result.legacyQueueDelayAvailability.reason = "legacy queue delay was removed from the trace format in Tracy 0.12.3";
     const auto& crash = worker.GetCrashEvent();
     result.hasCrash = crash.thread != 0 || crash.time != 0 || crash.message != 0 || crash.callstack != 0;
     result.samplesInconsistent = worker.AreSamplesInconsistent();
@@ -1058,6 +1124,10 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
         std::set<uint64_t> threads;
         for( const auto* thread : worker.GetThreadData() ) threads.emplace( thread->id );
         for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.emplace( thread );
+        for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.emplace( thread );
+        for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.emplace( thread );
+        for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.emplace( thread );
+        for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.emplace( thread );
         counts.threads = threads.size();
     }
     counts.locks = worker.GetLockCount();
@@ -1101,6 +1171,10 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
     std::map<uint64_t, const ThreadData*> threads;
     for( const auto* thread : worker.GetThreadData() ) threads.emplace( thread->id, thread );
     for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.try_emplace( thread, nullptr );
+    for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.try_emplace( thread, nullptr );
+    for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.try_emplace( thread, nullptr );
+    for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.try_emplace( thread, nullptr );
+    for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.try_emplace( thread, nullptr );
     result.reserve( threads.size() );
     for( const auto& [threadId, thread] : threads )
     {
@@ -1109,6 +1183,8 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
         dto.nativeId = threadId;
         dto.processId = worker.GetPidFromTid( threadId );
         dto.name = Safe( worker.GetThreadName( threadId ) );
+        const auto localName = worker.GetThreadNameMap().find( threadId );
+        if( localName != worker.GetThreadNameMap().end() ) dto.localName = Safe( localName->second );
         if( worker.HasExternalName( threadId ) )
         {
             const auto external = worker.GetExternalName( threadId );
@@ -1122,7 +1198,14 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
             dto.messageCount = thread->messages.size();
             dto.sampleCount = thread->samples.size();
             dto.kernelSampleCount = thread->kernelSampleCnt;
-            dto.groupHint = thread->groupHint;
+            dto.groupHintAvailability.available = worker.GetTraceVersion() >= FileVersion( 0, 11, 1 );
+            if( dto.groupHintAvailability.available ) dto.groupHint = thread->groupHint;
+            else dto.groupHintAvailability.reason = "thread group hint was not persisted before Tracy 0.11.1";
+        }
+        else
+        {
+            dto.groupHintAvailability.available = false;
+            dto.groupHintAvailability.reason = "this native thread has no persisted Tracy thread record";
         }
         if( const auto* context = worker.GetContextSwitchData( threadId ) ) dto.contextSwitchCount = context->v.size();
         const auto cpu = worker.GetCpuThreadData().find( threadId );
@@ -1178,6 +1261,9 @@ std::vector<GpuContextDto> WorkerTraceSource::GetGpuContexts() const
         dto.type = uint8_t( context->type );
         dto.typeName = GpuContextTypeName( context->type );
         dto.overflow = context->overflow;
+        dto.notesAvailability.available = worker.GetTraceVersion() >= FileVersion( 0, 12, 4 );
+        if( !dto.notesAvailability.available ) dto.notesAvailability.reason = "GPU note names, values, and query IDs were not persisted before Tracy 0.12.4";
+        if( context->name.Active() ) dto.customName = Safe( worker.TryGetString( context->name ) );
         dto.noteNames.reserve( context->noteNames.size() );
         for( const auto& [time, name] : context->noteNames ) dto.noteNames.push_back( { time, Safe( worker.TryGetString( name ) ) } );
         std::sort( dto.noteNames.begin(), dto.noteNames.end(), []( const auto& lhs, const auto& rhs ) {
@@ -1216,6 +1302,8 @@ std::vector<MemoryPoolDto> WorkerTraceSource::GetMemoryPools() const
         dto.gpuD3D12 = IsGpuD3D12PoolName( name );
         dto.freeCount = memory->frees.size();
         dto.persistedUsageBytes = memory->usage;
+        dto.storedNameId = memory->name;
+        dto.storedName = memory->name == 0 ? "Default allocator" : Safe( worker.GetString( memory->name ) );
         result.emplace_back( std::move( dto ) );
     }
     std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.name < rhs.name; } );
@@ -1273,6 +1361,7 @@ std::vector<LockDto> WorkerTraceSource::GetLocks() const
         if( value->timeTerminate >= 0 ) dto.terminateNs = value->timeTerminate;
         dto.type = uint8_t( value->type );
         dto.typeName = LockTypeName( value->type );
+        if( value->customName.Active() ) dto.customName = Safe( worker.TryGetString( value->customName ) );
         result.emplace_back( std::move( dto ) );
     }
     std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.nativeId < rhs.nativeId; } );
@@ -1507,13 +1596,20 @@ std::vector<CpuTopologyDto> WorkerTraceSource::GetCpuTopology() const
 {
     std::lock_guard lock( m_impl->readMutex );
     std::vector<CpuTopologyDto> result;
+    const auto dieAvailable = m_impl->worker->GetTraceVersion() >= FileVersion( 0, 11, 2 );
     for( const auto& [package, dies] : m_impl->worker->GetCpuTopology() )
     {
         for( const auto& [die, cores] : dies )
         {
             for( const auto& [core, cpus] : cores )
             {
-                for( const auto cpu : cpus ) result.push_back( { cpu, package, die, core } );
+                for( const auto cpu : cpus )
+                {
+                    CpuTopologyDto dto { cpu, package, die, core };
+                    dto.dieAvailability.available = dieAvailable;
+                    if( !dieAvailable ) dto.dieAvailability.reason = "CPU die IDs were not persisted before Tracy 0.11.2";
+                    result.emplace_back( std::move( dto ) );
+                }
             }
         }
     }
@@ -1566,6 +1662,8 @@ std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const 
             if( event.WakeupVal() >= 0 ) dto.wakeupNs = event.WakeupVal();
             dto.cpu = event.Cpu();
             dto.wakeupCpu = event.WakeupCpu();
+            dto.wakeupCpuAvailability.available = m_impl->worker->GetTraceVersion() >= FileVersion( 0, 11, 3 );
+            if( !dto.wakeupCpuAvailability.available ) dto.wakeupCpuAvailability.reason = "context-switch wakeup CPU was not persisted before Tracy 0.11.3";
             dto.reason = int8_t( event.Reason() );
             dto.state = event.State();
             dto.complete = event.IsEndValid();
@@ -1573,6 +1671,39 @@ std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const 
             dto.stateName = ContextSwitchStateName( dto.state );
             dto.relatedThreadIndex = event.Thread();
             if( dto.relatedThreadIndex != 0 ) dto.relatedThreadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( dto.relatedThreadIndex ) );
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+    }
+    return result;
+}
+
+std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( const ScanRange& range ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<CpuContextSwitchDto> result;
+    const auto* cpuData = m_impl->worker->GetCpuData();
+    if( !cpuData ) return result;
+    size_t skipped = 0;
+    uint64_t ordinal = 0;
+    for( int cpu = 0; cpu < m_impl->worker->GetCpuDataCpuCount(); cpu++ )
+    {
+        for( const auto& event : cpuData[cpu].cs )
+        {
+            const auto currentOrdinal = ordinal++;
+            const auto complete = event.IsEndValid();
+            const auto end = complete ? event.End() : event.Start();
+            const auto intersects = complete ? Intersects( event.Start(), end, range ) : event.Start() >= range.startNs && event.Start() < range.endNs;
+            if( !intersects ) continue;
+            if( skipped++ < range.offset ) continue;
+            CpuContextSwitchDto dto;
+            dto.ref = m_impl->MakeRef( "cpu-context-switch", currentOrdinal );
+            dto.cpu = uint32_t( cpu );
+            dto.startNs = event.Start();
+            if( complete ) dto.endNs = end;
+            dto.rawThreadIndex = event.Thread();
+            dto.threadRef = m_impl->MakeRef( "thread", m_impl->worker->DecompressThread( event.Thread() ) );
+            dto.complete = complete;
             result.emplace_back( std::move( dto ) );
             if( result.size() >= range.limit ) return result;
         }
@@ -1699,6 +1830,40 @@ std::vector<HardwareSampleDto> WorkerTraceSource::GetHardwareSamples() const
     return result;
 }
 
+std::vector<HardwareSampleEventDto> WorkerTraceSource::GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<HardwareSampleEventDto> result;
+    const auto found = m_impl->worker->GetHwSamples().find( address );
+    if( found == m_impl->worker->GetHwSamples().end() || limit == 0 ) return result;
+
+    size_t skipped = 0;
+    const auto append = [&]( std::string_view eventKind, const auto& events ) {
+        if( kind != "all" && kind != eventKind ) return;
+        for( size_t index = 0; index < events.size(); index++ )
+        {
+            if( skipped++ < offset ) continue;
+            if( result.size() >= limit ) return;
+            HardwareSampleEventDto dto;
+            dto.ref = m_impl->MakeRef( "hardware-sample", address ) + ':' + std::string( eventKind ) + ':' + std::to_string( index );
+            dto.address = Hex( address );
+            dto.kind = eventKind;
+            dto.eventIndex = index;
+            dto.timeNs = events[index].Val();
+            result.emplace_back( std::move( dto ) );
+        }
+    };
+
+    const auto& samples = found->second;
+    append( "cycles", samples.cycles );
+    append( "retired", samples.retired );
+    append( "cache_references", samples.cacheRef );
+    append( "cache_misses", samples.cacheMiss );
+    append( "branch_retired", samples.branchRetired );
+    append( "branch_misses", samples.branchMiss );
+    return result;
+}
+
 std::vector<LockEventDto> WorkerTraceSource::ScanLockEvents( const ScanRange& range ) const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -1737,6 +1902,7 @@ std::vector<LockEventDto> WorkerTraceSource::ScanLockEvents( const ScanRange& ra
             dto.type = typeName( event->type );
             if( item.lockCount != 0 && item.lockingThread < lock->threadList.size() ) dto.ownerThreadRef = m_impl->MakeRef( "thread", lock->threadList[item.lockingThread] );
             dto.lockCount = item.lockCount;
+            dto.sourceLocationRef = m_impl->SourceLocation( event->SrcLoc() ).ref;
             for( size_t bit = 0; bit < lock->threadList.size() && bit < 64; bit++ )
             {
                 if( item.waitList & ( uint64_t( 1 ) << bit ) ) dto.waiterThreadRefs.emplace_back( m_impl->MakeRef( "thread", lock->threadList[bit] ) );
@@ -1780,6 +1946,47 @@ std::vector<SymbolDto> WorkerTraceSource::GetSymbols() const
         result.emplace_back( std::move( dto ) );
     }
     return result;
+}
+
+std::vector<SymbolAddressMappingDto> WorkerTraceSource::GetSymbolAddressMappings( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<std::pair<uint64_t, uint64_t>> mappings;
+    mappings.reserve( m_impl->worker->GetCodeSymbolMap().size() );
+    for( const auto& value : m_impl->worker->GetCodeSymbolMap() ) mappings.emplace_back( value.first, value.second );
+    std::sort( mappings.begin(), mappings.end() );
+
+    std::vector<SymbolAddressMappingDto> result;
+    const auto begin = std::min( offset, mappings.size() );
+    const auto end = begin + std::min( limit, mappings.size() - begin );
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; index++ )
+    {
+        const auto [address, symbol] = mappings[index];
+        const auto* symbolData = m_impl->worker->GetSymbolData( symbol );
+        result.push_back( {
+            m_impl->MakeRef( "symbol-address", address ), Hex( address ), m_impl->MakeRef( "symbol", symbol ),
+            Hex( symbol ), address >= symbol ? uint32_t( std::min<uint64_t>( address - symbol, std::numeric_limits<uint32_t>::max() ) ) : 0,
+            symbolData && symbolData->isInline != 0
+        } );
+    }
+    return result;
+}
+
+std::optional<SymbolAddressMappingDto> WorkerTraceSource::ResolveSymbolAddress( uint64_t address ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    auto symbol = m_impl->worker->GetInlineSymbolForAddress( address );
+    uint32_t offset = 0;
+    if( symbol == 0 ) symbol = m_impl->worker->GetSymbolForAddress( address, offset );
+    else if( address >= symbol ) offset = uint32_t( std::min<uint64_t>( address - symbol, std::numeric_limits<uint32_t>::max() ) );
+    if( symbol == 0 ) return std::nullopt;
+    const auto* symbolData = m_impl->worker->GetSymbolData( symbol );
+    if( !symbolData ) return std::nullopt;
+    return SymbolAddressMappingDto {
+        m_impl->MakeRef( "symbol-address", address ), Hex( address ), m_impl->MakeRef( "symbol", symbol ),
+        Hex( symbol ), offset, symbolData->isInline != 0
+    };
 }
 
 std::vector<SourceLocationDto> WorkerTraceSource::GetSourceLocations() const

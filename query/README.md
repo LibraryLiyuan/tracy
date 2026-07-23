@@ -43,8 +43,11 @@ Trace loading is asynchronous under MCP. At most two sessions are retained, and 
 - [Persisted-field coverage ledger](schema/coverage-fields-v1.json)
 
 The implementation supports all persisted data domains enumerated in the domain
-manifest. Domain completeness is not the same as field or MCP completeness;
-the separate field ledger records every persisted semantic field and the
-remaining lossless-query work. Capability absence is explicit: a missing
-domain is reported as `present=false`, and a query against it returns
-`CAPABILITY_UNAVAILABLE` instead of an ambiguous empty result.
+manifest. The separate field ledger records every persisted semantic field and
+is complete for saved traces accepted by Tracy 0.13.1. Version-dependent fields
+carry explicit `field_availability` metadata, and large persisted byte sequences
+can be exhausted through bounded chunk reads. MCP completeness remains an
+independent gate until every public Query method is reachable through the MCP
+method registry. A missing domain is reported as `present=false`, and a query
+against it returns `CAPABILITY_UNAVAILABLE` instead of an ambiguous empty
+result.
