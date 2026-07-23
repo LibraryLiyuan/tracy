@@ -1,10 +1,20 @@
 # Tracy Query v1
 
-`tracy-query` is a read-only, headless query and MCP process for saved `.tracy` captures. It does not use ImGui, open network connections, create a database, or call an LLM.
+`tracy-query` is the read-only, headless structured-query companion to the Tracy profiler. It opens a completed `.tracy` capture with `FileRead + Worker(EventType::All)`, waits for Tracy's background indexing, and exposes bounded JSON/NDJSON and MCP STDIO queries. It does not use ImGui, call an LLM, open a network connection, create SQLite, or write a sidecar.
 
-The protocol contract is frozen in `schema/tracy-query-v1.schema.json`. `schema/coverage-v1.json` maps every persisted Tracy 0.13.1 data domain to its v1 query surface and test status.
+The analysis core is shared with `tracy-profiler`: frame-accurate memory snapshots and D3D12/GTMEM1 pass attribution are calculated by `TracyAnalysis`, while `TracyView_Memory.cpp` retains only GUI selection and drawing state. `QueryService` depends on the storage-neutral `TraceSource` contract; only `WorkerTraceSource` includes `TracyWorker.hpp`, so a future `SegmentTraceSource` can implement the same batch interface.
 
-Current executable surface:
+## Build
+
+```powershell
+cmake -S query -B ..\tracy-query-build -G "Visual Studio 18 2026" -A x64 -DGIT_REV=HEAD
+cmake --build ..\tracy-query-build --config Release --parallel
+ctest --test-dir ..\tracy-query-build -C Release --output-on-failure
+```
+
+`NO_STATISTICS=ON` is rejected at configure time. Windows, Linux, and macOS are built by the independent `query` CI workflow; Emscripten intentionally does not build this process.
+
+## Executable surface
 
 ```text
 tracy-query --version
@@ -12,9 +22,22 @@ tracy-query --schema
 tracy-query --doctor [--trace file.tracy]
 tracy-query --trace file.tracy --request request.json|-
 tracy-query --trace file.tracy --batch requests.ndjson|-
-tracy-query --mcp
+tracy-query --mcp [--allow-root DIR] [--allow-source-root DIR]
 ```
 
-Trace paths are denied unless their canonical final path is below an `--allow-root`. With no explicit root, only the current working directory is allowed. Requests are limited to 1 MiB, ordinary responses to 8 MiB, and list methods use stable trace/revision/filter-bound cursors.
+`--request` loads once and emits one JSON response. `--batch` loads once and processes NDJSON until EOF. `--mcp` is a UTF-8, one-JSON-object-per-line MCP STDIO server. Protocol data is the only content written to stdout; diagnostics go to stderr.
 
-`--request` and `--batch` are implemented. `--mcp` is wired in the next milestone. Until every coverage entry is marked `complete`, the v1 implementation must not be described as complete.
+Trace loading is asynchronous under MCP. At most two sessions are retained, and loads are serialized because Tracy's load progress is global. `tracy_trace_status` reports the native load stage and counters, followed by the `analysis_indexes` stage. Large analyses can be requested with `async=true`; sufficiently large validation, comparison, and analysis calls are promoted automatically to a cooperative job. Poll or cancel them with `tracy_job`.
+
+## Contracts and documentation
+
+- [Protocol v1](docs/protocol-v1.md)
+- [MCP and ChatGPT desktop setup](docs/chatgpt-mcp.md)
+- [Security and privacy boundary](docs/security.md)
+- [Analysis workflow and examples](docs/analysis-workflow.md)
+- [Acceptance and performance tests](docs/acceptance.md)
+- [Latest local acceptance results](docs/acceptance-results.md)
+- [JSON envelope schema](schema/tracy-query-v1.schema.json)
+- [Persisted-domain coverage manifest](schema/coverage-v1.json)
+
+The implementation supports all persisted data domains enumerated in the coverage manifest. Capability absence is explicit: a missing domain is reported as `present=false`, and a query against it returns `CAPABILITY_UNAVAILABLE` instead of an ambiguous empty result.

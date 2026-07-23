@@ -1,0 +1,53 @@
+name: query
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  CPM_SOURCE_CACHE: ${{ github.workspace }}/cpm-cache
+
+jobs:
+  query:
+    name: tracy-query (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-15]
+
+    steps:
+    - uses: actions/checkout@v4
+    - if: runner.os == 'Windows'
+      uses: microsoft/setup-msbuild@v2
+    - if: runner.os == 'Linux'
+      name: Install Linux dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake ninja-build pkg-config libfreetype6-dev libglfw3-dev libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+    - if: runner.os == 'macOS'
+      name: Install macOS dependencies
+      run: brew install pkg-config glfw
+    - name: Trust git repo
+      run: git config --global --add safe.directory '*'
+    - name: Configure
+      run: cmake -S query -B query/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DGIT_REV=${{ github.sha }}
+    - name: Build
+      run: cmake --build query/build --config Release --parallel
+    - name: Contract and MCP tests
+      run: ctest --test-dir query/build -C Release --output-on-failure
+    - if: runner.os == 'Windows'
+      name: Doctor (Windows)
+      run: query\build\Release\tracy-query.exe --doctor
+    - if: runner.os != 'Windows'
+      name: Doctor (Unix)
+      run: query/build/tracy-query --doctor
+    - uses: actions/upload-artifact@v4
+      with:
+        name: tracy-query-${{ matrix.os }}
+        if-no-files-found: error
+        path: |
+          query/build/tracy-query
+          query/build/Release/tracy-query.exe
