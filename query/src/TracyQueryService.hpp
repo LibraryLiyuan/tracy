@@ -10,8 +10,10 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <stop_token>
 #include <unordered_map>
+#include <vector>
 
 namespace tracy::query
 {
@@ -79,6 +81,8 @@ private:
     std::unordered_map<std::string, MemoryCacheEntry> m_memoryCache;
 };
 
+const std::vector<std::string>& QueryMethodRegistry();
+bool IsPublicQueryMethod( std::string_view method );
 std::string DumpProtocolJson( const nlohmann::json& value );
 
 }

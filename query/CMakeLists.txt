@@ -24,8 +24,16 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-mcp-v1.json
+)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json TRACY_QUERY_SCHEMA_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json TRACY_QUERY_COVERAGE_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json TRACY_QUERY_FIELD_COVERAGE_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-mcp-v1.json TRACY_QUERY_MCP_COVERAGE_JSON)
 configure_file(src/TracyEmbeddedData.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp @ONLY)
 
 add_library(TracyQueryProtocol STATIC
@@ -71,6 +79,7 @@ if(BUILD_TESTING)
         TRACY_QUERY_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json"
         TRACY_QUERY_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json"
         TRACY_QUERY_FIELD_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json"
+        TRACY_QUERY_MCP_COVERAGE_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/coverage-mcp-v1.json"
     )
     tracy_query_enable_assertions(tracy-query-contract-tests)
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)

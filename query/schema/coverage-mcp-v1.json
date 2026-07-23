@@ -1,0 +1,43 @@
+{
+  "schema_version": "1.0.0",
+  "coverage_level": "mcp",
+  "status": "complete",
+  "public_method_registry": "tracy::query::QueryMethodRegistry",
+  "workflow_tools": [
+    "tracy_trace_open",
+    "tracy_trace_status",
+    "tracy_trace_close",
+    "tracy_describe",
+    "tracy_overview",
+    "tracy_search",
+    "tracy_inspect",
+    "tracy_timeline",
+    "tracy_analyze",
+    "tracy_compare",
+    "tracy_validate",
+    "tracy_job"
+  ],
+  "complete_route": {
+    "tool": "tracy_inspect",
+    "method_property": "method",
+    "params_property": "params",
+    "trace_property": "trace_id",
+    "allowed_methods": "every exact method in QueryMethodRegistry",
+    "validation": "unknown methods return METHOD_NOT_FOUND before dispatch; conflicting trace_id values return INVALID_PARAMS",
+    "compatibility": "the existing domain/operation workflow form remains supported"
+  },
+  "invariants": [
+    "system.describe methods are generated from QueryMethodRegistry",
+    "system.schema exposes the embedded domain, field, and MCP manifests",
+    "QueryMethodRegistry contains no duplicate method names",
+    "every registered method is accepted by the tracy_inspect generic route",
+    "generic params cannot silently mix with workflow domain/operation arguments",
+    "tool results retain the tracy-query/1 structuredContent envelope and TextContent fallback",
+    "the model-visible tool count remains 12"
+  ],
+  "tests": [
+    "McpTranscriptTests registry equality and exhaustive route contract",
+    "McpTranscriptTests unknown method and conflicting trace validation",
+    "McpWorkerIntegrationTests real Worker trace.info through generic route"
+  ]
+}

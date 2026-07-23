@@ -5,5 +5,7 @@ namespace tracy::query
 
 const char QuerySchemaJson[] = R"TRACY_SCHEMA(@TRACY_QUERY_SCHEMA_JSON@)TRACY_SCHEMA";
 const char QueryCoverageJson[] = R"TRACY_COVERAGE(@TRACY_QUERY_COVERAGE_JSON@)TRACY_COVERAGE";
+const char QueryFieldCoverageJson[] = R"TRACY_FIELDS(@TRACY_QUERY_FIELD_COVERAGE_JSON@)TRACY_FIELDS";
+const char QueryMcpCoverageJson[] = R"TRACY_MCP(@TRACY_QUERY_MCP_COVERAGE_JSON@)TRACY_MCP";
 
 }

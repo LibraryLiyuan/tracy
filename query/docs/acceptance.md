@@ -1,6 +1,9 @@
 # Acceptance and performance verification
 
-The normal CTest suite contains deterministic statistics/Memory/GTMEM1 tests, a full-domain `FakeTraceSource`, query contract tests, MCP transcripts, CLI version/doctor checks, and, when local captures are configured, Worker and ChatGPT-style end-to-end tests.
+The normal CTest suite contains deterministic statistics/Memory/GTMEM1 tests,
+a full-domain `FakeTraceSource`, query contract tests, exhaustive MCP public
+method registry routing, CLI version/doctor checks, and, when local captures
+are configured, Worker and ChatGPT-style end-to-end tests.
 
 Set the local capture root before configuring:
 

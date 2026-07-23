@@ -17,8 +17,8 @@ not prove field or MCP completeness. `coverage-fields-v1.json` is the
 field-level ledger and is audited against `Worker::Write`, the corresponding
 load paths, `TracyEvent.hpp`, Worker getters, and Profiler consumers.
 
-The saved-trace field gate is currently `complete`. MCP and Producer
-completeness remain separate gates and are not implied by that status.
+The saved-trace field and MCP gates are currently `complete`. Producer
+completeness remains a separate gate and is not implied by either status.
 
 ## What "all fields" means
 

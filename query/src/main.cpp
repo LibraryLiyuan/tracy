@@ -199,6 +199,9 @@ int RunDoctor( const Arguments& args )
         { "checks", {
             { "json_schema", json::parse( QuerySchemaJson ).is_object() ? "ok" : "failed" },
             { "coverage_manifest", json::parse( QueryCoverageJson ).is_object() ? "ok" : "failed" },
+            { "domain_coverage_manifest", json::parse( QueryCoverageJson ).is_object() ? "ok" : "failed" },
+            { "field_coverage_manifest", json::parse( QueryFieldCoverageJson ).is_object() ? "ok" : "failed" },
+            { "mcp_coverage_manifest", json::parse( QueryMcpCoverageJson ).is_object() ? "ok" : "failed" },
             { "stdio_framing", "single-line UTF-8 JSON/NDJSON" }, { "statistics", "enabled" }
         } }
     };

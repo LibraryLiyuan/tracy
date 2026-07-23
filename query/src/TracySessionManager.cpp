@@ -279,7 +279,14 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
         try
         {
             auto source = m_sourceLoader( session->path, [this, weak = std::weak_ptr<Session>( session )]( auto state ) {
-                if( const auto locked = weak.lock() ) UpdateState( locked, state );
+                // The source reports Ready immediately before returning ownership to
+                // the session manager. Keep the externally visible session in
+                // Indexing until the source, fingerprint, watermark, and completeness
+                // fields have all been published under m_mutex below.
+                if( const auto locked = weak.lock() )
+                {
+                    UpdateState( locked, state == analysis::TraceSourceState::Ready ? analysis::TraceSourceState::Indexing : state );
+                }
             } );
             std::lock_guard lock( m_mutex );
             if( session->closePending )

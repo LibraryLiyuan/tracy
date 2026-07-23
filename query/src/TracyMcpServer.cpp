@@ -339,10 +339,17 @@ json McpServer::ToolsList( const json& id ) const
     json inspectProperties = {
         { "trace_id", traceId }, { "domain", enumeration( { "frame", "frame_image", "thread", "cpu_zone", "gpu_zone", "memory_event", "memory", "gpu_memory", "callstack", "parent_callstack", "symbol", "source", "lock", "message", "plot", "hardware_sample" } ) },
         { "operation", enumeration( { "get", "tree", "list", "active_at_time", "frame_snapshot", "diff", "callstack_tree", "leak_candidates", "allocations", "request_scopes", "pass_uses", "attribution", "frames", "raw_code", "disassembly", "lines", "embedded", "timeline", "points", "downsample", "statistics", "resource" } ) },
-        { "ref", { { "type", "string" } } }, { "address", { { "type", "string" } } }, { "frame_set", {} }, { "index", { { "type", "integer" } } }, { "max_depth", { { "type", "integer" } } }
+        { "ref", { { "type", "string" } } }, { "address", { { "type", "string" } } }, { "frame_set", {} }, { "index", { { "type", "integer" } } }, { "max_depth", { { "type", "integer" } } },
+        { "method", { { "type", "string" }, { "description", "Exact public tracy-query method returned by tracy_describe. Use this route when a workflow domain/operation mapping is insufficient." } } },
+        { "params", { { "type", "object" }, { "description", "Parameters for method. A top-level trace_id is injected and must not conflict with params.trace_id." } } }
     };
-    tools.emplace_back( Tool( "tracy_inspect", "Inspect a specific frame, thread, zone, memory event, callstack, symbol, or source ref returned by another tool.",
-        std::move( inspectProperties ), required( { "trace_id", "domain" } ), true ) );
+    auto inspectTool = Tool( "tracy_inspect", "Inspect by the model-friendly domain/operation form, or call any public read-only tracy-query method using method plus params. Call tracy_describe first for exact required parameters.",
+        std::move( inspectProperties ), json::array(), true );
+    inspectTool["inputSchema"]["oneOf"] = json::array( {
+        { { "required", json::array( { "method" } ) } },
+        { { "required", json::array( { "trace_id", "domain" } ) } }
+    } );
+    tools.emplace_back( std::move( inspectTool ) );
 
     json timelineProperties = {
         { "trace_id", traceId }, { "start_ns", { { "type", "string" } } }, { "end_ns", { { "type", "string" } } },
@@ -403,6 +410,29 @@ json McpServer::CallTool( const std::string& name, json arguments )
     }
     else if( name == "tracy_inspect" )
     {
+        if( arguments.contains( "method" ) )
+        {
+            if( !arguments["method"].is_string() ) throw QueryError( "INVALID_PARAMS", "method must be a string" );
+            if( arguments.contains( "domain" ) || arguments.contains( "operation" ) ) throw QueryError( "INVALID_PARAMS", "method cannot be combined with domain or operation" );
+            method = arguments["method"].get<std::string>();
+            if( !IsPublicQueryMethod( method ) ) throw QueryError( "METHOD_NOT_FOUND", "method is not present in the public tracy-query registry" );
+            for( const auto& item : arguments.items() )
+            {
+                const auto& key = item.key();
+                if( key != "method" && key != "params" && key != "trace_id" ) throw QueryError( "INVALID_PARAMS", "generic method parameters must be nested inside params" );
+            }
+            json forwarded = arguments.value( "params", json::object() );
+            if( !forwarded.is_object() ) throw QueryError( "INVALID_PARAMS", "params must be an object" );
+            if( arguments.contains( "trace_id" ) )
+            {
+                if( !arguments["trace_id"].is_string() ) throw QueryError( "INVALID_PARAMS", "trace_id must be a string" );
+                if( forwarded.contains( "trace_id" ) && forwarded["trace_id"] != arguments["trace_id"] ) throw QueryError( "INVALID_PARAMS", "top-level trace_id conflicts with params.trace_id" );
+                forwarded["trace_id"] = arguments["trace_id"];
+            }
+            arguments = std::move( forwarded );
+        }
+        else
+        {
         const std::string domain = arguments.value( "domain", "" );
         const std::string operation = arguments.value( "operation", "get" );
         arguments.erase( "domain" );
@@ -462,6 +492,7 @@ json McpServer::CallTool( const std::string& name, json arguments )
         }
         else if( domain == "hardware_sample" ) method = "hardware_sample.address";
         else throw QueryError( "INVALID_PARAMS", "unsupported inspect domain" );
+        }
     }
     else if( name == "tracy_analyze" )
     {

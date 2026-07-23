@@ -6,6 +6,8 @@ namespace tracy::query
 
 extern const char QuerySchemaJson[];
 extern const char QueryCoverageJson[];
+extern const char QueryFieldCoverageJson[];
+extern const char QueryMcpCoverageJson[];
 
 }
 

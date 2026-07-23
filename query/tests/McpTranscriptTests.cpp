@@ -2,8 +2,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -41,6 +43,49 @@ int main()
         assert( tool["annotations"]["destructiveHint"] == false );
         assert( tool["annotations"]["openWorldHint"] == false );
     }
+    const auto inspect = std::find_if( tools["result"]["tools"].begin(), tools["result"]["tools"].end(), []( const auto& tool ) {
+        return tool["name"] == "tracy_inspect";
+    } );
+    assert( inspect != tools["result"]["tools"].end() );
+    assert( ( *inspect )["inputSchema"]["properties"].contains( "method" ) );
+    assert( ( *inspect )["inputSchema"]["properties"].contains( "params" ) );
+    assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
+
+    const auto described = query.Execute( {
+        { "protocol", tracy::query::QueryProtocol }, { "id", "mcp-registry" },
+        { "method", "system.describe" }, { "params", json::object() }
+    } );
+    assert( described["ok"] == true );
+    std::set<std::string> describedMethods;
+    for( const auto& method : described["data"]["methods"] ) describedMethods.emplace( method.get<std::string>() );
+    const std::set<std::string> registeredMethods( tracy::query::QueryMethodRegistry().begin(), tracy::query::QueryMethodRegistry().end() );
+    assert( registeredMethods.size() == tracy::query::QueryMethodRegistry().size() );
+    assert( describedMethods == registeredMethods );
+
+    int registryRequestId = 1000;
+    for( const auto& method : tracy::query::QueryMethodRegistry() )
+    {
+        const auto routed = server.HandleRequest( Request( registryRequestId++, "tools/call", {
+            { "name", "tracy_inspect" }, { "arguments", { { "method", method }, { "params", json::object() } } }
+        } ) );
+        assert( !routed.contains( "error" ) );
+        assert( routed["result"]["structuredContent"].contains( "ok" ) );
+        if( routed["result"]["isError"] == true ) assert( routed["result"]["structuredContent"]["error"]["code"] != "METHOD_NOT_FOUND" );
+    }
+
+    const auto unknownRegistryMethod = server.HandleRequest( Request( registryRequestId++, "tools/call", {
+        { "name", "tracy_inspect" }, { "arguments", { { "method", "not.a.public.method" }, { "params", json::object() } } }
+    } ) );
+    assert( unknownRegistryMethod["result"]["isError"] == true );
+    assert( unknownRegistryMethod["result"]["structuredContent"]["error"]["code"] == "METHOD_NOT_FOUND" );
+
+    const auto conflictingTrace = server.HandleRequest( Request( registryRequestId++, "tools/call", {
+        { "name", "tracy_inspect" }, { "arguments", {
+            { "method", "trace.info" }, { "trace_id", "trace-a" }, { "params", { { "trace_id", "trace-b" } } }
+        } }
+    } ) );
+    assert( conflictingTrace["result"]["isError"] == true );
+    assert( conflictingTrace["result"]["structuredContent"]["error"]["code"] == "INVALID_PARAMS" );
 
     const auto templates = server.HandleRequest( Request( 3, "resources/templates/list" ) );
     assert( templates["result"]["resourceTemplates"].size() == 3 );

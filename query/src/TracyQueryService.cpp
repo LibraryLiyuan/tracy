@@ -18,6 +18,34 @@
 
 namespace tracy::query
 {
+
+const std::vector<std::string>& QueryMethodRegistry()
+{
+    static const std::vector<std::string> methods = {
+        "system.capabilities", "system.describe", "system.schema",
+        "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash",
+        "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
+        "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
+        "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
+        "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
+        "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
+        "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
+        "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
+        "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
+        "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
+        "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
+        "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
+        "timeline.slice", "statistics.describe", "statistics.compute", "compare.zones", "compare.frames", "compare.source", "validation.run"
+    };
+    return methods;
+}
+
+bool IsPublicQueryMethod( std::string_view method )
+{
+    const auto& methods = QueryMethodRegistry();
+    return std::find( methods.begin(), methods.end(), method ) != methods.end();
+}
+
 namespace
 {
 
@@ -697,22 +725,7 @@ json DescribeData( const json& selection = json::object() )
             { "frame_image_max_bytes", 16777216 }, { "frame_image_max_dimension", 4096 }
         } },
         { "filter_modes", { "exact", "contains", "prefix" } },
-        { "methods", {
-            "system.capabilities", "system.describe", "system.schema",
-            "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash",
-            "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
-            "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
-            "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
-            "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
-            "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
-            "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
-            "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
-            "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
-            "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
-            "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
-            "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
-            "timeline.slice", "statistics.describe", "statistics.compute", "compare.zones", "compare.frames", "compare.source", "validation.run"
-        } }
+        { "methods", QueryMethodRegistry() }
     };
 
     const std::string requestedDomain = selection.value( "domain", "" );
@@ -948,7 +961,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
     };
     checkCancelled();
-    if( method == "system.schema" ) return Success( id, { { "schema", json::parse( QuerySchemaJson ) } } );
+    if( method == "system.schema" ) return Success( id, {
+        { "schema", json::parse( QuerySchemaJson ) },
+        { "coverage", {
+            { "domain", json::parse( QueryCoverageJson ) },
+            { "field", json::parse( QueryFieldCoverageJson ) },
+            { "mcp", json::parse( QueryMcpCoverageJson ) }
+        } }
+    } );
     if( method == "system.describe" )
     {
         auto data = DescribeData( params );

@@ -26,6 +26,10 @@
 #  error TRACY_QUERY_FIELD_COVERAGE_PATH must be defined
 #endif
 
+#ifndef TRACY_QUERY_MCP_COVERAGE_PATH
+#  error TRACY_QUERY_MCP_COVERAGE_PATH must be defined
+#endif
+
 static nlohmann::json LoadJson( const char* path )
 {
     std::ifstream stream( path, std::ios::binary );
@@ -111,6 +115,7 @@ int main()
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
+    assert( coverage.at( "mcp_status" ) == "complete" );
     for( const auto& domain : coverage.at( "domains" ) )
     {
         assert( domain.at( "domain" ).is_string() );
@@ -144,6 +149,13 @@ int main()
     assert( fieldEntities.contains( "gpu.context" ) );
     assert( fieldEntities.contains( "hardware_sample" ) );
     assert( fieldCoverage.at( "non_persisted" ).size() >= 3 );
+
+    const auto mcpCoverage = LoadJson( TRACY_QUERY_MCP_COVERAGE_PATH );
+    assert( mcpCoverage.at( "coverage_level" ) == "mcp" );
+    assert( mcpCoverage.at( "status" ) == "complete" );
+    assert( mcpCoverage.at( "workflow_tools" ).size() == 12 );
+    assert( mcpCoverage.at( "complete_route" ).at( "tool" ) == "tracy_inspect" );
+    assert( mcpCoverage.at( "public_method_registry" ) == "tracy::query::QueryMethodRegistry" );
 
     using tracy::analysis::ComputeStatistics;
     const auto stats = ComputeStatistics( std::vector<int64_t>{ 1, 2, 3, 4, 100 } );
@@ -251,6 +263,12 @@ int main()
     std::set<std::string> coveredMethods;
     for( const auto& domain : coverage.at( "domains" ) ) for( const auto& method : domain.at( "methods" ) ) coveredMethods.emplace( method.get<std::string>() );
     assert( describedMethods == coveredMethods );
+
+    const auto schemaResponse = service.Execute( Request( 103, "system.schema" ) );
+    assert( schemaResponse.at( "ok" ) );
+    assert( schemaResponse.at( "data" ).at( "coverage" ).at( "domain" ).at( "domain_status" ) == "complete" );
+    assert( schemaResponse.at( "data" ).at( "coverage" ).at( "field" ).at( "status" ) == "complete" );
+    assert( schemaResponse.at( "data" ).at( "coverage" ).at( "mcp" ).at( "status" ) == "complete" );
 
     int requestId = 200;
     for( const auto& method : describedMethods )

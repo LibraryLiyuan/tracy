@@ -54,6 +54,19 @@ int main()
     assert( overview["result"]["structuredContent"]["data"]["trace"]["counts"]["cpu_zones"] != "0" );
     assert( overview["result"]["structuredContent"]["trace"]["fingerprint"] == ready.fingerprint );
 
+    stage( "generic registry route" );
+    const auto genericInfo = server.HandleRequest( ToolCall( 31, "tracy_inspect", {
+        { "method", "trace.info" }, { "trace_id", traceId }, { "params", json::object() }
+    } ) );
+    assert( genericInfo["result"]["isError"] == false );
+    assert( genericInfo["result"]["structuredContent"]["data"]["fingerprint"] == ready.fingerprint );
+
+    const auto workflowInspect = server.HandleRequest( ToolCall( 32, "tracy_inspect", {
+        { "trace_id", traceId }, { "domain", "frame" }, { "operation", "list" }, { "limit", 1 }
+    } ) );
+    assert( workflowInspect["result"]["isError"] == false );
+    assert( workflowInspect["result"]["structuredContent"]["data"]["frames"].is_array() );
+
     stage( "describe" );
     const auto described = server.HandleRequest( ToolCall( 7, "tracy_describe", { { "operation", "memory.frame_snapshot" } } ) );
     assert( described["result"]["isError"] == false );
@@ -70,7 +83,8 @@ int main()
     assert( submitted["result"]["isError"] == false );
     const auto jobId = submitted["result"]["structuredContent"]["data"]["job_id"].get<std::string>();
     std::string jobState;
-    for( size_t attempt = 0; attempt < 500; attempt++ )
+    const auto jobDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 60 );
+    while( std::chrono::steady_clock::now() < jobDeadline )
     {
         const auto status = server.HandleRequest( ToolCall( 81, "tracy_job", { { "job_id", jobId }, { "operation", "status" } } ) );
         assert( status["result"]["isError"] == false );

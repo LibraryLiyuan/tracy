@@ -35,6 +35,29 @@ The MCP server exposes 12 workflow tools rather than every internal method:
 11. `tracy_validate`
 12. `tracy_job`
 
+`tracy_inspect` has two compatible forms. The concise `domain`/`operation`
+form remains the preferred drill-down interface. For complete coverage, it also
+accepts an exact public Query `method` plus a nested `params` object:
+
+```json
+{
+  "method": "hardware_sample.events",
+  "trace_id": "trace-1",
+  "params": {
+    "address": "0x7ff600001000",
+    "kind": "cache_misses",
+    "limit": 100
+  }
+}
+```
+
+Call `tracy_describe` with `operation` set to the exact method first when the
+required parameters are unknown. `system.describe` and MCP routing share
+`QueryMethodRegistry`; transcript tests exhaust the registry so a newly added
+public Query method cannot silently remain unreachable from MCP. The
+`system.schema` method returns the envelope schema plus embedded domain, field,
+and MCP coverage manifests for machine-readable self-audit.
+
 All tools are declared read-only, non-destructive, and closed-world. They return both `structuredContent` and compact JSON text. Tool execution errors use `isError=true`, allowing the model to correct arguments and retry.
 
 MCP protocol versions `2025-06-18` and `2025-11-25` are supported over one-line UTF-8 STDIO framing. The server implements initialize, initialized notification, ping, tools list/call, resource list/templates/read, logging level, progress, and cancellation. Long analyses run as cooperative jobs; call `tracy_job status`, then `tracy_job result`, or request cancellation.
