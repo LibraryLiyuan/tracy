@@ -17,6 +17,9 @@ ctest --test-dir C:\CodeProjects\GodotProjects\tracy-query-build -C Release --ou
 The committed fixture path is optional; large local traces are never added to Git. The end-to-end test opens Fresh1/Fresh2, validates the first trace, exercises source resources, submits and retrieves an asynchronous analysis job, and compares frames, zones, and embedded source. It also runs the same three comparison modes for Connect1/Connect2 and Reconnect-1/Reconnect-2. The Startup capture is retained as a corrupt-input regression: it must fail quickly with `CORRUPT_TRACE`, not spin while reading a declared record count beyond EOF.
 
 The measurements from the implementation acceptance run are recorded in [acceptance-results.md](acceptance-results.md).
+The repeatable administrator capture procedure, fixed TPS evidence refs, and
+full GUI/Query manual parity ledger are in
+[godot-tps-gui-query-parity.md](godot-tps-gui-query-parity.md).
 
 Manual acceptance additionally uses Fresh/Connect/Reconnect/Startup/GPU/root captures. Verify Memory snapshot start/allocated/freed/end counts and bytes against the GUI, GTMEM1 pass pairing and use masks, reconnect-safe pool/allocation IDs, absent-domain capabilities, resource bounding, and three randomly selected evidence refs.
 

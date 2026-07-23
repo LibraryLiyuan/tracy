@@ -37,6 +37,7 @@ Trace loading is asynchronous under MCP. At most two sessions are retained, and 
 - [Security and privacy boundary](docs/security.md)
 - [Analysis workflow and examples](docs/analysis-workflow.md)
 - [Acceptance and performance tests](docs/acceptance.md)
+- [Godot TPS administrator capture and GUI/Query parity](docs/godot-tps-gui-query-parity.md)
 - [Latest local acceptance results](docs/acceptance-results.md)
 - [JSON envelope schema](schema/tracy-query-v1.schema.json)
 - [Persisted-domain coverage manifest](schema/coverage-v1.json)
