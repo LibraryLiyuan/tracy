@@ -227,7 +227,7 @@ int main()
     tracy::query::SessionManager sessions( { files.root }, 2,
         []( const std::filesystem::path& path, tracy::query::SessionManager::StateCallback callback ) -> std::unique_ptr<tracy::analysis::TraceSource> {
             callback( tracy::analysis::TraceSourceState::Indexing );
-            return std::make_unique<tracy::query::test::FakeTraceSource>( path.filename() == "baseline.tracy" );
+            return std::make_unique<tracy::query::test::FakeTraceSource>( path.filename() == "baseline.tracy", true );
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
 
@@ -281,6 +281,15 @@ int main()
             return 1;
         }
     }
+
+    const auto boundedSourceCompare = service.Execute( Request( requestId++, "compare.source", {
+        { "trace_id", candidateId }, { "baseline_trace_id", baselineId }, { "max_bytes", 16 }
+    } ) );
+    assert( boundedSourceCompare.at( "ok" ) );
+    assert( boundedSourceCompare.at( "data" ).at( "changed" ).empty() );
+    assert( boundedSourceCompare.at( "data" ).at( "inconclusive" ).size() == 1 );
+    assert( boundedSourceCompare.at( "data" ).at( "inconclusive" )[0].at( "reason" ) == "bounded_prefix_equal" );
+    assert( boundedSourceCompare.at( "data" ).at( "inconclusive" )[0].at( "compared_bytes" ) == "15" );
 
     const auto traceFields = service.Execute( Request( requestId++, "trace.info", { { "trace_id", candidateId } } ) ).at( "data" );
     assert( traceFields.at( "timer_multiplier" ) == 0.5 );
@@ -402,7 +411,7 @@ int main()
         { "trace_id", candidateId }, { "ref", "fake:source-file:0" }
     } ) ).at( "data" );
     assert( sourceRawFields.at( "data_base64url" ) == "Zm9v" );
-    assert( sourceRawFields.at( "eof" ) == true );
+    assert( sourceRawFields.at( "eof" ) == false );
 
     const auto symbolRawFields = service.Execute( Request( requestId++, "symbol.raw_code", {
         { "trace_id", candidateId }, { "ref", "fake:symbol:1" }

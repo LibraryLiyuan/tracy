@@ -155,7 +155,7 @@ int main()
         const auto& data = compared["result"]["structuredContent"]["data"];
         if( std::string_view( kind ) == "frames" ) assert( data["frame_sets"].is_array() );
         else if( std::string_view( kind ) == "zones" ) assert( data["groups"].is_array() );
-        else assert( data["changed"].is_array() && data["baseline_only"].is_array() && data["candidate_only"].is_array() );
+        else assert( data["changed"].is_array() && data["inconclusive"].is_array() && data["baseline_only"].is_array() && data["candidate_only"].is_array() );
     }
     stage( "close candidate" );
     const auto closedCandidate = server.HandleRequest( ToolCall( 11, "tracy_trace_close", { { "trace_id", candidateId } } ) );

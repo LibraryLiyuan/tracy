@@ -12,6 +12,7 @@ namespace tracy::query::test
 class FakeTraceSource final : public analysis::TraceSource
 {
     bool m_legacyFormat = false;
+    bool m_truncatedSource = false;
 
     template<typename T>
     static std::vector<T> Page( std::vector<T> values, const analysis::ScanRange& range )
@@ -28,8 +29,9 @@ class FakeTraceSource final : public analysis::TraceSource
     }
 
 public:
-    explicit FakeTraceSource( bool legacyFormat = false )
+    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false )
         : m_legacyFormat( legacyFormat )
+        , m_truncatedSource( truncatedSource )
     {}
 
     std::vector<analysis::Capability> GetCapabilities() const override
@@ -169,7 +171,7 @@ public:
 
     std::vector<analysis::FrameDto> GetFramesForSet( size_t set, size_t offset, size_t limit ) const override { if( set != 0 || offset != 0 || limit == 0 ) return {}; return { { MakeEntityRef( "frame", 0 ), MakeEntityRef( "frame-set", 0 ), 0, 0, 100, MakeEntityRef( "frame-image", 0 ), true } }; }
     std::vector<int64_t> GetFrameDurations( size_t set ) const override { return set == 0 ? std::vector<int64_t> { 100 } : std::vector<int64_t> {}; }
-    std::vector<analysis::SourceResourceDto> GetSourceResources() const override { return { { 0, MakeEntityRef( "source-file", 0 ), "fake.cpp", 15, { 'f', 'a', 'k', 'e', '.', 'c', 'p', 'p' } } }; }
+    std::vector<analysis::SourceResourceDto> GetSourceResources() const override { return { { 0, MakeEntityRef( "source-file", 0 ), "fake.cpp", m_truncatedSource ? 100000u : 15u, { 'f', 'a', 'k', 'e', '.', 'c', 'p', 'p' } } }; }
     std::vector<analysis::SymbolResourceDto> GetSymbolResources() const override { return { { 1, MakeEntityRef( "symbol", 1 ), "FakeSymbol", "fake.cpp", 1, 1 } }; }
     std::vector<analysis::FrameImageMetadataDto> GetFrameImageResources() const override { return { { 0, MakeEntityRef( "frame-image", 0 ), 1, 1, false, 0, MakeEntityRef( "frame", 0 ), 8 } }; }
     std::optional<analysis::CpuZoneDto> GetCpuZone( std::string_view ref ) const override { auto values = ScanCpuZones( {} ); return !values.empty() && values.front().ref == ref ? std::optional( values.front() ) : std::nullopt; }
@@ -199,11 +201,11 @@ public:
             { { 0, "Fake pass", 1, 20, 1000, 2000 } },
             { { { 1, 0 }, 7, 64, 1, 12 } } );
     }
-    analysis::SourceTextDto ReadEmbeddedSource( size_t id, size_t maxBytes ) const override { return id == 0 && maxBytes ? analysis::SourceTextDto { MakeEntityRef( "source-file", 0 ), "fake.cpp", "void Fake() {}\n", true, false } : analysis::SourceTextDto {}; }
+    analysis::SourceTextDto ReadEmbeddedSource( size_t id, size_t maxBytes ) const override { return id == 0 && maxBytes ? analysis::SourceTextDto { MakeEntityRef( "source-file", 0 ), "fake.cpp", "void Fake() {}\n", true, m_truncatedSource } : analysis::SourceTextDto {}; }
     analysis::BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t id, size_t offset, size_t maxBytes ) const override
     {
         if( id != 0 || offset != 0 || maxBytes == 0 ) return {};
-        return { MakeEntityRef( "source-file", 0 ), 0, 3, { 0x66, 0x6f, 0x6f }, true };
+        return { MakeEntityRef( "source-file", 0 ), 0, m_truncatedSource ? 100000u : 3u, { 0x66, 0x6f, 0x6f }, !m_truncatedSource };
     }
     analysis::SymbolCodeDto ReadSymbolCode( uint64_t id, size_t maxBytes ) const override { return id == 1 && maxBytes ? analysis::SymbolCodeDto { MakeEntityRef( "symbol", 1 ), "0x1", { 0x90 }, false } : analysis::SymbolCodeDto {}; }
     analysis::BinaryResourceChunkDto ReadSymbolCodeBytes( uint64_t id, size_t offset, size_t maxBytes ) const override

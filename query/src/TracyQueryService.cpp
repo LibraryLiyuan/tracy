@@ -2649,7 +2649,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::map<std::string, analysis::SourceResourceDto> after;
         for( const auto& resource : baseline->GetSourceResources() ) before.emplace( NormalizeSourceKey( resource.path ), resource );
         for( const auto& resource : source->GetSourceResources() ) after.emplace( NormalizeSourceKey( resource.path ), resource );
-        json baselineOnly = json::array(), candidateOnly = json::array(), changed = json::array();
+        json baselineOnly = json::array(), candidateOnly = json::array(), changed = json::array(), inconclusive = json::array();
         for( const auto& [key, resource] : before )
         {
             if( !pathFilter.empty() && key.find( NormalizeSourceKey( pathFilter ) ) == std::string::npos ) continue;
@@ -2657,7 +2657,28 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( candidate == after.end() ) { if( baselineOnly.size() < limit ) baselineOnly.emplace_back( resource.path ); continue; }
             const auto left = baseline->ReadEmbeddedSource( resource.id, maxBytes );
             const auto right = source->ReadEmbeddedSource( candidate->second.id, maxBytes );
-            if( left.text == right.text && !left.truncated && !right.truncated ) continue;
+            if( left.text == right.text )
+            {
+                if( resource.bytes != candidate->second.bytes )
+                {
+                    if( changed.size() < limit ) changed.push_back( {
+                        { "path", resource.path }, { "unified_diff", "" }, { "truncated", left.truncated || right.truncated },
+                        { "reason", "byte_size_changed" }, { "baseline_bytes", Decimal( resource.bytes ) },
+                        { "candidate_bytes", Decimal( candidate->second.bytes ) }, { "trust", "untrusted_trace_data" }
+                    } );
+                    continue;
+                }
+                if( left.truncated || right.truncated )
+                {
+                    if( inconclusive.size() < limit ) inconclusive.push_back( {
+                        { "path", resource.path }, { "reason", "bounded_prefix_equal" },
+                        { "compared_bytes", Decimal( std::min( left.text.size(), right.text.size() ) ) },
+                        { "total_bytes", Decimal( resource.bytes ) }, { "trust", "untrusted_trace_data" }
+                    } );
+                    continue;
+                }
+                continue;
+            }
             auto leftLines = TextLines( left.text ); auto rightLines = TextLines( right.text );
             dtl::Diff<std::string, std::vector<std::string>> diff( leftLines, rightLines );
             diff.compose(); diff.composeUnifiedHunks();
@@ -2673,7 +2694,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !pathFilter.empty() && key.find( NormalizeSourceKey( pathFilter ) ) == std::string::npos ) continue;
             if( before.find( key ) == before.end() && candidateOnly.size() < limit ) candidateOnly.emplace_back( resource.path );
         }
-        return Success( id, { { "traces", tracePair }, { "baseline_only", std::move( baselineOnly ) }, { "candidate_only", std::move( candidateOnly ) }, { "changed", std::move( changed ) }, { "bounded", true } }, trace );
+        return Success( id, {
+            { "traces", tracePair }, { "baseline_only", std::move( baselineOnly ) }, { "candidate_only", std::move( candidateOnly ) },
+            { "changed", std::move( changed ) }, { "inconclusive", std::move( inconclusive ) }, { "bounded", true }
+        }, trace );
     }
     if( method == "validation.run" )
     {

@@ -360,7 +360,7 @@ try {
             $resultCount = @($compare.data.groups).Count
         }
         else {
-            $resultCount = @($compare.data.changed).Count + @($compare.data.baseline_only).Count + @($compare.data.candidate_only).Count
+            $resultCount = @($compare.data.changed).Count + @($compare.data.inconclusive).Count + @($compare.data.baseline_only).Count + @($compare.data.candidate_only).Count
         }
         [Console]::Out.WriteLine("COMPARE kind=$kind RESULTS=$resultCount")
     }
