@@ -67,6 +67,19 @@ int main()
     assert( workflowInspect["result"]["isError"] == false );
     assert( workflowInspect["result"]["structuredContent"]["data"]["frames"].is_array() );
 
+    stage( "plot names" );
+    const auto plots = server.HandleRequest( ToolCall( 33, "tracy_inspect", {
+        { "method", "plot.list" }, { "trace_id", traceId }, { "params", { { "limit", 1000 } } }
+    } ) );
+    assert( plots["result"]["isError"] == false );
+    const auto& plotItems = plots["result"]["structuredContent"]["data"]["plots"];
+    assert( !plotItems.empty() );
+    for( const auto& plot : plotItems )
+    {
+        assert( plot["name"].is_string() );
+        assert( !plot["name"].get<std::string>().empty() );
+    }
+
     stage( "describe" );
     const auto described = server.HandleRequest( ToolCall( 7, "tracy_describe", { { "operation", "memory.frame_snapshot" } } ) );
     assert( described["result"]["isError"] == false );

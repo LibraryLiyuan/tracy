@@ -1323,7 +1323,24 @@ std::vector<PlotDto> WorkerTraceSource::GetPlotList() const
         PlotDto dto;
         dto.ref = m_impl->MakeRef( "plot", i );
         dto.index = i;
-        dto.name = Safe( worker.TryGetString( plot->name ) );
+        switch( plot->type )
+        {
+        case PlotType::User:
+            dto.name = Safe( worker.GetString( plot->name ) );
+            break;
+        case PlotType::Memory:
+            dto.name = plot->name == 0 ? "Default allocator" : Safe( worker.GetString( plot->name ) );
+            break;
+        case PlotType::SysTime:
+            dto.name = "CPU usage";
+            break;
+        case PlotType::Power:
+            dto.name = plot->name == 0 ? "Power" : Safe( worker.GetString( plot->name ) );
+            break;
+        default:
+            dto.name = "Unknown plot";
+            break;
+        }
         dto.type = uint8_t( plot->type );
         dto.format = uint8_t( plot->format );
         dto.pointCount = plot->data.size();
