@@ -1493,6 +1493,7 @@ Profiler::Profiler()
 #ifdef TRACY_ON_DEMAND
     , m_connectionId( 0 )
     , m_symbolsBusy( false )
+    , m_disconnectDrain( false )
     , m_deferredQueue( 64*1024 )
 #endif
     , m_paramCallback( nullptr )
@@ -3630,6 +3631,20 @@ void Profiler::SymbolWorker()
                 s_symbolThreadGone.store( true, std::memory_order_release );
                 return;
             }
+            if( m_disconnectDrain.load( std::memory_order_acquire ) )
+            {
+                auto si = m_symbolQueue.front();
+                if( si )
+                {
+                    HandleSymbolQueueItem( *si );
+                    m_symbolQueue.pop();
+                }
+                else
+                {
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+                }
+                continue;
+            }
             while( m_symbolQueue.front() ) m_symbolQueue.pop();
             std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
             m_symbolsBusy.store( false, std::memory_order_release );
@@ -3813,28 +3828,67 @@ void Profiler::HandleDisconnect()
     }
 #endif
 
+#ifdef TRACY_ON_DEMAND
+    m_disconnectDrain.store( true, std::memory_order_release );
+    m_isConnected.store( false, std::memory_order_release );
+#endif
+
     QueueItem terminate;
     MemWrite( &terminate.hdr.type, QueueType::Terminate );
-    if( !SendData( (const char*)&terminate, 1 ) ) return;
+    if( !SendData( (const char*)&terminate, 1 ) )
+    {
+#ifdef TRACY_ON_DEMAND
+        m_disconnectDrain.store( false, std::memory_order_release );
+#endif
+        return;
+    }
     for(;;)
     {
+#ifdef TRACY_ON_DEMAND
+        const auto status = Dequeue( token );
+        const auto serialStatus = DequeueSerial();
+        if( status == DequeueStatus::ConnectionLost || serialStatus == DequeueStatus::ConnectionLost )
+        {
+            m_disconnectDrain.store( false, std::memory_order_release );
+            return;
+        }
+#else
         ClearQueues( token );
+#endif
         if( m_sock->HasData() )
         {
             while( m_sock->HasData() )
             {
-                if( !HandleServerQuery() ) return;
+                if( !HandleServerQuery() )
+                {
+#ifdef TRACY_ON_DEMAND
+                    m_disconnectDrain.store( false, std::memory_order_release );
+#endif
+                    return;
+                }
             }
             if( m_bufferOffset != m_bufferStart )
             {
-                if( !CommitData() ) return;
+                if( !CommitData() )
+                {
+#ifdef TRACY_ON_DEMAND
+                    m_disconnectDrain.store( false, std::memory_order_release );
+#endif
+                    return;
+                }
             }
         }
         else
         {
             if( m_bufferOffset != m_bufferStart )
             {
-                if( !CommitData() ) return;
+                if( !CommitData() )
+                {
+#ifdef TRACY_ON_DEMAND
+                    m_disconnectDrain.store( false, std::memory_order_release );
+#endif
+                    return;
+                }
             }
             std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
         }

@@ -474,7 +474,8 @@ public:
 
     Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver = nullptr,
         Mode mode = Mode::Full, size_t recorderDefinitionLimit = DefaultRecorderDefinitionLimit,
-        size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit );
+        size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
+        uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false);
     ~Worker();
@@ -716,7 +717,7 @@ public:
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
     void Disconnect();
     void MarkProtocolDisconnect() { m_disconnect.store( true, std::memory_order_release ); }
-    void RequestProtocolDrain();
+    void RequestProtocolDrain( bool disconnectClient = true );
     void BeginProtocolDrain();
     bool IsProtocolDrainActive() const { return m_protocolDrainOnly.load( std::memory_order_acquire ); }
     bool WasDisconnectIssued() const { return m_disconnect.load( std::memory_order_relaxed ); }
@@ -771,6 +772,7 @@ private:
     void Exec();
     void Query( ServerQuery type, uint64_t data, uint32_t extra = 0 );
     bool QueryTerminate();
+    bool SendProtocolDisconnect();
     void QuerySourceFile( const char* fn, const char* image );
     void QueryDataTransfer( const void* ptr, size_t size );
     void QueryCallstackFrame( uint64_t addr );
@@ -1086,6 +1088,9 @@ private:
     std::atomic<bool> m_protocolObserverClosed { false };
     std::atomic<bool> m_protocolTransportError { false };
     Mode m_mode = Mode::Full;
+    bool m_deferSymbolExpansion = false;
+    uint32_t m_serverQuerySpaceOverride = 0;
+    bool m_useRecorderDrainState = false;
     size_t m_recorderDefinitionLimit = DefaultRecorderDefinitionLimit;
     size_t m_recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit;
     std::atomic<bool> m_protocolResolverFailed { false };
@@ -1099,6 +1104,7 @@ private:
     std::atomic<bool> m_hasData;
     std::atomic<bool> m_shutdown { false };
     std::atomic<bool> m_protocolDisconnectSent { false };
+    std::atomic<bool> m_protocolDisconnectClient { false };
     std::atomic<bool> m_protocolDrainOnly { false };
     std::atomic<uint64_t> m_protocolFramesProcessed { 0 };
     std::atomic<bool> m_networkReading { false };

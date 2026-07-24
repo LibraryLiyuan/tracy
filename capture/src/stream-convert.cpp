@@ -240,12 +240,23 @@ int main( int argc, char** argv )
     std::vector<tracy::stream::RecordInfo> clientRecords;
     std::vector<tracy::stream::RecordInfo> serverRecords;
     bool hasLocalDisconnect = false;
+    bool hasSessionBegin = false;
+    bool deferSymbolExpansion = false;
+    tracy::stream::RecordInfo sessionBeginRecord;
     uint64_t drainControlSequence = 0;
+    tracy::stream::RecordInfo drainControlRecord;
+    uint8_t drainControlVersion = 0;
+    uint32_t serverQuerySpaceOverride = 0;
     clientRecords.reserve( scan.records.size() );
     serverRecords.reserve( 1024 );
     for( const auto& record : scan.records )
     {
-        if( record.type == tracy::stream::RecordType::ClientToServer )
+        if( record.type == tracy::stream::RecordType::SessionBegin && !hasSessionBegin )
+        {
+            hasSessionBegin = true;
+            sessionBeginRecord = record;
+        }
+        else if( record.type == tracy::stream::RecordType::ClientToServer )
             clientRecords.push_back( record );
         else if( record.type == tracy::stream::RecordType::ServerToClient )
             serverRecords.push_back( record );
@@ -254,13 +265,90 @@ int main( int argc, char** argv )
         {
             hasLocalDisconnect = true;
             if( ( record.flags & tracy::stream::RecordFlagServerQuery ) == 0 )
+            {
                 drainControlSequence = record.sequence;
+                drainControlRecord = record;
+            }
         }
     }
     if( clientRecords.empty() || serverRecords.empty() )
     {
         std::fprintf( stderr, "Journal does not contain a bidirectional Tracy handshake.\n" );
         return 2;
+    }
+    if( hasSessionBegin )
+    {
+        PayloadReader sessionReader( options.input );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !sessionReader.IsOpen() || !sessionReader.Read( sessionBeginRecord, payload, error ) )
+        {
+            std::fprintf( stderr, "Cannot read session metadata: %s.\n", error.c_str() );
+            return 2;
+        }
+        if( payload.size() >= 2 )
+        {
+            const auto version = uint16_t( payload[0] ) | ( uint16_t( payload[1] ) << 8 );
+            if( version == 2 )
+            {
+                if( payload.size() < 24 )
+                {
+                    std::fprintf( stderr, "Invalid version 2 session metadata.\n" );
+                    return 2;
+                }
+                const auto headerSize = uint16_t( payload[2] ) | ( uint16_t( payload[3] ) << 8 );
+                const auto flags =
+                    uint32_t( payload[16] ) |
+                    ( uint32_t( payload[17] ) << 8 ) |
+                    ( uint32_t( payload[18] ) << 16 ) |
+                    ( uint32_t( payload[19] ) << 24 );
+                if( headerSize != 24 || ( flags & ~tracy::stream::SessionBeginSupportedFlags ) != 0 )
+                {
+                    std::fprintf( stderr, "Unsupported version 2 session metadata.\n" );
+                    return 2;
+                }
+                deferSymbolExpansion = ( flags & tracy::stream::SessionBeginFlagDeferredSymbolExpansion ) != 0;
+            }
+            else if( version != 1 )
+            {
+                std::fprintf( stderr, "Unsupported session metadata version %u.\n", version );
+                return 2;
+            }
+        }
+    }
+    if( drainControlSequence != 0 )
+    {
+        PayloadReader drainReader( options.input );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !drainReader.IsOpen() || !drainReader.Read( drainControlRecord, payload, error ) )
+        {
+            std::fprintf( stderr, "Cannot read protocol drain control record: %s.\n", error.c_str() );
+            return 2;
+        }
+        if( payload.size() == 1 && payload[0] >= 1 && payload[0] <= 3 )
+        {
+            drainControlVersion = payload[0];
+        }
+        else if( payload.size() == 5 && payload[0] == 4 )
+        {
+            drainControlVersion = payload[0];
+            serverQuerySpaceOverride =
+                uint32_t( payload[1] ) |
+                ( uint32_t( payload[2] ) << 8 ) |
+                ( uint32_t( payload[3] ) << 16 ) |
+                ( uint32_t( payload[4] ) << 24 );
+            if( serverQuerySpaceOverride == 0 || serverQuerySpaceOverride > 8 * 1024 )
+            {
+                std::fprintf( stderr, "Invalid recorded server-query window.\n" );
+                return 2;
+            }
+        }
+        else
+        {
+            std::fprintf( stderr, "Unsupported protocol drain control payload.\n" );
+            return 2;
+        }
     }
 
     EnableLocalReplayOnly();
@@ -272,7 +360,10 @@ int main( int argc, char** argv )
     }
 
     std::printf( "Replaying %zu client records and validating %zu server records on 127.0.0.1:%u...\n", clientRecords.size(), serverRecords.size(), options.port );
-    tracy::Worker worker( "127.0.0.1", options.port, -1 );
+    const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
+    tracy::Worker worker( "127.0.0.1", options.port, -1, nullptr, tracy::Worker::Mode::Full,
+        tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
+        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly );
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
 
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
@@ -287,13 +378,23 @@ int main( int argc, char** argv )
         std::fprintf( stderr, "Worker did not connect to the local replay socket.\n" );
         return 4;
     }
+    if( !peer->SetSendTimeout( 10000 ) )
+    {
+        worker.Shutdown();
+        std::fprintf( stderr, "Cannot configure the local replay send timeout.\n" );
+        return 4;
+    }
 
     ReplayError replayError;
     std::thread verifier( [&] {
+        const auto failReplay = [&]( std::string message ) {
+            replayError.Set( std::move( message ) );
+            peer->Close();
+        };
         PayloadReader reader( options.input );
         if( !reader.IsOpen() )
         {
-            replayError.Set( "cannot open journal for server-stream verification" );
+            failReplay( "cannot open journal for server-stream verification" );
             return;
         }
         std::vector<uint8_t> expected;
@@ -304,20 +405,23 @@ int main( int argc, char** argv )
             if( replayError.Failed() ) return;
             if( !reader.Read( record, expected, error ) )
             {
-                replayError.Set( "sequence " + std::to_string( record.sequence ) + ": " + error );
+                failReplay( "sequence " + std::to_string( record.sequence ) + ": " + error );
                 return;
             }
             actual.resize( expected.size() );
-            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 1000 ) )
+            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 100, [&] {
+                return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
+            } ) )
             {
-                replayError.Set( "sequence " + std::to_string( record.sequence ) + ": Worker server stream ended early" );
+                failReplay( "sequence " + std::to_string( record.sequence ) + ": Worker server stream ended early" );
                 return;
             }
             const auto mismatch = std::mismatch( expected.begin(), expected.end(), actual.begin(), actual.end() );
             if( mismatch.first != expected.end() )
             {
                 const auto offset = size_t( mismatch.first - expected.begin() );
-                replayError.Set( "sequence " + std::to_string( record.sequence ) +
+                failReplay( "sequence " + std::to_string( record.sequence ) +
                     ": Worker server-query stream diverged at payload byte " + std::to_string( offset ) +
                     " (recorded=" + std::to_string( unsigned( expected[offset] ) ) +
                     ", replay=" + std::to_string( unsigned( actual[offset] ) ) + ")" );
@@ -393,7 +497,7 @@ int main( int argc, char** argv )
             }
             else if( !replayError.Failed() )
             {
-                worker.RequestProtocolDrain();
+                worker.RequestProtocolDrain( drainControlVersion >= 2 );
                 for( ; splitIndex < clientRecords.size(); splitIndex++ )
                 {
                     const auto& record = clientRecords[splitIndex];

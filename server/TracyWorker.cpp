@@ -257,11 +257,15 @@ static bool IsQueryPrio( ServerQuery type )
 LoadProgress Worker::s_loadProgress;
 
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
-    Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit )
+    Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
+    uint32_t serverQuerySpaceOverride, bool useRecorderDrainState )
     : m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
     , m_mode( mode )
+    , m_deferSymbolExpansion( mode == Mode::ProtocolOnly || deferSymbolExpansion )
+    , m_serverQuerySpaceOverride( serverQuerySpaceOverride )
+    , m_useRecorderDrainState( mode == Mode::ProtocolOnly || useRecorderDrainState )
     , m_recorderDefinitionLimit( recorderDefinitionLimit )
     , m_recorderQueryQueueLimit( recorderQueryQueueLimit )
     , m_hasData( false )
@@ -2753,8 +2757,22 @@ bool Worker::SendProtocol( const void* data, int size, ProtocolChunk chunk )
 
 bool Worker::RecordProtocolDrainControl()
 {
-    constexpr uint8_t BeginDrain = 1;
-    const ProtocolDataSpan span { &BeginDrain, sizeof( BeginDrain ) };
+    const bool disconnectClient = m_protocolDisconnectClient.load( std::memory_order_acquire );
+    if( disconnectClient && m_deferSymbolExpansion )
+    {
+        const auto querySpace = uint32_t( m_serverQuerySpaceBase );
+        const std::array<uint8_t, 5> beginDrain = {
+            4,
+            uint8_t( querySpace ),
+            uint8_t( querySpace >> 8 ),
+            uint8_t( querySpace >> 16 ),
+            uint8_t( querySpace >> 24 )
+        };
+        const ProtocolDataSpan span { beginDrain.data(), beginDrain.size() };
+        return ObserveProtocol( ProtocolDirection::LocalControl, ProtocolChunk::ControlState, std::span<const ProtocolDataSpan>( &span, 1 ) );
+    }
+    const uint8_t beginDrain = disconnectClient ? 2 : 1;
+    const ProtocolDataSpan span { &beginDrain, sizeof( beginDrain ) };
     return ObserveProtocol( ProtocolDirection::LocalControl, ProtocolChunk::ControlState, std::span<const ProtocolDataSpan>( &span, 1 ) );
 }
 
@@ -3009,7 +3027,10 @@ void Worker::Exec()
         }
     }
 
-    m_serverQuerySpaceBase = m_serverQuerySpaceLeft = std::min( ( m_sock.GetSendBufSize() / ServerQueryPacketSize ), 8*1024 ) - 4;   // leave space for terminate request
+    m_serverQuerySpaceBase = m_serverQuerySpaceLeft =
+        m_serverQuerySpaceOverride != 0 ?
+        m_serverQuerySpaceOverride :
+        std::min( ( m_sock.GetSendBufSize() / ServerQueryPacketSize ), 8*1024 ) - 4;   // leave space for terminate request
     m_hasData.store( true, std::memory_order_release );
 
     LZ4_setStreamDecode( (LZ4_streamDecode_t*)m_stream, nullptr, 0 );
@@ -3105,11 +3126,18 @@ void Worker::Exec()
                     closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
                     goto close;
                 }
+                const bool disconnectClient = m_protocolDisconnectClient.load( std::memory_order_acquire );
+                if( disconnectClient && !SendProtocolDisconnect() )
+                {
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                    goto close;
+                }
                 BeginProtocolDrain();
-                if( HasPendingProtocolQueries() )
+                const auto readCredits = disconnectClient ? 1 : ( HasPendingProtocolQueries() ? 2 : 0 );
+                if( readCredits != 0 )
                 {
                     std::lock_guard writeLock( m_netWriteLock );
-                    m_netWriteCnt += 2;
+                    m_netWriteCnt += readCredits;
                     m_netWriteCv.notify_one();
                 }
                 continue;
@@ -3511,6 +3539,12 @@ bool Worker::QueryTerminate()
     return SendProtocol( &query, ServerQueryPacketSize, ProtocolChunk::ServerQuery );
 }
 
+bool Worker::SendProtocolDisconnect()
+{
+    ServerQueryPacket query { ServerQueryDisconnect, 0, 0 };
+    return SendProtocol( &query, ServerQueryPacketSize, ProtocolChunk::ServerQuery );
+}
+
 void Worker::QuerySourceFile( const char* fn, const char* image )
 {
     if( image ) QueryDataTransfer( image, strlen( image ) + 1 );
@@ -3798,7 +3832,7 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
                 RecorderPrepareSecondString();
                 if( !m_protocolResolverFailed.load( std::memory_order_relaxed ) )
                 {
-                    ProcessCallstackFrame( ev.callstackFrame, true );
+                    ProcessCallstackFrame( ev.callstackFrame, !m_deferSymbolExpansion );
                 }
                 break;
             case QueueType::SymbolInformation:
@@ -4017,7 +4051,7 @@ bool Worker::RecorderHasPendingQueries() const
 
 bool Worker::HasPendingProtocolQueries() const
 {
-    if( m_mode == Mode::ProtocolOnly ) return RecorderHasPendingQueries();
+    if( m_useRecorderDrainState ) return RecorderHasPendingQueries();
     return m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingSourceLocation != 0 ||
         m_pendingCallstackFrames != 0 || m_data.plots.IsPending() || m_pendingCallstackId != 0 ||
         m_pendingExternalNames != 0 || m_pendingCallstackSubframes != 0 ||
@@ -5714,7 +5748,7 @@ bool Worker::Process( const QueueItem& ev )
         m_serverQuerySpaceLeft++;
         break;
     case QueueType::CallstackFrame:
-        ProcessCallstackFrame( ev.callstackFrame, true );
+        ProcessCallstackFrame( ev.callstackFrame, !m_deferSymbolExpansion );
         break;
     case QueueType::SymbolInformation:
         ProcessSymbolInformation( ev.symbolInformation );
@@ -8873,8 +8907,9 @@ void Worker::Disconnect()
     }
 }
 
-void Worker::RequestProtocolDrain()
+void Worker::RequestProtocolDrain( bool disconnectClient )
 {
+    m_protocolDisconnectClient.store( disconnectClient, std::memory_order_release );
     MarkProtocolDisconnect();
     m_netReadCv.notify_one();
 }

@@ -34,11 +34,50 @@ function Assert-Condition {
     }
 }
 
+function Read-JournalPayloadByte {
+    param(
+        [string] $Path,
+        [UInt64] $RecordOffset,
+        [UInt64] $PayloadOffset = 0
+    )
+    $stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $stream.Position = $RecordOffset + 48 + $PayloadOffset
+        return $stream.ReadByte()
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Read-JournalPayloadUInt32 {
+    param(
+        [string] $Path,
+        [UInt64] $RecordOffset,
+        [UInt64] $PayloadOffset
+    )
+    $stream = [System.IO.File]::OpenRead($Path)
+    $reader = $null
+    try {
+        $stream.Position = $RecordOffset + 48 + $PayloadOffset
+        $reader = [System.IO.BinaryReader]::new($stream)
+        return $reader.ReadUInt32()
+    }
+    finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+        else {
+            $stream.Dispose()
+        }
+    }
+}
+
 foreach ($requiredPath in @($ProducerExe, $CaptureExe, $ConverterExe, $InspectorExe, $QueryExe, $OutputRoot)) {
     Assert-Condition (Test-Path -LiteralPath $requiredPath) "required path does not exist: $requiredPath"
 }
 Assert-Condition ($CaptureSeconds -ge 1 -and $CaptureSeconds -le 60) 'CaptureSeconds must be between 1 and 60'
-Assert-Condition ($ReplayPort -ge 1 -and $ReplayPort -le 65535) 'ReplayPort is invalid'
+Assert-Condition ($ReplayPort -ge 1 -and $ReplayPort -le 65533) 'ReplayPort must leave two ports for drain and recovery replay'
 
 $artifactRoot = Join-Path (Resolve-Path -LiteralPath $OutputRoot).Path ("stream-acceptance-" + [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss-fff'))
 [void](New-Item -ItemType Directory -Path $artifactRoot)
@@ -49,6 +88,8 @@ $replayedPath = Join-Path $artifactRoot 'replayed.tracy'
 $producerSeconds = $CaptureSeconds + 4
 $producer = $null
 $capture = $null
+$drainProducer = $null
+$drainCapture = $null
 $crashProducer = $null
 $crashCapture = $null
 
@@ -143,6 +184,77 @@ try {
     }
     $producer = $null
 
+    $drainJournalPath = Join-Path $artifactRoot 'protocol-only-drain.tracy-stream'
+    $drainReplayPath = Join-Path $artifactRoot 'protocol-only-drain-replayed.tracy'
+    $drainProducer = Start-Process -FilePath (Resolve-Path -LiteralPath $ProducerExe).Path `
+        -ArgumentList ([string]($CaptureSeconds + 20)) `
+        -WorkingDirectory (Split-Path (Resolve-Path -LiteralPath $ProducerExe).Path) `
+        -WindowStyle Hidden `
+        -PassThru
+    Start-Sleep -Milliseconds 300
+    $drainCapture = Start-Process -FilePath (Resolve-Path -LiteralPath $CaptureExe).Path `
+        -ArgumentList @('-j', $drainJournalPath, '-s', [string]$CaptureSeconds, '-f') `
+        -WorkingDirectory (Split-Path (Resolve-Path -LiteralPath $CaptureExe).Path) `
+        -WindowStyle Hidden `
+        -PassThru
+
+    Assert-Condition ($drainCapture.WaitForExit(($CaptureSeconds + 15) * 1000)) 'protocol-only capture did not finish its definition drain'
+    Assert-Condition ($drainCapture.ExitCode -eq 0) "protocol-only capture failed with exit code $($drainCapture.ExitCode)"
+    Assert-Condition (-not $drainProducer.HasExited) 'protocol-only producer exited instead of continuing after recorder disconnect'
+    $drainCapture = $null
+
+    $drainInspect = (& $InspectorExe inspect $drainJournalPath --records 1000000 | ConvertFrom-Json)
+    Assert-Condition ($LASTEXITCODE -eq 0) 'protocol-only journal inspection failed'
+    Assert-Condition ([bool]$drainInspect.complete) 'protocol-only journal does not have a clean SessionEnd'
+    $drainRecords = @($drainInspect.records)
+    Assert-Condition ($drainRecords.Count -eq [UInt64]$drainInspect.record_count) 'protocol-only journal record enumeration was truncated'
+    $sessionRecords = @($drainRecords | Where-Object { [string]$_.type -eq 'SessionBegin' })
+    Assert-Condition ($sessionRecords.Count -eq 1) "expected one SessionBegin, found $($sessionRecords.Count)"
+    $sessionVersion = Read-JournalPayloadByte -Path $drainJournalPath -RecordOffset ([UInt64]$sessionRecords[0].offset)
+    Assert-Condition ($sessionVersion -eq 2) "ProtocolOnly SessionBegin version is $sessionVersion instead of 2"
+    $sessionFlags = Read-JournalPayloadUInt32 -Path $drainJournalPath -RecordOffset ([UInt64]$sessionRecords[0].offset) -PayloadOffset 16
+    Assert-Condition (($sessionFlags -band 1) -ne 0) "ProtocolOnly SessionBegin omitted the deferred-symbol-expansion flag"
+    $drainMarkers = @($drainRecords | Where-Object {
+        (([UInt32]$_.flags -band 32) -ne 0) -and (([UInt32]$_.flags -band 4) -eq 0)
+    })
+    Assert-Condition ($drainMarkers.Count -eq 1) "expected one protocol drain marker, found $($drainMarkers.Count)"
+    $drainMarker = $drainMarkers[0]
+    Assert-Condition ([UInt64]$drainMarker.payload_size -eq 5) "protocol drain marker payload is $($drainMarker.payload_size) bytes instead of 5"
+    $drainControl = Read-JournalPayloadByte -Path $drainJournalPath -RecordOffset ([UInt64]$drainMarker.offset)
+    Assert-Condition ($drainControl -eq 4) "protocol drain marker payload is $drainControl instead of 4"
+    $recordedQueryWindow = Read-JournalPayloadUInt32 -Path $drainJournalPath -RecordOffset ([UInt64]$drainMarker.offset) -PayloadOffset 1
+    Assert-Condition ($recordedQueryWindow -ge 1 -and $recordedQueryWindow -le 8192) "recorded server-query window is outside [1, 8192]: $recordedQueryWindow"
+
+    $disconnectRecords = @($drainRecords | Where-Object {
+        ([UInt64]$_.sequence -gt [UInt64]$drainMarker.sequence) -and
+        ([string]$_.type -eq 'ServerToClient') -and
+        (([UInt32]$_.flags -band 4) -ne 0) -and
+        ([UInt64]$_.payload_size -eq 13)
+    })
+    Assert-Condition ($disconnectRecords.Count -ge 1) 'protocol drain did not record a server query after its marker'
+    $disconnectType = Read-JournalPayloadByte -Path $drainJournalPath -RecordOffset ([UInt64]$disconnectRecords[0].offset)
+    Assert-Condition ($disconnectType -eq 9) "first post-drain server query is $disconnectType instead of ServerQueryDisconnect (9)"
+
+    [UInt64]$postDrainClientBytes = 0
+    foreach ($record in $drainRecords) {
+        if ([UInt64]$record.sequence -gt [UInt64]$drainMarker.sequence -and [string]$record.type -eq 'ClientToServer') {
+            $postDrainClientBytes += [UInt64]$record.payload_size
+        }
+    }
+    Assert-Condition ($postDrainClientBytes -lt 32MB) "protocol drain accepted $postDrainClientBytes client bytes after disconnect"
+
+    $drainReplayPort = $ReplayPort + 1
+    & $ConverterExe -i $drainJournalPath -o $drainReplayPath -p $drainReplayPort -f
+    Assert-Condition ($LASTEXITCODE -eq 0) 'protocol-only drain conversion failed'
+    foreach ($trace in @($drainJournalPath, $drainReplayPath)) {
+        & $QueryExe --doctor --trace $trace --allow-root $artifactRoot | Out-Null
+        Assert-Condition ($LASTEXITCODE -eq 0) "tracy-query doctor rejected protocol drain artifact $trace"
+    }
+
+    Stop-Process -Id $drainProducer.Id -Force
+    $drainProducer.WaitForExit()
+    $drainProducer = $null
+
     $crashJournalPath = Join-Path $artifactRoot 'forced-stop.tracy-stream'
     $crashReplayPath = Join-Path $artifactRoot 'forced-stop-replayed.tracy'
     $crashProducer = Start-Process -FilePath (Resolve-Path -LiteralPath $ProducerExe).Path `
@@ -188,14 +300,13 @@ try {
     Assert-Condition (-not [bool]$crashInspect.complete) 'forced-stop journal unexpectedly has SessionEnd'
     Assert-Condition ([UInt64]$crashInspect.record_count -ge 15) 'forced-stop journal lost its previously published prefix'
 
-    $crashReplayPort = $ReplayPort + 1
-    Assert-Condition ($crashReplayPort -le 65535) 'ReplayPort leaves no port for forced-stop replay'
+    $crashReplayPort = $ReplayPort + 2
     & $ConverterExe -i $crashJournalPath -o $crashReplayPath -p $crashReplayPort -f
     Assert-Condition ($LASTEXITCODE -eq 0) "forced-stop valid-prefix conversion failed with exit code $LASTEXITCODE"
     & $QueryExe --doctor --trace $crashReplayPath --allow-root $artifactRoot | Out-Null
     Assert-Condition ($LASTEXITCODE -eq 0) 'tracy-query doctor rejected the forced-stop replay'
 
-    [Console]::Out.WriteLine("RESULT=PASS ARTIFACT_ROOT=$artifactRoot JOURNAL_RECORDS=$($inspectJson.record_count) JOURNAL_BYTES=$($inspectJson.file_size) LIVE_REVISIONS=$($liveRevisions.Count) FORCED_STOP_RECORDS=$($crashInspect.record_count)")
+    [Console]::Out.WriteLine("RESULT=PASS ARTIFACT_ROOT=$artifactRoot JOURNAL_RECORDS=$($inspectJson.record_count) JOURNAL_BYTES=$($inspectJson.file_size) LIVE_REVISIONS=$($liveRevisions.Count) DRAIN_RECORDS=$($drainInspect.record_count) POST_DRAIN_CLIENT_BYTES=$postDrainClientBytes FORCED_STOP_RECORDS=$($crashInspect.record_count)")
 }
 finally {
     if ($null -ne $crashCapture -and -not $crashCapture.HasExited) {
@@ -205,6 +316,14 @@ finally {
     if ($null -ne $crashProducer -and -not $crashProducer.HasExited) {
         Stop-Process -Id $crashProducer.Id -Force
         $crashProducer.WaitForExit()
+    }
+    if ($null -ne $drainCapture -and -not $drainCapture.HasExited) {
+        Stop-Process -Id $drainCapture.Id -Force
+        $drainCapture.WaitForExit()
+    }
+    if ($null -ne $drainProducer -and -not $drainProducer.HasExited) {
+        Stop-Process -Id $drainProducer.Id -Force
+        $drainProducer.WaitForExit()
     }
     if ($null -ne $capture -and -not $capture.HasExited) {
         Stop-Process -Id $capture.Id -Force

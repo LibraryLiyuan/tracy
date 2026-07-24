@@ -19,6 +19,8 @@ inline constexpr uint64_t FileHeaderSize = 64;
 inline constexpr uint64_t RecordHeaderSize = 48;
 inline constexpr uint64_t RecordTrailerSize = 32;
 inline constexpr uint64_t DefaultMaxPayloadSize = 64ull * 1024 * 1024;
+inline constexpr uint32_t SessionBeginFlagDeferredSymbolExpansion = 1u << 0;
+inline constexpr uint32_t SessionBeginSupportedFlags = SessionBeginFlagDeferredSymbolExpansion;
 
 enum class RecordType : uint16_t
 {

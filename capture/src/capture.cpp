@@ -8,6 +8,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cwctype>
 #include <filesystem>
 #include <inttypes.h>
@@ -39,13 +40,18 @@
 // The good thing with C++11 atomics is that we can use atomic<bool> instead
 // here and be on the actually supported path.
 static std::atomic<bool> s_disconnect { false };
+static std::atomic<bool> s_protocolDrainActive { false };
+static std::atomic<bool> s_forceStopProtocolDrain { false };
 
 void SigInt( int )
 {
     // Relaxed order is closest to a traditional `volatile` write.
     // We don't need stronger ordering since this signal handler doesn't do
     // anything else that would need to be ordered relatively to this.
-    s_disconnect.store(true, std::memory_order_relaxed);
+    if( s_protocolDrainActive.load( std::memory_order_relaxed ) )
+        s_forceStopProtocolDrain.store( true, std::memory_order_relaxed );
+    else
+        s_disconnect.store( true, std::memory_order_relaxed );
 }
 
 static bool s_isStdoutATerminal = false;
@@ -219,10 +225,13 @@ int main( int argc, char** argv )
         unlink( output );
     }
 
+    const bool protocolOnly = journalOutput && !output;
     std::unique_ptr<tracy::stream::StreamProtocolObserver> protocolObserver;
     if( journalOutput )
     {
         tracy::stream::ProtocolJournalOptions journalOptions;
+        if( protocolOnly )
+            journalOptions.sessionFlags |= tracy::stream::SessionBeginFlagDeferredSymbolExpansion;
         std::string journalError;
         protocolObserver = tracy::stream::StreamProtocolObserver::CreateFileJournal( journalOutput, address, uint16_t( port ), tracy::ProtocolVersion, overwrite, journalOptions, journalError );
         if( !protocolObserver )
@@ -233,7 +242,6 @@ int main( int argc, char** argv )
         printf( "Streaming protocol journal to %s\n", journalOutput );
     }
 
-    const bool protocolOnly = journalOutput && !output;
     printf( "Connecting to %s:%i...", address, port );
     fflush( stdout );
     tracy::Worker worker( address, port, memoryLimit, protocolObserver.get(),
@@ -287,6 +295,12 @@ int main( int argc, char** argv )
         // nothing else than storing `s_disconnect`.
         if( s_disconnect.load( std::memory_order_relaxed ) )
         {
+            if( protocolOnly )
+            {
+                s_protocolDrainActive.store( true, std::memory_order_relaxed );
+                printf( "\nStopping event capture and resolving pending definitions. Press Ctrl+C again to force stop.\n" );
+                fflush( stdout );
+            }
             worker.Disconnect();
             // Relaxed order is sufficient because only this thread ever reads
             // this value.
@@ -353,8 +367,15 @@ int main( int argc, char** argv )
     const auto t1 = std::chrono::high_resolution_clock::now();
     while( worker.IsConnected() )
     {
+        if( protocolOnly && s_forceStopProtocolDrain.load( std::memory_order_relaxed ) )
+        {
+            printf( "\nProtocol drain force-stopped. The committed journal prefix remains recoverable.\n" );
+            fflush( stdout );
+            std::_Exit( 130 );
+        }
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
     }
+    s_protocolDrainActive.store( false, std::memory_order_relaxed );
     const auto t2 = std::chrono::high_resolution_clock::now();
 
     const auto& failure = worker.GetFailureType();

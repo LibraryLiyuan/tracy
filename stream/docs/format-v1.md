@@ -98,29 +98,61 @@ bidirectional protocol: the server requests source locations, strings, call
 stacks, frame images, and other definitions while capture is in progress.
 
 Flag bit 5 (`RecordFlagLocalControl`) marks recorder-local state stored as
-`Diagnostic`; it is not a TCP packet. The current one-byte payload value `1`
-means `BeginDrain`. At this boundary the recorder stops dispatching ordinary
-post-boundary events, continues processing responses to already-issued
-definition queries, and finally sends the ordinary recorded
-`ServerQueryTerminate`. Replay excludes the diagnostic payload from both wire
-directions, restores the same local drain state at the same compressed-frame
+`Diagnostic`; it is not a TCP packet. Its `BeginDrain` payload is independently
+versioned without changing the journal file-format version:
+
+| Payload | Meaning |
+| --- | --- |
+| one byte `1` | Legacy server-only drain. |
+| one byte `2` | Send native `ServerQueryDisconnect`, then use the original full symbol-expansion behavior. |
+| one byte `3` | Send native disconnect and defer optional instruction-level symbol expansion. |
+| five bytes: `4`, then LE `uint32` | Current behavior; version 3 semantics plus the recorded server-query window. |
+
+For version 4 the query window must be in `[1, 8192]`. It is the exact
+`m_serverQuerySpaceBase` selected for the live socket. Replay restores this
+value before processing frames because a replay socket can have a different
+send-buffer size; deriving a new window could reorder priority and ordinary
+queries and break byte-for-byte validation.
+
+At the current v4 boundary the recorder sends the ordinary recorded
+`ServerQueryDisconnect`. An on-demand Client stops accepting new normal
+producer events while continuing to serialize its pre-disconnect backlog
+(finite at the boundary, but not protected by a Client hard limit) and
+asynchronous definition responses. `ProtocolOnly` keeps callstack
+function, file, and line data, but does not recursively request optional symbol
+code and disassembly addresses. After the remaining required definitions are
+resolved, the recorder sends the ordinary recorded `ServerQueryTerminate`.
+
+Replay excludes the diagnostic payload from both wire directions, restores
+the matching drain and symbol-expansion behavior at the same compressed-frame
 boundary, and validates the regenerated query stream and final terminate
-packet byte for byte.
+packet byte for byte. Readers accept legacy payload versions 1 through 3 for
+existing journals; current writers emit version 4.
 
 ### Versioned metadata payloads
 
-`SessionBegin` starts with a 24-byte little-endian payload header:
+`SessionBegin` starts with a 24-byte little-endian payload header. Payload
+version 1 is the legacy layout; current writers emit version 2:
 
 | Offset | Size | Field |
 | ---: | ---: | --- |
-| 0 | 2 | payload version (`1`) |
+| 0 | 2 | payload version (`1` legacy, `2` current) |
 | 2 | 2 | fixed header size (`24`) |
 | 4 | 4 | Tracy protocol version |
 | 8 | 2 | TCP port |
 | 10 | 2 | reserved |
 | 12 | 4 | UTF-8 address byte count |
-| 16 | 8 | reserved |
+| 16 | 4 | v2 session flags; reserved and zero in v1 |
+| 20 | 4 | reserved |
 | 24 | variable | address bytes, without a terminator |
+
+Session flag bit 0 (`SessionBeginFlagDeferredSymbolExpansion`) means the live
+recorder used ProtocolOnly's deferred optional symbol-expansion mode from the
+start of the session. Replay must select that mode and the recorder drain
+completion predicate before processing any client frames. This makes an
+in-progress revision deterministic even though its v4 `BeginDrain` record does
+not exist yet. Unknown v2 flag bits are rejected. A payload-level version bump
+does not change the journal file format, which remains version 1.0.
 
 `Checkpoint` has a 24-byte payload: version and size at offsets 0 and 2,
 reserved bytes 4–7, cumulative client bytes at offset 8, and cumulative server
@@ -158,6 +190,10 @@ handle and durably flushes the truncation before reporting success.
 - A clean end appends `SessionEnd` and performs a durable flush.
 - A missing `SessionEnd` is an incomplete but recoverable session, not a corrupt
   one.
+- Strict local replay imposes a 10-second deadline while waiting for each
+  recorded server chunk. A missing response or divergent completion state
+  fails explicitly instead of leaving conversion or query loading blocked
+  forever.
 - Immutable live views fingerprint their exact committed prefix and revalidate
   it before and after reads; a partial tail does not advance the revision.
 - Version 1 makes no guarantee for data that the producer had not yet delivered

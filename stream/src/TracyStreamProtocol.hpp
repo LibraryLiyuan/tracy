@@ -20,6 +20,7 @@ namespace tracy::stream
 struct ProtocolJournalOptions
 {
     WriterOptions writer;
+    uint32_t sessionFlags = 0;
     uint64_t durableIntervalNs = 1'000'000'000ull;
     uint64_t durableIntervalBytes = 16ull * 1024 * 1024;
     // The writer drains one buffer while producers may fill one queued

@@ -28,9 +28,17 @@ Completed in the current implementation:
 - asynchronous strict two-buffer protocol observer with TCP backpressure,
   durable checkpoints, and explicit sink-error propagation;
 - bounded ProtocolOnly resolver with memory, definition, and query-queue caps;
-- replay-external `LocalControl` record for the local `BeginDrain` boundary,
-  followed by response-only definition-query drain and ordinary
-  `ServerQueryTerminate`;
+- replay-external v4 `LocalControl` record for the local `BeginDrain` boundary,
+  including the original server-query window; native Client disconnect stops
+  new producer events while the pre-disconnect backlog (finite at the boundary,
+  but without a Client hard limit) and asynchronous definition responses drain,
+  followed by ordinary `ServerQueryTerminate`;
+- SessionBegin v2 records ProtocolOnly replay mode from session start, so live
+  revisions before `BeginDrain` use the same symbol-expansion behavior;
+- deferred optional symbol-code/disassembly expansion in ProtocolOnly and
+  matching Full replay with the recorder drain completion predicate;
+- ten-second per-server-record replay deadlines, verifier-triggered socket
+  close on divergence, and a second-Ctrl+C recoverable force-stop path;
 - offline replay with outgoing query-byte validation and `.tracy` conversion;
 - immutable `JournalStore` read views with revision/watermark publication and
   committed-prefix fingerprint revalidation;

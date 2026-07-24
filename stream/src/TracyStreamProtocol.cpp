@@ -72,6 +72,11 @@ std::unique_ptr<StreamProtocolObserver> StreamProtocolObserver::CreateJournal( s
         error = "protocol journal buffer size must be non-zero";
         return {};
     }
+    if( ( options.sessionFlags & ~SessionBeginSupportedFlags ) != 0 )
+    {
+        error = "protocol journal session flags are unsupported";
+        return {};
+    }
 
     auto observer = std::unique_ptr<StreamProtocolObserver>( new StreamProtocolObserver( std::move( writer ), options ) );
     if( !observer->AppendSessionBegin( address, port, protocolVersion, error ) )
@@ -106,11 +111,12 @@ bool StreamProtocolObserver::AppendSessionBegin( std::string_view address, uint1
     }
 
     std::array<uint8_t, 24> metadata = {};
-    Put16( metadata.data(), 0, 1 );
+    Put16( metadata.data(), 0, 2 );
     Put16( metadata.data(), 2, uint16_t( metadata.size() ) );
     Put32( metadata.data(), 4, protocolVersion );
     Put16( metadata.data(), 8, port );
     Put32( metadata.data(), 12, uint32_t( address.size() ) );
+    Put32( metadata.data(), 16, m_options.sessionFlags );
 
     const std::array<PayloadSpan, 2> payload = {
         PayloadSpan { metadata.data(), metadata.size() },

@@ -542,6 +542,7 @@ void TestProtocolObserver( TestContext& test )
 
     ProtocolJournalOptions options;
     options.writer.durableHeader = true;
+    options.sessionFlags = SessionBeginFlagDeferredSymbolExpansion;
     options.durableIntervalBytes = 32;
     options.durableIntervalNs = 0;
     std::string error;
@@ -595,11 +596,15 @@ void TestProtocolObserver( TestContext& test )
     size_t checkpointCount = 0;
     size_t endCount = 0;
     size_t localControlCount = 0;
+    RecordInfo beginRecord;
     for( const auto& record : scan.records )
     {
         switch( record.type )
         {
-        case RecordType::SessionBegin: beginCount++; break;
+        case RecordType::SessionBegin:
+            beginCount++;
+            beginRecord = record;
+            break;
         case RecordType::ClientToServer: clientCount++; break;
         case RecordType::ServerToClient: serverCount++; break;
         case RecordType::Checkpoint: checkpointCount++; break;
@@ -616,6 +621,19 @@ void TestProtocolObserver( TestContext& test )
     test.Check( checkpointCount > 0, "protocol observer writes byte-based durable checkpoints" );
     test.Check( endCount == 1, "protocol observer writes exactly one SessionEnd" );
     test.Check( localControlCount == 1, "protocol observer marks one replay-external local control record" );
+    if( beginCount == 1 )
+    {
+        std::array<uint8_t, 24> metadata = {};
+        std::ifstream input( path, std::ios::binary );
+        input.seekg( std::streamoff( beginRecord.offset + RecordHeaderSize ), std::ios::beg );
+        input.read( reinterpret_cast<char*>( metadata.data() ), std::streamsize( metadata.size() ) );
+        test.Check( input.gcount() == std::streamsize( metadata.size() ), "read protocol observer SessionBegin metadata" );
+        test.Check( metadata[0] == 2 && metadata[1] == 0, "protocol observer writes SessionBegin metadata version 2" );
+        test.Check( metadata[2] == 24 && metadata[3] == 0, "protocol observer writes the version 2 metadata header size" );
+        test.Check( metadata[16] == SessionBeginFlagDeferredSymbolExpansion &&
+            metadata[17] == 0 && metadata[18] == 0 && metadata[19] == 0,
+            "protocol observer persists deferred symbol-expansion mode" );
+    }
 
     std::filesystem::remove_all( directory, ec );
     test.Check( !ec, "remove protocol observer temporary directory" );

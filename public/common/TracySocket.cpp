@@ -267,14 +267,13 @@ bool Socket::ConnectBlocking( const char* addr, uint16_t port )
 
 void Socket::Close()
 {
-    const auto sock = m_sock.load( std::memory_order_relaxed );
-    assert( sock != -1 );
+    const auto sock = m_sock.exchange( -1, std::memory_order_acq_rel );
+    if( sock == -1 ) return;
 #ifdef _WIN32
     closesocket( sock );
 #else
     close( sock );
 #endif
-    m_sock.store( -1, std::memory_order_relaxed );
 }
 
 int Socket::Send( const void* _buf, int len )
@@ -305,6 +304,18 @@ int Socket::GetSendBufSize()
     getsockopt( sock, SOL_SOCKET, SO_SNDBUF, &bufSize, &sz );
 #endif
     return bufSize;
+}
+
+bool Socket::SetSendTimeout( int timeout )
+{
+    const auto sock = m_sock.load( std::memory_order_relaxed );
+#ifdef _WIN32
+    const DWORD value = DWORD( timeout );
+    return setsockopt( sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>( &value ), sizeof( value ) ) == 0;
+#else
+    const timeval value = { timeout / 1000, ( timeout % 1000 ) * 1000 };
+    return setsockopt( sock, SOL_SOCKET, SO_SNDTIMEO, &value, sizeof( value ) ) == 0;
+#endif
 }
 
 int Socket::RecvBuffered( void* buf, int len, int timeout )

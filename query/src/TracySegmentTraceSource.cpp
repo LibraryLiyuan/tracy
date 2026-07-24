@@ -139,22 +139,103 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     std::vector<stream::RecordInfo> clientRecords;
     std::vector<stream::RecordInfo> serverRecords;
     bool hasLocalDisconnect = false;
+    bool hasSessionBegin = false;
+    bool deferSymbolExpansion = false;
+    stream::RecordInfo sessionBeginRecord;
     uint64_t drainControlSequence = 0;
+    stream::RecordInfo drainControlRecord;
+    uint8_t drainControlVersion = 0;
+    uint32_t serverQuerySpaceOverride = 0;
     for( const auto& record : scan.records )
     {
-        if( record.type == stream::RecordType::ClientToServer ) clientRecords.emplace_back( record );
+        if( record.type == stream::RecordType::SessionBegin && !hasSessionBegin )
+        {
+            hasSessionBegin = true;
+            sessionBeginRecord = record;
+        }
+        else if( record.type == stream::RecordType::ClientToServer ) clientRecords.emplace_back( record );
         else if( record.type == stream::RecordType::ServerToClient ) serverRecords.emplace_back( record );
         else if( record.type == stream::RecordType::Diagnostic &&
             ( record.flags & stream::RecordFlagLocalControl ) != 0 )
         {
             hasLocalDisconnect = true;
             if( ( record.flags & stream::RecordFlagServerQuery ) == 0 )
+            {
                 drainControlSequence = record.sequence;
+                drainControlRecord = record;
+            }
         }
     }
     if( clientRecords.empty() || serverRecords.empty() )
     {
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "stream revision does not yet contain a complete Tracy handshake" );
+    }
+    if( hasSessionBegin )
+    {
+        PayloadReader sessionReader( view.path );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !sessionReader.Read( sessionBeginRecord, payload, error ) )
+        {
+            throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "cannot read session metadata: " + error );
+        }
+        if( payload.size() >= 2 )
+        {
+            const auto version = uint16_t( payload[0] ) | ( uint16_t( payload[1] ) << 8 );
+            if( version == 2 )
+            {
+                if( payload.size() < 24 )
+                {
+                    throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "invalid version 2 session metadata" );
+                }
+                const auto headerSize = uint16_t( payload[2] ) | ( uint16_t( payload[3] ) << 8 );
+                const auto flags =
+                    uint32_t( payload[16] ) |
+                    ( uint32_t( payload[17] ) << 8 ) |
+                    ( uint32_t( payload[18] ) << 16 ) |
+                    ( uint32_t( payload[19] ) << 24 );
+                if( headerSize != 24 || ( flags & ~stream::SessionBeginSupportedFlags ) != 0 )
+                {
+                    throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::UnsupportedVersion, "unsupported version 2 session metadata" );
+                }
+                deferSymbolExpansion = ( flags & stream::SessionBeginFlagDeferredSymbolExpansion ) != 0;
+            }
+            else if( version != 1 )
+            {
+                throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::UnsupportedVersion, "unsupported session metadata version" );
+            }
+        }
+    }
+    if( drainControlSequence != 0 )
+    {
+        PayloadReader drainReader( view.path );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !drainReader.Read( drainControlRecord, payload, error ) )
+        {
+            throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "cannot read protocol drain control record: " + error );
+        }
+        if( payload.size() == 1 && payload[0] >= 1 && payload[0] <= 3 )
+        {
+            drainControlVersion = payload[0];
+        }
+        else if( payload.size() == 5 && payload[0] == 4 )
+        {
+            drainControlVersion = payload[0];
+            serverQuerySpaceOverride =
+                uint32_t( payload[1] ) |
+                ( uint32_t( payload[2] ) << 8 ) |
+                ( uint32_t( payload[3] ) << 16 ) |
+                ( uint32_t( payload[4] ) << 24 );
+            if( serverQuerySpaceOverride == 0 || serverQuerySpaceOverride > 8 * 1024 )
+            {
+                throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "invalid recorded server-query window" );
+            }
+        }
+        else
+        {
+            throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::UnsupportedVersion, "unsupported protocol drain control payload" );
+        }
     }
 
     EnableLocalReplayOnly();
@@ -177,7 +258,10 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::ResourceLimit, "no local port is available for stream revision replay" );
     }
 
-    Worker worker( "127.0.0.1", port, -1 );
+    const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
+    Worker worker( "127.0.0.1", port, -1, nullptr, Worker::Mode::Full,
+        Worker::DefaultRecorderDefinitionLimit, Worker::DefaultRecorderQueryQueueLimit,
+        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly );
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
     std::unique_ptr<Socket, SocketDeleter> peer;
     const auto acceptDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
@@ -187,9 +271,18 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         worker.Shutdown();
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Internal, "Tracy Worker did not connect to the revision replay socket" );
     }
+    if( !peer->SetSendTimeout( 10000 ) )
+    {
+        worker.Shutdown();
+        throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Internal, "cannot configure the local replay send timeout" );
+    }
 
     ReplayError replayError;
     std::thread verifier( [&] {
+        const auto failReplay = [&]( std::string message ) {
+            replayError.Set( std::move( message ) );
+            peer->Close();
+        };
         PayloadReader reader( view.path );
         std::vector<uint8_t> expected;
         std::vector<uint8_t> actual;
@@ -199,19 +292,22 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
             if( replayError.Failed() ) return;
             if( !reader.Read( record, expected, error ) )
             {
-                replayError.Set( "server record " + std::to_string( record.sequence ) + ": " + error );
+                failReplay( "server record " + std::to_string( record.sequence ) + ": " + error );
                 return;
             }
             actual.resize( expected.size() );
-            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 1000 ) )
+            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 100, [&] {
+                return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
+            } ) )
             {
-                replayError.Set( "Worker server stream ended before record " + std::to_string( record.sequence ) );
+                failReplay( "Worker server stream ended before record " + std::to_string( record.sequence ) );
                 return;
             }
             const auto mismatch = std::mismatch( expected.begin(), expected.end(), actual.begin(), actual.end() );
             if( mismatch.first != expected.end() )
             {
-                replayError.Set( "Worker query stream diverged at record " + std::to_string( record.sequence ) );
+                failReplay( "Worker query stream diverged at record " + std::to_string( record.sequence ) );
                 return;
             }
         }
@@ -278,7 +374,7 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         }
         else if( !replayError.Failed() )
         {
-            worker.RequestProtocolDrain();
+            worker.RequestProtocolDrain( drainControlVersion >= 2 );
             for( ; splitIndex < clientRecords.size(); splitIndex++ )
             {
                 const auto& record = clientRecords[splitIndex];
