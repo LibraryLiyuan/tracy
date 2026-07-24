@@ -88,6 +88,9 @@ stream/tests/ProtocolCaptureAcceptance.ps1 `
 
 更多信息请参阅[格式约定](docs/format-v1.md)和
 [分阶段实施计划](docs/implementation-plan.md)。
+[风险与后续改进备忘录](docs/risks-and-future-improvements.md)记录了
+当前暂不实施的背压、Client 队列、定义排空、离线符号化、自动转换和
+GUI 支持方案，以及重新评估这些方案的触发条件。
 [Unreal Insights 源码分析](docs/unreal-insights-streaming-analysis.md)
 记录了本设计采用的背压、实时读取和可靠性行为。
 [验收结果](docs/acceptance-results.md)包含真实 Godot/TPS
