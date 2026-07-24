@@ -1,6 +1,6 @@
 # `.tracy-stream` journal format v1
 
-Status: implementation contract for `feature-stream`.
+Status: implementation contract on `feature-StructuredData`.
 
 ## Goals and non-goals
 
@@ -90,12 +90,22 @@ invalid record because doing so could expose causally incomplete protocol data.
 | 3 | `ServerToClient` | Exact TCP bytes sent by the recorder, including server queries |
 | 4 | `Checkpoint` | Versioned checkpoint metadata; may mark a durable boundary |
 | 5 | `SessionEnd` | Versioned terminal reason and counters |
-| 6 | `Diagnostic` | Versioned non-protocol diagnostic data |
+| 6 | `Diagnostic` | Versioned non-replay or diagnostic data |
 
 Wire records preserve exact bytes. Flags distinguish handshake bytes,
 compressed frames, and server-query packets. This matters because Tracy is a
 bidirectional protocol: the server requests source locations, strings, call
 stacks, frame images, and other definitions while capture is in progress.
+
+Flag bit 5 (`RecordFlagLocalControl`) marks recorder-local state stored as
+`Diagnostic`; it is not a TCP packet. The current one-byte payload value `1`
+means `BeginDrain`. At this boundary the recorder stops dispatching ordinary
+post-boundary events, continues processing responses to already-issued
+definition queries, and finally sends the ordinary recorded
+`ServerQueryTerminate`. Replay excludes the diagnostic payload from both wire
+directions, restores the same local drain state at the same compressed-frame
+boundary, and validates the regenerated query stream and final terminate
+packet byte for byte.
 
 ### Versioned metadata payloads
 

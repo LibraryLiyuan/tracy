@@ -1,11 +1,13 @@
 # tracy-stream
 
-`tracy-stream` is the streaming-capture work area for Tracy Structured Data.
-The first delivered layer is a portable `.tracy-stream` append journal with
+`tracy-stream` is the streaming-capture layer for Tracy Structured Data.
+It provides a portable `.tracy-stream` append journal with
 CRC32C records, explicit commit trailers, durable boundaries, recovery scanning,
-and opt-in tail repair. `tracy-capture` can write the journal continuously while
-it performs normal Tracy protocol resolution, and `tracy-stream-convert`
-replays a valid journal prefix into a standard `.tracy` snapshot.
+and opt-in tail repair. `tracy-capture` writes the journal continuously through
+an asynchronous strict two-buffer relay. Journal-only capture uses a bounded
+`Worker::Mode::ProtocolOnly` resolver instead of retaining the timeline.
+`tracy-stream-convert` strictly replays a valid journal prefix into a standard
+`.tracy` snapshot.
 
 `JournalStore` publishes immutable read views over only the committed prefix.
 Its revision is the last committed record sequence; its watermark is the last
@@ -41,9 +43,13 @@ capture/build/Release/tracy-capture.exe `
   -j output.tracy-stream -o output.tracy -s 30
 ```
 
-Either output may be omitted. The current compatibility recorder still uses
-`Worker` internally, so journal-only mode does not yet provide duration-
-independent process memory.
+Either output may be omitted. With only `-j`, the recorder defaults to a
+512 MiB memory limit, 8,000,000 retained definitions/state entries, and 2,000,000
+queued definition queries. Exceeding a limit or encountering a write/flush
+failure terminates explicitly; records are never silently dropped. A timed
+local stop records a replay-external `BeginDrain` boundary, processes only
+responses to already-issued definition queries, then sends the ordinary
+`ServerQueryTerminate` packet and writes the terminal record.
 
 Automation that cannot add `-j` may set the process-local
 `TRACY_STREAM_OUTPUT` environment variable to the journal path. An explicit
@@ -58,6 +64,17 @@ capture/build/Release/tracy-stream-convert.exe `
 
 The converter replays client bytes through `Worker` and validates the recorded
 server handshake/query byte stream before saving the snapshot.
+
+Query a committed live or completed journal directly:
+
+```powershell
+query/build/Release/tracy-query.exe `
+  --trace output.tracy-stream --allow-root (Split-Path output.tracy-stream)
+```
+
+`SegmentTraceSource` strictly replays each immutable committed revision, then
+publishes it atomically. Requests already using an older revision keep that
+view; a partial or invalid refresh cannot replace the last good revision.
 
 Run the unattended producer/capture/replay/MCP A/B acceptance workflow:
 
@@ -74,8 +91,7 @@ stream/tests/ProtocolCaptureAcceptance.ps1 `
 See [the format contract](docs/format-v1.md) and
 [the staged implementation plan](docs/implementation-plan.md). The
 [Unreal Insights source audit](docs/unreal-insights-streaming-analysis.md)
-records the exact backpressure, LIVE read, and reliability behavior used in the
-design, and [acceptance results](docs/acceptance-results.md) separate automated
-non-administrator coverage from the deferred elevated TPS matrix. The
-[repository state report](docs/repository-state.md) records the branch and
-worktree isolation used for this work.
+records the backpressure, LIVE-read, and reliability behavior used in the
+design. [Acceptance results](docs/acceptance-results.md) include the real
+Godot/TPS ProtocolOnly run, and the [repository state report](docs/repository-state.md)
+records the final single-worktree layout.

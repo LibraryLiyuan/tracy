@@ -239,6 +239,8 @@ int main( int argc, char** argv )
 
     std::vector<tracy::stream::RecordInfo> clientRecords;
     std::vector<tracy::stream::RecordInfo> serverRecords;
+    bool hasLocalDisconnect = false;
+    uint64_t drainControlSequence = 0;
     clientRecords.reserve( scan.records.size() );
     serverRecords.reserve( 1024 );
     for( const auto& record : scan.records )
@@ -247,6 +249,13 @@ int main( int argc, char** argv )
             clientRecords.push_back( record );
         else if( record.type == tracy::stream::RecordType::ServerToClient )
             serverRecords.push_back( record );
+        else if( record.type == tracy::stream::RecordType::Diagnostic &&
+            ( record.flags & tracy::stream::RecordFlagLocalControl ) != 0 )
+        {
+            hasLocalDisconnect = true;
+            if( ( record.flags & tracy::stream::RecordFlagServerQuery ) == 0 )
+                drainControlSequence = record.sequence;
+        }
     }
     if( clientRecords.empty() || serverRecords.empty() )
     {
@@ -264,6 +273,7 @@ int main( int argc, char** argv )
 
     std::printf( "Replaying %zu client records and validating %zu server records on 127.0.0.1:%u...\n", clientRecords.size(), serverRecords.size(), options.port );
     tracy::Worker worker( "127.0.0.1", options.port, -1 );
+    if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
 
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
     const auto acceptDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
@@ -306,7 +316,11 @@ int main( int argc, char** argv )
             const auto mismatch = std::mismatch( expected.begin(), expected.end(), actual.begin(), actual.end() );
             if( mismatch.first != expected.end() )
             {
-                replayError.Set( "sequence " + std::to_string( record.sequence ) + ": Worker server-query stream diverged at payload byte " + std::to_string( mismatch.first - expected.begin() ) );
+                const auto offset = size_t( mismatch.first - expected.begin() );
+                replayError.Set( "sequence " + std::to_string( record.sequence ) +
+                    ": Worker server-query stream diverged at payload byte " + std::to_string( offset ) +
+                    " (recorded=" + std::to_string( unsigned( expected[offset] ) ) +
+                    ", replay=" + std::to_string( unsigned( actual[offset] ) ) + ")" );
                 return;
             }
         }
@@ -321,18 +335,88 @@ int main( int argc, char** argv )
     {
         std::vector<uint8_t> payload;
         std::string error;
-        for( const auto& record : clientRecords )
-        {
-            if( replayError.Failed() ) break;
+        auto replayClientRecord = [&]( const tracy::stream::RecordInfo& record ) {
+            if( replayError.Failed() ) return false;
             if( !clientReader.Read( record, payload, error ) )
             {
                 replayError.Set( "sequence " + std::to_string( record.sequence ) + ": " + error );
-                break;
+                return false;
             }
             if( !payload.empty() && peer->Send( payload.data(), int( payload.size() ) ) != int( payload.size() ) )
             {
                 replayError.Set( "sequence " + std::to_string( record.sequence ) + ": cannot send recorded client stream" );
-                break;
+                return false;
+            }
+            return true;
+        };
+
+        if( drainControlSequence == 0 )
+        {
+            for( const auto& record : clientRecords )
+            {
+                if( !replayClientRecord( record ) ) break;
+            }
+        }
+        else
+        {
+            const auto preDrainFrameCount = std::count_if( clientRecords.begin(), clientRecords.end(), [&]( const auto& record ) {
+                return record.sequence < drainControlSequence &&
+                    ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
+            } );
+            if( preDrainFrameCount < 2 )
+            {
+                replayError.Set( "drain marker does not have two preceding client frames" );
+            }
+
+            const auto prefixFrameTarget = uint64_t( preDrainFrameCount >= 2 ? preDrainFrameCount - 2 : 0 );
+            uint64_t sentFrames = 0;
+            size_t splitIndex = 0;
+            for( ; splitIndex < clientRecords.size() && !replayError.Failed(); splitIndex++ )
+            {
+                const auto& record = clientRecords[splitIndex];
+                if( record.sequence > drainControlSequence ) break;
+                const bool compressed = ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
+                if( compressed && sentFrames == prefixFrameTarget ) break;
+                if( !replayClientRecord( record ) ) break;
+                if( compressed ) sentFrames++;
+            }
+
+            const auto prefixDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            while( worker.GetProtocolFramesProcessed() < prefixFrameTarget &&
+                !replayError.Failed() && std::chrono::steady_clock::now() < prefixDeadline )
+            {
+                std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+            }
+            if( worker.GetProtocolFramesProcessed() < prefixFrameTarget )
+            {
+                replayError.Set( "Worker did not process the pre-drain client revision" );
+            }
+            else if( !replayError.Failed() )
+            {
+                worker.RequestProtocolDrain();
+                for( ; splitIndex < clientRecords.size(); splitIndex++ )
+                {
+                    const auto& record = clientRecords[splitIndex];
+                    if( record.sequence > drainControlSequence ) break;
+                    if( !replayClientRecord( record ) ) break;
+                }
+                const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                while( !worker.IsProtocolDrainActive() && !replayError.Failed() &&
+                    std::chrono::steady_clock::now() < drainDeadline )
+                {
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+                }
+                if( !worker.IsProtocolDrainActive() )
+                {
+                    replayError.Set( "Worker did not enter protocol drain mode" );
+                }
+                else
+                {
+                    for( ; splitIndex < clientRecords.size(); splitIndex++ )
+                    {
+                        if( !replayClientRecord( clientRecords[splitIndex] ) ) break;
+                    }
+                }
             }
         }
     }

@@ -11,14 +11,16 @@ namespace tracy
 enum class ProtocolDirection : uint8_t
 {
     ClientToServer,
-    ServerToClient
+    ServerToClient,
+    LocalControl
 };
 
 enum class ProtocolChunk : uint8_t
 {
     Handshake,
     CompressedFrame,
-    ServerQuery
+    ServerQuery,
+    ControlState
 };
 
 enum class ProtocolCloseReason : uint32_t

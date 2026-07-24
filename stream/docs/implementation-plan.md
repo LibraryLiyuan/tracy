@@ -2,14 +2,15 @@
 
 ## Baseline
 
-The implementation branch is `feature-stream` in an isolated worktree and is
-based on `feature-StructuredData` (`75cce700`). The existing MCP/query worktree,
-Godot producer repository, and TPS demo repository remain independent.
+The work is integrated directly on `feature-StructuredData` in
+`C:\CodeProjects\GodotProjects\tracy-0.13.1`. The temporary streaming worktree
+was removed; Tracy now has one worktree and branch/commit history is the only
+development isolation. Godot and TPS remain independent clean repositories.
 
-The current Tracy capture path constructs a full `Worker`, retains the capture
-in memory, and writes a normal `.tracy` snapshot only after disconnect. Tracy's
-wire protocol is bidirectional, so a byte-only relay cannot replace the server:
-the server must continue issuing definition and frame-image queries.
+Normal `.tracy` capture still uses a full `Worker`. Journal-only capture uses
+the bounded `Worker::Mode::ProtocolOnly` resolver: it retains only definition
+and protocol state needed to issue Tracy's bidirectional queries, not timeline
+events.
 
 Unreal Insights provides a useful backpressure model: socket reads are gated by
 completion of bounded asynchronous file buffers, and live readers tolerate
@@ -21,24 +22,27 @@ and commit boundaries.
 
 Completed in the current implementation:
 
-- isolated `feature-stream` worktree and repository-state audit;
+- single-worktree repository-state audit;
 - v1 file/record/trailer contract;
 - writer, scanner, explicit repair, resume, fault injection, and CLI;
-- exact bidirectional `Worker` protocol observer with durable checkpoints;
+- asynchronous strict two-buffer protocol observer with TCP backpressure,
+  durable checkpoints, and explicit sink-error propagation;
+- bounded ProtocolOnly resolver with memory, definition, and query-queue caps;
+- replay-external `LocalControl` record for the local `BeginDrain` boundary,
+  followed by response-only definition-query drain and ordinary
+  `ServerQueryTerminate`;
 - offline replay with outgoing query-byte validation and `.tracy` conversion;
 - immutable `JournalStore` read views with revision/watermark publication and
   committed-prefix fingerprint revalidation;
-- live growth polling plus direct/replayed MCP A/B acceptance;
+- revision-backed `SegmentTraceSource` and direct `.tracy-stream` MCP queries;
+- live growth polling, direct/replayed MCP A/B, and real Godot/TPS acceptance;
 - source-level Unreal Engine 5.7.2 Recorder/Store/TraceAnalysis audit.
 
-The compatibility recorder intentionally remains the Stage 2 implementation:
-it performs bounded synchronous write-ahead recording but still retains the
-existing `Worker` timeline. Stage 4 requires extracting Tracy's definition and
-server-query resolver; Unreal's one-way relay cannot replace it. Stage 5's
-committed-prefix Store is implemented, while a domain-queryable
-`SegmentTraceSource` remains gated on the self-describing event/definition
-model produced by Stage 4. These limitations are explicit rather than hidden
-behind a nominal "stream" mode.
+The planned stages are complete. Live querying currently materializes each new
+committed revision through strict local replay before atomically swapping the
+query source. This favors correctness and API compatibility over incremental
+analysis cost; native segment-domain indexes are a future optimization, not a
+correctness blocker.
 
 ## Delivery stages
 
@@ -72,8 +76,7 @@ oracle before timeline allocation is removed.
 Exit gate: a live TPS capture grows continuously on disk, survives forced
 termination at every injected boundary, and leaves no silent disk errors.
 
-Status: **implementation complete; synthetic live acceptance complete; elevated
-TPS process matrix deferred until the user returns**.
+Status: **complete**, including real Godot/TPS capture.
 
 ### Stage 3 — replay and `.tracy` compatibility
 
@@ -102,8 +105,12 @@ fixtures**.
 Exit gate: resident memory is bounded independently of capture duration and no
 committed wire record is lost under supported termination cases.
 
-Status: **not yet complete**. This is the next recorder architecture milestone,
-not an administrator-test blocker.
+Status: **complete**. The default hard bounds are 512 MiB, 8,000,000 retained
+definitions/state entries, and 2,000,000 queued definition queries. Slow-sink
+backpressure and injected write/flush failures are covered by Release tests.
+ProtocolOnly does not retain the active-allocation set; memory events remain in
+the journal while only their names, threads, callstack definitions, and query
+state contribute to recorder memory.
 
 ### Stage 5 — live query path
 
@@ -117,8 +124,9 @@ not an administrator-test blocker.
 Exit gate: identical requests against a fixed revision are stable, readers never
 observe uncommitted bytes, and post-capture results match snapshot MCP results.
 
-Status: **Store/revision boundary complete; domain `SegmentTraceSource`
-pending Stage 4's event/definition model**.
+Status: **complete**. `SegmentTraceSource` serves the full existing query/MCP
+surface from immutable committed revisions and preserves the last good source
+when a refresh is partial or fails.
 
 ## Automated acceptance matrix
 
@@ -127,8 +135,8 @@ pending Stage 4's event/definition model**.
 | Journal | Unit, corruption, truncation, resume, CLI | None |
 | Protocol | Synthetic client/server transcript and replay | None |
 | Existing MCP | Contract tests, stdio transcript, classified local traces | None |
-| Godot/TPS | Plan validation, executable/manifest checks, non-elevated runs | D3D12 capture runner that requires Administrator |
-| End to end | Stream growth, forced process termination, replay, MCP A/B | Final administrator-only GPU capture matrix |
+| Godot/TPS | Real D3D12 TPS ProtocolOnly capture, strict replay, direct query | None required for this milestone |
+| End to end | Stream growth, local drain completion, forced termination, replay, MCP A/B | None |
 
 Fixtures are classified before use: corrupt captures must fail explicitly,
 captures without frame images skip that capability, and full captures exercise

@@ -233,9 +233,11 @@ int main( int argc, char** argv )
         printf( "Streaming protocol journal to %s\n", journalOutput );
     }
 
+    const bool protocolOnly = journalOutput && !output;
     printf( "Connecting to %s:%i...", address, port );
     fflush( stdout );
-    tracy::Worker worker( address, port, memoryLimit, protocolObserver.get() );
+    tracy::Worker worker( address, port, memoryLimit, protocolObserver.get(),
+        protocolOnly ? tracy::Worker::Mode::ProtocolOnly : tracy::Worker::Mode::Full );
     while( !worker.HasData() )
     {
         const auto handshake = worker.GetHandshakeStatus();
@@ -257,6 +259,13 @@ int main( int argc, char** argv )
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
     }
     printf( "\nTimer resolution: %s\n", tracy::TimeToString( worker.GetResolution() ) );
+    if( protocolOnly )
+    {
+        printf( "Recorder mode: bounded protocol-only (%s memory limit, %zu definitions, %zu queued queries)\n",
+            tracy::MemSizeToString( worker.GetMemoryLimit() ),
+            tracy::Worker::DefaultRecorderDefinitionLimit,
+            tracy::Worker::DefaultRecorderQueryQueueLimit );
+    }
 
 #ifdef _WIN32
     signal( SIGINT, SigInt );
@@ -267,7 +276,7 @@ int main( int argc, char** argv )
     sigaction( SIGINT, &sigint, &oldsigint );
 #endif
 
-    const auto firstTime = worker.GetFirstTime();
+    const auto firstTime = protocolOnly ? 0 : worker.GetFirstTime();
     auto& lock = worker.GetMbpsDataLock();
 
     const auto t0 = std::chrono::high_resolution_clock::now();
@@ -312,13 +321,20 @@ int main( int argc, char** argv )
             AnsiPrintf( ANSI_GREEN, "%s", tracy::MemSizeToString( netTotal ) );
             printf( " | ");
             AnsiPrintf( ANSI_RED ANSI_BOLD, "%s", tracy::MemSizeToString( tracy::memUsage.load( std::memory_order_relaxed ) ) );
-            if( memoryLimit > 0 )
+            if( worker.GetMemoryLimit() > 0 )
             {
                 printf( " / " );
-                AnsiPrintf( ANSI_BLUE ANSI_BOLD, "%s", tracy::MemSizeToString( memoryLimit ) );
+                AnsiPrintf( ANSI_BLUE ANSI_BOLD, "%s", tracy::MemSizeToString( worker.GetMemoryLimit() ) );
             }
             printf( " | ");
-            AnsiPrintf( ANSI_RED, "%s", tracy::TimeToString( worker.GetLastTime() - firstTime ) );
+            if( protocolOnly )
+            {
+                AnsiPrintf( ANSI_RED, "%" PRIu64 " events", worker.GetProtocolEventCount() );
+            }
+            else
+            {
+                AnsiPrintf( ANSI_RED, "%s", tracy::TimeToString( worker.GetLastTime() - firstTime ) );
+            }
             fflush( stdout );
         }
 
@@ -339,9 +355,10 @@ int main( int argc, char** argv )
     {
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
     }
+    const auto t2 = std::chrono::high_resolution_clock::now();
 
     const auto& failure = worker.GetFailureType();
-    if( failure != tracy::Worker::Failure::None )
+    if( !protocolOnly && failure != tracy::Worker::Failure::None )
     {
         AnsiPrintf( ANSI_RED ANSI_BOLD, "\nInstrumentation failure: %s", tracy::Worker::GetFailureString( failure ) );
         auto& fd = worker.GetFailureData();
@@ -417,9 +434,23 @@ int main( int argc, char** argv )
         }
     }
 
-    printf( "\nFrames: %" PRIu64 "\nTime span: %s\nZones: %s\nElapsed time: %s\n",
-        worker.GetFrameCount( *worker.GetFramesBase() ), tracy::TimeToString( worker.GetLastTime() - firstTime ), tracy::RealToString( worker.GetZoneCount() ),
-        tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count() ) );
+    if( protocolOnly )
+    {
+        printf( "\nProtocol events: %" PRIu64 "\nRetained definitions/state: %zu\nCapture time: %s\nProtocol drain time: %s\n",
+            worker.GetProtocolEventCount(), worker.GetProtocolDefinitionCount(),
+            tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count() ),
+            tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t2 - t1 ).count() ) );
+        if( worker.DidProtocolResolverFail() )
+        {
+            AnsiPrintf( ANSI_RED ANSI_BOLD, "Protocol resolver failed: %s\n", worker.GetProtocolResolverError().c_str() );
+        }
+    }
+    else
+    {
+        printf( "\nFrames: %" PRIu64 "\nTime span: %s\nZones: %s\nElapsed time: %s\n",
+            worker.GetFrameCount( *worker.GetFramesBase() ), tracy::TimeToString( worker.GetLastTime() - firstTime ), tracy::RealToString( worker.GetZoneCount() ),
+            tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count() ) );
+    }
     if( protocolObserver )
     {
         const std::string committedText = tracy::MemSizeToString( protocolObserver->CommittedSize() );
@@ -452,5 +483,7 @@ int main( int argc, char** argv )
         }
     }
 
-    return protocolObserver && protocolObserver->Failed() ? 6 : 0;
+    if( protocolObserver && protocolObserver->Failed() ) return 6;
+    if( worker.DidProtocolResolverFail() ) return 7;
+    return 0;
 }

@@ -1,5 +1,6 @@
 #include "TracySessionManager.hpp"
 
+#include "TracySegmentTraceSource.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <algorithm>
@@ -44,6 +45,7 @@ struct SessionManager::Session
     std::string id;
     std::filesystem::path path;
     std::string fingerprint;
+    analysis::TraceSourceKind sourceKind = analysis::TraceSourceKind::Snapshot;
     analysis::TraceSourceState state = analysis::TraceSourceState::Queued;
     uint64_t revision = 0;
     int64_t watermarkNs = 0;
@@ -52,6 +54,8 @@ struct SessionManager::Session
     std::string errorCode;
     std::string errorMessage;
     std::shared_ptr<analysis::TraceSource> source;
+    bool refreshInProgress = false;
+    std::chrono::steady_clock::time_point lastRefresh;
 };
 
 const char* ToString( SessionErrorCode code )
@@ -92,6 +96,10 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
     if( !m_sourceLoader )
     {
         m_sourceLoader = []( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
+            if( Lower( path.extension().string() ) == ".tracy-stream" )
+            {
+                return SegmentTraceSource::Open( path, std::move( callback ) );
+            }
             return analysis::WorkerTraceSource::Open( path, std::move( callback ) );
         };
     }
@@ -112,7 +120,11 @@ std::filesystem::path SessionManager::ResolveTracePath( const std::filesystem::p
     const auto canonical = std::filesystem::canonical( absolute, error );
     if( error ) throw SessionError( SessionErrorCode::TraceOpenFailed, "unable to resolve final trace path" );
     if( !std::filesystem::is_regular_file( canonical, error ) || error ) throw SessionError( SessionErrorCode::TraceOpenFailed, "trace path is not a regular file" );
-    if( Lower( canonical.extension().string() ) != ".tracy" ) throw SessionError( SessionErrorCode::TraceOpenFailed, "only .tracy files may be opened" );
+    const auto extension = Lower( canonical.extension().string() );
+    if( extension != ".tracy" && extension != ".tracy-stream" )
+    {
+        throw SessionError( SessionErrorCode::TraceOpenFailed, "only .tracy and .tracy-stream files may be opened" );
+    }
 
     const bool allowed = std::any_of( m_allowRoots.begin(), m_allowRoots.end(), [&]( const auto& root ) { return IsWithin( canonical, root ); } );
     if( !allowed ) throw SessionError( SessionErrorCode::PathNotAllowed, "trace path is outside every --allow-root" );
@@ -151,7 +163,7 @@ TraceSessionSnapshot SessionManager::SnapshotLocked( const Session& session ) co
     result.id = session.id;
     result.path = session.path;
     result.fingerprint = session.fingerprint;
-    result.sourceKind = analysis::TraceSourceKind::Snapshot;
+    result.sourceKind = session.sourceKind;
     result.state = session.state;
     result.revision = session.revision;
     result.watermarkNs = session.watermarkNs;
@@ -185,8 +197,14 @@ std::shared_ptr<SessionManager::Session> SessionManager::FindLocked( const std::
 
 TraceSessionSnapshot SessionManager::Status( const std::string& id ) const
 {
+    std::shared_ptr<Session> session;
+    {
+        std::lock_guard lock( m_mutex );
+        session = FindLocked( id );
+    }
+    RefreshSegmentSession( session );
     std::lock_guard lock( m_mutex );
-    return SnapshotLocked( *FindLocked( id ) );
+    return SnapshotLocked( *session );
 }
 
 std::vector<TraceSessionSnapshot> SessionManager::List() const
@@ -229,8 +247,13 @@ TraceSessionSnapshot SessionManager::WaitReady( const std::string& id, std::chro
 
 std::shared_ptr<analysis::TraceSource> SessionManager::GetReadySource( const std::string& id ) const
 {
+    std::shared_ptr<Session> session;
+    {
+        std::lock_guard lock( m_mutex );
+        session = FindLocked( id );
+    }
+    RefreshSegmentSession( session );
     std::lock_guard lock( m_mutex );
-    const auto session = FindLocked( id );
     if( session->state == analysis::TraceSourceState::Queued || session->state == analysis::TraceSourceState::Loading || session->state == analysis::TraceSourceState::Indexing )
     {
         throw SessionError( SessionErrorCode::TraceLoading, "trace is still loading or indexing", true );
@@ -244,6 +267,65 @@ std::shared_ptr<analysis::TraceSource> SessionManager::GetReadySource( const std
         throw SessionError( SessionErrorCode::TraceNotReady, session->errorMessage.empty() ? "trace is not ready" : session->errorMessage );
     }
     return session->source;
+}
+
+void SessionManager::RefreshSegmentSession( const std::shared_ptr<Session>& session ) const
+{
+    std::shared_ptr<SegmentTraceSource> current;
+    uint64_t currentRevision = 0;
+    {
+        std::lock_guard lock( m_mutex );
+        if( session->state != analysis::TraceSourceState::Ready ||
+            session->sourceKind != analysis::TraceSourceKind::Segment ||
+            session->refreshInProgress )
+        {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if( session->lastRefresh.time_since_epoch().count() != 0 &&
+            now - session->lastRefresh < std::chrono::milliseconds( 100 ) )
+        {
+            return;
+        }
+        current = std::dynamic_pointer_cast<SegmentTraceSource>( session->source );
+        if( !current ) return;
+        currentRevision = session->revision;
+        session->refreshInProgress = true;
+        session->lastRefresh = now;
+    }
+
+    try
+    {
+        const auto view = current->RefreshView();
+        if( view && view->revision > currentRevision )
+        {
+            auto replacement = SegmentTraceSource::OpenRevision( current->Store(), view );
+            auto shared = std::shared_ptr<analysis::TraceSource>( std::move( replacement ) );
+            const auto sourceView = shared->AcquireReadView();
+            const auto fingerprint = shared->GetTraceInfo().fingerprint;
+            std::lock_guard lock( m_mutex );
+            if( session->state == analysis::TraceSourceState::Ready && sourceView.revision > session->revision )
+            {
+                session->source = std::move( shared );
+                session->sourceKind = sourceView.sourceKind;
+                session->revision = sourceView.revision;
+                session->watermarkNs = sourceView.watermarkNs;
+                session->complete = sourceView.complete;
+                session->fingerprint = fingerprint;
+            }
+        }
+    }
+    catch( const std::exception& )
+    {
+        // Preserve and continue serving the last immutable good revision. A
+        // partial tail or transient replay failure must not invalidate it.
+    }
+
+    {
+        std::lock_guard lock( m_mutex );
+        session->refreshInProgress = false;
+    }
+    m_changed.notify_all();
 }
 
 void SessionManager::UpdateState( const std::shared_ptr<Session>& session, analysis::TraceSourceState state )
@@ -300,6 +382,8 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
                 session->source = std::shared_ptr<analysis::TraceSource>( std::move( source ) );
                 session->fingerprint = session->source->GetTraceInfo().fingerprint;
                 const auto view = session->source->AcquireReadView();
+                session->sourceKind = view.sourceKind;
+                session->revision = view.revision;
                 session->watermarkNs = view.watermarkNs;
                 session->complete = view.complete;
                 session->state = analysis::TraceSourceState::Ready;

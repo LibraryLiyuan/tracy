@@ -1017,7 +1017,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         limits["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         return Success( id, {
             { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.1" } },
-            { "source_kinds", { "snapshot" } }, { "statistics_required", true },
+            { "source_kinds", { "snapshot", "segment" } }, { "statistics_required", true },
             { "limits", std::move( limits ) }
         } );
     }

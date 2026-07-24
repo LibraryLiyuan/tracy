@@ -256,16 +256,20 @@ static bool IsQueryPrio( ServerQuery type )
 
 LoadProgress Worker::s_loadProgress;
 
-Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver )
+Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
+    Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit )
     : m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
+    , m_mode( mode )
+    , m_recorderDefinitionLimit( recorderDefinitionLimit )
+    , m_recorderQueryQueueLimit( recorderQueryQueueLimit )
     , m_hasData( false )
     , m_stream( LZ4_createStreamDecode() )
     , m_buffer( new char[TargetFrameSize*3 + 1] )
     , m_bufferOffset( 0 )
     , m_inconsistentSamples( false )
-    , m_memoryLimit( memoryLimit )
+    , m_memoryLimit( memoryLimit > 0 || mode == Mode::Full ? memoryLimit : DefaultRecorderMemoryLimit )
     , m_callstackFrameStaging( nullptr )
     , m_traceVersion( CurrentVersion )
     , m_loadTime( 0 )
@@ -277,6 +281,10 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     m_data.symbolLocInline.push_back( std::numeric_limits<uint64_t>::max() );
     m_data.memory = m_slab.AllocInit<MemData>();
     m_data.memNameMap.emplace( 0, m_data.memory );
+    if( m_mode == Mode::ProtocolOnly )
+    {
+        m_recorderFrameNames.emplace( 0 );
+    }
 
     memset( (char*)m_gpuCtxMap, 0, sizeof( m_gpuCtxMap ) );
 
@@ -2743,6 +2751,13 @@ bool Worker::SendProtocol( const void* data, int size, ProtocolChunk chunk )
     return false;
 }
 
+bool Worker::RecordProtocolDrainControl()
+{
+    constexpr uint8_t BeginDrain = 1;
+    const ProtocolDataSpan span { &BeginDrain, sizeof( BeginDrain ) };
+    return ObserveProtocol( ProtocolDirection::LocalControl, ProtocolChunk::ControlState, std::span<const ProtocolDataSpan>( &span, 1 ) );
+}
+
 void Worker::NotifyProtocolClose( ProtocolCloseReason reason )
 {
     if( !m_protocolObserver || m_protocolObserverClosed.exchange( true, std::memory_order_relaxed ) ) return;
@@ -2781,6 +2796,7 @@ void Worker::Network()
             m_netWriteCv.wait( lock, [this] { return m_netWriteCnt > 0 || m_shutdown.load( std::memory_order_relaxed ); } );
             if( m_shutdown.load( std::memory_order_relaxed ) ) goto close;
             m_netWriteCnt--;
+            m_networkReading.store( true, std::memory_order_release );
         }
 
         auto buf = m_buffer + m_bufferOffset;
@@ -2814,6 +2830,7 @@ void Worker::Network()
         {
             std::lock_guard<std::mutex> lock( m_netReadLock );
             m_netRead.push_back( NetBuffer { m_bufferOffset, sz } );
+            m_networkReading.store( false, std::memory_order_release );
             m_netReadCv.notify_one();
         }
 
@@ -2822,6 +2839,7 @@ void Worker::Network()
     }
 
 close:
+    m_networkReading.store( false, std::memory_order_release );
     {
         std::lock_guard<std::mutex> lock( m_netReadLock );
         m_netRead.push_back( NetBuffer { -1 } );
@@ -2900,16 +2918,19 @@ void Worker::Exec()
         goto close;
     }
 
-    m_data.framesBase = m_data.frames.Retrieve( 0, [this] ( uint64_t name ) {
-        auto fd = m_slab.AllocInit<FrameData>();
-        fd->name = name;
-        fd->continuous = 1;
-        return fd;
-    }, [this] ( uint64_t name ) {
-        assert( name == 0 );
-        char tmp[6] = "Frame";
-        HandleFrameName( name, tmp, 5 );
-    } );
+    if( m_mode == Mode::Full )
+    {
+        m_data.framesBase = m_data.frames.Retrieve( 0, [this] ( uint64_t name ) {
+            auto fd = m_slab.AllocInit<FrameData>();
+            fd->name = name;
+            fd->continuous = 1;
+            return fd;
+        }, [this] ( uint64_t name ) {
+            assert( name == 0 );
+            char tmp[6] = "Frame";
+            HandleFrameName( name, tmp, 5 );
+        } );
+    }
 
     {
         WelcomeMessage welcome;
@@ -2931,8 +2952,11 @@ void Worker::Exec()
         m_timerMul = welcome.timerMul;
         m_data.baseTime = welcome.initBegin;
         const auto initEnd = TscTime( welcome.initEnd );
-        m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
-        m_data.framesBase->frames.push_back( FrameEvent{ initEnd, -1, -1 } );
+        if( m_mode == Mode::Full )
+        {
+            m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
+            m_data.framesBase->frames.push_back( FrameEvent{ initEnd, -1, -1 } );
+        }
         m_data.lastTime = initEnd;
         m_resolution = TscPeriod( welcome.resolution );
         m_pid = welcome.pid;
@@ -2978,7 +3002,10 @@ void Worker::Exec()
                 goto close;
             }
             m_data.frameOffset = onDemand.frames;
-            m_data.framesBase->frames.push_back( FrameEvent{ TscTime( onDemand.currentTime ), -1, -1 } );
+            if( m_mode == Mode::Full )
+            {
+                m_data.framesBase->frames.push_back( FrameEvent{ TscTime( onDemand.currentTime ), -1, -1 } );
+            }
         }
     }
 
@@ -3006,9 +3033,24 @@ void Worker::Exec()
         }
         if( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit )
         {
-            closeReason = ProtocolCloseReason::MemoryLimit;
+            if( m_mode == Mode::ProtocolOnly )
+            {
+                RecorderFail( "Protocol recorder memory limit exceeded." );
+                closeReason = ProtocolCloseReason::RecorderFailure;
+            }
+            else
+            {
+                closeReason = ProtocolCloseReason::MemoryLimit;
+            }
             if( !QueryTerminate() )
                 closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+            goto close;
+        }
+        if( m_protocolResolverFailed.load( std::memory_order_relaxed ) )
+        {
+            closeReason = ProtocolCloseReason::RecorderFailure;
+            if( !QueryTerminate() && !m_protocolObserverFailed.load( std::memory_order_relaxed ) )
+                closeReason = ProtocolCloseReason::TransportError;
             goto close;
         }
         if( m_protocolObserverFailed.load( std::memory_order_relaxed ) )
@@ -3025,7 +3067,63 @@ void Worker::Exec()
         NetBuffer netbuf;
         {
             std::unique_lock<std::mutex> lock( m_netReadLock );
-            m_netReadCv.wait( lock, [this] { return !m_netRead.empty(); } );
+            m_netReadCv.wait( lock, [this] {
+                if( !m_netRead.empty() ) return true;
+                const bool beginDrain = m_disconnect.load( std::memory_order_acquire ) &&
+                    !m_protocolDisconnectSent.load( std::memory_order_acquire );
+                const bool finishDrain = m_protocolDrainOnly.load( std::memory_order_acquire ) &&
+                    m_disconnect.load( std::memory_order_acquire ) && !HasPendingProtocolQueries();
+                if( !beginDrain && !finishDrain )
+                {
+                    return false;
+                }
+                std::lock_guard writeLock( m_netWriteLock );
+                return m_netWriteCnt == 0 && !m_networkReading.load( std::memory_order_acquire );
+            } );
+            bool beginDrain = false;
+            bool finishDrain = false;
+            if( m_netRead.empty() && m_disconnect.load( std::memory_order_acquire ) &&
+                !m_protocolDisconnectSent.load( std::memory_order_acquire ) )
+            {
+                std::lock_guard writeLock( m_netWriteLock );
+                if( m_netWriteCnt == 0 && !m_networkReading.load( std::memory_order_acquire ) )
+                {
+                    beginDrain = !m_protocolDisconnectSent.exchange( true, std::memory_order_acq_rel );
+                }
+            }
+            else if( m_netRead.empty() && m_protocolDrainOnly.load( std::memory_order_acquire ) &&
+                m_disconnect.load( std::memory_order_acquire ) && !HasPendingProtocolQueries() )
+            {
+                std::lock_guard writeLock( m_netWriteLock );
+                finishDrain = m_netWriteCnt == 0 && !m_networkReading.load( std::memory_order_acquire );
+            }
+            if( beginDrain )
+            {
+                lock.unlock();
+                if( !RecordProtocolDrainControl() )
+                {
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                    goto close;
+                }
+                BeginProtocolDrain();
+                if( HasPendingProtocolQueries() )
+                {
+                    std::lock_guard writeLock( m_netWriteLock );
+                    m_netWriteCnt += 2;
+                    m_netWriteCv.notify_one();
+                }
+                continue;
+            }
+            if( finishDrain )
+            {
+                lock.unlock();
+                if( !QueryTerminate() )
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                else
+                    closeReason = ProtocolCloseReason::CaptureComplete;
+                UpdateMbps( 0 );
+                break;
+            }
             netbuf = m_netRead.front();
             m_netRead.erase( m_netRead.begin() );
         }
@@ -3044,32 +3142,40 @@ void Worker::Exec()
         const char* end = ptr + netbuf.size;
 
         {
-            std::unique_lock<std::mutex> lk( m_data.lock );
-            if( m_data.mainThreadWantsLock )
+            std::unique_lock<std::mutex> lk( m_data.lock, std::defer_lock );
+            if( m_mode == Mode::Full )
             {
-                // Hand over the lock to the main thread to avoid starving it.
-                // Wait for a millisecond maximum to avoid the opposite 
-                // problem where main thread would never let us execute
-                m_data.lockCv.wait_for( lk, std::chrono::milliseconds( 1 ) );
+                lk.lock();
+                if( m_data.mainThreadWantsLock )
+                {
+                    // Hand over the lock to the main thread to avoid starving it.
+                    // Wait for a millisecond maximum to avoid the opposite
+                    // problem where main thread would never let us execute.
+                    m_data.lockCv.wait_for( lk, std::chrono::milliseconds( 1 ) );
+                }
             }
 
             while( ptr < end )
             {
                 auto ev = (const QueueItem*)ptr;
-                if( !DispatchProcess( *ev, ptr ) )
+                const bool processed = m_protocolDrainOnly.load( std::memory_order_acquire ) ?
+                    DispatchProtocolDrain( *ev, ptr ) :
+                    ( m_mode == Mode::ProtocolOnly ? DispatchRecorder( *ev, ptr ) : DispatchProcess( *ev, ptr ) );
+                if( !processed )
                 {
-                    if( m_failure != Failure::None ) HandleFailure( ptr, end );
-                    closeReason = ProtocolCloseReason::InstrumentationFailure;
+                    if( m_mode == Mode::Full )
+                    {
+                        if( m_failure != Failure::None ) HandleFailure( ptr, end );
+                        closeReason = ProtocolCloseReason::InstrumentationFailure;
+                    }
+                    else
+                    {
+                        closeReason = ProtocolCloseReason::RecorderFailure;
+                    }
                     if( !QueryTerminate() )
                         closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
                     goto close;
                 }
-            }
-
-            {
-                std::lock_guard<std::mutex> lock( m_netWriteLock );
-                m_netWriteCnt++;
-                m_netWriteCv.notify_one();
             }
 
             if( m_serverQuerySpaceLeft > 0 && !m_serverQueryQueuePrio.empty() )
@@ -3108,6 +3214,18 @@ void Worker::Exec()
                     m_serverQueryQueue.erase( m_serverQueryQueue.begin(), m_serverQueryQueue.begin() + toSend );
                 }
             }
+
+            m_protocolFramesProcessed.fetch_add( 1, std::memory_order_release );
+            const bool pauseBeforeDrain = m_disconnect.load( std::memory_order_acquire ) &&
+                !m_protocolDisconnectSent.load( std::memory_order_acquire );
+            const bool pauseAfterDrain = m_protocolDrainOnly.load( std::memory_order_acquire ) &&
+                !HasPendingProtocolQueries();
+            if( !pauseBeforeDrain && !pauseAfterDrain )
+            {
+                std::lock_guard<std::mutex> lock( m_netWriteLock );
+                m_netWriteCnt++;
+                m_netWriteCv.notify_one();
+            }
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -3119,18 +3237,19 @@ void Worker::Exec()
             t0 = t1;
         }
 
-        if( m_terminate )
+        if( m_terminate && !m_protocolDrainOnly.load( std::memory_order_acquire ) )
         {
-            if( m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingSourceLocation != 0 || m_pendingCallstackFrames != 0 ||
-                m_data.plots.IsPending() || m_pendingCallstackId != 0 || m_pendingExternalNames != 0 ||
-                m_pendingCallstackSubframes != 0 || m_pendingFrameImageData.image != nullptr || !m_pendingSymbols.empty() ||
-                m_pendingSymbolCode != 0 || !m_serverQueryQueue.empty() || !m_serverQueryQueuePrio.empty() ||
-                m_pendingSourceLocationPayload != 0 || m_pendingSingleString.ptr != nullptr || m_pendingSecondString.ptr != nullptr ||
-                !m_sourceCodeQuery.empty() || m_pendingFibers != 0 )
+            if( m_mode == Mode::ProtocolOnly ? RecorderHasPendingQueries() :
+                ( m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingSourceLocation != 0 || m_pendingCallstackFrames != 0 ||
+                  m_data.plots.IsPending() || m_pendingCallstackId != 0 || m_pendingExternalNames != 0 ||
+                  m_pendingCallstackSubframes != 0 || m_pendingFrameImageData.image != nullptr || !m_pendingSymbols.empty() ||
+                  m_pendingSymbolCode != 0 || !m_serverQueryQueue.empty() || !m_serverQueryQueuePrio.empty() ||
+                  m_pendingSourceLocationPayload != 0 || m_pendingSingleString.ptr != nullptr || m_pendingSecondString.ptr != nullptr ||
+                  !m_sourceCodeQuery.empty() || m_pendingFibers != 0 ) )
             {
                 continue;
             }
-            if( !m_crashed && !m_disconnect.load( std::memory_order_relaxed ) )
+            if( m_mode == Mode::Full && !m_crashed && !m_disconnect.load( std::memory_order_relaxed ) )
             {
                 bool done = true;
                 for( auto& v : m_data.threads )
@@ -3363,6 +3482,13 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
 
 void Worker::Query( ServerQuery type, uint64_t data, uint32_t extra )
 {
+    if( m_mode == Mode::ProtocolOnly &&
+        m_serverQueryQueue.size() + m_serverQueryQueuePrio.size() >= m_recorderQueryQueueLimit )
+    {
+        RecorderFail( "Protocol resolver query queue limit exceeded." );
+        return;
+    }
+
     ServerQueryPacket query { type, data, extra };
     if( m_serverQuerySpaceLeft > 0 && m_serverQueryQueuePrio.empty() && m_serverQueryQueue.empty() )
     {
@@ -3543,6 +3669,696 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
             return Process( ev );
         }
     }
+}
+
+bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
+{
+    if( ev.hdr.idx >= (int)QueueType::StringData )
+    {
+        ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
+        if( ev.hdr.type == QueueType::FrameImageData ||
+            ev.hdr.type == QueueType::SymbolCode ||
+            ev.hdr.type == QueueType::SourceCode )
+        {
+            uint32_t sz;
+            memcpy( &sz, ptr, sizeof( sz ) );
+            ptr += sizeof( sz );
+            switch( ev.hdr.type )
+            {
+            case QueueType::FrameImageData:
+                break;
+            case QueueType::SymbolCode:
+                AddSymbolCode( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::SourceCode:
+                AddSourceCode( (uint32_t)ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            default:
+                break;
+            }
+            ptr += sz;
+        }
+        else
+        {
+            uint16_t sz;
+            memcpy( &sz, ptr, sizeof( sz ) );
+            ptr += sizeof( sz );
+            switch( ev.hdr.type )
+            {
+            case QueueType::StringData:
+                AddString( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::ThreadName:
+                AddThreadString( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::FiberName:
+                AddFiberName( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::PlotName:
+            case QueueType::FrameName:
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::SourceLocationPayload:
+                AddSourceLocationPayload( ptr, sz );
+                break;
+            case QueueType::CallstackPayload:
+                RecorderAddCallstackPayload( ptr, sz );
+                break;
+            case QueueType::CallstackAllocPayload:
+                m_recorderPendingCallstack = true;
+                break;
+            case QueueType::ExternalName:
+                AddExternalName( ev.stringTransfer.ptr, ptr, sz );
+                m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::ExternalThreadName:
+                AddExternalThreadName( ev.stringTransfer.ptr, ptr, sz );
+                break;
+            default:
+                RecorderFail( "Unsupported variable-size protocol event." );
+                break;
+            }
+            ptr += sz;
+        }
+    }
+    else
+    {
+        uint16_t sz;
+        switch( ev.hdr.type )
+        {
+        case QueueType::SingleStringData:
+            ptr += sizeof( QueueHeader );
+            memcpy( &sz, ptr, sizeof( sz ) );
+            ptr += sizeof( sz );
+            if( m_recorderHasSingleString )
+            {
+                RecorderFail( "Protocol single-string staging overflow." );
+            }
+            else
+            {
+                m_recorderSingleString.assign( ptr, sz );
+                m_recorderHasSingleString = true;
+            }
+            ptr += sz;
+            break;
+        case QueueType::SecondStringData:
+            ptr += sizeof( QueueHeader );
+            memcpy( &sz, ptr, sizeof( sz ) );
+            ptr += sizeof( sz );
+            if( m_recorderHasSecondString )
+            {
+                RecorderFail( "Protocol second-string staging overflow." );
+            }
+            else
+            {
+                m_recorderSecondString.assign( ptr, sz );
+                m_recorderHasSecondString = true;
+            }
+            ptr += sz;
+            break;
+        default:
+            ptr += QueueDataSize[ev.hdr.idx];
+            switch( ev.hdr.type )
+            {
+            case QueueType::CallstackFrameSize:
+                RecorderPrepareSingleString();
+                if( !m_protocolResolverFailed.load( std::memory_order_relaxed ) )
+                {
+                    ProcessCallstackFrameSize( ev.callstackFrameSize );
+                    m_serverQuerySpaceLeft++;
+                }
+                break;
+            case QueueType::CallstackFrame:
+                RecorderPrepareSingleString();
+                RecorderPrepareSecondString();
+                if( !m_protocolResolverFailed.load( std::memory_order_relaxed ) )
+                {
+                    ProcessCallstackFrame( ev.callstackFrame, true );
+                }
+                break;
+            case QueueType::SymbolInformation:
+                RecorderPrepareSingleString();
+                if( !m_protocolResolverFailed.load( std::memory_order_relaxed ) )
+                {
+                    ProcessSymbolInformation( ev.symbolInformation );
+                    m_serverQuerySpaceLeft++;
+                }
+                break;
+            default:
+                ProcessRecorder( ev );
+                break;
+            }
+            break;
+        }
+    }
+
+    m_protocolEventCount.fetch_add( 1, std::memory_order_relaxed );
+    return !m_protocolResolverFailed.load( std::memory_order_relaxed ) && RecorderCheckLimits();
+}
+
+bool Worker::DispatchProtocolDrain( const QueueItem& ev, const char*& ptr )
+{
+    bool definitionResponse = false;
+    switch( ev.hdr.type )
+    {
+    case QueueType::StringData:
+    case QueueType::ThreadName:
+    case QueueType::FiberName:
+    case QueueType::PlotName:
+    case QueueType::FrameName:
+    case QueueType::FrameImageData:
+    case QueueType::ExternalName:
+    case QueueType::ExternalThreadName:
+    case QueueType::SymbolCode:
+    case QueueType::SourceCode:
+    case QueueType::SingleStringData:
+    case QueueType::SecondStringData:
+    case QueueType::SourceLocation:
+    case QueueType::CallstackFrameSize:
+    case QueueType::CallstackFrame:
+    case QueueType::SymbolInformation:
+    case QueueType::AckServerQueryNoop:
+    case QueueType::AckSourceCodeNotAvailable:
+    case QueueType::AckSymbolCodeNotAvailable:
+    case QueueType::Terminate:
+        definitionResponse = true;
+        break;
+    default:
+        break;
+    }
+
+    if( definitionResponse )
+    {
+        return m_mode == Mode::ProtocolOnly ? DispatchRecorder( ev, ptr ) : DispatchProcess( ev, ptr );
+    }
+
+    ClearProtocolStaging();
+    SkipProtocolEvent( ev, ptr );
+    if( m_mode == Mode::ProtocolOnly )
+    {
+        m_protocolEventCount.fetch_add( 1, std::memory_order_relaxed );
+    }
+    return !m_protocolResolverFailed.load( std::memory_order_relaxed );
+}
+
+void Worker::SkipProtocolEvent( const QueueItem& ev, const char*& ptr )
+{
+    if( ev.hdr.idx >= (int)QueueType::StringData )
+    {
+        ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
+        if( ev.hdr.type == QueueType::FrameImageData ||
+            ev.hdr.type == QueueType::SymbolCode ||
+            ev.hdr.type == QueueType::SourceCode )
+        {
+            uint32_t size;
+            memcpy( &size, ptr, sizeof( size ) );
+            ptr += sizeof( size ) + size;
+        }
+        else
+        {
+            uint16_t size;
+            memcpy( &size, ptr, sizeof( size ) );
+            ptr += sizeof( size ) + size;
+        }
+    }
+    else if( ev.hdr.type == QueueType::SingleStringData || ev.hdr.type == QueueType::SecondStringData )
+    {
+        ptr += sizeof( QueueHeader );
+        uint16_t size;
+        memcpy( &size, ptr, sizeof( size ) );
+        ptr += sizeof( size ) + size;
+    }
+    else
+    {
+        ptr += QueueDataSize[ev.hdr.idx];
+    }
+}
+
+void Worker::ClearProtocolStaging()
+{
+    m_pendingSingleString = {};
+    m_pendingSecondString = {};
+    m_pendingCallstackId = 0;
+    m_pendingSourceLocationPayload = 0;
+    m_memNamePayload = 0;
+    m_recorderSingleString.clear();
+    m_recorderSecondString.clear();
+    m_recorderHasSingleString = false;
+    m_recorderHasSecondString = false;
+    m_recorderPendingCallstack = false;
+    m_recorderSerialCallstack = false;
+}
+
+void Worker::RecorderCheckCurrentThread()
+{
+    CheckThreadString( m_threadCtx );
+}
+
+void Worker::RecorderCheckFrameName( uint64_t name )
+{
+    if( m_recorderFrameNames.emplace( name ).second )
+    {
+        Query( ServerQueryFrameName, name );
+    }
+}
+
+void Worker::RecorderCheckPlotName( uint64_t name )
+{
+    if( m_recorderPlotNames.emplace( name ).second )
+    {
+        Query( ServerQueryPlotName, name );
+    }
+}
+
+void Worker::RecorderConsumeSingleString()
+{
+    if( !m_recorderHasSingleString )
+    {
+        RecorderFail( "Protocol event is missing its single-string payload." );
+        return;
+    }
+    m_recorderSingleString.clear();
+    m_recorderHasSingleString = false;
+}
+
+void Worker::RecorderConsumeSecondString()
+{
+    if( !m_recorderHasSecondString )
+    {
+        RecorderFail( "Protocol event is missing its second-string payload." );
+        return;
+    }
+    m_recorderSecondString.clear();
+    m_recorderHasSecondString = false;
+}
+
+void Worker::RecorderPrepareSingleString()
+{
+    if( !m_recorderHasSingleString )
+    {
+        RecorderFail( "Protocol definition is missing its single-string payload." );
+        return;
+    }
+    AddSingleString( m_recorderSingleString.data(), m_recorderSingleString.size() );
+    m_recorderSingleString.clear();
+    m_recorderHasSingleString = false;
+}
+
+void Worker::RecorderPrepareSecondString()
+{
+    if( !m_recorderHasSecondString )
+    {
+        RecorderFail( "Protocol definition is missing its second-string payload." );
+        return;
+    }
+    AddSecondString( m_recorderSecondString.data(), m_recorderSecondString.size() );
+    m_recorderSecondString.clear();
+    m_recorderHasSecondString = false;
+}
+
+void Worker::RecorderAddCallstackPayload( const char* data, size_t size )
+{
+    if( m_recorderPendingCallstack )
+    {
+        RecorderFail( "Protocol callstack staging overflow." );
+        return;
+    }
+    if( size % sizeof( uint64_t ) != 0 )
+    {
+        RecorderFail( "Invalid protocol callstack payload size." );
+        return;
+    }
+
+    const auto end = data + size;
+    while( data < end )
+    {
+        uint64_t frame;
+        memcpy( &frame, data, sizeof( frame ) );
+        data += sizeof( frame );
+        QueryCallstackFrame( GetCanonicalPointer( PackPointer( frame ) ) );
+    }
+    m_recorderPendingCallstack = true;
+}
+
+bool Worker::RecorderHasPendingQueries() const
+{
+    return m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingFibers != 0 ||
+        m_pendingExternalNames != 0 || m_pendingSourceLocation != 0 ||
+        m_pendingCallstackFrames != 0 || m_pendingCallstackSubframes != 0 ||
+        !m_pendingSymbols.empty() || m_pendingSymbolCode != 0 ||
+        !m_serverQueryQueue.empty() || !m_serverQueryQueuePrio.empty() ||
+        !m_sourceCodeQuery.empty() || m_serverQuerySpaceLeft != m_serverQuerySpaceBase;
+}
+
+bool Worker::HasPendingProtocolQueries() const
+{
+    if( m_mode == Mode::ProtocolOnly ) return RecorderHasPendingQueries();
+    return m_pendingStrings != 0 || m_pendingThreads != 0 || m_pendingSourceLocation != 0 ||
+        m_pendingCallstackFrames != 0 || m_data.plots.IsPending() || m_pendingCallstackId != 0 ||
+        m_pendingExternalNames != 0 || m_pendingCallstackSubframes != 0 ||
+        m_pendingFrameImageData.image != nullptr || !m_pendingSymbols.empty() ||
+        m_pendingSymbolCode != 0 || !m_serverQueryQueue.empty() || !m_serverQueryQueuePrio.empty() ||
+        m_pendingSourceLocationPayload != 0 || m_pendingSingleString.ptr != nullptr ||
+        m_pendingSecondString.ptr != nullptr || !m_sourceCodeQuery.empty() || m_pendingFibers != 0 ||
+        m_serverQuerySpaceLeft != m_serverQuerySpaceBase;
+}
+
+bool Worker::RecorderCheckLimits()
+{
+    size_t count =
+        m_data.strings.size() +
+        m_data.stringData.size() +
+        m_data.threadNames.size() +
+        m_data.externalNames.size() +
+        m_data.sourceLocation.size() +
+        m_data.sourceLocationPayload.size() +
+        m_data.callstackFrameMap.size() +
+        m_data.symbolMap.size() +
+        m_data.symbolCode.size() +
+        m_data.sourceFileCache.size() +
+        m_recorderFrameNames.size() +
+        m_recorderPlotNames.size() +
+        m_recorderPowerNames.size() +
+        m_data.fiberToThreadMap.size();
+
+    m_protocolDefinitionCount.store( count, std::memory_order_relaxed );
+
+    if( count > m_recorderDefinitionLimit )
+    {
+        RecorderFail( "Protocol resolver definition/state limit exceeded." );
+        return false;
+    }
+    return !m_protocolResolverFailed.load( std::memory_order_relaxed );
+}
+
+void Worker::RecorderFail( const char* message )
+{
+    if( m_protocolResolverFailed.load( std::memory_order_relaxed ) ) return;
+    m_protocolResolverError = message;
+    m_protocolResolverFailed.store( true, std::memory_order_release );
+}
+
+bool Worker::ProcessRecorder( const QueueItem& ev )
+{
+    switch( ev.hdr.type )
+    {
+    case QueueType::ThreadContext:
+        m_threadCtx = ev.threadCtx.thread;
+        break;
+    case QueueType::ZoneBegin:
+    case QueueType::ZoneBeginCallstack:
+        CheckSourceLocation( ev.zoneBegin.srcloc );
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::ZoneBeginAllocSrcLoc:
+    case QueueType::ZoneBeginAllocSrcLocCallstack:
+        if( m_pendingSourceLocationPayload == 0 )
+        {
+            RecorderFail( "Zone is missing its dynamic source location." );
+        }
+        m_pendingSourceLocationPayload = 0;
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::ZoneEnd:
+    case QueueType::ZoneValidation:
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::FrameMarkMsg:
+    case QueueType::FrameMarkMsgStart:
+    case QueueType::FrameMarkMsgEnd:
+        RecorderCheckFrameName( ev.frameMark.name );
+        break;
+    case QueueType::FrameVsync:
+    case QueueType::FrameImage:
+        break;
+    case QueueType::SourceLocation:
+        AddSourceLocation( ev.srcloc );
+        m_serverQuerySpaceLeft++;
+        break;
+    case QueueType::ZoneText:
+    case QueueType::ZoneName:
+        RecorderConsumeSingleString();
+        break;
+    case QueueType::ZoneColor:
+    case QueueType::ZoneValue:
+        break;
+    case QueueType::LockAnnounce:
+        CheckSourceLocation( ev.lockAnnounce.lckloc );
+        break;
+    case QueueType::LockWait:
+    case QueueType::LockObtain:
+    case QueueType::LockSharedWait:
+    case QueueType::LockSharedObtain:
+        CheckThreadString( ev.lockWait.thread );
+        break;
+    case QueueType::LockRelease:
+        // The exclusive release packet carries no thread. Full Worker uses
+        // the lock owner established by an earlier obtain, whose name has
+        // therefore already been requested.
+        break;
+    case QueueType::LockSharedRelease:
+        CheckThreadString( ev.lockReleaseShared.thread );
+        break;
+    case QueueType::LockMark:
+        CheckSourceLocation( ev.lockMark.srcloc );
+        break;
+    case QueueType::LockName:
+        RecorderConsumeSingleString();
+        break;
+    case QueueType::LockTerminate:
+        break;
+    case QueueType::PlotDataInt:
+        RecorderCheckPlotName( ev.plotDataInt.name );
+        break;
+    case QueueType::PlotDataFloat:
+        RecorderCheckPlotName( ev.plotDataFloat.name );
+        break;
+    case QueueType::PlotDataDouble:
+        RecorderCheckPlotName( ev.plotDataDouble.name );
+        break;
+    case QueueType::PlotConfig:
+        RecorderCheckPlotName( ev.plotConfig.name );
+        break;
+    case QueueType::Message:
+    case QueueType::MessageColor:
+    case QueueType::MessageCallstack:
+    case QueueType::MessageColorCallstack:
+        RecorderCheckCurrentThread();
+        RecorderConsumeSingleString();
+        break;
+    case QueueType::MessageLiteral:
+    case QueueType::MessageLiteralCallstack:
+        RecorderCheckCurrentThread();
+        CheckString( ev.messageLiteral.text );
+        break;
+    case QueueType::MessageLiteralColor:
+    case QueueType::MessageLiteralColorCallstack:
+        RecorderCheckCurrentThread();
+        CheckString( ev.messageColorLiteral.text );
+        break;
+    case QueueType::MessageAppInfo:
+        RecorderConsumeSingleString();
+        break;
+    case QueueType::GpuZoneBegin:
+    case QueueType::GpuZoneBeginCallstack:
+    case QueueType::GpuZoneBeginSerial:
+    case QueueType::GpuZoneBeginCallstackSerial:
+        CheckSourceLocation( ev.gpuZoneBegin.srcloc );
+        if( ev.hdr.type == QueueType::GpuZoneBeginCallstackSerial )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "GPU zone is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
+    case QueueType::GpuZoneBeginAllocSrcLoc:
+    case QueueType::GpuZoneBeginAllocSrcLocCallstack:
+    case QueueType::GpuZoneBeginAllocSrcLocSerial:
+    case QueueType::GpuZoneBeginAllocSrcLocCallstackSerial:
+        if( m_pendingSourceLocationPayload == 0 )
+        {
+            RecorderFail( "GPU zone is missing its dynamic source location." );
+        }
+        m_pendingSourceLocationPayload = 0;
+        if( ev.hdr.type == QueueType::GpuZoneBeginAllocSrcLocCallstackSerial )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "GPU zone is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
+    case QueueType::GpuContextName:
+    case QueueType::GpuAnnotationName:
+        RecorderConsumeSingleString();
+        break;
+    case QueueType::GpuNewContext:
+    case QueueType::GpuZoneEnd:
+    case QueueType::GpuZoneEndSerial:
+    case QueueType::GpuTime:
+    case QueueType::GpuCalibration:
+    case QueueType::GpuTimeSync:
+    case QueueType::GpuZoneAnnotation:
+        break;
+    case QueueType::MemNamePayload:
+        if( m_memNamePayload != 0 ) RecorderFail( "Memory-name staging overflow." );
+        m_memNamePayload = ev.memName.name;
+        break;
+    case QueueType::MemAlloc:
+    case QueueType::MemAllocCallstack:
+    case QueueType::MemAllocNamed:
+    case QueueType::MemAllocCallstackNamed:
+    {
+        const bool named = ev.hdr.type == QueueType::MemAllocNamed || ev.hdr.type == QueueType::MemAllocCallstackNamed;
+        const bool callstack = ev.hdr.type == QueueType::MemAllocCallstack || ev.hdr.type == QueueType::MemAllocCallstackNamed;
+        const uint64_t poolName = named ? m_memNamePayload : 0;
+        if( named && poolName == 0 ) RecorderFail( "Named allocation is missing its memory name." );
+        m_memNamePayload = 0;
+        if( named ) CheckString( poolName );
+        CheckThreadString( ev.memAlloc.thread );
+        if( callstack )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "Allocation is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
+    }
+    case QueueType::MemFree:
+    case QueueType::MemFreeCallstack:
+    case QueueType::MemFreeNamed:
+    case QueueType::MemFreeCallstackNamed:
+    {
+        const bool named = ev.hdr.type == QueueType::MemFreeNamed || ev.hdr.type == QueueType::MemFreeCallstackNamed;
+        const bool callstack = ev.hdr.type == QueueType::MemFreeCallstack || ev.hdr.type == QueueType::MemFreeCallstackNamed;
+        const uint64_t poolName = named ? m_memNamePayload : 0;
+        if( named && poolName == 0 ) RecorderFail( "Named free is missing its memory name." );
+        m_memNamePayload = 0;
+        if( named ) CheckString( poolName );
+        CheckThreadString( ev.memFree.thread );
+        if( callstack )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "Free is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
+    }
+    case QueueType::MemDiscard:
+    case QueueType::MemDiscardCallstack:
+    {
+        if( ev.hdr.type == QueueType::MemDiscardCallstack )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "Memory discard is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        CheckString( ev.memDiscard.name );
+        CheckThreadString( ev.memDiscard.thread );
+        break;
+    }
+    case QueueType::CallstackSerial:
+        if( !m_recorderPendingCallstack ) RecorderFail( "Serial callstack marker is missing its payload." );
+        m_recorderPendingCallstack = false;
+        m_recorderSerialCallstack = true;
+        break;
+    case QueueType::Callstack:
+    case QueueType::CallstackAlloc:
+        if( !m_recorderPendingCallstack ) RecorderFail( "Callstack marker is missing its payload." );
+        m_recorderPendingCallstack = false;
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::CallstackSample:
+    case QueueType::CallstackSampleContextSwitch:
+        if( !m_recorderPendingCallstack ) RecorderFail( "Callstack sample is missing its payload." );
+        m_recorderPendingCallstack = false;
+        CheckThreadString( ev.callstackSample.thread );
+        break;
+    case QueueType::CallstackFrameSize:
+    case QueueType::CallstackFrame:
+    case QueueType::SymbolInformation:
+        break;
+    case QueueType::Terminate:
+        if( m_recorderHasSingleString || m_recorderHasSecondString ||
+            m_recorderPendingCallstack || m_recorderSerialCallstack ||
+            m_pendingSourceLocationPayload != 0 || m_memNamePayload != 0 )
+        {
+            RecorderFail( "Protocol terminated with an incomplete staged event." );
+        }
+        m_terminate = true;
+        break;
+    case QueueType::KeepAlive:
+        break;
+    case QueueType::Crash:
+        m_crashed = true;
+        break;
+    case QueueType::CrashReport:
+        CheckString( ev.crashReport.text );
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::SysTimeReport:
+        break;
+    case QueueType::SysPowerReport:
+        if( m_recorderPowerNames.emplace( ev.sysPower.name ).second )
+        {
+            CheckString( ev.sysPower.name );
+        }
+        break;
+    case QueueType::ContextSwitch:
+        if( ev.contextSwitch.newThread != 0 ) CheckExternalName( ev.contextSwitch.newThread );
+        break;
+    case QueueType::ThreadWakeup:
+    case QueueType::TidToPid:
+    case QueueType::HwSampleCpuCycle:
+    case QueueType::HwSampleInstructionRetired:
+    case QueueType::HwSampleCacheReference:
+    case QueueType::HwSampleCacheMiss:
+    case QueueType::HwSampleBranchRetired:
+    case QueueType::HwSampleBranchMiss:
+        break;
+    case QueueType::ParamSetup:
+        CheckString( ev.paramSetup.name );
+        break;
+    case QueueType::AckServerQueryNoop:
+        m_serverQuerySpaceLeft++;
+        break;
+    case QueueType::AckSourceCodeNotAvailable:
+        ProcessSourceCodeNotAvailable( ev.sourceCodeNotAvailable );
+        m_serverQuerySpaceLeft++;
+        break;
+    case QueueType::AckSymbolCodeNotAvailable:
+        if( m_pendingSymbolCode == 0 )
+        {
+            RecorderFail( "Unexpected symbol-code acknowledgement." );
+        }
+        else
+        {
+            m_pendingSymbolCode--;
+            m_serverQuerySpaceLeft++;
+        }
+        break;
+    case QueueType::CpuTopology:
+    case QueueType::ThreadGroupHint:
+        break;
+    case QueueType::FiberEnter:
+    {
+        auto it = m_data.fiberToThreadMap.find( ev.fiberEnter.fiber );
+        if( it == m_data.fiberToThreadMap.end() )
+        {
+            const auto tid = ( uint64_t( 1 ) << 32 ) | m_data.fiberToThreadMap.size();
+            m_data.fiberToThreadMap.emplace( ev.fiberEnter.fiber, tid );
+            CheckFiberName( ev.fiberEnter.fiber, tid );
+        }
+        CheckThreadString( ev.fiberEnter.thread );
+        break;
+    }
+    case QueueType::FiberLeave:
+        break;
+    default:
+        RecorderFail( "Unsupported fixed-size protocol event." );
+        break;
+    }
+
+    return !m_protocolResolverFailed.load( std::memory_order_relaxed );
 }
 
 void Worker::CheckSourceLocation( uint64_t ptr )
@@ -8046,9 +8862,28 @@ void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint6
 
 void Worker::Disconnect()
 {
-    //Query( ServerQueryDisconnect, 0 );
-    m_disconnect.store( true, std::memory_order_relaxed );
-    Shutdown();
+    if( m_mode == Mode::Full )
+    {
+        MarkProtocolDisconnect();
+        Shutdown();
+    }
+    else
+    {
+        RequestProtocolDrain();
+    }
+}
+
+void Worker::RequestProtocolDrain()
+{
+    MarkProtocolDisconnect();
+    m_netReadCv.notify_one();
+}
+
+void Worker::BeginProtocolDrain()
+{
+    m_protocolDisconnectSent.store( true, std::memory_order_release );
+    m_protocolDrainOnly.store( true, std::memory_order_release );
+    m_netReadCv.notify_one();
 }
 
 static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec )

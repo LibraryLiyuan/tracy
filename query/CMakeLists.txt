@@ -20,8 +20,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
+set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "Build zstd programs" FORCE)
+set(ZSTD_BUILD_TESTS OFF CACHE BOOL "Build zstd tests" FORCE)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -43,6 +46,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyPng.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
+    src/TracySegmentTraceSource.cpp
+    src/TracySegmentTraceSource.hpp
     src/TracySessionManager.cpp
     src/TracySessionManager.hpp
     src/TracyEmbeddedData.hpp
@@ -50,7 +55,7 @@ add_library(TracyQueryProtocol STATIC
 )
 target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
-target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis nlohmann_json::nlohmann_json)
+target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore nlohmann_json::nlohmann_json)
 target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
 
 add_executable(tracy-query src/main.cpp)

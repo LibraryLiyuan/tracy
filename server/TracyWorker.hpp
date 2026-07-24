@@ -442,6 +442,16 @@ private:
     };
 
 public:
+    enum class Mode : uint8_t
+    {
+        Full,
+        ProtocolOnly
+    };
+
+    static constexpr size_t DefaultRecorderDefinitionLimit = 8000000;
+    static constexpr size_t DefaultRecorderQueryQueueLimit = 2000000;
+    static constexpr int64_t DefaultRecorderMemoryLimit = 512ll * 1024 * 1024;
+
     enum class Failure
     {
         None,
@@ -462,7 +472,9 @@ public:
         NUM_FAILURES
     };
 
-    Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver = nullptr );
+    Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver = nullptr,
+        Mode mode = Mode::Full, size_t recorderDefinitionLimit = DefaultRecorderDefinitionLimit,
+        size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false);
     ~Worker();
@@ -703,9 +715,19 @@ public:
     bool IsOnDemand() const { return m_onDemand; }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
     void Disconnect();
+    void MarkProtocolDisconnect() { m_disconnect.store( true, std::memory_order_release ); }
+    void RequestProtocolDrain();
+    void BeginProtocolDrain();
+    bool IsProtocolDrainActive() const { return m_protocolDrainOnly.load( std::memory_order_acquire ); }
     bool WasDisconnectIssued() const { return m_disconnect.load( std::memory_order_relaxed ); }
     int64_t GetMemoryLimit() const { return m_memoryLimit; }
     bool DidProtocolObserverFail() const { return m_protocolObserverFailed.load( std::memory_order_relaxed ); }
+    bool IsProtocolOnly() const { return m_mode == Mode::ProtocolOnly; }
+    bool DidProtocolResolverFail() const { return m_protocolResolverFailed.load( std::memory_order_acquire ); }
+    const std::string& GetProtocolResolverError() const { return m_protocolResolverError; }
+    size_t GetProtocolDefinitionCount() const { return m_protocolDefinitionCount.load( std::memory_order_relaxed ); }
+    uint64_t GetProtocolEventCount() const { return m_protocolEventCount.load( std::memory_order_relaxed ); }
+    uint64_t GetProtocolFramesProcessed() const { return m_protocolFramesProcessed.load( std::memory_order_acquire ); }
 
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
@@ -754,11 +776,29 @@ private:
     void QueryCallstackFrame( uint64_t addr );
     bool ObserveProtocol( ProtocolDirection direction, ProtocolChunk chunk, std::span<const ProtocolDataSpan> data );
     bool SendProtocol( const void* data, int size, ProtocolChunk chunk );
+    bool RecordProtocolDrainControl();
     void NotifyProtocolClose( ProtocolCloseReason reason );
     void FinishProtocol( ProtocolCloseReason reason );
 
     tracy_force_inline bool DispatchProcess( const QueueItem& ev, const char*& ptr );
     tracy_force_inline bool Process( const QueueItem& ev );
+    tracy_force_inline bool DispatchRecorder( const QueueItem& ev, const char*& ptr );
+    tracy_force_inline bool ProcessRecorder( const QueueItem& ev );
+    tracy_force_inline bool DispatchProtocolDrain( const QueueItem& ev, const char*& ptr );
+    void SkipProtocolEvent( const QueueItem& ev, const char*& ptr );
+    void ClearProtocolStaging();
+    void RecorderCheckCurrentThread();
+    void RecorderCheckFrameName( uint64_t name );
+    void RecorderCheckPlotName( uint64_t name );
+    void RecorderConsumeSingleString();
+    void RecorderConsumeSecondString();
+    void RecorderPrepareSingleString();
+    void RecorderPrepareSecondString();
+    void RecorderAddCallstackPayload( const char* data, size_t size );
+    bool RecorderHasPendingQueries() const;
+    bool HasPendingProtocolQueries() const;
+    bool RecorderCheckLimits();
+    void RecorderFail( const char* message );
     tracy_force_inline void ProcessThreadContext( const QueueThreadContext& ev );
     tracy_force_inline void ProcessZoneBegin( const QueueZoneBegin& ev );
     tracy_force_inline void ProcessZoneBeginCallstack( const QueueZoneBegin& ev );
@@ -1045,12 +1085,23 @@ private:
     std::atomic<bool> m_protocolObserverFailed { false };
     std::atomic<bool> m_protocolObserverClosed { false };
     std::atomic<bool> m_protocolTransportError { false };
+    Mode m_mode = Mode::Full;
+    size_t m_recorderDefinitionLimit = DefaultRecorderDefinitionLimit;
+    size_t m_recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit;
+    std::atomic<bool> m_protocolResolverFailed { false };
+    std::string m_protocolResolverError;
+    std::atomic<size_t> m_protocolDefinitionCount { 0 };
+    std::atomic<uint64_t> m_protocolEventCount { 0 };
 
     std::thread m_thread;
     std::thread m_threadNet;
     std::atomic<bool> m_connected { false };
     std::atomic<bool> m_hasData;
     std::atomic<bool> m_shutdown { false };
+    std::atomic<bool> m_protocolDisconnectSent { false };
+    std::atomic<bool> m_protocolDrainOnly { false };
+    std::atomic<uint64_t> m_protocolFramesProcessed { 0 };
+    std::atomic<bool> m_networkReading { false };
 
     std::atomic<bool> m_backgroundDone { true };
     std::thread m_threadBackground;
@@ -1110,6 +1161,15 @@ private:
     uint32_t m_serialNextCallstack = 0;
     uint64_t m_memNamePayload = 0;
 
+    std::string m_recorderSingleString;
+    std::string m_recorderSecondString;
+    bool m_recorderHasSingleString = false;
+    bool m_recorderHasSecondString = false;
+    bool m_recorderPendingCallstack = false;
+    bool m_recorderSerialCallstack = false;
+    unordered_flat_set<uint64_t> m_recorderFrameNames;
+    unordered_flat_set<uint64_t> m_recorderPlotNames;
+    unordered_flat_set<uint64_t> m_recorderPowerNames;
     Slab<64*1024*1024> m_slab;
     int64_t m_memoryLimit;
 

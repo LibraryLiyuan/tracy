@@ -37,7 +37,8 @@ enum RecordFlags : uint32_t
     RecordFlagCompressedFrame = 1u << 1,
     RecordFlagServerQuery = 1u << 2,
     RecordFlagDurabilityBoundary = 1u << 3,
-    RecordFlagTerminal = 1u << 4
+    RecordFlagTerminal = 1u << 4,
+    RecordFlagLocalControl = 1u << 5
 };
 
 enum class FlushMode

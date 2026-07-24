@@ -31,6 +31,7 @@ class MemorySink final : public JournalSink
 public:
     bool Write( const uint8_t* data, size_t size, size_t& written, std::string& error ) override
     {
+        if( writeDelay.count() != 0 ) std::this_thread::sleep_for( writeDelay );
         if( m_position >= failAt )
         {
             written = 0;
@@ -73,6 +74,7 @@ public:
     size_t maxWriteChunk = std::numeric_limits<size_t>::max();
     uint64_t failAt = std::numeric_limits<uint64_t>::max();
     bool failFlush = false;
+    std::chrono::microseconds writeDelay { 0 };
     size_t flushCount = 0;
     size_t durableFlushCount = 0;
 
@@ -569,6 +571,9 @@ void TestProtocolObserver( TestContext& test )
         test.Check( rejected.load() == 0, "concurrent protocol observer writes all succeed" );
         test.Check( observer->ClientBytes() == 25 * 16, "protocol observer counts client bytes" );
         test.Check( observer->ServerBytes() == 25 * 16, "protocol observer counts server bytes" );
+        test.Check( observer->OnProtocolData( ProtocolDirection::LocalControl, ProtocolChunk::ControlState, spans ),
+            "protocol observer records local control bytes" );
+        test.Check( observer->ServerBytes() == 25 * 16, "local control bytes stay outside the replayable server byte count" );
         test.Check( observer->OnProtocolClose( ProtocolCloseReason::CaptureComplete ), "protocol observer appends terminal record" );
         test.Check( observer->Finalized(), "protocol observer reports finalized" );
         test.Check( observer->DurableSize() == observer->CommittedSize(), "terminal record makes protocol journal durable" );
@@ -589,6 +594,7 @@ void TestProtocolObserver( TestContext& test )
     size_t serverCount = 0;
     size_t checkpointCount = 0;
     size_t endCount = 0;
+    size_t localControlCount = 0;
     for( const auto& record : scan.records )
     {
         switch( record.type )
@@ -598,6 +604,9 @@ void TestProtocolObserver( TestContext& test )
         case RecordType::ServerToClient: serverCount++; break;
         case RecordType::Checkpoint: checkpointCount++; break;
         case RecordType::SessionEnd: endCount++; break;
+        case RecordType::Diagnostic:
+            if( ( record.flags & RecordFlagLocalControl ) != 0 ) localControlCount++;
+            break;
         default: break;
         }
     }
@@ -606,9 +615,70 @@ void TestProtocolObserver( TestContext& test )
     test.Check( serverCount == 25, "protocol observer writes all server records" );
     test.Check( checkpointCount > 0, "protocol observer writes byte-based durable checkpoints" );
     test.Check( endCount == 1, "protocol observer writes exactly one SessionEnd" );
+    test.Check( localControlCount == 1, "protocol observer marks one replay-external local control record" );
 
     std::filesystem::remove_all( directory, ec );
     test.Check( !ec, "remove protocol observer temporary directory" );
+}
+
+void TestProtocolBackpressure( TestContext& test )
+{
+    WriterOptions writerOptions;
+    writerOptions.durableHeader = false;
+    auto ownedSink = std::make_unique<MemorySink>();
+    auto* sink = ownedSink.get();
+    sink->writeDelay = std::chrono::microseconds( 1000 );
+
+    std::string error;
+    auto writer = JournalWriter::Create( std::move( ownedSink ), DeterministicHeader(), writerOptions, error );
+    test.Check( writer != nullptr, "create slow protocol journal writer: " + error );
+    if( !writer ) return;
+
+    ProtocolJournalOptions options;
+    options.writer = writerOptions;
+    options.bufferBytes = 16;
+    options.durableIntervalBytes = 0;
+    options.durableIntervalNs = 0;
+    auto observer = StreamProtocolObserver::CreateJournal( std::move( writer ), "slow-disk", 8086, 69, options, error );
+    test.Check( observer != nullptr, "create bounded slow-disk observer: " + error );
+    if( !observer ) return;
+
+    constexpr std::array<uint8_t, 16> Payload = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
+    };
+    const ProtocolDataSpan span { Payload.data(), Payload.size() };
+    std::atomic<int> rejected { 0 };
+    auto produce = [&] {
+        for( int i = 0; i < 12; i++ )
+        {
+            if( !observer->OnProtocolData(
+                ProtocolDirection::ClientToServer,
+                ProtocolChunk::CompressedFrame,
+                std::span<const ProtocolDataSpan>( &span, 1 ) ) )
+            {
+                rejected++;
+            }
+        }
+    };
+
+    std::array<std::thread, 4> producers = {
+        std::thread( produce ), std::thread( produce ), std::thread( produce ), std::thread( produce )
+    };
+    for( auto& thread : producers ) thread.join();
+
+    test.Check( rejected.load() == 0, "bounded observer never drops a slow-disk protocol record" );
+    test.Check( observer->OnProtocolClose( ProtocolCloseReason::CaptureComplete ), "slow-disk observer drains before SessionEnd" );
+    test.Check( observer->BackpressureWaitCount() > 0, "slow disk causes measurable producer backpressure" );
+    test.Check( observer->PeakBufferedBytes() <= options.bufferBytes * 2, "two-buffer relay stays inside its strict memory cap" );
+    test.Check( observer->PeakBufferedBytes() >= options.bufferBytes, "slow-disk test exercises a populated relay buffer" );
+    test.Check( observer->ClientBytes() == 48 * Payload.size(), "slow-disk observer commits every client byte" );
+
+    ScanOptions scanOptions;
+    scanOptions.maxCollectedRecords = 128;
+    const auto scan = ScanJournal( sink->bytes, scanOptions );
+    test.Check( scan.code == ScanCode::Ok, "slow-disk journal remains structurally valid: " + scan.message );
+    test.Check( scan.complete, "slow-disk journal ends with a durable SessionEnd" );
+    test.Check( scan.recordCount == 50, "slow-disk journal contains begin, all protocol records, and end" );
 }
 
 }
@@ -629,6 +699,7 @@ int main()
     TestFileRecoveryAndResume( test );
     TestJournalStore( test );
     TestProtocolObserver( test );
+    TestProtocolBackpressure( test );
 
     if( test.failures != 0 )
     {

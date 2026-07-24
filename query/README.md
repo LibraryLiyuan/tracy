@@ -1,8 +1,8 @@
 # Tracy Query v1
 
-`tracy-query` is the read-only, headless structured-query companion to the Tracy profiler. It opens a completed `.tracy` capture with `FileRead + Worker(EventType::All)`, waits for Tracy's background indexing, and exposes bounded JSON/NDJSON and MCP STDIO queries. It does not use ImGui, call an LLM, open a network connection, create SQLite, or write a sidecar.
+`tracy-query` is the read-only, headless structured-query companion to the Tracy profiler. It opens a completed `.tracy` capture with `FileRead + Worker(EventType::All)` or a committed `.tracy-stream` revision with `SegmentTraceSource`, waits for Tracy's background indexing, and exposes bounded JSON/NDJSON and MCP STDIO queries. It does not use ImGui, call an LLM, open an external network connection, create SQLite, or write a sidecar.
 
-The analysis core is shared with `tracy-profiler`: frame-accurate memory snapshots and D3D12/GTMEM1 pass attribution are calculated by `TracyAnalysis`, while `TracyView_Memory.cpp` retains only GUI selection and drawing state. `QueryService` depends on the storage-neutral `TraceSource` contract; only `WorkerTraceSource` includes `TracyWorker.hpp`, so a future `SegmentTraceSource` can implement the same batch interface.
+The analysis core is shared with `tracy-profiler`: frame-accurate memory snapshots and D3D12/GTMEM1 pass attribution are calculated by `TracyAnalysis`, while `TracyView_Memory.cpp` retains only GUI selection and drawing state. `QueryService` depends on the storage-neutral `TraceSource` contract. `WorkerTraceSource` serves snapshots, while `SegmentTraceSource` strictly replays immutable committed journal revisions and atomically publishes only valid newer sources.
 
 ## Build
 
@@ -19,9 +19,9 @@ ctest --test-dir ..\tracy-query-build -C Release --output-on-failure
 ```text
 tracy-query --version
 tracy-query --schema
-tracy-query --doctor [--trace file.tracy]
-tracy-query --trace file.tracy --request request.json|-
-tracy-query --trace file.tracy --batch requests.ndjson|-
+tracy-query --doctor [--trace file.tracy|file.tracy-stream]
+tracy-query --trace file.tracy|file.tracy-stream --request request.json|-
+tracy-query --trace file.tracy|file.tracy-stream --batch requests.ndjson|-
 tracy-query --mcp [--allow-root DIR] [--allow-source-root DIR]
 ```
 

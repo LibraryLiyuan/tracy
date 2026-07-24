@@ -94,6 +94,7 @@ private:
 
     TraceSessionSnapshot SnapshotLocked( const Session& session ) const;
     std::shared_ptr<Session> FindLocked( const std::string& id ) const;
+    void RefreshSegmentSession( const std::shared_ptr<Session>& session ) const;
     void LoaderLoop( std::stop_token stopToken );
     void UpdateState( const std::shared_ptr<Session>& session, analysis::TraceSourceState state );
 
