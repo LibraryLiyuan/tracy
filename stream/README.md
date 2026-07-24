@@ -1,22 +1,21 @@
-# tracy-stream
+# tracy-stream 流式采集模块
 
-`tracy-stream` is the streaming-capture layer for Tracy Structured Data.
-It provides a portable `.tracy-stream` append journal with
-CRC32C records, explicit commit trailers, durable boundaries, recovery scanning,
-and opt-in tail repair. `tracy-capture` writes the journal continuously through
-an asynchronous strict two-buffer relay. Journal-only capture uses a bounded
-`Worker::Mode::ProtocolOnly` resolver instead of retaining the timeline.
-`tracy-stream-convert` strictly replays a valid journal prefix into a standard
-`.tracy` snapshot.
+`tracy-stream` 是 Tracy 结构化数据的流式采集层。它提供可移植的
+`.tracy-stream` 追加式日志，支持 CRC32C 记录校验、显式提交尾部、
+持久化边界、恢复扫描和按需尾部修复。`tracy-capture` 通过严格的异步
+双缓冲转发器持续写入日志。仅输出日志时，采集器使用有界的
+`Worker::Mode::ProtocolOnly` 解析器，不保留完整时间线。
+`tracy-stream-convert` 可以严格重放有效日志前缀，并生成标准 `.tracy`
+快照。
 
-`JournalStore` publishes immutable read views over only the committed prefix.
-Its revision is the last committed record sequence; its watermark is the last
-committed monotonic timestamp. A partial live tail does not change either
-value. Each published prefix also carries a CRC32C fingerprint, so a
-structurally valid in-place rewrite, truncate, or replacement never replaces
-the last good view.
+`JournalStore` 只为已经提交的前缀发布不可变读取视图。修订号
+（revision）等于最后一条已提交记录的序号，水位时间戳（watermark）
+等于最后一条已提交记录的单调时间戳。实时写入中的不完整尾部不会
+改变这两个值。每个已发布前缀还带有 CRC32C 指纹，因此即使文件被
+原地改写、截断或替换后仍能通过
+结构校验，也不会覆盖上一份有效视图。
 
-Build and test it independently:
+独立构建并测试：
 
 ```powershell
 cmake -S stream -B stream/build -DBUILD_TESTING=ON
@@ -24,59 +23,58 @@ cmake --build stream/build --config Release
 ctest --test-dir stream/build -C Release --output-on-failure
 ```
 
-Inspect without changing a journal:
+只检查日志，不修改文件：
 
 ```powershell
 stream/build/Release/tracy-stream.exe inspect capture.tracy-stream --records 20
 ```
 
-Tail repair is intentionally explicit:
+尾部修复必须显式执行：
 
 ```powershell
 stream/build/Release/tracy-stream.exe recover capture.tracy-stream --truncate
 ```
 
-Record a journal alongside a normal snapshot:
+同时记录流式日志和普通快照：
 
 ```powershell
 capture/build/Release/tracy-capture.exe `
   -j output.tracy-stream -o output.tracy -s 30
 ```
 
-Either output may be omitted. With only `-j`, the recorder defaults to a
-512 MiB memory limit, 8,000,000 retained definitions/state entries, and 2,000,000
-queued definition queries. Exceeding a limit or encountering a write/flush
-failure terminates explicitly; records are never silently dropped. A timed
-local stop records a replay-external `BeginDrain` boundary, processes only
-responses to already-issued definition queries, then sends the ordinary
-`ServerQueryTerminate` packet and writes the terminal record.
+两种输出都可以单独省略。仅指定 `-j` 时，记录器默认限制为 512 MiB
+内存、8,000,000 个保留定义/状态项和 2,000,000 个排队定义查询。
+超过任何限制，或发生写入、刷盘（flush）失败时，采集都会显式终止；
+记录绝不会被静默丢弃。定时本地停止会记录一个不属于协议重放字节流的
+`BeginDrain` 边界，之后只处理已发出定义查询的响应，最后发送普通
+`ServerQueryTerminate` 数据包并写入终止记录。
 
-Automation that cannot add `-j` may set the process-local
-`TRACY_STREAM_OUTPUT` environment variable to the journal path. An explicit
-`-j` argument takes precedence.
+无法添加 `-j` 参数的自动化程序，可以将当前进程的
+`TRACY_STREAM_OUTPUT` 环境变量设置为日志路径。显式传入的 `-j` 参数
+优先级更高。
 
-Convert a complete or recoverable-prefix journal:
+转换完整日志或包含可恢复前缀的日志：
 
 ```powershell
 capture/build/Release/tracy-stream-convert.exe `
   -i output.tracy-stream -o replayed.tracy
 ```
 
-The converter replays client bytes through `Worker` and validates the recorded
-server handshake/query byte stream before saving the snapshot.
+转换器通过 `Worker` 重放客户端字节，在保存快照前校验记录中的服务器
+握手和查询字节流。
 
-Query a committed live or completed journal directly:
+直接查询已提交的实时日志或完整日志：
 
 ```powershell
 query/build/Release/tracy-query.exe `
   --trace output.tracy-stream --allow-root (Split-Path output.tracy-stream)
 ```
 
-`SegmentTraceSource` strictly replays each immutable committed revision, then
-publishes it atomically. Requests already using an older revision keep that
-view; a partial or invalid refresh cannot replace the last good revision.
+`SegmentTraceSource` 会严格重放每个不可变的已提交修订版本，再以原子
+方式发布。已经使用旧修订版本的请求会继续持有原视图；部分写入或
+无效刷新无法替换上一份有效修订版本。
 
-Run the unattended producer/capture/replay/MCP A/B acceptance workflow:
+运行无人值守的生产者、采集、重放和 MCP A/B 验收流程：
 
 ```powershell
 stream/tests/ProtocolCaptureAcceptance.ps1 `
@@ -88,10 +86,10 @@ stream/tests/ProtocolCaptureAcceptance.ps1 `
   -OutputRoot stream/build
 ```
 
-See [the format contract](docs/format-v1.md) and
-[the staged implementation plan](docs/implementation-plan.md). The
-[Unreal Insights source audit](docs/unreal-insights-streaming-analysis.md)
-records the backpressure, LIVE-read, and reliability behavior used in the
-design. [Acceptance results](docs/acceptance-results.md) include the real
-Godot/TPS ProtocolOnly run, and the [repository state report](docs/repository-state.md)
-records the final single-worktree layout.
+更多信息请参阅[格式约定](docs/format-v1.md)和
+[分阶段实施计划](docs/implementation-plan.md)。
+[Unreal Insights 源码分析](docs/unreal-insights-streaming-analysis.md)
+记录了本设计采用的背压、实时读取和可靠性行为。
+[验收结果](docs/acceptance-results.md)包含真实 Godot/TPS
+`ProtocolOnly` 运行结果，[仓库状态报告](docs/repository-state.md)记录了
+最终的单工作树（worktree）布局。
