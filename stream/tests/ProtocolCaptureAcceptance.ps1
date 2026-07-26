@@ -142,8 +142,10 @@ try {
         Assert-Condition ($liveWatermarks[$i] -ge $liveWatermarks[$i - 1]) 'live watermark moved backwards'
     }
 
-    $inspectJson = (& $InspectorExe inspect $journalPath | ConvertFrom-Json)
-    Assert-Condition ($LASTEXITCODE -eq 0) "journal inspection failed with exit code $LASTEXITCODE"
+    $inspectRaw = (& $InspectorExe inspect $journalPath) -join [Environment]::NewLine
+    $inspectExitCode = $LASTEXITCODE
+    Assert-Condition ($inspectExitCode -eq 0) "journal inspection failed with exit code $inspectExitCode"
+    $inspectJson = $inspectRaw | ConvertFrom-Json
     Assert-Condition ([string]$inspectJson.status -eq 'OK') "journal status is $($inspectJson.status)"
     Assert-Condition ([bool]$inspectJson.complete) 'journal does not have a clean SessionEnd'
     Assert-Condition ([UInt64]$inspectJson.record_count -gt 6) 'journal did not capture protocol frames'
@@ -203,8 +205,10 @@ try {
     Assert-Condition (-not $drainProducer.HasExited) 'protocol-only producer exited instead of continuing after recorder disconnect'
     $drainCapture = $null
 
-    $drainInspect = (& $InspectorExe inspect $drainJournalPath --records 1000000 | ConvertFrom-Json)
-    Assert-Condition ($LASTEXITCODE -eq 0) 'protocol-only journal inspection failed'
+    $drainInspectRaw = (& $InspectorExe inspect $drainJournalPath --records 1000000) -join [Environment]::NewLine
+    $drainInspectExitCode = $LASTEXITCODE
+    Assert-Condition ($drainInspectExitCode -eq 0) 'protocol-only journal inspection failed'
+    $drainInspect = $drainInspectRaw | ConvertFrom-Json
     Assert-Condition ([bool]$drainInspect.complete) 'protocol-only journal does not have a clean SessionEnd'
     $drainRecords = @($drainInspect.records)
     Assert-Condition ($drainRecords.Count -eq [UInt64]$drainInspect.record_count) 'protocol-only journal record enumeration was truncated'

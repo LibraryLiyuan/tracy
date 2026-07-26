@@ -6,6 +6,7 @@
 #include "../../server/TracyFileWrite.hpp"
 #include "../../server/TracyWorker.hpp"
 #include "../../stream/src/TracyStreamJournal.hpp"
+#include "../../stream/src/TracyStreamReplay.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -284,32 +285,36 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
             peer->Close();
         };
         PayloadReader reader( view.path );
-        std::vector<uint8_t> expected;
-        std::vector<uint8_t> actual;
+        stream::ReplayServerTranscriptVerifier transcriptVerifier;
         std::string error;
         for( const auto& record : serverRecords )
         {
             if( replayError.Failed() ) return;
-            if( !reader.Read( record, expected, error ) )
+            stream::ReplayServerPacket recorded { record.sequence, record.flags, {} };
+            if( !reader.Read( record, recorded.payload, error ) )
             {
                 failReplay( "server record " + std::to_string( record.sequence ) + ": " + error );
                 return;
             }
-            actual.resize( expected.size() );
+            stream::ReplayServerPacket replayed { record.sequence, record.flags, {} };
+            replayed.payload.resize( recorded.payload.size() );
             const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
-            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 100, [&] {
+            if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
                 failReplay( "Worker server stream ended before record " + std::to_string( record.sequence ) );
                 return;
             }
-            const auto mismatch = std::mismatch( expected.begin(), expected.end(), actual.begin(), actual.end() );
-            if( mismatch.first != expected.end() )
+            if( !transcriptVerifier.Append( recorded, replayed, error ) )
             {
-                failReplay( "Worker query stream diverged at record " + std::to_string( record.sequence ) );
+                failReplay( error );
                 return;
             }
+        }
+        if( !transcriptVerifier.Finish( error ) )
+        {
+            failReplay( error );
         }
     } );
 

@@ -66,6 +66,13 @@ capture/build/Release/tracy-capture.exe `
 提交的 journal 前缀仍可检查、恢复和转换。转换器和 Query 保持对旧版
 v1、v2、v3 排空控制记录的读取兼容；当前新录制统一写入 v4。
 
+仅输出 `-j` 的 ProtocolOnly 模式还默认启用 30 秒排空无进展看门狗。
+看门狗同时观察已提交字节、双向协议字节、事件数和定义数；任一指标前进
+都会重新计时。连续无进展达到阈值时，采集器以退出码 124 结束，不伪造
+`SessionEnd`，已经提交的前缀仍可直接查询和严格转换。可用
+`-d 0..3600` 调整阈值，`-d 0` 明确关闭；参数只接受完整十进制整数。
+双写和仅输出普通 `.tracy` 的 Full 模式不使用该看门狗。
+
 无法添加 `-j` 参数的自动化程序，可以将当前进程的
 `TRACY_STREAM_OUTPUT` 环境变量设置为日志路径。显式传入的 `-j` 参数
 优先级更高。
@@ -81,6 +88,32 @@ capture/build/Release/tracy-stream-convert.exe `
 握手和查询字节流。ProtocolOnly journal 的 Full 重放保留完整时间线，
 但使用录制器相同的排空完成条件。每条服务器记录还有 10 秒本地读取
 截止时间；协议缺失或发散会显式失败，不会无限等待。
+
+服务器校验对握手、终止、断开和数据分片保持逐包顺序一致；仅对连续且
+互不依赖的定义查询批次允许并发导致的顺序互换，并按完整 payload 多重集
+校验。因此相同查询的合法调度差异不会误报，缺包、改字节或跨控制边界
+重排仍会失败。校验器增量消费服务器记录，只缓存当前连续定义批次，不会
+为整场录制复制全部服务器 payload。
+
+高细节调用栈建议使用 Tracy 自带的离线符号解析流程，避免游戏内 Symbol
+Worker 在停止阶段长时间响应 PDB 查询：
+
+```powershell
+$env:TRACY_SYMBOL_OFFLINE_RESOLVE = '1'
+# 在同一环境中启动被测游戏，使游戏进程继承上面的变量。
+capture/build/Release/tracy-capture.exe `
+  -j output.tracy-stream -s 30 -d 30
+capture/build/Release/tracy-stream-convert.exe `
+  -i output.tracy-stream -o replayed.tracy
+update/build/Release/tracy-update.exe `
+  -r replayed.tracy resolved.tracy
+```
+
+环境变量必须在游戏启动前设置；只给已经独立运行的 `capture.exe` 设置
+不会改变游戏内 Tracy Client。离线录制仍保存模块路径和地址偏移，转换后
+用 `tracy-update -r` 在独立进程中读取匹配的 EXE/DLL/PDB 并补全符号。
+`.tracy-stream` 不会在录制结束时自动变成 `.tracy`，上述转换和符号解析
+目前是显式步骤。
 
 直接查询已提交的实时日志或完整日志：
 
@@ -109,9 +142,11 @@ stream/tests/ProtocolCaptureAcceptance.ps1 `
 [分阶段实施计划](docs/implementation-plan.md)。
 [风险与后续改进备忘录](docs/risks-and-future-improvements.md)记录了
 真实超长排空事故、已经实施的定向修复，以及仍暂不实施的背压指标、
-Client 队列硬上限、完整离线符号化、自动转换和 GUI 支持方案。
+Client 队列硬上限、自动转换和 GUI 支持方案；官方离线符号流程已经验证。
 [Unreal Insights 源码分析](docs/unreal-insights-streaming-analysis.md)
 记录了本设计采用的背压、实时读取和可靠性行为。
 [验收结果](docs/acceptance-results.md)包含真实 Godot/TPS
-`ProtocolOnly` 运行结果，[仓库状态报告](docs/repository-state.md)记录了
-最终的单工作树（worktree）布局。
+`ProtocolOnly` 运行结果，[2026-07-26 正式验证报告](docs/formal-validation-20260726.md)
+覆盖 Release 构建、故障注入、历史格式、真实长录、离线符号和 MCP 全工具
+验收；[仓库状态报告](docs/repository-state.md)记录了最终的单工作树
+（worktree）布局。

@@ -1,6 +1,9 @@
 #include "TracyStreamJournal.hpp"
 #include "TracyStreamProtocol.hpp"
+#include "TracyStreamReplay.hpp"
 #include "TracyStreamStore.hpp"
+
+#include "../../public/common/TracyProtocol.hpp"
 
 #include <algorithm>
 #include <array>
@@ -9,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <set>
@@ -699,6 +703,75 @@ void TestProtocolBackpressure( TestContext& test )
     test.Check( scan.recordCount == 50, "slow-disk journal contains begin, all protocol records, and end" );
 }
 
+void TestReplayServerTranscript( TestContext& test )
+{
+    auto packet = []( uint64_t sequence, uint32_t flags, std::initializer_list<uint8_t> payload ) {
+        return ReplayServerPacket { sequence, flags, std::vector<uint8_t>( payload ) };
+    };
+    auto query = []( uint64_t sequence, uint8_t type, uint8_t tag ) {
+        std::vector<uint8_t> payload( 13, 0 );
+        payload[0] = type;
+        payload[1] = tag;
+        return ReplayServerPacket { sequence, RecordFlagServerQuery, std::move( payload ) };
+    };
+
+    const std::vector<ReplayServerPacket> recorded = {
+        packet( 2, RecordFlagHandshake, { 1, 2, 3, 4 } ),
+        query( 9, uint8_t( tracy::ServerQuerySourceLocation ), 1 ),
+        query( 10, uint8_t( tracy::ServerQueryCallstackFrame ), 2 ),
+        query( 11, uint8_t( tracy::ServerQueryThreadString ), 3 ),
+        query( 12, uint8_t( tracy::ServerQueryDisconnect ), 0 ),
+        query( 13, uint8_t( tracy::ServerQueryDataTransferPart ), 4 ),
+        query( 14, uint8_t( tracy::ServerQueryDataTransferPart ), 5 ),
+        query( 15, uint8_t( tracy::ServerQueryTerminate ), 0 )
+    };
+
+    std::string error;
+    test.Check( VerifyServerTranscript( recorded, recorded, error ), "identical server transcript verifies: " + error );
+
+    auto reordered = recorded;
+    std::swap( reordered[1], reordered[2] );
+    std::swap( reordered[2], reordered[3] );
+    test.Check( VerifyServerTranscript( recorded, reordered, error ), "independent definition queries may reorder: " + error );
+
+    auto changed = reordered;
+    changed[2].payload[1] = 99;
+    test.Check( !VerifyServerTranscript( recorded, changed, error ) && !error.empty(),
+        "reordered batch still rejects changed query bytes" );
+
+    auto crossedControl = reordered;
+    std::swap( crossedControl[3], crossedControl[4] );
+    test.Check( !VerifyServerTranscript( recorded, crossedControl, error ),
+        "definition queries cannot reorder across Disconnect" );
+
+    const std::vector<ReplayServerPacket> separatedByClient = {
+        query( 20, uint8_t( tracy::ServerQueryString ), 8 ),
+        query( 22, uint8_t( tracy::ServerQueryThreadString ), 9 )
+    };
+    auto crossedClient = separatedByClient;
+    std::swap( crossedClient[0], crossedClient[1] );
+    test.Check( !VerifyServerTranscript( separatedByClient, crossedClient, error ),
+        "definition queries cannot reorder across an intervening client record" );
+
+    auto reorderedTransfer = recorded;
+    std::swap( reorderedTransfer[5], reorderedTransfer[6] );
+    test.Check( !VerifyServerTranscript( recorded, reorderedTransfer, error ),
+        "source-transfer fragments retain strict ordering" );
+
+    auto parameterRecorded = recorded;
+    parameterRecorded.insert( parameterRecorded.begin() + 2,
+        query( 10, uint8_t( tracy::ServerQueryParameter ), 7 ) );
+    for( size_t i = 3; i < parameterRecorded.size(); i++ ) parameterRecorded[i].sequence++;
+    auto reorderedParameter = parameterRecorded;
+    std::swap( reorderedParameter[1], reorderedParameter[2] );
+    test.Check( !VerifyServerTranscript( parameterRecorded, reorderedParameter, error ),
+        "state-changing parameter queries retain strict ordering" );
+
+    auto missing = recorded;
+    missing.pop_back();
+    test.Check( !VerifyServerTranscript( recorded, missing, error ), "missing server packet is rejected" );
+}
+
 }
 
 int main()
@@ -718,6 +791,7 @@ int main()
     TestJournalStore( test );
     TestProtocolObserver( test );
     TestProtocolBackpressure( test );
+    TestReplayServerTranscript( test );
 
     if( test.failures != 0 )
     {

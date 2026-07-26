@@ -4,6 +4,7 @@
 #include "../../server/TracyFileWrite.hpp"
 #include "../../server/TracyWorker.hpp"
 #include "../../stream/src/TracyStreamJournal.hpp"
+#include "../../stream/src/TracyStreamReplay.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -397,36 +398,36 @@ int main( int argc, char** argv )
             failReplay( "cannot open journal for server-stream verification" );
             return;
         }
-        std::vector<uint8_t> expected;
-        std::vector<uint8_t> actual;
+        tracy::stream::ReplayServerTranscriptVerifier transcriptVerifier;
         std::string error;
         for( const auto& record : serverRecords )
         {
             if( replayError.Failed() ) return;
-            if( !reader.Read( record, expected, error ) )
+            tracy::stream::ReplayServerPacket recorded { record.sequence, record.flags, {} };
+            if( !reader.Read( record, recorded.payload, error ) )
             {
                 failReplay( "sequence " + std::to_string( record.sequence ) + ": " + error );
                 return;
             }
-            actual.resize( expected.size() );
+            tracy::stream::ReplayServerPacket replayed { record.sequence, record.flags, {} };
+            replayed.payload.resize( recorded.payload.size() );
             const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
-            if( !actual.empty() && !peer->Read( actual.data(), int( actual.size() ), 100, [&] {
+            if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
                 failReplay( "sequence " + std::to_string( record.sequence ) + ": Worker server stream ended early" );
                 return;
             }
-            const auto mismatch = std::mismatch( expected.begin(), expected.end(), actual.begin(), actual.end() );
-            if( mismatch.first != expected.end() )
+            if( !transcriptVerifier.Append( recorded, replayed, error ) )
             {
-                const auto offset = size_t( mismatch.first - expected.begin() );
-                failReplay( "sequence " + std::to_string( record.sequence ) +
-                    ": Worker server-query stream diverged at payload byte " + std::to_string( offset ) +
-                    " (recorded=" + std::to_string( unsigned( expected[offset] ) ) +
-                    ", replay=" + std::to_string( unsigned( actual[offset] ) ) + ")" );
+                failReplay( error );
                 return;
             }
+        }
+        if( !transcriptVerifier.Finish( error ) )
+        {
+            failReplay( error );
         }
     } );
 

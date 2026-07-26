@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <cwctype>
@@ -102,7 +103,7 @@ void AnsiPrintf( const char* ansiEscape, const char* format, ... ) {
 
 [[noreturn]] void Usage()
 {
-    printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit]\n" );
+    printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit] [-d drain-idle-seconds]\n" );
     exit( 1 );
 }
 
@@ -131,6 +132,15 @@ bool SameOutputPath( const char* lhs, const char* rhs )
     return NormalizeOutputPath( lhs ) == NormalizeOutputPath( rhs );
 }
 
+bool ParseIntegerOption( const char* value, int& result )
+{
+    if( !value || value[0] == '\0' ) return false;
+    auto end = value;
+    while( *end != '\0' ) end++;
+    const auto parsed = std::from_chars( value, end, result );
+    return parsed.ec == std::errc() && parsed.ptr == end;
+}
+
 int main( int argc, char** argv )
 {
 #ifdef _WIN32
@@ -149,10 +159,11 @@ int main( int argc, char** argv )
     const char* journalOutput = nullptr;
     int port = 8086;
     int seconds = -1;
+    int drainIdleSeconds = 30;
     int64_t memoryLimit = -1;
 
     int c;
-    while( ( c = getopt( argc, argv, "a:o:j:p:fs:m:" ) ) != -1 )
+    while( ( c = getopt( argc, argv, "a:o:j:p:fs:m:d:" ) ) != -1 )
     {
         switch( c )
         {
@@ -177,6 +188,13 @@ int main( int argc, char** argv )
         case 'm':
             memoryLimit = std::clamp( atoll( optarg ), 1ll, 999ll ) * tracy::GetPhysicalMemorySize() / 100;
             break;
+        case 'd':
+            if( !ParseIntegerOption( optarg, drainIdleSeconds ) )
+            {
+                printf( "Protocol drain idle timeout must be a decimal integer.\n" );
+                return 4;
+            }
+            break;
         default:
             Usage();
             break;
@@ -198,6 +216,11 @@ int main( int argc, char** argv )
     if( seconds < -1 )
     {
         printf( "Capture duration must be -1 or a non-negative number of seconds.\n" );
+        return 4;
+    }
+    if( drainIdleSeconds < 0 || drainIdleSeconds > 3600 )
+    {
+        printf( "Protocol drain idle timeout must be between 0 and 3600 seconds. Use 0 to disable it.\n" );
         return 4;
     }
     if( output && journalOutput && SameOutputPath( output, journalOutput ) )
@@ -269,10 +292,14 @@ int main( int argc, char** argv )
     printf( "\nTimer resolution: %s\n", tracy::TimeToString( worker.GetResolution() ) );
     if( protocolOnly )
     {
-        printf( "Recorder mode: bounded protocol-only (%s memory limit, %zu definitions, %zu queued queries)\n",
+        printf( "Recorder mode: bounded protocol-only (%s memory limit, %zu definitions, %zu queued queries, ",
             tracy::MemSizeToString( worker.GetMemoryLimit() ),
             tracy::Worker::DefaultRecorderDefinitionLimit,
             tracy::Worker::DefaultRecorderQueryQueueLimit );
+        if( drainIdleSeconds == 0 )
+            printf( "drain idle timeout disabled)\n" );
+        else
+            printf( "%d s drain idle timeout)\n", drainIdleSeconds );
     }
 
 #ifdef _WIN32
@@ -365,6 +392,12 @@ int main( int argc, char** argv )
         }
     }
     const auto t1 = std::chrono::high_resolution_clock::now();
+    auto lastDrainProgress = std::chrono::steady_clock::now();
+    uint64_t drainCommittedSize = protocolObserver ? protocolObserver->CommittedSize() : 0;
+    uint64_t drainClientBytes = protocolObserver ? protocolObserver->ClientBytes() : 0;
+    uint64_t drainServerBytes = protocolObserver ? protocolObserver->ServerBytes() : 0;
+    uint64_t drainEventCount = protocolOnly ? worker.GetProtocolEventCount() : 0;
+    size_t drainDefinitionCount = protocolOnly ? worker.GetProtocolDefinitionCount() : 0;
     while( worker.IsConnected() )
     {
         if( protocolOnly && s_forceStopProtocolDrain.load( std::memory_order_relaxed ) )
@@ -372,6 +405,32 @@ int main( int argc, char** argv )
             printf( "\nProtocol drain force-stopped. The committed journal prefix remains recoverable.\n" );
             fflush( stdout );
             std::_Exit( 130 );
+        }
+        if( protocolOnly && drainIdleSeconds != 0 )
+        {
+            const auto committedSize = protocolObserver->CommittedSize();
+            const auto clientBytes = protocolObserver->ClientBytes();
+            const auto serverBytes = protocolObserver->ServerBytes();
+            const auto eventCount = worker.GetProtocolEventCount();
+            const auto definitionCount = worker.GetProtocolDefinitionCount();
+            const auto now = std::chrono::steady_clock::now();
+            if( committedSize != drainCommittedSize || clientBytes != drainClientBytes || serverBytes != drainServerBytes ||
+                eventCount != drainEventCount || definitionCount != drainDefinitionCount )
+            {
+                drainCommittedSize = committedSize;
+                drainClientBytes = clientBytes;
+                drainServerBytes = serverBytes;
+                drainEventCount = eventCount;
+                drainDefinitionCount = definitionCount;
+                lastDrainProgress = now;
+            }
+            else if( std::chrono::duration_cast<std::chrono::seconds>( now - lastDrainProgress ).count() >= drainIdleSeconds )
+            {
+                printf( "\nProtocol drain made no progress for %d seconds and was force-stopped. "
+                    "The committed journal prefix remains recoverable.\n", drainIdleSeconds );
+                fflush( stdout );
+                std::_Exit( 124 );
+            }
         }
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
     }
