@@ -13,8 +13,10 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -117,6 +119,17 @@ std::filesystem::path MakeSnapshotPath( uint64_t revision )
     const auto stamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
     return directory / ( "revision-" + std::to_string( revision ) + "-" + std::to_string( stamp ) + "-" +
         std::to_string( counter.fetch_add( 1, std::memory_order_relaxed ) ) + ".tracy" );
+}
+
+std::string StreamFingerprint( const stream::JournalReadView& view )
+{
+    std::ostringstream out;
+    out << std::hex << std::setfill( '0' );
+    for( const auto byte : view.header.sessionId ) out << std::setw( 2 ) << unsigned( byte );
+    out << std::setw( 16 ) << view.header.createdUnixNs;
+    out << std::setw( 8 ) << view.header.protocolVersion;
+    out << std::setw( 8 ) << view.header.flags;
+    return out.str();
 }
 
 std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
@@ -477,7 +490,7 @@ std::unique_ptr<SegmentTraceSource> SegmentTraceSource::OpenRevision(
     auto snapshotPath = ReplayRevision( *view );
     try
     {
-        auto source = analysis::WorkerTraceSource::Open( snapshotPath, std::move( stateCallback ) );
+        auto source = analysis::WorkerTraceSource::Open( snapshotPath, std::move( stateCallback ), StreamFingerprint( *view ) );
         return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( std::move( store ), std::move( view ), std::move( snapshotPath ), std::move( source ) ) );
     }
     catch( ... )
@@ -552,6 +565,10 @@ TRACY_SEGMENT_FORWARD1( std::vector<analysis::PlotPointDto>, ScanPlots, const an
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanLocks, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanContextSwitches, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
+TRACY_SEGMENT_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
+TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
+TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxEntityDto>, GetGfxEntities )
+TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxLinkDto>, GetGfxLinks )
 TRACY_SEGMENT_FORWARD0( analysis::CrashDto, GetCrash )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuTopologyDto>, GetCpuTopology )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )

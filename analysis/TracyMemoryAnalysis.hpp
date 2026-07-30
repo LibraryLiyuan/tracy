@@ -111,6 +111,7 @@ struct GpuMemoryAllocationInput
     uint64_t size = 0;
     uint64_t thread = 0;
     int64_t allocationNs = 0;
+    std::string poolName;
 };
 
 struct GpuMemoryRequestScope
@@ -173,6 +174,37 @@ struct GpuMemoryAllocationAttribution
     std::vector<size_t> passIndices;
 };
 
+struct GpuMemoryLogicalResource
+{
+    uint64_t logicalResourceId = 0;
+    uint64_t physicalAllocationId = 0;
+    uint64_t size = 0;
+    uint64_t physicalOffset = 0;
+    uint32_t primaryOwnerId = 0;
+    uint32_t physicalOwnerId = 0;
+    uint32_t flags = 0;
+    char kind = 'U';
+    char segment = 'L';
+    std::string name;
+};
+
+struct GpuMemoryOwnerRollup
+{
+    uint32_t taxonomyId = 0;
+    uint64_t physicalBytes = 0;
+    uint64_t physicalAllocationCount = 0;
+    uint64_t logicalResourceCount = 0;
+};
+
+struct GpuMemoryWorkingSet
+{
+    uint64_t frame = 0;
+    uint32_t taxonomyId = 0;
+    uint64_t referencedPhysicalBytes = 0;
+    uint64_t physicalAllocationCount = 0;
+    uint64_t logicalResourceCount = 0;
+};
+
 struct GpuMemoryAttribution
 {
     bool protocolPresent = false;
@@ -181,8 +213,12 @@ struct GpuMemoryAttribution
     std::vector<GpuMemoryRequestScope> requestScopes;
     std::vector<GpuMemoryPass> passes;
     std::vector<GpuMemoryAllocationAttribution> allocations;
+    std::vector<GpuMemoryLogicalResource> logicalResources;
+    std::vector<GpuMemoryOwnerRollup> ownerRollups;
+    std::vector<GpuMemoryWorkingSet> workingSets;
     std::unordered_map<uint64_t, size_t> passById;
     std::unordered_map<uint64_t, size_t> allocationById;
+    std::unordered_map<uint64_t, size_t> logicalById;
 };
 
 GpuMemoryAttribution BuildGpuMemoryAttribution(

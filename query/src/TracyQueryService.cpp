@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <unordered_map>
@@ -32,6 +33,7 @@ const std::vector<std::string>& QueryMethodRegistry()
         "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
         "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
+        "job.search", "job.get", "job.dependencies", "job.critical_path", "job.gfx.statistics", "job.gfx_chain",
         "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
         "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
         "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
@@ -290,7 +292,11 @@ json CountsJson( const analysis::TraceCountsDto& value )
         { "hardware_samples", Decimal( value.hardwareSamples ) },
         { "symbols", Decimal( value.symbols ) }, { "symbol_code_bytes", Decimal( value.symbolCodeBytes ) },
         { "source_locations", Decimal( value.sourceLocations ) }, { "source_cache_files", Decimal( value.sourceCacheFiles ) },
-        { "source_cache_bytes", Decimal( value.sourceCacheBytes ) }, { "frame_images", Decimal( value.frameImages ) }
+        { "source_cache_bytes", Decimal( value.sourceCacheBytes ) }, { "frame_images", Decimal( value.frameImages ) },
+        { "job_types", Decimal( value.jobTypes ) }, { "jobs", Decimal( value.jobs ) },
+        { "job_dependencies", Decimal( value.jobDependencies ) }, { "job_stages", Decimal( value.jobStages ) },
+        { "gfx_dispatches", Decimal( value.gfxDispatches ) }, { "gfx_entities", Decimal( value.gfxEntities ) },
+        { "gfx_links", Decimal( value.gfxLinks ) }
     };
 }
 
@@ -578,7 +584,8 @@ json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemory
         } );
     }
     return {
-        { "ref", source.MakeEntityRef( "gpu-memory-pass", pass.passId ) }, { "pass_id", Decimal( pass.passId ) }, { "label_id", Decimal( pass.labelId ) },
+        { "ref", source.MakeEntityRef( "gpu-memory-pass", pass.passId ) }, { "pass_id", Decimal( pass.passId ) },
+        { "label_id", Decimal( pass.labelId ) }, { "taxonomy_id", Decimal( pass.labelId ) },
         { "frame", Decimal( pass.frame ) }, { "ordinal", Decimal( pass.ordinal ) }, { "thread_id", Decimal( pass.thread ) },
         { "start_ns", Decimal( pass.start ) }, { "end_ns", Decimal( pass.end ) }, { "level", pass.level },
         { "name", pass.name }, { "operations", pass.operations }, { "command_count", pass.commandCount },
@@ -600,6 +607,107 @@ json MessageJson( const analysis::MessageDto& value )
         { "color", value.color }, { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
         { "trust", "untrusted_trace_data" }
+    };
+}
+
+const char* JobKindName( uint8_t kind )
+{
+    static constexpr const char* names[] = { "native", "managed", "burst", "gfx" };
+    return kind < std::size( names ) ? names[kind] : "unknown";
+}
+
+const char* JobStageName( uint8_t stage )
+{
+    static constexpr const char* names[] = {
+        "pre_execute_begin", "pre_execute_end", "worker_slice_begin", "worker_slice_end",
+        "post_execute_begin", "post_execute_end", "completed", "wait_begin",
+        "wait_active_help_begin", "wait_active_help_end", "wait_spin_yield_begin", "wait_spin_yield_end",
+        "wait_sleep_begin", "wait_sleep_end", "wait_end", "flow_begin", "flow_next",
+        "flow_parallel_next", "flow_end", "cancelled", "incomplete", "schedule_callstack"
+    };
+    return stage < std::size( names ) ? names[stage] : "unknown";
+}
+
+const char* GfxEntityKindName( uint8_t kind )
+{
+    static constexpr const char* names[] = { "dispatch", "gfx_job", "command_list", "submission", "gpu_segment" };
+    return kind < std::size( names ) ? names[kind] : "unknown";
+}
+
+const char* GfxRelationName( uint8_t relation )
+{
+    static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits", "runs_on_gpu", "depends_on" };
+    return relation < std::size( names ) ? names[relation] : "unknown";
+}
+
+json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value, bool detailed )
+{
+    const char* state = value.cancelled ? "cancelled" : value.incomplete ? "incomplete" : value.completedNs ? "completed" : value.truncated ? "truncated" : "scheduled";
+    json result = {
+        { "ref", value.ref }, { "job_id", Decimal( value.jobId ) }, { "packed_handle", Decimal( value.packedHandle ) },
+        { "handle_index", uint32_t( value.packedHandle ) }, { "handle_generation", uint32_t( value.packedHandle >> 32 ) },
+        { "name", value.name }, { "type_id", value.typeId }, { "kind", JobKindName( value.kind ) }, { "kind_id", value.kind },
+        { "flags", value.flags }, { "state", state }, { "schedule_ns", Decimal( value.scheduleNs ) },
+        { "schedule_thread_ref", value.scheduleThreadRef }, { "count", value.count }, { "grain_size", value.grainSize },
+        { "unity_flow_id", value.unityFlowId }, { "expected_dependency_count", value.expectedDependencyCount },
+        { "schedule_callstack", value.scheduleCallstack },
+        { "schedule_callstack_ref", value.scheduleCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.scheduleCallstack ) ) },
+        { "dependency_count", value.dependencies.size() }, { "stage_count", value.stages.size() },
+        { "first_run_ns", value.firstRunNs ? json( Decimal( *value.firstRunNs ) ) : json( nullptr ) },
+        { "completed_ns", value.completedNs ? json( Decimal( *value.completedNs ) ) : json( nullptr ) },
+        { "schedule_to_first_run_ns", value.firstRunNs && !value.orphan ? json( Decimal( *value.firstRunNs - value.scheduleNs ) ) : json( nullptr ) },
+        { "schedule_to_complete_ns", value.completedNs && !value.orphan ? json( Decimal( *value.completedNs - value.scheduleNs ) ) : json( nullptr ) },
+        { "execution_ns", Decimal( value.executionNs ) },
+        { "wait", { { "active_help_ns", Decimal( value.waitActiveHelpNs ) }, { "spin_yield_ns", Decimal( value.waitSpinYieldNs ) }, { "sleep_ns", Decimal( value.waitSleepNs ) } } },
+        { "orphan", value.orphan }, { "truncated", value.truncated }, { "trust", "untrusted_trace_data" }
+    };
+    if( !detailed ) return result;
+
+    json dependencies = json::array();
+    for( const auto& dependency : value.dependencies ) dependencies.push_back( {
+        { "prerequisite_job_ref", dependency.prerequisiteJobId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "job", dependency.prerequisiteJobId ) ) },
+        { "prerequisite_job_id", Decimal( dependency.prerequisiteJobId ) }, { "prerequisite_handle", Decimal( dependency.prerequisiteHandle ) },
+        { "flags", dependency.flags }
+    } );
+    json stages = json::array();
+    for( size_t index = 0; index < value.stages.size(); index++ )
+    {
+        const auto& stage = value.stages[index];
+        stages.push_back( {
+            { "ref", source.MakeEntityRef( "job-stage", ( value.jobId << 24 ) ^ index ) },
+            { "time_ns", Decimal( stage.timeNs ) }, { "thread_ref", stage.threadRef }, { "stage", JobStageName( stage.stage ) },
+            { "stage_id", stage.stage }, { "span_id", stage.spanId }, { "arg0", stage.arg0 }, { "arg1", stage.arg1 }, { "flags", stage.flags }
+        } );
+    }
+    result["dependencies"] = std::move( dependencies );
+    result["stages"] = std::move( stages );
+    return result;
+}
+
+json GfxDispatchJson( const analysis::GfxDispatchDto& value )
+{
+    return {
+        { "ref", value.ref }, { "dispatch_id", Decimal( value.dispatchId ) }, { "frame_index", Decimal( value.frameIndex ) },
+        { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef }, { "expected_jobs", value.expectedJobs },
+        { "threading_mode", value.threadingMode }, { "flags", value.flags }
+    };
+}
+
+json GfxEntityJson( const analysis::GfxEntityDto& value )
+{
+    return {
+        { "ref", value.ref }, { "entity_id", Decimal( value.entityId ) }, { "parent_id", Decimal( value.parentId ) },
+        { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef }, { "kind", GfxEntityKindName( value.kind ) },
+        { "kind_id", value.kind }, { "gpu_query_id", value.gpuQueryId }, { "gpu_context", value.gpuContext }, { "flags", value.flags }
+    };
+}
+
+json GfxLinkJson( const analysis::GfxLinkDto& value )
+{
+    return {
+        { "ref", value.ref }, { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+        { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef }, { "relation", GfxRelationName( value.relation ) },
+        { "relation_id", value.relation }, { "flags", value.flags }
     };
 }
 
@@ -746,7 +854,7 @@ json DescribeData( const json& selection = json::object() )
         if( method == "trace.open" ) required.emplace_back( "path" );
         else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
         else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" ) || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+        if( ( method.ends_with( ".get" ) && method != "frame.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
             method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
         if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
         if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
@@ -1016,7 +1124,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         auto limits = DescribeData()["limits"];
         limits["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         return Success( id, {
-            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.1" } },
+            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.2-JN" } },
             { "source_kinds", { "snapshot", "segment" } }, { "statistics_required", true },
             { "limits", std::move( limits ) }
         } );
@@ -1095,13 +1203,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     const auto requiredDomain = [&]() -> std::string {
+        if( method == "job.gfx.statistics" || method == "job.gfx_chain" ) return "job.gfx";
         if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
         if( method.rfind( "frame_image.", 0 ) == 0 ) return "frame_image";
         if( method.rfind( "hardware_sample.", 0 ) == 0 ) return "hardware_sample";
         if( method.rfind( "context_switch.", 0 ) == 0 ) return "context_switch";
         if( method.rfind( "zone.cpu.", 0 ) == 0 ) return "zone.cpu";
         if( method.rfind( "zone.gpu.", 0 ) == 0 ) return "zone.gpu";
-        for( const auto* domain : { "thread", "cpu", "frame", "timeline", "callstack", "sample", "symbol", "source", "memory", "lock", "plot", "message" } )
+        for( const auto* domain : { "thread", "cpu", "frame", "timeline", "callstack", "sample", "symbol", "source", "memory", "lock", "plot", "message", "job" } )
         {
             const std::string prefix = std::string( domain ) + '.';
             if( method.rfind( prefix, 0 ) == 0 ) return domain;
@@ -1856,12 +1965,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 if( index < attribution.passes.size() && passes.size() < DefaultPageSize ) passes.emplace_back( source->MakeEntityRef( "gpu-memory-pass", attribution.passes[index].passId ) );
             }
-            allocations.push_back( {
+            json allocationJson = {
                 { "allocation", MemoryEventJson( *event ) }, { "allocation_id", Decimal( item.allocation.allocationId ) },
                 { "request_label_id", item.requestLabelId ? json( Decimal( *item.requestLabelId ) ) : json( nullptr ) },
                 { "pass_ref_count", Decimal( item.passIndices.size() ) }, { "pass_refs", std::move( passes ) },
-                { "pass_refs_truncated", item.passIndices.size() > DefaultPageSize }, { "relation_state", relationState }
-            } );
+                { "pass_refs_truncated", item.passIndices.size() > DefaultPageSize }, { "relation_state", relationState },
+                { "logical_resource", nullptr }
+            };
+            if( item.allocation.poolName.rfind( "GPU D3D12 Logical ", 0 ) == 0 )
+            {
+                const auto logical = attribution.logicalById.find( item.allocation.allocationId );
+                if( logical != attribution.logicalById.end() )
+                {
+                    const auto& resource = attribution.logicalResources[logical->second];
+                    allocationJson["logical_resource"] = {
+                        { "logical_resource_id", Decimal( resource.logicalResourceId ) },
+                        { "physical_allocation_id", Decimal( resource.physicalAllocationId ) },
+                        { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
+                        { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
+                        { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
+                        { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                    };
+                }
+            }
+            allocations.emplace_back( std::move( allocationJson ) );
         }
         const auto returned = allocations.size();
         const auto cursor = NextCursor( page, method, trace, returned, hasMore );
@@ -1870,6 +1997,46 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             json passes = json::array(); for( size_t index = 0; index < std::min<size_t>( attribution.passes.size(), DefaultTopN ); index++ ) passes.emplace_back( GpuPassJson( *source, attribution.passes[index], false ) );
             data["pass_count"] = Decimal( attribution.passes.size() ); data["pass_preview"] = std::move( passes );
+            json logicalResources = json::array();
+            for( size_t index = 0; index < std::min<size_t>( attribution.logicalResources.size(), DefaultPageSize ); index++ )
+            {
+                const auto& resource = attribution.logicalResources[index];
+                logicalResources.push_back( {
+                    { "logical_resource_id", Decimal( resource.logicalResourceId ) }, { "physical_allocation_id", Decimal( resource.physicalAllocationId ) },
+                    { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
+                    { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
+                    { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
+                    { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                } );
+            }
+            json ownerRollups = json::array();
+            for( const auto& rollup : attribution.ownerRollups ) ownerRollups.push_back( {
+                { "taxonomy_id", Decimal( uint64_t( rollup.taxonomyId ) ) }, { "owned_physical_bytes", Decimal( rollup.physicalBytes ) },
+                { "physical_allocation_count", Decimal( rollup.physicalAllocationCount ) },
+                { "logical_resource_count", Decimal( rollup.logicalResourceCount ) }
+            } );
+            json workingSets = json::array();
+            for( size_t index = 0; index < std::min<size_t>( attribution.workingSets.size(), MaximumPageSize ); index++ )
+            {
+                const auto& workingSet = attribution.workingSets[index];
+                workingSets.push_back( {
+                    { "frame", Decimal( workingSet.frame ) }, { "taxonomy_id", Decimal( uint64_t( workingSet.taxonomyId ) ) },
+                    { "referenced_working_set_bytes", Decimal( workingSet.referencedPhysicalBytes ) },
+                    { "physical_allocation_count", Decimal( workingSet.physicalAllocationCount ) },
+                    { "logical_resource_count", Decimal( workingSet.logicalResourceCount ) }
+                } );
+            }
+            data["logical_resource_count"] = Decimal( attribution.logicalResources.size() );
+            data["logical_resources"] = std::move( logicalResources );
+            data["logical_resources_truncated"] = attribution.logicalResources.size() > DefaultPageSize;
+            data["owner_rollups"] = std::move( ownerRollups );
+            data["working_sets"] = std::move( workingSets );
+            data["working_sets_truncated"] = attribution.workingSets.size() > MaximumPageSize;
+            data["rollup_semantics"] = {
+                { "owner", "each physical allocation is counted once under one primary owner" },
+                { "working_set", "deduplicated by physical allocation within each frame and taxonomy node" },
+                { "sibling_sum", "working sets of sibling taxonomy nodes may overlap and must not be summed as physical total" }
+            };
         }
         return Success( id, std::move( data ), trace, PageJson( page, returned, cursor ) );
     }
@@ -2050,6 +2217,264 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         values = ProjectFields( std::move( values ), params );
         const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
         return Success( id, { { "messages", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+    }
+    if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
+    {
+        auto jobs = source->GetJobs();
+        const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
+        const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
+            if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
+            const auto value = params[parameter].get<std::string>();
+            const auto parsed = source->ParseEntityRef( value, "job" );
+            if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
+            return *parsed;
+        };
+
+        if( method == "job.search" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string kind = params.value( "kind", "" );
+            const std::string state = params.value( "state", "" );
+            jobs.erase( std::remove_if( jobs.begin(), jobs.end(), [&]( const auto& job ) {
+                const char* currentState = job.cancelled ? "cancelled" : job.incomplete ? "incomplete" : job.completedNs ? "completed" : job.truncated ? "truncated" : "scheduled";
+                return !TextMatches( job.name, params ) || ( !kind.empty() && kind != JobKindName( job.kind ) ) || ( !state.empty() && state != currentState );
+            } ), jobs.end() );
+            std::sort( jobs.begin(), jobs.end(), []( const auto& lhs, const auto& rhs ) { return lhs.scheduleNs != rhs.scheduleNs ? lhs.scheduleNs < rhs.scheduleNs : lhs.jobId < rhs.jobId; } );
+            const auto begin = std::min( page.offset, jobs.size() );
+            const auto end = std::min( begin + page.limit, jobs.size() );
+            json values = json::array();
+            for( size_t index = begin; index < end; index++ ) values.push_back( JobJson( *source, jobs[index], false ) );
+            values = ProjectFields( std::move( values ), params );
+            const auto cursor = NextCursor( page, method, trace, end - begin, end < jobs.size() );
+            return Success( id, { { "jobs", std::move( values ) } }, trace, PageJson( page, end - begin, cursor ) );
+        }
+
+        if( method == "job.get" )
+        {
+            const auto jobId = parseJobRef();
+            const auto job = findJob( jobId );
+            if( job == jobs.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+            return Success( id, JobJson( *source, *job, true ), trace );
+        }
+
+        if( method == "job.dependencies" )
+        {
+            const auto jobId = parseJobRef();
+            const auto job = findJob( jobId );
+            if( job == jobs.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+            json upstream = json::array();
+            for( const auto& dependency : job->dependencies )
+            {
+                const auto prerequisite = findJob( dependency.prerequisiteJobId );
+                upstream.push_back( prerequisite == jobs.end() ? json {
+                    { "ref", source->MakeEntityRef( "job", dependency.prerequisiteJobId ) }, { "job_id", Decimal( dependency.prerequisiteJobId ) }, { "missing", true }
+                } : JobJson( *source, *prerequisite, false ) );
+            }
+            json downstream = json::array();
+            for( const auto& candidate : jobs )
+            {
+                if( std::any_of( candidate.dependencies.begin(), candidate.dependencies.end(), [&]( const auto& dependency ) { return dependency.prerequisiteJobId == jobId; } ) )
+                    downstream.push_back( JobJson( *source, candidate, false ) );
+            }
+            return Success( id, { { "job", JobJson( *source, *job, false ) }, { "upstream", std::move( upstream ) }, { "downstream", std::move( downstream ) } }, trace );
+        }
+
+        if( method == "job.critical_path" )
+        {
+            if( jobs.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
+            std::unordered_map<uint64_t, size_t> indexById;
+            indexById.reserve( jobs.size() );
+            for( size_t index = 0; index < jobs.size(); index++ ) indexById.emplace( jobs[index].jobId, index );
+            std::vector<std::vector<size_t>> outgoing( jobs.size() );
+            std::vector<size_t> indegree( jobs.size(), 0 );
+            for( size_t index = 0; index < jobs.size(); index++ )
+            {
+                for( const auto& dependency : jobs[index].dependencies )
+                {
+                    const auto prerequisite = indexById.find( dependency.prerequisiteJobId );
+                    if( prerequisite == indexById.end() ) continue;
+                    outgoing[prerequisite->second].push_back( index );
+                    indegree[index]++;
+                }
+            }
+            std::queue<size_t> ready;
+            for( size_t index = 0; index < indegree.size(); index++ ) if( indegree[index] == 0 ) ready.push( index );
+            std::vector<int64_t> cost( jobs.size(), 0 );
+            std::vector<std::optional<size_t>> parent( jobs.size() );
+            size_t processed = 0;
+            while( !ready.empty() )
+            {
+                checkCancelled();
+                const auto current = ready.front();
+                ready.pop();
+                processed++;
+                cost[current] += std::max<int64_t>( jobs[current].executionNs, 0 );
+                for( const auto next : outgoing[current] )
+                {
+                    if( cost[next] < cost[current] )
+                    {
+                        cost[next] = cost[current];
+                        parent[next] = current;
+                    }
+                    if( --indegree[next] == 0 ) ready.push( next );
+                }
+            }
+            size_t endIndex;
+            if( params.contains( "ref" ) )
+            {
+                const auto requested = parseJobRef();
+                const auto found = indexById.find( requested );
+                if( found == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+                endIndex = found->second;
+            }
+            else
+            {
+                endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
+            }
+            std::vector<size_t> path;
+            for( std::optional<size_t> current = endIndex; current; current = parent[*current] ) path.push_back( *current );
+            std::reverse( path.begin(), path.end() );
+            json values = json::array();
+            for( const auto index : path ) values.push_back( JobJson( *source, jobs[index], false ) );
+            return Success( id, {
+                { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
+                { "has_cycle", processed != jobs.size() }, { "processed_jobs", processed }, { "total_jobs", jobs.size() }
+            }, trace );
+        }
+
+        if( method == "job.gfx.statistics" )
+        {
+            const auto dispatches = source->GetGfxDispatches();
+            const auto entities = source->GetGfxEntities();
+            const auto links = source->GetGfxLinks();
+            std::set<uint64_t> dispatchIds;
+            std::set<uint64_t> entityIds;
+            std::map<uint64_t, std::string> jobRefs;
+            json entitiesByKind = json::object();
+            json linksByRelation = json::object();
+            json sampleDispatchRef = nullptr;
+            json sampleEntityRef = nullptr;
+            json sampleLinkedJobRef = nullptr;
+            for( const auto& dispatch : dispatches )
+            {
+                dispatchIds.emplace( dispatch.dispatchId );
+                if( sampleDispatchRef.is_null() ) sampleDispatchRef = dispatch.ref;
+            }
+            for( const auto& entity : entities )
+            {
+                entityIds.emplace( entity.entityId );
+                const auto name = GfxEntityKindName( entity.kind );
+                entitiesByKind[name] = Decimal( entitiesByKind.contains( name ) ? std::stoull( entitiesByKind[name].get<std::string>() ) + 1 : 1 );
+                if( sampleEntityRef.is_null() ) sampleEntityRef = entity.ref;
+            }
+            for( const auto& job : jobs ) jobRefs.emplace( job.jobId, job.ref );
+
+            uint64_t danglingParents = 0;
+            for( const auto& entity : entities )
+            {
+                if( entity.parentId != 0 && !dispatchIds.contains( entity.parentId ) && !entityIds.contains( entity.parentId ) ) danglingParents++;
+            }
+            uint64_t danglingSources = 0;
+            uint64_t danglingTargets = 0;
+            uint64_t capturedExecuteLinks = 0;
+            uint64_t uncapturedExecuteLinks = 0;
+            for( const auto& link : links )
+            {
+                const auto relationName = GfxRelationName( link.relation );
+                linksByRelation[relationName] = Decimal( linksByRelation.contains( relationName ) ? std::stoull( linksByRelation[relationName].get<std::string>() ) + 1 : 1 );
+                const bool sourceKnown = dispatchIds.contains( link.sourceId ) || entityIds.contains( link.sourceId ) || jobRefs.contains( link.sourceId );
+                const bool targetKnown = dispatchIds.contains( link.targetId ) || entityIds.contains( link.targetId ) || jobRefs.contains( link.targetId );
+                if( !sourceKnown ) danglingSources++;
+                if( !targetKnown && link.relation != 5 ) danglingTargets++;
+                if( link.relation == 2 )
+                {
+                    const auto sourceJob = jobRefs.find( link.sourceId );
+                    const auto targetJob = jobRefs.find( link.targetId );
+                    if( sourceJob != jobRefs.end() || targetJob != jobRefs.end() )
+                    {
+                        capturedExecuteLinks++;
+                        if( sampleLinkedJobRef.is_null() ) sampleLinkedJobRef = sourceJob != jobRefs.end() ? sourceJob->second : targetJob->second;
+                    }
+                    else
+                    {
+                        uncapturedExecuteLinks++;
+                    }
+                }
+            }
+            return Success( id, {
+                { "counts", {
+                    { "dispatches", Decimal( dispatches.size() ) }, { "entities", Decimal( entities.size() ) },
+                    { "links", Decimal( links.size() ) }, { "jobs", Decimal( jobs.size() ) }
+                } },
+                { "entities_by_kind", std::move( entitiesByKind ) },
+                { "links_by_relation", std::move( linksByRelation ) },
+                { "integrity", {
+                    { "dangling_parent_entities", Decimal( danglingParents ) },
+                    { "dangling_link_sources", Decimal( danglingSources ) },
+                    { "dangling_link_targets", Decimal( danglingTargets ) },
+                    { "captured_execute_links", Decimal( capturedExecuteLinks ) },
+                    { "uncaptured_execute_links", Decimal( uncapturedExecuteLinks ) }
+                } },
+                { "samples", {
+                    { "dispatch_ref", std::move( sampleDispatchRef ) },
+                    { "entity_ref", std::move( sampleEntityRef ) },
+                    { "linked_job_ref", std::move( sampleLinkedJobRef ) }
+                } }
+            }, trace );
+        }
+
+        uint64_t rootId = 0;
+        if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+        const auto rootRef = params["ref"].get<std::string>();
+        for( const auto* kind : { "job", "gfx-dispatch", "gfx-entity" } )
+        {
+            const auto parsed = source->ParseEntityRef( rootRef, kind );
+            if( parsed ) { rootId = *parsed; break; }
+        }
+        if( rootId == 0 ) throw QueryError( "INVALID_PARAMS", "ref must identify a Job, GfxDispatch, or GfxEntity in this trace" );
+        const auto dispatches = source->GetGfxDispatches();
+        const auto entities = source->GetGfxEntities();
+        const auto links = source->GetGfxLinks();
+        std::unordered_map<uint64_t, std::vector<uint64_t>> adjacency;
+        for( const auto& link : links )
+        {
+            adjacency[link.sourceId].push_back( link.targetId );
+            adjacency[link.targetId].push_back( link.sourceId );
+        }
+        for( const auto& entity : entities ) if( entity.parentId != 0 )
+        {
+            adjacency[entity.entityId].push_back( entity.parentId );
+            adjacency[entity.parentId].push_back( entity.entityId );
+        }
+        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+        std::set<uint64_t> visited;
+        std::queue<uint64_t> frontier;
+        visited.emplace( rootId );
+        frontier.push( rootId );
+        bool truncated = false;
+        while( !frontier.empty() )
+        {
+            const auto current = frontier.front();
+            frontier.pop();
+            for( const auto next : adjacency[current] )
+            {
+                if( visited.size() >= maxNodes ) { truncated = true; break; }
+                if( visited.emplace( next ).second ) frontier.push( next );
+            }
+            if( truncated ) break;
+        }
+        json dispatchJson = json::array();
+        for( const auto& dispatch : dispatches ) if( visited.contains( dispatch.dispatchId ) ) dispatchJson.push_back( GfxDispatchJson( dispatch ) );
+        json entityJson = json::array();
+        for( const auto& entity : entities ) if( visited.contains( entity.entityId ) ) entityJson.push_back( GfxEntityJson( entity ) );
+        json linkJson = json::array();
+        for( const auto& link : links ) if( visited.contains( link.sourceId ) && visited.contains( link.targetId ) ) linkJson.push_back( GfxLinkJson( link ) );
+        json jobJson = json::array();
+        for( const auto& job : jobs ) if( visited.contains( job.jobId ) ) jobJson.push_back( JobJson( *source, job, false ) );
+        return Success( id, {
+            { "root_ref", rootRef }, { "jobs", std::move( jobJson ) }, { "dispatches", std::move( dispatchJson ) },
+            { "entities", std::move( entityJson ) }, { "links", std::move( linkJson ) }, { "visited_nodes", visited.size() }, { "truncated", truncated }
+        }, trace );
     }
     if( method == "callstack.resolve" || method == "callstack.frames" || method == "callstack.parent" || method == "callstack.batch" )
     {

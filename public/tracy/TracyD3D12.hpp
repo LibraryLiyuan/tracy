@@ -36,6 +36,7 @@ using TracyD3D12Ctx = void*;
 #include "../client/TracyProfiler.hpp"
 #include "../client/TracyCallstack.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cassert>
 #include <chrono>
@@ -60,6 +61,12 @@ namespace tracy
         uint64_t m_connectionId = 0;
     };
 
+    struct D3D12ReadyQuery
+    {
+        uint32_t m_queryId = 0;
+        ID3D12CommandList* m_commandList = nullptr;
+    };
+
     // Command queue context.
     class D3D12QueueCtx
     {
@@ -71,12 +78,23 @@ namespace tracy
         ID3D12QueryHeap* m_queryHeap = nullptr;
         ID3D12Resource* m_readbackBuffer = nullptr;
 
-        // In-progress payload.
+        enum QueryState : uint8_t
+        {
+            QueryFree,
+            QueryAllocated,
+            QueryReady,
+            QuerySubmitted
+        };
+
+        // Query pairs may be allocated by several recording threads while
+        // older command lists remain open.  Only pairs whose EndQuery and
+        // ResolveQueryData have been recorded are eligible for submission.
         uint32_t m_queryLimit = 0;
-        std::atomic<uint32_t> m_queryCounter = 0;
-        uint32_t m_previousQueryCounter = 0;
+        uint32_t m_nextQueryPair = 0;
         uint32_t m_allocatedQueries = 0;
         std::mutex m_queryLock;
+        std::vector<uint8_t> m_queryState;
+        std::vector<D3D12ReadyQuery> m_readyQueries;
 
         uint64_t m_activePayload = 0;
         ID3D12Fence* m_payloadFence = nullptr;
@@ -254,6 +272,8 @@ namespace tracy
                 return;
             }
             m_queryConnection.resize(m_queryLimit);
+            m_queryState.resize(m_queryLimit / 2, QueryFree);
+            m_readyQueries.reserve(m_queryLimit / 2);
 
             // Create a readback buffer, which will be used as a destination for the query data.
 
@@ -375,7 +395,7 @@ namespace tracy
         }
 
 
-        bool NewFrame()
+        bool NewFrame(ID3D12CommandList* const* submittedCommandLists = nullptr, uint32_t submittedCommandListCount = 0)
         {
             if (!m_valid || m_submissionFailed)
             {
@@ -385,32 +405,57 @@ namespace tracy
             std::vector<D3D12QueryPayload> payloads;
             {
                 std::lock_guard<std::mutex> lock(m_queryLock);
-                const auto queryCount = m_queryCounter.exchange(0);
-                if (queryCount == 0)
+                if (m_readyQueries.empty())
                 {
                     return true;
                 }
 
-                uint32_t queryOffset = 0;
-                while (queryOffset < queryCount)
+                payloads.reserve(m_readyQueries.size());
+                std::vector<D3D12ReadyQuery> pendingQueries;
+                if (submittedCommandLists != nullptr)
                 {
-                    D3D12QueryPayload payload;
-                    payload.m_queryIdStart = (m_previousQueryCounter + queryOffset) % m_queryLimit;
-                    payload.m_connectionId = m_queryConnection[payload.m_queryIdStart];
-                    payload.m_queryCount = 1;
-                    while (queryOffset + payload.m_queryCount < queryCount)
+                    pendingQueries.reserve(m_readyQueries.size());
+                }
+                for (const auto& readyQuery : m_readyQueries)
+                {
+                    const auto queryId = readyQuery.m_queryId;
+                    const auto pair = queryId / 2;
+                    if (pair >= m_queryState.size() || m_queryState[pair] != QueryReady)
                     {
-                        const auto queryId = (m_previousQueryCounter + queryOffset + payload.m_queryCount) % m_queryLimit;
-                        if (m_queryConnection[queryId] != payload.m_connectionId)
-                        {
-                            break;
-                        }
-                        payload.m_queryCount++;
+                        continue;
                     }
-                    queryOffset += payload.m_queryCount;
+                    bool submitted = submittedCommandLists == nullptr;
+                    for (uint32_t i = 0; !submitted && i < submittedCommandListCount; ++i)
+                    {
+                        submitted = readyQuery.m_commandList == submittedCommandLists[i];
+                    }
+                    if (!submitted)
+                    {
+                        pendingQueries.emplace_back(readyQuery);
+                        continue;
+                    }
+                    m_queryState[pair] = QuerySubmitted;
+                    D3D12QueryPayload payload;
+                    payload.m_queryIdStart = queryId;
+                    payload.m_connectionId = m_queryConnection[queryId];
+                    payload.m_queryCount = 2;
+                    if (!payloads.empty())
+                    {
+                        auto& previous = payloads.back();
+                        if (previous.m_connectionId == payload.m_connectionId &&
+                            previous.m_queryIdStart + previous.m_queryCount == payload.m_queryIdStart)
+                        {
+                            previous.m_queryCount += payload.m_queryCount;
+                            continue;
+                        }
+                    }
                     payloads.emplace_back(payload);
                 }
-                m_previousQueryCounter = (m_previousQueryCounter + queryCount) % m_queryLimit;
+                m_readyQueries.swap(pendingQueries);
+                if (payloads.empty())
+                {
+                    return true;
+                }
             }
 
             if (m_activePayload == UINT64_MAX - 1)
@@ -470,6 +515,8 @@ namespace tracy
                 }
                 std::lock_guard<std::mutex> lock(m_queryLock);
                 m_allocatedQueries = 0;
+                std::fill(m_queryState.begin(), m_queryState.end(), QueryFree);
+                m_readyQueries.clear();
                 m_submissionFailed = true;
                 return;
             }
@@ -524,6 +571,14 @@ namespace tracy
                     std::lock_guard<std::mutex> lock(m_queryLock);
                     assert(m_allocatedQueries >= payload.m_queryCount);
                     m_allocatedQueries -= payload.m_queryCount;
+                    for (uint32_t j = 0; j < payload.m_queryCount; j += 2)
+                    {
+                        const auto pair = (payload.m_queryIdStart + j) / 2;
+                        if (pair < m_queryState.size())
+                        {
+                            m_queryState[pair] = QueryFree;
+                        }
+                    }
                 }
                 m_payloadQueue.pop();
             }
@@ -545,23 +600,57 @@ namespace tracy
             return m_valid && !m_submissionFailed;
         }
 
+        // Stable identifiers used by integrations that correlate Tracy's
+        // physical GPU zones with a separate logical work graph.  These are
+        // deliberately read-only; timestamp allocation remains owned by this
+        // context.
+        tracy_force_inline uint8_t ContextId() const
+        {
+            return GetId();
+        }
+
     private:
         tracy_force_inline uint32_t NextQueryId(uint64_t connectionId)
         {
             std::lock_guard<std::mutex> lock(m_queryLock);
-            auto queryCounter = m_queryCounter.load(std::memory_order_relaxed);
             if (m_allocatedQueries > m_queryLimit - 2)
             {
                 TracyD3D12Error("Submitted too many GPU queries; dropping the zone.");
                 return UINT32_MAX;
             }
 
-            const uint32_t id = (m_previousQueryCounter + queryCounter) % m_queryLimit;
+            const auto pairCount = uint32_t(m_queryState.size());
+            uint32_t pair = m_nextQueryPair;
+            uint32_t scanned = 0;
+            while (scanned < pairCount && m_queryState[pair] != QueryFree)
+            {
+                pair = (pair + 1) % pairCount;
+                scanned++;
+            }
+            if (scanned == pairCount)
+            {
+                TracyD3D12Error("Submitted too many GPU queries; dropping the zone.");
+                return UINT32_MAX;
+            }
+
+            m_queryState[pair] = QueryAllocated;
+            m_nextQueryPair = (pair + 1) % pairCount;
+            const uint32_t id = pair * 2;
             m_queryConnection[id] = connectionId;
             m_queryConnection[id + 1] = connectionId;
-            m_queryCounter.store(queryCounter + 2, std::memory_order_relaxed);
             m_allocatedQueries += 2;
             return id;
+        }
+
+        tracy_force_inline void MarkQueryReady(uint32_t queryId, ID3D12GraphicsCommandList* commandList)
+        {
+            std::lock_guard<std::mutex> lock(m_queryLock);
+            const auto pair = queryId / 2;
+            if (pair < m_queryState.size() && m_queryState[pair] == QueryAllocated)
+            {
+                m_queryState[pair] = QueryReady;
+                m_readyQueries.push_back(D3D12ReadyQuery { queryId, static_cast<ID3D12CommandList*>(commandList) });
+            }
         }
 
         tracy_force_inline uint8_t GetId() const
@@ -577,13 +666,17 @@ namespace tracy
         ID3D12GraphicsCommandList* m_cmdList = nullptr;
         uint32_t m_queryId = 0;  // Used for tracking in nested zones.
         uint64_t m_connectionId = 0;
+        // QueueGpuZoneBegin/QueueGpuZoneEnd store a 32-bit Tracy thread handle.
+        // Keep the cached value the same width so MemWrite cannot overwrite the
+        // adjacent query/context/source-location fields in the packed queue item.
+        uint32_t m_thread = 0;
 
         tracy_force_inline void WriteQueueItem(QueueItem* item, QueueType type, uint64_t srcLocation)
         {
             MemWrite(&item->hdr.type, type);
             MemWrite(&item->gpuZoneBegin.cpuTime, Profiler::GetTime());
             MemWrite(&item->gpuZoneBegin.srcloc, srcLocation);
-            MemWrite(&item->gpuZoneBegin.thread, GetThreadHandle());
+            MemWrite(&item->gpuZoneBegin.thread, m_thread);
             MemWrite(&item->gpuZoneBegin.queryId, static_cast<uint16_t>(m_queryId));
             MemWrite(&item->gpuZoneBegin.context, m_ctx->GetId());
             Profiler::QueueSerialFinish();
@@ -604,6 +697,10 @@ namespace tracy
 
             m_ctx = ctx;
             m_cmdList = cmdList;
+            // A command list may be closed or submitted by a different CPU thread.
+            // Keep both GPU zone events on the recording thread so the server uses
+            // one consistent per-thread GPU nesting stack.
+            m_thread = GetThreadHandle();
             m_connectionId = m_ctx->CurrentConnectionId();
             if (!m_ctx->IsConnectionActive(m_connectionId))
             {
@@ -692,13 +789,29 @@ namespace tracy
             {
                 MemWrite(&item->hdr.type, QueueType::GpuZoneEndSerial);
                 MemWrite(&item->gpuZoneEnd.cpuTime, Profiler::GetTime());
-                MemWrite(&item->gpuZoneEnd.thread, GetThreadHandle());
+                MemWrite(&item->gpuZoneEnd.thread, m_thread);
                 MemWrite(&item->gpuZoneEnd.queryId, static_cast<uint16_t>(queryId));
                 MemWrite(&item->gpuZoneEnd.context, m_ctx->GetId());
                 Profiler::QueueSerialFinish();
             }
 
             m_cmdList->ResolveQueryData(m_ctx->m_queryHeap, D3D12_QUERY_TYPE_TIMESTAMP, m_queryId, 2, m_ctx->m_readbackBuffer, m_queryId * sizeof(uint64_t));
+            m_ctx->MarkQueryReady(m_queryId, m_cmdList);
+        }
+
+        tracy_force_inline bool IsActive() const
+        {
+            return m_active;
+        }
+
+        tracy_force_inline uint32_t QueryId() const
+        {
+            return m_active ? m_queryId : UINT32_MAX;
+        }
+
+        tracy_force_inline uint8_t ContextId() const
+        {
+            return m_active ? m_ctx->GetId() : uint8_t( 255 );
         }
     };
 

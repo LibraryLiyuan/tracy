@@ -942,6 +942,11 @@ bool View::DrawImpl()
         {
             m_showWaitStacks = true;
         }
+        const auto& jn = m_worker.GetJnTraceData();
+        if( ButtonDisablable( "Unity Jobs", !jn.present || jn.jobSchedules.empty() ) )
+        {
+            m_showJnJobs = true;
+        }
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -1170,6 +1175,7 @@ bool View::DrawImpl()
     if( m_showRanges ) DrawRanges();
     if( m_showWaitStacks ) DrawWaitStacks();
     if( m_showManual ) DrawManual();
+    if( m_showJnJobs ) DrawJnJobWindow();
 #ifndef __EMSCRIPTEN__
     if( m_llm.m_show ) m_llm.Draw();
 #endif

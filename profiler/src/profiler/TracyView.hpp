@@ -279,6 +279,48 @@ private:
         unordered_flat_map<uint64_t, std::vector<size_t>> passesByAllocation;
     };
 
+    struct JnJobViewData
+    {
+        uint64_t jobId = 0;
+        uint64_t packedHandle = 0;
+        uint64_t scheduleThread = 0;
+        int64_t scheduleTime = 0;
+        int64_t firstRunTime = -1;
+        int64_t completedTime = -1;
+        int64_t executionTime = 0;
+        int64_t waitActiveHelpTime = 0;
+        int64_t waitSpinYieldTime = 0;
+        int64_t waitSleepTime = 0;
+        uint32_t typeId = 0;
+        uint32_t count = 0;
+        uint32_t grainSize = 0;
+        uint32_t unityFlowId = 0;
+        uint32_t scheduleCallstack = 0;
+        uint16_t expectedDependencyCount = 0;
+        uint8_t kind = 0;
+        uint8_t flags = 0;
+        bool orphan = true;
+        bool cancelled = false;
+        bool incomplete = false;
+        std::vector<size_t> dependencies;
+        std::vector<size_t> stages;
+    };
+
+    struct JnJobThreadBounds
+    {
+        ImVec2 upperLeft;
+        ImVec2 lowerRight;
+    };
+
+    struct JnJobNavigationState
+    {
+        uint64_t jobId = 0;
+        uint64_t selectedThread = 0;
+        int64_t viewStart = 0;
+        int64_t viewEnd = 0;
+        float scrollY = 0;
+    };
+
     struct MemoryFrameSelection
     {
         bool active = false;
@@ -414,6 +456,12 @@ private:
     void DrawGpuMemoryPassesForSelectedFrame();
     void DrawGpuMemoryPassDetails( const GpuMemoryPass& pass, int& widgetId );
     void DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widgetId );
+    void RebuildJnJobView();
+    void DrawJnJobWindow();
+    void DrawJnJobTimelineOverlay( const ImVec2& timelinePos, double pxns, bool hover );
+    void NavigateToJnJobTime( uint64_t jobId, int64_t time, uint64_t thread, int64_t rangeStart, int64_t rangeEnd );
+    void RestoreJnJobNavigation();
+    const char* GetJnJobName( const JnJobViewData& job ) const;
     bool DrawGpuMemoryPassLink( const GpuMemoryPass& pass, int& widgetId );
     std::string FormatGpuMemoryUsage( uint32_t usageMask ) const;
 
@@ -649,6 +697,7 @@ private:
     bool m_showWaitStacks = false;
     bool m_showFlameGraph = false;
     bool m_showManual = false;
+    bool m_showJnJobs = false;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
     bool m_statSampleTime = true;
@@ -695,6 +744,21 @@ private:
 
     Vector<const ZoneEvent*> m_zoneInfoStack;
     Vector<const GpuEvent*> m_gpuInfoStack;
+
+    std::vector<JnJobViewData> m_jnJobs;
+    unordered_flat_map<uint64_t, size_t> m_jnJobById;
+    unordered_flat_map<uint32_t, uint64_t> m_jnJobTypeNames;
+    unordered_flat_map<uint64_t, JnJobThreadBounds> m_jnJobThreadBounds;
+    std::vector<JnJobNavigationState> m_jnJobNavigation;
+    ImGuiTextFilter m_jnJobFilter;
+    uint64_t m_selectedJnJob = 0;
+    size_t m_jnJobTypeCount = std::numeric_limits<size_t>::max();
+    size_t m_jnJobScheduleCount = std::numeric_limits<size_t>::max();
+    size_t m_jnJobConfigCount = std::numeric_limits<size_t>::max();
+    size_t m_jnJobDependencyCount = std::numeric_limits<size_t>::max();
+    size_t m_jnJobStageCount = std::numeric_limits<size_t>::max();
+    float m_jnTimelineScrollY = 0;
+    float m_jnPendingTimelineScrollY = -1;
 
     SourceContents m_srcHintCache;
     std::unique_ptr<SourceView> m_sourceView;

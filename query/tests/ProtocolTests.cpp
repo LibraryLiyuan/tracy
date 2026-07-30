@@ -62,6 +62,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "lock.timeline" ) params["lock_ref"] = "fake:lock:1";
     if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) params["plot_ref"] = "fake:plot:0";
     if( method == "message.get" ) params["ref"] = "fake:message:0";
+    if( method == "job.get" || method == "job.dependencies" || method == "job.gfx_chain" ) params["ref"] = "fake:job:1";
     if( method == "callstack.resolve" || method == "callstack.batch" ) params["callstacks"] = json::array( { "1" } );
     if( method == "callstack.frames" || method == "callstack.parent" ) params["callstack"] = "1";
     if( method == "symbol.get" || method == "symbol.raw_code" || method == "symbol.disassembly" ) params["ref"] = "fake:symbol:1";
@@ -111,7 +112,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 23 );
+    assert( coverage.at( "domains" ).size() == 25 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -148,6 +149,9 @@ int main()
     assert( fieldEntities.contains( "zone.cpu" ) );
     assert( fieldEntities.contains( "gpu.context" ) );
     assert( fieldEntities.contains( "hardware_sample" ) );
+    assert( fieldEntities.contains( "job" ) );
+    assert( fieldEntities.contains( "job.gfx.statistics" ) );
+    assert( fieldEntities.contains( "job.gfx_chain" ) );
     assert( fieldCoverage.at( "non_persisted" ).size() >= 3 );
 
     const auto mcpCoverage = LoadJson( TRACY_QUERY_MCP_COVERAGE_PATH );
@@ -185,17 +189,27 @@ int main()
     assert( snapshot.allocated.size() == 2 && snapshot.freed.size() == 2 && snapshot.transitions.size() == 3 );
 
     const std::vector<GpuMemoryCpuZoneInput> cpuMarkers = {
-        { 0, GpuMemoryRequestMarker, "Upload request", "GTMEM1|SCOPE|label=7|frame=3", 9, 0, 100 },
+        { 0, GpuMemoryRequestMarker, "Upload request", "GTMEM1|SCOPE|label=7|frame=3\nGTMEM1|RESOURCE|allocation=42|physical=100|bytes=4096|offset=256|owner=7|physical_owner=7|kind=T|segment=L|flags=0|name=VSM%20Atlas", 9, 0, 100 },
         { 1, GpuMemoryPassMarker, "RenderPass", "GTMEM1|PASS|pass=11|label=7|frame=3|level=1|ordinal=2|ops=draw|commands=4|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=42:T:3", 9, 20, 80 }
     };
     const std::vector<GpuMemoryGpuZoneInput> gpuMarkers = { { 0, "RenderPass", 9, 30, 1000, 2000 } };
-    const std::vector<GpuMemoryAllocationInput> gpuAllocations = { { { 5, 0 }, 42, 4096, 9, 50 } };
+    const std::vector<GpuMemoryAllocationInput> gpuAllocations = {
+        { { 5, 0 }, 100, 16384, 9, 40, "GPU D3D12 Physical Local Heap" },
+        { { 6, 0 }, 42, 4096, 9, 50, "GPU D3D12 Logical Texture" }
+    };
     const auto attribution = BuildGpuMemoryAttribution( cpuMarkers, gpuMarkers, gpuAllocations );
     assert( attribution.protocolPresent && attribution.complete );
-    assert( attribution.requestScopes.size() == 1 && attribution.passes.size() == 1 && attribution.allocations.size() == 1 );
+    assert( attribution.requestScopes.size() == 1 && attribution.passes.size() == 1 && attribution.allocations.size() == 2 );
     assert( attribution.passes[0].complete && attribution.passes[0].gpuPairing == GpuZonePairing::Exact );
     assert( attribution.passes[0].uses.size() == 1 && attribution.passes[0].uses[0].allocationId == 42 );
-    assert( attribution.allocations[0].requestLabelId == 7 && attribution.allocations[0].passIndices == std::vector<size_t> { 0 } );
+    const auto logicalAllocation = attribution.allocationById.at( 42 );
+    assert( attribution.allocations[logicalAllocation].requestLabelId == 7 && attribution.allocations[logicalAllocation].passIndices == std::vector<size_t> { 0 } );
+    assert( attribution.logicalResources.size() == 1 && attribution.logicalResources[0].logicalResourceId == 42 && attribution.logicalResources[0].physicalAllocationId == 100 );
+    assert( attribution.logicalResources[0].primaryOwnerId == 7 && attribution.logicalResources[0].physicalOwnerId == 7 );
+    assert( attribution.ownerRollups.size() == 1 && attribution.ownerRollups[0].taxonomyId == 7 );
+    assert( attribution.ownerRollups[0].physicalBytes == 16384 && attribution.ownerRollups[0].physicalAllocationCount == 1 && attribution.ownerRollups[0].logicalResourceCount == 1 );
+    assert( attribution.workingSets.size() == 1 && attribution.workingSets[0].frame == 3 && attribution.workingSets[0].taxonomyId == 7 );
+    assert( attribution.workingSets[0].referencedPhysicalBytes == 16384 && attribution.workingSets[0].physicalAllocationCount == 1 && attribution.workingSets[0].logicalResourceCount == 1 );
     assert( FormatGpuMemoryUsage( 3 ) == "Read/Write" );
 
     tracy::query::test::FakeTraceSource fake;
@@ -213,7 +227,9 @@ int main()
     assert( fake.ResolveCallstacks( { 1 }, 1 ).size() == 1 && fake.ResolveParentCallstacks( { 1 }, 1 ).size() == 1 );
     assert( fake.GetSourceResources().size() == 1 && fake.GetSymbolResources().size() == 1 && fake.GetFrameImageResources().size() == 1 );
     assert( fake.GetMemoryFrameSnapshot( 0, 0, {}, false ).valid );
-    assert( fake.GetMemoryEvent( { 1, 0 } ).has_value() && fake.GetGpuMemoryAttribution().allocations.size() == 1 );
+    assert( fake.GetMemoryEvent( { 1, 0 } ).has_value() && fake.GetGpuMemoryAttribution().allocations.size() == 2 );
+    assert( fake.GetGpuMemoryAttribution().logicalResources.size() == 1 && fake.GetGpuMemoryAttribution().ownerRollups.size() == 1 && fake.GetGpuMemoryAttribution().workingSets.size() == 1 );
+    assert( fake.GetJobs().size() == 2 && fake.GetGfxDispatches().size() == 1 && fake.GetGfxEntities().size() == 1 && fake.GetGfxLinks().size() == 1 );
     assert( fake.ReadEmbeddedSource( 0, 64 ).embedded && fake.ReadSymbolCode( 1, 64 ).bytes.size() == 1 && fake.ReadFrameImage( 0, 64 ).rgba.size() == 4 );
     assert( fake.ReadEmbeddedSourceBytes( 0, 0, 64 ).bytes.size() == 3 && fake.ReadSymbolCodeBytes( 1, 0, 64 ).bytes.size() == 1 && fake.ReadFrameImageBc1( 0, 0, 64 ).bytes.size() == 8 );
     assert( fake.GetHardwareSampleEvents( 1, "all", 0, 1 ).front().timeNs == 33 );

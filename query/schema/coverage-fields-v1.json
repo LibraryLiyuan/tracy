@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "trace_format": "Tracy 0.9.0-0.13.1",
+  "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
   "source_audit": [
@@ -488,6 +488,33 @@
       ],
       "unmapped_fields": [],
       "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities"],
+      "status": "complete"
+    },
+    {
+      "entity": "job",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["type", "schedule", "config", "dependency", "stage"],
+      "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "dependencies", "stages", "first_run_ns", "completed_ns", "execution_ns", "wait", "orphan", "truncated"],
+      "unmapped_fields": [],
+      "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path"],
+      "status": "complete"
+    },
+    {
+      "entity": "job.gfx.statistics",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["gfx_dispatch", "gfx_entity", "gfx_link", "job_schedule"],
+      "query_fields": ["counts", "entities_by_kind", "links_by_relation", "integrity", "samples"],
+      "unmapped_fields": [],
+      "methods": ["job.gfx.statistics"],
+      "status": "complete"
+    },
+    {
+      "entity": "job.gfx_chain",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["gfx_dispatch", "gfx_entity", "gfx_link"],
+      "query_fields": ["root_ref", "jobs", "dispatches", "entities", "links", "visited_nodes", "truncated"],
+      "unmapped_fields": [],
+      "methods": ["job.gfx_chain"],
       "status": "complete"
     },
     {

@@ -44,6 +44,10 @@ public:
     std::vector<std::string> ScanLocks( const analysis::ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const analysis::ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
+    std::vector<analysis::JobDto> GetJobs() const override;
+    std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override;
+    std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
+    std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
     analysis::CrashDto GetCrash() const override;
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override;
     std::vector<analysis::CpuUsagePointDto> GetCpuUsage() const override;

@@ -50,7 +50,7 @@ class WorkerTraceSource final : public TraceSource
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
 
-    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {} );
+    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {} );
     static WorkerLoadProgress GetLoadProgress();
     ~WorkerTraceSource() override;
 
@@ -77,6 +77,10 @@ public:
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
+    std::vector<JobDto> GetJobs() const override;
+    std::vector<GfxDispatchDto> GetGfxDispatches() const override;
+    std::vector<GfxEntityDto> GetGfxEntities() const override;
+    std::vector<GfxLinkDto> GetGfxLinks() const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;

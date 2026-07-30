@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "trace_format": "Tracy 0.9.0-0.13.1",
+  "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
   "field_status": "complete",
@@ -30,6 +30,8 @@
     { "domain": "lock", "worker_data": ["lockMap"], "methods": ["lock.list", "lock.get", "lock.timeline", "lock.contention_statistics"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "plot", "worker_data": ["plots"], "methods": ["plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics"], "status": "complete", "tests": ["FakeTraceSource", "bounded statistics contract"] },
     { "domain": "message", "worker_data": ["messages", "thread messages"], "methods": ["message.search", "message.get"], "status": "complete", "tests": ["FakeTraceSource", "untrusted-data contract"] },
+    { "domain": "job", "worker_data": ["JnTraceData jobTypes/jobSchedules/jobConfigs/jobDependencies/jobStages"], "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path"], "status": "complete", "tests": ["FakeTraceSource", "JN synthetic capture save/load"] },
+    { "domain": "job.gfx", "worker_data": ["JnTraceData gfxDispatches/gfxEntities/gfxLinks"], "methods": ["job.gfx.statistics", "job.gfx_chain"], "status": "complete", "tests": ["FakeTraceSource", "JN synthetic capture save/load"] },
     { "domain": "statistics", "worker_data": ["derived indexes"], "methods": ["statistics.describe", "statistics.compute"], "status": "complete", "tests": ["deterministic percentile/statistics unit"] },
     { "domain": "compare", "worker_data": ["two trace sessions"], "methods": ["compare.zones", "compare.frames", "compare.source"], "status": "complete", "tests": ["Fresh1/Fresh2 MCP integration"] },
     { "domain": "validation", "worker_data": ["all persisted domains"], "methods": ["validation.run"], "status": "complete", "tests": ["Worker integration", "asynchronous job integration"] }

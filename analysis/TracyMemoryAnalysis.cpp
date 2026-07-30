@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <set>
 #include <sstream>
 
@@ -199,6 +200,7 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     const std::vector<GpuMemoryGpuZoneInput>& gpuZones, const std::vector<GpuMemoryAllocationInput>& allocations )
 {
     GpuMemoryAttribution result;
+    std::unordered_map<uint64_t, GpuMemoryLogicalResource> logicalMetadata;
     for( const auto& zone : cpuZones )
     {
         const bool requestMarker = zone.markerName == GpuMemoryRequestMarker;
@@ -207,13 +209,37 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         result.protocolPresent = true;
         if( requestMarker )
         {
-            const auto lineEnd = zone.text.find( '\n' );
-            const auto line = zone.text.substr( 0, lineEnd );
-            if( !StartsWith( line, "GTMEM1|SCOPE|" ) ) continue;
-            GpuMemoryRequestScope scope;
-            scope.labelId = UnsignedField( line, "label" ); scope.frame = UnsignedField( line, "frame" );
-            scope.thread = zone.thread; scope.start = zone.startNs; scope.end = zone.endNs; scope.name = zone.name; scope.cpuZoneIndex = zone.zoneIndex;
-            result.requestScopes.emplace_back( std::move( scope ) );
+            size_t cursor = 0;
+            while( cursor <= zone.text.size() )
+            {
+                const auto lineEnd = zone.text.find( '\n', cursor );
+                const auto line = zone.text.substr( cursor, lineEnd == std::string::npos ? std::string::npos : lineEnd - cursor );
+                if( StartsWith( line, "GTMEM1|SCOPE|" ) )
+                {
+                    GpuMemoryRequestScope scope;
+                    scope.labelId = UnsignedField( line, "label" ); scope.frame = UnsignedField( line, "frame" );
+                    scope.thread = zone.thread; scope.start = zone.startNs; scope.end = zone.endNs; scope.name = zone.name; scope.cpuZoneIndex = zone.zoneIndex;
+                    result.requestScopes.emplace_back( std::move( scope ) );
+                }
+                else if( StartsWith( line, "GTMEM1|RESOURCE|" ) )
+                {
+                    GpuMemoryLogicalResource resource;
+                    resource.logicalResourceId = UnsignedField( line, "allocation" );
+                    resource.physicalAllocationId = UnsignedField( line, "physical" );
+                    resource.size = UnsignedField( line, "bytes" );
+                    resource.physicalOffset = UnsignedField( line, "offset" );
+                    resource.primaryOwnerId = uint32_t( UnsignedField( line, "owner" ) );
+                    resource.physicalOwnerId = uint32_t( UnsignedField( line, "physical_owner" ) );
+                    resource.flags = uint32_t( UnsignedField( line, "flags" ) );
+                    const auto kind = Field( line, "kind" ); if( !kind.empty() ) resource.kind = kind.front();
+                    const auto segment = Field( line, "segment" ); if( !segment.empty() ) resource.segment = segment.front();
+                    resource.name = zone.name;
+                    if( resource.logicalResourceId != 0 && resource.physicalAllocationId != 0 )
+                        logicalMetadata[resource.logicalResourceId] = std::move( resource );
+                }
+                if( lineEnd == std::string::npos ) break;
+                cursor = lineEnd + 1;
+            }
             continue;
         }
 
@@ -267,6 +293,14 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         if( header ) result.passes.emplace_back( std::move( pass ) );
     }
 
+    result.logicalResources.reserve( logicalMetadata.size() );
+    for( auto& [logicalId, resource] : logicalMetadata ) result.logicalResources.emplace_back( std::move( resource ) );
+    std::sort( result.logicalResources.begin(), result.logicalResources.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.logicalResourceId < rhs.logicalResourceId;
+    } );
+    for( size_t index = 0; index < result.logicalResources.size(); index++ )
+        result.logicalById[result.logicalResources[index].logicalResourceId] = index;
+
     std::sort( result.requestScopes.begin(), result.requestScopes.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.thread != rhs.thread ? lhs.thread < rhs.thread : lhs.start < rhs.start;
     } );
@@ -287,8 +321,17 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
                 if( scope.end < allocation.allocationNs ) break;
             }
         }
-        result.allocationById[allocation.allocationId] = result.allocations.size();
+        const bool logicalPool = StartsWith( allocation.poolName, "GPU D3D12 Logical " );
+        if( logicalPool || result.allocationById.find( allocation.allocationId ) == result.allocationById.end() )
+            result.allocationById[allocation.allocationId] = result.allocations.size();
         result.allocations.emplace_back( std::move( attributed ) );
+    }
+
+    for( const auto& resource : result.logicalResources )
+    {
+        if( resource.primaryOwnerId == 0 ) continue;
+        const auto allocation = result.allocationById.find( resource.logicalResourceId );
+        if( allocation != result.allocationById.end() ) result.allocations[allocation->second].requestLabelId = resource.primaryOwnerId;
     }
 
     for( size_t passIndex = 0; passIndex < result.passes.size(); passIndex++ )
@@ -300,6 +343,65 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
             const auto allocation = result.allocationById.find( use.allocationId );
             if( allocation != result.allocationById.end() ) result.allocations[allocation->second].passIndices.emplace_back( passIndex );
         }
+    }
+
+    std::unordered_map<uint64_t, uint64_t> physicalSizes;
+    for( const auto& allocation : allocations )
+    {
+        if( StartsWith( allocation.poolName, "GPU D3D12 Physical " ) )
+            physicalSizes[allocation.allocationId] = std::max( physicalSizes[allocation.allocationId], allocation.size );
+    }
+    for( const auto& resource : result.logicalResources )
+        physicalSizes[resource.physicalAllocationId] = std::max( physicalSizes[resource.physicalAllocationId], resource.size );
+
+    std::map<uint32_t, std::set<uint64_t>> ownerPhysicalIds;
+    std::map<uint32_t, std::set<uint64_t>> ownerLogicalIds;
+    for( const auto& resource : result.logicalResources )
+    {
+        if( resource.primaryOwnerId != 0 ) ownerLogicalIds[resource.primaryOwnerId].insert( resource.logicalResourceId );
+        uint32_t physicalOwner = resource.physicalOwnerId;
+        if( physicalOwner == 0 && resource.physicalAllocationId == resource.logicalResourceId ) physicalOwner = resource.primaryOwnerId;
+        if( physicalOwner != 0 ) ownerPhysicalIds[physicalOwner].insert( resource.physicalAllocationId );
+    }
+    std::set<uint32_t> ownerIds;
+    for( const auto& [owner, values] : ownerPhysicalIds ) ownerIds.insert( owner );
+    for( const auto& [owner, values] : ownerLogicalIds ) ownerIds.insert( owner );
+    for( const auto owner : ownerIds )
+    {
+        GpuMemoryOwnerRollup rollup; rollup.taxonomyId = owner;
+        const auto physical = ownerPhysicalIds.find( owner );
+        if( physical != ownerPhysicalIds.end() )
+        {
+            rollup.physicalAllocationCount = physical->second.size();
+            for( const auto id : physical->second ) rollup.physicalBytes += physicalSizes[id];
+        }
+        const auto logical = ownerLogicalIds.find( owner );
+        if( logical != ownerLogicalIds.end() ) rollup.logicalResourceCount = logical->second.size();
+        result.ownerRollups.emplace_back( rollup );
+    }
+
+    using WorkingSetKey = std::pair<uint64_t, uint32_t>;
+    std::map<WorkingSetKey, std::set<uint64_t>> workingPhysicalIds;
+    std::map<WorkingSetKey, std::set<uint64_t>> workingLogicalIds;
+    for( const auto& pass : result.passes )
+    {
+        const WorkingSetKey key { pass.frame, uint32_t( pass.labelId ) };
+        for( const auto& use : pass.uses )
+        {
+            const auto logical = result.logicalById.find( use.allocationId );
+            if( logical == result.logicalById.end() ) continue;
+            const auto& resource = result.logicalResources[logical->second];
+            workingLogicalIds[key].insert( resource.logicalResourceId );
+            workingPhysicalIds[key].insert( resource.physicalAllocationId );
+        }
+    }
+    for( const auto& [key, physicalIds] : workingPhysicalIds )
+    {
+        GpuMemoryWorkingSet workingSet; workingSet.frame = key.first; workingSet.taxonomyId = key.second;
+        workingSet.physicalAllocationCount = physicalIds.size();
+        for( const auto id : physicalIds ) workingSet.referencedPhysicalBytes += physicalSizes[id];
+        workingSet.logicalResourceCount = workingLogicalIds[key].size();
+        result.workingSets.emplace_back( workingSet );
     }
 
     std::unordered_map<std::string, std::vector<const GpuMemoryGpuZoneInput*>> gpuByName;

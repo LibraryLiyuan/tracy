@@ -37,7 +37,7 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override
     {
         std::vector<analysis::Capability> result;
-        for( const auto* domain : { "system", "trace", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "statistics", "compare", "validation" } )
+        for( const auto* domain : { "system", "trace", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "statistics", "compare", "validation" } )
         {
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
@@ -65,6 +65,8 @@ public:
         value.counts.memoryEvents = value.counts.memoryPools = value.counts.contextSwitches = 1;
         value.counts.callstackPayloads = value.counts.callstackFrames = value.counts.samples = 1;
         value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = 1;
+        value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
+        value.counts.gfxDispatches = value.counts.gfxEntities = value.counts.gfxLinks = 1;
         return value;
     }
 
@@ -137,6 +139,39 @@ public:
     std::vector<std::string> ScanLocks( const analysis::ScanRange& range ) const override { return Page( { MakeEntityRef( "lock", 1 ) }, range ); }
     std::vector<std::string> ScanContextSwitches( const analysis::ScanRange& range ) const override { return Page( { MakeEntityRef( "context-switch", 0 ) }, range ); }
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override { return Page( { MakeEntityRef( "sample", 0 ) }, range ); }
+    std::vector<analysis::JobDto> GetJobs() const override
+    {
+        analysis::JobDto value;
+        value.ref = MakeEntityRef( "job", 1 ); value.jobId = 1; value.packedHandle = ( uint64_t( 1 ) << 32 ) | 7;
+        value.name = "Fake.ManagedJob"; value.typeId = 1; value.kind = 1; value.scheduleNs = 10;
+        value.scheduleThreadRef = MakeEntityRef( "thread", 1 ); value.count = 64; value.grainSize = 16; value.unityFlowId = 1001;
+        value.firstRunNs = 20; value.completedNs = 40; value.executionNs = 20;
+        value.dependencies = { { 2, ( uint64_t( 1 ) << 32 ) | 8, 0 } };
+        value.stages = {
+            { 20, MakeEntityRef( "thread", 1 ), 1, 0, 16, 2, 0 },
+            { 40, MakeEntityRef( "thread", 1 ), 1, 0, 16, 3, 0 },
+            { 40, MakeEntityRef( "thread", 1 ), 1, 0, 0, 6, 0 }
+        };
+        analysis::JobDto prerequisite = value;
+        prerequisite.ref = MakeEntityRef( "job", 2 ); prerequisite.jobId = 2; prerequisite.name = "Fake.Prerequisite";
+        prerequisite.dependencies.clear(); prerequisite.scheduleNs = 1; prerequisite.firstRunNs = 2; prerequisite.completedNs = 9; prerequisite.executionNs = 7;
+        return { prerequisite, value };
+    }
+    std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override
+    {
+        const uint64_t id = uint64_t( 1 ) << 63;
+        return { { MakeEntityRef( "gfx-dispatch", id ), id, 1, 41, MakeEntityRef( "thread", 1 ), 1, 1, 0 } };
+    }
+    std::vector<analysis::GfxEntityDto> GetGfxEntities() const override
+    {
+        const uint64_t dispatch = uint64_t( 1 ) << 63;
+        return { { MakeEntityRef( "gfx-entity", dispatch + 1 ), dispatch + 1, dispatch, 42, MakeEntityRef( "thread", 1 ), 0, 0, 1, 0 } };
+    }
+    std::vector<analysis::GfxLinkDto> GetGfxLinks() const override
+    {
+        const uint64_t entity = ( uint64_t( 1 ) << 63 ) + 1;
+        return { { MakeEntityRef( "gfx-link", 0 ), 1, entity, 42, MakeEntityRef( "thread", 1 ), 2, 0 } };
+    }
 
     analysis::CrashDto GetCrash() const override { analysis::CrashDto value; value.present = true; value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 90; value.message = "fake crash"; return value; }
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override
@@ -195,11 +230,14 @@ public:
     {
         return analysis::BuildGpuMemoryAttribution(
             {
-                { 0, analysis::GpuMemoryRequestMarker, "Fake request", "GTMEM1|SCOPE|label=7|frame=0", 1, 0, 100 },
+                { 0, analysis::GpuMemoryRequestMarker, "Fake request", "GTMEM1|SCOPE|label=7|frame=0\nGTMEM1|RESOURCE|allocation=7|physical=70|bytes=64|offset=0|owner=7|physical_owner=7|kind=T|segment=L|flags=0|name=Fake", 1, 0, 100 },
                 { 0, analysis::GpuMemoryPassMarker, "Fake pass", "GTMEM1|PASS|pass=11|label=7|frame=0|level=1|ordinal=0|ops=draw|commands=1|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=7:T:3", 1, 10, 90 }
             },
             { { 0, "Fake pass", 1, 20, 1000, 2000 } },
-            { { { 1, 0 }, 7, 64, 1, 12 } } );
+            {
+                { { 1, 0 }, 70, 64, 1, 11, "GPU D3D12 Physical Local Committed" },
+                { { 2, 0 }, 7, 64, 1, 12, "GPU D3D12 Logical Texture" }
+            } );
     }
     analysis::SourceTextDto ReadEmbeddedSource( size_t id, size_t maxBytes ) const override { return id == 0 && maxBytes ? analysis::SourceTextDto { MakeEntityRef( "source-file", 0 ), "fake.cpp", "void Fake() {}\n", true, m_truncatedSource } : analysis::SourceTextDto {}; }
     analysis::BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t id, size_t offset, size_t maxBytes ) const override

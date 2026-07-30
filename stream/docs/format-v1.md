@@ -147,12 +147,14 @@ version 1 is the legacy layout; current writers emit version 2:
 | 24 | variable | address bytes, without a terminator |
 
 Session flag bit 0 (`SessionBeginFlagDeferredSymbolExpansion`) means the live
-recorder used ProtocolOnly's deferred optional symbol-expansion mode from the
-start of the session. Replay must select that mode and the recorder drain
-completion predicate before processing any client frames. This makes an
-in-progress revision deterministic even though its v4 `BeginDrain` record does
-not exist yet. Unknown v2 flag bits are rejected. A payload-level version bump
-does not change the journal file format, which remains version 1.0.
+recorder deferred optional symbol and source-file expansion from the start of
+the session. Capture sets it for every journal, including simultaneous
+snapshot+journal recording, because local source availability and the current
+working directory are not replay-stable. Replay must select that mode and the
+recorder drain completion predicate before processing any client frames. This
+makes an in-progress revision deterministic even though its v4 `BeginDrain`
+record does not exist yet. Unknown v2 flag bits are rejected. A payload-level
+version bump does not change the journal file format, which remains version 1.0.
 
 `Checkpoint` has a 24-byte payload: version and size at offsets 0 and 2,
 reserved bytes 4–7, cumulative client bytes at offset 8, and cumulative server

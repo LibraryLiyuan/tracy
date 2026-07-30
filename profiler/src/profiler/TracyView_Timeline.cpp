@@ -333,6 +333,12 @@ void View::DrawTimeline()
     ImGui::SetNextWindowContentSize( ImVec2( 0, m_tc.GetHeight() ) );
     ImGui::BeginChild( "##zoneWin", ImVec2( ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y ), false, ImGuiWindowFlags_AlwaysVerticalScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
 
+    if( m_jnPendingTimelineScrollY >= 0 )
+    {
+        ImGui::SetScrollY( m_jnPendingTimelineScrollY );
+        m_jnPendingTimelineScrollY = -1;
+    }
+
     const auto verticallyCenterTimeline = true;
 
     if( m_yDelta != 0 )
@@ -404,7 +410,10 @@ void View::DrawTimeline()
     }
 
     const auto vcenter = verticallyCenterTimeline && drawMouseLine && m_viewMode == ViewMode::Paused;
+    m_jnJobThreadBounds.clear();
     m_tc.End( pxns, wpos, hover, vcenter, yMin, yMax );
+    m_jnTimelineScrollY = ImGui::GetScrollY();
+    DrawJnJobTimelineOverlay( wpos, pxns, hover );
     ImGui::EndChild();
 
     m_lockHighlight = m_nextLockHighlight;

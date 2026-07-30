@@ -203,6 +203,7 @@ void View::DrawThreadMessagesList( const TimelineContext& ctx, const std::vector
 void View::DrawThreadOverlays( const ThreadData& thread, const ImVec2& ul, const ImVec2& dr )
 {
     auto draw = ImGui::GetWindowDrawList();
+    m_jnJobThreadBounds[thread.id] = JnJobThreadBounds { ul, dr };
 
     if( m_gpuThread == thread.id )
     {

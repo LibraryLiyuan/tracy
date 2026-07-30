@@ -19,6 +19,7 @@
 #include "../public/common/TracySocket.hpp"
 #include "tracy_robin_hood.h"
 #include "TracyEvent.hpp"
+#include "TracyJnData.hpp"
 #include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -91,7 +92,8 @@ struct LoadProgress
         Symbols,
         SymbolCode,
         HardwareSamples,
-        SourceCache
+        SourceCache,
+        JnJobs
     };
 
     LoadProgress() : total( 0 ), progress( 0 ), subTotal( 0 ), subProgress( 0 ) {}
@@ -414,6 +416,7 @@ private:
         bool hasBranchRetirement = false;
 
         unordered_flat_map<uint64_t, uint64_t> fiberToThreadMap;
+        JnTraceData jnTrace;
     };
 
     struct MbpsBlock
@@ -596,6 +599,8 @@ public:
     const unordered_flat_map<uint64_t, MemData*>& GetMemNameMap() const { return m_data.memNameMap; }
     const Vector<short_ptr<FrameImage>>& GetFrameImages() const { return m_data.frameImage; }
     const Vector<StringRef>& GetAppInfo() const { return m_data.appInfo; }
+    const JnTraceData& GetJnTraceData() const { return m_data.jnTrace; }
+    bool HasJnTraceData() const { return m_data.jnTrace.present; }
 
     const VarArray<CallstackFrameId>& GetCallstack( uint32_t idx ) const { return *m_data.callstackPayload[idx]; }
     const CallstackFrameData* GetCallstackFrame( const CallstackFrameId& ptr ) const;
@@ -888,6 +893,14 @@ private:
     tracy_force_inline void ProcessThreadGroupHint( const QueueThreadGroupHint& ev );
     tracy_force_inline void ProcessFiberEnter( const QueueFiberEnter& ev );
     tracy_force_inline void ProcessFiberLeave( const QueueFiberLeave& ev );
+    tracy_force_inline void ProcessJnJobType( const QueueJnJobType& ev );
+    tracy_force_inline void ProcessJnJobSchedule( const QueueJnJobSchedule& ev );
+    tracy_force_inline void ProcessJnJobConfig( const QueueJnJobConfig& ev );
+    tracy_force_inline void ProcessJnJobDependency( const QueueJnJobDependency& ev );
+    tracy_force_inline void ProcessJnJobStage( const QueueJnJobStage& ev );
+    tracy_force_inline void ProcessJnGfxDispatch( const QueueJnGfxDispatch& ev );
+    tracy_force_inline void ProcessJnGfxEntity( const QueueJnGfxEntity& ev );
+    tracy_force_inline void ProcessJnGfxLink( const QueueJnGfxLink& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );

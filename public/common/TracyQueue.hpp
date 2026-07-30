@@ -113,6 +113,14 @@ enum class QueueType : uint8_t
     MemNamePayload,
     ThreadGroupHint,
     GpuZoneAnnotation,
+    JnJobType,
+    JnJobSchedule,
+    JnJobConfig,
+    JnJobDependency,
+    JnJobStage,
+    JnGfxDispatch,
+    JnGfxEntity,
+    JnGfxLink,
     StringData,
     ThreadName,
     PlotName,
@@ -456,6 +464,138 @@ struct QueueGpuZoneAnnotation
     uint32_t thread;
     uint16_t queryId;
     uint8_t context;
+};
+
+enum class JnJobKind : uint8_t
+{
+    Native,
+    Managed,
+    Burst,
+    Gfx
+};
+
+enum class JnJobStage : uint8_t
+{
+    PreExecuteBegin,
+    PreExecuteEnd,
+    WorkerSliceBegin,
+    WorkerSliceEnd,
+    PostExecuteBegin,
+    PostExecuteEnd,
+    Completed,
+    WaitBegin,
+    WaitActiveHelpBegin,
+    WaitActiveHelpEnd,
+    WaitSpinYieldBegin,
+    WaitSpinYieldEnd,
+    WaitSleepBegin,
+    WaitSleepEnd,
+    WaitEnd,
+    FlowBegin,
+    FlowNext,
+    FlowParallelNext,
+    FlowEnd,
+    Cancelled,
+    Incomplete,
+    ScheduleCallstack
+};
+
+enum class JnGfxEntityKind : uint8_t
+{
+    GfxDispatch,
+    GfxJob,
+    CommandList,
+    Submission,
+    GpuSegment
+};
+
+enum class JnGfxRelation : uint8_t
+{
+    Parent,
+    Dispatches,
+    Executes,
+    Produces,
+    Submits,
+    RunsOnGpu,
+    DependsOn
+};
+
+struct QueueJnJobType
+{
+    uint64_t name;
+    uint32_t typeId;
+    uint8_t kind;
+    uint8_t flags;
+};
+
+struct QueueJnJobSchedule
+{
+    int64_t time;
+    uint64_t jobId;
+    uint64_t packedHandle;
+    uint16_t dependencyCount;
+    uint8_t kind;
+    uint8_t flags;
+};
+
+struct QueueJnJobConfig
+{
+    uint64_t jobId;
+    uint32_t typeId;
+    uint32_t count;
+    uint32_t grainSize;
+    uint32_t unityFlowId;
+    uint8_t kind;
+    uint8_t flags;
+};
+
+struct QueueJnJobDependency
+{
+    uint64_t jobId;
+    uint64_t prerequisiteJobId;
+    uint64_t prerequisiteHandle;
+    uint8_t flags;
+};
+
+struct QueueJnJobStage
+{
+    int64_t time;
+    uint64_t jobId;
+    uint32_t spanId;
+    uint32_t arg0;
+    uint32_t arg1;
+    uint8_t stage;
+    uint8_t flags;
+};
+
+struct QueueJnGfxDispatch
+{
+    int64_t time;
+    uint64_t dispatchId;
+    uint64_t frameIndex;
+    uint32_t expectedJobs;
+    uint8_t threadingMode;
+    uint8_t flags;
+};
+
+struct QueueJnGfxEntity
+{
+    int64_t time;
+    uint64_t entityId;
+    uint64_t parentId;
+    uint32_t gpuQueryId;
+    uint8_t gpuContext;
+    uint8_t kind;
+    uint8_t flags;
+};
+
+struct QueueJnGfxLink
+{
+    int64_t time;
+    uint64_t sourceId;
+    uint64_t targetId;
+    uint8_t relation;
+    uint8_t flags;
 };
 
 struct QueueGpuTime
@@ -816,6 +956,14 @@ struct QueueItem
         QueueFiberEnter fiberEnter;
         QueueFiberLeave fiberLeave;
         QueueGpuZoneAnnotation zoneAnnotation;
+        QueueJnJobType jnJobType;
+        QueueJnJobSchedule jnJobSchedule;
+        QueueJnJobConfig jnJobConfig;
+        QueueJnJobDependency jnJobDependency;
+        QueueJnJobStage jnJobStage;
+        QueueJnGfxDispatch jnGfxDispatch;
+        QueueJnGfxEntity jnGfxEntity;
+        QueueJnGfxLink jnGfxLink;
     };
 };
 #pragma pack( pop )
@@ -929,6 +1077,14 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueMemNamePayload ),
     sizeof( QueueHeader ) + sizeof( QueueThreadGroupHint ),
     sizeof( QueueHeader ) + sizeof( QueueGpuZoneAnnotation ), // GPU zone annotation
+    sizeof( QueueHeader ) + sizeof( QueueJnJobType ),
+    sizeof( QueueHeader ) + sizeof( QueueJnJobSchedule ),
+    sizeof( QueueHeader ) + sizeof( QueueJnJobConfig ),
+    sizeof( QueueHeader ) + sizeof( QueueJnJobDependency ),
+    sizeof( QueueHeader ) + sizeof( QueueJnJobStage ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGfxDispatch ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGfxEntity ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGfxLink ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -946,6 +1102,14 @@ static constexpr size_t QueueDataSize[] = {
 };
 
 static_assert( QueueItemSize == 32, "Queue item size not 32 bytes" );
+static_assert( sizeof( QueueJnJobType ) == 14, "JN Job type payload size mismatch" );
+static_assert( sizeof( QueueJnJobSchedule ) == 28, "JN Job schedule payload size mismatch" );
+static_assert( sizeof( QueueJnJobConfig ) == 26, "JN Job config payload size mismatch" );
+static_assert( sizeof( QueueJnJobDependency ) == 25, "JN Job dependency payload size mismatch" );
+static_assert( sizeof( QueueJnJobStage ) == 30, "JN Job stage payload size mismatch" );
+static_assert( sizeof( QueueJnGfxDispatch ) == 30, "JN Gfx dispatch payload size mismatch" );
+static_assert( sizeof( QueueJnGfxEntity ) == 31, "JN Gfx entity payload size mismatch" );
+static_assert( sizeof( QueueJnGfxLink ) == 26, "JN Gfx link payload size mismatch" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );

@@ -93,6 +93,13 @@ struct TraceCountsDto
     uint64_t sourceCacheFiles = 0;
     uint64_t sourceCacheBytes = 0;
     uint64_t frameImages = 0;
+    uint64_t jobTypes = 0;
+    uint64_t jobs = 0;
+    uint64_t jobDependencies = 0;
+    uint64_t jobStages = 0;
+    uint64_t gfxDispatches = 0;
+    uint64_t gfxEntities = 0;
+    uint64_t gfxLinks = 0;
 };
 
 struct TraceInfoDto
@@ -495,6 +502,90 @@ struct PlotPointDto
     double value = 0;
 };
 
+struct JobDependencyDto
+{
+    uint64_t prerequisiteJobId = 0;
+    uint64_t prerequisiteHandle = 0;
+    uint8_t flags = 0;
+};
+
+struct JobStageDto
+{
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint32_t spanId = 0;
+    uint32_t arg0 = 0;
+    uint32_t arg1 = 0;
+    uint8_t stage = 0;
+    uint8_t flags = 0;
+};
+
+struct JobDto
+{
+    std::string ref;
+    uint64_t jobId = 0;
+    uint64_t packedHandle = 0;
+    std::string name;
+    uint32_t typeId = 0;
+    uint8_t kind = 0;
+    uint8_t flags = 0;
+    int64_t scheduleNs = 0;
+    std::string scheduleThreadRef;
+    uint32_t count = 0;
+    uint32_t grainSize = 0;
+    uint32_t unityFlowId = 0;
+    uint32_t scheduleCallstack = 0;
+    uint16_t expectedDependencyCount = 0;
+    std::optional<int64_t> firstRunNs;
+    std::optional<int64_t> completedNs;
+    int64_t executionNs = 0;
+    int64_t waitActiveHelpNs = 0;
+    int64_t waitSpinYieldNs = 0;
+    int64_t waitSleepNs = 0;
+    bool cancelled = false;
+    bool incomplete = false;
+    bool orphan = false;
+    bool truncated = false;
+    std::vector<JobDependencyDto> dependencies;
+    std::vector<JobStageDto> stages;
+};
+
+struct GfxDispatchDto
+{
+    std::string ref;
+    uint64_t dispatchId = 0;
+    uint64_t frameIndex = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint32_t expectedJobs = 0;
+    uint8_t threadingMode = 0;
+    uint8_t flags = 0;
+};
+
+struct GfxEntityDto
+{
+    std::string ref;
+    uint64_t entityId = 0;
+    uint64_t parentId = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint32_t gpuQueryId = 0;
+    uint8_t gpuContext = 0;
+    uint8_t kind = 0;
+    uint8_t flags = 0;
+};
+
+struct GfxLinkDto
+{
+    std::string ref;
+    uint64_t sourceId = 0;
+    uint64_t targetId = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t relation = 0;
+    uint8_t flags = 0;
+};
+
 struct CallstackFrameDto
 {
     std::string ref;
@@ -610,6 +701,11 @@ public:
     virtual std::vector<std::string> ScanLocks( const ScanRange& range ) const = 0;
     virtual std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const = 0;
     virtual std::vector<std::string> ScanSamples( const ScanRange& range ) const = 0;
+
+    virtual std::vector<JobDto> GetJobs() const { return {}; }
+    virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
+    virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
+    virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

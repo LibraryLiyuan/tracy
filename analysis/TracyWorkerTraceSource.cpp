@@ -607,7 +607,7 @@ WorkerLoadProgress WorkerTraceSource::GetLoadProgress()
     };
 }
 
-std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback )
+std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, std::string fingerprintOverride )
 {
     auto impl = std::make_unique<Impl>( path );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
@@ -615,7 +615,7 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
 
     try
     {
-        impl->fingerprint = Sha256File( path );
+        impl->fingerprint = fingerprintOverride.empty() ? Sha256File( path ) : std::move( fingerprintOverride );
         impl->file.reset( FileRead::Open( path.string().c_str() ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
         impl->worker = std::make_unique<Worker>( *impl->file, EventType::All, true, false );
@@ -967,7 +967,8 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
         {
             const auto& event = memory.data[index];
             if( event.Ptr() == 0 ) continue;
-            allocations.push_back( { { pool, index }, event.Ptr(), event.Size(), m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc() } );
+            allocations.push_back( { { pool, index }, event.Ptr(), event.Size(),
+                m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(), name } );
         }
     }
     return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations );
@@ -1052,6 +1053,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto info = GetTraceInfo();
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
+    const bool hasJnTrace = m_impl->worker->HasJnTraceData();
     auto capability = []( std::string domain, bool present, bool indexed, std::vector<std::string> methods, std::string reason = {} ) {
         if( reason.empty() ) reason = present ? "available in the persisted snapshot" : "data is absent from the persisted snapshot";
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
@@ -1078,6 +1080,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
+        capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
+        capability( "job.gfx", hasJnTrace, true, { "job.gfx.statistics", "job.gfx_chain" }, hasJnTrace ? "JN Graphics Jobs schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "statistics", true, true, { "statistics.describe", "statistics.compute" } ),
         capability( "compare", true, true, { "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
         capability( "validation", true, true, { "validation.run" } )
@@ -1159,6 +1163,14 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.sourceCacheFiles = worker.GetSourceFileCacheCount();
     counts.sourceCacheBytes = worker.GetSourceFileCacheSize();
     counts.frameImages = worker.GetFrameImageCount();
+    const auto& jn = worker.GetJnTraceData();
+    counts.jobTypes = jn.jobTypes.size();
+    counts.jobs = jn.jobSchedules.size();
+    counts.jobDependencies = jn.jobDependencies.size();
+    counts.jobStages = jn.jobStages.size();
+    counts.gfxDispatches = jn.gfxDispatches.size();
+    counts.gfxEntities = jn.gfxEntities.size();
+    counts.gfxLinks = jn.gfxLinks.size();
     for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
     return result;
 }
@@ -1234,7 +1246,10 @@ std::vector<FrameSetDto> WorkerTraceSource::GetFrameSets() const
         std::string name;
         if( frameSet->name == 0 ) name = "Frames";
         else if( frameSet->name >> 63 ) name = "Vsync " + std::to_string( uint32_t( frameSet->name ) );
-        else name = Safe( worker.TryGetString( frameSet->name ) );
+        // FrameData::name is a raw client string pointer, not an encoded
+        // StringRef.  Calling TryGetString(StringRef) through its converting
+        // constructor silently loses named frame sets after save/load.
+        else name = Safe( worker.GetString( frameSet->name ) );
         result.push_back( { m_impl->MakeRef( "frame-set", i ), i, std::move( name ), frameSet->continuous != 0, worker.GetFrameCount( *frameSet ), worker.GetFullFrameCount( *frameSet ) } );
     }
     return result;
@@ -1590,6 +1605,143 @@ std::vector<std::string> WorkerTraceSource::ScanSamples( const ScanRange& range 
             result.emplace_back( m_impl->MakeRef( "sample", ( thread->id << 24 ) ^ index ) );
             if( result.size() >= range.limit ) return result;
         }
+    }
+    return result;
+}
+
+std::vector<JobDto> WorkerTraceSource::GetJobs() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& data = m_impl->worker->GetJnTraceData();
+    std::map<uint64_t, JobDto> jobs;
+    std::unordered_map<uint32_t, std::string> typeNames;
+    for( const auto& type : data.jobTypes ) typeNames[type.typeId] = Safe( m_impl->worker->GetString( type.name ) );
+
+    const auto ensureJob = [&]( uint64_t jobId ) -> JobDto& {
+        auto [it, inserted] = jobs.try_emplace( jobId );
+        if( inserted )
+        {
+            it->second.ref = m_impl->MakeRef( "job", jobId );
+            it->second.jobId = jobId;
+            it->second.orphan = true;
+        }
+        return it->second;
+    };
+
+    for( const auto& schedule : data.jobSchedules )
+    {
+        auto& job = ensureJob( schedule.jobId );
+        job.packedHandle = schedule.packedHandle;
+        job.kind = schedule.kind;
+        job.flags = schedule.flags;
+        job.scheduleNs = schedule.time;
+        job.scheduleThreadRef = m_impl->MakeRef( "thread", schedule.thread );
+        job.expectedDependencyCount = schedule.dependencyCount;
+        job.orphan = false;
+    }
+    for( const auto& config : data.jobConfigs )
+    {
+        auto& job = ensureJob( config.jobId );
+        if( config.typeId != 0 ) job.typeId = config.typeId;
+        if( config.count != 0 || job.count == 0 ) job.count = config.count;
+        if( config.grainSize != 0 || job.grainSize == 0 ) job.grainSize = config.grainSize;
+        if( config.unityFlowId != 0 || job.unityFlowId == 0 ) job.unityFlowId = config.unityFlowId;
+        job.kind = config.kind;
+        job.flags |= config.flags;
+    }
+    for( const auto& dependency : data.jobDependencies )
+    {
+        auto& job = ensureJob( dependency.jobId );
+        job.dependencies.push_back( { dependency.prerequisiteJobId, dependency.prerequisiteHandle, dependency.flags } );
+    }
+
+    using SpanStarts = std::unordered_map<uint32_t, int64_t>;
+    std::unordered_map<uint64_t, SpanStarts> sliceStarts;
+    std::unordered_map<uint64_t, SpanStarts> activeHelpStarts;
+    std::unordered_map<uint64_t, SpanStarts> spinStarts;
+    std::unordered_map<uint64_t, SpanStarts> sleepStarts;
+    const auto closeSpan = []( auto& starts, uint64_t jobId, uint32_t spanId, int64_t time, int64_t& total ) {
+        const auto jobsIt = starts.find( jobId );
+        if( jobsIt == starts.end() ) return;
+        const auto spanIt = jobsIt->second.find( spanId );
+        if( spanIt == jobsIt->second.end() ) return;
+        if( time >= spanIt->second ) total += time - spanIt->second;
+        jobsIt->second.erase( spanIt );
+    };
+
+    for( const auto& stage : data.jobStages )
+    {
+        auto& job = ensureJob( stage.jobId );
+        job.stages.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.spanId, stage.arg0, stage.arg1, stage.stage, stage.flags } );
+        switch( JnJobStage( stage.stage ) )
+        {
+        case JnJobStage::WorkerSliceBegin:
+            if( !job.firstRunNs || stage.time < *job.firstRunNs ) job.firstRunNs = stage.time;
+            sliceStarts[stage.jobId][stage.spanId] = stage.time;
+            break;
+        case JnJobStage::WorkerSliceEnd: closeSpan( sliceStarts, stage.jobId, stage.spanId, stage.time, job.executionNs ); break;
+        case JnJobStage::Completed: job.completedNs = stage.time; break;
+        case JnJobStage::WaitActiveHelpBegin: activeHelpStarts[stage.jobId][stage.spanId] = stage.time; break;
+        case JnJobStage::WaitActiveHelpEnd: closeSpan( activeHelpStarts, stage.jobId, stage.spanId, stage.time, job.waitActiveHelpNs ); break;
+        case JnJobStage::WaitSpinYieldBegin: spinStarts[stage.jobId][stage.spanId] = stage.time; break;
+        case JnJobStage::WaitSpinYieldEnd: closeSpan( spinStarts, stage.jobId, stage.spanId, stage.time, job.waitSpinYieldNs ); break;
+        case JnJobStage::WaitSleepBegin: sleepStarts[stage.jobId][stage.spanId] = stage.time; break;
+        case JnJobStage::WaitSleepEnd: closeSpan( sleepStarts, stage.jobId, stage.spanId, stage.time, job.waitSleepNs ); break;
+        case JnJobStage::ScheduleCallstack: job.scheduleCallstack = stage.spanId; break;
+        case JnJobStage::Cancelled: job.cancelled = true; break;
+        case JnJobStage::Incomplete: job.incomplete = true; break;
+        default: break;
+        }
+    }
+
+    std::vector<JobDto> result;
+    result.reserve( jobs.size() );
+    for( auto& [jobId, job] : jobs )
+    {
+        const auto type = typeNames.find( job.typeId );
+        job.name = type == typeNames.end() ? "<unknown job type>" : type->second;
+        job.truncated = !job.completedNs && !job.cancelled && !job.incomplete;
+        std::sort( job.stages.begin(), job.stages.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+        result.emplace_back( std::move( job ) );
+    }
+    return result;
+}
+
+std::vector<GfxDispatchDto> WorkerTraceSource::GetGfxDispatches() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxDispatches;
+    std::vector<GfxDispatchDto> result;
+    result.reserve( values.size() );
+    for( const auto& value : values ) result.push_back( {
+        m_impl->MakeRef( "gfx-dispatch", value.dispatchId ), value.dispatchId, value.frameIndex, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.expectedJobs, value.threadingMode, value.flags } );
+    return result;
+}
+
+std::vector<GfxEntityDto> WorkerTraceSource::GetGfxEntities() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxEntities;
+    std::vector<GfxEntityDto> result;
+    result.reserve( values.size() );
+    for( const auto& value : values ) result.push_back( {
+        m_impl->MakeRef( "gfx-entity", value.entityId ), value.entityId, value.parentId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
+    return result;
+}
+
+std::vector<GfxLinkDto> WorkerTraceSource::GetGfxLinks() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxLinks;
+    std::vector<GfxLinkDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
+            m_impl->MakeRef( "thread", value.thread ), value.relation, value.flags } );
     }
     return result;
 }

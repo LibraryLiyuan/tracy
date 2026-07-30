@@ -249,11 +249,12 @@ int main( int argc, char** argv )
     }
 
     const bool protocolOnly = journalOutput && !output;
+    const bool deferSymbolExpansion = journalOutput != nullptr;
     std::unique_ptr<tracy::stream::StreamProtocolObserver> protocolObserver;
     if( journalOutput )
     {
         tracy::stream::ProtocolJournalOptions journalOptions;
-        if( protocolOnly )
+        if( deferSymbolExpansion )
             journalOptions.sessionFlags |= tracy::stream::SessionBeginFlagDeferredSymbolExpansion;
         std::string journalError;
         protocolObserver = tracy::stream::StreamProtocolObserver::CreateFileJournal( journalOutput, address, uint16_t( port ), tracy::ProtocolVersion, overwrite, journalOptions, journalError );
@@ -268,7 +269,9 @@ int main( int argc, char** argv )
     printf( "Connecting to %s:%i...", address, port );
     fflush( stdout );
     tracy::Worker worker( address, port, memoryLimit, protocolObserver.get(),
-        protocolOnly ? tracy::Worker::Mode::ProtocolOnly : tracy::Worker::Mode::Full );
+        protocolOnly ? tracy::Worker::Mode::ProtocolOnly : tracy::Worker::Mode::Full,
+        tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
+        deferSymbolExpansion );
     while( !worker.HasData() )
     {
         const auto handshake = worker.GetHandshakeStatus();

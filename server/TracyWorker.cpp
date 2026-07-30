@@ -59,6 +59,29 @@ enum { FileHeaderMagic = 5 };
 static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
 static const int MinSupportedVersion = FileVersion( 0, 9, 0 );
 
+template<typename T>
+static void ReadJnVector( FileRead& f, std::vector<T>& target, const char* domain )
+{
+    uint64_t size;
+    f.Read( size );
+    if( size > JnTraceMaxRecordsPerDomain )
+    {
+        char message[128];
+        snprintf( message, sizeof( message ), "JN trace %s record count is invalid.", domain );
+        throw LoadFailure( message );
+    }
+    target.resize( size );
+    if( size != 0 ) f.Read( target.data(), size * sizeof( T ) );
+}
+
+template<typename T>
+static void WriteJnVector( FileWrite& f, const std::vector<T>& source )
+{
+    const uint64_t size = source.size();
+    f.Write( &size, sizeof( size ) );
+    if( size != 0 ) f.Write( source.data(), size * sizeof( T ) );
+}
+
 
 static void UpdateLockCountLockable( LockMap& lockmap, size_t pos )
 {
@@ -592,7 +615,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
     m_traceVersion = fileVer;
 
-    s_loadProgress.total.store( 17, std::memory_order_relaxed );
+    s_loadProgress.total.store( fileVer >= FileVersion( 0, 13, 2 ) ? 18 : 17, std::memory_order_relaxed );
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::Initialization, std::memory_order_relaxed );
     f.Read8( m_resolution, m_timerMul, m_data.lastTime, m_data.frameOffset, m_pid, m_samplingPeriod, m_data.cpuArch, m_data.cpuId );
@@ -1728,6 +1751,32 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             f.Read( s32 );
             f.Skip( s32 );
         }
+    }
+
+    if( fileVer >= FileVersion( 0, 13, 2 ) )
+    {
+        s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
+        s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
+        s_loadProgress.progress.store( LoadProgress::JnJobs, std::memory_order_relaxed );
+
+        uint32_t magic;
+        uint16_t schemaVersion;
+        uint8_t present;
+        f.Read3( magic, schemaVersion, present );
+        if( magic != JnTraceSectionMagic ) throw LoadFailure( "JN trace section magic mismatch." );
+        if( schemaVersion != JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
+
+        auto& jn = m_data.jnTrace;
+        jn.present = present != 0;
+        jn.schemaVersion = schemaVersion;
+        ReadJnVector( f, jn.jobTypes, "job type" );
+        ReadJnVector( f, jn.jobSchedules, "job schedule" );
+        ReadJnVector( f, jn.jobConfigs, "job config" );
+        ReadJnVector( f, jn.jobDependencies, "job dependency" );
+        ReadJnVector( f, jn.jobStages, "job stage" );
+        ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
+        ReadJnVector( f, jn.gfxEntities, "gfx entity" );
+        ReadJnVector( f, jn.gfxLinks, "gfx link" );
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -4387,6 +4436,25 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     }
     case QueueType::FiberLeave:
         break;
+    case QueueType::JnJobType:
+        CheckString( ev.jnJobType.name );
+        break;
+    case QueueType::JnJobSchedule:
+    case QueueType::JnJobConfig:
+    case QueueType::JnJobDependency:
+    case QueueType::JnGfxDispatch:
+    case QueueType::JnGfxEntity:
+    case QueueType::JnGfxLink:
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::JnJobStage:
+        RecorderCheckCurrentThread();
+        if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "JN Job schedule is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
     default:
         RecorderFail( "Unsupported fixed-size protocol event." );
         break;
@@ -5827,6 +5895,30 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::FiberLeave:
         ProcessFiberLeave( ev.fiberLeave );
         break;
+    case QueueType::JnJobType:
+        ProcessJnJobType( ev.jnJobType );
+        break;
+    case QueueType::JnJobSchedule:
+        ProcessJnJobSchedule( ev.jnJobSchedule );
+        break;
+    case QueueType::JnJobConfig:
+        ProcessJnJobConfig( ev.jnJobConfig );
+        break;
+    case QueueType::JnJobDependency:
+        ProcessJnJobDependency( ev.jnJobDependency );
+        break;
+    case QueueType::JnJobStage:
+        ProcessJnJobStage( ev.jnJobStage );
+        break;
+    case QueueType::JnGfxDispatch:
+        ProcessJnGfxDispatch( ev.jnGfxDispatch );
+        break;
+    case QueueType::JnGfxEntity:
+        ProcessJnGfxEntity( ev.jnGfxEntity );
+        break;
+    case QueueType::JnGfxLink:
+        ProcessJnGfxLink( ev.jnGfxLink );
+        break;
     default:
         assert( false );
         break;
@@ -5843,6 +5935,90 @@ void Worker::ProcessThreadContext( const QueueThreadContext& ev )
         m_threadCtx = ev.thread;
         m_threadCtxData = RetrieveThread( ev.thread );
     }
+}
+
+void Worker::ProcessJnJobType( const QueueJnJobType& ev )
+{
+    CheckString( ev.name );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.jobTypes.push_back( JnJobTypeData { ev.name, ev.typeId, ev.kind, ev.flags } );
+}
+
+void Worker::ProcessJnJobSchedule( const QueueJnJobSchedule& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.jobSchedules.push_back( JnJobScheduleData { time, ev.jobId, ev.packedHandle, m_threadCtx, ev.dependencyCount, ev.kind, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnJobConfig( const QueueJnJobConfig& ev )
+{
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.jobConfigs.push_back( JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.kind, ev.flags } );
+}
+
+void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
+{
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.jobDependencies.push_back( JnJobDependencyData { ev.jobId, ev.prerequisiteJobId, ev.prerequisiteHandle, ev.flags } );
+}
+
+void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    uint32_t spanId = ev.spanId;
+    uint64_t thread = m_threadCtx;
+    if( JnJobStage( ev.stage ) == JnJobStage::ScheduleCallstack )
+    {
+        assert( m_serialNextCallstack != 0 );
+        spanId = m_serialNextCallstack;
+        thread = ev.arg0;
+        m_serialNextCallstack = 0;
+    }
+    data.jobStages.push_back( JnJobStageData { time, ev.jobId, thread, spanId, ev.arg0, ev.arg1, ev.stage, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGfxDispatch( const QueueJnGfxDispatch& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gfxDispatches.push_back( JnGfxDispatchData { time, ev.dispatchId, ev.frameIndex, m_threadCtx, ev.expectedJobs, ev.threadingMode, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGfxEntity( const QueueJnGfxEntity& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gfxEntities.push_back( JnGfxEntityData { time, ev.entityId, ev.parentId, m_threadCtx, ev.gpuQueryId, ev.gpuContext, ev.kind, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGfxLink( const QueueJnGfxLink& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gfxLinks.push_back( JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
 static tracy_force_inline int64_t RefTime( int64_t& reference, int64_t delta )
@@ -6935,12 +7111,22 @@ void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLea
 void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
 {
     auto ctx = m_gpuCtxMap[ev.context];
-    assert( ctx );
+    if( !ctx )
+    {
+        m_failure = Failure::ZoneStack;
+        m_failureData.thread = ev.thread;
+        m_failureData.srcloc = 0;
+        return;
+    }
 
     auto td = ctx->threadData.find( ev.thread );
-    assert( td != ctx->threadData.end() );
-
-    assert( !td->second.stack.empty() );
+    if( td == ctx->threadData.end() || td->second.stack.empty() )
+    {
+        m_failure = Failure::ZoneStack;
+        m_failureData.thread = ev.thread;
+        m_failureData.srcloc = 0;
+        return;
+    }
     auto zone = td->second.stack.back_and_pop();
 
     assert( !ctx->query[ev.queryId] );
@@ -6963,7 +7149,21 @@ void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
 void Worker::ProcessGpuTime( const QueueGpuTime& ev )
 {
     auto ctx = m_gpuCtxMap[ev.context];
-    assert( ctx );
+    if( !ctx )
+    {
+        m_failure = Failure::ZoneStack;
+        m_failureData.thread = 0;
+        m_failureData.srcloc = 0;
+        return;
+    }
+    auto zone = ctx->query[ev.queryId];
+    if( !zone )
+    {
+        m_failure = Failure::ZoneStack;
+        m_failureData.thread = 0;
+        m_failureData.srcloc = 0;
+        return;
+    }
 
     int64_t tgpu = RefTime( m_refTimeGpu, ev.gpuTime );
     if( tgpu < ctx->lastGpuTime - ( 1u << 31 ) )
@@ -7004,8 +7204,6 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
         }
     }
 
-    auto zone = ctx->query[ev.queryId];
-    assert( zone );
     ctx->query[ev.queryId] = nullptr;
 
     if( zone->GpuStart() < 0 )
@@ -9576,6 +9774,20 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &v.second.len, sizeof( v.second.len ) );
         f.Write( v.second.data, v.second.len );
     }
+
+    f.Write( &JnTraceSectionMagic, sizeof( JnTraceSectionMagic ) );
+    const uint16_t schemaVersion = JnTraceSchemaVersion;
+    f.Write( &schemaVersion, sizeof( schemaVersion ) );
+    const uint8_t jnPresent = m_data.jnTrace.present;
+    f.Write( &jnPresent, sizeof( jnPresent ) );
+    WriteJnVector( f, m_data.jnTrace.jobTypes );
+    WriteJnVector( f, m_data.jnTrace.jobSchedules );
+    WriteJnVector( f, m_data.jnTrace.jobConfigs );
+    WriteJnVector( f, m_data.jnTrace.jobDependencies );
+    WriteJnVector( f, m_data.jnTrace.jobStages );
+    WriteJnVector( f, m_data.jnTrace.gfxDispatches );
+    WriteJnVector( f, m_data.jnTrace.gfxEntities );
+    WriteJnVector( f, m_data.jnTrace.gfxLinks );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )
@@ -9728,6 +9940,11 @@ void Worker::CacheSource( const StringRef& str, const StringIdx& image )
     assert( str.active );
     assert( m_checkedFileStrings.find( str ) == m_checkedFileStrings.end() );
     m_checkedFileStrings.emplace( str );
+    // Source-file availability depends on the recorder's current directory and
+    // local filesystem.  Journal sessions defer this optional expansion so a
+    // replay on another machine or from another directory emits the exact same
+    // server-query transcript while preserving all source-location metadata.
+    if( m_deferSymbolExpansion ) return;
     auto file = GetString( str );
     // Possible duplication of pointer and index strings
     if( m_data.sourceFileCache.find( file ) != m_data.sourceFileCache.end() ) return;
