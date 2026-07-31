@@ -54,6 +54,21 @@ typedef enum JNTracyFrameMarkKind
     JNTracyFrameMark_End = 2
 } JNTracyFrameMarkKind;
 
+typedef enum JNTracyFrameDomain
+{
+    JNTracyFrameDomain_Editor = 0,
+    JNTracyFrameDomain_Player = 1,
+    JNTracyFrameDomain_Render = 2,
+    JNTracyFrameDomain_Present = 3,
+    JNTracyFrameDomain_GpuMemory = 4
+} JNTracyFrameDomain;
+
+typedef enum JNTracyFrameIdentityFlag
+{
+    JNTracyFrameIdentity_Canonical = 1 << 0,
+    JNTracyFrameIdentity_Alias = 1 << 1
+} JNTracyFrameIdentityFlag;
+
 typedef enum JNTracyJobKind
 {
     JNTracyJobKind_Native = 0,
@@ -159,6 +174,10 @@ JN_TRACY_API uint64_t JNTracy_RegisterSourceLocation( const JNTracySourceLocatio
 JN_TRACY_API uint64_t JNTracy_ZoneBegin( uint64_t sourceLocation, uint32_t callstackDepth );
 JN_TRACY_API void JNTracy_ZoneEnd( uint64_t zoneToken );
 JN_TRACY_API void JNTracy_FrameMark( const char* name, uint32_t nameLength, uint8_t kind );
+JN_TRACY_API uint64_t JNTracy_FrameBegin( uint64_t parentFrameId, uint64_t domainIndex, uint8_t domain, uint8_t flags );
+JN_TRACY_API void JNTracy_FrameEnd( uint64_t frameId, uint64_t domainIndex, uint8_t domain, uint8_t flags );
+JN_TRACY_API void JNTracy_FrameBoundary( uint64_t frameId, uint64_t domainIndex, uint8_t domain, uint8_t flags );
+JN_TRACY_API uint64_t JNTracy_GetCurrentFrameId( void );
 JN_TRACY_API void JNTracy_ThreadName( const char* name, uint32_t nameLength );
 JN_TRACY_API void JNTracy_Message( const char* text, uint32_t textLength, uint32_t color, uint32_t callstackDepth );
 JN_TRACY_API void JNTracy_Plot( const char* name, uint32_t nameLength, double value );

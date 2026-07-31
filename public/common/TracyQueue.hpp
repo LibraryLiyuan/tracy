@@ -121,6 +121,7 @@ enum class QueueType : uint8_t
     JnGfxDispatch,
     JnGfxEntity,
     JnGfxLink,
+    JnFrame,
     StringData,
     ThreadName,
     PlotName,
@@ -520,6 +521,29 @@ enum class JnGfxRelation : uint8_t
     DependsOn
 };
 
+enum class JnFrameDomain : uint8_t
+{
+    Editor,
+    Player,
+    Render,
+    Present,
+    GpuMemory
+};
+
+enum class JnFramePhase : uint8_t
+{
+    Begin,
+    End,
+    Boundary
+};
+
+enum class JnFrameFlags : uint8_t
+{
+    None = 0,
+    Canonical = 1 << 0,
+    Alias = 1 << 1
+};
+
 struct QueueJnJobType
 {
     uint64_t name;
@@ -545,6 +569,7 @@ struct QueueJnJobConfig
     uint32_t count;
     uint32_t grainSize;
     uint32_t unityFlowId;
+    uint32_t originFrameSequence;
     uint8_t kind;
     uint8_t flags;
 };
@@ -595,6 +620,16 @@ struct QueueJnGfxLink
     uint64_t sourceId;
     uint64_t targetId;
     uint8_t relation;
+    uint8_t flags;
+};
+
+struct QueueJnFrame
+{
+    int64_t time;
+    uint64_t frameId;
+    uint64_t domainIndex;
+    uint8_t domain;
+    uint8_t phase;
     uint8_t flags;
 };
 
@@ -964,6 +999,7 @@ struct QueueItem
         QueueJnGfxDispatch jnGfxDispatch;
         QueueJnGfxEntity jnGfxEntity;
         QueueJnGfxLink jnGfxLink;
+        QueueJnFrame jnFrame;
     };
 };
 #pragma pack( pop )
@@ -1085,6 +1121,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnGfxDispatch ),
     sizeof( QueueHeader ) + sizeof( QueueJnGfxEntity ),
     sizeof( QueueHeader ) + sizeof( QueueJnGfxLink ),
+    sizeof( QueueHeader ) + sizeof( QueueJnFrame ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1104,12 +1141,13 @@ static constexpr size_t QueueDataSize[] = {
 static_assert( QueueItemSize == 32, "Queue item size not 32 bytes" );
 static_assert( sizeof( QueueJnJobType ) == 14, "JN Job type payload size mismatch" );
 static_assert( sizeof( QueueJnJobSchedule ) == 28, "JN Job schedule payload size mismatch" );
-static_assert( sizeof( QueueJnJobConfig ) == 26, "JN Job config payload size mismatch" );
+static_assert( sizeof( QueueJnJobConfig ) == 30, "JN Job config payload size mismatch" );
 static_assert( sizeof( QueueJnJobDependency ) == 25, "JN Job dependency payload size mismatch" );
 static_assert( sizeof( QueueJnJobStage ) == 30, "JN Job stage payload size mismatch" );
 static_assert( sizeof( QueueJnGfxDispatch ) == 30, "JN Gfx dispatch payload size mismatch" );
 static_assert( sizeof( QueueJnGfxEntity ) == 31, "JN Gfx entity payload size mismatch" );
 static_assert( sizeof( QueueJnGfxLink ) == 26, "JN Gfx link payload size mismatch" );
+static_assert( sizeof( QueueJnFrame ) == 27, "JN frame payload size mismatch" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );

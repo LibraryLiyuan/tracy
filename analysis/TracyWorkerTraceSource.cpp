@@ -1075,9 +1075,11 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
-        capability( "frame", info.counts.frameSets != 0, true, { "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping" } ),
+        capability( "frame", info.counts.frameSets != 0 || info.counts.correlatedFrameEvents != 0, true, { "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity" } ),
         capability( "frame_image", info.counts.frameImages != 0, true, { "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw" } ),
-        capability( "timeline", info.counts.cpuZones != 0 || info.counts.gpuZones != 0 || info.counts.frames != 0 || info.counts.messages != 0 || info.counts.plots != 0 || info.counts.locks != 0 || info.counts.contextSwitches != 0, true, { "timeline.slice" } ),
+        capability( "timeline", info.counts.cpuZones != 0 || info.counts.gpuZones != 0 || info.counts.frames != 0 || info.counts.correlatedFrameEvents != 0 || info.counts.messages != 0 || info.counts.plots != 0 || info.counts.locks != 0 || info.counts.contextSwitches != 0, true, { "timeline.slice", "timeline.correlated_slice" } ),
+        capability( "correlation", info.counts.correlatedFrameEvents != 0, true, { "entity.related", "correlation.chain" },
+            info.counts.correlatedFrameEvents ? "exact JN frame and entity relations are present" : "trace predates or does not contain JN frame correlation" ),
         capability( "zone.cpu", info.counts.cpuZones != 0, true, { "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph" } ),
         capability( "zone.gpu", info.counts.gpuZones != 0, true, { "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph" } ),
         capability( "callstack", info.counts.callstackPayloads != 0 || info.counts.parentCallstackPayloads != 0, true, { "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch" } ),
@@ -1181,6 +1183,7 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.gfxDispatches = jn.gfxDispatches.size();
     counts.gfxEntities = jn.gfxEntities.size();
     counts.gfxLinks = jn.gfxLinks.size();
+    counts.correlatedFrameEvents = jn.frames.size();
     for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
     return result;
 }
@@ -1625,7 +1628,13 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
     const auto& data = m_impl->worker->GetJnTraceData();
     std::map<uint64_t, JobDto> jobs;
     std::unordered_map<uint32_t, std::string> typeNames;
+    std::unordered_map<uint32_t, uint64_t> frameIdsBySequence;
     for( const auto& type : data.jobTypes ) typeNames[type.typeId] = Safe( m_impl->worker->GetString( type.name ) );
+    for( const auto& frame : data.frames )
+    {
+        if( frame.phase == uint8_t( JnFramePhase::Begin ) && ( frame.flags & uint8_t( JnFrameFlags::Canonical ) ) != 0 )
+            frameIdsBySequence[uint32_t( frame.frameId )] = frame.frameId;
+    }
 
     const auto ensureJob = [&]( uint64_t jobId ) -> JobDto& {
         auto [it, inserted] = jobs.try_emplace( jobId );
@@ -1656,6 +1665,12 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         if( config.count != 0 || job.count == 0 ) job.count = config.count;
         if( config.grainSize != 0 || job.grainSize == 0 ) job.grainSize = config.grainSize;
         if( config.unityFlowId != 0 || job.unityFlowId == 0 ) job.unityFlowId = config.unityFlowId;
+        if( config.originFrameSequence != 0 )
+        {
+            job.originFrameSequence = config.originFrameSequence;
+            const auto frame = frameIdsBySequence.find( config.originFrameSequence );
+            if( frame != frameIdsBySequence.end() ) job.originFrameId = frame->second;
+        }
         job.kind = config.kind;
         job.flags |= config.flags;
     }
@@ -1752,6 +1767,21 @@ std::vector<GfxLinkDto> WorkerTraceSource::GetGfxLinks() const
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
             m_impl->MakeRef( "thread", value.thread ), value.relation, value.flags } );
+    }
+    return result;
+}
+
+std::vector<CorrelatedFrameEventDto> WorkerTraceSource::GetCorrelatedFrameEvents() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().frames;
+    std::vector<CorrelatedFrameEventDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "frame-identity-event", index ), value.frameId, value.domainIndex,
+            value.time, m_impl->MakeRef( "thread", value.thread ), value.domain, value.phase, value.flags } );
     }
     return result;
 }

@@ -51,6 +51,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "thread.get" ) params["ref"] = "fake:thread:1";
     if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) params["thread_ref"] = "fake:thread:1";
     if( method == "frame.get" ) params["ref"] = "fake:frame:0";
+    if( method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" ) params["ref"] = "fake:frame-identity:281474976710657";
     if( method == "frame.range_mapping" || method == "timeline.slice" ) { params["start_ns"] = "0"; params["end_ns"] = "100"; }
     if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) params["ref"] = "fake:frame-image:0";
     if( method == "producer.get" ) params["key"] = "test.real-zero";
@@ -126,12 +127,12 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.3.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.4.0" );
     assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 28 );
+    assert( coverage.at( "domains" ).size() == 29 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );

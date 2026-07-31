@@ -36,7 +36,7 @@ public:
     static std::vector<std::string> DefaultIdentityAppInfo()
     {
         return {
-            "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010000\",\"jn_config_hash\":\"0x8daf4c01004d000a\",\"tracy_protocol_version\":\"77\"}}}",
+            "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010000\",\"jn_config_hash\":\"0x8daf4c01004d000b\",\"tracy_protocol_version\":\"78\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"runtime\",\"producer\":\"unity-native\",\"identity\":{\"runtime\":{\"target_kind\":\"editor\",\"engine_build_hash\":\"fake-engine-build\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"connection\",\"producer\":\"jn-native-client\",\"identity\":{\"connection\":{\"id\":\"1\",\"instance_cookie\":\"0123456789abcdef\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"manifest\",\"producer\":\"build-manifest\",\"identity\":{\"build\":{\"build_id\":\"0123456789abcdef0123456789abcdef\",\"repositories\":{\"engine\":{\"revision\":\"1111111111111111111111111111111111111111\"},\"package\":{\"revision\":\"2222222222222222222222222222222222222222\"},\"tracy\":{\"revision\":\"3333333333333333333333333333333333333333\"}},\"artifacts\":{\"unity\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"jn_client\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"query\":{\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}}",
@@ -63,7 +63,7 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override
     {
         std::vector<analysis::Capability> result;
-        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "statistics", "compare", "validation" } )
+        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "correlation", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "statistics", "compare", "validation" } )
         {
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
@@ -93,6 +93,7 @@ public:
         value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = 1;
         value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
         value.counts.gfxDispatches = value.counts.gfxEntities = value.counts.gfxLinks = 1;
+        value.counts.correlatedFrameEvents = 4;
         if( !m_legacyFormat )
         {
             value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
@@ -175,6 +176,7 @@ public:
         value.ref = MakeEntityRef( "job", 1 ); value.jobId = 1; value.packedHandle = ( uint64_t( 1 ) << 32 ) | 7;
         value.name = "Fake.ManagedJob"; value.typeId = 1; value.kind = 1; value.scheduleNs = 10;
         value.scheduleThreadRef = MakeEntityRef( "thread", 1 ); value.count = 64; value.grainSize = 16; value.unityFlowId = 1001;
+        value.originFrameSequence = 1; value.originFrameId = ( uint64_t( 1 ) << 48 ) | 1;
         value.firstRunNs = 20; value.completedNs = 40; value.executionNs = 20;
         value.dependencies = { { 2, ( uint64_t( 1 ) << 32 ) | 8, 0 } };
         value.stages = {
@@ -190,7 +192,7 @@ public:
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override
     {
         const uint64_t id = uint64_t( 1 ) << 63;
-        return { { MakeEntityRef( "gfx-dispatch", id ), id, 1, 41, MakeEntityRef( "thread", 1 ), 1, 1, 0 } };
+        return { { MakeEntityRef( "gfx-dispatch", id ), id, ( uint64_t( 1 ) << 48 ) | 1, 41, MakeEntityRef( "thread", 1 ), 1, 1, 0 } };
     }
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override
     {
@@ -201,6 +203,16 @@ public:
     {
         const uint64_t entity = ( uint64_t( 1 ) << 63 ) + 1;
         return { { MakeEntityRef( "gfx-link", 0 ), 1, entity, 42, MakeEntityRef( "thread", 1 ), 2, 0 } };
+    }
+    std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override
+    {
+        const uint64_t frameId = ( uint64_t( 1 ) << 48 ) | 1;
+        return {
+            { MakeEntityRef( "frame-identity-event", 0 ), frameId, 1, 10, MakeEntityRef( "thread", 1 ), 0, 0, 1 },
+            { MakeEntityRef( "frame-identity-event", 1 ), frameId, 1, 11, MakeEntityRef( "thread", 1 ), 1, 0, 2 },
+            { MakeEntityRef( "frame-identity-event", 2 ), frameId, 1, 90, MakeEntityRef( "thread", 1 ), 1, 1, 2 },
+            { MakeEntityRef( "frame-identity-event", 3 ), frameId, 1, 100, MakeEntityRef( "thread", 1 ), 0, 1, 1 }
+        };
     }
 
     analysis::CrashDto GetCrash() const override { analysis::CrashDto value; value.present = true; value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 90; value.message = "fake crash"; return value; }

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.3.0",
+  "schema_version": "1.4.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -497,6 +497,15 @@
       "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "dependencies", "stages", "first_run_ns", "completed_ns", "execution_ns", "wait", "orphan", "truncated"],
       "unmapped_fields": [],
       "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path"],
+      "status": "complete"
+    },
+    {
+      "entity": "frame.identity_and_correlation",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["frame_id", "domain_index", "time", "thread", "domain", "phase", "flags", "job_origin_frame_sequence", "gfx_dispatch_frame_id", "typed_dependency_and_gfx_links"],
+      "query_fields": ["ref", "frame_id", "connection_generation", "sequence", "begin_ns", "end_ns", "duration_ns", "complete", "domains", "events", "source_ref", "target_ref", "relation", "correlation_id", "parent_span_id", "origin_frame_id", "origin_frame_ref", "evidence_kind", "window_inference_used"],
+      "unmapped_fields": [],
+      "methods": ["frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice"],
       "status": "complete"
     },
     {

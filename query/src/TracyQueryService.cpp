@@ -29,7 +29,7 @@ const std::vector<std::string>& QueryMethodRegistry()
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
-        "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
+        "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
         "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
         "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
@@ -298,7 +298,7 @@ json CountsJson( const analysis::TraceCountsDto& value )
         { "job_types", Decimal( value.jobTypes ) }, { "jobs", Decimal( value.jobs ) },
         { "job_dependencies", Decimal( value.jobDependencies ) }, { "job_stages", Decimal( value.jobStages ) },
         { "gfx_dispatches", Decimal( value.gfxDispatches ) }, { "gfx_entities", Decimal( value.gfxEntities ) },
-        { "gfx_links", Decimal( value.gfxLinks ) }
+        { "gfx_links", Decimal( value.gfxLinks ) }, { "correlated_frame_events", Decimal( value.correlatedFrameEvents ) }
     };
 }
 
@@ -642,6 +642,31 @@ const char* GfxRelationName( uint8_t relation )
     return relation < std::size( names ) ? names[relation] : "unknown";
 }
 
+const char* CorrelatedFrameDomainName( uint8_t domain )
+{
+    static constexpr const char* names[] = { "editor", "player", "render", "present", "gpu_memory" };
+    return domain < std::size( names ) ? names[domain] : "unknown";
+}
+
+const char* CorrelatedFramePhaseName( uint8_t phase )
+{
+    static constexpr const char* names[] = { "begin", "end", "boundary" };
+    return phase < std::size( names ) ? names[phase] : "unknown";
+}
+
+json CorrelatedFrameEventJson( const analysis::TraceSource& source, const analysis::CorrelatedFrameEventDto& value )
+{
+    return {
+        { "ref", value.ref }, { "frame_ref", source.MakeEntityRef( "frame-identity", value.frameId ) },
+        { "frame_id", Decimal( value.frameId ) }, { "domain_index", Decimal( value.domainIndex ) },
+        { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef },
+        { "domain", CorrelatedFrameDomainName( value.domain ) }, { "domain_id", value.domain },
+        { "phase", CorrelatedFramePhaseName( value.phase ) }, { "phase_id", value.phase },
+        { "canonical", ( value.flags & 1 ) != 0 }, { "alias", ( value.flags & 2 ) != 0 },
+        { "flags", value.flags }, { "evidence_kind", "exact" }
+    };
+}
+
 json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value, bool detailed )
 {
     const char* state = value.cancelled ? "cancelled" : value.incomplete ? "incomplete" : value.completedNs ? "completed" : value.truncated ? "truncated" : "scheduled";
@@ -652,6 +677,8 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
         { "flags", value.flags }, { "state", state }, { "schedule_ns", Decimal( value.scheduleNs ) },
         { "schedule_thread_ref", value.scheduleThreadRef }, { "count", value.count }, { "grain_size", value.grainSize },
         { "unity_flow_id", value.unityFlowId }, { "expected_dependency_count", value.expectedDependencyCount },
+        { "origin_frame_sequence", value.originFrameSequence },
+        { "origin_frame_ref", value.originFrameId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "frame-identity", value.originFrameId ) ) },
         { "schedule_callstack", value.scheduleCallstack },
         { "schedule_callstack_ref", value.scheduleCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.scheduleCallstack ) ) },
         { "dependency_count", value.dependencies.size() }, { "stage_count", value.stages.size() },
@@ -1757,7 +1784,7 @@ json DescribeData( const json& selection = json::object() )
         if( method == "trace.open" ) required.emplace_back( "path" );
         else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
         else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
             method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
         if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
         if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
@@ -2131,6 +2158,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     const auto requiredDomain = [&]() -> std::string {
+        if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" ) return {};
         if( method == "job.gfx.statistics" || method == "job.gfx_chain" ) return "job.gfx";
         if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
         if( method.rfind( "frame_image.", 0 ) == 0 ) return "frame_image";
@@ -3230,6 +3258,176 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         values = ProjectFields( std::move( values ), params );
         const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
         return Success( id, { { "messages", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+    }
+    if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
+    {
+        auto frameEvents = source->GetCorrelatedFrameEvents();
+        if( frameEvents.empty() )
+            return Success( id, { { "present", false }, { "reason", "trace predates or does not contain JN frame correlation" }, { "identities", json::array() } }, trace );
+
+        std::map<uint64_t, std::vector<analysis::CorrelatedFrameEventDto>> frames;
+        for( auto& event : frameEvents ) frames[event.frameId].push_back( std::move( event ) );
+        for( auto& [frameId, events] : frames )
+            std::sort( events.begin(), events.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+
+        const auto frameJson = [&]( uint64_t frameId ) {
+            const auto found = frames.find( frameId );
+            if( found == frames.end() ) throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
+            int64_t begin = std::numeric_limits<int64_t>::max();
+            int64_t end = std::numeric_limits<int64_t>::min();
+            bool canonicalBegin = false;
+            bool canonicalEnd = false;
+            std::set<std::string> domains;
+            json events = json::array();
+            for( const auto& event : found->second )
+            {
+                begin = std::min( begin, event.timeNs );
+                end = std::max( end, event.timeNs );
+                domains.emplace( CorrelatedFrameDomainName( event.domain ) );
+                canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
+                canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
+                events.push_back( CorrelatedFrameEventJson( *source, event ) );
+            }
+            return json {
+                { "ref", source->MakeEntityRef( "frame-identity", frameId ) }, { "frame_id", Decimal( frameId ) },
+                { "connection_generation", uint16_t( frameId >> 48 ) }, { "sequence", uint32_t( frameId ) },
+                { "begin_ns", Decimal( begin ) }, { "end_ns", Decimal( end ) },
+                { "duration_ns", Decimal( std::max<int64_t>( 0, end - begin ) ) },
+                { "complete", canonicalBegin && canonicalEnd }, { "domains", domains },
+                { "events", std::move( events ) }, { "evidence_kind", "exact" }
+            };
+        };
+
+        const auto parseFrame = [&]() -> uint64_t {
+            if( params.contains( "ref" ) )
+            {
+                if( !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "frame-identity" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref from this trace" );
+                return *parsed;
+            }
+            if( params.contains( "frame_id" ) ) return UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
+            throw QueryError( "INVALID_PARAMS", "ref or frame_id is required" );
+        };
+
+        if( method == "frame.identity" )
+        {
+            if( params.contains( "ref" ) || params.contains( "frame_id" ) )
+                return Success( id, { { "present", true }, { "identity", frameJson( parseFrame() ) } }, trace );
+            const auto page = ParsePage( params, method, trace );
+            json values = json::array();
+            auto it = frames.begin();
+            std::advance( it, std::min( page.offset, frames.size() ) );
+            size_t count = 0;
+            while( it != frames.end() && count < page.limit ) { values.push_back( frameJson( it->first ) ); ++it; ++count; }
+            const bool hasMore = it != frames.end();
+            const auto cursor = NextCursor( page, method, trace, count, hasMore );
+            return Success( id, { { "present", true }, { "identities", std::move( values ) } }, trace, PageJson( page, count, cursor ) );
+        }
+
+        const auto jobs = source->GetJobs();
+        const auto dispatches = source->GetGfxDispatches();
+        const auto entities = source->GetGfxEntities();
+        const auto gfxLinks = source->GetGfxLinks();
+        std::unordered_map<uint64_t, std::string> jobRefs;
+        std::unordered_map<uint64_t, std::string> dispatchRefs;
+        std::unordered_map<uint64_t, std::string> entityRefs;
+        for( const auto& value : jobs ) jobRefs[value.jobId] = value.ref;
+        for( const auto& value : dispatches ) dispatchRefs[value.dispatchId] = value.ref;
+        for( const auto& value : entities ) entityRefs[value.entityId] = value.ref;
+        const auto refForId = [&]( uint64_t value ) -> std::string {
+            if( const auto it = jobRefs.find( value ); it != jobRefs.end() ) return it->second;
+            if( const auto it = dispatchRefs.find( value ); it != dispatchRefs.end() ) return it->second;
+            if( const auto it = entityRefs.find( value ); it != entityRefs.end() ) return it->second;
+            return source->MakeEntityRef( "gfx-external", value );
+        };
+        json relations = json::array();
+        const auto addRelation = [&]( std::string sourceRef, std::string targetRef, const char* relation, uint64_t originFrameId ) {
+            relations.push_back( {
+                { "ref", source->MakeEntityRef( "correlation", relations.size() + 1 ) },
+                { "source_ref", sourceRef }, { "target_ref", targetRef }, { "relation", relation },
+                { "correlation_id", targetRef }, { "parent_span_id", sourceRef },
+                { "origin_frame_id", originFrameId == 0 ? json( nullptr ) : json( Decimal( originFrameId ) ) },
+                { "origin_frame_ref", originFrameId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "frame-identity", originFrameId ) ) },
+                { "evidence_kind", "exact" }
+            } );
+        };
+        for( const auto& job : jobs )
+        {
+            if( job.originFrameId != 0 ) addRelation( source->MakeEntityRef( "frame-identity", job.originFrameId ), job.ref, "schedules", job.originFrameId );
+            for( const auto& dependency : job.dependencies ) if( dependency.prerequisiteJobId != 0 )
+                addRelation( source->MakeEntityRef( "job", dependency.prerequisiteJobId ), job.ref, "dependency_precedes", job.originFrameId );
+        }
+        for( const auto& dispatch : dispatches ) if( frames.contains( dispatch.frameIndex ) )
+            addRelation( source->MakeEntityRef( "frame-identity", dispatch.frameIndex ), dispatch.ref, "dispatches", dispatch.frameIndex );
+        for( const auto& entity : entities ) if( entity.parentId != 0 )
+            addRelation( refForId( entity.parentId ), entity.ref, "parent", 0 );
+        for( const auto& link : gfxLinks )
+            addRelation( refForId( link.sourceId ), refForId( link.targetId ), GfxRelationName( link.relation ), 0 );
+
+        if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+        const auto rootRef = params["ref"].get<std::string>();
+        std::unordered_map<std::string, std::vector<size_t>> relationIndicesByRef;
+        relationIndicesByRef.reserve( relations.size() * 2 );
+        for( size_t index = 0; index < relations.size(); index++ )
+        {
+            const auto sourceRef = relations[index].value( "source_ref", "" );
+            const auto targetRef = relations[index].value( "target_ref", "" );
+            if( !sourceRef.empty() ) relationIndicesByRef[sourceRef].push_back( index );
+            if( !targetRef.empty() && targetRef != sourceRef ) relationIndicesByRef[targetRef].push_back( index );
+        }
+        const auto parsedRootFrame = source->ParseEntityRef( rootRef, "frame-identity" );
+        const bool knownRoot = relationIndicesByRef.contains( rootRef ) || ( parsedRootFrame && frames.contains( *parsedRootFrame ) );
+        if( !knownRoot ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
+
+        if( method == "entity.related" )
+        {
+            json selected = json::array();
+            if( const auto found = relationIndicesByRef.find( rootRef ); found != relationIndicesByRef.end() )
+                for( const auto index : found->second ) selected.push_back( relations[index] );
+            return Success( id, { { "present", true }, { "root_ref", rootRef }, { "relations", std::move( selected ) }, { "evidence_kind", "exact" } }, trace );
+        }
+
+        std::set<std::string> visited { rootRef };
+        std::queue<std::string> frontier;
+        frontier.push( rootRef );
+        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+        bool truncated = false;
+        while( !frontier.empty() )
+        {
+            checkCancelled();
+            const auto current = frontier.front();
+            frontier.pop();
+            const auto adjacent = relationIndicesByRef.find( current );
+            if( adjacent == relationIndicesByRef.end() ) continue;
+            for( const auto index : adjacent->second )
+            {
+                const auto& edge = relations[index];
+                std::string next;
+                if( edge.value( "source_ref", "" ) == current ) next = edge.value( "target_ref", "" );
+                else if( edge.value( "target_ref", "" ) == current ) next = edge.value( "source_ref", "" );
+                if( next.empty() || visited.contains( next ) ) continue;
+                if( visited.size() >= maxNodes ) { truncated = true; break; }
+                visited.emplace( next );
+                frontier.push( next );
+            }
+            if( truncated ) break;
+        }
+        json selectedRelations = json::array();
+        for( const auto& edge : relations ) if( visited.contains( edge.value( "source_ref", "" ) ) && visited.contains( edge.value( "target_ref", "" ) ) ) selectedRelations.push_back( edge );
+        if( method == "correlation.chain" )
+            return Success( id, { { "present", true }, { "root_ref", rootRef }, { "nodes", visited }, { "relations", std::move( selectedRelations ) }, { "truncated", truncated }, { "evidence_kind", "exact" } }, trace );
+
+        const auto frameId = parseFrame();
+        json relatedJobs = json::array();
+        for( const auto& job : jobs ) if( job.originFrameId == frameId ) relatedJobs.push_back( JobJson( *source, job, false ) );
+        json relatedDispatches = json::array();
+        for( const auto& dispatch : dispatches ) if( dispatch.frameIndex == frameId ) relatedDispatches.push_back( GfxDispatchJson( dispatch ) );
+        return Success( id, {
+            { "present", true }, { "identity", frameJson( frameId ) }, { "jobs", std::move( relatedJobs ) },
+            { "gfx_dispatches", std::move( relatedDispatches ) }, { "relations", std::move( selectedRelations ) },
+            { "evidence_kind", "exact" }, { "window_inference_used", false }, { "truncated", truncated }
+        }, trace );
     }
     if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {

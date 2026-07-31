@@ -1764,19 +1764,43 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         uint8_t present;
         f.Read3( magic, schemaVersion, present );
         if( magic != JnTraceSectionMagic ) throw LoadFailure( "JN trace section magic mismatch." );
-        if( schemaVersion != JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
+        if( schemaVersion != 1 && schemaVersion != JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
 
         auto& jn = m_data.jnTrace;
         jn.present = present != 0;
         jn.schemaVersion = schemaVersion;
         ReadJnVector( f, jn.jobTypes, "job type" );
         ReadJnVector( f, jn.jobSchedules, "job schedule" );
-        ReadJnVector( f, jn.jobConfigs, "job config" );
+        if( schemaVersion == 1 )
+        {
+#pragma pack( push, 1 )
+            struct JnJobConfigDataV1
+            {
+                uint64_t jobId;
+                uint32_t typeId;
+                uint32_t count;
+                uint32_t grainSize;
+                uint32_t unityFlowId;
+                uint8_t kind;
+                uint8_t flags;
+            };
+#pragma pack( pop )
+            std::vector<JnJobConfigDataV1> oldConfigs;
+            ReadJnVector( f, oldConfigs, "job config" );
+            jn.jobConfigs.reserve( oldConfigs.size() );
+            for( const auto& value : oldConfigs )
+                jn.jobConfigs.push_back( { value.jobId, value.typeId, value.count, value.grainSize, value.unityFlowId, 0, value.kind, value.flags } );
+        }
+        else
+        {
+            ReadJnVector( f, jn.jobConfigs, "job config" );
+        }
         ReadJnVector( f, jn.jobDependencies, "job dependency" );
         ReadJnVector( f, jn.jobStages, "job stage" );
         ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
         ReadJnVector( f, jn.gfxEntities, "gfx entity" );
         ReadJnVector( f, jn.gfxLinks, "gfx link" );
+        if( schemaVersion >= 2 ) ReadJnVector( f, jn.frames, "frame correlation" );
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -4445,6 +4469,7 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnGfxDispatch:
     case QueueType::JnGfxEntity:
     case QueueType::JnGfxLink:
+    case QueueType::JnFrame:
         RecorderCheckCurrentThread();
         break;
     case QueueType::JnJobStage:
@@ -5919,6 +5944,9 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::JnGfxLink:
         ProcessJnGfxLink( ev.jnGfxLink );
         break;
+    case QueueType::JnFrame:
+        ProcessJnFrame( ev.jnFrame );
+        break;
     default:
         assert( false );
         break;
@@ -5961,7 +5989,7 @@ void Worker::ProcessJnJobConfig( const QueueJnJobConfig& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobConfigs.push_back( JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.kind, ev.flags } );
+    data.jobConfigs.push_back( JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.originFrameSequence, ev.kind, ev.flags } );
 }
 
 void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
@@ -6018,6 +6046,16 @@ void Worker::ProcessJnGfxLink( const QueueJnGfxLink& ev )
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
     data.gfxLinks.push_back( JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnFrame( const QueueJnFrame& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.frames.push_back( JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -9788,6 +9826,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.gfxDispatches );
     WriteJnVector( f, m_data.jnTrace.gfxEntities );
     WriteJnVector( f, m_data.jnTrace.gfxLinks );
+    WriteJnVector( f, m_data.jnTrace.frames );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

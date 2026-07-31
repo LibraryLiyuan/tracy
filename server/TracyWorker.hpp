@@ -901,6 +901,7 @@ private:
     tracy_force_inline void ProcessJnGfxDispatch( const QueueJnGfxDispatch& ev );
     tracy_force_inline void ProcessJnGfxEntity( const QueueJnGfxEntity& ev );
     tracy_force_inline void ProcessJnGfxLink( const QueueJnGfxLink& ev );
+    tracy_force_inline void ProcessJnFrame( const QueueJnFrame& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );

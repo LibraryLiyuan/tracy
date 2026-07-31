@@ -19,7 +19,7 @@
 namespace
 {
 
-constexpr uint64_t ConfigHash = 0x8DAF4C01004D0001ull;
+constexpr uint64_t ConfigHash = 0x8DAF4C01004D0002ull;
 constexpr const char* TracyRevision = "32123070f977b534daf39e8ec0d08776ff106547";
 
 struct JobTypeEntry
@@ -51,8 +51,12 @@ std::atomic<JNTracyState> s_state { JNTracyState_NotStarted };
 std::atomic<uint64_t> s_instanceCookie { 0 };
 std::atomic<uint64_t> s_nextJobId { 1 };
 std::atomic<uint64_t> s_nextGfxId { uint64_t( 1 ) << 63 };
+std::atomic<uint64_t> s_frameConnectionId { 0 };
+std::atomic<uint64_t> s_nextFrameSequence { 1 };
+std::atomic<uint64_t> s_currentFrameId { 0 };
 std::mutex s_lifecycleMutex;
 std::mutex s_registryMutex;
+std::mutex s_frameMutex;
 HANDLE s_singletonMutex = nullptr;
 std::atomic<uint64_t> s_lastDefinitionConnection { 0 };
 std::atomic<uint32_t> s_jobCallstackDepth { 0 };
@@ -118,6 +122,22 @@ uint64_t CurrentConnectionId()
 {
     if( !IsStarted() || !tracy::GetProfiler().IsConnected() ) return 0;
     return tracy::GetProfiler().ConnectionId();
+}
+
+uint16_t FrameConnectionGeneration( uint64_t connectionId )
+{
+    return connectionId == 0 ? 0 : uint16_t( ( connectionId - 1 ) % 65535 + 1 );
+}
+
+bool FrameIdMatchesConnection( uint64_t frameId, uint64_t connectionId )
+{
+    return frameId != 0 && uint16_t( frameId >> 48 ) == FrameConnectionGeneration( connectionId );
+}
+
+uint32_t CurrentOriginFrameSequence( uint64_t connectionId )
+{
+    const auto frameId = s_currentFrameId.load( std::memory_order_acquire );
+    return FrameIdMatchesConnection( frameId, connectionId ) ? uint32_t( frameId ) : 0;
 }
 
 void EnsureJobDefinitions()
@@ -283,11 +303,14 @@ JNTracyResult JNTracy_Startup( const JNTracyStartupDesc* desc )
 
     s_instanceCookie.store( MakeInstanceCookie(), std::memory_order_release );
     s_jobCallstackDepth.store( ReadJobCallstackDepth(), std::memory_order_release );
+    s_frameConnectionId.store( 0, std::memory_order_release );
+    s_nextFrameSequence.store( 1, std::memory_order_release );
+    s_currentFrameId.store( 0, std::memory_order_release );
     tracy::StartupProfiler();
     s_state.store( JNTracyState_Started, std::memory_order_release );
 
     char info[256];
-    const auto length = snprintf( info, sizeof( info ), "JNTracyClient ABI=%u Config=%016llX Tracy=%s Protocol=77 JobSchema=1 JobCallstackDepth=%u",
+    const auto length = snprintf( info, sizeof( info ), "JNTracyClient ABI=%u Config=%016llX Tracy=%s Protocol=78 JobSchema=1 FrameSchema=1 JobCallstackDepth=%u",
         JN_TRACY_ABI_VERSION, static_cast<unsigned long long>( ConfigHash ), TracyRevision,
         s_jobCallstackDepth.load( std::memory_order_relaxed ) );
     if( length > 0 ) ___tracy_emit_message_appinfo( info, std::min<size_t>( size_t( length ), sizeof( info ) - 1 ) );
@@ -300,6 +323,8 @@ JNTracyResult JNTracy_Shutdown( void )
     if( s_state.load( std::memory_order_acquire ) != JNTracyState_Started ) return JNTracyResult_NotStarted;
     s_state.store( JNTracyState_Stopping, std::memory_order_release );
     tracy::ShutdownProfiler();
+    s_currentFrameId.store( 0, std::memory_order_release );
+    s_frameConnectionId.store( 0, std::memory_order_release );
     if( s_singletonMutex != nullptr )
     {
         CloseHandle( s_singletonMutex );
@@ -360,6 +385,65 @@ void JNTracy_FrameMark( const char* name, uint32_t nameLength, uint8_t kind )
     case JNTracyFrameMark_End: ___tracy_emit_frame_mark_end( stableName ); break;
     default: break;
     }
+}
+
+uint64_t JNTracy_FrameBegin( uint64_t parentFrameId, uint64_t domainIndex, uint8_t domain, uint8_t flags )
+{
+    if( !IsStarted() || domain > JNTracyFrameDomain_GpuMemory ) return 0;
+    const auto connectionId = CurrentConnectionId();
+    if( connectionId == 0 ) return 0;
+    std::lock_guard<std::mutex> lock( s_frameMutex );
+    if( s_frameConnectionId.load( std::memory_order_relaxed ) != connectionId )
+    {
+        s_frameConnectionId.store( connectionId, std::memory_order_relaxed );
+        s_nextFrameSequence.store( 1, std::memory_order_relaxed );
+        s_currentFrameId.store( 0, std::memory_order_relaxed );
+    }
+    uint64_t frameId;
+    if( FrameIdMatchesConnection( parentFrameId, connectionId ) )
+    {
+        frameId = parentFrameId;
+        flags = uint8_t( ( flags | JNTracyFrameIdentity_Alias ) & ~JNTracyFrameIdentity_Canonical );
+    }
+    else
+    {
+        const auto sequence = s_nextFrameSequence.fetch_add( 1, std::memory_order_relaxed );
+        if( sequence == 0 || sequence > uint64_t( UINT32_MAX ) ) return 0;
+        frameId = ( uint64_t( FrameConnectionGeneration( connectionId ) ) << 48 ) | sequence;
+        flags = uint8_t( ( flags | JNTracyFrameIdentity_Canonical ) & ~JNTracyFrameIdentity_Alias );
+    }
+    s_currentFrameId.store( frameId, std::memory_order_release );
+    tracy::EmitJnFrame( frameId, domainIndex, domain, uint8_t( tracy::JnFramePhase::Begin ), flags );
+    return frameId;
+}
+
+void JNTracy_FrameEnd( uint64_t frameId, uint64_t domainIndex, uint8_t domain, uint8_t flags )
+{
+    const auto connectionId = CurrentConnectionId();
+    if( !IsStarted() || domain > JNTracyFrameDomain_GpuMemory || !FrameIdMatchesConnection( frameId, connectionId ) ) return;
+    tracy::EmitJnFrame( frameId, domainIndex, domain, uint8_t( tracy::JnFramePhase::End ), flags );
+    if( ( flags & JNTracyFrameIdentity_Canonical ) != 0 )
+    {
+        auto expected = frameId;
+        s_currentFrameId.compare_exchange_strong( expected, 0, std::memory_order_acq_rel );
+    }
+}
+
+void JNTracy_FrameBoundary( uint64_t frameId, uint64_t domainIndex, uint8_t domain, uint8_t flags )
+{
+    const auto connectionId = CurrentConnectionId();
+    if( !IsStarted() || domain > JNTracyFrameDomain_GpuMemory ) return;
+    if( frameId == 0 ) frameId = s_currentFrameId.load( std::memory_order_acquire );
+    if( !FrameIdMatchesConnection( frameId, connectionId ) ) return;
+    tracy::EmitJnFrame( frameId, domainIndex, domain, uint8_t( tracy::JnFramePhase::Boundary ), flags );
+}
+
+uint64_t JNTracy_GetCurrentFrameId( void )
+{
+    if( !IsStarted() ) return 0;
+    const auto connectionId = CurrentConnectionId();
+    const auto frameId = s_currentFrameId.load( std::memory_order_acquire );
+    return FrameIdMatchesConnection( frameId, connectionId ) ? frameId : 0;
 }
 
 void JNTracy_ThreadName( const char* name, uint32_t nameLength )
@@ -460,7 +544,9 @@ uint64_t JNTracy_JobSchedule( const JNTracyJobScheduleDesc* desc )
         if( dependencyJob != 0 || dependencyHandle != 0 ) validDependencyCount++;
     }
     tracy::EmitJnJobSchedule( jobId, desc->packedHandle, validDependencyCount, desc->kind, desc->flags );
-    tracy::EmitJnJobConfig( jobId, desc->typeId, desc->count, desc->grainSize, desc->unityFlowId, desc->kind, desc->flags );
+    const auto connectionId = CurrentConnectionId();
+    tracy::EmitJnJobConfig( jobId, desc->typeId, desc->count, desc->grainSize, desc->unityFlowId,
+        CurrentOriginFrameSequence( connectionId ), desc->kind, desc->flags );
     for( uint16_t i=0; i<desc->dependencyCount; i++ )
     {
         auto dependencyJob = desc->dependencyJobIds != nullptr ? desc->dependencyJobIds[i] : 0;
@@ -488,7 +574,7 @@ void JNTracy_JobBindType( uint64_t packedHandle, uint32_t typeId )
         const auto type = s_jobTypes.find( typeId );
         if( type != s_jobTypes.end() ) kind = type->second.kind;
     }
-    if( jobId != 0 ) tracy::EmitJnJobConfig( jobId, typeId, 0, 0, 0, kind, 0 );
+    if( jobId != 0 ) tracy::EmitJnJobConfig( jobId, typeId, 0, 0, 0, 0, kind, 0 );
 }
 
 void JNTracy_JobStage( const JNTracyJobStageDesc* desc )
@@ -520,7 +606,8 @@ uint64_t JNTracy_GfxDispatchBegin( uint64_t frameIndex, uint32_t expectedJobs, u
 {
     if( !IsStarted() ) return 0;
     const auto id = s_nextGfxId.fetch_add( 1, std::memory_order_relaxed );
-    tracy::EmitJnGfxDispatch( id, frameIndex, expectedJobs, threadingMode, 0 );
+    const auto originFrameId = JNTracy_GetCurrentFrameId();
+    tracy::EmitJnGfxDispatch( id, originFrameId != 0 ? originFrameId : frameIndex, expectedJobs, threadingMode, 0 );
     return id;
 }
 

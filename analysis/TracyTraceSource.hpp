@@ -100,6 +100,7 @@ struct TraceCountsDto
     uint64_t gfxDispatches = 0;
     uint64_t gfxEntities = 0;
     uint64_t gfxLinks = 0;
+    uint64_t correlatedFrameEvents = 0;
 };
 
 struct TraceInfoDto
@@ -534,6 +535,8 @@ struct JobDto
     uint32_t count = 0;
     uint32_t grainSize = 0;
     uint32_t unityFlowId = 0;
+    uint32_t originFrameSequence = 0;
+    uint64_t originFrameId = 0;
     uint32_t scheduleCallstack = 0;
     uint16_t expectedDependencyCount = 0;
     std::optional<int64_t> firstRunNs;
@@ -583,6 +586,18 @@ struct GfxLinkDto
     int64_t timeNs = 0;
     std::string threadRef;
     uint8_t relation = 0;
+    uint8_t flags = 0;
+};
+
+struct CorrelatedFrameEventDto
+{
+    std::string ref;
+    uint64_t frameId = 0;
+    uint64_t domainIndex = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t domain = 0;
+    uint8_t phase = 0;
     uint8_t flags = 0;
 };
 
@@ -706,6 +721,7 @@ public:
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
+    virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

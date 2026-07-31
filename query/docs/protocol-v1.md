@@ -8,7 +8,7 @@ Every CLI/NDJSON request is an object with `protocol`, `id`, `method`, and optio
 {"protocol":"tracy-query/1","id":"request-1","method":"frame.outliers","params":{"trace_id":"trace-1","limit":20}}
 ```
 
-A success contains `schema_version=1.3.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 added typed Capture Context and Producer Quality queries. Schema 1.3 adds versioned `JNCAT1` stable definitions and generation-bearing `JNENT1` entities without changing the Tracy live protocol or trace file version.
+A success contains `schema_version=1.4.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 added typed Capture Context and Producer Quality queries. Schema 1.3 added versioned `JNCAT1` stable definitions and generation-bearing `JNENT1` entities. Schema 1.4 adds exact FrameIdentity and typed cross-domain correlation queries; it uses Tracy live protocol 78 and JN persisted-section schema 2 while retaining snapshot schema 1 load compatibility.
 
 ## Numeric and range rules
 
