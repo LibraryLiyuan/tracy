@@ -1718,6 +1718,35 @@ bool Profiler::ShouldExit()
     return s_instance->m_shutdown.load( std::memory_order_relaxed );
 }
 
+void Profiler::SendConnectionCallbackData( uint64_t connectionId, uint64_t snapshotSequence )
+{
+#ifdef TRACY_ON_DEMAND
+    if( !m_connectionCallback ) return;
+
+    alignas( 16 ) char connectionPayload[48 * 1024];
+    for( uint32_t recordIndex = 0; recordIndex < 128; recordIndex++ )
+    {
+        const auto connectionPayloadSize = m_connectionCallback(
+            m_connectionCallbackData, connectionId, snapshotSequence, recordIndex,
+            connectionPayload, sizeof( connectionPayload ) );
+        if( connectionPayloadSize == 0 ) break;
+        if( connectionPayloadSize >= sizeof( connectionPayload ) ||
+            connectionPayloadSize >= (std::numeric_limits<uint16_t>::max)() ) continue;
+
+        QueueItem item;
+        MemWrite( &item.hdr.type, QueueType::MessageAppInfo );
+        MemWrite( &item.messageFat.time, GetTime() );
+        MemWrite( &item.messageFat.text, (uint64_t)connectionPayload );
+        MemWrite( &item.messageFat.size, (uint16_t)connectionPayloadSize );
+        SendSingleString( connectionPayload, connectionPayloadSize );
+        AppendData( &item, QueueDataSize[(int)QueueType::MessageAppInfo] );
+    }
+#else
+    (void)connectionId;
+    (void)snapshotSequence;
+#endif
+}
+
 void Profiler::Worker()
 {
 #if defined __linux__ && !defined TRACY_NO_CRASH_HANDLER
@@ -2009,23 +2038,7 @@ void Profiler::Worker()
 
         m_sock->Send( &onDemand, sizeof( onDemand ) );
 
-        if( m_connectionCallback )
-        {
-            char connectionPayload[2048];
-            const auto connectionPayloadSize = m_connectionCallback(
-                m_connectionCallbackData, connectionId, connectionPayload, sizeof( connectionPayload ) );
-            if( connectionPayloadSize > 0 && connectionPayloadSize < sizeof( connectionPayload ) &&
-                connectionPayloadSize < (std::numeric_limits<uint16_t>::max)() )
-            {
-                QueueItem item;
-                MemWrite( &item.hdr.type, QueueType::MessageAppInfo );
-                MemWrite( &item.messageFat.time, GetTime() );
-                MemWrite( &item.messageFat.text, (uint64_t)connectionPayload );
-                MemWrite( &item.messageFat.size, (uint16_t)connectionPayloadSize );
-                SendSingleString( connectionPayload, connectionPayloadSize );
-                AppendData( &item, QueueDataSize[(int)QueueType::MessageAppInfo] );
-            }
-        }
+        SendConnectionCallbackData( connectionId, 0 );
 
         m_deferredLock.lock();
         for( auto& item : m_deferredQueue )
@@ -2060,8 +2073,24 @@ void Profiler::Worker()
 
         // Main communications loop
         int keepAlive = 0;
+#ifdef TRACY_ON_DEMAND
+        uint64_t connectionSnapshotSequence = 0;
+        uint32_t connectionSnapshotCheck = 0;
+        auto nextConnectionSnapshot = std::chrono::steady_clock::now() + std::chrono::seconds( 1 );
+#endif
         for(;;)
         {
+#ifdef TRACY_ON_DEMAND
+            if( ( ++connectionSnapshotCheck & 0x7F ) == 0 )
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if( now >= nextConnectionSnapshot )
+                {
+                    SendConnectionCallbackData( connectionId, ++connectionSnapshotSequence );
+                    nextConnectionSnapshot = now + std::chrono::seconds( 1 );
+                }
+            }
+#endif
             ProcessSysTime();
 #ifdef TRACY_HAS_SYSPOWER
             m_sysPower.Tick();

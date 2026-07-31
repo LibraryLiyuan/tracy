@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "coverage_level": "mcp",
   "status": "complete",
   "public_method_registry": "tracy::query::QueryMethodRegistry",
@@ -40,6 +40,8 @@
     "McpTranscriptTests unknown method and conflicting trace validation",
     "McpWorkerIntegrationTests real Worker trace.info through generic route",
     "McpTranscriptTests trace.identity discovery and generic inspect route",
-    "JnIdentityMcpAcceptance snapshot, stream, and replay identity equality"
+    "JnIdentityMcpAcceptance snapshot, stream, and replay identity equality",
+    "capture.context/capture.coverage/producer.get discovery and generic inspect route",
+    "JnContextQualityMcpAcceptance snapshot, stream, and replay equality"
   ]
 }

@@ -1059,9 +1059,14 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
     };
     const bool hasCpu = !GetCpuTopology().empty() || info.counts.contextSwitches != 0;
+    const bool hasCapture = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
+        return record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" );
+    } );
     return {
         capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
         capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash" } ),
+        capability( "capture", hasCapture, true, { "capture.context", "capture.coverage", "producer.list", "producer.get" },
+            hasCapture ? "" : "trace predates or did not emit JN Capture Context or Producer Quality" ),
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
@@ -2071,7 +2076,7 @@ std::vector<LockEventDto> WorkerTraceSource::ScanLockEvents( const ScanRange& ra
             dto.type = typeName( event->type );
             if( item.lockCount != 0 && item.lockingThread < lock->threadList.size() ) dto.ownerThreadRef = m_impl->MakeRef( "thread", lock->threadList[item.lockingThread] );
             dto.lockCount = item.lockCount;
-            dto.sourceLocationRef = m_impl->SourceLocation( event->SrcLoc() ).ref;
+            if( event->SrcLoc() != 0 ) dto.sourceLocationRef = m_impl->SourceLocation( event->SrcLoc() ).ref;
             for( size_t bit = 0; bit < lock->threadList.size() && bit < 64; bit++ )
             {
                 if( item.waitList & ( uint64_t( 1 ) << bit ) ) dto.waiterThreadRefs.emplace_back( m_impl->MakeRef( "thread", lock->threadList[bit] ) );

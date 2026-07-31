@@ -5,7 +5,19 @@ param(
     [Parameter(Mandatory = $true)][string]$StreamTrace,
     [Parameter(Mandatory = $true)][string]$ReplayTrace,
     [Parameter(Mandatory = $true)][string]$AllowRoot,
-    [string]$LegacyTrace
+    [string]$LegacyTrace,
+    [switch]$CheckContextQuality,
+    [switch]$SkipSyntheticProducerChecks,
+    [string]$ExpectedDegradedProducer = 'test.degraded',
+    [string]$ExpectedRealZeroProducer = 'test.real-zero',
+    [string]$ExpectedDisabledProducer = 'test.disabled',
+    [string]$ExpectedUnsupportedProducer = 'test.unsupported',
+    [string]$ExpectedZoneDomainProducer = 'test.zone-domain',
+    [string]$ExpectedGpuMemoryProducer = 'memory.gpu.registry',
+    [string]$ExpectedWorkloadScene,
+    [string[]]$RequiredProducerKeys = @(),
+    [string[]]$ExpectedDisabledProducerKeys = @(),
+    [switch]$RequireAnyEmittedProducer
 )
 
 $ErrorActionPreference = 'Stop'
@@ -98,6 +110,15 @@ function Read-IdentityTrace([string]$Path, [bool]$RunGeneralChecks = $false)
     try
     {
         $identity = Inspect-Identity $opened.Id
+        $context = $null
+        $coverage = $null
+        $producerList = $null
+        if ($CheckContextQuality)
+        {
+            $context = Invoke-Tool 'tracy_inspect' @{ trace_id = $opened.Id; method = 'capture.context'; params = @{} }
+            $coverage = Invoke-Tool 'tracy_inspect' @{ trace_id = $opened.Id; method = 'capture.coverage'; params = @{} }
+            $producerList = Invoke-Tool 'tracy_inspect' @{ trace_id = $opened.Id; method = 'producer.list'; params = @{} }
+        }
         $overview = $null
         $validation = $null
         if ($RunGeneralChecks)
@@ -109,7 +130,7 @@ function Read-IdentityTrace([string]$Path, [bool]$RunGeneralChecks = $false)
         }
         Invoke-Tool 'tracy_trace_close' @{ trace_id = $opened.Id } | Out-Null
         $script:OpenedIds = @($script:OpenedIds | Where-Object { $_ -ne $opened.Id })
-        return [pscustomobject]@{ Status = $opened.Status; Identity = $identity; Overview = $overview; Validation = $validation }
+        return [pscustomobject]@{ Status = $opened.Status; Identity = $identity; Context = $context; Coverage = $coverage; ProducerList = $producerList; Overview = $overview; Validation = $validation }
     }
     catch
     {
@@ -141,7 +162,7 @@ try
     foreach ($result in @($snapshotIdentity, $streamIdentity, $replayIdentity))
     {
         Assert-Condition ([bool]$result.ok) 'trace.identity query failed'
-        Assert-Condition ([string]$result.schema_version -eq '1.1.0') 'unexpected Query schema version'
+        Assert-Condition ([string]$result.schema_version -eq '1.2.0') 'unexpected Query schema version'
         Assert-Condition ([bool]$result.data.present) 'capture identity is absent'
         Assert-Condition ([bool]$result.data.complete) 'capture identity is incomplete'
         Assert-Condition (@($result.data.missing_required).Count -eq 0) 'required identity fields are missing'
@@ -157,6 +178,91 @@ try
     Assert-Condition ([string]$snapshotIdentity.data.canonical_fingerprint -eq [string]$replayIdentity.data.canonical_fingerprint) 'snapshot and replay identity fingerprints differ'
     Assert-Condition (-not [string]::IsNullOrEmpty([string]$snapshotIdentity.data.identity.build.artifacts.jn_client.loaded_path)) 'actual JNTracyClient loaded path is missing'
 
+    $contextGeneration = $null
+    $producerCount = $null
+    $degradedState = $null
+    $realZeroState = $null
+    if ($CheckContextQuality)
+    {
+        foreach ($result in @($snapshot.Context, $stream.Context, $replay.Context))
+        {
+            Assert-Condition ([bool]$result.ok) 'capture.context query failed'
+            Assert-Condition ([bool]$result.data.present) 'capture context is absent'
+            Assert-Condition ([bool]$result.data.complete) 'capture context is incomplete'
+            Assert-Condition (@($result.data.missing_layers).Count -eq 0) 'capture context layers are missing'
+            Assert-Condition (@($result.data.invalid_records).Count -eq 0) 'capture context has invalid records'
+        }
+        foreach ($result in @($snapshot.Coverage, $stream.Coverage, $replay.Coverage))
+        {
+            Assert-Condition ([bool]$result.ok) 'capture.coverage query failed'
+            Assert-Condition ([bool]$result.data.present) 'producer coverage is absent'
+            Assert-Condition ([bool]$result.data.complete) 'producer coverage is incomplete'
+            Assert-Condition (@($result.data.invalid_records).Count -eq 0) 'producer coverage has invalid records'
+        }
+        foreach ($result in @($snapshot.ProducerList, $stream.ProducerList, $replay.ProducerList))
+        {
+            Assert-Condition ([bool]$result.ok) 'producer.list query failed'
+            Assert-Condition ([bool]$result.data.present) 'producer list is absent'
+            Assert-Condition ([bool]$result.data.complete) 'producer list is incomplete'
+            Assert-Condition (@($result.data.invalid_records).Count -eq 0) 'producer list has invalid records'
+        }
+        $snapshotContext = $snapshot.Context.data.context | ConvertTo-Json -Compress -Depth 30
+        Assert-Condition ($snapshotContext -eq ($stream.Context.data.context | ConvertTo-Json -Compress -Depth 30)) 'snapshot and stream context differ'
+        Assert-Condition ($snapshotContext -eq ($replay.Context.data.context | ConvertTo-Json -Compress -Depth 30)) 'snapshot and replay context differ'
+        $snapshotProducers = $snapshot.Coverage.data.producers | ConvertTo-Json -Compress -Depth 30
+        Assert-Condition ($snapshotProducers -eq ($stream.Coverage.data.producers | ConvertTo-Json -Compress -Depth 30)) 'snapshot and stream producer coverage differ'
+        Assert-Condition ($snapshotProducers -eq ($replay.Coverage.data.producers | ConvertTo-Json -Compress -Depth 30)) 'snapshot and replay producer coverage differ'
+        Assert-Condition ($snapshotProducers -eq ($snapshot.ProducerList.data.producers | ConvertTo-Json -Compress -Depth 30)) 'producer.list and capture.coverage differ'
+        if (-not [string]::IsNullOrEmpty($ExpectedWorkloadScene))
+        {
+            Assert-Condition ([string]$snapshot.Context.data.context.workload.scene -eq $ExpectedWorkloadScene) 'unexpected workload scene'
+        }
+        foreach ($producerKey in $RequiredProducerKeys)
+        {
+            $required = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $producerKey })
+            Assert-Condition ($required.Count -eq 1) "required producer is missing or duplicated: $producerKey"
+        }
+        foreach ($producerKey in $ExpectedDisabledProducerKeys)
+        {
+            $disabledRequired = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $producerKey })
+            Assert-Condition ($disabledRequired.Count -eq 1 -and [string]$disabledRequired[0].state -eq 'disabled') "producer is not disabled: $producerKey"
+        }
+        if ($RequireAnyEmittedProducer)
+        {
+            $emitted = @($snapshot.Coverage.data.producers | Where-Object { [uint64]$_.counters.emitted -gt 0 })
+            Assert-Condition ($emitted.Count -gt 0) 'no producer emitted an event in the capture window'
+        }
+        if (-not $SkipSyntheticProducerChecks)
+        {
+            $degraded = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedDegradedProducer })
+            $realZero = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedRealZeroProducer })
+            $disabled = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedDisabledProducer })
+            $unsupported = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedUnsupportedProducer })
+            $zoneDomain = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedZoneDomainProducer })
+            $gpuMemory = @($snapshot.Coverage.data.producers | Where-Object { $_.key -eq $ExpectedGpuMemoryProducer })
+            Assert-Condition ($degraded.Count -eq 1 -and [string]$degraded[0].state -eq 'degraded') 'degraded producer state was not preserved'
+            Assert-Condition ([uint64]$degraded[0].counters.filtered -gt 0 -and [uint64]$degraded[0].counters.overflow -gt 0) 'filter/overflow counters were not preserved'
+            Assert-Condition ($realZero.Count -eq 1 -and [string]$realZero[0].state -eq 'real_zero') 'real-zero producer was not distinguished'
+            Assert-Condition ($disabled.Count -eq 1 -and [string]$disabled[0].state -eq 'disabled') 'disabled producer was not distinguished'
+            Assert-Condition ($unsupported.Count -eq 1 -and [string]$unsupported[0].state -eq 'unsupported') 'unsupported producer was not distinguished'
+            Assert-Condition ($zoneDomain.Count -eq 1 -and [string]$zoneDomain[0].state -eq 'covered') 'attributed Zone producer was not covered'
+            Assert-Condition ([uint64]$zoneDomain[0].counters.observed -gt 0 -and [uint64]$zoneDomain[0].counters.emitted -gt 0) 'attributed Zone counters were not preserved'
+            Assert-Condition ($gpuMemory.Count -eq 1 -and [bool]$gpuMemory[0].effective) 'GPU memory producer was not effective'
+            Assert-Condition ([uint64]$gpuMemory[0].counters.observed -gt 0 -and [uint64]$gpuMemory[0].counters.emitted -gt 0) 'GPU memory producer counters were not preserved'
+            $degradedState = [string]$degraded[0].state
+            $realZeroState = [string]$realZero[0].state
+        }
+        $probe = Open-Trace $SnapshotTrace
+        $script:OpenedIds += $probe.Id
+        $probeKey = if ($RequiredProducerKeys.Count -gt 0) { $RequiredProducerKeys[0] } else { $ExpectedDegradedProducer }
+        $producerGet = Invoke-Tool 'tracy_inspect' @{ trace_id = $probe.Id; method = 'producer.get'; params = @{ key = $probeKey } }
+        Assert-Condition ([string]$producerGet.data.producer.key -eq $probeKey) 'producer.get did not return the requested producer'
+        Invoke-Tool 'tracy_trace_close' @{ trace_id = $probe.Id } | Out-Null
+        $script:OpenedIds = @($script:OpenedIds | Where-Object { $_ -ne $probe.Id })
+        $contextGeneration = [string]$snapshot.Context.data.generation
+        $producerCount = @($snapshot.Coverage.data.producers).Count
+    }
+
     $legacyPresent = $null
     if (-not [string]::IsNullOrEmpty($LegacyTrace))
     {
@@ -165,6 +271,11 @@ try
         Assert-Condition (-not [bool]$legacyIdentity.data.present) 'legacy trace fabricated a capture identity'
         Assert-Condition ($null -eq $legacyIdentity.data.identity) 'legacy identity must be null'
         $legacyPresent = [bool]$legacyIdentity.data.present
+        if ($CheckContextQuality)
+        {
+            Assert-Condition (-not [bool]$legacy.Context.data.present) 'legacy trace fabricated Capture Context'
+            Assert-Condition (-not [bool]$legacy.Coverage.data.present) 'legacy trace fabricated Producer Quality'
+        }
     }
 
     [pscustomobject]@{
@@ -186,6 +297,10 @@ try
         overview_ok = [bool]$snapshot.Overview.ok
         validation_ok = [bool]$snapshot.Validation.ok
         legacy_present = $legacyPresent
+        context_generation = $contextGeneration
+        producer_count = $producerCount
+        degraded_state = $degradedState
+        real_zero_state = $realZeroState
     } | ConvertTo-Json -Depth 10
 }
 finally

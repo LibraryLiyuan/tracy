@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.1.0",
+  "schema_version": "1.2.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -506,6 +506,24 @@
       "query_fields": ["present", "schema_version", "complete", "reason", "identity", "canonical_fingerprint", "field_sources", "missing_required", "conflicts", "invalid_records", "records", "limits", "trust"],
       "unmapped_fields": [],
       "methods": ["trace.identity"],
+      "status": "complete"
+    },
+    {
+      "entity": "capture.context",
+      "classification": "derived_semantic",
+      "persisted_fields": ["ordered JNCTX1 AppInfo envelopes"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "connection_id", "generation", "context", "field_sources", "generations", "missing_layers", "invalid_records", "layers", "records", "trust"],
+      "unmapped_fields": [],
+      "methods": ["capture.context"],
+      "status": "complete"
+    },
+    {
+      "entity": "capture.producer_coverage",
+      "classification": "derived_semantic",
+      "persisted_fields": ["ordered JNQ1 AppInfo producer snapshots"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "connection_id", "evidence_kind", "coverage_ratio", "scanned_count", "total_count", "omitted_count", "producers", "producer", "quality_findings", "invalid_records", "records", "trust"],
+      "unmapped_fields": [],
+      "methods": ["capture.coverage", "producer.list", "producer.get"],
       "status": "complete"
     },
     {

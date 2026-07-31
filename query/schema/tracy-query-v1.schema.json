@@ -32,6 +32,49 @@
         "trust": { "const": "untrusted_trace_data" }
       }
     },
+    "captureContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present", "schema_version", "complete", "reason", "connection_id", "generation", "context", "field_sources", "generations", "missing_layers", "invalid_records", "layers", "records", "trust"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "schema_version": { "const": 1 },
+        "complete": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "connection_id": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+        "generation": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+        "context": { "type": ["object", "null"] },
+        "field_sources": { "type": "object" },
+        "generations": { "type": "array", "items": { "type": "object" } },
+        "missing_layers": { "type": "array", "items": { "type": "string" } },
+        "invalid_records": { "type": "array", "items": { "type": "object" } },
+        "layers": { "type": "object" },
+        "records": { "type": "object" },
+        "trust": { "const": "untrusted_trace_data" }
+      }
+    },
+    "producerCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present", "schema_version", "complete", "reason", "connection_id", "evidence_kind", "coverage_ratio", "scanned_count", "total_count", "omitted_count", "producers", "quality_findings", "invalid_records", "records", "trust"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "schema_version": { "const": 1 },
+        "complete": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "connection_id": { "type": ["string", "null"], "pattern": "^[0-9]+$" },
+        "evidence_kind": { "enum": ["exact", "derived", "heuristic"] },
+        "coverage_ratio": { "type": ["number", "null"], "minimum": 0 },
+        "scanned_count": { "$ref": "#/$defs/decimal64" },
+        "total_count": { "$ref": "#/$defs/decimal64" },
+        "omitted_count": { "$ref": "#/$defs/decimal64" },
+        "producers": { "type": "array", "items": { "type": "object" } },
+        "quality_findings": { "type": "array", "items": { "type": "object" } },
+        "invalid_records": { "type": "array", "items": { "type": "object" } },
+        "records": { "type": "object" },
+        "trust": { "const": "untrusted_trace_data" }
+      }
+    },
     "request": {
       "type": "object",
       "additionalProperties": false,
@@ -74,7 +117,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "data", "warnings"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.1.0" },
+        "schema_version": { "const": "1.2.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": true },
         "trace": { "$ref": "#/$defs/trace" },
@@ -98,7 +141,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "error"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.1.0" },
+        "schema_version": { "const": "1.2.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": false },
         "error": {

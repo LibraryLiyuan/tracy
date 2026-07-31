@@ -49,7 +49,13 @@
 
 namespace tracy
 {
-using ConnectionCallback = size_t (*)( void* data, uint64_t connectionId, char* buffer, size_t capacity );
+// Invoked by the profiler worker at handshake (snapshotSequence == 0) and at
+// a low-frequency cadence while the connection remains active. The callback
+// returns one AppInfo record per recordIndex and terminates a snapshot by
+// returning zero. This path is intentionally current-connection-only and does
+// not populate the on-demand deferred queue.
+using ConnectionCallback = size_t (*)( void* data, uint64_t connectionId, uint64_t snapshotSequence,
+    uint32_t recordIndex, char* buffer, size_t capacity );
 
 #if defined(TRACY_DELAYED_INIT) && defined(TRACY_MANUAL_LIFETIME)
 TRACY_API void StartupProfiler( ConnectionCallback callback = nullptr, void* callbackData = nullptr );
@@ -963,6 +969,7 @@ private:
 
     static void LaunchWorker( void* ptr ) { ((Profiler*)ptr)->Worker(); }
     void Worker();
+    void SendConnectionCallbackData( uint64_t connectionId, uint64_t snapshotSequence );
 
 #ifndef TRACY_NO_FRAME_IMAGE
     static void LaunchCompressWorker( void* ptr ) { ((Profiler*)ptr)->CompressWorker(); }

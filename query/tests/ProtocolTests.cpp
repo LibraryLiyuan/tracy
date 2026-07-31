@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <filesystem>
@@ -52,6 +53,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "frame.get" ) params["ref"] = "fake:frame:0";
     if( method == "frame.range_mapping" || method == "timeline.slice" ) { params["start_ns"] = "0"; params["end_ns"] = "100"; }
     if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) params["ref"] = "fake:frame-image:0";
+    if( method == "producer.get" ) params["key"] = "test.real-zero";
     if( method == "zone.cpu.get" || method == "zone.cpu.tree" ) params["ref"] = "fake:cpu-zone:0";
     if( method == "zone.gpu.get" || method == "zone.gpu.tree" ) params["ref"] = "fake:gpu-zone:0";
     if( method == "memory.get" ) params["ref"] = "fake:memory-event:0";
@@ -85,6 +87,7 @@ struct TemporaryTraceFiles
         duplicateIdentity = root / "duplicate-identity.tracy";
         malformedIdentity = root / "malformed-identity.tracy";
         conflictingIdentity = root / "conflicting-identity.tracy";
+        mismatchedConnection = root / "mismatched-connection.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
@@ -93,6 +96,7 @@ struct TemporaryTraceFiles
         std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
+        std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
 
@@ -109,6 +113,7 @@ struct TemporaryTraceFiles
     std::filesystem::path duplicateIdentity;
     std::filesystem::path malformedIdentity;
     std::filesystem::path conflictingIdentity;
+    std::filesystem::path mismatchedConnection;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -117,12 +122,12 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.1.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.2.0" );
     assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 25 );
+    assert( coverage.at( "domains" ).size() == 27 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -227,6 +232,10 @@ int main()
     assert( fake.AcquireReadView().sourceKind == TraceSourceKind::Snapshot );
     assert( fake.AcquireReadView().complete );
     assert( fake.GetCapabilities().size() >= 20 );
+    const auto fakeCapabilities = fake.GetCapabilities();
+    assert( std::find_if( fakeCapabilities.begin(), fakeCapabilities.end(), []( const auto& capability ) {
+        return capability.domain == "capture" && capability.present && capability.queryable;
+    } ) != fakeCapabilities.end() );
     assert( fake.GetTraceInfo().fingerprint == std::string( 64, 'f' ) );
     assert( fake.GetThreads().size() == 1 && fake.GetFrameSets().size() == 1 && fake.GetGpuContexts().size() == 1 );
     assert( fake.GetMemoryPools().size() == 1 && fake.GetPlotList().size() == 1 && fake.GetLocks().size() == 1 );
@@ -277,6 +286,19 @@ int main()
                 records.emplace_back( "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"conflicting-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00020000\"}}}" );
                 return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
             }
+            if( filename == "mismatched-connection.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                for( const size_t index : { size_t( 4 ), size_t( 5 ) } )
+                {
+                    auto record = records[index];
+                    const auto offset = record.find( "\"connection_id\":\"1\"" );
+                    assert( offset != std::string::npos );
+                    record.replace( offset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
+                    records.emplace_back( std::move( record ) );
+                }
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
             return std::make_unique<tracy::query::test::FakeTraceSource>( false, true );
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
@@ -313,6 +335,14 @@ int main()
     std::set<std::string> coveredMethods;
     for( const auto& domain : coverage.at( "domains" ) ) for( const auto& method : domain.at( "methods" ) ) coveredMethods.emplace( method.get<std::string>() );
     assert( describedMethods == coveredMethods );
+    const auto& operations = described.at( "data" ).at( "operations" );
+    const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
+        return operation.at( "method" ) == "producer.get";
+    } );
+    assert( producerGetOperation != operations.end() );
+    const std::set<std::string> producerGetRequired(
+        producerGetOperation->at( "required" ).begin(), producerGetOperation->at( "required" ).end() );
+    assert( producerGetRequired == std::set<std::string>( { "trace_id", "key" } ) );
 
     const auto schemaResponse = service.Execute( Request( 103, "system.schema" ) );
     assert( schemaResponse.at( "ok" ) );
@@ -362,6 +392,30 @@ int main()
     assert( captureIdentity.at( "records" ).at( "valid" ) == 4 );
     assert( captureIdentity.at( "canonical_fingerprint" ).get<std::string>().size() == 16 );
     const auto captureIdentityFingerprint = captureIdentity.at( "canonical_fingerprint" ).get<std::string>();
+
+    const auto captureContext = service.Execute( Request( requestId++, "capture.context", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( captureContext.at( "present" ) == true );
+    assert( captureContext.at( "complete" ) == true );
+    assert( captureContext.at( "generation" ) == "1" );
+    assert( captureContext.at( "context" ).at( "workload" ).at( "scene" ) == "Init" );
+    assert( captureContext.at( "missing_layers" ).empty() );
+
+    const auto captureCoverage = service.Execute( Request( requestId++, "capture.coverage", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( captureCoverage.at( "present" ) == true );
+    assert( captureCoverage.at( "complete" ) == true );
+    assert( captureCoverage.at( "evidence_kind" ) == "exact" );
+    assert( captureCoverage.at( "producers" ).size() == 2 );
+    const auto degradedProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
+        []( const auto& value ) { return value.at( "key" ) == "test.degraded"; } );
+    assert( degradedProducer != captureCoverage.at( "producers" ).end() );
+    assert( degradedProducer->at( "state" ) == "degraded" );
+    assert( degradedProducer->at( "counters" ).at( "filtered" ) == "5" );
+    assert( degradedProducer->at( "counters" ).at( "overflow" ) == "1" );
+    const auto realZero = service.Execute( Request( requestId++, "producer.get", {
+        { "trace_id", candidateId }, { "key", "test.real-zero" }
+    } ) ).at( "data" );
+    assert( realZero.at( "producer" ).at( "state" ) == "real_zero" );
+    assert( realZero.at( "producer" ).at( "coverage_ratio" ) == 1.0 );
 
     const auto threadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", candidateId }, { "ref", "fake:thread:1" }
@@ -513,6 +567,17 @@ int main()
     assert( legacyIdentity.at( "identity" ).is_null() );
     assert( legacyIdentity.at( "reason" ) == "trace predates or did not emit JN Capture Identity" );
 
+    const auto legacyContext = service.Execute( Request( requestId++, "capture.context", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" );
+    assert( legacyContext.at( "present" ) == false );
+    assert( legacyContext.at( "complete" ) == false );
+    const auto legacyCoverage = service.Execute( Request( requestId++, "capture.coverage", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" );
+    assert( legacyCoverage.at( "present" ) == false );
+    assert( legacyCoverage.at( "complete" ) == false );
+
     const auto legacyThreadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", baselineId }, { "ref", "fake:thread:1" }
     } ) ).at( "data" );
@@ -609,6 +674,26 @@ int main()
     assert( conflictingIdentity.at( "conflicts" ).size() == 1 );
     assert( conflictingIdentity.at( "conflicts" )[0].at( "path" ) == "/protocol/jn_abi_version" );
     assert( conflictingIdentity.at( "identity" ).at( "protocol" ).at( "jn_abi_version" ) == "0x00010000" );
+
+    const auto mismatchedOpen = service.Execute( Request( requestId++, "trace.open", {
+        { "path", files.mismatchedConnection.string() }
+    } ) );
+    assert( mismatchedOpen.at( "ok" ) );
+    const auto mismatchedId = mismatchedOpen.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( mismatchedId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto mismatchedContext = service.Execute( Request( requestId++, "capture.context", {
+        { "trace_id", mismatchedId }
+    } ) ).at( "data" );
+    const auto mismatchedCoverage = service.Execute( Request( requestId++, "capture.coverage", {
+        { "trace_id", mismatchedId }
+    } ) ).at( "data" );
+    assert( mismatchedContext.at( "present" ) == true && mismatchedContext.at( "complete" ) == false );
+    assert( mismatchedContext.at( "invalid_records" ).size() == 1 );
+    assert( mismatchedContext.at( "invalid_records" )[0].at( "reason" ) == "capture context contains multiple connection ids" );
+    assert( mismatchedCoverage.at( "present" ) == true && mismatchedCoverage.at( "complete" ) == false );
+    assert( mismatchedCoverage.at( "invalid_records" ).size() == 1 );
+    assert( mismatchedCoverage.at( "invalid_records" )[0].at( "reason" ) == "producer quality contains multiple connection ids" );
+    assert( service.Execute( Request( requestId++, "trace.close", { { "trace_id", mismatchedId } } ) ).at( "ok" ) );
 
     std::cout << "protocol, statistics, all query methods, fake trace source, memory snapshot, and GTMEM1 contracts passed\n";
     return 0;

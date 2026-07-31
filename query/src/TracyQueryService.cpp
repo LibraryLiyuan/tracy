@@ -25,6 +25,7 @@ const std::vector<std::string>& QueryMethodRegistry()
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
+        "capture.context", "capture.coverage", "producer.list", "producer.get",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
         "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
@@ -685,10 +686,24 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
 }
 
 constexpr std::string_view CaptureIdentityPrefix = "JNCI1|";
+constexpr std::string_view CaptureContextPrefix = "JNCTX1|";
+constexpr std::string_view ProducerQualityPrefix = "JNQ1|";
 constexpr size_t MaximumIdentityEnvelopeBytes = 48 * 1024;
 constexpr size_t MaximumIdentityRecords = 4096;
 constexpr size_t MaximumIdentityFields = 256;
 constexpr size_t MaximumIdentityStringBytes = 8192;
+constexpr size_t MaximumContextRecords = 4096;
+constexpr size_t MaximumQualityRecords = 16384;
+
+std::optional<uint64_t> DecimalStringValue( const json& value )
+{
+    if( !value.is_string() ) return std::nullopt;
+    const auto& text = value.get_ref<const std::string&>();
+    uint64_t parsed = 0;
+    const auto result = std::from_chars( text.data(), text.data() + text.size(), parsed, 10 );
+    if( result.ec != std::errc() || result.ptr != text.data() + text.size() ) return std::nullopt;
+    return parsed;
+}
 
 bool IdentityShapeAllowed( const json& value, size_t depth, size_t& fields )
 {
@@ -865,6 +880,386 @@ json CaptureIdentityJson( const analysis::TraceInfoDto& info )
     };
 }
 
+void MergeContextPatch( json& target, const json& patch, const std::string& path,
+    const std::string& producer, uint64_t generation, json& fieldSources )
+{
+    if( patch.is_object() )
+    {
+        if( !target.is_object() ) target = json::object();
+        for( const auto& [key, value] : patch.items() )
+        {
+            const auto childPath = path + '/' + EscapeJsonPointerToken( key );
+            if( value.is_object() )
+            {
+                if( !target.contains( key ) || !target[key].is_object() ) target[key] = json::object();
+                MergeContextPatch( target[key], value, childPath, producer, generation, fieldSources );
+            }
+            else
+            {
+                target[key] = value;
+                fieldSources[childPath] = { { "producer", producer }, { "generation", Decimal( generation ) } };
+            }
+        }
+    }
+    else
+    {
+        target = patch;
+        fieldSources[path] = { { "producer", producer }, { "generation", Decimal( generation ) } };
+    }
+}
+
+json CaptureContextJson( const analysis::TraceInfoDto& info )
+{
+    struct Entry
+    {
+        uint64_t generation;
+        uint64_t snapshotSequence;
+        uint64_t recordIndex;
+        json document;
+    };
+
+    std::vector<Entry> entries;
+    json invalid = json::array();
+    std::set<std::string> definitions;
+    std::set<uint64_t> snapshots;
+    std::set<uint64_t> connectionIds;
+    size_t seen = 0;
+    size_t duplicates = 0;
+    size_t envelopeBytes = 0;
+
+    for( size_t index = 0; index < info.appInfo.size(); index++ )
+    {
+        const auto& record = info.appInfo[index];
+        const bool currentEnvelope = record.starts_with( CaptureContextPrefix );
+        const bool contextLike = currentEnvelope || ( record.size() >= 6 && record.compare( 0, 5, "JNCTX" ) == 0 && record.find( '|' ) != std::string::npos );
+        if( !contextLike ) continue;
+        if( ++seen > MaximumContextRecords )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture context record limit exceeded" } } );
+            break;
+        }
+        envelopeBytes += record.size();
+        if( !currentEnvelope )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "unsupported capture context envelope version" } } );
+            continue;
+        }
+        if( record.size() <= CaptureContextPrefix.size() || record.size() > MaximumIdentityEnvelopeBytes )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture context envelope has an invalid size" } } );
+            continue;
+        }
+
+        auto document = json::parse( record.begin() + CaptureContextPrefix.size(), record.end(), nullptr, false );
+        size_t fields = 0;
+        if( document.is_discarded() || !document.is_object() || !IdentityShapeAllowed( document, 0, fields ) ||
+            document.value( "schema_version", 0 ) != 1 || !document.contains( "connection_id" ) ||
+            !document.contains( "snapshot_sequence" ) || !document.contains( "generation" ) ||
+            !document.contains( "effective_frame" ) || !document.contains( "effective_qpc" ) ||
+            !document.contains( "snapshot_qpc" ) || !document.contains( "qpc_frequency" ) ||
+            !document.contains( "producer" ) || !document["producer"].is_string() ||
+            document["producer"].get_ref<const std::string&>().empty() ||
+            !document.contains( "context" ) || !document["context"].is_object() )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture context JSON failed schema or resource-limit validation" } } );
+            continue;
+        }
+        const auto connectionId = DecimalStringValue( document["connection_id"] );
+        const auto snapshotSequence = DecimalStringValue( document["snapshot_sequence"] );
+        const auto generation = DecimalStringValue( document["generation"] );
+        const auto effectiveFrame = DecimalStringValue( document["effective_frame"] );
+        const auto effectiveQpc = DecimalStringValue( document["effective_qpc"] );
+        const auto snapshotQpc = DecimalStringValue( document["snapshot_qpc"] );
+        const auto qpcFrequency = DecimalStringValue( document["qpc_frequency"] );
+        if( !connectionId || !snapshotSequence || !generation || !effectiveFrame || !effectiveQpc || !snapshotQpc || !qpcFrequency || *qpcFrequency == 0 )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture context numeric field is invalid" } } );
+            continue;
+        }
+        connectionIds.emplace( *connectionId );
+
+        const auto definition = document["producer"].get<std::string>() + '\n' + std::to_string( *generation ) + '\n' + document["context"].dump();
+        if( !definitions.emplace( definition ).second )
+        {
+            duplicates++;
+            snapshots.emplace( *snapshotSequence );
+            continue;
+        }
+        snapshots.emplace( *snapshotSequence );
+        entries.push_back( { *generation, *snapshotSequence, uint64_t( index ), std::move( document ) } );
+    }
+
+    std::sort( entries.begin(), entries.end(), []( const auto& left, const auto& right ) {
+        if( left.generation != right.generation ) return left.generation < right.generation;
+        return left.recordIndex < right.recordIndex;
+    } );
+
+    json context = json::object();
+    json sources = json::object();
+    json generations = json::array();
+    uint64_t latestGeneration = 0;
+    for( const auto& entry : entries )
+    {
+        const auto& document = entry.document;
+        const auto producer = document["producer"].get<std::string>();
+        MergeContextPatch( context, document["context"], "", producer, entry.generation, sources );
+        latestGeneration = std::max( latestGeneration, entry.generation );
+        generations.push_back( {
+            { "generation", Decimal( entry.generation ) }, { "producer", producer },
+            { "effective_frame", document["effective_frame"] }, { "effective_qpc", document["effective_qpc"] },
+            { "qpc_frequency", document["qpc_frequency"] }, { "context", document["context"] }
+        } );
+    }
+
+    const auto identity = CaptureIdentityJson( info );
+    if( connectionIds.size() > 1 )
+        invalid.push_back( { { "record_index", nullptr }, { "reason", "capture context contains multiple connection ids" } } );
+    const auto connectionId = connectionIds.size() == 1 ? std::optional<uint64_t>( *connectionIds.begin() ) : std::nullopt;
+    if( connectionId && identity.value( "present", false ) && identity.contains( "identity" ) &&
+        identity["identity"].is_object() && identity["identity"].contains( "connection" ) &&
+        identity["identity"]["connection"].is_object() && identity["identity"]["connection"].contains( "id" ) )
+    {
+        const auto identityConnectionId = DecimalStringValue( identity["identity"]["connection"]["id"] );
+        if( !identityConnectionId || *identityConnectionId != *connectionId )
+            invalid.push_back( { { "record_index", nullptr }, { "reason", "capture context connection id does not match Capture Identity" } } );
+    }
+    const bool present = !entries.empty();
+    json missing = json::array();
+    if( !identity.value( "present", false ) ) missing.emplace_back( "build_identity" );
+    if( !context.contains( "runtime" ) ) missing.emplace_back( "runtime" );
+    if( !context.contains( "workload" ) ) missing.emplace_back( "workload" );
+    if( !context.contains( "capture_config" ) ) missing.emplace_back( "capture_config" );
+    const bool complete = present && missing.empty() && invalid.empty();
+    std::string reason;
+    if( !present ) reason = seen == 0 ? "trace predates or did not emit JN Capture Context" : "no valid JN Capture Context document was found";
+    else if( !complete ) reason = "capture context is present but incomplete or invalid";
+
+    return {
+        { "present", present }, { "schema_version", 1 }, { "complete", complete },
+        { "reason", reason.empty() ? json( nullptr ) : json( reason ) },
+        { "connection_id", connectionId ? json( Decimal( *connectionId ) ) : json( nullptr ) },
+        { "generation", present ? json( Decimal( latestGeneration ) ) : json( nullptr ) },
+        { "context", present ? context : json( nullptr ) }, { "field_sources", sources },
+        { "generations", generations }, { "missing_layers", missing }, { "invalid_records", invalid },
+        { "layers", {
+            { "build_identity", { { "present", identity.value( "present", false ) }, { "complete", identity.value( "complete", false ) },
+                { "canonical_fingerprint", identity.value( "canonical_fingerprint", json( nullptr ) ) } } },
+            { "runtime", context.contains( "runtime" ) }, { "workload", context.contains( "workload" ) },
+            { "capture_config", context.contains( "capture_config" ) }
+        } },
+        { "records", { { "seen", seen }, { "valid", entries.size() }, { "duplicates", duplicates },
+            { "snapshots", snapshots.size() }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
+json CaptureCoverageJson( const analysis::TraceInfoDto& info )
+{
+    static constexpr const char* CounterNames[] = {
+        "observed", "emitted", "dropped", "filtered", "sampled_out", "overflow",
+        "mismatch", "unresolved", "pre_capture", "replayed", "tail_truncated"
+    };
+    struct Snapshot
+    {
+        uint64_t sequence;
+        uint64_t recordIndex;
+        json document;
+    };
+
+    std::map<std::string, std::vector<Snapshot>> byProducer;
+    json invalid = json::array();
+    size_t seen = 0;
+    size_t duplicates = 0;
+    size_t envelopeBytes = 0;
+    std::set<std::string> documents;
+    std::set<uint64_t> connectionIds;
+    for( size_t index = 0; index < info.appInfo.size(); index++ )
+    {
+        const auto& record = info.appInfo[index];
+        const bool currentEnvelope = record.starts_with( ProducerQualityPrefix );
+        const bool qualityLike = currentEnvelope || ( record.size() >= 4 && record.compare( 0, 3, "JNQ" ) == 0 && record.find( '|' ) != std::string::npos );
+        if( !qualityLike ) continue;
+        if( ++seen > MaximumQualityRecords )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality record limit exceeded" } } );
+            break;
+        }
+        envelopeBytes += record.size();
+        if( !currentEnvelope )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "unsupported producer quality envelope version" } } );
+            continue;
+        }
+        if( record.size() <= ProducerQualityPrefix.size() || record.size() > MaximumIdentityEnvelopeBytes )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality envelope has an invalid size" } } );
+            continue;
+        }
+        auto document = json::parse( record.begin() + ProducerQualityPrefix.size(), record.end(), nullptr, false );
+        size_t fields = 0;
+        if( document.is_discarded() || !document.is_object() || !IdentityShapeAllowed( document, 0, fields ) ||
+            document.value( "schema_version", 0 ) != 1 || !document.contains( "connection_id" ) ||
+            !document.contains( "snapshot_sequence" ) || !document.contains( "producer" ) || !document["producer"].is_object() )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality JSON failed schema or resource-limit validation" } } );
+            continue;
+        }
+        auto& producer = document["producer"];
+        if( !producer.contains( "key" ) || !producer["key"].is_string() || producer["key"].get_ref<const std::string&>().empty() ||
+            !producer.contains( "source_mode" ) || !producer["source_mode"].is_string() ||
+            !producer.contains( "requested" ) || !producer["requested"].is_boolean() ||
+            !producer.contains( "compiled" ) || !producer["compiled"].is_boolean() ||
+            !producer.contains( "supported" ) || !producer["supported"].is_boolean() ||
+            !producer.contains( "enabled" ) || !producer["enabled"].is_boolean() ||
+            !producer.contains( "effective" ) || !producer["effective"].is_boolean() ||
+            !producer.contains( "permission_denied" ) || !producer["permission_denied"].is_boolean() ||
+            !producer.contains( "deferred" ) || !producer["deferred"].is_boolean() ||
+            !producer.contains( "counters" ) || !producer["counters"].is_object() )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality state is invalid" } } );
+            continue;
+        }
+        const auto connectionId = DecimalStringValue( document["connection_id"] );
+        const auto sequence = DecimalStringValue( document["snapshot_sequence"] );
+        bool countersValid = connectionId.has_value() && sequence.has_value();
+        for( const auto* counter : CounterNames )
+            countersValid = countersValid && producer["counters"].contains( counter ) && DecimalStringValue( producer["counters"][counter] ).has_value();
+        if( !countersValid )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality counter is invalid" } } );
+            continue;
+        }
+        connectionIds.emplace( *connectionId );
+        const auto canonical = document.dump();
+        if( !documents.emplace( canonical ).second )
+        {
+            duplicates++;
+            continue;
+        }
+        byProducer[producer["key"].get<std::string>()].push_back( { *sequence, uint64_t( index ), std::move( document ) } );
+    }
+
+    if( connectionIds.size() > 1 )
+        invalid.push_back( { { "record_index", nullptr }, { "reason", "producer quality contains multiple connection ids" } } );
+    const auto connectionId = connectionIds.size() == 1 ? std::optional<uint64_t>( *connectionIds.begin() ) : std::nullopt;
+    const auto identity = CaptureIdentityJson( info );
+    if( connectionId && identity.value( "present", false ) && identity.contains( "identity" ) &&
+        identity["identity"].is_object() && identity["identity"].contains( "connection" ) &&
+        identity["identity"]["connection"].is_object() && identity["identity"]["connection"].contains( "id" ) )
+    {
+        const auto identityConnectionId = DecimalStringValue( identity["identity"]["connection"]["id"] );
+        if( !identityConnectionId || *identityConnectionId != *connectionId )
+            invalid.push_back( { { "record_index", nullptr }, { "reason", "producer quality connection id does not match Capture Identity" } } );
+    }
+
+    json producers = json::array();
+    json globalFindings = json::array();
+    uint64_t globalObserved = 0;
+    uint64_t globalEmitted = 0;
+    bool complete = !byProducer.empty() && invalid.empty();
+    for( auto& [key, snapshots] : byProducer )
+    {
+        std::sort( snapshots.begin(), snapshots.end(), []( const auto& left, const auto& right ) {
+            if( left.sequence != right.sequence ) return left.sequence < right.sequence;
+            return left.recordIndex < right.recordIndex;
+        } );
+        const auto& first = snapshots.front().document["producer"];
+        const auto& last = snapshots.back().document["producer"];
+        const bool windowComplete = snapshots.front().sequence < snapshots.back().sequence;
+        complete = complete && windowComplete;
+        json counters = json::object();
+        std::array<uint64_t, 11> deltas {};
+        bool regression = false;
+        for( size_t counter = 0; counter < 11; counter++ )
+        {
+            const auto base = *DecimalStringValue( first["counters"][CounterNames[counter]] );
+            const auto final = *DecimalStringValue( last["counters"][CounterNames[counter]] );
+            if( final < base ) regression = true;
+            deltas[counter] = final >= base ? final - base : 0;
+            counters[CounterNames[counter]] = Decimal( deltas[counter] );
+        }
+        complete = complete && !regression;
+
+        const bool requested = last["requested"].get<bool>();
+        const bool compiled = last["compiled"].get<bool>();
+        const bool supported = last["supported"].get<bool>();
+        const bool enabled = last["enabled"].get<bool>();
+        const bool effective = last["effective"].get<bool>();
+        const bool permissionDenied = last["permission_denied"].get<bool>();
+        const bool deferred = last["deferred"].get<bool>();
+        std::string state;
+        if( deferred ) state = "deferred";
+        else if( !compiled ) state = "uncompiled";
+        else if( permissionDenied ) state = "permission_denied";
+        else if( !supported ) state = "unsupported";
+        else if( !requested || !enabled || !effective ) state = "disabled";
+        else if( !windowComplete || regression ) state = "unknown";
+        else if( deltas[2] != 0 || deltas[5] != 0 || deltas[6] != 0 || deltas[7] != 0 || deltas[10] != 0 ) state = "degraded";
+        else if( deltas[3] != 0 || deltas[4] != 0 ) state = "filtered";
+        else if( deltas[0] == 0 && deltas[1] == 0 ) state = "real_zero";
+        else state = "covered";
+
+        json findings = json::array();
+        const auto addFinding = [&]( const char* code, uint64_t count ) {
+            if( count != 0 ) findings.push_back( { { "code", code }, { "count", Decimal( count ) } } );
+        };
+        addFinding( "DROPPED", deltas[2] );
+        addFinding( "FILTERED", deltas[3] );
+        addFinding( "SAMPLED_OUT", deltas[4] );
+        addFinding( "OVERFLOW", deltas[5] );
+        addFinding( "MISMATCH", deltas[6] );
+        addFinding( "UNRESOLVED", deltas[7] );
+        addFinding( "TAIL_TRUNCATED", deltas[10] );
+        if( !windowComplete ) findings.push_back( { { "code", "NO_CLOSED_COUNTER_WINDOW" }, { "count", "1" } } );
+        if( regression ) findings.push_back( { { "code", "COUNTER_REGRESSION" }, { "count", "1" } } );
+        if( !findings.empty() ) globalFindings.push_back( { { "producer", key }, { "findings", findings } } );
+
+        json ratio = nullptr;
+        if( requested && compiled && supported && enabled && effective && windowComplete && !regression )
+        {
+            ratio = deltas[0] == 0 ? json( 1.0 ) : json( double( deltas[1] ) / double( deltas[0] ) );
+            globalObserved += deltas[0];
+            globalEmitted += deltas[1];
+        }
+        producers.push_back( {
+            { "key", key }, { "id", last.value( "id", 0 ) }, { "source_mode", last["source_mode"] },
+            { "producer_schema", last.value( "producer_schema", 0 ) },
+            { "config_generation", last.value( "config_generation", "0" ) },
+            { "requested", requested }, { "compiled", compiled }, { "supported", supported },
+            { "enabled", enabled }, { "effective", effective }, { "permission_denied", permissionDenied },
+            { "deferred", deferred }, { "reason", last.value( "reason", "" ) },
+            { "filter", last.value( "filter", "" ) }, { "threshold", last.value( "threshold", "0" ) },
+            { "budget", last.value( "budget", "0" ) }, { "sample_rate", last.value( "sample_rate", json::object() ) },
+            { "state", state }, { "complete", windowComplete && !regression }, { "coverage_ratio", ratio },
+            { "scanned_count", Decimal( deltas[0] ) }, { "total_count", Decimal( deltas[0] ) },
+            { "omitted_count", Decimal( deltas[0] >= deltas[1] ? deltas[0] - deltas[1] : 0 ) },
+            { "counters", counters }, { "quality_findings", findings },
+            { "window", { { "first_sequence", Decimal( snapshots.front().sequence ) },
+                { "last_sequence", Decimal( snapshots.back().sequence ) }, { "snapshot_count", snapshots.size() } } }
+        } );
+    }
+
+    const bool present = !byProducer.empty();
+    std::string reason;
+    if( !present ) reason = seen == 0 ? "trace predates or did not emit JN Producer Quality" : "no valid JN Producer Quality document was found";
+    else if( !complete ) reason = "producer quality is present but one or more counter windows are incomplete or invalid";
+    json globalRatio = nullptr;
+    if( globalObserved != 0 ) globalRatio = double( globalEmitted ) / double( globalObserved );
+    else if( present && complete ) globalRatio = 1.0;
+    return {
+        { "present", present }, { "schema_version", 1 }, { "complete", complete },
+        { "connection_id", connectionId ? json( Decimal( *connectionId ) ) : json( nullptr ) },
+        { "reason", reason.empty() ? json( nullptr ) : json( reason ) },
+        { "evidence_kind", "exact" }, { "coverage_ratio", globalRatio },
+        { "scanned_count", Decimal( globalObserved ) }, { "total_count", Decimal( globalObserved ) },
+        { "omitted_count", Decimal( globalObserved >= globalEmitted ? globalObserved - globalEmitted : 0 ) },
+        { "producers", producers }, { "quality_findings", globalFindings }, { "invalid_records", invalid },
+        { "records", { { "seen", seen }, { "valid", [&] { size_t count = 0; for( const auto& item : byProducer ) count += item.second.size(); return count; }() },
+            { "duplicates", duplicates }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
 json GfxDispatchJson( const analysis::GfxDispatchDto& value )
 {
     return {
@@ -1035,11 +1430,12 @@ json DescribeData( const json& selection = json::object() )
         if( method == "trace.open" ) required.emplace_back( "path" );
         else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
         else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
             method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
         if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
         if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
         if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
+        if( method == "producer.get" ) required.emplace_back( "key" );
         if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) required.emplace_back( "thread_ref" );
         if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) required.emplace_back( "plot_ref" );
         if( method == "hardware_sample.address" || method == "hardware_sample.events" || method == "symbol.address" ) required.emplace_back( "address" );
@@ -1066,6 +1462,7 @@ json DescribeData( const json& selection = json::object() )
             else if( name == "thread_ref" || name == "plot_ref" ) exampleParams[name] = "tracy:v1:<fingerprint>:<kind>:<id>";
             else if( name == "time_ns" ) exampleParams[name] = "0";
             else if( name == "address" ) exampleParams[name] = "0x0";
+            else if( name == "key" ) exampleParams[name] = "cpu.zone.c-abi";
             else exampleParams[name] = 0;
         }
         if( method == "frame.get" ) exampleParams["index"] = 0;
@@ -1358,6 +1755,26 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "trace.counts" ) return Success( id, CountsJson( info().counts ), trace );
     if( method == "trace.app_info" ) return Success( id, { { "app_info", info().appInfo }, { "trust", "untrusted_trace_data" } }, trace );
     if( method == "trace.identity" ) return Success( id, CaptureIdentityJson( info() ), trace );
+    if( method == "capture.context" ) return Success( id, CaptureContextJson( info() ), trace );
+    if( method == "capture.coverage" || method == "producer.list" )
+        return Success( id, CaptureCoverageJson( info() ), trace );
+    if( method == "producer.get" )
+    {
+        if( !params.contains( "key" ) || !params["key"].is_string() || params["key"].get_ref<const std::string&>().empty() )
+            throw QueryError( "INVALID_PARAMS", "key is required" );
+        auto coverage = CaptureCoverageJson( info() );
+        for( const auto& producer : coverage["producers"] )
+        {
+            if( producer.value( "key", "" ) == params["key"].get<std::string>() )
+            {
+                auto selected = producer;
+                coverage.erase( "producers" );
+                coverage["producer"] = std::move( selected );
+                return Success( id, std::move( coverage ), trace );
+            }
+        }
+        throw QueryError( "ENTITY_NOT_FOUND", "producer key was not found in this trace" );
+    }
     if( method == "trace.crash" )
     {
         const auto crash = source->GetCrash();

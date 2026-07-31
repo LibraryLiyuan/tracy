@@ -8,7 +8,7 @@ Every CLI/NDJSON request is an object with `protocol`, `id`, `method`, and optio
 {"protocol":"tracy-query/1","id":"request-1","method":"frame.outliers","params":{"trace_id":"trace-1","limit":20}}
 ```
 
-A success contains `schema_version=1.1.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.1 adds the typed `trace.identity` method without changing the Tracy live protocol or trace file version.
+A success contains `schema_version=1.2.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 adds typed Capture Context and Producer Quality queries without changing the Tracy live protocol or trace file version.
 
 ## Numeric and range rules
 
@@ -43,6 +43,26 @@ Modes are `exact`, `contains`, and `prefix`. `fields` performs bounded response 
 ## Domains
 
 `system.capabilities` reports `present`, `queryable`, `indexed`, `reason`, methods, and limits for every domain. The complete method-to-Worker-data map is in `schema/coverage-v1.json`. The main groups are trace/session, threads and scheduling, frames/images, CPU/GPU zones, callstacks/samples/symbols/source, memory/GTMEM1, locks, plots/messages, statistics, compare, and validation.
+
+## Capture context and producer quality
+
+Schema 1.2 reads versioned `JNCTX1` Capture Context and `JNQ1` Producer Quality
+envelopes from trace AppInfo. These records are untrusted trace data. A valid
+result has exactly one `connection_id`, and that ID must match the connection
+record in Capture Identity. Records from different connections are never
+merged into a complete result.
+
+- `capture.context` merges process-monotonic context generations and reports
+  build identity, runtime, workload, and capture configuration layers.
+- `capture.coverage` and `producer.list` return exact closed-window counter
+  deltas and distinguish covered, filtered, degraded, real-zero, disabled,
+  unsupported, permission-denied, deferred, and unknown states.
+- `producer.get` requires `trace_id` and stable producer `key`; it does not
+  accept or require an entity `ref`.
+
+Snapshot, committed `.tracy-stream`, and stream-replayed `.tracy` inputs use
+the same result contract. A trace that predates these envelopes returns
+`present=false` instead of fabricating empty context or producer data.
 
 ## Errors
 
