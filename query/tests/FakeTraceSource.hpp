@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <charconv>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace tracy::query::test
 {
@@ -13,6 +16,7 @@ class FakeTraceSource final : public analysis::TraceSource
 {
     bool m_legacyFormat = false;
     bool m_truncatedSource = false;
+    std::optional<std::vector<std::string>> m_appInfoOverride;
 
     template<typename T>
     static std::vector<T> Page( std::vector<T> values, const analysis::ScanRange& range )
@@ -29,9 +33,24 @@ class FakeTraceSource final : public analysis::TraceSource
     }
 
 public:
+    static std::vector<std::string> DefaultIdentityAppInfo()
+    {
+        return {
+            "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010000\",\"jn_config_hash\":\"0x8daf4c01004d0006\",\"tracy_protocol_version\":\"77\"}}}",
+            "JNCI1|{\"schema_version\":1,\"kind\":\"runtime\",\"producer\":\"unity-native\",\"identity\":{\"runtime\":{\"target_kind\":\"editor\",\"engine_build_hash\":\"fake-engine-build\"}}}",
+            "JNCI1|{\"schema_version\":1,\"kind\":\"connection\",\"producer\":\"jn-native-client\",\"identity\":{\"connection\":{\"id\":\"1\",\"instance_cookie\":\"0123456789abcdef\"}}}",
+            "JNCI1|{\"schema_version\":1,\"kind\":\"manifest\",\"producer\":\"build-manifest\",\"identity\":{\"build\":{\"build_id\":\"0123456789abcdef0123456789abcdef\",\"repositories\":{\"engine\":{\"revision\":\"1111111111111111111111111111111111111111\"},\"package\":{\"revision\":\"2222222222222222222222222222222222222222\"},\"tracy\":{\"revision\":\"3333333333333333333333333333333333333333\"}},\"artifacts\":{\"unity\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"jn_client\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"query\":{\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}}"
+        };
+    }
+
     explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false )
         : m_legacyFormat( legacyFormat )
         , m_truncatedSource( truncatedSource )
+    {}
+
+    explicit FakeTraceSource( std::vector<std::string> appInfoOverride, bool truncatedSource = false )
+        : m_truncatedSource( truncatedSource )
+        , m_appInfoOverride( std::move( appInfoOverride ) )
     {}
 
     std::vector<analysis::Capability> GetCapabilities() const override
@@ -67,6 +86,10 @@ public:
         value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = 1;
         value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
         value.counts.gfxDispatches = value.counts.gfxEntities = value.counts.gfxLinks = 1;
+        if( !m_legacyFormat )
+        {
+            value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
+        }
         return value;
     }
 

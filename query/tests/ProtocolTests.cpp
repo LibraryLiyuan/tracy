@@ -82,11 +82,17 @@ struct TemporaryTraceFiles
         std::filesystem::create_directories( root );
         baseline = root / "baseline.tracy";
         candidate = root / "candidate.tracy";
+        duplicateIdentity = root / "duplicate-identity.tracy";
+        malformedIdentity = root / "malformed-identity.tracy";
+        conflictingIdentity = root / "conflicting-identity.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
         std::ofstream( baseline, std::ios::binary ).put( '\0' );
         std::ofstream( candidate, std::ios::binary ).put( '\0' );
+        std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
+        std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
+        std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
 
@@ -100,6 +106,9 @@ struct TemporaryTraceFiles
     std::filesystem::path root;
     std::filesystem::path baseline;
     std::filesystem::path candidate;
+    std::filesystem::path duplicateIdentity;
+    std::filesystem::path malformedIdentity;
+    std::filesystem::path conflictingIdentity;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -108,7 +117,8 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.0.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.1.0" );
+    assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
@@ -152,6 +162,7 @@ int main()
     assert( fieldEntities.contains( "job" ) );
     assert( fieldEntities.contains( "job.gfx.statistics" ) );
     assert( fieldEntities.contains( "job.gfx_chain" ) );
+    assert( fieldEntities.contains( "trace.capture_identity" ) );
     assert( fieldCoverage.at( "non_persisted" ).size() >= 3 );
 
     const auto mcpCoverage = LoadJson( TRACY_QUERY_MCP_COVERAGE_PATH );
@@ -243,7 +254,30 @@ int main()
     tracy::query::SessionManager sessions( { files.root }, 2,
         []( const std::filesystem::path& path, tracy::query::SessionManager::StateCallback callback ) -> std::unique_ptr<tracy::analysis::TraceSource> {
             callback( tracy::analysis::TraceSourceState::Indexing );
-            return std::make_unique<tracy::query::test::FakeTraceSource>( path.filename() == "baseline.tracy", true );
+            const auto filename = path.filename().string();
+            if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
+            if( filename == "duplicate-identity.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                records.push_back( records.front() );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
+            if( filename == "malformed-identity.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                records.resize( 1 );
+                records.emplace_back( "JNCI1|{broken" );
+                records.emplace_back( "JNCI1|{\"schema_version\":2,\"kind\":\"future\",\"producer\":\"future-client\",\"identity\":{}}" );
+                records.emplace_back( "JNCI2|{\"schema_version\":2,\"kind\":\"future\",\"producer\":\"future-client\",\"identity\":{}}" );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
+            if( filename == "conflicting-identity.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                records.emplace_back( "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"conflicting-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00020000\"}}}" );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
+            return std::make_unique<tracy::query::test::FakeTraceSource>( false, true );
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
 
@@ -314,6 +348,20 @@ int main()
     assert( traceFields.at( "on_demand" ) == true );
     assert( traceFields.at( "legacy_queue_delay_ns" ).is_null() );
     assert( traceFields.at( "field_availability" ).at( "legacy_queue_delay_ns" ).at( "available" ) == false );
+
+    const auto captureIdentity = service.Execute( Request( requestId++, "trace.identity", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( captureIdentity.at( "present" ) == true );
+    assert( captureIdentity.at( "complete" ) == true );
+    assert( captureIdentity.at( "schema_version" ) == 1 );
+    assert( captureIdentity.at( "identity" ).at( "runtime" ).at( "target_kind" ) == "editor" );
+    assert( captureIdentity.at( "identity" ).at( "connection" ).at( "id" ) == "1" );
+    assert( captureIdentity.at( "identity" ).at( "build" ).at( "repositories" ).at( "engine" ).at( "revision" ) == std::string( 40, '1' ) );
+    assert( captureIdentity.at( "missing_required" ).empty() );
+    assert( captureIdentity.at( "conflicts" ).empty() );
+    assert( captureIdentity.at( "invalid_records" ).empty() );
+    assert( captureIdentity.at( "records" ).at( "valid" ) == 4 );
+    assert( captureIdentity.at( "canonical_fingerprint" ).get<std::string>().size() == 16 );
+    const auto captureIdentityFingerprint = captureIdentity.at( "canonical_fingerprint" ).get<std::string>();
 
     const auto threadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", candidateId }, { "ref", "fake:thread:1" }
@@ -457,6 +505,14 @@ int main()
     assert( legacyTraceFields.at( "legacy_queue_delay_ns" ) == "42" );
     assert( legacyTraceFields.at( "field_availability" ).at( "legacy_queue_delay_ns" ).at( "available" ) == true );
 
+    const auto legacyIdentity = service.Execute( Request( requestId++, "trace.identity", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" );
+    assert( legacyIdentity.at( "present" ) == false );
+    assert( legacyIdentity.at( "complete" ) == false );
+    assert( legacyIdentity.at( "identity" ).is_null() );
+    assert( legacyIdentity.at( "reason" ) == "trace predates or did not emit JN Capture Identity" );
+
     const auto legacyThreadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", baselineId }, { "ref", "fake:thread:1" }
     } ) ).at( "data" );
@@ -517,6 +573,42 @@ int main()
 
     assert( service.Execute( Request( requestId++, "trace.close", { { "trace_id", candidateId } } ) ).at( "ok" ) );
     assert( service.Execute( Request( requestId++, "trace.close", { { "trace_id", baselineId } } ) ).at( "ok" ) );
+
+    const auto verifyIdentityTrace = [&]( const std::filesystem::path& path ) {
+        const auto opened = service.Execute( Request( requestId++, "trace.open", { { "path", path.string() } } ) );
+        assert( opened.at( "ok" ) );
+        const auto traceId = opened.at( "data" ).at( "trace_id" ).get<std::string>();
+        assert( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+        const auto identity = service.Execute( Request( requestId++, "trace.identity", { { "trace_id", traceId } } ) ).at( "data" );
+        assert( service.Execute( Request( requestId++, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+        return identity;
+    };
+
+    const auto duplicateIdentity = verifyIdentityTrace( files.duplicateIdentity );
+    assert( duplicateIdentity.at( "present" ) == true );
+    assert( duplicateIdentity.at( "complete" ) == true );
+    assert( duplicateIdentity.at( "records" ).at( "seen" ) == 5 );
+    assert( duplicateIdentity.at( "records" ).at( "valid" ) == 4 );
+    assert( duplicateIdentity.at( "records" ).at( "duplicates" ) == 1 );
+    assert( duplicateIdentity.at( "canonical_fingerprint" ) == captureIdentityFingerprint );
+
+    const auto malformedIdentity = verifyIdentityTrace( files.malformedIdentity );
+    assert( malformedIdentity.at( "present" ) == true );
+    assert( malformedIdentity.at( "complete" ) == false );
+    assert( malformedIdentity.at( "records" ).at( "seen" ) == 4 );
+    assert( malformedIdentity.at( "records" ).at( "valid" ) == 1 );
+    assert( malformedIdentity.at( "invalid_records" ).size() == 3 );
+    assert( malformedIdentity.at( "invalid_records" )[0].at( "reason" ) == "capture identity JSON failed schema or resource-limit validation" );
+    assert( malformedIdentity.at( "invalid_records" )[1].at( "reason" ) == "capture identity JSON failed schema or resource-limit validation" );
+    assert( malformedIdentity.at( "invalid_records" )[2].at( "reason" ) == "unsupported capture identity envelope version" );
+
+    const auto conflictingIdentity = verifyIdentityTrace( files.conflictingIdentity );
+    assert( conflictingIdentity.at( "present" ) == true );
+    assert( conflictingIdentity.at( "complete" ) == false );
+    assert( conflictingIdentity.at( "records" ).at( "valid" ) == 5 );
+    assert( conflictingIdentity.at( "conflicts" ).size() == 1 );
+    assert( conflictingIdentity.at( "conflicts" )[0].at( "path" ) == "/protocol/jn_abi_version" );
+    assert( conflictingIdentity.at( "identity" ).at( "protocol" ).at( "jn_abi_version" ) == "0x00010000" );
 
     std::cout << "protocol, statistics, all query methods, fake trace source, memory snapshot, and GTMEM1 contracts passed\n";
     return 0;

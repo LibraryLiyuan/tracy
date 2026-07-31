@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -497,6 +497,15 @@
       "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "dependencies", "stages", "first_run_ns", "completed_ns", "execution_ns", "wait", "orphan", "truncated"],
       "unmapped_fields": [],
       "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path"],
+      "status": "complete"
+    },
+    {
+      "entity": "trace.capture_identity",
+      "classification": "derived_semantic",
+      "persisted_fields": ["ordered JNCI1 AppInfo envelopes"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "identity", "canonical_fingerprint", "field_sources", "missing_required", "conflicts", "invalid_records", "records", "limits", "trust"],
+      "unmapped_fields": [],
+      "methods": ["trace.identity"],
       "status": "complete"
     },
     {

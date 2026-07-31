@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "coverage_level": "mcp",
   "status": "complete",
   "public_method_registry": "tracy::query::QueryMethodRegistry",
@@ -38,6 +38,8 @@
   "tests": [
     "McpTranscriptTests registry equality and exhaustive route contract",
     "McpTranscriptTests unknown method and conflicting trace validation",
-    "McpWorkerIntegrationTests real Worker trace.info through generic route"
+    "McpWorkerIntegrationTests real Worker trace.info through generic route",
+    "McpTranscriptTests trace.identity discovery and generic inspect route",
+    "JnIdentityMcpAcceptance snapshot, stream, and replay identity equality"
   ]
 }

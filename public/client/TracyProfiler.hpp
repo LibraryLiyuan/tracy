@@ -49,8 +49,10 @@
 
 namespace tracy
 {
+using ConnectionCallback = size_t (*)( void* data, uint64_t connectionId, char* buffer, size_t capacity );
+
 #if defined(TRACY_DELAYED_INIT) && defined(TRACY_MANUAL_LIFETIME)
-TRACY_API void StartupProfiler();
+TRACY_API void StartupProfiler( ConnectionCallback callback = nullptr, void* callbackData = nullptr );
 TRACY_API void ShutdownProfiler();
 TRACY_API bool IsProfilerStarted();
 #  define TracyIsStarted tracy::IsProfilerStarted()
@@ -871,6 +873,12 @@ public:
         return m_isConnected.load( std::memory_order_acquire );
     }
 
+    void SetConnectionCallback( ConnectionCallback callback, void* data )
+    {
+        m_connectionCallback = callback;
+        m_connectionCallbackData = data;
+    }
+
     tracy_force_inline void SetProgramName( const char* name )
     {
         m_programNameLock.lock();
@@ -1181,6 +1189,8 @@ private:
     void* m_paramCallbackData;
     SourceContentsCallback m_sourceCallback;
     void* m_sourceCallbackData;
+    ConnectionCallback m_connectionCallback;
+    void* m_connectionCallbackData;
 
     char* m_queryImage;
     char* m_queryData;

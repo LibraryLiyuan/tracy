@@ -1273,10 +1273,11 @@ thread_local bool RpThreadShutdown = false;
 ProfilerData* s_profilerData = nullptr;
 static ProfilerThreadData& GetProfilerThreadData();
 static std::atomic<bool> s_isProfilerStarted { false };
-TRACY_API void StartupProfiler()
+TRACY_API void StartupProfiler( ConnectionCallback callback, void* callbackData )
 {
     s_profilerData = (ProfilerData*)tracy_malloc( sizeof( ProfilerData ) );
     new (s_profilerData) ProfilerData();
+    s_profilerData->profiler.SetConnectionCallback( callback, callbackData );
     s_profilerData->profiler.SpawnWorkerThreads();
     GetProfilerThreadData().token = ProducerWrapper( *s_profilerData );
     s_isProfilerStarted.store( true, std::memory_order_seq_cst );
@@ -1498,6 +1499,8 @@ Profiler::Profiler()
 #endif
     , m_paramCallback( nullptr )
     , m_sourceCallback( nullptr )
+    , m_connectionCallback( nullptr )
+    , m_connectionCallbackData( nullptr )
     , m_queryImage( nullptr )
     , m_queryData( nullptr )
     , m_crashHandlerInstalled( false )
@@ -1983,7 +1986,7 @@ void Profiler::Worker()
         m_symbolsBusy.store( true, std::memory_order_release );
         const auto currentTime = GetTime();
         ClearQueues( token );
-        m_connectionId.fetch_add( 1, std::memory_order_release );
+        const auto connectionId = m_connectionId.fetch_add( 1, std::memory_order_release ) + 1;
 #endif
         m_isConnected.store( true, std::memory_order_release );
         InstallCrashHandler();
@@ -2005,6 +2008,24 @@ void Profiler::Worker()
         onDemand.currentTime = currentTime;
 
         m_sock->Send( &onDemand, sizeof( onDemand ) );
+
+        if( m_connectionCallback )
+        {
+            char connectionPayload[2048];
+            const auto connectionPayloadSize = m_connectionCallback(
+                m_connectionCallbackData, connectionId, connectionPayload, sizeof( connectionPayload ) );
+            if( connectionPayloadSize > 0 && connectionPayloadSize < sizeof( connectionPayload ) &&
+                connectionPayloadSize < (std::numeric_limits<uint16_t>::max)() )
+            {
+                QueueItem item;
+                MemWrite( &item.hdr.type, QueueType::MessageAppInfo );
+                MemWrite( &item.messageFat.time, GetTime() );
+                MemWrite( &item.messageFat.text, (uint64_t)connectionPayload );
+                MemWrite( &item.messageFat.size, (uint16_t)connectionPayloadSize );
+                SendSingleString( connectionPayload, connectionPayloadSize );
+                AppendData( &item, QueueDataSize[(int)QueueType::MessageAppInfo] );
+            }
+        }
 
         m_deferredLock.lock();
         for( auto& item : m_deferredQueue )

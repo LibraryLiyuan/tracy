@@ -8,7 +8,7 @@ Every CLI/NDJSON request is an object with `protocol`, `id`, `method`, and optio
 {"protocol":"tracy-query/1","id":"request-1","method":"frame.outliers","params":{"trace_id":"trace-1","limit":20}}
 ```
 
-A success contains `schema_version=1.0.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits.
+A success contains `schema_version=1.1.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.1 adds the typed `trace.identity` method without changing the Tracy live protocol or trace file version.
 
 ## Numeric and range rules
 

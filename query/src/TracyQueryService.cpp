@@ -24,7 +24,7 @@ const std::vector<std::string>& QueryMethodRegistry()
 {
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
-        "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash",
+        "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
         "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
@@ -684,6 +684,187 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
     return result;
 }
 
+constexpr std::string_view CaptureIdentityPrefix = "JNCI1|";
+constexpr size_t MaximumIdentityEnvelopeBytes = 48 * 1024;
+constexpr size_t MaximumIdentityRecords = 4096;
+constexpr size_t MaximumIdentityFields = 256;
+constexpr size_t MaximumIdentityStringBytes = 8192;
+
+bool IdentityShapeAllowed( const json& value, size_t depth, size_t& fields )
+{
+    if( depth > 8 ) return false;
+    if( value.is_string() ) return value.get_ref<const std::string&>().size() <= MaximumIdentityStringBytes;
+    if( value.is_array() )
+    {
+        if( value.size() > 64 ) return false;
+        for( const auto& child : value ) if( !IdentityShapeAllowed( child, depth + 1, fields ) ) return false;
+        return true;
+    }
+    if( value.is_object() )
+    {
+        if( fields + value.size() > MaximumIdentityFields ) return false;
+        fields += value.size();
+        for( const auto& [key, child] : value.items() )
+        {
+            if( key.empty() || key.size() > 128 || !IdentityShapeAllowed( child, depth + 1, fields ) ) return false;
+        }
+    }
+    return true;
+}
+
+std::string EscapeJsonPointerToken( const std::string& token )
+{
+    std::string result;
+    result.reserve( token.size() );
+    for( const char c : token )
+    {
+        if( c == '~' ) result += "~0";
+        else if( c == '/' ) result += "~1";
+        else result.push_back( c );
+    }
+    return result;
+}
+
+void MergeIdentity( json& target, const json& patch, const std::string& path, const std::string& producer,
+    json& fieldSources, json& conflicts )
+{
+    if( patch.is_object() )
+    {
+        if( target.is_null() ) target = json::object();
+        if( !target.is_object() )
+        {
+            conflicts.push_back( { { "path", path }, { "producer", producer }, { "reason", "object conflicts with an existing scalar value" } } );
+            return;
+        }
+        for( const auto& [key, value] : patch.items() )
+        {
+            const auto childPath = path + '/' + EscapeJsonPointerToken( key );
+            if( !target.contains( key ) ) target[key] = nullptr;
+            MergeIdentity( target[key], value, childPath, producer, fieldSources, conflicts );
+        }
+        return;
+    }
+
+    if( target.is_null() )
+    {
+        target = patch;
+        fieldSources[path] = producer;
+    }
+    else if( target != patch )
+    {
+        conflicts.push_back( {
+            { "path", path }, { "producer", producer }, { "previous_producer", fieldSources.value( path, "unknown" ) },
+            { "reason", "distinct values were emitted for the same identity field" }
+        } );
+    }
+}
+
+bool HasIdentityPath( const json& value, std::initializer_list<const char*> path )
+{
+    const json* current = &value;
+    for( const auto* key : path )
+    {
+        if( !current->is_object() || !current->contains( key ) ) return false;
+        current = &current->at( key );
+    }
+    return !current->is_null() && ( !current->is_string() || !current->get_ref<const std::string&>().empty() );
+}
+
+json CaptureIdentityJson( const analysis::TraceInfoDto& info )
+{
+    json identity = json::object();
+    json sources = json::object();
+    json conflicts = json::array();
+    json invalid = json::array();
+    std::set<std::string> documents;
+    size_t seen = 0;
+    size_t valid = 0;
+    size_t duplicates = 0;
+    size_t envelopeBytes = 0;
+
+    for( size_t index = 0; index < info.appInfo.size(); index++ )
+    {
+        const auto& record = info.appInfo[index];
+        const bool currentEnvelope = record.starts_with( CaptureIdentityPrefix );
+        const bool identityLike = currentEnvelope || ( record.size() >= 5 && record.compare( 0, 4, "JNCI" ) == 0 && record.find( '|' ) != std::string::npos );
+        if( !identityLike ) continue;
+        if( ++seen > MaximumIdentityRecords )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "identity record limit exceeded" } } );
+            break;
+        }
+        envelopeBytes += record.size();
+        if( !currentEnvelope )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "unsupported capture identity envelope version" } } );
+            continue;
+        }
+        if( record.size() <= CaptureIdentityPrefix.size() || record.size() > MaximumIdentityEnvelopeBytes )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture identity envelope has an invalid size" } } );
+            continue;
+        }
+
+        const auto document = json::parse( record.begin() + CaptureIdentityPrefix.size(), record.end(), nullptr, false );
+        size_t fields = 0;
+        if( document.is_discarded() || !document.is_object() || !IdentityShapeAllowed( document, 0, fields ) ||
+            !document.contains( "schema_version" ) || !document["schema_version"].is_number_unsigned() || document["schema_version"].get<uint64_t>() != 1 ||
+            !document.contains( "kind" ) || !document["kind"].is_string() ||
+            !document.contains( "producer" ) || !document["producer"].is_string() ||
+            !document.contains( "identity" ) || !document["identity"].is_object() )
+        {
+            if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "capture identity JSON failed schema or resource-limit validation" } } );
+            continue;
+        }
+
+        const auto canonical = document.dump();
+        if( !documents.emplace( canonical ).second )
+        {
+            duplicates++;
+            continue;
+        }
+        valid++;
+        MergeIdentity( identity, document["identity"], "", document["producer"].get<std::string>(), sources, conflicts );
+    }
+
+    json missing = json::array();
+    const auto require = [&]( std::initializer_list<const char*> path, const char* pointer ) {
+        if( !HasIdentityPath( identity, path ) ) missing.push_back( pointer );
+    };
+    require( { "protocol", "jn_abi_version" }, "/protocol/jn_abi_version" );
+    require( { "protocol", "jn_config_hash" }, "/protocol/jn_config_hash" );
+    require( { "protocol", "tracy_protocol_version" }, "/protocol/tracy_protocol_version" );
+    require( { "runtime", "target_kind" }, "/runtime/target_kind" );
+    require( { "runtime", "engine_build_hash" }, "/runtime/engine_build_hash" );
+    require( { "connection", "id" }, "/connection/id" );
+    require( { "connection", "instance_cookie" }, "/connection/instance_cookie" );
+    require( { "build", "build_id" }, "/build/build_id" );
+    require( { "build", "repositories", "engine", "revision" }, "/build/repositories/engine/revision" );
+    require( { "build", "repositories", "package", "revision" }, "/build/repositories/package/revision" );
+    require( { "build", "repositories", "tracy", "revision" }, "/build/repositories/tracy/revision" );
+    require( { "build", "artifacts", "unity", "sha256" }, "/build/artifacts/unity/sha256" );
+    require( { "build", "artifacts", "jn_client", "sha256" }, "/build/artifacts/jn_client/sha256" );
+    require( { "build", "artifacts", "query", "sha256" }, "/build/artifacts/query/sha256" );
+
+    const bool present = valid != 0;
+    const bool complete = present && missing.empty() && conflicts.empty() && invalid.empty();
+    std::string reason;
+    if( !present ) reason = seen == 0 ? "trace predates or did not emit JN Capture Identity" : "no valid JN Capture Identity document was found";
+    else if( !complete ) reason = "capture identity is present but incomplete or inconsistent";
+
+    return {
+        { "present", present }, { "schema_version", 1 }, { "complete", complete },
+        { "reason", reason.empty() ? json( nullptr ) : json( reason ) },
+        { "identity", present ? identity : json( nullptr ) },
+        { "canonical_fingerprint", present ? json( Hex16( Fnv1a( identity.dump() ) ) ) : json( nullptr ) },
+        { "field_sources", sources }, { "missing_required", missing }, { "conflicts", conflicts }, { "invalid_records", invalid },
+        { "records", { { "seen", seen }, { "valid", valid }, { "duplicates", duplicates }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "limits", { { "maximum_envelope_bytes", MaximumIdentityEnvelopeBytes }, { "maximum_records", MaximumIdentityRecords },
+            { "maximum_fields", MaximumIdentityFields }, { "maximum_string_bytes", MaximumIdentityStringBytes } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
 json GfxDispatchJson( const analysis::GfxDispatchDto& value )
 {
     return {
@@ -1176,6 +1357,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "trace.info" ) return Success( id, TraceInfoJson( info() ), trace );
     if( method == "trace.counts" ) return Success( id, CountsJson( info().counts ), trace );
     if( method == "trace.app_info" ) return Success( id, { { "app_info", info().appInfo }, { "trust", "untrusted_trace_data" } }, trace );
+    if( method == "trace.identity" ) return Success( id, CaptureIdentityJson( info() ), trace );
     if( method == "trace.crash" )
     {
         const auto crash = source->GetCrash();

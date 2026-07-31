@@ -12,6 +12,26 @@
     "decimal64": { "type": "string", "pattern": "^-?[0-9]+$" },
     "hex64": { "type": "string", "pattern": "^0x[0-9a-fA-F]+$" },
     "opaqueRef": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "captureIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["present", "schema_version", "complete", "reason", "identity", "canonical_fingerprint", "field_sources", "missing_required", "conflicts", "invalid_records", "records", "limits", "trust"],
+      "properties": {
+        "present": { "type": "boolean" },
+        "schema_version": { "const": 1 },
+        "complete": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "identity": { "type": ["object", "null"] },
+        "canonical_fingerprint": { "type": ["string", "null"], "pattern": "^[0-9a-f]{16}$" },
+        "field_sources": { "type": "object", "additionalProperties": { "type": "string" } },
+        "missing_required": { "type": "array", "items": { "type": "string" } },
+        "conflicts": { "type": "array", "items": { "type": "object" } },
+        "invalid_records": { "type": "array", "items": { "type": "object" } },
+        "records": { "type": "object" },
+        "limits": { "type": "object" },
+        "trust": { "const": "untrusted_trace_data" }
+      }
+    },
     "request": {
       "type": "object",
       "additionalProperties": false,
@@ -54,7 +74,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "data", "warnings"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.0.0" },
+        "schema_version": { "const": "1.1.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": true },
         "trace": { "$ref": "#/$defs/trace" },
@@ -78,7 +98,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "error"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.0.0" },
+        "schema_version": { "const": "1.1.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": false },
         "error": {

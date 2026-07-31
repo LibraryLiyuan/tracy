@@ -1061,7 +1061,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasCpu = !GetCpuTopology().empty() || info.counts.contextSwitches != 0;
     return {
         capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
-        capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.crash" } ),
+        capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash" } ),
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
