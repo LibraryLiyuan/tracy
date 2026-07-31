@@ -34,6 +34,18 @@ bool ValidateIdentity()
     return std::string( modulePath.data() ).find( "JNTracyClient.dll" ) != std::string::npos;
 }
 
+bool ValidateCaptureConfig()
+{
+    JNTracyCaptureConfig config {};
+    config.structSize = sizeof( config );
+    if( JNTracy_GetCaptureConfig( &config ) != JNTracyResult_Ok ) return false;
+    if( config.structSize != sizeof( config ) || config.schemaVersion != 1 ||
+        config.domainCount != JNTracyCallstackDomain_Count || config.configGeneration == 0 ) return false;
+    for( uint16_t domain = 0; domain < config.domainCount; domain++ )
+        if( config.callstack[domain].effectiveDepth > 62 ) return false;
+    return true;
+}
+
 bool WaitForConnection( uint32_t waitMilliseconds )
 {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( waitMilliseconds );
@@ -68,6 +80,7 @@ bool EmitSyntheticTrace( uint32_t holdMilliseconds, uint32_t waitConnectionMilli
     }
     if( JNTracy_GetState() != JNTracyState_Started || JNTracy_GetInstanceCookie() == 0 ||
         JNTracy_Startup( &startup ) != JNTracyResult_AlreadyStarted ) return false;
+    if( !ValidateCaptureConfig() ) return false;
     if( waitConnectionMilliseconds != 0 && !WaitForConnection( waitConnectionMilliseconds ) )
     {
         std::fprintf( stderr, "capture did not connect within %u ms\n", waitConnectionMilliseconds );

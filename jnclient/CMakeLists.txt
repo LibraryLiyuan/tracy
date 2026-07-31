@@ -20,6 +20,7 @@ target_compile_definitions(JNTracyClient PRIVATE
     TRACY_NO_CRASH_HANDLER
 )
 target_include_directories(JNTracyClient PUBLIC include PRIVATE ../public)
+target_link_libraries(JNTracyClient PRIVATE Shell32)
 set_target_properties(JNTracyClient PROPERTIES
     OUTPUT_NAME JNTracyClient
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"

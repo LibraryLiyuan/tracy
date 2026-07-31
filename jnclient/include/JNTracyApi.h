@@ -69,6 +69,59 @@ typedef enum JNTracyFrameIdentityFlag
     JNTracyFrameIdentity_Alias = 1 << 1
 } JNTracyFrameIdentityFlag;
 
+typedef enum JNTracyCallstackDomain
+{
+    JNTracyCallstackDomain_Global = 0,
+    JNTracyCallstackDomain_CSharp = 1,
+    JNTracyCallstackDomain_UnityMarker = 2,
+    JNTracyCallstackDomain_Lua = 3,
+    JNTracyCallstackDomain_Job = 4,
+    JNTracyCallstackDomain_GpuZone = 5,
+    JNTracyCallstackDomain_CpuAlloc = 6,
+    JNTracyCallstackDomain_GpuAlloc = 7,
+    JNTracyCallstackDomain_Count = 8
+} JNTracyCallstackDomain;
+
+typedef enum JNTracyCallstackConfigSource
+{
+    JNTracyCallstackSource_CompileGlobal = 0,
+    JNTracyCallstackSource_CompileDomain = 1,
+    JNTracyCallstackSource_CompileCSharp = 2,
+    JNTracyCallstackSource_EnvironmentGlobal = 3,
+    JNTracyCallstackSource_EnvironmentDomain = 4,
+    JNTracyCallstackSource_EnvironmentCSharp = 5,
+    JNTracyCallstackSource_CommandLineGlobal = 6,
+    JNTracyCallstackSource_CommandLineDomain = 7,
+    JNTracyCallstackSource_CommandLineCSharp = 8
+} JNTracyCallstackConfigSource;
+
+typedef enum JNTracyCallstackConfigFlag
+{
+    JNTracyCallstackConfig_HasRequested = 1 << 0,
+    JNTracyCallstackConfig_Invalid = 1 << 1,
+    JNTracyCallstackConfig_Clamped = 1 << 2,
+    JNTracyCallstackConfig_Inherited = 1 << 3,
+    JNTracyCallstackConfig_NonNumeric = 1 << 4
+} JNTracyCallstackConfigFlag;
+
+typedef struct JNTracyCallstackDomainConfig
+{
+    int32_t requestedDepth;
+    uint8_t effectiveDepth;
+    uint8_t source;
+    uint8_t flags;
+    uint8_t reserved;
+} JNTracyCallstackDomainConfig;
+
+typedef struct JNTracyCaptureConfig
+{
+    uint32_t structSize;
+    uint16_t schemaVersion;
+    uint16_t domainCount;
+    uint64_t configGeneration;
+    JNTracyCallstackDomainConfig callstack[JNTracyCallstackDomain_Count];
+} JNTracyCaptureConfig;
+
 typedef enum JNTracyJobKind
 {
     JNTracyJobKind_Native = 0,
@@ -166,6 +219,7 @@ JN_TRACY_API int JNTracy_IsConnected( void );
 JN_TRACY_API uint64_t JNTracy_GetConnectionId( void );
 JN_TRACY_API uint64_t JNTracy_GetInstanceCookie( void );
 JN_TRACY_API JNTracyResult JNTracy_GetModulePath( char* buffer, uint32_t capacity, uint32_t* requiredBytes );
+JN_TRACY_API JNTracyResult JNTracy_GetCaptureConfig( JNTracyCaptureConfig* config );
 
 JN_TRACY_API JNTracyResult JNTracy_Startup( const JNTracyStartupDesc* desc );
 JN_TRACY_API JNTracyResult JNTracy_Shutdown( void );

@@ -1,11 +1,15 @@
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <Shellapi.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -16,11 +20,18 @@
 #include "../../public/client/TracyJnClient.hpp"
 #include "../../public/tracy/TracyC.h"
 
+#pragma comment( lib, "Shell32.lib" )
+
+#ifndef JN_TRACY_DEFAULT_CALLSTACK_DEPTH
+#  define JN_TRACY_DEFAULT_CALLSTACK_DEPTH 0
+#endif
+
 namespace
 {
 
-constexpr uint64_t ConfigHash = 0x8DAF4C01004D0002ull;
+constexpr uint64_t ConfigHash = 0x8DAF4C01004D0003ull;
 constexpr const char* TracyRevision = "32123070f977b534daf39e8ec0d08776ff106547";
+constexpr int32_t MaximumCallstackDepth = 62;
 
 struct JobTypeEntry
 {
@@ -59,7 +70,7 @@ std::mutex s_registryMutex;
 std::mutex s_frameMutex;
 HANDLE s_singletonMutex = nullptr;
 std::atomic<uint64_t> s_lastDefinitionConnection { 0 };
-std::atomic<uint32_t> s_jobCallstackDepth { 0 };
+JNTracyCaptureConfig s_captureConfig = {};
 uint32_t s_nextJobTypeId = 1;
 std::unordered_map<std::string, uint32_t> s_jobTypeKeys;
 std::unordered_map<uint32_t, JobTypeEntry> s_jobTypes;
@@ -176,15 +187,251 @@ uint64_t MakeInstanceCookie()
     return value == 0 ? 1 : value;
 }
 
-uint32_t ReadJobCallstackDepth()
+uint64_t StableFnv1a64( const char* data, size_t length )
 {
-    char value[16];
-    const auto length = GetEnvironmentVariableA( "JN_TRACY_JOB_CALLSTACK_DEPTH", value, DWORD( sizeof( value ) ) );
-    if( length == 0 || length >= sizeof( value ) ) return 0;
-    char* end = nullptr;
-    const auto depth = strtoul( value, &end, 10 );
-    if( end == value || *end != '\0' ) return 0;
-    return uint32_t( std::min<unsigned long>( depth, 64 ) );
+    uint64_t result = 14695981039346656037ull;
+    for( size_t index = 0; index < length; index++ )
+    {
+        result ^= uint8_t( data[index] );
+        result *= 1099511628211ull;
+    }
+    return result;
+}
+
+struct CallstackSetting
+{
+    bool present = false;
+    bool numeric = false;
+    bool inherited = false;
+    int64_t requested = 0;
+    uint8_t source = JNTracyCallstackSource_CompileGlobal;
+};
+
+CallstackSetting ParseCallstackSetting( const wchar_t* value, uint8_t source, bool inherited )
+{
+    CallstackSetting result;
+    result.present = true;
+    result.source = source;
+    result.inherited = inherited;
+    if( value == nullptr || *value == L'\0' ) return result;
+
+    errno = 0;
+    wchar_t* end = nullptr;
+    const auto parsed = wcstoll( value, &end, 10 );
+    if( end == value || *end != L'\0' ) return result;
+    result.numeric = true;
+    result.requested = int64_t( parsed );
+    return result;
+}
+
+CallstackSetting ReadEnvironmentCallstackSetting( const wchar_t* name, uint8_t source, bool inherited = false )
+{
+    wchar_t value[64] = {};
+    SetLastError( ERROR_SUCCESS );
+    const auto length = GetEnvironmentVariableW( name, value, DWORD( sizeof( value ) / sizeof( value[0] ) ) );
+    if( length == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND ) return {};
+    if( length >= sizeof( value ) / sizeof( value[0] ) ) return ParseCallstackSetting( nullptr, source, inherited );
+    return ParseCallstackSetting( value, source, inherited );
+}
+
+CallstackSetting ReadCommandLineCallstackSetting( const wchar_t* option, uint8_t source, bool inherited = false )
+{
+    CallstackSetting result;
+    int argc = 0;
+    auto argv = CommandLineToArgvW( GetCommandLineW(), &argc );
+    if( argv == nullptr ) return result;
+    const auto optionLength = wcslen( option );
+    for( int index = 1; index < argc; index++ )
+    {
+        const wchar_t* value = nullptr;
+        if( wcscmp( argv[index], option ) == 0 )
+        {
+            value = index + 1 < argc ? argv[++index] : nullptr;
+        }
+        else if( wcsncmp( argv[index], option, optionLength ) == 0 && argv[index][optionLength] == L'=' )
+        {
+            value = argv[index] + optionLength + 1;
+        }
+        else
+        {
+            continue;
+        }
+        result = ParseCallstackSetting( value, source, inherited );
+    }
+    LocalFree( argv );
+    return result;
+}
+
+CallstackSetting CompileCallstackSetting( int64_t requested, uint8_t source, bool inherited )
+{
+    CallstackSetting result;
+    result.present = true;
+    result.numeric = true;
+    result.inherited = inherited;
+    result.requested = requested;
+    result.source = source;
+    return result;
+}
+
+CallstackSetting CompileDomainCallstackSetting( uint8_t domain )
+{
+    switch( domain )
+    {
+    case JNTracyCallstackDomain_Global:
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileGlobal, false );
+    case JNTracyCallstackDomain_CSharp:
+#if defined( JN_TRACY_DEFAULT_CSHARP_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CSHARP_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileGlobal, true );
+#endif
+    case JNTracyCallstackDomain_UnityMarker:
+#if defined( JN_TRACY_DEFAULT_UNITY_MARKER_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_UNITY_MARKER_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( 0, JNTracyCallstackSource_CompileDomain, false );
+#endif
+    case JNTracyCallstackDomain_Lua:
+#if defined( JN_TRACY_DEFAULT_LUA_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_LUA_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#elif defined( JN_TRACY_DEFAULT_CSHARP_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CSHARP_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileCSharp, true );
+#else
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileGlobal, true );
+#endif
+    case JNTracyCallstackDomain_Job:
+#if defined( JN_TRACY_DEFAULT_JOB_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_JOB_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileGlobal, true );
+#endif
+    case JNTracyCallstackDomain_GpuZone:
+#if defined( JN_TRACY_DEFAULT_GPU_ZONE_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_GPU_ZONE_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( 0, JNTracyCallstackSource_CompileDomain, false );
+#endif
+    case JNTracyCallstackDomain_CpuAlloc:
+#if defined( JN_TRACY_DEFAULT_CPU_ALLOC_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_CPU_ALLOC_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( 0, JNTracyCallstackSource_CompileDomain, false );
+#endif
+    case JNTracyCallstackDomain_GpuAlloc:
+#if defined( JN_TRACY_DEFAULT_GPU_ALLOC_CALLSTACK_DEPTH )
+        return CompileCallstackSetting( JN_TRACY_DEFAULT_GPU_ALLOC_CALLSTACK_DEPTH, JNTracyCallstackSource_CompileDomain, false );
+#else
+        return CompileCallstackSetting( 0, JNTracyCallstackSource_CompileDomain, false );
+#endif
+    default:
+        return CompileCallstackSetting( 0, JNTracyCallstackSource_CompileGlobal, false );
+    }
+}
+
+CallstackSetting FirstCallstackSetting( std::initializer_list<CallstackSetting> candidates )
+{
+    for( const auto& candidate : candidates )
+        if( candidate.present ) return candidate;
+    return {};
+}
+
+JNTracyCallstackDomainConfig ResolveCallstackSetting( const CallstackSetting& setting )
+{
+    JNTracyCallstackDomainConfig result = {};
+    result.source = setting.source;
+    result.flags = JNTracyCallstackConfig_HasRequested;
+    if( setting.inherited ) result.flags |= JNTracyCallstackConfig_Inherited;
+    if( !setting.numeric )
+    {
+        result.flags |= JNTracyCallstackConfig_Invalid | JNTracyCallstackConfig_NonNumeric;
+        return result;
+    }
+    if( setting.requested > INT32_MAX ) result.requestedDepth = INT32_MAX;
+    else if( setting.requested < INT32_MIN ) result.requestedDepth = INT32_MIN;
+    else result.requestedDepth = int32_t( setting.requested );
+    if( setting.requested < 0 )
+    {
+        result.flags |= JNTracyCallstackConfig_Invalid;
+        return result;
+    }
+    if( setting.requested > MaximumCallstackDepth )
+    {
+        result.effectiveDepth = MaximumCallstackDepth;
+        result.flags |= JNTracyCallstackConfig_Clamped;
+        return result;
+    }
+    result.effectiveDepth = uint8_t( setting.requested );
+    return result;
+}
+
+void ResolveCallstackConfig()
+{
+    const auto commandGlobal = ReadCommandLineCallstackSetting( L"-jn-tracy-callstack-depth", JNTracyCallstackSource_CommandLineGlobal );
+    const auto environmentGlobal = ReadEnvironmentCallstackSetting( L"JN_TRACY_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentGlobal );
+    const auto commandCSharp = ReadCommandLineCallstackSetting( L"-jn-tracy-csharp-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentCSharp = ReadEnvironmentCallstackSetting( L"JN_TRACY_CSHARP_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandUnity = ReadCommandLineCallstackSetting( L"-jn-tracy-unity-marker-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentUnity = ReadEnvironmentCallstackSetting( L"JN_TRACY_UNITY_MARKER_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandLua = ReadCommandLineCallstackSetting( L"-jn-tracy-lua-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentLua = ReadEnvironmentCallstackSetting( L"JN_TRACY_LUA_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandJob = ReadCommandLineCallstackSetting( L"-jn-tracy-job-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentJob = ReadEnvironmentCallstackSetting( L"JN_TRACY_JOB_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandGpuZone = ReadCommandLineCallstackSetting( L"-jn-tracy-gpu-zone-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentGpuZone = ReadEnvironmentCallstackSetting( L"JN_TRACY_GPU_ZONE_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandCpuAlloc = ReadCommandLineCallstackSetting( L"-jn-tracy-cpu-alloc-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentCpuAlloc = ReadEnvironmentCallstackSetting( L"JN_TRACY_CPU_ALLOC_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+    const auto commandGpuAlloc = ReadCommandLineCallstackSetting( L"-jn-tracy-gpu-alloc-callstack-depth", JNTracyCallstackSource_CommandLineDomain );
+    const auto environmentGpuAlloc = ReadEnvironmentCallstackSetting( L"JN_TRACY_GPU_ALLOC_CALLSTACK_DEPTH", JNTracyCallstackSource_EnvironmentDomain );
+
+    auto inheritedCommandGlobal = commandGlobal;
+    inheritedCommandGlobal.inherited = true;
+    auto inheritedEnvironmentGlobal = environmentGlobal;
+    inheritedEnvironmentGlobal.inherited = true;
+    auto inheritedCommandCSharp = commandCSharp;
+    inheritedCommandCSharp.source = JNTracyCallstackSource_CommandLineCSharp;
+    inheritedCommandCSharp.inherited = true;
+    auto inheritedEnvironmentCSharp = environmentCSharp;
+    inheritedEnvironmentCSharp.source = JNTracyCallstackSource_EnvironmentCSharp;
+    inheritedEnvironmentCSharp.inherited = true;
+
+    s_captureConfig = {};
+    s_captureConfig.structSize = sizeof( s_captureConfig );
+    s_captureConfig.schemaVersion = 1;
+    s_captureConfig.domainCount = JNTracyCallstackDomain_Count;
+    s_captureConfig.callstack[JNTracyCallstackDomain_Global] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandGlobal, environmentGlobal, CompileDomainCallstackSetting( JNTracyCallstackDomain_Global ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_CSharp] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandCSharp, inheritedCommandGlobal, environmentCSharp, inheritedEnvironmentGlobal,
+        CompileDomainCallstackSetting( JNTracyCallstackDomain_CSharp ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_UnityMarker] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandUnity, inheritedCommandGlobal, environmentUnity, inheritedEnvironmentGlobal,
+        CompileDomainCallstackSetting( JNTracyCallstackDomain_UnityMarker ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_Lua] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandLua, inheritedCommandCSharp, inheritedCommandGlobal, environmentLua, inheritedEnvironmentCSharp,
+        inheritedEnvironmentGlobal, CompileDomainCallstackSetting( JNTracyCallstackDomain_Lua ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_Job] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandJob, inheritedCommandGlobal, environmentJob, inheritedEnvironmentGlobal,
+        CompileDomainCallstackSetting( JNTracyCallstackDomain_Job ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_GpuZone] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandGpuZone, inheritedCommandGlobal, environmentGpuZone, inheritedEnvironmentGlobal,
+        CompileDomainCallstackSetting( JNTracyCallstackDomain_GpuZone ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_CpuAlloc] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandCpuAlloc, environmentCpuAlloc, CompileDomainCallstackSetting( JNTracyCallstackDomain_CpuAlloc ) } ) );
+    s_captureConfig.callstack[JNTracyCallstackDomain_GpuAlloc] = ResolveCallstackSetting( FirstCallstackSetting( {
+        commandGpuAlloc, environmentGpuAlloc, CompileDomainCallstackSetting( JNTracyCallstackDomain_GpuAlloc ) } ) );
+    s_captureConfig.configGeneration = StableFnv1a64(
+        reinterpret_cast<const char*>( s_captureConfig.callstack ), sizeof( s_captureConfig.callstack ) );
+    if( s_captureConfig.configGeneration == 0 ) s_captureConfig.configGeneration = 1;
+}
+
+uint32_t EffectiveCallstackDepth( uint8_t domain )
+{
+    return domain < JNTracyCallstackDomain_Count ? s_captureConfig.callstack[domain].effectiveDepth : 0;
+}
+
+uint32_t SafeCallstackDepth( uint32_t requested )
+{
+    return std::min<uint32_t>( requested, MaximumCallstackDepth );
 }
 
 std::string GetModulePathUtf8()
@@ -270,6 +517,15 @@ JNTracyResult JNTracy_GetModulePath( char* buffer, uint32_t capacity, uint32_t* 
     }
 }
 
+JNTracyResult JNTracy_GetCaptureConfig( JNTracyCaptureConfig* config )
+{
+    if( config == nullptr || config->structSize < sizeof( JNTracyCaptureConfig ) )
+        return JNTracyResult_InvalidArgument;
+    if( !IsStarted() ) return JNTracyResult_NotStarted;
+    memcpy( config, &s_captureConfig, sizeof( s_captureConfig ) );
+    return JNTracyResult_Ok;
+}
+
 JNTracyResult JNTracy_Startup( const JNTracyStartupDesc* desc )
 {
     std::lock_guard<std::mutex> lock( s_lifecycleMutex );
@@ -302,17 +558,24 @@ JNTracyResult JNTracy_Startup( const JNTracyStartupDesc* desc )
     }
 
     s_instanceCookie.store( MakeInstanceCookie(), std::memory_order_release );
-    s_jobCallstackDepth.store( ReadJobCallstackDepth(), std::memory_order_release );
+    ResolveCallstackConfig();
     s_frameConnectionId.store( 0, std::memory_order_release );
     s_nextFrameSequence.store( 1, std::memory_order_release );
     s_currentFrameId.store( 0, std::memory_order_release );
     tracy::StartupProfiler();
     s_state.store( JNTracyState_Started, std::memory_order_release );
 
-    char info[256];
-    const auto length = snprintf( info, sizeof( info ), "JNTracyClient ABI=%u Config=%016llX Tracy=%s Protocol=78 JobSchema=1 FrameSchema=1 JobCallstackDepth=%u",
+    char info[384];
+    const auto length = snprintf( info, sizeof( info ), "JNTracyClient ABI=%u Config=%016llX Tracy=%s Protocol=78 JobSchema=1 FrameSchema=1 CallstackConfigSchema=1 CallstackConfigGeneration=%llu CSharp=%u UnityMarker=%u Lua=%u Job=%u GpuZone=%u CpuAlloc=%u GpuAlloc=%u",
         JN_TRACY_ABI_VERSION, static_cast<unsigned long long>( ConfigHash ), TracyRevision,
-        s_jobCallstackDepth.load( std::memory_order_relaxed ) );
+        static_cast<unsigned long long>( s_captureConfig.configGeneration ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_CSharp ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_UnityMarker ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_Lua ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_Job ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_GpuZone ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_CpuAlloc ),
+        EffectiveCallstackDepth( JNTracyCallstackDomain_GpuAlloc ) );
     if( length > 0 ) ___tracy_emit_message_appinfo( info, std::min<size_t>( size_t( length ), sizeof( info ) - 1 ) );
     return JNTracyResult_Ok;
 }
@@ -362,8 +625,9 @@ uint64_t JNTracy_ZoneBegin( uint64_t sourceLocation, uint32_t callstackDepth )
 {
     if( !IsStarted() || sourceLocation == 0 ) return 0;
     const auto* source = reinterpret_cast<const ___tracy_source_location_data*>( static_cast<uintptr_t>( sourceLocation ) );
-    const auto zone = callstackDepth == 0 ? ___tracy_emit_zone_begin( source, 1 ) :
-        ___tracy_emit_zone_begin_callstack( source, int32_t( callstackDepth ), 1 );
+    const auto safeDepth = SafeCallstackDepth( callstackDepth );
+    const auto zone = safeDepth == 0 ? ___tracy_emit_zone_begin( source, 1 ) :
+        ___tracy_emit_zone_begin_callstack( source, int32_t( safeDepth ), 1 );
     return PackZone( zone );
 }
 
@@ -462,8 +726,9 @@ void JNTracy_ThreadName( const char* name, uint32_t nameLength )
 void JNTracy_Message( const char* text, uint32_t textLength, uint32_t color, uint32_t callstackDepth )
 {
     if( !IsStarted() || !ValidBytes( text, textLength ) ) return;
-    if( color == 0 ) ___tracy_emit_message( text, textLength, int32_t( callstackDepth ) );
-    else ___tracy_emit_messageC( text, textLength, color, int32_t( callstackDepth ) );
+    const auto safeDepth = SafeCallstackDepth( callstackDepth );
+    if( color == 0 ) ___tracy_emit_message( text, textLength, int32_t( safeDepth ) );
+    else ___tracy_emit_messageC( text, textLength, color, int32_t( safeDepth ) );
 }
 
 void JNTracy_Plot( const char* name, uint32_t nameLength, double value )
@@ -559,7 +824,7 @@ uint64_t JNTracy_JobSchedule( const JNTracyJobScheduleDesc* desc )
         }
         tracy::EmitJnJobDependency( jobId, dependencyJob, dependencyHandle, 0 );
     }
-    tracy::EmitJnJobScheduleCallstack( jobId, int32_t( s_jobCallstackDepth.load( std::memory_order_relaxed ) ) );
+    tracy::EmitJnJobScheduleCallstack( jobId, int32_t( EffectiveCallstackDepth( JNTracyCallstackDomain_Job ) ) );
     return jobId;
 }
 
