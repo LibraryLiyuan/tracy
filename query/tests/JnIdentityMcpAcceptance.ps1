@@ -162,7 +162,7 @@ try
     foreach ($result in @($snapshotIdentity, $streamIdentity, $replayIdentity))
     {
         Assert-Condition ([bool]$result.ok) 'trace.identity query failed'
-        Assert-Condition ([string]$result.schema_version -eq '1.2.0') 'unexpected Query schema version'
+        Assert-Condition ([string]$result.schema_version -eq '1.3.0') 'unexpected Query schema version'
         Assert-Condition ([bool]$result.data.present) 'capture identity is absent'
         Assert-Condition ([bool]$result.data.complete) 'capture identity is incomplete'
         Assert-Condition (@($result.data.missing_required).Count -eq 0) 'required identity fields are missing'

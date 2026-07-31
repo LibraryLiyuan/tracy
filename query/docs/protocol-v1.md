@@ -8,7 +8,7 @@ Every CLI/NDJSON request is an object with `protocol`, `id`, `method`, and optio
 {"protocol":"tracy-query/1","id":"request-1","method":"frame.outliers","params":{"trace_id":"trace-1","limit":20}}
 ```
 
-A success contains `schema_version=1.2.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 adds typed Capture Context and Producer Quality queries without changing the Tracy live protocol or trace file version.
+A success contains `schema_version=1.3.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 added typed Capture Context and Producer Quality queries. Schema 1.3 adds versioned `JNCAT1` stable definitions and generation-bearing `JNENT1` entities without changing the Tracy live protocol or trace file version.
 
 ## Numeric and range rules
 
@@ -63,6 +63,19 @@ merged into a complete result.
 Snapshot, committed `.tracy-stream`, and stream-replayed `.tracy` inputs use
 the same result contract. A trace that predates these envelopes returns
 `present=false` instead of fabricating empty context or producer data.
+
+## Stable catalog and capture-local entities
+
+Schema 1.3 reads `JNCAT1` and `JNENT1` AppInfo envelopes. `catalog.kinds`,
+`catalog.list`, `catalog.get`, `catalog.entities`, and `catalog.quality` expose
+versioned DefinitionKeys, normalized SourceFileIds, generation-bearing
+EntityIds, unresolved references, collisions, resource limits, and privacy
+violations. DefinitionKeys are stable across captures; catalog IDs and
+EntityIds are not. An old trace reports the catalog capability as absent.
+On-demand Tracy clients retain incremental AppInfo across reconnects. Catalog
+queries use Capture Identity's current connection ID and report older catalog
+envelopes as `records.stale_connection`; stale EntityIds are never surfaced in
+the current capture-local entity namespace.
 
 ## Errors
 

@@ -54,6 +54,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "frame.range_mapping" || method == "timeline.slice" ) { params["start_ns"] = "0"; params["end_ns"] = "100"; }
     if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) params["ref"] = "fake:frame-image:0";
     if( method == "producer.get" ) params["key"] = "test.real-zero";
+    if( method == "catalog.get" ) params["definition_key"] = "jn-def:v1:source:03e2e6f19c364e11";
     if( method == "zone.cpu.get" || method == "zone.cpu.tree" ) params["ref"] = "fake:cpu-zone:0";
     if( method == "zone.gpu.get" || method == "zone.gpu.tree" ) params["ref"] = "fake:gpu-zone:0";
     if( method == "memory.get" ) params["ref"] = "fake:memory-event:0";
@@ -88,6 +89,7 @@ struct TemporaryTraceFiles
         malformedIdentity = root / "malformed-identity.tracy";
         conflictingIdentity = root / "conflicting-identity.tracy";
         mismatchedConnection = root / "mismatched-connection.tracy";
+        reconnectCatalog = root / "reconnect-catalog.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
@@ -97,6 +99,7 @@ struct TemporaryTraceFiles
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
+        std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
 
@@ -114,6 +117,7 @@ struct TemporaryTraceFiles
     std::filesystem::path malformedIdentity;
     std::filesystem::path conflictingIdentity;
     std::filesystem::path mismatchedConnection;
+    std::filesystem::path reconnectCatalog;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -122,12 +126,12 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.2.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.3.0" );
     assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 27 );
+    assert( coverage.at( "domains" ).size() == 28 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -236,6 +240,9 @@ int main()
     assert( std::find_if( fakeCapabilities.begin(), fakeCapabilities.end(), []( const auto& capability ) {
         return capability.domain == "capture" && capability.present && capability.queryable;
     } ) != fakeCapabilities.end() );
+    assert( std::find_if( fakeCapabilities.begin(), fakeCapabilities.end(), []( const auto& capability ) {
+        return capability.domain == "catalog" && capability.present && capability.queryable;
+    } ) != fakeCapabilities.end() );
     assert( fake.GetTraceInfo().fingerprint == std::string( 64, 'f' ) );
     assert( fake.GetThreads().size() == 1 && fake.GetFrameSets().size() == 1 && fake.GetGpuContexts().size() == 1 );
     assert( fake.GetMemoryPools().size() == 1 && fake.GetPlotList().size() == 1 && fake.GetLocks().size() == 1 );
@@ -260,7 +267,7 @@ int main()
     ScanRange paged; paged.offset = 2; assert( fake.ScanCpuZones( paged ).empty() );
 
     TemporaryTraceFiles files;
-    tracy::query::SessionManager sessions( { files.root }, 2,
+    tracy::query::SessionManager sessions( { files.root }, 3,
         []( const std::filesystem::path& path, tracy::query::SessionManager::StateCallback callback ) -> std::unique_ptr<tracy::analysis::TraceSource> {
             callback( tracy::analysis::TraceSourceState::Indexing );
             const auto filename = path.filename().string();
@@ -297,6 +304,37 @@ int main()
                     record.replace( offset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
                     records.emplace_back( std::move( record ) );
                 }
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
+            if( filename == "reconnect-catalog.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                auto& connectionIdentity = records[2];
+                auto identityOffset = connectionIdentity.find( "\"id\":\"1\"" );
+                assert( identityOffset != std::string::npos );
+                connectionIdentity.replace( identityOffset, sizeof( "\"id\":\"1\"" ) - 1, "\"id\":\"2\"" );
+                for( size_t index = 4; index <= 8; index++ )
+                {
+                    auto offset = records[index].find( "\"connection_id\":\"1\"" );
+                    assert( offset != std::string::npos );
+                    records[index].replace( offset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
+                }
+                auto currentDefinition = records[9];
+                auto definitionOffset = currentDefinition.find( "\"connection_id\":\"1\"" );
+                assert( definitionOffset != std::string::npos );
+                currentDefinition.replace( definitionOffset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
+                records.emplace_back( std::move( currentDefinition ) );
+                auto currentEntity = records[10];
+                auto entityConnectionOffset = currentEntity.find( "\"connection_id\":\"1\"" );
+                assert( entityConnectionOffset != std::string::npos );
+                currentEntity.replace( entityConnectionOffset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
+                auto entityIdOffset = currentEntity.find( "281474976710657" );
+                assert( entityIdOffset != std::string::npos );
+                currentEntity.replace( entityIdOffset, sizeof( "281474976710657" ) - 1, "562949953421313" );
+                auto generationOffset = currentEntity.find( "\"connection_generation\":1" );
+                assert( generationOffset != std::string::npos );
+                currentEntity.replace( generationOffset, sizeof( "\"connection_generation\":1" ) - 1, "\"connection_generation\":2" );
+                records.emplace_back( std::move( currentEntity ) );
                 return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
             }
             return std::make_unique<tracy::query::test::FakeTraceSource>( false, true );
@@ -416,6 +454,51 @@ int main()
     } ) ).at( "data" );
     assert( realZero.at( "producer" ).at( "state" ) == "real_zero" );
     assert( realZero.at( "producer" ).at( "coverage_ratio" ) == 1.0 );
+
+    const auto catalogKinds = service.Execute( Request( requestId++, "catalog.kinds", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" );
+    assert( catalogKinds.at( "present" ) == true && catalogKinds.at( "complete" ) == true );
+    assert( catalogKinds.at( "definition_count" ) == 1 && catalogKinds.at( "entity_count" ) == 1 );
+    const auto catalogDefinition = service.Execute( Request( requestId++, "catalog.get", {
+        { "trace_id", candidateId }, { "definition_key", "jn-def:v1:source:03e2e6f19c364e11" }
+    } ) ).at( "data" ).at( "definition" );
+    assert( catalogDefinition.at( "canonical_name" ) == "Fake.Source" );
+    assert( catalogDefinition.at( "source" ).at( "file_id" ) == "engine/runtime/fake.cpp" );
+    const auto catalogEntities = service.Execute( Request( requestId++, "catalog.entities", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" );
+    assert( catalogEntities.at( "entities" ).size() == 1 );
+    assert( catalogEntities.at( "entities" )[0].at( "connection_generation" ) == 1 );
+    const auto catalogQuality = service.Execute( Request( requestId++, "catalog.quality", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" );
+    assert( catalogQuality.at( "quality" ).at( "invalid_count" ) == 0 );
+
+    const auto openReconnectCatalog = service.Execute( Request( requestId++, "trace.open", {
+        { "path", files.reconnectCatalog.string() }
+    } ) );
+    assert( openReconnectCatalog.at( "ok" ) );
+    const auto reconnectCatalogId = openReconnectCatalog.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( reconnectCatalogId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto reconnectKinds = service.Execute( Request( requestId++, "catalog.kinds", {
+        { "trace_id", reconnectCatalogId }
+    } ) ).at( "data" );
+    assert( reconnectKinds.at( "complete" ) == true );
+    assert( reconnectKinds.at( "active_connection_id" ) == "2" );
+    assert( reconnectKinds.at( "connection_ids" ).size() == 1 && reconnectKinds.at( "connection_ids" )[0] == "2" );
+    assert( reconnectKinds.at( "definition_count" ) == 1 && reconnectKinds.at( "entity_count" ) == 1 );
+    const auto reconnectEntities = service.Execute( Request( requestId++, "catalog.entities", {
+        { "trace_id", reconnectCatalogId }
+    } ) ).at( "data" );
+    assert( reconnectEntities.at( "entities" ).size() == 1 );
+    assert( reconnectEntities.at( "entities" )[0].at( "connection_generation" ) == 2 );
+    const auto reconnectQuality = service.Execute( Request( requestId++, "catalog.quality", {
+        { "trace_id", reconnectCatalogId }
+    } ) ).at( "data" );
+    assert( reconnectQuality.at( "quality" ).at( "invalid_count" ) == 0 );
+    assert( reconnectQuality.at( "records" ).at( "stale_connection" ) == 2 );
+    assert( service.Execute( Request( requestId++, "trace.close", { { "trace_id", reconnectCatalogId } } ) ).at( "ok" ) );
 
     const auto threadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", candidateId }, { "ref", "fake:thread:1" }
@@ -577,6 +660,11 @@ int main()
     } ) ).at( "data" );
     assert( legacyCoverage.at( "present" ) == false );
     assert( legacyCoverage.at( "complete" ) == false );
+    const auto legacyCatalog = service.Execute( Request( requestId++, "catalog.kinds", {
+        { "trace_id", baselineId }
+    } ) ).at( "data" );
+    assert( legacyCatalog.at( "present" ) == false );
+    assert( legacyCatalog.at( "complete" ) == false );
 
     const auto legacyThreadFields = service.Execute( Request( requestId++, "thread.get", {
         { "trace_id", baselineId }, { "ref", "fake:thread:1" }

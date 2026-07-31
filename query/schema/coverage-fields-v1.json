@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.2.0",
+  "schema_version": "1.3.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -524,6 +524,15 @@
       "query_fields": ["present", "schema_version", "complete", "reason", "connection_id", "evidence_kind", "coverage_ratio", "scanned_count", "total_count", "omitted_count", "producers", "producer", "quality_findings", "invalid_records", "records", "trust"],
       "unmapped_fields": [],
       "methods": ["capture.coverage", "producer.list", "producer.get"],
+      "status": "complete"
+    },
+    {
+      "entity": "catalog.definition_and_entity",
+      "classification": "derived_semantic",
+      "persisted_fields": ["ordered JNCAT1 definition envelopes", "ordered JNENT1 entity envelopes"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "active_connection_id", "connection_ids", "kinds", "definitions", "entities", "quality", "invalid_records", "records", "limits", "trust"],
+      "unmapped_fields": [],
+      "methods": ["catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality"],
       "status": "complete"
     },
     {

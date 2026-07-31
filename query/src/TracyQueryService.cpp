@@ -26,6 +26,7 @@ const std::vector<std::string>& QueryMethodRegistry()
         "system.capabilities", "system.describe", "system.schema",
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "capture.context", "capture.coverage", "producer.list", "producer.get",
+        "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
         "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
@@ -688,12 +689,17 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
 constexpr std::string_view CaptureIdentityPrefix = "JNCI1|";
 constexpr std::string_view CaptureContextPrefix = "JNCTX1|";
 constexpr std::string_view ProducerQualityPrefix = "JNQ1|";
+constexpr std::string_view CatalogDefinitionPrefix = "JNCAT1|";
+constexpr std::string_view CatalogEntityPrefix = "JNENT1|";
 constexpr size_t MaximumIdentityEnvelopeBytes = 48 * 1024;
 constexpr size_t MaximumIdentityRecords = 4096;
 constexpr size_t MaximumIdentityFields = 256;
 constexpr size_t MaximumIdentityStringBytes = 8192;
 constexpr size_t MaximumContextRecords = 4096;
 constexpr size_t MaximumQualityRecords = 16384;
+constexpr size_t MaximumCatalogRecords = 4096;
+constexpr size_t MaximumCatalogDefinitions = 32768;
+constexpr size_t MaximumCatalogEntities = 65536;
 
 std::optional<uint64_t> DecimalStringValue( const json& value )
 {
@@ -1260,6 +1266,327 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
     };
 }
 
+bool CatalogDefinitionKeyValid( const std::string& key, const std::string& kind )
+{
+    const auto prefix = "jn-def:v1:" + kind + ":";
+    if( key.rfind( prefix, 0 ) != 0 || key.size() != prefix.size() + 16 ) return false;
+    return std::all_of( key.begin() + ptrdiff_t( prefix.size() ), key.end(), []( const char c ) {
+        return ( c >= '0' && c <= '9' ) || ( c >= 'a' && c <= 'f' );
+    } );
+}
+
+std::string CatalogCanonicalMaterial( const json& definition )
+{
+    std::string material = "jn-catalog-definition-v1";
+    material.push_back( char( definition["kind_id"].get<uint8_t>() ) );
+    const auto append = [&material]( const std::string& value ) {
+        material.push_back( '\0' );
+        material += std::to_string( value.size() );
+        material.push_back( ':' );
+        material += value;
+    };
+    append( Lower( definition["namespace"].get<std::string>() ) );
+    append( definition["canonical_name"].get<std::string>() );
+    append( definition["source"]["file_id"].get<std::string>() );
+    append( definition["source"]["function"].get<std::string>() );
+    material.push_back( '\0' );
+    material += std::to_string( definition["source"]["line"].get<uint32_t>() );
+    return material;
+}
+
+bool CatalogPrivacySafe( const json& definition )
+{
+    const auto unsafeText = []( const std::string& value ) {
+        const auto lower = Lower( value );
+        for( const auto* pattern : { "password=", "passwd=", "payload=", "account=", "user=",
+            "username=", "token=", "authorization:", "bearer " } )
+            if( lower.find( pattern ) != std::string::npos ) return true;
+        uint32_t dots = 0;
+        uint32_t digits = 0;
+        for( const char c : lower )
+        {
+            if( c >= '0' && c <= '9' ) digits++;
+            else if( c == '.' && digits != 0 ) { dots++; digits = 0; }
+            else { dots = 0; digits = 0; }
+            if( dots >= 3 && digits != 0 ) return true;
+        }
+        return false;
+    };
+    const auto file = definition["source"]["file_id"].get<std::string>();
+    const auto lowerFile = Lower( file );
+    if( file.find( '\\' ) != std::string::npos || ( lowerFile.size() >= 2 && lowerFile[1] == ':' ) ||
+        lowerFile.rfind( "/", 0 ) == 0 || lowerFile.find( "/users/" ) != std::string::npos ) return false;
+    return !unsafeText( definition["canonical_name"].get<std::string>() ) &&
+        !unsafeText( definition["namespace"].get<std::string>() ) &&
+        !unsafeText( definition["source"]["function"].get<std::string>() );
+}
+
+json CatalogJson( const analysis::TraceInfoDto& info )
+{
+    std::optional<uint64_t> activeConnectionId;
+    const auto captureIdentity = CaptureIdentityJson( info );
+    if( captureIdentity.value( "present", false ) && captureIdentity.contains( "identity" ) &&
+        captureIdentity["identity"].is_object() && captureIdentity["identity"].contains( "connection" ) &&
+        captureIdentity["identity"]["connection"].is_object() &&
+        captureIdentity["identity"]["connection"].contains( "id" ) )
+        activeConnectionId = DecimalStringValue( captureIdentity["identity"]["connection"]["id"] );
+
+    std::map<std::string, json> definitions;
+    std::map<std::string, std::string> catalogIds;
+    std::map<uint64_t, json> entities;
+    json invalid = json::array();
+    std::set<uint64_t> connectionIds;
+    size_t seen = 0;
+    size_t validRecords = 0;
+    size_t duplicates = 0;
+    size_t envelopeBytes = 0;
+    size_t privacyViolations = 0;
+    size_t unresolvedEntities = 0;
+    size_t staleConnectionRecords = 0;
+
+    const auto addInvalid = [&]( size_t index, const std::string& reason ) {
+        if( invalid.size() < 128 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", reason } } );
+    };
+    for( size_t recordIndex = 0; recordIndex < info.appInfo.size(); recordIndex++ )
+    {
+        const auto& record = info.appInfo[recordIndex];
+        const bool definitionRecord = record.starts_with( CatalogDefinitionPrefix );
+        const bool entityRecord = record.starts_with( CatalogEntityPrefix );
+        const bool catalogLike = definitionRecord || entityRecord ||
+            ( record.size() >= 6 && ( record.compare( 0, 5, "JNCAT" ) == 0 || record.compare( 0, 5, "JNENT" ) == 0 ) &&
+                record.find( '|' ) != std::string::npos );
+        if( !catalogLike ) continue;
+        if( ++seen > MaximumCatalogRecords )
+        {
+            addInvalid( recordIndex, "catalog record limit exceeded" );
+            break;
+        }
+        envelopeBytes += record.size();
+        if( !definitionRecord && !entityRecord )
+        {
+            addInvalid( recordIndex, "unsupported catalog envelope version" );
+            continue;
+        }
+        const auto prefix = definitionRecord ? CatalogDefinitionPrefix : CatalogEntityPrefix;
+        if( record.size() <= prefix.size() || record.size() > MaximumIdentityEnvelopeBytes )
+        {
+            addInvalid( recordIndex, "catalog envelope has an invalid size" );
+            continue;
+        }
+        const auto document = json::parse( record.begin() + ptrdiff_t( prefix.size() ), record.end(), nullptr, false );
+        if( document.is_discarded() || !document.is_object() || document.value( "schema_version", 0 ) != 1 ||
+            !document.contains( "connection_id" ) )
+        {
+            addInvalid( recordIndex, "catalog envelope failed schema validation" );
+            continue;
+        }
+        const auto connectionId = DecimalStringValue( document["connection_id"] );
+        if( !connectionId )
+        {
+            addInvalid( recordIndex, "catalog connection_id is invalid" );
+            continue;
+        }
+        // Tracy retains incremental AppInfo across on-demand reconnects. The
+        // connection snapshot identifies the active capture generation; old
+        // catalog/entity envelopes are history from an earlier capture and
+        // must not fabricate entities in the current capture-local namespace.
+        if( activeConnectionId && *connectionId != *activeConnectionId )
+        {
+            staleConnectionRecords++;
+            continue;
+        }
+        connectionIds.emplace( *connectionId );
+
+        if( definitionRecord )
+        {
+            if( !document.contains( "definitions" ) || !document["definitions"].is_array() || document["definitions"].size() > 512 )
+            {
+                addInvalid( recordIndex, "catalog definitions array is invalid" );
+                continue;
+            }
+            bool recordValid = true;
+            for( auto definition : document["definitions"] )
+            {
+                if( definitions.size() >= MaximumCatalogDefinitions )
+                {
+                    addInvalid( recordIndex, "catalog definition limit exceeded" );
+                    recordValid = false;
+                    break;
+                }
+                if( !definition.is_object() || !definition.contains( "catalog_id" ) || !DecimalStringValue( definition["catalog_id"] ) ||
+                    !definition.contains( "definition_key" ) || !definition["definition_key"].is_string() ||
+                    !definition.contains( "kind" ) || !definition["kind"].is_string() ||
+                    !definition.contains( "kind_id" ) || !definition["kind_id"].is_number_unsigned() ||
+                    definition["kind_id"].get<uint64_t>() == 0 || definition["kind_id"].get<uint64_t>() > 9 ||
+                    !definition.contains( "flags" ) || !definition["flags"].is_number_unsigned() ||
+                    !definition.contains( "canonical_name" ) || !definition["canonical_name"].is_string() ||
+                    definition["canonical_name"].get_ref<const std::string&>().empty() ||
+                    definition["canonical_name"].get_ref<const std::string&>().size() > 192 ||
+                    !definition.contains( "namespace" ) || !definition["namespace"].is_string() ||
+                    !definition.contains( "source" ) || !definition["source"].is_object() ||
+                    !definition["source"].contains( "file_id" ) || !definition["source"]["file_id"].is_string() ||
+                    !definition["source"].contains( "function" ) || !definition["source"]["function"].is_string() ||
+                    !definition["source"].contains( "line" ) || !definition["source"]["line"].is_number_unsigned() )
+                {
+                    addInvalid( recordIndex, "catalog definition failed field validation" );
+                    recordValid = false;
+                    continue;
+                }
+                const auto key = definition["definition_key"].get<std::string>();
+                const auto kind = definition["kind"].get<std::string>();
+                if( !CatalogDefinitionKeyValid( key, kind ) ||
+                    key.substr( key.size() - 16 ) != Hex16( Fnv1a( CatalogCanonicalMaterial( definition ) ) ) )
+                {
+                    addInvalid( recordIndex, "catalog definition_key does not match canonical fields" );
+                    recordValid = false;
+                    continue;
+                }
+                definition["connection_id"] = Decimal( *connectionId );
+                definition["trust"] = "untrusted_trace_data";
+                if( !CatalogPrivacySafe( definition ) )
+                {
+                    privacyViolations++;
+                    addInvalid( recordIndex, "catalog definition violates privacy policy" );
+                    recordValid = false;
+                    continue;
+                }
+                const auto idKey = Decimal( *connectionId ) + ":" + definition["catalog_id"].get<std::string>();
+                const auto existingId = catalogIds.find( idKey );
+                if( existingId != catalogIds.end() && existingId->second != key )
+                {
+                    addInvalid( recordIndex, "catalog_id maps to multiple definition keys" );
+                    recordValid = false;
+                    continue;
+                }
+                const auto existing = definitions.find( key );
+                if( existing != definitions.end() )
+                {
+                    auto comparable = definition;
+                    comparable.erase( "connection_id" );
+                    comparable.erase( "trust" );
+                    auto oldComparable = existing->second;
+                    oldComparable.erase( "connection_id" );
+                    oldComparable.erase( "trust" );
+                    if( comparable != oldComparable )
+                    {
+                        addInvalid( recordIndex, "definition_key maps to conflicting canonical fields" );
+                        recordValid = false;
+                    }
+                    else duplicates++;
+                    continue;
+                }
+                catalogIds[idKey] = key;
+                definitions.emplace( key, std::move( definition ) );
+            }
+            if( recordValid ) validRecords++;
+        }
+        else
+        {
+            if( !document.contains( "entities" ) || !document["entities"].is_array() || document["entities"].size() > 1024 )
+            {
+                addInvalid( recordIndex, "catalog entities array is invalid" );
+                continue;
+            }
+            bool recordValid = true;
+            for( auto entity : document["entities"] )
+            {
+                if( entities.size() >= MaximumCatalogEntities )
+                {
+                    addInvalid( recordIndex, "catalog entity limit exceeded" );
+                    recordValid = false;
+                    break;
+                }
+                if( !entity.is_object() || entity.contains( "name" ) || !entity.contains( "entity_id" ) ||
+                    !entity.contains( "catalog_id" ) || !entity.contains( "definition_key" ) ||
+                    !entity.contains( "connection_generation" ) || !entity["connection_generation"].is_number_unsigned() ||
+                    !entity.contains( "parent_entity_id" ) || !entity.contains( "flags" ) || !entity["flags"].is_number_unsigned() )
+                {
+                    addInvalid( recordIndex, "catalog entity failed field validation" );
+                    recordValid = false;
+                    continue;
+                }
+                const auto entityId = DecimalStringValue( entity["entity_id"] );
+                const auto catalogId = DecimalStringValue( entity["catalog_id"] );
+                const auto parentId = DecimalStringValue( entity["parent_entity_id"] );
+                if( !entityId || !catalogId || !parentId || !entity["definition_key"].is_string() ||
+                    entity["connection_generation"].get<uint64_t>() == 0 ||
+                    entity["connection_generation"].get<uint64_t>() != ( *entityId >> 48 ) ||
+                    ( *parentId != 0 && ( *parentId >> 48 ) != ( *entityId >> 48 ) ) )
+                {
+                    addInvalid( recordIndex, "catalog entity identifiers are invalid" );
+                    recordValid = false;
+                    continue;
+                }
+                entity["connection_id"] = Decimal( *connectionId );
+                entity["trust"] = "untrusted_trace_data";
+                const auto existing = entities.find( *entityId );
+                if( existing != entities.end() )
+                {
+                    if( existing->second != entity )
+                    {
+                        addInvalid( recordIndex, "entity_id maps to conflicting fields" );
+                        recordValid = false;
+                    }
+                    else duplicates++;
+                    continue;
+                }
+                entities.emplace( *entityId, std::move( entity ) );
+            }
+            if( recordValid ) validRecords++;
+        }
+    }
+
+    for( const auto& [entityId, entity] : entities )
+    {
+        const auto idKey = entity["connection_id"].get<std::string>() + ":" + entity["catalog_id"].get<std::string>();
+        const auto definition = catalogIds.find( idKey );
+        if( definition == catalogIds.end() || definition->second != entity["definition_key"].get<std::string>() )
+        {
+            unresolvedEntities++;
+            if( invalid.size() < 128 ) invalid.push_back( {
+                { "record_index", nullptr }, { "reason", "catalog entity references an unresolved definition" },
+                { "entity_id", Decimal( entityId ) }
+            } );
+        }
+    }
+
+    json definitionArray = json::array();
+    std::map<std::string, size_t> kindCounts;
+    for( auto& [key, definition] : definitions )
+    {
+        kindCounts[definition["kind"].get<std::string>()]++;
+        definitionArray.push_back( definition );
+    }
+    json entityArray = json::array();
+    for( const auto& [entityId, entity] : entities ) entityArray.push_back( entity );
+    json kinds = json::array();
+    for( const auto& [kind, count] : kindCounts ) kinds.push_back( { { "kind", kind }, { "definition_count", count } } );
+    json connections = json::array();
+    for( const auto value : connectionIds ) connections.push_back( Decimal( value ) );
+
+    const bool present = !definitions.empty();
+    const bool complete = present && invalid.empty();
+    std::string reason;
+    if( !present ) reason = seen == 0 ? "trace predates or did not emit JN Catalog" : "no valid JN Catalog definitions were found";
+    else if( !complete ) reason = "catalog is present but contains invalid, unresolved, or privacy-unsafe records";
+    return {
+        { "present", present }, { "schema_version", 1 }, { "complete", complete },
+        { "reason", reason.empty() ? json( nullptr ) : json( reason ) },
+        { "active_connection_id", activeConnectionId ? json( Decimal( *activeConnectionId ) ) : json( nullptr ) },
+        { "connection_ids", std::move( connections ) }, { "kinds", std::move( kinds ) },
+        { "definitions", std::move( definitionArray ) }, { "entities", std::move( entityArray ) },
+        { "quality", { { "invalid_count", invalid.size() }, { "privacy_violation_count", privacyViolations },
+            { "unresolved_entity_count", unresolvedEntities }, { "duplicate_count", duplicates } } },
+        { "invalid_records", std::move( invalid ) },
+        { "records", { { "seen", seen }, { "valid", validRecords }, { "duplicates", duplicates },
+            { "stale_connection", staleConnectionRecords },
+            { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "limits", { { "maximum_records", MaximumCatalogRecords }, { "maximum_definitions", MaximumCatalogDefinitions },
+            { "maximum_entities", MaximumCatalogEntities } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
 json GfxDispatchJson( const analysis::GfxDispatchDto& value )
 {
     return {
@@ -1430,12 +1757,13 @@ json DescribeData( const json& selection = json::object() )
         if( method == "trace.open" ) required.emplace_back( "path" );
         else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
         else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
             method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
         if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
         if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
         if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
         if( method == "producer.get" ) required.emplace_back( "key" );
+        if( method == "catalog.get" ) required.emplace_back( "definition_key" );
         if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) required.emplace_back( "thread_ref" );
         if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) required.emplace_back( "plot_ref" );
         if( method == "hardware_sample.address" || method == "hardware_sample.events" || method == "symbol.address" ) required.emplace_back( "address" );
@@ -1463,6 +1791,7 @@ json DescribeData( const json& selection = json::object() )
             else if( name == "time_ns" ) exampleParams[name] = "0";
             else if( name == "address" ) exampleParams[name] = "0x0";
             else if( name == "key" ) exampleParams[name] = "cpu.zone.c-abi";
+            else if( name == "definition_key" ) exampleParams[name] = "jn-def:v1:source:0000000000000000";
             else exampleParams[name] = 0;
         }
         if( method == "frame.get" ) exampleParams["index"] = 0;
@@ -1824,6 +2153,91 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             const auto reason = capability == capabilities.end() ? "trace source does not advertise this domain" : capability->reason;
             throw QueryError( "CAPABILITY_UNAVAILABLE", requiredDomain + " is unavailable: " + reason, false, { { "domain", requiredDomain }, { "reason", reason } } );
+        }
+    }
+
+    if( method.rfind( "catalog.", 0 ) == 0 )
+    {
+        auto catalog = CatalogJson( info() );
+        const auto base = [&]() {
+            return json {
+                { "present", catalog["present"] }, { "schema_version", catalog["schema_version"] },
+                { "complete", catalog["complete"] }, { "reason", catalog["reason"] },
+                { "active_connection_id", catalog["active_connection_id"] },
+                { "connection_ids", catalog["connection_ids"] }, { "trust", catalog["trust"] }
+            };
+        };
+        if( method == "catalog.kinds" )
+        {
+            auto result = base();
+            result["kinds"] = catalog["kinds"];
+            result["definition_count"] = catalog["definitions"].size();
+            result["entity_count"] = catalog["entities"].size();
+            return Success( id, std::move( result ), trace );
+        }
+        if( method == "catalog.quality" )
+        {
+            auto result = base();
+            result["quality"] = catalog["quality"];
+            result["invalid_records"] = catalog["invalid_records"];
+            result["records"] = catalog["records"];
+            result["limits"] = catalog["limits"];
+            return Success( id, std::move( result ), trace );
+        }
+        if( method == "catalog.get" )
+        {
+            if( !params.contains( "definition_key" ) || !params["definition_key"].is_string() ||
+                params["definition_key"].get_ref<const std::string&>().empty() )
+                throw QueryError( "INVALID_PARAMS", "definition_key is required" );
+            const auto key = params["definition_key"].get<std::string>();
+            const auto found = std::find_if( catalog["definitions"].begin(), catalog["definitions"].end(),
+                [&]( const auto& definition ) { return definition.value( "definition_key", "" ) == key; } );
+            if( found == catalog["definitions"].end() )
+                throw QueryError( "ENTITY_NOT_FOUND", "catalog definition_key was not found in this trace" );
+            auto result = base();
+            result["definition"] = *found;
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto offset = size_t( UnsignedParameter( params, "offset", 0, MaximumCatalogEntities ) );
+        const auto limit = size_t( UnsignedParameter( params, "limit", DefaultPageSize, MaximumPageSize ) );
+        json selected = json::array();
+        if( method == "catalog.list" )
+        {
+            std::vector<json> matches;
+            for( const auto& definition : catalog["definitions"] )
+            {
+                if( params.contains( "kind" ) && ( !params["kind"].is_string() ||
+                    definition.value( "kind", "" ) != params["kind"].get<std::string>() ) ) continue;
+                const auto searchable = definition.value( "canonical_name", "" ) + " " +
+                    definition.value( "namespace", "" ) + " " + definition.value( "definition_key", "" );
+                if( !TextMatches( searchable, params ) ) continue;
+                matches.emplace_back( definition );
+            }
+            const auto end = std::min( matches.size(), offset + limit );
+            for( auto index = offset; index < end; index++ ) selected.push_back( matches[index] );
+            auto result = base();
+            result["definitions"] = std::move( selected );
+            result["page"] = { { "offset", offset }, { "limit", limit }, { "returned", result["definitions"].size() },
+                { "total", matches.size() }, { "has_more", end < matches.size() } };
+            return Success( id, std::move( result ), trace );
+        }
+        if( method == "catalog.entities" )
+        {
+            std::vector<json> matches;
+            for( const auto& entity : catalog["entities"] )
+            {
+                if( params.contains( "definition_key" ) && ( !params["definition_key"].is_string() ||
+                    entity.value( "definition_key", "" ) != params["definition_key"].get<std::string>() ) ) continue;
+                matches.emplace_back( entity );
+            }
+            const auto end = std::min( matches.size(), offset + limit );
+            for( auto index = offset; index < end; index++ ) selected.push_back( matches[index] );
+            auto result = base();
+            result["entities"] = std::move( selected );
+            result["page"] = { { "offset", offset }, { "limit", limit }, { "returned", result["entities"].size() },
+                { "total", matches.size() }, { "has_more", end < matches.size() } };
+            return Success( id, std::move( result ), trace );
         }
     }
 
