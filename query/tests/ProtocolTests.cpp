@@ -128,7 +128,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.7.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.8.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -253,7 +253,7 @@ int main()
     assert( fake.GetThreads().size() == 1 && fake.GetFrameSets().size() == 1 && fake.GetGpuContexts().size() == 1 );
     assert( fake.GetMemoryPools().size() == 1 && fake.GetPlotList().size() == 1 && fake.GetLocks().size() == 1 );
     ScanRange entire;
-    assert( fake.ScanCpuZones( entire ).size() == 2 && fake.ScanGpuZones( entire ).size() == 1 && fake.ScanFrames( entire ).size() == 1 );
+    assert( fake.ScanCpuZones( entire ).size() == 2 && fake.ScanGpuZones( entire ).size() == 2 && fake.ScanFrames( entire ).size() == 1 );
     assert( fake.ScanMemoryEvents( entire ).size() == 1 && fake.ScanMessages( entire ).size() == 1 && fake.ScanPlots( entire ).size() == 1 );
     assert( fake.ScanContextSwitchEvents( entire ).size() == 1 && fake.ScanCpuContextSwitchEvents( entire ).size() == 1 && fake.ScanSampleEvents( entire ).size() == 1 && fake.ScanGhostZones( entire ).size() == 1 );
     assert( fake.ScanLockEvents( entire ).size() == 1 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 );
@@ -262,7 +262,7 @@ int main()
     assert( fake.GetMemoryFrameSnapshot( 0, 0, {}, false ).valid );
     assert( fake.GetMemoryEvent( { 1, 0 } ).has_value() && fake.GetGpuMemoryAttribution().allocations.size() == 2 );
     assert( fake.GetGpuMemoryAttribution().logicalResources.size() == 1 && fake.GetGpuMemoryAttribution().ownerRollups.size() == 1 && fake.GetGpuMemoryAttribution().workingSets.size() == 1 );
-    assert( fake.GetJobs().size() == 2 && fake.GetGfxDispatches().size() == 1 && fake.GetGfxEntities().size() == 3 && fake.GetGfxLinks().size() == 6 );
+    assert( fake.GetJobs().size() == 2 && fake.GetGfxDispatches().size() == 1 && fake.GetGfxEntities().size() == 5 && fake.GetGfxLinks().size() == 11 );
     assert( fake.ReadEmbeddedSource( 0, 64 ).embedded && fake.ReadSymbolCode( 1, 64 ).bytes.size() == 1 && fake.ReadFrameImage( 0, 64 ).rgba.size() == 4 );
     assert( fake.ReadEmbeddedSourceBytes( 0, 0, 64 ).bytes.size() == 3 && fake.ReadSymbolCodeBytes( 1, 0, 64 ).bytes.size() == 1 && fake.ReadFrameImageBc1( 0, 0, 64 ).bytes.size() == 8 );
     assert( fake.GetHardwareSampleEvents( 1, "all", 0, 1 ).front().timeNs == 33 );
@@ -381,7 +381,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.7.0" );
+    assert( described.at( "schema_version" ) == "1.8.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -393,9 +393,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.7.0" );
+        assert( operation.at( "schema_version" ) == "1.8.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.7.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.8.0" );
         assert( operation.at( "budget_parameters" ).size() == 4 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -467,7 +467,7 @@ int main()
     assert( captureCoverage.at( "present" ) == true );
     assert( captureCoverage.at( "complete" ) == true );
     assert( captureCoverage.at( "evidence_kind" ) == "exact" );
-    assert( captureCoverage.at( "producers" ).size() == 4 );
+    assert( captureCoverage.at( "producers" ).size() == 5 );
     const auto degradedProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
         []( const auto& value ) { return value.at( "key" ) == "test.degraded"; } );
     assert( degradedProducer != captureCoverage.at( "producers" ).end() );
@@ -489,15 +489,15 @@ int main()
     assert( taxonomyTree.at( "quality" ).at( "missing_part_count" ) == 0 );
     assert( taxonomyTree.at( "hierarchy_gate" ).at( "static_l0_has_multiple_l1" ) == true );
     assert( taxonomyTree.at( "hierarchy_gate" ).at( "static_l1_has_multiple_l2" ) == true );
-    assert( taxonomyTree.at( "taxonomy_zone_count" ) == "1" );
-    assert( taxonomyTree.at( "explicit_pass_zone_count" ) == "1" );
+    assert( taxonomyTree.at( "taxonomy_zone_count" ) == "2" );
+    assert( taxonomyTree.at( "explicit_pass_zone_count" ) == "2" );
 
     const auto taxonomyCoverage = service.Execute( Request( requestId++, "gpu.taxonomy.coverage", {
         { "trace_id", candidateId }, { "max_scan_events", 100 }
     } ) ).at( "data" );
     assert( taxonomyCoverage.at( "statuses" ).at( "fallback" ).at( "available" ) == true );
     assert( taxonomyCoverage.at( "statuses" ).at( "explicit" ).at( "available" ) == true );
-    assert( taxonomyCoverage.at( "statuses" ).at( "explicit" ).at( "count" ) == "1" );
+    assert( taxonomyCoverage.at( "statuses" ).at( "explicit" ).at( "count" ) == "2" );
     assert( taxonomyCoverage.at( "statuses" ).at( "fallback" ).at( "classified_marker_count" ) == "7" );
     assert( taxonomyCoverage.at( "statuses" ).at( "unclassified" ).at( "count" ) == "3" );
     assert( taxonomyCoverage.at( "statuses" ).at( "culled" ).at( "available" ) == false );
@@ -507,7 +507,10 @@ int main()
     } ) ).at( "data" );
     assert( gpuPassSearch.at( "present" ) == true && gpuPassSearch.at( "complete" ) == true );
     assert( gpuPassSearch.at( "effective" ) == true && gpuPassSearch.at( "producer_state" ) == "covered" );
-    assert( gpuPassSearch.at( "instance_count" ) == "1" && gpuPassSearch.at( "missing_gpu_zone_count" ) == "0" );
+    assert( gpuPassSearch.at( "source_mode" ) == "mixed" );
+    assert( gpuPassSearch.at( "instance_count" ) == "2" && gpuPassSearch.at( "missing_gpu_zone_count" ) == "0" );
+    assert( gpuPassSearch.at( "source_modes" ).at( "cpp-marker-command-list" ).at( "instance_count" ) == "1" );
+    assert( gpuPassSearch.at( "source_modes" ).at( "managed-command-buffer" ).at( "instance_count" ) == "1" );
     assert( gpuPassSearch.at( "passes" ).size() == 1 );
     const auto gpuPass = gpuPassSearch.at( "passes" )[0];
     assert( gpuPass.at( "pass_source_id" ) == 77 );
@@ -525,6 +528,27 @@ int main()
         { "trace_id", candidateId }, { "ref", gpuPass.at( "ref" ) }, { "max_scan_events", 100 }
     } ) ).at( "data" );
     assert( gpuPassGet.at( "pass" ).at( "gpu_zone_ref" ) == gpuPass.at( "gpu_zone_ref" ) );
+
+    const auto managedGpuPassSearch = service.Execute( Request( requestId++, "gpu.pass.search", {
+        { "trace_id", candidateId }, { "source_mode", "managed-command-buffer" }, { "max_scan_events", 100 }
+    } ) ).at( "data" );
+    assert( managedGpuPassSearch.at( "source_mode" ) == "managed-command-buffer" );
+    assert( managedGpuPassSearch.at( "instance_count" ) == "1" );
+    assert( managedGpuPassSearch.at( "page" ).at( "total" ) == 1 );
+    assert( managedGpuPassSearch.at( "producer" ).at( "key" ) == "gpu.pass.managed" );
+    assert( managedGpuPassSearch.at( "producers" ).size() == 1 );
+    assert( managedGpuPassSearch.at( "present" ) == true && managedGpuPassSearch.at( "effective" ) == true );
+    assert( managedGpuPassSearch.at( "complete" ) == true && managedGpuPassSearch.at( "producer_state" ) == "covered" );
+    assert( managedGpuPassSearch.at( "missing_gpu_zone_count" ) == "0" );
+    assert( managedGpuPassSearch.at( "unresolved_taxonomy_count" ) == "0" );
+    assert( managedGpuPassSearch.at( "passes" ).size() == 1 );
+    const auto managedGpuPass = managedGpuPassSearch.at( "passes" )[0];
+    assert( managedGpuPass.at( "pass_source_id" ) == 0x81234567u );
+    assert( managedGpuPass.at( "source_mode" ) == "managed-command-buffer" );
+    assert( managedGpuPass.at( "taxonomy_id" ) == "537198593" );
+    assert( managedGpuPass.at( "name" ) == "ScreenProbe.Execute" );
+    assert( managedGpuPass.at( "source" ).at( "file" ) == "Packages/com.jngame.render-pipelines/Runtime/ScreenProbe/ScreenProbePass.cs" );
+    assert( managedGpuPass.at( "source" ).at( "line" ) == 211 );
 
     const auto catalogKinds = service.Execute( Request( requestId++, "catalog.kinds", {
         { "trace_id", candidateId }

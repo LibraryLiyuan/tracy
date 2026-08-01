@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.7.0",
+  "schema_version": "1.8.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
@@ -25,7 +25,7 @@
     { "domain": "zone.cpu", "worker_data": ["threads.timeline", "zoneChildren", "sourceLocationZones", "zoneExtra"], "methods": ["zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker overview", "two-trace compare"] },
     { "domain": "zone.gpu", "worker_data": ["gpuData", "gpuChildren", "gpuSourceLocationZones"], "methods": ["zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation", "two-trace compare"] },
     { "domain": "gpu.taxonomy", "worker_data": ["JNGT1 taxonomy definitions", "JNCAT1 gpu_taxonomy definitions", "GPU taxonomy source locations and parent refs", "JNQ1 gpu.taxonomy.fallback counters"], "methods": ["gpu.taxonomy.tree", "gpu.taxonomy.coverage"], "status": "complete", "tests": ["FakeTraceSource hierarchy/status contract", "N07 snapshot/stream/replay MCP acceptance", "old trace present=false"] },
-    { "domain": "gpu.pass", "worker_data": ["JnTraceData explicit_gpu_pass and gpu_segment entities", "typed gfx links", "D3D12 GPU timestamp zones", "JNGT1 taxonomy definitions", "JNQ1 gpu.pass.explicit counters"], "methods": ["gpu.pass.search", "gpu.pass.get"], "status": "complete", "tests": ["FakeTraceSource entity/link/query/source contract", "N08 snapshot/stream/replay MCP acceptance", "old trace present=false"] },
+    { "domain": "gpu.pass", "worker_data": ["JnTraceData explicit_gpu_pass and gpu_segment entities", "source flags for native and managed CommandBuffer markers", "typed gfx links", "D3D12 GPU timestamp zones", "JNGT1 taxonomy definitions", "JNQ1 gpu.pass.explicit and gpu.pass.managed counters"], "methods": ["gpu.pass.search", "gpu.pass.get"], "status": "complete", "tests": ["FakeTraceSource native/managed source-mode contract", "N08 native snapshot/stream/replay MCP acceptance", "N09 managed snapshot/stream/replay MCP acceptance", "old trace present=false"] },
     { "domain": "callstack", "worker_data": ["callstackPayload", "callstackFrameMap", "runtime-only parentCallstackPayload when present"], "methods": ["callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch"], "status": "complete", "tests": ["FakeTraceSource", "opaque-ref contract", "Worker validation"] },
     { "domain": "sample", "worker_data": ["samples", "ctxSwitchSamples", "ghostZones", "childSamples", "symbolStats"], "methods": ["sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "hardware_sample", "worker_data": ["hwSamples", "hasBranchRetirement"], "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities"], "status": "complete", "tests": ["FakeTraceSource", "pagination contract"] },

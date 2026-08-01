@@ -36,7 +36,7 @@ public:
     static std::vector<std::string> DefaultIdentityAppInfo()
     {
         return {
-            "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010000\",\"jn_config_hash\":\"0x8daf4c01004d000b\",\"tracy_protocol_version\":\"78\"}}}",
+            "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010000\",\"jn_config_hash\":\"0x8daf4c01004d000d\",\"tracy_protocol_version\":\"78\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"runtime\",\"producer\":\"unity-native\",\"identity\":{\"runtime\":{\"target_kind\":\"editor\",\"engine_build_hash\":\"fake-engine-build\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"connection\",\"producer\":\"jn-native-client\",\"identity\":{\"connection\":{\"id\":\"1\",\"instance_cookie\":\"0123456789abcdef\"}}}",
             "JNCI1|{\"schema_version\":1,\"kind\":\"manifest\",\"producer\":\"build-manifest\",\"identity\":{\"build\":{\"build_id\":\"0123456789abcdef0123456789abcdef\",\"repositories\":{\"engine\":{\"revision\":\"1111111111111111111111111111111111111111\"},\"package\":{\"revision\":\"2222222222222222222222222222222222222222\"},\"tracy\":{\"revision\":\"3333333333333333333333333333333333333333\"}},\"artifacts\":{\"unity\":{\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"},\"jn_client\":{\"sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"},\"query\":{\"sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}}}}",
@@ -49,6 +49,8 @@ public:
             "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"1\",\"snapshot_qpc\":\"30\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":3,\"key\":\"gpu.taxonomy.fallback\",\"source_mode\":\"unity-marker-classifier\",\"producer_schema\":2,\"config_generation\":\"3\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"10\",\"emitted\":\"7\",\"dropped\":\"0\",\"filtered\":\"3\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
             "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"0\",\"snapshot_qpc\":\"20\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":4,\"key\":\"gpu.pass.explicit\",\"source_mode\":\"cpp-marker-command-list\",\"producer_schema\":1,\"config_generation\":\"4\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
             "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"1\",\"snapshot_qpc\":\"30\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":4,\"key\":\"gpu.pass.explicit\",\"source_mode\":\"cpp-marker-command-list\",\"producer_schema\":1,\"config_generation\":\"4\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"1\",\"emitted\":\"1\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
+            "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"0\",\"snapshot_qpc\":\"20\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":5,\"key\":\"gpu.pass.managed\",\"source_mode\":\"managed-command-buffer\",\"producer_schema\":1,\"config_generation\":\"5\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
+            "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"1\",\"snapshot_qpc\":\"30\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":5,\"key\":\"gpu.pass.managed\",\"source_mode\":\"managed-command-buffer\",\"producer_schema\":1,\"config_generation\":\"5\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"1\",\"emitted\":\"1\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
             "JNGT1|{\"schema_version\":2,\"connection_id\":\"1\",\"part_index\":0,\"part_count\":1,\"source_mode\":\"UnityMarkerFallback\",\"status_capabilities\":{\"executed\":{\"available\":true},\"fallback\":{\"available\":true},\"unclassified\":{\"available\":true},\"culled\":{\"available\":false,\"reason\":\"fake explicit producer absent\"},\"disabled\":{\"available\":false,\"reason\":\"fake explicit producer absent\"}},\"definitions\":[{\"taxonomy_id\":\"65537\",\"parent_id\":\"0\",\"level\":0,\"queue_mask\":1,\"canonical_name\":\"GPU.Frame.Direct\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"268632064\",\"parent_id\":\"65537\",\"level\":1,\"queue_mask\":3,\"canonical_name\":\"GPU.L1.Shadows\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"268763136\",\"parent_id\":\"65537\",\"level\":1,\"queue_mask\":3,\"canonical_name\":\"GPU.L1.Lighting\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"537067521\",\"parent_id\":\"268632064\",\"level\":2,\"queue_mask\":3,\"canonical_name\":\"GPU.L2.Shadows.MainLight\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"537067522\",\"parent_id\":\"268632064\",\"level\":2,\"queue_mask\":3,\"canonical_name\":\"GPU.L2.Shadows.VSM\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"537198593\",\"parent_id\":\"268763136\",\"level\":2,\"queue_mask\":3,\"canonical_name\":\"GPU.L2.Lighting.ScreenProbe\",\"catalog_definition_key\":\"\"},{\"taxonomy_id\":\"537198595\",\"parent_id\":\"268763136\",\"level\":2,\"queue_mask\":3,\"canonical_name\":\"GPU.L2.Lighting.Forward\",\"catalog_definition_key\":\"\"}]} ",
             "JNCAT1|{\"schema_version\":1,\"connection_id\":\"1\",\"definitions\":[{\"catalog_id\":\"1\",\"definition_key\":\"jn-def:v1:source:03e2e6f19c364e11\",\"kind\":\"source\",\"kind_id\":1,\"flags\":0,\"canonical_name\":\"Fake.Source\",\"namespace\":\"fake.source\",\"source\":{\"file_id\":\"engine/runtime/fake.cpp\",\"function\":\"FakeFunction\",\"line\":42}}]}",
             "JNENT1|{\"schema_version\":1,\"connection_id\":\"1\",\"entities\":[{\"entity_id\":\"281474976710657\",\"catalog_id\":\"1\",\"definition_key\":\"jn-def:v1:source:03e2e6f19c364e11\",\"connection_generation\":1,\"parent_entity_id\":\"0\",\"flags\":0}]}"
@@ -90,14 +92,14 @@ public:
         value.legacyQueueDelayAvailability.available = m_legacyFormat;
         if( m_legacyFormat ) value.legacyQueueDelayNs = 42;
         else value.legacyQueueDelayAvailability.reason = "legacy queue delay was removed from the trace format in Tracy 0.12.3";
-        value.counts.frames = value.counts.frameSets = value.counts.gpuZones = 1;
+        value.counts.frames = value.counts.frameSets = 1; value.counts.gpuZones = 2;
         value.counts.cpuZones = 2;
         value.counts.threads = value.counts.locks = value.counts.plots = value.counts.messages = 1;
         value.counts.memoryEvents = value.counts.memoryPools = value.counts.contextSwitches = 1;
         value.counts.callstackPayloads = value.counts.callstackFrames = value.counts.samples = 1;
         value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = 1;
         value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
-        value.counts.gfxDispatches = 1; value.counts.gfxEntities = 3; value.counts.gfxLinks = 6;
+        value.counts.gfxDispatches = 1; value.counts.gfxEntities = 5; value.counts.gfxLinks = 11;
         value.counts.correlatedFrameEvents = 4;
         if( !m_legacyFormat )
         {
@@ -159,8 +161,10 @@ public:
     }
     std::vector<analysis::GpuZoneDto> ScanGpuZones( const analysis::ScanRange& range ) const override
     {
-        if( range.endNs <= 20 || range.startNs >= 50 ) return {};
-        analysis::GpuZoneDto value; value.ref = MakeEntityRef( "gpu-zone", 0 ); value.contextRef = MakeEntityRef( "gpu-context", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.sourceLocationRef = MakeEntityRef( "source", 1 ); value.name = "Shadows.Draw"; value.function = "RenderShadowCasterParts"; value.file = "Runtime/Graphics/ScriptableRenderLoop/ScriptableDrawShadows.cpp"; value.line = 373; value.gpuStartNs = 20; value.gpuEndNs = 50; value.cpuStartNs = 15; value.cpuEndNs = 45; value.selfTimeNs = 30; value.callstack = 1; value.callstackRef = MakeEntityRef( "callstack", 1 ); value.complete = true; value.queryId = 5; value.queryIdAvailability.available = !m_legacyFormat; if( m_legacyFormat ) value.queryIdAvailability.reason = "gpu query IDs were not persisted before Tracy 0.12.4"; return Page( { value }, range );
+        if( range.endNs <= 20 || range.startNs >= 70 ) return {};
+        analysis::GpuZoneDto value; value.ref = MakeEntityRef( "gpu-zone", 0 ); value.contextRef = MakeEntityRef( "gpu-context", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.sourceLocationRef = MakeEntityRef( "source", 1 ); value.name = "Shadows.Draw"; value.function = "RenderShadowCasterParts"; value.file = "Runtime/Graphics/ScriptableRenderLoop/ScriptableDrawShadows.cpp"; value.line = 373; value.gpuStartNs = 20; value.gpuEndNs = 50; value.cpuStartNs = 15; value.cpuEndNs = 45; value.selfTimeNs = 30; value.callstack = 1; value.callstackRef = MakeEntityRef( "callstack", 1 ); value.complete = true; value.queryId = 5; value.queryIdAvailability.available = !m_legacyFormat; if( m_legacyFormat ) value.queryIdAvailability.reason = "gpu query IDs were not persisted before Tracy 0.12.4";
+        analysis::GpuZoneDto managed = value; managed.ref = MakeEntityRef( "gpu-zone", 1 ); managed.name = "ScreenProbe.Execute"; managed.function = "Execute"; managed.file = "Packages/com.jngame.render-pipelines/Runtime/ScreenProbe/ScreenProbePass.cs"; managed.line = 211; managed.gpuStartNs = 51; managed.gpuEndNs = 70; managed.cpuStartNs = 46; managed.cpuEndNs = 65; managed.selfTimeNs = 19; managed.queryId = 6;
+        return Page( { value, managed }, range );
     }
     std::vector<analysis::FrameDto> ScanFrames( const analysis::ScanRange& range ) const override { return Page( GetFramesForSet( 0, 0, 1 ), range ); }
     std::vector<analysis::MemoryEventDto> ScanMemoryEvents( const analysis::ScanRange& range ) const override
@@ -205,7 +209,9 @@ public:
         return {
             { MakeEntityRef( "gfx-entity", dispatch + 1 ), dispatch + 1, dispatch, 42, MakeEntityRef( "thread", 1 ), 0, 0, 1, 0 },
             { MakeEntityRef( "gfx-entity", dispatch + 2 ), dispatch + 2, 0, 15, MakeEntityRef( "thread", 1 ), 77, 3, 5, 1 },
-            { MakeEntityRef( "gfx-entity", dispatch + 3 ), dispatch + 3, dispatch + 1, 15, MakeEntityRef( "thread", 1 ), 5, 0, 4, 0 }
+            { MakeEntityRef( "gfx-entity", dispatch + 3 ), dispatch + 3, dispatch + 1, 15, MakeEntityRef( "thread", 1 ), 5, 0, 4, 0 },
+            { MakeEntityRef( "gfx-entity", dispatch + 4 ), dispatch + 4, dispatch + 2, 46, MakeEntityRef( "thread", 1 ), 0x81234567u, 5, 5, 3 },
+            { MakeEntityRef( "gfx-entity", dispatch + 5 ), dispatch + 5, dispatch + 1, 46, MakeEntityRef( "thread", 1 ), 6, 0, 4, 0 }
         };
     }
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override
@@ -213,6 +219,8 @@ public:
         const uint64_t entity = ( uint64_t( 1 ) << 63 ) + 1;
         const uint64_t explicitPass = ( uint64_t( 1 ) << 63 ) + 2;
         const uint64_t segment = ( uint64_t( 1 ) << 63 ) + 3;
+        const uint64_t managedPass = ( uint64_t( 1 ) << 63 ) + 4;
+        const uint64_t managedSegment = ( uint64_t( 1 ) << 63 ) + 5;
         const uint64_t frameId = ( uint64_t( 1 ) << 48 ) | 1;
         return {
             { MakeEntityRef( "gfx-link", 0 ), 1, entity, 42, MakeEntityRef( "thread", 1 ), 2, 0 },
@@ -220,7 +228,12 @@ public:
             { MakeEntityRef( "gfx-link", 2 ), explicitPass, entity, 15, MakeEntityRef( "thread", 1 ), 7, 0 },
             { MakeEntityRef( "gfx-link", 3 ), explicitPass, frameId, 15, MakeEntityRef( "thread", 1 ), 8, 0 },
             { MakeEntityRef( "gfx-link", 4 ), explicitPass, 11, 15, MakeEntityRef( "thread", 1 ), 11, 0 },
-            { MakeEntityRef( "gfx-link", 5 ), explicitPass, 537067521, 15, MakeEntityRef( "thread", 1 ), 12, 0 }
+            { MakeEntityRef( "gfx-link", 5 ), explicitPass, 537067521, 15, MakeEntityRef( "thread", 1 ), 12, 0 },
+            { MakeEntityRef( "gfx-link", 6 ), managedPass, managedSegment, 46, MakeEntityRef( "thread", 1 ), 5, 0 },
+            { MakeEntityRef( "gfx-link", 7 ), managedPass, entity, 46, MakeEntityRef( "thread", 1 ), 7, 0 },
+            { MakeEntityRef( "gfx-link", 8 ), managedPass, frameId, 46, MakeEntityRef( "thread", 1 ), 8, 0 },
+            { MakeEntityRef( "gfx-link", 9 ), managedPass, 12, 46, MakeEntityRef( "thread", 1 ), 11, 0 },
+            { MakeEntityRef( "gfx-link", 10 ), managedPass, 537198593, 46, MakeEntityRef( "thread", 1 ), 12, 0 }
         };
     }
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override

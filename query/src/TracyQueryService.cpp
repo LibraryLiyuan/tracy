@@ -146,6 +146,14 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["frame_set"] = ParameterSchemaFor( "frame_set" );
                 properties["index"] = { { "type", "integer" }, { "minimum", 0 } };
             }
+            else if( method == "gpu.pass.search" )
+            {
+                properties["source_mode"] = { { "type", "string" },
+                    { "enum", { "cpp-marker-command-list", "managed-command-buffer" } } };
+                properties["pass_source_id"] = ParameterSchemaFor( "pass_source_id" );
+                properties["taxonomy_id"] = ParameterSchemaFor( "taxonomy_id" );
+                properties["name"] = ParameterSchemaFor( "name" );
+            }
             json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", true } };
             if( !alternatives.empty() ) inputSchema["oneOf"] = json::array( {
                 json { { "required", alternatives[0] } }, json { { "required", alternatives[1] } }
@@ -2275,9 +2283,10 @@ void MatchExplicitGpuPassZone( const analysis::TraceSource& source, ExplicitGpuP
 json ExplicitGpuPassJson( const analysis::TraceSource& source, const ExplicitGpuPassMatch& match,
     const std::map<uint32_t, json>& taxonomyDefinitions )
 {
+    const char* sourceMode = ( match.pass.flags & 2 ) != 0 ? "managed-command-buffer" : "cpp-marker-command-list";
     json result = {
         { "ref", match.pass.ref }, { "pass_instance_id", Decimal( match.pass.entityId ) },
-        { "pass_source_id", match.pass.gpuQueryId }, { "source_mode", "cpp-marker-command-list" },
+        { "pass_source_id", match.pass.gpuQueryId }, { "source_mode", sourceMode },
         { "taxonomy_index", match.pass.gpuContext }, { "taxonomy_id", Decimal( uint64_t( match.taxonomyId ) ) },
         { "taxonomy_evidence", match.taxonomyStableId ? "stable_id_relation" : "legacy_catalog_index" },
         { "logical_parent_id", Decimal( match.pass.parentId ) },
@@ -2960,14 +2969,41 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         const auto coverage = CaptureCoverageJson( info() );
-        json producer = nullptr;
+        json nativeProducer = nullptr;
+        json managedProducer = nullptr;
         if( coverage.value( "present", false ) )
             for( const auto& value : coverage["producers"] )
-                if( value.value( "key", "" ) == "gpu.pass.explicit" ) { producer = value; break; }
-        const bool present = producer.is_object() || !passes.matches.empty();
-        const bool effective = producer.is_object() ? producer.value( "effective", false ) : !passes.matches.empty();
-        const std::string producerState = producer.is_object() ? producer.value( "state", "unknown" ) :
-            ( passes.matches.empty() ? "absent" : "persisted_entities_without_producer_record" );
+            {
+                if( value.value( "key", "" ) == "gpu.pass.explicit" ) nativeProducer = value;
+                else if( value.value( "key", "" ) == "gpu.pass.managed" ) managedProducer = value;
+            }
+        uint64_t nativePassCount = 0;
+        uint64_t managedPassCount = 0;
+        for( const auto& pass : passes.matches )
+        {
+            if( ( pass.pass.flags & 2 ) != 0 ) managedPassCount++;
+            else nativePassCount++;
+        }
+        const bool hasProducer = nativeProducer.is_object() || managedProducer.is_object();
+        const bool present = hasProducer || !passes.matches.empty();
+        const bool effective = hasProducer ?
+            ( ( nativeProducer.is_object() && nativeProducer.value( "effective", false ) ) ||
+              ( managedProducer.is_object() && managedProducer.value( "effective", false ) ) ) :
+            !passes.matches.empty();
+        std::string producerState = passes.matches.empty() ? "absent" : "persisted_entities_without_producer_record";
+        if( nativeProducer.is_object() && managedProducer.is_object() )
+        {
+            const auto nativeState = nativeProducer.value( "state", "unknown" );
+            const auto managedState = managedProducer.value( "state", "unknown" );
+            producerState = nativeState == managedState ? nativeState : "mixed";
+        }
+        else if( nativeProducer.is_object() ) producerState = nativeProducer.value( "state", "unknown" );
+        else if( managedProducer.is_object() ) producerState = managedProducer.value( "state", "unknown" );
+        const std::string sourceMode = nativePassCount != 0 && managedPassCount != 0 ? "mixed" :
+            ( managedPassCount != 0 ? "managed-command-buffer" :
+              ( nativePassCount != 0 ? "cpp-marker-command-list" :
+                ( nativeProducer.is_object() && managedProducer.is_object() ? "mixed" :
+                  ( managedProducer.is_object() ? "managed-command-buffer" : "cpp-marker-command-list" ) ) ) );
         uint64_t missingGpuZoneCount = 0;
         uint64_t unresolvedTaxonomyCount = 0;
         for( const auto& pass : passes.matches ) if( !pass.zone ) missingGpuZoneCount++;
@@ -2975,14 +3011,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( pass.taxonomyId == 0 || taxonomyDefinitions.find( pass.taxonomyId ) == taxonomyDefinitions.end() ) unresolvedTaxonomyCount++;
         const bool complete = present && taxonomy.value( "present", false ) && !BudgetPartial() && missingGpuZoneCount == 0 &&
             unresolvedTaxonomyCount == 0 &&
-            ( !producer.is_object() || producer.value( "complete", false ) );
+            ( !nativeProducer.is_object() || nativeProducer.value( "complete", false ) ) &&
+            ( !managedProducer.is_object() || managedProducer.value( "complete", false ) );
         const auto base = [&]() {
+            json producers = json::array();
+            if( nativeProducer.is_object() ) producers.emplace_back( nativeProducer );
+            if( managedProducer.is_object() ) producers.emplace_back( managedProducer );
             return json {
                 { "present", present }, { "complete", complete },
                 { "effective", effective }, { "producer_state", producerState },
-                { "reason", present ? ( complete ? json( nullptr ) : json( "explicit GPU pass evidence is incomplete" ) ) :
-                    json( "gpu.pass.explicit producer and persisted explicit pass entities are absent" ) },
-                { "source_mode", "cpp-marker-command-list" }, { "producer", producer },
+                { "reason", present ? ( complete ? json( nullptr ) : json( "GPU pass evidence is incomplete" ) ) :
+                    json( "GPU pass producers and persisted explicit pass entities are absent" ) },
+                { "source_mode", sourceMode },
+                { "source_modes", {
+                    { "cpp-marker-command-list", { { "instance_count", Decimal( nativePassCount ) }, { "producer", nativeProducer } } },
+                    { "managed-command-buffer", { { "instance_count", Decimal( managedPassCount ) }, { "producer", managedProducer } } }
+                } },
+                { "producer", nativeProducer.is_object() ? nativeProducer : managedProducer }, { "producers", std::move( producers ) },
                 { "scan_complete", !BudgetPartial() }, { "instance_count", Decimal( passes.matches.size() ) },
                 { "missing_gpu_zone_count", Decimal( missingGpuZoneCount ) },
                 { "unresolved_taxonomy_count", Decimal( unresolvedTaxonomyCount ) },
@@ -3005,7 +3050,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         const auto page = ParsePage( params, method, trace );
+        std::optional<std::string> requestedSourceMode;
+        if( params.contains( "source_mode" ) )
+        {
+            if( !params["source_mode"].is_string() ) throw QueryError( "INVALID_PARAMS", "source_mode must be a string" );
+            requestedSourceMode = params["source_mode"].get<std::string>();
+            if( *requestedSourceMode != "cpp-marker-command-list" && *requestedSourceMode != "managed-command-buffer" )
+                throw QueryError( "INVALID_PARAMS", "source_mode must be cpp-marker-command-list or managed-command-buffer" );
+        }
         std::vector<json> selected;
+        uint64_t selectedMissingGpuZoneCount = 0;
+        uint64_t selectedUnresolvedTaxonomyCount = 0;
         for( const auto& pass : passes.matches )
         {
             if( params.contains( "pass_source_id" ) )
@@ -3019,6 +3074,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !requested || *requested != pass.taxonomyId ) continue;
             }
             auto value = ExplicitGpuPassJson( *source, pass, taxonomyDefinitions );
+            if( requestedSourceMode && value["source_mode"] != *requestedSourceMode ) continue;
             if( params.contains( "name" ) )
             {
                 if( !params["name"].is_string() ) throw QueryError( "INVALID_PARAMS", "name must be a string" );
@@ -3026,6 +3082,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     value["name"].get<std::string>() : std::string();
                 if( Lower( passName ).find( Lower( params["name"].get<std::string>() ) ) == std::string::npos ) continue;
             }
+            if( !pass.zone ) selectedMissingGpuZoneCount++;
+            if( pass.taxonomyId == 0 || taxonomyDefinitions.find( pass.taxonomyId ) == taxonomyDefinitions.end() )
+                selectedUnresolvedTaxonomyCount++;
             selected.emplace_back( std::move( value ) );
         }
         const size_t total = selected.size();
@@ -3034,6 +3093,34 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json values = json::array();
         for( size_t index = begin; index < end; ++index ) values.emplace_back( std::move( selected[index] ) );
         auto result = base();
+        if( requestedSourceMode )
+        {
+            const bool managed = *requestedSourceMode == "managed-command-buffer";
+            const json& selectedProducer = managed ? managedProducer : nativeProducer;
+            const bool selectedPresent = selectedProducer.is_object() || total != 0;
+            const bool selectedEffective = selectedProducer.is_object() ?
+                selectedProducer.value( "effective", false ) : total != 0;
+            const bool selectedComplete = selectedPresent && taxonomy.value( "present", false ) && !BudgetPartial() &&
+                selectedMissingGpuZoneCount == 0 && selectedUnresolvedTaxonomyCount == 0 &&
+                ( !selectedProducer.is_object() || selectedProducer.value( "complete", false ) );
+            json selectedProducers = json::array();
+            if( selectedProducer.is_object() ) selectedProducers.emplace_back( selectedProducer );
+            result["present"] = selectedPresent;
+            result["complete"] = selectedComplete;
+            result["effective"] = selectedEffective;
+            result["producer_state"] = selectedProducer.is_object() ?
+                selectedProducer.value( "state", "unknown" ) :
+                ( total == 0 ? "absent" : "persisted_entities_without_producer_record" );
+            result["reason"] = selectedPresent ?
+                ( selectedComplete ? json( nullptr ) : json( "Selected GPU pass evidence is incomplete" ) ) :
+                json( "Selected GPU pass producer and persisted entities are absent" );
+            result["source_mode"] = *requestedSourceMode;
+            result["producer"] = selectedProducer;
+            result["producers"] = std::move( selectedProducers );
+            result["instance_count"] = Decimal( total );
+            result["missing_gpu_zone_count"] = Decimal( selectedMissingGpuZoneCount );
+            result["unresolved_taxonomy_count"] = Decimal( selectedUnresolvedTaxonomyCount );
+        }
         result["passes"] = std::move( values );
         result["page"] = { { "offset", begin }, { "limit", page.limit }, { "returned", end - begin },
             { "total", total }, { "has_more", end < total } };
@@ -3251,18 +3338,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         const auto producerCoverage = CaptureCoverageJson( info() );
         json fallbackProducer = nullptr;
-        json explicitProducer = nullptr;
+        json nativePassProducer = nullptr;
+        json managedPassProducer = nullptr;
         if( producerCoverage.value( "present", false ) )
             for( const auto& producer : producerCoverage["producers"] )
             {
                 if( producer.value( "key", "" ) == "gpu.taxonomy.fallback" ) fallbackProducer = producer;
-                else if( producer.value( "key", "" ) == "gpu.pass.explicit" ) explicitProducer = producer;
+                else if( producer.value( "key", "" ) == "gpu.pass.explicit" ) nativePassProducer = producer;
+                else if( producer.value( "key", "" ) == "gpu.pass.managed" ) managedPassProducer = producer;
             }
         const bool classifierAvailable = fallbackProducer.is_object() && fallbackProducer.value( "complete", false );
-        const bool explicitProducerComplete = explicitProducer.is_object() && explicitProducer.value( "complete", false );
-        const bool explicitAvailable = explicitProducerComplete && explicitProducer.value( "effective", false );
-        const std::string explicitUnavailableReason = !explicitProducerComplete ? "no complete gpu.pass.explicit counter window" :
-            "gpu.pass.explicit producer state is " + explicitProducer.value( "state", "disabled" );
+        const bool nativePassComplete = nativePassProducer.is_object() && nativePassProducer.value( "complete", false );
+        const bool managedPassComplete = managedPassProducer.is_object() && managedPassProducer.value( "complete", false );
+        const bool explicitProducerComplete = nativePassComplete || managedPassComplete;
+        const bool explicitAvailable =
+            ( nativePassComplete && nativePassProducer.value( "effective", false ) ) ||
+            ( managedPassComplete && managedPassProducer.value( "effective", false ) );
+        const std::string explicitUnavailableReason = !explicitProducerComplete ? "no complete GPU pass producer counter window" :
+            "all complete GPU pass producers are ineffective";
         const auto producerCounter = [&]( const char* name ) -> json {
             if( !classifierAvailable || !fallbackProducer.contains( "counters" ) ||
                 !fallbackProducer["counters"].contains( name ) ) return nullptr;
@@ -3295,7 +3388,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "overflow", producerCounter( "overflow" ) }, { "mismatch", producerCounter( "mismatch" ) },
             { "unresolved", producerCounter( "unresolved" ) }
         };
-        result["explicit_quality"] = { { "producer", explicitProducer },
+        result["explicit_quality"] = { { "producer", nativePassProducer.is_object() ? nativePassProducer : managedPassProducer },
+            { "producers", json::array( { nativePassProducer, managedPassProducer } ) },
             { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) } };
         return Success( id, std::move( result ), trace );
     }
