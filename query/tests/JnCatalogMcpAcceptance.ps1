@@ -126,7 +126,7 @@ function Definition-KeySet($Catalog)
 function Assert-Catalog($Catalog, [string]$Label)
 {
     Assert-Condition ([bool]$Catalog.Kinds.ok) "$Label catalog.kinds failed"
-    Assert-Condition ([string]$Catalog.Kinds.schema_version -eq '1.5.0') "$Label query schema is not 1.5.0"
+    Assert-Condition ([string]$Catalog.Kinds.schema_version -eq '1.6.0') "$Label query schema is not 1.6.0"
     Assert-Condition ([bool]$Catalog.Kinds.data.present) "$Label catalog is absent"
     Assert-Condition ([bool]$Catalog.Kinds.data.complete) "$Label catalog is incomplete"
     $activeConnectionId = [string]$Catalog.Kinds.data.active_connection_id

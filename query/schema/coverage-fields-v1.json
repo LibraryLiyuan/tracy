@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.5.0",
+  "schema_version": "1.6.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -497,6 +497,46 @@
       "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "dependencies", "stages", "first_run_ns", "completed_ns", "execution_ns", "wait", "orphan", "truncated"],
       "unmapped_fields": [],
       "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path"],
+      "status": "complete"
+    },
+    {
+      "entity": "gpu.taxonomy",
+      "classification": "persisted_semantic",
+      "persisted_fields": [
+        "JNGT1 taxonomy_id",
+        "parent_id",
+        "level",
+        "queue_mask",
+        "canonical_name",
+        "catalog_definition_key",
+        "status_capabilities",
+        "GPU zone source line taxonomy_id",
+        "GPU zone parent_ref",
+        "JNQ1 fallback classifier counters"
+      ],
+      "query_fields": [
+        "present",
+        "schema_version",
+        "complete",
+        "source_mode",
+        "nodes[].taxonomy_id",
+        "nodes[].parent_id",
+        "nodes[].level",
+        "nodes[].queue_mask",
+        "nodes[].catalog_linked",
+        "nodes[].execution",
+        "logical_edges",
+        "observed_edges",
+        "hierarchy_gate",
+        "statuses.executed",
+        "statuses.fallback",
+        "statuses.unclassified",
+        "statuses.culled",
+        "statuses.disabled",
+        "classifier_quality"
+      ],
+      "unmapped_fields": [],
+      "methods": ["gpu.taxonomy.tree", "gpu.taxonomy.coverage"],
       "status": "complete"
     },
     {

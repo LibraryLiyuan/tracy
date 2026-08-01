@@ -258,7 +258,7 @@ try
 
     $result = [ordered]@{
         status = 'passed'
-        query_schema = '1.5.0'
+        query_schema = '1.6.0'
         maximum_callstack_depth = 62
         config_generation = $snapshot.config_generation
         direct_zone_count = $snapshot.direct.count

@@ -238,11 +238,11 @@ try
     $operationSchemas = @($inspectTool.inputSchema.PSObject.Properties['x-tracy-operationSchemas'].Value)
     $methodEnum = @($inspectTool.inputSchema.properties.method.enum)
     Assert-Condition ($operationSchemas.Count -eq $methodEnum.Count) 'MCP method enum and operation schema registry differ'
-    Assert-Condition ([string]$inspectTool.outputSchema.properties.schema_version.const -eq '1.5.0') 'MCP output schema version mismatch'
+    Assert-Condition ([string]$inspectTool.outputSchema.properties.schema_version.const -eq '1.6.0') 'MCP output schema version mismatch'
 
     $schema = Inspect '' 'system.schema'
     $describe = Inspect '' 'system.describe'
-    Assert-Condition ([string]$schema.schema_version -eq '1.5.0') 'Query schema version mismatch'
+    Assert-Condition ([string]$schema.schema_version -eq '1.6.0') 'Query schema version mismatch'
     Assert-Condition (@($schema.data.operations).Count -eq $operationSchemas.Count) 'system.schema registry count differs from MCP'
     Assert-Condition (@($describe.data.operations).Count -eq $operationSchemas.Count) 'system.describe registry count differs from MCP'
 
@@ -286,7 +286,7 @@ try
     Close-Trace $legacyId
 
     $result = [ordered]@{
-        schema_version = '1.5.0'
+        schema_version = '1.6.0'
         registry = [ordered]@{ methods = $methodEnum.Count; describe = @($describe.data.operations).Count; system_schema = @($schema.data.operations).Count; mcp = $operationSchemas.Count }
         semantics = [ordered]@{ snapshot = $snapshotSemantics; committed_stream = $streamSemantics; stream_replay = $replaySemantics }
         budget_cursor = $budgetGate

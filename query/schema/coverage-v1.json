@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.5.0",
+  "schema_version": "1.6.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
@@ -24,6 +24,7 @@
     { "domain": "correlation", "worker_data": ["JnTraceData frames", "jobConfigs.originFrameSequence", "jobDependencies", "gfxDispatch.frameIndex", "gfxEntity", "gfxLink"], "methods": ["entity.related", "correlation.chain"], "status": "complete", "tests": ["FakeTraceSource exact relation contract", "FrameIdentity MCP acceptance", "old trace present=false"] },
     { "domain": "zone.cpu", "worker_data": ["threads.timeline", "zoneChildren", "sourceLocationZones", "zoneExtra"], "methods": ["zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker overview", "two-trace compare"] },
     { "domain": "zone.gpu", "worker_data": ["gpuData", "gpuChildren", "gpuSourceLocationZones"], "methods": ["zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation", "two-trace compare"] },
+    { "domain": "gpu.taxonomy", "worker_data": ["JNGT1 taxonomy definitions", "JNCAT1 gpu_taxonomy definitions", "GPU taxonomy source locations and parent refs", "JNQ1 gpu.taxonomy.fallback counters"], "methods": ["gpu.taxonomy.tree", "gpu.taxonomy.coverage"], "status": "complete", "tests": ["FakeTraceSource hierarchy/status contract", "N07 snapshot/stream/replay MCP acceptance", "old trace present=false"] },
     { "domain": "callstack", "worker_data": ["callstackPayload", "callstackFrameMap", "runtime-only parentCallstackPayload when present"], "methods": ["callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch"], "status": "complete", "tests": ["FakeTraceSource", "opaque-ref contract", "Worker validation"] },
     { "domain": "sample", "worker_data": ["samples", "ctxSwitchSamples", "ghostZones", "childSamples", "symbolStats"], "methods": ["sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "hardware_sample", "worker_data": ["hwSamples", "hasBranchRetirement"], "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities"], "status": "complete", "tests": ["FakeTraceSource", "pagination contract"] },

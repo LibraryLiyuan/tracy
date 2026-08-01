@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.5.0",
+  "schema_version": "1.6.0",
   "coverage_level": "mcp",
   "status": "complete",
   "public_method_registry": "tracy::query::QueryMethodRegistry",
@@ -43,6 +43,7 @@
     "JnIdentityMcpAcceptance snapshot, stream, and replay identity equality",
     "capture.context/capture.coverage/producer.get discovery and generic inspect route",
     "JnContextQualityMcpAcceptance snapshot, stream, and replay equality",
-    "JnCatalogMcpAcceptance cross-capture DefinitionKey stability, EntityId generation, privacy, old-trace absence, and snapshot/stream/replay equality"
+    "JnCatalogMcpAcceptance cross-capture DefinitionKey stability, EntityId generation, privacy, old-trace absence, and snapshot/stream/replay equality",
+    "JnGpuTaxonomyMcpAcceptance stable L0/L1/L2 definitions, observed hierarchy, status capability, old-trace absence, and snapshot/stream/replay equality"
   ]
 }

@@ -31,6 +31,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "capture.context", "capture.coverage", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
+        "gpu.taxonomy.tree", "gpu.taxonomy.coverage",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
         "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
@@ -87,6 +88,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 std::string MethodDomain( const std::string& method )
 {
     if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
+    if( method.rfind( "gpu.taxonomy.", 0 ) == 0 ) return "gpu.taxonomy";
     if( method.rfind( "job.gfx", 0 ) == 0 ) return "job.gfx";
     const auto separator = method.find( '.' );
     return separator == std::string::npos ? method : method.substr( 0, separator );
@@ -1458,7 +1460,8 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
             duplicates++;
             continue;
         }
-        byProducer[producer["key"].get<std::string>()].push_back( { *sequence, uint64_t( index ), std::move( document ) } );
+        const auto producerKey = producer["key"].get<std::string>();
+        byProducer[producerKey].push_back( { *sequence, uint64_t( index ), std::move( document ) } );
     }
 
     if( connectionIds.size() > 1 )
@@ -1485,8 +1488,12 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
             if( left.sequence != right.sequence ) return left.sequence < right.sequence;
             return left.recordIndex < right.recordIndex;
         } );
-        const auto& first = snapshots.front().document["producer"];
-        const auto& last = snapshots.back().document["producer"];
+        // Keep cold-path value copies instead of references into vector-owned
+        // JSON documents. This query may be built with LTCG; explicit values
+        // avoid optimizer-sensitive lifetime/evaluation-order coupling with
+        // the later output initializer list.
+        const auto first = snapshots.front().document["producer"];
+        const auto last = snapshots.back().document["producer"];
         const bool windowComplete = snapshots.front().sequence < snapshots.back().sequence;
         complete = complete && windowComplete;
         json counters = json::object();
@@ -1899,6 +1906,228 @@ json CatalogJson( const analysis::TraceInfoDto& info )
             { "envelope_bytes", Decimal( envelopeBytes ) } } },
         { "limits", { { "maximum_records", MaximumCatalogRecords }, { "maximum_definitions", MaximumCatalogDefinitions },
             { "maximum_entities", MaximumCatalogEntities } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
+constexpr std::string_view GpuTaxonomyPrefix = "JNGT1|";
+constexpr size_t MaximumGpuTaxonomyDefinitions = 256;
+
+json GpuTaxonomyCatalogJson( const analysis::TraceInfoDto& info )
+{
+    std::optional<uint64_t> activeConnectionId;
+    const auto captureIdentity = CaptureIdentityJson( info );
+    if( captureIdentity.value( "present", false ) && captureIdentity.contains( "identity" ) &&
+        captureIdentity["identity"].is_object() && captureIdentity["identity"].contains( "connection" ) &&
+        captureIdentity["identity"]["connection"].is_object() &&
+        captureIdentity["identity"]["connection"].contains( "id" ) )
+        activeConnectionId = DecimalStringValue( captureIdentity["identity"]["connection"]["id"] );
+
+    std::map<uint32_t, json> definitions;
+    json invalid = json::array();
+    json statusCapabilities = json::object();
+    std::string sourceMode;
+    size_t seen = 0;
+    size_t validRecords = 0;
+    size_t duplicates = 0;
+    size_t staleConnectionRecords = 0;
+    size_t catalogUnresolved = 0;
+    size_t duplicatePartRecords = 0;
+    std::optional<uint32_t> expectedPartCount;
+    std::set<uint32_t> receivedParts;
+    const auto addInvalid = [&]( size_t index, const std::string& reason ) {
+        if( invalid.size() < 128 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", reason } } );
+    };
+
+    for( size_t recordIndex = 0; recordIndex < info.appInfo.size(); recordIndex++ )
+    {
+        const auto& record = info.appInfo[recordIndex];
+        const bool currentEnvelope = record.starts_with( GpuTaxonomyPrefix );
+        const bool taxonomyLike = currentEnvelope || ( record.size() >= 5 && record.compare( 0, 4, "JNGT" ) == 0 &&
+            record.find( '|' ) != std::string::npos );
+        if( !taxonomyLike ) continue;
+        seen++;
+        if( !currentEnvelope )
+        {
+            addInvalid( recordIndex, "unsupported GPU taxonomy envelope version" );
+            continue;
+        }
+        if( record.size() <= GpuTaxonomyPrefix.size() || record.size() > MaximumIdentityEnvelopeBytes )
+        {
+            addInvalid( recordIndex, "GPU taxonomy envelope has an invalid size" );
+            continue;
+        }
+        const auto document = json::parse( record.begin() + ptrdiff_t( GpuTaxonomyPrefix.size() ), record.end(), nullptr, false );
+        if( document.is_discarded() || !document.is_object() || document.value( "schema_version", 0 ) != 2 ||
+            !document.contains( "connection_id" ) || !document.contains( "source_mode" ) ||
+            !document["source_mode"].is_string() || !document.contains( "status_capabilities" ) ||
+            !document["status_capabilities"].is_object() || !document.contains( "definitions" ) ||
+            !document["definitions"].is_array() || document["definitions"].size() > MaximumGpuTaxonomyDefinitions )
+        {
+            addInvalid( recordIndex, "GPU taxonomy envelope failed schema validation" );
+            continue;
+        }
+        const auto connectionId = DecimalStringValue( document["connection_id"] );
+        if( !connectionId )
+        {
+            addInvalid( recordIndex, "GPU taxonomy connection_id is invalid" );
+            continue;
+        }
+        if( activeConnectionId && *connectionId != *activeConnectionId )
+        {
+            staleConnectionRecords++;
+            continue;
+        }
+        const bool hasPartIndex = document.contains( "part_index" );
+        const bool hasPartCount = document.contains( "part_count" );
+        if( hasPartIndex != hasPartCount ||
+            ( hasPartIndex && ( !document["part_index"].is_number_unsigned() ||
+                !document["part_count"].is_number_unsigned() ) ) )
+        {
+            addInvalid( recordIndex, "GPU taxonomy part metadata is invalid" );
+            continue;
+        }
+        const uint64_t partIndex64 = hasPartIndex ? document["part_index"].get<uint64_t>() : 0;
+        const uint64_t partCount64 = hasPartCount ? document["part_count"].get<uint64_t>() : 1;
+        if( partCount64 == 0 || partCount64 > 64 || partIndex64 >= partCount64 )
+        {
+            addInvalid( recordIndex, "GPU taxonomy part index/count is out of range" );
+            continue;
+        }
+        const uint32_t partIndex = uint32_t( partIndex64 );
+        const uint32_t partCount = uint32_t( partCount64 );
+        if( !expectedPartCount ) expectedPartCount = partCount;
+        else if( *expectedPartCount != partCount )
+        {
+            addInvalid( recordIndex, "GPU taxonomy part_count changed within one connection" );
+            continue;
+        }
+        if( !receivedParts.emplace( partIndex ).second ) duplicatePartRecords++;
+        if( sourceMode.empty() ) sourceMode = document["source_mode"].get<std::string>();
+        else if( sourceMode != document["source_mode"].get<std::string>() )
+            addInvalid( recordIndex, "GPU taxonomy source_mode changed within one connection" );
+        if( statusCapabilities.empty() ) statusCapabilities = document["status_capabilities"];
+        else if( statusCapabilities != document["status_capabilities"] )
+            addInvalid( recordIndex, "GPU taxonomy status capabilities changed within one connection" );
+
+        bool recordValid = true;
+        for( auto definition : document["definitions"] )
+        {
+            if( !definition.is_object() || !definition.contains( "taxonomy_id" ) ||
+                !definition.contains( "parent_id" ) || !definition.contains( "level" ) ||
+                !definition["level"].is_number_unsigned() || definition["level"].get<uint64_t>() > 2 ||
+                !definition.contains( "queue_mask" ) || !definition["queue_mask"].is_number_unsigned() ||
+                definition["queue_mask"].get<uint64_t>() == 0 || definition["queue_mask"].get<uint64_t>() > 7 ||
+                !definition.contains( "canonical_name" ) || !definition["canonical_name"].is_string() ||
+                definition["canonical_name"].get_ref<const std::string&>().empty() ||
+                definition["canonical_name"].get_ref<const std::string&>().size() > 192 ||
+                !definition.contains( "catalog_definition_key" ) || !definition["catalog_definition_key"].is_string() )
+            {
+                addInvalid( recordIndex, "GPU taxonomy definition failed field validation" );
+                recordValid = false;
+                continue;
+            }
+            const auto taxonomyId64 = DecimalStringValue( definition["taxonomy_id"] );
+            const auto parentId64 = DecimalStringValue( definition["parent_id"] );
+            if( !taxonomyId64 || !parentId64 || *taxonomyId64 == 0 || *taxonomyId64 > std::numeric_limits<uint32_t>::max() ||
+                *parentId64 > std::numeric_limits<uint32_t>::max() )
+            {
+                addInvalid( recordIndex, "GPU taxonomy identifier is invalid" );
+                recordValid = false;
+                continue;
+            }
+            const uint32_t taxonomyId = uint32_t( *taxonomyId64 );
+            const uint32_t parentId = uint32_t( *parentId64 );
+            const uint8_t level = definition["level"].get<uint8_t>();
+            const bool encodedLevelValid = ( level == 0 && taxonomyId >= 0x00010001u && taxonomyId <= 0x00010003u ) ||
+                ( level == 1 && ( taxonomyId & 0xF0000000u ) == 0x10000000u ) ||
+                ( level == 2 && ( taxonomyId & 0xF0000000u ) == 0x20000000u );
+            if( !encodedLevelValid || ( level == 0 ) != ( parentId == 0 ) )
+            {
+                addInvalid( recordIndex, "GPU taxonomy level/parent encoding is invalid" );
+                recordValid = false;
+                continue;
+            }
+            definition["taxonomy_id"] = Decimal( uint64_t( taxonomyId ) );
+            definition["parent_id"] = Decimal( uint64_t( parentId ) );
+            definition["evidence_kind"] = "producer_definition";
+            const auto existing = definitions.find( taxonomyId );
+            if( existing != definitions.end() )
+            {
+                if( existing->second != definition )
+                {
+                    addInvalid( recordIndex, "taxonomy_id maps to conflicting definitions" );
+                    recordValid = false;
+                }
+                else duplicates++;
+                continue;
+            }
+            definitions.emplace( taxonomyId, std::move( definition ) );
+        }
+        if( recordValid ) validRecords++;
+    }
+
+    for( const auto& [taxonomyId, definition] : definitions )
+    {
+        const uint8_t level = definition["level"].get<uint8_t>();
+        const uint32_t parentId = uint32_t( *DecimalStringValue( definition["parent_id"] ) );
+        if( level == 0 ) continue;
+        const auto parent = definitions.find( parentId );
+        if( parent == definitions.end() || parent->second["level"].get<uint8_t>() + 1 != level )
+            invalid.push_back( { { "record_index", nullptr }, { "reason", "GPU taxonomy parent is unresolved or has the wrong level" },
+                { "taxonomy_id", Decimal( uint64_t( taxonomyId ) ) }, { "parent_id", Decimal( uint64_t( parentId ) ) } } );
+    }
+
+    const auto catalog = CatalogJson( info );
+    std::map<std::string, json> catalogDefinitions;
+    if( catalog.value( "present", false ) )
+        for( const auto& definition : catalog["definitions"] )
+            catalogDefinitions.emplace( definition.value( "definition_key", "" ), definition );
+    for( auto& [taxonomyId, definition] : definitions )
+    {
+        const auto key = definition.value( "catalog_definition_key", "" );
+        const auto linked = catalogDefinitions.find( key );
+        const bool catalogLinked = !key.empty() && linked != catalogDefinitions.end() &&
+            linked->second.value( "kind", "" ) == "gpu_taxonomy" &&
+            linked->second.value( "canonical_name", "" ) == definition.value( "canonical_name", "" ) &&
+            linked->second["source"].value( "line", 0u ) == taxonomyId;
+        definition["catalog_linked"] = catalogLinked;
+        if( !catalogLinked ) catalogUnresolved++;
+    }
+
+    json definitionArray = json::array();
+    json edges = json::array();
+    std::array<size_t, 3> levels {};
+    for( const auto& [taxonomyId, definition] : definitions )
+    {
+        definitionArray.push_back( definition );
+        levels[definition["level"].get<uint8_t>()]++;
+        const auto parentId = *DecimalStringValue( definition["parent_id"] );
+        if( parentId != 0 ) edges.push_back( { { "parent_id", Decimal( parentId ) },
+            { "child_id", Decimal( uint64_t( taxonomyId ) ) }, { "evidence_kind", "producer_definition" } } );
+    }
+    const size_t expectedParts = expectedPartCount.value_or( seen == 0 ? 0u : 1u );
+    const size_t missingParts = expectedParts > receivedParts.size() ? expectedParts - receivedParts.size() : 0;
+    const bool present = !definitions.empty();
+    const bool complete = present && invalid.empty() && catalogUnresolved == 0 && missingParts == 0;
+    std::string reason;
+    if( !present ) reason = seen == 0 ? "trace predates or did not emit JN GPU Taxonomy" : "no valid JN GPU Taxonomy definition was found";
+    else if( !complete ) reason = "GPU taxonomy is present but contains invalid hierarchy, missing parts or unresolved catalog links";
+    return {
+        { "present", present }, { "schema_version", 2 }, { "complete", complete },
+        { "reason", reason.empty() ? json( nullptr ) : json( reason ) },
+        { "active_connection_id", activeConnectionId ? json( Decimal( *activeConnectionId ) ) : json( nullptr ) },
+        { "source_mode", sourceMode.empty() ? json( nullptr ) : json( sourceMode ) },
+        { "status_capabilities", std::move( statusCapabilities ) }, { "definitions", std::move( definitionArray ) },
+        { "logical_edges", std::move( edges ) },
+        { "level_counts", { { "level0", levels[0] }, { "level1", levels[1] }, { "level2", levels[2] } } },
+        { "quality", { { "invalid_count", invalid.size() }, { "duplicate_count", duplicates },
+            { "catalog_unresolved_count", catalogUnresolved }, { "missing_part_count", missingParts } } },
+        { "invalid_records", std::move( invalid ) },
+        { "records", { { "seen", seen }, { "valid", validRecords }, { "duplicates", duplicates },
+            { "stale_connection", staleConnectionRecords }, { "expected_parts", expectedParts },
+            { "received_parts", receivedParts.size() }, { "missing_parts", missingParts },
+            { "duplicate_part_records", duplicatePartRecords } } },
         { "trust", "untrusted_trace_data" }
     };
 }
@@ -2541,6 +2770,209 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "total", matches.size() }, { "has_more", end < matches.size() } };
             return Success( id, std::move( result ), trace );
         }
+    }
+
+    if( method == "gpu.taxonomy.tree" || method == "gpu.taxonomy.coverage" )
+    {
+        auto taxonomy = GpuTaxonomyCatalogJson( info() );
+        const auto base = [&]() {
+            return json {
+                { "present", taxonomy["present"] }, { "schema_version", taxonomy["schema_version"] },
+                { "complete", taxonomy["complete"] }, { "reason", taxonomy["reason"] },
+                { "active_connection_id", taxonomy["active_connection_id"] },
+                { "source_mode", taxonomy["source_mode"] }, { "trust", taxonomy["trust"] }
+            };
+        };
+        if( !taxonomy.value( "present", false ) )
+        {
+            auto result = base();
+            result["status_capabilities"] = taxonomy["status_capabilities"];
+            result["level_counts"] = taxonomy["level_counts"];
+            result["quality"] = taxonomy["quality"];
+            if( method == "gpu.taxonomy.tree" )
+            {
+                result["nodes"] = json::array();
+                result["logical_edges"] = json::array();
+                result["observed_edges"] = json::array();
+            }
+            else result["statuses"] = json::object();
+            return Success( id, std::move( result ), trace );
+        }
+
+        struct ExecutionStats
+        {
+            uint64_t count = 0;
+            uint64_t complete = 0;
+            uint64_t incomplete = 0;
+            uint64_t totalNs = 0;
+            std::set<std::string> contexts;
+        };
+        std::map<uint32_t, json> definitions;
+        std::map<uint32_t, ExecutionStats> execution;
+        for( const auto& definition : taxonomy["definitions"] )
+        {
+            const auto taxonomyId = DecimalStringValue( definition["taxonomy_id"] );
+            if( taxonomyId ) definitions.emplace( uint32_t( *taxonomyId ), definition );
+        }
+
+        std::unordered_map<std::string, uint32_t> taxonomyByZoneRef;
+        std::vector<std::pair<uint32_t, std::string>> pendingParents;
+        std::map<std::pair<uint32_t, uint32_t>, uint64_t> observedEdges;
+        uint64_t taxonomyZoneCount = 0;
+        uint64_t unknownTaxonomyZoneCount = 0;
+        uint64_t fallbackZoneCount = 0;
+        size_t offset = 0;
+        constexpr size_t chunk = 4096;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( chunk );
+            if( allowed == 0 ) break;
+            const auto zones = source->ScanGpuZones( ScanRangeFrom( params, offset, allowed ) );
+            BudgetScanned( zones.size(), chunk, allowed );
+            for( const auto& zone : zones )
+            {
+                const auto file = Lower( zone.file );
+                if( file.find( "jntracygputaxonomy.h" ) == std::string::npos ) continue;
+                const uint32_t taxonomyId = zone.line;
+                const auto definition = definitions.find( taxonomyId );
+                if( definition == definitions.end() )
+                {
+                    unknownTaxonomyZoneCount++;
+                    continue;
+                }
+                taxonomyZoneCount++;
+                auto& stats = execution[taxonomyId];
+                stats.count++;
+                stats.contexts.emplace( zone.contextRef );
+                if( zone.gpuEndNs && *zone.gpuEndNs >= zone.gpuStartNs )
+                {
+                    stats.complete++;
+                    stats.totalNs += uint64_t( *zone.gpuEndNs - zone.gpuStartNs );
+                }
+                else stats.incomplete++;
+                if( definition->second.value( "level", 0 ) > 0 ) fallbackZoneCount++;
+                taxonomyByZoneRef.emplace( zone.ref, taxonomyId );
+                if( zone.parentRef ) pendingParents.emplace_back( taxonomyId, *zone.parentRef );
+            }
+            offset += zones.size();
+            if( zones.size() < allowed ) break;
+        }
+        for( const auto& [childId, parentRef] : pendingParents )
+        {
+            const auto parent = taxonomyByZoneRef.find( parentRef );
+            if( parent != taxonomyByZoneRef.end() ) observedEdges[{ parent->second, childId }]++;
+        }
+
+        std::map<uint32_t, std::set<uint32_t>> logicalChildren;
+        for( const auto& edge : taxonomy["logical_edges"] )
+        {
+            const auto parent = DecimalStringValue( edge["parent_id"] );
+            const auto child = DecimalStringValue( edge["child_id"] );
+            if( parent && child ) logicalChildren[uint32_t( *parent )].emplace( uint32_t( *child ) );
+        }
+        bool staticL0HasMultipleL1 = false;
+        bool staticL1HasMultipleL2 = false;
+        for( const auto& [parentId, children] : logicalChildren )
+        {
+            const auto parent = definitions.find( parentId );
+            if( parent == definitions.end() ) continue;
+            if( parent->second.value( "level", 0 ) == 0 && children.size() >= 2 ) staticL0HasMultipleL1 = true;
+            if( parent->second.value( "level", 0 ) == 1 && children.size() >= 2 ) staticL1HasMultipleL2 = true;
+        }
+        std::map<uint32_t, std::set<uint32_t>> observedChildren;
+        for( const auto& [edge, count] : observedEdges ) if( count != 0 ) observedChildren[edge.first].emplace( edge.second );
+        bool observedL0HasMultipleL1 = false;
+        bool observedL1HasMultipleL2 = false;
+        for( const auto& [parentId, children] : observedChildren )
+        {
+            const auto parent = definitions.find( parentId );
+            if( parent == definitions.end() ) continue;
+            if( parent->second.value( "level", 0 ) == 0 && children.size() >= 2 ) observedL0HasMultipleL1 = true;
+            if( parent->second.value( "level", 0 ) == 1 && children.size() >= 2 ) observedL1HasMultipleL2 = true;
+        }
+
+        json nodes = json::array();
+        for( const auto& [taxonomyId, definition] : definitions )
+        {
+            auto node = definition;
+            const auto found = execution.find( taxonomyId );
+            const ExecutionStats empty;
+            const auto& stats = found == execution.end() ? empty : found->second;
+            json contexts = json::array();
+            for( const auto& context : stats.contexts ) contexts.emplace_back( context );
+            node["execution"] = {
+                { "zone_count", Decimal( stats.count ) }, { "complete_zone_count", Decimal( stats.complete ) },
+                { "incomplete_zone_count", Decimal( stats.incomplete ) }, { "total_gpu_ns", Decimal( stats.totalNs ) },
+                { "context_refs", std::move( contexts ) }, { "evidence_kind", "gpu_timestamp_zone" }
+            };
+            nodes.emplace_back( std::move( node ) );
+        }
+        json physicalEdges = json::array();
+        for( const auto& [edge, count] : observedEdges ) physicalEdges.push_back( {
+            { "parent_id", Decimal( uint64_t( edge.first ) ) }, { "child_id", Decimal( uint64_t( edge.second ) ) },
+            { "zone_pair_count", Decimal( count ) }, { "evidence_kind", "persisted_gpu_parent_ref" }
+        } );
+
+        auto result = base();
+        result["scan_complete"] = !BudgetPartial();
+        result["definition_count"] = taxonomy["definitions"].size();
+        result["taxonomy_zone_count"] = Decimal( taxonomyZoneCount );
+        result["unknown_taxonomy_zone_count"] = Decimal( unknownTaxonomyZoneCount );
+        result["level_counts"] = taxonomy["level_counts"];
+        result["hierarchy_gate"] = {
+            { "static_l0_has_multiple_l1", staticL0HasMultipleL1 },
+            { "static_l1_has_multiple_l2", staticL1HasMultipleL2 },
+            { "observed_l0_has_multiple_l1", observedL0HasMultipleL1 },
+            { "observed_l1_has_multiple_l2", observedL1HasMultipleL2 }
+        };
+        result["quality"] = taxonomy["quality"];
+        result["quality"]["unknown_taxonomy_zone_count"] = Decimal( unknownTaxonomyZoneCount );
+        result["quality"]["budget_partial"] = BudgetPartial();
+
+        if( method == "gpu.taxonomy.tree" )
+        {
+            result["nodes"] = std::move( nodes );
+            result["logical_edges"] = taxonomy["logical_edges"];
+            result["observed_edges"] = std::move( physicalEdges );
+            result["status_capabilities"] = taxonomy["status_capabilities"];
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto producerCoverage = CaptureCoverageJson( info() );
+        json fallbackProducer = nullptr;
+        if( producerCoverage.value( "present", false ) )
+            for( const auto& producer : producerCoverage["producers"] )
+                if( producer.value( "key", "" ) == "gpu.taxonomy.fallback" ) { fallbackProducer = producer; break; }
+        const bool classifierAvailable = fallbackProducer.is_object() && fallbackProducer.value( "complete", false );
+        const auto producerCounter = [&]( const char* name ) -> json {
+            if( !classifierAvailable || !fallbackProducer.contains( "counters" ) ||
+                !fallbackProducer["counters"].contains( name ) ) return nullptr;
+            return fallbackProducer["counters"][name];
+        };
+        const auto capability = [&]( const char* name ) -> json {
+            if( taxonomy["status_capabilities"].is_object() && taxonomy["status_capabilities"].contains( name ) )
+                return taxonomy["status_capabilities"][name];
+            return { { "available", false }, { "reason", "status capability was not declared by the producer" } };
+        };
+        result["statuses"] = {
+            { "executed", { { "available", true }, { "count", Decimal( taxonomyZoneCount ) },
+                { "unit", "gpu_zones" }, { "evidence_kind", "gpu_timestamp_zone" } } },
+            { "fallback", { { "available", classifierAvailable }, { "count", classifierAvailable ? json( Decimal( fallbackZoneCount ) ) : json( nullptr ) },
+                { "classified_marker_count", producerCounter( "emitted" ) }, { "unit", "gpu_zones" },
+                { "evidence_kind", "unity_marker_classifier_plus_gpu_timestamp_zone" },
+                { "reason", classifierAvailable ? json( nullptr ) : json( "no complete gpu.taxonomy.fallback counter window" ) } } },
+            { "unclassified", { { "available", classifierAvailable }, { "count", producerCounter( "filtered" ) },
+                { "unit", "markers" }, { "evidence_kind", "producer_filtered_counter" },
+                { "reason", classifierAvailable ? json( nullptr ) : json( "no complete gpu.taxonomy.fallback counter window" ) } } },
+            { "culled", capability( "culled" ) }, { "disabled", capability( "disabled" ) }
+        };
+        result["classifier_quality"] = {
+            { "producer", fallbackProducer }, { "dropped", producerCounter( "dropped" ) },
+            { "overflow", producerCounter( "overflow" ) }, { "mismatch", producerCounter( "mismatch" ) },
+            { "unresolved", producerCounter( "unresolved" ) }
+        };
+        return Success( id, std::move( result ), trace );
     }
 
     if( method == "thread.list" || method == "thread.get" )

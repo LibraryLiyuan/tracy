@@ -127,7 +127,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.5.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.6.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -135,7 +135,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 29 );
+    assert( coverage.at( "domains" ).size() == 30 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -171,6 +171,7 @@ int main()
     assert( unmappedFields == 0 );
     assert( fieldEntities.contains( "zone.cpu" ) );
     assert( fieldEntities.contains( "gpu.context" ) );
+    assert( fieldEntities.contains( "gpu.taxonomy" ) );
     assert( fieldEntities.contains( "hardware_sample" ) );
     assert( fieldEntities.contains( "job" ) );
     assert( fieldEntities.contains( "job.gfx.statistics" ) );
@@ -317,18 +318,25 @@ int main()
                 auto identityOffset = connectionIdentity.find( "\"id\":\"1\"" );
                 assert( identityOffset != std::string::npos );
                 connectionIdentity.replace( identityOffset, sizeof( "\"id\":\"1\"" ) - 1, "\"id\":\"2\"" );
-                for( size_t index = 4; index <= 8; index++ )
+                for( auto& record : records )
                 {
-                    auto offset = records[index].find( "\"connection_id\":\"1\"" );
+                    if( !record.starts_with( "JNCTX1|" ) && !record.starts_with( "JNQ1|" ) && !record.starts_with( "JNGT1|" ) )
+                        continue;
+                    auto offset = record.find( "\"connection_id\":\"1\"" );
                     assert( offset != std::string::npos );
-                    records[index].replace( offset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
+                    record.replace( offset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
                 }
-                auto currentDefinition = records[9];
+                const auto definitionRecord = std::find_if( records.begin(), records.end(),
+                    []( const auto& record ) { return record.starts_with( "JNCAT1|" ); } );
+                const auto entityRecord = std::find_if( records.begin(), records.end(),
+                    []( const auto& record ) { return record.starts_with( "JNENT1|" ); } );
+                assert( definitionRecord != records.end() && entityRecord != records.end() );
+                auto currentDefinition = *definitionRecord;
+                auto currentEntity = *entityRecord;
                 auto definitionOffset = currentDefinition.find( "\"connection_id\":\"1\"" );
                 assert( definitionOffset != std::string::npos );
                 currentDefinition.replace( definitionOffset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
                 records.emplace_back( std::move( currentDefinition ) );
-                auto currentEntity = records[10];
                 auto entityConnectionOffset = currentEntity.find( "\"connection_id\":\"1\"" );
                 assert( entityConnectionOffset != std::string::npos );
                 currentEntity.replace( entityConnectionOffset, sizeof( "\"connection_id\":\"1\"" ) - 1, "\"connection_id\":\"2\"" );
@@ -372,7 +380,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.5.0" );
+    assert( described.at( "schema_version" ) == "1.6.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -384,9 +392,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.5.0" );
+        assert( operation.at( "schema_version" ) == "1.6.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.5.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.6.0" );
         assert( operation.at( "budget_parameters" ).size() == 4 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -458,7 +466,7 @@ int main()
     assert( captureCoverage.at( "present" ) == true );
     assert( captureCoverage.at( "complete" ) == true );
     assert( captureCoverage.at( "evidence_kind" ) == "exact" );
-    assert( captureCoverage.at( "producers" ).size() == 2 );
+    assert( captureCoverage.at( "producers" ).size() == 3 );
     const auto degradedProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
         []( const auto& value ) { return value.at( "key" ) == "test.degraded"; } );
     assert( degradedProducer != captureCoverage.at( "producers" ).end() );
@@ -470,6 +478,25 @@ int main()
     } ) ).at( "data" );
     assert( realZero.at( "producer" ).at( "state" ) == "real_zero" );
     assert( realZero.at( "producer" ).at( "coverage_ratio" ) == 1.0 );
+
+    const auto taxonomyTree = service.Execute( Request( requestId++, "gpu.taxonomy.tree", {
+        { "trace_id", candidateId }, { "max_scan_events", 100 }
+    } ) ).at( "data" );
+    assert( taxonomyTree.at( "present" ) == true );
+    assert( taxonomyTree.at( "schema_version" ) == 2 );
+    assert( taxonomyTree.at( "nodes" ).size() == 7 );
+    assert( taxonomyTree.at( "quality" ).at( "missing_part_count" ) == 0 );
+    assert( taxonomyTree.at( "hierarchy_gate" ).at( "static_l0_has_multiple_l1" ) == true );
+    assert( taxonomyTree.at( "hierarchy_gate" ).at( "static_l1_has_multiple_l2" ) == true );
+    assert( taxonomyTree.at( "taxonomy_zone_count" ) == "0" );
+
+    const auto taxonomyCoverage = service.Execute( Request( requestId++, "gpu.taxonomy.coverage", {
+        { "trace_id", candidateId }, { "max_scan_events", 100 }
+    } ) ).at( "data" );
+    assert( taxonomyCoverage.at( "statuses" ).at( "fallback" ).at( "available" ) == true );
+    assert( taxonomyCoverage.at( "statuses" ).at( "fallback" ).at( "classified_marker_count" ) == "7" );
+    assert( taxonomyCoverage.at( "statuses" ).at( "unclassified" ).at( "count" ) == "3" );
+    assert( taxonomyCoverage.at( "statuses" ).at( "culled" ).at( "available" ) == false );
 
     const auto catalogKinds = service.Execute( Request( requestId++, "catalog.kinds", {
         { "trace_id", candidateId }
