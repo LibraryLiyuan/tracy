@@ -31,7 +31,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "capture.context", "capture.coverage", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
-        "gpu.taxonomy.tree", "gpu.taxonomy.coverage",
+        "gpu.taxonomy.tree", "gpu.taxonomy.coverage", "gpu.pass.search", "gpu.pass.get",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
         "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
@@ -88,6 +88,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 std::string MethodDomain( const std::string& method )
 {
     if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
+    if( method.rfind( "gpu.pass.", 0 ) == 0 ) return "gpu.pass";
     if( method.rfind( "gpu.taxonomy.", 0 ) == 0 ) return "gpu.taxonomy";
     if( method.rfind( "job.gfx", 0 ) == 0 ) return "job.gfx";
     const auto separator = method.find( '.' );
@@ -803,13 +804,14 @@ const char* JobStageName( uint8_t stage )
 
 const char* GfxEntityKindName( uint8_t kind )
 {
-    static constexpr const char* names[] = { "dispatch", "gfx_job", "command_list", "submission", "gpu_segment" };
+    static constexpr const char* names[] = { "dispatch", "gfx_job", "command_list", "submission", "gpu_segment", "explicit_gpu_pass" };
     return kind < std::size( names ) ? names[kind] : "unknown";
 }
 
 const char* GfxRelationName( uint8_t relation )
 {
-    static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits", "runs_on_gpu", "depends_on" };
+    static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits", "runs_on_gpu", "depends_on",
+        "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera", "belongs_to_view", "references_resources", "classifies_as_taxonomy" };
     return relation < std::size( names ) ? names[relation] : "unknown";
 }
 
@@ -2159,6 +2161,162 @@ json GfxLinkJson( const analysis::GfxLinkDto& value )
     };
 }
 
+struct ExplicitGpuPassMatch
+{
+    analysis::GfxEntityDto pass;
+    std::optional<analysis::GfxEntityDto> segment;
+    std::optional<analysis::GpuZoneDto> zone;
+    uint64_t commandListId = 0;
+    uint64_t frameId = 0;
+    uint64_t cameraId = 0;
+    uint64_t viewId = 0;
+    uint64_t referenceToken = 0;
+    uint32_t taxonomyId = 0;
+    bool taxonomyStableId = false;
+    uint64_t bestDistance = std::numeric_limits<uint64_t>::max();
+};
+
+struct ExplicitGpuPassSet
+{
+    std::vector<ExplicitGpuPassMatch> matches;
+    std::unordered_map<uint64_t, std::vector<size_t>> byGpuQuery;
+};
+
+uint64_t ExplicitGpuQueryKey( uint8_t context, uint32_t queryId )
+{
+    return ( uint64_t( context ) << 32 ) | queryId;
+}
+
+ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source, const json& taxonomy )
+{
+    ExplicitGpuPassSet result;
+    std::vector<uint32_t> taxonomyIds;
+    if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
+    {
+        taxonomyIds.reserve( taxonomy["definitions"].size() );
+        for( const auto& definition : taxonomy["definitions"] )
+        {
+            const auto value = definition.contains( "taxonomy_id" ) ? DecimalStringValue( definition["taxonomy_id"] ) : std::nullopt;
+            taxonomyIds.emplace_back( value && *value <= std::numeric_limits<uint32_t>::max() ? uint32_t( *value ) : 0 );
+        }
+    }
+
+    const auto entities = source.GetGfxEntities();
+    const auto links = source.GetGfxLinks();
+    std::unordered_map<uint64_t, analysis::GfxEntityDto> entityById;
+    entityById.reserve( entities.size() );
+    for( const auto& entity : entities ) entityById.emplace( entity.entityId, entity );
+    std::unordered_map<uint64_t, size_t> passById;
+    for( const auto& entity : entities )
+    {
+        if( entity.kind != 5 ) continue;
+        ExplicitGpuPassMatch match;
+        match.pass = entity;
+        if( entity.gpuContext < taxonomyIds.size() ) match.taxonomyId = taxonomyIds[entity.gpuContext];
+        passById.emplace( entity.entityId, result.matches.size() );
+        result.matches.emplace_back( std::move( match ) );
+    }
+    for( const auto& link : links )
+    {
+        const auto found = passById.find( link.sourceId );
+        if( found == passById.end() ) continue;
+        auto& match = result.matches[found->second];
+        switch( link.relation )
+        {
+        case 5:
+        {
+            const auto target = entityById.find( link.targetId );
+            if( target != entityById.end() && target->second.kind == 4 ) match.segment = target->second;
+            break;
+        }
+        case 7: match.commandListId = link.targetId; break;
+        case 8: match.frameId = link.targetId; break;
+        case 9: match.cameraId = link.targetId; break;
+        case 10: match.viewId = link.targetId; break;
+        case 11: match.referenceToken = link.targetId; break;
+        case 12:
+            if( link.targetId != 0 && link.targetId <= std::numeric_limits<uint32_t>::max() )
+            {
+                match.taxonomyId = uint32_t( link.targetId );
+                match.taxonomyStableId = true;
+            }
+            break;
+        default: break;
+        }
+    }
+    for( size_t index = 0; index < result.matches.size(); ++index )
+    {
+        const auto& match = result.matches[index];
+        if( !match.segment ) continue;
+        result.byGpuQuery[ExplicitGpuQueryKey( match.segment->gpuContext, match.segment->gpuQueryId )].emplace_back( index );
+    }
+    return result;
+}
+
+void MatchExplicitGpuPassZone( const analysis::TraceSource& source, ExplicitGpuPassSet& passes,
+    const analysis::GpuZoneDto& zone )
+{
+    const auto context = source.ParseEntityRef( zone.contextRef, "gpu-context" );
+    if( !context || *context > std::numeric_limits<uint8_t>::max() ) return;
+    const auto candidates = passes.byGpuQuery.find( ExplicitGpuQueryKey( uint8_t( *context ), zone.queryId ) );
+    if( candidates == passes.byGpuQuery.end() ) return;
+    for( const auto index : candidates->second )
+    {
+        auto& match = passes.matches[index];
+        if( !match.segment ) continue;
+        const uint64_t distance = zone.cpuStartNs >= match.segment->timeNs ?
+            uint64_t( zone.cpuStartNs - match.segment->timeNs ) : uint64_t( match.segment->timeNs - zone.cpuStartNs );
+        if( distance >= match.bestDistance ) continue;
+        match.bestDistance = distance;
+        match.zone = zone;
+    }
+}
+
+json ExplicitGpuPassJson( const analysis::TraceSource& source, const ExplicitGpuPassMatch& match,
+    const std::map<uint32_t, json>& taxonomyDefinitions )
+{
+    json result = {
+        { "ref", match.pass.ref }, { "pass_instance_id", Decimal( match.pass.entityId ) },
+        { "pass_source_id", match.pass.gpuQueryId }, { "source_mode", "cpp-marker-command-list" },
+        { "taxonomy_index", match.pass.gpuContext }, { "taxonomy_id", Decimal( uint64_t( match.taxonomyId ) ) },
+        { "taxonomy_evidence", match.taxonomyStableId ? "stable_id_relation" : "legacy_catalog_index" },
+        { "logical_parent_id", Decimal( match.pass.parentId ) },
+        { "logical_parent_ref", match.pass.parentId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "gfx-entity", match.pass.parentId ) ) },
+        { "command_list_id", Decimal( match.commandListId ) },
+        { "command_list_ref", match.commandListId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "gfx-entity", match.commandListId ) ) },
+        { "frame_id", Decimal( match.frameId ) }, { "camera_id", Decimal( match.cameraId ) },
+        { "view_id", Decimal( match.viewId ) }, { "reference_token", Decimal( match.referenceToken ) },
+        { "gpu_segment_ref", match.segment ? json( match.segment->ref ) : json( nullptr ) },
+        { "gpu_zone_ref", match.zone ? json( match.zone->ref ) : json( nullptr ) },
+        { "complete", match.zone && match.zone->complete }, { "flags", match.pass.flags }
+    };
+    const auto definition = taxonomyDefinitions.find( match.taxonomyId );
+    result["taxonomy_name"] = definition == taxonomyDefinitions.end() ? json( nullptr ) :
+        json( definition->second.value( "canonical_name", "" ) );
+    if( match.zone )
+    {
+        result["name"] = match.zone->name;
+        result["source"] = { { "source_location_ref", match.zone->sourceLocationRef },
+            { "file", match.zone->file }, { "function", match.zone->function }, { "line", match.zone->line } };
+        result["gpu"] = { { "context_ref", match.zone->contextRef }, { "query_id", match.zone->queryId },
+            { "gpu_start_ns", Decimal( match.zone->gpuStartNs ) },
+            { "gpu_end_ns", match.zone->gpuEndNs ? json( Decimal( *match.zone->gpuEndNs ) ) : json( nullptr ) },
+            { "cpu_record_begin_ns", Decimal( match.zone->cpuStartNs ) },
+            { "cpu_record_end_ns", match.zone->cpuEndNs ? json( Decimal( *match.zone->cpuEndNs ) ) : json( nullptr ) } };
+        result["callstack"] = match.zone->callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( match.zone->callstack ) ) );
+        result["callstack_ref"] = match.zone->callstackRef ? json( *match.zone->callstackRef ) : json( nullptr );
+    }
+    else
+    {
+        result["name"] = nullptr;
+        result["source"] = nullptr;
+        result["gpu"] = nullptr;
+        result["callstack"] = nullptr;
+        result["callstack_ref"] = nullptr;
+    }
+    return result;
+}
+
 json ProjectFields( json value, const json& params )
 {
     if( !params.contains( "fields" ) ) return value;
@@ -2772,6 +2930,116 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
     }
 
+    if( method == "gpu.pass.search" || method == "gpu.pass.get" )
+    {
+        auto taxonomy = GpuTaxonomyCatalogJson( info() );
+        auto passes = BuildExplicitGpuPassSet( *source, taxonomy );
+        size_t scanOffset = 0;
+        constexpr size_t chunk = 4096;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( chunk );
+            if( allowed == 0 ) break;
+            const auto zones = source->ScanGpuZones( ScanRangeFrom( params, scanOffset, allowed ) );
+            BudgetScanned( zones.size(), chunk, allowed );
+            for( const auto& zone : zones ) MatchExplicitGpuPassZone( *source, passes, zone );
+            scanOffset += zones.size();
+            if( zones.size() < allowed ) break;
+        }
+
+        std::map<uint32_t, json> taxonomyDefinitions;
+        if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
+        {
+            for( const auto& definition : taxonomy["definitions"] )
+            {
+                const auto taxonomyId = definition.contains( "taxonomy_id" ) ? DecimalStringValue( definition["taxonomy_id"] ) : std::nullopt;
+                if( taxonomyId && *taxonomyId <= std::numeric_limits<uint32_t>::max() )
+                    taxonomyDefinitions.emplace( uint32_t( *taxonomyId ), definition );
+            }
+        }
+
+        const auto coverage = CaptureCoverageJson( info() );
+        json producer = nullptr;
+        if( coverage.value( "present", false ) )
+            for( const auto& value : coverage["producers"] )
+                if( value.value( "key", "" ) == "gpu.pass.explicit" ) { producer = value; break; }
+        const bool present = producer.is_object() || !passes.matches.empty();
+        const bool effective = producer.is_object() ? producer.value( "effective", false ) : !passes.matches.empty();
+        const std::string producerState = producer.is_object() ? producer.value( "state", "unknown" ) :
+            ( passes.matches.empty() ? "absent" : "persisted_entities_without_producer_record" );
+        uint64_t missingGpuZoneCount = 0;
+        uint64_t unresolvedTaxonomyCount = 0;
+        for( const auto& pass : passes.matches ) if( !pass.zone ) missingGpuZoneCount++;
+        for( const auto& pass : passes.matches )
+            if( pass.taxonomyId == 0 || taxonomyDefinitions.find( pass.taxonomyId ) == taxonomyDefinitions.end() ) unresolvedTaxonomyCount++;
+        const bool complete = present && taxonomy.value( "present", false ) && !BudgetPartial() && missingGpuZoneCount == 0 &&
+            unresolvedTaxonomyCount == 0 &&
+            ( !producer.is_object() || producer.value( "complete", false ) );
+        const auto base = [&]() {
+            return json {
+                { "present", present }, { "complete", complete },
+                { "effective", effective }, { "producer_state", producerState },
+                { "reason", present ? ( complete ? json( nullptr ) : json( "explicit GPU pass evidence is incomplete" ) ) :
+                    json( "gpu.pass.explicit producer and persisted explicit pass entities are absent" ) },
+                { "source_mode", "cpp-marker-command-list" }, { "producer", producer },
+                { "scan_complete", !BudgetPartial() }, { "instance_count", Decimal( passes.matches.size() ) },
+                { "missing_gpu_zone_count", Decimal( missingGpuZoneCount ) },
+                { "unresolved_taxonomy_count", Decimal( unresolvedTaxonomyCount ) },
+                { "taxonomy_catalog_complete", taxonomy.value( "complete", false ) },
+                { "taxonomy_catalog_reason", taxonomy.value( "reason", json( nullptr ) ) },
+                { "trust", { { "input", "untrusted_trace_data" }, { "evidence", "persisted_gfx_entity_link_plus_gpu_timestamp_zone" } } }
+            };
+        };
+
+        if( method == "gpu.pass.get" )
+        {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto ref = params["ref"].get<std::string>();
+            const auto found = std::find_if( passes.matches.begin(), passes.matches.end(),
+                [&]( const auto& value ) { return value.pass.ref == ref; } );
+            if( found == passes.matches.end() ) throw QueryError( "ENTITY_NOT_FOUND", "explicit GPU pass ref was not found" );
+            auto result = base();
+            result["pass"] = ExplicitGpuPassJson( *source, *found, taxonomyDefinitions );
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto page = ParsePage( params, method, trace );
+        std::vector<json> selected;
+        for( const auto& pass : passes.matches )
+        {
+            if( params.contains( "pass_source_id" ) )
+            {
+                const auto requested = DecimalStringValue( params["pass_source_id"] );
+                if( !requested || *requested != pass.pass.gpuQueryId ) continue;
+            }
+            if( params.contains( "taxonomy_id" ) )
+            {
+                const auto requested = DecimalStringValue( params["taxonomy_id"] );
+                if( !requested || *requested != pass.taxonomyId ) continue;
+            }
+            auto value = ExplicitGpuPassJson( *source, pass, taxonomyDefinitions );
+            if( params.contains( "name" ) )
+            {
+                if( !params["name"].is_string() ) throw QueryError( "INVALID_PARAMS", "name must be a string" );
+                const std::string passName = value.contains( "name" ) && value["name"].is_string() ?
+                    value["name"].get<std::string>() : std::string();
+                if( Lower( passName ).find( Lower( params["name"].get<std::string>() ) ) == std::string::npos ) continue;
+            }
+            selected.emplace_back( std::move( value ) );
+        }
+        const size_t total = selected.size();
+        const size_t begin = std::min( page.offset, total );
+        const size_t end = std::min( begin + page.limit, total );
+        json values = json::array();
+        for( size_t index = begin; index < end; ++index ) values.emplace_back( std::move( selected[index] ) );
+        auto result = base();
+        result["passes"] = std::move( values );
+        result["page"] = { { "offset", begin }, { "limit", page.limit }, { "returned", end - begin },
+            { "total", total }, { "has_more", end < total } };
+        return Success( id, std::move( result ), trace );
+    }
+
     if( method == "gpu.taxonomy.tree" || method == "gpu.taxonomy.coverage" )
     {
         auto taxonomy = GpuTaxonomyCatalogJson( info() );
@@ -2814,8 +3082,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto taxonomyId = DecimalStringValue( definition["taxonomy_id"] );
             if( taxonomyId ) definitions.emplace( uint32_t( *taxonomyId ), definition );
         }
+        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
 
         std::unordered_map<std::string, uint32_t> taxonomyByZoneRef;
+        std::set<std::string> syntheticTaxonomyZoneRefs;
         std::vector<std::pair<uint32_t, std::string>> pendingParents;
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> observedEdges;
         uint64_t taxonomyZoneCount = 0;
@@ -2832,6 +3102,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             BudgetScanned( zones.size(), chunk, allowed );
             for( const auto& zone : zones )
             {
+                MatchExplicitGpuPassZone( *source, explicitPasses, zone );
                 const auto file = Lower( zone.file );
                 if( file.find( "jntracygputaxonomy.h" ) == std::string::npos ) continue;
                 const uint32_t taxonomyId = zone.line;
@@ -2842,6 +3113,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     continue;
                 }
                 taxonomyZoneCount++;
+                syntheticTaxonomyZoneRefs.emplace( zone.ref );
                 auto& stats = execution[taxonomyId];
                 stats.count++;
                 stats.contexts.emplace( zone.contextRef );
@@ -2858,6 +3130,42 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             offset += zones.size();
             if( zones.size() < allowed ) break;
         }
+        uint64_t explicitPassZoneCount = 0;
+        uint64_t explicitPassMissingZoneCount = 0;
+        std::set<std::string> explicitAncestorZoneRefs;
+        for( const auto& pass : explicitPasses.matches )
+        {
+            if( !pass.zone )
+            {
+                explicitPassMissingZoneCount++;
+                continue;
+            }
+            const auto definition = definitions.find( pass.taxonomyId );
+            if( definition == definitions.end() )
+            {
+                unknownTaxonomyZoneCount++;
+                continue;
+            }
+            explicitPassZoneCount++;
+            taxonomyZoneCount++;
+            auto& stats = execution[pass.taxonomyId];
+            stats.count++;
+            stats.contexts.emplace( pass.zone->contextRef );
+            if( pass.zone->gpuEndNs && *pass.zone->gpuEndNs >= pass.zone->gpuStartNs )
+            {
+                stats.complete++;
+                stats.totalNs += uint64_t( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
+            }
+            else stats.incomplete++;
+            taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
+            if( pass.zone->parentRef )
+            {
+                pendingParents.emplace_back( pass.taxonomyId, *pass.zone->parentRef );
+                if( syntheticTaxonomyZoneRefs.contains( *pass.zone->parentRef ) )
+                    explicitAncestorZoneRefs.emplace( *pass.zone->parentRef );
+            }
+        }
+        fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount, explicitAncestorZoneRefs.size() );
         for( const auto& [childId, parentRef] : pendingParents )
         {
             const auto parent = taxonomyByZoneRef.find( parentRef );
@@ -2918,6 +3226,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["scan_complete"] = !BudgetPartial();
         result["definition_count"] = taxonomy["definitions"].size();
         result["taxonomy_zone_count"] = Decimal( taxonomyZoneCount );
+        result["explicit_pass_zone_count"] = Decimal( explicitPassZoneCount );
+        result["explicit_pass_missing_zone_count"] = Decimal( explicitPassMissingZoneCount );
         result["unknown_taxonomy_zone_count"] = Decimal( unknownTaxonomyZoneCount );
         result["level_counts"] = taxonomy["level_counts"];
         result["hierarchy_gate"] = {
@@ -2941,10 +3251,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         const auto producerCoverage = CaptureCoverageJson( info() );
         json fallbackProducer = nullptr;
+        json explicitProducer = nullptr;
         if( producerCoverage.value( "present", false ) )
             for( const auto& producer : producerCoverage["producers"] )
-                if( producer.value( "key", "" ) == "gpu.taxonomy.fallback" ) { fallbackProducer = producer; break; }
+            {
+                if( producer.value( "key", "" ) == "gpu.taxonomy.fallback" ) fallbackProducer = producer;
+                else if( producer.value( "key", "" ) == "gpu.pass.explicit" ) explicitProducer = producer;
+            }
         const bool classifierAvailable = fallbackProducer.is_object() && fallbackProducer.value( "complete", false );
+        const bool explicitProducerComplete = explicitProducer.is_object() && explicitProducer.value( "complete", false );
+        const bool explicitAvailable = explicitProducerComplete && explicitProducer.value( "effective", false );
+        const std::string explicitUnavailableReason = !explicitProducerComplete ? "no complete gpu.pass.explicit counter window" :
+            "gpu.pass.explicit producer state is " + explicitProducer.value( "state", "disabled" );
         const auto producerCounter = [&]( const char* name ) -> json {
             if( !classifierAvailable || !fallbackProducer.contains( "counters" ) ||
                 !fallbackProducer["counters"].contains( name ) ) return nullptr;
@@ -2958,6 +3276,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["statuses"] = {
             { "executed", { { "available", true }, { "count", Decimal( taxonomyZoneCount ) },
                 { "unit", "gpu_zones" }, { "evidence_kind", "gpu_timestamp_zone" } } },
+            { "explicit", { { "available", explicitAvailable },
+                { "count", explicitAvailable ? json( Decimal( explicitPassZoneCount ) ) : json( nullptr ) },
+                { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) }, { "unit", "gpu_pass_instances" },
+                { "evidence_kind", "gfx_entity_link_plus_gpu_timestamp_zone" },
+                { "reason", explicitAvailable ? json( nullptr ) : json( explicitUnavailableReason ) } } },
             { "fallback", { { "available", classifierAvailable }, { "count", classifierAvailable ? json( Decimal( fallbackZoneCount ) ) : json( nullptr ) },
                 { "classified_marker_count", producerCounter( "emitted" ) }, { "unit", "gpu_zones" },
                 { "evidence_kind", "unity_marker_classifier_plus_gpu_timestamp_zone" },
@@ -2972,6 +3295,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "overflow", producerCounter( "overflow" ) }, { "mismatch", producerCounter( "mismatch" ) },
             { "unresolved", producerCounter( "unresolved" ) }
         };
+        result["explicit_quality"] = { { "producer", explicitProducer },
+            { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) } };
         return Success( id, std::move( result ), trace );
     }
 

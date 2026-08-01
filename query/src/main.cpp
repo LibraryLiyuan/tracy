@@ -15,6 +15,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 namespace
 {
 
@@ -149,6 +153,7 @@ int RunSingle( const Arguments& args )
     const auto parsed = ParseRequest( ReadRequest( *args.request ), service );
     const auto response = parsed.contains( "ok" ) && parsed.value( "ok", true ) == false ? parsed : service.Execute( parsed, trace );
     std::cout << DumpProtocolJson( response ) << '\n';
+    std::cout.flush();
     return response.value( "ok", false ) ? 0 : 2;
 }
 
@@ -237,6 +242,9 @@ int RunDoctor( const Arguments& args )
 
 int main( int argc, char** argv )
 {
+#ifdef _WIN32
+    SetErrorMode( SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX );
+#endif
     try
     {
         const auto args = ParseArguments( argc, argv );

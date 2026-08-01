@@ -184,6 +184,17 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     {
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "stream revision does not yet contain a complete Tracy handshake" );
     }
+    bool recordedEndsWithTerminate = false;
+    {
+        PayloadReader tailReader( view.path );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !tailReader.Read( serverRecords.back(), payload, error ) )
+        {
+            throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "cannot read final recorded server packet: " + error );
+        }
+        recordedEndsWithTerminate = payload.size() == ServerQueryPacketSize && payload[0] == ServerQueryTerminate;
+    }
     if( hasSessionBegin )
     {
         PayloadReader sessionReader( view.path );
@@ -351,9 +362,28 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
 
     if( drainControlSequence == 0 )
     {
+        uint64_t replayedFrames = 0;
         for( const auto& record : clientRecords )
         {
             if( !replayClientRecord( record ) ) break;
+            if( ( record.flags & stream::RecordFlagCompressedFrame ) != 0 ) replayedFrames++;
+        }
+        if( !replayError.Failed() && scan.complete && recordedEndsWithTerminate )
+        {
+            const auto replayDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            while( worker.GetProtocolFramesProcessed() < replayedFrames && !replayError.Failed() &&
+                std::chrono::steady_clock::now() < replayDeadline )
+            {
+                std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+            }
+            if( worker.GetProtocolFramesProcessed() < replayedFrames )
+            {
+                replayError.Set( "Worker did not process the complete Full-capture stream revision" );
+            }
+            else if( worker.IsConnected() )
+            {
+                worker.RequestProtocolReplayTerminate();
+            }
         }
     }
     else
@@ -427,7 +457,8 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         uint8_t extraByte = 0;
         if( peer->HasData() && peer->ReadRaw( &extraByte, 1, 1 ) )
         {
-            replayError.Set( "Worker emitted server bytes beyond the committed revision" );
+            replayError.Set( "Worker emitted server bytes beyond the committed revision; first byte=" +
+                std::to_string( unsigned( extraByte ) ) );
         }
     }
     if( peer->IsValid() ) peer->Close();

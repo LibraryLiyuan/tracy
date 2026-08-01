@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.6.0",
+  "schema_version": "1.7.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -537,6 +537,15 @@
       ],
       "unmapped_fields": [],
       "methods": ["gpu.taxonomy.tree", "gpu.taxonomy.coverage"],
+      "status": "complete"
+    },
+    {
+      "entity": "gpu.pass.explicit",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["explicit_gpu_pass entity", "pass_source_id", "taxonomy_index", "stable taxonomy_id typed relation", "logical_parent_id", "typed command_list/frame/camera/view/reference links", "runs_on_gpu link", "gpu_segment query/context", "GPU zone source location, timestamps and callstack"],
+      "query_fields": ["present", "complete", "effective", "producer_state", "instance_count", "missing_gpu_zone_count", "unresolved_taxonomy_count", "ref", "pass_instance_id", "pass_source_id", "source_mode", "taxonomy_index", "taxonomy_id", "taxonomy_name", "taxonomy_evidence", "logical_parent_ref", "command_list_ref", "frame_id", "camera_id", "view_id", "reference_token", "gpu_segment_ref", "gpu_zone_ref", "name", "source.file", "source.function", "source.line", "gpu.context_ref", "gpu.query_id", "gpu.gpu_start_ns", "gpu.gpu_end_ns", "gpu.cpu_record_begin_ns", "gpu.cpu_record_end_ns", "callstack", "callstack_ref", "complete"],
+      "unmapped_fields": [],
+      "methods": ["gpu.pass.search", "gpu.pass.get", "gpu.taxonomy.tree", "gpu.taxonomy.coverage"],
       "status": "complete"
     },
     {

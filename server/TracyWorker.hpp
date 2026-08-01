@@ -717,12 +717,13 @@ public:
     bool HasData() const { return m_hasData.load( std::memory_order_acquire ); }
     bool IsConnected() const { return m_connected.load( std::memory_order_relaxed ); }
     bool IsDataStatic() const { return !m_thread.joinable(); }
-    bool IsBackgroundDone() const { return m_backgroundDone.load( std::memory_order_relaxed ); }
+    bool IsBackgroundDone() const { return m_backgroundDone.load( std::memory_order_acquire ); }
     bool IsOnDemand() const { return m_onDemand; }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
     void Disconnect();
     void MarkProtocolDisconnect() { m_disconnect.store( true, std::memory_order_release ); }
     void RequestProtocolDrain( bool disconnectClient = true );
+    void RequestProtocolReplayTerminate();
     void BeginProtocolDrain();
     bool IsProtocolDrainActive() const { return m_protocolDrainOnly.load( std::memory_order_acquire ); }
     bool WasDisconnectIssued() const { return m_disconnect.load( std::memory_order_relaxed ); }
@@ -1120,6 +1121,8 @@ private:
     std::atomic<bool> m_protocolDisconnectSent { false };
     std::atomic<bool> m_protocolDisconnectClient { false };
     std::atomic<bool> m_protocolDrainOnly { false };
+    std::atomic<bool> m_protocolReplayTerminate { false };
+    std::atomic<bool> m_protocolTerminateSent { false };
     std::atomic<uint64_t> m_protocolFramesProcessed { 0 };
     std::atomic<bool> m_networkReading { false };
 

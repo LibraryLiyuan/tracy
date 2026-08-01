@@ -277,6 +277,18 @@ int main( int argc, char** argv )
         std::fprintf( stderr, "Journal does not contain a bidirectional Tracy handshake.\n" );
         return 2;
     }
+    bool recordedEndsWithTerminate = false;
+    {
+        PayloadReader tailReader( options.input );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !tailReader.IsOpen() || !tailReader.Read( serverRecords.back(), payload, error ) )
+        {
+            std::fprintf( stderr, "Cannot read final recorded server packet: %s.\n", error.c_str() );
+            return 2;
+        }
+        recordedEndsWithTerminate = payload.size() == tracy::ServerQueryPacketSize && payload[0] == tracy::ServerQueryTerminate;
+    }
     if( hasSessionBegin )
     {
         PayloadReader sessionReader( options.input );
@@ -457,9 +469,32 @@ int main( int argc, char** argv )
 
         if( drainControlSequence == 0 )
         {
+            uint64_t replayedFrames = 0;
             for( const auto& record : clientRecords )
             {
                 if( !replayClientRecord( record ) ) break;
+                if( ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0 ) replayedFrames++;
+            }
+            if( !replayError.Failed() && scan.complete && recordedEndsWithTerminate )
+            {
+                const auto replayDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                while( worker.GetProtocolFramesProcessed() < replayedFrames && !replayError.Failed() &&
+                    std::chrono::steady_clock::now() < replayDeadline )
+                {
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+                }
+                if( worker.GetProtocolFramesProcessed() < replayedFrames )
+                {
+                    replayError.Set( "Worker did not process the complete Full-capture client revision" );
+                }
+                else if( worker.IsConnected() )
+                {
+                    // Full capture stops locally, but old/double-write journals do not contain the
+                    // ProtocolOnly BeginDrain marker. Ask the Worker's protocol thread to reproduce the
+                    // recorded final Terminate after every client frame and preceding server query has
+                    // been processed. The transcript verifier still rejects missing or extra packets.
+                    worker.RequestProtocolReplayTerminate();
+                }
             }
         }
         else
@@ -536,7 +571,8 @@ int main( int argc, char** argv )
         {
             if( scan.complete )
             {
-                replayError.Set( "Worker emitted server bytes beyond the recorded complete transcript" );
+                replayError.Set( "Worker emitted server bytes beyond the recorded complete transcript; first byte=" +
+                    std::to_string( unsigned( extraByte ) ) );
             }
             else
             {
@@ -567,6 +603,14 @@ int main( int argc, char** argv )
     if( replayError.Failed() )
     {
         std::fprintf( stderr, "Replay failed: %s\n", replayError.Message().c_str() );
+        const auto failure = worker.GetFailureType();
+        if( failure != tracy::Worker::Failure::None )
+        {
+            std::fprintf( stderr, "Replay Worker instrumentation failure: %s\n", tracy::Worker::GetFailureString( failure ) );
+            const auto& failureData = worker.GetFailureData();
+            if( !failureData.message.empty() )
+                std::fprintf( stderr, "Replay Worker failure context: %s\n", failureData.message.c_str() );
+        }
         return 5;
     }
 

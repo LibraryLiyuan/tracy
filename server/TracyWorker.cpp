@@ -1808,7 +1808,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     if( !bgTasks )
     {
-        m_backgroundDone.store( true, std::memory_order_relaxed );
+        m_backgroundDone.store( true, std::memory_order_release );
     }
     else
     {
@@ -2043,10 +2043,10 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             }
 
             for( auto& job : jobs ) job.join();
-            m_backgroundDone.store( true, std::memory_order_relaxed );
+            m_backgroundDone.store( true, std::memory_order_release );
         } );
 #else
-        m_backgroundDone.store( true, std::memory_order_relaxed );
+        m_backgroundDone.store( true, std::memory_order_release );
 #endif
     }
 }
@@ -3163,6 +3163,7 @@ void Worker::Exec()
             std::unique_lock<std::mutex> lock( m_netReadLock );
             m_netReadCv.wait( lock, [this] {
                 if( !m_netRead.empty() ) return true;
+                if( m_protocolReplayTerminate.load( std::memory_order_acquire ) ) return true;
                 const bool beginDrain = m_disconnect.load( std::memory_order_acquire ) &&
                     !m_protocolDisconnectSent.load( std::memory_order_acquire );
                 const bool finishDrain = m_protocolDrainOnly.load( std::memory_order_acquire ) &&
@@ -3176,6 +3177,16 @@ void Worker::Exec()
             } );
             bool beginDrain = false;
             bool finishDrain = false;
+            if( m_netRead.empty() && m_protocolReplayTerminate.exchange( false, std::memory_order_acq_rel ) )
+            {
+                lock.unlock();
+                if( !QueryTerminate() )
+                    closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
+                else
+                    closeReason = ProtocolCloseReason::CaptureComplete;
+                UpdateMbps( 0 );
+                break;
+            }
             if( m_netRead.empty() && m_disconnect.load( std::memory_order_acquire ) &&
                 !m_protocolDisconnectSent.load( std::memory_order_acquire ) )
             {
@@ -3608,6 +3619,7 @@ void Worker::Query( ServerQuery type, uint64_t data, uint32_t extra )
 
 bool Worker::QueryTerminate()
 {
+    if( m_protocolTerminateSent.exchange( true, std::memory_order_acq_rel ) ) return true;
     ServerQueryPacket query { ServerQueryTerminate, 0, 0 };
     return SendProtocol( &query, ServerQueryPacketSize, ProtocolChunk::ServerQuery );
 }
@@ -9147,6 +9159,12 @@ void Worker::RequestProtocolDrain( bool disconnectClient )
 {
     m_protocolDisconnectClient.store( disconnectClient, std::memory_order_release );
     MarkProtocolDisconnect();
+    m_netReadCv.notify_one();
+}
+
+void Worker::RequestProtocolReplayTerminate()
+{
+    m_protocolReplayTerminate.store( true, std::memory_order_release );
     m_netReadCv.notify_one();
 }
 

@@ -507,7 +507,8 @@ enum class JnGfxEntityKind : uint8_t
     GfxJob,
     CommandList,
     Submission,
-    GpuSegment
+    GpuSegment,
+    ExplicitGpuPass
 };
 
 enum class JnGfxRelation : uint8_t
@@ -518,7 +519,13 @@ enum class JnGfxRelation : uint8_t
     Produces,
     Submits,
     RunsOnGpu,
-    DependsOn
+    DependsOn,
+    RecordedOnCommandList,
+    BelongsToFrame,
+    BelongsToCamera,
+    BelongsToView,
+    ReferencesResources,
+    ClassifiesAsTaxonomy
 };
 
 enum class JnFrameDomain : uint8_t
