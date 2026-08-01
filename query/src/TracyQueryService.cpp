@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cctype>
 #include <iomanip>
@@ -20,7 +21,10 @@
 namespace tracy::query
 {
 
-const std::vector<std::string>& QueryMethodRegistry()
+namespace
+{
+
+const std::vector<std::string>& RawQueryMethodRegistry()
 {
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
@@ -41,6 +45,145 @@ const std::vector<std::string>& QueryMethodRegistry()
         "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
         "timeline.slice", "statistics.describe", "statistics.compute", "compare.zones", "compare.frames", "compare.source", "validation.run"
     };
+    return methods;
+}
+
+nlohmann::json RequiredParametersFor( const std::string& method )
+{
+    nlohmann::json required = nlohmann::json::array();
+    if( method == "trace.open" ) required.emplace_back( "path" );
+    else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
+    else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
+    if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+        method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
+    if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
+    if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
+    if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
+    if( method == "producer.get" ) required.emplace_back( "key" );
+    if( method == "catalog.get" ) required.emplace_back( "definition_key" );
+    if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) required.emplace_back( "thread_ref" );
+    if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) required.emplace_back( "plot_ref" );
+    if( method == "hardware_sample.address" || method == "hardware_sample.events" || method == "symbol.address" ) required.emplace_back( "address" );
+    if( method == "callstack.frames" || method == "callstack.parent" ) required.emplace_back( "callstack" );
+    if( method == "callstack.resolve" || method == "callstack.batch" ) required.emplace_back( "callstacks" );
+    if( method == "statistics.compute" ) required.emplace_back( "values_ns" );
+    return required;
+}
+
+nlohmann::json ParameterSchemaFor( const std::string& name )
+{
+    using nlohmann::json;
+    if( name == "limit" ) return { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumPageSize } };
+    if( name == "frame_index" || name == "base_frame_index" || name == "target_frame_index" || name == "index" ) return { { "type", "integer" }, { "minimum", 0 } };
+    if( name == "max_scan_events" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxScanEvents } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
+    if( name == "max_cpu_ms" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxCpuMs } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
+    if( name == "max_nodes" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxNodes } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
+    if( name == "max_groups" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxGroups } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
+    if( name == "filter" ) return { { "type", "object" } };
+    if( name == "callstacks" || name == "values_ns" || name == "fields" ) return { { "type", "array" }, { "items", { { "type", { "string", "integer" } } } } };
+    return { { "type", "string" } };
+}
+
+std::string MethodDomain( const std::string& method )
+{
+    if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
+    if( method.rfind( "job.gfx", 0 ) == 0 ) return "job.gfx";
+    const auto separator = method.find( '.' );
+    return separator == std::string::npos ? method : method.substr( 0, separator );
+}
+
+}
+
+const nlohmann::json& QueryEnvelopeOutputSchema()
+{
+    static const nlohmann::json schema = {
+        { "type", "object" }, { "required", { "protocol", "schema_version", "id", "ok" } },
+        { "properties", {
+            { "protocol", { { "const", QueryProtocol } } }, { "schema_version", { { "const", QuerySchemaVersion } } },
+            { "id", {} }, { "ok", { { "type", "boolean" } } }, { "data", {} }, { "trace", { { "type", "object" } } },
+            { "page", { { "type", "object" } } }, { "partial", { { "type", "boolean" } } },
+            { "omitted_count", { { "type", { "string", "null" } } } }, { "budget", { { "type", "object" } } },
+            { "warnings", { { "type", "array" } } }, { "error", { { "type", "object" } } }
+        } },
+        { "allOf", nlohmann::json::array( {
+            nlohmann::json { { "if", { { "properties", { { "ok", { { "const", true } } } } } } },
+                { "then", { { "required", { "data", "partial", "omitted_count", "budget", "warnings" } } } } },
+            nlohmann::json { { "if", { { "properties", { { "ok", { { "const", false } } } } } } },
+                { "then", { { "required", { "error" } } } } }
+        } ) },
+        { "additionalProperties", true }
+    };
+    return schema;
+}
+
+const nlohmann::json& QueryOperationSchemaRegistry()
+{
+    using nlohmann::json;
+    static const json registry = [] {
+        json operations = json::array();
+        const std::vector<std::string> common = {
+            "trace_id", "baseline_trace_id", "start_ns", "end_ns", "limit", "cursor", "filter", "fields",
+            "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups"
+        };
+        for( const auto& method : RawQueryMethodRegistry() )
+        {
+            const auto required = RequiredParametersFor( method );
+            json properties = json::object();
+            for( const auto& name : common ) properties[name] = ParameterSchemaFor( name );
+            for( const auto& value : required )
+            {
+                const auto name = value.get<std::string>();
+                properties[name] = ParameterSchemaFor( name );
+            }
+            json alternatives = json::array();
+            if( method == "frame.get" )
+            {
+                alternatives = json::array( { json::array( { "ref" } ), json::array( { "frame_set", "index" } ) } );
+                properties["ref"] = ParameterSchemaFor( "ref" );
+                properties["frame_set"] = ParameterSchemaFor( "frame_set" );
+                properties["index"] = { { "type", "integer" }, { "minimum", 0 } };
+            }
+            json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", true } };
+            if( !alternatives.empty() ) inputSchema["oneOf"] = json::array( {
+                json { { "required", alternatives[0] } }, json { { "required", alternatives[1] } }
+            } );
+            json exampleParams = json::object();
+            for( const auto& value : required )
+            {
+                const auto name = value.get<std::string>();
+                if( name == "path" ) exampleParams[name] = "C:\\\\captures\\\\capture.tracy";
+                else if( name == "trace_id" || name == "baseline_trace_id" ) exampleParams[name] = "trace-1";
+                else if( name == "ref" || name == "thread_ref" || name == "plot_ref" ) exampleParams[name] = "tracy:v1:<fingerprint>:<kind>:<id>";
+                else if( name == "callstacks" || name == "values_ns" ) exampleParams[name] = json::array( { "1" } );
+                else if( name == "callstack" ) exampleParams[name] = "1";
+                else if( name == "time_ns" ) exampleParams[name] = "0";
+                else if( name == "address" ) exampleParams[name] = "0x0";
+                else if( name == "key" ) exampleParams[name] = "cpu.zone.c-abi";
+                else if( name == "definition_key" ) exampleParams[name] = "jn-def:v1:source:0000000000000000";
+                else exampleParams[name] = 0;
+            }
+            if( method == "frame.get" ) exampleParams["index"] = 0;
+            operations.push_back( {
+                { "method", method }, { "schema_version", QuerySchemaVersion }, { "domain", MethodDomain( method ) },
+                { "required", required }, { "one_of_required", alternatives }, { "pagination", true },
+                { "budget_parameters", { "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups" } },
+                { "input_schema", std::move( inputSchema ) }, { "output_schema", QueryEnvelopeOutputSchema() },
+                { "request_example", { { "protocol", QueryProtocol }, { "id", "request-1" }, { "method", method }, { "params", std::move( exampleParams ) } } }
+            } );
+        }
+        return operations;
+    }();
+    return registry;
+}
+
+const std::vector<std::string>& QueryMethodRegistry()
+{
+    static const std::vector<std::string> methods = [] {
+        std::vector<std::string> result;
+        result.reserve( QueryOperationSchemaRegistry().size() );
+        for( const auto& operation : QueryOperationSchemaRegistry() ) result.emplace_back( operation.at( "method" ).get<std::string>() );
+        return result;
+    }();
     return methods;
 }
 
@@ -202,9 +345,13 @@ std::vector<std::string> Split( const std::string& value, char separator )
 struct PageRequest
 {
     size_t offset = 0;
+    size_t rawOffset = 0;
+    bool rawOffsetBound = false;
     size_t limit = DefaultPageSize;
     std::string binding;
 };
+
+bool BudgetPartial();
 
 PageRequest ParsePage( const json& params, const std::string& method, const TraceSessionSnapshot& trace )
 {
@@ -220,19 +367,31 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
     json bound = params;
     bound.erase( "cursor" );
     bound.erase( "limit" );
+    bound.erase( "max_scan_events" );
+    bound.erase( "max_cpu_ms" );
+    bound.erase( "max_nodes" );
+    bound.erase( "max_groups" );
     page.binding = Hex16( Fnv1a( bound.dump() ) );
     if( params.contains( "cursor" ) )
     {
         if( !params["cursor"].is_string() ) throw QueryError( "INVALID_PARAMS", "cursor must be a string" );
         const auto parts = Split( Base64UrlDecode( params["cursor"].get<std::string>() ), '|' );
-        if( parts.size() != 7 || parts[0] != "v1" || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
+        const bool legacy = parts.size() == 7 && parts[0] == "v1";
+        const bool current = parts.size() == 8 && parts[0] == "v2";
+        if( ( !legacy && !current ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
         {
             throw QueryError( "STALE_CURSOR", "cursor does not match the trace, revision, method, or filters" );
         }
         try
         {
             page.offset = size_t( std::stoull( parts[5] ) );
-            if( parts[6] != "stable" ) throw std::invalid_argument( "tie breaker" );
+            if( current )
+            {
+                page.rawOffset = size_t( std::stoull( parts[6] ) );
+                page.rawOffsetBound = true;
+                if( parts[7] != "stable" ) throw std::invalid_argument( "tie breaker" );
+            }
+            else if( parts[6] != "stable" ) throw std::invalid_argument( "tie breaker" );
         }
         catch( const std::exception& )
         {
@@ -245,7 +404,15 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
 std::string NextCursor( const PageRequest& page, const std::string& method, const TraceSessionSnapshot& trace, size_t returned, bool hasMore )
 {
     if( !hasMore ) return {};
-    const std::string value = "v1|" + trace.id + '|' + Decimal( trace.revision ) + '|' + method + '|' + page.binding + '|' + std::to_string( page.offset + returned ) + "|stable";
+    const auto nextOffset = page.offset + returned;
+    const std::string value = "v2|" + trace.id + '|' + Decimal( trace.revision ) + '|' + method + '|' + page.binding + '|' + std::to_string( nextOffset ) + '|' + std::to_string( nextOffset ) + "|stable";
+    return Base64UrlEncode( value );
+}
+
+std::string NextCursorAt( const PageRequest& page, const std::string& method, const TraceSessionSnapshot& trace, size_t nextOffset, size_t nextRawOffset, bool hasMore )
+{
+    if( !hasMore ) return {};
+    const std::string value = "v2|" + trace.id + '|' + Decimal( trace.revision ) + '|' + method + '|' + page.binding + '|' + std::to_string( nextOffset ) + '|' + std::to_string( nextRawOffset ) + "|stable";
     return Base64UrlEncode( value );
 }
 
@@ -253,7 +420,9 @@ json PageJson( const PageRequest& page, size_t returned, const std::string& next
 {
     return {
         { "limit", page.limit }, { "returned", returned },
-        { "next_cursor", nextCursor.empty() ? json( nullptr ) : json( nextCursor ) }, { "truncated", truncated }
+        { "next_cursor", nextCursor.empty() ? json( nullptr ) : json( nextCursor ) }, { "truncated", truncated },
+        { "partial", BudgetPartial() }, { "omitted_count", BudgetPartial() ? json( nullptr ) : json( "0" ) },
+        { "omitted_count_exact", !BudgetPartial() }
     };
 }
 
@@ -737,6 +906,126 @@ std::optional<uint64_t> DecimalStringValue( const json& value )
     if( result.ec != std::errc() || result.ptr != text.data() + text.size() ) return std::nullopt;
     return parsed;
 }
+
+uint64_t PositiveBudgetParameter( const json& params, const char* name, uint64_t defaultValue, uint64_t maximum )
+{
+    const auto value = UnsignedParameter( params, name, defaultValue, maximum );
+    if( value == 0 ) throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be greater than zero" );
+    return value;
+}
+
+struct QueryBudgetState
+{
+    explicit QueryBudgetState( const json& params, std::stop_token token )
+        : stopToken( token )
+        , started( std::chrono::steady_clock::now() )
+        , maxScanEvents( PositiveBudgetParameter( params, "max_scan_events", DefaultMaxScanEvents, MaximumMaxScanEvents ) )
+        , maxCpuMs( PositiveBudgetParameter( params, "max_cpu_ms", DefaultMaxCpuMs, MaximumMaxCpuMs ) )
+        , maxNodes( PositiveBudgetParameter( params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) )
+        , maxGroups( PositiveBudgetParameter( params, "max_groups", DefaultMaxGroups, MaximumMaxGroups ) )
+    {}
+
+    void CheckCancelled() const
+    {
+        if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+    }
+
+    uint64_t ElapsedMs() const
+    {
+        return uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() );
+    }
+
+    void Exhaust( const char* reason )
+    {
+        partial = true;
+        exhaustedBy.emplace( reason );
+    }
+
+    size_t ScanAllowance( size_t requested )
+    {
+        CheckCancelled();
+        if( ElapsedMs() >= maxCpuMs ) { Exhaust( "max_cpu_ms" ); return 0; }
+        if( scannedEvents >= maxScanEvents ) { Exhaust( "max_scan_events" ); return 0; }
+        return size_t( std::min<uint64_t>( requested, maxScanEvents - scannedEvents ) );
+    }
+
+    void Scanned( size_t actual, size_t requested, size_t allowed )
+    {
+        (void)requested;
+        (void)allowed;
+        scannedEvents += actual;
+    }
+
+    bool ConsumeNodes( size_t count = 1 )
+    {
+        CheckCancelled();
+        if( ElapsedMs() >= maxCpuMs ) { Exhaust( "max_cpu_ms" ); return false; }
+        if( nodes + count > maxNodes ) { Exhaust( "max_nodes" ); return false; }
+        nodes += count;
+        return true;
+    }
+
+    bool ConsumeGroups( size_t count = 1 )
+    {
+        CheckCancelled();
+        if( ElapsedMs() >= maxCpuMs ) { Exhaust( "max_cpu_ms" ); return false; }
+        if( groups + count > maxGroups ) { Exhaust( "max_groups" ); return false; }
+        groups += count;
+        return true;
+    }
+
+    void Attach( json& response ) const
+    {
+        if( !response.value( "ok", false ) ) return;
+        response["partial"] = partial;
+        response["omitted_count"] = partial ? json( nullptr ) : json( "0" );
+        response["budget"] = {
+            { "limits", {
+                { "max_scan_events", Decimal( maxScanEvents ) }, { "max_cpu_ms", Decimal( maxCpuMs ) },
+                { "max_nodes", Decimal( maxNodes ) }, { "max_groups", Decimal( maxGroups ) }
+            } },
+            { "consumed", {
+                { "scan_events", Decimal( scannedEvents ) }, { "cpu_ms", Decimal( ElapsedMs() ) },
+                { "nodes", Decimal( nodes ) }, { "groups", Decimal( groups ) }
+            } },
+            { "exhausted_by", json( exhaustedBy ) }, { "omitted_count_exact", !partial }
+        };
+        if( response.contains( "page" ) )
+        {
+            response["page"]["partial"] = partial;
+            response["page"]["omitted_count"] = partial ? json( nullptr ) : json( "0" );
+            response["page"]["omitted_count_exact"] = !partial;
+        }
+        if( partial ) response["warnings"].emplace_back( "query budget exhausted; resume with next_cursor when available" );
+    }
+
+    std::stop_token stopToken;
+    std::chrono::steady_clock::time_point started;
+    uint64_t maxScanEvents;
+    uint64_t maxCpuMs;
+    uint64_t maxNodes;
+    uint64_t maxGroups;
+    uint64_t scannedEvents = 0;
+    uint64_t nodes = 0;
+    uint64_t groups = 0;
+    bool partial = false;
+    std::set<std::string> exhaustedBy;
+};
+
+thread_local QueryBudgetState* ActiveBudget = nullptr;
+
+struct QueryBudgetScope
+{
+    explicit QueryBudgetScope( QueryBudgetState& budget ) : previous( ActiveBudget ) { ActiveBudget = &budget; }
+    ~QueryBudgetScope() { ActiveBudget = previous; }
+    QueryBudgetState* previous;
+};
+
+size_t BudgetScanAllowance( size_t requested ) { return ActiveBudget ? ActiveBudget->ScanAllowance( requested ) : requested; }
+void BudgetScanned( size_t actual, size_t requested, size_t allowed ) { if( ActiveBudget ) ActiveBudget->Scanned( actual, requested, allowed ); }
+bool BudgetConsumeNode( size_t count = 1 ) { return !ActiveBudget || ActiveBudget->ConsumeNodes( count ); }
+bool BudgetConsumeGroup( size_t count = 1 ) { return !ActiveBudget || ActiveBudget->ConsumeGroups( count ); }
+bool BudgetPartial() { return ActiveBudget && ActiveBudget->partial; }
 
 bool IdentityShapeAllowed( const json& value, size_t depth, size_t& fields )
 {
@@ -1758,6 +2047,10 @@ json DescribeData( const json& selection = json::object() )
             { "default_top_n", DefaultTopN }, { "maximum_top_n", MaximumTopN },
             { "request_bytes", MaximumRequestBytes }, { "response_bytes", MaximumResponseBytes },
             { "analysis_cache_bytes", Decimal( uint64_t( DefaultAnalysisCacheBytes ) ) },
+            { "default_max_scan_events", Decimal( DefaultMaxScanEvents ) }, { "maximum_max_scan_events", Decimal( MaximumMaxScanEvents ) },
+            { "default_max_cpu_ms", Decimal( DefaultMaxCpuMs ) }, { "maximum_max_cpu_ms", Decimal( MaximumMaxCpuMs ) },
+            { "default_max_nodes", Decimal( DefaultMaxNodes ) }, { "maximum_max_nodes", Decimal( MaximumMaxNodes ) },
+            { "default_max_groups", Decimal( DefaultMaxGroups ) }, { "maximum_max_groups", Decimal( MaximumMaxGroups ) },
             { "callstack_default_depth", 32 }, { "callstack_max_depth", 256 },
             { "source_default_bytes", 65536 }, { "source_max_bytes", 1048576 },
             { "frame_image_max_bytes", 16777216 }, { "frame_image_max_dimension", 4096 }
@@ -1779,87 +2072,64 @@ json DescribeData( const json& selection = json::object() )
     if( ( !requestedDomain.empty() || !requestedOperation.empty() ) && methods.empty() ) throw QueryError( "METHOD_NOT_FOUND", "no tracy-query operation matches the requested domain/operation" );
     result["methods"] = methods;
 
-    const auto requiredFor = []( const std::string& method ) {
-        json required = json::array();
-        if( method == "trace.open" ) required.emplace_back( "path" );
-        else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
-        else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-        if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
-            method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
-        if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
-        if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
-        if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
-        if( method == "producer.get" ) required.emplace_back( "key" );
-        if( method == "catalog.get" ) required.emplace_back( "definition_key" );
-        if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) required.emplace_back( "thread_ref" );
-        if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) required.emplace_back( "plot_ref" );
-        if( method == "hardware_sample.address" || method == "hardware_sample.events" || method == "symbol.address" ) required.emplace_back( "address" );
-        if( method == "callstack.frames" || method == "callstack.parent" ) required.emplace_back( "callstack" );
-        if( method == "callstack.resolve" || method == "callstack.batch" ) required.emplace_back( "callstacks" );
-        if( method == "statistics.compute" ) required.emplace_back( "values_ns" );
-        return required;
-    };
     json descriptors = json::array();
-    for( const auto& value : methods )
+    for( const auto& descriptor : QueryOperationSchemaRegistry() )
     {
-        const auto method = value.get<std::string>();
-        const json alternatives = method == "frame.get" ? json::array( { json::array( { "ref" } ), json::array( { "frame_set", "index" } ) } ) : json::array();
-        json exampleParams = json::object();
-        for( const auto& required : requiredFor( method ) )
-        {
-            const auto name = required.get<std::string>();
-            if( name == "path" ) exampleParams[name] = "C:\\\\captures\\\\capture.tracy";
-            else if( name == "trace_id" ) exampleParams[name] = "trace-1";
-            else if( name == "baseline_trace_id" ) exampleParams[name] = "trace-1";
-            else if( name == "ref" ) exampleParams[name] = "tracy:v1:<fingerprint>:<kind>:<id>";
-            else if( name == "callstacks" || name == "values_ns" ) exampleParams[name] = json::array( { "1" } );
-            else if( name == "callstack" ) exampleParams[name] = "1";
-            else if( name == "thread_ref" || name == "plot_ref" ) exampleParams[name] = "tracy:v1:<fingerprint>:<kind>:<id>";
-            else if( name == "time_ns" ) exampleParams[name] = "0";
-            else if( name == "address" ) exampleParams[name] = "0x0";
-            else if( name == "key" ) exampleParams[name] = "cpu.zone.c-abi";
-            else if( name == "definition_key" ) exampleParams[name] = "jn-def:v1:source:0000000000000000";
-            else exampleParams[name] = 0;
-        }
-        if( method == "frame.get" ) exampleParams["index"] = 0;
-        descriptors.push_back( {
-            { "method", method }, { "required", requiredFor( method ) },
-            { "one_of_required", alternatives },
-            { "accepted_common_parameters", { "trace_id", "start_ns", "end_ns", "limit", "cursor", "filter", "fields" } },
-            { "request_example", { { "protocol", QueryProtocol }, { "id", "request-1" }, { "method", method }, { "params", std::move( exampleParams ) } } },
-            { "response_contract", "tracy-query/1 success or failure envelope; int64 values are decimal strings; refs are opaque" }
-        } );
+        const auto method = descriptor.at( "method" ).get<std::string>();
+        if( std::find( methods.begin(), methods.end(), method ) != methods.end() ) descriptors.emplace_back( descriptor );
     }
     result["operations"] = std::move( descriptors );
     return result;
 }
 
-template<typename T, typename Scan, typename Match, typename Convert>
-std::pair<json, bool> ScanFiltered( const analysis::TraceSource& source, const json& params, const PageRequest& page, Scan&& scan, Match&& match, Convert&& convert )
+struct FilteredScanPage
 {
-    json output = json::array();
-    size_t rawOffset = 0;
-    size_t matchedOffset = 0;
+    json values = json::array();
+    bool hasMore = false;
+    size_t nextOffset = 0;
+    size_t nextRawOffset = 0;
+};
+
+template<typename T, typename Scan, typename Match, typename Convert>
+FilteredScanPage ScanFiltered( const analysis::TraceSource& source, const json& params, const PageRequest& page, Scan&& scan, Match&& match, Convert&& convert )
+{
+    FilteredScanPage result;
+    size_t rawOffset = page.rawOffsetBound ? page.rawOffset : 0;
+    size_t matchedOffset = page.rawOffsetBound ? page.offset : 0;
     constexpr size_t chunk = 4096;
     bool exhausted = false;
-    while( output.size() <= page.limit && !exhausted )
+    while( !result.hasMore && !exhausted )
     {
-        auto range = ScanRangeFrom( params, rawOffset, chunk );
-        const std::vector<T> values = scan( source, range );
-        exhausted = values.size() < chunk;
-        rawOffset += values.size();
-        for( const auto& value : values )
+        const auto allowed = BudgetScanAllowance( chunk );
+        if( allowed == 0 )
         {
+            result.hasMore = BudgetPartial();
+            break;
+        }
+        auto range = ScanRangeFrom( params, rawOffset, allowed );
+        const std::vector<T> values = scan( source, range );
+        BudgetScanned( values.size(), chunk, allowed );
+        exhausted = values.size() < allowed;
+        for( size_t index = 0; index < values.size(); index++ )
+        {
+            const auto& value = values[index];
             if( !match( value ) ) continue;
             if( matchedOffset++ < page.offset ) continue;
-            output.emplace_back( convert( value ) );
-            if( output.size() > page.limit ) break;
+            if( result.values.size() == page.limit )
+            {
+                result.hasMore = true;
+                result.nextRawOffset = rawOffset + index;
+                break;
+            }
+            result.values.emplace_back( convert( value ) );
         }
+        rawOffset += values.size();
         if( values.empty() ) exhausted = true;
     }
-    const bool hasMore = output.size() > page.limit;
-    if( hasMore ) output.erase( output.end() - 1 );
-    return { std::move( output ), hasMore };
+    if( !result.hasMore && BudgetPartial() ) result.hasMore = true;
+    result.nextOffset = page.offset + result.values.size();
+    if( result.nextRawOffset == 0 || !result.hasMore ) result.nextRawOffset = rawOffset;
+    return result;
 }
 
 }
@@ -1975,7 +2245,10 @@ json QueryService::Execute( const json& request, const std::optional<std::string
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
         std::lock_guard lock( m_queryMutex );
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+        QueryBudgetState budget( params, stopToken );
+        QueryBudgetScope budgetScope( budget );
         auto response = Dispatch( id, request["method"].get<std::string>(), params, defaultTraceId, stopToken );
+        budget.Attach( response );
         if( DumpProtocolJson( response ).size() > MaximumResponseBytes ) throw QueryError( "RESOURCE_LIMIT", "response exceeds the 8 MiB budget; use pagination or field projection" );
         return response;
     }
@@ -2005,6 +2278,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     checkCancelled();
     if( method == "system.schema" ) return Success( id, {
         { "schema", json::parse( QuerySchemaJson ) },
+        { "operations", QueryOperationSchemaRegistry() },
         { "coverage", {
             { "domain", json::parse( QueryCoverageJson ) },
             { "field", json::parse( QueryFieldCoverageJson ) },
@@ -2304,11 +2578,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto events = source->ScanContextSwitchEvents( range );
+            BudgetScanned( events.size(), chunk, allowed );
             for( const auto& event : events ) if( event.threadRef == threadRef && event.endNs ) running.emplace_back( *event.endNs - event.startNs );
             offset += events.size();
-            if( events.size() < chunk ) break;
+            if( events.size() < allowed ) break;
         }
         return Success( id, { { "thread", ThreadJson( *found ) }, { "running_regions", StatisticsJson( analysis::ComputeStatistics( std::move( running ) ) ) } }, trace );
     }
@@ -2327,8 +2603,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             while( true )
             {
                 checkCancelled();
-                auto range = ScanRangeFrom( params, scanOffset, chunk );
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                auto range = ScanRangeFrom( params, scanOffset, allowed );
                 const auto values = source->ScanContextSwitchEvents( range );
+                BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& event : values )
                 {
                     if( event.threadRef != threadRef ) continue;
@@ -2339,7 +2617,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     previousCpu = event.cpu;
                 }
                 scanOffset += values.size();
-                if( values.size() < chunk ) break;
+                if( values.size() < allowed ) break;
             }
             const size_t begin = std::min( page.offset, all.size() );
             const size_t end = std::min( begin + page.limit, all.size() );
@@ -2348,11 +2626,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto cursor = NextCursor( page, method, trace, end - begin, end < all.size() );
             return Success( id, { { "thread_ref", threadRef }, { "migration_count", Decimal( all.size() ) }, { "migrations", std::move( migrations ) } }, trace, PageJson( page, end - begin, cursor ) );
         }
-        auto [events, hasMore] = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanContextSwitchEvents( range ); },
             [&]( const auto& event ) { return event.threadRef == threadRef; }, ContextSwitchJson );
-        const auto cursor = NextCursor( page, method, trace, events.size(), hasMore );
-        return Success( id, { { "thread_ref", threadRef }, { "context_switches", std::move( events ) } }, trace, PageJson( page, events.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "thread_ref", threadRef }, { "context_switches", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
 
     if( method == "cpu.topology" )
@@ -2383,12 +2662,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto page = ParsePage( params, method, trace );
         const auto cpuFilter = params.contains( "cpu" ) ? std::optional<unsigned>( params["cpu"].get<unsigned>() ) : std::nullopt;
-        auto [events, hasMore] = ScanFiltered<analysis::CpuContextSwitchDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::CpuContextSwitchDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanCpuContextSwitchEvents( range ); },
             [&]( const auto& event ) { return !cpuFilter || event.cpu == *cpuFilter; }, CpuContextSwitchJson );
-        const auto returned = events.size();
-        const auto cursor = NextCursor( page, method, trace, events.size(), hasMore );
-        return Success( id, { { "segments", std::move( events ) } }, trace, PageJson( page, returned, cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "segments", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "context_switch.range" || method == "context_switch.thread" )
     {
@@ -2396,11 +2675,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const std::string threadRef = params.value( "thread_ref", "" );
         if( method == "context_switch.thread" && threadRef.empty() ) throw QueryError( "INVALID_PARAMS", "thread_ref is required" );
         const auto cpuFilter = params.contains( "cpu" ) ? std::optional<unsigned>( params["cpu"].get<unsigned>() ) : std::nullopt;
-        auto [events, hasMore] = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanContextSwitchEvents( range ); },
             [&]( const auto& event ) { return ( threadRef.empty() || event.threadRef == threadRef ) && ( !cpuFilter || event.cpu == *cpuFilter ); }, ContextSwitchJson );
-        const auto cursor = NextCursor( page, method, trace, events.size(), hasMore );
-        return Success( id, { { "context_switches", std::move( events ) } }, trace, PageJson( page, events.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "context_switches", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "context_switch.statistics" )
     {
@@ -2411,15 +2691,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto events = source->ScanContextSwitchEvents( range );
+            BudgetScanned( events.size(), chunk, allowed );
             for( const auto& event : events )
             {
+                if( !byThread.contains( event.threadRef ) )
+                {
+                    if( !BudgetConsumeGroup() ) continue;
+                    byThread.try_emplace( event.threadRef );
+                }
                 if( event.endNs ) byThread[event.threadRef].emplace_back( *event.endNs - event.startNs );
                 if( event.wakeupNs && event.startNs >= *event.wakeupNs ) wakeLatency[event.threadRef].emplace_back( event.startNs - *event.wakeupNs );
             }
             offset += events.size();
-            if( events.size() < chunk ) break;
+            if( events.size() < allowed ) break;
         }
         json groups = json::array();
         for( auto& [threadRef, durations] : byThread ) groups.push_back( {
@@ -2459,12 +2746,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 while( true )
                 {
                     checkCancelled();
-                    analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+                    const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                    analysis::ScanRange range; range.offset = offset; range.limit = allowed;
                     const auto frames = source->ScanFrames( range );
+                    BudgetScanned( frames.size(), chunk, allowed );
                     const auto found = std::find_if( frames.begin(), frames.end(), [&]( const auto& frame ) { return frame.ref == requested; } );
                     if( found != frames.end() ) return Success( id, FrameJson( *found ), trace );
-                    offset += frames.size(); if( frames.size() < chunk ) break;
+                    offset += frames.size(); if( frames.size() < allowed ) break;
                 }
+                if( BudgetPartial() ) return Success( id, { { "present", false }, { "reason", "query budget exhausted before the frame ref was resolved" } }, trace );
                 throw QueryError( "ENTITY_NOT_FOUND", "frame ref was not found" );
             }
             if( !params.contains( "index" ) ) throw QueryError( "INVALID_PARAMS", "index is required" );
@@ -2565,12 +2855,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "zone.cpu.search" )
     {
         const auto page = ParsePage( params, method, trace );
-        auto [values, hasMore] = ScanFiltered<analysis::CpuZoneDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::CpuZoneDto>( *source, params, page,
             []( const auto& source, const auto& range ) { return source.ScanCpuZones( range ); },
             [&]( const auto& value ) { return TextMatches( value.name, params ); }, CpuZoneJson );
-        values = ProjectFields( std::move( values ), params );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "zones", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "zones", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "zone.gpu.contexts" )
     {
@@ -2604,12 +2895,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "zone.gpu.search" )
     {
         const auto page = ParsePage( params, method, trace );
-        auto [values, hasMore] = ScanFiltered<analysis::GpuZoneDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::GpuZoneDto>( *source, params, page,
             []( const auto& source, const auto& range ) { return source.ScanGpuZones( range ); },
             [&]( const auto& value ) { return TextMatches( value.name, params ); }, GpuZoneJson );
-        values = ProjectFields( std::move( values ), params );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "zones", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "zones", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "zone.cpu.get" || method == "zone.gpu.get" || method == "zone.cpu.tree" || method == "zone.gpu.tree" )
     {
@@ -2668,25 +2960,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             if( gpu )
             {
                 const auto values = source->ScanGpuZones( range );
+                BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& value : values ) if( value.gpuEndNs && TextMatches( value.name, params ) )
                 {
+                    if( !groups.contains( value.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                     auto& group = groups[value.sourceLocationRef];
                     group.name = value.name; group.file = value.file; group.line = value.line;
                     group.inclusive.emplace_back( *value.gpuEndNs - value.gpuStartNs );
                     if( value.selfTimeNs ) group.self.emplace_back( *value.selfTimeNs );
                 }
                 offset += values.size();
-                if( values.size() < chunk ) break;
+                if( values.size() < allowed ) break;
             }
             else
             {
                 const auto values = source->ScanCpuZones( range );
+                BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& value : values ) if( value.endNs && TextMatches( value.name, params ) )
                 {
+                    if( !groups.contains( value.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                     auto& group = groups[value.sourceLocationRef];
                     group.name = value.name; group.file = value.file; group.line = value.line;
                     group.inclusive.emplace_back( *value.endNs - value.startNs );
@@ -2694,7 +2991,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     if( value.runningTimeNs ) group.running.emplace_back( *value.runningTimeNs );
                 }
                 offset += values.size();
-                if( values.size() < chunk ) break;
+                if( values.size() < allowed ) break;
             }
         }
         std::vector<std::pair<std::string, Aggregate*>> order;
@@ -2729,7 +3026,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             size_t received = 0;
             if( gpu )
             {
@@ -2740,6 +3038,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     const auto path = parent == pathsByRef.end() ? zone.name : parent->second + ";" + zone.name;
                     pathsByRef[zone.ref] = path;
                     if( !zone.gpuEndNs || !TextMatches( zone.name, params ) ) continue;
+                    if( !groups.contains( path ) && !BudgetConsumeGroup() ) continue;
                     auto& stats = groups[path]; stats.path = path; stats.count++; stats.inclusive += *zone.gpuEndNs - zone.gpuStartNs;
                     if( zone.selfTimeNs ) stats.self += *zone.selfTimeNs;
                 }
@@ -2753,11 +3052,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     const auto path = parent == pathsByRef.end() ? zone.name : parent->second + ";" + zone.name;
                     pathsByRef[zone.ref] = path;
                     if( !zone.endNs || !TextMatches( zone.name, params ) ) continue;
+                    if( !groups.contains( path ) && !BudgetConsumeGroup() ) continue;
                     auto& stats = groups[path]; stats.path = path; stats.count++; stats.inclusive += *zone.endNs - zone.startNs;
                     if( zone.selfTimeNs ) stats.self += *zone.selfTimeNs;
                 }
             }
-            offset += received; if( received < chunk ) break;
+            BudgetScanned( received, chunk, allowed );
+            offset += received; if( received < allowed ) break;
         }
         std::vector<PathStats*> order; order.reserve( groups.size() ); for( auto& [path, stats] : groups ) order.emplace_back( &stats );
         std::sort( order.begin(), order.end(), []( const auto* lhs, const auto* rhs ) { return lhs->inclusive != rhs->inclusive ? lhs->inclusive > rhs->inclusive : lhs->path < rhs->path; } );
@@ -2785,12 +3086,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto page = ParsePage( params, method, trace );
         const std::string pool = params.value( "pool_ref", "" );
-        auto [values, hasMore] = ScanFiltered<analysis::MemoryEventDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::MemoryEventDto>( *source, params, page,
             []( const auto& source, const auto& range ) { return source.ScanMemoryEvents( range ); },
             [&]( const auto& value ) { return ( pool.empty() || value.poolRef == pool ) && TextMatches( value.address, params ); }, MemoryEventJson );
-        values = ProjectFields( std::move( values ), params );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "events", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "events", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "memory.get" )
     {
@@ -2801,12 +3103,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto events = source->ScanMemoryEvents( range );
+            BudgetScanned( events.size(), chunk, allowed );
             const auto found = std::find_if( events.begin(), events.end(), [&]( const auto& event ) { return event.ref == requested; } );
             if( found != events.end() ) return Success( id, MemoryEventJson( *found ), trace );
-            offset += events.size(); if( events.size() < chunk ) break;
+            offset += events.size(); if( events.size() < allowed ) break;
         }
+        if( BudgetPartial() ) return Success( id, { { "present", false }, { "reason", "query budget exhausted before the memory event ref was resolved" } }, trace );
         throw QueryError( "ENTITY_NOT_FOUND", "memory event ref was not found" );
     }
     if( method == "memory.active_at_time" )
@@ -2815,11 +3120,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto time = ScanRangeFrom( json { { "start_ns", params["time_ns"] }, { "end_ns", Decimal( std::numeric_limits<int64_t>::max() ) } }, 0, 1 ).startNs;
         const auto page = ParsePage( params, method, trace );
         const std::string pool = params.value( "pool_ref", "" );
-        auto [values, hasMore] = ScanFiltered<analysis::MemoryEventDto>( *source, json::object(), page,
+        auto scanPage = ScanFiltered<analysis::MemoryEventDto>( *source, json::object(), page,
             []( const auto& item, const auto& range ) { return item.ScanMemoryEvents( range ); },
             [&]( const auto& event ) { return ( pool.empty() || event.poolRef == pool ) && event.allocationNs <= time && ( !event.freeNs || *event.freeNs > time ); }, MemoryEventJson );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "time_ns", Decimal( time ) }, { "events", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "time_ns", Decimal( time ) }, { "events", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "memory.frame_snapshot" )
     {
@@ -2894,15 +3200,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto events = source->ScanMemoryEvents( range );
+            BudgetScanned( events.size(), chunk, allowed );
             for( const auto& event : events ) if( !event.freeNs ) active.emplace_back( event );
-            offset += events.size(); if( events.size() < chunk ) break;
+            offset += events.size(); if( events.size() < allowed ) break;
         }
         if( method == "memory.callstack_tree" )
         {
             struct Group { uint64_t bytes = 0, count = 0; };
-            std::map<uint32_t, Group> groups; for( const auto& event : active ) { auto& group = groups[event.allocationCallstack]; group.bytes += event.size; group.count++; }
+            std::map<uint32_t, Group> groups; for( const auto& event : active )
+            {
+                if( !groups.contains( event.allocationCallstack ) && !BudgetConsumeGroup() ) continue;
+                auto& group = groups[event.allocationCallstack]; group.bytes += event.size; group.count++;
+            }
             const auto maxDepth = params.value( "max_depth", size_t( 64 ) );
             if( maxDepth < 1 || maxDepth > 256 ) throw QueryError( "INVALID_PARAMS", "max_depth must be between 1 and 256" );
             const auto direction = params.value( "direction", "bottom_up" );
@@ -3115,11 +3427,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto page = ParsePage( params, method, trace );
         const std::string lockRef = params.value( "lock_ref", "" );
-        auto [events, hasMore] = ScanFiltered<analysis::LockEventDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::LockEventDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanLockEvents( range ); },
             [&]( const auto& event ) { return lockRef.empty() || event.lockRef == lockRef; }, LockEventJson );
-        const auto cursor = NextCursor( page, method, trace, events.size(), hasMore );
-        return Success( id, { { "events", std::move( events ) } }, trace, PageJson( page, events.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "events", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "lock.contention_statistics" )
     {
@@ -3130,10 +3443,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto events = source->ScanLockEvents( range );
+            BudgetScanned( events.size(), chunk, allowed );
             for( const auto& event : events )
             {
+                if( !groups.contains( event.lockRef ) && !BudgetConsumeGroup() ) continue;
                 auto& stats = groups[event.lockRef];
                 const bool wait = event.type == "wait" || event.type == "wait_shared";
                 const bool obtain = event.type == "obtain" || event.type == "obtain_shared";
@@ -3148,7 +3464,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( release ) stats.releases++;
             }
             offset += events.size();
-            if( events.size() < chunk ) break;
+            if( events.size() < allowed ) break;
         }
         json values = json::array();
         for( auto& [lockRef, stats] : groups ) values.push_back( {
@@ -3184,12 +3500,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto page = ParsePage( params, method, trace );
         const std::string plot = params.value( "plot_ref", "" );
-        auto [values, hasMore] = ScanFiltered<analysis::PlotPointDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::PlotPointDto>( *source, params, page,
             []( const auto& source, const auto& range ) { return source.ScanPlots( range ); },
             [&]( const auto& value ) { return plot.empty() || value.plotRef == plot; },
             []( const auto& value ) { return json { { "ref", value.ref }, { "plot_ref", value.plotRef }, { "time_ns", Decimal( value.timeNs ) }, { "value", value.value } }; } );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "points", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "points", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "plot.statistics" || method == "plot.downsample" )
     {
@@ -3201,11 +3518,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto values = source->ScanPlots( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& point : values ) if( point.plotRef == plot ) points.emplace_back( point );
             offset += values.size();
-            if( values.size() < chunk ) break;
+            if( values.size() < allowed ) break;
         }
         if( method == "plot.statistics" )
         {
@@ -3246,18 +3565,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::optional<uint32_t> callstack;
         if( params.contains( "callstack" ) ) callstack = parseCallstack( params["callstack"] );
         const auto page = ParsePage( params, method, trace );
-        auto [values, hasMore] = ScanFiltered<analysis::MessageDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::MessageDto>( *source, params, page,
             []( const auto& source, const auto& range ) { return source.ScanMessages( range ); },
             [&]( const auto& value ) { return ( requestedRef.empty() || value.ref == requestedRef ) && ( threadRef.empty() || value.threadRef == threadRef ) &&
                 ( !callstack || value.callstack == *callstack ) && TextMatches( value.text, params ); }, MessageJson );
         if( method == "message.get" )
         {
-            if( values.empty() ) throw QueryError( "ENTITY_NOT_FOUND", "message ref was not found" );
-            return Success( id, std::move( values.front() ), trace );
+            if( scanPage.values.empty() )
+            {
+                if( BudgetPartial() ) return Success( id, { { "present", false }, { "reason", "query budget exhausted before the message ref was resolved" } }, trace );
+                throw QueryError( "ENTITY_NOT_FOUND", "message ref was not found" );
+            }
+            return Success( id, std::move( scanPage.values.front() ), trace );
         }
-        values = ProjectFields( std::move( values ), params );
-        const auto cursor = NextCursor( page, method, trace, values.size(), hasMore );
-        return Success( id, { { "messages", std::move( values ) } }, trace, PageJson( page, values.size(), cursor ) );
+        scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "messages", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {
@@ -3392,6 +3716,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::queue<std::string> frontier;
         frontier.push( rootRef );
         const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+        BudgetConsumeNode();
         bool truncated = false;
         while( !frontier.empty() )
         {
@@ -3407,7 +3732,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( edge.value( "source_ref", "" ) == current ) next = edge.value( "target_ref", "" );
                 else if( edge.value( "target_ref", "" ) == current ) next = edge.value( "source_ref", "" );
                 if( next.empty() || visited.contains( next ) ) continue;
-                if( visited.size() >= maxNodes ) { truncated = true; break; }
+                if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; break; }
                 visited.emplace( next );
                 frontier.push( next );
             }
@@ -3662,6 +3987,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::queue<uint64_t> frontier;
         visited.emplace( rootId );
         frontier.push( rootId );
+        BudgetConsumeNode();
         bool truncated = false;
         while( !frontier.empty() )
         {
@@ -3669,7 +3995,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             frontier.pop();
             for( const auto next : adjacency[current] )
             {
-                if( visited.size() >= maxNodes ) { truncated = true; break; }
+                if( visited.contains( next ) ) continue;
+                if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; break; }
                 if( visited.emplace( next ).second ) frontier.push( next );
             }
             if( truncated ) break;
@@ -3721,21 +4048,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
         const std::string kind = params.value( "kind", "" );
-        auto [samples, hasMore] = ScanFiltered<analysis::SampleDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::SampleDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanSampleEvents( range ); },
             [&]( const auto& sample ) { return ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind.empty() || sample.kind == kind ); }, SampleJson );
-        const auto cursor = NextCursor( page, method, trace, samples.size(), hasMore );
-        return Success( id, { { "samples", std::move( samples ) } }, trace, PageJson( page, samples.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "samples", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "sample.ghost_zones" )
     {
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
-        auto [zones, hasMore] = ScanFiltered<analysis::GhostZoneDto>( *source, params, page,
+        auto scanPage = ScanFiltered<analysis::GhostZoneDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanGhostZones( range ); },
             [&]( const auto& zone ) { return ( threadRef.empty() || zone.threadRef == threadRef ) && TextMatches( zone.name + " " + zone.file, params ); }, GhostZoneJson );
-        const auto cursor = NextCursor( page, method, trace, zones.size(), hasMore );
-        return Success( id, { { "ready", true }, { "ghost_zones", std::move( zones ) } }, trace, PageJson( page, zones.size(), cursor ) );
+        const auto returned = scanPage.values.size();
+        const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+        return Success( id, { { "ready", true }, { "ghost_zones", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
     }
     if( method == "sample.flamegraph" )
     {
@@ -3752,10 +4081,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto samples = source->ScanSampleEvents( range );
-            for( const auto& sample : samples ) if( sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) ) counts[sample.callstack]++;
-            offset += samples.size(); if( samples.size() < chunk ) break;
+            BudgetScanned( samples.size(), chunk, allowed );
+            for( const auto& sample : samples ) if( sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
+            {
+                if( !counts.contains( sample.callstack ) && !BudgetConsumeGroup() ) continue;
+                counts[sample.callstack]++;
+            }
+            offset += samples.size(); if( samples.size() < allowed ) break;
         }
         std::vector<uint32_t> callstacks; callstacks.reserve( counts.size() ); for( const auto& [callstack, count] : counts ) callstacks.emplace_back( callstack );
         std::unordered_map<uint32_t, std::vector<std::string>> paths;
@@ -3953,27 +4288,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto zones = source->ScanCpuZones( range );
+            BudgetScanned( zones.size(), chunk, allowed );
             for( const auto& zone : zones ) if( zone.endNs )
             {
+                if( !groups.contains( zone.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                 auto& stats = groups[zone.sourceLocationRef]; stats.cpuCount++; stats.cpuInclusive += *zone.endNs - zone.startNs;
                 if( zone.selfTimeNs ) stats.cpuSelf += *zone.selfTimeNs; if( zone.runningTimeNs ) stats.cpuRunning += *zone.runningTimeNs;
             }
-            offset += zones.size(); if( zones.size() < chunk ) break;
+            offset += zones.size(); if( zones.size() < allowed ) break;
         }
         offset = 0;
         while( true )
         {
             checkCancelled();
-            auto range = ScanRangeFrom( params, offset, chunk );
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            auto range = ScanRangeFrom( params, offset, allowed );
             const auto zones = source->ScanGpuZones( range );
+            BudgetScanned( zones.size(), chunk, allowed );
             for( const auto& zone : zones ) if( zone.gpuEndNs )
             {
+                if( !groups.contains( zone.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                 auto& stats = groups[zone.sourceLocationRef]; stats.gpuCount++; stats.gpuInclusive += *zone.gpuEndNs - zone.gpuStartNs;
                 if( zone.selfTimeNs ) stats.gpuSelf += *zone.selfTimeNs;
             }
-            offset += zones.size(); if( zones.size() < chunk ) break;
+            offset += zones.size(); if( zones.size() < allowed ) break;
         }
         const auto locations = source->GetSourceLocations();
         std::unordered_map<std::string, analysis::SourceLocationDto> metadata;
@@ -4170,6 +4511,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             using ZoneMap = std::map<std::string, ZoneAggregate>;
             const auto domain = params.value( "zone_domain", "cpu" );
             if( domain != "cpu" && domain != "gpu" ) throw QueryError( "INVALID_PARAMS", "zone_domain must be cpu or gpu" );
+            std::set<std::string> budgetedGroupKeys;
             const auto collect = [&]( const std::shared_ptr<analysis::TraceSource>& item ) {
                 ZoneMap groups;
                 size_t offset = 0;
@@ -4177,7 +4519,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 while( true )
                 {
                     checkCancelled();
-                    auto range = ScanRangeFrom( params, offset, chunk );
+                    const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                    auto range = ScanRangeFrom( params, offset, allowed );
                     size_t count = 0;
                     if( domain == "gpu" )
                     {
@@ -4186,6 +4529,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         for( const auto& zone : zones ) if( zone.gpuEndNs && TextMatches( zone.name + " " + zone.function + " " + zone.file, params ) )
                         {
                             const auto key = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + zone.name + '|' + zone.function;
+                            if( !budgetedGroupKeys.contains( key ) )
+                            {
+                                if( !BudgetConsumeGroup() ) continue;
+                                budgetedGroupKeys.emplace( key );
+                            }
                             auto& group = groups[key]; group.name = zone.name; group.function = zone.function; group.file = zone.file; group.line = zone.line;
                             group.inclusive.emplace_back( *zone.gpuEndNs - zone.gpuStartNs );
                             if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
@@ -4198,14 +4546,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         for( const auto& zone : zones ) if( zone.endNs && TextMatches( zone.name + " " + zone.function + " " + zone.file, params ) )
                         {
                             const auto key = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + zone.name + '|' + zone.function;
+                            if( !budgetedGroupKeys.contains( key ) )
+                            {
+                                if( !BudgetConsumeGroup() ) continue;
+                                budgetedGroupKeys.emplace( key );
+                            }
                             auto& group = groups[key]; group.name = zone.name; group.function = zone.function; group.file = zone.file; group.line = zone.line;
                             group.inclusive.emplace_back( *zone.endNs - zone.startNs );
                             if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
                             if( zone.runningTimeNs ) group.running.emplace_back( *zone.runningTimeNs );
                         }
                     }
+                    BudgetScanned( count, chunk, allowed );
                     offset += count;
-                    if( count < chunk ) break;
+                    if( count < allowed ) break;
                 }
                 return groups;
             };
@@ -4344,6 +4698,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "count", Decimal( count ) }, { "refs", std::move( refs ) } } );
         };
         const auto addRef = []( json& refs, const std::string& ref ) { if( refs.size() < 20 ) refs.emplace_back( ref ); };
+        if( trace.sourceKind == analysis::TraceSourceKind::Segment && !trace.complete )
+        {
+            addFinding( "warning", "TRUNCATED_STREAM_TAIL", "the selected committed stream revision has an incomplete or truncated tail; results are bounded to the last readable records", 1 );
+        }
         struct ReferenceFinding { uint64_t count = 0; json refs = json::array(); };
         std::map<std::string, ReferenceFinding> referenceFindings;
         const auto noteReference = [&]( const char* kind, const std::string& ownerRef ) {
@@ -4369,8 +4727,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanCpuZones( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 cpuZoneRefs.emplace( value.ref );
@@ -4383,14 +4743,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( value.endNs && *value.endNs < value.startNs ) { invalidCpu++; addRef( invalidCpuRefs, value.ref ); }
             }
             offset += values.size();
-            if( values.size() < chunk ) break;
+            if( values.size() < allowed ) break;
         }
         offset = 0;
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanGpuZones( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 gpuZoneRefs.emplace( value.ref );
@@ -4403,15 +4765,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( ( value.gpuEndNs && *value.gpuEndNs < value.gpuStartNs ) || ( value.cpuEndNs && *value.cpuEndNs < value.cpuStartNs ) ) { invalidGpu++; addRef( invalidGpuRefs, value.ref ); }
             }
             offset += values.size();
-            if( values.size() < chunk ) break;
+            if( values.size() < allowed ) break;
         }
         if( incompleteCpu ) addFinding( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", incompleteCpu, std::move( incompleteCpuRefs ) );
         if( invalidCpu ) addFinding( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", invalidCpu, std::move( invalidCpuRefs ) );
         if( unresolvedCpuNames ) addFinding( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", unresolvedCpuNames, std::move( unresolvedCpuNameRefs ) );
         if( incompleteGpu ) addFinding( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", incompleteGpu, std::move( incompleteGpuRefs ) );
         if( invalidGpu ) addFinding( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", invalidGpu, std::move( invalidGpuRefs ) );
-        for( const auto& [owner, parent] : cpuParents ) if( cpuZoneRefs.find( parent ) == cpuZoneRefs.end() ) noteReference( "CPU_ZONE_PARENT", owner );
-        for( const auto& [owner, parent] : gpuParents ) if( gpuZoneRefs.find( parent ) == gpuZoneRefs.end() ) noteReference( "GPU_ZONE_PARENT", owner );
+        if( !BudgetPartial() )
+        {
+            for( const auto& [owner, parent] : cpuParents ) if( cpuZoneRefs.find( parent ) == cpuZoneRefs.end() ) noteReference( "CPU_ZONE_PARENT", owner );
+            for( const auto& [owner, parent] : gpuParents ) if( gpuZoneRefs.find( parent ) == gpuZoneRefs.end() ) noteReference( "GPU_ZONE_PARENT", owner );
+        }
 
         size_t incompleteFrames = 0, invalidFrames = 0;
         json incompleteFrameRefs = json::array(), invalidFrameRefs = json::array();
@@ -4419,8 +4784,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanFrames( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.frameSetRef.empty() && frameSetRefs.find( value.frameSetRef ) == frameSetRefs.end() ) noteReference( "FRAME_SET", value.ref );
@@ -4428,7 +4795,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !value.complete ) { incompleteFrames++; addRef( incompleteFrameRefs, value.ref ); }
                 if( value.endNs && *value.endNs < value.beginNs ) { invalidFrames++; addRef( invalidFrameRefs, value.ref ); }
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
         if( incompleteFrames ) addFinding( "info", "INCOMPLETE_FRAMES", "frame sets contain an open final frame", incompleteFrames, std::move( incompleteFrameRefs ) );
         if( invalidFrames ) addFinding( "error", "INVALID_FRAME_TIMING", "frames end before they begin", invalidFrames, std::move( invalidFrameRefs ) );
@@ -4439,8 +4806,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanMemoryEvents( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.poolRef.empty() && memoryPoolRefs.find( value.poolRef ) == memoryPoolRefs.end() ) noteReference( "MEMORY_POOL", value.ref );
@@ -4452,7 +4821,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( value.freeCallstack != 0 ) referencedCallstacks.emplace( value.freeCallstack );
                 if( value.freeNs && *value.freeNs < value.allocationNs ) { invalidMemory++; addRef( invalidMemoryRefs, value.ref ); }
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
         if( invalidMemory ) addFinding( "error", "INVALID_MEMORY_LIFETIME", "memory events are freed before allocation", invalidMemory, std::move( invalidMemoryRefs ) );
         size_t invalidContextSwitches = 0, invalidWakeups = 0;
@@ -4461,15 +4830,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanContextSwitchEvents( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
                 if( value.endNs && *value.endNs < value.startNs ) { invalidContextSwitches++; addRef( invalidContextRefs, value.ref ); }
                 if( value.wakeupNs && *value.wakeupNs > value.startNs ) { invalidWakeups++; addRef( invalidWakeupRefs, value.ref ); }
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
         if( invalidContextSwitches ) addFinding( "error", "INVALID_CONTEXT_SWITCH_TIMING", "context-switch running intervals are reversed", invalidContextSwitches, std::move( invalidContextRefs ) );
         if( invalidWakeups ) addFinding( "warning", "INVALID_WAKEUP_ORDER", "thread wakeup occurs after its running interval begins", invalidWakeups, std::move( invalidWakeupRefs ) );
@@ -4478,14 +4849,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanSampleEvents( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
                 if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
         if( metadata.samplesInconsistent ) addFinding( "warning", "INCONSISTENT_SAMPLES", "sampling data was marked inconsistent by Worker", 1 );
 
@@ -4493,21 +4866,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanMessages( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
                 if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
         offset = 0;
         while( true )
         {
             checkCancelled();
-            analysis::ScanRange range; range.offset = offset; range.limit = chunk;
+            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
             const auto values = source->ScanLockEvents( range );
+            BudgetScanned( values.size(), chunk, allowed );
             for( const auto& value : values )
             {
                 if( !value.lockRef.empty() && lockRefs.find( value.lockRef ) == lockRefs.end() ) noteReference( "LOCK", value.ref );
@@ -4515,7 +4892,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( value.ownerThreadRef && threadRefs.find( *value.ownerThreadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
                 for( const auto& waiter : value.waiterThreadRefs ) if( threadRefs.find( waiter ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
             }
-            offset += values.size(); if( values.size() < chunk ) break;
+            offset += values.size(); if( values.size() < allowed ) break;
         }
 
         if( metadata.hasCrash )
@@ -4571,10 +4948,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             findings.push_back( { { "severity", "info" }, { "code", "CAPABILITY_ABSENT" }, { "message", capability.reason.empty() ? capability.domain + " is absent" : capability.reason },
                 { "count", "0" }, { "refs", json::array() }, { "domain", capability.domain } } );
         }
+        if( BudgetPartial() ) addFinding( "info", "VALIDATION_PARTIAL", "validation stopped at the caller-supplied query budget; rerun with a larger budget for a complete verdict", 1 );
         const auto errors = std::count_if( findings.begin(), findings.end(), []( const auto& finding ) { return finding.value( "severity", "" ) == "error"; } );
         return Success( id, {
-            { "valid", errors == 0 }, { "error_count", errors }, { "finding_count", findings.size() }, { "findings", std::move( findings ) },
-            { "checks", { "worker_load", "cpu_zone_timing", "gpu_zone_timing", "zone_parent_references", "frame_boundaries", "frame_image_references", "memory_lifetimes", "entity_references", "callstack_references", "symbol_references", "context_switch_timing", "sample_consistency", "gtmem1_protocol", "gpu_pass_pairing", "capability_presence" } }
+            { "valid", errors == 0 }, { "complete", !BudgetPartial() && trace.complete }, { "error_count", errors }, { "finding_count", findings.size() }, { "findings", std::move( findings ) },
+            { "checks", { "worker_load", "stream_completeness", "cpu_zone_timing", "gpu_zone_timing", "zone_parent_references", "frame_boundaries", "frame_image_references", "memory_lifetimes", "entity_references", "callstack_references", "symbol_references", "context_switch_timing", "sample_consistency", "gtmem1_protocol", "gpu_pass_pairing", "capability_presence" } }
         }, trace );
     }
 

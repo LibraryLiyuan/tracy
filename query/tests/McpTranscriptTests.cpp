@@ -50,12 +50,17 @@ int main()
     assert( ( *inspect )["inputSchema"]["properties"].contains( "method" ) );
     assert( ( *inspect )["inputSchema"]["properties"].contains( "params" ) );
     assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
+    assert( ( *inspect )["inputSchema"]["properties"]["method"]["enum"].size() == tracy::query::QueryMethodRegistry().size() );
+    assert( ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] == tracy::query::QueryOperationSchemaRegistry() );
+    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.5.0" );
+    assert( ( *inspect )["outputSchema"]["properties"].contains( "partial" ) );
 
     const auto described = query.Execute( {
         { "protocol", tracy::query::QueryProtocol }, { "id", "mcp-registry" },
         { "method", "system.describe" }, { "params", json::object() }
     } );
     assert( described["ok"] == true );
+    assert( described["data"]["operations"] == ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] );
     std::set<std::string> describedMethods;
     for( const auto& method : described["data"]["methods"] ) describedMethods.emplace( method.get<std::string>() );
     const std::set<std::string> registeredMethods( tracy::query::QueryMethodRegistry().begin(), tracy::query::QueryMethodRegistry().end() );

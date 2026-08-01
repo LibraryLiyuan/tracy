@@ -206,7 +206,7 @@ try
 
     $result = [ordered]@{
         status = 'passed'
-        query_schema = '1.4.0'
+        query_schema = '1.5.0'
         scene = $snapshot.scene
         config_generation = $snapshot.config_generation
         cpu_zones = $snapshot.cpu_zones

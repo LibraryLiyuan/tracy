@@ -127,7 +127,10 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.4.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.5.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
+    assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
+    assert( schema.at( "$defs" ).contains( "budget" ) );
     assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
@@ -369,12 +372,23 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
+    assert( described.at( "schema_version" ) == "1.5.0" );
+    assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
+    assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
     for( const auto& method : described.at( "data" ).at( "methods" ) ) describedMethods.emplace( method.get<std::string>() );
     std::set<std::string> coveredMethods;
     for( const auto& domain : coverage.at( "domains" ) ) for( const auto& method : domain.at( "methods" ) ) coveredMethods.emplace( method.get<std::string>() );
     assert( describedMethods == coveredMethods );
     const auto& operations = described.at( "data" ).at( "operations" );
+    assert( operations.size() == describedMethods.size() );
+    for( const auto& operation : operations )
+    {
+        assert( operation.at( "schema_version" ) == "1.5.0" );
+        assert( operation.at( "input_schema" ).at( "type" ) == "object" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.5.0" );
+        assert( operation.at( "budget_parameters" ).size() == 4 );
+    }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
         return operation.at( "method" ) == "producer.get";
     } );
@@ -388,6 +402,7 @@ int main()
     assert( schemaResponse.at( "data" ).at( "coverage" ).at( "domain" ).at( "domain_status" ) == "complete" );
     assert( schemaResponse.at( "data" ).at( "coverage" ).at( "field" ).at( "status" ) == "complete" );
     assert( schemaResponse.at( "data" ).at( "coverage" ).at( "mcp" ).at( "status" ) == "complete" );
+    assert( schemaResponse.at( "data" ).at( "operations" ) == operations );
 
     int requestId = 200;
     for( const auto& method : describedMethods )
@@ -712,6 +727,43 @@ int main()
     } ) );
     assert( secondPage.at( "ok" ) && secondPage.at( "page" ).at( "next_cursor" ).is_null() );
     assert( firstPage.at( "data" ).at( "zones" )[0].at( "ref" ) != secondPage.at( "data" ).at( "zones" )[0].at( "ref" ) );
+
+    const auto budgetedFirstPage = service.Execute( Request( requestId++, "zone.cpu.search", {
+        { "trace_id", candidateId }, { "limit", 1 }, { "max_scan_events", 1 }
+    } ) );
+    assert( budgetedFirstPage.at( "ok" ) && budgetedFirstPage.at( "partial" ) == true );
+    assert( budgetedFirstPage.at( "omitted_count" ).is_null() );
+    assert( budgetedFirstPage.at( "page" ).at( "partial" ) == true );
+    assert( budgetedFirstPage.at( "page" ).at( "next_cursor" ).is_string() );
+    assert( budgetedFirstPage.at( "budget" ).at( "exhausted_by" ).at( 0 ) == "max_scan_events" );
+    const auto budgetedSecondPage = service.Execute( Request( requestId++, "zone.cpu.search", {
+        { "trace_id", candidateId }, { "limit", 1 }, { "max_scan_events", 2 },
+        { "cursor", budgetedFirstPage.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( budgetedSecondPage.at( "ok" ) && budgetedSecondPage.at( "partial" ) == false );
+    assert( budgetedSecondPage.at( "page" ).at( "next_cursor" ).is_null() );
+    assert( budgetedFirstPage.at( "data" ).at( "zones" )[0].at( "ref" ) != budgetedSecondPage.at( "data" ).at( "zones" )[0].at( "ref" ) );
+    assert( budgetedFirstPage.at( "data" ).at( "zones" )[0].at( "ref" ) == firstPage.at( "data" ).at( "zones" )[0].at( "ref" ) );
+    assert( budgetedSecondPage.at( "data" ).at( "zones" )[0].at( "ref" ) == secondPage.at( "data" ).at( "zones" )[0].at( "ref" ) );
+
+    const auto groupBudget = service.Execute( Request( requestId++, "zone.cpu.flamegraph", {
+        { "trace_id", candidateId }, { "max_groups", 1 }, { "max_scan_events", 100 }
+    } ) );
+    assert( groupBudget.at( "ok" ) && groupBudget.at( "partial" ) == true );
+    assert( groupBudget.at( "budget" ).at( "exhausted_by" ).at( 0 ) == "max_groups" );
+    assert( groupBudget.at( "data" ).at( "paths" ).size() == 1 );
+
+    const auto nodeBudget = service.Execute( Request( requestId++, "correlation.chain", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" }, { "max_nodes", 1 }
+    } ) );
+    assert( nodeBudget.at( "ok" ) && nodeBudget.at( "partial" ) == true );
+    assert( nodeBudget.at( "budget" ).at( "exhausted_by" ).at( 0 ) == "max_nodes" );
+    assert( nodeBudget.at( "data" ).at( "truncated" ) == true );
+
+    std::stop_source cancelledSource;
+    cancelledSource.request_stop();
+    const auto cancelled = service.Execute( Request( requestId++, "zone.cpu.search", { { "trace_id", candidateId } } ), std::nullopt, cancelledSource.get_token() );
+    assert( !cancelled.at( "ok" ) && cancelled.at( "error" ).at( "code" ) == "CANCELLED" );
 
     const auto invalidLimit = service.Execute( Request( requestId++, "frame.list", { { "trace_id", candidateId }, { "limit", 1001 } } ) );
     assert( !invalidLimit.at( "ok" ) && invalidLimit.at( "error" ).at( "code" ) == "INVALID_PARAMS" );

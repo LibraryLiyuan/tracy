@@ -63,13 +63,18 @@ std::string HexText( const analysis::SymbolCodeDto& code )
 
 json ToolOutputSchema()
 {
+    return QueryEnvelopeOutputSchema();
+}
+
+json EmptyBudgetJson()
+{
     return {
-        { "type", "object" }, { "required", { "protocol", "schema_version", "id", "ok" } },
-        { "properties", {
-            { "protocol", { { "const", QueryProtocol } } }, { "schema_version", { { "const", QuerySchemaVersion } } },
-            { "id", {} }, { "ok", { { "type", "boolean" } } }, { "data", {} }, { "trace", { { "type", "object" } } },
-            { "page", { { "type", "object" } } }, { "warnings", { { "type", "array" } } }, { "error", { { "type", "object" } } }
-        } }, { "additionalProperties", true }
+        { "limits", {
+            { "max_scan_events", std::to_string( DefaultMaxScanEvents ) }, { "max_cpu_ms", std::to_string( DefaultMaxCpuMs ) },
+            { "max_nodes", std::to_string( DefaultMaxNodes ) }, { "max_groups", std::to_string( DefaultMaxGroups ) }
+        } },
+        { "consumed", { { "scan_events", "0" }, { "cpu_ms", "0" }, { "nodes", "0" }, { "groups", "0" } } },
+        { "exhausted_by", json::array() }, { "omitted_count_exact", true }
     };
 }
 
@@ -340,7 +345,7 @@ json McpServer::ToolsList( const json& id ) const
         { "trace_id", traceId }, { "domain", enumeration( { "frame", "frame_image", "thread", "cpu_zone", "gpu_zone", "memory_event", "memory", "gpu_memory", "callstack", "parent_callstack", "symbol", "source", "lock", "message", "plot", "hardware_sample" } ) },
         { "operation", enumeration( { "get", "tree", "list", "active_at_time", "frame_snapshot", "diff", "callstack_tree", "leak_candidates", "allocations", "request_scopes", "pass_uses", "attribution", "frames", "raw_code", "disassembly", "lines", "embedded", "timeline", "points", "downsample", "statistics", "resource" } ) },
         { "ref", { { "type", "string" } } }, { "address", { { "type", "string" } } }, { "frame_set", {} }, { "index", { { "type", "integer" } } }, { "max_depth", { { "type", "integer" } } },
-        { "method", { { "type", "string" }, { "description", "Exact public tracy-query method returned by tracy_describe. Use this route when a workflow domain/operation mapping is insufficient." } } },
+        { "method", { { "type", "string" }, { "enum", QueryMethodRegistry() }, { "description", "Exact public tracy-query method returned by tracy_describe. Use this route when a workflow domain/operation mapping is insufficient." } } },
         { "params", { { "type", "object" }, { "description", "Parameters for method. A top-level trace_id is injected and must not conflict with params.trace_id." } } }
     };
     auto inspectTool = Tool( "tracy_inspect", "Inspect by the model-friendly domain/operation form, or call any public read-only tracy-query method using method plus params. Call tracy_describe first for exact required parameters.",
@@ -349,6 +354,7 @@ json McpServer::ToolsList( const json& id ) const
         { { "required", json::array( { "method" } ) } },
         { { "required", json::array( { "trace_id", "domain" } ) } }
     } );
+    inspectTool["inputSchema"]["x-tracy-operationSchemas"] = QueryOperationSchemaRegistry();
     tools.emplace_back( std::move( inspectTool ) );
 
     json timelineProperties = {
@@ -590,7 +596,8 @@ json McpServer::SubmitJob( json request, std::string operation )
     } );
     return {
         { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "id", "job-submit" }, { "ok", true },
-        { "data", { { "job_id", job->id }, { "state", "queued" }, { "operation", job->operation }, { "poll_with", "tracy_job" } } }, { "warnings", json::array() }
+        { "data", { { "job_id", job->id }, { "state", "queued" }, { "operation", job->operation }, { "poll_with", "tracy_job" } } },
+        { "partial", false }, { "omitted_count", "0" }, { "budget", EmptyBudgetJson() }, { "warnings", json::array() }
     };
 }
 
@@ -624,7 +631,8 @@ json McpServer::JobTool( const json& arguments )
         }
         return {
             { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "id", "job-cancel" }, { "ok", true },
-            { "data", { { "job_id", id }, { "state", job->state }, { "cancel_requested", true } } }, { "warnings", json::array() }
+            { "data", { { "job_id", id }, { "state", job->state }, { "cancel_requested", true } } },
+            { "partial", false }, { "omitted_count", "0" }, { "budget", EmptyBudgetJson() }, { "warnings", json::array() }
         };
     }
     std::lock_guard lock( job->mutex );
@@ -639,7 +647,8 @@ json McpServer::JobTool( const json& arguments )
     return {
         { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "id", "job-status" }, { "ok", true },
         { "data", { { "job_id", id }, { "state", job->state }, { "operation", job->operation },
-            { "done", job->state == "completed" || job->state == "failed" || job->state == "cancelled" } } }, { "warnings", json::array() }
+            { "done", job->state == "completed" || job->state == "failed" || job->state == "cancelled" } } },
+        { "partial", false }, { "omitted_count", "0" }, { "budget", EmptyBudgetJson() }, { "warnings", json::array() }
     };
 }
 

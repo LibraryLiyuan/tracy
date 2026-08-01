@@ -19,7 +19,7 @@ namespace tracy::query
 {
 
 inline constexpr const char* QueryProtocol = "tracy-query/1";
-inline constexpr const char* QuerySchemaVersion = "1.4.0";
+inline constexpr const char* QuerySchemaVersion = "1.5.0";
 inline constexpr size_t DefaultPageSize = 100;
 inline constexpr size_t MaximumPageSize = 1000;
 inline constexpr size_t DefaultTopN = 20;
@@ -27,6 +27,14 @@ inline constexpr size_t MaximumTopN = 500;
 inline constexpr size_t MaximumRequestBytes = 1024 * 1024;
 inline constexpr size_t MaximumResponseBytes = 8 * 1024 * 1024;
 inline constexpr size_t DefaultAnalysisCacheBytes = size_t( 512 ) * 1024 * 1024;
+inline constexpr uint64_t DefaultMaxScanEvents = 5000000;
+inline constexpr uint64_t MaximumMaxScanEvents = 100000000;
+inline constexpr uint64_t DefaultMaxCpuMs = 5000;
+inline constexpr uint64_t MaximumMaxCpuMs = 60000;
+inline constexpr uint64_t DefaultMaxNodes = 10000;
+inline constexpr uint64_t MaximumMaxNodes = 100000;
+inline constexpr uint64_t DefaultMaxGroups = 500;
+inline constexpr uint64_t MaximumMaxGroups = 10000;
 
 class QueryError : public std::runtime_error
 {
@@ -82,6 +90,8 @@ private:
 };
 
 const std::vector<std::string>& QueryMethodRegistry();
+const nlohmann::json& QueryOperationSchemaRegistry();
+const nlohmann::json& QueryEnvelopeOutputSchema();
 bool IsPublicQueryMethod( std::string_view method );
 std::string DumpProtocolJson( const nlohmann::json& value );
 

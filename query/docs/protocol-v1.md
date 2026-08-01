@@ -8,7 +8,7 @@ Every CLI/NDJSON request is an object with `protocol`, `id`, `method`, and optio
 {"protocol":"tracy-query/1","id":"request-1","method":"frame.outliers","params":{"trace_id":"trace-1","limit":20}}
 ```
 
-A success contains `schema_version=1.4.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; `system.describe` supplies the method inventory, required arguments, examples, numeric rules, and active limits. Schema 1.2 added typed Capture Context and Producer Quality queries. Schema 1.3 added versioned `JNCAT1` stable definitions and generation-bearing `JNENT1` entities. Schema 1.4 adds exact FrameIdentity and typed cross-domain correlation queries; it uses Tracy live protocol 78 and JN persisted-section schema 2 while retaining snapshot schema 1 load compatibility.
+A success contains `schema_version=1.5.0`, `ok=true`, `data`, warnings, and—when relevant—a trace read view and page. A failure contains `ok=false` plus a stable error code, human-readable message, retryability, and structured details. The authoritative envelope schema is `schema/tracy-query-v1.schema.json`; one canonical operation registry generates `system.describe`, `system.schema`, and the generic MCP inspect schema. Schema 1.2 added typed Capture Context and Producer Quality queries. Schema 1.3 added versioned `JNCAT1` stable definitions and generation-bearing `JNENT1` entities. Schema 1.4 added exact FrameIdentity and typed cross-domain correlation queries. Schema 1.5 adds bounded scan/CPU/node/group budgets, explicit partial-result metadata, raw-position cursors, and stream-completeness diagnostics.
 
 ## Numeric and range rules
 
@@ -24,7 +24,22 @@ A success contains `schema_version=1.4.0`, `ok=true`, `data`, warnings, and—wh
 
 Entities expose trace-scoped opaque refs such as `tracy:v1:<fingerprint-prefix>:cpu-zone:<id>`. Clients must not parse them. A ref from another trace is rejected.
 
-List methods default to 100 entries and accept at most 1000. Top-N analyses default to 20 and accept at most 500. Cursors are opaque Base64URL values bound to the session, revision, method, normalized parameters, sorting, and offset. Reusing a cursor after changing parameters or closing the trace returns `STALE_CURSOR`.
+List methods default to 100 entries and accept at most 1000. Top-N analyses default to 20 and accept at most 500. Cursors are opaque Base64URL values bound to the session, revision, method, normalized filters, sorting, logical offset, and raw scan position. Budget values are intentionally excluded from cursor binding so a caller may resume a partial page with a larger budget. Reusing a cursor after changing semantic parameters or closing the trace returns `STALE_CURSOR`.
+
+## Budgets and partial results
+
+Every request accepts `max_scan_events`, `max_cpu_ms`, `max_nodes`, and
+`max_groups`. The defaults are 5,000,000 events, 5,000 ms, 10,000 nodes, and
+500 groups; the hard maxima are 100,000,000 events, 60,000 ms, 100,000 nodes,
+and 10,000 groups.
+
+Every successful envelope contains `partial`, `omitted_count`, and `budget`.
+When no budget is exhausted, `partial=false`, `omitted_count="0"`, and the
+count is exact. When work stops at a budget, `partial=true`; an unknown omitted
+count is `null`, never a fabricated zero. Paginated scans also return a
+`next_cursor` at the first unconsumed raw record, so resuming produces neither
+duplicates nor omissions. Cancellation is different from a partial result: a
+cancelled request returns the stable `CANCELLED` failure code.
 
 While a trace is opening, `trace.status` also returns `load_progress` with the native Worker stage plus its global and per-stage counters. Loading is serialized, so these counters belong to the sole active loader. After native loading completes, the stage changes to `analysis_indexes` before the session becomes ready.
 
