@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tracy::analysis
@@ -14,7 +15,10 @@ namespace tracy::analysis
 inline constexpr const char* GpuD3D12PoolPrefix = "GPU D3D12 ";
 inline constexpr const char* GpuMemoryRequestMarker = "GTMEM Request Scope";
 inline constexpr const char* GpuMemoryPassMarker = "GTMEM Pass Relations";
+inline constexpr const char* GpuMemoryOriginMarker = "GTMEM Allocation Origin";
+inline constexpr const char* GpuMemoryResidencyMarker = "GTMEM Residency State";
 inline constexpr const char* GpuMemoryProtocolPrefix = "GTMEM1|";
+inline constexpr const char* GpuMemoryProtocol2Prefix = "GTMEM2|";
 
 bool IsGpuD3D12PoolName( const std::string& name );
 
@@ -102,6 +106,9 @@ struct GpuMemoryGpuZoneInput
     int64_t cpuStartNs = 0;
     int64_t gpuStartNs = 0;
     int64_t gpuEndNs = 0;
+    // Authoritative JN GPU pass relation. Zero means the zone is a taxonomy
+    // fallback and must use the legacy name/time pairing path.
+    uint64_t referenceToken = 0;
 };
 
 struct GpuMemoryAllocationInput
@@ -111,7 +118,74 @@ struct GpuMemoryAllocationInput
     uint64_t size = 0;
     uint64_t thread = 0;
     int64_t allocationNs = 0;
+    std::optional<int64_t> freeNs;
+    uint32_t allocationCallstack = 0;
+    uint32_t freeCallstack = 0;
     std::string poolName;
+};
+
+struct GpuMemoryAllocationOrigin
+{
+    uint64_t allocationId = 0;
+    uint64_t connectionId = 0;
+    uint64_t cpuZoneIndex = 0;
+    uint32_t callstackRequested = 0;
+    char layer = 'U';
+    char residency = 'U';
+    bool replayed = false;
+    bool preCapture = false;
+    bool callstackEmitted = false;
+    bool residencyManaged = false;
+};
+
+struct GpuMemoryResidencyEvent
+{
+    uint64_t allocationId = 0;
+    uint64_t frame = 0;
+    uint64_t fence = 0;
+    uint64_t size = 0;
+    uint64_t connectionId = 0;
+    uint64_t cpuZoneIndex = 0;
+    uint32_t flags = 0;
+    uint8_t reason = 0;
+    char state = 'U';
+    bool replayed = false;
+    int64_t timeNs = 0;
+};
+
+struct GpuMemoryFragmentation
+{
+    uint64_t heapId = 0;
+    uint64_t capacityBytes = 0;
+    uint64_t requestedBytes = 0;
+    uint64_t coveredBytes = 0;
+    uint64_t aliasedBytes = 0;
+    uint64_t freeBytes = 0;
+    uint64_t largestFreeBlockBytes = 0;
+    uint64_t logicalResourceCount = 0;
+    double externalFragmentationRatio = 0;
+};
+
+struct GpuMemoryChurn
+{
+    uint64_t peakPhysicalBytes = 0;
+    uint64_t activePhysicalBytes = 0;
+    uint64_t createdBytes = 0;
+    uint64_t createdCount = 0;
+    uint64_t freedBytes = 0;
+    uint64_t freedCount = 0;
+    uint64_t freedFromBaselineBytes = 0;
+    uint64_t freedFromBaselineCount = 0;
+};
+
+struct GpuMemoryResidencySummary
+{
+    uint64_t residentBytes = 0;
+    uint64_t residentCount = 0;
+    uint64_t evictedBytes = 0;
+    uint64_t evictedCount = 0;
+    uint64_t unknownBytes = 0;
+    uint64_t unknownCount = 0;
 };
 
 struct GpuMemoryRequestScope
@@ -136,7 +210,10 @@ enum class GpuZonePairing : uint8_t
 {
     Missing,
     Exact,
-    Ambiguous
+    Ambiguous,
+    CaptureBoundary,
+    SubmissionUnobserved,
+    GpuResultUnavailable
 };
 
 struct GpuMemoryPass
@@ -145,6 +222,7 @@ struct GpuMemoryPass
     uint64_t labelId = 0;
     uint64_t frame = 0;
     uint64_t ordinal = 0;
+    uint64_t commandListId = 0;
     uint64_t thread = 0;
     uint64_t gpuThread = 0;
     int64_t start = 0;
@@ -208,7 +286,11 @@ struct GpuMemoryWorkingSet
 struct GpuMemoryAttribution
 {
     bool protocolPresent = false;
+    bool protocol2Present = false;
     bool complete = true;
+    uint64_t captureBoundaryPasses = 0;
+    uint64_t submissionUnobservedPasses = 0;
+    uint64_t gpuResultUnavailablePasses = 0;
     std::vector<std::string> warnings;
     std::vector<GpuMemoryRequestScope> requestScopes;
     std::vector<GpuMemoryPass> passes;
@@ -216,15 +298,24 @@ struct GpuMemoryAttribution
     std::vector<GpuMemoryLogicalResource> logicalResources;
     std::vector<GpuMemoryOwnerRollup> ownerRollups;
     std::vector<GpuMemoryWorkingSet> workingSets;
+    std::vector<GpuMemoryAllocationOrigin> origins;
+    std::vector<GpuMemoryResidencyEvent> residencyEvents;
+    std::vector<GpuMemoryFragmentation> fragmentation;
+    GpuMemoryChurn churn;
+    GpuMemoryResidencySummary residency;
     std::unordered_map<uint64_t, size_t> passById;
     std::unordered_map<uint64_t, size_t> allocationById;
     std::unordered_map<uint64_t, size_t> logicalById;
+    std::unordered_map<uint64_t, size_t> physicalOriginById;
+    std::unordered_map<uint64_t, size_t> logicalOriginById;
 };
 
 GpuMemoryAttribution BuildGpuMemoryAttribution(
     const std::vector<GpuMemoryCpuZoneInput>& cpuZones,
     const std::vector<GpuMemoryGpuZoneInput>& gpuZones,
-    const std::vector<GpuMemoryAllocationInput>& allocations );
+    const std::vector<GpuMemoryAllocationInput>& allocations,
+    const std::unordered_set<uint64_t>& submittedCommandLists = {},
+    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens = {} );
 
 std::string FormatGpuMemoryUsage( uint32_t usageMask );
 const char* ToString( GpuZonePairing pairing );

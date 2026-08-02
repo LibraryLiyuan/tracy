@@ -197,7 +197,9 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
 }
 
 GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZoneInput>& cpuZones,
-    const std::vector<GpuMemoryGpuZoneInput>& gpuZones, const std::vector<GpuMemoryAllocationInput>& allocations )
+    const std::vector<GpuMemoryGpuZoneInput>& gpuZones, const std::vector<GpuMemoryAllocationInput>& allocations,
+    const std::unordered_set<uint64_t>& submittedCommandLists,
+    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens )
 {
     GpuMemoryAttribution result;
     std::unordered_map<uint64_t, GpuMemoryLogicalResource> logicalMetadata;
@@ -205,8 +207,60 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     {
         const bool requestMarker = zone.markerName == GpuMemoryRequestMarker;
         const bool passMarker = zone.markerName == GpuMemoryPassMarker;
-        if( !requestMarker && !passMarker ) continue;
+        const bool originMarker = zone.markerName == GpuMemoryOriginMarker;
+        const bool residencyMarker = zone.markerName == GpuMemoryResidencyMarker;
+        if( !requestMarker && !passMarker && !originMarker && !residencyMarker ) continue;
         result.protocolPresent = true;
+        if( originMarker || residencyMarker )
+        {
+            result.protocol2Present = true;
+            size_t cursor = 0;
+            while( cursor <= zone.text.size() )
+            {
+                const auto lineEnd = zone.text.find( '\n', cursor );
+                const auto line = zone.text.substr( cursor, lineEnd == std::string::npos ? std::string::npos : lineEnd - cursor );
+                if( originMarker && StartsWith( line, "GTMEM2|ORIGIN|" ) )
+                {
+                    GpuMemoryAllocationOrigin origin;
+                    origin.allocationId = UnsignedField( line, "allocation" );
+                    origin.connectionId = UnsignedField( line, "connection" );
+                    origin.cpuZoneIndex = zone.zoneIndex;
+                    origin.callstackRequested = uint32_t( UnsignedField( line, "callstack_requested" ) );
+                    const auto layer = Field( line, "layer" ); if( !layer.empty() ) origin.layer = layer.front();
+                    const auto residency = Field( line, "residency" ); if( !residency.empty() ) origin.residency = residency.front();
+                    origin.replayed = UnsignedField( line, "replayed" ) != 0;
+                    origin.preCapture = UnsignedField( line, "pre_capture" ) != 0;
+                    origin.callstackEmitted = UnsignedField( line, "callstack_emitted" ) != 0;
+                    origin.residencyManaged = UnsignedField( line, "managed" ) != 0;
+                    if( origin.allocationId != 0 )
+                    {
+                        const size_t index = result.origins.size();
+                        result.origins.emplace_back( origin );
+                        if( origin.layer == 'P' ) result.physicalOriginById[origin.allocationId] = index;
+                        else if( origin.layer == 'L' ) result.logicalOriginById[origin.allocationId] = index;
+                    }
+                }
+                else if( residencyMarker && StartsWith( line, "GTMEM2|RESIDENCY|" ) )
+                {
+                    GpuMemoryResidencyEvent event;
+                    event.allocationId = UnsignedField( line, "allocation" );
+                    event.frame = UnsignedField( line, "frame" );
+                    event.fence = UnsignedField( line, "fence" );
+                    event.size = UnsignedField( line, "bytes" );
+                    event.connectionId = UnsignedField( line, "connection" );
+                    event.cpuZoneIndex = zone.zoneIndex;
+                    event.flags = uint32_t( UnsignedField( line, "flags" ) );
+                    event.reason = uint8_t( UnsignedField( line, "reason" ) );
+                    const auto state = Field( line, "state" ); if( !state.empty() ) event.state = state.front();
+                    event.replayed = UnsignedField( line, "replayed" ) != 0;
+                    event.timeNs = zone.startNs;
+                    if( event.allocationId != 0 ) result.residencyEvents.emplace_back( event );
+                }
+                if( lineEnd == std::string::npos ) break;
+                cursor = lineEnd + 1;
+            }
+            continue;
+        }
         if( requestMarker )
         {
             size_t cursor = 0;
@@ -258,7 +312,8 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
                 pass.commandCount = uint32_t( UnsignedField( line, "commands" ) ); pass.emittedUseCount = uint32_t( UnsignedField( line, "uses" ) );
                 pass.totalUseCount = uint32_t( UnsignedField( line, "total" ) ); pass.expectedChunks = uint32_t( UnsignedField( line, "chunks" ) );
                 pass.untrackedReferences = uint32_t( UnsignedField( line, "untracked" ) ); pass.truncated = UnsignedField( line, "truncated" ) != 0;
-                pass.droppedUses = uint32_t( UnsignedField( line, "dropped" ) ); header = pass.passId != 0;
+                pass.droppedUses = uint32_t( UnsignedField( line, "dropped" ) ); pass.commandListId = UnsignedField( line, "command_list" );
+                header = pass.passId != 0;
             }
             else if( StartsWith( line, "GTMEM1|USE|" ) )
             {
@@ -346,23 +401,133 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     }
 
     std::unordered_map<uint64_t, uint64_t> physicalSizes;
+    std::unordered_map<uint64_t, bool> physicalActive;
+    std::unordered_map<uint64_t, bool> logicalActive;
+    std::unordered_map<uint64_t, uint64_t> activeHeapSizes;
+    struct ChurnPoint { int64_t time; int64_t bytes; int32_t count; bool allocation; };
+    std::vector<ChurnPoint> churnPoints;
     for( const auto& allocation : allocations )
     {
         if( StartsWith( allocation.poolName, "GPU D3D12 Physical " ) )
+        {
             physicalSizes[allocation.allocationId] = std::max( physicalSizes[allocation.allocationId], allocation.size );
+            physicalActive[allocation.allocationId] = !allocation.freeNs.has_value();
+            if( !allocation.freeNs && allocation.poolName.find( " Heap" ) != std::string::npos )
+                activeHeapSizes[allocation.allocationId] = allocation.size;
+            churnPoints.push_back( { allocation.allocationNs, int64_t( allocation.size ), 1, true } );
+            if( allocation.freeNs ) churnPoints.push_back( { *allocation.freeNs, -int64_t( allocation.size ), -1, false } );
+            const auto origin = result.physicalOriginById.find( allocation.allocationId );
+            const bool baseline = origin != result.physicalOriginById.end() &&
+                ( result.origins[origin->second].replayed || result.origins[origin->second].preCapture );
+            if( !baseline )
+            {
+                result.churn.createdBytes += allocation.size;
+                result.churn.createdCount++;
+            }
+            if( allocation.freeNs )
+            {
+                if( baseline )
+                {
+                    result.churn.freedFromBaselineBytes += allocation.size;
+                    result.churn.freedFromBaselineCount++;
+                }
+                else
+                {
+                    result.churn.freedBytes += allocation.size;
+                    result.churn.freedCount++;
+                }
+            }
+            if( !allocation.freeNs ) result.churn.activePhysicalBytes += allocation.size;
+        }
+        else if( StartsWith( allocation.poolName, "GPU D3D12 Logical " ) )
+        {
+            logicalActive[allocation.allocationId] = !allocation.freeNs.has_value();
+        }
     }
     for( const auto& resource : result.logicalResources )
         physicalSizes[resource.physicalAllocationId] = std::max( physicalSizes[resource.physicalAllocationId], resource.size );
+
+    std::sort( churnPoints.begin(), churnPoints.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.time != rhs.time ? lhs.time < rhs.time : lhs.allocation > rhs.allocation;
+    } );
+    int64_t activePhysicalBytes = 0;
+    for( const auto& point : churnPoints )
+    {
+        activePhysicalBytes = std::max<int64_t>( 0, activePhysicalBytes + point.bytes );
+        result.churn.peakPhysicalBytes = std::max<uint64_t>( result.churn.peakPhysicalBytes, uint64_t( activePhysicalBytes ) );
+    }
+
+    for( const auto& [heapId, capacity] : activeHeapSizes )
+    {
+        struct Interval { uint64_t begin; uint64_t end; };
+        std::vector<Interval> intervals;
+        GpuMemoryFragmentation heap;
+        heap.heapId = heapId;
+        heap.capacityBytes = capacity;
+        for( const auto& resource : result.logicalResources )
+        {
+            if( resource.physicalAllocationId != heapId || !logicalActive[resource.logicalResourceId] ) continue;
+            heap.requestedBytes += resource.size;
+            heap.logicalResourceCount++;
+            const uint64_t begin = std::min( resource.physicalOffset, capacity );
+            const uint64_t end = std::min( capacity, begin + std::min( resource.size, capacity - begin ) );
+            if( end > begin ) intervals.push_back( { begin, end } );
+        }
+        std::sort( intervals.begin(), intervals.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.begin != rhs.begin ? lhs.begin < rhs.begin : lhs.end < rhs.end;
+        } );
+        uint64_t cursor = 0;
+        for( const auto& interval : intervals )
+        {
+            if( interval.begin > cursor ) heap.largestFreeBlockBytes = std::max( heap.largestFreeBlockBytes, interval.begin - cursor );
+            if( interval.end > cursor )
+            {
+                heap.coveredBytes += interval.end - std::max( cursor, interval.begin );
+                cursor = interval.end;
+            }
+        }
+        if( cursor < capacity ) heap.largestFreeBlockBytes = std::max( heap.largestFreeBlockBytes, capacity - cursor );
+        heap.freeBytes = capacity - std::min( capacity, heap.coveredBytes );
+        heap.aliasedBytes = heap.requestedBytes > heap.coveredBytes ? heap.requestedBytes - heap.coveredBytes : 0;
+        heap.externalFragmentationRatio = heap.freeBytes == 0 ? 0.0 :
+            1.0 - double( heap.largestFreeBlockBytes ) / double( heap.freeBytes );
+        result.fragmentation.emplace_back( heap );
+    }
+    std::sort( result.fragmentation.begin(), result.fragmentation.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.externalFragmentationRatio != rhs.externalFragmentationRatio ?
+            lhs.externalFragmentationRatio > rhs.externalFragmentationRatio : lhs.heapId < rhs.heapId;
+    } );
+
+    std::unordered_map<uint64_t, char> residencyByPhysical;
+    for( const auto& [allocationId, originIndex] : result.physicalOriginById )
+        residencyByPhysical[allocationId] = result.origins[originIndex].residency;
+    std::sort( result.residencyEvents.begin(), result.residencyEvents.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.allocationId < rhs.allocationId;
+    } );
+    for( const auto& event : result.residencyEvents ) residencyByPhysical[event.allocationId] = event.state;
+    for( const auto& [allocationId, size] : physicalSizes )
+    {
+        if( !physicalActive[allocationId] ) continue;
+        const char state = residencyByPhysical.count( allocationId ) != 0 ? residencyByPhysical[allocationId] : 'U';
+        if( state == 'R' ) { result.residency.residentBytes += size; result.residency.residentCount++; }
+        else if( state == 'E' ) { result.residency.evictedBytes += size; result.residency.evictedCount++; }
+        else { result.residency.unknownBytes += size; result.residency.unknownCount++; }
+    }
 
     std::map<uint32_t, std::set<uint64_t>> ownerPhysicalIds;
     std::map<uint32_t, std::set<uint64_t>> ownerLogicalIds;
     for( const auto& resource : result.logicalResources )
     {
-        if( resource.primaryOwnerId != 0 ) ownerLogicalIds[resource.primaryOwnerId].insert( resource.logicalResourceId );
+        ownerLogicalIds[resource.primaryOwnerId].insert( resource.logicalResourceId );
         uint32_t physicalOwner = resource.physicalOwnerId;
         if( physicalOwner == 0 && resource.physicalAllocationId == resource.logicalResourceId ) physicalOwner = resource.primaryOwnerId;
-        if( physicalOwner != 0 ) ownerPhysicalIds[physicalOwner].insert( resource.physicalAllocationId );
+        if( resource.physicalAllocationId == resource.logicalResourceId || physicalOwner != 0 )
+            ownerPhysicalIds[physicalOwner].insert( resource.physicalAllocationId );
     }
+    std::set<uint64_t> assignedPhysicalIds;
+    for( const auto& [owner, ids] : ownerPhysicalIds ) assignedPhysicalIds.insert( ids.begin(), ids.end() );
+    for( const auto& [allocationId, size] : physicalSizes )
+        if( assignedPhysicalIds.count( allocationId ) == 0 ) ownerPhysicalIds[0].insert( allocationId );
     std::set<uint32_t> ownerIds;
     for( const auto& [owner, values] : ownerPhysicalIds ) ownerIds.insert( owner );
     for( const auto& [owner, values] : ownerLogicalIds ) ownerIds.insert( owner );
@@ -404,11 +569,40 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         result.workingSets.emplace_back( workingSet );
     }
 
+    std::unordered_map<uint64_t, std::vector<const GpuMemoryGpuZoneInput*>> gpuByReference;
     std::unordered_map<std::string, std::vector<const GpuMemoryGpuZoneInput*>> gpuByName;
-    for( const auto& zone : gpuZones ) gpuByName[zone.name].emplace_back( &zone );
+    for( const auto& zone : gpuZones )
+    {
+        if( zone.referenceToken != 0 ) gpuByReference[zone.referenceToken].emplace_back( &zone );
+        gpuByName[zone.name].emplace_back( &zone );
+    }
     for( auto& [name, values] : gpuByName ) std::sort( values.begin(), values.end(), []( const auto* lhs, const auto* rhs ) { return lhs->cpuStartNs < rhs->cpuStartNs; } );
     for( auto& pass : result.passes )
     {
+        const auto authoritative = gpuByReference.find( pass.passId );
+        if( authoritative != gpuByReference.end() )
+        {
+            if( authoritative->second.size() == 1 )
+            {
+                const auto* match = authoritative->second.front();
+                pass.gpuPairing = GpuZonePairing::Exact; pass.gpuZoneIndex = match->zoneIndex; pass.gpuThread = match->thread;
+                continue;
+            }
+            pass.gpuPairing = GpuZonePairing::Ambiguous; result.complete = false;
+            continue;
+        }
+        if( gpuSegmentReferenceTokens.find( pass.passId ) != gpuSegmentReferenceTokens.end() )
+        {
+            pass.gpuPairing = GpuZonePairing::GpuResultUnavailable;
+            result.gpuResultUnavailablePasses++;
+            continue;
+        }
+        if( pass.commandListId != 0 && !submittedCommandLists.empty() && submittedCommandLists.find( pass.commandListId ) == submittedCommandLists.end() )
+        {
+            pass.gpuPairing = GpuZonePairing::SubmissionUnobserved;
+            result.submissionUnobservedPasses++;
+            continue;
+        }
         const auto candidates = gpuByName.find( pass.name );
         if( candidates == gpuByName.end() ) continue;
         std::vector<const GpuMemoryGpuZoneInput*> matches;
@@ -426,11 +620,32 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         {
             pass.gpuPairing = GpuZonePairing::Ambiguous; result.complete = false;
         }
+        else
+        {
+            const GpuMemoryGpuZoneInput* first = nullptr;
+            const GpuMemoryGpuZoneInput* last = nullptr;
+            for( const auto* candidate : candidates->second )
+            {
+                if( candidate->thread != pass.thread ) continue;
+                if( !first ) first = candidate;
+                last = candidate;
+            }
+            // A bounded on-demand capture can receive CPU-side GTMEM metadata
+            // for fallback scopes whose D3D12 timestamp zone began before the
+            // connection, or whose result drains after capture stop. Preserve
+            // that unavailability explicitly; never invent a zone relation.
+            if( first && ( pass.end < first->cpuStartNs || pass.start > last->cpuStartNs ) )
+            {
+                pass.gpuPairing = GpuZonePairing::CaptureBoundary;
+                result.captureBoundaryPasses++;
+            }
+        }
     }
 
     if( result.protocolPresent && result.passes.empty() ) result.warnings.emplace_back( "GTMEM1 markers are present but no valid PASS record was parsed" );
     const auto missing = std::count_if( result.passes.begin(), result.passes.end(), []( const auto& pass ) { return pass.gpuPairing == GpuZonePairing::Missing; } );
     const auto ambiguous = std::count_if( result.passes.begin(), result.passes.end(), []( const auto& pass ) { return pass.gpuPairing == GpuZonePairing::Ambiguous; } );
+    if( missing || ambiguous ) result.complete = false;
     if( missing ) result.warnings.emplace_back( std::to_string( missing ) + " pass(es) have no matching GPU zone" );
     if( ambiguous ) result.warnings.emplace_back( std::to_string( ambiguous ) + " pass(es) have ambiguous GPU zone pairing" );
     return result;
@@ -458,6 +673,9 @@ const char* ToString( GpuZonePairing pairing )
     case GpuZonePairing::Missing: return "missing";
     case GpuZonePairing::Exact: return "exact";
     case GpuZonePairing::Ambiguous: return "ambiguous";
+    case GpuZonePairing::CaptureBoundary: return "capture_boundary";
+    case GpuZonePairing::SubmissionUnobserved: return "submission_unobserved";
+    case GpuZonePairing::GpuResultUnavailable: return "gpu_result_unavailable";
     }
     return "missing";
 }

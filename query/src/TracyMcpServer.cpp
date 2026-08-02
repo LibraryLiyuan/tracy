@@ -465,7 +465,9 @@ json McpServer::CallTool( const std::string& name, json arguments )
         {
             static const std::map<std::string, std::string> operations = {
                 { "allocations", "memory.gpu.allocations" }, { "request_scopes", "memory.gpu.request_scopes" },
-                { "pass_uses", "memory.gpu.pass_uses" }, { "attribution", "memory.gpu.attribution" }
+                { "pass_uses", "memory.gpu.pass_uses" }, { "attribution", "memory.gpu.attribution" },
+                { "summary", "memory.gpu.summary" }, { "residency", "memory.gpu.residency" },
+                { "fragmentation", "memory.gpu.fragmentation" }, { "churn", "memory.gpu.churn" }
             };
             const auto found = operations.find( operation ); if( found == operations.end() ) throw QueryError( "INVALID_PARAMS", "unsupported GPU memory inspect operation" ); method = found->second;
         }

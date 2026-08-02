@@ -525,7 +525,8 @@ enum class JnGfxRelation : uint8_t
     BelongsToCamera,
     BelongsToView,
     ReferencesResources,
-    ClassifiesAsTaxonomy
+    ClassifiesAsTaxonomy,
+    GpuSegmentReferencesResources
 };
 
 enum class JnFrameDomain : uint8_t

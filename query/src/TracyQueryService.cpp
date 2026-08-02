@@ -38,6 +38,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
         "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
+        "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn",
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
         "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.gfx.statistics", "job.gfx_chain",
@@ -769,6 +770,7 @@ json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemory
         { "ref", source.MakeEntityRef( "gpu-memory-pass", pass.passId ) }, { "pass_id", Decimal( pass.passId ) },
         { "label_id", Decimal( pass.labelId ) }, { "taxonomy_id", Decimal( pass.labelId ) },
         { "frame", Decimal( pass.frame ) }, { "ordinal", Decimal( pass.ordinal ) }, { "thread_id", Decimal( pass.thread ) },
+        { "command_list_id", Decimal( pass.commandListId ) },
         { "start_ns", Decimal( pass.start ) }, { "end_ns", Decimal( pass.end ) }, { "level", pass.level },
         { "name", pass.name }, { "operations", pass.operations }, { "command_count", pass.commandCount },
         { "emitted_use_count", pass.emittedUseCount }, { "total_use_count", pass.totalUseCount },
@@ -819,7 +821,8 @@ const char* GfxEntityKindName( uint8_t kind )
 const char* GfxRelationName( uint8_t relation )
 {
     static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits", "runs_on_gpu", "depends_on",
-        "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera", "belongs_to_view", "references_resources", "classifies_as_taxonomy" };
+        "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera", "belongs_to_view", "references_resources", "classifies_as_taxonomy",
+        "gpu_segment_references_resources" };
     return relation < std::size( names ) ? names[relation] : "unknown";
 }
 
@@ -4092,11 +4095,136 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json values = json::array(); for( const auto& event : active ) values.emplace_back( MemoryEventJson( event ) );
         return Success( id, { { "candidates", std::move( values ) }, { "heuristic", "allocations still active at capture end, ordered by size; not proof of a leak" } }, trace );
     }
-    if( method == "memory.gpu.allocations" || method == "memory.gpu.request_scopes" || method == "memory.gpu.pass_uses" || method == "memory.gpu.attribution" )
+    if( method == "memory.gpu.allocations" || method == "memory.gpu.request_scopes" || method == "memory.gpu.pass_uses" || method == "memory.gpu.attribution" ||
+        method == "memory.gpu.summary" || method == "memory.gpu.residency" || method == "memory.gpu.fragmentation" || method == "memory.gpu.churn" )
     {
         const auto attributionValue = CachedGpuAttribution( trace.id, source );
         const auto& attribution = *attributionValue;
         if( !attribution.protocolPresent && method != "memory.gpu.allocations" ) throw QueryError( "CAPABILITY_UNAVAILABLE", "trace contains no GTMEM1 relation protocol" );
+        const bool n10Method = method == "memory.gpu.summary" || method == "memory.gpu.residency" ||
+            method == "memory.gpu.fragmentation" || method == "memory.gpu.churn";
+        if( n10Method && !attribution.protocol2Present )
+            return Success( id, { { "present", false }, { "reason", "trace contains no GTMEM2 allocation-origin/residency protocol" } }, trace );
+
+        if( method == "memory.gpu.churn" )
+        {
+            const auto& churn = attribution.churn;
+            return Success( id, { { "present", true }, { "semantics", "live allocation churn excludes replayed/pre-capture baseline allocations" },
+                { "peak_physical_bytes", Decimal( churn.peakPhysicalBytes ) }, { "active_physical_bytes", Decimal( churn.activePhysicalBytes ) },
+                { "created_bytes", Decimal( churn.createdBytes ) }, { "created_count", Decimal( churn.createdCount ) },
+                { "freed_bytes", Decimal( churn.freedBytes ) }, { "freed_count", Decimal( churn.freedCount ) },
+                { "freed_from_baseline_bytes", Decimal( churn.freedFromBaselineBytes ) },
+                { "freed_from_baseline_count", Decimal( churn.freedFromBaselineCount ) } }, trace );
+        }
+        if( method == "memory.gpu.fragmentation" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const size_t begin = std::min( page.offset, attribution.fragmentation.size() );
+            const size_t end = std::min( begin + page.limit, attribution.fragmentation.size() );
+            json heaps = json::array();
+            for( size_t index = begin; index < end; index++ )
+            {
+                const auto& heap = attribution.fragmentation[index];
+                heaps.push_back( { { "heap_allocation_id", Decimal( heap.heapId ) },
+                    { "capacity_bytes", Decimal( heap.capacityBytes ) }, { "requested_bytes", Decimal( heap.requestedBytes ) },
+                    { "covered_bytes", Decimal( heap.coveredBytes ) }, { "aliased_bytes", Decimal( heap.aliasedBytes ) },
+                    { "free_bytes", Decimal( heap.freeBytes ) }, { "largest_free_block_bytes", Decimal( heap.largestFreeBlockBytes ) },
+                    { "logical_resource_count", Decimal( heap.logicalResourceCount ) },
+                    { "external_fragmentation_ratio", heap.externalFragmentationRatio } } );
+            }
+            const auto cursor = NextCursor( page, method, trace, end - begin, end < attribution.fragmentation.size() );
+            return Success( id, { { "present", true }, { "heaps", std::move( heaps ) },
+                { "semantics", "active placed-resource intervals at capture end; alias overlap is reported separately and is not fragmentation" } },
+                trace, PageJson( page, end - begin, cursor ) );
+        }
+        if( method == "memory.gpu.residency" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const size_t begin = std::min( page.offset, attribution.residencyEvents.size() );
+            const size_t end = std::min( begin + page.limit, attribution.residencyEvents.size() );
+            json events = json::array();
+            for( size_t index = begin; index < end; index++ )
+            {
+                const auto& event = attribution.residencyEvents[index];
+                events.push_back( { { "allocation_id", Decimal( event.allocationId ) }, { "frame_id", Decimal( event.frame ) },
+                    { "fence_value", Decimal( event.fence ) }, { "size_bytes", Decimal( event.size ) },
+                    { "connection_id", Decimal( event.connectionId ) }, { "state", std::string( 1, event.state ) },
+                    { "reason", event.reason }, { "replayed", event.replayed }, { "flags", event.flags },
+                    { "time_ns", Decimal( event.timeNs ) },
+                    { "cpu_zone_ref", source->GetCpuZoneRef( event.cpuZoneIndex ).value_or( "" ) } } );
+            }
+            const auto& residency = attribution.residency;
+            const auto cursor = NextCursor( page, method, trace, end - begin, end < attribution.residencyEvents.size() );
+            return Success( id, { { "present", true }, { "current", {
+                    { "resident_bytes", Decimal( residency.residentBytes ) }, { "resident_count", Decimal( residency.residentCount ) },
+                    { "evicted_bytes", Decimal( residency.evictedBytes ) }, { "evicted_count", Decimal( residency.evictedCount ) },
+                    { "unknown_bytes", Decimal( residency.unknownBytes ) }, { "unknown_count", Decimal( residency.unknownCount ) } } },
+                { "events", std::move( events ) }, { "sampling_interval_ms", 250 },
+                { "semantics", "D3DX12 library residency state; OS physical page migration may not be observable as a state transition" } },
+                trace, PageJson( page, end - begin, cursor ) );
+        }
+        if( method == "memory.gpu.summary" )
+        {
+            static const std::set<std::string> wantedPlots = {
+                "GPU.DXGI.Local.UsageBytes", "GPU.DXGI.Local.BudgetBytes", "GPU.DXGI.Local.ReservationBytes",
+                "GPU.DXGI.NonLocal.UsageBytes", "GPU.DXGI.NonLocal.BudgetBytes", "GPU.DXGI.NonLocal.ReservationBytes",
+                "GPU.VRAM.EngineKnownPhysical.LocalBytes", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes"
+            };
+            std::unordered_map<std::string, std::string> plotNameByRef;
+            for( const auto& plot : source->GetPlotList() ) if( wantedPlots.count( plot.name ) != 0 ) plotNameByRef[plot.ref] = plot.name;
+            struct LatestPlot { int64_t time = std::numeric_limits<int64_t>::min(); double value = 0; bool present = false; };
+            std::unordered_map<std::string, LatestPlot> latest;
+            size_t offset = 0;
+            constexpr size_t chunk = 4096;
+            while( true )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange range; range.offset = offset; range.limit = allowed;
+                const auto points = source->ScanPlots( range );
+                BudgetScanned( points.size(), chunk, allowed );
+                for( const auto& point : points )
+                {
+                    const auto name = plotNameByRef.find( point.plotRef );
+                    if( name == plotNameByRef.end() ) continue;
+                    auto& value = latest[name->second];
+                    if( !value.present || point.timeNs >= value.time ) value = { point.timeNs, point.value, true };
+                }
+                offset += points.size();
+                if( points.size() < allowed ) break;
+            }
+            const auto bytes = [&]( const char* name ) -> uint64_t {
+                const auto found = latest.find( name );
+                return found == latest.end() || !found->second.present || found->second.value <= 0 ? 0 : uint64_t( found->second.value );
+            };
+            const auto segment = [&]( const char* prefix, const char* knownName ) {
+                const std::string base = std::string( "GPU.DXGI." ) + prefix;
+                const uint64_t usage = bytes( ( base + ".UsageBytes" ).c_str() );
+                const uint64_t known = bytes( knownName );
+                return json { { "usage_bytes", Decimal( usage ) }, { "budget_bytes", Decimal( bytes( ( base + ".BudgetBytes" ).c_str() ) ) },
+                    { "reservation_bytes", Decimal( bytes( ( base + ".ReservationBytes" ).c_str() ) ) },
+                    { "engine_known_physical_bytes", Decimal( known ) },
+                    { "implicit_untracked_bytes", Decimal( usage > known ? usage - known : 0 ) },
+                    { "overtracked_bytes", Decimal( known > usage ? known - usage : 0 ) } };
+            };
+            const auto& churn = attribution.churn;
+            const auto& residency = attribution.residency;
+            return Success( id, { { "present", true }, { "protocol", "GTMEM2" },
+                { "dxgi_reconciliation", { { "local", segment( "Local", "GPU.VRAM.EngineKnownPhysical.LocalBytes" ) },
+                    { "non_local", segment( "NonLocal", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes" ) },
+                    { "semantics", "Implicit/Untracked is max(DXGI Usage - EngineKnownPhysical, 0) and is not proof of a leak" } } },
+                { "physical", { { "active_bytes", Decimal( churn.activePhysicalBytes ) }, { "peak_bytes", Decimal( churn.peakPhysicalBytes ) } } },
+                { "logical_resource_count", Decimal( attribution.logicalResources.size() ) },
+                { "owner_rollup_count", Decimal( attribution.ownerRollups.size() ) },
+                { "working_set_count", Decimal( attribution.workingSets.size() ) },
+                { "heap_fragmentation_count", Decimal( attribution.fragmentation.size() ) },
+                { "residency", { { "resident_bytes", Decimal( residency.residentBytes ) }, { "evicted_bytes", Decimal( residency.evictedBytes ) },
+                    { "unknown_bytes", Decimal( residency.unknownBytes ) } } },
+                { "quality", { { "complete", attribution.complete }, { "warnings", attribution.warnings },
+                    { "capture_boundary_passes", Decimal( attribution.captureBoundaryPasses ) },
+                    { "submission_unobserved_passes", Decimal( attribution.submissionUnobservedPasses ) },
+                    { "gpu_result_unavailable_passes", Decimal( attribution.gpuResultUnavailablePasses ) } } } }, trace );
+        }
         if( method == "memory.gpu.request_scopes" )
         {
             const auto page = ParsePage( params, method, trace );
@@ -4176,7 +4304,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "pass_refs_truncated", item.passIndices.size() > DefaultPageSize }, { "relation_state", relationState },
                 { "logical_resource", nullptr }
             };
-            if( item.allocation.poolName.rfind( "GPU D3D12 Logical ", 0 ) == 0 )
+            const bool logicalPool = item.allocation.poolName.rfind( "GPU D3D12 Logical ", 0 ) == 0;
+            const auto& originMap = logicalPool ? attribution.logicalOriginById : attribution.physicalOriginById;
+            const auto origin = originMap.find( item.allocation.allocationId );
+            if( origin != originMap.end() && origin->second < attribution.origins.size() )
+            {
+                const auto& value = attribution.origins[origin->second];
+                const std::string availability = value.replayed || value.preCapture ? "unavailable_pre_capture_or_replay" :
+                    value.callstackRequested == 0 ? "disabled" : event->allocationCallstack != 0 ? "available" : "requested_but_unresolved";
+                allocationJson["origin"] = {
+                    { "layer", std::string( 1, value.layer ) }, { "connection_id", Decimal( value.connectionId ) },
+                    { "replayed", value.replayed }, { "pre_capture", value.preCapture },
+                    { "callstack_requested", value.callstackRequested }, { "callstack_emitted", value.callstackEmitted },
+                    { "callstack_availability", availability }, { "residency", std::string( 1, value.residency ) },
+                    { "residency_managed", value.residencyManaged },
+                    { "cpu_zone_ref", source->GetCpuZoneRef( value.cpuZoneIndex ).value_or( "" ) }
+                };
+            }
+            else allocationJson["origin"] = nullptr;
+            if( logicalPool )
             {
                 const auto logical = attribution.logicalById.find( item.allocation.allocationId );
                 if( logical != attribution.logicalById.end() )
@@ -4217,7 +4363,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( const auto& rollup : attribution.ownerRollups ) ownerRollups.push_back( {
                 { "taxonomy_id", Decimal( uint64_t( rollup.taxonomyId ) ) }, { "owned_physical_bytes", Decimal( rollup.physicalBytes ) },
                 { "physical_allocation_count", Decimal( rollup.physicalAllocationCount ) },
-                { "logical_resource_count", Decimal( rollup.logicalResourceCount ) }
+                { "logical_resource_count", Decimal( rollup.logicalResourceCount ) },
+                { "owner_kind", rollup.taxonomyId == 0 ? "shared_or_unclassified" : "taxonomy" }
             } );
             json workingSets = json::array();
             for( size_t index = 0; index < std::min<size_t>( attribution.workingSets.size(), MaximumPageSize ); index++ )
@@ -4238,6 +4385,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             data["working_sets_truncated"] = attribution.workingSets.size() > MaximumPageSize;
             data["rollup_semantics"] = {
                 { "owner", "each physical allocation is counted once under one primary owner" },
+                { "shared_heap", "taxonomy_id 0 is the explicit Shared/Unclassified owner; a heap is never assigned to its first placed resource" },
                 { "working_set", "deduplicated by physical allocation within each frame and taxonomy node" },
                 { "sibling_sum", "working sets of sibling taxonomy nodes may overlap and must not be summed as physical total" }
             };

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.8.0",
+  "schema_version": "1.9.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
@@ -32,7 +32,7 @@
     { "domain": "symbol", "worker_data": ["symbolMap", "symbolCode", "codeSymbolMap"], "methods": ["symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly"], "status": "complete", "tests": ["FakeTraceSource", "bounded resource contract", "native Capstone build"] },
     { "domain": "source", "worker_data": ["sourceLocation", "sourceLocationPayload", "sourceFileCache"], "methods": ["source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw"], "status": "complete", "tests": ["FakeTraceSource", "MCP resource read", "two-trace source diff"] },
     { "domain": "memory", "worker_data": ["memData", "memNameMap", "memory plots"], "methods": ["memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates"], "status": "complete", "tests": ["deterministic Memory unit", "Fresh1 Worker frame snapshot", "Profiler shared-core build"] },
-    { "domain": "memory.gpu", "worker_data": ["D3D12 named memory", "logical allocation id", "GTMEM1 messages and GPU zones"], "methods": ["memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution"], "status": "complete", "tests": ["deterministic GTMEM1 unit", "Fresh1 Worker integration", "Profiler shared-core build"] },
+    { "domain": "memory.gpu", "worker_data": ["D3D12 named memory and allocation callstacks", "logical allocation id", "GTMEM1 owner/reference relations", "GTMEM2 origin/residency records", "DXGI and EngineKnownPhysical plots"], "methods": ["memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn"], "status": "complete", "tests": ["deterministic GTMEM1/GTMEM2 unit", "N10 Worker integration", "snapshot/stream/replay MCP acceptance"] },
     { "domain": "lock", "worker_data": ["lockMap"], "methods": ["lock.list", "lock.get", "lock.timeline", "lock.contention_statistics"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "plot", "worker_data": ["plots"], "methods": ["plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics"], "status": "complete", "tests": ["FakeTraceSource", "bounded statistics contract"] },
     { "domain": "message", "worker_data": ["messages", "thread messages"], "methods": ["message.search", "message.get"], "status": "complete", "tests": ["FakeTraceSource", "untrusted-data contract"] },

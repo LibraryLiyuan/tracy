@@ -305,12 +305,14 @@ public:
         return analysis::BuildGpuMemoryAttribution(
             {
                 { 0, analysis::GpuMemoryRequestMarker, "Fake request", "GTMEM1|SCOPE|label=7|frame=0\nGTMEM1|RESOURCE|allocation=7|physical=70|bytes=64|offset=0|owner=7|physical_owner=7|kind=T|segment=L|flags=0|name=Fake", 1, 0, 100 },
-                { 0, analysis::GpuMemoryPassMarker, "Fake pass", "GTMEM1|PASS|pass=11|label=7|frame=0|level=1|ordinal=0|ops=draw|commands=1|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=7:T:3", 1, 10, 90 }
+                { 1, analysis::GpuMemoryPassMarker, "Fake pass", "GTMEM1|PASS|pass=11|label=7|frame=0|level=1|ordinal=0|ops=draw|commands=1|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=7:T:3", 1, 10, 90 },
+                { 2, analysis::GpuMemoryOriginMarker, analysis::GpuMemoryOriginMarker, "GTMEM2|ORIGIN|allocation=70|layer=P|connection=1|replayed=0|pre_capture=0|callstack_requested=8|callstack_emitted=1|residency=R|managed=1", 1, 11, 12 },
+                { 3, analysis::GpuMemoryOriginMarker, analysis::GpuMemoryOriginMarker, "GTMEM2|ORIGIN|allocation=7|layer=L|connection=1|replayed=0|pre_capture=0|callstack_requested=8|callstack_emitted=1|residency=U|managed=0", 1, 12, 13 }
             },
             { { 0, "Fake pass", 1, 20, 1000, 2000 } },
             {
-                { { 1, 0 }, 70, 64, 1, 11, "GPU D3D12 Physical Local Committed" },
-                { { 2, 0 }, 7, 64, 1, 12, "GPU D3D12 Logical Texture" }
+                { { 1, 0 }, 70, 64, 1, 11, std::nullopt, 1, 0, "GPU D3D12 Physical Local Committed" },
+                { { 2, 0 }, 7, 64, 1, 12, std::nullopt, 1, 0, "GPU D3D12 Logical Texture" }
             } );
     }
     analysis::SourceTextDto ReadEmbeddedSource( size_t id, size_t maxBytes ) const override { return id == 0 && maxBytes ? analysis::SourceTextDto { MakeEntityRef( "source-file", 0 ), "fake.cpp", "void Fake() {}\n", true, m_truncatedSource } : analysis::SourceTextDto {}; }

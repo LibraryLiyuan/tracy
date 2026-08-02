@@ -128,7 +128,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.8.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.9.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -216,15 +216,21 @@ int main()
 
     const std::vector<GpuMemoryCpuZoneInput> cpuMarkers = {
         { 0, GpuMemoryRequestMarker, "Upload request", "GTMEM1|SCOPE|label=7|frame=3\nGTMEM1|RESOURCE|allocation=42|physical=100|bytes=4096|offset=256|owner=7|physical_owner=7|kind=T|segment=L|flags=0|name=VSM%20Atlas", 9, 0, 100 },
-        { 1, GpuMemoryPassMarker, "RenderPass", "GTMEM1|PASS|pass=11|label=7|frame=3|level=1|ordinal=2|ops=draw|commands=4|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=42:T:3", 9, 20, 80 }
+        { 1, GpuMemoryPassMarker, "RenderPass", "GTMEM1|PASS|pass=11|label=7|frame=3|level=1|ordinal=2|ops=draw|commands=4|uses=1|total=1|chunks=1|untracked=0|truncated=0|dropped=0\nGTMEM1|USE|pass=11|data=42:T:3", 9, 20, 80 },
+        { 2, GpuMemoryOriginMarker, GpuMemoryOriginMarker, "GTMEM2|ORIGIN|allocation=100|layer=P|connection=1|replayed=0|pre_capture=0|callstack_requested=8|callstack_emitted=1|residency=R|managed=1", 9, 10, 11 },
+        { 3, GpuMemoryOriginMarker, GpuMemoryOriginMarker, "GTMEM2|ORIGIN|allocation=42|layer=L|connection=1|replayed=0|pre_capture=0|callstack_requested=8|callstack_emitted=1|residency=U|managed=0", 9, 12, 13 },
+        { 4, GpuMemoryResidencyMarker, GpuMemoryResidencyMarker, "GTMEM2|RESIDENCY|allocation=100|frame=3|fence=7|bytes=16384|connection=1|state=E|reason=2|replayed=0|flags=0", 9, 60, 61 }
     };
-    const std::vector<GpuMemoryGpuZoneInput> gpuMarkers = { { 0, "RenderPass", 9, 30, 1000, 2000 } };
+    // The authoritative reference token must pair an explicit raw GPU zone to
+    // its taxonomy memory pass even when their display names differ.
+    const std::vector<GpuMemoryGpuZoneInput> gpuMarkers = { { 0, "ExplicitRawPass", 9, 30, 1000, 2000, 11 } };
     const std::vector<GpuMemoryAllocationInput> gpuAllocations = {
-        { { 5, 0 }, 100, 16384, 9, 40, "GPU D3D12 Physical Local Heap" },
-        { { 6, 0 }, 42, 4096, 9, 50, "GPU D3D12 Logical Texture" }
+        { { 5, 0 }, 100, 16384, 9, 40, std::nullopt, 8, 0, "GPU D3D12 Physical Local Heap" },
+        { { 6, 0 }, 42, 4096, 9, 50, std::nullopt, 9, 0, "GPU D3D12 Logical Texture" }
     };
     const auto attribution = BuildGpuMemoryAttribution( cpuMarkers, gpuMarkers, gpuAllocations );
     assert( attribution.protocolPresent && attribution.complete );
+    assert( attribution.protocol2Present && attribution.origins.size() == 2 && attribution.residencyEvents.size() == 1 );
     assert( attribution.requestScopes.size() == 1 && attribution.passes.size() == 1 && attribution.allocations.size() == 2 );
     assert( attribution.passes[0].complete && attribution.passes[0].gpuPairing == GpuZonePairing::Exact );
     assert( attribution.passes[0].uses.size() == 1 && attribution.passes[0].uses[0].allocationId == 42 );
@@ -236,7 +242,36 @@ int main()
     assert( attribution.ownerRollups[0].physicalBytes == 16384 && attribution.ownerRollups[0].physicalAllocationCount == 1 && attribution.ownerRollups[0].logicalResourceCount == 1 );
     assert( attribution.workingSets.size() == 1 && attribution.workingSets[0].frame == 3 && attribution.workingSets[0].taxonomyId == 7 );
     assert( attribution.workingSets[0].referencedPhysicalBytes == 16384 && attribution.workingSets[0].physicalAllocationCount == 1 && attribution.workingSets[0].logicalResourceCount == 1 );
+    assert( attribution.fragmentation.size() == 1 && attribution.fragmentation[0].heapId == 100 );
+    assert( attribution.fragmentation[0].coveredBytes == 4096 && attribution.fragmentation[0].freeBytes == 12288 );
+    assert( attribution.churn.createdCount == 1 && attribution.churn.createdBytes == 16384 && attribution.churn.peakPhysicalBytes == 16384 );
+    assert( attribution.residency.evictedCount == 1 && attribution.residency.evictedBytes == 16384 );
     assert( FormatGpuMemoryUsage( 3 ) == "Read/Write" );
+
+    const std::vector<GpuMemoryCpuZoneInput> boundaryCpuMarkers = {
+        { 10, GpuMemoryPassMarker, "BoundaryPass", "GTMEM1|PASS|pass=12|label=7|frame=3|level=1|ordinal=3|ops=draw|commands=1|uses=0|total=0|chunks=0|untracked=0|truncated=0|dropped=0", 9, 0, 10 }
+    };
+    const std::vector<GpuMemoryGpuZoneInput> boundaryGpuMarkers = {
+        { 10, "BoundaryPass", 9, 20, 1000, 2000, 0 }
+    };
+    const auto boundaryAttribution = BuildGpuMemoryAttribution( boundaryCpuMarkers, boundaryGpuMarkers, {} );
+    assert( boundaryAttribution.complete && boundaryAttribution.warnings.empty() );
+    assert( boundaryAttribution.captureBoundaryPasses == 1 );
+    assert( boundaryAttribution.passes.size() == 1 && boundaryAttribution.passes[0].gpuPairing == GpuZonePairing::CaptureBoundary );
+
+    const std::vector<GpuMemoryCpuZoneInput> unsubmittedCpuMarkers = {
+        { 11, GpuMemoryPassMarker, "UnsubmittedPass", "GTMEM1|PASS|pass=13|label=7|frame=3|level=1|ordinal=4|ops=draw|commands=1|uses=0|total=0|chunks=0|untracked=0|truncated=0|dropped=0|command_list=99", 9, 30, 40 }
+    };
+    const auto unsubmittedAttribution = BuildGpuMemoryAttribution( unsubmittedCpuMarkers, {}, {}, { 100 } );
+    assert( unsubmittedAttribution.complete && unsubmittedAttribution.warnings.empty() );
+    assert( unsubmittedAttribution.submissionUnobservedPasses == 1 );
+    assert( unsubmittedAttribution.passes.size() == 1 && unsubmittedAttribution.passes[0].commandListId == 99 );
+    assert( unsubmittedAttribution.passes[0].gpuPairing == GpuZonePairing::SubmissionUnobserved );
+
+    const auto gpuUnavailableAttribution = BuildGpuMemoryAttribution( unsubmittedCpuMarkers, {}, {}, { 99 }, { 13 } );
+    assert( gpuUnavailableAttribution.complete && gpuUnavailableAttribution.warnings.empty() );
+    assert( gpuUnavailableAttribution.gpuResultUnavailablePasses == 1 );
+    assert( gpuUnavailableAttribution.passes[0].gpuPairing == GpuZonePairing::GpuResultUnavailable );
 
     tracy::query::test::FakeTraceSource fake;
     assert( fake.AcquireReadView().sourceKind == TraceSourceKind::Snapshot );
@@ -381,7 +416,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.8.0" );
+    assert( described.at( "schema_version" ) == "1.9.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -393,9 +428,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.8.0" );
+        assert( operation.at( "schema_version" ) == "1.9.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.8.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.9.0" );
         assert( operation.at( "budget_parameters" ).size() == 4 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {

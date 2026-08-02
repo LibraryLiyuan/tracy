@@ -501,12 +501,16 @@ void View::RebuildGpuMemoryAttribution()
     {
         const auto pool = memoryEntry.first;
         if( !IsGpuD3D12MemoryPool( pool ) ) continue;
+        const auto* poolName = m_worker.GetString( pool );
         const auto& memory = *memoryEntry.second;
         for( size_t index=0; index<memory.data.size(); index++ )
         {
             const auto& event = memory.data[index];
             if( event.Ptr() == 0 ) continue;
-            allocationInputs.push_back( { { pool, index }, event.Ptr(), event.Size(), m_worker.DecompressThread( event.ThreadAlloc() ), event.TimeAlloc() } );
+            allocationInputs.push_back( { { pool, index }, event.Ptr(), event.Size(),
+                m_worker.DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(),
+                event.TimeFree() >= 0 ? std::optional<int64_t>( event.TimeFree() ) : std::nullopt,
+                event.CsAlloc(), event.csFree.Val(), poolName ? poolName : "" } );
         }
     }
 

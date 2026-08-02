@@ -932,7 +932,8 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
         if( !zone->IsEndValid() ) continue;
         const auto& location = m_impl->worker->GetSourceLocation( zone->SrcLoc() );
         const auto marker = Safe( location.name.active ? m_impl->worker->TryGetString( location.name ) : m_impl->worker->TryGetString( location.function ) );
-        if( marker != GpuMemoryRequestMarker && marker != GpuMemoryPassMarker ) continue;
+        if( marker != GpuMemoryRequestMarker && marker != GpuMemoryPassMarker &&
+            marker != GpuMemoryOriginMarker && marker != GpuMemoryResidencyMarker ) continue;
         if( !m_impl->worker->HasValidZoneExtra( *zone ) ) continue;
         const auto& extra = m_impl->worker->GetZoneExtra( *zone );
         if( !extra.text.Active() ) continue;
@@ -948,13 +949,85 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
 
     std::vector<GpuMemoryGpuZoneInput> gpuInputs;
     gpuInputs.reserve( m_impl->gpuZones.size() );
+    struct ReferenceCandidate { uint64_t token; int64_t time; };
+    std::unordered_map<uint64_t, const tracy::JnGfxEntityData*> entityById;
+    std::unordered_map<uint64_t, uint64_t> segmentByPass;
+    std::unordered_map<uint64_t, uint64_t> referenceByPass;
+    std::unordered_map<uint64_t, uint64_t> referenceBySegment;
+    std::unordered_map<uint64_t, std::vector<ReferenceCandidate>> referenceByQuery;
+    std::unordered_map<uint64_t, std::vector<size_t>> zonePositionsByQuery;
+    std::unordered_set<uint64_t> submittedCommandLists;
+    std::unordered_set<uint64_t> gpuSegmentReferenceTokens;
+    const auto& jn = m_impl->worker->GetJnTraceData();
+    entityById.reserve( jn.gfxEntities.size() );
+    for( const auto& entity : jn.gfxEntities ) entityById.emplace( entity.entityId, &entity );
+    for( const auto& link : jn.gfxLinks )
+    {
+        if( link.relation == 5 ) segmentByPass[link.sourceId] = link.targetId;
+        else if( link.relation == 11 ) referenceByPass[link.sourceId] = link.targetId;
+        else if( link.relation == 4 ) submittedCommandLists.emplace( link.sourceId );
+        else if( link.relation == 13 ) referenceBySegment[link.sourceId] = link.targetId;
+    }
+    for( const auto& [passId, referenceToken] : referenceByPass )
+    {
+        const auto segmentLink = segmentByPass.find( passId );
+        if( segmentLink == segmentByPass.end() ) continue;
+        const auto segment = entityById.find( segmentLink->second );
+        if( segment == entityById.end() || segment->second->kind != 4 ) continue;
+        // The explicit pass and its GPU segment are authoritative evidence
+        // even when the bounded capture does not contain a resolved D3D12
+        // timestamp result for that segment.  Keep the reference token so the
+        // memory analysis reports gpu_result_unavailable instead of the
+        // incorrect missing state.  Fallback passes provide the same evidence
+        // through relation 13 below.
+        gpuSegmentReferenceTokens.emplace( referenceToken );
+        const uint64_t key = ( uint64_t( segment->second->gpuContext ) << 32 ) | segment->second->gpuQueryId;
+        referenceByQuery[key].push_back( { referenceToken, segment->second->time } );
+    }
+    for( const auto& [segmentId, referenceToken] : referenceBySegment )
+    {
+        gpuSegmentReferenceTokens.emplace( referenceToken );
+        const auto segment = entityById.find( segmentId );
+        if( segment == entityById.end() || segment->second->kind != 4 ) continue;
+        const uint64_t key = ( uint64_t( segment->second->gpuContext ) << 32 ) | segment->second->gpuQueryId;
+        referenceByQuery[key].push_back( { referenceToken, segment->second->time } );
+    }
     for( const auto& entry : m_impl->gpuZones )
     {
         const auto* zone = entry.zone;
         if( zone->GpuEnd() < 0 ) continue;
         const auto thread = zone->Thread() != 0 ? m_impl->worker->DecompressThread( zone->Thread() ) : entry.thread;
         const auto source = m_impl->SourceLocation( zone->SrcLoc() );
-        gpuInputs.push_back( { entry.index, source.name.empty() ? source.function : source.name, thread, zone->CpuStart(), zone->GpuStart(), zone->GpuEnd() } );
+        const uint64_t key = ( uint64_t( entry.context ) << 32 ) | zone->query_id;
+        zonePositionsByQuery[key].emplace_back( gpuInputs.size() );
+        gpuInputs.push_back( { entry.index, source.name.empty() ? source.function : source.name, thread,
+            zone->CpuStart(), zone->GpuStart(), zone->GpuEnd(), 0 } );
+    }
+    std::vector<bool> zoneAssigned( gpuInputs.size(), false );
+    for( const auto& [key, candidates] : referenceByQuery )
+    {
+        const auto positions = zonePositionsByQuery.find( key );
+        if( positions == zonePositionsByQuery.end() ) continue;
+        auto sortedCandidates = candidates;
+        std::sort( sortedCandidates.begin(), sortedCandidates.end(), []( const auto& lhs, const auto& rhs ) { return lhs.time < rhs.time; } );
+        for( const auto& candidate : sortedCandidates )
+        {
+            size_t bestPosition = ~size_t( 0 );
+            uint64_t bestDistance = ~uint64_t( 0 );
+            for( const auto position : positions->second )
+            {
+                if( zoneAssigned[position] ) continue;
+                const auto zoneStart = gpuInputs[position].cpuStartNs;
+                const uint64_t distance = zoneStart >= candidate.time ?
+                    uint64_t( zoneStart - candidate.time ) : uint64_t( candidate.time - zoneStart );
+                if( distance < bestDistance ) { bestDistance = distance; bestPosition = position; }
+            }
+            if( bestPosition != ~size_t( 0 ) )
+            {
+                gpuInputs[bestPosition].referenceToken = candidate.token;
+                zoneAssigned[bestPosition] = true;
+            }
+        }
     }
 
     std::vector<GpuMemoryAllocationInput> allocations;
@@ -968,10 +1041,12 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
             const auto& event = memory.data[index];
             if( event.Ptr() == 0 ) continue;
             allocations.push_back( { { pool, index }, event.Ptr(), event.Size(),
-                m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(), name } );
+                m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(),
+                event.TimeFree() >= 0 ? std::optional<int64_t>( event.TimeFree() ) : std::nullopt,
+                event.CsAlloc(), event.csFree.Val(), name } );
         }
     }
-    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations );
+    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations, submittedCommandLists, gpuSegmentReferenceTokens );
 }
 
 SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
@@ -1088,7 +1163,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "symbol", info.counts.symbols != 0, true, { "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly" } ),
         capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw" } ),
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
-        capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution" } ),
+        capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn" } ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
