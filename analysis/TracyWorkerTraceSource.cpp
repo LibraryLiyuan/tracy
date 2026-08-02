@@ -1177,7 +1177,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
-        capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
+        capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "job.gfx", hasJnTrace, true, { "job.gfx.statistics", "job.gfx_chain" }, hasJnTrace ? "JN Graphics Jobs schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "statistics", true, true, { "statistics.describe", "statistics.compute" } ),
         capability( "compare", true, true, { "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
@@ -1770,6 +1770,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
     std::unordered_map<uint64_t, SpanStarts> activeHelpStarts;
     std::unordered_map<uint64_t, SpanStarts> spinStarts;
     std::unordered_map<uint64_t, SpanStarts> sleepStarts;
+    std::unordered_map<uint64_t, SpanStarts> waitStarts;
     const auto closeSpan = []( auto& starts, uint64_t jobId, uint32_t spanId, int64_t time, int64_t& total ) {
         const auto jobsIt = starts.find( jobId );
         if( jobsIt == starts.end() ) return;
@@ -1787,10 +1788,13 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         {
         case JnJobStage::WorkerSliceBegin:
             if( !job.firstRunNs || stage.time < *job.firstRunNs ) job.firstRunNs = stage.time;
+            if( ( stage.flags & uint8_t( 1 << 7 ) ) != 0 ) job.rangeStealSliceCount++;
             sliceStarts[stage.jobId][stage.spanId] = stage.time;
             break;
         case JnJobStage::WorkerSliceEnd: closeSpan( sliceStarts, stage.jobId, stage.spanId, stage.time, job.executionNs ); break;
         case JnJobStage::Completed: job.completedNs = stage.time; break;
+        case JnJobStage::WaitBegin: waitStarts[stage.jobId][stage.spanId] = stage.time; break;
+        case JnJobStage::WaitEnd: closeSpan( waitStarts, stage.jobId, stage.spanId, stage.time, job.waitNs ); break;
         case JnJobStage::WaitActiveHelpBegin: activeHelpStarts[stage.jobId][stage.spanId] = stage.time; break;
         case JnJobStage::WaitActiveHelpEnd: closeSpan( activeHelpStarts, stage.jobId, stage.spanId, stage.time, job.waitActiveHelpNs ); break;
         case JnJobStage::WaitSpinYieldBegin: spinStarts[stage.jobId][stage.spanId] = stage.time; break;
@@ -1798,10 +1802,63 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         case JnJobStage::WaitSleepBegin: sleepStarts[stage.jobId][stage.spanId] = stage.time; break;
         case JnJobStage::WaitSleepEnd: closeSpan( sleepStarts, stage.jobId, stage.spanId, stage.time, job.waitSleepNs ); break;
         case JnJobStage::ScheduleCallstack: job.scheduleCallstack = stage.spanId; break;
+        case JnJobStage::Ready:
+            job.jobSchemaVersion = 2;
+            if( !job.readyNs || stage.time < *job.readyNs )
+            {
+                job.readyNs = stage.time;
+                job.readyLane = stage.arg0;
+                job.readyFlags = stage.flags;
+            }
+            break;
+        case JnJobStage::QueueEnter:
+            job.jobSchemaVersion = 2;
+            if( !job.queueEnterNs || stage.time < *job.queueEnterNs )
+            {
+                job.queueEnterNs = stage.time;
+                job.queueLane = stage.arg0;
+            }
+            if( ( stage.flags & uint8_t( 1 << 6 ) ) != 0 ) job.queueRetryCount++;
+            break;
+        case JnJobStage::Dispatch:
+            job.jobSchemaVersion = 2;
+            job.dispatchCount++;
+            if( ( stage.flags & uint8_t( 1 << 1 ) ) != 0 ) job.activeHelpDispatchCount++;
+            if( std::find( job.executionLanes.begin(), job.executionLanes.end(), stage.arg0 ) == job.executionLanes.end() )
+                job.executionLanes.push_back( stage.arg0 );
+            break;
+        case JnJobStage::Steal:
+            job.jobSchemaVersion = 2;
+            job.schedulerStealCount++;
+            break;
+        case JnJobStage::WaitCallstack:
+            job.jobSchemaVersion = 2;
+            job.waitCallstacks.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.arg1, stage.spanId } );
+            break;
         case JnJobStage::Cancelled: job.cancelled = true; break;
         case JnJobStage::Incomplete: job.incomplete = true; break;
         default: break;
         }
+    }
+
+    for( auto& [jobId, job] : jobs )
+    {
+        if( !job.readyNs || job.dependencies.empty() ) continue;
+        std::optional<int64_t> maximumPrerequisiteCompleted;
+        bool complete = true;
+        for( const auto& dependency : job.dependencies )
+        {
+            const auto prerequisite = jobs.find( dependency.prerequisiteJobId );
+            if( prerequisite == jobs.end() || !prerequisite->second.completedNs )
+            {
+                complete = false;
+                break;
+            }
+            if( !maximumPrerequisiteCompleted || *prerequisite->second.completedNs > *maximumPrerequisiteCompleted )
+                maximumPrerequisiteCompleted = *prerequisite->second.completedNs;
+        }
+        if( complete && maximumPrerequisiteCompleted && *job.readyNs >= *maximumPrerequisiteCompleted )
+            job.dependencyReadyLatencyNs = *job.readyNs - *maximumPrerequisiteCompleted;
     }
 
     std::vector<JobDto> result;
@@ -1811,6 +1868,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         const auto type = typeNames.find( job.typeId );
         job.name = type == typeNames.end() ? "<unknown job type>" : type->second;
         job.truncated = !job.completedNs && !job.cancelled && !job.incomplete;
+        std::sort( job.executionLanes.begin(), job.executionLanes.end() );
         std::sort( job.stages.begin(), job.stages.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
         result.emplace_back( std::move( job ) );
     }

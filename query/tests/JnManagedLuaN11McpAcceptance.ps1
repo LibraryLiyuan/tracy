@@ -206,7 +206,7 @@ try {
     $snapshotSemantics = $results.snapshot.semantics | ConvertTo-Json -Compress -Depth 30
     Assert-Condition (($results.stream.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/stream N11 semantic mismatch'
     Assert-Condition (($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/replay N11 semantic mismatch'
-    [ordered]@{ ok = $true; schema_version = '1.10.0'; traces = $results } | ConvertTo-Json -Compress -Depth 40
+    [ordered]@{ ok = $true; schema_version = '1.11.0'; traces = $results } | ConvertTo-Json -Compress -Depth 40
 }
 finally {
     foreach ($traceId in $traceIds) {

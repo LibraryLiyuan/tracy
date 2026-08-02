@@ -207,7 +207,7 @@ try {
     $summaryGatePassed = [double]$summaryComparison.frame_p95_ns_median_percent -le 3.0
     $result = [ordered]@{
         ok = $summaryGatePassed
-        schema_version = '1.10.0'
+        schema_version = '1.11.0'
         sample_count_per_group = 3
         workload = [ordered]@{ scene = 'taijibase_constructedarmor_main_01'; graphics_api = 'd3d12'; graphics_jobs = 'off'; stable_frames = 300; warmup_seconds = 45; capture_seconds = 10 }
         gate = [ordered]@{ summary_p95_limit_percent = 3.0; summary_p95_passed = $summaryGatePassed; detail_is_bounded_diagnostic = $true }

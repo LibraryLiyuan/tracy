@@ -80,9 +80,9 @@ tracy_force_inline void EmitJnJobStage( uint64_t jobId, uint32_t spanId, uint32_
     TracyLfqCommit;
 }
 
-tracy_force_inline void EmitJnJobScheduleCallstack( uint64_t jobId, int32_t depth )
+tracy_force_inline void EmitJnJobCallstack( uint64_t jobId, uint32_t relatedSpanId, JnJobStage stage, int32_t depth )
 {
-    if( depth <= 0 || !has_callstack() ) return;
+    if( depth <= 0 || !has_callstack() || ( stage != JnJobStage::ScheduleCallstack && stage != JnJobStage::WaitCallstack ) ) return;
     TracyJnOnDemandGuard;
     auto item = Profiler::QueueSerialCallstack( Callstack( depth ) );
     MemWrite( &item->hdr.type, QueueType::JnJobStage );
@@ -90,10 +90,20 @@ tracy_force_inline void EmitJnJobScheduleCallstack( uint64_t jobId, int32_t dept
     MemWrite( &item->jnJobStage.jobId, jobId );
     MemWrite( &item->jnJobStage.spanId, uint32_t( 0 ) );
     MemWrite( &item->jnJobStage.arg0, GetThreadHandle() );
-    MemWrite( &item->jnJobStage.arg1, uint32_t( 0 ) );
-    MemWrite( &item->jnJobStage.stage, uint8_t( JnJobStage::ScheduleCallstack ) );
+    MemWrite( &item->jnJobStage.arg1, relatedSpanId );
+    MemWrite( &item->jnJobStage.stage, uint8_t( stage ) );
     MemWrite( &item->jnJobStage.flags, uint8_t( 0 ) );
     Profiler::QueueSerialFinish();
+}
+
+tracy_force_inline void EmitJnJobScheduleCallstack( uint64_t jobId, int32_t depth )
+{
+    EmitJnJobCallstack( jobId, 0, JnJobStage::ScheduleCallstack, depth );
+}
+
+tracy_force_inline void EmitJnJobWaitCallstack( uint64_t jobId, uint32_t waitSpanId, int32_t depth )
+{
+    EmitJnJobCallstack( jobId, waitSpanId, JnJobStage::WaitCallstack, depth );
 }
 
 tracy_force_inline void EmitJnGfxDispatch( uint64_t dispatchId, uint64_t frameIndex, uint32_t expectedJobs, uint8_t threadingMode, uint8_t flags )
@@ -157,7 +167,9 @@ tracy_force_inline void EmitJnJobSchedule( uint64_t, uint64_t, uint16_t, uint8_t
 tracy_force_inline void EmitJnJobConfig( uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnJobDependency( uint64_t, uint64_t, uint64_t, uint8_t ) {}
 tracy_force_inline void EmitJnJobStage( uint64_t, uint32_t, uint32_t, uint32_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnJobCallstack( uint64_t, uint32_t, JnJobStage, int32_t ) {}
 tracy_force_inline void EmitJnJobScheduleCallstack( uint64_t, int32_t ) {}
+tracy_force_inline void EmitJnJobWaitCallstack( uint64_t, uint32_t, int32_t ) {}
 tracy_force_inline void EmitJnGfxDispatch( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGfxEntity( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGfxLink( uint64_t, uint64_t, uint8_t, uint8_t ) {}

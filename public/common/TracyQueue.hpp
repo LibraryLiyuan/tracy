@@ -498,7 +498,12 @@ enum class JnJobStage : uint8_t
     FlowEnd,
     Cancelled,
     Incomplete,
-    ScheduleCallstack
+    ScheduleCallstack,
+    Ready,
+    QueueEnter,
+    Dispatch,
+    Steal,
+    WaitCallstack
 };
 
 enum class JnGfxEntityKind : uint8_t

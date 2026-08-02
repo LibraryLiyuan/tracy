@@ -4486,9 +4486,10 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
         break;
     case QueueType::JnJobStage:
         RecorderCheckCurrentThread();
-        if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack )
+        if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack ||
+            JnJobStage( ev.jnJobStage.stage ) == JnJobStage::WaitCallstack )
         {
-            if( !m_recorderSerialCallstack ) RecorderFail( "JN Job schedule is missing its serial callstack." );
+            if( !m_recorderSerialCallstack ) RecorderFail( "JN Job stage is missing its serial callstack." );
             m_recorderSerialCallstack = false;
         }
         break;
@@ -6020,7 +6021,8 @@ void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
     data.schemaVersion = JnTraceSchemaVersion;
     uint32_t spanId = ev.spanId;
     uint64_t thread = m_threadCtx;
-    if( JnJobStage( ev.stage ) == JnJobStage::ScheduleCallstack )
+    if( JnJobStage( ev.stage ) == JnJobStage::ScheduleCallstack ||
+        JnJobStage( ev.stage ) == JnJobStage::WaitCallstack )
     {
         assert( m_serialNextCallstack != 0 );
         spanId = m_serialNextCallstack;

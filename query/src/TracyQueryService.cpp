@@ -2,6 +2,7 @@
 
 #include "TracyAnalysis.hpp"
 #include "TracyEmbeddedData.hpp"
+#include "../../public/common/TracyQueue.hpp"
 
 #include "../../dtl/dtl.hpp"
 
@@ -43,7 +44,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "memory.gc.summary", "memory.gc.events",
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
         "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
-        "job.search", "job.get", "job.dependencies", "job.critical_path", "job.gfx.statistics", "job.gfx_chain",
+        "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics", "job.gfx.statistics", "job.gfx_chain",
         "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
         "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
         "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
@@ -811,7 +812,8 @@ const char* JobStageName( uint8_t stage )
         "post_execute_begin", "post_execute_end", "completed", "wait_begin",
         "wait_active_help_begin", "wait_active_help_end", "wait_spin_yield_begin", "wait_spin_yield_end",
         "wait_sleep_begin", "wait_sleep_end", "wait_end", "flow_begin", "flow_next",
-        "flow_parallel_next", "flow_end", "cancelled", "incomplete", "schedule_callstack"
+        "flow_parallel_next", "flow_end", "cancelled", "incomplete", "schedule_callstack",
+        "ready", "queue_enter", "dispatch", "steal", "wait_callstack"
     };
     return stage < std::size( names ) ? names[stage] : "unknown";
 }
@@ -867,15 +869,30 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
         { "unity_flow_id", value.unityFlowId }, { "expected_dependency_count", value.expectedDependencyCount },
         { "origin_frame_sequence", value.originFrameSequence },
         { "origin_frame_ref", value.originFrameId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "frame-identity", value.originFrameId ) ) },
+        { "job_schema_version", value.jobSchemaVersion },
         { "schedule_callstack", value.scheduleCallstack },
         { "schedule_callstack_ref", value.scheduleCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.scheduleCallstack ) ) },
         { "dependency_count", value.dependencies.size() }, { "stage_count", value.stages.size() },
+        { "ready_ns", value.readyNs ? json( Decimal( *value.readyNs ) ) : json( nullptr ) },
+        { "ready_lane", value.readyNs ? json( value.readyLane ) : json( nullptr ) },
+        { "ready_flags", value.readyFlags },
+        { "queue_enter_ns", value.queueEnterNs ? json( Decimal( *value.queueEnterNs ) ) : json( nullptr ) },
+        { "queue_lane", value.queueEnterNs ? json( value.queueLane ) : json( nullptr ) },
         { "first_run_ns", value.firstRunNs ? json( Decimal( *value.firstRunNs ) ) : json( nullptr ) },
         { "completed_ns", value.completedNs ? json( Decimal( *value.completedNs ) ) : json( nullptr ) },
         { "schedule_to_first_run_ns", value.firstRunNs && !value.orphan ? json( Decimal( *value.firstRunNs - value.scheduleNs ) ) : json( nullptr ) },
         { "schedule_to_complete_ns", value.completedNs && !value.orphan ? json( Decimal( *value.completedNs - value.scheduleNs ) ) : json( nullptr ) },
+        { "schedule_to_ready_ns", value.readyNs && !value.orphan ? json( Decimal( *value.readyNs - value.scheduleNs ) ) : json( nullptr ) },
+        { "ready_to_queue_ns", value.readyNs && value.queueEnterNs ? json( Decimal( *value.queueEnterNs - *value.readyNs ) ) : json( nullptr ) },
+        { "queue_to_first_run_ns", value.queueEnterNs && value.firstRunNs ? json( Decimal( *value.firstRunNs - *value.queueEnterNs ) ) : json( nullptr ) },
+        { "dependency_ready_latency_ns", value.dependencyReadyLatencyNs ? json( Decimal( *value.dependencyReadyLatencyNs ) ) : json( nullptr ) },
         { "execution_ns", Decimal( value.executionNs ) },
-        { "wait", { { "active_help_ns", Decimal( value.waitActiveHelpNs ) }, { "spin_yield_ns", Decimal( value.waitSpinYieldNs ) }, { "sleep_ns", Decimal( value.waitSleepNs ) } } },
+        { "dispatch_count", value.dispatchCount }, { "scheduler_steal_count", value.schedulerStealCount },
+        { "range_steal_slice_count", value.rangeStealSliceCount }, { "active_help_dispatch_count", value.activeHelpDispatchCount },
+        { "queue_retry_count", value.queueRetryCount }, { "execution_lanes", value.executionLanes },
+        { "wait", { { "total_ns", Decimal( value.waitNs ) }, { "active_help_ns", Decimal( value.waitActiveHelpNs ) },
+            { "spin_yield_ns", Decimal( value.waitSpinYieldNs ) }, { "sleep_ns", Decimal( value.waitSleepNs ) },
+            { "callstack_count", value.waitCallstacks.size() } } },
         { "orphan", value.orphan }, { "truncated", value.truncated }, { "trust", "untrusted_trace_data" }
     };
     if( !detailed ) return result;
@@ -890,14 +907,56 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
     for( size_t index = 0; index < value.stages.size(); index++ )
     {
         const auto& stage = value.stages[index];
-        stages.push_back( {
+        json stageJson = {
             { "ref", source.MakeEntityRef( "job-stage", ( value.jobId << 24 ) ^ index ) },
             { "time_ns", Decimal( stage.timeNs ) }, { "thread_ref", stage.threadRef }, { "stage", JobStageName( stage.stage ) },
             { "stage_id", stage.stage }, { "span_id", stage.spanId }, { "arg0", stage.arg0 }, { "arg1", stage.arg1 }, { "flags", stage.flags }
-        } );
+        };
+        if( stage.stage == uint8_t( JnJobStage::Ready ) )
+        {
+            stageJson["source_lane"] = stage.arg0;
+            stageJson["reason"] = ( stage.flags & uint8_t( 1 << 3 ) ) != 0 ? "dependency" :
+                ( stage.flags & uint8_t( 1 << 4 ) ) != 0 ? "manual" :
+                ( stage.flags & uint8_t( 1 << 5 ) ) != 0 ? "immediate" : "unknown";
+        }
+        else if( stage.stage == uint8_t( JnJobStage::QueueEnter ) )
+        {
+            stageJson["queue_lane"] = stage.arg0;
+            stageJson["participant_count"] = stage.arg1;
+            stageJson["retry"] = ( stage.flags & uint8_t( 1 << 6 ) ) != 0;
+        }
+        else if( stage.stage == uint8_t( JnJobStage::Dispatch ) )
+        {
+            stageJson["executor_lane"] = stage.arg0;
+            stageJson["source_lane"] = stage.arg1;
+            stageJson["stolen"] = ( stage.flags & uint8_t( 1 << 0 ) ) != 0;
+            stageJson["wait_active_help"] = ( stage.flags & uint8_t( 1 << 1 ) ) != 0;
+            stageJson["worker_lane"] = ( stage.flags & uint8_t( 1 << 2 ) ) != 0;
+        }
+        else if( stage.stage == uint8_t( JnJobStage::Steal ) )
+        {
+            stageJson["thief_lane"] = stage.arg0;
+            stageJson["victim_lane"] = stage.arg1;
+            stageJson["range_partition"] = ( stage.flags & uint8_t( 1 << 7 ) ) != 0;
+        }
+        else if( stage.stage == uint8_t( JnJobStage::WaitCallstack ) )
+        {
+            stageJson["callstack_ref"] = stage.spanId == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", stage.spanId ) );
+            stageJson["wait_span_id"] = stage.arg1;
+            stageJson["callstack_kind"] = "native";
+        }
+        stages.push_back( std::move( stageJson ) );
     }
+    json waitCallstacks = json::array();
+    for( const auto& callstack : value.waitCallstacks ) waitCallstacks.push_back( {
+        { "time_ns", Decimal( callstack.timeNs ) }, { "thread_ref", callstack.threadRef },
+        { "wait_span_id", callstack.waitSpanId }, { "callstack", callstack.callstack },
+        { "callstack_ref", callstack.callstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", callstack.callstack ) ) },
+        { "callstack_kind", "native" }
+    } );
     result["dependencies"] = std::move( dependencies );
     result["stages"] = std::move( stages );
+    result["wait_callstacks"] = std::move( waitCallstacks );
     return result;
 }
 
@@ -5215,7 +5274,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "evidence_kind", "exact" }, { "window_inference_used", false }, { "truncated", truncated }
         }, trace );
     }
-    if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
+    if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.statistics" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {
         auto jobs = source->GetJobs();
         const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
@@ -5226,6 +5285,137 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
             return *parsed;
         };
+
+        if( method == "job.statistics" )
+        {
+            std::vector<int64_t> scheduleToReady;
+            std::vector<int64_t> readyToQueue;
+            std::vector<int64_t> queueToFirstRun;
+            std::vector<int64_t> dependencyReady;
+            std::vector<int64_t> execution;
+            std::vector<int64_t> wait;
+            std::map<uint32_t, uint64_t> laneDispatches;
+            std::map<uint32_t, uint64_t> laneStealsAsThief;
+            std::map<uint32_t, uint64_t> laneStealsAsVictim;
+            uint64_t completed = 0;
+            uint64_t managed = 0;
+            uint64_t burst = 0;
+            uint64_t v2 = 0;
+            uint64_t missingReady = 0;
+            uint64_t missingQueue = 0;
+            uint64_t invalidOrder = 0;
+            uint64_t invalidScheduleToReady = 0;
+            uint64_t invalidReadyToQueue = 0;
+            uint64_t invalidQueueToFirstRun = 0;
+            uint64_t schedulerSteals = 0;
+            uint64_t rangeStealSlices = 0;
+            uint64_t waitJobs = 0;
+            uint64_t scheduleCallstacks = 0;
+            uint64_t waitCallstacks = 0;
+            uint64_t orphan = 0;
+            uint64_t truncated = 0;
+            json invalidOrderExamples = json::array();
+            const auto recordInvalidOrder = [&]( const analysis::JobDto& job, const char* relation, int64_t begin, int64_t end ) {
+                if( invalidOrderExamples.size() >= 16 ) return;
+                invalidOrderExamples.push_back( {
+                    { "job_ref", job.ref }, { "job_id", Decimal( job.jobId ) }, { "name", job.name },
+                    { "relation", relation }, { "begin_ns", Decimal( begin ) }, { "end_ns", Decimal( end ) },
+                    { "delta_ns", Decimal( end - begin ) }
+                } );
+            };
+            for( const auto& job : jobs )
+            {
+                checkCancelled();
+                const bool captureBoundary = job.orphan || job.truncated;
+                completed += job.completedNs.has_value();
+                managed += job.kind == uint8_t( JnJobKind::Managed );
+                burst += job.kind == uint8_t( JnJobKind::Burst );
+                orphan += job.orphan;
+                truncated += job.truncated;
+                scheduleCallstacks += job.scheduleCallstack != 0;
+                waitCallstacks += job.waitCallstacks.size();
+                schedulerSteals += job.schedulerStealCount;
+                rangeStealSlices += job.rangeStealSliceCount;
+                if( job.waitNs > 0 ) { waitJobs++; wait.push_back( job.waitNs ); }
+                if( job.executionNs > 0 ) execution.push_back( job.executionNs );
+                if( job.jobSchemaVersion >= 2 )
+                {
+                    v2++;
+                    if( !captureBoundary && !job.readyNs ) missingReady++;
+                    if( !captureBoundary && job.dispatchCount != 0 && !job.queueEnterNs ) missingQueue++;
+                }
+                if( !captureBoundary && job.readyNs )
+                {
+                    const auto value = *job.readyNs - job.scheduleNs;
+                    if( value >= 0 ) scheduleToReady.push_back( value );
+                    else { invalidOrder++; invalidScheduleToReady++; recordInvalidOrder( job, "schedule_to_ready", job.scheduleNs, *job.readyNs ); }
+                }
+                if( !captureBoundary && job.readyNs && job.queueEnterNs )
+                {
+                    const auto value = *job.queueEnterNs - *job.readyNs;
+                    if( value >= 0 ) readyToQueue.push_back( value );
+                    else { invalidOrder++; invalidReadyToQueue++; recordInvalidOrder( job, "ready_to_queue", *job.readyNs, *job.queueEnterNs ); }
+                }
+                if( !captureBoundary && job.queueEnterNs && job.firstRunNs )
+                {
+                    const auto value = *job.firstRunNs - *job.queueEnterNs;
+                    if( value >= 0 ) queueToFirstRun.push_back( value );
+                    else { invalidOrder++; invalidQueueToFirstRun++; recordInvalidOrder( job, "queue_to_first_run", *job.queueEnterNs, *job.firstRunNs ); }
+                }
+                if( !captureBoundary && job.dependencyReadyLatencyNs ) dependencyReady.push_back( *job.dependencyReadyLatencyNs );
+                for( const auto& stage : job.stages )
+                {
+                    if( stage.stage == uint8_t( JnJobStage::Dispatch ) ) laneDispatches[stage.arg0]++;
+                    else if( stage.stage == uint8_t( JnJobStage::Steal ) )
+                    {
+                        laneStealsAsThief[stage.arg0]++;
+                        laneStealsAsVictim[stage.arg1]++;
+                    }
+                }
+            }
+            json lanes = json::array();
+            std::set<uint32_t> laneIds;
+            for( const auto& [lane, count] : laneDispatches ) laneIds.insert( lane );
+            for( const auto& [lane, count] : laneStealsAsThief ) laneIds.insert( lane );
+            for( const auto& [lane, count] : laneStealsAsVictim ) laneIds.insert( lane );
+            for( const auto lane : laneIds ) lanes.push_back( {
+                { "lane", lane }, { "dispatches", Decimal( laneDispatches[lane] ) },
+                { "steals_as_thief", Decimal( laneStealsAsThief[lane] ) },
+                { "steals_as_victim", Decimal( laneStealsAsVictim[lane] ) }
+            } );
+            return Success( id, {
+                { "present", !jobs.empty() }, { "job_schema_version", v2 != 0 ? 2 : 1 },
+                { "source_mode", v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
+                { "counts", {
+                    { "jobs", Decimal( jobs.size() ) }, { "completed", Decimal( completed ) },
+                    { "managed", Decimal( managed ) }, { "burst", Decimal( burst ) },
+                    { "v2", Decimal( v2 ) }, { "scheduler_steals", Decimal( schedulerSteals ) },
+                    { "range_steal_slices", Decimal( rangeStealSlices ) }, { "wait_jobs", Decimal( waitJobs ) },
+                    { "schedule_callstacks", Decimal( scheduleCallstacks ) }, { "wait_callstacks", Decimal( waitCallstacks ) }
+                } },
+                { "latency", {
+                    { "schedule_to_ready", StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
+                    { "ready_to_queue", StatisticsJson( analysis::ComputeStatistics( readyToQueue ) ) },
+                    { "queue_to_first_run", StatisticsJson( analysis::ComputeStatistics( queueToFirstRun ) ) },
+                    { "dependency_complete_to_ready", StatisticsJson( analysis::ComputeStatistics( dependencyReady ) ) },
+                    { "execution", StatisticsJson( analysis::ComputeStatistics( execution ) ) },
+                    { "wait", StatisticsJson( analysis::ComputeStatistics( wait ) ) }
+                } },
+                { "lanes", std::move( lanes ) },
+                { "quality", {
+                    { "complete", missingReady == 0 && missingQueue == 0 && invalidOrder == 0 },
+                    { "missing_ready", Decimal( missingReady ) }, { "missing_queue", Decimal( missingQueue ) },
+                    { "invalid_order", Decimal( invalidOrder ) },
+                    { "invalid_schedule_to_ready", Decimal( invalidScheduleToReady ) },
+                    { "invalid_ready_to_queue", Decimal( invalidReadyToQueue ) },
+                    { "invalid_queue_to_first_run", Decimal( invalidQueueToFirstRun ) },
+                    { "invalid_order_examples", std::move( invalidOrderExamples ) },
+                    { "capture_boundary_orphan", Decimal( orphan ) },
+                    { "capture_boundary_truncated", Decimal( truncated ) }, { "cancelled_supported", false },
+                    { "cancelled_reason", "this Unity uJobs branch has no real cancellation API" }
+                } }
+            }, trace );
+        }
 
         if( method == "job.search" )
         {

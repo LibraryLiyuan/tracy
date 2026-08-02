@@ -521,6 +521,14 @@ struct JobStageDto
     uint8_t flags = 0;
 };
 
+struct JobWaitCallstackDto
+{
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint32_t waitSpanId = 0;
+    uint32_t callstack = 0;
+};
+
 struct JobDto
 {
     std::string ref;
@@ -538,18 +546,33 @@ struct JobDto
     uint32_t originFrameSequence = 0;
     uint64_t originFrameId = 0;
     uint32_t scheduleCallstack = 0;
+    uint16_t jobSchemaVersion = 1;
     uint16_t expectedDependencyCount = 0;
+    std::optional<int64_t> readyNs;
+    std::optional<int64_t> queueEnterNs;
     std::optional<int64_t> firstRunNs;
     std::optional<int64_t> completedNs;
+    std::optional<int64_t> dependencyReadyLatencyNs;
+    uint32_t readyLane = 0;
+    uint32_t queueLane = 0;
+    uint8_t readyFlags = 0;
     int64_t executionNs = 0;
+    int64_t waitNs = 0;
     int64_t waitActiveHelpNs = 0;
     int64_t waitSpinYieldNs = 0;
     int64_t waitSleepNs = 0;
+    uint32_t dispatchCount = 0;
+    uint32_t schedulerStealCount = 0;
+    uint32_t rangeStealSliceCount = 0;
+    uint32_t activeHelpDispatchCount = 0;
+    uint32_t queueRetryCount = 0;
     bool cancelled = false;
     bool incomplete = false;
     bool orphan = false;
     bool truncated = false;
     std::vector<JobDependencyDto> dependencies;
+    std::vector<uint32_t> executionLanes;
+    std::vector<JobWaitCallstackDto> waitCallstacks;
     std::vector<JobStageDto> stages;
 };
 
