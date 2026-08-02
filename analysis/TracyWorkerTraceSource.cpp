@@ -1140,6 +1140,12 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasCatalog = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
         return record.starts_with( "JNCAT1|" );
     } );
+    const bool hasScriptStack = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
+        return record.starts_with( "JNSTK1|" );
+    } );
+    const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
+        return record.starts_with( "JNGC1|" );
+    } );
     return {
         capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
         capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash" } ),
@@ -1164,6 +1170,10 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw" } ),
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn" } ),
+        capability( "runtime.script", hasScriptStack, true, { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" },
+            hasScriptStack ? "" : "trace predates or did not emit JNSTK1/JNSZ1" ),
+        capability( "memory.gc", hasStructuredGc, true, { "memory.gc.summary", "memory.gc.events" },
+            hasStructuredGc ? "" : "trace predates or did not emit JNGC1" ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
         capability( "plot", info.counts.plots != 0, true, { "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics" } ),
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),

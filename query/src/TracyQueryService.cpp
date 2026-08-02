@@ -39,6 +39,8 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
         "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
         "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn",
+        "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones",
+        "memory.gc.summary", "memory.gc.events",
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
         "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.gfx.statistics", "job.gfx_chain",
@@ -88,6 +90,8 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 
 std::string MethodDomain( const std::string& method )
 {
+    if( method.rfind( "runtime.script.", 0 ) == 0 ) return "runtime.script";
+    if( method.rfind( "memory.gc.", 0 ) == 0 ) return "memory.gc";
     if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
     if( method.rfind( "gpu.pass.", 0 ) == 0 ) return "gpu.pass";
     if( method.rfind( "gpu.taxonomy.", 0 ) == 0 ) return "gpu.taxonomy";
@@ -2531,6 +2535,320 @@ FilteredScanPage ScanFiltered( const analysis::TraceSource& source, const json& 
     return result;
 }
 
+struct N11TraceData
+{
+    bool scriptPresent = false;
+    bool scriptCapability = false;
+    bool gcPresent = false;
+    bool gcCapability = false;
+    uint64_t scriptInvalid = 0;
+    uint64_t scriptUnresolved = 0;
+    uint64_t scriptOrphanEnds = 0;
+    uint64_t gcInvalid = 0;
+    std::map<uint32_t, json> frames;
+    std::map<uint64_t, json> stacks;
+    std::map<uint32_t, json> markers;
+    std::vector<json> zones;
+    std::vector<json> gcEvents;
+};
+
+bool JsonUnsigned( const json& document, const char* key, uint64_t& value, uint64_t maximum = std::numeric_limits<uint64_t>::max() )
+{
+    if( !document.contains( key ) ) return false;
+    const auto& item = document[key];
+    if( item.is_number_unsigned() ) value = item.get<uint64_t>();
+    else if( item.is_number_integer() )
+    {
+        const auto signedValue = item.get<int64_t>();
+        if( signedValue < 0 ) return false;
+        value = uint64_t( signedValue );
+    }
+    else return false;
+    return value <= maximum;
+}
+
+bool JsonDecimalString( const json& document, const char* key, uint64_t& value )
+{
+    if( !document.contains( key ) || !document[key].is_string() ) return false;
+    const auto& text = document[key].get_ref<const std::string&>();
+    if( text.empty() ) return false;
+    const auto parsed = std::from_chars( text.data(), text.data() + text.size(), value, 10 );
+    return parsed.ec == std::errc() && parsed.ptr == text.data() + text.size();
+}
+
+json ParseN11Record( const std::string& text, std::string_view prefix )
+{
+    if( !text.starts_with( prefix ) ) return json();
+    auto document = json::parse( text.begin() + prefix.size(), text.end(), nullptr, false );
+    if( document.is_discarded() || !document.is_object() ) return json();
+    uint64_t schema = 0;
+    if( !JsonUnsigned( document, "schema_version", schema, 1 ) || schema != 1 ) return json();
+    return document;
+}
+
+const char* ScriptRuntimeName( uint64_t runtime )
+{
+    return runtime == 1 ? "managed" : runtime == 2 ? "lua" : "unknown";
+}
+
+bool ScriptRuntimeValid( uint64_t runtime )
+{
+    return runtime == 1 || runtime == 2;
+}
+
+const char* GcKindName( uint64_t kind )
+{
+    switch( kind )
+    {
+    case 1: return "managed_heap_used";
+    case 2: return "managed_heap_reserved";
+    case 3: return "managed_allocation_bytes";
+    case 4: return "managed_collection_begin";
+    case 5: return "managed_collection_end";
+    case 6: return "managed_collection_observed";
+    case 7: return "managed_incremental_slice_begin";
+    case 8: return "managed_incremental_slice_end";
+    case 16: return "lua_heap_used";
+    case 17: return "lua_cycle_begin";
+    case 18: return "lua_cycle_end";
+    case 19: return "lua_slice";
+    case 20: return "lua_pause";
+    case 21: return "lua_reload_generation";
+    default: return "unknown";
+    }
+}
+
+N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis::TraceInfoDto& info )
+{
+    N11TraceData result;
+    for( const auto& record : info.appInfo )
+    {
+        if( record.starts_with( "JNSTK1|" ) )
+        {
+            result.scriptPresent = true;
+            auto document = ParseN11Record( record, "JNSTK1|" );
+            if( document.empty() || !document.contains( "record" ) || !document["record"].is_string() )
+            {
+                result.scriptInvalid++;
+                continue;
+            }
+            const auto kind = document["record"].get<std::string>();
+            if( kind == "capability" )
+            {
+                result.scriptCapability = true;
+                continue;
+            }
+            if( kind == "frame" )
+            {
+                uint64_t id = 0, line = 0, flags = 0;
+                const auto runtime = document.value( "runtime", "" );
+                if( !JsonUnsigned( document, "frame_id", id, std::numeric_limits<uint32_t>::max() ) || id == 0 ||
+                    !JsonUnsigned( document, "line", line, std::numeric_limits<uint32_t>::max() ) ||
+                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    ( runtime != "managed" && runtime != "lua" ) ||
+                    !document.contains( "function" ) || !document["function"].is_string() || document["function"].get_ref<const std::string&>().empty() ||
+                    !document.contains( "file" ) || !document["file"].is_string() || result.frames.contains( uint32_t( id ) ) )
+                {
+                    result.scriptInvalid++;
+                    continue;
+                }
+                document["trust"] = "untrusted_trace_data";
+                result.frames.emplace( uint32_t( id ), std::move( document ) );
+            }
+            else if( kind == "stack" )
+            {
+                uint64_t id = 0, flags = 0;
+                const auto runtime = document.value( "runtime", "" );
+                if( !JsonDecimalString( document, "stack_id", id ) || id == 0 ||
+                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    ( runtime != "managed" && runtime != "lua" ) ||
+                    !document.contains( "frame_ids" ) || !document["frame_ids"].is_array() ||
+                    document["frame_ids"].empty() || document["frame_ids"].size() > 64 || result.stacks.contains( id ) )
+                {
+                    result.scriptInvalid++;
+                    continue;
+                }
+                bool validFrames = true;
+                for( const auto& frame : document["frame_ids"] )
+                    validFrames &= frame.is_number_unsigned() || ( frame.is_number_integer() && frame.get<int64_t>() > 0 );
+                if( !validFrames )
+                {
+                    result.scriptInvalid++;
+                    continue;
+                }
+                document["trust"] = "untrusted_trace_data";
+                result.stacks.emplace( id, std::move( document ) );
+            }
+            else if( kind == "marker" )
+            {
+                uint64_t id = 0, sourceFrame = 0, color = 0, flags = 0;
+                const auto runtime = document.value( "runtime", "" );
+                if( !JsonUnsigned( document, "marker_id", id, std::numeric_limits<uint32_t>::max() ) || id == 0 ||
+                    !JsonUnsigned( document, "source_frame_id", sourceFrame, std::numeric_limits<uint32_t>::max() ) || sourceFrame == 0 ||
+                    !JsonUnsigned( document, "color", color, std::numeric_limits<uint32_t>::max() ) ||
+                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    ( runtime != "managed" && runtime != "lua" ) ||
+                    !document.contains( "name" ) || !document["name"].is_string() || document["name"].get_ref<const std::string&>().empty() ||
+                    result.markers.contains( uint32_t( id ) ) )
+                {
+                    result.scriptInvalid++;
+                    continue;
+                }
+                document["trust"] = "untrusted_trace_data";
+                result.markers.emplace( uint32_t( id ), std::move( document ) );
+            }
+            else result.scriptInvalid++;
+        }
+        else if( record.starts_with( "JNGC1|" ) )
+        {
+            result.gcPresent = true;
+            auto document = ParseN11Record( record, "JNGC1|" );
+            if( document.empty() || document.value( "record", "" ) != "capability" ) result.gcInvalid++;
+            else result.gcCapability = true;
+        }
+    }
+
+    std::map<uint64_t, size_t> openZones;
+    size_t rawOffset = 0;
+    constexpr size_t chunk = 4096;
+    while( true )
+    {
+        const auto allowed = BudgetScanAllowance( chunk );
+        if( allowed == 0 ) break;
+        analysis::ScanRange range;
+        range.offset = rawOffset;
+        range.limit = allowed;
+        const auto messages = source.ScanMessages( range );
+        BudgetScanned( messages.size(), chunk, allowed );
+        for( const auto& message : messages )
+        {
+            if( message.text.starts_with( "JNSZ1|" ) )
+            {
+                result.scriptPresent = true;
+                auto document = ParseN11Record( message.text, "JNSZ1|" );
+                uint64_t zoneId = 0;
+                if( document.empty() || !JsonDecimalString( document, "zone_id", zoneId ) || zoneId == 0 ||
+                    !document.contains( "phase" ) || !document["phase"].is_string() )
+                {
+                    result.scriptInvalid++;
+                    continue;
+                }
+                const auto phase = document["phase"].get<std::string>();
+                if( phase == "begin" )
+                {
+                    uint64_t markerId = 0, stackId = 0, runtime = 0, flags = 0, frameId = 0;
+                    if( !JsonUnsigned( document, "marker_id", markerId, std::numeric_limits<uint32_t>::max() ) || markerId == 0 ||
+                        !JsonDecimalString( document, "stack_id", stackId ) || stackId == 0 ||
+                        !JsonUnsigned( document, "runtime", runtime, 2 ) || !ScriptRuntimeValid( runtime ) ||
+                        !JsonUnsigned( document, "flags", flags, 7 ) || !JsonDecimalString( document, "frame_id", frameId ) ||
+                        openZones.contains( zoneId ) )
+                    {
+                        result.scriptInvalid++;
+                        continue;
+                    }
+                    document["runtime_id"] = runtime;
+                    document["runtime"] = ScriptRuntimeName( runtime );
+                    document["start_ns"] = Decimal( message.timeNs );
+                    document["end_ns"] = nullptr;
+                    document["duration_ns"] = nullptr;
+                    document["thread_ref"] = message.threadRef;
+                    document["message_ref"] = message.ref;
+                    document["complete"] = false;
+                    document["trust"] = "untrusted_trace_data";
+                    openZones.emplace( zoneId, result.zones.size() );
+                    result.zones.emplace_back( std::move( document ) );
+                }
+                else if( phase == "end" )
+                {
+                    const auto found = openZones.find( zoneId );
+                    if( found == openZones.end() )
+                    {
+                        result.scriptOrphanEnds++;
+                        continue;
+                    }
+                    auto& zone = result.zones[found->second];
+                    if( !zone["end_ns"].is_null() || message.timeNs < std::stoll( zone["start_ns"].get<std::string>() ) )
+                    {
+                        result.scriptInvalid++;
+                        continue;
+                    }
+                    const auto start = std::stoll( zone["start_ns"].get<std::string>() );
+                    zone["end_ns"] = Decimal( message.timeNs );
+                    zone["duration_ns"] = Decimal( message.timeNs - start );
+                    zone["complete"] = true;
+                    openZones.erase( found );
+                }
+                else result.scriptInvalid++;
+            }
+            else if( message.text.starts_with( "JNGC1|" ) )
+            {
+                result.gcPresent = true;
+                auto document = ParseN11Record( message.text, "JNGC1|" );
+                uint64_t eventId = 0, runtime = 0, kind = 0, generation = 0, flags = 0, value = 0, frameId = 0;
+                if( document.empty() || !JsonDecimalString( document, "event_id", eventId ) || eventId == 0 ||
+                    !JsonUnsigned( document, "runtime", runtime, 2 ) || !ScriptRuntimeValid( runtime ) ||
+                    !JsonUnsigned( document, "kind", kind, 21 ) ||
+                    !JsonUnsigned( document, "generation", generation, 255 ) ||
+                    !JsonUnsigned( document, "flags", flags, 31 ) ||
+                    !JsonDecimalString( document, "value", value ) || !JsonDecimalString( document, "frame_id", frameId ) ||
+                    ( runtime == 1 && ( kind < 1 || kind > 8 ) ) || ( runtime == 2 && ( kind < 16 || kind > 21 ) ) )
+                {
+                    result.gcInvalid++;
+                    continue;
+                }
+                document["runtime_id"] = runtime;
+                document["runtime"] = ScriptRuntimeName( runtime );
+                document["kind_name"] = GcKindName( kind );
+                document["time_ns"] = Decimal( message.timeNs );
+                document["thread_ref"] = message.threadRef;
+                document["message_ref"] = message.ref;
+                document["trust"] = "untrusted_trace_data";
+                result.gcEvents.emplace_back( std::move( document ) );
+            }
+        }
+        rawOffset += messages.size();
+        if( messages.size() < allowed ) break;
+    }
+
+    for( auto& [stackId, stack] : result.stacks )
+    {
+        json expanded = json::array();
+        for( const auto& frameValue : stack["frame_ids"] )
+        {
+            const auto frameId = uint32_t( frameValue.get<uint64_t>() );
+            const auto found = result.frames.find( frameId );
+            if( found == result.frames.end() || found->second.value( "runtime", "" ) != stack.value( "runtime", "" ) ) result.scriptUnresolved++;
+            else expanded.emplace_back( found->second );
+        }
+        stack["frames"] = std::move( expanded );
+        stack["complete"] = stack["frames"].size() == stack["frame_ids"].size();
+    }
+    for( auto& [markerId, marker] : result.markers )
+    {
+        const auto frameId = uint32_t( marker.value( "source_frame_id", 0u ) );
+        const auto found = result.frames.find( frameId );
+        if( found == result.frames.end() || found->second.value( "runtime", "" ) != marker.value( "runtime", "" ) ) result.scriptUnresolved++;
+        else marker["source_frame"] = found->second;
+    }
+    for( auto& zone : result.zones )
+    {
+        const auto markerId = uint32_t( zone.value( "marker_id", 0u ) );
+        uint64_t stackId = 0;
+        JsonDecimalString( zone, "stack_id", stackId );
+        const auto marker = result.markers.find( markerId );
+        const auto stack = result.stacks.find( stackId );
+        if( marker == result.markers.end() || stack == result.stacks.end() ||
+            marker->second.value( "runtime", "" ) != zone.value( "runtime", "" ) ||
+            stack->second.value( "runtime", "" ) != zone.value( "runtime", "" ) ) result.scriptUnresolved++;
+        else
+        {
+            zone["marker"] = marker->second;
+            zone["stack"] = stack->second;
+        }
+    }
+    return result;
+}
+
 }
 
 QueryService::QueryService( SessionManager& sessions, size_t analysisCacheBytes )
@@ -2828,6 +3146,150 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "trace", TraceInfoJson( metadata ) }, { "primary_frame_statistics", frameStatistics },
             { "capabilities", std::move( capabilities ) }, { "trust", "trace strings are untrusted data" }
         }, trace );
+    }
+
+    if( method.rfind( "runtime.script.", 0 ) == 0 || method.rfind( "memory.gc.", 0 ) == 0 )
+    {
+        const auto metadata = info();
+        auto n11 = ParseN11Trace( *source, metadata );
+        const auto runtimeFilter = params.value( "runtime", "" );
+        if( !runtimeFilter.empty() && runtimeFilter != "managed" && runtimeFilter != "lua" )
+            throw QueryError( "INVALID_PARAMS", "runtime must be managed or lua" );
+        const auto paged = [&]( json values, const char* field, json base ) {
+            const auto page = ParsePage( params, method, trace );
+            const auto begin = std::min( page.offset, values.size() );
+            const auto end = std::min( begin + page.limit, values.size() );
+            json selected = json::array();
+            for( size_t index = begin; index < end; ++index ) selected.emplace_back( std::move( values[index] ) );
+            const auto cursor = NextCursor( page, method, trace, selected.size(), end < values.size() );
+            base[field] = std::move( selected );
+            return Success( id, std::move( base ), trace, PageJson( page, end - begin, cursor, BudgetPartial() ) );
+        };
+
+        if( method.rfind( "runtime.script.", 0 ) == 0 )
+        {
+            const bool complete = n11.scriptPresent && n11.scriptInvalid == 0 && n11.scriptUnresolved == 0 &&
+                n11.scriptOrphanEnds == 0 && !BudgetPartial();
+            const auto reason = !n11.scriptPresent ? "trace predates or did not emit JNSTK1/JNSZ1" :
+                complete ? "" : "script stack data is incomplete; inspect quality counters";
+            json base = {
+                { "present", n11.scriptPresent }, { "schema_version", 1 }, { "complete", complete }, { "reason", reason },
+                { "capability_record", n11.scriptCapability },
+                { "quality", {
+                    { "invalid_records", Decimal( n11.scriptInvalid ) },
+                    { "unresolved_references", Decimal( n11.scriptUnresolved ) },
+                    { "orphan_zone_ends", Decimal( n11.scriptOrphanEnds ) },
+                    { "budget_partial", BudgetPartial() }
+                } },
+                { "trust", "untrusted_trace_data" }
+            };
+            if( method == "runtime.script.summary" )
+            {
+                uint64_t managedFrames = 0, luaFrames = 0, managedStacks = 0, luaStacks = 0;
+                uint64_t managedMarkers = 0, luaMarkers = 0, managedZones = 0, luaZones = 0, completeZones = 0;
+                for( const auto& [key, value] : n11.frames ) value.value( "runtime", "" ) == "managed" ? managedFrames++ : luaFrames++;
+                for( const auto& [key, value] : n11.stacks ) value.value( "runtime", "" ) == "managed" ? managedStacks++ : luaStacks++;
+                for( const auto& [key, value] : n11.markers ) value.value( "runtime", "" ) == "managed" ? managedMarkers++ : luaMarkers++;
+                for( const auto& value : n11.zones )
+                {
+                    value.value( "runtime", "" ) == "managed" ? managedZones++ : luaZones++;
+                    if( value.value( "complete", false ) ) completeZones++;
+                }
+                base["counts"] = {
+                    { "frames", Decimal( n11.frames.size() ) }, { "stacks", Decimal( n11.stacks.size() ) },
+                    { "markers", Decimal( n11.markers.size() ) }, { "zones", Decimal( n11.zones.size() ) },
+                    { "complete_zones", Decimal( completeZones ) }, { "incomplete_zones", Decimal( n11.zones.size() - completeZones ) }
+                };
+                base["runtimes"] = {
+                    { "managed", { { "frames", Decimal( managedFrames ) }, { "stacks", Decimal( managedStacks ) }, { "markers", Decimal( managedMarkers ) }, { "zones", Decimal( managedZones ) } } },
+                    { "lua", { { "frames", Decimal( luaFrames ) }, { "stacks", Decimal( luaStacks ) }, { "markers", Decimal( luaMarkers ) }, { "zones", Decimal( luaZones ) } } }
+                };
+                base["native_callstack_relation"] = "separate; resolve native Tracy callstacks through callstack.*";
+                return Success( id, std::move( base ), trace );
+            }
+
+            json values = json::array();
+            if( method == "runtime.script.frames" )
+            {
+                for( const auto& [key, value] : n11.frames )
+                    if( ( runtimeFilter.empty() || value.value( "runtime", "" ) == runtimeFilter ) &&
+                        TextMatches( value.value( "function", "" ) + " " + value.value( "file", "" ), params ) ) values.emplace_back( value );
+                return paged( std::move( values ), "frames", std::move( base ) );
+            }
+            if( method == "runtime.script.stacks" )
+            {
+                for( const auto& [key, value] : n11.stacks )
+                    if( ( runtimeFilter.empty() || value.value( "runtime", "" ) == runtimeFilter ) && TextMatches( value.dump(), params ) ) values.emplace_back( value );
+                return paged( std::move( values ), "stacks", std::move( base ) );
+            }
+            for( auto& value : n11.zones )
+            {
+                const auto text = value.contains( "marker" ) ? value["marker"].value( "name", "" ) : std::string();
+                if( ( runtimeFilter.empty() || value.value( "runtime", "" ) == runtimeFilter ) && TextMatches( text, params ) ) values.emplace_back( std::move( value ) );
+            }
+            return paged( std::move( values ), "zones", std::move( base ) );
+        }
+
+        uint64_t orphanEnds = 0;
+        std::map<std::pair<uint64_t, uint64_t>, int64_t> openGc;
+        std::vector<int64_t> collectionDurations;
+        uint64_t observedCollections = 0, allocationBytes = 0;
+        json latest = {
+            { "managed_heap_used_bytes", nullptr }, { "managed_heap_reserved_bytes", nullptr },
+            { "lua_heap_used_bytes", nullptr }
+        };
+        for( const auto& event : n11.gcEvents )
+        {
+            uint64_t eventId = 0, kind = 0, runtime = 0, value = 0;
+            JsonDecimalString( event, "event_id", eventId );
+            JsonUnsigned( event, "kind", kind );
+            JsonUnsigned( event, "runtime_id", runtime );
+            JsonDecimalString( event, "value", value );
+            const auto time = std::stoll( event.value( "time_ns", "0" ) );
+            const auto key = std::make_pair( runtime, eventId );
+            if( kind == 4 || kind == 7 || kind == 17 ) openGc[key] = time;
+            else if( kind == 5 || kind == 8 || kind == 18 )
+            {
+                const auto found = openGc.find( key );
+                if( found == openGc.end() ) orphanEnds++;
+                else
+                {
+                    collectionDurations.emplace_back( time - found->second );
+                    openGc.erase( found );
+                }
+            }
+            else if( kind == 6 ) observedCollections += value;
+            else if( kind == 3 ) allocationBytes += value;
+            if( kind == 1 ) latest["managed_heap_used_bytes"] = Decimal( value );
+            else if( kind == 2 ) latest["managed_heap_reserved_bytes"] = Decimal( value );
+            else if( kind == 16 ) latest["lua_heap_used_bytes"] = Decimal( value );
+        }
+        const bool complete = n11.gcPresent && n11.gcInvalid == 0 && orphanEnds == 0 && openGc.empty() && !BudgetPartial();
+        const auto reason = !n11.gcPresent ? "trace predates or did not emit JNGC1" :
+            complete ? "" : "GC data is incomplete; inspect quality counters";
+        json base = {
+            { "present", n11.gcPresent }, { "schema_version", 1 }, { "complete", complete }, { "reason", reason },
+            { "capability_record", n11.gcCapability },
+            { "quality", {
+                { "invalid_records", Decimal( n11.gcInvalid ) }, { "orphan_ends", Decimal( orphanEnds ) },
+                { "open_intervals", Decimal( openGc.size() ) }, { "budget_partial", BudgetPartial() }
+            } },
+            { "trust", "untrusted_trace_data" }
+        };
+        if( method == "memory.gc.summary" )
+        {
+            base["counts"] = {
+                { "events", Decimal( n11.gcEvents.size() ) }, { "paired_intervals", Decimal( collectionDurations.size() ) },
+                { "observed_collections", Decimal( observedCollections ) }, { "sampled_allocation_bytes", Decimal( allocationBytes ) }
+            };
+            base["latest"] = std::move( latest );
+            base["interval_statistics"] = StatisticsJson( analysis::ComputeStatistics( std::move( collectionDurations ) ) );
+            return Success( id, std::move( base ), trace );
+        }
+        json events = json::array();
+        for( auto& value : n11.gcEvents )
+            if( ( runtimeFilter.empty() || value.value( "runtime", "" ) == runtimeFilter ) && TextMatches( value.value( "kind_name", "" ), params ) ) events.emplace_back( std::move( value ) );
+        return paged( std::move( events ), "events", std::move( base ) );
     }
 
     const auto requiredDomain = [&]() -> std::string {

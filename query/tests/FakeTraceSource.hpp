@@ -16,6 +16,7 @@ class FakeTraceSource final : public analysis::TraceSource
 {
     bool m_legacyFormat = false;
     bool m_truncatedSource = false;
+    bool m_n11 = false;
     std::optional<std::vector<std::string>> m_appInfoOverride;
 
     template<typename T>
@@ -57,9 +58,10 @@ public:
         };
     }
 
-    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false )
+    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false, bool n11 = false )
         : m_legacyFormat( legacyFormat )
         , m_truncatedSource( truncatedSource )
+        , m_n11( n11 )
     {}
 
     explicit FakeTraceSource( std::vector<std::string> appInfoOverride, bool truncatedSource = false )
@@ -74,6 +76,8 @@ public:
         {
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
+        result.push_back( { "runtime.script", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" } } );
+        result.push_back( { "memory.gc", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "memory.gc.summary", "memory.gc.events" } } );
         return result;
     }
 
@@ -104,6 +108,18 @@ public:
         if( !m_legacyFormat )
         {
             value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
+            if( m_n11 )
+            {
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"capability\",\"managed_stack\":\"selective\",\"lua_stack\":\"explicit_debug_api\"}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"frame\",\"frame_id\":1,\"runtime\":\"managed\",\"function\":\"Fake.Managed.Caller\",\"file\":\"Packages/com.jngame.tracy/Fake.cs\",\"line\":42,\"flags\":4}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"frame\",\"frame_id\":2,\"runtime\":\"lua\",\"function\":\"FakeLuaUpdate\",\"file\":\"lua/fake.lua\",\"line\":12,\"flags\":4}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"stack\",\"stack_id\":\"1\",\"runtime\":\"managed\",\"flags\":4,\"frame_ids\":[1]}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"stack\",\"stack_id\":\"2\",\"runtime\":\"lua\",\"flags\":4,\"frame_ids\":[2]}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"marker\",\"marker_id\":1,\"runtime\":\"managed\",\"name\":\"JN.Direct/Fake.Managed\",\"source_frame_id\":1,\"color\":0,\"flags\":0}" );
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"marker\",\"marker_id\":2,\"runtime\":\"lua\",\"name\":\"JN.Direct/Fake.Lua\",\"source_frame_id\":2,\"color\":0,\"flags\":0}" );
+                value.appInfo.emplace_back( "JNGC1|{\"schema_version\":1,\"record\":\"capability\",\"managed_heap\":\"sampled\",\"lua_gc\":\"explicit_api\"}" );
+                value.counts.messages = 9;
+            }
         }
         return value;
     }
@@ -173,7 +189,21 @@ public:
     }
     std::vector<analysis::MessageDto> ScanMessages( const analysis::ScanRange& range ) const override
     {
-        analysis::MessageDto value; value.ref = MakeEntityRef( "message", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 25; value.text = "untrusted fake message"; return Page( { value }, range );
+        analysis::MessageDto value; value.ref = MakeEntityRef( "message", 0 ); value.threadRef = MakeEntityRef( "thread", 1 ); value.timeNs = 25; value.text = "untrusted fake message";
+        if( !m_n11 ) return Page( { value }, range );
+        std::vector<analysis::MessageDto> values { value };
+        const auto add = [&]( int64_t time, const char* text ) {
+            analysis::MessageDto message; message.ref = MakeEntityRef( "message", values.size() ); message.threadRef = MakeEntityRef( "thread", 1 ); message.timeNs = time; message.text = text; values.emplace_back( std::move( message ) );
+        };
+        add( 30, "JNSZ1|{\"schema_version\":1,\"zone_id\":\"1\",\"marker_id\":1,\"stack_id\":\"1\",\"runtime\":1,\"phase\":\"begin\",\"frame_id\":\"1\",\"flags\":1}" );
+        add( 35, "JNSZ1|{\"schema_version\":1,\"zone_id\":\"1\",\"phase\":\"end\"}" );
+        add( 40, "JNSZ1|{\"schema_version\":1,\"zone_id\":\"2\",\"marker_id\":2,\"stack_id\":\"2\",\"runtime\":2,\"phase\":\"begin\",\"frame_id\":\"1\",\"flags\":1}" );
+        add( 45, "JNSZ1|{\"schema_version\":1,\"zone_id\":\"2\",\"phase\":\"end\"}" );
+        add( 50, "JNGC1|{\"schema_version\":1,\"event_id\":\"1\",\"runtime\":1,\"kind\":4,\"generation\":255,\"flags\":12,\"value\":\"0\",\"frame_id\":\"1\"}" );
+        add( 55, "JNGC1|{\"schema_version\":1,\"event_id\":\"1\",\"runtime\":1,\"kind\":5,\"generation\":255,\"flags\":12,\"value\":\"0\",\"frame_id\":\"1\"}" );
+        add( 60, "JNGC1|{\"schema_version\":1,\"event_id\":\"2\",\"runtime\":1,\"kind\":1,\"generation\":255,\"flags\":5,\"value\":\"1048576\",\"frame_id\":\"1\"}" );
+        add( 65, "JNGC1|{\"schema_version\":1,\"event_id\":\"3\",\"runtime\":2,\"kind\":16,\"generation\":255,\"flags\":1,\"value\":\"65536\",\"frame_id\":\"1\"}" );
+        return Page( std::move( values ), range );
     }
     std::vector<analysis::PlotPointDto> ScanPlots( const analysis::ScanRange& range ) const override { return Page( { analysis::PlotPointDto { MakeEntityRef( "plot-point", 0 ), MakeEntityRef( "plot", 0 ), 30, 1.0 } }, range ); }
     std::vector<std::string> ScanLocks( const analysis::ScanRange& range ) const override { return Page( { MakeEntityRef( "lock", 1 ) }, range ); }

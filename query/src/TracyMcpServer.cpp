@@ -405,6 +405,7 @@ json McpServer::CallTool( const std::string& name, json arguments )
         static const std::map<std::string, std::string> methods = {
             { "cpu_zone", "zone.cpu.search" }, { "gpu_zone", "zone.gpu.search" }, { "message", "message.search" },
             { "memory", "memory.events" }, { "gpu_memory", "memory.gpu.allocations" }, { "thread", "thread.list" },
+            { "script_stack", "runtime.script.stacks" }, { "script_zone", "runtime.script.zones" }, { "gc", "memory.gc.events" },
             { "lock", "lock.list" }, { "plot", "plot.list" }, { "frame", "frame.list" }, { "frame_image", "frame_image.list" },
             { "sample", "sample.list" }, { "context_switch", "context_switch.range" }, { "symbol", "symbol.search" },
             { "source", "source.locations" }, { "hardware_sample", "hardware_sample.counts" }
@@ -471,6 +472,15 @@ json McpServer::CallTool( const std::string& name, json arguments )
             };
             const auto found = operations.find( operation ); if( found == operations.end() ) throw QueryError( "INVALID_PARAMS", "unsupported GPU memory inspect operation" ); method = found->second;
         }
+        else if( domain == "script" )
+        {
+            static const std::map<std::string, std::string> operations = {
+                { "summary", "runtime.script.summary" }, { "frames", "runtime.script.frames" },
+                { "stacks", "runtime.script.stacks" }, { "zones", "runtime.script.zones" }
+            };
+            const auto found = operations.find( operation ); if( found == operations.end() ) throw QueryError( "INVALID_PARAMS", "unsupported script inspect operation" ); method = found->second;
+        }
+        else if( domain == "gc" ) method = operation == "events" ? "memory.gc.events" : "memory.gc.summary";
         else if( domain == "callstack" )
         {
             method = "callstack.resolve";

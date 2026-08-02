@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.9.0",
+  "schema_version": "1.10.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -609,6 +609,33 @@
       "query_fields": ["root_ref", "jobs", "dispatches", "entities", "links", "visited_nodes", "truncated"],
       "unmapped_fields": [],
       "methods": ["job.gfx_chain"],
+      "status": "complete"
+    },
+    {
+      "entity": "runtime.script.frame_stack_marker",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["JNSTK1 schema_version", "record", "frame_id", "stack_id", "marker_id", "runtime", "function", "file", "line", "frame_ids", "source_frame_id", "flags"],
+      "query_fields": ["present", "complete", "frames", "stacks", "markers", "runtimes", "unresolved_references", "trust"],
+      "unmapped_fields": [],
+      "methods": ["runtime.script.summary", "runtime.script.frames", "runtime.script.stacks"],
+      "status": "complete"
+    },
+    {
+      "entity": "runtime.script.zone",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["JNSZ1 zone_id", "marker_id", "stack_id", "runtime", "phase", "frame_id", "flags", "message time", "message thread"],
+      "query_fields": ["zone_id", "marker", "stack", "runtime", "start_ns", "end_ns", "duration_ns", "thread_ref", "frame_id", "complete"],
+      "unmapped_fields": [],
+      "methods": ["runtime.script.summary", "runtime.script.zones"],
+      "status": "complete"
+    },
+    {
+      "entity": "memory.gc.event",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["JNGC1 event_id", "runtime", "kind", "generation", "flags", "value", "frame_id", "message time", "message thread"],
+      "query_fields": ["present", "complete", "event_id", "runtime", "kind_name", "generation", "flags", "value", "frame_id", "time_ns", "thread_ref", "latest", "interval_statistics"],
+      "unmapped_fields": [],
+      "methods": ["memory.gc.summary", "memory.gc.events"],
       "status": "complete"
     },
     {

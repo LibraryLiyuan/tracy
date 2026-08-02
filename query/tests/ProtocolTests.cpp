@@ -87,6 +87,7 @@ struct TemporaryTraceFiles
         std::filesystem::create_directories( root );
         baseline = root / "baseline.tracy";
         candidate = root / "candidate.tracy";
+        n11 = root / "n11.tracy";
         duplicateIdentity = root / "duplicate-identity.tracy";
         malformedIdentity = root / "malformed-identity.tracy";
         conflictingIdentity = root / "conflicting-identity.tracy";
@@ -97,6 +98,7 @@ struct TemporaryTraceFiles
         outside = outsideRoot / "outside.tracy";
         std::ofstream( baseline, std::ios::binary ).put( '\0' );
         std::ofstream( candidate, std::ios::binary ).put( '\0' );
+        std::ofstream( n11, std::ios::binary ).put( '\0' );
         std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
@@ -115,6 +117,7 @@ struct TemporaryTraceFiles
     std::filesystem::path root;
     std::filesystem::path baseline;
     std::filesystem::path candidate;
+    std::filesystem::path n11;
     std::filesystem::path duplicateIdentity;
     std::filesystem::path malformedIdentity;
     std::filesystem::path conflictingIdentity;
@@ -128,7 +131,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.9.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.10.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -136,7 +139,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 31 );
+    assert( coverage.at( "domains" ).size() == 33 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -313,6 +316,7 @@ int main()
             callback( tracy::analysis::TraceSourceState::Indexing );
             const auto filename = path.filename().string();
             if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
+            if( filename == "n11.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, true );
             if( filename == "duplicate-identity.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
@@ -414,9 +418,39 @@ int main()
     const auto candidateId = openCandidate.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( candidateId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
 
+    const auto oldScript = service.Execute( Request( 1000, "runtime.script.summary", { { "trace_id", candidateId } } ) );
+    assert( oldScript.at( "ok" ) && oldScript.at( "data" ).at( "present" ) == false && oldScript.at( "data" ).at( "complete" ) == false );
+    const auto oldGc = service.Execute( Request( 1001, "memory.gc.summary", { { "trace_id", candidateId } } ) );
+    assert( oldGc.at( "ok" ) && oldGc.at( "data" ).at( "present" ) == false && oldGc.at( "data" ).at( "complete" ) == false );
+
+    const auto openN11 = service.Execute( Request( 1002, "trace.open", { { "path", files.n11.string() } } ) );
+    assert( openN11.at( "ok" ) );
+    const auto n11Id = openN11.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( n11Id, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto scriptSummary = service.Execute( Request( 1003, "runtime.script.summary", { { "trace_id", n11Id } } ) ).at( "data" );
+    assert( scriptSummary.at( "present" ) == true && scriptSummary.at( "complete" ) == true );
+    assert( scriptSummary.at( "counts" ).at( "frames" ) == "2" && scriptSummary.at( "counts" ).at( "stacks" ) == "2" );
+    assert( scriptSummary.at( "counts" ).at( "zones" ) == "2" && scriptSummary.at( "counts" ).at( "complete_zones" ) == "2" );
+    assert( scriptSummary.at( "runtimes" ).at( "managed" ).at( "zones" ) == "1" );
+    assert( scriptSummary.at( "runtimes" ).at( "lua" ).at( "zones" ) == "1" );
+    const auto managedFrames = service.Execute( Request( 1004, "runtime.script.frames", { { "trace_id", n11Id }, { "runtime", "managed" } } ) ).at( "data" ).at( "frames" );
+    assert( managedFrames.size() == 1 && managedFrames[0].at( "function" ) == "Fake.Managed.Caller" && managedFrames[0].at( "line" ) == 42 );
+    const auto luaStacks = service.Execute( Request( 1005, "runtime.script.stacks", { { "trace_id", n11Id }, { "runtime", "lua" } } ) ).at( "data" ).at( "stacks" );
+    assert( luaStacks.size() == 1 && luaStacks[0].at( "complete" ) == true && luaStacks[0].at( "frames" )[0].at( "function" ) == "FakeLuaUpdate" );
+    const auto scriptZones = service.Execute( Request( 1006, "runtime.script.zones", { { "trace_id", n11Id } } ) ).at( "data" ).at( "zones" );
+    assert( scriptZones.size() == 2 && scriptZones[0].at( "duration_ns" ) == "5" && scriptZones[1].at( "duration_ns" ) == "5" );
+    const auto gcSummary = service.Execute( Request( 1007, "memory.gc.summary", { { "trace_id", n11Id } } ) ).at( "data" );
+    assert( gcSummary.at( "present" ) == true && gcSummary.at( "complete" ) == true );
+    assert( gcSummary.at( "counts" ).at( "events" ) == "4" && gcSummary.at( "counts" ).at( "paired_intervals" ) == "1" );
+    assert( gcSummary.at( "latest" ).at( "managed_heap_used_bytes" ) == "1048576" );
+    assert( gcSummary.at( "latest" ).at( "lua_heap_used_bytes" ) == "65536" );
+    const auto luaGcEvents = service.Execute( Request( 1008, "memory.gc.events", { { "trace_id", n11Id }, { "runtime", "lua" } } ) ).at( "data" ).at( "events" );
+    assert( luaGcEvents.size() == 1 && luaGcEvents[0].at( "kind_name" ) == "lua_heap_used" );
+    assert( service.Execute( Request( 1009, "trace.close", { { "trace_id", n11Id } } ) ).at( "ok" ) );
+
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.9.0" );
+    assert( described.at( "schema_version" ) == "1.10.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -428,9 +462,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.9.0" );
+        assert( operation.at( "schema_version" ) == "1.10.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.9.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.10.0" );
         assert( operation.at( "budget_parameters" ).size() == 4 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
