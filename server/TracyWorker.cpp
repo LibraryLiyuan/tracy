@@ -1764,7 +1764,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         uint8_t present;
         f.Read3( magic, schemaVersion, present );
         if( magic != JnTraceSectionMagic ) throw LoadFailure( "JN trace section magic mismatch." );
-        if( schemaVersion != 1 && schemaVersion != JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
+        if( schemaVersion < 1 || schemaVersion > JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
 
         auto& jn = m_data.jnTrace;
         jn.present = present != 0;
@@ -1801,6 +1801,12 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         ReadJnVector( f, jn.gfxEntities, "gfx entity" );
         ReadJnVector( f, jn.gfxLinks, "gfx link" );
         if( schemaVersion >= 2 ) ReadJnVector( f, jn.frames, "frame correlation" );
+        if( schemaVersion >= 3 )
+        {
+            ReadJnVector( f, jn.ioRequests, "I/O request" );
+            ReadJnVector( f, jn.ioConfigs, "I/O config" );
+            ReadJnVector( f, jn.ioStages, "I/O stage" );
+        }
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -4482,6 +4488,8 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnGfxEntity:
     case QueueType::JnGfxLink:
     case QueueType::JnFrame:
+    case QueueType::JnIoRequest:
+    case QueueType::JnIoConfig:
         RecorderCheckCurrentThread();
         break;
     case QueueType::JnJobStage:
@@ -4490,6 +4498,14 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
             JnJobStage( ev.jnJobStage.stage ) == JnJobStage::WaitCallstack )
         {
             if( !m_recorderSerialCallstack ) RecorderFail( "JN Job stage is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
+    case QueueType::JnIoStage:
+        RecorderCheckCurrentThread();
+        if( JnIoStage( ev.jnIoStage.stage ) == JnIoStage::RequestCallstack )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "JN I/O stage is missing its serial callstack." );
             m_recorderSerialCallstack = false;
         }
         break;
@@ -5960,6 +5976,15 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::JnFrame:
         ProcessJnFrame( ev.jnFrame );
         break;
+    case QueueType::JnIoRequest:
+        ProcessJnIoRequest( ev.jnIoRequest );
+        break;
+    case QueueType::JnIoConfig:
+        ProcessJnIoConfig( ev.jnIoConfig );
+        break;
+    case QueueType::JnIoStage:
+        ProcessJnIoStage( ev.jnIoStage );
+        break;
     default:
         assert( false );
         break;
@@ -6070,6 +6095,43 @@ void Worker::ProcessJnFrame( const QueueJnFrame& ev )
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
     data.frames.push_back( JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnIoRequest( const QueueJnIoRequest& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.ioRequests.push_back( JnIoRequestData { time, ev.requestId, ev.resourceId, m_threadCtx, ev.operation, ev.source, ev.priority, ev.subsystem, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnIoConfig( const QueueJnIoConfig& ev )
+{
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.ioConfigs.push_back( JnIoConfigData { ev.requestId, ev.parentId, ev.requestedBytes, ev.originFrameSequence, ev.parentKind, ev.flags } );
+}
+
+void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    uint32_t detail = ev.detail;
+    uint64_t thread = m_threadCtx;
+    if( JnIoStage( ev.stage ) == JnIoStage::RequestCallstack )
+    {
+        assert( m_serialNextCallstack != 0 );
+        detail = m_serialNextCallstack;
+        thread = ev.detail;
+        m_serialNextCallstack = 0;
+    }
+    data.ioStages.push_back( JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -9847,6 +9909,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.gfxEntities );
     WriteJnVector( f, m_data.jnTrace.gfxLinks );
     WriteJnVector( f, m_data.jnTrace.frames );
+    WriteJnVector( f, m_data.jnTrace.ioRequests );
+    WriteJnVector( f, m_data.jnTrace.ioConfigs );
+    WriteJnVector( f, m_data.jnTrace.ioStages );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

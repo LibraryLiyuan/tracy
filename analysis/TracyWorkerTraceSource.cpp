@@ -1129,6 +1129,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
+    const auto& jnTrace = m_impl->worker->GetJnTraceData();
+    const bool hasIo = jnTrace.schemaVersion >= 3 && ( !jnTrace.ioRequests.empty() || !jnTrace.ioStages.empty() );
     auto capability = []( std::string domain, bool present, bool indexed, std::vector<std::string> methods, std::string reason = {} ) {
         if( reason.empty() ) reason = present ? "available in the persisted snapshot" : "data is absent from the persisted snapshot";
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
@@ -1179,6 +1181,9 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "message", info.counts.messages != 0, true, { "message.search", "message.get" } ),
         capability( "job", hasJnTrace, true, { "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics" }, hasJnTrace ? "JN Job schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
         capability( "job.gfx", hasJnTrace, true, { "job.gfx.statistics", "job.gfx_chain" }, hasJnTrace ? "JN Graphics Jobs schema is present in the persisted snapshot" : "trace predates or does not contain the JN Job schema" ),
+        capability( "io", hasIo, true, { "io.search", "io.get", "io.statistics", "io.chain" },
+            hasIo ? "JN structured I/O schema is present in the persisted snapshot" : "trace predates or does not contain JN structured I/O records" ),
+        capability( "network", false, false, { "network.capabilities" }, "deferred_by_user" ),
         capability( "statistics", true, true, { "statistics.describe", "statistics.compute" } ),
         capability( "compare", true, true, { "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
         capability( "validation", true, true, { "validation.run" } )
@@ -1269,6 +1274,9 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.gfxEntities = jn.gfxEntities.size();
     counts.gfxLinks = jn.gfxLinks.size();
     counts.correlatedFrameEvents = jn.frames.size();
+    counts.ioRequests = jn.ioRequests.size();
+    counts.ioConfigs = jn.ioConfigs.size();
+    counts.ioStages = jn.ioStages.size();
     for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
     return result;
 }
@@ -1871,6 +1879,84 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         std::sort( job.executionLanes.begin(), job.executionLanes.end() );
         std::sort( job.stages.begin(), job.stages.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
         result.emplace_back( std::move( job ) );
+    }
+    return result;
+}
+
+std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& data = m_impl->worker->GetJnTraceData();
+    std::map<uint64_t, IoRequestDto> requests;
+    const auto ensureRequest = [&]( uint64_t requestId ) -> IoRequestDto& {
+        auto [it, inserted] = requests.try_emplace( requestId );
+        if( inserted )
+        {
+            it->second.ref = m_impl->MakeRef( "io-request", requestId );
+            it->second.requestId = requestId;
+            it->second.orphan = true;
+        }
+        return it->second;
+    };
+
+    for( const auto& value : data.ioRequests )
+    {
+        auto& request = ensureRequest( value.requestId );
+        request.resourceId = value.resourceId;
+        request.queueThreadRef = m_impl->MakeRef( "thread", value.thread );
+        request.queueNs = value.time;
+        request.operation = value.operation;
+        request.source = value.source;
+        request.priority = value.priority;
+        request.subsystem = value.subsystem;
+        request.flags = value.flags;
+        request.captureBoundary = ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+        request.orphan = false;
+    }
+    for( const auto& value : data.ioConfigs )
+    {
+        auto& request = ensureRequest( value.requestId );
+        request.parentId = value.parentId;
+        request.requestedBytes = value.requestedBytes;
+        request.originFrameSequence = value.originFrameSequence;
+        request.parentKind = value.parentKind;
+        request.configFlags = value.flags;
+        request.captureBoundary = request.captureBoundary || ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+    }
+    for( const auto& value : data.ioStages )
+    {
+        auto& request = ensureRequest( value.requestId );
+        request.stages.push_back( { value.time, m_impl->MakeRef( "thread", value.thread ), value.bytes, value.detail, value.stage, value.status, value.flags } );
+        request.captureBoundary = request.captureBoundary || ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+        switch( JnIoStage( value.stage ) )
+        {
+        case JnIoStage::Start:
+            if( !request.startNs || value.time < *request.startNs ) request.startNs = value.time;
+            break;
+        case JnIoStage::Complete:
+        case JnIoStage::Error:
+        case JnIoStage::Cancel:
+            request.terminalCount++;
+            if( !request.endNs || value.time > *request.endNs ) request.endNs = value.time;
+            request.transferredBytes = value.bytes;
+            request.status = value.status;
+            break;
+        case JnIoStage::RequestCallstack:
+            request.requestCallstack = value.detail;
+            break;
+        case JnIoStage::Requeue:
+            request.status = value.status;
+            break;
+        }
+    }
+
+    std::vector<IoRequestDto> result;
+    result.reserve( requests.size() );
+    for( auto& [requestId, request] : requests )
+    {
+        request.truncated = !request.endNs.has_value();
+        std::sort( request.stages.begin(), request.stages.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+        result.emplace_back( std::move( request ) );
     }
     return result;
 }

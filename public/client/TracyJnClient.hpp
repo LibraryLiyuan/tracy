@@ -158,6 +158,64 @@ tracy_force_inline void EmitJnFrame( uint64_t frameId, uint64_t domainIndex, uin
     TracyLfqCommit;
 }
 
+tracy_force_inline void EmitJnIoRequest( uint64_t requestId, uint64_t resourceId, uint8_t operation, uint8_t source, uint8_t priority, uint8_t subsystem, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnIoRequest );
+    MemWrite( &item->jnIoRequest.time, Profiler::GetTime() );
+    MemWrite( &item->jnIoRequest.requestId, requestId );
+    MemWrite( &item->jnIoRequest.resourceId, resourceId );
+    MemWrite( &item->jnIoRequest.operation, operation );
+    MemWrite( &item->jnIoRequest.source, source );
+    MemWrite( &item->jnIoRequest.priority, priority );
+    MemWrite( &item->jnIoRequest.subsystem, subsystem );
+    MemWrite( &item->jnIoRequest.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnIoConfig( uint64_t requestId, uint64_t parentId, uint64_t requestedBytes, uint32_t originFrameSequence, uint8_t parentKind, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnIoConfig );
+    MemWrite( &item->jnIoConfig.requestId, requestId );
+    MemWrite( &item->jnIoConfig.parentId, parentId );
+    MemWrite( &item->jnIoConfig.requestedBytes, requestedBytes );
+    MemWrite( &item->jnIoConfig.originFrameSequence, originFrameSequence );
+    MemWrite( &item->jnIoConfig.parentKind, parentKind );
+    MemWrite( &item->jnIoConfig.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnIoStage( uint64_t requestId, uint64_t bytes, uint32_t detail, uint8_t stage, uint8_t status, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnIoStage );
+    MemWrite( &item->jnIoStage.time, Profiler::GetTime() );
+    MemWrite( &item->jnIoStage.requestId, requestId );
+    MemWrite( &item->jnIoStage.bytes, bytes );
+    MemWrite( &item->jnIoStage.detail, detail );
+    MemWrite( &item->jnIoStage.stage, stage );
+    MemWrite( &item->jnIoStage.status, status );
+    MemWrite( &item->jnIoStage.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnIoRequestCallstack( uint64_t requestId, int32_t depth )
+{
+    if( depth <= 0 || !has_callstack() ) return;
+    TracyJnOnDemandGuard;
+    auto item = Profiler::QueueSerialCallstack( Callstack( depth ) );
+    MemWrite( &item->hdr.type, QueueType::JnIoStage );
+    MemWrite( &item->jnIoStage.time, Profiler::GetTime() );
+    MemWrite( &item->jnIoStage.requestId, requestId );
+    MemWrite( &item->jnIoStage.bytes, uint64_t( 0 ) );
+    MemWrite( &item->jnIoStage.detail, GetThreadHandle() );
+    MemWrite( &item->jnIoStage.stage, uint8_t( JnIoStage::RequestCallstack ) );
+    MemWrite( &item->jnIoStage.status, uint8_t( JnIoStatus::Unknown ) );
+    MemWrite( &item->jnIoStage.flags, uint8_t( 0 ) );
+    Profiler::QueueSerialFinish();
+}
+
 #undef TracyJnOnDemandGuard
 
 #else
@@ -174,6 +232,10 @@ tracy_force_inline void EmitJnGfxDispatch( uint64_t, uint64_t, uint32_t, uint8_t
 tracy_force_inline void EmitJnGfxEntity( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGfxLink( uint64_t, uint64_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnFrame( uint64_t, uint64_t, uint8_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnIoRequest( uint64_t, uint64_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnIoConfig( uint64_t, uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnIoStage( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnIoRequestCallstack( uint64_t, int32_t ) {}
 
 #endif
 

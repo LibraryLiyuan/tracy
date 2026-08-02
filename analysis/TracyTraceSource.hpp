@@ -101,6 +101,9 @@ struct TraceCountsDto
     uint64_t gfxEntities = 0;
     uint64_t gfxLinks = 0;
     uint64_t correlatedFrameEvents = 0;
+    uint64_t ioRequests = 0;
+    uint64_t ioConfigs = 0;
+    uint64_t ioStages = 0;
 };
 
 struct TraceInfoDto
@@ -576,6 +579,46 @@ struct JobDto
     std::vector<JobStageDto> stages;
 };
 
+struct IoStageDto
+{
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint64_t bytes = 0;
+    uint32_t detail = 0;
+    uint8_t stage = 0;
+    uint8_t status = 0;
+    uint8_t flags = 0;
+};
+
+struct IoRequestDto
+{
+    std::string ref;
+    uint64_t requestId = 0;
+    uint64_t resourceId = 0;
+    uint64_t parentId = 0;
+    std::string queueThreadRef;
+    int64_t queueNs = 0;
+    std::optional<int64_t> startNs;
+    std::optional<int64_t> endNs;
+    uint64_t requestedBytes = 0;
+    uint64_t transferredBytes = 0;
+    uint32_t originFrameSequence = 0;
+    uint32_t requestCallstack = 0;
+    uint8_t operation = 0;
+    uint8_t source = 0;
+    uint8_t priority = 0;
+    uint8_t subsystem = 0;
+    uint8_t flags = 0;
+    uint8_t configFlags = 0;
+    uint8_t parentKind = 0;
+    uint8_t status = 0;
+    uint32_t terminalCount = 0;
+    bool orphan = false;
+    bool truncated = false;
+    bool captureBoundary = false;
+    std::vector<IoStageDto> stages;
+};
+
 struct GfxDispatchDto
 {
     std::string ref;
@@ -741,6 +784,7 @@ public:
     virtual std::vector<std::string> ScanSamples( const ScanRange& range ) const = 0;
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
+    virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }

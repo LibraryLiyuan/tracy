@@ -598,6 +598,7 @@ TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanContextSwitches, const ana
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CorrelatedFrameEventDto>, GetCorrelatedFrameEvents )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
+TRACY_SEGMENT_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxEntityDto>, GetGfxEntities )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxLinkDto>, GetGfxLinks )

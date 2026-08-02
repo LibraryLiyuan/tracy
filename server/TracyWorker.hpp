@@ -903,6 +903,9 @@ private:
     tracy_force_inline void ProcessJnGfxEntity( const QueueJnGfxEntity& ev );
     tracy_force_inline void ProcessJnGfxLink( const QueueJnGfxLink& ev );
     tracy_force_inline void ProcessJnFrame( const QueueJnFrame& ev );
+    tracy_force_inline void ProcessJnIoRequest( const QueueJnIoRequest& ev );
+    tracy_force_inline void ProcessJnIoConfig( const QueueJnIoConfig& ev );
+    tracy_force_inline void ProcessJnIoStage( const QueueJnIoStage& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );

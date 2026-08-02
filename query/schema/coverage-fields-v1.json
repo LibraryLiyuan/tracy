@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.11.0",
+  "schema_version": "1.12.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -497,6 +497,15 @@
       "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "job_schema_version", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "wait_callstacks", "dependencies", "stages", "ready_ns", "ready_lane", "queue_enter_ns", "queue_lane", "first_run_ns", "completed_ns", "schedule_to_ready_ns", "ready_to_queue_ns", "queue_to_first_run_ns", "dependency_ready_latency_ns", "execution_ns", "execution_lanes", "dispatch_count", "scheduler_steal_count", "range_steal_slice_count", "queue_retry_count", "wait", "orphan", "truncated", "statistics.counts", "statistics.latency", "statistics.lanes", "statistics.quality.missing_ready", "statistics.quality.missing_queue", "statistics.quality.invalid_order", "statistics.quality.invalid_schedule_to_ready", "statistics.quality.invalid_ready_to_queue", "statistics.quality.invalid_queue_to_first_run", "statistics.quality.invalid_order_examples", "statistics.quality.capture_boundary_orphan", "statistics.quality.capture_boundary_truncated"],
       "unmapped_fields": [],
       "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"],
+      "status": "complete"
+    },
+    {
+      "entity": "io.request",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["request", "config", "stage"],
+      "query_fields": ["ref", "request_id", "resource_id", "resource_identity", "parent_id", "parent_kind", "parent_ref", "operation", "source", "sync", "async", "priority", "subsystem", "queue_ns", "queue_thread_ref", "start_ns", "end_ns", "queue_latency_ns", "execution_ns", "total_ns", "requested_bytes", "transferred_bytes", "status", "origin_frame_sequence", "request_callstack", "request_callstack_ref", "stages", "terminal_count", "orphan", "truncated", "capture_boundary", "statistics.counts", "statistics.latency", "statistics.quality"],
+      "unmapped_fields": [],
+      "methods": ["io.search", "io.get", "io.statistics", "io.chain"],
       "status": "complete"
     },
     {

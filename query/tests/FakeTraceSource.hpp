@@ -2,6 +2,7 @@
 #define __TRACYQUERYFAKETRACESOURCE_HPP__
 
 #include "TracyTraceSource.hpp"
+#include "../../public/common/TracyQueue.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -72,12 +73,13 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override
     {
         std::vector<analysis::Capability> result;
-        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "correlation", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "statistics", "compare", "validation" } )
+        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "correlation", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "io", "statistics", "compare", "validation" } )
         {
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
         result.push_back( { "runtime.script", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" } } );
         result.push_back( { "memory.gc", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "memory.gc.summary", "memory.gc.events" } } );
+        result.push_back( { "network", false, false, false, "deferred_by_user", { "network.capabilities" } } );
         return result;
     }
 
@@ -105,6 +107,7 @@ public:
         value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
         value.counts.gfxDispatches = 1; value.counts.gfxEntities = 5; value.counts.gfxLinks = 11;
         value.counts.correlatedFrameEvents = 4;
+        value.counts.ioRequests = 2; value.counts.ioConfigs = 2; value.counts.ioStages = 7;
         if( !m_legacyFormat )
         {
             value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
@@ -262,6 +265,37 @@ public:
             { 9, MakeEntityRef( "thread", 1 ), 1, 0, 0, 6, 0 }
         };
         return { prerequisite, value };
+    }
+    std::vector<analysis::IoRequestDto> GetIoRequests() const override
+    {
+        analysis::IoRequestDto parent;
+        parent.ref = MakeEntityRef( "io-request", 100 ); parent.requestId = 100; parent.resourceId = 0x1234;
+        parent.queueThreadRef = MakeEntityRef( "thread", 1 ); parent.queueNs = 10; parent.startNs = 12; parent.endNs = 50;
+        parent.requestedBytes = 4096; parent.transferredBytes = 4096; parent.originFrameSequence = 1;
+        parent.operation = uint8_t( JnIoOperation::ResourceLoad ); parent.source = uint8_t( JnIoSource::JnfsManaged );
+        parent.flags = uint8_t( JnIoFlags::Async ); parent.parentKind = uint8_t( JnIoParentKind::Resource ); parent.parentId = 0x1234;
+        parent.status = uint8_t( JnIoStatus::Success ); parent.terminalCount = 1;
+        parent.stages = {
+            { 12, MakeEntityRef( "thread", 1 ), 0, 0, uint8_t( JnIoStage::Start ), uint8_t( JnIoStatus::Unknown ), 0 },
+            { 50, MakeEntityRef( "thread", 1 ), 4096, 0, uint8_t( JnIoStage::Complete ), uint8_t( JnIoStatus::Success ), 0 }
+        };
+
+        analysis::IoRequestDto child;
+        child.ref = MakeEntityRef( "io-request", 101 ); child.requestId = 101; child.resourceId = 0xabcdef;
+        child.parentId = 100; child.parentKind = uint8_t( JnIoParentKind::IoRequest );
+        child.queueThreadRef = MakeEntityRef( "thread", 1 ); child.queueNs = 13; child.startNs = 15; child.endNs = 35;
+        child.requestedBytes = 4096; child.transferredBytes = 4096; child.originFrameSequence = 1; child.requestCallstack = 1;
+        child.operation = uint8_t( JnIoOperation::Read ); child.source = uint8_t( JnIoSource::AsyncReadManager );
+        child.flags = uint8_t( JnIoFlags::Async ) | uint8_t( JnIoFlags::ResourcePathHash );
+        child.status = uint8_t( JnIoStatus::Success ); child.terminalCount = 1;
+        child.stages = {
+            { 13, MakeEntityRef( "thread", 1 ), 0, 1, uint8_t( JnIoStage::RequestCallstack ), uint8_t( JnIoStatus::Unknown ), 0 },
+            { 15, MakeEntityRef( "thread", 1 ), 0, 0, uint8_t( JnIoStage::Start ), uint8_t( JnIoStatus::Unknown ), 0 },
+            { 20, MakeEntityRef( "thread", 1 ), 0, 0, uint8_t( JnIoStage::Requeue ), uint8_t( JnIoStatus::Requeued ), 0 },
+            { 25, MakeEntityRef( "thread", 1 ), 0, 0, uint8_t( JnIoStage::Start ), uint8_t( JnIoStatus::Unknown ), 0 },
+            { 35, MakeEntityRef( "thread", 1 ), 4096, 0, uint8_t( JnIoStage::Complete ), uint8_t( JnIoStatus::Success ), 0 }
+        };
+        return { parent, child };
     }
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override
     {

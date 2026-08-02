@@ -68,6 +68,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "plot.points" || method == "plot.range" || method == "plot.downsample" || method == "plot.statistics" ) params["plot_ref"] = "fake:plot:0";
     if( method == "message.get" ) params["ref"] = "fake:message:0";
     if( method == "job.get" || method == "job.dependencies" || method == "job.gfx_chain" ) params["ref"] = "fake:job:1";
+    if( method == "io.get" || method == "io.chain" ) params["ref"] = "fake:io-request:100";
     if( method == "callstack.resolve" || method == "callstack.batch" ) params["callstacks"] = json::array( { "1" } );
     if( method == "callstack.frames" || method == "callstack.parent" ) params["callstack"] = "1";
     if( method == "symbol.get" || method == "symbol.raw_code" || method == "symbol.disassembly" ) params["ref"] = "fake:symbol:1";
@@ -131,7 +132,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.11.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.12.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -139,7 +140,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 33 );
+    assert( coverage.at( "domains" ).size() == 35 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -149,7 +150,8 @@ int main()
         assert( domain.at( "domain" ).is_string() );
         assert( !domain.at( "methods" ).empty() );
         assert( !domain.at( "worker_data" ).empty() );
-        assert( domain.at( "status" ) == "complete" );
+        if( domain.at( "domain" ) == "network" ) assert( domain.at( "status" ) == "deferred_by_user" );
+        else assert( domain.at( "status" ) == "complete" );
         assert( !domain.at( "tests" ).empty() );
     }
 
@@ -450,7 +452,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.11.0" );
+    assert( described.at( "schema_version" ) == "1.12.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -462,9 +464,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.11.0" );
+        assert( operation.at( "schema_version" ) == "1.12.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.11.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.12.0" );
         assert( operation.at( "budget_parameters" ).size() == 4 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -542,6 +544,34 @@ int main()
     assert( jobStatistics.at( "quality" ).at( "invalid_queue_to_first_run" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "invalid_order_examples" ).empty() );
     assert( jobStatistics.at( "quality" ).at( "cancelled_supported" ) == false );
+
+    const auto ioGet = service.Execute( Request( requestId++, "io.get", {
+        { "trace_id", candidateId }, { "ref", "fake:io-request:101" }
+    } ) ).at( "data" );
+    assert( ioGet.at( "present" ) == true && ioGet.at( "io_schema_version" ) == 1 );
+    const auto& ioRequest = ioGet.at( "request" );
+    assert( ioRequest.at( "operation" ) == "read" && ioRequest.at( "source" ) == "async_read_manager" );
+    assert( ioRequest.at( "parent_ref" ) == "fake:io-request:100" && ioRequest.at( "resource_identity" ) == "path_hash" );
+    assert( ioRequest.at( "queue_latency_ns" ) == "2" && ioRequest.at( "execution_ns" ) == "20" && ioRequest.at( "total_ns" ) == "22" );
+    assert( ioRequest.at( "requested_bytes" ) == "4096" && ioRequest.at( "transferred_bytes" ) == "4096" );
+    assert( ioRequest.at( "request_callstack_ref" ) == "fake:callstack:1" && ioRequest.at( "stage_count" ) == 5 );
+
+    const auto ioStatistics = service.Execute( Request( requestId++, "io.statistics", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( ioStatistics.at( "present" ) == true && ioStatistics.at( "complete" ) == true );
+    assert( ioStatistics.at( "counts" ).at( "requests" ) == "2" && ioStatistics.at( "counts" ).at( "completed" ) == "2" );
+    assert( ioStatistics.at( "counts" ).at( "request_callstacks" ) == "1" && ioStatistics.at( "counts" ).at( "requeue_stages" ) == "1" );
+    assert( ioStatistics.at( "quality" ).at( "missing_start" ) == "0" && ioStatistics.at( "quality" ).at( "missing_terminal" ) == "0" );
+    assert( ioStatistics.at( "quality" ).at( "invalid_order" ) == "0" && ioStatistics.at( "quality" ).at( "unresolved_parent" ) == "0" );
+
+    const auto ioChain = service.Execute( Request( requestId++, "io.chain", {
+        { "trace_id", candidateId }, { "ref", "fake:io-request:101" }
+    } ) ).at( "data" );
+    assert( ioChain.at( "present" ) == true && ioChain.at( "nodes" ).size() == 2 && ioChain.at( "edges" ).size() == 1 );
+    assert( ioChain.at( "edges" )[0].at( "evidence_kind" ) == "exact" && ioChain.at( "truncated" ) == false );
+
+    const auto networkCapabilities = service.Execute( Request( requestId++, "network.capabilities", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( networkCapabilities.at( "present" ) == false && networkCapabilities.at( "status" ) == "DeferredByUser" );
+    assert( networkCapabilities.at( "reason" ) == "deferred_by_user" );
 
     const auto boundedSourceCompare = service.Execute( Request( requestId++, "compare.source", {
         { "trace_id", candidateId }, { "baseline_trace_id", baselineId }, { "max_bytes", 16 }

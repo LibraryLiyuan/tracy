@@ -45,6 +45,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics",
         "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics", "message.search", "message.get",
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics", "job.gfx.statistics", "job.gfx_chain",
+        "io.search", "io.get", "io.statistics", "io.chain", "network.capabilities",
         "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
         "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
         "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
@@ -59,7 +60,7 @@ nlohmann::json RequiredParametersFor( const std::string& method )
     if( method == "trace.open" ) required.emplace_back( "path" );
     else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
     else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
-    if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
+    if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "io.chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
         method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
     if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
     if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
@@ -484,7 +485,8 @@ json CountsJson( const analysis::TraceCountsDto& value )
         { "job_types", Decimal( value.jobTypes ) }, { "jobs", Decimal( value.jobs ) },
         { "job_dependencies", Decimal( value.jobDependencies ) }, { "job_stages", Decimal( value.jobStages ) },
         { "gfx_dispatches", Decimal( value.gfxDispatches ) }, { "gfx_entities", Decimal( value.gfxEntities ) },
-        { "gfx_links", Decimal( value.gfxLinks ) }, { "correlated_frame_events", Decimal( value.correlatedFrameEvents ) }
+        { "gfx_links", Decimal( value.gfxLinks ) }, { "correlated_frame_events", Decimal( value.correlatedFrameEvents ) },
+        { "io_requests", Decimal( value.ioRequests ) }, { "io_configs", Decimal( value.ioConfigs ) }, { "io_stages", Decimal( value.ioStages ) }
     };
 }
 
@@ -957,6 +959,81 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
     result["dependencies"] = std::move( dependencies );
     result["stages"] = std::move( stages );
     result["wait_callstacks"] = std::move( waitCallstacks );
+    return result;
+}
+
+const char* IoOperationName( uint8_t value )
+{
+    static constexpr const char* names[] = { "read", "stat", "open", "close", "jnfs_load", "decompress", "deserialize", "integrate", "upload", "resource_load" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* IoSourceName( uint8_t value )
+{
+    static constexpr const char* names[] = { "async_read_manager", "jnfs_native", "jnfs_managed", "async_upload_manager", "lua" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* IoStageName( uint8_t value )
+{
+    static constexpr const char* names[] = { "start", "complete", "error", "cancel", "requeue", "request_callstack" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* IoStatusName( uint8_t value )
+{
+    static constexpr const char* names[] = { "unknown", "success", "failure", "truncated", "cancelled", "requeued" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* IoParentKindName( uint8_t value )
+{
+    static constexpr const char* names[] = { "none", "io_request", "unity_flow", "job", "resource" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+json IoRequestJson( const analysis::TraceSource& source, const analysis::IoRequestDto& value, bool detailed )
+{
+    const bool sync = ( value.flags & uint8_t( JnIoFlags::Sync ) ) != 0;
+    const bool async = ( value.flags & uint8_t( JnIoFlags::Async ) ) != 0;
+    json result = {
+        { "ref", value.ref }, { "request_id", Decimal( value.requestId ) }, { "resource_id", Decimal( value.resourceId ) },
+        { "resource_identity", ( value.flags & uint8_t( JnIoFlags::ResourcePathHash ) ) != 0 ? "path_hash" : "stable_id" },
+        { "parent_id", Decimal( value.parentId ) }, { "parent_kind", IoParentKindName( value.parentKind ) }, { "parent_kind_id", value.parentKind },
+        { "parent_ref", value.parentKind == uint8_t( JnIoParentKind::IoRequest ) && value.parentId != 0 ? json( source.MakeEntityRef( "io-request", value.parentId ) ) : json( nullptr ) },
+        { "operation", IoOperationName( value.operation ) }, { "operation_id", value.operation },
+        { "source", IoSourceName( value.source ) }, { "source_id", value.source },
+        { "sync", sync }, { "async", async }, { "priority", value.priority }, { "subsystem", value.subsystem },
+        { "queue_ns", value.orphan ? json( nullptr ) : json( Decimal( value.queueNs ) ) }, { "queue_thread_ref", value.queueThreadRef },
+        { "start_ns", value.startNs ? json( Decimal( *value.startNs ) ) : json( nullptr ) },
+        { "end_ns", value.endNs ? json( Decimal( *value.endNs ) ) : json( nullptr ) },
+        { "queue_latency_ns", value.startNs && !value.orphan ? json( Decimal( *value.startNs - value.queueNs ) ) : json( nullptr ) },
+        { "execution_ns", value.startNs && value.endNs ? json( Decimal( *value.endNs - *value.startNs ) ) : json( nullptr ) },
+        { "total_ns", value.endNs && !value.orphan ? json( Decimal( *value.endNs - value.queueNs ) ) : json( nullptr ) },
+        { "requested_bytes", Decimal( value.requestedBytes ) }, { "transferred_bytes", Decimal( value.transferredBytes ) },
+        { "status", IoStatusName( value.status ) }, { "status_id", value.status },
+        { "origin_frame_sequence", value.originFrameSequence }, { "request_callstack", value.requestCallstack },
+        { "request_callstack_ref", value.requestCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.requestCallstack ) ) },
+        { "callstack_kind", value.requestCallstack == 0 ? json( nullptr ) : json( "native" ) },
+        { "flags", value.flags }, { "config_flags", value.configFlags }, { "stage_count", value.stages.size() },
+        { "terminal_count", value.terminalCount }, { "orphan", value.orphan }, { "truncated", value.truncated },
+        { "capture_boundary", value.captureBoundary }, { "evidence_kind", "exact" }, { "trust", "untrusted_trace_data" }
+    };
+    if( !detailed ) return result;
+    json stages = json::array();
+    for( size_t index = 0; index < value.stages.size(); index++ )
+    {
+        const auto& stage = value.stages[index];
+        stages.push_back( {
+            { "ref", source.MakeEntityRef( "io-stage", ( value.requestId << 16 ) ^ index ) },
+            { "time_ns", Decimal( stage.timeNs ) }, { "thread_ref", stage.threadRef },
+            { "bytes", Decimal( stage.bytes ) }, { "detail", stage.detail },
+            { "stage", IoStageName( stage.stage ) }, { "stage_id", stage.stage },
+            { "status", IoStatusName( stage.status ) }, { "status_id", stage.status }, { "flags", stage.flags },
+            { "callstack_ref", stage.stage == uint8_t( JnIoStage::RequestCallstack ) && stage.detail != 0 ? json( source.MakeEntityRef( "callstack", stage.detail ) ) : json( nullptr ) }
+        } );
+    }
+    result["stages"] = std::move( stages );
     return result;
 }
 
@@ -3349,6 +3426,195 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         for( auto& value : n11.gcEvents )
             if( ( runtimeFilter.empty() || value.value( "runtime", "" ) == runtimeFilter ) && TextMatches( value.value( "kind_name", "" ), params ) ) events.emplace_back( std::move( value ) );
         return paged( std::move( events ), "events", std::move( base ) );
+    }
+
+    if( method == "network.capabilities" )
+    {
+        return Success( id, {
+            { "present", false }, { "status", "DeferredByUser" }, { "reason", "deferred_by_user" },
+            { "implemented", false }, { "capture_enabled", false }, { "methods", json::array( { "network.capabilities" } ) }
+        }, trace );
+    }
+
+    if( method == "io.search" || method == "io.get" || method == "io.statistics" || method == "io.chain" )
+    {
+        auto requests = source->GetIoRequests();
+        const auto capabilities = source->GetCapabilities();
+        const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
+        const bool present = capability != capabilities.end() && capability->present;
+        const std::string reason = present ? "" : capability == capabilities.end() ? "trace source does not advertise structured I/O" : capability->reason;
+        const auto base = [&]() -> json {
+            return {
+                { "present", present }, { "io_schema_version", present ? 1 : 0 }, { "complete", present && !BudgetPartial() },
+                { "reason", reason }, { "request_count", Decimal( requests.size() ) }, { "trust", "untrusted_trace_data" }
+            };
+        };
+        if( !present )
+        {
+            auto result = base();
+            if( method == "io.search" ) result["requests"] = json::array();
+            else if( method == "io.get" ) result["request"] = nullptr;
+            else if( method == "io.chain" )
+            {
+                result["nodes"] = json::array();
+                result["edges"] = json::array();
+                result["truncated"] = false;
+            }
+            else
+            {
+                result["counts"] = { { "requests", "0" }, { "completed", "0" }, { "failed", "0" }, { "cancelled", "0" } };
+                result["quality"] = { { "missing_start", "0" }, { "missing_terminal", "0" }, { "duplicate_terminal", "0" },
+                    { "invalid_order", "0" }, { "unresolved_parent", "0" }, { "bytes_overflow", "0" },
+                    { "orphan", "0" }, { "truncated", "0" }, { "capture_boundary", "0" } };
+            }
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto parseIoRef = [&]() -> uint64_t {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "io-request" );
+            if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref is not an I/O request ref from this trace" );
+            return *parsed;
+        };
+        const auto findRequest = [&]( uint64_t requestId ) { return std::find_if( requests.begin(), requests.end(), [&]( const auto& value ) { return value.requestId == requestId; } ); };
+
+        if( method == "io.search" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string operation = params.value( "operation", "" );
+            const std::string sourceFilter = params.value( "source", "" );
+            const std::string status = params.value( "status", "" );
+            requests.erase( std::remove_if( requests.begin(), requests.end(), [&]( const auto& value ) {
+                const std::string searchable = std::string( IoOperationName( value.operation ) ) + " " + IoSourceName( value.source ) + " " + IoStatusName( value.status );
+                return !TextMatches( searchable, params ) || ( !operation.empty() && operation != IoOperationName( value.operation ) ) ||
+                    ( !sourceFilter.empty() && sourceFilter != IoSourceName( value.source ) ) || ( !status.empty() && status != IoStatusName( value.status ) );
+            } ), requests.end() );
+            std::sort( requests.begin(), requests.end(), []( const auto& lhs, const auto& rhs ) { return lhs.queueNs != rhs.queueNs ? lhs.queueNs < rhs.queueNs : lhs.requestId < rhs.requestId; } );
+            const auto begin = std::min( page.offset, requests.size() );
+            const auto end = std::min( begin + page.limit, requests.size() );
+            json values = json::array();
+            for( size_t index = begin; index < end; index++ ) values.push_back( IoRequestJson( *source, requests[index], false ) );
+            values = ProjectFields( std::move( values ), params );
+            auto result = base();
+            result["requests"] = std::move( values );
+            const auto cursor = NextCursor( page, method, trace, end - begin, end < requests.size() );
+            return Success( id, std::move( result ), trace, PageJson( page, end - begin, cursor ) );
+        }
+
+        if( method == "io.get" )
+        {
+            const auto requestId = parseIoRef();
+            const auto found = findRequest( requestId );
+            if( found == requests.end() ) throw QueryError( "ENTITY_NOT_FOUND", "I/O request ref was not found" );
+            auto result = base();
+            result["request"] = IoRequestJson( *source, *found, true );
+            return Success( id, std::move( result ), trace );
+        }
+
+        if( method == "io.statistics" )
+        {
+            uint64_t completed = 0, failed = 0, cancelled = 0, requeued = 0;
+            uint64_t missingStart = 0, missingTerminal = 0, duplicateTerminal = 0, invalidOrder = 0;
+            uint64_t unresolvedParent = 0, bytesOverflow = 0, orphan = 0, truncated = 0, captureBoundary = 0, callstacks = 0;
+            std::vector<int64_t> queueLatency, execution, total;
+            std::set<uint64_t> ids;
+            for( const auto& value : requests ) ids.emplace( value.requestId );
+            json operationCounts = json::object();
+            for( const auto& value : requests )
+            {
+                checkCancelled();
+                operationCounts[IoOperationName( value.operation )] = Decimal( std::stoull( operationCounts.value( IoOperationName( value.operation ), "0" ) ) + 1 );
+                completed += value.status == uint8_t( JnIoStatus::Success );
+                failed += value.status == uint8_t( JnIoStatus::Failure ) || value.status == uint8_t( JnIoStatus::Truncated );
+                cancelled += value.status == uint8_t( JnIoStatus::Cancelled );
+                requeued += std::count_if( value.stages.begin(), value.stages.end(), []( const auto& stage ) { return stage.stage == uint8_t( JnIoStage::Requeue ); } );
+                missingStart += !value.startNs.has_value();
+                missingTerminal += !value.endNs.has_value();
+                duplicateTerminal += value.terminalCount > 1;
+                orphan += value.orphan;
+                truncated += value.truncated;
+                captureBoundary += value.captureBoundary;
+                callstacks += value.requestCallstack != 0;
+                unresolvedParent += value.parentKind == uint8_t( JnIoParentKind::IoRequest ) && value.parentId != 0 && !ids.contains( value.parentId );
+                bytesOverflow += value.operation == uint8_t( JnIoOperation::Read ) && value.requestedBytes != 0 && value.transferredBytes > value.requestedBytes;
+                const bool badOrder = ( value.startNs && !value.orphan && *value.startNs < value.queueNs ) ||
+                    ( value.endNs && value.startNs && *value.endNs < *value.startNs ) || ( value.endNs && !value.orphan && *value.endNs < value.queueNs );
+                invalidOrder += badOrder;
+                if( value.startNs && !value.orphan && *value.startNs >= value.queueNs ) queueLatency.push_back( *value.startNs - value.queueNs );
+                if( value.startNs && value.endNs && *value.endNs >= *value.startNs ) execution.push_back( *value.endNs - *value.startNs );
+                if( value.endNs && !value.orphan && *value.endNs >= value.queueNs ) total.push_back( *value.endNs - value.queueNs );
+            }
+            auto result = base();
+            result["counts"] = {
+                { "requests", Decimal( requests.size() ) }, { "completed", Decimal( completed ) }, { "failed", Decimal( failed ) },
+                { "cancelled", Decimal( cancelled ) }, { "requeue_stages", Decimal( requeued ) }, { "request_callstacks", Decimal( callstacks ) },
+                { "operations", std::move( operationCounts ) }
+            };
+            result["latency"] = {
+                { "queue", StatisticsJson( analysis::ComputeStatistics( std::move( queueLatency ) ) ) },
+                { "execution", StatisticsJson( analysis::ComputeStatistics( std::move( execution ) ) ) },
+                { "total", StatisticsJson( analysis::ComputeStatistics( std::move( total ) ) ) }
+            };
+            result["quality"] = {
+                { "missing_start", Decimal( missingStart ) }, { "missing_terminal", Decimal( missingTerminal ) },
+                { "duplicate_terminal", Decimal( duplicateTerminal ) }, { "invalid_order", Decimal( invalidOrder ) },
+                { "unresolved_parent", Decimal( unresolvedParent ) }, { "bytes_overflow", Decimal( bytesOverflow ) },
+                { "orphan", Decimal( orphan ) }, { "truncated", Decimal( truncated ) }, { "capture_boundary", Decimal( captureBoundary ) }
+            };
+            result["complete"] = missingStart == 0 && missingTerminal == 0 && duplicateTerminal == 0 && invalidOrder == 0 && unresolvedParent == 0 && bytesOverflow == 0 && !BudgetPartial();
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto rootId = parseIoRef();
+        if( findRequest( rootId ) == requests.end() ) throw QueryError( "ENTITY_NOT_FOUND", "I/O request ref was not found" );
+        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+        std::unordered_map<uint64_t, std::vector<uint64_t>> adjacency;
+        json edges = json::array();
+        for( const auto& value : requests )
+        {
+            if( value.parentKind != uint8_t( JnIoParentKind::IoRequest ) || value.parentId == 0 || findRequest( value.parentId ) == requests.end() ) continue;
+            adjacency[value.parentId].push_back( value.requestId );
+            adjacency[value.requestId].push_back( value.parentId );
+            edges.push_back( {
+                { "source_ref", source->MakeEntityRef( "io-request", value.parentId ) }, { "target_ref", value.ref },
+                { "relation", "parent" }, { "evidence_kind", "exact" }
+            } );
+        }
+        std::queue<uint64_t> pending;
+        std::set<uint64_t> visited;
+        pending.push( rootId );
+        visited.emplace( rootId );
+        bool chainTruncated = false;
+        while( !pending.empty() )
+        {
+            checkCancelled();
+            const auto current = pending.front();
+            pending.pop();
+            for( const auto next : adjacency[current] )
+            {
+                if( visited.contains( next ) ) continue;
+                if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { chainTruncated = true; break; }
+                visited.emplace( next );
+                pending.push( next );
+            }
+            if( chainTruncated ) break;
+        }
+        json nodes = json::array();
+        for( const auto& value : requests ) if( visited.contains( value.requestId ) ) nodes.push_back( IoRequestJson( *source, value, false ) );
+        json selectedEdges = json::array();
+        for( auto& edge : edges )
+        {
+            const auto sourceId = source->ParseEntityRef( edge["source_ref"].get<std::string>(), "io-request" );
+            const auto targetId = source->ParseEntityRef( edge["target_ref"].get<std::string>(), "io-request" );
+            if( sourceId && targetId && visited.contains( *sourceId ) && visited.contains( *targetId ) ) selectedEdges.push_back( std::move( edge ) );
+        }
+        auto result = base();
+        result["root_ref"] = source->MakeEntityRef( "io-request", rootId );
+        result["nodes"] = std::move( nodes );
+        result["edges"] = std::move( selectedEdges );
+        result["truncated"] = chainTruncated || BudgetPartial();
+        result["evidence_kind"] = "exact";
+        return Success( id, std::move( result ), trace );
     }
 
     const auto requiredDomain = [&]() -> std::string {

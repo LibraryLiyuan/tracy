@@ -122,6 +122,9 @@ enum class QueueType : uint8_t
     JnGfxEntity,
     JnGfxLink,
     JnFrame,
+    JnIoRequest,
+    JnIoConfig,
+    JnIoStage,
     StringData,
     ThreadName,
     PlotName,
@@ -557,6 +560,68 @@ enum class JnFrameFlags : uint8_t
     Alias = 1 << 1
 };
 
+enum class JnIoOperation : uint8_t
+{
+    Read,
+    Stat,
+    Open,
+    Close,
+    JnfsLoad,
+    Decompress,
+    Deserialize,
+    Integrate,
+    Upload,
+    ResourceLoad
+};
+
+enum class JnIoSource : uint8_t
+{
+    AsyncReadManager,
+    JnfsNative,
+    JnfsManaged,
+    AsyncUploadManager,
+    Lua
+};
+
+enum class JnIoStage : uint8_t
+{
+    Start,
+    Complete,
+    Error,
+    Cancel,
+    Requeue,
+    RequestCallstack
+};
+
+enum class JnIoStatus : uint8_t
+{
+    Unknown,
+    Success,
+    Failure,
+    Truncated,
+    Cancelled,
+    Requeued
+};
+
+enum class JnIoParentKind : uint8_t
+{
+    None,
+    IoRequest,
+    UnityFlow,
+    Job,
+    Resource
+};
+
+enum class JnIoFlags : uint8_t
+{
+    None = 0,
+    Sync = 1 << 0,
+    Async = 1 << 1,
+    ResourcePathHash = 1 << 2,
+    Cached = 1 << 3,
+    CaptureBoundary = 1 << 4
+};
+
 struct QueueJnJobType
 {
     uint64_t name;
@@ -643,6 +708,39 @@ struct QueueJnFrame
     uint64_t domainIndex;
     uint8_t domain;
     uint8_t phase;
+    uint8_t flags;
+};
+
+struct QueueJnIoRequest
+{
+    int64_t time;
+    uint64_t requestId;
+    uint64_t resourceId;
+    uint8_t operation;
+    uint8_t source;
+    uint8_t priority;
+    uint8_t subsystem;
+    uint8_t flags;
+};
+
+struct QueueJnIoConfig
+{
+    uint64_t requestId;
+    uint64_t parentId;
+    uint64_t requestedBytes;
+    uint32_t originFrameSequence;
+    uint8_t parentKind;
+    uint8_t flags;
+};
+
+struct QueueJnIoStage
+{
+    int64_t time;
+    uint64_t requestId;
+    uint64_t bytes;
+    uint32_t detail;
+    uint8_t stage;
+    uint8_t status;
     uint8_t flags;
 };
 
@@ -1013,6 +1111,9 @@ struct QueueItem
         QueueJnGfxEntity jnGfxEntity;
         QueueJnGfxLink jnGfxLink;
         QueueJnFrame jnFrame;
+        QueueJnIoRequest jnIoRequest;
+        QueueJnIoConfig jnIoConfig;
+        QueueJnIoStage jnIoStage;
     };
 };
 #pragma pack( pop )
@@ -1135,6 +1236,9 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnGfxEntity ),
     sizeof( QueueHeader ) + sizeof( QueueJnGfxLink ),
     sizeof( QueueHeader ) + sizeof( QueueJnFrame ),
+    sizeof( QueueHeader ) + sizeof( QueueJnIoRequest ),
+    sizeof( QueueHeader ) + sizeof( QueueJnIoConfig ),
+    sizeof( QueueHeader ) + sizeof( QueueJnIoStage ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1161,6 +1265,9 @@ static_assert( sizeof( QueueJnGfxDispatch ) == 30, "JN Gfx dispatch payload size
 static_assert( sizeof( QueueJnGfxEntity ) == 31, "JN Gfx entity payload size mismatch" );
 static_assert( sizeof( QueueJnGfxLink ) == 26, "JN Gfx link payload size mismatch" );
 static_assert( sizeof( QueueJnFrame ) == 27, "JN frame payload size mismatch" );
+static_assert( sizeof( QueueJnIoRequest ) == 29, "JN I/O request payload size mismatch" );
+static_assert( sizeof( QueueJnIoConfig ) == 30, "JN I/O config payload size mismatch" );
+static_assert( sizeof( QueueJnIoStage ) == 31, "JN I/O stage payload size mismatch" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );

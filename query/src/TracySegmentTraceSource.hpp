@@ -46,6 +46,7 @@ public:
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<analysis::JobDto> GetJobs() const override;
+    std::vector<analysis::IoRequestDto> GetIoRequests() const override;
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;

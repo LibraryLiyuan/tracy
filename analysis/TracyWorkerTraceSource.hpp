@@ -78,6 +78,7 @@ public:
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
     std::vector<JobDto> GetJobs() const override;
+    std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
