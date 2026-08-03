@@ -89,6 +89,7 @@ struct TemporaryTraceFiles
         baseline = root / "baseline.tracy";
         candidate = root / "candidate.tracy";
         n11 = root / "n11.tracy";
+        profileMismatch = root / "profile-mismatch.tracy";
         duplicateIdentity = root / "duplicate-identity.tracy";
         malformedIdentity = root / "malformed-identity.tracy";
         conflictingIdentity = root / "conflicting-identity.tracy";
@@ -100,6 +101,7 @@ struct TemporaryTraceFiles
         std::ofstream( baseline, std::ios::binary ).put( '\0' );
         std::ofstream( candidate, std::ios::binary ).put( '\0' );
         std::ofstream( n11, std::ios::binary ).put( '\0' );
+        std::ofstream( profileMismatch, std::ios::binary ).put( '\0' );
         std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
@@ -119,6 +121,7 @@ struct TemporaryTraceFiles
     std::filesystem::path baseline;
     std::filesystem::path candidate;
     std::filesystem::path n11;
+    std::filesystem::path profileMismatch;
     std::filesystem::path duplicateIdentity;
     std::filesystem::path malformedIdentity;
     std::filesystem::path conflictingIdentity;
@@ -132,7 +135,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.13.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.14.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -325,6 +328,20 @@ int main()
             const auto filename = path.filename().string();
             if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
             if( filename == "n11.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, true );
+            if( filename == "profile-mismatch.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                auto& context = records[4];
+                for( const auto& field : { "profile_requested", "profile_effective" } )
+                {
+                    const auto expected = std::string( "\"" ) + field + "\":\"Detail\"";
+                    const auto replacement = std::string( "\"" ) + field + "\":\"Summary\"";
+                    const auto offset = context.find( expected );
+                    assert( offset != std::string::npos );
+                    context.replace( offset, expected.size(), replacement );
+                }
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
             if( filename == "duplicate-identity.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
@@ -454,11 +471,57 @@ int main()
     assert( gcSummary.at( "latest" ).at( "lua_heap_used_bytes" ) == "65536" );
     const auto luaGcEvents = service.Execute( Request( 1008, "memory.gc.events", { { "trace_id", n11Id }, { "runtime", "lua" } } ) ).at( "data" ).at( "events" );
     assert( luaGcEvents.size() == 1 && luaGcEvents[0].at( "kind_name" ) == "lua_heap_used" );
+
+    const auto compatiblePair = service.Execute( Request( 1010, "compare.compatibility", {
+        { "trace_id", n11Id }, { "baseline_trace_id", candidateId }, { "comparison_mode", "performance" },
+        { "frame_set", "Frames" }, { "warmup_frames", 0 }, { "window_frames", 1 }
+    } ) ).at( "data" );
+    assert( compatiblePair.at( "verdict" ) == "compatible" );
+    assert( compatiblePair.at( "performance_comparable" ) == true );
+    assert( compatiblePair.at( "hard_failure_count" ) == 0 && compatiblePair.at( "warning_count" ) == 0 );
+    assert( compatiblePair.at( "frame_window" ).at( "valid" ) == true );
+    assert( compatiblePair.at( "frame_window" ).at( "window_frames" ) == 1 );
+
+    const auto normalizedPair = service.Execute( Request( 1011, "compare.normalized", {
+        { "trace_id", n11Id }, { "baseline_trace_id", candidateId }, { "comparison_mode", "performance" },
+        { "frame_set", "Frames" }, { "warmup_frames", 0 }, { "window_frames", 1 }, { "limit", 20 }
+    } ) ).at( "data" );
+    assert( normalizedPair.at( "performed" ) == true );
+    assert( normalizedPair.at( "normalization" ).at( "frame_alignment" ) == "complete-frame ordinal" );
+    assert( normalizedPair.at( "frames" ).at( "delta" ).at( "mean_ns" ) == 0.0 );
+    assert( normalizedPair.at( "cpu" ).at( "unmatched_count" ) == 0 );
+    assert( normalizedPair.at( "gpu" ).at( "unmatched_count" ) == 0 );
+    assert( normalizedPair.at( "jobs" ).at( "unmatched_count" ) == 0 );
+
+    const auto incompatibleLegacyPair = service.Execute( Request( 1012, "compare.compatibility", {
+        { "trace_id", candidateId }, { "baseline_trace_id", baselineId }, { "comparison_mode", "performance" }
+    } ) ).at( "data" );
+    assert( incompatibleLegacyPair.at( "verdict" ) == "incompatible" );
+    assert( incompatibleLegacyPair.at( "performance_comparable" ) == false );
+    assert( incompatibleLegacyPair.at( "hard_failure_count" ).get<size_t>() > 0 );
     assert( service.Execute( Request( 1009, "trace.close", { { "trace_id", n11Id } } ) ).at( "ok" ) );
+
+    const auto openProfileMismatch = service.Execute( Request( 1013, "trace.open", { { "path", files.profileMismatch.string() } } ) );
+    assert( openProfileMismatch.at( "ok" ) );
+    const auto profileMismatchId = openProfileMismatch.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( profileMismatchId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto profileMismatchPair = service.Execute( Request( 1014, "compare.compatibility", {
+        { "trace_id", profileMismatchId }, { "baseline_trace_id", candidateId }, { "comparison_mode", "performance" },
+        { "frame_set", "Frames" }, { "warmup_frames", 0 }, { "window_frames", 1 }
+    } ) ).at( "data" );
+    assert( profileMismatchPair.at( "verdict" ) == "compatible_with_warnings" );
+    assert( profileMismatchPair.at( "warning_count" ).get<size_t>() >= 2 );
+    assert( std::count_if( profileMismatchPair.at( "checks" ).begin(), profileMismatchPair.at( "checks" ).end(),
+        []( const auto& check ) {
+            const auto id = check.at( "id" ).get<std::string>();
+            return !check.at( "matched" ).get<bool>() &&
+                ( id == "configuration.capture_profile_requested" || id == "configuration.capture_profile_effective" );
+        } ) == 2 );
+    assert( service.Execute( Request( 1015, "trace.close", { { "trace_id", profileMismatchId } } ) ).at( "ok" ) );
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.13.0" );
+    assert( described.at( "schema_version" ) == "1.14.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -470,9 +533,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.13.0" );
+        assert( operation.at( "schema_version" ) == "1.14.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.13.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.14.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -704,6 +767,7 @@ int main()
     assert( degradedProducer->at( "state" ) == "degraded" );
     assert( degradedProducer->at( "counters" ).at( "filtered" ) == "5" );
     assert( degradedProducer->at( "counters" ).at( "overflow" ) == "1" );
+    assert( degradedProducer->at( "runtime_policy" ).is_object() );
     const auto realZero = service.Execute( Request( requestId++, "producer.get", {
         { "trace_id", candidateId }, { "key", "test.real-zero" }
     } ) ).at( "data" );

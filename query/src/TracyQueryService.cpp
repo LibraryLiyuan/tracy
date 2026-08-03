@@ -49,7 +49,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
         "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
         "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
-        "timeline.slice", "statistics.describe", "statistics.compute", "compare.zones", "compare.frames", "compare.source", "validation.run"
+        "timeline.slice", "statistics.describe", "statistics.compute", "compare.compatibility", "compare.normalized", "compare.zones", "compare.frames", "compare.source", "validation.run"
     };
     return methods;
 }
@@ -80,7 +80,9 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 {
     using nlohmann::json;
     if( name == "limit" ) return { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumPageSize } };
-    if( name == "frame_index" || name == "base_frame_index" || name == "target_frame_index" || name == "index" ) return { { "type", "integer" }, { "minimum", 0 } };
+    if( name == "frame_index" || name == "base_frame_index" || name == "target_frame_index" || name == "index" || name == "warmup_frames" || name == "window_frames" ) return { { "type", "integer" }, { "minimum", 0 }, { "maximum", 1000000 } };
+    if( name == "allow_warnings" ) return { { "type", "boolean" } };
+    if( name == "comparison_mode" ) return { { "type", "string" }, { "enum", { "performance", "contract" } } };
     if( name == "max_scan_events" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxScanEvents } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_cpu_ms" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxCpuMs } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_nodes" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxNodes } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
@@ -135,7 +137,8 @@ const nlohmann::json& QueryOperationSchemaRegistry()
         json operations = json::array();
         const std::vector<std::string> common = {
             "trace_id", "baseline_trace_id", "start_ns", "end_ns", "limit", "cursor", "filter", "fields",
-            "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups", "max_edges"
+            "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups", "max_edges",
+            "comparison_mode", "frame_set", "warmup_frames", "window_frames", "allow_warnings"
         };
         for( const auto& method : RawQueryMethodRegistry() )
         {
@@ -1619,6 +1622,7 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
             !producer.contains( "effective" ) || !producer["effective"].is_boolean() ||
             !producer.contains( "permission_denied" ) || !producer["permission_denied"].is_boolean() ||
             !producer.contains( "deferred" ) || !producer["deferred"].is_boolean() ||
+            ( producer.contains( "runtime_policy" ) && !producer["runtime_policy"].is_object() ) ||
             !producer.contains( "counters" ) || !producer["counters"].is_object() )
         {
             if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality state is invalid" } } );
@@ -1739,7 +1743,8 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
             { "enabled", enabled }, { "effective", effective }, { "permission_denied", permissionDenied },
             { "deferred", deferred }, { "reason", last.value( "reason", "" ) },
             { "filter", last.value( "filter", "" ) }, { "threshold", last.value( "threshold", "0" ) },
-            { "budget", last.value( "budget", "0" ) }, { "sample_rate", last.value( "sample_rate", json::object() ) },
+            { "budget", last.value( "budget", "0" ) }, { "runtime_policy", last.value( "runtime_policy", json::object() ) },
+            { "sample_rate", last.value( "sample_rate", json::object() ) },
             { "state", state }, { "complete", windowComplete && !regression }, { "coverage_ratio", ratio },
             { "scanned_count", Decimal( deltas[0] ) }, { "total_count", Decimal( deltas[0] ) },
             { "omitted_count", Decimal( deltas[0] >= deltas[1] ? deltas[0] - deltas[1] : 0 ) },
@@ -2982,6 +2987,226 @@ FilteredScanPage ScanFiltered( const analysis::TraceSource& source, const json& 
     result.nextOffset = page.offset + result.values.size();
     if( result.nextRawOffset == 0 || !result.hasMore ) result.nextRawOffset = rawOffset;
     return result;
+}
+
+const json* JsonPointerValue( const json& value, const char* pointer )
+{
+    try
+    {
+        const auto& result = value.at( json::json_pointer( pointer ) );
+        return result.is_null() ? nullptr : &result;
+    }
+    catch( const std::exception& )
+    {
+        return nullptr;
+    }
+}
+
+std::optional<uint64_t> NonNegativeJsonInteger( const json* value )
+{
+    if( value == nullptr ) return std::nullopt;
+    if( value->is_number_unsigned() ) return value->get<uint64_t>();
+    if( value->is_number_integer() )
+    {
+        const auto result = value->get<int64_t>();
+        return result < 0 ? std::nullopt : std::optional<uint64_t>( uint64_t( result ) );
+    }
+    if( value->is_string() ) return DecimalStringValue( *value );
+    return std::nullopt;
+}
+
+struct ComparisonFrameWindow
+{
+    bool valid = false;
+    std::string reason;
+    analysis::FrameSetDto baselineSet;
+    analysis::FrameSetDto candidateSet;
+    std::vector<analysis::FrameDto> baselineFrames;
+    std::vector<analysis::FrameDto> candidateFrames;
+    size_t warmupFrames = 0;
+    size_t frameCount = 0;
+    analysis::ScanRange baselineRange;
+    analysis::ScanRange candidateRange;
+};
+
+ComparisonFrameWindow SelectComparisonFrameWindow( const analysis::TraceSource& baseline,
+    const analysis::TraceSource& candidate, const json& params, const json& baselineContext,
+    const json& candidateContext )
+{
+    ComparisonFrameWindow result;
+    const auto baselineSets = baseline.GetFrameSets();
+    const auto candidateSets = candidate.GetFrameSets();
+    if( baselineSets.empty() || candidateSets.empty() )
+    {
+        result.reason = "one or both traces contain no frame sets";
+        return result;
+    }
+
+    const auto normalized = []( const std::string& value ) { return Lower( NormalizeSourceKey( value ) ); };
+    const analysis::FrameSetDto* selectedBaseline = nullptr;
+    const analysis::FrameSetDto* selectedCandidate = nullptr;
+    const auto selectByName = [&]( const std::string& name ) {
+        const auto key = normalized( name );
+        const auto left = std::find_if( baselineSets.begin(), baselineSets.end(), [&]( const auto& value ) { return normalized( value.name ) == key; } );
+        const auto right = std::find_if( candidateSets.begin(), candidateSets.end(), [&]( const auto& value ) { return normalized( value.name ) == key; } );
+        if( left == baselineSets.end() || right == candidateSets.end() ) return false;
+        selectedBaseline = &*left;
+        selectedCandidate = &*right;
+        return true;
+    };
+
+    if( params.contains( "frame_set" ) )
+    {
+        const auto& requested = params["frame_set"];
+        if( requested.is_string() )
+        {
+            const auto text = requested.get<std::string>();
+            if( !selectByName( text ) )
+            {
+                const auto left = std::find_if( baselineSets.begin(), baselineSets.end(), [&]( const auto& value ) { return value.ref == text; } );
+                if( left == baselineSets.end() || !selectByName( left->name ) )
+                {
+                    result.reason = "requested frame set is not present in both traces";
+                    return result;
+                }
+            }
+        }
+        else if( requested.is_number_integer() || requested.is_number_unsigned() )
+        {
+            const auto index = requested.get<int64_t>();
+            if( index < 0 || size_t( index ) >= baselineSets.size() || !selectByName( baselineSets[size_t( index )].name ) )
+            {
+                result.reason = "requested frame set index is invalid or has no candidate match";
+                return result;
+            }
+        }
+        else
+        {
+            result.reason = "frame_set must be a name, ref, or non-negative index";
+            return result;
+        }
+    }
+    else if( !selectByName( "Player.Frame" ) && !selectByName( "Editor.Frame" ) )
+    {
+        for( const auto& left : baselineSets )
+        {
+            if( !left.continuous ) continue;
+            const auto right = std::find_if( candidateSets.begin(), candidateSets.end(), [&]( const auto& value ) {
+                return value.continuous && normalized( value.name ) == normalized( left.name );
+            } );
+            if( right == candidateSets.end() ) continue;
+            selectedBaseline = &left;
+            selectedCandidate = &*right;
+            break;
+        }
+    }
+
+    if( selectedBaseline == nullptr || selectedCandidate == nullptr )
+    {
+        result.reason = "no common Player.Frame, Editor.Frame, or continuous frame set was found";
+        return result;
+    }
+    result.baselineSet = *selectedBaseline;
+    result.candidateSet = *selectedCandidate;
+
+    const auto completeFrames = []( const analysis::TraceSource& source, const analysis::FrameSetDto& set ) {
+        std::vector<analysis::FrameDto> output;
+        const auto frames = source.GetFramesForSet( set.index, 0, set.frameCount );
+        output.reserve( frames.size() );
+        for( const auto& frame : frames ) if( frame.complete && frame.endNs && *frame.endNs >= frame.beginNs ) output.emplace_back( frame );
+        return output;
+    };
+    auto baselineFrames = completeFrames( baseline, *selectedBaseline );
+    auto candidateFrames = completeFrames( candidate, *selectedCandidate );
+
+    size_t warmup = 0;
+    if( params.contains( "warmup_frames" ) )
+    {
+        if( !params["warmup_frames"].is_number_integer() && !params["warmup_frames"].is_number_unsigned() )
+        {
+            result.reason = "warmup_frames must be a non-negative integer";
+            return result;
+        }
+        const auto requested = params["warmup_frames"].get<int64_t>();
+        if( requested < 0 )
+        {
+            result.reason = "warmup_frames must be a non-negative integer";
+            return result;
+        }
+        warmup = size_t( requested );
+    }
+    else
+    {
+        const auto left = NonNegativeJsonInteger( JsonPointerValue( baselineContext, "/context/workload/warmup_frames" ) ).value_or( 0 );
+        const auto right = NonNegativeJsonInteger( JsonPointerValue( candidateContext, "/context/workload/warmup_frames" ) ).value_or( 0 );
+        warmup = size_t( std::max( left, right ) );
+    }
+    if( baselineFrames.size() <= warmup || candidateFrames.size() <= warmup )
+    {
+        result.reason = "warmup removes every complete frame from one or both traces";
+        return result;
+    }
+    baselineFrames.erase( baselineFrames.begin(), baselineFrames.begin() + ptrdiff_t( warmup ) );
+    candidateFrames.erase( candidateFrames.begin(), candidateFrames.begin() + ptrdiff_t( warmup ) );
+    const size_t available = std::min( baselineFrames.size(), candidateFrames.size() );
+    size_t count = std::min<size_t>( available, 300 );
+    if( params.contains( "window_frames" ) )
+    {
+        if( !params["window_frames"].is_number_integer() && !params["window_frames"].is_number_unsigned() )
+        {
+            result.reason = "window_frames must be a non-negative integer";
+            return result;
+        }
+        const auto requested = params["window_frames"].get<int64_t>();
+        if( requested < 0 )
+        {
+            result.reason = "window_frames must be a non-negative integer";
+            return result;
+        }
+        if( requested != 0 )
+        {
+            if( uint64_t( requested ) > available )
+            {
+                result.reason = "requested frame window exceeds the common complete-frame count";
+                return result;
+            }
+            count = size_t( requested );
+        }
+    }
+    if( count == 0 )
+    {
+        result.reason = "the common complete-frame window is empty";
+        return result;
+    }
+    baselineFrames.resize( count );
+    candidateFrames.resize( count );
+    result.baselineRange.startNs = baselineFrames.front().beginNs;
+    result.baselineRange.endNs = *baselineFrames.back().endNs + 1;
+    result.candidateRange.startNs = candidateFrames.front().beginNs;
+    result.candidateRange.endNs = *candidateFrames.back().endNs + 1;
+    result.baselineRange.limit = std::numeric_limits<size_t>::max();
+    result.candidateRange.limit = std::numeric_limits<size_t>::max();
+    result.baselineFrames = std::move( baselineFrames );
+    result.candidateFrames = std::move( candidateFrames );
+    result.warmupFrames = warmup;
+    result.frameCount = count;
+    result.valid = true;
+    return result;
+}
+
+json ComparisonWindowJson( const ComparisonFrameWindow& value )
+{
+    if( !value.valid ) return { { "valid", false }, { "reason", value.reason } };
+    return {
+        { "valid", true }, { "alignment", "complete-frame ordinal" }, { "frame_set", value.baselineSet.name },
+        { "warmup_frames", value.warmupFrames }, { "window_frames", value.frameCount },
+        { "baseline", { { "frame_set_ref", value.baselineSet.ref }, { "first_index", value.baselineFrames.front().index },
+            { "last_index", value.baselineFrames.back().index }, { "start_ns", Decimal( value.baselineRange.startNs ) },
+            { "end_ns", Decimal( value.baselineRange.endNs ) } } },
+        { "candidate", { { "frame_set_ref", value.candidateSet.ref }, { "first_index", value.candidateFrames.front().index },
+            { "last_index", value.candidateFrames.back().index }, { "start_ns", Decimal( value.candidateRange.startNs ) },
+            { "end_ns", Decimal( value.candidateRange.endNs ) } } }
+    };
 }
 
 struct N11TraceData
@@ -7329,7 +7554,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         return Success( id, { { "statistics", StatisticsJson( analysis::ComputeStatistics( values, params.value( "truncate_percentile", 0.90 ) ) ) } }, trace );
     }
-    if( method == "compare.zones" || method == "compare.frames" || method == "compare.source" )
+    if( method == "compare.compatibility" || method == "compare.normalized" || method == "compare.zones" || method == "compare.frames" || method == "compare.source" )
     {
         if( !params.contains( "baseline_trace_id" ) || !params["baseline_trace_id"].is_string() ) throw QueryError( "INVALID_PARAMS", "baseline_trace_id is required" );
         const auto baselineId = params["baseline_trace_id"].get<std::string>();
@@ -7342,6 +7567,410 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "baseline", { { "trace_id", baselineTrace.id }, { "fingerprint", baselineTrace.fingerprint } } },
             { "candidate", { { "trace_id", trace.id }, { "fingerprint", trace.fingerprint } } }
         };
+
+        const auto comparisonMode = params.value( "comparison_mode", "performance" );
+        if( comparisonMode != "performance" && comparisonMode != "contract" ) throw QueryError( "INVALID_PARAMS", "comparison_mode must be performance or contract" );
+        const auto baselineInfo = baseline->GetTraceInfo();
+        const auto candidateInfo = source->GetTraceInfo();
+        const auto baselineIdentity = CaptureIdentityJson( baselineInfo );
+        const auto candidateIdentity = CaptureIdentityJson( candidateInfo );
+        const auto baselineContext = CaptureContextJson( baselineInfo );
+        const auto candidateContext = CaptureContextJson( candidateInfo );
+        const auto baselineCoverage = CaptureCoverageJson( baselineInfo );
+        const auto candidateCoverage = CaptureCoverageJson( candidateInfo );
+        const auto comparisonWindow = SelectComparisonFrameWindow( *baseline, *source, params, baselineContext, candidateContext );
+
+        json compatibilityChecks = json::array();
+        size_t hardFailures = 0;
+        size_t warningFailures = 0;
+        size_t informationDifferences = 0;
+        const auto addCheck = [&]( const std::string& checkId, const char* severity, const std::string& path,
+            json left, json right, bool matched, const std::string& reason ) {
+            compatibilityChecks.push_back( {
+                { "id", checkId }, { "severity", severity }, { "path", path },
+                { "baseline", std::move( left ) }, { "candidate", std::move( right ) },
+                { "matched", matched }, { "reason", reason }
+            } );
+            if( matched ) return;
+            if( std::string_view( severity ) == "hard" ) hardFailures++;
+            else if( std::string_view( severity ) == "warning" ) warningFailures++;
+            else informationDifferences++;
+        };
+        const auto comparePath = [&]( const std::string& checkId, const char* severity, const std::string& path,
+            const json& leftDocument, const json& rightDocument, const std::string& reason ) {
+            const auto* left = JsonPointerValue( leftDocument, path.c_str() );
+            const auto* right = JsonPointerValue( rightDocument, path.c_str() );
+            const bool required = std::string_view( severity ) == "hard";
+            addCheck( checkId, severity, path, left ? *left : json( nullptr ), right ? *right : json( nullptr ),
+                ( left == nullptr && right == nullptr && !required ) || ( left != nullptr && right != nullptr && *left == *right ), reason );
+        };
+
+        addCheck( "identity.complete", "hard", "/capture_identity/complete",
+            baselineIdentity.value( "complete", false ), candidateIdentity.value( "complete", false ),
+            baselineIdentity.value( "complete", false ) && candidateIdentity.value( "complete", false ),
+            "both traces require complete, conflict-free Capture Identity" );
+        addCheck( "context.complete", "hard", "/capture_context/complete",
+            baselineContext.value( "complete", false ), candidateContext.value( "complete", false ),
+            baselineContext.value( "complete", false ) && candidateContext.value( "complete", false ),
+            "both traces require complete runtime, workload, and capture configuration context" );
+        comparePath( "protocol.jn_abi", "hard", "/identity/protocol/jn_abi_version", baselineIdentity, candidateIdentity, "JN C ABI must match" );
+        comparePath( "protocol.jn_config", "hard", "/identity/protocol/jn_config_hash", baselineIdentity, candidateIdentity, "JN compile-time configuration must match" );
+        comparePath( "protocol.tracy", "hard", "/identity/protocol/tracy_protocol_version", baselineIdentity, candidateIdentity, "Tracy wire protocol must match" );
+        comparePath( "runtime.architecture", "hard", "/identity/runtime/architecture", baselineIdentity, candidateIdentity, "CPU architecture must match" );
+        comparePath( "runtime.graphics_api", "hard", "/identity/runtime/graphics_api", baselineIdentity, candidateIdentity, "graphics API must match" );
+        comparePath( "runtime.gfx_jobs_requested", "hard", "/context/runtime/graphics_jobs_requested", baselineContext, candidateContext, "requested Graphics Jobs mode must match" );
+        comparePath( "runtime.gfx_jobs_effective", "hard", "/context/runtime/graphics_jobs_effective", baselineContext, candidateContext, "effective Graphics Jobs mode must match" );
+
+        const auto targetSeverity = comparisonMode == "performance" ? "hard" : "info";
+        comparePath( "runtime.target_kind", targetSeverity, "/identity/runtime/target_kind", baselineIdentity, candidateIdentity,
+            comparisonMode == "performance" ? "performance comparisons require the same Editor or Player target" : "contract mode permits Editor/Player target differences" );
+        comparePath( "workload.scene", targetSeverity, "/context/workload/scene", baselineContext, candidateContext,
+            comparisonMode == "performance" ? "performance comparisons require the same scene" : "contract mode records scene differences without treating them as failure" );
+        comparePath( "workload.scenario", targetSeverity, "/context/workload/scenario", baselineContext, candidateContext,
+            comparisonMode == "performance" ? "performance comparisons require the same scenario" : "contract mode records scenario differences without treating them as failure" );
+
+        for( const auto& [idSuffix, pointer] : std::vector<std::pair<std::string, std::string>> {
+            { "engine", "/identity/build/repositories/engine/revision" },
+            { "package", "/identity/build/repositories/package/revision" },
+            { "tracy", "/identity/build/repositories/tracy/revision" },
+            { "unity", "/identity/build/artifacts/unity/sha256" },
+            { "jn_client", "/identity/build/artifacts/jn_client/sha256" },
+            { "query", "/identity/build/artifacts/query/sha256" } } )
+            comparePath( "build." + idSuffix, "warning", pointer, baselineIdentity, candidateIdentity, "build identity differs; expected changes must be reviewed" );
+
+        for( const auto& [idSuffix, pointer] : std::vector<std::pair<std::string, std::string>> {
+            { "resolution_width", "/context/runtime/resolution_width" },
+            { "resolution_height", "/context/runtime/resolution_height" },
+            { "quality_level", "/context/runtime/quality_level" },
+            { "vsync_count", "/context/runtime/vsync_count" },
+            { "target_frame_rate", "/context/runtime/target_frame_rate" },
+            { "dynamic_resolution_width", "/context/runtime/dynamic_resolution_width_scale" },
+            { "dynamic_resolution_height", "/context/runtime/dynamic_resolution_height_scale" },
+            { "capture_profile_legacy", "/context/capture_config/profile" },
+            { "capture_profile_requested", "/context/capture_config/profile_requested" },
+            { "capture_profile_effective", "/context/capture_config/profile_effective" },
+            { "capture_profile_fallback", "/context/capture_config/profile_fallback" },
+            { "managed_profile", "/context/capture_config/n11_profile" },
+            { "managed_stack", "/context/capture_config/managed_stack_explicit" },
+            { "lua_stack", "/context/capture_config/lua_stack_explicit" },
+            { "job_mode", "/context/capture_config/n12_job_mode" },
+            { "job_callstack_depth", "/context/capture_config/job_callstack_depth_requested" } } )
+            comparePath( "configuration." + idSuffix, "warning", pointer, baselineContext, candidateContext, "runtime or capture configuration differs" );
+
+        const auto producerSchemas = []( const json& coverage ) {
+            json schemas = json::object();
+            if( coverage.contains( "producers" ) && coverage["producers"].is_array() )
+                for( const auto& producer : coverage["producers"] )
+                    schemas[producer.value( "key", "" )] = producer.value( "producer_schema", 0 );
+            return schemas;
+        };
+        const auto leftSchemas = producerSchemas( baselineCoverage );
+        const auto rightSchemas = producerSchemas( candidateCoverage );
+        addCheck( "producer.schemas", "warning", "/capture_coverage/producers", leftSchemas, rightSchemas,
+            leftSchemas == rightSchemas, "producer keys and schemas should match for normalized domain comparison" );
+        addCheck( "producer.coverage_complete", "warning", "/capture_coverage/complete",
+            baselineCoverage.value( "complete", false ), candidateCoverage.value( "complete", false ),
+            baselineCoverage.value( "complete", false ) && candidateCoverage.value( "complete", false ),
+            "producer counter windows must be closed and internally consistent" );
+        addCheck( "trace.complete", "warning", "/trace/complete", baselineTrace.complete, trace.complete,
+            baselineTrace.complete && trace.complete, "truncated or open stream tails reduce confidence" );
+        addCheck( "frame_window", comparisonMode == "performance" ? "hard" : "info", "/frame_window",
+            comparisonWindow.valid ? json( comparisonWindow.frameCount ) : json( nullptr ),
+            comparisonWindow.valid ? json( comparisonWindow.frameCount ) : json( nullptr ), comparisonWindow.valid,
+            comparisonWindow.valid ? "complete frames are aligned by ordinal after warmup" : comparisonWindow.reason );
+
+        const auto compatibilityVerdict = hardFailures != 0 ? "incompatible" : warningFailures != 0 ? "compatible_with_warnings" : "compatible";
+        const json compatibility = {
+            { "traces", tracePair }, { "comparison_mode", comparisonMode }, { "verdict", compatibilityVerdict },
+            { "performance_comparable", comparisonMode == "performance" && hardFailures == 0 },
+            { "contract_comparable", hardFailures == 0 },
+            { "hard_failure_count", hardFailures }, { "warning_count", warningFailures },
+            { "information_difference_count", informationDifferences },
+            { "frame_window", ComparisonWindowJson( comparisonWindow ) }, { "checks", compatibilityChecks },
+            { "policy", { { "warnings_require_explicit_override_for_normalized_compare", true },
+                { "stable_matching_required", true }, { "legacy_fallback_reported", true } } }
+        };
+        if( method == "compare.compatibility" ) return Success( id, compatibility, trace );
+
+        if( method == "compare.normalized" )
+        {
+            const bool allowWarnings = params.value( "allow_warnings", false );
+            if( comparisonMode != "performance" )
+                return Success( id, { { "performed", false }, { "reason", "compare.normalized is a performance comparison; use compare.compatibility with contract mode for Editor/Player data-contract checks" },
+                    { "compatibility", compatibility } }, trace );
+            if( hardFailures != 0 )
+                return Success( id, { { "performed", false }, { "reason", "capture pair is incompatible" }, { "compatibility", compatibility } }, trace );
+            if( warningFailures != 0 && !allowWarnings )
+                return Success( id, { { "performed", false }, { "reason", "capture pair has compatibility warnings; review them and set allow_warnings=true to proceed" },
+                    { "compatibility", compatibility } }, trace );
+
+            struct MetricGroup
+            {
+                std::string key;
+                std::string name;
+                std::string matchKind;
+                std::vector<int64_t> inclusive;
+                std::vector<int64_t> self;
+                std::vector<int64_t> running;
+                std::vector<int64_t> latency;
+                std::vector<int64_t> wait;
+            };
+            using MetricMap = std::map<std::string, MetricGroup>;
+            const auto buildCatalogMaps = []( const json& catalog ) {
+                std::map<std::string, std::string> sourceKeys;
+                std::map<std::string, std::string> jobKeys;
+                std::set<std::string> ambiguousSources;
+                if( !catalog.value( "present", false ) ) return std::pair { sourceKeys, jobKeys };
+                for( const auto& definition : catalog["definitions"] )
+                {
+                    const auto kind = definition.value( "kind", "" );
+                    const auto name = definition.value( "canonical_name", "" );
+                    const auto stable = definition.value( "definition_key", "" );
+                    if( kind == "job" && !name.empty() && !stable.empty() ) jobKeys.emplace( name, stable );
+                    if( kind != "source" || name.empty() || stable.empty() ) continue;
+                    const auto function = definition["source"].value( "function", "" );
+                    const auto line = definition["source"].value( "line", 0u );
+                    const auto key = name + '\n' + function + '\n' + std::to_string( line );
+                    if( sourceKeys.contains( key ) ) ambiguousSources.emplace( key );
+                    else sourceKeys.emplace( key, stable );
+                }
+                for( const auto& key : ambiguousSources ) sourceKeys.erase( key );
+                return std::pair { sourceKeys, jobKeys };
+            };
+            const auto baselineCatalog = CatalogJson( baselineInfo );
+            const auto candidateCatalog = CatalogJson( candidateInfo );
+            const auto [baselineSourceKeys, baselineJobKeys] = buildCatalogMaps( baselineCatalog );
+            const auto [candidateSourceKeys, candidateJobKeys] = buildCatalogMaps( candidateCatalog );
+
+            const auto collectCpu = [&]( const analysis::TraceSource& item, analysis::ScanRange selectedRange,
+                const std::map<std::string, std::string>& sourceKeys ) {
+                MetricMap groups;
+                size_t offset = 0;
+                constexpr size_t chunk = 4096;
+                while( true )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( chunk );
+                    if( allowed == 0 ) break;
+                    selectedRange.offset = offset;
+                    selectedRange.limit = allowed;
+                    const auto values = item.ScanCpuZones( selectedRange );
+                    BudgetScanned( values.size(), chunk, allowed );
+                    for( const auto& zone : values )
+                    {
+                        if( !zone.endNs || *zone.endNs < zone.startNs ) continue;
+                        const auto displayName = zone.name.empty() ? zone.function : zone.name;
+                        const auto sourceMatch = displayName + '\n' + zone.function + '\n' + std::to_string( zone.line );
+                        const auto stable = sourceKeys.find( sourceMatch );
+                        const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName + '|' + zone.function;
+                        const auto key = stable == sourceKeys.end() ? "fallback:cpu:" + fallback : "stable:" + stable->second;
+                        auto& group = groups[key];
+                        group.key = key;
+                        group.name = displayName;
+                        group.matchKind = stable == sourceKeys.end() ? "legacy_source_fallback" : "catalog_definition_key";
+                        group.inclusive.emplace_back( *zone.endNs - zone.startNs );
+                        if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
+                        if( zone.runningTimeNs ) group.running.emplace_back( *zone.runningTimeNs );
+                    }
+                    offset += values.size();
+                    if( values.size() < allowed ) break;
+                }
+                return groups;
+            };
+
+            const auto collectGpu = [&]( const analysis::TraceSource& item, const analysis::TraceInfoDto& itemInfo,
+                analysis::ScanRange selectedRange ) {
+                MetricMap groups;
+                const auto taxonomy = GpuTaxonomyCatalogJson( itemInfo );
+                std::map<uint32_t, json> definitions;
+                if( taxonomy.value( "present", false ) )
+                    for( const auto& definition : taxonomy["definitions"] )
+                    {
+                        const auto id = DecimalStringValue( definition["taxonomy_id"] );
+                        if( id && *id <= std::numeric_limits<uint32_t>::max() ) definitions.emplace( uint32_t( *id ), definition );
+                    }
+                auto explicitPasses = BuildExplicitGpuPassSet( item, taxonomy );
+                std::vector<analysis::GpuZoneDto> zones;
+                size_t offset = 0;
+                constexpr size_t chunk = 4096;
+                while( true )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( chunk );
+                    if( allowed == 0 ) break;
+                    selectedRange.offset = offset;
+                    selectedRange.limit = allowed;
+                    auto values = item.ScanGpuZones( selectedRange );
+                    BudgetScanned( values.size(), chunk, allowed );
+                    for( const auto& value : values )
+                    {
+                        MatchExplicitGpuPassZone( item, explicitPasses, value );
+                        zones.emplace_back( value );
+                    }
+                    offset += values.size();
+                    if( values.size() < allowed ) break;
+                }
+                std::set<std::string> explicitlyMatchedZones;
+                for( const auto& pass : explicitPasses.matches )
+                {
+                    if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) continue;
+                    if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) continue;
+                    explicitlyMatchedZones.emplace( pass.zone->ref );
+                    const auto definition = definitions.find( pass.taxonomyId );
+                    const bool stable = pass.taxonomyStableId && definition != definitions.end();
+                    const auto displayName = stable ? definition->second.value( "canonical_name", pass.zone->name ) :
+                        ( pass.zone->name.empty() ? pass.zone->function : pass.zone->name );
+                    const auto fallback = NormalizeSourceKey( pass.zone->file ) + ':' + std::to_string( pass.zone->line ) + '|' + displayName;
+                    const auto key = stable ? "stable:gpu-taxonomy:" + std::to_string( pass.taxonomyId ) : "fallback:gpu:" + fallback;
+                    auto& group = groups[key];
+                    group.key = key;
+                    group.name = displayName;
+                    group.matchKind = stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback";
+                    group.inclusive.emplace_back( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
+                    if( pass.zone->selfTimeNs ) group.self.emplace_back( *pass.zone->selfTimeNs );
+                }
+                for( const auto& zone : zones )
+                {
+                    if( explicitlyMatchedZones.contains( zone.ref ) || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) continue;
+                    const auto displayName = zone.name.empty() ? zone.function : zone.name;
+                    const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName;
+                    const auto key = "fallback:gpu:" + fallback;
+                    auto& group = groups[key];
+                    group.key = key;
+                    group.name = displayName;
+                    group.matchKind = "legacy_source_fallback";
+                    group.inclusive.emplace_back( *zone.gpuEndNs - zone.gpuStartNs );
+                    if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
+                }
+                return groups;
+            };
+
+            const auto collectJobs = []( const analysis::TraceSource& item, const analysis::ScanRange& range,
+                const std::map<std::string, std::string>& jobKeys ) {
+                MetricMap groups;
+                for( const auto& job : item.GetJobs() )
+                {
+                    if( job.scheduleNs < range.startNs || job.scheduleNs >= range.endNs ) continue;
+                    const auto stable = jobKeys.find( job.name );
+                    const auto key = stable == jobKeys.end() ? "fallback:job:" + job.name : "stable:" + stable->second;
+                    auto& group = groups[key];
+                    group.key = key;
+                    group.name = job.name;
+                    group.matchKind = stable == jobKeys.end() ? "job_name_fallback" : "catalog_definition_key";
+                    group.inclusive.emplace_back( job.executionNs );
+                    group.wait.emplace_back( job.waitNs );
+                    if( job.firstRunNs ) group.latency.emplace_back( *job.firstRunNs - job.scheduleNs );
+                }
+                return groups;
+            };
+
+            const auto compareMetricMaps = [&]( const MetricMap& left, const MetricMap& right, size_t frameCount ) {
+                std::set<std::string> keys;
+                for( const auto& [key, value] : left ) keys.emplace( key );
+                for( const auto& [key, value] : right ) keys.emplace( key );
+                struct RankedGroup { double magnitude = 0; std::string key; json value; };
+                std::vector<RankedGroup> ranked;
+                size_t stableMatches = 0, fallbackMatches = 0, unmatched = 0;
+                for( const auto& key : keys )
+                {
+                    const auto before = left.find( key );
+                    const auto after = right.find( key );
+                    const bool both = before != left.end() && after != right.end();
+                    const auto& metadata = after != right.end() ? after->second : before->second;
+                    if( !both ) unmatched++;
+                    else if( key.rfind( "stable:", 0 ) == 0 ) stableMatches++;
+                    else fallbackMatches++;
+                    const analysis::Statistics empty;
+                    const auto beforeInclusive = before == left.end() ? empty : analysis::ComputeStatistics( before->second.inclusive );
+                    const auto afterInclusive = after == right.end() ? empty : analysis::ComputeStatistics( after->second.inclusive );
+                    const auto beforeSelf = before == left.end() ? empty : analysis::ComputeStatistics( before->second.self );
+                    const auto afterSelf = after == right.end() ? empty : analysis::ComputeStatistics( after->second.self );
+                    const auto beforeRunning = before == left.end() ? empty : analysis::ComputeStatistics( before->second.running );
+                    const auto afterRunning = after == right.end() ? empty : analysis::ComputeStatistics( after->second.running );
+                    const auto beforeLatency = before == left.end() ? empty : analysis::ComputeStatistics( before->second.latency );
+                    const auto afterLatency = after == right.end() ? empty : analysis::ComputeStatistics( after->second.latency );
+                    const auto beforeWait = before == left.end() ? empty : analysis::ComputeStatistics( before->second.wait );
+                    const auto afterWait = after == right.end() ? empty : analysis::ComputeStatistics( after->second.wait );
+                    const double deltaPerFrame = frameCount == 0 ? 0 : double( afterInclusive.total - beforeInclusive.total ) / double( frameCount );
+                    const double deltaP95 = afterInclusive.p95 - beforeInclusive.p95;
+                    ranked.push_back( { std::max( std::abs( deltaPerFrame ), std::abs( deltaP95 ) ), key, {
+                        { "match_key", key }, { "match_kind", metadata.matchKind }, { "name", metadata.name },
+                        { "presence", !both ? ( before == left.end() ? "candidate_only" : "baseline_only" ) : "both" },
+                        { "baseline", { { "event", StatisticsJson( beforeInclusive ) }, { "self", StatisticsJson( beforeSelf ) },
+                            { "running", StatisticsJson( beforeRunning ) }, { "latency", StatisticsJson( beforeLatency ) },
+                            { "wait", StatisticsJson( beforeWait ) }, { "total_per_frame_ns", frameCount == 0 ? 0 : double( beforeInclusive.total ) / double( frameCount ) } } },
+                        { "candidate", { { "event", StatisticsJson( afterInclusive ) }, { "self", StatisticsJson( afterSelf ) },
+                            { "running", StatisticsJson( afterRunning ) }, { "latency", StatisticsJson( afterLatency ) },
+                            { "wait", StatisticsJson( afterWait ) }, { "total_per_frame_ns", frameCount == 0 ? 0 : double( afterInclusive.total ) / double( frameCount ) } } },
+                        { "delta", { { "total_per_frame_ns", deltaPerFrame }, { "p95_ns", deltaP95 },
+                            { "mean_ratio", beforeInclusive.mean == 0 ? json( nullptr ) : json( afterInclusive.mean / beforeInclusive.mean ) } } }
+                    } } );
+                }
+                std::sort( ranked.begin(), ranked.end(), []( const auto& leftValue, const auto& rightValue ) {
+                    return leftValue.magnitude != rightValue.magnitude ? leftValue.magnitude > rightValue.magnitude : leftValue.key < rightValue.key;
+                } );
+                const auto total = ranked.size();
+                if( ranked.size() > limit ) ranked.resize( limit );
+                json groups = json::array();
+                for( auto& value : ranked ) groups.emplace_back( std::move( value.value ) );
+                return json { { "group_count", total }, { "stable_match_count", stableMatches },
+                    { "fallback_match_count", fallbackMatches }, { "unmatched_count", unmatched }, { "groups", std::move( groups ) } };
+            };
+
+            const auto baselineCpu = collectCpu( *baseline, comparisonWindow.baselineRange, baselineSourceKeys );
+            const auto candidateCpu = collectCpu( *source, comparisonWindow.candidateRange, candidateSourceKeys );
+            const auto baselineGpu = collectGpu( *baseline, baselineInfo, comparisonWindow.baselineRange );
+            const auto candidateGpu = collectGpu( *source, candidateInfo, comparisonWindow.candidateRange );
+            const auto baselineJobs = collectJobs( *baseline, comparisonWindow.baselineRange, baselineJobKeys );
+            const auto candidateJobs = collectJobs( *source, comparisonWindow.candidateRange, candidateJobKeys );
+
+            std::vector<int64_t> baselineFrameDurations, candidateFrameDurations;
+            for( const auto& frame : comparisonWindow.baselineFrames ) baselineFrameDurations.emplace_back( *frame.endNs - frame.beginNs );
+            for( const auto& frame : comparisonWindow.candidateFrames ) candidateFrameDurations.emplace_back( *frame.endNs - frame.beginNs );
+            const auto beforeFrames = analysis::ComputeStatistics( baselineFrameDurations );
+            const auto afterFrames = analysis::ComputeStatistics( candidateFrameDurations );
+
+            const auto producerMap = []( const json& coverage ) {
+                std::map<std::string, json> output;
+                if( coverage.contains( "producers" ) && coverage["producers"].is_array() )
+                    for( const auto& producer : coverage["producers"] )
+                    {
+                        const auto key = producer.value( "key", "" ) + ":schema-" + std::to_string( producer.value( "producer_schema", 0 ) );
+                        output.emplace( key, producer );
+                    }
+                return output;
+            };
+            const auto beforeProducers = producerMap( baselineCoverage );
+            const auto afterProducers = producerMap( candidateCoverage );
+            std::set<std::string> producerKeys;
+            for( const auto& [key, value] : beforeProducers ) producerKeys.emplace( key );
+            for( const auto& [key, value] : afterProducers ) producerKeys.emplace( key );
+            json producerComparisons = json::array();
+            for( const auto& key : producerKeys )
+            {
+                const auto before = beforeProducers.find( key );
+                const auto after = afterProducers.find( key );
+                producerComparisons.push_back( {
+                    { "match_key", key }, { "presence", before == beforeProducers.end() ? "candidate_only" : after == afterProducers.end() ? "baseline_only" : "both" },
+                    { "baseline", before == beforeProducers.end() ? json( nullptr ) : before->second },
+                    { "candidate", after == afterProducers.end() ? json( nullptr ) : after->second }
+                } );
+            }
+
+            return Success( id, {
+                { "performed", true }, { "compatibility", compatibility }, { "frame_window", ComparisonWindowJson( comparisonWindow ) },
+                { "normalization", { { "unit", "nanoseconds" }, { "per_frame_denominator", comparisonWindow.frameCount },
+                    { "frame_alignment", "complete-frame ordinal" }, { "stable_id_precedence", { "catalog_definition_key", "gpu_taxonomy_stable_id", "legacy_fallback" } } } },
+                { "frames", { { "baseline", StatisticsJson( beforeFrames ) }, { "candidate", StatisticsJson( afterFrames ) },
+                    { "delta", { { "mean_ns", afterFrames.mean - beforeFrames.mean }, { "p95_ns", afterFrames.p95 - beforeFrames.p95 },
+                        { "p99_ns", afterFrames.p99 - beforeFrames.p99 }, { "mean_ratio", beforeFrames.mean == 0 ? json( nullptr ) : json( afterFrames.mean / beforeFrames.mean ) } } } } },
+                { "cpu", compareMetricMaps( baselineCpu, candidateCpu, comparisonWindow.frameCount ) },
+                { "gpu", compareMetricMaps( baselineGpu, candidateGpu, comparisonWindow.frameCount ) },
+                { "jobs", compareMetricMaps( baselineJobs, candidateJobs, comparisonWindow.frameCount ) },
+                { "producers", { { "match_key", "producer key + schema" }, { "values", std::move( producerComparisons ) } } },
+                { "partial", BudgetPartial() }, { "legacy_fallback_is_performance_evidence", false }
+            }, trace );
+        }
 
         if( method == "compare.zones" )
         {

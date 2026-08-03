@@ -374,11 +374,14 @@ json McpServer::ToolsList( const json& id ) const
         std::move( analyzeProperties ), required( { "trace_id", "analysis" } ), true ) );
 
     json compareProperties = {
-        { "baseline_trace_id", traceId }, { "candidate_trace_id", traceId }, { "kind", enumeration( { "zones", "frames", "source" } ) },
+        { "baseline_trace_id", traceId }, { "candidate_trace_id", traceId }, { "kind", enumeration( { "compatibility", "normalized", "zones", "frames", "source" } ) },
         { "zone_domain", enumeration( { "cpu", "gpu" } ) }, { "path", { { "type", "string" } } }, { "filter", { { "type", "object" } } },
-        { "max_bytes", integer( 1, 1048576 ) }, { "limit", integer( 1, 500 ) }, { "async", { { "type", "boolean" } } }
+        { "comparison_mode", enumeration( { "performance", "contract" } ) }, { "frame_set", { { "type", { "string", "integer" } } } },
+        { "warmup_frames", integer( 0, 1000000 ) }, { "window_frames", integer( 0, 1000000 ) },
+        { "allow_warnings", { { "type", "boolean" } } }, { "max_bytes", integer( 1, 1048576 ) },
+        { "limit", integer( 1, 500 ) }, { "async", { { "type", "boolean" } } }
     };
-    tools.emplace_back( Tool( "tracy_compare", "Compare two ready trace sessions by zones, frames, or bounded embedded source diff.",
+    tools.emplace_back( Tool( "tracy_compare", "Check capture compatibility or compare normalized aligned frame windows, zones, frames, or bounded embedded source.",
         std::move( compareProperties ), required( { "baseline_trace_id", "candidate_trace_id", "kind" } ), true ) );
     tools.emplace_back( Tool( "tracy_validate", "Validate persisted timing, references, memory lifetimes, samples, and GPU attribution evidence. Findings contain severity and reviewable refs when available.", json { { "trace_id", traceId }, { "async", { { "type", "boolean" } } } }, required( { "trace_id" } ) ) );
     tools.emplace_back( Tool( "tracy_job", "Poll, retrieve, or cooperatively cancel a long-running trace-open or analysis job.",
@@ -533,7 +536,7 @@ json McpServer::CallTool( const std::string& name, json arguments )
     else if( name == "tracy_compare" )
     {
         const std::string kind = arguments.value( "kind", "" );
-        if( kind != "zones" && kind != "frames" && kind != "source" ) throw QueryError( "INVALID_PARAMS", "compare kind must be zones, frames, or source" );
+        if( kind != "compatibility" && kind != "normalized" && kind != "zones" && kind != "frames" && kind != "source" ) throw QueryError( "INVALID_PARAMS", "compare kind must be compatibility, normalized, zones, frames, or source" );
         method = "compare." + kind;
         arguments["trace_id"] = arguments.value( "candidate_trace_id", "" );
         arguments.erase( "kind" );

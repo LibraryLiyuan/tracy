@@ -1187,7 +1187,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             hasIo ? "JN structured I/O schema is present in the persisted snapshot" : "trace predates or does not contain JN structured I/O records" ),
         capability( "network", false, false, { "network.capabilities" }, "deferred_by_user" ),
         capability( "statistics", true, true, { "statistics.describe", "statistics.compute" } ),
-        capability( "compare", true, true, { "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
+        capability( "compare", true, true, { "compare.compatibility", "compare.normalized", "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
         capability( "validation", true, true, { "validation.run" } )
     };
 }

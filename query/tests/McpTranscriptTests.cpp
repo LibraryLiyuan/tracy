@@ -52,8 +52,17 @@ int main()
     assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
     assert( ( *inspect )["inputSchema"]["properties"]["method"]["enum"].size() == tracy::query::QueryMethodRegistry().size() );
     assert( ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] == tracy::query::QueryOperationSchemaRegistry() );
-    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.13.0" );
+    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.14.0" );
     assert( ( *inspect )["outputSchema"]["properties"].contains( "partial" ) );
+    const auto compare = std::find_if( tools["result"]["tools"].begin(), tools["result"]["tools"].end(), []( const auto& tool ) {
+        return tool["name"] == "tracy_compare";
+    } );
+    assert( compare != tools["result"]["tools"].end() );
+    const auto& compareKinds = ( *compare )["inputSchema"]["properties"]["kind"]["enum"];
+    assert( std::find( compareKinds.begin(), compareKinds.end(), "compatibility" ) != compareKinds.end() );
+    assert( std::find( compareKinds.begin(), compareKinds.end(), "normalized" ) != compareKinds.end() );
+    assert( ( *compare )["inputSchema"]["properties"].contains( "comparison_mode" ) );
+    assert( ( *compare )["inputSchema"]["properties"].contains( "allow_warnings" ) );
 
     const auto described = query.Execute( {
         { "protocol", tracy::query::QueryProtocol }, { "id", "mcp-registry" },

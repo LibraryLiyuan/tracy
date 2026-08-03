@@ -1456,6 +1456,7 @@ TRACY_API LuaZoneState& GetLuaZoneState() { return s_luaZoneState; }
 #  endif
 #endif
 
+TRACY_API size_t GetQueueSizeApprox() { return GetQueue().size_approx(); }
 TRACY_API bool ProfilerAvailable() { return s_instance != nullptr; }
 TRACY_API bool ProfilerAllocatorAvailable() { return !RpThreadShutdown; }
 
