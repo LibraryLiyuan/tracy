@@ -2150,6 +2150,17 @@ void Profiler::Worker()
         tracy_free( m_sock );
         m_sock = nullptr;
 
+#if defined(TRACY_HAS_SYSTEM_TRACING) && !defined(TRACY_SAMPLING_PROFILER_MANUAL_START)
+        // A graceful protocol drain temporarily stops the producer so that the
+        // client queue has a finite tail. Restore the opt-in system tracing
+        // session after the drained connection has been closed.
+        if( m_restartSystemTracingAfterDrain )
+        {
+            StartSystemTracing( m_samplingPeriod );
+            m_restartSystemTracingAfterDrain = false;
+        }
+#endif
+
 #ifndef TRACY_ON_DEMAND
         // Client is no longer available here. Accept incoming connections, but reject handshake.
         for(;;)
@@ -3832,50 +3843,14 @@ void Profiler::HandleDisconnect()
 #ifdef TRACY_HAS_SYSTEM_TRACING
     if( s_sysTraceThread )
     {
-        auto timestamp = GetTime();
-        for(;;)
-        {
-            const auto status = DequeueContextSwitches( token, timestamp );
-            if( status == DequeueStatus::ConnectionLost )
-            {
-                return;
-            }
-            else if( status == DequeueStatus::QueueEmpty )
-            {
-                if( m_bufferOffset != m_bufferStart )
-                {
-                    if( !CommitData() ) return;
-                }
-            }
-            if( timestamp < 0 )
-            {
-                if( m_bufferOffset != m_bufferStart )
-                {
-                    if( !CommitData() ) return;
-                }
-                break;
-            }
-            ClearSerial();
-            if( m_sock->HasData() )
-            {
-                while( m_sock->HasData() )
-                {
-                    if( !HandleServerQuery() ) return;
-                }
-                if( m_bufferOffset != m_bufferStart )
-                {
-                    if( !CommitData() ) return;
-                }
-            }
-            else
-            {
-                if( m_bufferOffset != m_bufferStart )
-                {
-                    if( !CommitData() ) return;
-                }
-                std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
-            }
-        }
+#if !defined(TRACY_SAMPLING_PROFILER_MANUAL_START)
+        m_restartSystemTracingAfterDrain = true;
+#endif
+        // The generic on-demand drain below can only reach an empty queue when
+        // the system tracing producer has stopped. StopSystemTracing joins the
+        // producer thread, so all queued context-switch and sampling events now
+        // form a finite tail and are drained by Dequeue() with every other event.
+        StopSystemTracing();
     }
 #endif
 

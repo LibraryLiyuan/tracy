@@ -1145,6 +1145,7 @@ private:
     uint32_t m_userPort;
     std::atomic<uint32_t> m_zoneId;
     int64_t m_samplingPeriod;
+    bool m_restartSystemTracingAfterDrain = false;
 
     uint32_t m_threadCtx;
     int64_t m_refTimeThread;

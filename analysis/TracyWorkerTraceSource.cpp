@@ -1192,6 +1192,46 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     };
 }
 
+#ifndef TRACY_NO_STATISTICS
+template<typename F>
+void ForEachContextSwitchSample( Worker& worker, const ThreadData& thread, F&& callback )
+{
+    // The persisted list is a statistics-layer cache: tracy-capture snapshots
+    // may leave it empty, while live segment replay may retain classifications
+    // made before the final context-switch timeline is complete. Reconstruct it
+    // from the two persisted facts instead: a context-switch sample is a sample
+    // whose timestamp equals a switch-in interval start on the same thread.
+    // This makes snapshot, segment and replay media deterministic without a file
+    // format change and preserves the original sample callstack.
+    const auto* context = worker.GetContextSwitchData( thread.id );
+    if( !context || context->v.empty() ) return;
+
+    for( const auto& sample : thread.samples )
+    {
+        const auto time = sample.time.Val();
+        const auto it = std::lower_bound( context->v.begin(), context->v.end(), time,
+            []( const auto& event, int64_t value ) { return event.Start() < value; } );
+        if( it != context->v.end() && it->Start() == time )
+        {
+            if( !callback( sample ) ) return;
+        }
+    }
+}
+
+uint64_t GetContextSwitchSampleCount( Worker& worker )
+{
+    uint64_t count = 0;
+    for( const auto* thread : worker.GetThreadData() )
+    {
+        ForEachContextSwitchSample( worker, *thread, [&]( const auto& ) {
+            count++;
+            return true;
+        } );
+    }
+    return count;
+}
+#endif
+
 TraceInfoDto WorkerTraceSource::GetTraceInfo() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -1254,7 +1294,7 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
 #endif
     counts.samples = worker.GetCallstackSampleCount();
 #ifndef TRACY_NO_STATISTICS
-    counts.contextSwitchSamples = worker.GetContextSwitchSampleCount();
+    counts.contextSwitchSamples = GetContextSwitchSampleCount( worker );
     for( const auto* thread : worker.GetThreadData() ) counts.kernelSamples += thread->kernelSampleCnt;
     counts.ghostZones = worker.GetGhostZonesCount();
     counts.childSampleSymbols = worker.GetChildSamplesCountSyms();
@@ -2179,11 +2219,11 @@ std::vector<SampleDto> WorkerTraceSource::ScanSampleEvents( const ScanRange& ran
             if( result.size() >= range.limit ) return result;
         }
 #ifndef TRACY_NO_STATISTICS
-        for( const auto& sample : thread->ctxSwitchSamples )
-        {
+        bool limitReached = false;
+        ForEachContextSwitchSample( *m_impl->worker, *thread, [&]( const auto& sample ) {
             const auto currentOrdinal = ordinal++;
-            if( sample.time.Val() < range.startNs || sample.time.Val() >= range.endNs ) continue;
-            if( skipped++ < range.offset ) continue;
+            if( sample.time.Val() < range.startNs || sample.time.Val() >= range.endNs ) return true;
+            if( skipped++ < range.offset ) return true;
             SampleDto dto;
             dto.ref = m_impl->MakeRef( "context-switch-sample", currentOrdinal );
             dto.threadRef = m_impl->MakeRef( "thread", thread->id );
@@ -2192,8 +2232,10 @@ std::vector<SampleDto> WorkerTraceSource::ScanSampleEvents( const ScanRange& ran
             if( dto.callstack != 0 ) dto.callstackRef = m_impl->MakeRef( "callstack", dto.callstack );
             dto.kind = "context_switch";
             result.emplace_back( std::move( dto ) );
-            if( result.size() >= range.limit ) return result;
-        }
+            limitReached = result.size() >= range.limit;
+            return !limitReached;
+        } );
+        if( limitReached ) return result;
 #endif
     }
     return result;

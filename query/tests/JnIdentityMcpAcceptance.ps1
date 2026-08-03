@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$StreamTrace,
     [Parameter(Mandatory = $true)][string]$ReplayTrace,
     [Parameter(Mandatory = $true)][string]$AllowRoot,
+    [string]$ExpectedQuerySchema = '1.14.0',
     [string]$LegacyTrace,
     [switch]$CheckContextQuality,
     [switch]$SkipSyntheticProducerChecks,
@@ -162,7 +163,7 @@ try
     foreach ($result in @($snapshotIdentity, $streamIdentity, $replayIdentity))
     {
         Assert-Condition ([bool]$result.ok) 'trace.identity query failed'
-        Assert-Condition ([string]$result.schema_version -eq '1.6.0') 'unexpected Query schema version'
+        Assert-Condition ([string]$result.schema_version -eq $ExpectedQuerySchema) "unexpected Query schema version: expected $ExpectedQuerySchema, got $($result.schema_version)"
         Assert-Condition ([bool]$result.data.present) 'capture identity is absent'
         Assert-Condition ([bool]$result.data.complete) 'capture identity is incomplete'
         Assert-Condition (@($result.data.missing_required).Count -eq 0) 'required identity fields are missing'

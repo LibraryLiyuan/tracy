@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory = $true)][string] $AllowRoot,
     [switch] $RealCapture,
     [switch] $RequireContextSwitch,
+    [switch] $RequireSampling,
     [string] $CheckpointDirectory = ''
 )
 
@@ -104,6 +105,9 @@ function Get-ComparableN14Semantics {
     if ($null -ne $normalized.context_switch_capability) {
         $normalized.context_switch_capability.reason = '<source-specific-capability-provenance>'
     }
+    if ($null -ne $normalized.sampling_capability) {
+        $normalized.sampling_capability.reason = '<source-specific-capability-provenance>'
+    }
     return $normalized | ConvertTo-Json -Compress -Depth 70
 }
 
@@ -121,6 +125,26 @@ function Validate-N14 {
     $contextSwitchAvailable = [bool]$contextCapability[0].present
     if ($RequireContextSwitch) {
         Assert-Condition $contextSwitchAvailable 'context_switch capability is required but unavailable'
+    }
+    $sampleCapability = @($capabilities.data.domains | Where-Object { [string]$_.domain -eq 'sample' })
+    Assert-Condition ($sampleCapability.Count -eq 1) 'sample capability entry is missing'
+    $samplingAvailable = [bool]$sampleCapability[0].present
+    if ($RequireSampling) {
+        Assert-Condition $samplingAvailable 'sample capability is required but unavailable'
+        Assert-Condition ([bool]$sampleCapability[0].queryable) 'sample capability is present but not queryable'
+    }
+    $traceInfo = Inspect $TraceId 'trace.info'
+    $traceCounts = Inspect $TraceId 'trace.counts'
+    $sampleCount = [UInt64]$traceCounts.data.samples
+    $contextSwitchSampleCount = [UInt64]$traceCounts.data.context_switch_samples
+    $samplingPeriodNs = [UInt64]$traceInfo.data.sampling_period_ns
+    $sampleProbeCount = 0
+    if ($RequireSampling) {
+        Assert-Condition ($samplingPeriodNs -gt 0) 'required sampling period is zero'
+        Assert-Condition (($sampleCount + $contextSwitchSampleCount) -gt 0) 'required persisted sample count is zero'
+        $sampleProbe = Inspect $TraceId 'sample.list' @{ limit = 1 }
+        $sampleProbeCount = @($sampleProbe.data.samples).Count
+        Assert-Condition ($sampleProbeCount -gt 0) 'sample.list returned no persisted sample entity'
     }
 
     $frames = @(Get-CompleteFrames $TraceId)
@@ -309,6 +333,15 @@ function Validate-N14 {
             run_node_count = $contextSwitchRunCount
             wait_node_count = $contextSwitchWaitCount
             reason = [string]$contextCapability[0].reason
+        }
+        sampling_capability = [ordered]@{
+            present = $samplingAvailable
+            required = [bool]$RequireSampling
+            sampling_period_ns = [string]$samplingPeriodNs
+            samples = [string]$sampleCount
+            context_switch_samples = [string]$contextSwitchSampleCount
+            selected_probe_count = $sampleProbeCount
+            reason = [string]$sampleCapability[0].reason
         }
         edge_budget_partial = [bool]$edgeBounded.partial
     }
