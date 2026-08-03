@@ -19,7 +19,7 @@ namespace tracy::query
 {
 
 inline constexpr const char* QueryProtocol = "tracy-query/1";
-inline constexpr const char* QuerySchemaVersion = "1.12.0";
+inline constexpr const char* QuerySchemaVersion = "1.13.0";
 inline constexpr size_t DefaultPageSize = 100;
 inline constexpr size_t MaximumPageSize = 1000;
 inline constexpr size_t DefaultTopN = 20;
@@ -33,6 +33,8 @@ inline constexpr uint64_t DefaultMaxCpuMs = 5000;
 inline constexpr uint64_t MaximumMaxCpuMs = 60000;
 inline constexpr uint64_t DefaultMaxNodes = 10000;
 inline constexpr uint64_t MaximumMaxNodes = 100000;
+inline constexpr uint64_t DefaultMaxEdges = 20000;
+inline constexpr uint64_t MaximumMaxEdges = 200000;
 inline constexpr uint64_t DefaultMaxGroups = 500;
 inline constexpr uint64_t MaximumMaxGroups = 10000;
 

@@ -249,6 +249,7 @@ int main( int argc, char** argv )
     }
 
     const bool protocolOnly = journalOutput && !output;
+    const bool protocolDrain = journalOutput != nullptr;
     const bool deferSymbolExpansion = journalOutput != nullptr;
     std::unique_ptr<tracy::stream::StreamProtocolObserver> protocolObserver;
     if( journalOutput )
@@ -304,6 +305,13 @@ int main( int argc, char** argv )
         else
             printf( "%d s drain idle timeout)\n", drainIdleSeconds );
     }
+    else if( protocolDrain )
+    {
+        if( drainIdleSeconds == 0 )
+            printf( "Full capture journal drain: idle timeout disabled\n" );
+        else
+            printf( "Full capture journal drain: %d s idle timeout\n", drainIdleSeconds );
+    }
 
 #ifdef _WIN32
     signal( SIGINT, SigInt );
@@ -325,13 +333,16 @@ int main( int argc, char** argv )
         // nothing else than storing `s_disconnect`.
         if( s_disconnect.load( std::memory_order_relaxed ) )
         {
-            if( protocolOnly )
+            if( protocolDrain )
             {
                 s_protocolDrainActive.store( true, std::memory_order_relaxed );
                 printf( "\nStopping event capture and resolving pending definitions. Press Ctrl+C again to force stop.\n" );
                 fflush( stdout );
             }
-            worker.Disconnect();
+            if( protocolDrain )
+                worker.RequestProtocolDrain();
+            else
+                worker.Disconnect();
             // Relaxed order is sufficient because only this thread ever reads
             // this value.
             s_disconnect.store(false, std::memory_order_relaxed );
@@ -403,13 +414,13 @@ int main( int argc, char** argv )
     size_t drainDefinitionCount = protocolOnly ? worker.GetProtocolDefinitionCount() : 0;
     while( worker.IsConnected() )
     {
-        if( protocolOnly && s_forceStopProtocolDrain.load( std::memory_order_relaxed ) )
+        if( protocolDrain && s_forceStopProtocolDrain.load( std::memory_order_relaxed ) )
         {
             printf( "\nProtocol drain force-stopped. The committed journal prefix remains recoverable.\n" );
             fflush( stdout );
             std::_Exit( 130 );
         }
-        if( protocolOnly && drainIdleSeconds != 0 )
+        if( protocolDrain && drainIdleSeconds != 0 )
         {
             const auto committedSize = protocolObserver->CommittedSize();
             const auto clientBytes = protocolObserver->ClientBytes();
@@ -418,7 +429,7 @@ int main( int argc, char** argv )
             const auto definitionCount = worker.GetProtocolDefinitionCount();
             const auto now = std::chrono::steady_clock::now();
             if( committedSize != drainCommittedSize || clientBytes != drainClientBytes || serverBytes != drainServerBytes ||
-                eventCount != drainEventCount || definitionCount != drainDefinitionCount )
+                ( protocolOnly && ( eventCount != drainEventCount || definitionCount != drainDefinitionCount ) ) )
             {
                 drainCommittedSize = committedSize;
                 drainClientBytes = clientBytes;
@@ -533,6 +544,11 @@ int main( int argc, char** argv )
         printf( "\nFrames: %" PRIu64 "\nTime span: %s\nZones: %s\nElapsed time: %s\n",
             worker.GetFrameCount( *worker.GetFramesBase() ), tracy::TimeToString( worker.GetLastTime() - firstTime ), tracy::RealToString( worker.GetZoneCount() ),
             tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t1 - t0 ).count() ) );
+        if( protocolDrain )
+        {
+            printf( "Protocol drain time: %s\n",
+                tracy::TimeToString( std::chrono::duration_cast<std::chrono::nanoseconds>( t2 - t1 ).count() ) );
+        }
     }
     if( protocolObserver )
     {

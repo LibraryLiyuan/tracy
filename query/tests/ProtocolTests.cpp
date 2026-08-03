@@ -51,7 +51,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "thread.get" ) params["ref"] = "fake:thread:1";
     if( method == "thread.statistics" || method == "thread.timeline" || method == "thread.migration" || method == "context_switch.thread" ) params["thread_ref"] = "fake:thread:1";
     if( method == "frame.get" ) params["ref"] = "fake:frame:0";
-    if( method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" ) params["ref"] = "fake:frame-identity:281474976710657";
+    if( method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" ) params["ref"] = "fake:frame-identity:281474976710657";
     if( method == "frame.range_mapping" || method == "timeline.slice" ) { params["start_ns"] = "0"; params["end_ns"] = "100"; }
     if( method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) params["ref"] = "fake:frame-image:0";
     if( method == "producer.get" ) params["key"] = "test.real-zero";
@@ -132,7 +132,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.12.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.13.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -140,7 +140,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 35 );
+    assert( coverage.at( "domains" ).size() == 36 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -289,6 +289,12 @@ int main()
     assert( std::find_if( fakeCapabilities.begin(), fakeCapabilities.end(), []( const auto& capability ) {
         return capability.domain == "catalog" && capability.present && capability.queryable;
     } ) != fakeCapabilities.end() );
+    assert( std::find_if( fakeCapabilities.begin(), fakeCapabilities.end(), []( const auto& capability ) {
+        return capability.domain == "evidence" && capability.present && capability.queryable &&
+            std::find( capability.methods.begin(), capability.methods.end(), "evidence.graph" ) != capability.methods.end() &&
+            std::find( capability.methods.begin(), capability.methods.end(), "frame.critical_path" ) != capability.methods.end() &&
+            std::find( capability.methods.begin(), capability.methods.end(), "frame.explain" ) != capability.methods.end();
+    } ) != fakeCapabilities.end() );
     assert( fake.GetTraceInfo().fingerprint == std::string( 64, 'f' ) );
     assert( fake.GetThreads().size() == 1 && fake.GetFrameSets().size() == 1 && fake.GetGpuContexts().size() == 1 );
     assert( fake.GetMemoryPools().size() == 1 && fake.GetPlotList().size() == 1 && fake.GetLocks().size() == 1 );
@@ -296,7 +302,7 @@ int main()
     assert( fake.ScanCpuZones( entire ).size() == 2 && fake.ScanGpuZones( entire ).size() == 2 && fake.ScanFrames( entire ).size() == 1 );
     assert( fake.ScanMemoryEvents( entire ).size() == 1 && fake.ScanMessages( entire ).size() == 1 && fake.ScanPlots( entire ).size() == 1 );
     assert( fake.ScanContextSwitchEvents( entire ).size() == 1 && fake.ScanCpuContextSwitchEvents( entire ).size() == 1 && fake.ScanSampleEvents( entire ).size() == 1 && fake.ScanGhostZones( entire ).size() == 1 );
-    assert( fake.ScanLockEvents( entire ).size() == 1 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 );
+    assert( fake.ScanLockEvents( entire ).size() == 2 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 );
     assert( fake.ResolveCallstacks( { 1 }, 1 ).size() == 1 && fake.ResolveParentCallstacks( { 1 }, 1 ).size() == 1 );
     assert( fake.GetSourceResources().size() == 1 && fake.GetSymbolResources().size() == 1 && fake.GetFrameImageResources().size() == 1 );
     assert( fake.GetMemoryFrameSnapshot( 0, 0, {}, false ).valid );
@@ -452,7 +458,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.12.0" );
+    assert( described.at( "schema_version" ) == "1.13.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -464,10 +470,10 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.12.0" );
+        assert( operation.at( "schema_version" ) == "1.13.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.12.0" );
-        assert( operation.at( "budget_parameters" ).size() == 4 );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.13.0" );
+        assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
         return operation.at( "method" ) == "producer.get";
@@ -572,6 +578,82 @@ int main()
     const auto networkCapabilities = service.Execute( Request( requestId++, "network.capabilities", { { "trace_id", candidateId } } ) ).at( "data" );
     assert( networkCapabilities.at( "present" ) == false && networkCapabilities.at( "status" ) == "DeferredByUser" );
     assert( networkCapabilities.at( "reason" ) == "deferred_by_user" );
+
+    const auto evidenceGraphResponse = service.Execute( Request( requestId++, "evidence.graph", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },
+        { "max_scan_events", 10000 }, { "max_nodes", 1000 }, { "max_edges", 2000 }
+    } ) );
+    assert( evidenceGraphResponse.at( "ok" ) );
+    const auto& evidenceGraph = evidenceGraphResponse.at( "data" );
+    assert( evidenceGraph.at( "present" ) == true );
+    assert( evidenceGraph.at( "heuristic_enabled" ) == false );
+    assert( evidenceGraph.at( "evidence_counts" ).at( "heuristic" ) == "0" );
+    assert( std::stoull( evidenceGraph.at( "evidence_counts" ).at( "exact" ).get<std::string>() ) > 0 );
+    assert( std::stoull( evidenceGraph.at( "evidence_counts" ).at( "derived" ).get<std::string>() ) > 0 );
+    assert( std::stoull( evidenceGraph.at( "node_count" ).get<std::string>() ) > 10 );
+    assert( std::stoull( evidenceGraph.at( "edge_count" ).get<std::string>() ) > 10 );
+    const auto hasDomain = [&]( const char* domain ) {
+        return std::any_of( evidenceGraph.at( "domain_coverage" ).begin(), evidenceGraph.at( "domain_coverage" ).end(),
+            [&]( const auto& value ) { return value.at( "domain" ) == domain && value.at( "present" ) == true; } );
+    };
+    assert( hasDomain( "cpu" ) && hasDomain( "job" ) && hasDomain( "wait" ) && hasDomain( "lock" ) );
+    assert( hasDomain( "context_switch" ) && hasDomain( "io" ) && hasDomain( "submission" ) );
+    assert( hasDomain( "gpu" ) && hasDomain( "resource" ) );
+    assert( evidenceGraph.at( "critical_path_summary" ).at( "valid_contribution" ) == true );
+    assert( evidenceGraph.at( "critical_path_summary" ).at( "has_cycle" ) == false );
+
+    const auto criticalPath = service.Execute( Request( requestId++, "frame.critical_path", {
+        { "trace_id", candidateId }, { "frame_id", "281474976710657" },
+        { "max_scan_events", 10000 }, { "max_nodes", 1000 }, { "max_edges", 2000 }
+    } ) ).at( "data" );
+    assert( criticalPath.at( "algorithm" ) == "causal_dag_incremental_wall_clock_v1" );
+    const auto contribution = std::stoll( criticalPath.at( "critical_path" ).at( "total_wall_clock_contribution_ns" ).get<std::string>() );
+    const auto frameDuration = std::stoll( criticalPath.at( "critical_path" ).at( "frame_duration_ns" ).get<std::string>() );
+    assert( contribution >= 0 && contribution <= frameDuration );
+    assert( criticalPath.at( "critical_path" ).at( "overlap_accounting" ) == "incremental_wall_clock_union_v1" );
+
+    const auto frameExplain = service.Execute( Request( requestId++, "frame.explain", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },
+        { "max_scan_events", 10000 }, { "max_nodes", 1000 }, { "max_edges", 2000 }
+    } ) ).at( "data" );
+    assert( frameExplain.at( "analysis_confidence" ) == "medium" );
+    assert( frameExplain.at( "conclusion_contract" ) == "all conclusions must cite returned node/edge refs; absent domains are not real zero" );
+    assert( frameExplain.at( "missing_evidence" ).empty() );
+
+    const auto boundedEvidence = service.Execute( Request( requestId++, "evidence.graph", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },
+        { "max_scan_events", 10000 }, { "max_nodes", 2 }, { "max_edges", 2 }
+    } ) );
+    assert( boundedEvidence.at( "ok" ) );
+    assert( boundedEvidence.at( "partial" ) == true );
+    assert( boundedEvidence.at( "data" ).at( "complete" ) == false );
+    assert( boundedEvidence.at( "data" ).at( "truncated" ) == true );
+
+    const auto edgeBoundedEvidence = service.Execute( Request( requestId++, "evidence.graph", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },
+        { "max_scan_events", 10000 }, { "max_nodes", 1000 }, { "max_edges", 2 }
+    } ) );
+    assert( edgeBoundedEvidence.at( "ok" ) );
+    assert( edgeBoundedEvidence.at( "partial" ) == true );
+    assert( edgeBoundedEvidence.at( "data" ).at( "omitted_edges" ) != "0" );
+    assert( std::find( edgeBoundedEvidence.at( "budget" ).at( "exhausted_by" ).begin(),
+        edgeBoundedEvidence.at( "budget" ).at( "exhausted_by" ).end(), "max_edges" ) !=
+        edgeBoundedEvidence.at( "budget" ).at( "exhausted_by" ).end() );
+
+    const auto jobOnlyEvidence = service.Execute( Request( requestId++, "evidence.graph", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },
+        { "domains", nlohmann::json::array( { "job" } ) }, { "max_scan_events", 10000 },
+        { "max_nodes", 1000 }, { "max_edges", 2000 }
+    } ) ).at( "data" );
+    assert( std::all_of( jobOnlyEvidence.at( "nodes" ).begin(), jobOnlyEvidence.at( "nodes" ).end(),
+        []( const auto& value ) { return value.at( "domain" ) == "frame" || value.at( "domain" ) == "job"; } ) );
+    const auto cpuFilteredCoverage = std::find_if( jobOnlyEvidence.at( "domain_coverage" ).begin(),
+        jobOnlyEvidence.at( "domain_coverage" ).end(), []( const auto& value ) { return value.at( "domain" ) == "cpu"; } );
+    assert( cpuFilteredCoverage != jobOnlyEvidence.at( "domain_coverage" ).end() );
+    assert( cpuFilteredCoverage->at( "present" ) == false );
+    assert( cpuFilteredCoverage->at( "status" ) == "not_observed_in_selected_frame" );
+    assert( cpuFilteredCoverage->at( "capability_domain" ) == "zone.cpu" );
+    assert( cpuFilteredCoverage->at( "capability_available" ) == true );
 
     const auto boundedSourceCompare = service.Execute( Request( requestId++, "compare.source", {
         { "trace_id", candidateId }, { "baseline_trace_id", baselineId }, { "max_bytes", 16 }

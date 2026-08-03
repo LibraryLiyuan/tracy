@@ -35,7 +35,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "gpu.taxonomy.tree", "gpu.taxonomy.coverage", "gpu.pass.search", "gpu.pass.get",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
-        "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
+        "frame.sets", "frame.list", "frame.get", "frame.statistics", "frame.outliers", "frame.range_mapping", "frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice", "evidence.graph", "frame.critical_path", "frame.explain", "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw",
         "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph", "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph",
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates",
         "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution",
@@ -84,6 +84,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
     if( name == "max_scan_events" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxScanEvents } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_cpu_ms" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxCpuMs } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_nodes" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxNodes } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
+    if( name == "max_edges" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxEdges } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_groups" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxGroups } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "filter" ) return { { "type", "object" } };
     if( name == "callstacks" || name == "values_ns" || name == "fields" ) return { { "type", "array" }, { "items", { { "type", { "string", "integer" } } } } };
@@ -92,6 +93,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 
 std::string MethodDomain( const std::string& method )
 {
+    if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" ) return "evidence";
     if( method.rfind( "runtime.script.", 0 ) == 0 ) return "runtime.script";
     if( method.rfind( "memory.gc.", 0 ) == 0 ) return "memory.gc";
     if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
@@ -133,7 +135,7 @@ const nlohmann::json& QueryOperationSchemaRegistry()
         json operations = json::array();
         const std::vector<std::string> common = {
             "trace_id", "baseline_trace_id", "start_ns", "end_ns", "limit", "cursor", "filter", "fields",
-            "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups"
+            "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups", "max_edges"
         };
         for( const auto& method : RawQueryMethodRegistry() )
         {
@@ -152,6 +154,16 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["ref"] = ParameterSchemaFor( "ref" );
                 properties["frame_set"] = ParameterSchemaFor( "frame_set" );
                 properties["index"] = { { "type", "integer" }, { "minimum", 0 } };
+            }
+            else if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
+            {
+                alternatives = json::array( { json::array( { "ref" } ), json::array( { "frame_id" } ) } );
+                properties["ref"] = ParameterSchemaFor( "ref" );
+                properties["frame_id"] = ParameterSchemaFor( "frame_id" );
+                properties["include_exact"] = { { "type", "boolean" } };
+                properties["include_derived"] = { { "type", "boolean" } };
+                properties["include_heuristic"] = { { "type", "boolean" } };
+                properties["domains"] = { { "type", "array" }, { "items", { { "type", "string" } } } };
             }
             else if( method == "gpu.pass.search" )
             {
@@ -181,10 +193,12 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 else exampleParams[name] = 0;
             }
             if( method == "frame.get" ) exampleParams["index"] = 0;
+            if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
+                exampleParams["ref"] = "tracy:v1:<fingerprint>:frame-identity:<id>";
             operations.push_back( {
                 { "method", method }, { "schema_version", QuerySchemaVersion }, { "domain", MethodDomain( method ) },
                 { "required", required }, { "one_of_required", alternatives }, { "pagination", true },
-                { "budget_parameters", { "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups" } },
+                { "budget_parameters", { "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups", "max_edges" } },
                 { "input_schema", std::move( inputSchema ) }, { "output_schema", QueryEnvelopeOutputSchema() },
                 { "request_example", { { "protocol", QueryProtocol }, { "id", "request-1" }, { "method", method }, { "params", std::move( exampleParams ) } } }
             } );
@@ -1077,6 +1091,7 @@ struct QueryBudgetState
         , maxScanEvents( PositiveBudgetParameter( params, "max_scan_events", DefaultMaxScanEvents, MaximumMaxScanEvents ) )
         , maxCpuMs( PositiveBudgetParameter( params, "max_cpu_ms", DefaultMaxCpuMs, MaximumMaxCpuMs ) )
         , maxNodes( PositiveBudgetParameter( params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) )
+        , maxEdges( PositiveBudgetParameter( params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) )
         , maxGroups( PositiveBudgetParameter( params, "max_groups", DefaultMaxGroups, MaximumMaxGroups ) )
     {}
 
@@ -1129,6 +1144,15 @@ struct QueryBudgetState
         return true;
     }
 
+    bool ConsumeEdges( size_t count = 1 )
+    {
+        CheckCancelled();
+        if( ElapsedMs() >= maxCpuMs ) { Exhaust( "max_cpu_ms" ); return false; }
+        if( edges + count > maxEdges ) { Exhaust( "max_edges" ); return false; }
+        edges += count;
+        return true;
+    }
+
     void Attach( json& response ) const
     {
         if( !response.value( "ok", false ) ) return;
@@ -1137,11 +1161,12 @@ struct QueryBudgetState
         response["budget"] = {
             { "limits", {
                 { "max_scan_events", Decimal( maxScanEvents ) }, { "max_cpu_ms", Decimal( maxCpuMs ) },
-                { "max_nodes", Decimal( maxNodes ) }, { "max_groups", Decimal( maxGroups ) }
+                { "max_nodes", Decimal( maxNodes ) }, { "max_edges", Decimal( maxEdges ) },
+                { "max_groups", Decimal( maxGroups ) }
             } },
             { "consumed", {
                 { "scan_events", Decimal( scannedEvents ) }, { "cpu_ms", Decimal( ElapsedMs() ) },
-                { "nodes", Decimal( nodes ) }, { "groups", Decimal( groups ) }
+                { "nodes", Decimal( nodes ) }, { "edges", Decimal( edges ) }, { "groups", Decimal( groups ) }
             } },
             { "exhausted_by", json( exhaustedBy ) }, { "omitted_count_exact", !partial }
         };
@@ -1159,9 +1184,11 @@ struct QueryBudgetState
     uint64_t maxScanEvents;
     uint64_t maxCpuMs;
     uint64_t maxNodes;
+    uint64_t maxEdges;
     uint64_t maxGroups;
     uint64_t scannedEvents = 0;
     uint64_t nodes = 0;
+    uint64_t edges = 0;
     uint64_t groups = 0;
     bool partial = false;
     std::set<std::string> exhaustedBy;
@@ -1179,6 +1206,7 @@ struct QueryBudgetScope
 size_t BudgetScanAllowance( size_t requested ) { return ActiveBudget ? ActiveBudget->ScanAllowance( requested ) : requested; }
 void BudgetScanned( size_t actual, size_t requested, size_t allowed ) { if( ActiveBudget ) ActiveBudget->Scanned( actual, requested, allowed ); }
 bool BudgetConsumeNode( size_t count = 1 ) { return !ActiveBudget || ActiveBudget->ConsumeNodes( count ); }
+bool BudgetConsumeEdge( size_t count = 1 ) { return !ActiveBudget || ActiveBudget->ConsumeEdges( count ); }
 bool BudgetConsumeGroup( size_t count = 1 ) { return !ActiveBudget || ActiveBudget->ConsumeGroups( count ); }
 bool BudgetPartial() { return ActiveBudget && ActiveBudget->partial; }
 
@@ -2469,6 +2497,290 @@ json ExplicitGpuPassJson( const analysis::TraceSource& source, const ExplicitGpu
     return result;
 }
 
+struct EvidenceNodeData
+{
+    std::string ref;
+    std::string sourceRef;
+    std::string key;
+    std::string kind;
+    std::string domain;
+    std::string name;
+    std::string threadRef;
+    std::string contextRef;
+    std::optional<std::string> sourceLocationRef;
+    std::optional<std::string> callstackRef;
+    int64_t sourceStartNs = 0;
+    int64_t sourceEndNs = 0;
+    int64_t startNs = 0;
+    int64_t endNs = 0;
+    bool complete = true;
+    bool criticalEligible = true;
+    json details = json::object();
+};
+
+struct EvidenceEdgeData
+{
+    std::string ref;
+    size_t source = 0;
+    size_t target = 0;
+    std::string relation;
+    std::string evidenceKind;
+    std::string ruleId;
+    double confidence = 0;
+    int64_t timeDeltaNs = 0;
+    bool complete = true;
+    bool criticalEligible = false;
+    json sourceFields = json::array();
+};
+
+struct EvidenceGraphBuilder
+{
+    static constexpr size_t InvalidIndex = std::numeric_limits<size_t>::max();
+
+    EvidenceGraphBuilder( const analysis::TraceSource& traceSource, std::string frameEntityRef,
+        int64_t beginNs, int64_t endNs, size_t nodeLimit, size_t edgeLimit,
+        bool exact, bool derived, bool heuristic, std::set<std::string> selectedDomains )
+        : source( traceSource )
+        , frameRef( std::move( frameEntityRef ) )
+        , frameBeginNs( beginNs )
+        , frameEndNs( std::max( beginNs, endNs ) )
+        , maxNodes( nodeLimit )
+        , maxEdges( edgeLimit )
+        , includeExact( exact )
+        , includeDerived( derived )
+        , includeHeuristic( heuristic )
+        , domains( std::move( selectedDomains ) )
+    {}
+
+    bool DomainAllowed( const std::string& domain ) const
+    {
+        return domain == "frame" || domains.empty() || domains.contains( domain );
+    }
+
+    size_t AddNode( std::string key, std::string sourceRef, std::string kind, std::string domain,
+        std::string name, int64_t sourceStartNs, int64_t sourceEndNs, std::string threadRef = {},
+        std::string contextRef = {}, std::optional<std::string> sourceLocationRef = std::nullopt,
+        std::optional<std::string> callstackRef = std::nullopt, bool complete = true,
+        bool criticalEligible = true, json details = json::object(), bool preserveSourceRef = false )
+    {
+        if( !DomainAllowed( domain ) ) return InvalidIndex;
+        if( const auto found = byKey.find( key ); found != byKey.end() ) return found->second;
+        if( !BudgetConsumeNode() || nodes.size() >= maxNodes )
+        {
+            truncated = true;
+            omittedNodes++;
+            return InvalidIndex;
+        }
+        EvidenceNodeData value;
+        value.key = std::move( key );
+        value.sourceRef = std::move( sourceRef );
+        value.ref = preserveSourceRef && !value.sourceRef.empty() ? value.sourceRef :
+            source.MakeEntityRef( "evidence-node", nodes.size() + 1 );
+        value.kind = std::move( kind );
+        value.domain = std::move( domain );
+        value.name = std::move( name );
+        value.threadRef = std::move( threadRef );
+        value.contextRef = std::move( contextRef );
+        value.sourceLocationRef = std::move( sourceLocationRef );
+        value.callstackRef = std::move( callstackRef );
+        value.sourceStartNs = sourceStartNs;
+        value.sourceEndNs = std::max( sourceStartNs, sourceEndNs );
+        value.startNs = std::clamp( value.sourceStartNs, frameBeginNs, frameEndNs );
+        value.endNs = std::clamp( value.sourceEndNs, frameBeginNs, frameEndNs );
+        if( value.endNs < value.startNs ) value.endNs = value.startNs;
+        value.complete = complete;
+        value.criticalEligible = criticalEligible;
+        value.details = std::move( details );
+        const auto index = nodes.size();
+        byKey.emplace( value.key, index );
+        if( !value.sourceRef.empty() && !bySourceRef.contains( value.sourceRef ) ) bySourceRef.emplace( value.sourceRef, index );
+        domainCounts[value.domain]++;
+        nodes.emplace_back( std::move( value ) );
+        return index;
+    }
+
+    size_t FindKey( std::string_view key ) const
+    {
+        const auto found = byKey.find( std::string( key ) );
+        return found == byKey.end() ? InvalidIndex : found->second;
+    }
+
+    size_t FindSource( std::string_view ref ) const
+    {
+        const auto found = bySourceRef.find( std::string( ref ) );
+        return found == bySourceRef.end() ? InvalidIndex : found->second;
+    }
+
+    void AddEdge( size_t sourceIndex, size_t targetIndex, std::string relation,
+        std::string evidenceKind, std::string ruleId, double confidence,
+        bool criticalEligible, json sourceFields = json::array(), bool complete = true )
+    {
+        if( sourceIndex == InvalidIndex || targetIndex == InvalidIndex || sourceIndex >= nodes.size() || targetIndex >= nodes.size() ) return;
+        if( evidenceKind == "exact" && !includeExact ) return;
+        if( evidenceKind == "derived" && !includeDerived ) return;
+        if( evidenceKind == "heuristic" && !includeHeuristic ) return;
+        const auto key = std::to_string( sourceIndex ) + '|' + std::to_string( targetIndex ) + '|' + relation + '|' + evidenceKind;
+        if( !edgeKeys.emplace( key ).second ) return;
+        if( !BudgetConsumeEdge() || edges.size() >= maxEdges )
+        {
+            truncated = true;
+            omittedEdges++;
+            return;
+        }
+        EvidenceEdgeData value;
+        value.ref = source.MakeEntityRef( "evidence-edge", edges.size() + 1 );
+        value.source = sourceIndex;
+        value.target = targetIndex;
+        value.relation = std::move( relation );
+        value.evidenceKind = std::move( evidenceKind );
+        value.ruleId = std::move( ruleId );
+        value.confidence = confidence;
+        value.timeDeltaNs = nodes[targetIndex].startNs - nodes[sourceIndex].endNs;
+        value.complete = complete;
+        value.criticalEligible = criticalEligible;
+        value.sourceFields = std::move( sourceFields );
+        evidenceCounts[value.evidenceKind]++;
+        edges.emplace_back( std::move( value ) );
+    }
+
+    json NodeJson( size_t index ) const
+    {
+        const auto& value = nodes.at( index );
+        return {
+            { "ref", value.ref }, { "source_ref", value.sourceRef.empty() ? json( nullptr ) : json( value.sourceRef ) },
+            { "kind", value.kind }, { "domain", value.domain }, { "name", value.name },
+            { "frame_ref", frameRef }, { "thread_ref", value.threadRef.empty() ? json( nullptr ) : json( value.threadRef ) },
+            { "context_ref", value.contextRef.empty() ? json( nullptr ) : json( value.contextRef ) },
+            { "source_location_ref", value.sourceLocationRef ? json( *value.sourceLocationRef ) : json( nullptr ) },
+            { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
+            { "source_start_ns", Decimal( value.sourceStartNs ) }, { "source_end_ns", Decimal( value.sourceEndNs ) },
+            { "start_ns", Decimal( value.startNs ) }, { "end_ns", Decimal( value.endNs ) },
+            { "duration_ns", Decimal( std::max<int64_t>( 0, value.endNs - value.startNs ) ) },
+            { "outside_frame", value.sourceEndNs < frameBeginNs || value.sourceStartNs > frameEndNs },
+            { "complete", value.complete }, { "critical_eligible", value.criticalEligible },
+            { "details", value.details }, { "trust", "untrusted_trace_data" }
+        };
+    }
+
+    json EdgeJson( size_t index ) const
+    {
+        const auto& value = edges.at( index );
+        return {
+            { "ref", value.ref }, { "source_ref", nodes[value.source].ref }, { "target_ref", nodes[value.target].ref },
+            { "relation", value.relation }, { "evidence_kind", value.evidenceKind },
+            { "confidence", value.confidence }, { "rule_id", value.ruleId },
+            { "source_fields", value.sourceFields }, { "time_delta_ns", Decimal( value.timeDeltaNs ) },
+            { "complete", value.complete }, { "critical_eligible", value.criticalEligible }
+        };
+    }
+
+    const analysis::TraceSource& source;
+    std::string frameRef;
+    int64_t frameBeginNs = 0;
+    int64_t frameEndNs = 0;
+    size_t maxNodes = 0;
+    size_t maxEdges = 0;
+    bool includeExact = true;
+    bool includeDerived = true;
+    bool includeHeuristic = false;
+    bool truncated = false;
+    uint64_t omittedNodes = 0;
+    uint64_t omittedEdges = 0;
+    size_t root = InvalidIndex;
+    std::set<std::string> domains;
+    std::vector<EvidenceNodeData> nodes;
+    std::vector<EvidenceEdgeData> edges;
+    std::unordered_map<std::string, size_t> byKey;
+    std::unordered_map<std::string, size_t> bySourceRef;
+    std::set<std::string> edgeKeys;
+    std::map<std::string, uint64_t> domainCounts;
+    std::map<std::string, uint64_t> evidenceCounts;
+};
+
+json EvidenceCriticalPathJson( const EvidenceGraphBuilder& graph )
+{
+    const auto count = graph.nodes.size();
+    std::vector<std::vector<size_t>> outgoing( count );
+    std::vector<size_t> indegree( count, 0 );
+    for( size_t index = 0; index < graph.edges.size(); index++ )
+    {
+        const auto& edge = graph.edges[index];
+        if( !edge.criticalEligible || !graph.nodes[edge.source].criticalEligible || !graph.nodes[edge.target].criticalEligible ) continue;
+        outgoing[edge.source].emplace_back( index );
+        indegree[edge.target]++;
+    }
+    std::queue<size_t> ready;
+    for( size_t index = 0; index < count; index++ ) if( indegree[index] == 0 ) ready.push( index );
+    constexpr int64_t Unreachable = std::numeric_limits<int64_t>::min() / 4;
+    std::vector<int64_t> cost( count, Unreachable );
+    std::vector<int64_t> coveredEnd( count, graph.frameBeginNs );
+    std::vector<std::optional<size_t>> parentNode( count );
+    std::vector<std::optional<size_t>> parentEdge( count );
+    if( graph.root != EvidenceGraphBuilder::InvalidIndex && graph.root < count ) cost[graph.root] = 0;
+    size_t processed = 0;
+    while( !ready.empty() )
+    {
+        const auto current = ready.front();
+        ready.pop();
+        processed++;
+        for( const auto edgeIndex : outgoing[current] )
+        {
+            const auto& edge = graph.edges[edgeIndex];
+            const auto next = edge.target;
+            if( cost[current] != Unreachable )
+            {
+                const auto& node = graph.nodes[next];
+                const auto contribution = std::max<int64_t>( 0, node.endNs - std::max( node.startNs, coveredEnd[current] ) );
+                const auto candidate = cost[current] + contribution;
+                const auto candidateCoveredEnd = std::max( coveredEnd[current], node.endNs );
+                if( candidate > cost[next] || ( candidate == cost[next] && candidateCoveredEnd < coveredEnd[next] ) )
+                {
+                    cost[next] = candidate;
+                    coveredEnd[next] = candidateCoveredEnd;
+                    parentNode[next] = current;
+                    parentEdge[next] = edgeIndex;
+                }
+            }
+            if( --indegree[next] == 0 ) ready.push( next );
+        }
+    }
+    size_t end = graph.root;
+    for( size_t index = 0; index < count; index++ ) if( cost[index] > ( end < count ? cost[end] : Unreachable ) ) end = index;
+    std::vector<size_t> path;
+    if( end < count && cost[end] != Unreachable )
+        for( std::optional<size_t> current = end; current; current = parentNode[*current] ) path.emplace_back( *current );
+    std::reverse( path.begin(), path.end() );
+    json values = json::array();
+    int64_t pathCoveredEnd = graph.frameBeginNs;
+    int64_t total = 0;
+    for( const auto index : path )
+    {
+        if( index == graph.root ) continue;
+        const auto& node = graph.nodes[index];
+        const auto raw = std::max<int64_t>( 0, node.endNs - node.startNs );
+        const auto contribution = std::max<int64_t>( 0, node.endNs - std::max( node.startNs, pathCoveredEnd ) );
+        pathCoveredEnd = std::max( pathCoveredEnd, node.endNs );
+        total += contribution;
+        auto value = graph.NodeJson( index );
+        value["raw_duration_ns"] = Decimal( raw );
+        value["wall_clock_contribution_ns"] = Decimal( contribution );
+        value["overlap_excluded_ns"] = Decimal( raw - contribution );
+        value["entering_edge_ref"] = parentEdge[index] ? json( graph.edges[*parentEdge[index]].ref ) : json( nullptr );
+        value["entering_evidence_kind"] = parentEdge[index] ? json( graph.edges[*parentEdge[index]].evidenceKind ) : json( nullptr );
+        values.emplace_back( std::move( value ) );
+    }
+    const auto frameDuration = std::max<int64_t>( 0, graph.frameEndNs - graph.frameBeginNs );
+    const auto boundedTotal = std::min( total, frameDuration );
+    return {
+        { "nodes", std::move( values ) }, { "total_wall_clock_contribution_ns", Decimal( boundedTotal ) },
+        { "frame_duration_ns", Decimal( frameDuration ) },
+        { "temporal_coverage_ratio", frameDuration == 0 ? 0.0 : double( boundedTotal ) / double( frameDuration ) },
+        { "overlap_accounting", "incremental_wall_clock_union_v1" },
+        { "has_cycle", processed != count }, { "processed_nodes", processed }, { "total_nodes", count },
+        { "valid_contribution", total <= frameDuration }
+    };
+}
+
 json ProjectFields( json value, const json& params )
 {
     if( !params.contains( "fields" ) ) return value;
@@ -2589,6 +2901,7 @@ json DescribeData( const json& selection = json::object() )
             { "default_max_scan_events", Decimal( DefaultMaxScanEvents ) }, { "maximum_max_scan_events", Decimal( MaximumMaxScanEvents ) },
             { "default_max_cpu_ms", Decimal( DefaultMaxCpuMs ) }, { "maximum_max_cpu_ms", Decimal( MaximumMaxCpuMs ) },
             { "default_max_nodes", Decimal( DefaultMaxNodes ) }, { "maximum_max_nodes", Decimal( MaximumMaxNodes ) },
+            { "default_max_edges", Decimal( DefaultMaxEdges ) }, { "maximum_max_edges", Decimal( MaximumMaxEdges ) },
             { "default_max_groups", Decimal( DefaultMaxGroups ) }, { "maximum_max_groups", Decimal( MaximumMaxGroups ) },
             { "callstack_default_depth", 32 }, { "callstack_max_depth", 256 },
             { "source_default_bytes", 65536 }, { "source_max_bytes", 1048576 },
@@ -5368,6 +5681,623 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "messages", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
+    }
+    if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
+    {
+        const auto frameEvents = source->GetCorrelatedFrameEvents();
+        if( frameEvents.empty() )
+            return Success( id, { { "present", false }, { "complete", false },
+                { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
+                { "evidence_kind", "unavailable" } }, trace );
+
+        uint64_t frameId = 0;
+        if( params.contains( "ref" ) )
+        {
+            if( !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
+            const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "frame-identity" );
+            if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref from this trace" );
+            frameId = *parsed;
+        }
+        else if( params.contains( "frame_id" ) )
+        {
+            frameId = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
+        }
+        else throw QueryError( "INVALID_PARAMS", "ref or frame_id is required" );
+
+        int64_t frameBegin = std::numeric_limits<int64_t>::max();
+        int64_t frameEnd = std::numeric_limits<int64_t>::min();
+        bool canonicalBegin = false;
+        bool canonicalEnd = false;
+        json frameEventRefs = json::array();
+        for( const auto& event : frameEvents ) if( event.frameId == frameId )
+        {
+            frameBegin = std::min( frameBegin, event.timeNs );
+            frameEnd = std::max( frameEnd, event.timeNs );
+            canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
+            canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
+            frameEventRefs.emplace_back( event.ref );
+        }
+        if( frameBegin == std::numeric_limits<int64_t>::max() ) throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity was not found" );
+        const bool frameComplete = canonicalBegin && canonicalEnd && frameEnd >= frameBegin;
+        if( frameEnd < frameBegin ) frameEnd = frameBegin;
+        const auto frameRef = source->MakeEntityRef( "frame-identity", frameId );
+
+        const auto readBool = [&]( const char* name, bool fallback ) {
+            if( !params.contains( name ) ) return fallback;
+            if( !params[name].is_boolean() ) throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be boolean" );
+            return params[name].get<bool>();
+        };
+        const bool includeExact = readBool( "include_exact", true );
+        const bool includeDerived = readBool( "include_derived", true );
+        const bool includeHeuristic = readBool( "include_heuristic", false );
+        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, MaximumMaxNodes ) );
+        const auto maxEdges = size_t( UnsignedParameter( params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+        std::set<std::string> selectedDomains;
+        if( params.contains( "domains" ) )
+        {
+            if( !params["domains"].is_array() ) throw QueryError( "INVALID_PARAMS", "domains must be an array of strings" );
+            for( const auto& domain : params["domains"] )
+            {
+                if( !domain.is_string() ) throw QueryError( "INVALID_PARAMS", "domains must contain only strings" );
+                selectedDomains.emplace( domain.get<std::string>() );
+            }
+        }
+
+        EvidenceGraphBuilder graph( *source, frameRef, frameBegin, frameEnd, maxNodes, maxEdges,
+            includeExact, includeDerived, includeHeuristic, std::move( selectedDomains ) );
+        graph.root = graph.AddNode( "frame:" + std::to_string( frameId ), frameRef, "frame", "frame",
+            "Canonical Frame", frameBegin, frameEnd, {}, {}, std::nullopt, std::nullopt, frameComplete,
+            true, { { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
+                { "sequence", uint32_t( frameId ) }, { "event_refs", std::move( frameEventRefs ) } }, true );
+
+        const auto jobs = source->GetJobs();
+        std::unordered_map<uint64_t, const analysis::JobDto*> jobsById;
+        for( const auto& job : jobs ) jobsById[job.jobId] = &job;
+        std::set<uint64_t> selectedJobIds;
+        for( const auto& job : jobs ) if( job.originFrameId == frameId ) selectedJobIds.emplace( job.jobId );
+        std::queue<uint64_t> dependencyFrontier;
+        for( const auto jobId : selectedJobIds ) dependencyFrontier.push( jobId );
+        std::set<uint64_t> expandedDependencies;
+        while( !dependencyFrontier.empty() )
+        {
+            const auto jobId = dependencyFrontier.front();
+            dependencyFrontier.pop();
+            if( !expandedDependencies.emplace( jobId ).second ) continue;
+            const auto found = jobsById.find( jobId );
+            if( found == jobsById.end() ) continue;
+            for( const auto& dependency : found->second->dependencies ) if( dependency.prerequisiteJobId != 0 )
+            {
+                selectedJobIds.emplace( dependency.prerequisiteJobId );
+                const auto prerequisite = jobsById.find( dependency.prerequisiteJobId );
+                if( prerequisite == jobsById.end() ) continue;
+                const auto completed = prerequisite->second->completedNs;
+                if( !completed || *completed >= frameBegin ) dependencyFrontier.push( dependency.prerequisiteJobId );
+            }
+        }
+
+        std::unordered_map<uint64_t, size_t> jobNodes;
+        std::unordered_map<uint64_t, size_t> jobReadyNodes;
+        std::unordered_map<uint64_t, size_t> jobCompleteNodes;
+        std::unordered_map<uint64_t, std::vector<size_t>> jobStageNodes;
+        for( const auto jobId : selectedJobIds )
+        {
+            checkCancelled();
+            const auto found = jobsById.find( jobId );
+            if( found == jobsById.end() ) continue;
+            const auto& job = *found->second;
+            const auto jobNode = graph.AddNode( "job:" + std::to_string( job.jobId ), job.ref, "job", "job",
+                job.name, job.scheduleNs, job.scheduleNs, job.scheduleThreadRef, {}, std::nullopt,
+                job.scheduleCallstack == 0 ? std::nullopt : std::optional<std::string>( source->MakeEntityRef( "callstack", job.scheduleCallstack ) ),
+                !job.incomplete && !job.truncated, true,
+                { { "job_id", Decimal( job.jobId ) }, { "origin_frame_id", Decimal( job.originFrameId ) },
+                    { "execution_ns", Decimal( job.executionNs ) }, { "wait_ns", Decimal( job.waitNs ) } } );
+            jobNodes[job.jobId] = jobNode;
+            if( job.originFrameId == frameId )
+                graph.AddEdge( graph.root, jobNode, "schedules", "exact", "job_origin_frame_id_v1", 1.0, true,
+                    { "JobDto.originFrameId", "JobDto.scheduleNs" } );
+
+            if( job.readyNs )
+            {
+                const auto ready = graph.AddNode( "job-ready:" + std::to_string( job.jobId ), {}, "job_ready", "job",
+                    job.name + " Ready", *job.readyNs, *job.readyNs, {}, {}, std::nullopt, std::nullopt,
+                    !job.incomplete, true, { { "job_ref", job.ref }, { "lane", job.readyLane } } );
+                jobReadyNodes[job.jobId] = ready;
+                graph.AddEdge( jobNode, ready, "becomes_ready", "exact", "job_v2_ready_stage_v1", 1.0, true,
+                    { "JobDto.readyNs" } );
+            }
+            if( job.completedNs )
+            {
+                const auto completed = graph.AddNode( "job-complete:" + std::to_string( job.jobId ), {}, "job_complete", "job",
+                    job.name + " Complete", *job.completedNs, *job.completedNs, {}, {}, std::nullopt, std::nullopt,
+                    !job.incomplete, true, { { "job_ref", job.ref } } );
+                jobCompleteNodes[job.jobId] = completed;
+                graph.AddEdge( jobNode, completed, "completes", "exact", "job_completed_stage_v1", 1.0, false,
+                    { "JobDto.completedNs" } );
+            }
+
+            struct OpenSpan { analysis::JobStageDto stage; std::string family; std::string label; };
+            std::map<std::string, OpenSpan> openSpans;
+            auto stages = job.stages;
+            std::sort( stages.begin(), stages.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+            const auto beginFamily = []( uint8_t stage ) -> std::pair<const char*, const char*> {
+                if( stage == uint8_t( JnJobStage::WorkerSliceBegin ) ) return { "slice", "Worker Slice" };
+                if( stage == uint8_t( JnJobStage::WaitBegin ) ) return { "wait", "Wait" };
+                if( stage == uint8_t( JnJobStage::WaitActiveHelpBegin ) ) return { "active-help", "Wait ActiveHelp" };
+                if( stage == uint8_t( JnJobStage::WaitSpinYieldBegin ) ) return { "spin-yield", "Wait Spin/Yield" };
+                if( stage == uint8_t( JnJobStage::WaitSleepBegin ) ) return { "sleep", "Wait Sleep" };
+                return { nullptr, nullptr };
+            };
+            const auto endFamily = []( uint8_t stage ) -> const char* {
+                if( stage == uint8_t( JnJobStage::WorkerSliceEnd ) ) return "slice";
+                if( stage == uint8_t( JnJobStage::WaitEnd ) ) return "wait";
+                if( stage == uint8_t( JnJobStage::WaitActiveHelpEnd ) ) return "active-help";
+                if( stage == uint8_t( JnJobStage::WaitSpinYieldEnd ) ) return "spin-yield";
+                if( stage == uint8_t( JnJobStage::WaitSleepEnd ) ) return "sleep";
+                return nullptr;
+            };
+            for( const auto& stage : stages )
+            {
+                const auto begin = beginFamily( stage.stage );
+                if( begin.first )
+                {
+                    const auto key = std::string( begin.first ) + '|' + std::to_string( stage.spanId ) + '|' + stage.threadRef;
+                    openSpans[key] = { stage, begin.first, begin.second };
+                    continue;
+                }
+                const auto family = endFamily( stage.stage );
+                if( !family ) continue;
+                const auto key = std::string( family ) + '|' + std::to_string( stage.spanId ) + '|' + stage.threadRef;
+                const auto open = openSpans.find( key );
+                if( open == openSpans.end() || stage.timeNs < open->second.stage.timeNs ) continue;
+                const auto stageIndex = jobStageNodes[job.jobId].size();
+                const auto kind = open->second.family == "slice" ? "job_slice" : "job_wait";
+                const auto node = graph.AddNode( "job-stage:" + std::to_string( job.jobId ) + ':' +
+                    std::to_string( stageIndex ), {}, kind, kind == "job_slice" ? "job" : "wait",
+                    job.name + " " + open->second.label, open->second.stage.timeNs, stage.timeNs,
+                    open->second.stage.threadRef, {}, std::nullopt, std::nullopt, true, true,
+                    { { "job_ref", job.ref }, { "span_id", stage.spanId }, { "arg0", open->second.stage.arg0 },
+                        { "arg1", open->second.stage.arg1 }, { "flags", open->second.stage.flags } } );
+                if( node != EvidenceGraphBuilder::InvalidIndex )
+                {
+                    jobStageNodes[job.jobId].emplace_back( node );
+                    const auto origin = jobReadyNodes.contains( job.jobId ) ? jobReadyNodes[job.jobId] : jobNode;
+                    graph.AddEdge( origin, node, "executes_stage", "exact", "job_span_id_pair_v1", 1.0, true,
+                        { "JobStageDto.spanId", "JobStageDto.stage", "JobStageDto.timeNs" } );
+                    if( jobCompleteNodes.contains( job.jobId ) )
+                        graph.AddEdge( node, jobCompleteNodes[job.jobId], "stage_precedes_completion", "exact",
+                            "job_completed_stage_v1", 1.0, true, { "JobDto.completedNs" } );
+                }
+                openSpans.erase( open );
+            }
+        }
+
+        for( const auto jobId : selectedJobIds )
+        {
+            const auto found = jobsById.find( jobId );
+            if( found == jobsById.end() || !jobNodes.contains( jobId ) ) continue;
+            for( const auto& dependency : found->second->dependencies )
+            {
+                if( !jobNodes.contains( dependency.prerequisiteJobId ) ) continue;
+                const auto sourceNode = jobCompleteNodes.contains( dependency.prerequisiteJobId ) ?
+                    jobCompleteNodes[dependency.prerequisiteJobId] : jobNodes[dependency.prerequisiteJobId];
+                const auto targetNode = jobReadyNodes.contains( jobId ) ? jobReadyNodes[jobId] : jobNodes[jobId];
+                graph.AddEdge( sourceNode, targetNode, "dependency_precedes", "exact", "job_dependency_id_v1", 1.0, true,
+                    { "JobDependencyDto.prerequisiteJobId" } );
+            }
+        }
+
+        const auto ioRequests = source->GetIoRequests();
+        std::unordered_map<uint64_t, size_t> ioNodes;
+        const auto frameSequence = uint32_t( frameId );
+        for( const auto& request : ioRequests )
+        {
+            const auto requestBegin = request.orphan && request.startNs ? *request.startNs : request.queueNs;
+            const auto requestEnd = request.endNs.value_or( frameEnd );
+            const bool sequenceMatch = request.originFrameSequence != 0 && request.originFrameSequence == frameSequence;
+            const bool overlaps = requestEnd >= frameBegin && requestBegin <= frameEnd;
+            if( !sequenceMatch && !overlaps ) continue;
+            const auto node = graph.AddNode( "io:" + std::to_string( request.requestId ), request.ref, "io_request", "io",
+                IoOperationName( request.operation ), requestBegin, requestEnd, request.queueThreadRef, {}, std::nullopt,
+                request.requestCallstack == 0 ? std::nullopt : std::optional<std::string>( source->MakeEntityRef( "callstack", request.requestCallstack ) ),
+                request.endNs.has_value() && !request.truncated, true,
+                { { "request_id", Decimal( request.requestId ) }, { "resource_id", Decimal( request.resourceId ) },
+                    { "requested_bytes", Decimal( request.requestedBytes ) }, { "transferred_bytes", Decimal( request.transferredBytes ) },
+                    { "status", IoStatusName( request.status ) } } );
+            ioNodes[request.requestId] = node;
+            graph.AddEdge( graph.root, node, sequenceMatch ? "originates_in_frame" : "overlaps_frame", "derived",
+                sequenceMatch ? "origin_frame_sequence_v1" : "frame_window_overlap_v1", sequenceMatch ? 0.95 : 0.75, true,
+                sequenceMatch ? json { "IoRequestDto.originFrameSequence", "FrameIdentity.sequence" } :
+                    json { "IoRequestDto.queueNs", "IoRequestDto.endNs", "FrameIdentity.begin/end" } );
+        }
+        for( const auto& request : ioRequests ) if( ioNodes.contains( request.requestId ) )
+        {
+            const auto child = ioNodes[request.requestId];
+            if( request.parentKind == uint8_t( JnIoParentKind::IoRequest ) && ioNodes.contains( request.parentId ) )
+                graph.AddEdge( ioNodes[request.parentId], child, "io_parent", "exact", "io_parent_request_id_v1", 1.0, true,
+                    { "IoRequestDto.parentKind", "IoRequestDto.parentId" } );
+            else if( request.parentKind == uint8_t( JnIoParentKind::Job ) && jobNodes.contains( request.parentId ) )
+                graph.AddEdge( jobNodes[request.parentId], child, "job_starts_io", "exact", "io_parent_job_id_v1", 1.0, true,
+                    { "IoRequestDto.parentKind", "IoRequestDto.parentId" } );
+            if( request.resourceId != 0 )
+            {
+                const auto resource = graph.AddNode( "resource:" + std::to_string( request.resourceId ),
+                    source->MakeEntityRef( "io-resource", request.resourceId ), "resource", "resource",
+                    "I/O Resource", request.queueNs, request.queueNs, {}, {}, std::nullopt, std::nullopt, true, false,
+                    { { "resource_id", Decimal( request.resourceId ) }, { "identity_kind", "stable_resource_or_path_hash" } } );
+                graph.AddEdge( child, resource, "accesses_resource", "exact", "io_resource_id_v1", 1.0, false,
+                    { "IoRequestDto.resourceId" } );
+            }
+        }
+
+        const auto dispatches = source->GetGfxDispatches();
+        const auto entities = source->GetGfxEntities();
+        const auto gfxLinks = source->GetGfxLinks();
+        std::set<uint64_t> reachableIds;
+        std::unordered_map<uint64_t, size_t> rawNodes;
+        for( const auto jobId : selectedJobIds ) if( jobNodes.contains( jobId ) )
+        {
+            reachableIds.emplace( jobId );
+            rawNodes.emplace( jobId, jobNodes[jobId] );
+        }
+        for( const auto& dispatch : dispatches ) if( dispatch.frameIndex == frameId )
+        {
+            const auto node = graph.AddNode( "gfx-dispatch:" + std::to_string( dispatch.dispatchId ), dispatch.ref,
+                "gfx_dispatch", "submission", "Gfx Dispatch", dispatch.timeNs, dispatch.timeNs, dispatch.threadRef, {},
+                std::nullopt, std::nullopt, true, true,
+                { { "dispatch_id", Decimal( dispatch.dispatchId ) }, { "expected_jobs", dispatch.expectedJobs },
+                    { "threading_mode", dispatch.threadingMode } } );
+            reachableIds.emplace( dispatch.dispatchId );
+            rawNodes[dispatch.dispatchId] = node;
+            graph.AddEdge( graph.root, node, "dispatches", "exact", "gfx_dispatch_frame_id_v1", 1.0, true,
+                { "GfxDispatchDto.frameIndex" } );
+        }
+
+        auto taxonomy = GpuTaxonomyCatalogJson( info() );
+        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
+        std::vector<analysis::GpuZoneDto> frameGpuZones;
+        size_t gpuOffset = 0;
+        constexpr size_t EvidenceChunk = 4096;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( EvidenceChunk );
+            if( allowed == 0 ) break;
+            analysis::ScanRange range;
+            range.startNs = frameBegin;
+            range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
+            range.offset = gpuOffset;
+            range.limit = allowed;
+            const auto values = source->ScanGpuZones( range );
+            BudgetScanned( values.size(), EvidenceChunk, allowed );
+            for( const auto& zone : values )
+            {
+                MatchExplicitGpuPassZone( *source, explicitPasses, zone );
+                frameGpuZones.emplace_back( zone );
+            }
+            gpuOffset += values.size();
+            if( values.size() < allowed ) break;
+        }
+
+        std::set<std::string> explicitGpuZoneRefs;
+        std::unordered_map<uint64_t, size_t> explicitPassNodes;
+        for( const auto& match : explicitPasses.matches ) if( match.frameId == frameId )
+        {
+            const auto start = match.zone ? match.zone->gpuStartNs : match.pass.timeNs;
+            const auto end = match.zone && match.zone->gpuEndNs ? *match.zone->gpuEndNs : start;
+            const auto passNode = graph.AddNode( "gpu-pass:" + std::to_string( match.pass.entityId ), match.pass.ref,
+                "gpu_pass", "gpu", match.zone ? match.zone->name : "Explicit GPU Pass", start, end,
+                match.pass.threadRef, match.zone ? match.zone->contextRef : std::string(),
+                match.zone ? std::optional<std::string>( match.zone->sourceLocationRef ) : std::nullopt,
+                match.zone ? match.zone->callstackRef : std::nullopt, match.zone && match.zone->complete, true,
+                { { "pass_instance_id", Decimal( match.pass.entityId ) }, { "pass_source_id", match.pass.gpuQueryId },
+                    { "taxonomy_id", Decimal( uint64_t( match.taxonomyId ) ) }, { "command_list_id", Decimal( match.commandListId ) },
+                    { "reference_token", Decimal( match.referenceToken ) } } );
+            if( passNode == EvidenceGraphBuilder::InvalidIndex ) continue;
+            explicitPassNodes[match.pass.entityId] = passNode;
+            rawNodes[match.pass.entityId] = passNode;
+            reachableIds.emplace( match.pass.entityId );
+            graph.AddEdge( graph.root, passNode, "executes_gpu_pass", "exact", "explicit_gpu_pass_frame_id_v1", 1.0, true,
+                { "GfxLink.frameId", "GfxEntity.passInstanceId" } );
+            if( match.zone )
+            {
+                explicitGpuZoneRefs.emplace( match.zone->ref );
+                const auto zoneNode = graph.AddNode( "gpu-zone:" + match.zone->ref, match.zone->ref, "gpu_zone", "gpu",
+                    match.zone->name, match.zone->gpuStartNs, match.zone->gpuEndNs.value_or( match.zone->gpuStartNs ),
+                    match.zone->threadRef, match.zone->contextRef, match.zone->sourceLocationRef, match.zone->callstackRef,
+                    match.zone->complete, false, { { "query_id", match.zone->queryId }, { "pairing", "context_query_id_exact" } } );
+                graph.AddEdge( passNode, zoneNode, "binds_gpu_zone", "exact", "gpu_context_query_id_v1", 1.0, false,
+                    { "GfxEntity.gpuContext", "GfxEntity.gpuQueryId", "GpuZoneDto.contextRef", "GpuZoneDto.queryId" } );
+            }
+        }
+
+        bool reachabilityChanged = true;
+        while( reachabilityChanged )
+        {
+            reachabilityChanged = false;
+            for( const auto& entity : entities ) if( entity.parentId != 0 && reachableIds.contains( entity.parentId ) )
+                reachabilityChanged |= reachableIds.emplace( entity.entityId ).second;
+            for( const auto& link : gfxLinks ) if( reachableIds.contains( link.sourceId ) )
+                reachabilityChanged |= reachableIds.emplace( link.targetId ).second;
+        }
+        for( const auto& entity : entities ) if( reachableIds.contains( entity.entityId ) && !rawNodes.contains( entity.entityId ) )
+        {
+            const auto domain = entity.kind == 3 || entity.kind == 4 ? "submission" : "gfx";
+            const auto kind = entity.kind == 3 ? "submission" : "gfx_entity";
+            const auto node = graph.AddNode( "gfx-entity:" + std::to_string( entity.entityId ), entity.ref, kind, domain,
+                GfxEntityKindName( entity.kind ), entity.timeNs, entity.timeNs, entity.threadRef, {}, std::nullopt, std::nullopt,
+                true, true, { { "entity_id", Decimal( entity.entityId ) }, { "entity_kind", entity.kind },
+                    { "gpu_query_id", entity.gpuQueryId }, { "gpu_context", entity.gpuContext } } );
+            rawNodes[entity.entityId] = node;
+        }
+        for( const auto& entity : entities ) if( rawNodes.contains( entity.entityId ) && rawNodes.contains( entity.parentId ) )
+            graph.AddEdge( rawNodes[entity.parentId], rawNodes[entity.entityId], "parent", "exact", "gfx_entity_parent_id_v1", 1.0, true,
+                { "GfxEntityDto.parentId" } );
+        for( const auto& link : gfxLinks ) if( rawNodes.contains( link.sourceId ) && rawNodes.contains( link.targetId ) )
+            graph.AddEdge( rawNodes[link.sourceId], rawNodes[link.targetId], GfxRelationName( link.relation ), "exact",
+                "gfx_link_id_v1", 1.0, true, { "GfxLinkDto.sourceId", "GfxLinkDto.targetId", "GfxLinkDto.relation" } );
+
+        const auto attribution = CachedGpuAttribution( trace.id, source );
+        for( const auto& match : explicitPasses.matches ) if( match.frameId == frameId && match.referenceToken != 0 && explicitPassNodes.contains( match.pass.entityId ) )
+        {
+            const auto pass = attribution->passById.find( match.referenceToken );
+            if( pass == attribution->passById.end() ) continue;
+            for( const auto& use : attribution->passes[pass->second].uses )
+            {
+                uint64_t bytes = 0;
+                std::string pool;
+                if( const auto allocation = attribution->allocationById.find( use.allocationId ); allocation != attribution->allocationById.end() )
+                {
+                    bytes = attribution->allocations[allocation->second].allocation.size;
+                    pool = attribution->allocations[allocation->second].allocation.poolName;
+                }
+                const auto resource = graph.AddNode( "gpu-resource:" + std::to_string( use.allocationId ),
+                    source->MakeEntityRef( "gpu-allocation", use.allocationId ), "gpu_resource", "resource", pool.empty() ?
+                    "GPU Resource" : pool, graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
+                    graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
+                    true, false, { { "allocation_id", Decimal( use.allocationId ) }, { "bytes", Decimal( bytes ) },
+                        { "usage_mask", use.usageMask }, { "usage_kind", std::string( 1, use.kind ) } } );
+                graph.AddEdge( explicitPassNodes[match.pass.entityId], resource, "references_resource", "exact",
+                    "gpu_reference_token_allocation_id_v1", 1.0, false,
+                    { "ExplicitGpuPass.referenceToken", "GpuMemoryPassUse.allocationId" } );
+            }
+        }
+
+        std::vector<std::pair<size_t, std::optional<std::string>>> cpuParents;
+        size_t cpuOffset = 0;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( EvidenceChunk );
+            if( allowed == 0 ) break;
+            analysis::ScanRange range;
+            range.startNs = frameBegin;
+            range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
+            range.offset = cpuOffset;
+            range.limit = allowed;
+            const auto zones = source->ScanCpuZones( range );
+            BudgetScanned( zones.size(), EvidenceChunk, allowed );
+            for( const auto& zone : zones ) if( zone.endNs )
+            {
+                const auto node = graph.AddNode( "cpu-zone:" + zone.ref, zone.ref, "cpu_zone", "cpu", zone.name,
+                    zone.startNs, *zone.endNs, zone.threadRef, {}, zone.sourceLocationRef, zone.callstackRef,
+                    zone.complete, true, { { "self_time_ns", zone.selfTimeNs ? json( Decimal( *zone.selfTimeNs ) ) : json( nullptr ) },
+                        { "running_time_ns", zone.runningTimeNs ? json( Decimal( *zone.runningTimeNs ) ) : json( nullptr ) } } );
+                cpuParents.emplace_back( node, zone.parentRef );
+                graph.AddEdge( graph.root, node, "overlaps_frame", "derived", "frame_window_overlap_v1", 0.75, true,
+                    { "CpuZoneDto.startNs/endNs", "FrameIdentity.begin/end" } );
+            }
+            cpuOffset += zones.size();
+            if( zones.size() < allowed ) break;
+        }
+        for( const auto& [node, parentRef] : cpuParents ) if( parentRef )
+        {
+            const auto parent = graph.FindSource( *parentRef );
+            graph.AddEdge( parent, node, "zone_parent", "exact", "cpu_zone_parent_ref_v1", 1.0, false,
+                { "CpuZoneDto.parentRef" } );
+        }
+
+        for( const auto& zone : frameGpuZones ) if( zone.gpuEndNs && !explicitGpuZoneRefs.contains( zone.ref ) )
+        {
+            const auto node = graph.AddNode( "gpu-zone:" + zone.ref, zone.ref, "gpu_zone", "gpu", zone.name,
+                zone.gpuStartNs, *zone.gpuEndNs, zone.threadRef, zone.contextRef, zone.sourceLocationRef, zone.callstackRef,
+                zone.complete, true, { { "query_id", zone.queryId }, { "pairing", "frame_window_only" } } );
+            graph.AddEdge( graph.root, node, "overlaps_frame", "derived", "gpu_frame_window_overlap_v1", 0.70, true,
+                { "GpuZoneDto.gpuStartNs/gpuEndNs", "FrameIdentity.begin/end" } );
+            if( zone.parentRef ) graph.AddEdge( graph.FindSource( *zone.parentRef ), node, "zone_parent", "exact",
+                "gpu_zone_parent_ref_v1", 1.0, false, { "GpuZoneDto.parentRef" } );
+        }
+
+        std::map<std::string, analysis::LockEventDto> lockWaits;
+        size_t lockOffset = 0;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( EvidenceChunk );
+            if( allowed == 0 ) break;
+            analysis::ScanRange range;
+            range.startNs = frameBegin;
+            range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
+            range.offset = lockOffset;
+            range.limit = allowed;
+            const auto events = source->ScanLockEvents( range );
+            BudgetScanned( events.size(), EvidenceChunk, allowed );
+            for( const auto& event : events )
+            {
+                const auto key = event.lockRef + '|' + event.threadRef;
+                if( event.type == "wait" || event.type == "wait_shared" ) lockWaits[key] = event;
+                else if( ( event.type == "obtain" || event.type == "obtain_shared" ) && lockWaits.contains( key ) )
+                {
+                    const auto& wait = lockWaits[key];
+                    const auto node = graph.AddNode( "lock-wait:" + wait.ref, wait.ref, "lock_wait", "lock",
+                        "Lock Wait", wait.timeNs, event.timeNs, wait.threadRef, {}, wait.sourceLocationRef, std::nullopt,
+                        true, true, { { "lock_ref", wait.lockRef }, { "obtain_event_ref", event.ref },
+                            { "owner_thread_ref", wait.ownerThreadRef ? json( *wait.ownerThreadRef ) : json( nullptr ) } } );
+                    graph.AddEdge( graph.root, node, "overlaps_frame", "derived", "lock_wait_obtain_pair_v1", 0.90, true,
+                        { "LockEvent.wait.timeNs", "LockEvent.obtain.timeNs", "LockEvent.threadRef" } );
+                    lockWaits.erase( key );
+                }
+            }
+            lockOffset += events.size();
+            if( events.size() < allowed ) break;
+        }
+
+        size_t contextOffset = 0;
+        while( true )
+        {
+            checkCancelled();
+            const auto allowed = BudgetScanAllowance( EvidenceChunk );
+            if( allowed == 0 ) break;
+            analysis::ScanRange range;
+            range.startNs = frameBegin;
+            range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
+            range.offset = contextOffset;
+            range.limit = allowed;
+            const auto events = source->ScanContextSwitchEvents( range );
+            BudgetScanned( events.size(), EvidenceChunk, allowed );
+            for( const auto& event : events )
+            {
+                if( event.endNs )
+                {
+                    const auto run = graph.AddNode( "context-run:" + event.ref, event.ref, "context_switch_run",
+                        "context_switch", "Thread Running", event.startNs, *event.endNs, event.threadRef, {},
+                        std::nullopt, std::nullopt, event.complete, true,
+                        { { "cpu", event.cpu }, { "reason", event.reasonName }, { "state", event.stateName } } );
+                    graph.AddEdge( graph.root, run, "overlaps_frame", "derived", "context_switch_running_interval_v1", 0.85, true,
+                        { "ContextSwitchDto.startNs/endNs", "ContextSwitchDto.threadRef" } );
+                }
+                if( event.wakeupNs && *event.wakeupNs <= event.startNs )
+                {
+                    const auto wait = graph.AddNode( "context-wait:" + event.ref, {}, "context_switch_wait",
+                        "context_switch", "Runnable Wait", *event.wakeupNs, event.startNs, event.threadRef, {},
+                        std::nullopt, std::nullopt, event.complete, true,
+                        { { "run_event_ref", event.ref }, { "reason", event.reasonName }, { "state", event.stateName } } );
+                    graph.AddEdge( graph.root, wait, "overlaps_frame", "derived", "context_switch_wakeup_to_run_v1", 0.85, true,
+                        { "ContextSwitchDto.wakeupNs", "ContextSwitchDto.startNs" } );
+                }
+            }
+            contextOffset += events.size();
+            if( events.size() < allowed ) break;
+        }
+
+        std::map<std::string, std::vector<size_t>> timelineByThread;
+        for( size_t index = 0; index < graph.nodes.size(); index++ )
+            if( index != graph.root && graph.nodes[index].criticalEligible && !graph.nodes[index].threadRef.empty() )
+                timelineByThread[graph.nodes[index].threadRef].emplace_back( index );
+        for( auto& [thread, timeline] : timelineByThread )
+        {
+            std::sort( timeline.begin(), timeline.end(), [&]( size_t lhs, size_t rhs ) {
+                const auto& left = graph.nodes[lhs];
+                const auto& right = graph.nodes[rhs];
+                return left.startNs != right.startNs ? left.startNs < right.startNs : left.endNs < right.endNs;
+            } );
+            std::optional<size_t> previous;
+            for( const auto current : timeline )
+            {
+                if( previous && graph.nodes[*previous].endNs <= graph.nodes[current].startNs )
+                    graph.AddEdge( *previous, current, "timeline_precedes", "derived", "same_thread_adjacency_v1", 0.70, true,
+                        { "node.thread_ref", "node.start_ns", "node.end_ns" } );
+                if( !previous || graph.nodes[current].endNs >= graph.nodes[*previous].endNs ) previous = current;
+            }
+        }
+
+        auto criticalPath = EvidenceCriticalPathJson( graph );
+        json evidenceCounts = {
+            { "exact", Decimal( graph.evidenceCounts["exact"] ) },
+            { "derived", Decimal( graph.evidenceCounts["derived"] ) },
+            { "heuristic", Decimal( graph.evidenceCounts["heuristic"] ) }
+        };
+        json domainCoverage = json::array();
+        static constexpr std::pair<const char*, const char*> RequiredDomains[] = {
+            { "cpu", "zone.cpu" }, { "job", "job" }, { "wait", "job" }, { "lock", "lock" },
+            { "context_switch", "context_switch" }, { "io", "io" }, { "submission", "job.gfx" },
+            { "gpu", "job.gfx" }, { "resource", "memory.gpu" }
+        };
+        const auto capabilities = source->GetCapabilities();
+        for( const auto& [domain, capabilityDomain] : RequiredDomains )
+        {
+            const auto count = graph.domainCounts[domain];
+            const auto capability = std::find_if( capabilities.begin(), capabilities.end(), [&]( const auto& value ) {
+                return value.domain == capabilityDomain;
+            } );
+            const bool available = capability != capabilities.end() && capability->present;
+            const char* status = count != 0 ? "present" : available ? "not_observed_in_selected_frame" : "unavailable";
+            const std::string reason = count != 0 ? "" : available ?
+                "capability is available, but no matching evidence was observed in the selected frame and query budget" :
+                capability != capabilities.end() ? capability->reason : "required capability was not declared by the trace source";
+            domainCoverage.push_back( {
+                { "domain", domain }, { "present", count != 0 }, { "node_count", Decimal( count ) },
+                { "status", status }, { "capability_domain", capabilityDomain }, { "capability_available", available },
+                { "reason", reason }
+            } );
+        }
+        const bool contributionValid = criticalPath.value( "valid_contribution", false );
+        const bool complete = frameComplete && !graph.truncated && !BudgetPartial() && contributionValid && !criticalPath.value( "has_cycle", true );
+        json qualityFindings = json::array();
+        if( !frameComplete ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "INCOMPLETE_FRAME" }, { "message", "canonical frame begin/end is incomplete" } } );
+        if( graph.truncated || BudgetPartial() ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "EVIDENCE_BUDGET_PARTIAL" }, { "message", "node, edge, scan, or CPU budget truncated the evidence graph" } } );
+        if( criticalPath.value( "has_cycle", false ) ) qualityFindings.push_back( { { "severity", "error" }, { "code", "CRITICAL_PATH_CYCLE" }, { "message", "critical-eligible evidence contains a cycle" } } );
+        if( !contributionValid ) qualityFindings.push_back( { { "severity", "error" }, { "code", "INVALID_WALL_CLOCK_CONTRIBUTION" }, { "message", "critical path contribution exceeds frame wall time" } } );
+        if( !includeHeuristic && graph.evidenceCounts["heuristic"] != 0 ) qualityFindings.push_back( { { "severity", "error" }, { "code", "HEURISTIC_LEAK" }, { "message", "heuristic evidence was emitted while disabled" } } );
+
+        const auto base = [&]() {
+            return json {
+                { "present", true }, { "schema_version", 1 }, { "complete", complete },
+                { "reason", complete ? "" : "inspect quality_findings and missing_evidence" },
+                { "frame", { { "ref", frameRef }, { "frame_id", Decimal( frameId ) },
+                    { "begin_ns", Decimal( frameBegin ) }, { "end_ns", Decimal( frameEnd ) },
+                    { "duration_ns", Decimal( std::max<int64_t>( 0, frameEnd - frameBegin ) ) }, { "complete", frameComplete } } },
+                { "evidence_counts", evidenceCounts }, { "domain_coverage", domainCoverage },
+                { "heuristic_enabled", includeHeuristic }, { "heuristic_used_by_default_path", false },
+                { "truncated", graph.truncated || BudgetPartial() },
+                { "omitted_nodes", Decimal( graph.omittedNodes ) }, { "omitted_edges", Decimal( graph.omittedEdges ) },
+                { "quality_findings", qualityFindings }, { "trust", "untrusted_trace_data" }
+            };
+        };
+
+        if( method == "evidence.graph" )
+        {
+            auto result = base();
+            json nodes = json::array();
+            for( size_t index = 0; index < graph.nodes.size(); index++ ) nodes.emplace_back( graph.NodeJson( index ) );
+            json edges = json::array();
+            for( size_t index = 0; index < graph.edges.size(); index++ ) edges.emplace_back( graph.EdgeJson( index ) );
+            result["nodes"] = std::move( nodes );
+            result["edges"] = std::move( edges );
+            result["node_count"] = Decimal( graph.nodes.size() );
+            result["edge_count"] = Decimal( graph.edges.size() );
+            result["critical_path_summary"] = criticalPath;
+            return Success( id, std::move( result ), trace );
+        }
+        if( method == "frame.critical_path" )
+        {
+            auto result = base();
+            result["critical_path"] = std::move( criticalPath );
+            result["algorithm"] = "causal_dag_incremental_wall_clock_v1";
+            result["heuristic_baseline_same"] = true;
+            return Success( id, std::move( result ), trace );
+        }
+
+        auto result = base();
+        std::vector<size_t> contributors;
+        for( size_t index = 0; index < graph.nodes.size(); index++ ) if( index != graph.root && graph.nodes[index].endNs > graph.nodes[index].startNs ) contributors.emplace_back( index );
+        std::sort( contributors.begin(), contributors.end(), [&]( size_t lhs, size_t rhs ) {
+            const auto left = graph.nodes[lhs].endNs - graph.nodes[lhs].startNs;
+            const auto right = graph.nodes[rhs].endNs - graph.nodes[rhs].startNs;
+            return left != right ? left > right : graph.nodes[lhs].ref < graph.nodes[rhs].ref;
+        } );
+        json top = json::array();
+        for( size_t index = 0; index < std::min<size_t>( contributors.size(), 20 ); index++ ) top.emplace_back( graph.NodeJson( contributors[index] ) );
+        json missing = json::array();
+        for( const auto& value : domainCoverage ) if( !value.value( "present", false ) ) missing.emplace_back( value );
+        const auto exactCount = graph.evidenceCounts["exact"];
+        const auto derivedCount = graph.evidenceCounts["derived"];
+        const auto confidence = !complete ? "partial" : exactCount != 0 && derivedCount == 0 ? "high" : exactCount != 0 ? "medium" : "low";
+        result["critical_path"] = std::move( criticalPath );
+        result["top_contributors"] = std::move( top );
+        result["missing_evidence"] = std::move( missing );
+        result["analysis_confidence"] = confidence;
+        result["conclusion_contract"] = "all conclusions must cite returned node/edge refs; absent domains are not real zero";
+        return Success( id, std::move( result ), trace );
     }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {

@@ -1163,6 +1163,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "timeline", info.counts.cpuZones != 0 || info.counts.gpuZones != 0 || info.counts.frames != 0 || info.counts.correlatedFrameEvents != 0 || info.counts.messages != 0 || info.counts.plots != 0 || info.counts.locks != 0 || info.counts.contextSwitches != 0, true, { "timeline.slice", "timeline.correlated_slice" } ),
         capability( "correlation", info.counts.correlatedFrameEvents != 0, true, { "entity.related", "correlation.chain" },
             info.counts.correlatedFrameEvents ? "exact JN frame and entity relations are present" : "trace predates or does not contain JN frame correlation" ),
+        capability( "evidence", info.counts.correlatedFrameEvents != 0, true, { "evidence.graph", "frame.critical_path", "frame.explain" },
+            info.counts.correlatedFrameEvents ? "FrameIdentity-backed evidence graph is queryable" : "trace predates or does not contain JN FrameIdentity evidence" ),
         capability( "zone.cpu", info.counts.cpuZones != 0, true, { "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph" } ),
         capability( "zone.gpu", info.counts.gpuZones != 0, true, { "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics", "zone.gpu.flamegraph" } ),
         capability( "callstack", info.counts.callstackPayloads != 0 || info.counts.parentCallstackPayloads != 0, true, { "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch" } ),

@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.12.0",
+  "schema_version": "1.13.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -564,6 +564,15 @@
       "query_fields": ["ref", "frame_id", "connection_generation", "sequence", "begin_ns", "end_ns", "duration_ns", "complete", "domains", "events", "source_ref", "target_ref", "relation", "correlation_id", "parent_span_id", "origin_frame_id", "origin_frame_ref", "evidence_kind", "window_inference_used"],
       "unmapped_fields": [],
       "methods": ["frame.identity", "entity.related", "correlation.chain", "timeline.correlated_slice"],
+      "status": "complete"
+    },
+    {
+      "entity": "evidence.graph_and_frame_critical_path",
+      "classification": "derived_semantic",
+      "persisted_fields": ["frame identity and bounds", "job schedule/config/dependencies/stages/waits", "structured file I/O request/config/stages", "gfx dispatch/entities/typed links", "explicit GPU pass and GPU zones", "GTMEM1 resource references", "CPU zones", "lock wait/obtain events", "context switch running and wakeup intervals"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "frame", "nodes", "edges", "node_count", "edge_count", "limits.max_edges", "limits.omitted_edges", "evidence_counts.exact", "evidence_counts.derived", "evidence_counts.heuristic", "heuristic_enabled", "critical_path.node_refs", "critical_path.edge_refs", "critical_path.total_wall_clock_contribution_ns", "critical_path.frame_duration_ns", "critical_path.valid_contribution", "critical_path.has_cycle", "domain_coverage", "top_contributors", "missing_evidence", "confidence", "trust"],
+      "unmapped_fields": [],
+      "methods": ["evidence.graph", "frame.critical_path", "frame.explain"],
       "status": "complete"
     },
     {
