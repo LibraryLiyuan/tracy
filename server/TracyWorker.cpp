@@ -1818,6 +1818,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use" );
             ReadJnVector( f, jn.gpuReferenceEnds, "GPU reference end" );
         }
+        if( schemaVersion >= 6 )
+        {
+            ReadJnVector( f, jn.scriptFrames, "script frame" );
+            ReadJnVector( f, jn.scriptStacks, "script stack" );
+        }
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -4508,6 +4513,16 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnGpuReferenceEnd:
         RecorderCheckCurrentThread();
         break;
+    case QueueType::JnScriptFrame:
+        CheckString( ev.jnScriptFrame.function );
+        CheckString( ev.jnScriptFrame.file );
+        RecorderCheckCurrentThread();
+        break;
+    case QueueType::JnScriptStack:
+        if( JnScriptRecordKind( ev.jnScriptStack.kind ) == JnScriptRecordKind::Marker )
+            CheckString( ev.jnScriptStack.secondaryId );
+        RecorderCheckCurrentThread();
+        break;
     case QueueType::JnJobStage:
         RecorderCheckCurrentThread();
         if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack ||
@@ -6016,6 +6031,12 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::JnGpuReferenceEnd:
         ProcessJnGpuReferenceEnd( ev.jnGpuReferenceEnd );
         break;
+    case QueueType::JnScriptFrame:
+        ProcessJnScriptFrame( ev.jnScriptFrame );
+        break;
+    case QueueType::JnScriptStack:
+        ProcessJnScriptStack( ev.jnScriptStack );
+        break;
     default:
         assert( false );
         break;
@@ -6218,6 +6239,29 @@ void Worker::ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev )
     data.schemaVersion = JnTraceSchemaVersion;
     data.gpuReferenceEnds.push_back( JnGpuReferenceEndData { time, ev.passId, ev.commandListId,
         m_threadCtx, ev.totalReferenceCount, ev.droppedReferenceCount, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnScriptFrame( const QueueJnScriptFrame& ev )
+{
+    CheckString( ev.function );
+    CheckString( ev.file );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.scriptFrames.push_back( JnScriptFrameData { ev.function, ev.file, m_threadCtx,
+        ev.frameId, ev.line, ev.runtime, ev.flags } );
+}
+
+void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
+{
+    if( JnScriptRecordKind( ev.kind ) == JnScriptRecordKind::Marker ) CheckString( ev.secondaryId );
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.scriptStacks.push_back( JnScriptStackData { time, ev.primaryId, ev.secondaryId, m_threadCtx,
+        ev.value, ev.runtime, ev.flags, ev.kind } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -10003,6 +10047,8 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
     WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
     WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
+    WriteJnVector( f, m_data.jnTrace.scriptFrames );
+    WriteJnVector( f, m_data.jnTrace.scriptStacks );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

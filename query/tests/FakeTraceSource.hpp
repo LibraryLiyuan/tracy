@@ -126,6 +126,9 @@ public:
                 value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"stack\",\"stack_id\":\"2\",\"runtime\":\"lua\",\"flags\":4,\"frame_ids\":[2]}" );
                 value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"marker\",\"marker_id\":1,\"runtime\":\"managed\",\"name\":\"JN.Direct/Fake.Managed\",\"source_frame_id\":1,\"color\":0,\"flags\":0}" );
                 value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"marker\",\"marker_id\":2,\"runtime\":\"lua\",\"name\":\"JN.Direct/Fake.Lua\",\"source_frame_id\":2,\"color\":0,\"flags\":0}" );
+                // AppInfo is retained by an on-demand Tracy client and may contain an
+                // identical marker definition after reconnect. This must be idempotent.
+                value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"marker\",\"marker_id\":1,\"runtime\":\"managed\",\"name\":\"JN.Direct/Fake.Managed\",\"source_frame_id\":1,\"color\":0,\"flags\":0}" );
                 value.appInfo.emplace_back( "JNGC1|{\"schema_version\":1,\"record\":\"capability\",\"managed_heap\":\"sampled\",\"lua_gc\":\"explicit_api\"}" );
                 value.counts.messages = 9;
             }

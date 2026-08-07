@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.17.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.18.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -550,6 +550,7 @@ int main()
 
     const auto oldScript = service.Execute( Request( 1000, "runtime.script.summary", { { "trace_id", candidateId } } ) );
     assert( oldScript.at( "ok" ) && oldScript.at( "data" ).at( "present" ) == false && oldScript.at( "data" ).at( "complete" ) == false );
+    assert( oldScript.at( "data" ).at( "schema_version" ) == 0 );
     const auto oldGc = service.Execute( Request( 1001, "memory.gc.summary", { { "trace_id", candidateId } } ) );
     assert( oldGc.at( "ok" ) && oldGc.at( "data" ).at( "present" ) == false && oldGc.at( "data" ).at( "complete" ) == false );
     const auto oldRelations = service.Execute( Request( 1009, "relation.search", { { "trace_id", candidateId } } ) ).at( "data" );
@@ -591,6 +592,7 @@ int main()
     assert( sessions.WaitReady( n11Id, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
     const auto scriptSummary = service.Execute( Request( 1003, "runtime.script.summary", { { "trace_id", n11Id } } ) ).at( "data" );
     assert( scriptSummary.at( "present" ) == true && scriptSummary.at( "complete" ) == true );
+    assert( scriptSummary.at( "schema_version" ) == 1 );
     assert( scriptSummary.at( "counts" ).at( "frames" ) == "2" && scriptSummary.at( "counts" ).at( "stacks" ) == "2" );
     assert( scriptSummary.at( "counts" ).at( "zones" ) == "2" && scriptSummary.at( "counts" ).at( "complete_zones" ) == "2" );
     assert( scriptSummary.at( "runtimes" ).at( "managed" ).at( "zones" ) == "1" );
@@ -658,7 +660,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.17.0" );
+    assert( described.at( "schema_version" ) == "1.18.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -670,9 +672,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.17.0" );
+        assert( operation.at( "schema_version" ) == "1.18.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.17.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.18.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {

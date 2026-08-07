@@ -52,6 +52,8 @@ public:
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
     std::vector<analysis::RelationDto> GetRelations() const override;
     std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
+    std::vector<analysis::ScriptFrameDto> GetScriptFrames() const override;
+    std::vector<analysis::ScriptStackEventDto> GetScriptStackEvents() const override;
     analysis::CrashDto GetCrash() const override;
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override;
     std::vector<analysis::CpuUsagePointDto> GetCpuUsage() const override;

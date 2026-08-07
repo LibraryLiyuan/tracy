@@ -1188,7 +1188,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasCatalog = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
         return record.starts_with( "JNCAT1|" );
     } );
-    const bool hasScriptStack = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
+    const bool hasScriptStack = jnTrace.schemaVersion >= 6 && ( !jnTrace.scriptFrames.empty() || !jnTrace.scriptStacks.empty() ) ||
+        std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
         return record.starts_with( "JNSTK1|" );
     } );
     const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
@@ -1225,7 +1226,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn" } ),
         capability( "runtime.script", hasScriptStack, true, { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" },
-            hasScriptStack ? "" : "trace predates or did not emit JNSTK1/JNSZ1" ),
+            hasScriptStack ? "" : "trace predates or did not emit Script schema 2 or JNSTK1/JNSZ1" ),
         capability( "memory.gc", hasStructuredGc, true, { "memory.gc.summary", "memory.gc.events" },
             hasStructuredGc ? "" : "trace predates or did not emit JNGC1" ),
         capability( "lock", info.counts.locks != 0, true, { "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics" } ),
@@ -2140,6 +2141,38 @@ std::vector<RuntimeDomainStateDto> WorkerTraceSource::GetRuntimeDomainStates() c
         result.push_back( { m_impl->MakeRef( "runtime-domain-state", index ), value.generation, value.requestedFrame,
             value.time, m_impl->MakeRef( "thread", value.thread ), value.domain, value.requestedMode,
             value.effectiveMode, value.reason, value.flags } );
+    }
+    return result;
+}
+
+std::vector<ScriptFrameDto> WorkerTraceSource::GetScriptFrames() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().scriptFrames;
+    std::vector<ScriptFrameDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "script-frame", index ), value.frameId,
+            Safe( m_impl->worker->GetString( value.function ) ), Safe( m_impl->worker->GetString( value.file ) ),
+            value.line, 0, m_impl->MakeRef( "thread", value.thread ), value.runtime, value.flags } );
+    }
+    return result;
+}
+
+std::vector<ScriptStackEventDto> WorkerTraceSource::GetScriptStackEvents() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().scriptStacks;
+    std::vector<ScriptStackEventDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "script-stack-event", index ), value.primaryId, value.secondaryId,
+            value.value, value.time, m_impl->MakeRef( "thread", value.thread ), value.runtime, value.flags, value.kind,
+            value.kind == uint8_t( JnScriptRecordKind::Marker ) ? Safe( m_impl->worker->GetString( value.secondaryId ) ) : std::string() } );
     }
     return result;
 }

@@ -700,6 +700,33 @@ struct RuntimeDomainStateDto
     uint8_t flags = 0;
 };
 
+struct ScriptFrameDto
+{
+    std::string ref;
+    uint32_t frameId = 0;
+    std::string function;
+    std::string file;
+    uint32_t line = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t runtime = 0;
+    uint8_t flags = 0;
+};
+
+struct ScriptStackEventDto
+{
+    std::string ref;
+    uint64_t primaryId = 0;
+    uint64_t secondaryId = 0;
+    uint32_t value = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t runtime = 0;
+    uint8_t flags = 0;
+    uint8_t kind = 0;
+    std::string text;
+};
+
 struct CallstackFrameDto
 {
     std::string ref;
@@ -824,6 +851,8 @@ public:
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
     virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
+    virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
+    virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

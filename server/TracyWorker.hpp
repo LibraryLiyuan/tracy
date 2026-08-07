@@ -911,6 +911,8 @@ private:
     tracy_force_inline void ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev );
     tracy_force_inline void ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev );
     tracy_force_inline void ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev );
+    tracy_force_inline void ProcessJnScriptFrame( const QueueJnScriptFrame& ev );
+    tracy_force_inline void ProcessJnScriptStack( const QueueJnScriptStack& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );

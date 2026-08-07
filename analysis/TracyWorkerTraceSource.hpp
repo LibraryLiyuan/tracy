@@ -85,6 +85,8 @@ public:
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<RelationDto> GetRelations() const override;
     std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
+    std::vector<ScriptFrameDto> GetScriptFrames() const override;
+    std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;

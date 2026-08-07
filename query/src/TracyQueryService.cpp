@@ -3320,6 +3320,7 @@ struct N11TraceData
 {
     bool scriptPresent = false;
     bool scriptCapability = false;
+    uint8_t scriptSchema = 0;
     bool gcPresent = false;
     bool gcCapability = false;
     uint64_t scriptInvalid = 0;
@@ -3402,11 +3403,180 @@ const char* GcKindName( uint64_t kind )
 N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis::TraceInfoDto& info )
 {
     N11TraceData result;
+    const auto binaryFrames = source.GetScriptFrames();
+    const auto binaryEvents = source.GetScriptStackEvents();
+    const bool binaryScript = !binaryFrames.empty() || !binaryEvents.empty();
+    std::map<uint64_t, size_t> openZones;
+    if( binaryScript )
+    {
+        result.scriptPresent = true;
+        result.scriptCapability = true;
+        result.scriptSchema = 2;
+        std::unordered_map<uint64_t, uint64_t> frameByScriptZone;
+        for( const auto& relation : source.GetRelations() )
+        {
+            if( relation.relationNamespace == 4 && relation.relation == 1 &&
+                relation.sourceKind == 1 && relation.targetKind == 11 )
+                frameByScriptZone[relation.targetId] = relation.sourceId;
+        }
+        for( const auto& frame : binaryFrames )
+        {
+            if( frame.frameId == 0 || !ScriptRuntimeValid( frame.runtime ) || frame.function.empty() ||
+                result.frames.contains( frame.frameId ) )
+            {
+                result.scriptInvalid++;
+                continue;
+            }
+            result.frames.emplace( frame.frameId, json {
+                { "schema_version", 2 }, { "record", "frame" }, { "frame_id", frame.frameId },
+                { "runtime", ScriptRuntimeName( frame.runtime ) }, { "function", frame.function },
+                { "file", frame.file }, { "line", frame.line }, { "flags", frame.flags },
+                { "source_mode", "binary-script-schema-2" }, { "trust", "untrusted_trace_data" }
+            } );
+        }
+
+        struct PendingStack
+        {
+            uint8_t runtime = 0;
+            uint8_t flags = 0;
+            std::vector<uint32_t> frames;
+            bool header = false;
+        };
+        std::map<uint64_t, PendingStack> pendingStacks;
+        for( const auto& event : binaryEvents )
+        {
+            if( event.primaryId == 0 || ( event.kind != 5 && !ScriptRuntimeValid( event.runtime ) ) )
+            {
+                result.scriptInvalid++;
+                continue;
+            }
+            switch( event.kind )
+            {
+            case 1:
+            {
+                if( event.value == 0 || event.value > 64 || pendingStacks.contains( event.primaryId ) )
+                {
+                    result.scriptInvalid++;
+                    break;
+                }
+                auto& stack = pendingStacks[event.primaryId];
+                stack.runtime = event.runtime;
+                stack.flags = event.flags;
+                stack.frames.resize( event.value );
+                stack.header = true;
+                break;
+            }
+            case 2:
+            {
+                auto found = pendingStacks.find( event.primaryId );
+                if( found == pendingStacks.end() || !found->second.header || event.secondaryId == 0 ||
+                    event.secondaryId > std::numeric_limits<uint32_t>::max() || event.value >= found->second.frames.size() ||
+                    found->second.frames[event.value] != 0 )
+                {
+                    result.scriptInvalid++;
+                    break;
+                }
+                found->second.frames[event.value] = uint32_t( event.secondaryId );
+                break;
+            }
+            case 3:
+            {
+                const auto markerId = uint32_t( event.primaryId );
+                const auto color = uint32_t( event.primaryId >> 32 );
+                if( markerId == 0 || event.value == 0 || event.text.empty() )
+                {
+                    result.scriptInvalid++;
+                    break;
+                }
+                json marker = {
+                    { "schema_version", 2 }, { "record", "marker" }, { "marker_id", markerId },
+                    { "runtime", ScriptRuntimeName( event.runtime ) }, { "name", event.text },
+                    { "source_frame_id", event.value }, { "color", color }, { "flags", event.flags },
+                    { "source_mode", "binary-script-schema-2" }, { "trust", "untrusted_trace_data" }
+                };
+                const auto found = result.markers.find( markerId );
+                if( found != result.markers.end() )
+                {
+                    const auto& existing = found->second;
+                    const bool identical = existing.value( "runtime", "" ) == marker.value( "runtime", "" ) &&
+                        existing.value( "source_frame_id", 0u ) == event.value &&
+                        existing.value( "color", 0u ) == color && existing.value( "flags", 0u ) == uint32_t( event.flags ) &&
+                        existing.value( "name", "" ) == event.text;
+                    if( !identical ) result.scriptInvalid++;
+                    break;
+                }
+                result.markers.emplace( markerId, std::move( marker ) );
+                break;
+            }
+            case 4:
+            {
+                if( event.secondaryId == 0 || event.value == 0 || openZones.contains( event.primaryId ) )
+                {
+                    result.scriptInvalid++;
+                    break;
+                }
+                json zone = {
+                    { "schema_version", 2 }, { "zone_id", std::to_string( event.primaryId ) },
+                    { "marker_id", event.value }, { "stack_id", std::to_string( event.secondaryId ) },
+                    { "runtime_id", event.runtime }, { "runtime", ScriptRuntimeName( event.runtime ) },
+                    { "phase", "begin" }, { "frame_id", std::to_string( frameByScriptZone[event.primaryId] ) }, { "flags", event.flags },
+                    { "start_ns", Decimal( event.timeNs ) }, { "end_ns", nullptr }, { "duration_ns", nullptr },
+                    { "thread_ref", event.threadRef }, { "event_ref", event.ref }, { "complete", false },
+                    { "source_mode", "binary-script-schema-2" }, { "trust", "untrusted_trace_data" }
+                };
+                openZones.emplace( event.primaryId, result.zones.size() );
+                result.zones.emplace_back( std::move( zone ) );
+                break;
+            }
+            case 5:
+            {
+                const auto found = openZones.find( event.primaryId );
+                if( found == openZones.end() )
+                {
+                    result.scriptOrphanEnds++;
+                    break;
+                }
+                auto& zone = result.zones[found->second];
+                const auto start = std::stoll( zone["start_ns"].get<std::string>() );
+                if( event.timeNs < start )
+                {
+                    result.scriptInvalid++;
+                    break;
+                }
+                zone["end_ns"] = Decimal( event.timeNs );
+                zone["duration_ns"] = Decimal( event.timeNs - start );
+                zone["complete"] = true;
+                openZones.erase( found );
+                break;
+            }
+            default:
+                result.scriptInvalid++;
+                break;
+            }
+        }
+        for( auto& [stackId, stack] : pendingStacks )
+        {
+            if( !stack.header || std::any_of( stack.frames.begin(), stack.frames.end(), []( uint32_t value ) { return value == 0; } ) )
+            {
+                result.scriptUnresolved++;
+                continue;
+            }
+            json frameIds = json::array();
+            for( const auto frameId : stack.frames ) frameIds.push_back( frameId );
+            result.stacks.emplace( stackId, json {
+                { "schema_version", 2 }, { "record", "stack" }, { "stack_id", std::to_string( stackId ) },
+                { "runtime", ScriptRuntimeName( stack.runtime ) }, { "flags", stack.flags },
+                { "frame_ids", std::move( frameIds ) }, { "source_mode", "binary-script-schema-2" },
+                { "trust", "untrusted_trace_data" }
+            } );
+        }
+    }
     for( const auto& record : info.appInfo )
     {
         if( record.starts_with( "JNSTK1|" ) )
         {
             result.scriptPresent = true;
+            if( result.scriptSchema == 0 ) result.scriptSchema = 1;
             auto document = ParseN11Record( record, "JNSTK1|" );
             if( document.empty() || !document.contains( "record" ) || !document["record"].is_string() )
             {
@@ -3421,11 +3591,12 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
             }
             if( kind == "frame" )
             {
+                if( binaryScript ) continue;
                 uint64_t id = 0, line = 0, flags = 0;
                 const auto runtime = document.value( "runtime", "" );
                 if( !JsonUnsigned( document, "frame_id", id, std::numeric_limits<uint32_t>::max() ) || id == 0 ||
                     !JsonUnsigned( document, "line", line, std::numeric_limits<uint32_t>::max() ) ||
-                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    !JsonUnsigned( document, "flags", flags, 255 ) ||
                     ( runtime != "managed" && runtime != "lua" ) ||
                     !document.contains( "function" ) || !document["function"].is_string() || document["function"].get_ref<const std::string&>().empty() ||
                     !document.contains( "file" ) || !document["file"].is_string() || result.frames.contains( uint32_t( id ) ) )
@@ -3438,10 +3609,11 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
             }
             else if( kind == "stack" )
             {
+                if( binaryScript ) continue;
                 uint64_t id = 0, flags = 0;
                 const auto runtime = document.value( "runtime", "" );
                 if( !JsonDecimalString( document, "stack_id", id ) || id == 0 ||
-                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    !JsonUnsigned( document, "flags", flags, 255 ) ||
                     ( runtime != "managed" && runtime != "lua" ) ||
                     !document.contains( "frame_ids" ) || !document["frame_ids"].is_array() ||
                     document["frame_ids"].empty() || document["frame_ids"].size() > 64 || result.stacks.contains( id ) )
@@ -3467,16 +3639,29 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
                 if( !JsonUnsigned( document, "marker_id", id, std::numeric_limits<uint32_t>::max() ) || id == 0 ||
                     !JsonUnsigned( document, "source_frame_id", sourceFrame, std::numeric_limits<uint32_t>::max() ) || sourceFrame == 0 ||
                     !JsonUnsigned( document, "color", color, std::numeric_limits<uint32_t>::max() ) ||
-                    !JsonUnsigned( document, "flags", flags, 7 ) ||
+                    !JsonUnsigned( document, "flags", flags, 255 ) ||
                     ( runtime != "managed" && runtime != "lua" ) ||
-                    !document.contains( "name" ) || !document["name"].is_string() || document["name"].get_ref<const std::string&>().empty() ||
-                    result.markers.contains( uint32_t( id ) ) )
+                    !document.contains( "name" ) || !document["name"].is_string() || document["name"].get_ref<const std::string&>().empty() )
                 {
                     result.scriptInvalid++;
                     continue;
                 }
+                const auto markerId = uint32_t( id );
+                const auto found = result.markers.find( markerId );
+                if( found != result.markers.end() )
+                {
+                    const auto& existing = found->second;
+                    const bool identical = existing.value( "runtime", "" ) == runtime &&
+                        existing.value( "source_frame_id", 0u ) == uint32_t( sourceFrame ) &&
+                        existing.value( "color", 0u ) == uint32_t( color ) &&
+                        existing.value( "flags", 0u ) == uint32_t( flags ) &&
+                        existing.value( "name", "" ) == document.value( "name", "" );
+                    if( identical ) continue;
+                    result.scriptInvalid++;
+                    continue;
+                }
                 document["trust"] = "untrusted_trace_data";
-                result.markers.emplace( uint32_t( id ), std::move( document ) );
+                result.markers.emplace( markerId, std::move( document ) );
             }
             else result.scriptInvalid++;
         }
@@ -3489,7 +3674,6 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
         }
     }
 
-    std::map<uint64_t, size_t> openZones;
     size_t rawOffset = 0;
     constexpr size_t chunk = 4096;
     while( true )
@@ -3505,7 +3689,9 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
         {
             if( message.text.starts_with( "JNSZ1|" ) )
             {
+                if( binaryScript ) continue;
                 result.scriptPresent = true;
+                if( result.scriptSchema == 0 ) result.scriptSchema = 1;
                 auto document = ParseN11Record( message.text, "JNSZ1|" );
                 uint64_t zoneId = 0;
                 if( document.empty() || !JsonDecimalString( document, "zone_id", zoneId ) || zoneId == 0 ||
@@ -3521,7 +3707,7 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
                     if( !JsonUnsigned( document, "marker_id", markerId, std::numeric_limits<uint32_t>::max() ) || markerId == 0 ||
                         !JsonDecimalString( document, "stack_id", stackId ) || stackId == 0 ||
                         !JsonUnsigned( document, "runtime", runtime, 2 ) || !ScriptRuntimeValid( runtime ) ||
-                        !JsonUnsigned( document, "flags", flags, 7 ) || !JsonDecimalString( document, "frame_id", frameId ) ||
+                        !JsonUnsigned( document, "flags", flags, 255 ) || !JsonDecimalString( document, "frame_id", frameId ) ||
                         openZones.contains( zoneId ) )
                     {
                         result.scriptInvalid++;
@@ -4065,7 +4251,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto reason = !n11.scriptPresent ? "trace predates or did not emit JNSTK1/JNSZ1" :
                 complete ? "" : "script stack data is incomplete; inspect quality counters";
             json base = {
-                { "present", n11.scriptPresent }, { "schema_version", 1 }, { "complete", complete }, { "reason", reason },
+                { "present", n11.scriptPresent }, { "schema_version", n11.scriptSchema }, { "complete", complete }, { "reason", reason },
                 { "capability_record", n11.scriptCapability },
                 { "quality", {
                     { "invalid_records", Decimal( n11.scriptInvalid ) },

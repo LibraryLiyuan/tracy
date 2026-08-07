@@ -7,6 +7,7 @@ namespace tracy
 {
 
 static constexpr uint16_t JnJobSchemaVersion = 2;
+static constexpr uint16_t JnScriptSchemaVersion = 2;
 
 #ifdef TRACY_ENABLE
 
@@ -313,6 +314,42 @@ tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t passId, uint64_t command
     TracyLfqCommit;
 }
 
+tracy_force_inline void EmitJnScriptFrame( const char* function, const char* file, uint32_t frameId, uint32_t line,
+    uint8_t runtime, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnScriptFrame );
+    MemWrite( &item->jnScriptFrame.function, uint64_t( function ) );
+    MemWrite( &item->jnScriptFrame.file, uint64_t( file ) );
+    MemWrite( &item->jnScriptFrame.frameId, frameId );
+    MemWrite( &item->jnScriptFrame.line, line );
+    MemWrite( &item->jnScriptFrame.runtime, runtime );
+    MemWrite( &item->jnScriptFrame.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnScriptStack( uint64_t primaryId, uint64_t secondaryId, uint32_t value,
+    uint8_t runtime, uint8_t flags, JnScriptRecordKind kind )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnScriptStack );
+    MemWrite( &item->jnScriptStack.time, Profiler::GetTime() );
+    MemWrite( &item->jnScriptStack.primaryId, primaryId );
+    MemWrite( &item->jnScriptStack.secondaryId, secondaryId );
+    MemWrite( &item->jnScriptStack.value, value );
+    MemWrite( &item->jnScriptStack.runtime, runtime );
+    MemWrite( &item->jnScriptStack.flags, flags );
+    MemWrite( &item->jnScriptStack.kind, uint8_t( kind ) );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnScriptMarker( const char* name, uint32_t markerId, uint32_t sourceFrameId,
+    uint32_t color, uint8_t runtime, uint8_t flags )
+{
+    const uint64_t packedMarker = ( uint64_t( color ) << 32 ) | markerId;
+    EmitJnScriptStack( packedMarker, uint64_t( name ), sourceFrameId, runtime, flags, JnScriptRecordKind::Marker );
+}
+
 #undef TracyJnOnDemandGuard
 
 #else
@@ -338,6 +375,9 @@ tracy_force_inline void EmitJnRuntimeDomainState( uint64_t, uint64_t, uint8_t, u
 tracy_force_inline void EmitJnGpuReferencePass( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGpuReferenceUse( uint64_t, uint64_t, uint32_t, uint8_t ) {}
 tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t, uint64_t, uint32_t, uint16_t, uint8_t ) {}
+tracy_force_inline void EmitJnScriptFrame( const char*, const char*, uint32_t, uint32_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnScriptStack( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, JnScriptRecordKind ) {}
+tracy_force_inline void EmitJnScriptMarker( const char*, uint32_t, uint32_t, uint32_t, uint8_t, uint8_t ) {}
 
 #endif
 

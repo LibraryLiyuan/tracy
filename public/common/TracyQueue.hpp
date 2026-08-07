@@ -130,6 +130,8 @@ enum class QueueType : uint8_t
     JnGpuReferencePass,
     JnGpuReferenceUse,
     JnGpuReferenceEnd,
+    JnScriptFrame,
+    JnScriptStack,
     StringData,
     ThreadName,
     PlotName,
@@ -684,6 +686,15 @@ enum class JnGpuReferenceFlags : uint8_t
     CaptureBoundary = 1 << 4
 };
 
+enum class JnScriptRecordKind : uint8_t
+{
+    StackHeader = 1,
+    StackFrame = 2,
+    Marker = 3,
+    ZoneBegin = 4,
+    ZoneEnd = 5
+};
+
 struct QueueJnJobType
 {
     uint64_t name;
@@ -861,6 +872,30 @@ struct QueueJnGpuReferenceEnd
     uint32_t totalReferenceCount;
     uint16_t droppedReferenceCount;
     uint8_t flags;
+};
+
+// Script schema 2 keeps strings on the cold definition path and represents
+// high-frequency stack/zone relations with fixed-size ids.  Both payloads
+// remain within Tracy's 31-byte queue payload limit.
+struct QueueJnScriptFrame
+{
+    uint64_t function;
+    uint64_t file;
+    uint32_t frameId;
+    uint32_t line;
+    uint8_t runtime;
+    uint8_t flags;
+};
+
+struct QueueJnScriptStack
+{
+    int64_t time;
+    uint64_t primaryId;
+    uint64_t secondaryId;
+    uint32_t value;
+    uint8_t runtime;
+    uint8_t flags;
+    uint8_t kind;
 };
 
 struct QueueGpuTime
@@ -1238,6 +1273,8 @@ struct QueueItem
         QueueJnGpuReferencePass jnGpuReferencePass;
         QueueJnGpuReferenceUse jnGpuReferenceUse;
         QueueJnGpuReferenceEnd jnGpuReferenceEnd;
+        QueueJnScriptFrame jnScriptFrame;
+        QueueJnScriptStack jnScriptStack;
     };
 };
 #pragma pack( pop )
@@ -1368,6 +1405,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferencePass ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceUse ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceEnd ),
+    sizeof( QueueHeader ) + sizeof( QueueJnScriptFrame ),
+    sizeof( QueueHeader ) + sizeof( QueueJnScriptStack ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1402,6 +1441,8 @@ static_assert( sizeof( QueueJnRuntimeDomainState ) == 29, "JN runtime-domain pay
 static_assert( sizeof( QueueJnGpuReferencePass ) == 30, "JN GPU reference pass payload size mismatch" );
 static_assert( sizeof( QueueJnGpuReferenceUse ) == 29, "JN GPU reference use payload size mismatch" );
 static_assert( sizeof( QueueJnGpuReferenceEnd ) == 31, "JN GPU reference end payload size mismatch" );
+static_assert( sizeof( QueueJnScriptFrame ) == 26, "JN script frame payload size mismatch" );
+static_assert( sizeof( QueueJnScriptStack ) == 31, "JN script stack payload size mismatch" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );
