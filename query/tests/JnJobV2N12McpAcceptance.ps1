@@ -5,7 +5,11 @@ param(
     [Parameter(Mandatory = $true)][string] $StreamTrace,
     [Parameter(Mandatory = $true)][string] $ReplayTrace,
     [Parameter(Mandatory = $true)][string] $AllowRoot,
-    [switch] $RealCapture
+    [switch] $RealCapture,
+    [ValidateSet(2, 3)][int] $ExpectedJobSchema = 2,
+    [string] $ExpectedSourceMode = '',
+    [switch] $ExpectContinuation,
+    [string] $OutputPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,8 +118,9 @@ function Validate-N12 {
     $stats = $statistics.data
 
     Assert-Condition ([bool]$stats.present) 'job.statistics is not present'
-    Assert-Condition ([int]$stats.job_schema_version -eq 2) 'Job schema 2 was not detected'
-    Assert-Condition ([string]$stats.source_mode -eq 'native-hooks-job-v2') 'unexpected Job source mode'
+    $sourceMode = if ([string]::IsNullOrWhiteSpace($ExpectedSourceMode)) { "native-hooks-job-v$ExpectedJobSchema" } else { $ExpectedSourceMode }
+    Assert-Condition ([int]$stats.job_schema_version -eq $ExpectedJobSchema) "Job schema $ExpectedJobSchema was not detected"
+    Assert-Condition ([string]$stats.source_mode -eq $sourceMode) 'unexpected Job source mode'
     Assert-Condition ([string]$stats.callstack_kind -eq 'native') 'Job callstack kind is not native'
     Assert-Condition ([UInt64]$stats.counts.jobs -gt 0 -and [UInt64]$stats.counts.v2 -gt 0) 'Job v2 events are empty'
     Assert-Condition ([UInt64]$stats.counts.completed -gt 0) 'no completed Job was captured'
@@ -131,25 +136,51 @@ function Validate-N12 {
     Assert-Condition ([UInt64]$stats.quality.missing_ready -eq 0) 'non-boundary Job is missing Ready'
     Assert-Condition ([UInt64]$stats.quality.missing_queue -eq 0) 'non-boundary dispatched Job is missing QueueEnter'
     Assert-Condition ([UInt64]$stats.quality.invalid_order -eq 0) 'Job stage timestamp order is invalid'
+    if ($ExpectContinuation) {
+        Assert-Condition ([UInt64]$stats.counts.v3 -gt 0) 'Job schema 3 events are empty'
+        Assert-Condition ([UInt64]$stats.counts.wait_ends -gt 0) 'Job WaitEnd is missing'
+        Assert-Condition ([UInt64]$stats.counts.continuations -gt 0) 'Job Continuation is missing'
+        Assert-Condition ([UInt64]$stats.quality.missing_continuation -eq 0) 'normal WaitEnd is missing Continuation'
+        Assert-Condition ([UInt64]$stats.quality.continuation_without_wait -eq 0) 'Continuation has no matching WaitEnd'
+        Assert-Condition ([UInt64]$stats.quality.continuation_before_completion -eq 0) 'Continuation precedes Job completion'
+    }
     Assert-Condition (-not [bool]$stats.quality.cancelled_supported) 'cancelled_supported must remain false for this uJobs branch'
     Assert-Condition ([bool]$validation.data.valid -and [UInt64]$validation.data.error_count -eq 0) 'trace validation failed'
 
     if (-not $RealCapture) {
-        Assert-Condition ([UInt64]$stats.counts.jobs -eq 2 -and [UInt64]$stats.counts.v2 -eq 2) 'synthetic Job count mismatch'
-        Assert-Condition ([UInt64]$stats.counts.completed -eq 2) 'synthetic completed Job count mismatch'
+        $expectedSyntheticJobs = if ($ExpectContinuation) { 3 } else { 2 }
+        Assert-Condition ([UInt64]$stats.counts.jobs -eq $expectedSyntheticJobs -and [UInt64]$stats.counts.v2 -eq $expectedSyntheticJobs) 'synthetic Job count mismatch'
+        Assert-Condition ([UInt64]$stats.counts.completed -eq $expectedSyntheticJobs) 'synthetic completed Job count mismatch'
         Assert-Condition ([UInt64]$stats.counts.managed -eq 1 -and [UInt64]$stats.counts.burst -eq 1) 'synthetic kind count mismatch'
         Assert-Condition ([UInt64]$stats.counts.scheduler_steals -eq 1) 'synthetic scheduler steal count mismatch'
         Assert-Condition ([UInt64]$stats.counts.range_steal_slices -eq 1) 'synthetic range steal count mismatch'
         Assert-Condition ([UInt64]$stats.counts.wait_jobs -eq 1) 'synthetic wait count mismatch'
         Assert-Condition ([UInt64]$stats.counts.schedule_callstacks -eq 2) 'synthetic schedule callstack count mismatch'
         Assert-Condition ([UInt64]$stats.counts.wait_callstacks -eq 1) 'synthetic wait callstack count mismatch'
-        Assert-Condition ([string]$context.data.context.workload.scenario -eq 'n12-job-v2') 'synthetic capture context mismatch'
+        Assert-Condition ([string]$context.data.context.runtime.target_kind -eq 'native-harness' -and
+            [string]$context.data.context.workload.scene -eq 'synthetic') 'synthetic capture context mismatch'
+        if ($ExpectContinuation) {
+            Assert-Condition ([UInt64]$stats.counts.jobs -eq 3 -and [UInt64]$stats.counts.completed -eq 3) 'synthetic Job v3/boundary count mismatch'
+            Assert-Condition ([UInt64]$stats.counts.v3 -eq 3) 'synthetic Job v3 count mismatch'
+            Assert-Condition ([UInt64]$stats.counts.wait_ends -eq 1) 'synthetic WaitEnd count mismatch'
+            Assert-Condition ([UInt64]$stats.counts.continuations -eq 1) 'synthetic Continuation count mismatch'
+            Assert-Condition ([UInt64]$stats.counts.jobs_without_waiter -eq 2) 'synthetic no-waiter Job count mismatch'
+            Assert-Condition ([UInt64]$stats.quality.capture_boundary_orphan -eq 1) 'synthetic capture-boundary Job missing'
+        }
     }
 
     $scheduleJob = @($jobs | Where-Object { $null -ne $_.schedule_callstack_ref } | Select-Object -First 1)
-    $waitJob = @($jobs | Where-Object { [UInt64]$_.wait.callstack_count -gt 0 } | Select-Object -First 1)
+    $waitCandidates = @($jobs | Where-Object {
+        [UInt64]$_.wait.callstack_count -gt 0 -and
+        (-not $ExpectContinuation -or (
+            -not [bool]$_.capture_boundary -and
+            $null -ne $_.origin_frame_ref -and
+            [UInt64]$_.wait.end_count -gt 0 -and
+            [UInt64]$_.wait.continuation_count -gt 0))
+    })
     Assert-Condition ($scheduleJob.Count -eq 1) 'could not select a Job with schedule callstack'
-    Assert-Condition ($waitJob.Count -eq 1) 'could not select a Job with wait callstack'
+    Assert-Condition ($waitCandidates.Count -gt 0) 'could not select a non-boundary Job with wait/continuation evidence'
+    $waitJob = @($waitCandidates | Select-Object -First 1)
     $scheduleDepth = Resolve-Depth $TraceId ([string]$scheduleJob[0].schedule_callstack_ref) 'Job schedule'
     $detail = Inspect $TraceId 'job.get' @{ ref = [string]$waitJob[0].ref }
     $waitCallstacks = @($detail.data.wait_callstacks)
@@ -157,18 +188,52 @@ function Validate-N12 {
     Assert-Condition ([string]$waitCallstacks[0].callstack_kind -eq 'native') 'wait callstack kind mismatch'
     $waitDepth = Resolve-Depth $TraceId ([string]$waitCallstacks[0].callstack_ref) 'Job wait'
 
+    $chainNodeCount = 0
+    $continuationRelationCount = 0
+    if ($ExpectContinuation) {
+        $chain = Inspect $TraceId 'correlation.chain' @{
+            ref = [string]$waitJob[0].origin_frame_ref
+            max_nodes = 10000
+            max_cpu_ms = 60000
+        }
+        $relations = @($chain.data.relations)
+        $chainNodeCount = @($chain.data.nodes).Count
+        $continuationRelationCount = @($relations | Where-Object { [string]$_.relation -eq 'continues_on_waiter' }).Count
+        $chainRelationNames = @($relations | ForEach-Object { [string]$_.relation } | Sort-Object -Unique)
+        Assert-Condition ($chainNodeCount -gt 2) ("Frame correlation chain did not reach Job stages; " +
+            "job=$([string]$waitJob[0].job_id) frame=$([string]$waitJob[0].origin_frame_ref) " +
+            "job_stage_count=$([string]$waitJob[0].stage_count) chain_nodes=$chainNodeCount " +
+            "chain_relations=$($relations.Count) relation_names=$($chainRelationNames -join ',')")
+        Assert-Condition ($continuationRelationCount -gt 0) 'Frame correlation chain omitted WaitEnd -> Continuation'
+        Assert-Condition (@($relations | Where-Object { [string]$_.relation -eq 'completion_releases' }).Count -gt 0) 'Frame correlation chain omitted Complete -> Continuation'
+        Assert-Condition ([string]$chain.data.evidence_kind -eq 'exact') 'Job continuation chain is not exact evidence'
+        if ([bool]$chain.partial) {
+            $exhaustedBy = @($chain.budget.exhausted_by | ForEach-Object { [string]$_ })
+            Assert-Condition ([bool]$chain.data.truncated -and $chainNodeCount -eq 10000) `
+                'partial Frame correlation chain did not stop at its explicit node budget'
+            Assert-Condition ($exhaustedBy.Count -eq 1 -and $exhaustedBy[0] -eq 'max_nodes') `
+                "Frame correlation chain exhausted an unexpected budget: $($exhaustedBy -join ',')"
+        }
+    }
+
     $stageNames = @($detail.data.stages | ForEach-Object { [string]$_.stage } | Sort-Object -Unique)
-    foreach ($required in @('ready', 'queue_enter', 'dispatch', 'steal', 'wait_callstack')) {
+    $requiredStages = @('ready', 'queue_enter', 'dispatch', 'wait_callstack')
+    if ($ExpectContinuation) { $requiredStages += 'continuation' }
+    foreach ($required in $requiredStages) {
         Assert-Condition ($stageNames -contains $required) "job.get is missing stage: $required"
     }
     $ready = @($detail.data.stages | Where-Object { [string]$_.stage -eq 'ready' } | Select-Object -First 1)
-    $steal = @($detail.data.stages | Where-Object { [string]$_.stage -eq 'steal' } | Select-Object -First 1)
     Assert-Condition ($ready.Count -eq 1 -and [string]$ready[0].reason -ne 'unknown') 'Ready reason is not decoded'
+    $stealJob = @($jobs | Where-Object { [UInt64]$_.scheduler_steal_count -gt 0 } | Select-Object -First 1)
+    Assert-Condition ($stealJob.Count -eq 1) 'could not select a Job with scheduler steal evidence'
+    $stealDetail = Inspect $TraceId 'job.get' @{ ref = [string]$stealJob[0].ref }
+    $steal = @($stealDetail.data.stages | Where-Object { [string]$_.stage -eq 'steal' } | Select-Object -First 1)
     Assert-Condition ($steal.Count -eq 1 -and $null -ne $steal[0].thief_lane -and $null -ne $steal[0].victim_lane) 'Steal lanes are not decoded'
 
     return [ordered]@{
         jobs = [string]$stats.counts.jobs
         v2 = [string]$stats.counts.v2
+        v3 = if ($null -eq $stats.counts.v3) { '0' } else { [string]$stats.counts.v3 }
         completed = [string]$stats.counts.completed
         managed = [string]$stats.counts.managed
         burst = [string]$stats.counts.burst
@@ -177,6 +242,11 @@ function Validate-N12 {
         wait_jobs = [string]$stats.counts.wait_jobs
         schedule_callstacks = [string]$stats.counts.schedule_callstacks
         wait_callstacks = [string]$stats.counts.wait_callstacks
+        wait_ends = if ($null -eq $stats.counts.wait_ends) { '0' } else { [string]$stats.counts.wait_ends }
+        continuations = if ($null -eq $stats.counts.continuations) { '0' } else { [string]$stats.counts.continuations }
+        jobs_without_waiter = if ($null -eq $stats.counts.jobs_without_waiter) { '0' } else { [string]$stats.counts.jobs_without_waiter }
+        correlation_chain_nodes = $chainNodeCount
+        continuation_relations = $continuationRelationCount
         lane_count = @($stats.lanes).Count
         schedule_callstack_depth = $scheduleDepth
         wait_callstack_depth = $waitDepth
@@ -216,7 +286,13 @@ try {
     $snapshotSemantics = $results.snapshot.semantics | ConvertTo-Json -Compress -Depth 30
     Assert-Condition (($results.stream.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/stream N12 semantic mismatch'
     Assert-Condition (($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/replay N12 semantic mismatch'
-    [ordered]@{ ok = $true; schema_version = '1.11.0'; traces = $results } | ConvertTo-Json -Compress -Depth 40
+    $resultJson = [ordered]@{ ok = $true; schema_version = '1.19.0'; expected_job_schema = $ExpectedJobSchema; traces = $results } | ConvertTo-Json -Compress -Depth 40
+    if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+        $parent = Split-Path -Parent $OutputPath
+        if (-not [string]::IsNullOrWhiteSpace($parent)) { [void](New-Item -ItemType Directory -Force -Path $parent) }
+        [IO.File]::WriteAllText($OutputPath, $resultJson, [Text.UTF8Encoding]::new($false))
+    }
+    $resultJson
 }
 finally {
     foreach ($traceId in $traceIds) {

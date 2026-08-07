@@ -574,6 +574,9 @@ struct JobDto
     uint32_t rangeStealSliceCount = 0;
     uint32_t activeHelpDispatchCount = 0;
     uint32_t queueRetryCount = 0;
+    uint32_t waitEndCount = 0;
+    uint32_t continuationCount = 0;
+    bool captureBoundary = false;
     bool cancelled = false;
     bool incomplete = false;
     bool orphan = false;

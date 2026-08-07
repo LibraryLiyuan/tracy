@@ -852,9 +852,14 @@ const char* JobStageName( uint8_t stage )
         "wait_active_help_begin", "wait_active_help_end", "wait_spin_yield_begin", "wait_spin_yield_end",
         "wait_sleep_begin", "wait_sleep_end", "wait_end", "flow_begin", "flow_next",
         "flow_parallel_next", "flow_end", "cancelled", "incomplete", "schedule_callstack",
-        "ready", "queue_enter", "dispatch", "steal", "wait_callstack"
+        "ready", "queue_enter", "dispatch", "steal", "wait_callstack", "continuation"
     };
     return stage < std::size( names ) ? names[stage] : "unknown";
+}
+
+std::string JobStageRef( const analysis::TraceSource& source, uint64_t jobId, size_t index )
+{
+    return source.MakeEntityRef( "job-stage", ( jobId << 24 ) ^ index );
 }
 
 const char* GfxEntityKindName( uint8_t kind )
@@ -1018,8 +1023,10 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
         { "queue_retry_count", value.queueRetryCount }, { "execution_lanes", value.executionLanes },
         { "wait", { { "total_ns", Decimal( value.waitNs ) }, { "active_help_ns", Decimal( value.waitActiveHelpNs ) },
             { "spin_yield_ns", Decimal( value.waitSpinYieldNs ) }, { "sleep_ns", Decimal( value.waitSleepNs ) },
-            { "callstack_count", value.waitCallstacks.size() } } },
-        { "orphan", value.orphan }, { "truncated", value.truncated }, { "trust", "untrusted_trace_data" }
+            { "callstack_count", value.waitCallstacks.size() }, { "end_count", value.waitEndCount },
+            { "continuation_count", value.continuationCount } } },
+        { "capture_boundary", value.captureBoundary }, { "orphan", value.orphan },
+        { "truncated", value.truncated }, { "trust", "untrusted_trace_data" }
     };
     if( !detailed ) return result;
 
@@ -1034,7 +1041,7 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
     {
         const auto& stage = value.stages[index];
         json stageJson = {
-            { "ref", source.MakeEntityRef( "job-stage", ( value.jobId << 24 ) ^ index ) },
+            { "ref", JobStageRef( source, value.jobId, index ) },
             { "time_ns", Decimal( stage.timeNs ) }, { "thread_ref", stage.threadRef }, { "stage", JobStageName( stage.stage ) },
             { "stage_id", stage.stage }, { "span_id", stage.spanId }, { "arg0", stage.arg0 }, { "arg1", stage.arg1 }, { "flags", stage.flags }
         };
@@ -7040,6 +7047,43 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
         const auto rootRef = params["ref"].get<std::string>();
+        const auto parsedRootFrame = source->ParseEntityRef( rootRef, "frame-identity" );
+        const auto parsedRootJob = source->ParseEntityRef( rootRef, "job" );
+
+        // Expand lifecycle stages only for the requested Frame or Job. The
+        // existing API contract and direct relations remain unchanged, while
+        // correlation.chain gains exact navigation through wait continuation.
+        for( const auto& job : jobs )
+        {
+            const bool expand = ( parsedRootFrame && job.originFrameId == *parsedRootFrame ) ||
+                ( parsedRootJob && job.jobId == *parsedRootJob );
+            if( !expand ) continue;
+
+            std::map<std::pair<uint32_t, std::string>, std::string> waitEndsBySpan;
+            std::map<std::pair<uint32_t, std::string>, std::string> continuationsBySpan;
+            std::string completedRef;
+            for( size_t index = 0; index < job.stages.size(); index++ )
+            {
+                const auto& stage = job.stages[index];
+                if( stage.stage == uint8_t( JnJobStage::ScheduleCallstack ) ||
+                    stage.stage == uint8_t( JnJobStage::WaitCallstack ) ) continue;
+                const auto stageRef = JobStageRef( *source, job.jobId, index );
+                addRelation( job.ref, stageRef, "has_stage", job.originFrameId );
+                const auto key = std::make_pair( stage.spanId, stage.threadRef );
+                if( stage.stage == uint8_t( JnJobStage::Completed ) ) completedRef = stageRef;
+                else if( stage.stage == uint8_t( JnJobStage::WaitEnd ) ) waitEndsBySpan[key] = stageRef;
+                else if( stage.stage == uint8_t( JnJobStage::Continuation ) ) continuationsBySpan[key] = stageRef;
+            }
+            for( const auto& [key, continuationRef] : continuationsBySpan )
+            {
+                const auto waitEnd = waitEndsBySpan.find( key );
+                if( waitEnd != waitEndsBySpan.end() )
+                    addRelation( waitEnd->second, continuationRef, "continues_on_waiter", job.originFrameId );
+                if( !completedRef.empty() )
+                    addRelation( completedRef, continuationRef, "completion_releases", job.originFrameId );
+            }
+        }
+
         std::unordered_map<std::string, std::vector<size_t>> relationIndicesByRef;
         relationIndicesByRef.reserve( relations.size() * 2 );
         for( size_t index = 0; index < relations.size(); index++ )
@@ -7049,7 +7093,6 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !sourceRef.empty() ) relationIndicesByRef[sourceRef].push_back( index );
             if( !targetRef.empty() && targetRef != sourceRef ) relationIndicesByRef[targetRef].push_back( index );
         }
-        const auto parsedRootFrame = source->ParseEntityRef( rootRef, "frame-identity" );
         const bool knownRoot = relationIndicesByRef.contains( rootRef ) || ( parsedRootFrame && frames.contains( *parsedRootFrame ) );
         if( !knownRoot ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
 
@@ -7130,8 +7173,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t managed = 0;
             uint64_t burst = 0;
             uint64_t v2 = 0;
+            uint64_t v3 = 0;
             uint64_t missingReady = 0;
             uint64_t missingQueue = 0;
+            uint64_t missingContinuation = 0;
+            uint64_t continuationWithoutWait = 0;
+            uint64_t continuationBeforeCompletion = 0;
+            uint64_t waitEnds = 0;
+            uint64_t continuations = 0;
+            uint64_t jobsWithoutWaiter = 0;
             uint64_t invalidOrder = 0;
             uint64_t invalidScheduleToReady = 0;
             uint64_t invalidReadyToQueue = 0;
@@ -7165,6 +7215,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 waitCallstacks += job.waitCallstacks.size();
                 schedulerSteals += job.schedulerStealCount;
                 rangeStealSlices += job.rangeStealSliceCount;
+                waitEnds += job.waitEndCount;
+                continuations += job.continuationCount;
+                jobsWithoutWaiter += job.waitEndCount == 0 && job.continuationCount == 0;
                 if( job.waitNs > 0 ) { waitJobs++; wait.push_back( job.waitNs ); }
                 if( job.executionNs > 0 ) execution.push_back( job.executionNs );
                 if( job.jobSchemaVersion >= 2 )
@@ -7172,6 +7225,32 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     v2++;
                     if( !captureBoundary && !job.readyNs ) missingReady++;
                     if( !captureBoundary && job.dispatchCount != 0 && !job.queueEnterNs ) missingQueue++;
+                }
+                if( job.jobSchemaVersion >= 3 )
+                {
+                    v3++;
+                    std::map<std::pair<uint32_t, std::string>, int64_t> waitEndBySpan;
+                    std::map<std::pair<uint32_t, std::string>, int64_t> continuationBySpan;
+                    for( const auto& stage : job.stages )
+                    {
+                        const auto key = std::make_pair( stage.spanId, stage.threadRef );
+                        if( stage.stage == uint8_t( JnJobStage::WaitEnd ) ) waitEndBySpan[key] = stage.timeNs;
+                        else if( stage.stage == uint8_t( JnJobStage::Continuation ) ) continuationBySpan[key] = stage.timeNs;
+                    }
+                    if( !captureBoundary && !job.incomplete )
+                    {
+                        for( const auto& [key, waitEnd] : waitEndBySpan )
+                        {
+                            const auto continuation = continuationBySpan.find( key );
+                            if( continuation == continuationBySpan.end() || continuation->second < waitEnd ) missingContinuation++;
+                        }
+                        for( const auto& [key, continuation] : continuationBySpan )
+                        {
+                            const auto waitEnd = waitEndBySpan.find( key );
+                            if( waitEnd == waitEndBySpan.end() || continuation < waitEnd->second ) continuationWithoutWait++;
+                            if( job.completedNs && continuation < *job.completedNs ) continuationBeforeCompletion++;
+                        }
+                    }
                 }
                 if( !captureBoundary && job.readyNs )
                 {
@@ -7213,14 +7292,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "steals_as_victim", Decimal( laneStealsAsVictim[lane] ) }
             } );
             return Success( id, {
-                { "present", !jobs.empty() }, { "job_schema_version", v2 != 0 ? 2 : 1 },
-                { "source_mode", v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
+                { "present", !jobs.empty() }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
+                { "source_mode", v3 != 0 ? "native-hooks-job-v3" : v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
                 { "counts", {
                     { "jobs", Decimal( jobs.size() ) }, { "completed", Decimal( completed ) },
                     { "managed", Decimal( managed ) }, { "burst", Decimal( burst ) },
-                    { "v2", Decimal( v2 ) }, { "scheduler_steals", Decimal( schedulerSteals ) },
+                    { "v2", Decimal( v2 ) }, { "v2_or_newer", Decimal( v2 ) }, { "v3", Decimal( v3 ) },
+                    { "scheduler_steals", Decimal( schedulerSteals ) },
                     { "range_steal_slices", Decimal( rangeStealSlices ) }, { "wait_jobs", Decimal( waitJobs ) },
-                    { "schedule_callstacks", Decimal( scheduleCallstacks ) }, { "wait_callstacks", Decimal( waitCallstacks ) }
+                    { "schedule_callstacks", Decimal( scheduleCallstacks ) }, { "wait_callstacks", Decimal( waitCallstacks ) },
+                    { "wait_ends", Decimal( waitEnds ) }, { "continuations", Decimal( continuations ) },
+                    { "jobs_without_waiter", Decimal( jobsWithoutWaiter ) }
                 } },
                 { "latency", {
                     { "schedule_to_ready", StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
@@ -7232,8 +7314,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 } },
                 { "lanes", std::move( lanes ) },
                 { "quality", {
-                    { "complete", missingReady == 0 && missingQueue == 0 && invalidOrder == 0 },
+                    { "complete", missingReady == 0 && missingQueue == 0 && invalidOrder == 0 &&
+                        missingContinuation == 0 && continuationWithoutWait == 0 && continuationBeforeCompletion == 0 },
                     { "missing_ready", Decimal( missingReady ) }, { "missing_queue", Decimal( missingQueue ) },
+                    { "missing_continuation", Decimal( missingContinuation ) },
+                    { "continuation_without_wait", Decimal( continuationWithoutWait ) },
+                    { "continuation_before_completion", Decimal( continuationBeforeCompletion ) },
                     { "invalid_order", Decimal( invalidOrder ) },
                     { "invalid_schedule_to_ready", Decimal( invalidScheduleToReady ) },
                     { "invalid_ready_to_queue", Decimal( invalidReadyToQueue ) },

@@ -228,12 +228,13 @@ public:
         value.name = "Fake.ManagedJob"; value.typeId = 1; value.kind = 1; value.scheduleNs = 10;
         value.scheduleThreadRef = MakeEntityRef( "thread", 1 ); value.count = 64; value.grainSize = 16; value.unityFlowId = 1001;
         value.originFrameSequence = 1; value.originFrameId = ( uint64_t( 1 ) << 48 ) | 1;
-        value.scheduleCallstack = 1; value.jobSchemaVersion = 2; value.expectedDependencyCount = 1;
-        value.readyNs = 12; value.queueEnterNs = 13; value.firstRunNs = 20; value.completedNs = 40;
+        value.scheduleCallstack = 1; value.jobSchemaVersion = 3; value.expectedDependencyCount = 1;
+        value.readyNs = 12; value.queueEnterNs = 13; value.firstRunNs = 20; value.completedNs = 28;
         value.dependencyReadyLatencyNs = 3; value.readyLane = 0; value.queueLane = 1; value.readyFlags = uint8_t( 1 << 3 );
         value.executionNs = 20; value.waitNs = 12; value.waitActiveHelpNs = 3; value.waitSpinYieldNs = 4; value.waitSleepNs = 2;
         value.dispatchCount = 2; value.schedulerStealCount = 1; value.rangeStealSliceCount = 1;
-        value.activeHelpDispatchCount = 1; value.queueRetryCount = 1; value.executionLanes = { 1, 2 };
+        value.activeHelpDispatchCount = 1; value.queueRetryCount = 1; value.waitEndCount = 1;
+        value.continuationCount = 1; value.executionLanes = { 1, 2 };
         value.waitCallstacks = { { 19, MakeEntityRef( "thread", 1 ), 7, 1 } };
         value.dependencies = { { 2, ( uint64_t( 1 ) << 32 ) | 8, 0 } };
         value.stages = {
@@ -252,8 +253,9 @@ public:
             { 26, MakeEntityRef( "thread", 1 ), 7, 0, 0, 12, 0 },
             { 28, MakeEntityRef( "thread", 1 ), 7, 0, 0, 13, 0 },
             { 30, MakeEntityRef( "thread", 1 ), 7, 0, 0, 14, 0 },
-            { 40, MakeEntityRef( "thread", 1 ), 1, 0, 16, 3, uint8_t( 1 << 7 ) },
-            { 40, MakeEntityRef( "thread", 1 ), 1, 0, 0, 6, 0 }
+            { 28, MakeEntityRef( "thread", 1 ), 1, 0, 16, 3, uint8_t( 1 << 7 ) },
+            { 28, MakeEntityRef( "thread", 1 ), 1, 0, 0, 6, 0 },
+            { 31, MakeEntityRef( "thread", 1 ), 7, 0, 0, 27, 0 }
         };
         analysis::JobDto prerequisite = value;
         prerequisite.ref = MakeEntityRef( "job", 2 ); prerequisite.jobId = 2; prerequisite.name = "Fake.Prerequisite";
@@ -264,7 +266,8 @@ public:
         prerequisite.readyFlags = uint8_t( 1 << 5 ); prerequisite.executionNs = 7; prerequisite.waitNs = 0;
         prerequisite.waitActiveHelpNs = 0; prerequisite.waitSpinYieldNs = 0; prerequisite.waitSleepNs = 0;
         prerequisite.dispatchCount = 1; prerequisite.schedulerStealCount = 0; prerequisite.rangeStealSliceCount = 0;
-        prerequisite.activeHelpDispatchCount = 0; prerequisite.queueRetryCount = 0; prerequisite.executionLanes = { 0 };
+        prerequisite.activeHelpDispatchCount = 0; prerequisite.queueRetryCount = 0; prerequisite.waitEndCount = 0;
+        prerequisite.continuationCount = 0; prerequisite.executionLanes = { 0 };
         prerequisite.waitCallstacks.clear(); prerequisite.stages = {
             { 1, MakeEntityRef( "thread", 1 ), 0, 0, 0, 22, uint8_t( 1 << 5 ) },
             { 1, MakeEntityRef( "thread", 1 ), 0, 0, 1, 23, 0 },

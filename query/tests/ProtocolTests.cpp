@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.18.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.19.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -660,7 +660,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.18.0" );
+    assert( described.at( "schema_version" ) == "1.19.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -672,9 +672,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.18.0" );
+        assert( operation.at( "schema_version" ) == "1.19.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.18.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.19.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -704,52 +704,73 @@ int main()
         }
     }
 
-    const auto jobV2 = service.Execute( Request( requestId++, "job.get", {
+    const auto jobV3 = service.Execute( Request( requestId++, "job.get", {
         { "trace_id", candidateId }, { "ref", "fake:job:1" }
     } ) ).at( "data" );
-    assert( jobV2.at( "job_schema_version" ) == 2 );
-    assert( jobV2.at( "ready_ns" ) == "12" && jobV2.at( "queue_enter_ns" ) == "13" );
-    assert( jobV2.at( "schedule_to_ready_ns" ) == "2" && jobV2.at( "ready_to_queue_ns" ) == "1" );
-    assert( jobV2.at( "queue_to_first_run_ns" ) == "7" && jobV2.at( "dependency_ready_latency_ns" ) == "3" );
-    assert( jobV2.at( "scheduler_steal_count" ) == 1 && jobV2.at( "range_steal_slice_count" ) == 1 );
-    assert( jobV2.at( "wait" ).at( "total_ns" ) == "12" && jobV2.at( "wait" ).at( "callstack_count" ) == 1 );
-    assert( jobV2.at( "wait_callstacks" ).size() == 1 );
-    assert( jobV2.at( "wait_callstacks" )[0].at( "wait_span_id" ) == 7 );
-    assert( jobV2.at( "wait_callstacks" )[0].at( "callstack_kind" ) == "native" );
-    const auto readyStage = std::find_if( jobV2.at( "stages" ).begin(), jobV2.at( "stages" ).end(), []( const auto& stage ) {
+    assert( jobV3.at( "job_schema_version" ) == 3 );
+    assert( jobV3.at( "ready_ns" ) == "12" && jobV3.at( "queue_enter_ns" ) == "13" );
+    assert( jobV3.at( "schedule_to_ready_ns" ) == "2" && jobV3.at( "ready_to_queue_ns" ) == "1" );
+    assert( jobV3.at( "queue_to_first_run_ns" ) == "7" && jobV3.at( "dependency_ready_latency_ns" ) == "3" );
+    assert( jobV3.at( "scheduler_steal_count" ) == 1 && jobV3.at( "range_steal_slice_count" ) == 1 );
+    assert( jobV3.at( "wait" ).at( "total_ns" ) == "12" && jobV3.at( "wait" ).at( "callstack_count" ) == 1 );
+    assert( jobV3.at( "wait" ).at( "end_count" ) == 1 && jobV3.at( "wait" ).at( "continuation_count" ) == 1 );
+    assert( jobV3.at( "wait_callstacks" ).size() == 1 );
+    assert( jobV3.at( "wait_callstacks" )[0].at( "wait_span_id" ) == 7 );
+    assert( jobV3.at( "wait_callstacks" )[0].at( "callstack_kind" ) == "native" );
+    const auto readyStage = std::find_if( jobV3.at( "stages" ).begin(), jobV3.at( "stages" ).end(), []( const auto& stage ) {
         return stage.at( "stage" ) == "ready";
     } );
-    assert( readyStage != jobV2.at( "stages" ).end() && readyStage->at( "reason" ) == "dependency" );
-    const auto retryStage = std::find_if( jobV2.at( "stages" ).begin(), jobV2.at( "stages" ).end(), []( const auto& stage ) {
+    assert( readyStage != jobV3.at( "stages" ).end() && readyStage->at( "reason" ) == "dependency" );
+    const auto retryStage = std::find_if( jobV3.at( "stages" ).begin(), jobV3.at( "stages" ).end(), []( const auto& stage ) {
         return stage.at( "stage" ) == "queue_enter" && stage.at( "retry" ) == true;
     } );
-    assert( retryStage != jobV2.at( "stages" ).end() );
-    const auto stealStage = std::find_if( jobV2.at( "stages" ).begin(), jobV2.at( "stages" ).end(), []( const auto& stage ) {
+    assert( retryStage != jobV3.at( "stages" ).end() );
+    const auto stealStage = std::find_if( jobV3.at( "stages" ).begin(), jobV3.at( "stages" ).end(), []( const auto& stage ) {
         return stage.at( "stage" ) == "steal";
     } );
-    assert( stealStage != jobV2.at( "stages" ).end() );
+    assert( stealStage != jobV3.at( "stages" ).end() );
     assert( stealStage->at( "thief_lane" ) == 2 && stealStage->at( "victim_lane" ) == 1 );
 
     const auto jobStatistics = service.Execute( Request( requestId++, "job.statistics", {
         { "trace_id", candidateId }
     } ) ).at( "data" );
-    assert( jobStatistics.at( "present" ) == true && jobStatistics.at( "job_schema_version" ) == 2 );
+    assert( jobStatistics.at( "present" ) == true && jobStatistics.at( "job_schema_version" ) == 3 );
+    assert( jobStatistics.at( "source_mode" ) == "native-hooks-job-v3" );
     assert( jobStatistics.at( "callstack_kind" ) == "native" );
     assert( jobStatistics.at( "counts" ).at( "jobs" ) == "2" && jobStatistics.at( "counts" ).at( "v2" ) == "2" );
     assert( jobStatistics.at( "counts" ).at( "scheduler_steals" ) == "1" );
     assert( jobStatistics.at( "counts" ).at( "range_steal_slices" ) == "1" );
     assert( jobStatistics.at( "counts" ).at( "schedule_callstacks" ) == "1" );
     assert( jobStatistics.at( "counts" ).at( "wait_callstacks" ) == "1" );
+    assert( jobStatistics.at( "counts" ).at( "v3" ) == "2" );
+    assert( jobStatistics.at( "counts" ).at( "wait_ends" ) == "1" );
+    assert( jobStatistics.at( "counts" ).at( "continuations" ) == "1" );
+    assert( jobStatistics.at( "counts" ).at( "jobs_without_waiter" ) == "1" );
     assert( jobStatistics.at( "latency" ).at( "schedule_to_ready" ).at( "count" ) == "2" );
     assert( jobStatistics.at( "latency" ).at( "dependency_complete_to_ready" ).at( "count" ) == "1" );
     assert( jobStatistics.at( "lanes" ).size() == 3 );
     assert( jobStatistics.at( "quality" ).at( "complete" ) == true );
     assert( jobStatistics.at( "quality" ).at( "missing_ready" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "missing_queue" ) == "0" );
+    assert( jobStatistics.at( "quality" ).at( "missing_continuation" ) == "0" );
+    assert( jobStatistics.at( "quality" ).at( "continuation_without_wait" ) == "0" );
+    assert( jobStatistics.at( "quality" ).at( "continuation_before_completion" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "invalid_order" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "invalid_schedule_to_ready" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "invalid_ready_to_queue" ) == "0" );
     assert( jobStatistics.at( "quality" ).at( "invalid_queue_to_first_run" ) == "0" );
+
+    const auto jobChain = service.Execute( Request( requestId++, "correlation.chain", {
+        { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" }, { "max_nodes", 1000 }
+    } ) ).at( "data" );
+    assert( jobChain.at( "nodes" ).size() > 2 );
+    const auto hasContinuationEdge = std::any_of( jobChain.at( "relations" ).begin(), jobChain.at( "relations" ).end(), []( const auto& relation ) {
+        return relation.at( "relation" ) == "continues_on_waiter";
+    } );
+    const auto hasCompletionEdge = std::any_of( jobChain.at( "relations" ).begin(), jobChain.at( "relations" ).end(), []( const auto& relation ) {
+        return relation.at( "relation" ) == "completion_releases";
+    } );
+    assert( hasContinuationEdge && hasCompletionEdge );
     assert( jobStatistics.at( "quality" ).at( "invalid_order_examples" ).empty() );
     assert( jobStatistics.at( "quality" ).at( "cancelled_supported" ) == false );
 

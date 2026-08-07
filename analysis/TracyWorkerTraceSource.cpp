@@ -1844,10 +1844,12 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         job.packedHandle = schedule.packedHandle;
         job.kind = schedule.kind;
         job.flags = schedule.flags;
+        if( ( schedule.flags & uint8_t( 1 << 6 ) ) != 0 ) job.jobSchemaVersion = 3;
+        job.captureBoundary = ( schedule.flags & uint8_t( 1 << 7 ) ) != 0;
         job.scheduleNs = schedule.time;
         job.scheduleThreadRef = m_impl->MakeRef( "thread", schedule.thread );
         job.expectedDependencyCount = schedule.dependencyCount;
-        job.orphan = false;
+        job.orphan = job.captureBoundary;
     }
     for( const auto& config : data.jobConfigs )
     {
@@ -1864,6 +1866,9 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         }
         job.kind = config.kind;
         job.flags |= config.flags;
+        if( ( config.flags & uint8_t( 1 << 6 ) ) != 0 ) job.jobSchemaVersion = 3;
+        job.captureBoundary = job.captureBoundary || ( config.flags & uint8_t( 1 << 7 ) ) != 0;
+        if( job.captureBoundary ) job.orphan = true;
     }
     for( const auto& dependency : data.jobDependencies )
     {
@@ -1900,7 +1905,10 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         case JnJobStage::WorkerSliceEnd: closeSpan( sliceStarts, stage.jobId, stage.spanId, stage.time, job.executionNs ); break;
         case JnJobStage::Completed: job.completedNs = stage.time; break;
         case JnJobStage::WaitBegin: waitStarts[stage.jobId][stage.spanId] = stage.time; break;
-        case JnJobStage::WaitEnd: closeSpan( waitStarts, stage.jobId, stage.spanId, stage.time, job.waitNs ); break;
+        case JnJobStage::WaitEnd:
+            closeSpan( waitStarts, stage.jobId, stage.spanId, stage.time, job.waitNs );
+            job.waitEndCount++;
+            break;
         case JnJobStage::WaitActiveHelpBegin: activeHelpStarts[stage.jobId][stage.spanId] = stage.time; break;
         case JnJobStage::WaitActiveHelpEnd: closeSpan( activeHelpStarts, stage.jobId, stage.spanId, stage.time, job.waitActiveHelpNs ); break;
         case JnJobStage::WaitSpinYieldBegin: spinStarts[stage.jobId][stage.spanId] = stage.time; break;
@@ -1909,7 +1917,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         case JnJobStage::WaitSleepEnd: closeSpan( sleepStarts, stage.jobId, stage.spanId, stage.time, job.waitSleepNs ); break;
         case JnJobStage::ScheduleCallstack: job.scheduleCallstack = stage.spanId; break;
         case JnJobStage::Ready:
-            job.jobSchemaVersion = 2;
+            job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             if( !job.readyNs || stage.time < *job.readyNs )
             {
                 job.readyNs = stage.time;
@@ -1918,7 +1926,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
             }
             break;
         case JnJobStage::QueueEnter:
-            job.jobSchemaVersion = 2;
+            job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             if( !job.queueEnterNs || stage.time < *job.queueEnterNs )
             {
                 job.queueEnterNs = stage.time;
@@ -1927,19 +1935,23 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
             if( ( stage.flags & uint8_t( 1 << 6 ) ) != 0 ) job.queueRetryCount++;
             break;
         case JnJobStage::Dispatch:
-            job.jobSchemaVersion = 2;
+            job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             job.dispatchCount++;
             if( ( stage.flags & uint8_t( 1 << 1 ) ) != 0 ) job.activeHelpDispatchCount++;
             if( std::find( job.executionLanes.begin(), job.executionLanes.end(), stage.arg0 ) == job.executionLanes.end() )
                 job.executionLanes.push_back( stage.arg0 );
             break;
         case JnJobStage::Steal:
-            job.jobSchemaVersion = 2;
+            job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             job.schedulerStealCount++;
             break;
         case JnJobStage::WaitCallstack:
-            job.jobSchemaVersion = 2;
+            job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             job.waitCallstacks.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.arg1, stage.spanId } );
+            break;
+        case JnJobStage::Continuation:
+            job.jobSchemaVersion = 3;
+            job.continuationCount++;
             break;
         case JnJobStage::Cancelled: job.cancelled = true; break;
         case JnJobStage::Incomplete: job.incomplete = true; break;

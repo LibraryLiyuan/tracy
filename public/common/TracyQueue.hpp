@@ -513,7 +513,8 @@ enum class JnJobStage : uint8_t
     QueueEnter,
     Dispatch,
     Steal,
-    WaitCallstack
+    WaitCallstack,
+    Continuation
 };
 
 enum class JnGfxEntityKind : uint8_t

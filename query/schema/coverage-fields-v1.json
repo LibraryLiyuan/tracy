@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.18.0",
+  "schema_version": "1.19.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -494,7 +494,7 @@
       "entity": "job",
       "classification": "persisted_semantic",
       "persisted_fields": ["type", "schedule", "config", "dependency", "stage"],
-      "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "job_schema_version", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "wait_callstacks", "dependencies", "stages", "ready_ns", "ready_lane", "queue_enter_ns", "queue_lane", "first_run_ns", "completed_ns", "schedule_to_ready_ns", "ready_to_queue_ns", "queue_to_first_run_ns", "dependency_ready_latency_ns", "execution_ns", "execution_lanes", "dispatch_count", "scheduler_steal_count", "range_steal_slice_count", "queue_retry_count", "wait", "orphan", "truncated", "statistics.counts", "statistics.latency", "statistics.lanes", "statistics.quality.missing_ready", "statistics.quality.missing_queue", "statistics.quality.invalid_order", "statistics.quality.invalid_schedule_to_ready", "statistics.quality.invalid_ready_to_queue", "statistics.quality.invalid_queue_to_first_run", "statistics.quality.invalid_order_examples", "statistics.quality.capture_boundary_orphan", "statistics.quality.capture_boundary_truncated"],
+      "query_fields": ["ref", "job_id", "packed_handle", "handle_index", "handle_generation", "name", "type_id", "kind", "state", "job_schema_version", "schedule_ns", "schedule_thread_ref", "count", "grain_size", "unity_flow_id", "schedule_callstack", "schedule_callstack_ref", "wait_callstacks", "dependencies", "stages", "ready_ns", "ready_lane", "queue_enter_ns", "queue_lane", "first_run_ns", "completed_ns", "schedule_to_ready_ns", "ready_to_queue_ns", "queue_to_first_run_ns", "dependency_ready_latency_ns", "execution_ns", "execution_lanes", "dispatch_count", "scheduler_steal_count", "range_steal_slice_count", "queue_retry_count", "wait", "capture_boundary", "orphan", "truncated", "statistics.counts.v3", "statistics.counts.wait_ends", "statistics.counts.continuations", "statistics.counts.jobs_without_waiter", "statistics.latency", "statistics.lanes", "statistics.quality.missing_ready", "statistics.quality.missing_queue", "statistics.quality.missing_continuation", "statistics.quality.continuation_without_wait", "statistics.quality.continuation_before_completion", "statistics.quality.invalid_order", "statistics.quality.invalid_schedule_to_ready", "statistics.quality.invalid_ready_to_queue", "statistics.quality.invalid_queue_to_first_run", "statistics.quality.invalid_order_examples", "statistics.quality.capture_boundary_orphan", "statistics.quality.capture_boundary_truncated"],
       "unmapped_fields": [],
       "methods": ["job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"],
       "status": "complete"
