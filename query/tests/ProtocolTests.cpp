@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.16.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.17.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -580,6 +580,8 @@ int main()
         { "trace_id", n16Id }, { "domain", "gpu_reference" }
     } ) ).at( "data" );
     assert( runtimeStates.at( "present" ) == true && runtimeStates.at( "state_count" ) == "2" && runtimeStates.at( "states" ).size() == 2 );
+    assert( runtimeStates.at( "states" )[0].at( "reason" ) == "performance_gate" );
+    assert( runtimeStates.at( "states" )[0].at( "capability_status" ) == "TriggeredOnly_PerformanceGateFailed" );
     assert( runtimeStates.at( "latest" ).at( "gpu_reference" ).at( "effective_mode" ) == "enabled" );
     assert( service.Execute( Request( 1017, "trace.close", { { "trace_id", n16Id } } ) ).at( "ok" ) );
 
@@ -656,7 +658,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.16.0" );
+    assert( described.at( "schema_version" ) == "1.17.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -668,9 +670,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.16.0" );
+        assert( operation.at( "schema_version" ) == "1.17.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.16.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.17.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {

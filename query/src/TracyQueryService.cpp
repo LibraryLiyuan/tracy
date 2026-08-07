@@ -906,6 +906,22 @@ const char* RuntimeStateReasonName( uint8_t value )
     return value < std::size( names ) ? names[value] : "unknown";
 }
 
+const char* RuntimeCapabilityStatus( const analysis::RuntimeDomainStateDto& value )
+{
+    if( value.domain == uint8_t( JnRuntimeDomain::GpuReference ) )
+    {
+        if( value.requestedMode == uint8_t( JnRuntimeMode::FollowProfile ) &&
+            value.effectiveMode == uint8_t( JnRuntimeMode::Disabled ) && value.reason == 3 )
+            return "TriggeredOnly_PerformanceGateFailed";
+        if( value.effectiveMode == uint8_t( JnRuntimeMode::ValidationDual ) ) return "ValidationOnly";
+        if( value.requestedMode == uint8_t( JnRuntimeMode::Disabled ) ) return "DisabledByRequest";
+        if( value.effectiveMode == uint8_t( JnRuntimeMode::Enabled ) )
+            return value.requestedMode == uint8_t( JnRuntimeMode::FollowProfile ) ? "Available" : "TriggeredExplicitly";
+        return "DisabledByProfile";
+    }
+    return value.effectiveMode == uint8_t( JnRuntimeMode::Disabled ) ? "Unavailable" : "Available";
+}
+
 const char* RelationName( uint8_t relationNamespace, uint8_t relation )
 {
     if( relationNamespace == uint8_t( JnRelationNamespace::Gfx ) ) return GfxRelationName( relation );
@@ -937,6 +953,7 @@ json RuntimeDomainStateJson( const analysis::RuntimeDomainStateDto& value )
         { "requested_mode", RuntimeModeName( value.requestedMode ) }, { "requested_mode_id", value.requestedMode },
         { "effective_mode", RuntimeModeName( value.effectiveMode ) }, { "effective_mode_id", value.effectiveMode },
         { "reason", RuntimeStateReasonName( value.reason ) }, { "reason_id", value.reason },
+        { "capability_status", RuntimeCapabilityStatus( value ) },
         { "flags", value.flags }, { "provenance", "exact-binary" }
     };
 }

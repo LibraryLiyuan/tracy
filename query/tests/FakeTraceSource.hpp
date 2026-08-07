@@ -369,7 +369,7 @@ public:
         return {
             { MakeEntityRef( "runtime-domain-state", 0 ), 1, 60, 20, MakeEntityRef( "thread", 1 ),
                 uint8_t( JnRuntimeDomain::GpuReference ), uint8_t( JnRuntimeMode::FollowProfile ),
-                uint8_t( JnRuntimeMode::Disabled ), 1, 0 },
+                uint8_t( JnRuntimeMode::Disabled ), 3, 0 },
             { MakeEntityRef( "runtime-domain-state", 1 ), 2, 120, 30, MakeEntityRef( "thread", 1 ),
                 uint8_t( JnRuntimeDomain::GpuReference ), uint8_t( JnRuntimeMode::Enabled ),
                 uint8_t( JnRuntimeMode::Enabled ), 0, 0 }
