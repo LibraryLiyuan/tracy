@@ -6166,6 +6166,74 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             };
             const auto& churn = attribution.churn;
             const auto& residency = attribution.residency;
+            json registryQuality = {
+                { "present", false }, { "complete", false }, { "producer_key", "memory.gpu.registry" },
+                { "source_mode", nullptr }, { "state", "missing" }, { "counters", json::object() },
+                { "incremental_contract", "authoritative_snapshot_then_incremental" }
+            };
+            const auto producerCoverage = CaptureCoverageJson( info() );
+            if( producerCoverage.contains( "producers" ) && producerCoverage["producers"].is_array() )
+            {
+                const auto registry = std::find_if( producerCoverage["producers"].begin(), producerCoverage["producers"].end(),
+                    []( const auto& producer ) { return producer.value( "key", "" ) == "memory.gpu.registry"; } );
+                if( registry != producerCoverage["producers"].end() )
+                {
+                    const auto& counters = registry->at( "counters" );
+                    const auto counterIsZero = [&]( const char* name ) {
+                        if( !counters.contains( name ) ) return false;
+                        const auto value = DecimalStringValue( counters[name] );
+                        return value.has_value() && *value == 0;
+                    };
+                    const bool clean = registry->value( "complete", false ) &&
+                        counterIsZero( "dropped" ) && counterIsZero( "overflow" ) &&
+                        counterIsZero( "mismatch" ) && counterIsZero( "unresolved" ) &&
+                        counterIsZero( "tail_truncated" );
+                    registryQuality = {
+                        { "present", true }, { "complete", clean }, { "producer_key", "memory.gpu.registry" },
+                        { "source_mode", registry->value( "source_mode", "" ) },
+                        { "state", registry->value( "state", "unknown" ) }, { "counters", counters },
+                        { "incremental_contract", "authoritative_snapshot_then_incremental" }
+                    };
+                }
+            }
+            json summaryWarnings = attribution.warnings;
+            if( !registryQuality.value( "complete", false ) )
+                summaryWarnings.push_back( "GPU memory registry producer is missing, incomplete, or contains dropped/unresolved data" );
+            uint64_t incompleteReferencePasses = 0;
+            uint64_t structuredIncompleteReferencePasses = 0;
+            uint64_t legacyIncompleteReferencePasses = 0;
+            uint64_t truncatedReferencePasses = 0;
+            uint64_t failureFlagReferencePasses = 0;
+            uint64_t commandListBoundaryPasses = 0;
+            uint64_t droppedReferenceUses = 0;
+            json incompleteReferencePreview = json::array();
+            for( const auto& pass : attribution.passes )
+            {
+                if( ( pass.flags & uint8_t( JnGpuReferenceFlags::CommandListBoundary ) ) != 0 )
+                    commandListBoundaryPasses++;
+                if( pass.complete || pass.gpuPairing == analysis::GpuZonePairing::CaptureBoundary ) continue;
+                incompleteReferencePasses++;
+                if( pass.structuredBinary ) structuredIncompleteReferencePasses++;
+                else legacyIncompleteReferencePasses++;
+                if( pass.truncated ) truncatedReferencePasses++;
+                if( ( pass.flags & 0xA ) != 0 ) failureFlagReferencePasses++;
+                droppedReferenceUses += pass.droppedUses;
+                if( incompleteReferencePreview.size() < 16 )
+                {
+                    incompleteReferencePreview.push_back( {
+                        { "pass_id", Decimal( pass.passId ) }, { "frame", Decimal( pass.frame ) },
+                        { "structured_binary", pass.structuredBinary }, { "flags", pass.flags },
+                        { "truncated", pass.truncated }, { "dropped_uses", Decimal( uint64_t( pass.droppedUses ) ) },
+                        { "emitted_use_count", Decimal( uint64_t( pass.emittedUseCount ) ) },
+                        { "total_use_count", Decimal( uint64_t( pass.totalUseCount ) ) },
+                        { "gpu_pairing", analysis::ToString( pass.gpuPairing ) }
+                    } );
+                }
+            }
+            if( incompleteReferencePasses != 0 && summaryWarnings.empty() )
+                summaryWarnings.push_back( std::to_string( incompleteReferencePasses ) +
+                    " GPU reference pass(es) are incomplete outside the accepted capture boundary" );
+            const bool summaryComplete = attribution.complete && registryQuality.value( "complete", false );
             return Success( id, { { "present", true }, { "protocol", attribution.structuredReferencePresent ? "JN_GPU_REFERENCE_2" : "GTMEM2" },
                 { "dxgi_reconciliation", { { "local", segment( "Local", "GPU.VRAM.EngineKnownPhysical.LocalBytes" ) },
                     { "non_local", segment( "NonLocal", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes" ) },
@@ -6174,13 +6242,35 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "logical_resource_count", Decimal( attribution.logicalResources.size() ) },
                 { "owner_rollup_count", Decimal( attribution.ownerRollups.size() ) },
                 { "working_set_count", Decimal( attribution.workingSets.size() ) },
+                { "layers", {
+                    { "cpu_allocation", { { "domain", "memory" }, { "included", false },
+                        { "semantics", "Unity native CPU allocations are separate from GPU memory" } } },
+                    { "gpu_physical", { { "domain", "memory.gpu" }, { "identity", "physical_allocation_id" },
+                        { "semantics", "committed resources and heaps; bytes are counted once" } } },
+                    { "gpu_logical", { { "domain", "memory.gpu" }, { "identity", "logical_resource_id" },
+                        { "semantics", "textures, buffers, upload and readback resources mapped to physical allocations" } } },
+                    { "primary_owner", { { "identity", "taxonomy_id" }, { "cardinality", "exactly_one_per_logical_resource" },
+                        { "semantics", "owner bytes are non-duplicating rollups" } } },
+                    { "pass_reference", { { "identity", "frame_taxonomy_physical_allocation" },
+                        { "semantics", "per-node deduplicated working set; sibling nodes are not additive" } } }
+                } },
+                { "allocation_callstack_semantics", "captured at physical/logical create when enabled; references do not capture allocation stacks" },
                 { "heap_fragmentation_count", Decimal( attribution.fragmentation.size() ) },
                 { "residency", { { "resident_bytes", Decimal( residency.residentBytes ) }, { "evicted_bytes", Decimal( residency.evictedBytes ) },
                     { "unknown_bytes", Decimal( residency.unknownBytes ) } } },
-                { "quality", { { "complete", attribution.complete }, { "warnings", attribution.warnings },
+                { "quality", { { "complete", summaryComplete }, { "warnings", std::move( summaryWarnings ) },
+                    { "registry", std::move( registryQuality ) },
                     { "capture_boundary_passes", Decimal( attribution.captureBoundaryPasses ) },
                     { "submission_unobserved_passes", Decimal( attribution.submissionUnobservedPasses ) },
-                    { "gpu_result_unavailable_passes", Decimal( attribution.gpuResultUnavailablePasses ) } } } }, trace );
+                    { "gpu_result_unavailable_passes", Decimal( attribution.gpuResultUnavailablePasses ) },
+                    { "incomplete_reference_passes", Decimal( incompleteReferencePasses ) },
+                    { "structured_incomplete_reference_passes", Decimal( structuredIncompleteReferencePasses ) },
+                    { "legacy_incomplete_reference_passes", Decimal( legacyIncompleteReferencePasses ) },
+                    { "truncated_reference_passes", Decimal( truncatedReferencePasses ) },
+                    { "failure_flag_reference_passes", Decimal( failureFlagReferencePasses ) },
+                    { "command_list_boundary_passes", Decimal( commandListBoundaryPasses ) },
+                    { "dropped_reference_uses", Decimal( droppedReferenceUses ) },
+                    { "incomplete_reference_preview", std::move( incompleteReferencePreview ) } } } }, trace );
         }
         if( method == "memory.gpu.request_scopes" )
         {

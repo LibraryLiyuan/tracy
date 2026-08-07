@@ -52,7 +52,7 @@ int main()
     assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
     assert( ( *inspect )["inputSchema"]["properties"]["method"]["enum"].size() == tracy::query::QueryMethodRegistry().size() );
     assert( ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] == tracy::query::QueryOperationSchemaRegistry() );
-    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.22.0" );
+    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.23.0" );
     assert( ( *inspect )["outputSchema"]["properties"].contains( "partial" ) );
     const auto compare = std::find_if( tools["result"]["tools"].begin(), tools["result"]["tools"].end(), []( const auto& tool ) {
         return tool["name"] == "tracy_compare";

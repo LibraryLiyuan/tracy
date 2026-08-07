@@ -684,7 +684,8 @@ enum class JnGpuReferenceFlags : uint8_t
     Overflow = 1 << 1,
     ValidationDual = 1 << 2,
     ValidationMismatch = 1 << 3,
-    CaptureBoundary = 1 << 4
+    CaptureBoundary = 1 << 4,
+    CommandListBoundary = 1 << 5
 };
 
 enum class JnScriptRecordKind : uint8_t

@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.22.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.23.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -384,6 +384,17 @@ int main()
     assert( gpuUnavailableAttribution.complete && gpuUnavailableAttribution.warnings.empty() );
     assert( gpuUnavailableAttribution.gpuResultUnavailablePasses == 1 );
     assert( gpuUnavailableAttribution.passes[0].gpuPairing == GpuZonePairing::GpuResultUnavailable );
+
+    GpuMemoryReferencePassInput commandListBoundary = structuredChild;
+    commandListBoundary.passId = 31;
+    commandListBoundary.parentPassId = 0;
+    commandListBoundary.frame = 5;
+    commandListBoundary.flags = uint8_t( 1u << 5 ); // JnGpuReferenceFlags::CommandListBoundary
+    const auto commandListBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, gpuAllocations,
+        {}, { 31 }, { commandListBoundary } );
+    assert( commandListBoundaryAttribution.complete && commandListBoundaryAttribution.warnings.empty() );
+    assert( commandListBoundaryAttribution.passes[0].complete );
+    assert( commandListBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::GpuResultUnavailable );
 
     tracy::query::test::FakeTraceSource fake;
     assert( fake.AcquireReadView().sourceKind == TraceSourceKind::Snapshot );
@@ -660,7 +671,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.22.0" );
+    assert( described.at( "schema_version" ) == "1.23.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -672,9 +683,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.22.0" );
+        assert( operation.at( "schema_version" ) == "1.23.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.22.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.23.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -933,6 +944,19 @@ int main()
     } ) ).at( "data" );
     assert( realZero.at( "producer" ).at( "state" ) == "real_zero" );
     assert( realZero.at( "producer" ).at( "coverage_ratio" ) == 1.0 );
+
+    const auto gpuMemorySummary = service.Execute( Request( requestId++, "memory.gpu.summary", {
+        { "trace_id", candidateId }, { "max_cpu_ms", 10000 }
+    } ) ).at( "data" );
+    assert( gpuMemorySummary.at( "present" ) == true );
+    assert( gpuMemorySummary.at( "quality" ).at( "complete" ) == false );
+    assert( gpuMemorySummary.at( "quality" ).at( "registry" ).at( "present" ) == false );
+    assert( gpuMemorySummary.at( "quality" ).at( "registry" ).at( "complete" ) == false );
+    assert( gpuMemorySummary.at( "quality" ).contains( "incomplete_reference_passes" ) );
+    assert( gpuMemorySummary.at( "quality" ).contains( "incomplete_reference_preview" ) );
+    assert( gpuMemorySummary.at( "quality" ).contains( "command_list_boundary_passes" ) );
+    assert( gpuMemorySummary.at( "layers" ).at( "cpu_allocation" ).at( "included" ) == false );
+    assert( gpuMemorySummary.at( "layers" ).at( "pass_reference" ).at( "semantics" ) == "per-node deduplicated working set; sibling nodes are not additive" );
 
     const auto taxonomyTree = service.Execute( Request( requestId++, "gpu.taxonomy.tree", {
         { "trace_id", candidateId }, { "max_scan_events", 100 }
