@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.19.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.22.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -660,7 +660,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.19.0" );
+    assert( described.at( "schema_version" ) == "1.22.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -672,9 +672,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.19.0" );
+        assert( operation.at( "schema_version" ) == "1.22.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.19.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.22.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -954,6 +954,20 @@ int main()
     assert( taxonomyCoverage.at( "statuses" ).at( "explicit" ).at( "count" ) == "2" );
     assert( taxonomyCoverage.at( "statuses" ).at( "fallback" ).at( "classified_marker_count" ) == "7" );
     assert( taxonomyCoverage.at( "statuses" ).at( "unclassified" ).at( "count" ) == "3" );
+    const auto& authority = taxonomyCoverage.at( "statuses" ).at( "authority" );
+    assert( authority.at( "available" ) == true && authority.at( "passed" ) == true );
+    assert( authority.at( "total_gpu_busy_ns" ) == "49" );
+    assert( authority.at( "explicit_gpu_busy_ns" ) == "49" );
+    assert( authority.at( "fallback_or_unclassified_gpu_busy_ns" ) == "0" );
+    assert( authority.at( "explicit_gpu_busy_ratio" ) == 1.0 );
+    assert( authority.at( "fallback_or_unclassified_gpu_busy_ratio" ) == 0.0 );
+    assert( authority.at( "missing_gpu_zone_count" ) == "0" );
+    assert( authority.at( "contexts" ).size() == 1 );
+    assert( authority.at( "uncovered_interval_count" ) == "0" );
+    assert( authority.at( "top_uncovered_intervals" ).empty() );
+    assert( authority.at( "evidence_kind" ) == "per_context_complete_leaf_gpu_interval_union" );
+    assert( authority.at( "timeline_envelope" ).at( "total_ns" ) == "49" );
+    assert( authority.at( "timeline_envelope" ).at( "used_for_gate" ) == false );
     assert( taxonomyCoverage.at( "statuses" ).at( "culled" ).at( "available" ) == false );
 
     const auto gpuPassSearch = service.Execute( Request( requestId++, "gpu.pass.search", {

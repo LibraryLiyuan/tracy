@@ -4910,6 +4910,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
 
+        using GpuInterval = std::pair<int64_t, int64_t>;
+        struct CompleteGpuZoneInterval
+        {
+            std::string ref;
+            std::string contextRef;
+            std::string name;
+            std::string file;
+            uint32_t line = 0;
+            int64_t begin = 0;
+            int64_t end = 0;
+        };
+        std::map<std::string, std::vector<GpuInterval>> allGpuIntervals;
+        std::map<std::string, std::vector<GpuInterval>> explicitGpuIntervals;
+        std::vector<CompleteGpuZoneInterval> completeGpuZones;
+        std::set<std::string> gpuParentZoneRefs;
         std::unordered_map<std::string, uint32_t> taxonomyByZoneRef;
         std::set<std::string> syntheticTaxonomyZoneRefs;
         std::vector<std::pair<uint32_t, std::string>> pendingParents;
@@ -4929,6 +4944,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( const auto& zone : zones )
             {
                 MatchExplicitGpuPassZone( *source, explicitPasses, zone );
+                if( zone.gpuEndNs && *zone.gpuEndNs >= zone.gpuStartNs )
+                {
+                    allGpuIntervals[zone.contextRef].emplace_back( zone.gpuStartNs, *zone.gpuEndNs );
+                    completeGpuZones.emplace_back( CompleteGpuZoneInterval {
+                        zone.ref, zone.contextRef, zone.name, zone.file, zone.line,
+                        zone.gpuStartNs, *zone.gpuEndNs } );
+                    if( zone.parentRef ) gpuParentZoneRefs.emplace( *zone.parentRef );
+                }
                 const auto file = Lower( zone.file );
                 if( file.find( "jntracygputaxonomy.h" ) == std::string::npos ) continue;
                 const uint32_t taxonomyId = zone.line;
@@ -4958,6 +4981,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         uint64_t explicitPassZoneCount = 0;
         uint64_t explicitPassMissingZoneCount = 0;
+        std::set<std::string> explicitPassZoneRefs;
         std::set<std::string> explicitAncestorZoneRefs;
         for( const auto& pass : explicitPasses.matches )
         {
@@ -4973,6 +4997,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 continue;
             }
             explicitPassZoneCount++;
+            explicitPassZoneRefs.emplace( pass.zone->ref );
             taxonomyZoneCount++;
             auto& stats = execution[pass.taxonomyId];
             stats.count++;
@@ -4981,6 +5006,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 stats.complete++;
                 stats.totalNs += uint64_t( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
+                explicitGpuIntervals[pass.zone->contextRef].emplace_back(
+                    pass.zone->gpuStartNs, *pass.zone->gpuEndNs );
             }
             else stats.incomplete++;
             taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
@@ -4992,6 +5019,170 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
         fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount, explicitAncestorZoneRefs.size() );
+        const auto mergeIntervals = []( std::vector<GpuInterval> intervals ) -> std::vector<GpuInterval> {
+            if( intervals.empty() ) return {};
+            std::sort( intervals.begin(), intervals.end() );
+            int64_t begin = intervals.front().first;
+            int64_t end = intervals.front().second;
+            std::vector<GpuInterval> merged;
+            for( size_t index = 1; index < intervals.size(); ++index )
+            {
+                if( intervals[index].first <= end )
+                {
+                    end = std::max( end, intervals[index].second );
+                    continue;
+                }
+                merged.emplace_back( begin, end );
+                begin = intervals[index].first;
+                end = intervals[index].second;
+            }
+            merged.emplace_back( begin, end );
+            return merged;
+        };
+        const auto mergedDuration = []( const std::vector<GpuInterval>& intervals ) -> uint64_t {
+            uint64_t duration = 0;
+            for( const auto& interval : intervals ) duration += uint64_t( interval.second - interval.first );
+            return duration;
+        };
+        const auto subtractIntervals = []( const std::vector<GpuInterval>& envelope,
+                                           const std::vector<GpuInterval>& covered ) {
+            std::vector<GpuInterval> gaps;
+            size_t coveredIndex = 0;
+            for( const auto& span : envelope )
+            {
+                int64_t cursor = span.first;
+                while( coveredIndex < covered.size() && covered[coveredIndex].second <= cursor ) coveredIndex++;
+                size_t index = coveredIndex;
+                while( index < covered.size() && covered[index].first < span.second )
+                {
+                    if( covered[index].first > cursor )
+                        gaps.emplace_back( cursor, std::min( span.second, covered[index].first ) );
+                    cursor = std::max( cursor, covered[index].second );
+                    if( cursor >= span.second ) break;
+                    index++;
+                }
+                if( cursor < span.second ) gaps.emplace_back( cursor, span.second );
+            }
+            return gaps;
+        };
+        const auto intersectionDuration = []( const std::vector<GpuInterval>& lhs,
+                                              const std::vector<GpuInterval>& rhs ) -> uint64_t {
+            uint64_t duration = 0;
+            size_t left = 0;
+            size_t right = 0;
+            while( left < lhs.size() && right < rhs.size() )
+            {
+                const int64_t begin = std::max( lhs[left].first, rhs[right].first );
+                const int64_t end = std::min( lhs[left].second, rhs[right].second );
+                if( end > begin ) duration += uint64_t( end - begin );
+                if( lhs[left].second < rhs[right].second ) left++;
+                else right++;
+            }
+            return duration;
+        };
+        std::map<std::string, std::vector<GpuInterval>> leafGpuIntervals;
+        for( const auto& zone : completeGpuZones )
+            if( zone.end > zone.begin && !gpuParentZoneRefs.contains( zone.ref ) )
+                leafGpuIntervals[zone.contextRef].emplace_back( zone.begin, zone.end );
+
+        uint64_t totalGpuBusyNs = 0;
+        uint64_t explicitGpuBusyNs = 0;
+        uint64_t timelineEnvelopeNs = 0;
+        uint64_t explicitTimelineEnvelopeNs = 0;
+        json gpuBusyContexts = json::array();
+        struct UncoveredGpuInterval { std::string contextRef; int64_t begin = 0; int64_t end = 0; };
+        std::vector<UncoveredGpuInterval> uncoveredGpuIntervals;
+        std::vector<UncoveredGpuInterval> timelineUncoveredGpuIntervals;
+        std::set<std::string> gpuContexts;
+        for( const auto& [context, unused] : allGpuIntervals ) gpuContexts.emplace( context );
+        for( const auto& [context, unused] : leafGpuIntervals ) gpuContexts.emplace( context );
+        for( const auto& context : gpuContexts )
+        {
+            const auto allFound = allGpuIntervals.find( context );
+            const auto leafFound = leafGpuIntervals.find( context );
+            const auto explicitFound = explicitGpuIntervals.find( context );
+            const auto mergedAll = allFound == allGpuIntervals.end() ?
+                std::vector<GpuInterval>() : mergeIntervals( allFound->second );
+            const auto mergedLeaf = leafFound == leafGpuIntervals.end() ?
+                std::vector<GpuInterval>() : mergeIntervals( leafFound->second );
+            const auto mergedExplicit = explicitFound == explicitGpuIntervals.end() ?
+                std::vector<GpuInterval>() : mergeIntervals( explicitFound->second );
+            const uint64_t totalNs = mergedDuration( mergedLeaf );
+            const uint64_t explicitNs = intersectionDuration( mergedLeaf, mergedExplicit );
+            const uint64_t envelopeNs = mergedDuration( mergedAll );
+            const uint64_t explicitEnvelopeNs = intersectionDuration( mergedAll, mergedExplicit );
+            for( const auto& gap : subtractIntervals( mergedLeaf, mergedExplicit ) )
+                if( gap.second > gap.first ) uncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            for( const auto& gap : subtractIntervals( mergedAll, mergedExplicit ) )
+                if( gap.second > gap.first ) timelineUncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            totalGpuBusyNs += totalNs;
+            explicitGpuBusyNs += explicitNs;
+            timelineEnvelopeNs += envelopeNs;
+            explicitTimelineEnvelopeNs += explicitEnvelopeNs;
+            gpuBusyContexts.push_back( {
+                { "context_ref", context }, { "total_gpu_busy_ns", Decimal( totalNs ) },
+                { "explicit_gpu_busy_ns", Decimal( explicitNs ) },
+                { "non_explicit_gpu_busy_ns", Decimal( totalNs - explicitNs ) },
+                { "explicit_coverage_ratio", totalNs == 0 ? 0.0 : double( explicitNs ) / double( totalNs ) },
+                { "timeline_envelope_ns", Decimal( envelopeNs ) },
+                { "explicit_timeline_envelope_ns", Decimal( explicitEnvelopeNs ) },
+                { "timeline_envelope_coverage_ratio", envelopeNs == 0 ? 0.0 :
+                    double( explicitEnvelopeNs ) / double( envelopeNs ) }
+            } );
+        }
+        const auto buildTopUncoveredIntervals = [&]( std::vector<UncoveredGpuInterval>& gaps ) -> json {
+            std::sort( gaps.begin(), gaps.end(), []( const auto& lhs, const auto& rhs ) {
+                const auto lhsDuration = lhs.end - lhs.begin;
+                const auto rhsDuration = rhs.end - rhs.begin;
+                if( lhsDuration != rhsDuration ) return lhsDuration > rhsDuration;
+                if( lhs.contextRef != rhs.contextRef ) return lhs.contextRef < rhs.contextRef;
+                return lhs.begin < rhs.begin;
+            } );
+            json values = json::array();
+            constexpr size_t maxUncoveredIntervals = 32;
+            for( size_t gapIndex = 0; gapIndex < std::min( maxUncoveredIntervals, gaps.size() ); ++gapIndex )
+            {
+                const auto& gap = gaps[gapIndex];
+                const CompleteGpuZoneInterval* containing = nullptr;
+                const CompleteGpuZoneInterval* previousExplicit = nullptr;
+                const CompleteGpuZoneInterval* nextExplicit = nullptr;
+                for( const auto& zone : completeGpuZones )
+                {
+                    if( zone.contextRef != gap.contextRef ) continue;
+                    if( !explicitPassZoneRefs.contains( zone.ref ) && zone.begin <= gap.begin && zone.end >= gap.end &&
+                        ( !containing || zone.end - zone.begin < containing->end - containing->begin ) )
+                        containing = &zone;
+                    if( !explicitPassZoneRefs.contains( zone.ref ) ) continue;
+                    if( zone.end <= gap.begin && ( !previousExplicit || zone.end > previousExplicit->end ) ) previousExplicit = &zone;
+                    if( zone.begin >= gap.end && ( !nextExplicit || zone.begin < nextExplicit->begin ) ) nextExplicit = &zone;
+                }
+                const auto zoneJson = []( const CompleteGpuZoneInterval* zone ) -> json {
+                    if( !zone ) return nullptr;
+                    return { { "ref", zone->ref }, { "name", zone->name }, { "file", zone->file },
+                        { "line", zone->line }, { "gpu_start_ns", Decimal( zone->begin ) },
+                        { "gpu_end_ns", Decimal( zone->end ) } };
+                };
+                values.push_back( {
+                    { "context_ref", gap.contextRef }, { "gpu_start_ns", Decimal( gap.begin ) },
+                    { "gpu_end_ns", Decimal( gap.end ) }, { "duration_ns", Decimal( gap.end - gap.begin ) },
+                    { "containing_non_explicit_zone", zoneJson( containing ) },
+                    { "previous_explicit_pass", zoneJson( previousExplicit ) },
+                    { "next_explicit_pass", zoneJson( nextExplicit ) }
+                } );
+            }
+            return values;
+        };
+        const auto topUncoveredGpuIntervals = buildTopUncoveredIntervals( uncoveredGpuIntervals );
+        const auto topTimelineUncoveredGpuIntervals = buildTopUncoveredIntervals( timelineUncoveredGpuIntervals );
+        const uint64_t nonExplicitGpuBusyNs = totalGpuBusyNs - std::min( totalGpuBusyNs, explicitGpuBusyNs );
+        const double explicitGpuBusyRatio = totalGpuBusyNs == 0 ?
+            0.0 : double( explicitGpuBusyNs ) / double( totalGpuBusyNs );
+        const double nonExplicitGpuBusyRatio = totalGpuBusyNs == 0 ?
+            0.0 : double( nonExplicitGpuBusyNs ) / double( totalGpuBusyNs );
+        const uint64_t nonExplicitTimelineEnvelopeNs = timelineEnvelopeNs -
+            std::min( timelineEnvelopeNs, explicitTimelineEnvelopeNs );
+        const double explicitTimelineEnvelopeRatio = timelineEnvelopeNs == 0 ?
+            0.0 : double( explicitTimelineEnvelopeNs ) / double( timelineEnvelopeNs );
         for( const auto& [childId, parentRef] : pendingParents )
         {
             const auto parent = taxonomyByZoneRef.find( parentRef );
@@ -5093,6 +5284,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool explicitAvailable =
             ( nativePassComplete && nativePassProducer.value( "effective", false ) ) ||
             ( managedPassComplete && managedPassProducer.value( "effective", false ) );
+        const bool authorityAvailable = explicitAvailable && !BudgetPartial() && totalGpuBusyNs != 0;
+        const bool authorityPassed = authorityAvailable && explicitPassMissingZoneCount == 0 &&
+            explicitGpuBusyRatio >= 0.95 && nonExplicitGpuBusyRatio <= 0.05;
         const std::string explicitUnavailableReason = !explicitProducerComplete ? "no complete GPU pass producer counter window" :
             "all complete GPU pass producers are ineffective";
         const auto producerCounter = [&]( const char* name ) -> json {
@@ -5120,6 +5314,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "unclassified", { { "available", classifierAvailable }, { "count", producerCounter( "filtered" ) },
                 { "unit", "markers" }, { "evidence_kind", "producer_filtered_counter" },
                 { "reason", classifierAvailable ? json( nullptr ) : json( "no complete gpu.taxonomy.fallback counter window" ) } } },
+            { "authority", { { "available", authorityAvailable }, { "passed", authorityPassed },
+                { "total_gpu_busy_ns", Decimal( totalGpuBusyNs ) },
+                { "explicit_gpu_busy_ns", Decimal( explicitGpuBusyNs ) },
+                { "fallback_or_unclassified_gpu_busy_ns", Decimal( nonExplicitGpuBusyNs ) },
+                { "explicit_gpu_busy_ratio", explicitGpuBusyRatio },
+                { "fallback_or_unclassified_gpu_busy_ratio", nonExplicitGpuBusyRatio },
+                { "required_explicit_ratio", 0.95 }, { "maximum_fallback_or_unclassified_ratio", 0.05 },
+                { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) },
+                { "contexts", std::move( gpuBusyContexts ) },
+                { "uncovered_interval_count", Decimal( uncoveredGpuIntervals.size() ) },
+                { "top_uncovered_intervals", std::move( topUncoveredGpuIntervals ) },
+                { "timeline_envelope", {
+                    { "total_ns", Decimal( timelineEnvelopeNs ) },
+                    { "explicit_ns", Decimal( explicitTimelineEnvelopeNs ) },
+                    { "non_explicit_ns", Decimal( nonExplicitTimelineEnvelopeNs ) },
+                    { "explicit_coverage_ratio", explicitTimelineEnvelopeRatio },
+                    { "uncovered_interval_count", Decimal( timelineUncoveredGpuIntervals.size() ) },
+                    { "top_uncovered_intervals", std::move( topTimelineUncoveredGpuIntervals ) },
+                    { "evidence_kind", "parent_gpu_zone_timeline_envelope" },
+                    { "used_for_gate", false }
+                } },
+                { "evidence_kind", "per_context_complete_leaf_gpu_interval_union" },
+                { "denominator_semantics", "instrumented_gpu_work_excludes_parent_envelope_idle_gaps" },
+                { "reason", authorityAvailable ? json( nullptr ) :
+                    json( BudgetPartial() ? "query budget was exhausted" :
+                        ( totalGpuBusyNs == 0 ? "no complete GPU timestamp intervals" :
+                            "no effective complete explicit GPU pass producer" ) ) } } },
             { "culled", capability( "culled" ) }, { "disabled", capability( "disabled" ) }
         };
         result["classifier_quality"] = {
