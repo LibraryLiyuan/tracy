@@ -381,7 +381,7 @@ try {
     $snapshotSemantics = Get-ComparableN14Semantics $results.snapshot.semantics
     Assert-Condition ((Get-ComparableN14Semantics $results.stream.semantics) -eq $snapshotSemantics) 'snapshot/stream N14 semantic mismatch'
     Assert-Condition ((Get-ComparableN14Semantics $results.replay.semantics) -eq $snapshotSemantics) 'snapshot/replay N14 semantic mismatch'
-    [ordered]@{ ok = $true; schema_version = '1.14.0'; traces = $results } | ConvertTo-Json -Compress -Depth 70
+    [ordered]@{ ok = $true; schema_version = '1.15.0'; traces = $results } | ConvertTo-Json -Compress -Depth 70
 }
 finally {
     foreach ($traceId in $traceIds) {

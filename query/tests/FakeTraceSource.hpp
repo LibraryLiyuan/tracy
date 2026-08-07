@@ -18,6 +18,7 @@ class FakeTraceSource final : public analysis::TraceSource
     bool m_legacyFormat = false;
     bool m_truncatedSource = false;
     bool m_n11 = false;
+    bool m_n16 = false;
     std::optional<std::vector<std::string>> m_appInfoOverride;
 
     template<typename T>
@@ -59,10 +60,11 @@ public:
         };
     }
 
-    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false, bool n11 = false )
+    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false, bool n11 = false, bool n16 = false )
         : m_legacyFormat( legacyFormat )
         , m_truncatedSource( truncatedSource )
         , m_n11( n11 )
+        , m_n16( n16 )
     {}
 
     explicit FakeTraceSource( std::vector<std::string> appInfoOverride, bool truncatedSource = false )
@@ -78,6 +80,8 @@ public:
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
         result.push_back( { "evidence", true, true, true, "deterministic N14 evidence graph", { "evidence.graph", "frame.critical_path", "frame.explain" } } );
+        result.push_back( { "relation", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 exact relation data" : "JN trace section schema 4 absent", { "relation.search", "relation.get" } } );
+        result.push_back( { "runtime.domain", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 runtime-domain state data" : "JN trace section schema 4 absent", { "runtime.domain.states" } } );
         result.push_back( { "runtime.script", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" } } );
         result.push_back( { "memory.gc", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "memory.gc.summary", "memory.gc.events" } } );
         result.push_back( { "network", false, false, false, "deferred_by_user", { "network.capabilities" } } );
@@ -109,6 +113,7 @@ public:
         value.counts.gfxDispatches = 1; value.counts.gfxEntities = 5; value.counts.gfxLinks = 11;
         value.counts.correlatedFrameEvents = 4;
         value.counts.ioRequests = 2; value.counts.ioConfigs = 2; value.counts.ioStages = 7;
+        if( m_n16 ) { value.counts.relations = 2; value.counts.runtimeDomainStates = 2; }
         if( !m_legacyFormat )
         {
             value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
@@ -344,6 +349,30 @@ public:
             { MakeEntityRef( "frame-identity-event", 1 ), frameId, 1, 11, MakeEntityRef( "thread", 1 ), 1, 0, 2 },
             { MakeEntityRef( "frame-identity-event", 2 ), frameId, 1, 90, MakeEntityRef( "thread", 1 ), 1, 1, 2 },
             { MakeEntityRef( "frame-identity-event", 3 ), frameId, 1, 100, MakeEntityRef( "thread", 1 ), 0, 1, 1 }
+        };
+    }
+    std::vector<analysis::RelationDto> GetRelations() const override
+    {
+        if( !m_n16 ) return {};
+        return {
+            { MakeEntityRef( "relation", 0 ), 100, 200, 40, MakeEntityRef( "thread", 1 ),
+                uint8_t( JnEntityKind::GpuPass ), uint8_t( JnEntityKind::GpuResource ),
+                uint8_t( JnRelationNamespace::GpuReference ), 2, 0 },
+            { MakeEntityRef( "relation", 1 ), 200, 300, 41, MakeEntityRef( "thread", 1 ),
+                uint8_t( JnEntityKind::GpuResource ), uint8_t( JnEntityKind::GpuAllocation ),
+                uint8_t( JnRelationNamespace::Generic ), 4, 1 }
+        };
+    }
+    std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override
+    {
+        if( !m_n16 ) return {};
+        return {
+            { MakeEntityRef( "runtime-domain-state", 0 ), 1, 60, 20, MakeEntityRef( "thread", 1 ),
+                uint8_t( JnRuntimeDomain::GpuReference ), uint8_t( JnRuntimeMode::FollowProfile ),
+                uint8_t( JnRuntimeMode::Disabled ), 1, 0 },
+            { MakeEntityRef( "runtime-domain-state", 1 ), 2, 120, 30, MakeEntityRef( "thread", 1 ),
+                uint8_t( JnRuntimeDomain::GpuReference ), uint8_t( JnRuntimeMode::Enabled ),
+                uint8_t( JnRuntimeMode::Enabled ), 0, 0 }
         };
     }
 

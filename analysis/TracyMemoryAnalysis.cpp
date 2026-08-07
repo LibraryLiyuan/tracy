@@ -199,7 +199,9 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
 GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZoneInput>& cpuZones,
     const std::vector<GpuMemoryGpuZoneInput>& gpuZones, const std::vector<GpuMemoryAllocationInput>& allocations,
     const std::unordered_set<uint64_t>& submittedCommandLists,
-    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens )
+    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens,
+    const std::vector<GpuMemoryReferencePassInput>& structuredReferencePasses,
+    int64_t captureEndNs )
 {
     GpuMemoryAttribution result;
     std::unordered_map<uint64_t, GpuMemoryLogicalResource> logicalMetadata;
@@ -348,6 +350,62 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         if( header ) result.passes.emplace_back( std::move( pass ) );
     }
 
+    if( !structuredReferencePasses.empty() )
+    {
+        result.protocolPresent = true;
+        result.structuredReferencePresent = true;
+        uint64_t earliestStructuredFrame = std::numeric_limits<uint64_t>::max();
+        uint64_t latestStructuredFrame = 0;
+        for( const auto& input : structuredReferencePasses )
+        {
+            earliestStructuredFrame = std::min( earliestStructuredFrame, input.frame );
+            latestStructuredFrame = std::max( latestStructuredFrame, input.frame );
+        }
+        for( const auto& input : structuredReferencePasses )
+        {
+            if( input.passId == 0 ) continue;
+            // The client may fail-open close marker scopes while a bounded
+            // capture is attaching or detaching.  Such scopes have a real End
+            // event with Truncated set, but no producer drop or validation
+            // mismatch.  Keep the boundary window deliberately narrow: the
+            // first/last two structured frames only.  An identical event in
+            // the interior remains an integrity failure.
+            const bool nearHead = input.frame <= earliestStructuredFrame + 1;
+            const bool nearTail = latestStructuredFrame <= input.frame + 1;
+            const bool explicitlyTruncated = ( input.flags & 0x1 ) != 0;
+            const bool hasFailureFlag = ( input.flags & 0xA ) != 0;
+            const bool forcedBoundaryClose = input.ended && explicitlyTruncated &&
+                !hasFailureFlag && input.droppedUses == 0 && ( nearHead || nearTail );
+            const bool captureBoundary = ( !input.ended && captureEndNs >= input.start &&
+                input.frame == latestStructuredFrame ) || forcedBoundaryClose;
+            GpuMemoryPass pass;
+            pass.passId = input.passId;
+            pass.parentPassId = input.parentPassId;
+            pass.labelId = input.taxonomyId;
+            pass.frame = input.frame;
+            pass.ordinal = input.passId;
+            pass.commandListId = input.commandListId;
+            pass.thread = input.thread;
+            pass.start = input.start;
+            pass.end = captureBoundary ? captureEndNs : input.end;
+            pass.level = input.taxonomyLevel;
+            pass.commandCount = 1;
+            pass.emittedUseCount = uint32_t( input.uses.size() );
+            pass.totalUseCount = input.totalUseCount;
+            pass.droppedUses = input.droppedUses;
+            pass.truncated = ( input.flags & 0x3 ) != 0;
+            pass.complete = input.ended && !pass.truncated && pass.droppedUses == 0;
+            if( captureBoundary ) pass.gpuPairing = GpuZonePairing::CaptureBoundary;
+            pass.structuredBinary = true;
+            pass.flags = input.flags;
+            pass.name = "Taxonomy " + std::to_string( input.taxonomyId );
+            pass.operations = "resource";
+            pass.uses = input.uses;
+            result.complete &= pass.complete || captureBoundary;
+            result.passes.emplace_back( std::move( pass ) );
+        }
+    }
+
     result.logicalResources.reserve( logicalMetadata.size() );
     for( auto& [logicalId, resource] : logicalMetadata ) result.logicalResources.emplace_back( std::move( resource ) );
     std::sort( result.logicalResources.begin(), result.logicalResources.end(), []( const auto& lhs, const auto& rhs ) {
@@ -393,8 +451,13 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     {
         auto& pass = result.passes[passIndex];
         result.passById[pass.passId] = passIndex;
-        for( const auto& use : pass.uses )
+        for( auto& use : pass.uses )
         {
+            const auto logical = result.logicalById.find( use.allocationId );
+            if( logical != result.logicalById.end() )
+                use.kind = result.logicalResources[logical->second].kind;
+            else
+                pass.untrackedReferences++;
             const auto allocation = result.allocationById.find( use.allocationId );
             if( allocation != result.allocationById.end() ) result.allocations[allocation->second].passIndices.emplace_back( passIndex );
         }
@@ -548,6 +611,9 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     using WorkingSetKey = std::pair<uint64_t, uint32_t>;
     std::map<WorkingSetKey, std::set<uint64_t>> workingPhysicalIds;
     std::map<WorkingSetKey, std::set<uint64_t>> workingLogicalIds;
+    std::map<WorkingSetKey, std::set<uint64_t>> inclusivePhysicalIds;
+    std::map<WorkingSetKey, std::set<uint64_t>> inclusiveLogicalIds;
+    std::map<WorkingSetKey, bool> structuredWorkingSet;
     for( const auto& pass : result.passes )
     {
         const WorkingSetKey key { pass.frame, uint32_t( pass.labelId ) };
@@ -558,14 +624,36 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
             const auto& resource = result.logicalResources[logical->second];
             workingLogicalIds[key].insert( resource.logicalResourceId );
             workingPhysicalIds[key].insert( resource.physicalAllocationId );
+
+            const GpuMemoryPass* ancestor = &pass;
+            std::set<uint64_t> visited;
+            while( ancestor != nullptr && visited.insert( ancestor->passId ).second )
+            {
+                const WorkingSetKey ancestorKey { ancestor->frame, uint32_t( ancestor->labelId ) };
+                inclusiveLogicalIds[ancestorKey].insert( resource.logicalResourceId );
+                inclusivePhysicalIds[ancestorKey].insert( resource.physicalAllocationId );
+                structuredWorkingSet[ancestorKey] = structuredWorkingSet[ancestorKey] || ancestor->structuredBinary;
+                if( ancestor->parentPassId == 0 ) break;
+                const auto parent = result.passById.find( ancestor->parentPassId );
+                ancestor = parent == result.passById.end() ? nullptr : &result.passes[parent->second];
+            }
         }
     }
-    for( const auto& [key, physicalIds] : workingPhysicalIds )
+    std::set<WorkingSetKey> workingKeys;
+    for( const auto& [key, values] : workingPhysicalIds ) workingKeys.insert( key );
+    for( const auto& [key, values] : inclusivePhysicalIds ) workingKeys.insert( key );
+    for( const auto& key : workingKeys )
     {
         GpuMemoryWorkingSet workingSet; workingSet.frame = key.first; workingSet.taxonomyId = key.second;
+        const auto& physicalIds = workingPhysicalIds[key];
         workingSet.physicalAllocationCount = physicalIds.size();
         for( const auto id : physicalIds ) workingSet.referencedPhysicalBytes += physicalSizes[id];
         workingSet.logicalResourceCount = workingLogicalIds[key].size();
+        const auto& inclusiveIds = inclusivePhysicalIds[key];
+        workingSet.inclusivePhysicalAllocationCount = inclusiveIds.size();
+        for( const auto id : inclusiveIds ) workingSet.inclusiveReferencedPhysicalBytes += physicalSizes[id];
+        workingSet.inclusiveLogicalResourceCount = inclusiveLogicalIds[key].size();
+        workingSet.provenance = structuredWorkingSet[key] ? "derived-exact-rollup" : "legacy-direct";
         result.workingSets.emplace_back( workingSet );
     }
 
@@ -577,8 +665,16 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         gpuByName[zone.name].emplace_back( &zone );
     }
     for( auto& [name, values] : gpuByName ) std::sort( values.begin(), values.end(), []( const auto* lhs, const auto* rhs ) { return lhs->cpuStartNs < rhs->cpuStartNs; } );
+    std::set<uint64_t> logicalParentPassIds;
+    for( const auto& pass : result.passes )
+        if( pass.parentPassId != 0 ) logicalParentPassIds.insert( pass.parentPassId );
     for( auto& pass : result.passes )
     {
+        if( pass.gpuPairing == GpuZonePairing::CaptureBoundary )
+        {
+            result.captureBoundaryPasses++;
+            continue;
+        }
         const auto authoritative = gpuByReference.find( pass.passId );
         if( authoritative != gpuByReference.end() )
         {
@@ -586,6 +682,7 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
             {
                 const auto* match = authoritative->second.front();
                 pass.gpuPairing = GpuZonePairing::Exact; pass.gpuZoneIndex = match->zoneIndex; pass.gpuThread = match->thread;
+                if( pass.structuredBinary ) pass.name = match->name;
                 continue;
             }
             pass.gpuPairing = GpuZonePairing::Ambiguous; result.complete = false;
@@ -642,6 +739,17 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         }
     }
 
+    // A structured parent with no direct resource use is a logical taxonomy
+    // rollup.  It deliberately has no GPU timestamp of its own; its inclusive
+    // working set is derived from exact child relations.  Do not invent a GPU
+    // zone and do not report the absence as data loss.
+    for( auto& pass : result.passes )
+    {
+        if( pass.gpuPairing == GpuZonePairing::Missing && pass.structuredBinary && pass.uses.empty() &&
+            logicalParentPassIds.find( pass.passId ) != logicalParentPassIds.end() )
+            pass.gpuPairing = GpuZonePairing::DerivedLogicalRollup;
+    }
+
     if( result.protocolPresent && result.passes.empty() ) result.warnings.emplace_back( "GTMEM1 markers are present but no valid PASS record was parsed" );
     const auto missing = std::count_if( result.passes.begin(), result.passes.end(), []( const auto& pass ) { return pass.gpuPairing == GpuZonePairing::Missing; } );
     const auto ambiguous = std::count_if( result.passes.begin(), result.passes.end(), []( const auto& pass ) { return pass.gpuPairing == GpuZonePairing::Ambiguous; } );
@@ -676,6 +784,7 @@ const char* ToString( GpuZonePairing pairing )
     case GpuZonePairing::CaptureBoundary: return "capture_boundary";
     case GpuZonePairing::SubmissionUnobserved: return "submission_unobserved";
     case GpuZonePairing::GpuResultUnavailable: return "gpu_result_unavailable";
+    case GpuZonePairing::DerivedLogicalRollup: return "derived_logical_rollup";
     }
     return "missing";
 }

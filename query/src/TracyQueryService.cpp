@@ -32,6 +32,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
         "capture.context", "capture.coverage", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
+        "relation.search", "relation.get", "runtime.domain.states",
         "gpu.taxonomy.tree", "gpu.taxonomy.coverage", "gpu.pass.search", "gpu.pass.get",
         "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration",
         "cpu.topology", "cpu.usage", "cpu.timeline", "context_switch.range", "context_switch.thread", "context_switch.statistics",
@@ -96,6 +97,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 std::string MethodDomain( const std::string& method )
 {
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" ) return "evidence";
+    if( method.rfind( "runtime.domain.", 0 ) == 0 ) return "runtime.domain";
     if( method.rfind( "runtime.script.", 0 ) == 0 ) return "runtime.script";
     if( method.rfind( "memory.gc.", 0 ) == 0 ) return "memory.gc";
     if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
@@ -175,6 +177,17 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["pass_source_id"] = ParameterSchemaFor( "pass_source_id" );
                 properties["taxonomy_id"] = ParameterSchemaFor( "taxonomy_id" );
                 properties["name"] = ParameterSchemaFor( "name" );
+            }
+            else if( method == "relation.search" )
+            {
+                properties["namespace"] = ParameterSchemaFor( "namespace" );
+                properties["source_kind"] = ParameterSchemaFor( "source_kind" );
+                properties["target_kind"] = ParameterSchemaFor( "target_kind" );
+                properties["relation"] = ParameterSchemaFor( "relation" );
+            }
+            else if( method == "runtime.domain.states" )
+            {
+                properties["domain"] = ParameterSchemaFor( "domain" );
             }
             json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", true } };
             if( !alternatives.empty() ) inputSchema["oneOf"] = json::array( {
@@ -503,7 +516,11 @@ json CountsJson( const analysis::TraceCountsDto& value )
         { "job_dependencies", Decimal( value.jobDependencies ) }, { "job_stages", Decimal( value.jobStages ) },
         { "gfx_dispatches", Decimal( value.gfxDispatches ) }, { "gfx_entities", Decimal( value.gfxEntities ) },
         { "gfx_links", Decimal( value.gfxLinks ) }, { "correlated_frame_events", Decimal( value.correlatedFrameEvents ) },
-        { "io_requests", Decimal( value.ioRequests ) }, { "io_configs", Decimal( value.ioConfigs ) }, { "io_stages", Decimal( value.ioStages ) }
+        { "io_requests", Decimal( value.ioRequests ) }, { "io_configs", Decimal( value.ioConfigs ) }, { "io_stages", Decimal( value.ioStages ) },
+        { "relations", Decimal( value.relations ) }, { "runtime_domain_states", Decimal( value.runtimeDomainStates ) },
+        { "gpu_reference_passes", Decimal( value.gpuReferencePasses ) },
+        { "gpu_reference_uses", Decimal( value.gpuReferenceUses ) },
+        { "gpu_reference_ends", Decimal( value.gpuReferenceEnds ) }
     };
 }
 
@@ -792,6 +809,7 @@ json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemory
     }
     return {
         { "ref", source.MakeEntityRef( "gpu-memory-pass", pass.passId ) }, { "pass_id", Decimal( pass.passId ) },
+        { "parent_pass_id", pass.parentPassId == 0 ? json( nullptr ) : json( Decimal( pass.parentPassId ) ) },
         { "label_id", Decimal( pass.labelId ) }, { "taxonomy_id", Decimal( pass.labelId ) },
         { "frame", Decimal( pass.frame ) }, { "ordinal", Decimal( pass.ordinal ) }, { "thread_id", Decimal( pass.thread ) },
         { "command_list_id", Decimal( pass.commandListId ) },
@@ -800,7 +818,9 @@ json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemory
         { "emitted_use_count", pass.emittedUseCount }, { "total_use_count", pass.totalUseCount },
         { "expected_chunks", pass.expectedChunks }, { "parsed_chunks", pass.parsedChunks },
         { "untracked_references", pass.untrackedReferences }, { "dropped_uses", pass.droppedUses },
-        { "truncated", pass.truncated }, { "complete", pass.complete }, { "gpu_pairing", analysis::ToString( pass.gpuPairing ) },
+        { "truncated", pass.truncated }, { "complete", pass.complete },
+        { "provenance", pass.structuredBinary ? "exact-binary" : "legacy-zone-text" },
+        { "event_flags", pass.flags }, { "gpu_pairing", analysis::ToString( pass.gpuPairing ) },
         { "cpu_zone_ref", source.GetCpuZoneRef( pass.cpuZoneIndex ).value_or( "" ) },
         { "gpu_zone_ref", pass.gpuZoneIndex ? json( source.GetGpuZoneRef( *pass.gpuZoneIndex ).value_or( "" ) ) : json( nullptr ) },
         { "uses", std::move( uses ) }, { "uses_returned", includeUses ? useEnd - useOffset : 0 },
@@ -849,6 +869,76 @@ const char* GfxRelationName( uint8_t relation )
         "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera", "belongs_to_view", "references_resources", "classifies_as_taxonomy",
         "gpu_segment_references_resources" };
     return relation < std::size( names ) ? names[relation] : "unknown";
+}
+
+const char* RelationNamespaceName( uint8_t value )
+{
+    static constexpr const char* names[] = { "generic", "gfx", "job", "gpu_reference", "script", "io" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* EntityKindName( uint8_t value )
+{
+    static constexpr const char* names[] = {
+        "unknown", "frame", "cpu_zone", "job", "gfx_entity", "gpu_pass", "gpu_segment", "gpu_taxonomy",
+        "gpu_resource", "gpu_allocation", "io_request", "script_zone", "camera", "view", "command_list", "submission"
+    };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* RuntimeDomainName( uint8_t value )
+{
+    static constexpr const char* names[] = { "unknown", "gpu_reference", "script_stack", "job", "gpu_pass", "io" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* RuntimeModeName( uint8_t value )
+{
+    static constexpr const char* names[] = { "follow_profile", "disabled", "enabled", "validation_dual" };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* RuntimeStateReasonName( uint8_t value )
+{
+    static constexpr const char* names[] = {
+        "requested", "connection_snapshot", "profile_change", "performance_gate", "overflow", "unsupported", "disconnect", "shutdown"
+    };
+    return value < std::size( names ) ? names[value] : "unknown";
+}
+
+const char* RelationName( uint8_t relationNamespace, uint8_t relation )
+{
+    if( relationNamespace == uint8_t( JnRelationNamespace::Gfx ) ) return GfxRelationName( relation );
+    static constexpr const char* generic[] = { "related_to", "parent", "uses_resource", "executes_pass", "owned_by", "depends_on", "continues_as" };
+    return relation < std::size( generic ) ? generic[relation] : "unknown";
+}
+
+json RelationJson( const analysis::TraceSource& source, const analysis::RelationDto& value )
+{
+    return {
+        { "ref", value.ref }, { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef },
+        { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+        { "source_kind", EntityKindName( value.sourceKind ) }, { "source_kind_id", value.sourceKind },
+        { "target_kind", EntityKindName( value.targetKind ) }, { "target_kind_id", value.targetKind },
+        { "source_ref", source.MakeEntityRef( EntityKindName( value.sourceKind ), value.sourceId ) },
+        { "target_ref", source.MakeEntityRef( EntityKindName( value.targetKind ), value.targetId ) },
+        { "namespace", RelationNamespaceName( value.relationNamespace ) }, { "namespace_id", value.relationNamespace },
+        { "relation", RelationName( value.relationNamespace, value.relation ) }, { "relation_id", value.relation },
+        { "flags", value.flags }, { "provenance", "exact-binary" }, { "evidence_kind", "exact" }
+    };
+}
+
+json RuntimeDomainStateJson( const analysis::RuntimeDomainStateDto& value )
+{
+    return {
+        { "ref", value.ref }, { "time_ns", Decimal( value.timeNs ) }, { "thread_ref", value.threadRef },
+        { "generation", Decimal( value.generation ) }, { "requested_frame", Decimal( value.requestedFrame ) },
+        { "domain", RuntimeDomainName( value.domain ) }, { "domain_id", value.domain },
+        { "requested_mode", RuntimeModeName( value.requestedMode ) }, { "requested_mode_id", value.requestedMode },
+        { "effective_mode", RuntimeModeName( value.effectiveMode ) }, { "effective_mode_id", value.effectiveMode },
+        { "reason", RuntimeStateReasonName( value.reason ) }, { "reason_id", value.reason },
+        { "flags", value.flags }, { "provenance", "exact-binary" }
+    };
 }
 
 const char* CorrelatedFrameDomainName( uint8_t domain )
@@ -3822,6 +3912,117 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }, trace );
     }
 
+    if( method == "relation.search" || method == "relation.get" )
+    {
+        const auto capabilities = source->GetCapabilities();
+        const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "relation"; } );
+        const bool present = capability != capabilities.end() && capability->present;
+        const std::string reason = present ? "" : capability == capabilities.end() ?
+            "trace source does not advertise exact relations" : capability->reason;
+        auto relations = source->GetRelations();
+        const auto totalRelationCount = relations.size();
+        auto base = [&]() -> json {
+            return {
+                { "present", present }, { "relation_schema_version", present ? 1 : 0 },
+                { "complete", present && !BudgetPartial() }, { "reason", reason },
+                { "relation_count", Decimal( totalRelationCount ) }, { "provenance", "exact-binary" },
+                { "trust", "untrusted_trace_data" }
+            };
+        };
+        if( !present )
+        {
+            auto result = base();
+            if( method == "relation.search" ) result["relations"] = json::array();
+            else result["relation"] = nullptr;
+            return Success( id, std::move( result ), trace );
+        }
+
+        if( method == "relation.get" )
+        {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "relation" );
+            if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref is not a relation ref from this trace" );
+            if( *parsed >= relations.size() ) throw QueryError( "ENTITY_NOT_FOUND", "relation ref was not found" );
+            auto result = base();
+            result["relation"] = RelationJson( *source, relations[size_t( *parsed )] );
+            return Success( id, std::move( result ), trace );
+        }
+
+        const auto page = ParsePage( params, method, trace );
+        const std::string namespaceFilter = params.value( "namespace", "" );
+        const std::string sourceKindFilter = params.value( "source_kind", "" );
+        const std::string targetKindFilter = params.value( "target_kind", "" );
+        const std::string relationFilter = params.value( "relation", "" );
+        relations.erase( std::remove_if( relations.begin(), relations.end(), [&]( const auto& value ) {
+            const std::string searchable = std::string( RelationNamespaceName( value.relationNamespace ) ) + " " +
+                EntityKindName( value.sourceKind ) + " " + EntityKindName( value.targetKind ) + " " +
+                RelationName( value.relationNamespace, value.relation );
+            return !TextMatches( searchable, params ) ||
+                ( !namespaceFilter.empty() && namespaceFilter != RelationNamespaceName( value.relationNamespace ) ) ||
+                ( !sourceKindFilter.empty() && sourceKindFilter != EntityKindName( value.sourceKind ) ) ||
+                ( !targetKindFilter.empty() && targetKindFilter != EntityKindName( value.targetKind ) ) ||
+                ( !relationFilter.empty() && relationFilter != RelationName( value.relationNamespace, value.relation ) );
+        } ), relations.end() );
+        std::sort( relations.begin(), relations.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
+        } );
+        const auto begin = std::min( page.offset, relations.size() );
+        const auto end = std::min( begin + page.limit, relations.size() );
+        json values = json::array();
+        for( size_t index = begin; index < end; index++ ) values.emplace_back( RelationJson( *source, relations[index] ) );
+        values = ProjectFields( std::move( values ), params );
+        auto result = base();
+        result["matched_count"] = Decimal( relations.size() );
+        result["relations"] = std::move( values );
+        const auto cursor = NextCursor( page, method, trace, end - begin, end < relations.size() );
+        return Success( id, std::move( result ), trace, PageJson( page, end - begin, cursor, BudgetPartial() ) );
+    }
+
+    if( method == "runtime.domain.states" )
+    {
+        const auto capabilities = source->GetCapabilities();
+        const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "runtime.domain"; } );
+        const bool present = capability != capabilities.end() && capability->present;
+        const std::string reason = present ? "" : capability == capabilities.end() ?
+            "trace source does not advertise runtime-domain states" : capability->reason;
+        auto states = source->GetRuntimeDomainStates();
+        const auto totalStateCount = states.size();
+        json base = {
+            { "present", present }, { "runtime_domain_schema_version", present ? 1 : 0 },
+            { "complete", present && !BudgetPartial() }, { "reason", reason },
+            { "state_count", Decimal( totalStateCount ) }, { "provenance", "exact-binary" },
+            { "trust", "untrusted_trace_data" }
+        };
+        if( !present )
+        {
+            base["states"] = json::array();
+            base["latest"] = json::object();
+            return Success( id, std::move( base ), trace );
+        }
+
+        const std::string domainFilter = params.value( "domain", "" );
+        states.erase( std::remove_if( states.begin(), states.end(), [&]( const auto& value ) {
+            return ( !domainFilter.empty() && domainFilter != RuntimeDomainName( value.domain ) ) ||
+                !TextMatches( std::string( RuntimeDomainName( value.domain ) ) + " " + RuntimeModeName( value.effectiveMode ), params );
+        } ), states.end() );
+        std::sort( states.begin(), states.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.generation < rhs.generation;
+        } );
+        json latest = json::object();
+        for( const auto& value : states ) latest[RuntimeDomainName( value.domain )] = RuntimeDomainStateJson( value );
+        const auto page = ParsePage( params, method, trace );
+        const auto begin = std::min( page.offset, states.size() );
+        const auto end = std::min( begin + page.limit, states.size() );
+        json values = json::array();
+        for( size_t index = begin; index < end; index++ ) values.emplace_back( RuntimeDomainStateJson( states[index] ) );
+        values = ProjectFields( std::move( values ), params );
+        base["matched_count"] = Decimal( states.size() );
+        base["states"] = std::move( values );
+        base["latest"] = std::move( latest );
+        const auto cursor = NextCursor( page, method, trace, end - begin, end < states.size() );
+        return Success( id, std::move( base ), trace, PageJson( page, end - begin, cursor, BudgetPartial() ) );
+    }
+
     if( method.rfind( "runtime.script.", 0 ) == 0 || method.rfind( "memory.gc.", 0 ) == 0 )
     {
         const auto metadata = info();
@@ -5534,7 +5735,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             };
             const auto& churn = attribution.churn;
             const auto& residency = attribution.residency;
-            return Success( id, { { "present", true }, { "protocol", "GTMEM2" },
+            return Success( id, { { "present", true }, { "protocol", attribution.structuredReferencePresent ? "JN_GPU_REFERENCE_2" : "GTMEM2" },
                 { "dxgi_reconciliation", { { "local", segment( "Local", "GPU.VRAM.EngineKnownPhysical.LocalBytes" ) },
                     { "non_local", segment( "NonLocal", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes" ) },
                     { "semantics", "Implicit/Untracked is max(DXGI Usage - EngineKnownPhysical, 0) and is not proof of a leak" } } },
@@ -5699,7 +5900,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "frame", Decimal( workingSet.frame ) }, { "taxonomy_id", Decimal( uint64_t( workingSet.taxonomyId ) ) },
                     { "referenced_working_set_bytes", Decimal( workingSet.referencedPhysicalBytes ) },
                     { "physical_allocation_count", Decimal( workingSet.physicalAllocationCount ) },
-                    { "logical_resource_count", Decimal( workingSet.logicalResourceCount ) }
+                    { "logical_resource_count", Decimal( workingSet.logicalResourceCount ) },
+                    { "inclusive_referenced_working_set_bytes", Decimal( workingSet.inclusiveReferencedPhysicalBytes ) },
+                    { "inclusive_physical_allocation_count", Decimal( workingSet.inclusivePhysicalAllocationCount ) },
+                    { "inclusive_logical_resource_count", Decimal( workingSet.inclusiveLogicalResourceCount ) },
+                    { "provenance", workingSet.provenance }
                 } );
             }
             data["logical_resource_count"] = Decimal( attribution.logicalResources.size() );
@@ -7120,9 +7325,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
         const std::string kind = params.value( "kind", "" );
+        std::optional<uint32_t> callstack;
+        if( params.contains( "callstack" ) ) callstack = parseCallstack( params["callstack"] );
         auto scanPage = ScanFiltered<analysis::SampleDto>( *source, params, page,
             []( const auto& item, const auto& range ) { return item.ScanSampleEvents( range ); },
-            [&]( const auto& sample ) { return ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind.empty() || sample.kind == kind ); }, SampleJson );
+            [&]( const auto& sample ) {
+                return ( threadRef.empty() || sample.threadRef == threadRef ) &&
+                    ( kind.empty() || sample.kind == kind ) && ( !callstack || sample.callstack == *callstack );
+            }, SampleJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "samples", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
@@ -8407,7 +8617,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 for( const auto& pass : attribution.passes )
                 {
                     const auto ref = source->MakeEntityRef( "gpu-memory-pass", pass.passId );
-                    if( !pass.complete ) { incompletePasses++; addRef( incompleteRefs, ref ); }
+                    if( !pass.complete && pass.gpuPairing != analysis::GpuZonePairing::CaptureBoundary )
+                    {
+                        incompletePasses++;
+                        addRef( incompleteRefs, ref );
+                    }
                     if( pass.gpuPairing == analysis::GpuZonePairing::Missing ) { missingGpu++; addRef( missingRefs, ref ); }
                     if( pass.gpuPairing == analysis::GpuZonePairing::Ambiguous ) { ambiguousGpu++; addRef( ambiguousRefs, ref ); }
                     for( const auto& use : pass.uses ) if( attribution.allocationById.find( use.allocationId ) == attribution.allocationById.end() ) unknownUses++;

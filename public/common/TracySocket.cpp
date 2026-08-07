@@ -530,7 +530,10 @@ Socket* ListenSocket::Accept()
     fd.fd = (socket_t)m_sock;
     fd.events = POLLIN;
 
-    if( poll( &fd, 1, 10 ) > 0 )
+#ifndef TRACY_LISTEN_POLL_TIMEOUT_MS
+#  define TRACY_LISTEN_POLL_TIMEOUT_MS 10
+#endif
+    if( poll( &fd, 1, TRACY_LISTEN_POLL_TIMEOUT_MS ) > 0 )
     {
         int sock = accept( m_sock, (sockaddr*)&remote, &sz);
         if( sock == -1 ) return nullptr;

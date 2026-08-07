@@ -95,7 +95,7 @@ function Read-FrameCorrelation([string]$Path, [string]$Label)
 
     $capabilities = Inspect $traceId 'system.capabilities'
     $frames = Inspect $traceId 'frame.identity' @{ limit = 1000 }
-    Assert-Condition ([string]$frames.schema_version -eq '1.14.0') "$Label query schema is not 1.14.0"
+    Assert-Condition ([string]$frames.schema_version -eq '1.15.0') "$Label query schema is not 1.15.0"
     Assert-Condition ([bool]$frames.data.present) "$Label FrameIdentity is absent"
     Assert-Condition (@($frames.data.identities).Count -gt 0) "$Label has no FrameIdentity"
 
@@ -217,7 +217,7 @@ try
 
     $result = [ordered]@{
         status = 'passed'
-        query_schema = '1.14.0'
+        query_schema = '1.15.0'
         snapshot_identity_count = $snapshot.IdentityCount
         nested_editor_player_identity_count = $snapshot.NestedIdentityCount
         capture_edge_incomplete_identity_count = $snapshot.IncompleteIdentityCount

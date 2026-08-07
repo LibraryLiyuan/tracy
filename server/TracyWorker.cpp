@@ -1807,6 +1807,17 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             ReadJnVector( f, jn.ioConfigs, "I/O config" );
             ReadJnVector( f, jn.ioStages, "I/O stage" );
         }
+        if( schemaVersion >= 4 )
+        {
+            ReadJnVector( f, jn.relations, "relation" );
+            ReadJnVector( f, jn.runtimeDomainStates, "runtime domain state" );
+        }
+        if( schemaVersion >= 5 )
+        {
+            ReadJnVector( f, jn.gpuReferencePasses, "GPU reference pass" );
+            ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use" );
+            ReadJnVector( f, jn.gpuReferenceEnds, "GPU reference end" );
+        }
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -4490,6 +4501,11 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnFrame:
     case QueueType::JnIoRequest:
     case QueueType::JnIoConfig:
+    case QueueType::JnRelation:
+    case QueueType::JnRuntimeDomainState:
+    case QueueType::JnGpuReferencePass:
+    case QueueType::JnGpuReferenceUse:
+    case QueueType::JnGpuReferenceEnd:
         RecorderCheckCurrentThread();
         break;
     case QueueType::JnJobStage:
@@ -5985,6 +6001,21 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::JnIoStage:
         ProcessJnIoStage( ev.jnIoStage );
         break;
+    case QueueType::JnRelation:
+        ProcessJnRelation( ev.jnRelation );
+        break;
+    case QueueType::JnRuntimeDomainState:
+        ProcessJnRuntimeDomainState( ev.jnRuntimeDomainState );
+        break;
+    case QueueType::JnGpuReferencePass:
+        ProcessJnGpuReferencePass( ev.jnGpuReferencePass );
+        break;
+    case QueueType::JnGpuReferenceUse:
+        ProcessJnGpuReferenceUse( ev.jnGpuReferenceUse );
+        break;
+    case QueueType::JnGpuReferenceEnd:
+        ProcessJnGpuReferenceEnd( ev.jnGpuReferenceEnd );
+        break;
     default:
         assert( false );
         break;
@@ -6132,6 +6163,61 @@ void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
         m_serialNextCallstack = 0;
     }
     data.ioStages.push_back( JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnRelation( const QueueJnRelation& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.relations.push_back( JnRelationData { time, ev.sourceId, ev.targetId, m_threadCtx,
+        ev.sourceKind, ev.targetKind, ev.relationNamespace, ev.relation, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnRuntimeDomainState( const QueueJnRuntimeDomainState& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.runtimeDomainStates.push_back( JnRuntimeDomainStateData { time, ev.generation, ev.requestedFrame,
+        m_threadCtx, ev.domain, ev.requestedMode, ev.effectiveMode, ev.reason, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gpuReferencePasses.push_back( JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
+        m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gpuReferenceUses.push_back( JnGpuReferenceUseData { time, ev.passId, ev.resourceId,
+        m_threadCtx, ev.usageMask, ev.flags } );
+    if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev )
+{
+    const auto time = TscTime( ev.time );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gpuReferenceEnds.push_back( JnGpuReferenceEndData { time, ev.passId, ev.commandListId,
+        m_threadCtx, ev.totalReferenceCount, ev.droppedReferenceCount, ev.flags } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -9912,6 +9998,11 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.ioRequests );
     WriteJnVector( f, m_data.jnTrace.ioConfigs );
     WriteJnVector( f, m_data.jnTrace.ioStages );
+    WriteJnVector( f, m_data.jnTrace.relations );
+    WriteJnVector( f, m_data.jnTrace.runtimeDomainStates );
+    WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
+    WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
+    WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

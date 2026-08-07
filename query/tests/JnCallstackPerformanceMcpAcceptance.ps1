@@ -244,7 +244,7 @@ try
     $detailSeconds = [double]$detailMetrics.trace_span_ns / 1e9
     $result = [ordered]@{
         status = 'passed'
-        query_schema = '1.14.0'
+        query_schema = '1.15.0'
         profile_gate = 'Detail is a bounded diagnostic profile; no production P95 threshold is claimed'
         off = $offMetrics
         detail = $detailMetrics

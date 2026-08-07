@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.14.0",
+  "schema_version": "1.16.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
@@ -15,6 +15,8 @@
     { "domain": "capture", "worker_data": ["JNCTX1 context generations", "JNQ1 producer snapshots"], "methods": ["capture.context", "capture.coverage"], "status": "complete", "tests": ["FakeTraceSource generation/quality contract", "snapshot/stream/replay MCP acceptance"] },
     { "domain": "producer", "worker_data": ["JNQ1 producer configuration and TLS counter snapshots"], "methods": ["producer.list", "producer.get"], "status": "complete", "tests": ["disabled/unsupported/filtered/dropped/real-zero contract", "MCP generic inspect route"] },
     { "domain": "catalog", "worker_data": ["JNCAT1 stable definitions", "JNENT1 capture-local entities"], "methods": ["catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality"], "status": "complete", "tests": ["stable DefinitionKey contract", "generation-bearing EntityId contract", "privacy and unresolved validation", "old trace present=false"] },
+    { "domain": "relation", "worker_data": ["JnTraceData schema 4 exact binary relations"], "methods": ["relation.search", "relation.get"], "status": "complete", "tests": ["deterministic FakeTraceSource relation contract", "old trace present=false", "Protocol 80 snapshot/stream/replay acceptance"] },
+    { "domain": "runtime.domain", "worker_data": ["JnTraceData schema 4 runtime-domain states"], "methods": ["runtime.domain.states"], "status": "complete", "tests": ["deterministic mode-generation contract", "old trace present=false", "Protocol 80 snapshot/stream/replay acceptance"] },
     { "domain": "thread", "worker_data": ["threads", "threadNames", "externalNames", "tidToPid", "fiber"], "methods": ["thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "cpu", "worker_data": ["cpuTopology", "cpuData", "ctxUsage"], "methods": ["cpu.topology", "cpu.usage", "cpu.timeline"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },
     { "domain": "context_switch", "worker_data": ["ctxSwitch", "cpuData", "cpuThreadData"], "methods": ["context_switch.range", "context_switch.thread", "context_switch.statistics"], "status": "complete", "tests": ["FakeTraceSource", "Worker validation"] },

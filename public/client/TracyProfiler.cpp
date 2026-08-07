@@ -1925,6 +1925,9 @@ void Profiler::Worker()
     // happen in the on-demand mode or when handshake fails.
     for(;;)
     {
+#ifdef _WIN32
+        SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_IDLE );
+#endif
         // Wait for incoming connection
         for(;;)
         {
@@ -1971,6 +1974,9 @@ void Profiler::Worker()
             }
         }
 
+#ifdef _WIN32
+        SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_NORMAL );
+#endif
         if( m_broadcast )
         {
             lastBroadcast = 0;
@@ -2305,11 +2311,19 @@ void Profiler::Worker()
     }
 }
 
+#ifndef TRACY_UNCONNECTED_WORKER_POLL_TIMEOUT_MS
+#  define TRACY_UNCONNECTED_WORKER_POLL_TIMEOUT_MS 20
+#endif
+
 #ifndef TRACY_NO_FRAME_IMAGE
 void Profiler::CompressWorker()
 {
     ThreadExitHandler threadExitHandler;
     SetThreadName( "Tracy DXT1" );
+#ifdef _WIN32
+    bool connectedPriority = false;
+    SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_IDLE );
+#endif
     while( m_timeBegin.load( std::memory_order_relaxed ) == 0 ) std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
 
 #ifdef TRACY_USE_RPMALLOC
@@ -2319,6 +2333,14 @@ void Profiler::CompressWorker()
     for(;;)
     {
         const auto shouldExit = ShouldExit();
+#ifdef _WIN32
+        const bool connectedPriorityNow = IsConnected();
+        if( connectedPriorityNow != connectedPriority )
+        {
+            connectedPriority = connectedPriorityNow;
+            SetThreadPriority( GetCurrentThread(), connectedPriority ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_IDLE );
+        }
+#endif
 
         {
             bool lockHeld = true;
@@ -2366,7 +2388,12 @@ void Profiler::CompressWorker()
         }
         else
         {
+#ifdef TRACY_ON_DEMAND
+            const auto waitMilliseconds = IsConnected() ? 20 : TRACY_UNCONNECTED_WORKER_POLL_TIMEOUT_MS;
+            std::this_thread::sleep_for( std::chrono::milliseconds( waitMilliseconds ) );
+#else
             std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
+#endif
         }
 
         if( shouldExit )
@@ -3676,6 +3703,10 @@ void Profiler::SymbolWorker()
 
     ThreadExitHandler threadExitHandler;
     SetThreadName( "Tracy Symbol Worker" );
+#ifdef _WIN32
+    bool connectedPriority = false;
+    SetThreadPriority( GetCurrentThread(), THREAD_PRIORITY_IDLE );
+#endif
 #ifdef TRACY_USE_RPMALLOC
     InitRpmalloc();
 #endif
@@ -3685,6 +3716,14 @@ void Profiler::SymbolWorker()
     for(;;)
     {
         const auto shouldExit = ShouldExit();
+#ifdef _WIN32
+        const bool connectedPriorityNow = IsConnected();
+        if( connectedPriorityNow != connectedPriority )
+        {
+            connectedPriority = connectedPriorityNow;
+            SetThreadPriority( GetCurrentThread(), connectedPriority ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_IDLE );
+        }
+#endif
 #ifdef TRACY_ON_DEMAND
         if( !IsConnected() )
         {
@@ -3708,7 +3747,7 @@ void Profiler::SymbolWorker()
                 continue;
             }
             while( m_symbolQueue.front() ) m_symbolQueue.pop();
-            std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
+            std::this_thread::sleep_for( std::chrono::milliseconds( TRACY_UNCONNECTED_WORKER_POLL_TIMEOUT_MS ) );
             m_symbolsBusy.store( false, std::memory_order_release );
             continue;
         }

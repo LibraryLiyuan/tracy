@@ -246,7 +246,7 @@ try
         $comparison[$field + '_percent'] = [Math]::Round((([double]$onSummary[$field] / $baseline) - 1.0) * 100.0, 3)
     }
     $result = [ordered]@{
-        schema_version = '1.14.0'
+        schema_version = '1.15.0'
         result = 'PASS'
         sample_count_per_group = 3
         workload = [ordered]@{ scene = 'taijibase_constructedarmor_main_01'; graphics_api = 'd3d12'; graphics_jobs = 'off'; capture_profile = 'PassAndPhase'; capture_seconds = 10 }

@@ -906,6 +906,11 @@ private:
     tracy_force_inline void ProcessJnIoRequest( const QueueJnIoRequest& ev );
     tracy_force_inline void ProcessJnIoConfig( const QueueJnIoConfig& ev );
     tracy_force_inline void ProcessJnIoStage( const QueueJnIoStage& ev );
+    tracy_force_inline void ProcessJnRelation( const QueueJnRelation& ev );
+    tracy_force_inline void ProcessJnRuntimeDomainState( const QueueJnRuntimeDomainState& ev );
+    tracy_force_inline void ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev );
+    tracy_force_inline void ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev );
+    tracy_force_inline void ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );

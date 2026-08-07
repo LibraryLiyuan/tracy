@@ -1046,7 +1046,52 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
                 event.CsAlloc(), event.csFree.Val(), name } );
         }
     }
-    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations, submittedCommandLists, gpuSegmentReferenceTokens );
+
+    std::vector<GpuMemoryReferencePassInput> structuredReferencePasses;
+    std::unordered_map<uint64_t, size_t> structuredReferenceById;
+    structuredReferencePasses.reserve( jn.gpuReferencePasses.size() );
+    structuredReferenceById.reserve( jn.gpuReferencePasses.size() );
+    for( const auto& value : jn.gpuReferencePasses )
+    {
+        if( value.passId == 0 || structuredReferenceById.find( value.passId ) != structuredReferenceById.end() ) continue;
+        GpuMemoryReferencePassInput input;
+        input.passId = value.passId;
+        input.frame = value.frameIndex;
+        input.thread = value.thread;
+        input.start = value.time;
+        input.end = value.time;
+        input.taxonomyId = value.taxonomyId;
+        input.taxonomyLevel = value.taxonomyLevel;
+        input.flags = value.flags;
+        structuredReferenceById.emplace( value.passId, structuredReferencePasses.size() );
+        structuredReferencePasses.emplace_back( std::move( input ) );
+    }
+    for( const auto& value : jn.gpuReferenceUses )
+    {
+        const auto pass = structuredReferenceById.find( value.passId );
+        if( pass == structuredReferenceById.end() || value.resourceId == 0 ) continue;
+        structuredReferencePasses[pass->second].uses.push_back( { value.resourceId, value.usageMask, 'U' } );
+    }
+    for( const auto& value : jn.gpuReferenceEnds )
+    {
+        const auto pass = structuredReferenceById.find( value.passId );
+        if( pass == structuredReferenceById.end() ) continue;
+        auto& input = structuredReferencePasses[pass->second];
+        input.end = value.time;
+        input.commandListId = value.commandListId;
+        input.totalUseCount = value.totalReferenceCount;
+        input.droppedUses = value.droppedReferenceCount;
+        input.flags |= value.flags;
+        input.ended = true;
+    }
+    for( const auto& value : jn.relations )
+    {
+        if( value.relationNamespace != uint8_t( JnRelationNamespace::GpuReference ) || value.relation != 1 ) continue;
+        const auto child = structuredReferenceById.find( value.sourceId );
+        if( child != structuredReferenceById.end() ) structuredReferencePasses[child->second].parentPassId = value.targetId;
+    }
+    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations, submittedCommandLists,
+        gpuSegmentReferenceTokens, structuredReferencePasses, m_impl->worker->GetLastTime() );
 }
 
 SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
@@ -1131,6 +1176,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
     const auto& jnTrace = m_impl->worker->GetJnTraceData();
     const bool hasIo = jnTrace.schemaVersion >= 3 && ( !jnTrace.ioRequests.empty() || !jnTrace.ioStages.empty() );
+    const bool hasRelationSchema = jnTrace.schemaVersion >= 4;
     auto capability = []( std::string domain, bool present, bool indexed, std::vector<std::string> methods, std::string reason = {} ) {
         if( reason.empty() ) reason = present ? "available in the persisted snapshot" : "data is absent from the persisted snapshot";
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
@@ -1155,6 +1201,10 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             hasCapture ? "" : "trace predates or did not emit JN Capture Context or Producer Quality" ),
         capability( "catalog", hasCatalog, true, { "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality" },
             hasCatalog ? "" : "trace predates or did not emit JN Catalog schema" ),
+        capability( "relation", hasRelationSchema, true, { "relation.search", "relation.get" },
+            hasRelationSchema ? "JN exact relation schema is present in the persisted snapshot" : "trace predates JN trace section schema 4" ),
+        capability( "runtime.domain", hasRelationSchema, true, { "runtime.domain.states" },
+            hasRelationSchema ? "JN runtime-domain state schema is present in the persisted snapshot" : "trace predates JN trace section schema 4" ),
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
@@ -1319,6 +1369,11 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.ioRequests = jn.ioRequests.size();
     counts.ioConfigs = jn.ioConfigs.size();
     counts.ioStages = jn.ioStages.size();
+    counts.relations = jn.relations.size();
+    counts.runtimeDomainStates = jn.runtimeDomainStates.size();
+    counts.gpuReferencePasses = jn.gpuReferencePasses.size();
+    counts.gpuReferenceUses = jn.gpuReferenceUses.size();
+    counts.gpuReferenceEnds = jn.gpuReferenceEnds.size();
     for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
     return result;
 }
@@ -2053,6 +2108,38 @@ std::vector<CorrelatedFrameEventDto> WorkerTraceSource::GetCorrelatedFrameEvents
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "frame-identity-event", index ), value.frameId, value.domainIndex,
             value.time, m_impl->MakeRef( "thread", value.thread ), value.domain, value.phase, value.flags } );
+    }
+    return result;
+}
+
+std::vector<RelationDto> WorkerTraceSource::GetRelations() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().relations;
+    std::vector<RelationDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "relation", index ), value.sourceId, value.targetId, value.time,
+            m_impl->MakeRef( "thread", value.thread ), value.sourceKind, value.targetKind,
+            value.relationNamespace, value.relation, value.flags } );
+    }
+    return result;
+}
+
+std::vector<RuntimeDomainStateDto> WorkerTraceSource::GetRuntimeDomainStates() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().runtimeDomainStates;
+    std::vector<RuntimeDomainStateDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "runtime-domain-state", index ), value.generation, value.requestedFrame,
+            value.time, m_impl->MakeRef( "thread", value.thread ), value.domain, value.requestedMode,
+            value.effectiveMode, value.reason, value.flags } );
     }
     return result;
 }

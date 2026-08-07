@@ -206,6 +206,24 @@ struct GpuMemoryPassUse
     char kind = 'U';
 };
 
+struct GpuMemoryReferencePassInput
+{
+    uint64_t passId = 0;
+    uint64_t parentPassId = 0;
+    uint64_t frame = 0;
+    uint64_t commandListId = 0;
+    uint64_t thread = 0;
+    int64_t start = 0;
+    int64_t end = 0;
+    uint32_t taxonomyId = 0;
+    uint32_t totalUseCount = 0;
+    uint32_t droppedUses = 0;
+    uint8_t taxonomyLevel = 0;
+    uint8_t flags = 0;
+    bool ended = false;
+    std::vector<GpuMemoryPassUse> uses;
+};
+
 enum class GpuZonePairing : uint8_t
 {
     Missing,
@@ -213,7 +231,8 @@ enum class GpuZonePairing : uint8_t
     Ambiguous,
     CaptureBoundary,
     SubmissionUnobserved,
-    GpuResultUnavailable
+    GpuResultUnavailable,
+    DerivedLogicalRollup
 };
 
 struct GpuMemoryPass
@@ -223,6 +242,7 @@ struct GpuMemoryPass
     uint64_t frame = 0;
     uint64_t ordinal = 0;
     uint64_t commandListId = 0;
+    uint64_t parentPassId = 0;
     uint64_t thread = 0;
     uint64_t gpuThread = 0;
     int64_t start = 0;
@@ -237,6 +257,8 @@ struct GpuMemoryPass
     uint32_t droppedUses = 0;
     bool truncated = false;
     bool complete = false;
+    bool structuredBinary = false;
+    uint8_t flags = 0;
     std::string name;
     std::string operations;
     std::vector<GpuMemoryPassUse> uses;
@@ -281,12 +303,17 @@ struct GpuMemoryWorkingSet
     uint64_t referencedPhysicalBytes = 0;
     uint64_t physicalAllocationCount = 0;
     uint64_t logicalResourceCount = 0;
+    uint64_t inclusiveReferencedPhysicalBytes = 0;
+    uint64_t inclusivePhysicalAllocationCount = 0;
+    uint64_t inclusiveLogicalResourceCount = 0;
+    std::string provenance;
 };
 
 struct GpuMemoryAttribution
 {
     bool protocolPresent = false;
     bool protocol2Present = false;
+    bool structuredReferencePresent = false;
     bool complete = true;
     uint64_t captureBoundaryPasses = 0;
     uint64_t submissionUnobservedPasses = 0;
@@ -315,7 +342,9 @@ GpuMemoryAttribution BuildGpuMemoryAttribution(
     const std::vector<GpuMemoryGpuZoneInput>& gpuZones,
     const std::vector<GpuMemoryAllocationInput>& allocations,
     const std::unordered_set<uint64_t>& submittedCommandLists = {},
-    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens = {} );
+    const std::unordered_set<uint64_t>& gpuSegmentReferenceTokens = {},
+    const std::vector<GpuMemoryReferencePassInput>& structuredReferencePasses = {},
+    int64_t captureEndNs = 0 );
 
 std::string FormatGpuMemoryUsage( uint32_t usageMask );
 const char* ToString( GpuZonePairing pairing );

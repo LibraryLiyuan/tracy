@@ -6,7 +6,7 @@
 namespace tracy
 {
 
-static constexpr uint16_t JnJobSchemaVersion = 1;
+static constexpr uint16_t JnJobSchemaVersion = 2;
 
 #ifdef TRACY_ENABLE
 
@@ -133,6 +133,9 @@ tracy_force_inline void EmitJnGfxEntity( uint64_t entityId, uint64_t parentId, u
     TracyLfqCommit;
 }
 
+tracy_force_inline void EmitJnRelation( uint64_t sourceId, uint64_t targetId, uint8_t sourceKind, uint8_t targetKind,
+    uint8_t relationNamespace, uint8_t relation, uint8_t flags );
+
 tracy_force_inline void EmitJnGfxLink( uint64_t sourceId, uint64_t targetId, uint8_t relation, uint8_t flags )
 {
     TracyJnOnDemandGuard;
@@ -143,6 +146,28 @@ tracy_force_inline void EmitJnGfxLink( uint64_t sourceId, uint64_t targetId, uin
     MemWrite( &item->jnGfxLink.relation, relation );
     MemWrite( &item->jnGfxLink.flags, flags );
     TracyLfqCommit;
+
+    auto sourceKind = JnEntityKind::GfxEntity;
+    auto targetKind = JnEntityKind::GfxEntity;
+    switch( JnGfxRelation( relation ) )
+    {
+    case JnGfxRelation::Executes: sourceKind = JnEntityKind::Job; break;
+    case JnGfxRelation::Produces: targetKind = JnEntityKind::CommandList; break;
+    case JnGfxRelation::Submits: sourceKind = JnEntityKind::CommandList; targetKind = JnEntityKind::Submission; break;
+    case JnGfxRelation::RunsOnGpu: targetKind = JnEntityKind::GpuSegment; break;
+    case JnGfxRelation::RecordedOnCommandList: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::CommandList; break;
+    case JnGfxRelation::BelongsToFrame: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::Frame; break;
+    case JnGfxRelation::BelongsToCamera: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::Camera; break;
+    case JnGfxRelation::BelongsToView: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::View; break;
+    case JnGfxRelation::ReferencesResources:
+        sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::GpuPass; break;
+    case JnGfxRelation::ClassifiesAsTaxonomy: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::GpuTaxonomy; break;
+    case JnGfxRelation::GpuSegmentReferencesResources:
+        sourceKind = JnEntityKind::GpuSegment; targetKind = JnEntityKind::GpuPass; break;
+    default: break;
+    }
+    EmitJnRelation( sourceId, targetId, uint8_t( sourceKind ), uint8_t( targetKind ),
+        uint8_t( JnRelationNamespace::Gfx ), relation, flags );
 }
 
 tracy_force_inline void EmitJnFrame( uint64_t frameId, uint64_t domainIndex, uint8_t domain, uint8_t phase, uint8_t flags )
@@ -216,6 +241,78 @@ tracy_force_inline void EmitJnIoRequestCallstack( uint64_t requestId, int32_t de
     Profiler::QueueSerialFinish();
 }
 
+tracy_force_inline void EmitJnRelation( uint64_t sourceId, uint64_t targetId, uint8_t sourceKind, uint8_t targetKind,
+    uint8_t relationNamespace, uint8_t relation, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnRelation );
+    MemWrite( &item->jnRelation.time, Profiler::GetTime() );
+    MemWrite( &item->jnRelation.sourceId, sourceId );
+    MemWrite( &item->jnRelation.targetId, targetId );
+    MemWrite( &item->jnRelation.sourceKind, sourceKind );
+    MemWrite( &item->jnRelation.targetKind, targetKind );
+    MemWrite( &item->jnRelation.relationNamespace, relationNamespace );
+    MemWrite( &item->jnRelation.relation, relation );
+    MemWrite( &item->jnRelation.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnRuntimeDomainState( uint64_t generation, uint64_t requestedFrame, uint8_t domain,
+    uint8_t requestedMode, uint8_t effectiveMode, uint8_t reason, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnRuntimeDomainState );
+    MemWrite( &item->jnRuntimeDomainState.time, Profiler::GetTime() );
+    MemWrite( &item->jnRuntimeDomainState.generation, generation );
+    MemWrite( &item->jnRuntimeDomainState.requestedFrame, requestedFrame );
+    MemWrite( &item->jnRuntimeDomainState.domain, domain );
+    MemWrite( &item->jnRuntimeDomainState.requestedMode, requestedMode );
+    MemWrite( &item->jnRuntimeDomainState.effectiveMode, effectiveMode );
+    MemWrite( &item->jnRuntimeDomainState.reason, reason );
+    MemWrite( &item->jnRuntimeDomainState.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnGpuReferencePass( uint64_t passId, uint64_t frameIndex, uint32_t taxonomyId,
+    uint8_t taxonomyLevel, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnGpuReferencePass );
+    MemWrite( &item->jnGpuReferencePass.time, Profiler::GetTime() );
+    MemWrite( &item->jnGpuReferencePass.passId, passId );
+    MemWrite( &item->jnGpuReferencePass.frameIndex, frameIndex );
+    MemWrite( &item->jnGpuReferencePass.taxonomyId, taxonomyId );
+    MemWrite( &item->jnGpuReferencePass.taxonomyLevel, taxonomyLevel );
+    MemWrite( &item->jnGpuReferencePass.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnGpuReferenceUse( uint64_t passId, uint64_t resourceId, uint32_t usageMask, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnGpuReferenceUse );
+    MemWrite( &item->jnGpuReferenceUse.time, Profiler::GetTime() );
+    MemWrite( &item->jnGpuReferenceUse.passId, passId );
+    MemWrite( &item->jnGpuReferenceUse.resourceId, resourceId );
+    MemWrite( &item->jnGpuReferenceUse.usageMask, usageMask );
+    MemWrite( &item->jnGpuReferenceUse.flags, flags );
+    TracyLfqCommit;
+}
+
+tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t passId, uint64_t commandListId,
+    uint32_t totalReferenceCount, uint16_t droppedReferenceCount, uint8_t flags )
+{
+    TracyJnOnDemandGuard;
+    TracyLfqPrepare( QueueType::JnGpuReferenceEnd );
+    MemWrite( &item->jnGpuReferenceEnd.time, Profiler::GetTime() );
+    MemWrite( &item->jnGpuReferenceEnd.passId, passId );
+    MemWrite( &item->jnGpuReferenceEnd.commandListId, commandListId );
+    MemWrite( &item->jnGpuReferenceEnd.totalReferenceCount, totalReferenceCount );
+    MemWrite( &item->jnGpuReferenceEnd.droppedReferenceCount, droppedReferenceCount );
+    MemWrite( &item->jnGpuReferenceEnd.flags, flags );
+    TracyLfqCommit;
+}
+
 #undef TracyJnOnDemandGuard
 
 #else
@@ -236,6 +333,11 @@ tracy_force_inline void EmitJnIoRequest( uint64_t, uint64_t, uint8_t, uint8_t, u
 tracy_force_inline void EmitJnIoConfig( uint64_t, uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnIoStage( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnIoRequestCallstack( uint64_t, int32_t ) {}
+tracy_force_inline void EmitJnRelation( uint64_t, uint64_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnRuntimeDomainState( uint64_t, uint64_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnGpuReferencePass( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
+tracy_force_inline void EmitJnGpuReferenceUse( uint64_t, uint64_t, uint32_t, uint8_t ) {}
+tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t, uint64_t, uint32_t, uint16_t, uint8_t ) {}
 
 #endif
 

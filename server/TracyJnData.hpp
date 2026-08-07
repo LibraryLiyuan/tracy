@@ -8,7 +8,7 @@ namespace tracy
 {
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
-static constexpr uint16_t JnTraceSchemaVersion = 3;
+static constexpr uint16_t JnTraceSchemaVersion = 5;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -143,6 +143,64 @@ struct JnIoStageData
     uint8_t flags;
 };
 
+struct JnRelationData
+{
+    int64_t time;
+    uint64_t sourceId;
+    uint64_t targetId;
+    uint64_t thread;
+    uint8_t sourceKind;
+    uint8_t targetKind;
+    uint8_t relationNamespace;
+    uint8_t relation;
+    uint8_t flags;
+};
+
+struct JnRuntimeDomainStateData
+{
+    int64_t time;
+    uint64_t generation;
+    uint64_t requestedFrame;
+    uint64_t thread;
+    uint8_t domain;
+    uint8_t requestedMode;
+    uint8_t effectiveMode;
+    uint8_t reason;
+    uint8_t flags;
+};
+
+struct JnGpuReferencePassData
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t frameIndex;
+    uint64_t thread;
+    uint32_t taxonomyId;
+    uint8_t taxonomyLevel;
+    uint8_t flags;
+};
+
+struct JnGpuReferenceUseData
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t resourceId;
+    uint64_t thread;
+    uint32_t usageMask;
+    uint8_t flags;
+};
+
+struct JnGpuReferenceEndData
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t commandListId;
+    uint64_t thread;
+    uint32_t totalReferenceCount;
+    uint16_t droppedReferenceCount;
+    uint8_t flags;
+};
+
 #pragma pack( pop )
 
 struct JnTraceData
@@ -161,6 +219,11 @@ struct JnTraceData
     std::vector<JnIoRequestData> ioRequests;
     std::vector<JnIoConfigData> ioConfigs;
     std::vector<JnIoStageData> ioStages;
+    std::vector<JnRelationData> relations;
+    std::vector<JnRuntimeDomainStateData> runtimeDomainStates;
+    std::vector<JnGpuReferencePassData> gpuReferencePasses;
+    std::vector<JnGpuReferenceUseData> gpuReferenceUses;
+    std::vector<JnGpuReferenceEndData> gpuReferenceEnds;
 };
 
 }

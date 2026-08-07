@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.14.0",
+  "schema_version": "1.16.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -663,6 +663,24 @@
       "query_fields": ["ref", "path", "path_base64url", "bytes", "bounded_text_resource", "raw_offset_bytes", "raw_returned_bytes", "raw_total_bytes", "raw_data_base64url", "raw_next_offset_bytes", "raw_eof"],
       "unmapped_fields": [],
       "methods": ["source.embedded", "source.lines", "source.raw"],
+      "status": "complete"
+    },
+    {
+      "entity": "relation.exact",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["time", "thread", "source_id", "target_id", "source_kind", "target_kind", "relation_namespace", "relation", "flags"],
+      "query_fields": ["ref", "time_ns", "thread_ref", "source_id", "target_id", "source_kind", "source_ref", "target_kind", "target_ref", "namespace", "relation", "flags", "provenance", "evidence_kind"],
+      "unmapped_fields": [],
+      "methods": ["relation.search", "relation.get"],
+      "status": "complete"
+    },
+    {
+      "entity": "runtime.domain.state",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["time", "thread", "generation", "requested_frame", "domain", "requested_mode", "effective_mode", "reason", "flags"],
+      "query_fields": ["ref", "time_ns", "thread_ref", "generation", "requested_frame", "domain", "requested_mode", "effective_mode", "reason", "flags", "provenance"],
+      "unmapped_fields": [],
+      "methods": ["runtime.domain.states"],
       "status": "complete"
     }
   ],

@@ -104,6 +104,11 @@ struct TraceCountsDto
     uint64_t ioRequests = 0;
     uint64_t ioConfigs = 0;
     uint64_t ioStages = 0;
+    uint64_t relations = 0;
+    uint64_t runtimeDomainStates = 0;
+    uint64_t gpuReferencePasses = 0;
+    uint64_t gpuReferenceUses = 0;
+    uint64_t gpuReferenceEnds = 0;
 };
 
 struct TraceInfoDto
@@ -667,6 +672,34 @@ struct CorrelatedFrameEventDto
     uint8_t flags = 0;
 };
 
+struct RelationDto
+{
+    std::string ref;
+    uint64_t sourceId = 0;
+    uint64_t targetId = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t sourceKind = 0;
+    uint8_t targetKind = 0;
+    uint8_t relationNamespace = 0;
+    uint8_t relation = 0;
+    uint8_t flags = 0;
+};
+
+struct RuntimeDomainStateDto
+{
+    std::string ref;
+    uint64_t generation = 0;
+    uint64_t requestedFrame = 0;
+    int64_t timeNs = 0;
+    std::string threadRef;
+    uint8_t domain = 0;
+    uint8_t requestedMode = 0;
+    uint8_t effectiveMode = 0;
+    uint8_t reason = 0;
+    uint8_t flags = 0;
+};
+
 struct CallstackFrameDto
 {
     std::string ref;
@@ -789,6 +822,8 @@ public:
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
+    virtual std::vector<RelationDto> GetRelations() const { return {}; }
+    virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory = $true)][string]$StreamTrace,
     [Parameter(Mandatory = $true)][string]$ReplayTrace,
     [Parameter(Mandatory = $true)][string]$AllowRoot,
-    [string]$ExpectedQuerySchema = '1.14.0',
+    [string]$ExpectedQuerySchema = '1.15.0',
     [string]$LegacyTrace,
     [switch]$CheckContextQuality,
     [switch]$SkipSyntheticProducerChecks,

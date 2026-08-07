@@ -203,7 +203,7 @@ try {
 
     [ordered]@{
         ok = $true
-        schema_version = '1.14.0'
+        schema_version = '1.15.0'
         traces = $opened
         compatibility = $compatibilitySummary
         normalized = $normalizedSummary

@@ -130,7 +130,7 @@ function Get-Semantics([string]$Path, [string]$Label)
         $coverage = Inspect $traceId 'gpu.taxonomy.coverage' @{ max_scan_events = 100000000; max_cpu_ms = 60000 }
         $catalog = Inspect $traceId 'catalog.list' @{ kind = 'gpu_taxonomy'; limit = 500 }
 
-        Assert-Condition ([string]$tree.schema_version -eq '1.14.0') "$Label query schema mismatch"
+        Assert-Condition ([string]$tree.schema_version -eq '1.15.0') "$Label query schema mismatch"
         Assert-Condition ([bool]$tree.data.present -and [bool]$tree.data.complete) "$Label taxonomy tree absent or incomplete"
         Assert-Condition ([int]$tree.data.schema_version -eq 2) "$Label taxonomy schema mismatch"
         Assert-Condition ([bool]$tree.data.scan_complete) "$Label taxonomy scan exhausted its budget"
@@ -250,7 +250,7 @@ try
     }
 
     $result = [ordered]@{
-        schema_version = '1.14.0'
+        schema_version = '1.15.0'
         taxonomy_schema_version = 2
         result = 'PASS'
         snapshot = $snapshotResult

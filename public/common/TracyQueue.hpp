@@ -125,6 +125,11 @@ enum class QueueType : uint8_t
     JnIoRequest,
     JnIoConfig,
     JnIoStage,
+    JnRelation,
+    JnRuntimeDomainState,
+    JnGpuReferencePass,
+    JnGpuReferenceUse,
+    JnGpuReferenceEnd,
     StringData,
     ThreadName,
     PlotName,
@@ -622,6 +627,63 @@ enum class JnIoFlags : uint8_t
     CaptureBoundary = 1 << 4
 };
 
+enum class JnRelationNamespace : uint8_t
+{
+    Generic,
+    Gfx,
+    Job,
+    GpuReference,
+    Script,
+    Io
+};
+
+enum class JnEntityKind : uint8_t
+{
+    Unknown,
+    Frame,
+    CpuZone,
+    Job,
+    GfxEntity,
+    GpuPass,
+    GpuSegment,
+    GpuTaxonomy,
+    GpuResource,
+    GpuAllocation,
+    IoRequest,
+    ScriptZone,
+    Camera,
+    View,
+    CommandList,
+    Submission
+};
+
+enum class JnRuntimeDomain : uint8_t
+{
+    GpuReference = 1,
+    ScriptStack,
+    Job,
+    GpuPass,
+    Io
+};
+
+enum class JnRuntimeMode : uint8_t
+{
+    FollowProfile,
+    Disabled,
+    Enabled,
+    ValidationDual
+};
+
+enum class JnGpuReferenceFlags : uint8_t
+{
+    None = 0,
+    Truncated = 1 << 0,
+    Overflow = 1 << 1,
+    ValidationDual = 1 << 2,
+    ValidationMismatch = 1 << 3,
+    CaptureBoundary = 1 << 4
+};
+
 struct QueueJnJobType
 {
     uint64_t name;
@@ -741,6 +803,63 @@ struct QueueJnIoStage
     uint32_t detail;
     uint8_t stage;
     uint8_t status;
+    uint8_t flags;
+};
+
+struct QueueJnRelation
+{
+    int64_t time;
+    uint64_t sourceId;
+    uint64_t targetId;
+    uint8_t sourceKind;
+    uint8_t targetKind;
+    uint8_t relationNamespace;
+    uint8_t relation;
+    uint8_t flags;
+};
+
+struct QueueJnRuntimeDomainState
+{
+    int64_t time;
+    uint64_t generation;
+    uint64_t requestedFrame;
+    uint8_t domain;
+    uint8_t requestedMode;
+    uint8_t effectiveMode;
+    uint8_t reason;
+    uint8_t flags;
+};
+
+// N16.3 fixed-size GPU resource-reference events.  These records deliberately
+// contain stable ids only; resource kind, owner and lifetime are joined by the
+// Worker/Query after capture so the D3D12 command-list hot path stays lock- and
+// allocation-free.
+struct QueueJnGpuReferencePass
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t frameIndex;
+    uint32_t taxonomyId;
+    uint8_t taxonomyLevel;
+    uint8_t flags;
+};
+
+struct QueueJnGpuReferenceUse
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t resourceId;
+    uint32_t usageMask;
+    uint8_t flags;
+};
+
+struct QueueJnGpuReferenceEnd
+{
+    int64_t time;
+    uint64_t passId;
+    uint64_t commandListId;
+    uint32_t totalReferenceCount;
+    uint16_t droppedReferenceCount;
     uint8_t flags;
 };
 
@@ -1114,6 +1233,11 @@ struct QueueItem
         QueueJnIoRequest jnIoRequest;
         QueueJnIoConfig jnIoConfig;
         QueueJnIoStage jnIoStage;
+        QueueJnRelation jnRelation;
+        QueueJnRuntimeDomainState jnRuntimeDomainState;
+        QueueJnGpuReferencePass jnGpuReferencePass;
+        QueueJnGpuReferenceUse jnGpuReferenceUse;
+        QueueJnGpuReferenceEnd jnGpuReferenceEnd;
     };
 };
 #pragma pack( pop )
@@ -1239,6 +1363,11 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnIoRequest ),
     sizeof( QueueHeader ) + sizeof( QueueJnIoConfig ),
     sizeof( QueueHeader ) + sizeof( QueueJnIoStage ),
+    sizeof( QueueHeader ) + sizeof( QueueJnRelation ),
+    sizeof( QueueHeader ) + sizeof( QueueJnRuntimeDomainState ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuReferencePass ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceUse ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceEnd ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1268,6 +1397,11 @@ static_assert( sizeof( QueueJnFrame ) == 27, "JN frame payload size mismatch" );
 static_assert( sizeof( QueueJnIoRequest ) == 29, "JN I/O request payload size mismatch" );
 static_assert( sizeof( QueueJnIoConfig ) == 30, "JN I/O config payload size mismatch" );
 static_assert( sizeof( QueueJnIoStage ) == 31, "JN I/O stage payload size mismatch" );
+static_assert( sizeof( QueueJnRelation ) == 29, "JN relation payload size mismatch" );
+static_assert( sizeof( QueueJnRuntimeDomainState ) == 29, "JN runtime-domain payload size mismatch" );
+static_assert( sizeof( QueueJnGpuReferencePass ) == 30, "JN GPU reference pass payload size mismatch" );
+static_assert( sizeof( QueueJnGpuReferenceUse ) == 29, "JN GPU reference use payload size mismatch" );
+static_assert( sizeof( QueueJnGpuReferenceEnd ) == 31, "JN GPU reference end payload size mismatch" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );

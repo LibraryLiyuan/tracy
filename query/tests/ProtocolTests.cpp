@@ -59,6 +59,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "zone.cpu.get" || method == "zone.cpu.tree" ) params["ref"] = "fake:cpu-zone:0";
     if( method == "zone.gpu.get" || method == "zone.gpu.tree" ) params["ref"] = "fake:gpu-zone:0";
     if( method == "gpu.pass.get" ) params["ref"] = "fake:gfx-entity:9223372036854775810";
+    if( method == "relation.get" ) params["ref"] = "fake:relation:0";
     if( method == "memory.get" ) params["ref"] = "fake:memory-event:0";
     if( method == "memory.active_at_time" ) params["time_ns"] = "50";
     if( method == "memory.frame_snapshot" ) params["frame_index"] = 0;
@@ -89,6 +90,7 @@ struct TemporaryTraceFiles
         baseline = root / "baseline.tracy";
         candidate = root / "candidate.tracy";
         n11 = root / "n11.tracy";
+        n16 = root / "n16.tracy";
         profileMismatch = root / "profile-mismatch.tracy";
         duplicateIdentity = root / "duplicate-identity.tracy";
         malformedIdentity = root / "malformed-identity.tracy";
@@ -101,6 +103,7 @@ struct TemporaryTraceFiles
         std::ofstream( baseline, std::ios::binary ).put( '\0' );
         std::ofstream( candidate, std::ios::binary ).put( '\0' );
         std::ofstream( n11, std::ios::binary ).put( '\0' );
+        std::ofstream( n16, std::ios::binary ).put( '\0' );
         std::ofstream( profileMismatch, std::ios::binary ).put( '\0' );
         std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
@@ -121,6 +124,7 @@ struct TemporaryTraceFiles
     std::filesystem::path baseline;
     std::filesystem::path candidate;
     std::filesystem::path n11;
+    std::filesystem::path n16;
     std::filesystem::path profileMismatch;
     std::filesystem::path duplicateIdentity;
     std::filesystem::path malformedIdentity;
@@ -135,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.14.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.16.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -143,7 +147,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 36 );
+    assert( coverage.at( "domains" ).size() == 38 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -186,6 +190,8 @@ int main()
     assert( fieldEntities.contains( "job.gfx.statistics" ) );
     assert( fieldEntities.contains( "job.gfx_chain" ) );
     assert( fieldEntities.contains( "trace.capture_identity" ) );
+    assert( fieldEntities.contains( "relation.exact" ) );
+    assert( fieldEntities.contains( "runtime.domain.state" ) );
     assert( fieldCoverage.at( "non_persisted" ).size() >= 3 );
 
     const auto mcpCoverage = LoadJson( TRACY_QUERY_MCP_COVERAGE_PATH );
@@ -255,6 +261,104 @@ int main()
     assert( attribution.churn.createdCount == 1 && attribution.churn.createdBytes == 16384 && attribution.churn.peakPhysicalBytes == 16384 );
     assert( attribution.residency.evictedCount == 1 && attribution.residency.evictedBytes == 16384 );
     assert( FormatGpuMemoryUsage( 3 ) == "Read/Write" );
+
+    const std::vector<GpuMemoryCpuZoneInput> metadataMarkers = {
+        cpuMarkers[0], cpuMarkers[2], cpuMarkers[3], cpuMarkers[4]
+    };
+    GpuMemoryReferencePassInput structuredParent;
+    structuredParent.passId = 21;
+    structuredParent.frame = 3;
+    structuredParent.commandListId = 99;
+    structuredParent.thread = 9;
+    structuredParent.start = 20;
+    structuredParent.end = 80;
+    structuredParent.taxonomyId = 7;
+    structuredParent.taxonomyLevel = 1;
+    structuredParent.ended = true;
+    GpuMemoryReferencePassInput structuredChild;
+    structuredChild.passId = 22;
+    structuredChild.parentPassId = 21;
+    structuredChild.frame = 3;
+    structuredChild.commandListId = 99;
+    structuredChild.thread = 9;
+    structuredChild.start = 30;
+    structuredChild.end = 70;
+    structuredChild.taxonomyId = 8;
+    structuredChild.taxonomyLevel = 2;
+    structuredChild.totalUseCount = 1;
+    structuredChild.ended = true;
+    structuredChild.uses.push_back( { 42, 0x401, 'U' } );
+    const auto structuredAttribution = BuildGpuMemoryAttribution( metadataMarkers, {}, gpuAllocations,
+        { 99 }, { 22 }, { structuredParent, structuredChild } );
+    assert( structuredAttribution.protocolPresent && structuredAttribution.structuredReferencePresent );
+    assert( structuredAttribution.complete && structuredAttribution.passes.size() == 2 );
+    assert( structuredAttribution.passes[0].structuredBinary && structuredAttribution.passes[0].passId == 21 );
+    assert( structuredAttribution.passes[0].gpuPairing == GpuZonePairing::DerivedLogicalRollup );
+    assert( structuredAttribution.passes[1].parentPassId == 21 && structuredAttribution.passes[1].uses.size() == 1 );
+    assert( structuredAttribution.passes[1].gpuPairing == GpuZonePairing::GpuResultUnavailable );
+    assert( structuredAttribution.passes[1].uses[0].kind == 'T' );
+    const auto parentWorking = std::find_if( structuredAttribution.workingSets.begin(), structuredAttribution.workingSets.end(),
+        []( const auto& value ) { return value.taxonomyId == 7; } );
+    const auto childWorking = std::find_if( structuredAttribution.workingSets.begin(), structuredAttribution.workingSets.end(),
+        []( const auto& value ) { return value.taxonomyId == 8; } );
+    assert( parentWorking != structuredAttribution.workingSets.end() && parentWorking->referencedPhysicalBytes == 0 );
+    assert( parentWorking->inclusiveReferencedPhysicalBytes == 16384 && parentWorking->provenance == "derived-exact-rollup" );
+    assert( childWorking != structuredAttribution.workingSets.end() && childWorking->referencedPhysicalBytes == 16384 );
+    assert( childWorking->inclusiveReferencedPhysicalBytes == 16384 && childWorking->logicalResourceCount == 1 );
+
+    GpuMemoryReferencePassInput structuredBoundary;
+    structuredBoundary.passId = 23;
+    structuredBoundary.frame = 4;
+    structuredBoundary.thread = 9;
+    structuredBoundary.start = 100;
+    structuredBoundary.end = 100;
+    structuredBoundary.taxonomyId = 9;
+    structuredBoundary.taxonomyLevel = 1;
+    const auto structuredBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, {}, {}, {},
+        { structuredBoundary }, 120 );
+    assert( structuredBoundaryAttribution.complete && structuredBoundaryAttribution.warnings.empty() );
+    assert( structuredBoundaryAttribution.captureBoundaryPasses == 1 );
+    assert( structuredBoundaryAttribution.passes.size() == 1 && !structuredBoundaryAttribution.passes[0].complete );
+    assert( structuredBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::CaptureBoundary );
+    assert( structuredBoundaryAttribution.passes[0].end == 120 );
+
+    GpuMemoryReferencePassInput forcedBoundary = structuredBoundary;
+    forcedBoundary.passId = 24;
+    forcedBoundary.ended = true;
+    forcedBoundary.end = 115;
+    forcedBoundary.flags = 1;
+    const auto forcedBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, {}, {}, {},
+        { forcedBoundary }, 120 );
+    assert( forcedBoundaryAttribution.complete && forcedBoundaryAttribution.warnings.empty() );
+    assert( forcedBoundaryAttribution.captureBoundaryPasses == 1 );
+    assert( forcedBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::CaptureBoundary );
+
+    GpuMemoryReferencePassInput boundaryHead = forcedBoundary;
+    boundaryHead.passId = 25;
+    boundaryHead.frame = 10;
+    GpuMemoryReferencePassInput truncatedInterior = forcedBoundary;
+    truncatedInterior.passId = 26;
+    truncatedInterior.frame = 20;
+    GpuMemoryReferencePassInput boundaryTail = forcedBoundary;
+    boundaryTail.passId = 27;
+    boundaryTail.frame = 30;
+    const auto interiorTruncationAttribution = BuildGpuMemoryAttribution( {}, {}, {}, {}, {},
+        { boundaryHead, truncatedInterior, boundaryTail }, 120 );
+    assert( !interiorTruncationAttribution.complete );
+    assert( interiorTruncationAttribution.captureBoundaryPasses == 2 );
+    assert( interiorTruncationAttribution.passes[0].gpuPairing == GpuZonePairing::CaptureBoundary );
+    assert( interiorTruncationAttribution.passes[1].gpuPairing == GpuZonePairing::Missing );
+    assert( interiorTruncationAttribution.passes[2].gpuPairing == GpuZonePairing::CaptureBoundary );
+
+    GpuMemoryReferencePassInput droppedBoundary = forcedBoundary;
+    droppedBoundary.passId = 28;
+    droppedBoundary.droppedUses = 1;
+    droppedBoundary.flags = 3;
+    const auto droppedBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, {}, {}, {},
+        { droppedBoundary }, 120 );
+    assert( !droppedBoundaryAttribution.complete );
+    assert( droppedBoundaryAttribution.captureBoundaryPasses == 0 );
+    assert( droppedBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::Missing );
 
     const std::vector<GpuMemoryCpuZoneInput> boundaryCpuMarkers = {
         { 10, GpuMemoryPassMarker, "BoundaryPass", "GTMEM1|PASS|pass=12|label=7|frame=3|level=1|ordinal=3|ops=draw|commands=1|uses=0|total=0|chunks=0|untracked=0|truncated=0|dropped=0", 9, 0, 10 }
@@ -328,6 +432,7 @@ int main()
             const auto filename = path.filename().string();
             if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
             if( filename == "n11.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, true );
+            if( filename == "n16.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, false, true );
             if( filename == "profile-mismatch.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
@@ -447,6 +552,36 @@ int main()
     assert( oldScript.at( "ok" ) && oldScript.at( "data" ).at( "present" ) == false && oldScript.at( "data" ).at( "complete" ) == false );
     const auto oldGc = service.Execute( Request( 1001, "memory.gc.summary", { { "trace_id", candidateId } } ) );
     assert( oldGc.at( "ok" ) && oldGc.at( "data" ).at( "present" ) == false && oldGc.at( "data" ).at( "complete" ) == false );
+    const auto oldRelations = service.Execute( Request( 1009, "relation.search", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( oldRelations.at( "present" ) == false && oldRelations.at( "relation_schema_version" ) == 0 && oldRelations.at( "relations" ).empty() );
+    const auto oldRuntimeStates = service.Execute( Request( 1012, "runtime.domain.states", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( oldRuntimeStates.at( "present" ) == false && oldRuntimeStates.at( "runtime_domain_schema_version" ) == 0 && oldRuntimeStates.at( "states" ).empty() );
+
+    const auto openN16 = service.Execute( Request( 1013, "trace.open", { { "path", files.n16.string() } } ) );
+    assert( openN16.at( "ok" ) );
+    const auto n16Id = openN16.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( n16Id, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto relations = service.Execute( Request( 1014, "relation.search", {
+        { "trace_id", n16Id }, { "namespace", "gpu_reference" }
+    } ) ).at( "data" );
+    if( !( relations.at( "present" ) == true && relations.at( "complete" ) == true && relations.at( "relation_count" ) == "2" ) )
+    {
+        std::cerr << "N16 relation contract response: " << relations.dump() << '\n';
+        assert( false );
+    }
+    assert( relations.at( "matched_count" ) == "1" && relations.at( "relations" )[0].at( "relation" ) == "uses_resource" );
+    assert( relations.at( "relations" )[0].at( "provenance" ) == "exact-binary" );
+    const auto relationRef = relations.at( "relations" )[0].at( "ref" );
+    const auto relation = service.Execute( Request( 1015, "relation.get", {
+        { "trace_id", n16Id }, { "ref", relationRef }
+    } ) ).at( "data" );
+    assert( relation.at( "relation" ).at( "source_id" ) == "100" && relation.at( "relation" ).at( "target_id" ) == "200" );
+    const auto runtimeStates = service.Execute( Request( 1016, "runtime.domain.states", {
+        { "trace_id", n16Id }, { "domain", "gpu_reference" }
+    } ) ).at( "data" );
+    assert( runtimeStates.at( "present" ) == true && runtimeStates.at( "state_count" ) == "2" && runtimeStates.at( "states" ).size() == 2 );
+    assert( runtimeStates.at( "latest" ).at( "gpu_reference" ).at( "effective_mode" ) == "enabled" );
+    assert( service.Execute( Request( 1017, "trace.close", { { "trace_id", n16Id } } ) ).at( "ok" ) );
 
     const auto openN11 = service.Execute( Request( 1002, "trace.open", { { "path", files.n11.string() } } ) );
     assert( openN11.at( "ok" ) );
@@ -521,7 +656,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.14.0" );
+    assert( described.at( "schema_version" ) == "1.16.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -533,9 +668,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.14.0" );
+        assert( operation.at( "schema_version" ) == "1.16.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.14.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.16.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -899,6 +1034,16 @@ int main()
     assert( threadFields.at( "group_hint" ) == -7 );
     assert( threadFields.at( "field_availability" ).at( "group_hint" ).at( "available" ) == true );
     assert( threadFields.at( "running_regions" ) == 4 );
+
+    const auto matchingCallstackSamples = service.Execute( Request( requestId++, "sample.list", {
+        { "trace_id", candidateId }, { "callstack", "1" }
+    } ) ).at( "data" ).at( "samples" );
+    assert( matchingCallstackSamples.size() == 1 );
+    assert( matchingCallstackSamples[0].at( "callstack" ) == "1" );
+    const auto missingCallstackSamples = service.Execute( Request( requestId++, "sample.list", {
+        { "trace_id", candidateId }, { "callstack", "2" }
+    } ) ).at( "data" ).at( "samples" );
+    assert( missingCallstackSamples.empty() );
 
     const auto cpuZoneFields = service.Execute( Request( requestId++, "zone.cpu.get", {
         { "trace_id", candidateId }, { "ref", "fake:cpu-zone:0" }

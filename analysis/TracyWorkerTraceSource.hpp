@@ -83,6 +83,8 @@ public:
     std::vector<GfxEntityDto> GetGfxEntities() const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    std::vector<RelationDto> GetRelations() const override;
+    std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
