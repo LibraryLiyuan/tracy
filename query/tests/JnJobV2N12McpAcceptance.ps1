@@ -286,7 +286,7 @@ try {
     $snapshotSemantics = $results.snapshot.semantics | ConvertTo-Json -Compress -Depth 30
     Assert-Condition (($results.stream.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/stream N12 semantic mismatch'
     Assert-Condition (($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $snapshotSemantics) 'snapshot/replay N12 semantic mismatch'
-    $resultJson = [ordered]@{ ok = $true; schema_version = '1.23.0'; expected_job_schema = $ExpectedJobSchema; traces = $results } | ConvertTo-Json -Compress -Depth 40
+    $resultJson = [ordered]@{ ok = $true; schema_version = '1.24.0'; expected_job_schema = $ExpectedJobSchema; traces = $results } | ConvertTo-Json -Compress -Depth 40
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $parent = Split-Path -Parent $OutputPath
         if (-not [string]::IsNullOrWhiteSpace($parent)) { [void](New-Item -ItemType Directory -Force -Path $parent) }

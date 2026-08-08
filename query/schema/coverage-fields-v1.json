@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.23.0",
+  "schema_version": "1.24.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -503,7 +503,7 @@
       "entity": "io.request",
       "classification": "persisted_semantic",
       "persisted_fields": ["request", "config", "stage"],
-      "query_fields": ["ref", "request_id", "resource_id", "resource_identity", "parent_id", "parent_kind", "parent_ref", "operation", "source", "sync", "async", "priority", "subsystem", "queue_ns", "queue_thread_ref", "start_ns", "end_ns", "queue_latency_ns", "execution_ns", "total_ns", "requested_bytes", "transferred_bytes", "status", "origin_frame_sequence", "request_callstack", "request_callstack_ref", "stages", "terminal_count", "orphan", "truncated", "capture_boundary", "statistics.counts", "statistics.latency", "statistics.quality"],
+      "query_fields": ["ref", "request_id", "resource_id", "resource_identity", "parent_id", "parent_kind", "parent_ref", "operation", "source", "sync", "async", "priority", "subsystem", "queue_ns", "queue_thread_ref", "start_ns", "end_ns", "queue_latency_ns", "execution_ns", "total_ns", "requested_bytes", "transferred_bytes", "status", "origin_frame_sequence", "request_callstack", "request_callstack_ref", "stages", "terminal_count", "orphan", "truncated", "right_censored", "capture_end_state", "capture_boundary", "producer_quality", "statistics.counts", "statistics.latency", "statistics.quality.right_censored", "statistics.quality.unexplained_missing_start", "statistics.quality.unexplained_missing_terminal", "statistics.quality.unexplained_truncated"],
       "unmapped_fields": [],
       "methods": ["io.search", "io.get", "io.statistics", "io.chain"],
       "status": "complete"

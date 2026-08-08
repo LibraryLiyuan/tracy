@@ -1127,6 +1127,8 @@ json IoRequestJson( const analysis::TraceSource& source, const analysis::IoReque
 {
     const bool sync = ( value.flags & uint8_t( JnIoFlags::Sync ) ) != 0;
     const bool async = ( value.flags & uint8_t( JnIoFlags::Async ) ) != 0;
+    const bool rightCensored = !value.endNs.has_value();
+    const char* captureEndState = !rightCensored ? "terminal" : value.startNs ? "running" : "queued";
     json result = {
         { "ref", value.ref }, { "request_id", Decimal( value.requestId ) }, { "resource_id", Decimal( value.resourceId ) },
         { "resource_identity", ( value.flags & uint8_t( JnIoFlags::ResourcePathHash ) ) != 0 ? "path_hash" : "stable_id" },
@@ -1148,6 +1150,7 @@ json IoRequestJson( const analysis::TraceSource& source, const analysis::IoReque
         { "callstack_kind", value.requestCallstack == 0 ? json( nullptr ) : json( "native" ) },
         { "flags", value.flags }, { "config_flags", value.configFlags }, { "stage_count", value.stages.size() },
         { "terminal_count", value.terminalCount }, { "orphan", value.orphan }, { "truncated", value.truncated },
+        { "right_censored", rightCensored }, { "capture_end_state", captureEndState },
         { "capture_boundary", value.captureBoundary }, { "evidence_kind", "exact" }, { "trust", "untrusted_trace_data" }
     };
     if( !detailed ) return result;
@@ -1886,6 +1889,37 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         { "records", { { "seen", seen }, { "valid", [&] { size_t count = 0; for( const auto& item : byProducer ) count += item.second.size(); return count; }() },
             { "duplicates", duplicates }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
         { "trust", "untrusted_trace_data" }
+    };
+}
+
+json ProducerDomainQualityJson( const analysis::TraceInfoDto& info, std::string_view producerKey )
+{
+    json result = {
+        { "present", false }, { "complete", false }, { "producer_key", producerKey },
+        { "source_mode", nullptr }, { "state", "missing" }, { "counters", json::object() },
+        { "optional_filtering_allowed", true }
+    };
+    const auto coverage = CaptureCoverageJson( info );
+    if( !coverage.contains( "producers" ) || !coverage["producers"].is_array() ) return result;
+    const auto producer = std::find_if( coverage["producers"].begin(), coverage["producers"].end(),
+        [&]( const auto& value ) { return value.value( "key", "" ) == producerKey; } );
+    if( producer == coverage["producers"].end() ) return result;
+
+    const auto& counters = producer->at( "counters" );
+    const auto counterIsZero = [&]( const char* name ) {
+        if( !counters.contains( name ) ) return false;
+        const auto value = DecimalStringValue( counters[name] );
+        return value.has_value() && *value == 0;
+    };
+    const bool clean = producer->value( "complete", false ) &&
+        counterIsZero( "dropped" ) && counterIsZero( "overflow" ) &&
+        counterIsZero( "mismatch" ) && counterIsZero( "unresolved" ) &&
+        counterIsZero( "tail_truncated" );
+    return {
+        { "present", true }, { "complete", clean }, { "producer_key", producerKey },
+        { "source_mode", producer->value( "source_mode", "" ) },
+        { "state", producer->value( "state", "unknown" ) }, { "counters", counters },
+        { "optional_filtering_allowed", true }
     };
 }
 
@@ -4391,11 +4425,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
         const bool present = capability != capabilities.end() && capability->present;
-        const std::string reason = present ? "" : capability == capabilities.end() ? "trace source does not advertise structured I/O" : capability->reason;
+        const auto producerQuality = ProducerDomainQualityJson( info(), "io.structured" );
+        const bool producerComplete = producerQuality.value( "complete", false );
+        const std::string reason = !present ? ( capability == capabilities.end() ? "trace source does not advertise structured I/O" : capability->reason ) :
+            !producerComplete ? "structured I/O producer quality is missing or contains core lifecycle loss" : "";
         const auto base = [&]() -> json {
             return {
-                { "present", present }, { "io_schema_version", present ? 1 : 0 }, { "complete", present && !BudgetPartial() },
-                { "reason", reason }, { "request_count", Decimal( requests.size() ) }, { "trust", "untrusted_trace_data" }
+                { "present", present }, { "io_schema_version", present ? 1 : 0 }, { "complete", present && producerComplete && !BudgetPartial() },
+                { "reason", reason }, { "request_count", Decimal( requests.size() ) },
+                { "producer_quality", producerQuality },
+                { "lifecycle_contract", {
+                    { "request_event", "queue" }, { "config_event", "request_configuration" },
+                    { "stages", json::array( { "start", "requeue", "complete", "error", "cancel" } ) },
+                    { "connection_boundary", "active_requests_only" },
+                    { "completed_before_connection", "not_replayed" },
+                    { "path_identity", "stable_privacy_safe_resource_id" }
+                } },
+                { "trust", "untrusted_trace_data" }
             };
         };
         if( !present )
@@ -4411,10 +4457,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             else
             {
-                result["counts"] = { { "requests", "0" }, { "completed", "0" }, { "failed", "0" }, { "cancelled", "0" } };
+                result["counts"] = { { "requests", "0" }, { "completed", "0" }, { "failed", "0" },
+                    { "cancelled", "0" }, { "connection_snapshots", "0" } };
                 result["quality"] = { { "missing_start", "0" }, { "missing_terminal", "0" }, { "duplicate_terminal", "0" },
                     { "invalid_order", "0" }, { "unresolved_parent", "0" }, { "bytes_overflow", "0" },
-                    { "orphan", "0" }, { "truncated", "0" }, { "capture_boundary", "0" } };
+                    { "orphan", "0" }, { "truncated", "0" }, { "capture_boundary", "0" },
+                    { "right_censored", "0" }, { "right_censored_queued", "0" }, { "right_censored_running", "0" },
+                    { "unexplained_missing_start", "0" }, { "unexplained_missing_terminal", "0" }, { "unexplained_truncated", "0" } };
             }
             return Success( id, std::move( result ), trace );
         }
@@ -4465,6 +4514,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t completed = 0, failed = 0, cancelled = 0, requeued = 0;
             uint64_t missingStart = 0, missingTerminal = 0, duplicateTerminal = 0, invalidOrder = 0;
             uint64_t unresolvedParent = 0, bytesOverflow = 0, orphan = 0, truncated = 0, captureBoundary = 0, callstacks = 0;
+            uint64_t rightCensored = 0, rightCensoredQueued = 0, rightCensoredRunning = 0;
+            uint64_t unexplainedMissingStart = 0, unexplainedMissingTerminal = 0, unexplainedTruncated = 0;
             std::vector<int64_t> queueLatency, execution, total;
             std::set<uint64_t> ids;
             for( const auto& value : requests ) ids.emplace( value.requestId );
@@ -4477,11 +4528,26 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 failed += value.status == uint8_t( JnIoStatus::Failure ) || value.status == uint8_t( JnIoStatus::Truncated );
                 cancelled += value.status == uint8_t( JnIoStatus::Cancelled );
                 requeued += std::count_if( value.stages.begin(), value.stages.end(), []( const auto& stage ) { return stage.stage == uint8_t( JnIoStage::Requeue ); } );
-                missingStart += !value.startNs.has_value();
-                missingTerminal += !value.endNs.has_value();
+                const bool hasStart = value.startNs.has_value();
+                const bool hasTerminal = value.endNs.has_value();
+                const bool observedOpenAtCaptureEnd = !hasTerminal && !value.orphan && value.terminalCount == 0;
+                missingStart += !hasStart;
+                missingTerminal += !hasTerminal;
+                if( observedOpenAtCaptureEnd && producerComplete )
+                {
+                    rightCensored++;
+                    if( hasStart ) rightCensoredRunning++;
+                    else rightCensoredQueued++;
+                }
+                else
+                {
+                    unexplainedMissingStart += !hasStart;
+                    unexplainedMissingTerminal += !hasTerminal;
+                }
                 duplicateTerminal += value.terminalCount > 1;
                 orphan += value.orphan;
                 truncated += value.truncated;
+                unexplainedTruncated += value.truncated && !( observedOpenAtCaptureEnd && producerComplete );
                 captureBoundary += value.captureBoundary;
                 callstacks += value.requestCallstack != 0;
                 unresolvedParent += value.parentKind == uint8_t( JnIoParentKind::IoRequest ) && value.parentId != 0 && !ids.contains( value.parentId );
@@ -4497,6 +4563,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             result["counts"] = {
                 { "requests", Decimal( requests.size() ) }, { "completed", Decimal( completed ) }, { "failed", Decimal( failed ) },
                 { "cancelled", Decimal( cancelled ) }, { "requeue_stages", Decimal( requeued ) }, { "request_callstacks", Decimal( callstacks ) },
+                { "connection_snapshots", Decimal( captureBoundary ) },
                 { "operations", std::move( operationCounts ) }
             };
             result["latency"] = {
@@ -4508,9 +4575,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "missing_start", Decimal( missingStart ) }, { "missing_terminal", Decimal( missingTerminal ) },
                 { "duplicate_terminal", Decimal( duplicateTerminal ) }, { "invalid_order", Decimal( invalidOrder ) },
                 { "unresolved_parent", Decimal( unresolvedParent ) }, { "bytes_overflow", Decimal( bytesOverflow ) },
-                { "orphan", Decimal( orphan ) }, { "truncated", Decimal( truncated ) }, { "capture_boundary", Decimal( captureBoundary ) }
+                { "orphan", Decimal( orphan ) }, { "truncated", Decimal( truncated ) }, { "capture_boundary", Decimal( captureBoundary ) },
+                { "right_censored", Decimal( rightCensored ) }, { "right_censored_queued", Decimal( rightCensoredQueued ) },
+                { "right_censored_running", Decimal( rightCensoredRunning ) },
+                { "unexplained_missing_start", Decimal( unexplainedMissingStart ) },
+                { "unexplained_missing_terminal", Decimal( unexplainedMissingTerminal ) },
+                { "unexplained_truncated", Decimal( unexplainedTruncated ) }
             };
-            result["complete"] = missingStart == 0 && missingTerminal == 0 && duplicateTerminal == 0 && invalidOrder == 0 && unresolvedParent == 0 && bytesOverflow == 0 && !BudgetPartial();
+            result["complete"] = producerComplete && unexplainedMissingStart == 0 && unexplainedMissingTerminal == 0 &&
+                unexplainedTruncated == 0 && duplicateTerminal == 0 && invalidOrder == 0 && unresolvedParent == 0 &&
+                bytesOverflow == 0 && orphan == 0 && !BudgetPartial();
+            if( result["complete"].get<bool>() ) result["reason"] = nullptr;
             return Success( id, std::move( result ), trace );
         }
 

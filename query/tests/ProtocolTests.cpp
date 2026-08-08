@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.23.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.24.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -671,7 +671,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.23.0" );
+    assert( described.at( "schema_version" ) == "1.24.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -683,9 +683,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.23.0" );
+        assert( operation.at( "schema_version" ) == "1.24.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.23.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.24.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -795,13 +795,16 @@ int main()
     assert( ioRequest.at( "queue_latency_ns" ) == "2" && ioRequest.at( "execution_ns" ) == "20" && ioRequest.at( "total_ns" ) == "22" );
     assert( ioRequest.at( "requested_bytes" ) == "4096" && ioRequest.at( "transferred_bytes" ) == "4096" );
     assert( ioRequest.at( "request_callstack_ref" ) == "fake:callstack:1" && ioRequest.at( "stage_count" ) == 5 );
+    assert( ioRequest.at( "right_censored" ) == false && ioRequest.at( "capture_end_state" ) == "terminal" );
 
     const auto ioStatistics = service.Execute( Request( requestId++, "io.statistics", { { "trace_id", candidateId } } ) ).at( "data" );
     assert( ioStatistics.at( "present" ) == true && ioStatistics.at( "complete" ) == true );
     assert( ioStatistics.at( "counts" ).at( "requests" ) == "2" && ioStatistics.at( "counts" ).at( "completed" ) == "2" );
     assert( ioStatistics.at( "counts" ).at( "request_callstacks" ) == "1" && ioStatistics.at( "counts" ).at( "requeue_stages" ) == "1" );
     assert( ioStatistics.at( "quality" ).at( "missing_start" ) == "0" && ioStatistics.at( "quality" ).at( "missing_terminal" ) == "0" );
+    assert( ioStatistics.at( "quality" ).at( "right_censored" ) == "0" && ioStatistics.at( "quality" ).at( "unexplained_truncated" ) == "0" );
     assert( ioStatistics.at( "quality" ).at( "invalid_order" ) == "0" && ioStatistics.at( "quality" ).at( "unresolved_parent" ) == "0" );
+    assert( ioStatistics.at( "producer_quality" ).at( "complete" ) == true );
 
     const auto ioChain = service.Execute( Request( requestId++, "io.chain", {
         { "trace_id", candidateId }, { "ref", "fake:io-request:101" }
@@ -931,7 +934,7 @@ int main()
     assert( captureCoverage.at( "present" ) == true );
     assert( captureCoverage.at( "complete" ) == true );
     assert( captureCoverage.at( "evidence_kind" ) == "exact" );
-    assert( captureCoverage.at( "producers" ).size() == 5 );
+    assert( captureCoverage.at( "producers" ).size() == 6 );
     const auto degradedProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
         []( const auto& value ) { return value.at( "key" ) == "test.degraded"; } );
     assert( degradedProducer != captureCoverage.at( "producers" ).end() );

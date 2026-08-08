@@ -135,19 +135,35 @@ function Validate-N13 {
 
     Assert-Condition ([bool]$stats.present) 'io.statistics is not present'
     Assert-Condition ([int]$stats.io_schema_version -eq 1) 'I/O schema 1 was not detected'
+    Assert-Condition ([string]$stats.lifecycle_contract.connection_boundary -eq 'active_requests_only') 'I/O active snapshot contract mismatch'
+    Assert-Condition ([string]$stats.lifecycle_contract.completed_before_connection -eq 'not_replayed') 'I/O completed-request replay contract mismatch'
     Assert-Condition ([UInt64]$stats.counts.requests -gt 0) 'structured I/O requests are empty'
     Assert-Condition ([UInt64]$stats.counts.completed -gt 0) 'completed I/O requests are empty'
     Assert-Condition ([UInt64]$stats.counts.request_callstacks -gt 0) 'I/O request callstacks are empty'
-    Assert-Condition ([UInt64]$stats.quality.missing_start -eq 0) 'I/O request is missing Start'
-    Assert-Condition ([UInt64]$stats.quality.missing_terminal -eq 0) 'I/O request is missing a terminal stage'
+    Assert-Condition ([bool]$stats.producer_quality.present) 'io.structured producer quality is missing'
+    Assert-Condition ([bool]$stats.producer_quality.complete) 'io.structured producer lost core lifecycle events'
+    foreach ($counter in @('dropped', 'overflow', 'mismatch', 'unresolved', 'tail_truncated')) {
+        Assert-Condition ([UInt64]$stats.producer_quality.counters.$counter -eq 0) "io.structured producer counter is non-zero: $counter"
+    }
+    Assert-Condition ([UInt64]$stats.quality.unexplained_missing_start -eq 0) 'I/O request has an unexplained missing Start'
+    Assert-Condition ([UInt64]$stats.quality.unexplained_missing_terminal -eq 0) 'I/O request has an unexplained missing terminal stage'
+    Assert-Condition ([UInt64]$stats.quality.unexplained_truncated -eq 0) 'I/O request has unexplained truncation'
     Assert-Condition ([UInt64]$stats.quality.duplicate_terminal -eq 0) 'I/O request has duplicate terminal stages'
     Assert-Condition ([UInt64]$stats.quality.invalid_order -eq 0) 'I/O stage order is invalid'
     Assert-Condition ([UInt64]$stats.quality.unresolved_parent -eq 0) 'I/O parent is unresolved'
     Assert-Condition ([UInt64]$stats.quality.bytes_overflow -eq 0) 'I/O transferred bytes overflow requested bytes'
+    Assert-Condition ([UInt64]$stats.quality.orphan -eq 0) 'I/O request is orphaned'
     Assert-Condition ([bool]$stats.complete) 'I/O quality gate is incomplete'
     Assert-Condition ([bool]$validation.data.valid -and [UInt64]$validation.data.error_count -eq 0) 'trace validation failed'
     if (-not $RealCapture) {
         Assert-Condition ($requests.Count -eq [int][UInt64]$stats.counts.requests) 'io.search count differs from io.statistics'
+        Assert-Condition ([UInt64]$stats.quality.missing_start -eq 0) 'synthetic I/O request is missing Start'
+        Assert-Condition ([UInt64]$stats.quality.missing_terminal -eq 0) 'synthetic I/O request is missing a terminal stage'
+        Assert-Condition ([UInt64]$stats.quality.right_censored -eq 0) 'synthetic I/O request was unexpectedly right-censored'
+    }
+    else {
+        Assert-Condition ([UInt64]$stats.quality.missing_terminal -eq [UInt64]$stats.quality.right_censored) 'real open I/O requests are not fully explained by capture-end censoring'
+        Assert-Condition ([UInt64]$stats.quality.missing_start -eq [UInt64]$stats.quality.right_censored_queued) 'real queued requests do not explain every missing Start'
     }
 
     $operations = @($stats.counts.operations.PSObject.Properties | Where-Object {
@@ -185,11 +201,13 @@ function Validate-N13 {
     }
 
     if (-not $RealCapture) {
-        Assert-Condition ([UInt64]$stats.counts.requests -eq 5) 'synthetic request count mismatch'
-        Assert-Condition ([UInt64]$stats.counts.completed -eq 5) 'synthetic completed request count mismatch'
+        Assert-Condition ([UInt64]$stats.counts.requests -eq 6) 'synthetic request count mismatch'
+        Assert-Condition ([UInt64]$stats.counts.completed -eq 6) 'synthetic completed request count mismatch'
         Assert-Condition ([UInt64]$stats.counts.failed -eq 0 -and [UInt64]$stats.counts.cancelled -eq 0) 'synthetic terminal status mismatch'
         Assert-Condition ([UInt64]$stats.counts.requeue_stages -eq 1) 'synthetic requeue count mismatch'
         Assert-Condition ([UInt64]$stats.counts.request_callstacks -eq 5) 'synthetic callstack count mismatch'
+        Assert-Condition ([UInt64]$stats.counts.connection_snapshots -eq 1) 'synthetic active connection snapshot mismatch'
+        Assert-Condition ([UInt64]$stats.quality.capture_boundary -eq 1) 'synthetic capture-boundary request mismatch'
         Assert-Condition (($operations -join ',') -eq 'decompress,integrate,jnfs_load,read,resource_load') 'synthetic operation set mismatch'
         Assert-Condition ($chainNodes.Count -eq 5 -and $chainEdges.Count -eq 4) 'synthetic exact chain shape mismatch'
         Assert-Condition ([string]$context.data.context.workload.scenario -eq 'n13-file-io') 'synthetic capture context mismatch'
@@ -216,6 +234,7 @@ function Validate-N13 {
         cancelled = [string]$stats.counts.cancelled
         requeue_stages = [string]$stats.counts.requeue_stages
         request_callstacks = [string]$stats.counts.request_callstacks
+        connection_snapshots = [string]$stats.counts.connection_snapshots
         operations = $operations
         sources = $sources
         quality = [ordered]@{
@@ -228,7 +247,14 @@ function Validate-N13 {
             orphan = [string]$stats.quality.orphan
             truncated = [string]$stats.quality.truncated
             capture_boundary = [string]$stats.quality.capture_boundary
+            right_censored = [string]$stats.quality.right_censored
+            right_censored_queued = [string]$stats.quality.right_censored_queued
+            right_censored_running = [string]$stats.quality.right_censored_running
+            unexplained_missing_start = [string]$stats.quality.unexplained_missing_start
+            unexplained_missing_terminal = [string]$stats.quality.unexplained_missing_terminal
+            unexplained_truncated = [string]$stats.quality.unexplained_truncated
         }
+        producer_quality = $stats.producer_quality
         chain_nodes = $chainNodes.Count
         chain_edges = $chainEdges.Count
         chain_evidence = @($chainEdges | ForEach-Object { [string]$_.evidence_kind } | Sort-Object -Unique)
@@ -268,7 +294,7 @@ try {
     $snapshotSemantics = $results.snapshot.semantics | ConvertTo-Json -Compress -Depth 50
     Assert-Condition (($results.stream.semantics | ConvertTo-Json -Compress -Depth 50) -eq $snapshotSemantics) 'snapshot/stream N13 semantic mismatch'
     Assert-Condition (($results.replay.semantics | ConvertTo-Json -Compress -Depth 50) -eq $snapshotSemantics) 'snapshot/replay N13 semantic mismatch'
-    [ordered]@{ ok = $true; schema_version = '1.12.0'; traces = $results } | ConvertTo-Json -Compress -Depth 60
+    [ordered]@{ ok = $true; schema_version = '1.24.0'; traces = $results } | ConvertTo-Json -Compress -Depth 60
 }
 finally {
     foreach ($traceId in $traceIds) {
