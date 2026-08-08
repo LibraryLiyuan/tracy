@@ -260,6 +260,7 @@ public:
     void CpuZoneEnd( uint64_t index, int64_t end ) override
     {
         auto* record = reinterpret_cast<CpuZoneIndexRecord*>( m_cpu.Record( index ) );
+        if( !QueryIndexCpuZoneTimingComplete( end ) ) return;
         record->end = end;
         record->flags |= 1;
         if( record->parent != std::numeric_limits<uint64_t>::max() && end >= record->start )
@@ -342,7 +343,9 @@ public:
     void GpuZoneEnd( uint64_t index, int64_t cpuEnd, int64_t gpuEnd, uint16_t queryId ) override
     {
         auto* record = reinterpret_cast<GpuZoneIndexRecord*>( m_gpu.Record( index ) );
-        record->cpuEnd = cpuEnd; record->gpuEnd = gpuEnd; record->queryId = queryId;
+        record->queryId = queryId;
+        if( !QueryIndexGpuZoneTimingComplete( cpuEnd, gpuEnd ) ) return;
+        record->cpuEnd = cpuEnd; record->gpuEnd = gpuEnd;
         record->flags |= 1;
         if( record->parent != std::numeric_limits<uint64_t>::max() && gpuEnd >= record->gpuStart )
             reinterpret_cast<GpuZoneIndexRecord*>( m_gpu.Record( record->parent ) )->childGpuTime += gpuEnd - record->gpuStart;

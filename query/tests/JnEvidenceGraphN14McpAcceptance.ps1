@@ -8,7 +8,9 @@ param(
     [switch] $RealCapture,
     [switch] $RequireContextSwitch,
     [switch] $RequireSampling,
-    [string] $CheckpointDirectory = ''
+    [string] $CheckpointDirectory = '',
+    [string] $OutputPath = '',
+    [switch] $UseIndexed
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,7 +31,7 @@ $script:NextRequestId = 1
 $script:RequiredFrameId = $null
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $QueryExe
-$startInfo.Arguments = "--mcp --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
+$startInfo.Arguments = "--mcp$(if ($UseIndexed) { ' --indexed' } else { '' }) --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
 $startInfo.WorkingDirectory = $AllowRoot
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
@@ -381,7 +383,14 @@ try {
     $snapshotSemantics = Get-ComparableN14Semantics $results.snapshot.semantics
     Assert-Condition ((Get-ComparableN14Semantics $results.stream.semantics) -eq $snapshotSemantics) 'snapshot/stream N14 semantic mismatch'
     Assert-Condition ((Get-ComparableN14Semantics $results.replay.semantics) -eq $snapshotSemantics) 'snapshot/replay N14 semantic mismatch'
-    [ordered]@{ ok = $true; schema_version = '1.15.0'; traces = $results } | ConvertTo-Json -Compress -Depth 70
+    $document = [ordered]@{ ok = $true; schema_version = '1.26.0'; indexed = [bool]$UseIndexed; traces = $results }
+    $json = $document | ConvertTo-Json -Depth 70
+    if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
+        $outputDirectory = Split-Path -Parent $OutputPath
+        if ($outputDirectory) { [IO.Directory]::CreateDirectory($outputDirectory) | Out-Null }
+        [IO.File]::WriteAllText($OutputPath, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    }
+    $json
 }
 finally {
     foreach ($traceId in $traceIds) {

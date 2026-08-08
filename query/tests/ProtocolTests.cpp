@@ -1,5 +1,6 @@
 #include "TracyAnalysis.hpp"
 #include "TracyMemoryAnalysis.hpp"
+#include "TracyQueryIndex.hpp"
 #include "TracyQueryService.hpp"
 #include "FakeTraceSource.hpp"
 
@@ -137,6 +138,12 @@ struct TemporaryTraceFiles
 
 int main()
 {
+    static_assert( tracy::query::QueryIndexSchemaVersion == 4 );
+    static_assert( tracy::query::QueryIndexCpuZoneTimingComplete( 0 ) );
+    static_assert( !tracy::query::QueryIndexCpuZoneTimingComplete( -1 ) );
+    static_assert( tracy::query::QueryIndexGpuZoneTimingComplete( 0, 0 ) );
+    static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( -1, 0 ) );
+    static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( 0, -1 ) );
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
     assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.26.0" );

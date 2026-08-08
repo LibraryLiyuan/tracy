@@ -4,7 +4,10 @@ param(
     [Parameter(Mandatory = $true)][string]$Trace,
     [Parameter(Mandatory = $true)][string]$AllowRoot,
     [Parameter(Mandatory = $true)][string]$OutputFile,
-    [string]$StreamTrace = ''
+    [string]$StreamTrace = '',
+    [UInt64]$ExpectedLogicalResourceCount = 6209,
+    [UInt64]$ExpectedGpuPassCount = 997075,
+    [UInt32]$ExpectedOwnerRollupCount = 18
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,7 +120,7 @@ try
 
     $gpuMemorySummary = Measure-Inspect $traceId 'memory.gpu.summary'
     Assert-Condition ($gpuMemorySummary.elapsed_ms -le 2000) "memory.gpu.summary exceeded 2 seconds: $($gpuMemorySummary.elapsed_ms) ms"
-    Assert-Condition ([bool]$gpuMemorySummary.response.data.present -and [string]$gpuMemorySummary.response.data.logical_resource_count -eq '6209') 'indexed GPU-memory summary is absent or has the wrong logical-resource count'
+    Assert-Condition ([bool]$gpuMemorySummary.response.data.present -and [UInt64]$gpuMemorySummary.response.data.logical_resource_count -eq $ExpectedLogicalResourceCount) 'indexed GPU-memory summary is absent or has the wrong logical-resource count'
     $gpuRequestScopes = Measure-Inspect $traceId 'memory.gpu.request_scopes' @{ limit = 100 }
     Assert-Condition ($gpuRequestScopes.elapsed_ms -le 2000 -and @($gpuRequestScopes.response.data.scopes).Count -eq 100) 'GPU request-scope page failed the 2-second/100-record gate'
     $gpuAllocations = Measure-Inspect $traceId 'memory.gpu.allocations' @{ limit = 100 }
@@ -125,7 +128,7 @@ try
     Assert-Condition ($null -ne $gpuAllocations.response.data.allocations[0].origin -and $null -ne $gpuAllocations.response.data.allocations[0].logical_resource) 'GPU allocation page omitted origin or logical-resource metadata'
     $gpuAttribution = Measure-Inspect $traceId 'memory.gpu.attribution' @{ limit = 100 }
     Assert-Condition ($gpuAttribution.elapsed_ms -le 5000 -and @($gpuAttribution.response.data.allocations).Count -eq 100) 'GPU attribution page failed the 5-second/100-record gate'
-    Assert-Condition ([string]$gpuAttribution.response.data.pass_count -eq '997075' -and [string]$gpuAttribution.response.data.logical_resource_count -eq '6209' -and @($gpuAttribution.response.data.owner_rollups).Count -eq 18) 'GPU attribution aggregate counts are inconsistent'
+    Assert-Condition ([UInt64]$gpuAttribution.response.data.pass_count -eq $ExpectedGpuPassCount -and [UInt64]$gpuAttribution.response.data.logical_resource_count -eq $ExpectedLogicalResourceCount -and @($gpuAttribution.response.data.owner_rollups).Count -eq $ExpectedOwnerRollupCount) 'GPU attribution aggregate counts are inconsistent'
 
     $validation = Measure-Inspect $traceId 'validation.run' @{ max_scan_events = 100000000; max_cpu_ms = 60000 }
     Assert-Condition ($validation.elapsed_ms -le 60000) "validation.run exceeded 60 seconds: $($validation.elapsed_ms) ms"
@@ -185,6 +188,7 @@ try
         trace = [ordered]@{ path = (Get-Item -LiteralPath $Trace).FullName; bytes = (Get-Item -LiteralPath $Trace).Length; sha256 = (Get-FileHash -LiteralPath $Trace -Algorithm SHA256).Hash.ToLowerInvariant(); trace_id = $traceId }
         timings_ms = [ordered]@{ indexed_open = $openWatch.ElapsedMilliseconds; overview = $overview.elapsed_ms; capabilities = $capabilities.elapsed_ms; gpu_domain_1000 = $gpu.elapsed_ms; relation_1000 = $relations.elapsed_ms; gpu_memory_summary = $gpuMemorySummary.elapsed_ms; gpu_request_scopes_100 = $gpuRequestScopes.elapsed_ms; gpu_allocations_100 = $gpuAllocations.elapsed_ms; gpu_attribution_100 = $gpuAttribution.elapsed_ms; validation = $validation.elapsed_ms; cancellation = $cancelWatch.ElapsedMilliseconds }
         counts = [ordered]@{ cpu_zones = [string]$overview.response.data.trace.counts.cpu_zones; gpu_zones = [string]$overview.response.data.trace.counts.gpu_zones; relations = [string]$overview.response.data.trace.counts.relations; io_requests = [string]$overview.response.data.trace.counts.io_requests }
+        expected_gpu_memory_counts = [ordered]@{ logical_resources = [string]$ExpectedLogicalResourceCount; passes = [string]$ExpectedGpuPassCount; owner_rollups = [string]$ExpectedOwnerRollupCount }
         pagination = [ordered]@{ first = @($first.data.zones).Count; second = @($second.data.zones).Count; unique = ($refs | Select-Object -Unique).Count; first_partial = [bool]$first.partial; second_partial = [bool]$second.partial }
         cancellation = [ordered]@{ job_id = $jobId; state = [string]$jobStatus.data.state }
         response_bytes = $responseBytes

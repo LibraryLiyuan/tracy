@@ -9,6 +9,8 @@ param(
     [ValidateSet(2, 3)][int] $ExpectedJobSchema = 2,
     [string] $ExpectedSourceMode = '',
     [switch] $ExpectContinuation,
+    [ValidateRange(1, 60000)][int] $ValidationCpuMilliseconds = 5000,
+    [switch] $RequireCompleteValidation,
     [string] $OutputPath = ''
 )
 
@@ -75,7 +77,7 @@ function Wait-Ready {
     $deadline = [DateTime]::UtcNow.AddMinutes(4)
     while ([DateTime]::UtcNow -lt $deadline) {
         $status = Invoke-Tool -Name 'tracy_trace_status' -Arguments @{ trace_id = $TraceId }
-        if ([string]$status.data.status.state -eq 'ready') { return $status }
+        if ([string]$status.data.status.state -eq 'ready' -and [bool]$status.data.status.complete) { return $status }
         if ([string]$status.data.status.state -in @('failed', 'closed')) { throw "trace entered $($status.data.status.state)" }
         Start-Sleep -Milliseconds 250
     }
@@ -96,7 +98,7 @@ function Get-JobPage {
     param([string] $TraceId)
     $values = [System.Collections.Generic.List[object]]::new()
     for ($offset = 0; $offset -lt 10000; $offset += 1000) {
-        $response = Inspect $TraceId 'job.search' @{ offset = $offset; limit = 1000 }
+        $response = Inspect $TraceId 'job.search' @{ offset = $offset; limit = 1000; max_scan_events = 100000000; max_cpu_ms = 60000 }
         $page = @($response.data.jobs)
         foreach ($job in $page) { $values.Add($job) }
         if ($page.Count -lt 1000) { break }
@@ -112,8 +114,8 @@ function Validate-N12 {
     Assert-Condition (@($jobCapability[0].methods) -contains 'job.statistics') 'job.statistics capability missing'
 
     $context = Inspect $TraceId 'capture.context'
-    $statistics = Inspect $TraceId 'job.statistics'
-    $validation = Inspect $TraceId 'validation.run'
+    $statistics = Inspect $TraceId 'job.statistics' @{ max_scan_events = 100000000; max_cpu_ms = 60000 }
+    $validation = Inspect $TraceId 'validation.run' @{ max_scan_events = 100000000; max_cpu_ms = $ValidationCpuMilliseconds }
     $jobs = Get-JobPage $TraceId
     $stats = $statistics.data
 
@@ -146,6 +148,9 @@ function Validate-N12 {
     }
     Assert-Condition (-not [bool]$stats.quality.cancelled_supported) 'cancelled_supported must remain false for this uJobs branch'
     Assert-Condition ([bool]$validation.data.valid -and [UInt64]$validation.data.error_count -eq 0) 'trace validation failed'
+    if ($RequireCompleteValidation) {
+        Assert-Condition ([bool]$validation.data.complete) 'trace validation was partial'
+    }
 
     if (-not $RealCapture) {
         $expectedSyntheticJobs = if ($ExpectContinuation) { 3 } else { 2 }
@@ -254,6 +259,7 @@ function Validate-N12 {
         boundary_orphan = [string]$stats.quality.capture_boundary_orphan
         boundary_truncated = [string]$stats.quality.capture_boundary_truncated
         validation_errors = [string]$validation.data.error_count
+        validation_complete = [bool]$validation.data.complete
     }
 }
 
