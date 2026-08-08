@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.25.0",
+  "schema_version": "1.26.0",
   "coverage_level": "mcp",
   "status": "complete",
   "public_method_registry": "tracy::query::QueryMethodRegistry",
@@ -47,6 +47,7 @@
     "JnGpuTaxonomyMcpAcceptance stable L0/L1/L2 definitions, observed hierarchy, status capability, old-trace absence, and snapshot/stream/replay equality",
     "JnManagedLuaN11McpAcceptance Managed/Lua script stacks, zones, GC pairing, old-trace absence, and snapshot/stream/replay equality",
     "N14 evidence.graph/frame.critical_path/frame.explain discovery, generic inspect, bounded output, and snapshot/stream/replay equality",
+    "N16 primary/script/elevated real-trace MCP acceptance for bounded cross-domain evidence, exact Script source stacks, GPU resource ownership, Sampling, and Context Switch",
     "N15 runtime policy, producer budgets, compatibility/common-window, normalized compare, validation, and snapshot/stream/replay equality",
     "N15 compare compatibility and normalized common-frame-window acceptance with explicit warning override"
   ]

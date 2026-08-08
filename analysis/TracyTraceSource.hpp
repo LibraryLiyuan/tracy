@@ -3,12 +3,16 @@
 
 #include "TracyMemoryAnalysis.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
+#include <queue>
+#include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace tracy::analysis
@@ -681,6 +685,13 @@ struct GfxLinkDto
     uint8_t flags = 0;
 };
 
+struct GfxEvidenceSlice
+{
+    std::vector<GfxDispatchDto> dispatches;
+    std::vector<GfxEntityDto> entities;
+    std::vector<GfxLinkDto> links;
+};
+
 struct CorrelatedFrameEventDto
 {
     std::string ref;
@@ -865,10 +876,60 @@ public:
     virtual std::vector<std::string> ScanSamples( const ScanRange& range ) const = 0;
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
+    virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
+    {
+        const auto jobs = GetJobs();
+        std::unordered_map<uint64_t, const JobDto*> byId;
+        for( const auto& job : jobs ) byId.emplace( job.jobId, &job );
+        std::set<uint64_t> selected;
+        std::queue<uint64_t> pending;
+        for( const auto& job : jobs ) if( job.originFrameId == frameId )
+        {
+            if( selected.emplace( job.jobId ).second ) pending.push( job.jobId );
+        }
+        while( !pending.empty() )
+        {
+            const auto found = byId.find( pending.front() );
+            pending.pop();
+            if( found == byId.end() ) continue;
+            for( const auto& dependency : found->second->dependencies )
+                if( dependency.prerequisiteJobId != 0 && selected.emplace( dependency.prerequisiteJobId ).second ) pending.push( dependency.prerequisiteJobId );
+        }
+        std::vector<JobDto> result;
+        result.reserve( selected.size() );
+        for( const auto jobId : selected ) if( const auto found = byId.find( jobId ); found != byId.end() ) result.emplace_back( *found->second );
+        return result;
+    }
     virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
+    virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const
+    {
+        GfxEvidenceSlice result;
+        const auto allDispatches = GetGfxDispatches();
+        const auto allEntities = GetGfxEntities();
+        const auto allLinks = GetGfxLinks();
+        std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
+        for( const auto& dispatch : allDispatches ) if( dispatch.frameIndex == frameId )
+        {
+            result.dispatches.emplace_back( dispatch );
+            reachable.emplace( dispatch.dispatchId );
+        }
+        for( const auto& link : allLinks ) if( link.relation == 8 && link.targetId == frameId ) reachable.emplace( link.sourceId );
+        bool changed = true;
+        while( changed )
+        {
+            changed = false;
+            for( const auto& entity : allEntities ) if( entity.parentId != 0 && reachable.contains( entity.parentId ) )
+                changed |= reachable.emplace( entity.entityId ).second;
+            for( const auto& link : allLinks ) if( reachable.contains( link.sourceId ) )
+                changed |= reachable.emplace( link.targetId ).second;
+        }
+        for( const auto& entity : allEntities ) if( reachable.contains( entity.entityId ) ) result.entities.emplace_back( entity );
+        for( const auto& link : allLinks ) if( reachable.contains( link.sourceId ) ) result.links.emplace_back( link );
+        return result;
+    }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
     virtual uint64_t GetRelationCount() const { return GetRelations().size(); }
@@ -929,6 +990,66 @@ public:
     virtual std::optional<GpuMemoryPassPage> ScanGpuMemoryPasses( size_t, size_t, std::optional<uint64_t>, size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t, size_t, std::optional<uint64_t>, const std::string&, const std::string& ) const { return std::nullopt; }
+    virtual GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const
+    {
+        GpuMemoryEvidenceSlice result;
+        const auto attribution = GetGpuMemoryAttribution();
+        result.protocolPresent = attribution.protocolPresent;
+        result.complete = attribution.complete;
+        result.warnings = attribution.warnings;
+        for( const auto passId : passIds )
+        {
+            const auto found = attribution.passById.find( passId );
+            if( found == attribution.passById.end() ) continue;
+            auto pass = attribution.passes[found->second];
+            result.passes.emplace_back( std::move( pass ) );
+        }
+        size_t keptUses = 0;
+        std::vector<uint64_t> resourceIds;
+        for( auto& pass : result.passes )
+        {
+            if( keptUses >= maxUses )
+            {
+                result.omittedUses += pass.uses.size();
+                pass.uses.clear();
+                result.truncated = result.omittedUses != 0;
+                continue;
+            }
+            if( pass.uses.size() > maxUses - keptUses )
+            {
+                result.omittedUses += pass.uses.size() - ( maxUses - keptUses );
+                pass.uses.resize( maxUses - keptUses );
+                result.truncated = true;
+            }
+            keptUses += pass.uses.size();
+            for( const auto& use : pass.uses ) if( use.allocationId != 0 ) resourceIds.emplace_back( use.allocationId );
+        }
+        std::sort( resourceIds.begin(), resourceIds.end() );
+        resourceIds.erase( std::unique( resourceIds.begin(), resourceIds.end() ), resourceIds.end() );
+        for( const auto resourceId : resourceIds )
+        {
+            GpuMemoryEvidenceResource resource;
+            resource.resourceId = resourceId;
+            if( const auto logical = attribution.logicalById.find( resourceId ); logical != attribution.logicalById.end() )
+            {
+                const auto& value = attribution.logicalResources[logical->second];
+                resource.physicalAllocationId = value.physicalAllocationId;
+                resource.size = value.size;
+                resource.primaryOwnerId = value.primaryOwnerId;
+                resource.kind = value.kind;
+                resource.name = value.name;
+            }
+            if( const auto allocation = attribution.allocationById.find( resourceId ); allocation != attribution.allocationById.end() )
+            {
+                const auto& value = attribution.allocations[allocation->second].allocation;
+                if( resource.physicalAllocationId == 0 ) resource.physicalAllocationId = resourceId;
+                if( resource.size == 0 ) resource.size = value.size;
+                if( resource.name.empty() ) resource.name = value.poolName;
+            }
+            result.resources.emplace_back( std::move( resource ) );
+        }
+        return result;
+    }
     virtual SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const = 0;
     virtual BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const = 0;
     virtual SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const = 0;

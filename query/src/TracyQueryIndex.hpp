@@ -12,7 +12,7 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 2;
+inline constexpr uint32_t QueryIndexSchemaVersion = 3;
 
 struct QueryIndexSection
 {

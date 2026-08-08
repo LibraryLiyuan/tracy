@@ -139,7 +139,7 @@ int main()
 {
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.25.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.26.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -595,6 +595,21 @@ int main()
     assert( runtimeStates.at( "states" )[0].at( "reason" ) == "performance_gate" );
     assert( runtimeStates.at( "states" )[0].at( "capability_status" ) == "TriggeredOnly_PerformanceGateFailed" );
     assert( runtimeStates.at( "latest" ).at( "gpu_reference" ).at( "effective_mode" ) == "enabled" );
+    const auto scriptEvidence = service.Execute( Request( 1018, "evidence.graph", {
+        { "trace_id", n16Id }, { "frame_id", "281474976710657" },
+        { "domains", nlohmann::json::array( { "script" } ) }, { "max_nodes", 100 }, { "max_edges", 200 }
+    } ) ).at( "data" );
+    const auto hasScriptKind = [&]( const char* kind ) {
+        return std::any_of( scriptEvidence.at( "nodes" ).begin(), scriptEvidence.at( "nodes" ).end(),
+            [&]( const auto& value ) { return value.at( "domain" ) == "script" && value.at( "kind" ) == kind; } );
+    };
+    const auto hasScriptRelation = [&]( const char* relationName ) {
+        return std::any_of( scriptEvidence.at( "edges" ).begin(), scriptEvidence.at( "edges" ).end(),
+            [&]( const auto& value ) { return value.at( "relation" ) == relationName && value.at( "evidence_kind" ) == "exact"; } );
+    };
+    assert( hasScriptKind( "managed_zone" ) && hasScriptKind( "lua_zone" ) );
+    assert( hasScriptKind( "source_stack" ) && hasScriptKind( "source_frame" ) );
+    assert( hasScriptRelation( "captures_source_stack" ) && hasScriptRelation( "contains_source_frame" ) );
     assert( service.Execute( Request( 1017, "trace.close", { { "trace_id", n16Id } } ) ).at( "ok" ) );
 
     const auto openN11 = service.Execute( Request( 1002, "trace.open", { { "path", files.n11.string() } } ) );
@@ -671,7 +686,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.25.0" );
+    assert( described.at( "schema_version" ) == "1.26.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -683,9 +698,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.25.0" );
+        assert( operation.at( "schema_version" ) == "1.26.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.25.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.26.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -855,7 +870,9 @@ int main()
     } ) ).at( "data" );
     assert( frameExplain.at( "analysis_confidence" ) == "medium" );
     assert( frameExplain.at( "conclusion_contract" ) == "all conclusions must cite returned node/edge refs; absent domains are not real zero" );
-    assert( frameExplain.at( "missing_evidence" ).empty() );
+    assert( frameExplain.at( "missing_evidence" ).size() == 1 );
+    assert( frameExplain.at( "missing_evidence" )[0].at( "domain" ) == "script" );
+    assert( frameExplain.at( "missing_evidence" )[0].at( "status" ) == "unavailable" );
 
     const auto boundedEvidence = service.Execute( Request( requestId++, "evidence.graph", {
         { "trace_id", candidateId }, { "ref", "fake:frame-identity:281474976710657" },

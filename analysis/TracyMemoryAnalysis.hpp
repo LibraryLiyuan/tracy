@@ -380,6 +380,27 @@ struct GpuMemoryAllocationPage
     std::vector<GpuMemoryAllocationPageItem> allocations;
 };
 
+struct GpuMemoryEvidenceResource
+{
+    uint64_t resourceId = 0;
+    uint64_t physicalAllocationId = 0;
+    uint64_t size = 0;
+    uint32_t primaryOwnerId = 0;
+    char kind = 'U';
+    std::string name;
+};
+
+struct GpuMemoryEvidenceSlice
+{
+    bool protocolPresent = false;
+    bool complete = true;
+    bool truncated = false;
+    uint64_t omittedUses = 0;
+    std::vector<std::string> warnings;
+    std::vector<GpuMemoryPass> passes;
+    std::vector<GpuMemoryEvidenceResource> resources;
+};
+
 GpuMemoryAttribution BuildGpuMemoryAttribution(
     const std::vector<GpuMemoryCpuZoneInput>& cpuZones,
     const std::vector<GpuMemoryGpuZoneInput>& gpuZones,

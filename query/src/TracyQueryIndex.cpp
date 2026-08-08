@@ -930,6 +930,7 @@ public:
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanContextSwitches, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
+    TRACY_INDEX_FORWARD1( std::vector<analysis::JobDto>, GetEvidenceJobs, uint64_t, frameId )
     TRACY_INDEX_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
     TRACY_INDEX_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override
@@ -952,6 +953,51 @@ public:
         {
             const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
             result.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
+                MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
+        }
+        return result;
+    }
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override
+    {
+        analysis::GfxEvidenceSlice result;
+        std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
+        for( const auto& dispatch : m_source->GetGfxDispatches() ) if( dispatch.frameIndex == frameId )
+        {
+            result.dispatches.emplace_back( dispatch );
+            reachable.emplace( dispatch.dispatchId );
+        }
+        for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
+        {
+            const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
+            if( value.relation == 8 && value.targetId == frameId ) reachable.emplace( value.sourceId );
+        }
+        bool changed = true;
+        while( changed )
+        {
+            changed = false;
+            for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
+            {
+                const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
+                if( value.parentId != 0 && reachable.contains( value.parentId ) ) changed |= reachable.emplace( value.entityId ).second;
+            }
+            for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
+            {
+                const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
+                if( reachable.contains( value.sourceId ) ) changed |= reachable.emplace( value.targetId ).second;
+            }
+        }
+        for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
+        {
+            const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
+            if( !reachable.contains( value.entityId ) ) continue;
+            result.entities.push_back( { MakeEntityRef( "gfx-entity", value.entityId ), value.entityId, value.parentId, value.time,
+                MakeEntityRef( "thread", value.thread ), value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
+        }
+        for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
+        {
+            const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
+            if( !reachable.contains( value.sourceId ) ) continue;
+            result.links.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
                 MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
         }
         return result;
@@ -1010,6 +1056,98 @@ public:
     analysis::GpuMemoryAttribution GetGpuMemorySummaryAttribution() const override
     {
         return m_precomputedGpuMemorySummary ? *m_precomputedGpuMemorySummary : BuildIndexedGpuMemoryAttribution( true );
+    }
+    analysis::GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const override
+    {
+        if( !m_precomputedGpuMemorySummary ) return analysis::TraceSource::GetGpuMemoryEvidence( passIds, maxUses );
+        analysis::GpuMemoryEvidenceSlice result;
+        result.protocolPresent = m_precomputedGpuMemorySummary->protocolPresent;
+        result.complete = m_precomputedGpuMemorySummary->complete;
+        result.warnings = m_precomputedGpuMemorySummary->warnings;
+        std::unordered_map<uint64_t, size_t> selected;
+        selected.reserve( passIds.size() );
+        for( const auto passId : passIds ) selected.emplace( passId, selected.size() );
+        result.passes.resize( selected.size() );
+        std::vector<bool> present( selected.size(), false );
+        for( uint64_t index = 0; index < m_gpuReferencePasses.Count(); index++ )
+        {
+            const auto& value = m_gpuReferencePasses.At<JnGpuReferencePassData>( index );
+            const auto found = selected.find( value.passId );
+            if( found == selected.end() ) continue;
+            auto& pass = result.passes[found->second];
+            pass.passId = value.passId; pass.labelId = value.taxonomyId; pass.frame = value.frameIndex;
+            pass.ordinal = value.passId; pass.thread = value.thread; pass.start = value.time; pass.end = value.time;
+            pass.level = value.taxonomyLevel; pass.commandCount = 1; pass.structuredBinary = true; pass.flags = value.flags;
+            pass.name = "Taxonomy " + std::to_string( value.taxonomyId ); pass.operations = "resource";
+            present[found->second] = true;
+        }
+        for( uint64_t index = 0; index < m_gpuReferenceEnds.Count(); index++ )
+        {
+            const auto& value = m_gpuReferenceEnds.At<JnGpuReferenceEndData>( index );
+            const auto found = selected.find( value.passId );
+            if( found == selected.end() || !present[found->second] ) continue;
+            auto& pass = result.passes[found->second];
+            pass.end = value.time; pass.commandListId = value.commandListId;
+            pass.totalUseCount = value.totalReferenceCount; pass.droppedUses = value.droppedReferenceCount; pass.flags |= value.flags;
+            pass.truncated = ( pass.flags & 0x3 ) != 0; pass.complete = !pass.truncated && pass.droppedUses == 0;
+        }
+        for( uint64_t index = 0; index < m_relations.Count(); index++ )
+        {
+            const auto& value = m_relations.At<JnRelationData>( index );
+            if( value.relationNamespace != uint8_t( JnRelationNamespace::GpuReference ) || value.relation != 1 ) continue;
+            const auto found = selected.find( value.sourceId );
+            if( found != selected.end() && present[found->second] ) result.passes[found->second].parentPassId = value.targetId;
+        }
+        size_t keptUses = 0;
+        std::unordered_set<uint64_t> resourceIds;
+        for( uint64_t index = 0; index < m_gpuReferenceUses.Count(); index++ )
+        {
+            const auto& value = m_gpuReferenceUses.At<JnGpuReferenceUseData>( index );
+            const auto found = selected.find( value.passId );
+            if( found == selected.end() || !present[found->second] || value.resourceId == 0 ) continue;
+            auto& pass = result.passes[found->second];
+            pass.emittedUseCount++;
+            if( keptUses < maxUses )
+            {
+                char kind = 'U';
+                if( const auto logical = m_precomputedGpuMemorySummary->logicalById.find( value.resourceId ); logical != m_precomputedGpuMemorySummary->logicalById.end() )
+                    kind = m_precomputedGpuMemorySummary->logicalResources[logical->second].kind;
+                pass.uses.push_back( { value.resourceId, value.usageMask, kind } );
+                resourceIds.emplace( value.resourceId );
+                keptUses++;
+            }
+            else
+            {
+                result.truncated = true;
+                result.omittedUses++;
+            }
+        }
+        result.passes.erase( std::remove_if( result.passes.begin(), result.passes.end(), [&]( const auto& pass ) {
+            return pass.passId == 0;
+        } ), result.passes.end() );
+        const auto allocations = m_source->GetGpuMemoryAllocationInputs();
+        std::unordered_map<uint64_t, const analysis::GpuMemoryAllocationInput*> allocationById;
+        for( const auto& allocation : allocations ) if( resourceIds.contains( allocation.allocationId ) ) allocationById.emplace( allocation.allocationId, &allocation );
+        result.resources.reserve( resourceIds.size() );
+        for( const auto resourceId : resourceIds )
+        {
+            analysis::GpuMemoryEvidenceResource resource;
+            resource.resourceId = resourceId;
+            if( const auto logical = m_precomputedGpuMemorySummary->logicalById.find( resourceId ); logical != m_precomputedGpuMemorySummary->logicalById.end() )
+            {
+                const auto& value = m_precomputedGpuMemorySummary->logicalResources[logical->second];
+                resource.physicalAllocationId = value.physicalAllocationId; resource.size = value.size;
+                resource.primaryOwnerId = value.primaryOwnerId; resource.kind = value.kind; resource.name = value.name;
+            }
+            if( const auto allocation = allocationById.find( resourceId ); allocation != allocationById.end() )
+            {
+                if( resource.physicalAllocationId == 0 ) resource.physicalAllocationId = resourceId;
+                if( resource.size == 0 ) resource.size = allocation->second->size;
+                if( resource.name.empty() ) resource.name = allocation->second->poolName;
+            }
+            result.resources.emplace_back( std::move( resource ) );
+        }
+        return result;
     }
     std::optional<analysis::GpuMemoryPassPage> ScanGpuMemoryPasses( size_t offset, size_t limit,
         std::optional<uint64_t> requestedPassId, size_t useOffset, size_t useLimit ) const override

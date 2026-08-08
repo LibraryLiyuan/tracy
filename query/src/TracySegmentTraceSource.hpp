@@ -47,10 +47,12 @@ public:
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<analysis::JobDto> GetJobs() const override;
+    std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<analysis::IoRequestDto> GetIoRequests() const override;
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override;
     std::vector<analysis::RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
@@ -99,6 +101,7 @@ public:
     std::optional<analysis::GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t offset, size_t limit ) const override;
     std::optional<analysis::GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t offset, size_t limit,
         std::optional<uint64_t> allocationId, const std::string& poolRef, const std::string& relationState ) const override;
+    analysis::GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const override;
     analysis::SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
     analysis::BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     analysis::SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;

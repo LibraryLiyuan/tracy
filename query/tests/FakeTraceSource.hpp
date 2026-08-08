@@ -84,7 +84,10 @@ public:
         result.push_back( { "evidence", true, true, true, "deterministic N14 evidence graph", { "evidence.graph", "frame.critical_path", "frame.explain" } } );
         result.push_back( { "relation", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 exact relation data" : "JN trace section schema 4 absent", { "relation.search", "relation.get" } } );
         result.push_back( { "runtime.domain", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 runtime-domain state data" : "JN trace section schema 4 absent", { "runtime.domain.states" } } );
-        result.push_back( { "runtime.script", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" } } );
+        const bool hasScript = m_n11 || m_n16;
+        result.push_back( { "runtime.script", hasScript, hasScript, hasScript,
+            hasScript ? "deterministic script source-stack data" : "script data absent",
+            { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" } } );
         result.push_back( { "memory.gc", m_n11, m_n11, m_n11, m_n11 ? "deterministic N11 fake data" : "N11 data absent", { "memory.gc.summary", "memory.gc.events" } } );
         result.push_back( { "network", false, false, false, "deferred_by_user", { "network.capabilities" } } );
         return result;
@@ -381,6 +384,33 @@ public:
             { MakeEntityRef( "runtime-domain-state", 1 ), 2, 120, 30, MakeEntityRef( "thread", 1 ),
                 uint8_t( JnRuntimeDomain::GpuReference ), uint8_t( JnRuntimeMode::Enabled ),
                 uint8_t( JnRuntimeMode::Enabled ), 0, 0 }
+        };
+    }
+    std::vector<analysis::ScriptFrameDto> GetScriptFrames() const override
+    {
+        if( !m_n16 ) return {};
+        return {
+            { MakeEntityRef( "script-frame", 0 ), 1, "Fake.Managed.Caller", "package/com.jngame.tracy/runtime/fake.cs",
+                42, 5, MakeEntityRef( "thread", 1 ), 1, 4 },
+            { MakeEntityRef( "script-frame", 1 ), 2, "FakeLuaUpdate", "project/lua/fake.lua",
+                12, 6, MakeEntityRef( "thread", 1 ), 2, 4 }
+        };
+    }
+    std::vector<analysis::ScriptStackEventDto> GetScriptStackEvents() const override
+    {
+        if( !m_n16 ) return {};
+        const auto thread = MakeEntityRef( "thread", 1 );
+        return {
+            { MakeEntityRef( "script-event", 0 ), 1, 0, 1, 7, thread, 1, 4, uint8_t( JnScriptRecordKind::StackHeader ), {} },
+            { MakeEntityRef( "script-event", 1 ), 1, 1, 0, 8, thread, 1, 4, uint8_t( JnScriptRecordKind::StackFrame ), {} },
+            { MakeEntityRef( "script-event", 2 ), 1, 0, 1, 9, thread, 1, 0, uint8_t( JnScriptRecordKind::Marker ), "JN.Direct/Fake.Managed" },
+            { MakeEntityRef( "script-event", 3 ), 1001, 1, 1, 30, thread, 1, 0, uint8_t( JnScriptRecordKind::ZoneBegin ), {} },
+            { MakeEntityRef( "script-event", 4 ), 1001, 0, 0, 35, thread, 0, 0, uint8_t( JnScriptRecordKind::ZoneEnd ), {} },
+            { MakeEntityRef( "script-event", 5 ), 2, 0, 1, 10, thread, 2, 4, uint8_t( JnScriptRecordKind::StackHeader ), {} },
+            { MakeEntityRef( "script-event", 6 ), 2, 2, 0, 11, thread, 2, 4, uint8_t( JnScriptRecordKind::StackFrame ), {} },
+            { MakeEntityRef( "script-event", 7 ), 2, 0, 2, 12, thread, 2, 0, uint8_t( JnScriptRecordKind::Marker ), "JN.Direct/Fake.Lua" },
+            { MakeEntityRef( "script-event", 8 ), 1002, 2, 2, 40, thread, 2, 0, uint8_t( JnScriptRecordKind::ZoneBegin ), {} },
+            { MakeEntityRef( "script-event", 9 ), 1002, 0, 0, 45, thread, 0, 0, uint8_t( JnScriptRecordKind::ZoneEnd ), {} }
         };
     }
 

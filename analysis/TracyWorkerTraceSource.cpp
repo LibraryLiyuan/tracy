@@ -626,8 +626,15 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         impl->fingerprint = fingerprintOverride.empty() ? Sha256File( path ) : std::move( fingerprintOverride );
         impl->file.reset( FileRead::Open( path.string().c_str() ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
+        // CPU/GPU zones and the high-volume JN relation streams are written to
+        // dedicated memory-mapped sidecar sections. Every other persisted domain
+        // must remain in the compact payload; otherwise opening with --indexed
+        // would silently turn real capabilities (sampling, context switches,
+        // locks, frame images, symbols, or source cache) into absent data.
         const auto eventMask = loadMode != WorkerTraceLoadMode::CompactIndex ? EventType::All : EventType::Type(
-            EventType::Messages | EventType::Plots | EventType::Memory );
+            EventType::Locks | EventType::Messages | EventType::Plots | EventType::Memory |
+            EventType::FrameImages | EventType::ContextSwitches | EventType::Samples |
+            EventType::SymbolCode | EventType::SourceCache );
         impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
         while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
         if( stateCallback ) stateCallback( TraceSourceState::Indexing );
@@ -1904,10 +1911,33 @@ std::vector<std::string> WorkerTraceSource::ScanSamples( const ScanRange& range 
     return result;
 }
 
-std::vector<JobDto> WorkerTraceSource::GetJobs() const
+std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> evidenceFrameId ) const
 {
     std::lock_guard lock( m_impl->readMutex );
     const auto& data = m_impl->worker->GetJnTraceData();
+    std::unordered_set<uint64_t> selectedJobIds;
+    if( evidenceFrameId )
+    {
+        const auto frameSequence = uint32_t( *evidenceFrameId );
+        for( const auto& config : data.jobConfigs )
+            if( config.originFrameSequence == frameSequence ) selectedJobIds.emplace( config.jobId );
+        std::unordered_map<uint64_t, std::vector<uint64_t>> dependencies;
+        for( const auto& dependency : data.jobDependencies )
+            if( dependency.prerequisiteJobId != 0 ) dependencies[dependency.jobId].emplace_back( dependency.prerequisiteJobId );
+        std::queue<uint64_t> pending;
+        for( const auto jobId : selectedJobIds ) pending.push( jobId );
+        while( !pending.empty() )
+        {
+            const auto jobId = pending.front();
+            pending.pop();
+            const auto found = dependencies.find( jobId );
+            if( found == dependencies.end() ) continue;
+            for( const auto prerequisite : found->second )
+                if( selectedJobIds.emplace( prerequisite ).second ) pending.push( prerequisite );
+        }
+        if( selectedJobIds.empty() ) return {};
+    }
+    const auto includeJob = [&]( uint64_t jobId ) { return !evidenceFrameId || selectedJobIds.contains( jobId ); };
     std::map<uint64_t, JobDto> jobs;
     std::unordered_map<uint32_t, std::string> typeNames;
     std::unordered_map<uint32_t, uint64_t> frameIdsBySequence;
@@ -1931,6 +1961,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
 
     for( const auto& schedule : data.jobSchedules )
     {
+        if( !includeJob( schedule.jobId ) ) continue;
         auto& job = ensureJob( schedule.jobId );
         job.packedHandle = schedule.packedHandle;
         job.kind = schedule.kind;
@@ -1944,6 +1975,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
     }
     for( const auto& config : data.jobConfigs )
     {
+        if( !includeJob( config.jobId ) ) continue;
         auto& job = ensureJob( config.jobId );
         if( config.typeId != 0 ) job.typeId = config.typeId;
         if( config.count != 0 || job.count == 0 ) job.count = config.count;
@@ -1963,6 +1995,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
     }
     for( const auto& dependency : data.jobDependencies )
     {
+        if( !includeJob( dependency.jobId ) ) continue;
         auto& job = ensureJob( dependency.jobId );
         job.dependencies.push_back( { dependency.prerequisiteJobId, dependency.prerequisiteHandle, dependency.flags } );
     }
@@ -1984,6 +2017,7 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
 
     for( const auto& stage : data.jobStages )
     {
+        if( !includeJob( stage.jobId ) ) continue;
         auto& job = ensureJob( stage.jobId );
         job.stages.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.spanId, stage.arg0, stage.arg1, stage.stage, stage.flags } );
         switch( JnJobStage( stage.stage ) )
@@ -2082,6 +2116,16 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
         result.emplace_back( std::move( job ) );
     }
     return result;
+}
+
+std::vector<JobDto> WorkerTraceSource::GetJobs() const
+{
+    return BuildJobs( std::nullopt );
+}
+
+std::vector<JobDto> WorkerTraceSource::GetEvidenceJobs( uint64_t frameId ) const
+{
+    return BuildJobs( frameId );
 }
 
 std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const

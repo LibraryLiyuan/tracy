@@ -2519,7 +2519,9 @@ uint64_t ExplicitGpuQueryKey( uint8_t context, uint32_t queryId )
     return ( uint64_t( context ) << 32 ) | queryId;
 }
 
-ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source, const json& taxonomy )
+ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source, const json& taxonomy,
+    const std::vector<analysis::GfxEntityDto>* entityOverride = nullptr,
+    const std::vector<analysis::GfxLinkDto>* linkOverride = nullptr )
 {
     ExplicitGpuPassSet result;
     std::vector<uint32_t> taxonomyIds;
@@ -2533,8 +2535,12 @@ ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source,
         }
     }
 
-    const auto entities = source.GetGfxEntities();
-    const auto links = source.GetGfxLinks();
+    std::vector<analysis::GfxEntityDto> ownedEntities;
+    std::vector<analysis::GfxLinkDto> ownedLinks;
+    if( !entityOverride ) ownedEntities = source.GetGfxEntities();
+    if( !linkOverride ) ownedLinks = source.GetGfxLinks();
+    const auto& entities = entityOverride ? *entityOverride : ownedEntities;
+    const auto& links = linkOverride ? *linkOverride : ownedLinks;
     std::unordered_map<uint64_t, analysis::GfxEntityDto> entityById;
     entityById.reserve( entities.size() );
     for( const auto& entity : entities ) entityById.emplace( entity.entityId, entity );
@@ -6983,7 +6989,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             true, { { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
                 { "sequence", uint32_t( frameId ) }, { "event_refs", std::move( frameEventRefs ) } }, true );
 
-        const auto jobs = source->GetJobs();
+        const auto jobs = source->GetEvidenceJobs( frameId );
         std::unordered_map<uint64_t, const analysis::JobDto*> jobsById;
         for( const auto& job : jobs ) jobsById[job.jobId] = &job;
         std::set<uint64_t> selectedJobIds;
@@ -7119,6 +7125,148 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
 
+        uint64_t incompleteScriptZones = 0;
+        uint64_t orphanScriptZoneEnds = 0;
+        if( graph.DomainAllowed( "script" ) )
+        {
+            checkCancelled();
+            const auto scriptFrames = source->GetScriptFrames();
+            const auto scriptEvents = source->GetScriptStackEvents();
+            std::unordered_map<uint32_t, const analysis::ScriptFrameDto*> framesById;
+            framesById.reserve( scriptFrames.size() );
+            for( const auto& scriptFrame : scriptFrames )
+                if( scriptFrame.frameId != 0 && ScriptRuntimeValid( scriptFrame.runtime ) )
+                    framesById.emplace( scriptFrame.frameId, &scriptFrame );
+
+            struct ScriptStackEvidence
+            {
+                const analysis::ScriptStackEventDto* header = nullptr;
+                std::vector<uint32_t> frameIds;
+            };
+            std::unordered_map<uint64_t, ScriptStackEvidence> stacksById;
+            std::unordered_map<uint32_t, const analysis::ScriptStackEventDto*> markersById;
+            for( const auto& event : scriptEvents )
+            {
+                if( event.kind == uint8_t( JnScriptRecordKind::StackHeader ) && event.primaryId != 0 &&
+                    event.value != 0 && event.value <= 64 && ScriptRuntimeValid( event.runtime ) )
+                {
+                    auto& stack = stacksById[event.primaryId];
+                    if( stack.header == nullptr )
+                    {
+                        stack.header = &event;
+                        stack.frameIds.resize( event.value );
+                    }
+                }
+                else if( event.kind == uint8_t( JnScriptRecordKind::Marker ) && event.primaryId != 0 &&
+                    event.value != 0 && ScriptRuntimeValid( event.runtime ) )
+                {
+                    markersById.try_emplace( uint32_t( event.primaryId ), &event );
+                }
+            }
+            for( const auto& event : scriptEvents )
+            {
+                if( event.kind != uint8_t( JnScriptRecordKind::StackFrame ) || event.primaryId == 0 ||
+                    event.secondaryId == 0 || event.secondaryId > std::numeric_limits<uint32_t>::max() ) continue;
+                const auto stack = stacksById.find( event.primaryId );
+                if( stack == stacksById.end() || event.value >= stack->second.frameIds.size() ) continue;
+                if( stack->second.frameIds[event.value] == 0 )
+                    stack->second.frameIds[event.value] = uint32_t( event.secondaryId );
+            }
+
+            std::vector<const analysis::ScriptStackEventDto*> timeline;
+            timeline.reserve( scriptEvents.size() );
+            for( const auto& event : scriptEvents )
+                if( event.kind == uint8_t( JnScriptRecordKind::ZoneBegin ) ||
+                    event.kind == uint8_t( JnScriptRecordKind::ZoneEnd ) ) timeline.emplace_back( &event );
+            std::sort( timeline.begin(), timeline.end(), []( const auto* lhs, const auto* rhs ) {
+                if( lhs->timeNs != rhs->timeNs ) return lhs->timeNs < rhs->timeNs;
+                return lhs->kind < rhs->kind;
+            } );
+
+            std::unordered_map<uint64_t, const analysis::ScriptStackEventDto*> openZones;
+            const auto emitScriptZone = [&]( const analysis::ScriptStackEventDto& begin, int64_t endNs, bool zoneComplete ) {
+                if( endNs < frameBegin || begin.timeNs > frameEnd ) return;
+                const auto marker = markersById.find( begin.value );
+                const analysis::ScriptStackEventDto* markerEvent = marker == markersById.end() ? nullptr : marker->second;
+                const auto sourceFrameId = markerEvent == nullptr ? 0u : markerEvent->value;
+                const auto sourceFrame = framesById.find( sourceFrameId );
+                const analysis::ScriptFrameDto* source = sourceFrame == framesById.end() ? nullptr : sourceFrame->second;
+                const auto runtime = ScriptRuntimeName( begin.runtime );
+                const auto zoneName = markerEvent != nullptr && !markerEvent->text.empty() ? markerEvent->text :
+                    std::string( runtime ) + " Script Zone";
+                json details = {
+                    { "zone_id", Decimal( begin.primaryId ) }, { "stack_id", Decimal( begin.secondaryId ) },
+                    { "marker_id", begin.value }, { "runtime", runtime }, { "flags", begin.flags },
+                    { "source_mode", "binary-script-schema-2" }
+                };
+                if( source != nullptr )
+                {
+                    details["source_function"] = source->function;
+                    details["source_file"] = source->file;
+                    details["source_line"] = source->line;
+                }
+                const auto zone = graph.AddNode( "script-zone:" + std::to_string( begin.primaryId ), begin.ref,
+                    begin.runtime == 2 ? "lua_zone" : "managed_zone", "script", zoneName,
+                    begin.timeNs, std::max( begin.timeNs, endNs ), begin.threadRef, {},
+                    source == nullptr ? std::nullopt : std::optional<std::string>( source->ref ), std::nullopt,
+                    zoneComplete, true, std::move( details ) );
+                graph.AddEdge( graph.root, zone, "overlaps_frame", "derived", "script_zone_frame_overlap_v1", 0.85,
+                    true, { "ScriptStackEventDto.timeNs", "FrameIdentity.begin/end" }, zoneComplete );
+
+                const auto stack = stacksById.find( begin.secondaryId );
+                if( stack == stacksById.end() || stack->second.header == nullptr ) return;
+                const bool stackComplete = std::all_of( stack->second.frameIds.begin(), stack->second.frameIds.end(),
+                    [&]( uint32_t frameId ) { return frameId != 0 && framesById.contains( frameId ); } );
+                json frameIds = json::array();
+                for( const auto frameId : stack->second.frameIds ) frameIds.emplace_back( frameId );
+                const auto stackNode = graph.AddNode( "script-stack:" + std::to_string( begin.secondaryId ),
+                    stack->second.header->ref, "source_stack", "script", zoneName + " Source Stack",
+                    begin.timeNs, begin.timeNs, begin.threadRef, {}, std::nullopt, std::nullopt,
+                    stackComplete, false, { { "stack_id", Decimal( begin.secondaryId ) }, { "runtime", runtime },
+                        { "frame_ids", std::move( frameIds ) }, { "source_mode", "binary-script-schema-2" } } );
+                graph.AddEdge( zone, stackNode, "captures_source_stack", "exact", "script_zone_stack_id_v1", 1.0,
+                    false, { "ScriptStackEventDto.secondaryId" }, stackComplete );
+                for( size_t depth = 0; depth < stack->second.frameIds.size(); depth++ )
+                {
+                    const auto frameId = stack->second.frameIds[depth];
+                    const auto found = framesById.find( frameId );
+                    if( found == framesById.end() ) continue;
+                    const auto& frame = *found->second;
+                    const auto frameNode = graph.AddNode( "script-source-frame:" + std::to_string( frameId ), frame.ref,
+                        "source_frame", "script", frame.function, begin.timeNs, begin.timeNs, begin.threadRef, {},
+                        frame.ref, std::nullopt, true, false,
+                        { { "frame_id", frameId }, { "depth", depth }, { "runtime", ScriptRuntimeName( frame.runtime ) },
+                            { "function", frame.function }, { "file", frame.file }, { "line", frame.line },
+                            { "flags", frame.flags }, { "registered_at_ns", Decimal( frame.timeNs ) } } );
+                    graph.AddEdge( stackNode, frameNode, "contains_source_frame", "exact", "script_stack_frame_index_v1",
+                        1.0, false, { "ScriptStackEventDto.value", "ScriptStackEventDto.secondaryId" } );
+                }
+            };
+
+            for( const auto* event : timeline )
+            {
+                if( event->kind == uint8_t( JnScriptRecordKind::ZoneBegin ) )
+                {
+                    if( event->primaryId != 0 && event->secondaryId != 0 && event->value != 0 )
+                        openZones.try_emplace( event->primaryId, event );
+                    continue;
+                }
+                const auto open = openZones.find( event->primaryId );
+                if( open == openZones.end() )
+                {
+                    orphanScriptZoneEnds++;
+                    continue;
+                }
+                if( event->timeNs >= open->second->timeNs ) emitScriptZone( *open->second, event->timeNs, true );
+                openZones.erase( open );
+            }
+            for( const auto& [zoneId, begin] : openZones ) if( begin->timeNs <= frameEnd )
+            {
+                incompleteScriptZones++;
+                emitScriptZone( *begin, frameEnd, false );
+            }
+        }
+
         const auto ioRequests = source->GetIoRequests();
         std::unordered_map<uint64_t, size_t> ioNodes;
         const auto frameSequence = uint32_t( frameId );
@@ -7162,9 +7310,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
 
-        const auto dispatches = source->GetGfxDispatches();
-        const auto entities = source->GetGfxEntities();
-        const auto gfxLinks = source->GetGfxLinks();
+        std::vector<uint64_t> gfxSeeds;
+        gfxSeeds.reserve( selectedJobIds.size() );
+        for( const auto jobId : selectedJobIds ) gfxSeeds.emplace_back( jobId );
+        const auto gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds );
+        const auto& dispatches = gfxEvidence.dispatches;
+        const auto& entities = gfxEvidence.entities;
+        const auto& gfxLinks = gfxEvidence.links;
         std::set<uint64_t> reachableIds;
         std::unordered_map<uint64_t, size_t> rawNodes;
         for( const auto jobId : selectedJobIds ) if( jobNodes.contains( jobId ) )
@@ -7186,29 +7338,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         auto taxonomy = GpuTaxonomyCatalogJson( info() );
-        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
+        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy, &entities, &gfxLinks );
         std::vector<analysis::GpuZoneDto> frameGpuZones;
-        size_t gpuOffset = 0;
-        constexpr size_t EvidenceChunk = 4096;
-        while( true )
         {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( EvidenceChunk );
-            if( allowed == 0 ) break;
+            const auto requested = std::max<size_t>( 1, maxNodes );
+            const auto allowed = BudgetScanAllowance( requested );
             analysis::ScanRange range;
             range.startNs = frameBegin;
             range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
-            range.offset = gpuOffset;
+            range.offset = 0;
             range.limit = allowed;
             const auto values = source->ScanGpuZones( range );
-            BudgetScanned( values.size(), EvidenceChunk, allowed );
+            BudgetScanned( values.size(), requested, allowed );
             for( const auto& zone : values )
             {
                 MatchExplicitGpuPassZone( *source, explicitPasses, zone );
                 frameGpuZones.emplace_back( zone );
             }
-            gpuOffset += values.size();
-            if( values.size() < allowed ) break;
         }
 
         std::set<std::string> explicitGpuZoneRefs;
@@ -7269,46 +7416,70 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             graph.AddEdge( rawNodes[link.sourceId], rawNodes[link.targetId], GfxRelationName( link.relation ), "exact",
                 "gfx_link_id_v1", 1.0, true, { "GfxLinkDto.sourceId", "GfxLinkDto.targetId", "GfxLinkDto.relation" } );
 
-        const auto attribution = CachedGpuAttribution( trace.id, source );
+        std::vector<uint64_t> frameReferenceTokens;
+        for( const auto& match : explicitPasses.matches )
+            if( match.frameId == frameId && match.referenceToken != 0 ) frameReferenceTokens.emplace_back( match.referenceToken );
+        std::sort( frameReferenceTokens.begin(), frameReferenceTokens.end() );
+        frameReferenceTokens.erase( std::unique( frameReferenceTokens.begin(), frameReferenceTokens.end() ), frameReferenceTokens.end() );
+        const auto gpuEvidence = source->GetGpuMemoryEvidence( frameReferenceTokens, maxNodes );
+        std::unordered_map<uint64_t, const analysis::GpuMemoryPass*> evidencePasses;
+        for( const auto& pass : gpuEvidence.passes ) evidencePasses.emplace( pass.passId, &pass );
+        std::unordered_map<uint64_t, const analysis::GpuMemoryEvidenceResource*> evidenceResources;
+        for( const auto& resource : gpuEvidence.resources ) evidenceResources.emplace( resource.resourceId, &resource );
         for( const auto& match : explicitPasses.matches ) if( match.frameId == frameId && match.referenceToken != 0 && explicitPassNodes.contains( match.pass.entityId ) )
         {
-            const auto pass = attribution->passById.find( match.referenceToken );
-            if( pass == attribution->passById.end() ) continue;
-            for( const auto& use : attribution->passes[pass->second].uses )
+            const auto pass = evidencePasses.find( match.referenceToken );
+            if( pass == evidencePasses.end() ) continue;
+            for( const auto& use : pass->second->uses )
             {
-                uint64_t bytes = 0;
-                std::string pool;
-                if( const auto allocation = attribution->allocationById.find( use.allocationId ); allocation != attribution->allocationById.end() )
-                {
-                    bytes = attribution->allocations[allocation->second].allocation.size;
-                    pool = attribution->allocations[allocation->second].allocation.poolName;
-                }
+                const auto metadata = evidenceResources.find( use.allocationId );
+                const auto bytes = metadata == evidenceResources.end() ? 0 : metadata->second->size;
+                const auto name = metadata == evidenceResources.end() || metadata->second->name.empty() ? "GPU Logical Resource" : metadata->second->name;
                 const auto resource = graph.AddNode( "gpu-resource:" + std::to_string( use.allocationId ),
-                    source->MakeEntityRef( "gpu-allocation", use.allocationId ), "gpu_resource", "resource", pool.empty() ?
-                    "GPU Resource" : pool, graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
+                    source->MakeEntityRef( "gpu-allocation", use.allocationId ), "gpu_logical_resource", "resource", name,
+                    graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
                     graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
                     true, false, { { "allocation_id", Decimal( use.allocationId ) }, { "bytes", Decimal( bytes ) },
                         { "usage_mask", use.usageMask }, { "usage_kind", std::string( 1, use.kind ) } } );
                 graph.AddEdge( explicitPassNodes[match.pass.entityId], resource, "references_resource", "exact",
                     "gpu_reference_token_allocation_id_v1", 1.0, false,
                     { "ExplicitGpuPass.referenceToken", "GpuMemoryPassUse.allocationId" } );
+                if( metadata != evidenceResources.end() )
+                {
+                    if( metadata->second->physicalAllocationId != 0 )
+                    {
+                        const auto physical = graph.AddNode( "gpu-physical:" + std::to_string( metadata->second->physicalAllocationId ),
+                            source->MakeEntityRef( "gpu-physical-allocation", metadata->second->physicalAllocationId ),
+                            "gpu_physical_allocation", "resource", "GPU Physical Allocation",
+                            graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
+                            graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
+                            true, false, { { "physical_allocation_id", Decimal( metadata->second->physicalAllocationId ) } } );
+                        graph.AddEdge( resource, physical, "backed_by", "exact", "gpu_logical_physical_id_v1", 1.0, false,
+                            { "GpuMemoryLogicalResource.physicalAllocationId" } );
+                    }
+                    const auto owner = graph.AddNode( "gpu-owner:" + std::to_string( metadata->second->primaryOwnerId ),
+                        source->MakeEntityRef( "gpu-owner", metadata->second->primaryOwnerId ), "gpu_primary_owner", "resource",
+                        "GPU Primary Owner", graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
+                        graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
+                        true, false, { { "taxonomy_id", metadata->second->primaryOwnerId } } );
+                    graph.AddEdge( resource, owner, "owned_by", "exact", "gpu_primary_owner_id_v1", 1.0, false,
+                        { "GpuMemoryLogicalResource.primaryOwnerId" } );
+                }
             }
         }
 
         std::vector<std::pair<size_t, std::optional<std::string>>> cpuParents;
-        size_t cpuOffset = 0;
-        while( true )
         {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( EvidenceChunk );
-            if( allowed == 0 ) break;
+            const auto requested = std::max<size_t>( 1, maxNodes );
+            const auto allowed = BudgetScanAllowance( requested );
             analysis::ScanRange range;
             range.startNs = frameBegin;
             range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
-            range.offset = cpuOffset;
+            range.offset = 0;
             range.limit = allowed;
             const auto zones = source->ScanCpuZones( range );
-            BudgetScanned( zones.size(), EvidenceChunk, allowed );
+            BudgetScanned( zones.size(), requested, allowed );
             for( const auto& zone : zones ) if( zone.endNs )
             {
                 const auto node = graph.AddNode( "cpu-zone:" + zone.ref, zone.ref, "cpu_zone", "cpu", zone.name,
@@ -7319,8 +7490,6 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 graph.AddEdge( graph.root, node, "overlaps_frame", "derived", "frame_window_overlap_v1", 0.75, true,
                     { "CpuZoneDto.startNs/endNs", "FrameIdentity.begin/end" } );
             }
-            cpuOffset += zones.size();
-            if( zones.size() < allowed ) break;
         }
         for( const auto& [node, parentRef] : cpuParents ) if( parentRef )
         {
@@ -7341,19 +7510,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         std::map<std::string, analysis::LockEventDto> lockWaits;
-        size_t lockOffset = 0;
-        while( true )
         {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( EvidenceChunk );
-            if( allowed == 0 ) break;
+            const auto requested = std::max<size_t>( 1, maxNodes * 2 );
+            const auto allowed = BudgetScanAllowance( requested );
             analysis::ScanRange range;
             range.startNs = frameBegin;
             range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
-            range.offset = lockOffset;
+            range.offset = 0;
             range.limit = allowed;
             const auto events = source->ScanLockEvents( range );
-            BudgetScanned( events.size(), EvidenceChunk, allowed );
+            BudgetScanned( events.size(), requested, allowed );
             for( const auto& event : events )
             {
                 const auto key = event.lockRef + '|' + event.threadRef;
@@ -7370,23 +7537,19 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     lockWaits.erase( key );
                 }
             }
-            lockOffset += events.size();
-            if( events.size() < allowed ) break;
         }
 
-        size_t contextOffset = 0;
-        while( true )
         {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( EvidenceChunk );
-            if( allowed == 0 ) break;
+            const auto requested = std::max<size_t>( 1, maxNodes );
+            const auto allowed = BudgetScanAllowance( requested );
             analysis::ScanRange range;
             range.startNs = frameBegin;
             range.endNs = frameEnd == frameBegin ? frameBegin + 1 : frameEnd;
-            range.offset = contextOffset;
+            range.offset = 0;
             range.limit = allowed;
             const auto events = source->ScanContextSwitchEvents( range );
-            BudgetScanned( events.size(), EvidenceChunk, allowed );
+            BudgetScanned( events.size(), requested, allowed );
             for( const auto& event : events )
             {
                 if( event.endNs )
@@ -7408,8 +7571,6 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "ContextSwitchDto.wakeupNs", "ContextSwitchDto.startNs" } );
                 }
             }
-            contextOffset += events.size();
-            if( events.size() < allowed ) break;
         }
 
         std::map<std::string, std::vector<size_t>> timelineByThread;
@@ -7442,6 +7603,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json domainCoverage = json::array();
         static constexpr std::pair<const char*, const char*> RequiredDomains[] = {
             { "cpu", "zone.cpu" }, { "job", "job" }, { "wait", "job" }, { "lock", "lock" },
+            { "script", "runtime.script" },
             { "context_switch", "context_switch" }, { "io", "io" }, { "submission", "job.gfx" },
             { "gpu", "job.gfx" }, { "resource", "memory.gpu" }
         };
@@ -7464,13 +7626,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             } );
         }
         const bool contributionValid = criticalPath.value( "valid_contribution", false );
-        const bool complete = frameComplete && !graph.truncated && !BudgetPartial() && contributionValid && !criticalPath.value( "has_cycle", true );
+        const bool complete = frameComplete && incompleteScriptZones == 0 && !graph.truncated && !BudgetPartial() &&
+            contributionValid && !criticalPath.value( "has_cycle", true );
         json qualityFindings = json::array();
         if( !frameComplete ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "INCOMPLETE_FRAME" }, { "message", "canonical frame begin/end is incomplete" } } );
         if( graph.truncated || BudgetPartial() ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "EVIDENCE_BUDGET_PARTIAL" }, { "message", "node, edge, scan, or CPU budget truncated the evidence graph" } } );
         if( criticalPath.value( "has_cycle", false ) ) qualityFindings.push_back( { { "severity", "error" }, { "code", "CRITICAL_PATH_CYCLE" }, { "message", "critical-eligible evidence contains a cycle" } } );
         if( !contributionValid ) qualityFindings.push_back( { { "severity", "error" }, { "code", "INVALID_WALL_CLOCK_CONTRIBUTION" }, { "message", "critical path contribution exceeds frame wall time" } } );
         if( !includeHeuristic && graph.evidenceCounts["heuristic"] != 0 ) qualityFindings.push_back( { { "severity", "error" }, { "code", "HEURISTIC_LEAK" }, { "message", "heuristic evidence was emitted while disabled" } } );
+        if( incompleteScriptZones != 0 ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "INCOMPLETE_SCRIPT_ZONES" }, { "message", "one or more C#/Lua source-stack zones overlap the frame without a matching end" }, { "count", Decimal( incompleteScriptZones ) } } );
+        if( orphanScriptZoneEnds != 0 ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "ORPHAN_SCRIPT_ZONE_ENDS" }, { "message", "the script source-stack producer contains unmatched end records" }, { "count", Decimal( orphanScriptZoneEnds ) } } );
+        if( !gpuEvidence.complete ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "GPU_REFERENCE_SOURCE_INCOMPLETE" }, { "message", "GPU resource-reference producer reported incomplete source data" } } );
+        if( gpuEvidence.truncated ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "GPU_REFERENCE_EVIDENCE_TRUNCATED" }, { "message", "GPU resource evidence exceeded the bounded per-frame use limit" }, { "omitted_uses", Decimal( gpuEvidence.omittedUses ) } } );
 
         const auto base = [&]() {
             return json {

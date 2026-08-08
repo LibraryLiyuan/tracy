@@ -91,6 +91,7 @@ public:
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
     std::vector<JobDto> GetJobs() const override;
+    std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
@@ -155,6 +156,7 @@ public:
     BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
+    std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId ) const;
     class Impl;
     explicit WorkerTraceSource( std::unique_ptr<Impl> impl );
     std::unique_ptr<Impl> m_impl;
