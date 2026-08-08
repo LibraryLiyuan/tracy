@@ -1834,7 +1834,15 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     result.sourceBytes = std::filesystem::file_size( tracePath );
     result.sourceWriteTime = WriteTime( tracePath );
     result.sourceFingerprint = analysis::WorkerTraceSource::ComputeFingerprint( tracePath );
-    const auto baseName = tracePath.filename().string() + "." + result.sourceFingerprint.substr( 0, 16 ) + ".s" + std::to_string( QueryIndexSchemaVersion );
+    // The manifest remains adjacent to and named after the source trace, but
+    // section files must not repeat an arbitrarily long trace filename.  The
+    // old form could exceed the legacy Win32 MAX_PATH limit only after the
+    // longest section suffix and the atomic-write .tmp.<pid> suffix were
+    // appended.  The manifest already validates the complete 256-bit source
+    // fingerprint; this bounded basename is only a collision-resistant local
+    // section identity within the trace directory.
+    const auto baseName = std::string( "jnidx." ) + result.sourceFingerprint.substr( 0, 16 ) +
+        ".s" + std::to_string( QueryIndexSchemaVersion );
     const auto dataName = baseName + ".jnidx.data";
     result.dataPath = tracePath.parent_path() / dataName;
     result.zoneExtras.path = tracePath.parent_path() / ( baseName + ".jnidx.zextra" );
