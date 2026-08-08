@@ -3,6 +3,7 @@
 #include "TracyHash.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyFileRead.hpp"
+#include "TracyFileWrite.hpp"
 #include "TracyWorker.hpp"
 
 #include <capstone.h>
@@ -286,8 +287,9 @@ public:
         std::optional<size_t> parent;
     };
 
-    explicit Impl( std::filesystem::path sourcePath )
+    explicit Impl( std::filesystem::path sourcePath, WorkerTraceLoadMode sourceLoadMode )
         : path( std::move( sourcePath ) )
+        , loadMode( sourceLoadMode )
     {}
 
     std::string MakeRef( const char* kind, uint64_t id ) const
@@ -562,6 +564,7 @@ public:
     }
 
     std::filesystem::path path;
+    WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full;
     std::string fingerprint;
     std::unique_ptr<FileRead> file;
     std::unique_ptr<Worker> worker;
@@ -607,9 +610,14 @@ WorkerLoadProgress WorkerTraceSource::GetLoadProgress()
     };
 }
 
-std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, std::string fingerprintOverride )
+std::string WorkerTraceSource::ComputeFingerprint( const std::filesystem::path& path )
 {
-    auto impl = std::make_unique<Impl>( path );
+    return Sha256File( path );
+}
+
+std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink )
+{
+    auto impl = std::make_unique<Impl>( path, loadMode );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
     if( !std::filesystem::exists( path ) ) throw TraceLoadError( TraceLoadErrorCode::NotFound, "trace file does not exist" );
 
@@ -618,7 +626,9 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         impl->fingerprint = fingerprintOverride.empty() ? Sha256File( path ) : std::move( fingerprintOverride );
         impl->file.reset( FileRead::Open( path.string().c_str() ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
-        impl->worker = std::make_unique<Worker>( *impl->file, EventType::All, true, false );
+        const auto eventMask = loadMode != WorkerTraceLoadMode::CompactIndex ? EventType::All : EventType::Type(
+            EventType::Messages | EventType::Plots | EventType::Memory );
+        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
         while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
         if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         impl->BuildIndexes();
@@ -664,6 +674,24 @@ WorkerTraceSource::WorkerTraceSource( std::unique_ptr<Impl> impl )
 {}
 
 WorkerTraceSource::~WorkerTraceSource() = default;
+
+std::optional<std::string> WorkerTraceSource::ResolveStringIndex( uint32_t index ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( index == 0 ) return std::nullopt;
+    const auto* value = m_impl->worker->TryGetString( StringIdx( index ) );
+    if( !value ) return std::nullopt;
+    return Safe( value );
+}
+
+void WorkerTraceSource::WriteCompactSnapshot( const std::filesystem::path& path )
+{
+    std::lock_guard lock( m_impl->readMutex );
+    auto output = std::unique_ptr<FileWrite>( FileWrite::Open( path.string().c_str(), FileCompression::Zstd, 3, 4 ) );
+    if( !output ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to create compact trace index payload" );
+    m_impl->worker->Write( *output, false );
+    output->Finish();
+}
 
 const std::filesystem::path& WorkerTraceSource::Path() const { return m_impl->path; }
 const std::string& WorkerTraceSource::Fingerprint() const { return m_impl->fingerprint; }
@@ -1094,6 +1122,56 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
         gpuSegmentReferenceTokens, structuredReferencePasses, m_impl->worker->GetLastTime() );
 }
 
+GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttributionFromExternalZones(
+    const std::vector<GpuMemoryCpuZoneInput>& cpuInputs,
+    const std::vector<GpuMemoryGpuZoneInput>& gpuInputs ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<GpuMemoryAllocationInput> allocations;
+    for( const auto pool : m_impl->memoryPools )
+    {
+        const auto name = pool == 0 ? std::string( "Default allocator" ) : Safe( m_impl->worker->GetString( pool ) );
+        if( !IsGpuD3D12PoolName( name ) ) continue;
+        const auto& memory = m_impl->worker->GetMemoryNamed( pool );
+        for( size_t index = 0; index < memory.data.size(); index++ )
+        {
+            const auto& event = memory.data[index];
+            if( event.Ptr() == 0 ) continue;
+            allocations.push_back( { { pool, index }, event.Ptr(), event.Size(),
+                m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(),
+                event.TimeFree() >= 0 ? std::optional<int64_t>( event.TimeFree() ) : std::nullopt,
+                event.CsAlloc(), event.csFree.Val(), name } );
+        }
+    }
+    static const std::unordered_set<uint64_t> emptyIds;
+    static const std::vector<GpuMemoryReferencePassInput> emptyPasses;
+    return BuildGpuMemoryAttribution( cpuInputs, gpuInputs, allocations, emptyIds, emptyIds, emptyPasses,
+        m_impl->worker->GetLastTime() );
+}
+
+std::vector<GpuMemoryAllocationInput> WorkerTraceSource::GetGpuMemoryAllocationInputs() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    std::vector<GpuMemoryAllocationInput> allocations;
+    for( const auto pool : m_impl->memoryPools )
+    {
+        const auto name = pool == 0 ? std::string( "Default allocator" ) : Safe( m_impl->worker->GetString( pool ) );
+        if( !IsGpuD3D12PoolName( name ) ) continue;
+        const auto& memory = m_impl->worker->GetMemoryNamed( pool );
+        allocations.reserve( allocations.size() + memory.data.size() );
+        for( size_t index = 0; index < memory.data.size(); index++ )
+        {
+            const auto& event = memory.data[index];
+            if( event.Ptr() == 0 ) continue;
+            allocations.push_back( { { pool, index }, event.Ptr(), event.Size(),
+                m_impl->worker->DecompressThread( event.ThreadAlloc() ), event.TimeAlloc(),
+                event.TimeFree() >= 0 ? std::optional<int64_t>( event.TimeFree() ) : std::nullopt,
+                event.CsAlloc(), event.csFree.Val(), name } );
+        }
+    }
+    return allocations;
+}
+
 SourceTextDto WorkerTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -1195,7 +1273,7 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
         return record.starts_with( "JNGC1|" );
     } );
-    return {
+    auto result = std::vector<Capability> {
         capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
         capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash" } ),
         capability( "capture", hasCapture, true, { "capture.context", "capture.coverage", "producer.list", "producer.get" },
@@ -1241,6 +1319,19 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "compare", true, true, { "compare.compatibility", "compare.normalized", "compare.zones", "compare.frames", "compare.source" }, "requires a second ready trace session" ),
         capability( "validation", true, true, { "validation.run" } )
     };
+    if( m_impl->loadMode == WorkerTraceLoadMode::IndexedSidecar )
+    {
+        for( auto& item : result )
+        {
+            if( item.domain == "zone.cpu" || item.domain == "zone.gpu" || item.domain == "timeline" || item.domain == "evidence" )
+            {
+                item.queryable = false;
+                item.indexed = false;
+                item.reason = "compact sidecar is valid, but the N16.10 zone index section is not present";
+            }
+        }
+    }
+    return result;
 }
 
 #ifndef TRACY_NO_STATISTICS
@@ -1317,8 +1408,8 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     auto& counts = result.counts;
     counts.frameSets = worker.GetFrames().size();
     for( const auto* frames : worker.GetFrames() ) counts.frames += worker.GetFrameCount( *frames );
-    counts.cpuZones = worker.GetZoneCount();
-    counts.gpuZones = worker.GetGpuZoneCount();
+    counts.cpuZones = m_impl->loadMode == WorkerTraceLoadMode::Full ? m_impl->cpuZones.size() : worker.GetZoneCount();
+    counts.gpuZones = m_impl->loadMode == WorkerTraceLoadMode::Full ? m_impl->gpuZones.size() : worker.GetGpuZoneCount();
     {
         std::set<uint64_t> threads;
         for( const auto* thread : worker.GetThreadData() ) threads.emplace( thread->id );
@@ -2132,6 +2223,30 @@ std::vector<RelationDto> WorkerTraceSource::GetRelations() const
     std::vector<RelationDto> result;
     result.reserve( values.size() );
     for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "relation", index ), value.sourceId, value.targetId, value.time,
+            m_impl->MakeRef( "thread", value.thread ), value.sourceKind, value.targetKind,
+            value.relationNamespace, value.relation, value.flags } );
+    }
+    return result;
+}
+
+uint64_t WorkerTraceSource::GetRelationCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().relations.size();
+}
+
+std::vector<RelationDto> WorkerTraceSource::ScanRelations( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().relations;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<RelationDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; index++ )
     {
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "relation", index ), value.sourceId, value.targetId, value.time,

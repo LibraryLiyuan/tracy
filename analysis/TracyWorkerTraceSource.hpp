@@ -9,6 +9,8 @@
 #include <memory>
 #include <stdexcept>
 
+namespace tracy { class SerializedZoneSink; }
+
 namespace tracy::analysis
 {
 
@@ -45,14 +47,25 @@ struct WorkerLoadProgress
     uint64_t subTotal = 0;
 };
 
+enum class WorkerTraceLoadMode
+{
+    Full,
+    CompactIndex,
+    IndexedSidecar
+};
+
 class WorkerTraceSource final : public TraceSource
 {
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
 
-    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {} );
+    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full, SerializedZoneSink* serializedZoneSink = nullptr );
     static WorkerLoadProgress GetLoadProgress();
+    static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;
+
+    void WriteCompactSnapshot( const std::filesystem::path& path );
+    std::optional<std::string> ResolveStringIndex( uint32_t index ) const;
 
     WorkerTraceSource( const WorkerTraceSource& ) = delete;
     WorkerTraceSource& operator=( const WorkerTraceSource& ) = delete;
@@ -84,6 +97,8 @@ public:
     std::vector<GfxLinkDto> GetGfxLinks() const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<RelationDto> GetRelations() const override;
+    uint64_t GetRelationCount() const override;
+    std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
     std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
     std::vector<ScriptFrameDto> GetScriptFrames() const override;
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
@@ -127,6 +142,10 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
+    GpuMemoryAttribution GetGpuMemoryAttributionFromExternalZones(
+        const std::vector<GpuMemoryCpuZoneInput>& cpuInputs,
+        const std::vector<GpuMemoryGpuZoneInput>& gpuInputs ) const;
+    std::vector<GpuMemoryAllocationInput> GetGpuMemoryAllocationInputs() const;
     SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
     BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;

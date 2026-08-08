@@ -1,6 +1,7 @@
 #include "TracySessionManager.hpp"
 
 #include "TracySegmentTraceSource.hpp"
+#include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <algorithm>
@@ -76,7 +77,7 @@ const char* ToString( SessionErrorCode code )
     return "INTERNAL_ERROR";
 }
 
-SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions, SourceLoader sourceLoader )
+SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions, SourceLoader sourceLoader, bool preferIndex )
     : m_maxSessions( maxSessions )
     , m_sourceLoader( std::move( sourceLoader ) )
 {
@@ -95,10 +96,25 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
     m_allowRoots.erase( std::unique( m_allowRoots.begin(), m_allowRoots.end() ), m_allowRoots.end() );
     if( !m_sourceLoader )
     {
-        m_sourceLoader = []( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
+        m_sourceLoader = [preferIndex]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
             if( Lower( path.extension().string() ) == ".tracy-stream" )
             {
-                return SegmentTraceSource::Open( path, std::move( callback ) );
+                return SegmentTraceSource::Open( path, std::move( callback ), preferIndex );
+            }
+            if( preferIndex )
+            {
+                auto validation = QueryIndex::Validate( path );
+                if( !validation.manifest )
+                {
+                    auto buildCallback = callback;
+                    QueryIndex::Build( path, std::move( buildCallback ) );
+                    validation = QueryIndex::Validate( path );
+                }
+                if( !validation.manifest )
+                {
+                    throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "query index validation failed: " + validation.reason );
+                }
+                return QueryIndex::Open( *validation.manifest, std::move( callback ) );
             }
             return analysis::WorkerTraceSource::Open( path, std::move( callback ) );
         };
@@ -299,7 +315,7 @@ void SessionManager::RefreshSegmentSession( const std::shared_ptr<Session>& sess
         const auto view = current->RefreshView();
         if( view && view->revision > currentRevision )
         {
-            auto replacement = SegmentTraceSource::OpenRevision( current->Store(), view );
+            auto replacement = SegmentTraceSource::OpenRevision( current->Store(), view, {}, current->PreferIndex() );
             auto shared = std::shared_ptr<analysis::TraceSource>( std::move( replacement ) );
             const auto sourceView = shared->AcquireReadView();
             const auto fingerprint = shared->GetTraceInfo().fingerprint;

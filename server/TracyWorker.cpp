@@ -75,6 +75,39 @@ static void ReadJnVector( FileRead& f, std::vector<T>& target, const char* domai
 }
 
 template<typename T>
+static void ReadJnVector( FileRead& f, std::vector<T>& target, const char* domain,
+    SerializedZoneSink* sink, SerializedZoneSink::JnDomain sinkDomain )
+{
+    uint64_t size;
+    f.Read( size );
+    if( size > JnTraceMaxRecordsPerDomain )
+    {
+        char message[128];
+        snprintf( message, sizeof( message ), "JN trace %s record count is invalid.", domain );
+        throw LoadFailure( message );
+    }
+    if( !sink || !sink->WantsJnRecords( sinkDomain, sizeof( T ) ) )
+    {
+        target.resize( size );
+        if( size != 0 ) f.Read( target.data(), size * sizeof( T ) );
+        return;
+    }
+
+    sink->JnRecordsBegin( sinkDomain, size, sizeof( T ) );
+    constexpr uint64_t RecordsPerBlock = 64 * 1024;
+    std::vector<T> block( size_t( std::min<uint64_t>( size, RecordsPerBlock ) ) );
+    uint64_t offset = 0;
+    while( offset < size )
+    {
+        const auto count = std::min<uint64_t>( RecordsPerBlock, size - offset );
+        f.Read( block.data(), count * sizeof( T ) );
+        sink->JnRecordsBlock( sinkDomain, offset, block.data(), count, sizeof( T ) );
+        offset += count;
+    }
+    sink->JnRecordsEnd( sinkDomain );
+}
+
+template<typename T>
 static void WriteJnVector( FileWrite& f, const std::vector<T>& source )
 {
     const uint64_t size = source.size();
@@ -579,13 +612,14 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     }
 }
 
-Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification )
+Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification, SerializedZoneSink* serializedZoneSink )
     : m_hasData( true )
     , m_stream( nullptr )
     , m_buffer( nullptr )
     , m_inconsistentSamples( false )
     , m_memoryLimit( -1 )
     , m_allowStringModification( allowStringModification )
+    , m_serializedZoneSink( serializedZoneSink )
 {
     auto loadStart = std::chrono::high_resolution_clock::now();
 
@@ -1020,16 +1054,37 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     f.Read( sz );
     assert( sz != 0 );
-    m_data.zoneExtra.reserve_exact( sz, m_slab );
-    f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+    if( eventMask & EventType::CpuZones )
+    {
+        m_data.zoneExtra.reserve_exact( sz, m_slab );
+        f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+    }
+    else
+    {
+        m_data.zoneExtra.reserve_exact( 1, m_slab );
+        if( m_serializedZoneSink ) m_serializedZoneSink->ZoneExtrasBegin( sz );
+        for( uint64_t index = 0; index < sz; index++ )
+        {
+            ZoneExtra value;
+            f.Read( value );
+            if( index == 0 ) m_data.zoneExtra[0] = value;
+            if( m_serializedZoneSink ) m_serializedZoneSink->ZoneExtraRecord( index, value.callstack.Val(), value.text.Active(), value.text.Active() ? value.text.Idx() : 0,
+                value.name.Active(), value.name.Active() ? value.name.Idx() : 0, value.color.Val() );
+        }
+        if( m_serializedZoneSink ) m_serializedZoneSink->ZoneExtrasEnd();
+    }
 
     s_loadProgress.progress.store( LoadProgress::Zones, std::memory_order_relaxed );
     f.Read( sz );
+    if( !( eventMask & EventType::CpuZones ) && m_serializedZoneSink ) m_serializedZoneSink->CpuZonesBegin( sz );
     s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
     f.Read( sz );
-    m_data.zoneChildren.reserve_exact( sz, m_slab );
-    memset( (char*)m_data.zoneChildren.data(), 0, sizeof( Vector<short_ptr<ZoneEvent>> ) * sz );
+    if( eventMask & EventType::CpuZones )
+    {
+        m_data.zoneChildren.reserve_exact( sz, m_slab );
+        memset( (char*)m_data.zoneChildren.data(), 0, sizeof( Vector<short_ptr<ZoneEvent>> ) * sz );
+    }
     int32_t childIdx = 0;
     f.Read( sz );
     m_data.threads.reserve_exact( sz, m_slab );
@@ -1052,7 +1107,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( tsz );
         if( tsz != 0 )
         {
-            ReadTimeline( f, td->timeline, tsz, 0, childIdx );
+            if( eventMask & EventType::CpuZones ) ReadTimeline( f, td->timeline, tsz, 0, childIdx );
+            else SkipTimeline( f, tsz, 0, tid, std::numeric_limits<uint64_t>::max() );
         }
         uint64_t msz;
         f.Read( msz );
@@ -1118,14 +1174,19 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         m_data.threads[i] = td;
         m_threadMap.emplace( tid, td );
     }
+    if( !( eventMask & EventType::CpuZones ) && m_serializedZoneSink ) m_serializedZoneSink->CpuZonesEnd();
 
     s_loadProgress.progress.store( LoadProgress::GpuZones, std::memory_order_relaxed );
     f.Read( sz );
+    if( !( eventMask & EventType::GpuZones ) && m_serializedZoneSink ) m_serializedZoneSink->GpuZonesBegin( sz );
     s_loadProgress.subTotal.store( sz, std::memory_order_relaxed );
     s_loadProgress.subProgress.store( 0, std::memory_order_relaxed );
     f.Read( sz );
-    m_data.gpuChildren.reserve_exact( sz, m_slab );
-    memset( (char*)m_data.gpuChildren.data(), 0, sizeof( Vector<short_ptr<GpuEvent>> ) * sz );
+    if( eventMask & EventType::GpuZones )
+    {
+        m_data.gpuChildren.reserve_exact( sz, m_slab );
+        memset( (char*)m_data.gpuChildren.data(), 0, sizeof( Vector<short_ptr<GpuEvent>> ) * sz );
+    }
     childIdx = 0;
     f.Read( sz );
     m_data.gpuData.reserve_exact( sz, m_slab );
@@ -1159,8 +1220,15 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             {
                 int64_t refTime = 0;
                 int64_t refGpuTime = 0;
-                auto td = ctx->threadData.emplace( tid, GpuCtxThreadData {} ).first;
-                ReadTimeline( f, td->second.timeline, tsz, refTime, refGpuTime, childIdx, fileVer >= FileVersion( 0, 12, 4 ) );
+                if( eventMask & EventType::GpuZones )
+                {
+                    auto td = ctx->threadData.emplace( tid, GpuCtxThreadData {} ).first;
+                    ReadTimeline( f, td->second.timeline, tsz, refTime, refGpuTime, childIdx, fileVer >= FileVersion( 0, 12, 4 ) );
+                }
+                else
+                {
+                    SkipTimeline( f, tsz, refTime, refGpuTime, fileVer >= FileVersion( 0, 12, 4 ), uint32_t( i ), std::numeric_limits<uint64_t>::max() );
+                }
             }
         }
 
@@ -1188,6 +1256,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
         m_data.gpuData[i] = ctx;
     }
+    if( !( eventMask & EventType::GpuZones ) && m_serializedZoneSink ) m_serializedZoneSink->GpuZonesEnd();
 
     s_loadProgress.progress.store( LoadProgress::Plots, std::memory_order_relaxed );
     f.Read( sz );
@@ -1798,8 +1867,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         ReadJnVector( f, jn.jobDependencies, "job dependency" );
         ReadJnVector( f, jn.jobStages, "job stage" );
         ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
-        ReadJnVector( f, jn.gfxEntities, "gfx entity" );
-        ReadJnVector( f, jn.gfxLinks, "gfx link" );
+        ReadJnVector( f, jn.gfxEntities, "gfx entity", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxEntity );
+        ReadJnVector( f, jn.gfxLinks, "gfx link", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxLink );
         if( schemaVersion >= 2 ) ReadJnVector( f, jn.frames, "frame correlation" );
         if( schemaVersion >= 3 )
         {
@@ -1809,14 +1878,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         if( schemaVersion >= 4 )
         {
-            ReadJnVector( f, jn.relations, "relation" );
+            ReadJnVector( f, jn.relations, "relation", m_serializedZoneSink, SerializedZoneSink::JnDomain::Relation );
             ReadJnVector( f, jn.runtimeDomainStates, "runtime domain state" );
         }
         if( schemaVersion >= 5 )
         {
-            ReadJnVector( f, jn.gpuReferencePasses, "GPU reference pass" );
-            ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use" );
-            ReadJnVector( f, jn.gpuReferenceEnds, "GPU reference end" );
+            ReadJnVector( f, jn.gpuReferencePasses, "GPU reference pass", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferencePass );
+            ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceUse );
+            ReadJnVector( f, jn.gpuReferenceEnds, "GPU reference end", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceEnd );
         }
         if( schemaVersion >= 6 )
         {
@@ -1867,20 +1936,27 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 }
             };
 
-            jobs.emplace_back( std::thread( [this, ProcessTimeline] {
-                for( auto& t : m_data.threads )
-                {
-                    if( m_shutdown.load( std::memory_order_relaxed ) ) return;
-                    if( !t->timeline.empty() )
+            if( eventMask & EventType::CpuZones )
+            {
+                jobs.emplace_back( std::thread( [this, ProcessTimeline] {
+                    for( auto& t : m_data.threads )
                     {
-                        uint8_t countMap[64*1024];
-                        // Don't touch thread compression cache in a thread.
-                        ProcessTimeline( countMap, t->timeline, m_data.localThreadCompress.DecompressMustRaw( t->id ) );
+                        if( m_shutdown.load( std::memory_order_relaxed ) ) return;
+                        if( !t->timeline.empty() )
+                        {
+                            uint8_t countMap[64*1024];
+                            // Don't touch thread compression cache in a thread.
+                            ProcessTimeline( countMap, t->timeline, m_data.localThreadCompress.DecompressMustRaw( t->id ) );
+                        }
                     }
-                }
-                std::lock_guard<std::mutex> lock( m_data.lock );
+                    std::lock_guard<std::mutex> lock( m_data.lock );
+                    m_data.sourceLocationZonesReady = true;
+                } ) );
+            }
+            else
+            {
                 m_data.sourceLocationZonesReady = true;
-            } ) );
+            }
 
             std::function<void(Vector<short_ptr<GpuEvent>>&, uint16_t)> ProcessTimelineGpu;
             ProcessTimelineGpu = [this, &ProcessTimelineGpu] ( Vector<short_ptr<GpuEvent>>& _vec, uint16_t thread )
@@ -1898,21 +1974,28 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 }
             };
 
-            jobs.emplace_back( std::thread( [this, ProcessTimelineGpu] {
-                for( auto& t : m_data.gpuData )
-                {
-                    for( auto& td : t->threadData )
+            if( eventMask & EventType::GpuZones )
+            {
+                jobs.emplace_back( std::thread( [this, ProcessTimelineGpu] {
+                    for( auto& t : m_data.gpuData )
                     {
-                        if( m_shutdown.load( std::memory_order_relaxed ) ) return;
-                        if( !td.second.timeline.empty() )
+                        for( auto& td : t->threadData )
                         {
-                            ProcessTimelineGpu( td.second.timeline, td.first );
+                            if( m_shutdown.load( std::memory_order_relaxed ) ) return;
+                            if( !td.second.timeline.empty() )
+                            {
+                                ProcessTimelineGpu( td.second.timeline, td.first );
+                            }
                         }
                     }
-                }
-                std::lock_guard<std::mutex> lock( m_data.lock );
+                    std::lock_guard<std::mutex> lock( m_data.lock );
+                    m_data.gpuSourceLocationZonesReady = true;
+                } ) );
+            }
+            else
+            {
                 m_data.gpuSourceLocationZonesReady = true;
-            } ) );
+            }
 
             if( eventMask & EventType::Samples )
             {
@@ -9300,6 +9383,36 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
     return refTime;
 }
 
+int64_t Worker::SkipTimeline( FileRead& f, uint32_t size, int64_t refTime, uint64_t thread, uint64_t parent )
+{
+    assert( size != 0 );
+    const auto lp = s_loadProgress.subProgress.load( std::memory_order_relaxed );
+    s_loadProgress.subProgress.store( lp + size, std::memory_order_relaxed );
+
+    int16_t srcloc;
+    int64_t tstart, tend;
+    uint32_t childSz, extra;
+    f.Read4( srcloc, tstart, extra, childSz );
+    for( uint32_t index = 0; index < size; index++ )
+    {
+        refTime += tstart;
+        const auto zoneIndex = m_serializedCpuZoneIndex++;
+        if( m_serializedZoneSink ) m_serializedZoneSink->CpuZoneBegin( zoneIndex, parent, thread, refTime, srcloc, extra, childSz );
+        if( childSz != 0 ) refTime = SkipTimeline( f, childSz, refTime, thread, zoneIndex );
+        if( index + 1 == size )
+        {
+            f.Read( tend );
+        }
+        else
+        {
+            f.Read5( tend, srcloc, tstart, extra, childSz );
+        }
+        refTime += tend;
+        if( m_serializedZoneSink ) m_serializedZoneSink->CpuZoneEnd( zoneIndex, refTime );
+    }
+    return refTime;
+}
+
 void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint64_t size, int64_t& refTime, int64_t& refGpuTime, int32_t& childIdx, bool hasQueryId )
 {
     assert( size != 0 );
@@ -9334,6 +9447,36 @@ void Worker::ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& _vec, uint6
         if( hasQueryId ) f.Read( zone->query_id );
     }
     while( ++zone != end );
+}
+
+void Worker::SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent )
+{
+    assert( size != 0 );
+    const auto lp = s_loadProgress.subProgress.load( std::memory_order_relaxed );
+    s_loadProgress.subProgress.store( lp + size, std::memory_order_relaxed );
+    for( uint64_t index = 0; index < size; index++ )
+    {
+        int64_t tcpu, tgpu;
+        int16_t srcloc;
+        uint16_t thread;
+        uint64_t childSz;
+        Int24 callstack;
+        f.Read6( tcpu, tgpu, srcloc, callstack, thread, childSz );
+        refTime += tcpu;
+        refGpuTime += tgpu;
+        const auto zoneIndex = m_serializedGpuZoneIndex++;
+        if( m_serializedZoneSink ) m_serializedZoneSink->GpuZoneBegin( zoneIndex, parent, context, refTime, refGpuTime, srcloc, callstack.Val(), DecompressThread( thread ), childSz );
+        if( childSz != 0 ) SkipTimeline( f, childSz, refTime, refGpuTime, hasQueryId, context, zoneIndex );
+        f.Read2( tcpu, tgpu );
+        refTime += tcpu;
+        refGpuTime += tgpu;
+        uint16_t queryId = 0;
+        if( hasQueryId )
+        {
+            f.Read( queryId );
+        }
+        if( m_serializedZoneSink ) m_serializedZoneSink->GpuZoneEnd( zoneIndex, refTime, refGpuTime, queryId );
+    }
 }
 
 void Worker::Disconnect()

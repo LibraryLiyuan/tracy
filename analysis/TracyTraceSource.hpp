@@ -4,6 +4,7 @@
 #include "TracyMemoryAnalysis.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <string>
@@ -511,6 +512,23 @@ struct PlotPointDto
     double value = 0;
 };
 
+struct ZoneValidationFindingDto
+{
+    std::string severity;
+    std::string code;
+    std::string message;
+    uint64_t count = 0;
+    std::vector<std::string> refs;
+};
+
+struct ZoneValidationSummaryDto
+{
+    bool complete = true;
+    uint64_t scanned = 0;
+    std::vector<ZoneValidationFindingDto> findings;
+    std::vector<uint32_t> referencedCallstacks;
+};
+
 struct JobDependencyDto
 {
     uint64_t prerequisiteJobId = 0;
@@ -853,6 +871,16 @@ public:
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
+    virtual uint64_t GetRelationCount() const { return GetRelations().size(); }
+    virtual std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const
+    {
+        auto values = GetRelations();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<RelationDto>( values.begin() + begin, values.begin() + end );
+    }
+    virtual std::optional<ZoneValidationSummaryDto> ValidateZoneIndex( const std::function<size_t( size_t )>& ) const { return std::nullopt; }
+    virtual std::optional<bool> HasGpuMemoryProtocol2() const { return std::nullopt; }
     virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
     virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
@@ -897,6 +925,10 @@ public:
     virtual std::string MakeEntityRef( std::string_view kind, uint64_t id ) const = 0;
     virtual std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const = 0;
     virtual GpuMemoryAttribution GetGpuMemoryAttribution() const = 0;
+    virtual GpuMemoryAttribution GetGpuMemorySummaryAttribution() const { return GetGpuMemoryAttribution(); }
+    virtual std::optional<GpuMemoryPassPage> ScanGpuMemoryPasses( size_t, size_t, std::optional<uint64_t>, size_t, size_t ) const { return std::nullopt; }
+    virtual std::optional<GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t, size_t ) const { return std::nullopt; }
+    virtual std::optional<GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t, size_t, std::optional<uint64_t>, const std::string&, const std::string& ) const { return std::nullopt; }
     virtual SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const = 0;
     virtual BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const = 0;
     virtual SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const = 0;

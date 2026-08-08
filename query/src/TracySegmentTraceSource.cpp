@@ -1,4 +1,5 @@
 #include "TracySegmentTraceSource.hpp"
+#include "TracyQueryIndex.hpp"
 
 #include "../../public/common/TracyAlloc.hpp"
 #include "../../public/common/TracyProtocol.hpp"
@@ -7,6 +8,8 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../stream/src/TracyStreamJournal.hpp"
 #include "../../stream/src/TracyStreamReplay.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -121,6 +124,19 @@ std::filesystem::path MakeSnapshotPath( uint64_t revision )
         std::to_string( counter.fetch_add( 1, std::memory_order_relaxed ) ) + ".tracy" );
 }
 
+std::string StreamFingerprint( const stream::JournalReadView& view );
+
+std::filesystem::path MakePersistentSnapshotPath( const stream::JournalReadView& view )
+{
+    std::ostringstream suffix;
+    suffix << ".revision-" << view.revision << '-' << std::hex << std::setw( 8 ) << std::setfill( '0' ) << view.prefixCrc32c;
+    const auto fingerprint = StreamFingerprint( view );
+    suffix << '-' << fingerprint.substr( 0, std::min<size_t>( 16, fingerprint.size() ) ) << ".tracy";
+    auto path = view.path;
+    path += suffix.str();
+    return path;
+}
+
 std::string StreamFingerprint( const stream::JournalReadView& view )
 {
     std::ostringstream out;
@@ -130,6 +146,80 @@ std::string StreamFingerprint( const stream::JournalReadView& view )
     out << std::setw( 8 ) << view.header.protocolVersion;
     out << std::setw( 8 ) << view.header.flags;
     return out.str();
+}
+
+int64_t StreamWriteTime( const std::filesystem::path& path )
+{
+    return std::filesystem::last_write_time( path ).time_since_epoch().count();
+}
+
+std::filesystem::path StreamIndexCachePath( const std::filesystem::path& path )
+{
+    auto result = path;
+    result += ".jnidx-stream";
+    return result;
+}
+
+struct CachedStreamRevision
+{
+    std::shared_ptr<stream::JournalReadView> view;
+    std::filesystem::path snapshotPath;
+    std::string fingerprint;
+};
+
+std::optional<CachedStreamRevision> ReadStreamIndexCache( const std::filesystem::path& streamPath )
+{
+    try
+    {
+        const auto cachePath = StreamIndexCachePath( streamPath );
+        if( !std::filesystem::is_regular_file( cachePath ) || std::filesystem::file_size( cachePath ) > 64 * 1024 ) return std::nullopt;
+        std::ifstream input( cachePath, std::ios::binary );
+        const auto value = nlohmann::json::parse( input );
+        if( value.value( "schema", 0u ) != 1 || !value.value( "complete", false ) ) return std::nullopt;
+        if( std::filesystem::file_size( streamPath ) != std::stoull( value.at( "stream_bytes" ).get<std::string>() ) ||
+            StreamWriteTime( streamPath ) != std::stoll( value.at( "stream_write_time" ).get<std::string>() ) ) return std::nullopt;
+        const auto file = std::filesystem::path( value.at( "snapshot" ).get<std::string>() );
+        if( file.empty() || file != file.filename() ) return std::nullopt;
+        auto snapshotPath = streamPath.parent_path() / file;
+        const auto validation = QueryIndex::Validate( snapshotPath );
+        if( !validation.manifest ) return std::nullopt;
+        auto view = std::make_shared<stream::JournalReadView>();
+        view->path = streamPath; view->revision = std::stoull( value.at( "revision" ).get<std::string>() );
+        view->validSize = std::stoull( value.at( "valid_size" ).get<std::string>() );
+        view->recordCount = std::stoull( value.at( "record_count" ).get<std::string>() );
+        view->watermarkNs = std::stoull( value.at( "watermark_ns" ).get<std::string>() );
+        view->prefixCrc32c = value.at( "prefix_crc32c" ).get<uint32_t>();
+        view->observedFileSize = std::filesystem::file_size( streamPath ); view->observedCode = stream::ScanCode::Ok; view->complete = true;
+        return CachedStreamRevision { std::move( view ), std::move( snapshotPath ), value.at( "fingerprint" ).get<std::string>() };
+    }
+    catch( ... )
+    {
+        return std::nullopt;
+    }
+}
+
+void WriteStreamIndexCache( const stream::JournalReadView& view, const std::filesystem::path& snapshotPath )
+{
+    if( !view.complete ) return;
+    const auto cachePath = StreamIndexCachePath( view.path );
+    auto temporary = cachePath; temporary += ".tmp";
+    const nlohmann::json value = {
+        { "schema", 1 }, { "complete", true }, { "stream_bytes", std::to_string( std::filesystem::file_size( view.path ) ) },
+        { "stream_write_time", std::to_string( StreamWriteTime( view.path ) ) }, { "revision", std::to_string( view.revision ) },
+        { "valid_size", std::to_string( view.validSize ) }, { "record_count", std::to_string( view.recordCount ) },
+        { "watermark_ns", std::to_string( view.watermarkNs ) }, { "prefix_crc32c", view.prefixCrc32c },
+        { "fingerprint", StreamFingerprint( view ) }, { "snapshot", snapshotPath.filename().string() }
+    };
+    {
+        std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+        if( !output ) return;
+        output << value.dump();
+        if( !output ) return;
+    }
+    std::error_code error;
+    std::filesystem::remove( cachePath, error ); error.clear();
+    std::filesystem::rename( temporary, cachePath, error );
+    if( error ) { std::error_code ignored; std::filesystem::remove( temporary, ignored ); }
 }
 
 std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
@@ -496,8 +586,23 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
 
 }
 
-std::unique_ptr<SegmentTraceSource> SegmentTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback )
+std::unique_ptr<SegmentTraceSource> SegmentTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, bool preferIndex )
 {
+    if( preferIndex )
+    {
+        const auto cached = ReadStreamIndexCache( path );
+        if( cached )
+        {
+            if( stateCallback ) stateCallback( analysis::TraceSourceState::Loading );
+            const auto validation = QueryIndex::Validate( cached->snapshotPath );
+            if( validation.manifest )
+            {
+                auto source = QueryIndex::Open( *validation.manifest, std::move( stateCallback ), cached->fingerprint );
+                return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( {}, cached->view, cached->snapshotPath,
+                    std::move( source ), true, true ) );
+            }
+        }
+    }
     std::string error;
     auto uniqueStore = stream::JournalStore::Open( path, error );
     if( !uniqueStore )
@@ -505,29 +610,63 @@ std::unique_ptr<SegmentTraceSource> SegmentTraceSource::Open( const std::filesys
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, error.empty() ? "cannot open stream journal" : error );
     }
     auto store = std::shared_ptr<stream::JournalStore>( std::move( uniqueStore ) );
-    return OpenRevision( store, store->AcquireReadView(), std::move( stateCallback ) );
+    return OpenRevision( store, store->AcquireReadView(), std::move( stateCallback ), preferIndex );
 }
 
 std::unique_ptr<SegmentTraceSource> SegmentTraceSource::OpenRevision(
     std::shared_ptr<stream::JournalStore> store,
     std::shared_ptr<const stream::JournalReadView> view,
-    StateCallback stateCallback )
+    StateCallback stateCallback,
+    bool preferIndex )
 {
     if( !store || !view )
     {
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Internal, "stream revision view is unavailable" );
     }
     if( stateCallback ) stateCallback( analysis::TraceSourceState::Loading );
-    auto snapshotPath = ReplayRevision( *view );
+    std::filesystem::path snapshotPath;
+    bool persistentSnapshot = false;
     try
     {
+        if( preferIndex )
+        {
+            snapshotPath = MakePersistentSnapshotPath( *view );
+            persistentSnapshot = true;
+            auto validation = std::filesystem::exists( snapshotPath ) ? QueryIndex::Validate( snapshotPath ) : QueryIndexValidation {};
+            if( !validation.manifest )
+            {
+                auto replayPath = ReplayRevision( *view );
+                std::error_code error;
+                std::filesystem::remove( snapshotPath, error );
+                error.clear();
+                std::filesystem::rename( replayPath, snapshotPath, error );
+                if( error )
+                {
+                    error.clear();
+                    std::filesystem::copy_file( replayPath, snapshotPath, std::filesystem::copy_options::overwrite_existing, error );
+                    std::error_code ignored; std::filesystem::remove( replayPath, ignored );
+                    if( error ) throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::OpenFailed, "cannot publish the committed stream snapshot: " + error.message() );
+                }
+                auto buildCallback = stateCallback;
+                QueryIndex::Build( snapshotPath, std::move( buildCallback ) );
+                validation = QueryIndex::Validate( snapshotPath );
+            }
+            if( !validation.manifest )
+                throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "committed stream query index validation failed: " + validation.reason );
+            auto source = QueryIndex::Open( *validation.manifest, std::move( stateCallback ), StreamFingerprint( *view ) );
+            WriteStreamIndexCache( *view, snapshotPath );
+            return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( std::move( store ), std::move( view ),
+                std::move( snapshotPath ), std::move( source ), true, true ) );
+        }
+        snapshotPath = ReplayRevision( *view );
         auto source = analysis::WorkerTraceSource::Open( snapshotPath, std::move( stateCallback ), StreamFingerprint( *view ) );
-        return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( std::move( store ), std::move( view ), std::move( snapshotPath ), std::move( source ) ) );
+        return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( std::move( store ), std::move( view ),
+            std::move( snapshotPath ), std::move( source ), false, false ) );
     }
     catch( ... )
     {
         std::error_code ignored;
-        std::filesystem::remove( snapshotPath, ignored );
+        if( !persistentSnapshot ) std::filesystem::remove( snapshotPath, ignored );
         throw;
     }
 }
@@ -536,22 +675,27 @@ SegmentTraceSource::SegmentTraceSource(
     std::shared_ptr<stream::JournalStore> store,
     std::shared_ptr<const stream::JournalReadView> view,
     std::filesystem::path snapshotPath,
-    std::unique_ptr<analysis::WorkerTraceSource> source )
+    std::unique_ptr<analysis::TraceSource> source,
+    bool preferIndex,
+    bool persistentSnapshot )
     : m_store( std::move( store ) )
     , m_view( std::move( view ) )
     , m_snapshotPath( std::move( snapshotPath ) )
     , m_source( std::move( source ) )
+    , m_preferIndex( preferIndex )
+    , m_persistentSnapshot( persistentSnapshot )
 {}
 
 SegmentTraceSource::~SegmentTraceSource()
 {
     m_source.reset();
     std::error_code ignored;
-    std::filesystem::remove( m_snapshotPath, ignored );
+    if( !m_persistentSnapshot ) std::filesystem::remove( m_snapshotPath, ignored );
 }
 
 std::shared_ptr<const stream::JournalReadView> SegmentTraceSource::RefreshView()
 {
+    if( !m_store ) return m_view;
     m_store->Refresh();
     return m_store->AcquireReadView();
 }
@@ -579,6 +723,7 @@ std::vector<analysis::Capability> SegmentTraceSource::GetCapabilities() const
 #define TRACY_SEGMENT_FORWARD2( Return, Name, T1, A1, T2, A2 ) Return SegmentTraceSource::Name( T1 A1, T2 A2 ) const { return m_source->Name( A1, A2 ); }
 #define TRACY_SEGMENT_FORWARD3( Return, Name, T1, A1, T2, A2, T3, A3 ) Return SegmentTraceSource::Name( T1 A1, T2 A2, T3 A3 ) const { return m_source->Name( A1, A2, A3 ); }
 #define TRACY_SEGMENT_FORWARD4( Return, Name, T1, A1, T2, A2, T3, A3, T4, A4 ) Return SegmentTraceSource::Name( T1 A1, T2 A2, T3 A3, T4 A4 ) const { return m_source->Name( A1, A2, A3, A4 ); }
+#define TRACY_SEGMENT_FORWARD5( Return, Name, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5 ) Return SegmentTraceSource::Name( T1 A1, T2 A2, T3 A3, T4 A4, T5 A5 ) const { return m_source->Name( A1, A2, A3, A4, A5 ); }
 
 TRACY_SEGMENT_FORWARD0( analysis::TraceInfoDto, GetTraceInfo )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ThreadDto>, GetThreads )
@@ -603,6 +748,8 @@ TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches 
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxEntityDto>, GetGfxEntities )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxLinkDto>, GetGfxLinks )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RelationDto>, GetRelations )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetRelationCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::RelationDto>, ScanRelations, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
@@ -642,6 +789,10 @@ TRACY_SEGMENT_FORWARD1( std::optional<std::string>, GetGpuZoneRef, uint64_t, int
 TRACY_SEGMENT_FORWARD2( std::string, MakeEntityRef, std::string_view, kind, uint64_t, id )
 TRACY_SEGMENT_FORWARD2( std::optional<uint64_t>, ParseEntityRef, std::string_view, ref, std::string_view, kind )
 TRACY_SEGMENT_FORWARD0( analysis::GpuMemoryAttribution, GetGpuMemoryAttribution )
+TRACY_SEGMENT_FORWARD0( analysis::GpuMemoryAttribution, GetGpuMemorySummaryAttribution )
+TRACY_SEGMENT_FORWARD5( std::optional<analysis::GpuMemoryPassPage>, ScanGpuMemoryPasses, size_t, offset, size_t, limit, std::optional<uint64_t>, requestedPassId, size_t, useOffset, size_t, useLimit )
+TRACY_SEGMENT_FORWARD2( std::optional<analysis::GpuMemoryRequestScopePage>, ScanGpuMemoryRequestScopes, size_t, offset, size_t, limit )
+TRACY_SEGMENT_FORWARD5( std::optional<analysis::GpuMemoryAllocationPage>, ScanGpuMemoryAllocations, size_t, offset, size_t, limit, std::optional<uint64_t>, allocationId, const std::string&, poolRef, const std::string&, relationState )
 TRACY_SEGMENT_FORWARD2( analysis::SourceTextDto, ReadEmbeddedSource, size_t, sourceId, size_t, maxBytes )
 TRACY_SEGMENT_FORWARD3( analysis::BinaryResourceChunkDto, ReadEmbeddedSourceBytes, size_t, sourceId, size_t, offset, size_t, maxBytes )
 TRACY_SEGMENT_FORWARD2( analysis::SymbolCodeDto, ReadSymbolCode, uint64_t, symbolId, size_t, maxBytes )
@@ -655,5 +806,6 @@ TRACY_SEGMENT_FORWARD3( analysis::BinaryResourceChunkDto, ReadFrameImageBc1, siz
 #undef TRACY_SEGMENT_FORWARD2
 #undef TRACY_SEGMENT_FORWARD3
 #undef TRACY_SEGMENT_FORWARD4
+#undef TRACY_SEGMENT_FORWARD5
 
 }

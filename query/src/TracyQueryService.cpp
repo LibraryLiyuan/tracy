@@ -3892,12 +3892,13 @@ void QueryService::EraseTraceCache( const std::string& traceId )
     }
 }
 
-std::shared_ptr<const analysis::GpuMemoryAttribution> QueryService::CachedGpuAttribution( const std::string& traceId, const std::shared_ptr<analysis::TraceSource>& source )
+std::shared_ptr<const analysis::GpuMemoryAttribution> QueryService::CachedGpuAttribution( const std::string& traceId,
+    const std::shared_ptr<analysis::TraceSource>& source, bool summaryOnly )
 {
-    const auto key = traceId + "|gpu-attribution";
+    const auto key = traceId + ( summaryOnly ? "|gpu-summary-attribution" : "|gpu-attribution" );
     const auto found = m_gpuCache.find( key );
     if( found != m_gpuCache.end() ) { found->second.access = ++m_cacheClock; return found->second.value; }
-    auto value = std::make_shared<analysis::GpuMemoryAttribution>( source->GetGpuMemoryAttribution() );
+    auto value = std::make_shared<analysis::GpuMemoryAttribution>( summaryOnly ? source->GetGpuMemorySummaryAttribution() : source->GetGpuMemoryAttribution() );
     size_t bytes = sizeof( *value ) + value->warnings.capacity() * sizeof( std::string ) + value->requestScopes.capacity() * sizeof( analysis::GpuMemoryRequestScope ) +
         value->passes.capacity() * sizeof( analysis::GpuMemoryPass ) + value->allocations.capacity() * sizeof( analysis::GpuMemoryAllocationAttribution );
     for( const auto& warning : value->warnings ) bytes += warning.capacity();
@@ -4163,8 +4164,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool present = capability != capabilities.end() && capability->present;
         const std::string reason = present ? "" : capability == capabilities.end() ?
             "trace source does not advertise exact relations" : capability->reason;
-        auto relations = source->GetRelations();
-        const auto totalRelationCount = relations.size();
+        const auto totalRelationCount = source->GetRelationCount();
         auto base = [&]() -> json {
             return {
                 { "present", present }, { "relation_schema_version", present ? 1 : 0 },
@@ -4186,9 +4186,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref is required" );
             const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "relation" );
             if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref is not a relation ref from this trace" );
-            if( *parsed >= relations.size() ) throw QueryError( "ENTITY_NOT_FOUND", "relation ref was not found" );
+            if( *parsed >= totalRelationCount ) throw QueryError( "ENTITY_NOT_FOUND", "relation ref was not found" );
+            const auto relations = source->ScanRelations( size_t( *parsed ), 1 );
+            if( relations.empty() ) throw QueryError( "ENTITY_NOT_FOUND", "relation ref was not found" );
             auto result = base();
-            result["relation"] = RelationJson( *source, relations[size_t( *parsed )] );
+            result["relation"] = RelationJson( *source, relations.front() );
             return Success( id, std::move( result ), trace );
         }
 
@@ -4197,29 +4199,57 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const std::string sourceKindFilter = params.value( "source_kind", "" );
         const std::string targetKindFilter = params.value( "target_kind", "" );
         const std::string relationFilter = params.value( "relation", "" );
-        relations.erase( std::remove_if( relations.begin(), relations.end(), [&]( const auto& value ) {
+        const auto matches = [&]( const auto& value ) {
             const std::string searchable = std::string( RelationNamespaceName( value.relationNamespace ) ) + " " +
                 EntityKindName( value.sourceKind ) + " " + EntityKindName( value.targetKind ) + " " +
                 RelationName( value.relationNamespace, value.relation );
-            return !TextMatches( searchable, params ) ||
-                ( !namespaceFilter.empty() && namespaceFilter != RelationNamespaceName( value.relationNamespace ) ) ||
-                ( !sourceKindFilter.empty() && sourceKindFilter != EntityKindName( value.sourceKind ) ) ||
-                ( !targetKindFilter.empty() && targetKindFilter != EntityKindName( value.targetKind ) ) ||
-                ( !relationFilter.empty() && relationFilter != RelationName( value.relationNamespace, value.relation ) );
-        } ), relations.end() );
-        std::sort( relations.begin(), relations.end(), []( const auto& lhs, const auto& rhs ) {
-            return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
-        } );
-        const auto begin = std::min( page.offset, relations.size() );
-        const auto end = std::min( begin + page.limit, relations.size() );
+            return TextMatches( searchable, params ) &&
+                ( namespaceFilter.empty() || namespaceFilter == RelationNamespaceName( value.relationNamespace ) ) &&
+                ( sourceKindFilter.empty() || sourceKindFilter == EntityKindName( value.sourceKind ) ) &&
+                ( targetKindFilter.empty() || targetKindFilter == EntityKindName( value.targetKind ) ) &&
+                ( relationFilter.empty() || relationFilter == RelationName( value.relationNamespace, value.relation ) );
+        };
+        const bool filtered = params.contains( "filter" ) || !namespaceFilter.empty() || !sourceKindFilter.empty() || !targetKindFilter.empty() || !relationFilter.empty();
+        std::vector<analysis::RelationDto> selected;
+        uint64_t matchedCount = 0;
+        if( !filtered )
+        {
+            const auto begin = std::min<uint64_t>( page.offset, totalRelationCount );
+            selected = source->ScanRelations( size_t( begin ), page.limit );
+            matchedCount = totalRelationCount;
+            BudgetScanned( selected.size(), page.limit, page.limit );
+        }
+        else
+        {
+            constexpr size_t chunk = 16 * 1024;
+            uint64_t rawOffset = 0;
+            while( rawOffset < totalRelationCount )
+            {
+                checkCancelled();
+                const auto requested = size_t( std::min<uint64_t>( chunk, totalRelationCount - rawOffset ) );
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) break;
+                const auto relations = source->ScanRelations( size_t( rawOffset ), allowed );
+                BudgetScanned( relations.size(), requested, allowed );
+                for( const auto& value : relations )
+                {
+                    if( !matches( value ) ) continue;
+                    if( matchedCount >= page.offset && selected.size() < page.limit ) selected.emplace_back( value );
+                    matchedCount++;
+                }
+                rawOffset += relations.size();
+                if( relations.size() < allowed ) break;
+            }
+        }
         json values = json::array();
-        for( size_t index = begin; index < end; index++ ) values.emplace_back( RelationJson( *source, relations[index] ) );
+        for( const auto& value : selected ) values.emplace_back( RelationJson( *source, value ) );
         values = ProjectFields( std::move( values ), params );
         auto result = base();
-        result["matched_count"] = Decimal( relations.size() );
+        result["matched_count"] = BudgetPartial() ? json( nullptr ) : json( Decimal( matchedCount ) );
         result["relations"] = std::move( values );
-        const auto cursor = NextCursor( page, method, trace, end - begin, end < relations.size() );
-        return Success( id, std::move( result ), trace, PageJson( page, end - begin, cursor, BudgetPartial() ) );
+        const bool hasMore = BudgetPartial() || page.offset + selected.size() < matchedCount;
+        const auto cursor = NextCursor( page, method, trace, selected.size(), hasMore );
+        return Success( id, std::move( result ), trace, PageJson( page, selected.size(), cursor, BudgetPartial() ) );
     }
 
     if( method == "runtime.domain.states" )
@@ -6130,11 +6160,182 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "memory.gpu.allocations" || method == "memory.gpu.request_scopes" || method == "memory.gpu.pass_uses" || method == "memory.gpu.attribution" ||
         method == "memory.gpu.summary" || method == "memory.gpu.residency" || method == "memory.gpu.fragmentation" || method == "memory.gpu.churn" )
     {
-        const auto attributionValue = CachedGpuAttribution( trace.id, source );
-        const auto& attribution = *attributionValue;
-        if( !attribution.protocolPresent && method != "memory.gpu.allocations" ) throw QueryError( "CAPABILITY_UNAVAILABLE", "trace contains no GTMEM1 relation protocol" );
         const bool n10Method = method == "memory.gpu.summary" || method == "memory.gpu.residency" ||
             method == "memory.gpu.fragmentation" || method == "memory.gpu.churn";
+        if( n10Method )
+        {
+            const auto protocol2 = source->HasGpuMemoryProtocol2();
+            if( protocol2 && !*protocol2 )
+                return Success( id, { { "present", false }, { "reason", "trace contains no GTMEM2 allocation-origin/residency protocol" } }, trace );
+        }
+        if( method == "memory.gpu.pass_uses" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            std::optional<uint64_t> requestedPass;
+            if( params.contains( "pass_id" ) )
+            {
+                try { requestedPass = params["pass_id"].is_string() ? std::stoull( params["pass_id"].get<std::string>() ) : params["pass_id"].get<uint64_t>(); }
+                catch( const std::exception& ) { throw QueryError( "INVALID_PARAMS", "pass_id must be an unsigned decimal string" ); }
+            }
+            if( params.contains( "pass_ref" ) && params["pass_ref"].is_string() )
+            {
+                requestedPass = source->ParseEntityRef( params["pass_ref"].get<std::string>(), "gpu-memory-pass" );
+                if( !requestedPass ) throw QueryError( "ENTITY_NOT_FOUND", "GPU memory pass ref was not found" );
+            }
+            const auto indexedPage = source->ScanGpuMemoryPasses( page.offset, page.limit, requestedPass, page.offset, page.limit );
+            if( indexedPage )
+            {
+                if( requestedPass )
+                {
+                    if( indexedPage->passes.empty() ) throw QueryError( "ENTITY_NOT_FOUND", "GPU memory pass id was not found" );
+                    auto pass = GpuPassJson( *source, indexedPage->passes.front(), true, 0, page.limit );
+                    pass["uses_returned"] = indexedPage->passes.front().uses.size();
+                    pass["uses_truncated"] = page.offset + indexedPage->passes.front().uses.size() < indexedPage->totalUses;
+                    const auto cursor = NextCursor( page, method, trace, indexedPage->passes.front().uses.size(), page.offset + indexedPage->passes.front().uses.size() < indexedPage->totalUses );
+                    return Success( id, { { "pass", std::move( pass ) }, { "complete", indexedPage->passes.front().complete } },
+                        trace, PageJson( page, indexedPage->passes.front().uses.size(), cursor ) );
+                }
+                json passes = json::array();
+                for( const auto& pass : indexedPage->passes ) passes.emplace_back( GpuPassJson( *source, pass, false ) );
+                const auto cursor = NextCursor( page, method, trace, indexedPage->passes.size(), page.offset + indexedPage->passes.size() < indexedPage->totalPasses );
+                return Success( id, { { "passes", std::move( passes ) }, { "complete", indexedPage->complete }, { "warnings", indexedPage->warnings } },
+                    trace, PageJson( page, indexedPage->passes.size(), cursor ) );
+            }
+        }
+        if( method == "memory.gpu.request_scopes" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const auto indexedPage = source->ScanGpuMemoryRequestScopes( page.offset, page.limit );
+            if( indexedPage )
+            {
+                json scopes = json::array();
+                for( size_t index = 0; index < indexedPage->scopes.size(); index++ )
+                {
+                    const auto& scope = indexedPage->scopes[index];
+                    scopes.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-memory-scope", page.offset + index ) },
+                        { "label_id", Decimal( scope.labelId ) }, { "frame", Decimal( scope.frame ) },
+                        { "thread_id", Decimal( scope.thread ) }, { "start_ns", Decimal( scope.start ) }, { "end_ns", Decimal( scope.end ) },
+                        { "name", scope.name }, { "cpu_zone_ref", source->GetCpuZoneRef( scope.cpuZoneIndex ).value_or( "" ) },
+                        { "trust", "untrusted_trace_data" }
+                    } );
+                }
+                const auto returned = scopes.size();
+                const auto hasMore = page.offset + returned < indexedPage->totalScopes;
+                const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+                return Success( id, { { "scopes", std::move( scopes ) }, { "total_scopes", Decimal( indexedPage->totalScopes ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+        }
+        if( method == "memory.gpu.allocations" || method == "memory.gpu.attribution" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string relationFilter = params.value( "relation_state", "" );
+            if( !relationFilter.empty() && relationFilter != "request_and_uses" && relationFilter != "request_only" && relationFilter != "uses_only" && relationFilter != "unattributed" )
+                throw QueryError( "INVALID_PARAMS", "relation_state must be request_and_uses, request_only, uses_only, or unattributed" );
+            const std::string poolFilter = params.value( "pool_ref", "" );
+            std::optional<uint64_t> allocationFilter;
+            if( params.contains( "allocation_id" ) )
+            {
+                try { allocationFilter = params["allocation_id"].is_string() ? std::stoull( params["allocation_id"].get<std::string>() ) : params["allocation_id"].get<uint64_t>(); }
+                catch( const std::exception& ) { throw QueryError( "INVALID_PARAMS", "allocation_id must be an unsigned decimal string" ); }
+            }
+            const auto indexedPage = source->ScanGpuMemoryAllocations( page.offset, page.limit, allocationFilter, poolFilter, relationFilter );
+            if( indexedPage )
+            {
+                json allocations = json::array();
+                for( const auto& item : indexedPage->allocations )
+                {
+                    const auto event = source->GetMemoryEvent( item.attribution.allocation.key );
+                    if( !event ) continue;
+                    const std::string relationState = item.attribution.requestLabelId && item.passRefCount != 0 ? "request_and_uses" :
+                        item.attribution.requestLabelId ? "request_only" : item.passRefCount != 0 ? "uses_only" : "unattributed";
+                    json passes = json::array();
+                    for( const auto passId : item.passIds ) passes.emplace_back( source->MakeEntityRef( "gpu-memory-pass", passId ) );
+                    json allocationJson = {
+                        { "allocation", MemoryEventJson( *event ) }, { "allocation_id", Decimal( item.attribution.allocation.allocationId ) },
+                        { "request_label_id", item.attribution.requestLabelId ? json( Decimal( *item.attribution.requestLabelId ) ) : json( nullptr ) },
+                        { "pass_ref_count", Decimal( item.passRefCount ) }, { "pass_refs", std::move( passes ) },
+                        { "pass_refs_truncated", item.passRefCount > item.passIds.size() }, { "relation_state", relationState },
+                        { "logical_resource", nullptr }
+                    };
+                    if( item.origin )
+                    {
+                        const auto& value = *item.origin;
+                        const std::string availability = value.replayed || value.preCapture ? "unavailable_pre_capture_or_replay" :
+                            value.callstackRequested == 0 ? "disabled" : event->allocationCallstack != 0 ? "available" : "requested_but_unresolved";
+                        allocationJson["origin"] = {
+                            { "layer", std::string( 1, value.layer ) }, { "connection_id", Decimal( value.connectionId ) },
+                            { "replayed", value.replayed }, { "pre_capture", value.preCapture },
+                            { "callstack_requested", value.callstackRequested }, { "callstack_emitted", value.callstackEmitted },
+                            { "callstack_availability", availability }, { "residency", std::string( 1, value.residency ) },
+                            { "residency_managed", value.residencyManaged },
+                            { "cpu_zone_ref", source->GetCpuZoneRef( value.cpuZoneIndex ).value_or( "" ) }
+                        };
+                    }
+                    else allocationJson["origin"] = nullptr;
+                    if( item.logicalResource )
+                    {
+                        const auto& resource = *item.logicalResource;
+                        allocationJson["logical_resource"] = {
+                            { "logical_resource_id", Decimal( resource.logicalResourceId ) }, { "physical_allocation_id", Decimal( resource.physicalAllocationId ) },
+                            { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
+                            { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
+                            { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
+                            { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                        };
+                    }
+                    allocations.emplace_back( std::move( allocationJson ) );
+                }
+                const auto returned = allocations.size();
+                const auto cursor = NextCursor( page, method, trace, returned, indexedPage->hasMore );
+                json data = { { "allocations", std::move( allocations ) }, { "protocol_present", indexedPage->protocolPresent },
+                    { "complete", indexedPage->complete }, { "warnings", indexedPage->warnings } };
+                if( method == "memory.gpu.attribution" )
+                {
+                    const auto summary = source->GetGpuMemorySummaryAttribution();
+                    json passes = json::array();
+                    const auto passPage = source->ScanGpuMemoryPasses( 0, DefaultTopN, std::nullopt, 0, 0 );
+                    if( passPage ) for( const auto& pass : passPage->passes ) passes.emplace_back( GpuPassJson( *source, pass, false ) );
+                    data["pass_count"] = Decimal( passPage ? passPage->totalPasses : summary.passes.size() );
+                    data["pass_preview"] = std::move( passes );
+                    json logicalResources = json::array();
+                    for( size_t index = 0; index < std::min<size_t>( summary.logicalResources.size(), DefaultPageSize ); index++ )
+                    {
+                        const auto& resource = summary.logicalResources[index];
+                        logicalResources.push_back( {
+                            { "logical_resource_id", Decimal( resource.logicalResourceId ) }, { "physical_allocation_id", Decimal( resource.physicalAllocationId ) },
+                            { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
+                            { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
+                            { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
+                            { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                        } );
+                    }
+                    json ownerRollups = json::array();
+                    for( const auto& rollup : summary.ownerRollups ) ownerRollups.push_back( {
+                        { "taxonomy_id", Decimal( uint64_t( rollup.taxonomyId ) ) }, { "owned_physical_bytes", Decimal( rollup.physicalBytes ) },
+                        { "physical_allocation_count", Decimal( rollup.physicalAllocationCount ) }, { "logical_resource_count", Decimal( rollup.logicalResourceCount ) },
+                        { "owner_kind", rollup.taxonomyId == 0 ? "shared_or_unclassified" : "taxonomy" }
+                    } );
+                    data["logical_resource_count"] = Decimal( summary.logicalResources.size() ); data["logical_resources"] = std::move( logicalResources );
+                    data["logical_resources_truncated"] = summary.logicalResources.size() > DefaultPageSize;
+                    data["owner_rollups"] = std::move( ownerRollups ); data["working_sets"] = json::array();
+                    data["working_sets_truncated"] = summary.aggregatedWorkingSetCount != 0;
+                    data["working_set_count"] = Decimal( summary.aggregatedWorkingSetCount );
+                    data["working_set_preview_availability"] = "use memory.gpu.pass_uses for exact paged evidence; the indexed summary stores aggregate cardinality";
+                    data["rollup_semantics"] = {
+                        { "owner", "each physical allocation is counted once under one primary owner" },
+                        { "shared_heap", "taxonomy_id 0 is the explicit Shared/Unclassified owner; a heap is never assigned to its first placed resource" },
+                        { "working_set", "deduplicated by physical allocation within each frame and taxonomy node" },
+                        { "sibling_sum", "working sets of sibling taxonomy nodes may overlap and must not be summed as physical total" }
+                    };
+                }
+                return Success( id, std::move( data ), trace, PageJson( page, returned, cursor ) );
+            }
+        }
+        const auto attributionValue = CachedGpuAttribution( trace.id, source, n10Method );
+        const auto& attribution = *attributionValue;
+        if( !attribution.protocolPresent && method != "memory.gpu.allocations" ) throw QueryError( "CAPABILITY_UNAVAILABLE", "trace contains no GTMEM1 relation protocol" );
         if( n10Method && !attribution.protocol2Present )
             return Success( id, { { "present", false }, { "reason", "trace contains no GTMEM2 allocation-origin/residency protocol" } }, trace );
 
@@ -6274,25 +6475,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             json summaryWarnings = attribution.warnings;
             if( !registryQuality.value( "complete", false ) )
                 summaryWarnings.push_back( "GPU memory registry producer is missing, incomplete, or contains dropped/unresolved data" );
-            uint64_t incompleteReferencePasses = 0;
-            uint64_t structuredIncompleteReferencePasses = 0;
-            uint64_t legacyIncompleteReferencePasses = 0;
-            uint64_t truncatedReferencePasses = 0;
-            uint64_t failureFlagReferencePasses = 0;
-            uint64_t commandListBoundaryPasses = 0;
-            uint64_t droppedReferenceUses = 0;
+            uint64_t incompleteReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedIncompleteReferencePasses : 0;
+            uint64_t structuredIncompleteReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedStructuredIncompleteReferencePasses : 0;
+            uint64_t legacyIncompleteReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedLegacyIncompleteReferencePasses : 0;
+            uint64_t truncatedReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedTruncatedReferencePasses : 0;
+            uint64_t failureFlagReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedFailureFlagReferencePasses : 0;
+            uint64_t commandListBoundaryPasses = attribution.passQualityAggregated ? attribution.aggregatedCommandListBoundaryPasses : 0;
+            uint64_t droppedReferenceUses = attribution.passQualityAggregated ? attribution.aggregatedDroppedReferenceUses : 0;
             json incompleteReferencePreview = json::array();
-            for( const auto& pass : attribution.passes )
+            const auto appendIncompletePreview = [&]( const auto& pass )
             {
-                if( ( pass.flags & uint8_t( JnGpuReferenceFlags::CommandListBoundary ) ) != 0 )
-                    commandListBoundaryPasses++;
-                if( pass.complete || pass.gpuPairing == analysis::GpuZonePairing::CaptureBoundary ) continue;
-                incompleteReferencePasses++;
-                if( pass.structuredBinary ) structuredIncompleteReferencePasses++;
-                else legacyIncompleteReferencePasses++;
-                if( pass.truncated ) truncatedReferencePasses++;
-                if( ( pass.flags & 0xA ) != 0 ) failureFlagReferencePasses++;
-                droppedReferenceUses += pass.droppedUses;
                 if( incompleteReferencePreview.size() < 16 )
                 {
                     incompleteReferencePreview.push_back( {
@@ -6304,6 +6496,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "gpu_pairing", analysis::ToString( pass.gpuPairing ) }
                     } );
                 }
+            };
+            if( attribution.passQualityAggregated )
+            {
+                for( const auto& pass : attribution.aggregatedIncompleteReferencePreview ) appendIncompletePreview( pass );
+            }
+            else for( const auto& pass : attribution.passes )
+            {
+                if( ( pass.flags & uint8_t( JnGpuReferenceFlags::CommandListBoundary ) ) != 0 ) commandListBoundaryPasses++;
+                if( pass.complete || pass.gpuPairing == analysis::GpuZonePairing::CaptureBoundary ) continue;
+                incompleteReferencePasses++;
+                if( pass.structuredBinary ) structuredIncompleteReferencePasses++; else legacyIncompleteReferencePasses++;
+                if( pass.truncated ) truncatedReferencePasses++;
+                if( ( pass.flags & 0xA ) != 0 ) failureFlagReferencePasses++;
+                droppedReferenceUses += pass.droppedUses;
+                appendIncompletePreview( pass );
             }
             if( incompleteReferencePasses != 0 && summaryWarnings.empty() )
                 summaryWarnings.push_back( std::to_string( incompleteReferencePasses ) +
@@ -6316,7 +6523,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "physical", { { "active_bytes", Decimal( churn.activePhysicalBytes ) }, { "peak_bytes", Decimal( churn.peakPhysicalBytes ) } } },
                 { "logical_resource_count", Decimal( attribution.logicalResources.size() ) },
                 { "owner_rollup_count", Decimal( attribution.ownerRollups.size() ) },
-                { "working_set_count", Decimal( attribution.workingSets.size() ) },
+                { "working_set_count", Decimal( attribution.passQualityAggregated ? attribution.aggregatedWorkingSetCount : attribution.workingSets.size() ) },
                 { "layers", {
                     { "cpu_allocation", { { "domain", "memory" }, { "included", false },
                         { "semantics", "Unity native CPU allocations are separate from GPU memory" } } },
@@ -9077,68 +9284,81 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         for( const auto& value : source->GetGpuContexts() ) gpuContextRefs.emplace( value.ref );
         for( const auto& value : source->GetLocks() ) lockRefs.emplace( value.ref );
         for( const auto& value : source->GetSymbols() ) symbolRefs.emplace( value.ref );
-        std::set<std::string> cpuZoneRefs, gpuZoneRefs;
-        std::vector<std::pair<std::string, std::string>> cpuParents, gpuParents;
+        const auto validEntityRef = [&]( const std::string& ref, std::string_view kind, uint64_t count ) {
+            const auto parsed = source->ParseEntityRef( ref, kind );
+            return parsed && *parsed < count;
+        };
         std::set<uint32_t> referencedCallstacks;
-        size_t incompleteCpu = 0, invalidCpu = 0, unresolvedCpuNames = 0;
-        size_t incompleteGpu = 0, invalidGpu = 0;
-        json incompleteCpuRefs = json::array(), invalidCpuRefs = json::array(), unresolvedCpuNameRefs = json::array(), incompleteGpuRefs = json::array(), invalidGpuRefs = json::array();
         size_t offset = 0;
         constexpr size_t chunk = 4096;
-        while( true )
-        {
+        const auto indexedZoneValidation = source->ValidateZoneIndex( [&]( size_t requested ) {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
-            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-            const auto values = source->ScanCpuZones( range );
-            BudgetScanned( values.size(), chunk, allowed );
-            for( const auto& value : values )
-            {
-                cpuZoneRefs.emplace( value.ref );
-                if( value.parentRef ) cpuParents.emplace_back( value.ref, *value.parentRef );
-                if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
-                if( !value.sourceLocationRef.empty() && sourceRefs.find( value.sourceLocationRef ) == sourceRefs.end() ) noteReference( "SOURCE_LOCATION", value.ref );
-                if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
-                if( !value.nameResolved ) { unresolvedCpuNames++; addRef( unresolvedCpuNameRefs, value.ref ); }
-                if( !value.complete ) { incompleteCpu++; addRef( incompleteCpuRefs, value.ref ); }
-                if( value.endNs && *value.endNs < value.startNs ) { invalidCpu++; addRef( invalidCpuRefs, value.ref ); }
-            }
-            offset += values.size();
-            if( values.size() < allowed ) break;
-        }
-        offset = 0;
-        while( true )
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed != 0 ) BudgetScanned( allowed, requested, allowed );
+            return allowed;
+        } );
+        if( indexedZoneValidation )
         {
-            checkCancelled();
-            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
-            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-            const auto values = source->ScanGpuZones( range );
-            BudgetScanned( values.size(), chunk, allowed );
-            for( const auto& value : values )
+            for( const auto& value : indexedZoneValidation->findings )
             {
-                gpuZoneRefs.emplace( value.ref );
-                if( value.parentRef ) gpuParents.emplace_back( value.ref, *value.parentRef );
-                if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
-                if( !value.contextRef.empty() && gpuContextRefs.find( value.contextRef ) == gpuContextRefs.end() ) noteReference( "GPU_CONTEXT", value.ref );
-                if( !value.sourceLocationRef.empty() && sourceRefs.find( value.sourceLocationRef ) == sourceRefs.end() ) noteReference( "SOURCE_LOCATION", value.ref );
-                if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
-                if( !value.complete ) { incompleteGpu++; addRef( incompleteGpuRefs, value.ref ); }
-                if( ( value.gpuEndNs && *value.gpuEndNs < value.gpuStartNs ) || ( value.cpuEndNs && *value.cpuEndNs < value.cpuStartNs ) ) { invalidGpu++; addRef( invalidGpuRefs, value.ref ); }
+                json refs = json::array();
+                for( const auto& ref : value.refs ) refs.emplace_back( ref );
+                addFinding( value.severity.c_str(), value.code.c_str(), value.message, value.count, std::move( refs ) );
             }
-            offset += values.size();
-            if( values.size() < allowed ) break;
+            referencedCallstacks.insert( indexedZoneValidation->referencedCallstacks.begin(), indexedZoneValidation->referencedCallstacks.end() );
         }
-        if( incompleteCpu ) addFinding( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", incompleteCpu, std::move( incompleteCpuRefs ) );
-        if( invalidCpu ) addFinding( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", invalidCpu, std::move( invalidCpuRefs ) );
-        if( unresolvedCpuNames ) addFinding( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", unresolvedCpuNames, std::move( unresolvedCpuNameRefs ) );
-        if( incompleteGpu ) addFinding( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", incompleteGpu, std::move( incompleteGpuRefs ) );
-        if( invalidGpu ) addFinding( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", invalidGpu, std::move( invalidGpuRefs ) );
-        if( !BudgetPartial() )
+        else
         {
-            for( const auto& [owner, parent] : cpuParents ) if( cpuZoneRefs.find( parent ) == cpuZoneRefs.end() ) noteReference( "CPU_ZONE_PARENT", owner );
-            for( const auto& [owner, parent] : gpuParents ) if( gpuZoneRefs.find( parent ) == gpuZoneRefs.end() ) noteReference( "GPU_ZONE_PARENT", owner );
+            size_t incompleteCpu = 0, invalidCpu = 0, unresolvedCpuNames = 0;
+            size_t incompleteGpu = 0, invalidGpu = 0;
+            json incompleteCpuRefs = json::array(), invalidCpuRefs = json::array(), unresolvedCpuNameRefs = json::array(), incompleteGpuRefs = json::array(), invalidGpuRefs = json::array();
+            while( true )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange range; range.offset = offset; range.limit = allowed;
+                const auto values = source->ScanCpuZones( range );
+                BudgetScanned( values.size(), chunk, allowed );
+                for( const auto& value : values )
+                {
+                    if( value.parentRef && !validEntityRef( *value.parentRef, "cpu-zone", metadata.counts.cpuZones ) ) noteReference( "CPU_ZONE_PARENT", value.ref );
+                    if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
+                    if( !value.sourceLocationRef.empty() && sourceRefs.find( value.sourceLocationRef ) == sourceRefs.end() ) noteReference( "SOURCE_LOCATION", value.ref );
+                    if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
+                    if( !value.nameResolved ) { unresolvedCpuNames++; addRef( unresolvedCpuNameRefs, value.ref ); }
+                    if( !value.complete ) { incompleteCpu++; addRef( incompleteCpuRefs, value.ref ); }
+                    if( value.endNs && *value.endNs < value.startNs ) { invalidCpu++; addRef( invalidCpuRefs, value.ref ); }
+                }
+                offset += values.size();
+                if( values.size() < allowed ) break;
+            }
+            offset = 0;
+            while( true )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange range; range.offset = offset; range.limit = allowed;
+                const auto values = source->ScanGpuZones( range );
+                BudgetScanned( values.size(), chunk, allowed );
+                for( const auto& value : values )
+                {
+                    if( value.parentRef && !validEntityRef( *value.parentRef, "gpu-zone", metadata.counts.gpuZones ) ) noteReference( "GPU_ZONE_PARENT", value.ref );
+                    if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
+                    if( !value.contextRef.empty() && gpuContextRefs.find( value.contextRef ) == gpuContextRefs.end() ) noteReference( "GPU_CONTEXT", value.ref );
+                    if( !value.sourceLocationRef.empty() && sourceRefs.find( value.sourceLocationRef ) == sourceRefs.end() ) noteReference( "SOURCE_LOCATION", value.ref );
+                    if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
+                    if( !value.complete ) { incompleteGpu++; addRef( incompleteGpuRefs, value.ref ); }
+                    if( ( value.gpuEndNs && *value.gpuEndNs < value.gpuStartNs ) || ( value.cpuEndNs && *value.cpuEndNs < value.cpuStartNs ) ) { invalidGpu++; addRef( invalidGpuRefs, value.ref ); }
+                }
+                offset += values.size();
+                if( values.size() < allowed ) break;
+            }
+            if( incompleteCpu ) addFinding( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", incompleteCpu, std::move( incompleteCpuRefs ) );
+            if( invalidCpu ) addFinding( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", invalidCpu, std::move( invalidCpuRefs ) );
+            if( unresolvedCpuNames ) addFinding( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", unresolvedCpuNames, std::move( unresolvedCpuNameRefs ) );
+            if( incompleteGpu ) addFinding( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", incompleteGpu, std::move( incompleteGpuRefs ) );
+            if( invalidGpu ) addFinding( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", invalidGpu, std::move( invalidGpuRefs ) );
         }
-
         size_t incompleteFrames = 0, invalidFrames = 0;
         json incompleteFrameRefs = json::array(), invalidFrameRefs = json::array();
         offset = 0;
@@ -9176,8 +9396,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !value.poolRef.empty() && memoryPoolRefs.find( value.poolRef ) == memoryPoolRefs.end() ) noteReference( "MEMORY_POOL", value.ref );
                 if( !value.allocationThreadRef.empty() && threadRefs.find( value.allocationThreadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
                 if( value.freeThreadRef && threadRefs.find( *value.freeThreadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
-                if( value.allocationZoneRef && cpuZoneRefs.find( *value.allocationZoneRef ) == cpuZoneRefs.end() ) noteReference( "CPU_ZONE", value.ref );
-                if( value.freeZoneRef && cpuZoneRefs.find( *value.freeZoneRef ) == cpuZoneRefs.end() ) noteReference( "CPU_ZONE", value.ref );
+                if( value.allocationZoneRef && !validEntityRef( *value.allocationZoneRef, "cpu-zone", metadata.counts.cpuZones ) ) noteReference( "CPU_ZONE", value.ref );
+                if( value.freeZoneRef && !validEntityRef( *value.freeZoneRef, "cpu-zone", metadata.counts.cpuZones ) ) noteReference( "CPU_ZONE", value.ref );
                 if( value.allocationCallstack != 0 ) referencedCallstacks.emplace( value.allocationCallstack );
                 if( value.freeCallstack != 0 ) referencedCallstacks.emplace( value.freeCallstack );
                 if( value.freeNs && *value.freeNs < value.allocationNs ) { invalidMemory++; addRef( invalidMemoryRefs, value.ref ); }
@@ -9283,28 +9503,35 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto gpuPools = source->GetMemoryPools();
         if( std::any_of( gpuPools.begin(), gpuPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } ) )
         {
-            const auto attributionValue = CachedGpuAttribution( trace.id, source );
-            const auto& attribution = *attributionValue;
-            if( attribution.protocolPresent )
+            if( indexedZoneValidation )
             {
-                size_t incompletePasses = 0, missingGpu = 0, ambiguousGpu = 0, unknownUses = 0;
-                json incompleteRefs = json::array(), missingRefs = json::array(), ambiguousRefs = json::array();
-                for( const auto& pass : attribution.passes )
+                addFinding( "info", "INDEXED_GTMEM_DEEP_VALIDATION_SEPARATE", "indexed validation avoids materializing the complete GPU-memory attribution graph; use memory.gpu.attribution and producer quality for the dedicated deep check", 0 );
+            }
+            else
+            {
+                const auto attributionValue = CachedGpuAttribution( trace.id, source );
+                const auto& attribution = *attributionValue;
+                if( attribution.protocolPresent )
                 {
-                    const auto ref = source->MakeEntityRef( "gpu-memory-pass", pass.passId );
-                    if( !pass.complete && pass.gpuPairing != analysis::GpuZonePairing::CaptureBoundary )
+                    size_t incompletePasses = 0, missingGpu = 0, ambiguousGpu = 0, unknownUses = 0;
+                    json incompleteRefs = json::array(), missingRefs = json::array(), ambiguousRefs = json::array();
+                    for( const auto& pass : attribution.passes )
                     {
-                        incompletePasses++;
-                        addRef( incompleteRefs, ref );
+                        const auto ref = source->MakeEntityRef( "gpu-memory-pass", pass.passId );
+                        if( !pass.complete && pass.gpuPairing != analysis::GpuZonePairing::CaptureBoundary )
+                        {
+                            incompletePasses++;
+                            addRef( incompleteRefs, ref );
+                        }
+                        if( pass.gpuPairing == analysis::GpuZonePairing::Missing ) { missingGpu++; addRef( missingRefs, ref ); }
+                        if( pass.gpuPairing == analysis::GpuZonePairing::Ambiguous ) { ambiguousGpu++; addRef( ambiguousRefs, ref ); }
+                        for( const auto& use : pass.uses ) if( attribution.allocationById.find( use.allocationId ) == attribution.allocationById.end() ) unknownUses++;
                     }
-                    if( pass.gpuPairing == analysis::GpuZonePairing::Missing ) { missingGpu++; addRef( missingRefs, ref ); }
-                    if( pass.gpuPairing == analysis::GpuZonePairing::Ambiguous ) { ambiguousGpu++; addRef( ambiguousRefs, ref ); }
-                    for( const auto& use : pass.uses ) if( attribution.allocationById.find( use.allocationId ) == attribution.allocationById.end() ) unknownUses++;
+                    if( incompletePasses ) addFinding( "warning", "INCOMPLETE_GTMEM_PASS", "GTMEM1 pass payload chunks or use counts are incomplete", incompletePasses, std::move( incompleteRefs ) );
+                    if( missingGpu ) addFinding( "warning", "MISSING_GTMEM_GPU_ZONE", "GTMEM1 passes have no matching GPU zone", missingGpu, std::move( missingRefs ) );
+                    if( ambiguousGpu ) addFinding( "warning", "AMBIGUOUS_GTMEM_GPU_ZONE", "GTMEM1 passes match more than one GPU zone", ambiguousGpu, std::move( ambiguousRefs ) );
+                    if( unknownUses ) addFinding( "warning", "UNKNOWN_GTMEM_ALLOCATION", "GTMEM1 pass uses reference allocation IDs absent from D3D12 pools", unknownUses );
                 }
-                if( incompletePasses ) addFinding( "warning", "INCOMPLETE_GTMEM_PASS", "GTMEM1 pass payload chunks or use counts are incomplete", incompletePasses, std::move( incompleteRefs ) );
-                if( missingGpu ) addFinding( "warning", "MISSING_GTMEM_GPU_ZONE", "GTMEM1 passes have no matching GPU zone", missingGpu, std::move( missingRefs ) );
-                if( ambiguousGpu ) addFinding( "warning", "AMBIGUOUS_GTMEM_GPU_ZONE", "GTMEM1 passes match more than one GPU zone", ambiguousGpu, std::move( ambiguousRefs ) );
-                if( unknownUses ) addFinding( "warning", "UNKNOWN_GTMEM_ALLOCATION", "GTMEM1 pass uses reference allocation IDs absent from D3D12 pools", unknownUses );
             }
         }
 

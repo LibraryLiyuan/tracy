@@ -318,6 +318,16 @@ struct GpuMemoryAttribution
     uint64_t captureBoundaryPasses = 0;
     uint64_t submissionUnobservedPasses = 0;
     uint64_t gpuResultUnavailablePasses = 0;
+    bool passQualityAggregated = false;
+    uint64_t aggregatedIncompleteReferencePasses = 0;
+    uint64_t aggregatedStructuredIncompleteReferencePasses = 0;
+    uint64_t aggregatedLegacyIncompleteReferencePasses = 0;
+    uint64_t aggregatedTruncatedReferencePasses = 0;
+    uint64_t aggregatedFailureFlagReferencePasses = 0;
+    uint64_t aggregatedCommandListBoundaryPasses = 0;
+    uint64_t aggregatedDroppedReferenceUses = 0;
+    uint64_t aggregatedWorkingSetCount = 0;
+    std::vector<GpuMemoryPass> aggregatedIncompleteReferencePreview;
     std::vector<std::string> warnings;
     std::vector<GpuMemoryRequestScope> requestScopes;
     std::vector<GpuMemoryPass> passes;
@@ -335,6 +345,39 @@ struct GpuMemoryAttribution
     std::unordered_map<uint64_t, size_t> logicalById;
     std::unordered_map<uint64_t, size_t> physicalOriginById;
     std::unordered_map<uint64_t, size_t> logicalOriginById;
+};
+
+struct GpuMemoryPassPage
+{
+    uint64_t totalPasses = 0;
+    uint64_t totalUses = 0;
+    bool complete = true;
+    std::vector<std::string> warnings;
+    std::vector<GpuMemoryPass> passes;
+};
+
+struct GpuMemoryRequestScopePage
+{
+    uint64_t totalScopes = 0;
+    std::vector<GpuMemoryRequestScope> scopes;
+};
+
+struct GpuMemoryAllocationPageItem
+{
+    GpuMemoryAllocationAttribution attribution;
+    std::optional<GpuMemoryAllocationOrigin> origin;
+    std::optional<GpuMemoryLogicalResource> logicalResource;
+    uint64_t passRefCount = 0;
+    std::vector<uint64_t> passIds;
+};
+
+struct GpuMemoryAllocationPage
+{
+    bool protocolPresent = false;
+    bool complete = true;
+    bool hasMore = false;
+    std::vector<std::string> warnings;
+    std::vector<GpuMemoryAllocationPageItem> allocations;
 };
 
 GpuMemoryAttribution BuildGpuMemoryAttribution(

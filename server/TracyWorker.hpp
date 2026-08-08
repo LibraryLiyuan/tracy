@@ -48,11 +48,46 @@ namespace EventType
         Samples         = 1 << 6,
         SymbolCode      = 1 << 7,
         SourceCache     = 1 << 8,
+        CpuZones        = 1 << 9,
+        GpuZones        = 1 << 10,
 
         None            = 0,
         All             = std::numeric_limits<uint32_t>::max()
     };
 }
+
+class SerializedZoneSink
+{
+public:
+    enum class JnDomain : uint8_t
+    {
+        JobStage,
+        GfxEntity,
+        GfxLink,
+        Relation,
+        GpuReferencePass,
+        GpuReferenceUse,
+        GpuReferenceEnd
+    };
+
+    virtual ~SerializedZoneSink() = default;
+    virtual void ZoneExtrasBegin( uint64_t count ) = 0;
+    virtual void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) = 0;
+    virtual void ZoneExtrasEnd() = 0;
+    virtual void CpuZonesBegin( uint64_t count ) = 0;
+    virtual void CpuZoneBegin( uint64_t index, uint64_t parent, uint64_t thread, int64_t start, int16_t sourceLocation, uint32_t extra, uint32_t childCount ) = 0;
+    virtual void CpuZoneEnd( uint64_t index, int64_t end ) = 0;
+    virtual void CpuZonesEnd() = 0;
+    virtual void GpuZonesBegin( uint64_t count ) = 0;
+    virtual void GpuZoneBegin( uint64_t index, uint64_t parent, uint32_t context, int64_t cpuStart, int64_t gpuStart,
+        int16_t sourceLocation, uint32_t callstack, uint64_t thread, uint64_t childCount ) = 0;
+    virtual void GpuZoneEnd( uint64_t index, int64_t cpuEnd, int64_t gpuEnd, uint16_t queryId ) = 0;
+    virtual void GpuZonesEnd() = 0;
+    virtual bool WantsJnRecords( JnDomain, uint32_t ) const { return false; }
+    virtual void JnRecordsBegin( JnDomain, uint64_t, uint32_t ) {}
+    virtual void JnRecordsBlock( JnDomain, uint64_t, const void*, uint64_t, uint32_t ) {}
+    virtual void JnRecordsEnd( JnDomain ) {}
+};
 
 struct UnsupportedVersion : public std::exception
 {
@@ -480,7 +515,7 @@ public:
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
-    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false);
+    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
 
     const std::string& GetAddr() const { return m_addr; }
@@ -1093,6 +1128,8 @@ private:
 
     int64_t ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& vec, uint32_t size, int64_t refTime, int32_t& childIdx );
     void ReadTimeline( FileRead& f, Vector<short_ptr<GpuEvent>>& vec, uint64_t size, int64_t& refTime, int64_t& refGpuTime, int32_t& childIdx, bool hasQueryId );
+    int64_t SkipTimeline( FileRead& f, uint32_t size, int64_t refTime, uint64_t thread, uint64_t parent );
+    void SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent );
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
@@ -1215,6 +1252,9 @@ private:
 
     static LoadProgress s_loadProgress;
     int64_t m_loadTime;
+    SerializedZoneSink* m_serializedZoneSink = nullptr;
+    uint64_t m_serializedCpuZoneIndex = 0;
+    uint64_t m_serializedGpuZoneIndex = 0;
 
     Failure m_failure = Failure::None;
     FailureData m_failureData = {};

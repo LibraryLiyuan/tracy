@@ -15,16 +15,17 @@ class SegmentTraceSource final : public analysis::TraceSource
 public:
     using StateCallback = analysis::WorkerTraceSource::StateCallback;
 
-    static std::unique_ptr<SegmentTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {} );
+    static std::unique_ptr<SegmentTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, bool preferIndex = false );
     static std::unique_ptr<SegmentTraceSource> OpenRevision(
         std::shared_ptr<stream::JournalStore> store,
         std::shared_ptr<const stream::JournalReadView> view,
-        StateCallback stateCallback = {} );
+        StateCallback stateCallback = {}, bool preferIndex = false );
 
     ~SegmentTraceSource() override;
 
     std::shared_ptr<const stream::JournalReadView> RefreshView();
     const std::shared_ptr<stream::JournalStore>& Store() const { return m_store; }
+    bool PreferIndex() const { return m_preferIndex; }
 
     std::vector<analysis::Capability> GetCapabilities() const override;
     analysis::TraceReadView AcquireReadView() const override;
@@ -51,6 +52,8 @@ public:
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
     std::vector<analysis::RelationDto> GetRelations() const override;
+    uint64_t GetRelationCount() const override;
+    std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
     std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
     std::vector<analysis::ScriptFrameDto> GetScriptFrames() const override;
     std::vector<analysis::ScriptStackEventDto> GetScriptStackEvents() const override;
@@ -90,6 +93,12 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     analysis::GpuMemoryAttribution GetGpuMemoryAttribution() const override;
+    analysis::GpuMemoryAttribution GetGpuMemorySummaryAttribution() const override;
+    std::optional<analysis::GpuMemoryPassPage> ScanGpuMemoryPasses( size_t offset, size_t limit,
+        std::optional<uint64_t> requestedPassId, size_t useOffset, size_t useLimit ) const override;
+    std::optional<analysis::GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t offset, size_t limit ) const override;
+    std::optional<analysis::GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t offset, size_t limit,
+        std::optional<uint64_t> allocationId, const std::string& poolRef, const std::string& relationState ) const override;
     analysis::SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
     analysis::BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     analysis::SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;
@@ -103,12 +112,16 @@ private:
         std::shared_ptr<stream::JournalStore> store,
         std::shared_ptr<const stream::JournalReadView> view,
         std::filesystem::path snapshotPath,
-        std::unique_ptr<analysis::WorkerTraceSource> source );
+        std::unique_ptr<analysis::TraceSource> source,
+        bool preferIndex,
+        bool persistentSnapshot );
 
     std::shared_ptr<stream::JournalStore> m_store;
     std::shared_ptr<const stream::JournalReadView> m_view;
     std::filesystem::path m_snapshotPath;
-    std::unique_ptr<analysis::WorkerTraceSource> m_source;
+    std::unique_ptr<analysis::TraceSource> m_source;
+    bool m_preferIndex = false;
+    bool m_persistentSnapshot = false;
 };
 
 }

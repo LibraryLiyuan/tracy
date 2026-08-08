@@ -1,7 +1,9 @@
 #include "TracyEmbeddedData.hpp"
 #include "TracyMcpServer.hpp"
+#include "TracyQueryIndex.hpp"
 #include "TracyQueryService.hpp"
 #include "TracySessionManager.hpp"
+#include "TracyWorkerTraceSource.hpp"
 
 #include "../../public/common/TracyVersion.hpp"
 
@@ -25,12 +27,25 @@ namespace
 using nlohmann::json;
 using namespace tracy::query;
 
+void ApplyIndexedMemoryBudget()
+{
+#ifdef _WIN32
+    constexpr SIZE_T MinimumWorkingSet = SIZE_T( 64 ) * 1024 * 1024;
+    constexpr SIZE_T MaximumWorkingSet = SIZE_T( 1900 ) * 1024 * 1024;
+    if( !SetProcessWorkingSetSizeEx( GetCurrentProcess(), MinimumWorkingSet, MaximumWorkingSet, QUOTA_LIMITS_HARDWS_MAX_ENABLE ) )
+        throw std::runtime_error( "cannot apply the 1.9 GiB indexed working-set budget (Windows error " + std::to_string( GetLastError() ) + ')' );
+#endif
+}
+
 struct Arguments
 {
     bool version = false;
     bool schema = false;
     bool doctor = false;
     bool mcp = false;
+    bool compactIndex = false;
+    bool buildIndex = false;
+    bool indexed = false;
     std::optional<std::filesystem::path> trace;
     std::optional<std::string> request;
     std::optional<std::string> batch;
@@ -46,10 +61,11 @@ void Usage()
         << "Usage:\n"
         << "  tracy-query --version\n"
         << "  tracy-query --schema\n"
-        << "  tracy-query --doctor [--trace file.tracy] [--allow-root path]\n"
-        << "  tracy-query --trace file.tracy --request request.json|- [--allow-root path]\n"
-        << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--allow-root path]\n"
-        << "  tracy-query --mcp [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
+        << "  tracy-query --doctor [--trace file.tracy] [--compact-index] [--allow-root path]\n"
+        << "  tracy-query --build-index --trace file.tracy [--allow-root path]\n"
+        << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path]\n"
+        << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path]\n"
+        << "  tracy-query --mcp [--indexed] [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
 }
 
 Arguments ParseArguments( int argc, char** argv )
@@ -66,6 +82,9 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--schema" ) result.schema = true;
         else if( option == "--doctor" ) result.doctor = true;
         else if( option == "--mcp" ) result.mcp = true;
+        else if( option == "--compact-index" ) result.compactIndex = true;
+        else if( option == "--build-index" ) result.buildIndex = true;
+        else if( option == "--indexed" ) result.indexed = true;
         else if( option == "--trace" ) result.trace = value( "--trace" );
         else if( option == "--request" ) result.request = value( "--request" );
         else if( option == "--batch" ) result.batch = value( "--batch" );
@@ -141,7 +160,7 @@ std::optional<std::string> OpenDefaultTrace( SessionManager& sessions, const std
 
 int RunSingle( const Arguments& args )
 {
-    SessionManager sessions( args.allowRoots );
+    SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
     QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
@@ -159,7 +178,7 @@ int RunSingle( const Arguments& args )
 
 int RunBatch( const Arguments& args )
 {
-    SessionManager sessions( args.allowRoots );
+    SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
     QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
@@ -212,20 +231,42 @@ int RunDoctor( const Arguments& args )
     };
     try
     {
-        SessionManager sessions( args.allowRoots );
+        SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
         json roots = json::array();
         for( const auto& root : sessions.AllowRoots() ) roots.emplace_back( root.string() );
         result["allow_roots"] = std::move( roots );
         if( args.trace )
         {
-            const auto opened = sessions.Open( *args.trace );
-            const auto ready = sessions.WaitReady( opened.id, std::chrono::hours( 24 ) );
-            result["checks"]["trace_loader"] = ready.state == tracy::analysis::TraceSourceState::Ready ? "ok" : "failed";
-            result["trace"] = {
-                { "id", ready.id }, { "state", tracy::analysis::ToString( ready.state ) }, { "fingerprint", ready.fingerprint },
-                { "error_code", ready.errorCode.empty() ? json( nullptr ) : json( ready.errorCode ) },
-                { "error_message", ready.errorMessage.empty() ? json( nullptr ) : json( ready.errorMessage ) }
-            };
+            if( args.compactIndex )
+            {
+                const auto path = sessions.ResolveTracePath( *args.trace );
+                const auto source = tracy::analysis::WorkerTraceSource::Open( path, {}, {}, tracy::analysis::WorkerTraceLoadMode::CompactIndex );
+                const auto info = source->GetTraceInfo();
+                result["checks"]["trace_loader"] = "ok";
+                result["checks"]["load_mode"] = "compact_index";
+                result["trace"] = {
+                    { "state", "ready" }, { "fingerprint", info.fingerprint },
+                    { "counts", {
+                        { "frames", std::to_string( info.counts.frames ) },
+                        { "cpu_zones_declared", std::to_string( info.counts.cpuZones ) },
+                        { "gpu_zones_declared", std::to_string( info.counts.gpuZones ) },
+                        { "jobs", std::to_string( info.counts.jobs ) },
+                        { "io_requests", std::to_string( info.counts.ioRequests ) },
+                        { "relations", std::to_string( info.counts.relations ) }
+                    } }
+                };
+            }
+            else
+            {
+                const auto opened = sessions.Open( *args.trace );
+                const auto ready = sessions.WaitReady( opened.id, std::chrono::hours( 24 ) );
+                result["checks"]["trace_loader"] = ready.state == tracy::analysis::TraceSourceState::Ready ? "ok" : "failed";
+                result["trace"] = {
+                    { "id", ready.id }, { "state", tracy::analysis::ToString( ready.state ) }, { "fingerprint", ready.fingerprint },
+                    { "error_code", ready.errorCode.empty() ? json( nullptr ) : json( ready.errorCode ) },
+                    { "error_message", ready.errorMessage.empty() ? json( nullptr ) : json( ready.errorMessage ) }
+                };
+            }
         }
         else result["checks"]["trace_loader"] = "not_requested";
     }
@@ -238,6 +279,35 @@ int RunDoctor( const Arguments& args )
     return result.contains( "error" ) || result["checks"].value( "trace_loader", "ok" ) == "failed" ? 2 : 0;
 }
 
+int RunBuildIndex( const Arguments& args )
+{
+    SessionManager sessions( args.allowRoots );
+    const auto path = sessions.ResolveTracePath( *args.trace );
+    const auto started = std::chrono::steady_clock::now();
+    const auto index = QueryIndex::Build( path );
+    const auto validation = QueryIndex::Validate( path, true );
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
+    const json result = {
+        { "program", "tracy-query" }, { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
+        { "operation", "build-index" }, { "ok", validation.manifest.has_value() },
+        { "elapsed_ms", std::to_string( elapsed ) },
+        { "index", {
+            { "schema_version", QueryIndexSchemaVersion }, { "manifest", index.manifestPath.string() },
+            { "data", index.dataPath.string() }, { "source_sha256", index.sourceFingerprint },
+            { "source_bytes", std::to_string( index.sourceBytes ) }, { "data_sha256", index.dataFingerprint },
+            { "data_bytes", std::to_string( index.dataBytes ) }, { "validation", validation.reason },
+            { "cpu_zone_index", index.cpuZoneIndex }, { "gpu_zone_index", index.gpuZoneIndex },
+            { "zone_sections", {
+                { "extras", { { "count", std::to_string( index.zoneExtras.count ) }, { "declared_count", std::to_string( index.zoneExtras.declaredCount ) }, { "bytes", std::to_string( index.zoneExtras.bytes ) }, { "sha256", index.zoneExtras.fingerprint } } },
+                { "cpu", { { "count", std::to_string( index.cpuZones.count ) }, { "declared_count", std::to_string( index.cpuZones.declaredCount ) }, { "bytes", std::to_string( index.cpuZones.bytes ) }, { "sha256", index.cpuZones.fingerprint } } },
+                { "gpu", { { "count", std::to_string( index.gpuZones.count ) }, { "declared_count", std::to_string( index.gpuZones.declaredCount ) }, { "bytes", std::to_string( index.gpuZones.bytes ) }, { "sha256", index.gpuZones.fingerprint } } }
+            } }
+        } }
+    };
+    std::cout << DumpProtocolJson( result ) << '\n';
+    return validation.manifest ? 0 : 2;
+}
+
 }
 
 int main( int argc, char** argv )
@@ -248,7 +318,10 @@ int main( int argc, char** argv )
     try
     {
         const auto args = ParseArguments( argc, argv );
-        const int modes = int( args.version ) + int( args.schema ) + int( args.doctor ) + int( args.mcp ) + int( args.request.has_value() ) + int( args.batch.has_value() );
+        if( args.indexed || args.buildIndex ) ApplyIndexedMemoryBudget();
+        if( args.compactIndex && ( !args.doctor || !args.trace ) ) throw std::runtime_error( "--compact-index requires --doctor and --trace" );
+        if( args.buildIndex && !args.trace ) throw std::runtime_error( "--build-index requires --trace" );
+        const int modes = int( args.version ) + int( args.schema ) + int( args.doctor ) + int( args.buildIndex ) + int( args.mcp ) + int( args.request.has_value() ) + int( args.batch.has_value() );
         if( modes != 1 )
         {
             Usage();
@@ -265,11 +338,12 @@ int main( int argc, char** argv )
             return 0;
         }
         if( args.doctor ) return RunDoctor( args );
+        if( args.buildIndex ) return RunBuildIndex( args );
         if( args.request ) return RunSingle( args );
         if( args.batch ) return RunBatch( args );
         if( args.mcp )
         {
-            SessionManager sessions( args.allowRoots );
+            SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
             QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
             McpServer server( sessions, service, args.allowSourceRoots );
             return server.Run( std::cin, std::cout );

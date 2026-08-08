@@ -44,6 +44,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyMcpServer.hpp
     src/TracyPng.cpp
     src/TracyPng.hpp
+    src/TracyQueryIndex.cpp
+    src/TracyQueryIndex.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
