@@ -9,12 +9,16 @@ namespace tracy
 
 constexpr unsigned Lz4CompressBound( unsigned isize ) { return isize + ( isize / 255 ) + 16; }
 
-enum : uint32_t { ProtocolVersion = 82 };
+enum : uint32_t { ProtocolVersion = 83 };
 enum : uint16_t { BroadcastVersion = 3 };
 
 using lz4sz_t = uint32_t;
 
-enum { TargetFrameSize = 256 * 1024 };
+// A 1280x720 BC1 FrameImage is 460,800 bytes before transport compression.
+// Keep each queue event inside one protocol frame (the server parser consumes
+// complete events per decompressed frame) while supporting the 720p evidence
+// capture tier.
+enum { TargetFrameSize = 512 * 1024 };
 enum { LZ4Size = Lz4CompressBound( TargetFrameSize ) };
 static_assert( LZ4Size <= (std::numeric_limits<lz4sz_t>::max)(), "LZ4Size greater than lz4sz_t" );
 static_assert( TargetFrameSize * 2 >= 64 * 1024, "Not enough space for LZ4 stream buffer" );

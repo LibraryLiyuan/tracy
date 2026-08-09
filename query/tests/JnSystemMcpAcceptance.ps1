@@ -12,7 +12,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $AllowRoot,
 
-    [switch] $RequireFrameImage
+    [switch] $RequireFrameImage,
+
+    [switch] $SkipNetwork,
+
+    [switch] $SkipSystemTracing
 )
 
 $ErrorActionPreference = 'Stop'
@@ -176,8 +180,19 @@ function Validate-SystemData {
     Assert-Condition ($engineIdentity.Count -eq 1) 'JN Unity Tracy AppInfo missing or duplicated'
     Assert-Condition ($engineIdentity[0] -match 'CPU.Memory=Selected\+Aggregate') 'CPU memory capture mode missing from AppInfo'
     Assert-Condition ($engineIdentity[0] -match 'IO=AsyncReadAggregate') 'I/O capture mode missing from AppInfo'
-    Assert-Condition ($engineIdentity[0] -match 'Network=SocketAggregate') 'network capture mode missing from AppInfo'
-    Assert-Condition ($engineIdentity[0] -match 'Sampling.ContextSwitch.Requested=TracyWindows Actual=QueryCapability') 'sampling/context-switch requested-vs-actual AppInfo mismatch'
+    if ($SkipNetwork) {
+        Assert-Condition ($engineIdentity[0] -match 'Network=Off') 'deferred network mode missing from AppInfo'
+        $networkCapability = Get-Capability -Capabilities $capabilities -Domain 'network'
+        Assert-Condition (-not [bool]$networkCapability.present -and -not [bool]$networkCapability.queryable) 'deferred network capability must be unavailable'
+        Assert-Condition ([string]$networkCapability.reason -eq 'deferred_by_user') 'deferred network capability reason mismatch'
+    } else {
+        Assert-Condition ($engineIdentity[0] -match 'Network=SocketAggregate') 'network capture mode missing from AppInfo'
+    }
+    if ($SkipSystemTracing) {
+        Assert-Condition ($engineIdentity[0] -match 'Sampling.ContextSwitch.Requested=Off Actual=QueryCapability') 'disabled sampling/context-switch AppInfo mismatch'
+    } else {
+        Assert-Condition ($engineIdentity[0] -match 'Sampling.ContextSwitch.Requested=TracyWindows Actual=QueryCapability') 'sampling/context-switch requested-vs-actual AppInfo mismatch'
+    }
 
     $pools = @($poolsResult.data.pools)
     $managedPools = @($pools | Where-Object { [string]$_.name -eq 'JN.Managed.Validation.NativeMemory' })
@@ -253,12 +268,18 @@ function Validate-SystemData {
     Assert-Condition ([double]$ioTotal.max -ge [double]$ioBytes.max) 'Unity AsyncRead total bytes are inconsistent'
     Assert-Condition ([UInt64]$ioQueue.point_count -gt 0) 'Unity AsyncRead queue depth has no points'
 
-    $networkReceive = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.BytesPerFrame'
-    $networkReceiveOperations = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.OperationsPerFrame'
-    $networkReceiveTotal = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.TotalBytes'
-    Assert-Condition ([double]$networkReceive.max -gt 0) 'Unity socket receive bytes were not captured'
-    Assert-Condition ([double]$networkReceiveOperations.max -gt 0) 'Unity socket receive operations were not captured'
-    Assert-Condition ([double]$networkReceiveTotal.max -ge [double]$networkReceive.max) 'Unity socket receive total bytes are inconsistent'
+    $networkReceiveBytesPerFrame = 'deferred'
+    $networkReceiveOperationsPerFrame = 'deferred'
+    if (-not $SkipNetwork) {
+        $networkReceive = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.BytesPerFrame'
+        $networkReceiveOperations = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.OperationsPerFrame'
+        $networkReceiveTotal = Get-ExactPlot -TraceId $TraceId -Name 'JN.Network.Receive.TotalBytes'
+        Assert-Condition ([double]$networkReceive.max -gt 0) 'Unity socket receive bytes were not captured'
+        Assert-Condition ([double]$networkReceiveOperations.max -gt 0) 'Unity socket receive operations were not captured'
+        Assert-Condition ([double]$networkReceiveTotal.max -ge [double]$networkReceive.max) 'Unity socket receive total bytes are inconsistent'
+        $networkReceiveBytesPerFrame = [string]$networkReceive.max
+        $networkReceiveOperationsPerFrame = [string]$networkReceiveOperations.max
+    }
 
     $frameImageWidth = '0'
     $frameImageHeight = '0'
@@ -293,14 +314,19 @@ function Validate-SystemData {
 
         $submitted = Get-ExactPlot -TraceId $TraceId -Name 'JN.FrameImage.Submitted'
         $latency = Get-ExactPlot -TraceId $TraceId -Name 'JN.FrameImage.ReadbackLatencyMs'
-        $downsample = Get-ExactPlot -TraceId $TraceId -Name 'JN.FrameImage.DownsampleSubmitCpuMs'
+        $captureSubmit = Get-ExactPlot -TraceId $TraceId -Name 'JN.FrameImage.CaptureSubmitCpuMs'
         Assert-Condition ([UInt64]$submitted.point_count -eq 1 -and [double]$submitted.max -eq 1) 'FrameImage submitted plot mismatch'
         Assert-Condition ([UInt64]$latency.point_count -eq 1 -and [double]$latency.max -gt 0) 'FrameImage readback latency plot mismatch'
-        Assert-Condition ([UInt64]$downsample.point_count -eq 1 -and [double]$downsample.max -ge 0) 'FrameImage downsample submit plot mismatch'
-        Assert-Condition ($engineIdentity[0] -match 'FrameImage=DefaultOff\+AsyncReadbackRing4\+Max320x180') 'FrameImage default-off native AppInfo mismatch'
-        $frameImageIdentity = @($appInfo.data.app_info | Where-Object { $_ -like 'JN FrameImage enabled=*' })
+        Assert-Condition ([UInt64]$captureSubmit.point_count -eq 1 -and [double]$captureSubmit.max -ge 0) 'FrameImage capture submit plot mismatch'
+        Assert-Condition ($engineIdentity[0] -match 'FrameImage=DefaultOff\+FinalColorOnly\+AsyncReadbackRing4\+Max1280x720') 'FrameImage default-off native AppInfo mismatch'
+        $frameImageIdentity = @($appInfo.data.app_info | Where-Object { $_ -like 'JNFI1|*' })
         Assert-Condition ($frameImageIdentity.Count -eq 1) 'FrameImage managed AppInfo missing or duplicated'
-        Assert-Condition ($frameImageIdentity[0] -match 'size=64x32.*ring=4.*async=1.*gpu_downsample=1.*present_wait=0') 'FrameImage managed AppInfo mismatch'
+        $frameImageConfig = ([string]$frameImageIdentity[0]).Substring(6) | ConvertFrom-Json
+        Assert-Condition ([UInt64]$frameImageConfig.schema_version -eq 1) 'FrameImage managed schema version mismatch'
+        Assert-Condition ([string]$frameImageConfig.source -eq 'final-color-only') 'FrameImage source policy mismatch'
+        Assert-Condition ([UInt64]$frameImageConfig.high_evidence.width -eq 64 -and [UInt64]$frameImageConfig.high_evidence.height -eq 32) 'FrameImage managed HighEvidence dimensions mismatch'
+        Assert-Condition ([UInt64]$frameImageConfig.triggered.width -eq 1280 -and [UInt64]$frameImageConfig.triggered.height -eq 720) 'FrameImage managed Triggered dimensions mismatch'
+        Assert-Condition ([UInt64]$frameImageConfig.ring -eq 4 -and [bool]$frameImageConfig.async -and -not [bool]$frameImageConfig.present_wait) 'FrameImage managed async policy mismatch'
 
         $frameImageWidth = [string]$image.width
         $frameImageHeight = [string]$image.height
@@ -320,8 +346,8 @@ function Validate-SystemData {
         cpu_memory_plot_count = [string]$cpuMemoryPlots.Count
         io_bytes_per_frame = [string]$ioBytes.max
         io_operations_per_frame = [string]$ioOperations.max
-        network_receive_bytes_per_frame = [string]$networkReceive.max
-        network_receive_operations_per_frame = [string]$networkReceiveOperations.max
+        network_receive_bytes_per_frame = $networkReceiveBytesPerFrame
+        network_receive_operations_per_frame = $networkReceiveOperationsPerFrame
         context_switch_present = [bool]$contextSwitch.present
         sample_present = [bool]$sample.present
         sampling_period_ns = [string]$traceInfo.data.sampling_period_ns
