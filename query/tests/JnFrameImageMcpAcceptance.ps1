@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory = $true)][ValidateRange(4, 65532)][int] $ExpectedWidth,
     [Parameter(Mandatory = $true)][ValidateRange(4, 65532)][int] $ExpectedHeight,
     [ValidateSet('HighEvidence', 'Triggered')][string] $ExpectedKind = 'HighEvidence',
+    [bool] $ExpectedFlipped = $false,
     [ValidateRange(1, 10000)][int] $MinimumMatchingImages = 1,
     [ValidateRange(0, 10000)][int] $ExpectedExactTotal = 0,
     [string] $OutputPngPath = '',
@@ -174,7 +175,7 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
     })
     Assert-Condition ($matchingImages.Count -ge $MinimumMatchingImages) 'required FrameImage dimensions are missing'
     $image = $matchingImages[0]
-    Assert-Condition (-not [bool]$image.flipped) 'D3D12 FrameImage unexpectedly requested vertical flip'
+    Assert-Condition ([bool]$image.flipped -eq $ExpectedFlipped) 'FrameImage flip metadata mismatch'
     Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$image.frame_ref)) 'FrameImage is not bound to a main frame'
     $expectedBc1Bytes = [UInt64]($ExpectedWidth * $ExpectedHeight / 2)
     Assert-Condition ([UInt64]$image.raw_bc1_bytes -eq $expectedBc1Bytes) 'FrameImage BC1 byte count mismatch'
@@ -251,6 +252,18 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
         raw_sha256 = Get-Sha256Hex $rawBytes
         png_sha256 = Get-Sha256Hex $png
         validation_errors = [string]$validation.data.error_count
+        capture_submit_cpu_ms = [ordered]@{
+            point_count = [string]$captureSubmit.point_count
+            min = [string]$captureSubmit.min
+            max = [string]$captureSubmit.max
+            mean = [string]([double]$captureSubmit.sum / [Math]::Max(1, [double]$captureSubmit.point_count))
+        }
+        readback_latency_ms = [ordered]@{
+            point_count = [string]$latency.point_count
+            min = [string]$latency.min
+            max = [string]$latency.max
+            mean = [string]([double]$latency.sum / [Math]::Max(1, [double]$latency.point_count))
+        }
     }
 }
 
