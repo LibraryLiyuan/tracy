@@ -10,6 +10,7 @@ param(
     [bool] $ExpectedFlipped = $false,
     [ValidateRange(1, 10000)][int] $MinimumMatchingImages = 1,
     [ValidateRange(0, 10000)][int] $ExpectedExactTotal = 0,
+    [ValidateRange(0, 10000)][int] $ExpectedIntervalFrames = 0,
     [string] $OutputPngPath = '',
     [string] $OutputReportPath = '',
     [switch] $Indexed
@@ -174,6 +175,15 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
         [int]$_.width -eq $ExpectedWidth -and [int]$_.height -eq $ExpectedHeight
     })
     Assert-Condition ($matchingImages.Count -ge $MinimumMatchingImages) 'required FrameImage dimensions are missing'
+    if ($ExpectedIntervalFrames -gt 0 -and $matchingImages.Count -gt 1)
+    {
+        $orderedFrameIndexes = @($matchingImages | ForEach-Object { [UInt64]$_.raw_frame_index } | Sort-Object)
+        for ($index = 1; $index -lt $orderedFrameIndexes.Count; ++$index)
+        {
+            Assert-Condition (($orderedFrameIndexes[$index] - $orderedFrameIndexes[$index - 1]) -eq [UInt64]$ExpectedIntervalFrames) `
+                "FrameImage interval mismatch at matching image $index"
+        }
+    }
     $image = $matchingImages[0]
     Assert-Condition ([bool]$image.flipped -eq $ExpectedFlipped) 'FrameImage flip metadata mismatch'
     Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$image.frame_ref)) 'FrameImage is not bound to a main frame'
@@ -211,7 +221,7 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
     }
 
     $engineIdentity = @($appInfo.data.app_info | Where-Object { $_ -like 'JN Unity Tracy Target=*' })
-    Assert-Condition ($engineIdentity.Count -eq 1 -and $engineIdentity[0] -match 'FrameImage=DefaultOff\+FinalColorOnly\+AsyncReadbackRing4\+Max1280x720') 'native FrameImage AppInfo mismatch'
+    Assert-Condition ($engineIdentity.Count -eq 1 -and $engineIdentity[0] -match 'FrameImage=Daily960x540Every60\+Triggered1280x720\+FinalColorOnly\+AsyncReadbackRing4') 'native FrameImage AppInfo mismatch'
     $managedIdentity = @($appInfo.data.app_info | Where-Object { $_ -like 'JNFI1|*' })
     Assert-Condition ($managedIdentity.Count -ge 1) 'managed FrameImage AppInfo missing'
     # Tracy on-demand replays process AppInfo after reconnect. The managed
@@ -248,6 +258,7 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
         height = [string]$ExpectedHeight
         kind = $ExpectedKind
         raw_frame_index = [string]$image.raw_frame_index
+        expected_interval_frames = [string]$ExpectedIntervalFrames
         raw_bc1_bytes = [string]$expectedBc1Bytes
         raw_sha256 = Get-Sha256Hex $rawBytes
         png_sha256 = Get-Sha256Hex $png
