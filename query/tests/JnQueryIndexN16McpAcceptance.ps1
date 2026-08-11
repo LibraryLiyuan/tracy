@@ -7,7 +7,8 @@ param(
     [string]$StreamTrace = '',
     [UInt64]$ExpectedLogicalResourceCount = 6209,
     [UInt64]$ExpectedGpuPassCount = 997075,
-    [UInt32]$ExpectedOwnerRollupCount = 18
+    [UInt32]$ExpectedOwnerRollupCount = 18,
+    [switch]$UseDefaultIndexed
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,7 +19,8 @@ if ($StreamTrace) { Assert-Condition (Test-Path -LiteralPath $StreamTrace) "stre
 $script:NextRequestId = 1
 $startInfo = [Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $QueryExe
-$startInfo.Arguments = "--mcp --indexed --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
+$indexedArgument = if ($UseDefaultIndexed) { '' } else { ' --indexed' }
+$startInfo.Arguments = "--mcp$indexedArgument --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
 $startInfo.WorkingDirectory = $AllowRoot
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
@@ -185,6 +187,7 @@ try
 
     $result = [ordered]@{
         passed = $true
+        indexed_launch = if ($UseDefaultIndexed) { 'mcp_default' } else { 'explicit' }
         trace = [ordered]@{ path = (Get-Item -LiteralPath $Trace).FullName; bytes = (Get-Item -LiteralPath $Trace).Length; sha256 = (Get-FileHash -LiteralPath $Trace -Algorithm SHA256).Hash.ToLowerInvariant(); trace_id = $traceId }
         timings_ms = [ordered]@{ indexed_open = $openWatch.ElapsedMilliseconds; overview = $overview.elapsed_ms; capabilities = $capabilities.elapsed_ms; gpu_domain_1000 = $gpu.elapsed_ms; relation_1000 = $relations.elapsed_ms; gpu_memory_summary = $gpuMemorySummary.elapsed_ms; gpu_request_scopes_100 = $gpuRequestScopes.elapsed_ms; gpu_allocations_100 = $gpuAllocations.elapsed_ms; gpu_attribution_100 = $gpuAttribution.elapsed_ms; validation = $validation.elapsed_ms; cancellation = $cancelWatch.ElapsedMilliseconds }
         counts = [ordered]@{ cpu_zones = [string]$overview.response.data.trace.counts.cpu_zones; gpu_zones = [string]$overview.response.data.trace.counts.gpu_zones; relations = [string]$overview.response.data.trace.counts.relations; io_requests = [string]$overview.response.data.trace.counts.io_requests }

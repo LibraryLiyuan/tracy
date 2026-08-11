@@ -46,6 +46,7 @@ struct Arguments
     bool compactIndex = false;
     bool buildIndex = false;
     bool indexed = false;
+    bool indexedExplicit = false;
     std::optional<std::filesystem::path> trace;
     std::optional<std::string> request;
     std::optional<std::string> batch;
@@ -65,7 +66,7 @@ void Usage()
         << "  tracy-query --build-index --trace file.tracy [--allow-root path]\n"
         << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path]\n"
         << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path]\n"
-        << "  tracy-query --mcp [--indexed] [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
+        << "  tracy-query --mcp [--indexed|--no-indexed] [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
 }
 
 Arguments ParseArguments( int argc, char** argv )
@@ -84,7 +85,8 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--mcp" ) result.mcp = true;
         else if( option == "--compact-index" ) result.compactIndex = true;
         else if( option == "--build-index" ) result.buildIndex = true;
-        else if( option == "--indexed" ) result.indexed = true;
+        else if( option == "--indexed" ) { result.indexed = true; result.indexedExplicit = true; }
+        else if( option == "--no-indexed" ) { result.indexed = false; result.indexedExplicit = true; }
         else if( option == "--trace" ) result.trace = value( "--trace" );
         else if( option == "--request" ) result.request = value( "--request" );
         else if( option == "--batch" ) result.batch = value( "--batch" );
@@ -103,6 +105,10 @@ Arguments ParseArguments( int argc, char** argv )
         }
         else throw std::runtime_error( "unknown option: " + option );
     }
+    // MCP is the formal AI-analysis entry point. Default it to the bounded,
+    // memory-mapped sidecar path while retaining an explicit diagnostic escape
+    // hatch for investigations that require the full in-memory Worker.
+    if( result.mcp && !result.indexedExplicit ) result.indexed = true;
     return result;
 }
 

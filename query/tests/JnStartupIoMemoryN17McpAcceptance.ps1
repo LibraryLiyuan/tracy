@@ -204,6 +204,11 @@ function Validate-Trace([string] $Path, [string] $Label)
 
         return [ordered]@{
             fingerprint = $opened.Fingerprint
+            validation = [ordered]@{
+                complete = [bool]$validation.data.complete
+                partial = [bool]$validation.partial
+                errors = [string]$validation.data.error_count
+            }
             semantics = [ordered]@{
                 cpu_pool_count = $cpuPools.Count
                 cpu_events = [string]$totalEvents
@@ -224,8 +229,6 @@ function Validate-Trace([string] $Path, [string] $Label)
                 managed_heap_reserved_bytes = [string]$gc.data.latest.managed_heap_reserved_bytes
                 sampling_events = [string]$actual.sampling.sample_count
                 context_switch_events = [string]$actual.context_switch.event_count
-                validation_complete = [bool]$validation.data.complete
-                validation_partial = [bool]$validation.partial
                 validation_errors = [string]$validation.data.error_count
             }
         }
@@ -254,12 +257,19 @@ try
         replay = Validate-Trace $ReplayTrace 'replay'
     }
     $baseline = $results.snapshot.semantics | ConvertTo-Json -Compress -Depth 30
-    Assert-Condition (($results.stream.semantics | ConvertTo-Json -Compress -Depth 30) -eq $baseline) `
-        'snapshot/stream Startup I/O/Memory semantics differ'
-    Assert-Condition (($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $baseline) `
-        'snapshot/replay Startup I/O/Memory semantics differ'
-
-    $result = [ordered]@{ ok = $true; schema_version = '1.26.0'; traces = $results }
+    $streamMatches = ($results.stream.semantics | ConvertTo-Json -Compress -Depth 30) -eq $baseline
+    $replayMatches = ($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $baseline
+    $result = [ordered]@{
+        ok = $streamMatches -and $replayMatches
+        schema_version = '1.26.0'
+        comparison = [ordered]@{
+            snapshot_stream_equal = $streamMatches
+            snapshot_replay_equal = $replayMatches
+            validation_all_complete = [bool]$results.snapshot.validation.complete -and
+                [bool]$results.stream.validation.complete -and [bool]$results.replay.validation.complete
+        }
+        traces = $results
+    }
     $json = $result | ConvertTo-Json -Depth 60
     if (-not [string]::IsNullOrWhiteSpace($OutputFile))
     {
@@ -267,6 +277,8 @@ try
         if (-not [string]::IsNullOrWhiteSpace($parent)) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
         [IO.File]::WriteAllText($OutputFile, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     }
+    Assert-Condition $streamMatches 'snapshot/stream Startup I/O/Memory semantics differ'
+    Assert-Condition $replayMatches 'snapshot/replay Startup I/O/Memory semantics differ'
     $json
 }
 finally

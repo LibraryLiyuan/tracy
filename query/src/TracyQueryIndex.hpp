@@ -12,7 +12,7 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 4;
+inline constexpr uint32_t QueryIndexSchemaVersion = 5;
 
 constexpr bool QueryIndexCpuZoneTimingComplete( int64_t end ) noexcept
 {
@@ -59,6 +59,8 @@ struct QueryIndexManifest
     bool cpuZoneIndex = false;
     bool gpuZoneIndex = false;
     bool gpuMemoryProtocol2 = false;
+    bool zoneValidationPrecomputed = false;
+    analysis::ZoneValidationSummaryDto zoneValidation;
     std::unordered_map<uint64_t, uint64_t> cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> gpuZonesByContext;
 };

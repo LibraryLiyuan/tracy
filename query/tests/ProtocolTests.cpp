@@ -138,7 +138,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 4 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 5 );
     static_assert( tracy::query::QueryIndexCpuZoneTimingComplete( 0 ) );
     static_assert( !tracy::query::QueryIndexCpuZoneTimingComplete( -1 ) );
     static_assert( tracy::query::QueryIndexGpuZoneTimingComplete( 0, 0 ) );
@@ -661,6 +661,16 @@ int main()
     assert( gcSummary.at( "counts" ).at( "events" ) == "4" && gcSummary.at( "counts" ).at( "paired_intervals" ) == "1" );
     assert( gcSummary.at( "latest" ).at( "managed_heap_used_bytes" ) == "1048576" );
     assert( gcSummary.at( "latest" ).at( "lua_heap_used_bytes" ) == "65536" );
+    const auto partialGcSummaryResponse = service.Execute( Request( 1019, "memory.gc.summary", {
+        { "trace_id", n11Id }, { "max_scan_events", 1 }
+    } ) );
+    const auto& partialGcSummary = partialGcSummaryResponse.at( "data" );
+    assert( partialGcSummaryResponse.at( "partial" ) == true );
+    assert( partialGcSummary.at( "present" ) == true && partialGcSummary.at( "complete" ) == false );
+    assert( partialGcSummary.at( "data_available" ) == false && partialGcSummary.at( "data_status" ) == "unavailable_budget_partial" );
+    assert( partialGcSummary.at( "counts" ).at( "events" ).is_null() );
+    assert( partialGcSummary.at( "latest" ).at( "managed_heap_used_bytes" ).is_null() );
+    assert( partialGcSummary.at( "interval_statistics" ).is_null() );
     const auto luaGcEvents = service.Execute( Request( 1008, "memory.gc.events", { { "trace_id", n11Id }, { "runtime", "lua" } } ) ).at( "data" ).at( "events" );
     assert( luaGcEvents.size() == 1 && luaGcEvents[0].at( "kind_name" ) == "lua_heap_used" );
 
@@ -1010,6 +1020,17 @@ int main()
     assert( gpuMemorySummary.at( "quality" ).contains( "command_list_boundary_passes" ) );
     assert( gpuMemorySummary.at( "layers" ).at( "cpu_allocation" ).at( "included" ) == false );
     assert( gpuMemorySummary.at( "layers" ).at( "pass_reference" ).at( "semantics" ) == "per-node deduplicated working set; sibling nodes are not additive" );
+    const auto partialGpuMemorySummaryResponse = service.Execute( Request( requestId++, "memory.gpu.summary", {
+        { "trace_id", candidateId }, { "max_scan_events", 1 }
+    } ) );
+    const auto& partialGpuMemorySummary = partialGpuMemorySummaryResponse.at( "data" );
+    assert( partialGpuMemorySummaryResponse.at( "partial" ) == true );
+    assert( partialGpuMemorySummary.at( "data_available" ) == false && partialGpuMemorySummary.at( "data_status" ) == "unavailable_budget_partial" );
+    assert( partialGpuMemorySummary.at( "logical_resource_count" ).is_null() );
+    assert( partialGpuMemorySummary.at( "physical" ).at( "active_bytes" ).is_null() );
+    assert( partialGpuMemorySummary.at( "dxgi_reconciliation" ).at( "available" ) == false );
+    assert( partialGpuMemorySummary.at( "dxgi_reconciliation" ).at( "local" ).is_null() );
+    assert( partialGpuMemorySummary.at( "quality" ).at( "budget_partial" ) == true );
 
     const auto taxonomyTree = service.Execute( Request( requestId++, "gpu.taxonomy.tree", {
         { "trace_id", candidateId }, { "max_scan_events", 100 }

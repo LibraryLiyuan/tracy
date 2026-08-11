@@ -788,6 +788,11 @@ TRACY_SEGMENT_FORWARD1( std::optional<analysis::MemoryEventDto>, GetMemoryEvent,
 TRACY_SEGMENT_FORWARD1( std::optional<std::string>, GetMemoryPoolRef, uint64_t, internalPoolKey )
 TRACY_SEGMENT_FORWARD1( std::optional<std::string>, GetCpuZoneRef, uint64_t, internalZoneIndex )
 TRACY_SEGMENT_FORWARD1( std::optional<std::string>, GetGpuZoneRef, uint64_t, internalZoneIndex )
+std::optional<analysis::ZoneValidationSummaryDto> SegmentTraceSource::ValidateZoneIndex( const std::function<size_t( size_t )>& allowance ) const
+{
+    return m_source->ValidateZoneIndex( allowance );
+}
+TRACY_SEGMENT_FORWARD0( std::optional<bool>, HasGpuMemoryProtocol2 )
 TRACY_SEGMENT_FORWARD2( std::string, MakeEntityRef, std::string_view, kind, uint64_t, id )
 TRACY_SEGMENT_FORWARD2( std::optional<uint64_t>, ParseEntityRef, std::string_view, ref, std::string_view, kind )
 TRACY_SEGMENT_FORWARD0( analysis::GpuMemoryAttribution, GetGpuMemoryAttribution )

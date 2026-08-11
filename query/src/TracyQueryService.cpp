@@ -4450,26 +4450,45 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             else if( kind == 2 ) latest["managed_heap_reserved_bytes"] = Decimal( value );
             else if( kind == 16 ) latest["lua_heap_used_bytes"] = Decimal( value );
         }
-        const bool complete = n11.gcPresent && n11.gcInvalid == 0 && orphanEnds == 0 && openGc.empty() && !BudgetPartial();
+        const bool budgetPartial = BudgetPartial();
+        const bool complete = n11.gcPresent && n11.gcInvalid == 0 && orphanEnds == 0 && openGc.empty() && !budgetPartial;
         const auto reason = !n11.gcPresent ? "trace predates or did not emit JNGC1" :
+            budgetPartial ? "query budget exhausted before the GC scan completed; retry with larger max_cpu_ms/max_scan_events" :
             complete ? "" : "GC data is incomplete; inspect quality counters";
         json base = {
             { "present", n11.gcPresent }, { "schema_version", 1 }, { "complete", complete }, { "reason", reason },
+            { "data_available", !budgetPartial },
+            { "data_status", budgetPartial ? "unavailable_budget_partial" : complete ? "complete" : "available_incomplete" },
             { "capability_record", n11.gcCapability },
             { "quality", {
                 { "invalid_records", Decimal( n11.gcInvalid ) }, { "orphan_ends", Decimal( orphanEnds ) },
-                { "open_intervals", Decimal( openGc.size() ) }, { "budget_partial", BudgetPartial() }
+                { "open_intervals", Decimal( openGc.size() ) }, { "budget_partial", budgetPartial }
             } },
             { "trust", "untrusted_trace_data" }
         };
         if( method == "memory.gc.summary" )
         {
-            base["counts"] = {
-                { "events", Decimal( n11.gcEvents.size() ) }, { "paired_intervals", Decimal( collectionDurations.size() ) },
-                { "observed_collections", Decimal( observedCollections ) }, { "sampled_allocation_bytes", Decimal( allocationBytes ) }
-            };
-            base["latest"] = std::move( latest );
-            base["interval_statistics"] = StatisticsJson( analysis::ComputeStatistics( std::move( collectionDurations ) ) );
+            if( budgetPartial )
+            {
+                base["counts"] = {
+                    { "events", nullptr }, { "paired_intervals", nullptr },
+                    { "observed_collections", nullptr }, { "sampled_allocation_bytes", nullptr }
+                };
+                base["latest"] = {
+                    { "managed_heap_used_bytes", nullptr }, { "managed_heap_reserved_bytes", nullptr },
+                    { "lua_heap_used_bytes", nullptr }
+                };
+                base["interval_statistics"] = nullptr;
+            }
+            else
+            {
+                base["counts"] = {
+                    { "events", Decimal( n11.gcEvents.size() ) }, { "paired_intervals", Decimal( collectionDurations.size() ) },
+                    { "observed_collections", Decimal( observedCollections ) }, { "sampled_allocation_bytes", Decimal( allocationBytes ) }
+                };
+                base["latest"] = std::move( latest );
+                base["interval_statistics"] = StatisticsJson( analysis::ComputeStatistics( std::move( collectionDurations ) ) );
+            }
             return Success( id, std::move( base ), trace );
         }
         json events = json::array();
@@ -6463,6 +6482,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 offset += points.size();
                 if( points.size() < allowed ) break;
             }
+            const bool budgetPartial = BudgetPartial();
             const auto bytes = [&]( const char* name ) -> uint64_t {
                 const auto found = latest.find( name );
                 return found == latest.end() || !found->second.present || found->second.value <= 0 ? 0 : uint64_t( found->second.value );
@@ -6510,6 +6530,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 }
             }
             json summaryWarnings = attribution.warnings;
+            if( budgetPartial )
+                summaryWarnings.push_back( "query budget exhausted before the GPU memory summary scan completed; aggregate values are unavailable" );
             if( !registryQuality.value( "complete", false ) )
                 summaryWarnings.push_back( "GPU memory registry producer is missing, incomplete, or contains dropped/unresolved data" );
             uint64_t incompleteReferencePasses = attribution.passQualityAggregated ? attribution.aggregatedIncompleteReferencePasses : 0;
@@ -6552,15 +6574,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( incompleteReferencePasses != 0 && summaryWarnings.empty() )
                 summaryWarnings.push_back( std::to_string( incompleteReferencePasses ) +
                     " GPU reference pass(es) are incomplete outside the accepted capture boundary" );
-            const bool summaryComplete = attribution.complete && registryQuality.value( "complete", false );
+            const bool summaryComplete = attribution.complete && registryQuality.value( "complete", false ) && !budgetPartial;
+            const auto valueOrNull = [&]( uint64_t value ) -> json { return budgetPartial ? json( nullptr ) : json( Decimal( value ) ); };
+            json dxgiReconciliation = {
+                { "available", !budgetPartial },
+                { "status", budgetPartial ? "unavailable_budget_partial" : "complete" },
+                { "local", budgetPartial ? json( nullptr ) : segment( "Local", "GPU.VRAM.EngineKnownPhysical.LocalBytes" ) },
+                { "non_local", budgetPartial ? json( nullptr ) : segment( "NonLocal", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes" ) },
+                { "semantics", "Implicit/Untracked is max(DXGI Usage - EngineKnownPhysical, 0) and is not proof of a leak" }
+            };
             return Success( id, { { "present", true }, { "protocol", attribution.structuredReferencePresent ? "JN_GPU_REFERENCE_2" : "GTMEM2" },
-                { "dxgi_reconciliation", { { "local", segment( "Local", "GPU.VRAM.EngineKnownPhysical.LocalBytes" ) },
-                    { "non_local", segment( "NonLocal", "GPU.VRAM.EngineKnownPhysical.NonLocalBytes" ) },
-                    { "semantics", "Implicit/Untracked is max(DXGI Usage - EngineKnownPhysical, 0) and is not proof of a leak" } } },
-                { "physical", { { "active_bytes", Decimal( churn.activePhysicalBytes ) }, { "peak_bytes", Decimal( churn.peakPhysicalBytes ) } } },
-                { "logical_resource_count", Decimal( attribution.logicalResources.size() ) },
-                { "owner_rollup_count", Decimal( attribution.ownerRollups.size() ) },
-                { "working_set_count", Decimal( attribution.passQualityAggregated ? attribution.aggregatedWorkingSetCount : attribution.workingSets.size() ) },
+                { "data_available", !budgetPartial },
+                { "data_status", budgetPartial ? "unavailable_budget_partial" : summaryComplete ? "complete" : "available_incomplete" },
+                { "dxgi_reconciliation", std::move( dxgiReconciliation ) },
+                { "physical", { { "active_bytes", valueOrNull( churn.activePhysicalBytes ) }, { "peak_bytes", valueOrNull( churn.peakPhysicalBytes ) } } },
+                { "logical_resource_count", valueOrNull( attribution.logicalResources.size() ) },
+                { "owner_rollup_count", valueOrNull( attribution.ownerRollups.size() ) },
+                { "working_set_count", valueOrNull( attribution.passQualityAggregated ? attribution.aggregatedWorkingSetCount : attribution.workingSets.size() ) },
                 { "layers", {
                     { "cpu_allocation", { { "domain", "memory" }, { "included", false },
                         { "semantics", "Unity native CPU allocations are separate from GPU memory" } } },
@@ -6574,10 +6604,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "semantics", "per-node deduplicated working set; sibling nodes are not additive" } } }
                 } },
                 { "allocation_callstack_semantics", "captured at physical/logical create when enabled; references do not capture allocation stacks" },
-                { "heap_fragmentation_count", Decimal( attribution.fragmentation.size() ) },
-                { "residency", { { "resident_bytes", Decimal( residency.residentBytes ) }, { "evicted_bytes", Decimal( residency.evictedBytes ) },
-                    { "unknown_bytes", Decimal( residency.unknownBytes ) } } },
+                { "heap_fragmentation_count", valueOrNull( attribution.fragmentation.size() ) },
+                { "residency", { { "resident_bytes", valueOrNull( residency.residentBytes ) }, { "evicted_bytes", valueOrNull( residency.evictedBytes ) },
+                    { "unknown_bytes", valueOrNull( residency.unknownBytes ) } } },
                 { "quality", { { "complete", summaryComplete }, { "warnings", std::move( summaryWarnings ) },
+                    { "budget_partial", budgetPartial },
                     { "registry", std::move( registryQuality ) },
                     { "capture_boundary_passes", Decimal( attribution.captureBoundaryPasses ) },
                     { "submission_unobserved_passes", Decimal( attribution.submissionUnobservedPasses ) },
