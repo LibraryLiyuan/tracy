@@ -952,6 +952,12 @@ int main()
     assert( captureContext.at( "complete" ) == true );
     assert( captureContext.at( "generation" ) == "1" );
     assert( captureContext.at( "context" ).at( "workload" ).at( "scene" ) == "Init" );
+    const auto& actualCapabilities = captureContext.at( "context" ).at( "capture_config" ).at( "actual_capabilities" );
+    assert( actualCapabilities.at( "verification" ) == "persisted_trace" );
+    assert( actualCapabilities.at( "sampling" ).at( "present" ) == true );
+    assert( actualCapabilities.at( "sampling" ).at( "period_ns" ) == "1000" );
+    assert( actualCapabilities.at( "sampling" ).at( "frequency_hz" ) == 1000000 );
+    assert( actualCapabilities.at( "context_switch" ).at( "present" ) == true );
     assert( captureContext.at( "missing_layers" ).empty() );
 
     const auto captureCoverage = service.Execute( Request( requestId++, "capture.coverage", { { "trace_id", candidateId } } ) ).at( "data" );

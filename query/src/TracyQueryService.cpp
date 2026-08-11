@@ -1636,6 +1636,37 @@ json CaptureContextJson( const analysis::TraceInfoDto& info )
         } );
     }
 
+    // The producer can report only that Sampling/Context Switch passed its
+    // startup gates. ETW privilege and kernel-session success are observable
+    // only in the persisted trace. Publish the authoritative result next to
+    // the requested configuration so automation never mistakes a request for
+    // captured data.
+    if( context.contains( "capture_config" ) && context["capture_config"].is_object() )
+    {
+        const bool samplingPresent = info.counts.samples != 0 && info.samplingPeriodNs > 0;
+        const bool contextSwitchPresent = info.counts.contextSwitches != 0;
+        const uint64_t samplingHz = samplingPresent ?
+            uint64_t( ( 1000000000ll + info.samplingPeriodNs / 2 ) / info.samplingPeriodNs ) : 0;
+        context["capture_config"]["actual_capabilities"] = {
+            { "verification", "persisted_trace" },
+            { "sampling", {
+                { "present", samplingPresent },
+                { "period_ns", Decimal( samplingPresent ? uint64_t( info.samplingPeriodNs ) : 0 ) },
+                { "frequency_hz", samplingHz },
+                { "sample_count", Decimal( info.counts.samples ) },
+                { "reason", samplingPresent ? json( nullptr ) : json( "absent_in_persisted_trace" ) }
+            } },
+            { "context_switch", {
+                { "present", contextSwitchPresent },
+                { "event_count", Decimal( info.counts.contextSwitches ) },
+                { "reason", contextSwitchPresent ? json( nullptr ) : json( "absent_in_persisted_trace" ) }
+            } }
+        };
+        sources["capture_config.actual_capabilities"] = {
+            { "producer", "tracy-query" }, { "generation", Decimal( uint64_t( 0 ) ) }
+        };
+    }
+
     const auto identity = CaptureIdentityJson( info );
     if( connectionIds.size() > 1 )
         invalid.push_back( { { "record_index", nullptr }, { "reason", "capture context contains multiple connection ids" } } );
