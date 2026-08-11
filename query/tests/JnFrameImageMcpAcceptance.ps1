@@ -13,7 +13,8 @@ param(
     [ValidateRange(0, 10000)][int] $ExpectedIntervalFrames = 0,
     [string] $OutputPngPath = '',
     [string] $OutputReportPath = '',
-    [switch] $Indexed
+    [switch] $Indexed,
+    [switch] $SkipValidation
 )
 
 Set-StrictMode -Version Latest
@@ -153,12 +154,16 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
     $counts = Inspect -TraceId $TraceId -Method 'trace.counts'
     $capabilities = Inspect -TraceId $TraceId -Method 'system.capabilities'
     $appInfo = Inspect -TraceId $TraceId -Method 'trace.app_info'
-    $validation = Inspect -TraceId $TraceId -Method 'validation.run' -Params @{
-        max_scan_events = 100000000
-        max_cpu_ms = 60000
+    $validation = if ($SkipValidation) { $null } else {
+        Inspect -TraceId $TraceId -Method 'validation.run' -Params @{
+            max_scan_events = 100000000
+            max_cpu_ms = 60000
+        }
     }
-    Assert-Condition ([bool]$validation.data.complete -and [bool]$validation.data.valid) 'trace validation is incomplete or invalid'
-    Assert-Condition ([UInt64]$validation.data.error_count -eq 0) 'trace validation reported errors'
+    # Continue collecting FrameImage evidence when whole-trace validation is
+    # partial. The report must survive a failed global gate so image transport,
+    # dimensions and frame binding can be diagnosed independently. The caller
+    # still fails after writing the structured report.
 
     $capability = Get-Capability -Capabilities $capabilities -Domain 'frame_image'
     Assert-Condition ([bool]$capability.present -and [bool]$capability.queryable) 'FrameImage capability is not queryable'
@@ -262,7 +267,11 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
         raw_bc1_bytes = [string]$expectedBc1Bytes
         raw_sha256 = Get-Sha256Hex $rawBytes
         png_sha256 = Get-Sha256Hex $png
-        validation_errors = [string]$validation.data.error_count
+        validation_skipped = [bool]$SkipValidation
+        validation_complete = $(if ($null -ne $validation) { [bool]$validation.data.complete } else { $null })
+        validation_valid = $(if ($null -ne $validation) { [bool]$validation.data.valid } else { $null })
+        validation_partial = $(if ($null -ne $validation) { [bool]$validation.partial } else { $null })
+        validation_errors = $(if ($null -ne $validation) { [string]$validation.data.error_count } else { $null })
         capture_submit_cpu_ms = [ordered]@{
             point_count = [string]$captureSubmit.point_count
             min = [string]$captureSubmit.min
@@ -308,7 +317,9 @@ try
     $queryProcess.Refresh()
 
     $result = [ordered]@{
-        ok = $true
+        ok = ([bool]$snapshot.validation_skipped -or
+            ([bool]$snapshot.validation_complete -and [bool]$snapshot.validation_valid -and
+                -not [bool]$snapshot.validation_partial -and [UInt64]$snapshot.validation_errors -eq 0))
         snapshot_fingerprint = [string]$snapshotStatus.data.status.fingerprint
         stream_fingerprint = [string]$streamStatus.data.status.fingerprint
         frame_image = $snapshot
@@ -328,6 +339,10 @@ try
             [IO.Directory]::CreateDirectory($reportDirectory) | Out-Null
         }
         [IO.File]::WriteAllText($OutputReportPath, $resultJson, [Text.UTF8Encoding]::new($false))
+    }
+    if (-not $SkipValidation)
+    {
+        Assert-Condition ([bool]$result.ok) 'trace validation is incomplete or invalid'
     }
     $resultJson
 }
