@@ -6,6 +6,7 @@ param(
     [Parameter(Mandatory = $true)][string] $ReplayTrace,
     [Parameter(Mandatory = $true)][string] $AllowRoot,
     [switch] $Synthetic,
+    [switch] $StreamFirst,
     [string] $OutputFile
 )
 
@@ -90,13 +91,19 @@ function Get-ExplicitReferenceTokens([string]$TraceId) {
 }
 
 function Validate-N10([string]$TraceId) {
-    $summary = Inspect $TraceId 'memory.gpu.summary'
+    # A real Triggered trace can spend the default five-second request budget
+    # building GPU attribution before DXGI plot reconciliation begins.  Use the
+    # explicit full-acceptance budget here so a partial result cannot silently
+    # compare real values against zero; bounded/default-budget behavior belongs
+    # to the dedicated Query pressure gate.
+    $summary = Inspect $TraceId 'memory.gpu.summary' @{ max_scan_events = 100000000; max_cpu_ms = 60000 }
     $residency = Inspect $TraceId 'memory.gpu.residency' @{ limit = 100 }
     $fragmentation = Inspect $TraceId 'memory.gpu.fragmentation' @{ limit = 100 }
     $churn = Inspect $TraceId 'memory.gpu.churn'
     $allocations = Inspect $TraceId 'memory.gpu.allocations' @{ limit = 100 }
     $validation = Inspect $TraceId 'validation.run'
 
+    Assert-Condition (-not [bool]$summary.partial) 'N10 summary exhausted its explicit acceptance budget'
     Assert-Condition ([bool]$summary.data.present) 'N10 summary is not present'
     Assert-Condition ([bool]$residency.data.present) 'N10 residency is not present'
     Assert-Condition ([bool]$fragmentation.data.present) 'N10 fragmentation is not present'
@@ -157,11 +164,13 @@ try {
     $process.StandardInput.WriteLine((@{ jsonrpc = '2.0'; method = 'notifications/initialized'; params = @{} } | ConvertTo-Json -Compress))
     $process.StandardInput.Flush()
 
-    $results = @()
-    foreach ($entry in @(
+    $entries = @(
         @{ name = 'snapshot'; path = $SnapshotTrace },
         @{ name = 'stream'; path = $StreamTrace },
-        @{ name = 'replay'; path = $ReplayTrace })) {
+        @{ name = 'replay'; path = $ReplayTrace })
+    if ($StreamFirst) { $entries = @($entries[1], $entries[0], $entries[2]) }
+    $results = @()
+    foreach ($entry in $entries) {
         $opened = Tool 'tracy_trace_open' @{ path = $entry.path }
         $traceId = [string]$opened.data.trace_id
         $traceIds += $traceId
@@ -171,7 +180,25 @@ try {
         $traceIds = @($traceIds | Where-Object { $_ -ne $traceId })
     }
 
-    $canonical = @($results | ForEach-Object { $_.data | ConvertTo-Json -Compress -Depth 30 })
+    $byName = @{}
+    foreach ($entry in $results) { $byName[[string]$entry.name] = $entry }
+    $canonical = @('snapshot', 'stream', 'replay' | ForEach-Object { $byName[$_].data | ConvertTo-Json -Compress -Depth 30 })
+    if ($OutputFile) {
+        $parent = Split-Path -Parent $OutputFile
+        if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        $diagnostic = [ordered]@{
+            ok = ($canonical[0] -eq $canonical[1]) -and ($canonical[0] -eq $canonical[2])
+            snapshot_stream_equal = $canonical[0] -eq $canonical[1]
+            snapshot_replay_equal = $canonical[0] -eq $canonical[2]
+            traces = $results
+            canonical = [ordered]@{
+                snapshot = $canonical[0]
+                stream = $canonical[1]
+                replay = $canonical[2]
+            }
+        }
+        [IO.File]::WriteAllText($OutputFile + '.diagnostic.json', ($diagnostic | ConvertTo-Json -Depth 40) + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    }
     Assert-Condition ($canonical[0] -eq $canonical[1]) 'snapshot/stream N10 data mismatch'
     Assert-Condition ($canonical[0] -eq $canonical[2]) 'snapshot/replay N10 data mismatch'
     $result = [ordered]@{ ok = $true; schema = 'GTMEM2'; traces = $results }

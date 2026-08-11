@@ -302,7 +302,8 @@ int main()
     assert( structuredAttribution.passes[0].structuredBinary && structuredAttribution.passes[0].passId == 21 );
     assert( structuredAttribution.passes[0].gpuPairing == GpuZonePairing::DerivedLogicalRollup );
     assert( structuredAttribution.passes[1].parentPassId == 21 && structuredAttribution.passes[1].uses.size() == 1 );
-    assert( structuredAttribution.passes[1].gpuPairing == GpuZonePairing::GpuResultUnavailable );
+    assert( structuredAttribution.captureBoundaryPasses == 1 );
+    assert( structuredAttribution.passes[1].gpuPairing == GpuZonePairing::CaptureBoundary );
     assert( structuredAttribution.passes[1].uses[0].kind == 'T' );
     const auto parentWorking = std::find_if( structuredAttribution.workingSets.begin(), structuredAttribution.workingSets.end(),
         []( const auto& value ) { return value.taxonomyId == 7; } );
@@ -397,11 +398,30 @@ int main()
     commandListBoundary.parentPassId = 0;
     commandListBoundary.frame = 5;
     commandListBoundary.flags = uint8_t( 1u << 5 ); // JnGpuReferenceFlags::CommandListBoundary
-    const auto commandListBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, gpuAllocations,
-        {}, { 31 }, { commandListBoundary } );
+    GpuMemoryReferencePassInput commandListInterior = commandListBoundary;
+    commandListInterior.passId = 32;
+    commandListInterior.frame = 5;
+    GpuMemoryReferencePassInput commandListTail = commandListBoundary;
+    commandListTail.passId = 33;
+    commandListTail.frame = 10;
+    const std::vector<GpuMemoryGpuZoneInput> commandListTailGpuZone = {
+        { 33, "CommandListTail", 9, 100, 1000, 2000, 33 }
+    };
+    const auto commandListBoundaryAttribution = BuildGpuMemoryAttribution( {}, commandListTailGpuZone, gpuAllocations,
+        {}, { 31, 32, 33 }, { commandListBoundary, commandListInterior, commandListTail } );
     assert( commandListBoundaryAttribution.complete && commandListBoundaryAttribution.warnings.empty() );
     assert( commandListBoundaryAttribution.passes[0].complete );
     assert( commandListBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::GpuResultUnavailable );
+    assert( commandListBoundaryAttribution.passes[1].gpuPairing == GpuZonePairing::GpuResultUnavailable );
+    assert( commandListBoundaryAttribution.passes[2].gpuPairing == GpuZonePairing::Exact );
+    assert( commandListBoundaryAttribution.gpuResultUnavailablePasses == 2 );
+
+    const auto timestampTailBoundaryAttribution = BuildGpuMemoryAttribution( {}, {}, gpuAllocations,
+        {}, { 31 }, { commandListBoundary } );
+    assert( timestampTailBoundaryAttribution.complete && timestampTailBoundaryAttribution.warnings.empty() );
+    assert( timestampTailBoundaryAttribution.captureBoundaryPasses == 1 );
+    assert( timestampTailBoundaryAttribution.gpuResultUnavailablePasses == 0 );
+    assert( timestampTailBoundaryAttribution.passes[0].gpuPairing == GpuZonePairing::CaptureBoundary );
 
     tracy::query::test::FakeTraceSource fake;
     assert( fake.AcquireReadView().sourceKind == TraceSourceKind::Snapshot );

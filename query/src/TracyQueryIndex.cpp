@@ -1254,8 +1254,14 @@ public:
             auto& item = selected[index]; auto& pass = item.pass;
             const bool nearHead = pass.frame <= earliestFrame + 1, nearTail = latestFrame <= pass.frame + 1;
             const bool failure = ( pass.flags & 0xA ) != 0;
-            const bool boundary = ( !item.ended && pass.frame == latestFrame ) || ( item.ended && pass.truncated && !failure && pass.droppedUses == 0 && ( nearHead || nearTail ) );
-            if( boundary ) { pass.gpuPairing = analysis::GpuZonePairing::CaptureBoundary; pass.end = captureEnd; }
+            const bool forcedBoundaryClose = item.ended && pass.truncated && !failure && pass.droppedUses == 0 && ( nearHead || nearTail );
+            const bool timestampBoundary = item.hasSegment && exact.find( index ) == exact.end() && nearTail;
+            const bool boundary = ( !item.ended && pass.frame == latestFrame ) || forcedBoundaryClose || timestampBoundary;
+            if( boundary )
+            {
+                pass.gpuPairing = analysis::GpuZonePairing::CaptureBoundary;
+                if( !item.ended || forcedBoundaryClose ) pass.end = captureEnd;
+            }
             else if( exact.find( index ) != exact.end() ) pass.gpuPairing = analysis::GpuZonePairing::Exact;
             else if( item.hasSegment ) pass.gpuPairing = analysis::GpuZonePairing::GpuResultUnavailable;
             else if( pass.commandListId != 0 && !item.submitted ) pass.gpuPairing = analysis::GpuZonePairing::SubmissionUnobserved;
@@ -1463,25 +1469,29 @@ public:
         }
         std::unordered_set<uint64_t> segmentTokens;
         segmentTokens.reserve( tokenBySegment.size() );
-        std::unordered_map<uint64_t, uint32_t> candidatesByQuery;
+        std::unordered_map<uint64_t, std::vector<uint64_t>> tokensByQuery;
         for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
         {
             const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
             if( value.kind != 4 ) continue;
             const auto token = tokenBySegment.find( value.entityId ); if( token == tokenBySegment.end() ) continue;
             segmentTokens.emplace( token->second );
-            candidatesByQuery[( uint64_t( value.gpuContext ) << 32 ) | value.gpuQueryId]++;
+            tokensByQuery[( uint64_t( value.gpuContext ) << 32 ) | value.gpuQueryId].emplace_back( token->second );
         }
-        uint64_t exactPairings = 0;
+        std::unordered_map<uint64_t, size_t> matchedByQuery;
+        std::unordered_set<uint64_t> exactTokens;
+        exactTokens.reserve( segmentTokens.size() );
         for( uint64_t index = 0; index < m_gpu.Count(); index++ )
         {
             const auto& zone = m_gpu.At<GpuZoneIndexRecord>( index );
             if( ( zone.flags & 1 ) == 0 || zone.gpuEnd < 0 ) continue;
             const auto key = ( uint64_t( zone.context ) << 32 ) | zone.queryId;
-            const auto found = candidatesByQuery.find( key );
-            if( found != candidatesByQuery.end() && found->second != 0 ) { found->second--; exactPairings++; }
+            const auto found = tokensByQuery.find( key );
+            if( found == tokensByQuery.end() ) continue;
+            auto& cursor = matchedByQuery[key];
+            while( cursor < found->second.size() && exactTokens.find( found->second[cursor] ) != exactTokens.end() ) cursor++;
+            if( cursor < found->second.size() ) exactTokens.emplace( found->second[cursor++] );
         }
-        result.gpuResultUnavailablePasses += segmentTokens.size() > exactPairings ? segmentTokens.size() - exactPairings : 0;
 
         result.protocolPresent = true;
         result.structuredReferencePresent = true;
@@ -1498,16 +1508,21 @@ public:
             const bool explicitlyTruncated = ( input.flags & 0x1 ) != 0;
             const bool hasFailureFlag = ( input.flags & 0xA ) != 0;
             const bool forcedBoundaryClose = input.ended && explicitlyTruncated && !hasFailureFlag && input.droppedUses == 0 && ( nearHead || nearTail );
-            const bool captureBoundary = ( !input.ended && captureEnd >= input.begin.time && input.begin.frameIndex == latestFrame ) || forcedBoundaryClose;
+            const bool hasSegment = segmentTokens.find( input.begin.passId ) != segmentTokens.end();
+            const bool hasExactTimestamp = exactTokens.find( input.begin.passId ) != exactTokens.end();
+            const bool timestampBoundary = hasSegment && !hasExactTimestamp && nearTail;
+            const bool captureBoundary = ( !input.ended && captureEnd >= input.begin.time && input.begin.frameIndex == latestFrame ) || forcedBoundaryClose || timestampBoundary;
             const bool complete = input.ended && !explicitlyTruncated && input.droppedUses == 0;
             analysis::GpuZonePairing pairing = analysis::GpuZonePairing::Missing;
             if( captureBoundary ) pairing = analysis::GpuZonePairing::CaptureBoundary;
-            else if( segmentTokens.find( input.begin.passId ) != segmentTokens.end() ) pairing = analysis::GpuZonePairing::Exact;
+            else if( hasExactTimestamp ) pairing = analysis::GpuZonePairing::Exact;
+            else if( hasSegment ) pairing = analysis::GpuZonePairing::GpuResultUnavailable;
             else if( input.commandListId != 0 && !submittedCommandLists.empty() && submittedCommandLists.find( input.commandListId ) == submittedCommandLists.end() )
                 pairing = analysis::GpuZonePairing::SubmissionUnobserved;
             else if( input.emittedUses == 0 && input.hasChild ) pairing = analysis::GpuZonePairing::DerivedLogicalRollup;
             else missingPairings++;
             if( captureBoundary ) result.captureBoundaryPasses++;
+            if( pairing == analysis::GpuZonePairing::GpuResultUnavailable ) result.gpuResultUnavailablePasses++;
             if( pairing == analysis::GpuZonePairing::SubmissionUnobserved ) result.submissionUnobservedPasses++;
             if( ( input.flags & uint8_t( JnGpuReferenceFlags::CommandListBoundary ) ) != 0 ) result.aggregatedCommandListBoundaryPasses++;
             if( complete || captureBoundary ) continue;

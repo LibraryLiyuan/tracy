@@ -350,12 +350,12 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         if( header ) result.passes.emplace_back( std::move( pass ) );
     }
 
+    uint64_t latestStructuredFrame = 0;
     if( !structuredReferencePasses.empty() )
     {
         result.protocolPresent = true;
         result.structuredReferencePresent = true;
         uint64_t earliestStructuredFrame = std::numeric_limits<uint64_t>::max();
-        uint64_t latestStructuredFrame = 0;
         for( const auto& input : structuredReferencePasses )
         {
             earliestStructuredFrame = std::min( earliestStructuredFrame, input.frame );
@@ -690,8 +690,21 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         }
         if( gpuSegmentReferenceTokens.find( pass.passId ) != gpuSegmentReferenceTokens.end() )
         {
-            pass.gpuPairing = GpuZonePairing::GpuResultUnavailable;
-            result.gpuResultUnavailablePasses++;
+            // A bounded capture may stop before D3D12 query results for the
+            // final two reference frames are collected.  The segment relation
+            // proves that the pass was submitted; classify only this narrow
+            // tail window as a capture boundary.  Missing results in interior
+            // frames remain an explicit data-quality failure.
+            if( pass.structuredBinary && latestStructuredFrame <= pass.frame + 1 )
+            {
+                pass.gpuPairing = GpuZonePairing::CaptureBoundary;
+                result.captureBoundaryPasses++;
+            }
+            else
+            {
+                pass.gpuPairing = GpuZonePairing::GpuResultUnavailable;
+                result.gpuResultUnavailablePasses++;
+            }
             continue;
         }
         if( pass.commandListId != 0 && !submittedCommandLists.empty() && submittedCommandLists.find( pass.commandListId ) == submittedCommandLists.end() )
