@@ -138,7 +138,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 5 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 6 );
     static_assert( tracy::query::QueryIndexCpuZoneTimingComplete( 0 ) );
     static_assert( !tracy::query::QueryIndexCpuZoneTimingComplete( -1 ) );
     static_assert( tracy::query::QueryIndexGpuZoneTimingComplete( 0, 0 ) );

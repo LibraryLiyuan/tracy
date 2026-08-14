@@ -9538,9 +9538,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         else
         {
+            struct FrameRootInterval
+            {
+                std::string ref;
+                std::string threadRef;
+                int64_t startNs = 0;
+                int64_t endNs = 0;
+            };
             size_t incompleteCpu = 0, invalidCpu = 0, unresolvedCpuNames = 0;
             size_t incompleteGpu = 0, invalidGpu = 0;
             json incompleteCpuRefs = json::array(), invalidCpuRefs = json::array(), unresolvedCpuNameRefs = json::array(), incompleteGpuRefs = json::array(), invalidGpuRefs = json::array();
+            std::vector<FrameRootInterval> mainPlayerLoopRoots;
+            uint64_t duplicateUnityPlayerLoopRoots = 0;
+            json duplicateUnityPlayerLoopRefs = json::array(), nestedMainPlayerLoopRefs = json::array();
+            uint64_t nestedMainPlayerLoopRoots = 0;
             while( true )
             {
                 checkCancelled();
@@ -9557,10 +9568,68 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     if( !value.nameResolved ) { unresolvedCpuNames++; addRef( unresolvedCpuNameRefs, value.ref ); }
                     if( !value.complete ) { incompleteCpu++; addRef( incompleteCpuRefs, value.ref ); }
                     if( value.endNs && *value.endNs < value.startNs ) { invalidCpu++; addRef( invalidCpuRefs, value.ref ); }
+                    if( value.name == "PlayerLoop" )
+                    {
+                        duplicateUnityPlayerLoopRoots++;
+                        addRef( duplicateUnityPlayerLoopRefs, value.ref );
+                    }
+                    if( value.name == "Main.PlayerLoop" )
+                    {
+                        if( value.endNs )
+                            mainPlayerLoopRoots.push_back( { value.ref, value.threadRef, value.startNs, *value.endNs } );
+                        auto parentRef = value.parentRef;
+                        size_t parentDepth = 0;
+                        while( parentRef && parentDepth++ < 4096 )
+                        {
+                            const auto parent = source->GetCpuZone( *parentRef );
+                            if( !parent ) break;
+                            if( parent->name == "Main.PlayerLoop" )
+                            {
+                                nestedMainPlayerLoopRoots++;
+                                addRef( nestedMainPlayerLoopRefs, value.ref );
+                                break;
+                            }
+                            parentRef = parent->parentRef;
+                        }
+                    }
                 }
                 offset += values.size();
                 if( values.size() < allowed ) break;
             }
+            if( !mainPlayerLoopRoots.empty() && duplicateUnityPlayerLoopRoots != 0 )
+                addFinding( "error", "DUPLICATE_AUTHORITATIVE_PLAYERLOOP_ROOT",
+                    "Unity's cross-frame PlayerLoop marker was mirrored beside the authoritative Main.PlayerLoop root",
+                    duplicateUnityPlayerLoopRoots, std::move( duplicateUnityPlayerLoopRefs ) );
+            if( nestedMainPlayerLoopRoots != 0 )
+                addFinding( "error", "CPU_FRAME_ROOT_NESTED_SAME_SOURCE",
+                    "Main.PlayerLoop is nested below another Main.PlayerLoop root",
+                    nestedMainPlayerLoopRoots, std::move( nestedMainPlayerLoopRefs ) );
+            std::unordered_map<std::string, std::vector<FrameRootInterval>> rootsByThread;
+            for( auto& root : mainPlayerLoopRoots ) rootsByThread[root.threadRef].emplace_back( std::move( root ) );
+            uint64_t crossingRoots = 0;
+            json crossingRootRefs = json::array();
+            for( auto& [threadRef, roots] : rootsByThread )
+            {
+                std::sort( roots.begin(), roots.end(), []( const auto& lhs, const auto& rhs ) {
+                    return lhs.startNs != rhs.startNs ? lhs.startNs < rhs.startNs : lhs.ref < rhs.ref;
+                } );
+                if( roots.empty() ) continue;
+                auto longestOpen = roots.front();
+                for( size_t rootIndex = 1; rootIndex < roots.size(); rootIndex++ )
+                {
+                    const auto& current = roots[rootIndex];
+                    if( current.startNs < longestOpen.endNs )
+                    {
+                        crossingRoots++;
+                        addRef( crossingRootRefs, current.ref );
+                    }
+                    if( current.endNs > longestOpen.endNs ) longestOpen = current;
+                }
+            }
+            if( crossingRoots != 0 )
+                addFinding( "error", "CPU_FRAME_ROOT_CROSSING",
+                    "Main.PlayerLoop overlaps the next authoritative frame root",
+                    crossingRoots, std::move( crossingRootRefs ) );
             offset = 0;
             while( true )
             {
@@ -9773,7 +9842,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto errors = std::count_if( findings.begin(), findings.end(), []( const auto& finding ) { return finding.value( "severity", "" ) == "error"; } );
         return Success( id, {
             { "valid", errors == 0 }, { "complete", !BudgetPartial() && trace.complete }, { "error_count", errors }, { "finding_count", findings.size() }, { "findings", std::move( findings ) },
-            { "checks", { "worker_load", "stream_completeness", "cpu_zone_timing", "gpu_zone_timing", "zone_parent_references", "frame_boundaries", "frame_image_references", "memory_lifetimes", "entity_references", "callstack_references", "symbol_references", "context_switch_timing", "sample_consistency", "gtmem1_protocol", "gpu_pass_pairing", "capability_presence" } }
+            { "checks", { "worker_load", "stream_completeness", "cpu_zone_timing", "cpu_frame_root_crossing", "cpu_frame_root_nesting", "duplicate_authoritative_root", "gpu_zone_timing", "zone_parent_references", "frame_boundaries", "frame_image_references", "memory_lifetimes", "entity_references", "callstack_references", "symbol_references", "context_switch_timing", "sample_consistency", "gtmem1_protocol", "gpu_pass_pairing", "capability_presence" } }
         }, trace );
     }
 

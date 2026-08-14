@@ -519,6 +519,71 @@ private:
 #endif
 };
 
+struct MainPlayerLoopInterval
+{
+    uint64_t index = 0;
+    int64_t start = 0;
+    int64_t end = 0;
+};
+
+template<typename RefFn, typename NoteFn>
+void ValidateMainPlayerLoopRoots( const ReadOnlyZoneSection& cpu,
+    const std::unordered_set<int16_t>& mainPlayerLoopSources,
+    const std::unordered_set<int16_t>& unityPlayerLoopSources,
+    RefFn&& makeRef, NoteFn&& note )
+{
+    if( mainPlayerLoopSources.empty() ) return;
+
+    std::unordered_map<uint64_t, std::vector<MainPlayerLoopInterval>> rootsByThread;
+    for( uint64_t index = 0; index < cpu.Count(); index++ )
+    {
+        const auto& zone = cpu.At<CpuZoneIndexRecord>( index );
+        if( unityPlayerLoopSources.find( zone.sourceLocation ) != unityPlayerLoopSources.end() )
+        {
+            note( "error", "DUPLICATE_AUTHORITATIVE_PLAYERLOOP_ROOT",
+                "Unity's cross-frame PlayerLoop marker was mirrored beside the authoritative Main.PlayerLoop root",
+                makeRef( index ) );
+        }
+        if( mainPlayerLoopSources.find( zone.sourceLocation ) == mainPlayerLoopSources.end() ) continue;
+
+        auto parent = zone.parent;
+        size_t parentDepth = 0;
+        while( parent != std::numeric_limits<uint64_t>::max() && parent < cpu.Count() && parentDepth++ < 4096 )
+        {
+            const auto& parentZone = cpu.At<CpuZoneIndexRecord>( parent );
+            if( mainPlayerLoopSources.find( parentZone.sourceLocation ) != mainPlayerLoopSources.end() )
+            {
+                note( "error", "CPU_FRAME_ROOT_NESTED_SAME_SOURCE",
+                    "Main.PlayerLoop is nested below another Main.PlayerLoop root", makeRef( index ) );
+                break;
+            }
+            parent = parentZone.parent;
+        }
+
+        if( zone.flags & 1 )
+            rootsByThread[zone.thread].push_back( { index, zone.start, zone.end } );
+    }
+
+    for( auto& [thread, roots] : rootsByThread )
+    {
+        std::sort( roots.begin(), roots.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.start != rhs.start ? lhs.start < rhs.start : lhs.index < rhs.index;
+        } );
+        if( roots.empty() ) continue;
+        auto longestOpen = roots.front();
+        for( size_t index = 1; index < roots.size(); index++ )
+        {
+            const auto& current = roots[index];
+            if( current.start < longestOpen.end )
+            {
+                note( "error", "CPU_FRAME_ROOT_CROSSING",
+                    "Main.PlayerLoop overlaps the next authoritative frame root", makeRef( current.index ) );
+            }
+            if( current.end > longestOpen.end ) longestOpen = current;
+        }
+    }
+}
+
 json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
 {
     json logicalResources = json::array();
@@ -839,6 +904,14 @@ public:
         // Source-location ids are persisted as int16_t. Validation touches every
         // zone, so replacing tens of millions of unordered-map lookups with a
         // fixed 64 KiB state table materially reduces indexed validation time.
+        std::unordered_set<int16_t> mainPlayerLoopSources;
+        std::unordered_set<int16_t> unityPlayerLoopSources;
+        for( const auto& [sourceId, source] : m_locations )
+        {
+            const auto& name = source.name.empty() ? source.function : source.name;
+            if( name == "Main.PlayerLoop" ) mainPlayerLoopSources.emplace( sourceId );
+            else if( name == "PlayerLoop" ) unityPlayerLoopSources.emplace( sourceId );
+        }
         // 0 = missing, 1 = present without a stable name, 2 = present and named.
         std::array<uint8_t, 1u << 16> sourceState {};
         for( const auto& [sourceId, source] : m_locations )
@@ -881,6 +954,10 @@ public:
             result.scanned += allowed; base += allowed;
             if( allowed < requested ) { result.complete = false; break; }
         }
+        if( result.complete )
+            ValidateMainPlayerLoopRoots( m_cpu, mainPlayerLoopSources, unityPlayerLoopSources,
+                [&]( uint64_t index ) { return m_source->MakeEntityRef( "cpu-zone", index ); }, note );
+
         if( result.complete )
         {
             for( uint64_t base = 0; base < m_gpu.Count(); )
@@ -1982,6 +2059,14 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             for( const auto& thread : source->GetThreads() ) validThreads.emplace( thread.nativeId );
             std::unordered_set<uint64_t> validContexts;
             for( const auto& context : source->GetGpuContexts() ) validContexts.emplace( context.index );
+            std::unordered_set<int16_t> mainPlayerLoopSources;
+            std::unordered_set<int16_t> unityPlayerLoopSources;
+            for( const auto& location : source->GetSourceLocations() )
+            {
+                const auto& name = location.name.empty() ? location.function : location.name;
+                if( name == "Main.PlayerLoop" ) mainPlayerLoopSources.emplace( int16_t( location.nativeId ) );
+                else if( name == "PlayerLoop" ) unityPlayerLoopSources.emplace( int16_t( location.nativeId ) );
+            }
             std::array<uint8_t, 1u << 16> validationSourceState {};
             for( const auto& location : source->GetSourceLocations() )
                 validationSourceState[uint16_t( int16_t( location.nativeId ) )] = location.name.empty() && location.function.empty() ? 1 : 2;
@@ -2057,6 +2142,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
                 if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
                     result.gpuMemoryProtocol2 = true;
             }
+            ValidateMainPlayerLoopRoots( cpuSection, mainPlayerLoopSources, unityPlayerLoopSources,
+                [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteValidation );
+
             for( uint64_t index = 0; index < gpuSection.Count(); index++ )
             {
                 const auto& zone = gpuSection.At<GpuZoneIndexRecord>( index );
