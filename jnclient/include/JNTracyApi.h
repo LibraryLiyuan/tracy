@@ -19,7 +19,7 @@ extern "C" {
 
 enum
 {
-    JN_TRACY_ABI_VERSION = 0x00010000,
+    JN_TRACY_ABI_VERSION = 0x00010003,
     JN_TRACY_SCHEMA_VERSION = 1
 };
 

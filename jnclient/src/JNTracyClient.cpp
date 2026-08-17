@@ -895,3 +895,20 @@ void JNTracy_GfxLink( uint64_t sourceId, uint64_t targetId, uint8_t relation )
     if( !IsStarted() || sourceId == 0 || targetId == 0 ) return;
     tracy::EmitJnGfxLink( sourceId, targetId, relation, 0 );
 }
+
+// The standalone harness client has no producer-quality registry. Keep the
+// Tracy core callback link-compatible; the Unity client records these batched
+// counters into the sampling.context-switch producer.
+extern "C" void JNTracy_InternalSamplingDictionaryBatch( uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t )
+{
+}
+
+extern "C" void JNTracy_InternalReleaseGpuReferencePacket( void* )
+{
+}
+
+extern "C" void JNTracy_InternalGpuReferenceDictionaryBatch( uint64_t, uint64_t,
+    uint64_t, uint64_t, uint64_t, uint64_t, uint64_t )
+{
+}

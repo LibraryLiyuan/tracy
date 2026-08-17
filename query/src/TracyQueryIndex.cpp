@@ -1210,7 +1210,7 @@ public:
                 char kind = 'U';
                 if( const auto logical = m_precomputedGpuMemorySummary->logicalById.find( value.resourceId ); logical != m_precomputedGpuMemorySummary->logicalById.end() )
                     kind = m_precomputedGpuMemorySummary->logicalResources[logical->second].kind;
-                pass.uses.push_back( { value.resourceId, value.usageMask, kind } );
+                pass.uses.push_back( { value.resourceId, value.usageMask, kind, value.resourceSetId, value.encoding } );
                 resourceIds.emplace( value.resourceId );
                 keptUses++;
             }
@@ -1303,7 +1303,7 @@ public:
                     const auto logical = m_precomputedGpuMemorySummary->logicalById.find( value.resourceId );
                     if( logical != m_precomputedGpuMemorySummary->logicalById.end() ) kind = m_precomputedGpuMemorySummary->logicalResources[logical->second].kind;
                 }
-                pass.uses.push_back( { value.resourceId, value.usageMask, kind } );
+                pass.uses.push_back( { value.resourceId, value.usageMask, kind, value.resourceSetId, value.encoding } );
             }
             else if( !requestedPassId && pass.uses.empty() ) pass.uses.push_back( {} );
         }

@@ -1,0 +1,6 @@
+{
+  "protocol": "tracy-query/1",
+  "id": "telemetry-cost-smoke",
+  "method": "trace.telemetry_cost",
+  "params": {}
+}

@@ -300,6 +300,70 @@ tracy_force_inline void EmitJnGpuReferenceUse( uint64_t passId, uint64_t resourc
     TracyLfqCommit;
 }
 
+tracy_force_inline bool EmitJnGpuReferenceSet( uint64_t passId, JnGpuReferencePacketBlock* packet,
+    uint16_t entryCount, uint8_t flags )
+{
+    if( packet == nullptr || entryCount == 0 || !GetProfiler().IsConnected() ) return false;
+    TracyLfqPrepare( QueueType::JnGpuReferenceSetUseFat );
+    MemWrite( &item->jnGpuReferenceSetUse.passId, passId );
+    MemWrite( &item->jnGpuReferenceSetUse.resourceSetId, uint32_t( 0 ) );
+    MemWrite( &item->jnGpuReferenceSetUse.entryCount, entryCount );
+    MemWrite( &item->jnGpuReferenceSetUse.flags, flags );
+    MemWrite( &item->jnGpuReferenceSetUse.encoding, uint8_t( 2 ) );
+    MemWrite( &item->jnGpuReferenceSetUseFat.ptr, uint64_t( packet ) );
+    TracyLfqCommit;
+    return true;
+}
+
+tracy_force_inline bool EmitJnGpuReferenceSetDefinition( uint64_t passId, uint32_t resourceSetId,
+    JnGpuReferencePacketBlock* packet, uint16_t entryCount, uint8_t flags )
+{
+    if( resourceSetId == 0 || packet == nullptr || entryCount == 0 || !GetProfiler().IsConnected() ) return false;
+    TracyLfqPrepare( QueueType::JnGpuReferenceSetUseFat );
+    MemWrite( &item->jnGpuReferenceSetUse.passId, passId );
+    MemWrite( &item->jnGpuReferenceSetUse.resourceSetId, resourceSetId );
+    MemWrite( &item->jnGpuReferenceSetUse.entryCount, entryCount );
+    MemWrite( &item->jnGpuReferenceSetUse.flags, flags );
+    MemWrite( &item->jnGpuReferenceSetUse.encoding, uint8_t( 2 ) );
+    MemWrite( &item->jnGpuReferenceSetUseFat.ptr, uint64_t( packet ) );
+    TracyLfqCommit;
+    return true;
+}
+
+tracy_force_inline bool EmitJnGpuReferenceSetReference( uint64_t passId, uint32_t resourceSetId,
+    uint16_t entryCount, uint8_t flags )
+{
+    if( resourceSetId == 0 || entryCount == 0 || !GetProfiler().IsConnected() ) return false;
+    TracyLfqPrepare( QueueType::JnGpuReferenceSetUse );
+    MemWrite( &item->jnGpuReferenceSetUse.passId, passId );
+    MemWrite( &item->jnGpuReferenceSetUse.resourceSetId, resourceSetId );
+    MemWrite( &item->jnGpuReferenceSetUse.entryCount, entryCount );
+    MemWrite( &item->jnGpuReferenceSetUse.flags, flags );
+    MemWrite( &item->jnGpuReferenceSetUse.encoding, uint8_t( 2 ) );
+    TracyLfqCommit;
+    return true;
+}
+
+tracy_force_inline bool EmitJnGpuReferenceSetDefinitionChunk( uint32_t resourceSetId,
+    uint16_t totalEntryCount, const JnGpuReferenceSetEntry* entries, uint8_t chunkEntryCount )
+{
+    if( resourceSetId == 0 || totalEntryCount == 0 || entries == nullptr ||
+        chunkEntryCount == 0 || chunkEntryCount > 2 || !GetProfiler().IsConnected() ) return false;
+    TracyLfqPrepare( QueueType::JnGpuReferenceSetDefinitionChunk );
+    MemWrite( &item->jnGpuReferenceSetDefinitionChunk.resourceSetId, resourceSetId );
+    MemWrite( &item->jnGpuReferenceSetDefinitionChunk.totalEntryCount, totalEntryCount );
+    MemWrite( &item->jnGpuReferenceSetDefinitionChunk.chunkEntryCount, chunkEntryCount );
+    for( uint8_t i=0; i<2; i++ )
+    {
+        MemWrite( &item->jnGpuReferenceSetDefinitionChunk.entries[i].resourceId,
+            i < chunkEntryCount ? entries[i].resourceId : uint64_t( 0 ) );
+        MemWrite( &item->jnGpuReferenceSetDefinitionChunk.entries[i].usageMask,
+            i < chunkEntryCount ? entries[i].usageMask : uint32_t( 0 ) );
+    }
+    TracyLfqCommit;
+    return true;
+}
+
 tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t passId, uint64_t commandListId,
     uint32_t totalReferenceCount, uint16_t droppedReferenceCount, uint8_t flags )
 {
@@ -374,6 +438,10 @@ tracy_force_inline void EmitJnRelation( uint64_t, uint64_t, uint8_t, uint8_t, ui
 tracy_force_inline void EmitJnRuntimeDomainState( uint64_t, uint64_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGpuReferencePass( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnGpuReferenceUse( uint64_t, uint64_t, uint32_t, uint8_t ) {}
+tracy_force_inline bool EmitJnGpuReferenceSet( uint64_t, JnGpuReferencePacketBlock*, uint16_t, uint8_t ) { return false; }
+tracy_force_inline bool EmitJnGpuReferenceSetDefinition( uint64_t, uint32_t, JnGpuReferencePacketBlock*, uint16_t, uint8_t ) { return false; }
+tracy_force_inline bool EmitJnGpuReferenceSetReference( uint64_t, uint32_t, uint16_t, uint8_t ) { return false; }
+tracy_force_inline bool EmitJnGpuReferenceSetDefinitionChunk( uint32_t, uint16_t, const JnGpuReferenceSetEntry*, uint8_t ) { return false; }
 tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t, uint64_t, uint32_t, uint16_t, uint8_t ) {}
 tracy_force_inline void EmitJnScriptFrame( const char*, const char*, uint32_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnScriptStack( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, JnScriptRecordKind ) {}

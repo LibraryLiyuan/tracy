@@ -19,6 +19,13 @@ bool SysTraceStart( int64_t& samplingPeriod );
 void SysTraceStop();
 void SysTraceWorker( void* ptr );
 
+#if defined _WIN32
+void SysTraceResetCallstackSampleDictionary();
+void SysTraceReleaseCallstackSample( uint64_t taggedPtr );
+uint64_t SysTraceConsumeCallstackSamplePoolFallbacks();
+uint64_t SysTraceConsumeCallstackSampleProducerCpuNs();
+#endif
+
 void SysTraceGetExternalName( uint64_t thread, const char*& threadName, const char*& name );
 
 }

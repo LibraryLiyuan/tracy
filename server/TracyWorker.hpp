@@ -907,6 +907,7 @@ private:
     tracy_force_inline void ProcessCallstack();
     tracy_force_inline void ProcessCallstackSample( const QueueCallstackSample& ev );
     tracy_force_inline void ProcessCallstackSampleContextSwitch( const QueueCallstackSample& ev );
+    tracy_force_inline void ProcessCallstackSampleRef( const QueueCallstackSampleRef& ev, bool contextSwitch );
     tracy_force_inline void ProcessCallstackFrameSize( const QueueCallstackFrameSize& ev );
     tracy_force_inline void ProcessCallstackFrame( const QueueCallstackFrame& ev, bool querySymbols );
     tracy_force_inline void ProcessSymbolInformation( const QueueSymbolInformation& ev );
@@ -945,6 +946,7 @@ private:
     tracy_force_inline void ProcessJnRuntimeDomainState( const QueueJnRuntimeDomainState& ev );
     tracy_force_inline void ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev );
     tracy_force_inline void ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev );
+    tracy_force_inline void ProcessJnGpuReferenceSetUse( const QueueJnGpuReferenceSetUse& ev );
     tracy_force_inline void ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev );
     tracy_force_inline void ProcessJnScriptFrame( const QueueJnScriptFrame& ev );
     tracy_force_inline void ProcessJnScriptStack( const QueueJnScriptStack& ev );
@@ -1065,6 +1067,8 @@ private:
     void AddSourceCode( uint32_t id, const char* data, size_t sz );
 
     tracy_force_inline void AddCallstackPayload( const char* data, size_t sz );
+    tracy_force_inline void AddCallstackSampleDictionary( uint32_t stackId, const char* data, size_t sz );
+    void AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* data, size_t sz );
     tracy_force_inline void AddCallstackAllocPayload( const char* data );
     uint32_t MergeCallstacks( uint32_t first, uint32_t second );
 
@@ -1203,6 +1207,9 @@ private:
 
     short_ptr<GpuCtxData> m_gpuCtxMap[256];
     uint32_t m_pendingCallstackId = 0;
+    unordered_flat_map<uint32_t, uint32_t> m_callstackSampleDictionary;
+    unordered_flat_map<uint32_t, std::vector<JnGpuReferenceSetEntry>> m_jnGpuResourceSets;
+    unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;
     unordered_flat_map<uint64_t, int16_t> m_sourceLocationShrink;
@@ -1238,6 +1245,8 @@ private:
     bool m_recorderHasSecondString = false;
     bool m_recorderPendingCallstack = false;
     bool m_recorderSerialCallstack = false;
+    unordered_flat_set<uint32_t> m_recorderCallstackSampleDictionary;
+    unordered_flat_map<uint32_t, uint16_t> m_recorderGpuResourceSets;
     unordered_flat_set<uint64_t> m_recorderFrameNames;
     unordered_flat_set<uint64_t> m_recorderPlotNames;
     unordered_flat_set<uint64_t> m_recorderPowerNames;

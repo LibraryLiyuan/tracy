@@ -138,7 +138,15 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 6 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 7 );
+    static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
+        uint8_t( tracy::QueueType::Terminate ) );
+    static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
+        uint8_t( tracy::QueueType::Terminate ) );
+    static_assert( tracy::QueueDataSize[int( tracy::QueueType::JnGpuReferenceSetUseFat )] ==
+        sizeof( tracy::QueueHeader ) );
+    static_assert( tracy::QueueDataSize[int( tracy::QueueType::JnGpuReferenceSetUse )] ==
+        sizeof( tracy::QueueHeader ) + sizeof( tracy::QueueJnGpuReferenceSetUse ) );
     static_assert( tracy::query::QueryIndexCpuZoneTimingComplete( 0 ) );
     static_assert( !tracy::query::QueryIndexCpuZoneTimingComplete( -1 ) );
     static_assert( tracy::query::QueryIndexGpuZoneTimingComplete( 0, 0 ) );
@@ -146,7 +154,7 @@ int main()
     static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( 0, -1 ) );
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.26.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.27.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -742,7 +750,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.26.0" );
+    assert( described.at( "schema_version" ) == "1.27.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -754,9 +762,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.26.0" );
+        assert( operation.at( "schema_version" ) == "1.27.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.26.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.27.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -1021,6 +1029,15 @@ int main()
     assert( degradedProducer->at( "counters" ).at( "filtered" ) == "5" );
     assert( degradedProducer->at( "counters" ).at( "overflow" ) == "1" );
     assert( degradedProducer->at( "runtime_policy" ).is_object() );
+    const auto telemetryCost = service.Execute( Request( requestId++, "trace.telemetry_cost", {
+        { "trace_id", candidateId }
+    } ) ).at( "data" );
+    assert( telemetryCost.at( "present" ) == true );
+    assert( telemetryCost.at( "complete" ) == true );
+    assert( telemetryCost.at( "measurement" ) == "producer_self_reported_cpu_time" );
+    assert( telemetryCost.at( "totals" ).at( "cpu_time_ns" ) == "0" );
+    assert( telemetryCost.at( "totals" ).at( "event_bytes" ) == "0" );
+    assert( telemetryCost.at( "producers" ).size() == captureCoverage.at( "producers" ).size() );
     const auto realZero = service.Execute( Request( requestId++, "producer.get", {
         { "trace_id", candidateId }, { "key", "test.real-zero" }
     } ) ).at( "data" );

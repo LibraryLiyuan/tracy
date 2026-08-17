@@ -52,7 +52,7 @@ int main()
     assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
     assert( ( *inspect )["inputSchema"]["properties"]["method"]["enum"].size() == tracy::query::QueryMethodRegistry().size() );
     assert( ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] == tracy::query::QueryOperationSchemaRegistry() );
-    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.26.0" );
+    assert( ( *inspect )["outputSchema"]["properties"]["schema_version"]["const"] == "1.27.0" );
     assert( ( *inspect )["outputSchema"]["properties"].contains( "partial" ) );
     const auto compare = std::find_if( tools["result"]["tools"].begin(), tools["result"]["tools"].end(), []( const auto& tool ) {
         return tool["name"] == "tracy_compare";
@@ -72,6 +72,7 @@ int main()
     assert( described["data"]["operations"] == ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] );
     std::set<std::string> describedMethods;
     for( const auto& method : described["data"]["methods"] ) describedMethods.emplace( method.get<std::string>() );
+    assert( describedMethods.contains( "trace.telemetry_cost" ) );
     const std::set<std::string> registeredMethods( tracy::query::QueryMethodRegistry().begin(), tracy::query::QueryMethodRegistry().end() );
     assert( registeredMethods.size() == tracy::query::QueryMethodRegistry().size() );
     assert( describedMethods == registeredMethods );

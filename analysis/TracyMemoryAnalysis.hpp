@@ -204,6 +204,8 @@ struct GpuMemoryPassUse
     uint64_t allocationId = 0;
     uint32_t usageMask = 0;
     char kind = 'U';
+    uint32_t resourceSetId = 0;
+    uint8_t encoding = 1;
 };
 
 struct GpuMemoryReferencePassInput

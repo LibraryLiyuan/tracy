@@ -350,7 +350,8 @@ int main( int argc, char** argv )
         }
 
         lock.lock();
-        const auto mbps = worker.GetMbpsData().back();
+        const auto& mbpsData = worker.GetMbpsData();
+        const auto mbps = mbpsData.empty() ? 0.f : mbpsData.back();
         const auto compRatio = worker.GetCompRatio();
         const auto netTotal = worker.GetDataTransferred();
         lock.unlock();

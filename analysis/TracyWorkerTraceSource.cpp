@@ -1105,7 +1105,8 @@ GpuMemoryAttribution WorkerTraceSource::GetGpuMemoryAttribution() const
     {
         const auto pass = structuredReferenceById.find( value.passId );
         if( pass == structuredReferenceById.end() || value.resourceId == 0 ) continue;
-        structuredReferencePasses[pass->second].uses.push_back( { value.resourceId, value.usageMask, 'U' } );
+        structuredReferencePasses[pass->second].uses.push_back( { value.resourceId, value.usageMask, 'U',
+            value.resourceSetId, value.encoding } );
     }
     for( const auto& value : jn.gpuReferenceEnds )
     {

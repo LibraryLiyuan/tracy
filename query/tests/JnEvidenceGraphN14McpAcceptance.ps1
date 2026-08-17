@@ -383,7 +383,7 @@ try {
     $snapshotSemantics = Get-ComparableN14Semantics $results.snapshot.semantics
     Assert-Condition ((Get-ComparableN14Semantics $results.stream.semantics) -eq $snapshotSemantics) 'snapshot/stream N14 semantic mismatch'
     Assert-Condition ((Get-ComparableN14Semantics $results.replay.semantics) -eq $snapshotSemantics) 'snapshot/replay N14 semantic mismatch'
-    $document = [ordered]@{ ok = $true; schema_version = '1.26.0'; indexed = [bool]$UseIndexed; traces = $results }
+    $document = [ordered]@{ ok = $true; schema_version = '1.27.0'; indexed = [bool]$UseIndexed; traces = $results }
     $json = $document | ConvertTo-Json -Depth 70
     if (-not [string]::IsNullOrWhiteSpace($OutputPath)) {
         $outputDirectory = Split-Path -Parent $OutputPath

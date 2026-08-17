@@ -6,6 +6,8 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <unordered_map>
+#include <vector>
 
 #include "tracy_concurrentqueue.h"
 #include "tracy_SPSCQueue.h"
@@ -1039,6 +1041,16 @@ private:
     void SendSourceLocationPayload( uint64_t ptr );
     void SendCallstackPayload( uint64_t ptr );
     void SendCallstackPayload64( uint64_t ptr );
+    void SendCallstackSampleDictionary( uint32_t stackId, uint64_t ptr );
+    uint32_t InternCallstackSample( uint64_t ptr, bool& inserted );
+    void AccountCallstackSampleDictionary( bool dictionaryHit, bool dictionaryMiss,
+        uint64_t eventBytes, uint64_t dictionaryBytes, uint64_t cpuTimeNs );
+    void FlushCallstackSampleDictionaryCounters();
+    uint32_t InternGpuResourceSet( const JnGpuReferencePacketBlock* packet, uint16_t entryCount,
+        bool& inserted, const std::vector<JnGpuReferenceSetEntry>*& normalized );
+    bool CollectGpuResourceSetPacket( const JnGpuReferencePacketBlock* packet, uint16_t entryCount,
+        const std::vector<JnGpuReferenceSetEntry>*& entries );
+    void SendGpuResourceSetDictionary( uint32_t resourceSetId, const std::vector<JnGpuReferenceSetEntry>& entries );
     void SendCallstackAlloc( uint64_t ptr );
 
     void QueueCallstackFrame( uint64_t ptr );
@@ -1152,6 +1164,39 @@ private:
     int64_t m_refTimeSerial;
     int64_t m_refTimeCtx;
     int64_t m_refTimeGpu;
+
+    struct SampleCallstackDictionaryEntry
+    {
+        uint64_t hash = 0;
+        uint32_t id = 0;
+        uint32_t frameOffset = 0;
+        uint16_t frameCount = 0;
+        uint16_t reserved = 0;
+    };
+    std::vector<SampleCallstackDictionaryEntry> m_sampleCallstackDictionary;
+    std::vector<uint64_t> m_sampleCallstackFrames;
+    uint32_t m_nextSampleCallstackId = 1;
+    uint64_t m_sampleDictionaryPendingEvents = 0;
+    uint64_t m_sampleDictionaryPendingBytes = 0;
+    uint64_t m_sampleDictionaryPendingHit = 0;
+    uint64_t m_sampleDictionaryPendingMiss = 0;
+    uint64_t m_sampleDictionaryPendingDictionaryBytes = 0;
+    uint64_t m_sampleDictionaryPendingCpuTimeNs = 0;
+
+    struct GpuResourceSetDictionaryEntry
+    {
+        uint32_t id;
+        std::vector<JnGpuReferenceSetEntry> entries;
+    };
+    std::unordered_map<uint64_t, std::vector<GpuResourceSetDictionaryEntry>> m_gpuResourceSetDictionary;
+    std::vector<JnGpuReferenceSetEntry> m_gpuResourceSetScratch;
+    struct GpuResourceSetChunkAccumulator
+    {
+        uint16_t expected = 0;
+        std::vector<JnGpuReferenceSetEntry> entries;
+    };
+    std::unordered_map<uint32_t, GpuResourceSetChunkAccumulator> m_gpuResourceSetChunks;
+    uint32_t m_nextGpuResourceSetId = 1;
 
     void* m_stream;     // LZ4_stream_t*
     char* m_buffer;

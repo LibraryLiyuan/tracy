@@ -261,7 +261,7 @@ try
     $replayMatches = ($results.replay.semantics | ConvertTo-Json -Compress -Depth 30) -eq $baseline
     $result = [ordered]@{
         ok = $streamMatches -and $replayMatches
-        schema_version = '1.26.0'
+        schema_version = '1.27.0'
         comparison = [ordered]@{
             snapshot_stream_equal = $streamMatches
             snapshot_replay_equal = $replayMatches

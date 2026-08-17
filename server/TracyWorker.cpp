@@ -1884,7 +1884,30 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         if( schemaVersion >= 5 )
         {
             ReadJnVector( f, jn.gpuReferencePasses, "GPU reference pass", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferencePass );
-            ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceUse );
+            if( schemaVersion >= 7 )
+            {
+                ReadJnVector( f, jn.gpuReferenceUses, "GPU reference use", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceUse );
+            }
+            else
+            {
+#pragma pack( push, 1 )
+                struct JnGpuReferenceUseDataV6
+                {
+                    int64_t time;
+                    uint64_t passId;
+                    uint64_t resourceId;
+                    uint64_t thread;
+                    uint32_t usageMask;
+                    uint8_t flags;
+                };
+#pragma pack( pop )
+                std::vector<JnGpuReferenceUseDataV6> oldUses;
+                ReadJnVector( f, oldUses, "GPU reference use", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceUse );
+                jn.gpuReferenceUses.reserve( oldUses.size() );
+                for( const auto& value : oldUses )
+                    jn.gpuReferenceUses.push_back( { value.time, value.passId, value.resourceId,
+                        value.thread, value.usageMask, 0, value.flags, 1 } );
+            }
             ReadJnVector( f, jn.gpuReferenceEnds, "GPU reference end", m_serializedZoneSink, SerializedZoneSink::JnDomain::GpuReferenceEnd );
         }
         if( schemaVersion >= 6 )
@@ -3626,7 +3649,8 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
-            ev.hdr.type == QueueType::SourceCode )
+            ev.hdr.type == QueueType::SourceCode ||
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
         {
             if( ev.hdr.type == QueueType::SymbolCode || ev.hdr.type == QueueType::SourceCode )
             {
@@ -3810,7 +3834,8 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
-            ev.hdr.type == QueueType::SourceCode )
+            ev.hdr.type == QueueType::SourceCode ||
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
         {
             uint32_t sz;
             memcpy( &sz, ptr, sizeof( sz ) );
@@ -3827,6 +3852,9 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
             case QueueType::SourceCode:
                 AddSourceCode( (uint32_t)ev.stringTransfer.ptr, ptr, sz );
                 m_serverQuerySpaceLeft++;
+                break;
+            case QueueType::JnGpuReferenceSetDefinition:
+                AddJnGpuResourceSetDefinition( uint32_t( ev.stringTransfer.ptr ), ptr, sz );
                 break;
             default:
                 assert( false );
@@ -3862,6 +3890,9 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
                 break;
             case QueueType::CallstackPayload:
                 AddCallstackPayload( ptr, sz );
+                break;
+            case QueueType::CallstackSampleDictionary:
+                AddCallstackSampleDictionary( uint32_t( ev.stringTransfer.ptr ), ptr, sz );
                 break;
             case QueueType::FrameName:
                 HandleFrameName( ev.stringTransfer.ptr, ptr, sz );
@@ -3918,7 +3949,8 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
-            ev.hdr.type == QueueType::SourceCode )
+            ev.hdr.type == QueueType::SourceCode ||
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
         {
             uint32_t sz;
             memcpy( &sz, ptr, sizeof( sz ) );
@@ -3935,6 +3967,16 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
                 AddSourceCode( (uint32_t)ev.stringTransfer.ptr, ptr, sz );
                 m_serverQuerySpaceLeft++;
                 break;
+            case QueueType::JnGpuReferenceSetDefinition:
+            {
+                const auto resourceSetId = uint32_t( ev.stringTransfer.ptr );
+                const auto entryCount = sz / sizeof( JnGpuReferenceSetEntry );
+                if( resourceSetId == 0 || sz == 0 || sz % sizeof( JnGpuReferenceSetEntry ) != 0 ||
+                    entryCount > 0xFFFF || !m_recorderGpuResourceSets.emplace(
+                        resourceSetId, uint16_t( entryCount ) ).second )
+                    RecorderFail( "Invalid or duplicate GPU ResourceSetV2 definition." );
+                break;
+            }
             default:
                 break;
             }
@@ -3969,6 +4011,20 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
             case QueueType::CallstackPayload:
                 RecorderAddCallstackPayload( ptr, sz );
                 break;
+            case QueueType::CallstackSampleDictionary:
+            {
+                const auto stackId = uint32_t( ev.stringTransfer.ptr );
+                if( stackId == 0 || !m_recorderCallstackSampleDictionary.emplace( stackId ).second )
+                {
+                    RecorderFail( "Invalid or duplicate sample callstack dictionary id." );
+                    break;
+                }
+                RecorderAddCallstackPayload( ptr, sz );
+                // Dictionary definitions are reusable and do not stage a
+                // one-shot callstack for the next legacy event.
+                m_recorderPendingCallstack = false;
+                break;
+            }
             case QueueType::CallstackAllocPayload:
                 m_recorderPendingCallstack = true;
                 break;
@@ -4513,6 +4569,12 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
         m_recorderPendingCallstack = false;
         CheckThreadString( ev.callstackSample.thread );
         break;
+    case QueueType::CallstackSampleRef:
+    case QueueType::CallstackSampleContextSwitchRef:
+        if( m_recorderCallstackSampleDictionary.find( ev.callstackSampleRef.stackId ) == m_recorderCallstackSampleDictionary.end() )
+            RecorderFail( "Callstack sample references an unknown dictionary id." );
+        CheckThreadString( ev.callstackSampleRef.thread );
+        break;
     case QueueType::CallstackFrameSize:
     case QueueType::CallstackFrame:
     case QueueType::SymbolInformation:
@@ -4612,6 +4674,15 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnGpuReferenceEnd:
         RecorderCheckCurrentThread();
         break;
+    case QueueType::JnGpuReferenceSetUse:
+    {
+        RecorderCheckCurrentThread();
+        const auto found = m_recorderGpuResourceSets.find( ev.jnGpuReferenceSetUse.resourceSetId );
+        if( ev.jnGpuReferenceSetUse.encoding != 2 || found == m_recorderGpuResourceSets.end() ||
+            found->second != ev.jnGpuReferenceSetUse.entryCount )
+            RecorderFail( "GPU ResourceSetV2 use references an invalid dictionary entry." );
+        break;
+    }
     case QueueType::JnScriptFrame:
         CheckString( ev.jnScriptFrame.function );
         CheckString( ev.jnScriptFrame.file );
@@ -5338,6 +5409,44 @@ void Worker::AddCallstackPayload( const char* _data, size_t _sz )
     m_pendingCallstackId = idx;
 }
 
+void Worker::AddCallstackSampleDictionary( uint32_t stackId, const char* data, size_t sz )
+{
+    if( stackId == 0 || m_callstackSampleDictionary.find( stackId ) != m_callstackSampleDictionary.end() || m_pendingCallstackId != 0 )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    AddCallstackPayload( data, sz );
+    if( m_pendingCallstackId == 0 )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    m_callstackSampleDictionary.emplace( stackId, m_pendingCallstackId );
+    m_pendingCallstackId = 0;
+}
+
+void Worker::AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* data, size_t sz )
+{
+    if( resourceSetId == 0 || data == nullptr || sz == 0 ||
+        sz % sizeof( JnGpuReferenceSetEntry ) != 0 ||
+        sz / sizeof( JnGpuReferenceSetEntry ) > 0xFFFF ||
+        m_jnGpuResourceSets.find( resourceSetId ) != m_jnGpuResourceSets.end() )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    const auto count = sz / sizeof( JnGpuReferenceSetEntry );
+    std::vector<JnGpuReferenceSetEntry> entries( count );
+    memcpy( entries.data(), data, sz );
+    if( std::any_of( entries.begin(), entries.end(), []( const auto& entry ) { return entry.resourceId == 0; } ) )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    m_jnGpuResourceSets.emplace( resourceSetId, std::move( entries ) );
+}
+
 void Worker::AddCallstackAllocPayload( const char* data )
 {
     CallstackFrameId stack[64];
@@ -5995,6 +6104,12 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::CallstackSampleContextSwitch:
         ProcessCallstackSampleContextSwitch( ev.callstackSample );
         break;
+    case QueueType::CallstackSampleRef:
+        ProcessCallstackSampleRef( ev.callstackSampleRef, false );
+        break;
+    case QueueType::CallstackSampleContextSwitchRef:
+        ProcessCallstackSampleRef( ev.callstackSampleRef, true );
+        break;
     case QueueType::CallstackFrameSize:
         ProcessCallstackFrameSize( ev.callstackFrameSize );
         m_serverQuerySpaceLeft++;
@@ -6126,6 +6241,9 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::JnGpuReferenceUse:
         ProcessJnGpuReferenceUse( ev.jnGpuReferenceUse );
+        break;
+    case QueueType::JnGpuReferenceSetUse:
+        ProcessJnGpuReferenceSetUse( ev.jnGpuReferenceSetUse );
         break;
     case QueueType::JnGpuReferenceEnd:
         ProcessJnGpuReferenceEnd( ev.jnGpuReferenceEnd );
@@ -6316,6 +6434,7 @@ void Worker::ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev )
     data.schemaVersion = JnTraceSchemaVersion;
     data.gpuReferencePasses.push_back( JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
         m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags } );
+    if( ev.passId != 0 ) m_jnGpuReferencePassTimes[ev.passId] = time;
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6326,8 +6445,27 @@ void Worker::ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev )
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
     data.gpuReferenceUses.push_back( JnGpuReferenceUseData { time, ev.passId, ev.resourceId,
-        m_threadCtx, ev.usageMask, ev.flags } );
+        m_threadCtx, ev.usageMask, 0, ev.flags, 1 } );
     if( m_data.lastTime < time ) m_data.lastTime = time;
+}
+
+void Worker::ProcessJnGpuReferenceSetUse( const QueueJnGpuReferenceSetUse& ev )
+{
+    const auto found = m_jnGpuResourceSets.find( ev.resourceSetId );
+    const auto passTime = m_jnGpuReferencePassTimes.find( ev.passId );
+    if( ev.encoding != 2 || found == m_jnGpuResourceSets.end() || passTime == m_jnGpuReferencePassTimes.end() ||
+        found->second.size() != ev.entryCount )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gpuReferenceUses.reserve( data.gpuReferenceUses.size() + found->second.size() );
+    for( const auto& entry : found->second )
+        data.gpuReferenceUses.push_back( JnGpuReferenceUseData { passTime->second, ev.passId,
+            entry.resourceId, m_threadCtx, entry.usageMask, ev.resourceSetId, ev.flags, ev.encoding } );
 }
 
 void Worker::ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev )
@@ -6338,6 +6476,7 @@ void Worker::ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev )
     data.schemaVersion = JnTraceSchemaVersion;
     data.gpuReferenceEnds.push_back( JnGpuReferenceEndData { time, ev.passId, ev.commandListId,
         m_threadCtx, ev.totalReferenceCount, ev.droppedReferenceCount, ev.flags } );
+    m_jnGpuReferencePassTimes.erase( ev.passId );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -8147,6 +8286,19 @@ void Worker::ProcessCallstackSampleContextSwitch( const QueueCallstackSample& ev
     ProcessCallstackSampleInsertSample( sd, td );
 
     td.ctxSwitchSamples.push_back( sd );
+}
+
+void Worker::ProcessCallstackSampleRef( const QueueCallstackSampleRef& ev, bool contextSwitch )
+{
+    const auto found = m_callstackSampleDictionary.find( ev.stackId );
+    if( found == m_callstackSampleDictionary.end() || found->second == 0 || m_pendingCallstackId != 0 )
+    {
+        MarkProtocolDisconnect();
+        return;
+    }
+    m_pendingCallstackId = found->second;
+    if( contextSwitch ) ProcessCallstackSampleContextSwitch( ev );
+    else ProcessCallstackSample( ev );
 }
 
 void Worker::ProcessCallstackFrameSize( const QueueCallstackFrameSize& ev )

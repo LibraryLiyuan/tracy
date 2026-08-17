@@ -500,6 +500,15 @@
       "status": "complete"
     },
     {
+      "entity": "memory.gpu.pass_resource_reference",
+      "classification": "persisted_semantic",
+      "persisted_fields": ["GPU reference pass/end", "ResourceSetV2 dictionary definition", "pass resource-set use", "legacy per-use compatibility"],
+      "query_fields": ["pass.pass_id", "pass.parent_pass_id", "pass.taxonomy_id", "pass.command_list_id", "pass.emitted_use_count", "pass.dropped_uses", "pass.truncated", "pass.uses[].allocation_id", "pass.uses[].usage", "pass.uses[].usage_mask", "pass.uses[].resource_set_id", "pass.uses[].encoding", "pass.uses_truncated"],
+      "unmapped_fields": [],
+      "methods": ["memory.gpu.pass_uses", "memory.gpu.attribution", "evidence.graph"],
+      "status": "complete"
+    },
+    {
       "entity": "io.request",
       "classification": "persisted_semantic",
       "persisted_fields": ["request", "config", "stage"],
@@ -612,6 +621,15 @@
       "query_fields": ["present", "schema_version", "complete", "reason", "connection_id", "evidence_kind", "coverage_ratio", "scanned_count", "total_count", "omitted_count", "producers", "producer", "producer.runtime_policy", "quality_findings", "invalid_records", "records", "trust"],
       "unmapped_fields": [],
       "methods": ["capture.coverage", "producer.list", "producer.get"],
+      "status": "complete"
+    },
+    {
+      "entity": "trace.telemetry_cost",
+      "classification": "derived_semantic",
+      "persisted_fields": ["ordered JNQ1 schema-2 producer snapshots with cpu_time_ns, event_bytes, dictionary and degrade counters"],
+      "query_fields": ["present", "schema_version", "complete", "reason", "measurement", "totals", "producers", "trust"],
+      "unmapped_fields": [],
+      "methods": ["trace.telemetry_cost"],
       "status": "complete"
     },
     {

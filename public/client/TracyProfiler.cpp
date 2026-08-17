@@ -78,6 +78,16 @@
 #include "TracyDebug.hpp"
 #include "TracyDxt1.hpp"
 #include "TracyScoped.hpp"
+
+#if defined( JN_TRACY_EXPORTS )
+extern "C" void JNTracy_InternalSamplingDictionaryBatch( uint64_t events, uint64_t eventBytes,
+    uint64_t dictionaryHit, uint64_t dictionaryMiss, uint64_t dictionaryBytes, uint64_t cpuTimeNs,
+    uint64_t degrade );
+extern "C" void JNTracy_InternalReleaseGpuReferencePacket( void* packet );
+extern "C" void JNTracy_InternalGpuReferenceDictionaryBatch( uint64_t events, uint64_t eventBytes,
+    uint64_t dictionaryHit, uint64_t dictionaryMiss, uint64_t dictionaryBytes, uint64_t cpuTimeNs,
+    uint64_t degrade );
+#endif
 #include "TracyProfiler.hpp"
 #include "TracyThread.hpp"
 #include "TracyArmCpuTable.hpp"
@@ -2024,6 +2034,17 @@ void Profiler::Worker()
         ClearQueues( token );
         const auto connectionId = m_connectionId.fetch_add( 1, std::memory_order_release ) + 1;
 #endif
+        if( !m_sampleCallstackDictionary.empty() )
+        {
+            memset( m_sampleCallstackDictionary.data(), 0,
+                m_sampleCallstackDictionary.size() * sizeof( SampleCallstackDictionaryEntry ) );
+        }
+        m_sampleCallstackFrames.clear();
+        m_nextSampleCallstackId = 1;
+        m_gpuResourceSetDictionary.clear();
+        m_gpuResourceSetScratch.clear();
+        m_gpuResourceSetChunks.clear();
+        m_nextGpuResourceSetId = 1;
         m_isConnected.store( true, std::memory_order_release );
         InstallCrashHandler();
 
@@ -2455,7 +2476,17 @@ static void FreeAssociatedMemory( const QueueItem& item )
     case QueueType::CallstackSample:
     case QueueType::CallstackSampleContextSwitch:
         ptr = MemRead<uint64_t>( &item.callstackSampleFat.ptr );
+#if defined( _WIN32 ) && defined( TRACY_HAS_SYSTEM_TRACING )
+        SysTraceReleaseCallstackSample( ptr );
+#else
         tracy_free( (void*)ptr );
+#endif
+        break;
+    case QueueType::JnGpuReferenceSetUseFat:
+#if defined( JN_TRACY_EXPORTS )
+        ptr = MemRead<uint64_t>( &item.jnGpuReferenceSetUseFat.ptr );
+        JNTracy_InternalReleaseGpuReferencePacket( (void*)ptr );
+#endif
         break;
     case QueueType::FrameImage:
         ptr = MemRead<uint64_t>( &item.frameImageFat.image );
@@ -2648,12 +2679,202 @@ Profiler::DequeueStatus Profiler::Dequeue( moodycamel::ConsumerToken& token )
                     case QueueType::CallstackSampleContextSwitch:
                     {
                         ptr = MemRead<uint64_t>( &item->callstackSampleFat.ptr );
-                        SendCallstackPayload64( ptr );
+#if defined( _WIN32 ) && defined( TRACY_HAS_SYSTEM_TRACING )
+                        const auto taggedSamplePtr = ptr;
+#endif
+                        const auto dictionaryStart = GetTime();
+                        bool inserted = false;
+                        uint32_t stackId = 0;
+                        size_t frameCount = 0;
+#if defined( _WIN32 ) && defined( TRACY_HAS_SYSTEM_TRACING )
+                        const auto pointerTag = ptr & 3;
+                        if( pointerTag == 1 )
+                        {
+                            stackId = uint32_t( ptr >> 2 );
+                        }
+                        else
+                        {
+                            ptr &= ~uint64_t( 3 );
+                            frameCount = size_t( *(const uint64_t*)ptr );
+                            if( pointerTag == 2 || pointerTag == 3 )
+                            {
+                                stackId = uint32_t( *( (const uint64_t*)ptr - 1 ) );
+                                inserted = true;
+                            }
+                        }
+#else
+                        stackId = InternCallstackSample( ptr, inserted );
+                        frameCount = size_t( *(const uint64_t*)ptr );
+#endif
+                        uint64_t eventBytes = QueueDataSize[(int)( idx == (uint8_t)QueueType::CallstackSample ?
+                            QueueType::CallstackSampleRef : QueueType::CallstackSampleContextSwitchRef )];
+                        uint64_t dictionaryBytes = 0;
+                        if( stackId != 0 )
+                        {
+                            if( inserted )
+                            {
+                                SendCallstackSampleDictionary( stackId, ptr );
+                                dictionaryBytes = frameCount * sizeof( uint64_t );
+                                eventBytes += QueueDataSize[(int)QueueType::CallstackSampleDictionary] + sizeof( uint16_t ) + dictionaryBytes;
+                            }
+                            const auto refType = idx == (uint8_t)QueueType::CallstackSample ?
+                                QueueType::CallstackSampleRef : QueueType::CallstackSampleContextSwitchRef;
+                            MemWrite( &item->hdr.type, refType );
+                            MemWrite( &item->callstackSampleRef.stackId, stackId );
+                            idx = (uint8_t)refType;
+                        }
+                        else
+                        {
+                            SendCallstackPayload64( ptr );
+                            eventBytes = QueueDataSize[(int)QueueType::CallstackSample] +
+                                QueueDataSize[(int)QueueType::CallstackPayload] + sizeof( uint16_t ) + frameCount * sizeof( uint64_t );
+                        }
+                        const auto dictionaryEnd = GetTime();
+                        const auto dictionaryCpuNs = dictionaryEnd > dictionaryStart ?
+                            uint64_t( double( dictionaryEnd - dictionaryStart ) * m_timerMul ) : 0;
+                        AccountCallstackSampleDictionary( stackId != 0 && !inserted, inserted || stackId == 0,
+                            eventBytes, dictionaryBytes, dictionaryCpuNs );
+#if defined( _WIN32 ) && defined( TRACY_HAS_SYSTEM_TRACING )
+                        SysTraceReleaseCallstackSample( taggedSamplePtr );
+#else
                         tracy_free_fast( (void*)ptr );
+#endif
                         int64_t t = MemRead<int64_t>( &item->callstackSampleFat.time );
                         int64_t dt = t - refCtx;
                         refCtx = t;
                         MemWrite( &item->callstackSampleFat.time, dt );
+                        break;
+                    }
+                    case QueueType::JnGpuReferenceSetDefinitionChunk:
+                    {
+                        const auto resourceSetId = MemRead<uint32_t>( &item->jnGpuReferenceSetDefinitionChunk.resourceSetId );
+                        const auto totalEntryCount = MemRead<uint16_t>( &item->jnGpuReferenceSetDefinitionChunk.totalEntryCount );
+                        const auto chunkEntryCount = MemRead<uint8_t>( &item->jnGpuReferenceSetDefinitionChunk.chunkEntryCount );
+                        if( resourceSetId == 0 || totalEntryCount == 0 || chunkEntryCount == 0 || chunkEntryCount > 2 )
+                        {
+                            m_gpuResourceSetChunks.erase( resourceSetId );
+                            ++item;
+                            continue;
+                        }
+                        auto it = m_gpuResourceSetChunks.find( resourceSetId );
+                        if( it == m_gpuResourceSetChunks.end() )
+                        {
+                            GpuResourceSetChunkAccumulator accumulator;
+                            accumulator.expected = totalEntryCount;
+                            accumulator.entries.reserve( totalEntryCount );
+                            it = m_gpuResourceSetChunks.emplace( resourceSetId, std::move( accumulator ) ).first;
+                        }
+                        auto& accumulator = it->second;
+                        if( accumulator.expected != totalEntryCount ||
+                            accumulator.entries.size() + chunkEntryCount > totalEntryCount )
+                        {
+                            m_gpuResourceSetChunks.erase( it );
+                            ++item;
+                            continue;
+                        }
+                        for( uint8_t entryIndex=0; entryIndex<chunkEntryCount; entryIndex++ )
+                        {
+                            accumulator.entries.emplace_back( JnGpuReferenceSetEntry {
+                                MemRead<uint64_t>( &item->jnGpuReferenceSetDefinitionChunk.entries[entryIndex].resourceId ),
+                                MemRead<uint32_t>( &item->jnGpuReferenceSetDefinitionChunk.entries[entryIndex].usageMask ) } );
+                        }
+                        if( accumulator.entries.size() == accumulator.expected )
+                        {
+                            SendGpuResourceSetDictionary( resourceSetId, accumulator.entries );
+                            m_gpuResourceSetChunks.erase( it );
+                        }
+                        ++item;
+                        continue;
+                    }
+                    case QueueType::JnGpuReferenceSetUseFat:
+                    {
+                        ptr = MemRead<uint64_t>( &item->jnGpuReferenceSetUseFat.ptr );
+                        const auto requestedCount = MemRead<uint16_t>( &item->jnGpuReferenceSetUse.entryCount );
+                        const auto requestedResourceSetId = MemRead<uint32_t>( &item->jnGpuReferenceSetUse.resourceSetId );
+                        const auto dictionaryStart = GetTime();
+                        bool inserted = false;
+                        const std::vector<JnGpuReferenceSetEntry>* entries = nullptr;
+                        uint32_t resourceSetId = 0;
+                        if( requestedResourceSetId != 0 )
+                        {
+                            inserted = CollectGpuResourceSetPacket(
+                                (const JnGpuReferencePacketBlock*)ptr, requestedCount, entries );
+                            resourceSetId = inserted ? requestedResourceSetId : 0;
+                        }
+                        else
+                        {
+                            resourceSetId = InternGpuResourceSet(
+                                (const JnGpuReferencePacketBlock*)ptr, requestedCount, inserted, entries );
+                        }
+                        const auto entryCount = entries == nullptr ? uint16_t( 0 ) : uint16_t( entries->size() );
+                        uint64_t eventBytes = 0;
+                        uint64_t dictionaryBytes = 0;
+                        uint64_t degrade = 0;
+                        if( resourceSetId != 0 && entryCount != 0 )
+                        {
+                            if( inserted )
+                            {
+                                SendGpuResourceSetDictionary( resourceSetId, *entries );
+                                dictionaryBytes = uint64_t( entryCount ) * sizeof( JnGpuReferenceSetEntry );
+                                eventBytes += QueueDataSize[(int)QueueType::JnGpuReferenceSetDefinition] + sizeof( uint32_t ) + dictionaryBytes;
+                            }
+                            MemWrite( &item->jnGpuReferenceSetUse.resourceSetId, resourceSetId );
+                            MemWrite( &item->jnGpuReferenceSetUse.entryCount, entryCount );
+                            MemWrite( &item->hdr.type, QueueType::JnGpuReferenceSetUse );
+                            idx = (uint8_t)QueueType::JnGpuReferenceSetUse;
+                            eventBytes += QueueDataSize[(int)QueueType::JnGpuReferenceSetUse];
+                        }
+                        else if( entries != nullptr )
+                        {
+                            // Dictionary exhaustion is exact and fail-open: emit the
+                            // established per-resource events without allocating or
+                            // dropping the set.
+                            const auto now = GetTime();
+                            auto dt = now - refThread;
+                            refThread = now;
+                            for( const auto& entry : *entries )
+                            {
+                                QueueItem legacy;
+                                MemWrite( &legacy.hdr.type, QueueType::JnGpuReferenceUse );
+                                MemWrite( &legacy.jnGpuReferenceUse.time, dt );
+                                MemWrite( &legacy.jnGpuReferenceUse.passId,
+                                    MemRead<uint64_t>( &item->jnGpuReferenceSetUse.passId ) );
+                                MemWrite( &legacy.jnGpuReferenceUse.resourceId, entry.resourceId );
+                                MemWrite( &legacy.jnGpuReferenceUse.usageMask, entry.usageMask );
+                                MemWrite( &legacy.jnGpuReferenceUse.flags, uint8_t( 1 ) );
+                                if( !AppendData( &legacy, QueueDataSize[(int)QueueType::JnGpuReferenceUse] ) )
+                                {
+#if defined( JN_TRACY_EXPORTS )
+                                    JNTracy_InternalReleaseGpuReferencePacket( (void*)ptr );
+#endif
+                                    connectionLost = true;
+                                    m_refTimeThread = refThread;
+                                    m_refTimeCtx = refCtx;
+                                    m_refTimeGpu = refGpu;
+                                    return;
+                                }
+                                dt = 0;
+                                eventBytes += QueueDataSize[(int)QueueType::JnGpuReferenceUse];
+                            }
+                            degrade = 1;
+                        }
+                        const auto dictionaryEnd = GetTime();
+                        const auto dictionaryCpuNs = dictionaryEnd > dictionaryStart ?
+                            uint64_t( double( dictionaryEnd - dictionaryStart ) * m_timerMul ) : 0;
+#if defined( JN_TRACY_EXPORTS )
+                        if( requestedResourceSetId == 0 )
+                        {
+                            JNTracy_InternalGpuReferenceDictionaryBatch( 1, eventBytes,
+                                resourceSetId != 0 && !inserted ? 1 : 0, inserted ? 1 : 0,
+                                dictionaryBytes, dictionaryCpuNs, degrade );
+                        }
+                        JNTracy_InternalReleaseGpuReferencePacket( (void*)ptr );
+#endif
+                        if( resourceSetId == 0 || entryCount == 0 )
+                        {
+                            ++item;
+                            continue;
+                        }
                         break;
                     }
                     case QueueType::FrameImage:
@@ -3512,6 +3733,218 @@ void Profiler::SendCallstackPayload64( uint64_t _ptr )
     AppendDataUnsafe( ptr, sizeof( uint64_t ) * sz );
 }
 
+uint32_t Profiler::InternCallstackSample( uint64_t _ptr, bool& inserted )
+{
+    constexpr size_t DictionaryCapacity = 128 * 1024;
+    constexpr size_t DictionaryMask = DictionaryCapacity - 1;
+    constexpr size_t InitialFrameCapacity = 2 * 1024 * 1024;
+    static_assert( ( DictionaryCapacity & DictionaryMask ) == 0, "Sample dictionary capacity must be a power of two." );
+
+    inserted = false;
+    const auto ptr = (const uint64_t*)_ptr;
+    const auto count = size_t( *ptr );
+    if( count > (std::numeric_limits<uint16_t>::max)() ) return 0;
+    const auto frames = ptr + 1;
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= count;
+    hash *= 1099511628211ull;
+    for( size_t i = 0; i < count; i++ )
+    {
+        hash ^= frames[i];
+        hash *= 1099511628211ull;
+    }
+
+    if( m_sampleCallstackDictionary.empty() )
+    {
+        m_sampleCallstackDictionary.resize( DictionaryCapacity );
+        m_sampleCallstackFrames.reserve( InitialFrameCapacity );
+    }
+
+    auto slot = size_t( hash ) & DictionaryMask;
+    for( size_t probe = 0; probe < DictionaryCapacity; probe++ )
+    {
+        auto& entry = m_sampleCallstackDictionary[slot];
+        if( entry.id == 0 )
+        {
+            // A bounded dictionary is telemetry-only. If a pathological workload
+            // exceeds the bound, fall back to the legacy full payload for that sample.
+            if( m_nextSampleCallstackId == 0 || m_nextSampleCallstackId > 65536 ||
+                m_sampleCallstackFrames.size() + count > (std::numeric_limits<uint32_t>::max)() ) return 0;
+            entry.hash = hash;
+            entry.id = m_nextSampleCallstackId++;
+            entry.frameOffset = uint32_t( m_sampleCallstackFrames.size() );
+            entry.frameCount = uint16_t( count );
+            m_sampleCallstackFrames.insert( m_sampleCallstackFrames.end(), frames, frames + count );
+            inserted = true;
+            return entry.id;
+        }
+        if( entry.hash == hash && entry.frameCount == count &&
+            ( count == 0 || memcmp( m_sampleCallstackFrames.data() + entry.frameOffset,
+                frames, count * sizeof( uint64_t ) ) == 0 ) )
+        {
+            return entry.id;
+        }
+        slot = ( slot + 1 ) & DictionaryMask;
+    }
+    return 0;
+}
+
+void Profiler::SendCallstackSampleDictionary( uint32_t stackId, uint64_t _ptr )
+{
+    const auto ptr = (const uint64_t*)_ptr;
+    const auto count = size_t( *ptr );
+    const auto len = count * sizeof( uint64_t );
+    assert( len <= (std::numeric_limits<uint16_t>::max)() );
+    const auto len16 = uint16_t( len );
+
+    QueueItem item;
+    MemWrite( &item.hdr.type, QueueType::CallstackSampleDictionary );
+    MemWrite( &item.stringTransfer.ptr, uint64_t( stackId ) );
+    NeedDataSize( QueueDataSize[(int)QueueType::CallstackSampleDictionary] + sizeof( len16 ) + len16 );
+    AppendDataUnsafe( &item, QueueDataSize[(int)QueueType::CallstackSampleDictionary] );
+    AppendDataUnsafe( &len16, sizeof( len16 ) );
+    AppendDataUnsafe( ptr + 1, len );
+}
+
+void Profiler::AccountCallstackSampleDictionary( bool dictionaryHit, bool dictionaryMiss,
+    uint64_t eventBytes, uint64_t dictionaryBytes, uint64_t cpuTimeNs )
+{
+    m_sampleDictionaryPendingEvents++;
+    m_sampleDictionaryPendingBytes += eventBytes;
+    m_sampleDictionaryPendingHit += dictionaryHit ? 1 : 0;
+    m_sampleDictionaryPendingMiss += dictionaryMiss ? 1 : 0;
+    m_sampleDictionaryPendingDictionaryBytes += dictionaryBytes;
+    m_sampleDictionaryPendingCpuTimeNs += cpuTimeNs;
+    if( m_sampleDictionaryPendingEvents >= 256 ) FlushCallstackSampleDictionaryCounters();
+}
+
+void Profiler::FlushCallstackSampleDictionaryCounters()
+{
+    if( m_sampleDictionaryPendingEvents == 0 ) return;
+    uint64_t degrade = 0;
+    uint64_t producerCpuNs = 0;
+#if defined( _WIN32 ) && defined( TRACY_HAS_SYSTEM_TRACING )
+    degrade = SysTraceConsumeCallstackSamplePoolFallbacks();
+    producerCpuNs = SysTraceConsumeCallstackSampleProducerCpuNs();
+#endif
+#if defined( JN_TRACY_EXPORTS )
+    JNTracy_InternalSamplingDictionaryBatch( m_sampleDictionaryPendingEvents,
+        m_sampleDictionaryPendingBytes, m_sampleDictionaryPendingHit,
+        m_sampleDictionaryPendingMiss, m_sampleDictionaryPendingDictionaryBytes,
+        m_sampleDictionaryPendingCpuTimeNs + producerCpuNs, degrade );
+#endif
+    m_sampleDictionaryPendingEvents = 0;
+    m_sampleDictionaryPendingBytes = 0;
+    m_sampleDictionaryPendingHit = 0;
+    m_sampleDictionaryPendingMiss = 0;
+    m_sampleDictionaryPendingDictionaryBytes = 0;
+    m_sampleDictionaryPendingCpuTimeNs = 0;
+}
+
+uint32_t Profiler::InternGpuResourceSet( const JnGpuReferencePacketBlock* packet, uint16_t entryCount,
+    bool& inserted, const std::vector<JnGpuReferenceSetEntry>*& normalized )
+{
+    inserted = false;
+    normalized = &m_gpuResourceSetScratch;
+    m_gpuResourceSetScratch.clear();
+    m_gpuResourceSetScratch.reserve( entryCount );
+    auto block = packet;
+    while( block != nullptr && m_gpuResourceSetScratch.size() < entryCount )
+    {
+        if( block->count > JnGpuReferencePacketEntryCapacity ) return 0;
+        const auto remaining = size_t( entryCount ) - m_gpuResourceSetScratch.size();
+        const auto count = std::min<size_t>( block->count, remaining );
+        m_gpuResourceSetScratch.insert( m_gpuResourceSetScratch.end(), block->entries, block->entries + count );
+        block = block->next;
+    }
+    if( m_gpuResourceSetScratch.size() != entryCount ) return 0;
+
+    std::sort( m_gpuResourceSetScratch.begin(), m_gpuResourceSetScratch.end(),
+        []( const auto& lhs, const auto& rhs ) {
+            return lhs.resourceId < rhs.resourceId ||
+                ( lhs.resourceId == rhs.resourceId && lhs.usageMask < rhs.usageMask );
+        } );
+    size_t write = 0;
+    for( const auto& entry : m_gpuResourceSetScratch )
+    {
+        if( entry.resourceId == 0 ) continue;
+        if( write != 0 && m_gpuResourceSetScratch[write - 1].resourceId == entry.resourceId )
+            m_gpuResourceSetScratch[write - 1].usageMask |= entry.usageMask;
+        else
+            m_gpuResourceSetScratch[write++] = entry;
+    }
+    m_gpuResourceSetScratch.resize( write );
+    if( write == 0 ) return 0;
+
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= write;
+    hash *= 1099511628211ull;
+    for( const auto& entry : m_gpuResourceSetScratch )
+    {
+        hash ^= entry.resourceId;
+        hash *= 1099511628211ull;
+        hash ^= entry.usageMask;
+        hash *= 1099511628211ull;
+    }
+    const auto found = m_gpuResourceSetDictionary.find( hash );
+    if( found != m_gpuResourceSetDictionary.end() )
+    {
+        for( const auto& entry : found->second )
+        {
+            if( entry.entries.size() == write &&
+                memcmp( entry.entries.data(), m_gpuResourceSetScratch.data(),
+                    write * sizeof( JnGpuReferenceSetEntry ) ) == 0 )
+            {
+                normalized = &entry.entries;
+                return entry.id;
+            }
+        }
+    }
+    if( m_nextGpuResourceSetId == 0 || m_nextGpuResourceSetId > 65536 ) return 0;
+    GpuResourceSetDictionaryEntry entry;
+    entry.id = m_nextGpuResourceSetId++;
+    entry.entries = m_gpuResourceSetScratch;
+    const auto id = entry.id;
+    if( found == m_gpuResourceSetDictionary.end() )
+    {
+        auto result = m_gpuResourceSetDictionary.emplace( hash,
+            std::vector<GpuResourceSetDictionaryEntry> { std::move( entry ) } );
+        normalized = &result.first->second.back().entries;
+    }
+    else
+    {
+        found->second.emplace_back( std::move( entry ) );
+        normalized = &found->second.back().entries;
+    }
+    inserted = true;
+    return id;
+}
+
+bool Profiler::CollectGpuResourceSetPacket( const JnGpuReferencePacketBlock* packet, uint16_t entryCount,
+    const std::vector<JnGpuReferenceSetEntry>*& entries )
+{
+    entries = &m_gpuResourceSetScratch;
+    m_gpuResourceSetScratch.clear();
+    m_gpuResourceSetScratch.reserve( entryCount );
+    auto block = packet;
+    while( block != nullptr && m_gpuResourceSetScratch.size() < entryCount )
+    {
+        if( block->count > JnGpuReferencePacketEntryCapacity ) return false;
+        const auto remaining = size_t( entryCount ) - m_gpuResourceSetScratch.size();
+        const auto count = std::min<size_t>( block->count, remaining );
+        m_gpuResourceSetScratch.insert( m_gpuResourceSetScratch.end(), block->entries, block->entries + count );
+        block = block->next;
+    }
+    return m_gpuResourceSetScratch.size() == entryCount;
+}
+
+void Profiler::SendGpuResourceSetDictionary( uint32_t resourceSetId,
+    const std::vector<JnGpuReferenceSetEntry>& entries )
+{
+    SendLongString( resourceSetId, (const char*)entries.data(),
+        entries.size() * sizeof( JnGpuReferenceSetEntry ), QueueType::JnGpuReferenceSetDefinition );
+}
+
 void Profiler::SendCallstackAlloc( uint64_t _ptr )
 {
     auto ptr = (const char*)_ptr;
@@ -3878,6 +4311,7 @@ bool Profiler::HandleServerQuery()
 void Profiler::HandleDisconnect()
 {
     moodycamel::ConsumerToken token( GetQueue() );
+    FlushCallstackSampleDictionaryCounters();
 
 #ifdef TRACY_HAS_SYSTEM_TRACING
     if( s_sysTraceThread )

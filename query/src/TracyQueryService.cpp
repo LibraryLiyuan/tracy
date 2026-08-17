@@ -30,7 +30,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
-        "capture.context", "capture.coverage", "producer.list", "producer.get",
+        "capture.context", "capture.coverage", "trace.telemetry_cost", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "relation.search", "relation.get", "runtime.domain.states",
         "gpu.taxonomy.tree", "gpu.taxonomy.coverage", "gpu.pass.search", "gpu.pass.get",
@@ -798,13 +798,33 @@ json MemorySummaryJson( const analysis::TraceSource& source, const analysis::Mem
 json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemoryPass& pass, bool includeUses = true, size_t useOffset = 0, size_t useLimit = MaximumPageSize )
 {
     json uses = json::array();
+    size_t resourceSetV2ResourceCount = 0;
+    size_t perUseV1ResourceCount = 0;
+    std::set<uint32_t> resourceSetIds;
+    for( const auto& use : pass.uses )
+    {
+        if( use.encoding == 2 )
+        {
+            resourceSetV2ResourceCount++;
+            if( use.resourceSetId != 0 ) resourceSetIds.emplace( use.resourceSetId );
+        }
+        else
+        {
+            perUseV1ResourceCount++;
+        }
+    }
+    const char* resourceEncoding = pass.uses.empty() ? "none" :
+        ( resourceSetV2ResourceCount == pass.uses.size() ? "ResourceSetV2" :
+        ( perUseV1ResourceCount == pass.uses.size() ? "PerUseV1" : "Mixed" ) );
     const size_t useEnd = includeUses ? std::min( pass.uses.size(), useOffset + useLimit ) : 0;
     for( size_t index = useOffset; index < useEnd; index++ )
     {
         const auto& use = pass.uses[index];
         uses.push_back( {
         { "allocation_id", Decimal( use.allocationId ) }, { "kind", std::string( 1, use.kind ) },
-        { "usage_mask", "0x" + Hex16( use.usageMask ) }, { "usage", analysis::FormatGpuMemoryUsage( use.usageMask ) }
+        { "usage_mask", "0x" + Hex16( use.usageMask ) }, { "usage", analysis::FormatGpuMemoryUsage( use.usageMask ) },
+        { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" }
         } );
     }
     return {
@@ -819,6 +839,12 @@ json GpuPassJson( const analysis::TraceSource& source, const analysis::GpuMemory
         { "expected_chunks", pass.expectedChunks }, { "parsed_chunks", pass.parsedChunks },
         { "untracked_references", pass.untrackedReferences }, { "dropped_uses", pass.droppedUses },
         { "truncated", pass.truncated }, { "complete", pass.complete },
+        { "resource_encoding", resourceEncoding },
+        { "resource_set_v2_resource_count", resourceSetV2ResourceCount },
+        { "per_use_v1_resource_count", perUseV1ResourceCount },
+        { "resource_set_id_count", resourceSetIds.size() },
+        { "resource_set_id_min", resourceSetIds.empty() ? json( nullptr ) : json( Decimal( uint64_t( *resourceSetIds.begin() ) ) ) },
+        { "resource_set_id_max", resourceSetIds.empty() ? json( nullptr ) : json( Decimal( uint64_t( *resourceSetIds.rbegin() ) ) ) },
         { "provenance", pass.structuredBinary ? "exact-binary" : "legacy-zone-text" },
         { "event_flags", pass.flags }, { "gpu_pairing", analysis::ToString( pass.gpuPairing ) },
         { "cpu_zone_ref", source.GetCpuZoneRef( pass.cpuZoneIndex ).value_or( "" ) },
@@ -1713,7 +1739,9 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
 {
     static constexpr const char* CounterNames[] = {
         "observed", "emitted", "dropped", "filtered", "sampled_out", "overflow",
-        "mismatch", "unresolved", "pre_capture", "replayed", "tail_truncated"
+        "mismatch", "unresolved", "pre_capture", "replayed", "tail_truncated",
+        "cpu_time_ns", "event_bytes", "dictionary_hit", "dictionary_miss",
+        "dictionary_bytes", "degrade"
     };
     struct Snapshot
     {
@@ -1754,7 +1782,8 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         auto document = json::parse( record.begin() + ProducerQualityPrefix.size(), record.end(), nullptr, false );
         size_t fields = 0;
         if( document.is_discarded() || !document.is_object() || !IdentityShapeAllowed( document, 0, fields ) ||
-            document.value( "schema_version", 0 ) != 1 || !document.contains( "connection_id" ) ||
+            ( document.value( "schema_version", 0 ) < 1 || document.value( "schema_version", 0 ) > 2 ) ||
+            !document.contains( "connection_id" ) ||
             !document.contains( "snapshot_sequence" ) || !document.contains( "producer" ) || !document["producer"].is_object() )
         {
             if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality JSON failed schema or resource-limit validation" } } );
@@ -1779,8 +1808,11 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         const auto connectionId = DecimalStringValue( document["connection_id"] );
         const auto sequence = DecimalStringValue( document["snapshot_sequence"] );
         bool countersValid = connectionId.has_value() && sequence.has_value();
-        for( const auto* counter : CounterNames )
-            countersValid = countersValid && producer["counters"].contains( counter ) && DecimalStringValue( producer["counters"][counter] ).has_value();
+        const size_t requiredCounterCount = document.value( "schema_version", 1 ) >= 2 ?
+            std::size( CounterNames ) : 11;
+        for( size_t counter = 0; counter < requiredCounterCount; counter++ )
+            countersValid = countersValid && producer["counters"].contains( CounterNames[counter] ) &&
+                DecimalStringValue( producer["counters"][CounterNames[counter]] ).has_value();
         if( !countersValid )
         {
             if( invalid.size() < 64 ) invalid.push_back( { { "record_index", Decimal( index ) }, { "reason", "producer quality counter is invalid" } } );
@@ -1830,12 +1862,16 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         const bool windowComplete = snapshots.front().sequence < snapshots.back().sequence;
         complete = complete && windowComplete;
         json counters = json::object();
-        std::array<uint64_t, 11> deltas {};
+        std::array<uint64_t, std::size( CounterNames )> deltas {};
         bool regression = false;
-        for( size_t counter = 0; counter < 11; counter++ )
+        for( size_t counter = 0; counter < std::size( CounterNames ); counter++ )
         {
-            const auto base = *DecimalStringValue( first["counters"][CounterNames[counter]] );
-            const auto final = *DecimalStringValue( last["counters"][CounterNames[counter]] );
+            const auto baseValue = first["counters"].contains( CounterNames[counter] ) ?
+                DecimalStringValue( first["counters"][CounterNames[counter]] ) : std::optional<uint64_t>( 0 );
+            const auto finalValue = last["counters"].contains( CounterNames[counter] ) ?
+                DecimalStringValue( last["counters"][CounterNames[counter]] ) : std::optional<uint64_t>( 0 );
+            const auto base = baseValue.value_or( 0 );
+            const auto final = finalValue.value_or( 0 );
             if( final < base ) regression = true;
             deltas[counter] = final >= base ? final - base : 0;
             counters[CounterNames[counter]] = Decimal( deltas[counter] );
@@ -1919,6 +1955,85 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         { "producers", producers }, { "quality_findings", globalFindings }, { "invalid_records", invalid },
         { "records", { { "seen", seen }, { "valid", [&] { size_t count = 0; for( const auto& item : byProducer ) count += item.second.size(); return count; }() },
             { "duplicates", duplicates }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
+json TelemetryCostJson( const analysis::TraceInfoDto& info )
+{
+    const auto coverage = CaptureCoverageJson( info );
+    json producers = json::array();
+    uint64_t totalCpuTimeNs = 0;
+    uint64_t totalEvents = 0;
+    uint64_t totalBytes = 0;
+    uint64_t totalDictionaryHit = 0;
+    uint64_t totalDictionaryMiss = 0;
+    uint64_t totalDictionaryBytes = 0;
+    uint64_t totalOverflow = 0;
+    uint64_t totalDegrade = 0;
+
+    if( coverage.contains( "producers" ) && coverage["producers"].is_array() )
+    {
+        for( const auto& producer : coverage["producers"] )
+        {
+            const auto& counters = producer.value( "counters", json::object() );
+            const auto counter = [&]( const char* name ) {
+                if( !counters.contains( name ) ) return uint64_t( 0 );
+                return DecimalStringValue( counters[name] ).value_or( 0 );
+            };
+            const auto cpuTimeNs = counter( "cpu_time_ns" );
+            const auto events = counter( "emitted" );
+            const auto bytes = counter( "event_bytes" );
+            const auto dictionaryHit = counter( "dictionary_hit" );
+            const auto dictionaryMiss = counter( "dictionary_miss" );
+            const auto dictionaryBytes = counter( "dictionary_bytes" );
+            const auto overflow = counter( "overflow" );
+            const auto degrade = counter( "degrade" );
+            totalCpuTimeNs += cpuTimeNs;
+            totalEvents += events;
+            totalBytes += bytes;
+            totalDictionaryHit += dictionaryHit;
+            totalDictionaryMiss += dictionaryMiss;
+            totalDictionaryBytes += dictionaryBytes;
+            totalOverflow += overflow;
+            totalDegrade += degrade;
+            producers.push_back( {
+                { "key", producer.value( "key", "" ) },
+                { "state", producer.value( "state", "unknown" ) },
+                { "complete", producer.value( "complete", false ) },
+                { "cpu_time_ns", Decimal( cpuTimeNs ) },
+                { "event_count", Decimal( events ) },
+                { "event_bytes", Decimal( bytes ) },
+                { "cpu_ns_per_event", events == 0 ? json( nullptr ) : json( double( cpuTimeNs ) / double( events ) ) },
+                { "bytes_per_event", events == 0 ? json( nullptr ) : json( double( bytes ) / double( events ) ) },
+                { "dictionary_hit", Decimal( dictionaryHit ) },
+                { "dictionary_miss", Decimal( dictionaryMiss ) },
+                { "dictionary_bytes", Decimal( dictionaryBytes ) },
+                { "overflow", Decimal( overflow ) },
+                { "degrade", Decimal( degrade ) }
+            } );
+        }
+    }
+
+    return {
+        { "present", coverage.value( "present", false ) },
+        { "schema_version", 1 },
+        { "complete", coverage.value( "complete", false ) },
+        { "reason", coverage.value( "reason", json( nullptr ) ) },
+        { "measurement", "producer_self_reported_cpu_time" },
+        { "totals", {
+            { "cpu_time_ns", Decimal( totalCpuTimeNs ) },
+            { "event_count", Decimal( totalEvents ) },
+            { "event_bytes", Decimal( totalBytes ) },
+            { "cpu_ns_per_event", totalEvents == 0 ? json( nullptr ) : json( double( totalCpuTimeNs ) / double( totalEvents ) ) },
+            { "bytes_per_event", totalEvents == 0 ? json( nullptr ) : json( double( totalBytes ) / double( totalEvents ) ) },
+            { "dictionary_hit", Decimal( totalDictionaryHit ) },
+            { "dictionary_miss", Decimal( totalDictionaryMiss ) },
+            { "dictionary_bytes", Decimal( totalDictionaryBytes ) },
+            { "overflow", Decimal( totalOverflow ) },
+            { "degrade", Decimal( totalDegrade ) }
+        } },
+        { "producers", std::move( producers ) },
         { "trust", "untrusted_trace_data" }
     };
 }
@@ -4151,6 +4266,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "capture.context" ) return Success( id, CaptureContextJson( info() ), trace );
     if( method == "capture.coverage" || method == "producer.list" )
         return Success( id, CaptureCoverageJson( info() ), trace );
+    if( method == "trace.telemetry_cost" )
+        return Success( id, TelemetryCostJson( info() ), trace );
     if( method == "producer.get" )
     {
         if( !params.contains( "key" ) || !params["key"].is_string() || params["key"].get_ref<const std::string&>().empty() )
@@ -7540,7 +7657,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
                     graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
                     true, false, { { "allocation_id", Decimal( use.allocationId ) }, { "bytes", Decimal( bytes ) },
-                        { "usage_mask", use.usageMask }, { "usage_kind", std::string( 1, use.kind ) } } );
+                        { "usage_mask", use.usageMask }, { "usage_kind", std::string( 1, use.kind ) },
+                        { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" } } );
                 graph.AddEdge( explicitPassNodes[match.pass.entityId], resource, "references_resource", "exact",
                     "gpu_reference_token_allocation_id_v1", 1.0, false,
                     { "ExplicitGpuPass.referenceToken", "GpuMemoryPassUse.allocationId" } );

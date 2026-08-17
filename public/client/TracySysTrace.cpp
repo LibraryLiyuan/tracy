@@ -55,7 +55,15 @@ static int GetSamplingPeriod()
 #    include <evntrace.h>
 #    include <evntcons.h>
 #    include <psapi.h>
+#    include <tlhelp32.h>
 #    include <winternl.h>
+
+#    include <algorithm>
+#    include <atomic>
+#    include <limits>
+#    include <stddef.h>
+#    include <unordered_set>
+#    include <vector>
 
 #    include "../common/TracyAlloc.hpp"
 #    include "../common/TracySystem.hpp"
@@ -74,6 +82,8 @@ static TRACEHANDLE s_traceHandle;
 static TRACEHANDLE s_traceHandle2;
 static EVENT_TRACE_PROPERTIES* s_prop;
 static DWORD s_pid;
+static bool s_processContextSwitchScope;
+static std::unordered_set<uint32_t> s_processThreads;
 
 static EVENT_TRACE_PROPERTIES* s_propVsync;
 static TRACEHANDLE s_traceHandleVsync;
@@ -127,6 +137,222 @@ struct StackWalkEvent
     uint64_t stack[192];
 };
 
+constexpr size_t CallstackSampleMaxFrames = 192;
+constexpr size_t CallstackSamplePoolCapacity = 8192;
+constexpr size_t CallstackSampleDictionaryCapacity = 128 * 1024;
+constexpr size_t CallstackSampleDictionaryMask = CallstackSampleDictionaryCapacity - 1;
+constexpr size_t CallstackSampleInitialFrameCapacity = 2 * 1024 * 1024;
+constexpr size_t CallstackSampleCacheSets = 4096;
+constexpr size_t CallstackSampleCacheMask = CallstackSampleCacheSets - 1;
+constexpr uint32_t CallstackSampleCostStride = 8;
+static_assert( ( CallstackSampleCostStride & ( CallstackSampleCostStride - 1 ) ) == 0,
+    "Sampling cost stride must be a power of two." );
+
+enum CallstackSamplePointerTag : uint64_t
+{
+    CallstackSamplePointerLegacy = 0,
+    CallstackSamplePointerReference = 1,
+    CallstackSamplePointerPooledDefinition = 2,
+    CallstackSamplePointerHeapDefinition = 3
+};
+
+struct CallstackSampleBlock
+{
+    CallstackSampleBlock* next;
+    uint64_t data[CallstackSampleMaxFrames + 2];
+};
+
+struct CallstackSampleDictionaryEntry
+{
+    uint64_t hash = 0;
+    uint32_t id = 0;
+    uint32_t frameOffset = 0;
+    uint16_t frameCount = 0;
+    uint16_t reserved = 0;
+};
+
+struct CallstackSampleCacheEntry
+{
+    uint64_t signature = 0;
+    uint32_t thread = 0;
+    uint32_t id = 0;
+    uint32_t frameOffset = 0;
+    uint16_t frameCount = 0;
+    uint16_t reserved = 0;
+};
+
+static CallstackSampleBlock* s_callstackSampleBlocks;
+static std::atomic<CallstackSampleBlock*> s_callstackSampleFreeList { nullptr };
+static std::atomic<uint64_t> s_callstackSamplePoolFallbacks { 0 };
+static std::atomic<uint64_t> s_callstackSampleProducerCpuNs { 0 };
+static std::vector<CallstackSampleDictionaryEntry> s_callstackSampleDictionary;
+static std::vector<uint64_t> s_callstackSampleFrames;
+static CallstackSampleCacheEntry s_callstackSampleCache[CallstackSampleCacheSets][2];
+static uint32_t s_nextCallstackSampleId = 1;
+static int64_t s_callstackSampleQpcFrequency;
+static uint32_t s_callstackSampleCostCounter;
+
+static void InitializeCallstackSamplePool()
+{
+    if( s_callstackSampleBlocks != nullptr ) return;
+    auto blocks = (CallstackSampleBlock*)tracy_malloc( sizeof( CallstackSampleBlock ) * CallstackSamplePoolCapacity );
+    for( size_t i = 0; i < CallstackSamplePoolCapacity - 1; i++ ) blocks[i].next = blocks + i + 1;
+    blocks[CallstackSamplePoolCapacity - 1].next = nullptr;
+    s_callstackSampleBlocks = blocks;
+    s_callstackSampleFreeList.store( blocks, std::memory_order_release );
+    s_callstackSampleDictionary.resize( CallstackSampleDictionaryCapacity );
+    s_callstackSampleFrames.reserve( CallstackSampleInitialFrameCapacity );
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency( &frequency );
+    s_callstackSampleQpcFrequency = frequency.QuadPart;
+}
+
+void SysTraceResetCallstackSampleDictionary()
+{
+    InitializeCallstackSamplePool();
+    memset( s_callstackSampleDictionary.data(), 0,
+        s_callstackSampleDictionary.size() * sizeof( CallstackSampleDictionaryEntry ) );
+    s_callstackSampleFrames.clear();
+    memset( s_callstackSampleCache, 0, sizeof( s_callstackSampleCache ) );
+    s_nextCallstackSampleId = 1;
+    s_callstackSampleCostCounter = 0;
+    s_callstackSamplePoolFallbacks.store( 0, std::memory_order_release );
+    s_callstackSampleProducerCpuNs.store( 0, std::memory_order_release );
+}
+
+static uint64_t CallstackSampleSignature( const uint64_t* frames, size_t frameCount )
+{
+    if( frameCount == 0 ) return 0;
+    auto signature = frames[0] ^ ( frames[frameCount - 1] << 7 ) ^ ( frames[frameCount - 1] >> 57 );
+    if( frameCount > 2 ) signature ^= ( frames[frameCount / 2] << 19 ) ^ ( frames[frameCount / 2] >> 45 );
+    return signature ^ ( uint64_t( frameCount ) * 0x9E3779B185EBCA87ull );
+}
+
+static void CacheCallstackSample( uint32_t threadId, uint64_t signature,
+    const CallstackSampleDictionaryEntry& dictionaryEntry )
+{
+    auto& set = s_callstackSampleCache[( threadId * 2654435761u ) & CallstackSampleCacheMask];
+    if( set[0].thread == threadId && set[0].id == dictionaryEntry.id ) return;
+    set[1] = set[0];
+    set[0].signature = signature;
+    set[0].thread = threadId;
+    set[0].id = dictionaryEntry.id;
+    set[0].frameOffset = dictionaryEntry.frameOffset;
+    set[0].frameCount = dictionaryEntry.frameCount;
+}
+
+static uint32_t InternCallstackSample( const uint64_t* frames, size_t frameCount,
+    uint32_t threadId, bool& inserted )
+{
+    inserted = false;
+    if( frameCount > (std::numeric_limits<uint16_t>::max)() ) return 0;
+    const auto signature = CallstackSampleSignature( frames, frameCount );
+    auto& cacheSet = s_callstackSampleCache[( threadId * 2654435761u ) & CallstackSampleCacheMask];
+    for( size_t way = 0; way < 2; way++ )
+    {
+        auto& cached = cacheSet[way];
+        if( cached.id != 0 && cached.thread == threadId && cached.signature == signature &&
+            cached.frameCount == frameCount && ( frameCount == 0 ||
+            memcmp( s_callstackSampleFrames.data() + cached.frameOffset,
+                frames, frameCount * sizeof( uint64_t ) ) == 0 ) )
+        {
+            if( way != 0 ) std::swap( cacheSet[0], cacheSet[1] );
+            return cached.id;
+        }
+    }
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= frameCount;
+    hash *= 1099511628211ull;
+    for( size_t i = 0; i < frameCount; i++ )
+    {
+        hash ^= frames[i];
+        hash *= 1099511628211ull;
+    }
+    auto slot = size_t( hash ) & CallstackSampleDictionaryMask;
+    for( size_t probe = 0; probe < CallstackSampleDictionaryCapacity; probe++ )
+    {
+        auto& entry = s_callstackSampleDictionary[slot];
+        if( entry.id == 0 )
+        {
+            if( s_nextCallstackSampleId == 0 || s_nextCallstackSampleId > 65536 ||
+                s_callstackSampleFrames.size() + frameCount > (std::numeric_limits<uint32_t>::max)() ) return 0;
+            entry.hash = hash;
+            entry.id = s_nextCallstackSampleId++;
+            entry.frameOffset = uint32_t( s_callstackSampleFrames.size() );
+            entry.frameCount = uint16_t( frameCount );
+            s_callstackSampleFrames.insert( s_callstackSampleFrames.end(), frames, frames + frameCount );
+            inserted = true;
+            CacheCallstackSample( threadId, signature, entry );
+            return entry.id;
+        }
+        if( entry.hash == hash && entry.frameCount == frameCount &&
+            ( frameCount == 0 || memcmp( s_callstackSampleFrames.data() + entry.frameOffset,
+                frames, frameCount * sizeof( uint64_t ) ) == 0 ) )
+        {
+            CacheCallstackSample( threadId, signature, entry );
+            return entry.id;
+        }
+        slot = ( slot + 1 ) & CallstackSampleDictionaryMask;
+    }
+    return 0;
+}
+
+static uint64_t* AcquireCallstackSampleDefinition( size_t frameCount, uint64_t& pointerTag )
+{
+    pointerTag = CallstackSamplePointerHeapDefinition;
+    if( frameCount <= CallstackSampleMaxFrames )
+    {
+        auto head = s_callstackSampleFreeList.load( std::memory_order_acquire );
+        while( head != nullptr )
+        {
+            auto next = head->next;
+            if( s_callstackSampleFreeList.compare_exchange_weak( head, next,
+                std::memory_order_acq_rel, std::memory_order_acquire ) )
+            {
+                pointerTag = CallstackSamplePointerPooledDefinition;
+                return head->data + 1;
+            }
+        }
+    }
+    s_callstackSamplePoolFallbacks.fetch_add( 1, std::memory_order_relaxed );
+    return (uint64_t*)tracy_malloc( ( 2 + frameCount ) * sizeof( uint64_t ) ) + 1;
+}
+
+void SysTraceReleaseCallstackSample( uint64_t taggedPtr )
+{
+    const auto tag = taggedPtr & 3;
+    if( tag == CallstackSamplePointerReference ) return;
+    auto ptr = (uint64_t*)( taggedPtr & ~uint64_t( 3 ) );
+    if( tag == CallstackSamplePointerLegacy )
+    {
+        tracy_free_fast( ptr );
+        return;
+    }
+    if( tag == CallstackSamplePointerHeapDefinition )
+    {
+        tracy_free_fast( ptr - 1 );
+        return;
+    }
+    auto block = (CallstackSampleBlock*)( (char*)( ptr - 1 ) - offsetof( CallstackSampleBlock, data ) );
+    auto head = s_callstackSampleFreeList.load( std::memory_order_acquire );
+    do
+    {
+        block->next = head;
+    }
+    while( !s_callstackSampleFreeList.compare_exchange_weak( head, block,
+        std::memory_order_release, std::memory_order_acquire ) );
+}
+
+uint64_t SysTraceConsumeCallstackSamplePoolFallbacks()
+{
+    return s_callstackSamplePoolFallbacks.exchange( 0, std::memory_order_acq_rel );
+}
+
+uint64_t SysTraceConsumeCallstackSampleProducerCpuNs()
+{
+    return s_callstackSampleProducerCpuNs.exchange( 0, std::memory_order_acq_rel );
+}
+
 struct VSyncInfo
 {
     void*       dxgAdapter;
@@ -153,6 +379,32 @@ t_GetModuleBaseNameA _GetModuleBaseNameA = (t_GetModuleBaseNameA)GetProcAddress(
 
 static t_GetThreadDescription _GetThreadDescription = 0;
 
+static bool IsProcessThread( uint32_t threadId )
+{
+    return !s_processContextSwitchScope || s_processThreads.find( threadId ) != s_processThreads.end();
+}
+
+static void SnapshotProcessThreads()
+{
+    s_processThreads.clear();
+    if( !s_processContextSwitchScope ) return;
+    const auto snapshot = CreateToolhelp32Snapshot( TH32CS_SNAPTHREAD, 0 );
+    if( snapshot == INVALID_HANDLE_VALUE ) return;
+    THREADENTRY32 entry = {};
+    entry.dwSize = sizeof( entry );
+    if( Thread32First( snapshot, &entry ) )
+    {
+        do
+        {
+            if( entry.th32OwnerProcessID == s_pid )
+                s_processThreads.emplace( entry.th32ThreadID );
+            entry.dwSize = sizeof( entry );
+        }
+        while( Thread32Next( snapshot, &entry ) );
+    }
+    CloseHandle( snapshot );
+}
+
 
 void WINAPI EventRecordCallback( PEVENT_RECORD record )
 {
@@ -167,6 +419,7 @@ void WINAPI EventRecordCallback( PEVENT_RECORD record )
         if( hdr.EventDescriptor.Opcode == 36 )
         {
             const auto cswitch = (const CSwitch*)record->UserData;
+            if( !IsProcessThread( cswitch->oldThreadId ) && !IsProcessThread( cswitch->newThreadId ) ) return;
 
             TracyLfqPrepare( QueueType::ContextSwitch );
             MemWrite( &item->contextSwitch.time, hdr.TimeStamp.QuadPart );
@@ -183,6 +436,7 @@ void WINAPI EventRecordCallback( PEVENT_RECORD record )
         else if( hdr.EventDescriptor.Opcode == 50 )
         {
             const auto rt = (const ReadyThread*)record->UserData;
+            if( !IsProcessThread( rt->threadId ) ) return;
 
             TracyLfqPrepare( QueueType::ThreadWakeup );
             MemWrite( &item->threadWakeup.time, hdr.TimeStamp.QuadPart );
@@ -199,10 +453,21 @@ void WINAPI EventRecordCallback( PEVENT_RECORD record )
             uint64_t tid = tt->threadId;
             if( tid == 0 ) return;
             uint64_t pid = tt->processId;
+            if( s_processContextSwitchScope )
+            {
+                if( pid == s_pid ) s_processThreads.emplace( uint32_t( tid ) );
+                else s_processThreads.erase( uint32_t( tid ) );
+                if( pid != s_pid ) return;
+            }
             TracyLfqPrepare( QueueType::TidToPid );
             MemWrite( &item->tidToPid.tid, tid );
             MemWrite( &item->tidToPid.pid, pid );
             TracyLfqCommit;
+        }
+        else if( hdr.EventDescriptor.Opcode == 2 || hdr.EventDescriptor.Opcode == 4 )
+        {
+            const auto tt = (const ThreadTrace*)record->UserData;
+            if( s_processContextSwitchScope ) s_processThreads.erase( tt->threadId );
         }
         break;
     case 0xdef2fe46:    // StackWalk Guid
@@ -214,14 +479,49 @@ void WINAPI EventRecordCallback( PEVENT_RECORD record )
                 const uint64_t sz = ( record->UserDataLength - 16 ) / 8;
                 if( sz > 0 )
                 {
-                    auto trace = (uint64_t*)tracy_malloc( ( 1 + sz ) * sizeof( uint64_t ) );
-                    memcpy( trace, &sz, sizeof( uint64_t ) );
-                    memcpy( trace+1, sw->stack, sizeof( uint64_t ) * sz );
+                    const bool measureProducerCost =
+                        ( ++s_callstackSampleCostCounter & ( CallstackSampleCostStride - 1 ) ) == 0;
+                    LARGE_INTEGER producerStart = {};
+                    if( measureProducerCost ) QueryPerformanceCounter( &producerStart );
+                    bool inserted;
+                    const auto stackId = InternCallstackSample( sw->stack, size_t( sz ), sw->stackThread, inserted );
+                    uint64_t packedPtr;
+                    if( stackId == 0 )
+                    {
+                        auto trace = (uint64_t*)tracy_malloc( ( 1 + sz ) * sizeof( uint64_t ) );
+                        trace[0] = sz;
+                        memcpy( trace + 1, sw->stack, sizeof( uint64_t ) * sz );
+                        packedPtr = uint64_t( trace );
+                    }
+                    else if( !inserted )
+                    {
+                        packedPtr = ( uint64_t( stackId ) << 2 ) | CallstackSamplePointerReference;
+                    }
+                    else
+                    {
+                        uint64_t pointerTag;
+                        auto trace = AcquireCallstackSampleDefinition( size_t( sz ), pointerTag );
+                        trace[-1] = stackId;
+                        trace[0] = sz;
+                        memcpy( trace + 1, sw->stack, sizeof( uint64_t ) * sz );
+                        packedPtr = uint64_t( trace ) | pointerTag;
+                    }
                     TracyLfqPrepare( QueueType::CallstackSample );
                     MemWrite( &item->callstackSampleFat.time, sw->eventTimeStamp );
                     MemWrite( &item->callstackSampleFat.thread, sw->stackThread );
-                    MemWrite( &item->callstackSampleFat.ptr, (uint64_t)trace );
+                    MemWrite( &item->callstackSampleFat.ptr, packedPtr );
                     TracyLfqCommit;
+                    if( measureProducerCost )
+                    {
+                        LARGE_INTEGER producerEnd;
+                        QueryPerformanceCounter( &producerEnd );
+                        if( producerEnd.QuadPart > producerStart.QuadPart && s_callstackSampleQpcFrequency > 0 )
+                        {
+                            const auto cpuNs = uint64_t( double( producerEnd.QuadPart - producerStart.QuadPart ) *
+                                ( 1000000000.0 * CallstackSampleCostStride ) / double( s_callstackSampleQpcFrequency ) );
+                            s_callstackSampleProducerCpuNs.fetch_add( cpuNs, std::memory_order_relaxed );
+                        }
+                    }
                 }
             }
         }
@@ -350,6 +650,10 @@ bool SysTraceStart( int64_t& samplingPeriod )
     if( !_GetThreadDescription ) _GetThreadDescription = (t_GetThreadDescription)GetProcAddress( GetModuleHandleA( "kernel32.dll" ), "GetThreadDescription" );
 
     s_pid = GetCurrentProcessId();
+    SysTraceResetCallstackSampleDictionary();
+    const auto contextSwitchScope = GetEnvVar( "JN_TRACY_CONTEXT_SWITCH_SCOPE" );
+    s_processContextSwitchScope = contextSwitchScope != nullptr && _stricmp( contextSwitchScope, "process" ) == 0;
+    SnapshotProcessThreads();
 
 #if defined _WIN64
     constexpr bool isOs64Bit = true;
@@ -483,6 +787,7 @@ void SysTraceStop()
 
     CloseTrace( s_traceHandle2 );
     CloseTrace( s_traceHandle );
+    s_processThreads.clear();
 }
 
 void SysTraceWorker( void* ptr )
@@ -620,6 +925,7 @@ void SysTraceGetExternalName( uint64_t thread, const char*& threadName, const ch
 #    include <stdlib.h>
 #    include <string.h>
 #    include <unistd.h>
+#    include <algorithm>
 #    include <atomic>
 #    include <thread>
 #    include <linux/perf_event.h>

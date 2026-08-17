@@ -23,6 +23,8 @@ enum class QueueType : uint8_t
     CallstackAlloc,
     CallstackSample,
     CallstackSampleContextSwitch,
+    CallstackSampleRef,
+    CallstackSampleContextSwitchRef,
     FrameImage,
     ZoneBegin,
     ZoneBeginCallstack,
@@ -69,6 +71,8 @@ enum class QueueType : uint8_t
     SourceCodeMetadata,
     FiberEnter,
     FiberLeave,
+    JnGpuReferenceSetDefinitionChunk,
+    JnGpuReferenceSetUseFat,
     Terminate,
     KeepAlive,
     ThreadContext,
@@ -129,6 +133,7 @@ enum class QueueType : uint8_t
     JnRuntimeDomainState,
     JnGpuReferencePass,
     JnGpuReferenceUse,
+    JnGpuReferenceSetUse,
     JnGpuReferenceEnd,
     JnScriptFrame,
     JnScriptStack,
@@ -137,6 +142,8 @@ enum class QueueType : uint8_t
     PlotName,
     SourceLocationPayload,
     CallstackPayload,
+    CallstackSampleDictionary,
+    JnGpuReferenceSetDefinition,
     CallstackAllocPayload,
     FrameName,
     FrameImageData,
@@ -640,6 +647,17 @@ enum class JnRelationNamespace : uint8_t
     Io
 };
 
+enum class JnRelationKind : uint8_t
+{
+    RelatedTo,
+    LogicalParent,
+    UsesResource,
+    ExecutesPass,
+    OwnedBy,
+    DependsOn,
+    ContinuesAs
+};
+
 enum class JnEntityKind : uint8_t
 {
     Unknown,
@@ -866,6 +884,49 @@ struct QueueJnGpuReferenceUse
     uint8_t flags;
 };
 
+// ResourceSetV2 removes the per-resource timestamp and queue item. The local
+// fat form owns a preallocated packet chain until the Tracy worker has
+// canonicalized it. The wire form references a per-connection dictionary.
+struct QueueJnGpuReferenceSetUse
+{
+    uint64_t passId;
+    uint32_t resourceSetId;
+    uint16_t entryCount;
+    uint8_t flags;
+    uint8_t encoding;
+};
+
+struct QueueJnGpuReferenceSetUseFat : public QueueJnGpuReferenceSetUse
+{
+    uint64_t ptr;
+};
+
+struct JnGpuReferenceSetEntry
+{
+    uint64_t resourceId;
+    uint32_t usageMask;
+};
+
+// Local-only ResourceSetV2 dictionary transport. Two entries fit exactly in
+// Tracy's 31-byte payload budget and require no external packet lifetime.
+struct QueueJnGpuReferenceSetDefinitionChunk
+{
+    uint32_t resourceSetId;
+    uint16_t totalEntryCount;
+    uint8_t chunkEntryCount;
+    JnGpuReferenceSetEntry entries[2];
+};
+
+static constexpr uint16_t JnGpuReferencePacketEntryCapacity = 256;
+
+struct alignas( 8 ) JnGpuReferencePacketBlock
+{
+    JnGpuReferencePacketBlock* next;
+    uint16_t count;
+    uint16_t reserved;
+    JnGpuReferenceSetEntry entries[JnGpuReferencePacketEntryCapacity];
+};
+
 struct QueueJnGpuReferenceEnd
 {
     int64_t time;
@@ -1008,6 +1069,11 @@ struct QueueCallstackSample
 struct QueueCallstackSampleFat : public QueueCallstackSample
 {
     uint64_t ptr;
+};
+
+struct QueueCallstackSampleRef : public QueueCallstackSample
+{
+    uint32_t stackId;
 };
 
 struct QueueCallstackFrameSize
@@ -1235,6 +1301,7 @@ struct QueueItem
         QueueCallstackAllocFatThread callstackAllocFatThread;
         QueueCallstackSample callstackSample;
         QueueCallstackSampleFat callstackSampleFat;
+        QueueCallstackSampleRef callstackSampleRef;
         QueueCallstackFrameSize callstackFrameSize;
         QueueCallstackFrameSizeFat callstackFrameSizeFat;
         QueueCallstackFrame callstackFrame;
@@ -1274,6 +1341,9 @@ struct QueueItem
         QueueJnRuntimeDomainState jnRuntimeDomainState;
         QueueJnGpuReferencePass jnGpuReferencePass;
         QueueJnGpuReferenceUse jnGpuReferenceUse;
+        QueueJnGpuReferenceSetUse jnGpuReferenceSetUse;
+        QueueJnGpuReferenceSetDefinitionChunk jnGpuReferenceSetDefinitionChunk;
+        QueueJnGpuReferenceSetUseFat jnGpuReferenceSetUseFat;
         QueueJnGpuReferenceEnd jnGpuReferenceEnd;
         QueueJnScriptFrame jnScriptFrame;
         QueueJnScriptStack jnScriptStack;
@@ -1299,6 +1369,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ),                                  // callstack alloc
     sizeof( QueueHeader ) + sizeof( QueueCallstackSample ),
     sizeof( QueueHeader ) + sizeof( QueueCallstackSample ), // context switch
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSampleRef ),
+    sizeof( QueueHeader ) + sizeof( QueueCallstackSampleRef ), // context switch ref
     sizeof( QueueHeader ) + sizeof( QueueFrameImage ),
     sizeof( QueueHeader ) + sizeof( QueueZoneBegin ),
     sizeof( QueueHeader ) + sizeof( QueueZoneBegin ),       // callstack
@@ -1345,6 +1417,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ),                                  // SourceCodeMetadata - not for wire transfer
     sizeof( QueueHeader ) + sizeof( QueueFiberEnter ),
     sizeof( QueueHeader ) + sizeof( QueueFiberLeave ),
+    sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local dictionary chunk - not for wire transfer
+    sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local packet - not for wire transfer
     // above items must be first
     sizeof( QueueHeader ),                                  // terminate
     sizeof( QueueHeader ),                                  // keep alive
@@ -1406,6 +1480,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnRuntimeDomainState ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferencePass ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceUse ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceSetUse ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceEnd ),
     sizeof( QueueHeader ) + sizeof( QueueJnScriptFrame ),
     sizeof( QueueHeader ) + sizeof( QueueJnScriptStack ),
@@ -1415,6 +1490,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // plot name
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // allocated source location payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // callstack payload
+    sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // sample callstack dictionary payload
+    sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // GPU ResourceSetV2 dictionary payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // callstack alloc payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // frame name
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // frame image data
@@ -1442,6 +1519,16 @@ static_assert( sizeof( QueueJnRelation ) == 29, "JN relation payload size mismat
 static_assert( sizeof( QueueJnRuntimeDomainState ) == 29, "JN runtime-domain payload size mismatch" );
 static_assert( sizeof( QueueJnGpuReferencePass ) == 30, "JN GPU reference pass payload size mismatch" );
 static_assert( sizeof( QueueJnGpuReferenceUse ) == 29, "JN GPU reference use payload size mismatch" );
+static_assert( sizeof( QueueJnGpuReferenceSetUse ) == 16, "JN GPU resource-set use payload size mismatch" );
+static_assert( sizeof( QueueJnGpuReferenceSetUseFat ) == 24, "JN GPU resource-set local payload size mismatch" );
+static_assert( sizeof( JnGpuReferenceSetEntry ) == 12, "JN GPU resource-set entry size mismatch" );
+static_assert( sizeof( QueueJnGpuReferenceSetDefinitionChunk ) == 31, "JN GPU resource-set chunk payload size mismatch" );
+static_assert( uint8_t( QueueType::JnGpuReferenceSetDefinitionChunk ) < uint8_t( QueueType::Terminate ),
+    "JN GPU resource-set chunk event must remain local-only" );
+static_assert( uint8_t( QueueType::JnGpuReferenceSetUseFat ) < uint8_t( QueueType::Terminate ),
+    "JN GPU resource-set fat event must remain local-only" );
+static_assert( uint8_t( QueueType::JnGpuReferenceSetUse ) > uint8_t( QueueType::Terminate ),
+    "JN GPU resource-set wire event must remain serializable" );
 static_assert( sizeof( QueueJnGpuReferenceEnd ) == 31, "JN GPU reference end payload size mismatch" );
 static_assert( sizeof( QueueJnScriptFrame ) == 26, "JN script frame payload size mismatch" );
 static_assert( sizeof( QueueJnScriptStack ) == 31, "JN script stack payload size mismatch" );

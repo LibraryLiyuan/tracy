@@ -8,7 +8,7 @@ namespace tracy
 {
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
-static constexpr uint16_t JnTraceSchemaVersion = 6;
+static constexpr uint16_t JnTraceSchemaVersion = 7;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -187,7 +187,9 @@ struct JnGpuReferenceUseData
     uint64_t resourceId;
     uint64_t thread;
     uint32_t usageMask;
+    uint32_t resourceSetId;
     uint8_t flags;
+    uint8_t encoding;
 };
 
 struct JnGpuReferenceEndData
