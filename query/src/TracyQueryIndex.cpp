@@ -165,12 +165,13 @@ public:
 
     uint8_t* Record( uint64_t index )
     {
-        if( !m_data || index >= m_count )
+        if( !m_data )
         {
             std::ostringstream message;
             message << "zone index record is outside declared bounds: path=" << m_path.string() << ", index=" << index << ", count=" << m_count;
             throw std::runtime_error( message.str() );
         }
+        if( index >= m_count ) Grow( index + 1 );
         return m_data + sizeof( ZoneSectionHeader ) + index * m_recordBytes;
     }
 
@@ -203,6 +204,42 @@ public:
     }
 
 private:
+    void Grow( uint64_t requiredCount )
+    {
+        if( requiredCount <= m_count ) return;
+        const auto increment = std::max<uint64_t>( 1024, m_count / 2 );
+        const auto grownCount = m_count <= std::numeric_limits<uint64_t>::max() - increment ? m_count + increment : std::numeric_limits<uint64_t>::max();
+        const auto newCount = std::max( requiredCount, grownCount );
+        if( newCount > ( std::numeric_limits<uint64_t>::max() - sizeof( ZoneSectionHeader ) ) / m_recordBytes )
+            throw std::runtime_error( "zone index section growth overflow" );
+        const auto newBytes = sizeof( ZoneSectionHeader ) + newCount * m_recordBytes;
+        if( newBytes > std::numeric_limits<size_t>::max() ) throw std::runtime_error( "zone index section growth exceeds address space" );
+#ifdef _WIN32
+        FlushViewOfFile( m_data, size_t( m_bytes ) );
+        UnmapViewOfFile( m_data );
+        m_data = nullptr;
+        CloseHandle( m_mapping );
+        m_mapping = nullptr;
+        LARGE_INTEGER size; size.QuadPart = newBytes;
+        if( !SetFilePointerEx( m_file, size, nullptr, FILE_BEGIN ) || !SetEndOfFile( m_file ) )
+            throw std::runtime_error( "cannot grow zone index section" );
+        m_mapping = CreateFileMappingW( m_file, nullptr, PAGE_READWRITE, size.HighPart, size.LowPart, nullptr );
+        if( !m_mapping ) throw std::runtime_error( "cannot remap grown zone index section" );
+        m_data = static_cast<uint8_t*>( MapViewOfFile( m_mapping, FILE_MAP_ALL_ACCESS, 0, 0, size_t( newBytes ) ) );
+        if( !m_data ) throw std::runtime_error( "cannot map grown zone index section" );
+#else
+        msync( m_data, size_t( m_bytes ), MS_SYNC );
+        munmap( m_data, size_t( m_bytes ) );
+        m_data = nullptr;
+        if( ftruncate( m_file, off_t( newBytes ) ) != 0 ) throw std::runtime_error( "cannot grow zone index section" );
+        m_data = static_cast<uint8_t*>( mmap( nullptr, size_t( newBytes ), PROT_READ | PROT_WRITE, MAP_SHARED, m_file, 0 ) );
+        if( m_data == MAP_FAILED ) { m_data = nullptr; throw std::runtime_error( "cannot map grown zone index section" ); }
+#endif
+        m_count = newCount;
+        m_bytes = newBytes;
+        reinterpret_cast<ZoneSectionHeader*>( m_data )->count = newCount;
+    }
+
     std::filesystem::path m_path;
     uint8_t* m_data = nullptr;
     uint64_t m_count = 0;
@@ -1135,6 +1172,7 @@ public:
     TRACY_INDEX_FORWARD2( std::vector<analysis::SymbolAddressMappingDto>, GetSymbolAddressMappings, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::optional<analysis::SymbolAddressMappingDto>, ResolveSymbolAddress, uint64_t, address )
     TRACY_INDEX_FORWARD0( std::vector<analysis::SourceLocationDto>, GetSourceLocations )
+    TRACY_INDEX_FORWARD0( std::vector<analysis::CallsiteDto>, GetCallsites )
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveParentCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes )

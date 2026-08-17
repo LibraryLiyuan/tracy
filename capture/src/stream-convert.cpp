@@ -277,6 +277,28 @@ int main( int argc, char** argv )
         std::fprintf( stderr, "Journal does not contain a bidirectional Tracy handshake.\n" );
         return 2;
     }
+    std::vector<bool> orderIndependentServerRecords;
+    orderIndependentServerRecords.reserve( serverRecords.size() );
+    {
+        PayloadReader serverReader( options.input );
+        std::vector<uint8_t> payload;
+        std::string error;
+        if( !serverReader.IsOpen() )
+        {
+            std::fprintf( stderr, "Cannot open journal for server dependency analysis.\n" );
+            return 2;
+        }
+        for( const auto& record : serverRecords )
+        {
+            if( !serverReader.Read( record, payload, error ) )
+            {
+                std::fprintf( stderr, "Cannot read server dependency record: %s.\n", error.c_str() );
+                return 2;
+            }
+            const tracy::stream::ReplayServerPacket packet { record.sequence, record.flags, payload };
+            orderIndependentServerRecords.push_back( tracy::stream::IsOrderIndependentServerQuery( packet ) );
+        }
+    }
     bool recordedEndsWithTerminate = false;
     {
         PayloadReader tailReader( options.input );
@@ -376,7 +398,7 @@ int main( int argc, char** argv )
     const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
     tracy::Worker worker( "127.0.0.1", options.port, -1, nullptr, tracy::Worker::Mode::Full,
         tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
-        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly );
+        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true );
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
 
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
@@ -399,6 +421,7 @@ int main( int argc, char** argv )
     }
 
     ReplayError replayError;
+    std::atomic<uint64_t> replayedServerSequence { 0 };
     std::thread verifier( [&] {
         const auto failReplay = [&]( std::string message ) {
             replayError.Set( std::move( message ) );
@@ -436,6 +459,12 @@ int main( int argc, char** argv )
                 failReplay( error );
                 return;
             }
+            // Preserve the journal's cross-direction causal ordering. Client
+            // responses must not be replayed before the Worker has emitted the
+            // earlier query they answer. Definition queries may still reorder
+            // within a consecutive server batch; the transcript verifier
+            // validates those batches by content and multiplicity.
+            replayedServerSequence.store( record.sequence, std::memory_order_release );
         }
         if( !transcriptVerifier.Finish( error ) )
         {
@@ -452,8 +481,33 @@ int main( int argc, char** argv )
     {
         std::vector<uint8_t> payload;
         std::string error;
+        size_t serverDependencyCursor = 0;
         auto replayClientRecord = [&]( const tracy::stream::RecordInfo& record ) {
             if( replayError.Failed() ) return false;
+            uint64_t requiredServerSequence = 0;
+            while( serverDependencyCursor < serverRecords.size() &&
+                serverRecords[serverDependencyCursor].sequence < record.sequence )
+            {
+                if( !orderIndependentServerRecords[serverDependencyCursor] )
+                    requiredServerSequence = serverRecords[serverDependencyCursor].sequence;
+                serverDependencyCursor++;
+            }
+            if( requiredServerSequence != 0 )
+            {
+                const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
+                    !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
+                {
+                    std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+                }
+                if( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence )
+                {
+                    replayError.Set( "sequence " + std::to_string( record.sequence ) +
+                        ": timed out waiting for preceding server sequence " +
+                        std::to_string( requiredServerSequence ) );
+                    return false;
+                }
+            }
             if( !clientReader.Read( record, payload, error ) )
             {
                 replayError.Set( "sequence " + std::to_string( record.sequence ) + ": " + error );

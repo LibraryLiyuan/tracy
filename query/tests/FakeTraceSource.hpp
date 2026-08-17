@@ -77,7 +77,7 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override
     {
         std::vector<analysis::Capability> result;
-        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "correlation", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "io", "statistics", "compare", "validation" } )
+        for( const auto* domain : { "system", "trace", "capture", "catalog", "thread", "cpu", "context_switch", "frame", "frame_image", "timeline", "correlation", "zone.cpu", "zone.gpu", "callstack", "sample", "hardware_sample", "symbol", "source", "source.callsite", "memory", "memory.gpu", "lock", "plot", "message", "job", "job.gfx", "io", "statistics", "compare", "validation" } )
         {
             result.push_back( { domain, true, true, true, "deterministic fake data", {} } );
         }
@@ -113,7 +113,7 @@ public:
         value.counts.threads = value.counts.locks = value.counts.plots = value.counts.messages = 1;
         value.counts.memoryEvents = value.counts.memoryPools = value.counts.contextSwitches = 1;
         value.counts.callstackPayloads = value.counts.callstackFrames = value.counts.samples = 1;
-        value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = 1;
+        value.counts.hardwareSamples = value.counts.symbols = value.counts.sourceLocations = value.counts.sourceCacheFiles = value.counts.frameImages = value.counts.callsites = 1;
         value.counts.jobTypes = value.counts.jobs = value.counts.jobDependencies = value.counts.jobStages = 1;
         value.counts.gfxDispatches = 1; value.counts.gfxEntities = 5; value.counts.gfxLinks = 11;
         value.counts.correlatedFrameEvents = 4;
@@ -438,6 +438,19 @@ public:
     std::vector<analysis::SymbolAddressMappingDto> GetSymbolAddressMappings( size_t offset, size_t limit ) const override { return offset == 0 && limit ? std::vector<analysis::SymbolAddressMappingDto> { { MakeEntityRef( "symbol-address", 1 ), "0x1", MakeEntityRef( "symbol", 1 ), "0x1", 0, true } } : std::vector<analysis::SymbolAddressMappingDto> {}; }
     std::optional<analysis::SymbolAddressMappingDto> ResolveSymbolAddress( uint64_t address ) const override { return address == 1 ? std::optional( GetSymbolAddressMappings( 0, 1 ).front() ) : std::nullopt; }
     std::vector<analysis::SourceLocationDto> GetSourceLocations() const override { return { { MakeEntityRef( "source", 1 ), "Fake", "Fake", "fake.cpp", 1, 0, 1, false } }; }
+    std::vector<analysis::CallsiteDto> GetCallsites() const override
+    {
+        analysis::CallsiteDto value;
+        value.ref = MakeEntityRef( "callsite", 7 );
+        value.callsiteId = 7;
+        value.threadRef = MakeEntityRef( "thread", 1 );
+        value.sourceLocationRef = MakeEntityRef( "source", 1 );
+        value.callstack = 1;
+        value.stackRef = MakeEntityRef( "callstack", 1 );
+        value.domain = 1;
+        value.provenance = "SiteReused";
+        return { value };
+    }
 
     std::vector<analysis::CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override { if( callstacks.empty() || maxDepth == 0 ) return {}; return { { MakeEntityRef( "callstack-frame", 1 ), "FakeSymbol", "fake.cpp", 1, "0x1", "0x1", false, callstacks.front(), 0, "fake.dll" } }; }
     std::vector<analysis::CallstackFrameDto> ResolveParentCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override { return ResolveCallstacks( callstacks, maxDepth ); }

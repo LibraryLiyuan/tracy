@@ -49,7 +49,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "io.search", "io.get", "io.statistics", "io.chain", "network.capabilities",
         "callstack.resolve", "callstack.frames", "callstack.parent", "callstack.batch", "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph", "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities",
         "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly",
-        "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw",
+        "source.locations", "source.callsite", "source.callsite.search", "source.statistics", "source.embedded", "source.lines", "source.raw",
         "timeline.slice", "statistics.describe", "statistics.compute", "compare.compatibility", "compare.normalized", "compare.zones", "compare.frames", "compare.source", "validation.run"
     };
     return methods;
@@ -64,6 +64,7 @@ nlohmann::json RequiredParametersFor( const std::string& method )
     if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "io.chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
         method == "symbol.raw_code" || method == "symbol.disassembly" || method == "frame_image.metadata" || method == "frame_image.resource" || method == "frame_image.raw" ) required.emplace_back( "ref" );
     if( method == "memory.frame_snapshot" ) required.emplace_back( "frame_index" );
+    if( method == "source.callsite" ) required.emplace_back( "callsite_id" );
     if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
     if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
     if( method == "producer.get" ) required.emplace_back( "key" );
@@ -82,6 +83,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
     using nlohmann::json;
     if( name == "limit" ) return { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumPageSize } };
     if( name == "frame_index" || name == "base_frame_index" || name == "target_frame_index" || name == "index" || name == "warmup_frames" || name == "window_frames" ) return { { "type", "integer" }, { "minimum", 0 }, { "maximum", 1000000 } };
+    if( name == "callsite_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", std::numeric_limits<uint32_t>::max() } }, json { { "type", "string" }, { "pattern", "^[1-9][0-9]*$" } } } ) } };
     if( name == "allow_warnings" ) return { { "type", "boolean" } };
     if( name == "comparison_mode" ) return { { "type", "string" }, { "enum", { "performance", "contract" } } };
     if( name == "max_scan_events" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxScanEvents } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
@@ -96,6 +98,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
 
 std::string MethodDomain( const std::string& method )
 {
+    if( method.rfind( "source.callsite", 0 ) == 0 ) return "source.callsite";
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" ) return "evidence";
     if( method.rfind( "runtime.domain.", 0 ) == 0 ) return "runtime.domain";
     if( method.rfind( "runtime.script.", 0 ) == 0 ) return "runtime.script";
@@ -187,6 +190,12 @@ const nlohmann::json& QueryOperationSchemaRegistry()
             }
             else if( method == "runtime.domain.states" )
             {
+                properties["domain"] = ParameterSchemaFor( "domain" );
+            }
+            else if( method == "source.callsite" || method == "source.callsite.search" )
+            {
+                properties["callsite_id"] = ParameterSchemaFor( "callsite_id" );
+                properties["provenance"] = ParameterSchemaFor( "provenance" );
                 properties["domain"] = ParameterSchemaFor( "domain" );
             }
             json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", true } };
@@ -520,7 +529,8 @@ json CountsJson( const analysis::TraceCountsDto& value )
         { "relations", Decimal( value.relations ) }, { "runtime_domain_states", Decimal( value.runtimeDomainStates ) },
         { "gpu_reference_passes", Decimal( value.gpuReferencePasses ) },
         { "gpu_reference_uses", Decimal( value.gpuReferenceUses ) },
-        { "gpu_reference_ends", Decimal( value.gpuReferenceEnds ) }
+        { "gpu_reference_ends", Decimal( value.gpuReferenceEnds ) },
+        { "callsites", Decimal( value.callsites ) }
     };
 }
 
@@ -619,6 +629,10 @@ json CpuZoneJson( const analysis::CpuZoneDto& value )
         { "running_regions", Decimal( value.runningRegions ) }, { "child_count", value.childCount },
         { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
+        { "callsite_id", value.callsiteId ? json( *value.callsiteId ) : json( nullptr ) },
+        { "stack_ref", value.stackRef ? json( *value.stackRef ) : json( nullptr ) },
+        { "provenance", value.stackProvenance },
+        { "unavailable_reason", value.stackUnavailableReason ? json( *value.stackUnavailableReason ) : json( nullptr ) },
         { "extra_index", value.extraIndex }, { "extra_valid", value.extraValid },
         { "extra_name", value.extraName ? json( *value.extraName ) : json( nullptr ) },
         { "extra_text", value.extraText ? json( *value.extraText ) : json( nullptr ) },
@@ -639,6 +653,10 @@ json GpuZoneJson( const analysis::GpuZoneDto& value )
         { "cpu_start_ns", Decimal( value.cpuStartNs ) }, { "cpu_end_ns", value.cpuEndNs ? json( Decimal( *value.cpuEndNs ) ) : json( nullptr ) },
         { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
         { "callstack_ref", value.callstackRef ? json( *value.callstackRef ) : json( nullptr ) },
+        { "callsite_id", value.callsiteId ? json( *value.callsiteId ) : json( nullptr ) },
+        { "stack_ref", value.stackRef ? json( *value.stackRef ) : json( nullptr ) },
+        { "provenance", value.stackProvenance },
+        { "unavailable_reason", value.stackUnavailableReason ? json( *value.stackUnavailableReason ) : json( nullptr ) },
         { "query_id", value.queryIdAvailability.available ? json( value.queryId ) : json( nullptr ) },
         { "field_availability", { { "query_id", FieldAvailabilityJson( value.queryIdAvailability ) } } },
         { "complete", value.complete }, { "trust", "untrusted_trace_data" }
@@ -1955,6 +1973,19 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         { "producers", producers }, { "quality_findings", globalFindings }, { "invalid_records", invalid },
         { "records", { { "seen", seen }, { "valid", [&] { size_t count = 0; for( const auto& item : byProducer ) count += item.second.size(); return count; }() },
             { "duplicates", duplicates }, { "envelope_bytes", Decimal( envelopeBytes ) } } },
+        { "trust", "untrusted_trace_data" }
+    };
+}
+
+json CallsiteJson( const analysis::CallsiteDto& value )
+{
+    return {
+        { "ref", value.ref }, { "callsite_id", value.callsiteId },
+        { "thread_ref", value.threadRef }, { "source_location_ref", value.sourceLocationRef },
+        { "stack_ref", value.stackRef ? json( *value.stackRef ) : json( nullptr ) },
+        { "callstack", value.callstack == 0 ? json( nullptr ) : json( Decimal( uint64_t( value.callstack ) ) ) },
+        { "domain", value.domain }, { "provenance", value.provenance }, { "flags", value.flags },
+        { "unavailable_reason", value.unavailableReason ? json( *value.unavailableReason ) : json( nullptr ) },
         { "trust", "untrusted_trace_data" }
     };
 }
@@ -8828,6 +8859,36 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json values = json::array(); for( size_t index = begin; index < end; index++ ) values.emplace_back( SourceLocationJson( locations[index] ) );
         const auto cursor = NextCursor( page, method, trace, values.size(), end < locations.size() );
         return Success( id, { { "source_locations", std::move( values ) } }, trace, PageJson( page, end - begin, cursor ) );
+    }
+    if( method == "source.callsite" || method == "source.callsite.search" )
+    {
+        auto callsites = source->GetCallsites();
+        if( method == "source.callsite" )
+        {
+            const auto requested = uint32_t( UnsignedParameter( params, "callsite_id", 0, std::numeric_limits<uint32_t>::max() ) );
+            const auto it = std::find_if( callsites.begin(), callsites.end(), [&]( const auto& value ) { return value.callsiteId == requested; } );
+            if( it == callsites.end() ) throw QueryError( "ENTITY_NOT_FOUND", "callsite_id was not found" );
+            return Success( id, CallsiteJson( *it ), trace );
+        }
+
+        std::optional<uint32_t> requestedId;
+        if( params.contains( "callsite_id" ) ) requestedId = uint32_t( UnsignedParameter( params, "callsite_id", 0, std::numeric_limits<uint32_t>::max() ) );
+        const auto requestedProvenance = params.value( "provenance", std::string() );
+        const auto requestedDomain = params.value( "domain", std::string() );
+        callsites.erase( std::remove_if( callsites.begin(), callsites.end(), [&]( const auto& value ) {
+            if( requestedId && value.callsiteId != *requestedId ) return true;
+            if( !requestedProvenance.empty() && value.provenance != requestedProvenance ) return true;
+            if( !requestedDomain.empty() && std::to_string( value.domain ) != requestedDomain ) return true;
+            const auto searchable = std::to_string( value.callsiteId ) + " " + value.threadRef + " " + value.sourceLocationRef + " " + value.provenance + " " + value.unavailableReason.value_or( "" );
+            return !TextMatches( searchable, params );
+        } ), callsites.end() );
+        const auto page = ParsePage( params, method, trace );
+        const size_t begin = std::min( page.offset, callsites.size() );
+        const size_t end = std::min( begin + page.limit, callsites.size() );
+        json values = json::array();
+        for( size_t index = begin; index < end; index++ ) values.emplace_back( CallsiteJson( callsites[index] ) );
+        const auto cursor = NextCursor( page, method, trace, values.size(), end < callsites.size() );
+        return Success( id, { { "callsites", std::move( values ) } }, trace, PageJson( page, end - begin, cursor ) );
     }
     if( method == "source.statistics" )
     {

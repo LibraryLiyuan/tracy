@@ -513,7 +513,8 @@ public:
     Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver = nullptr,
         Mode mode = Mode::Full, size_t recorderDefinitionLimit = DefaultRecorderDefinitionLimit,
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
-        uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false );
+        uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
+        bool allowEarlyProtocolDefinitions = false );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
@@ -845,6 +846,7 @@ private:
     tracy_force_inline void ProcessThreadContext( const QueueThreadContext& ev );
     tracy_force_inline void ProcessZoneBegin( const QueueZoneBegin& ev );
     tracy_force_inline void ProcessZoneBeginCallstack( const QueueZoneBegin& ev );
+    tracy_force_inline void ProcessJnZoneBeginCallsite( const QueueJnZoneBeginCallsite& ev );
     tracy_force_inline void ProcessZoneBeginAllocSrcLoc( const QueueZoneBeginLean& ev );
     tracy_force_inline void ProcessZoneBeginAllocSrcLocCallstack( const QueueZoneBeginLean& ev );
     tracy_force_inline void ProcessZoneEnd( const QueueZoneEnd& ev );
@@ -884,6 +886,7 @@ private:
     tracy_force_inline void ProcessGpuNewContext( const QueueGpuNewContext& ev );
     tracy_force_inline void ProcessGpuZoneBegin( const QueueGpuZoneBegin& ev, bool serial );
     tracy_force_inline void ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool serial );
+    tracy_force_inline void ProcessJnGpuZoneBeginCallsite( const QueueJnGpuZoneBeginCallsite& ev );
     tracy_force_inline void ProcessGpuZoneBeginAllocSrcLoc( const QueueGpuZoneBeginLean& ev, bool serial );
     tracy_force_inline void ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLean& ev, bool serial );
     tracy_force_inline void ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial );
@@ -950,6 +953,7 @@ private:
     tracy_force_inline void ProcessJnGpuReferenceEnd( const QueueJnGpuReferenceEnd& ev );
     tracy_force_inline void ProcessJnScriptFrame( const QueueJnScriptFrame& ev );
     tracy_force_inline void ProcessJnScriptStack( const QueueJnScriptStack& ev );
+    tracy_force_inline void ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
@@ -1158,6 +1162,7 @@ private:
     bool m_deferSymbolExpansion = false;
     uint32_t m_serverQuerySpaceOverride = 0;
     bool m_useRecorderDrainState = false;
+    bool m_allowEarlyProtocolDefinitions = false;
     size_t m_recorderDefinitionLimit = DefaultRecorderDefinitionLimit;
     size_t m_recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit;
     std::atomic<bool> m_protocolResolverFailed { false };
@@ -1209,6 +1214,9 @@ private:
     uint32_t m_pendingCallstackId = 0;
     unordered_flat_map<uint32_t, uint32_t> m_callstackSampleDictionary;
     unordered_flat_map<uint32_t, std::vector<JnGpuReferenceSetEntry>> m_jnGpuResourceSets;
+    unordered_flat_map<uint32_t, uint32_t> m_jnCallsiteCallstacks;
+    unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
+    unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;

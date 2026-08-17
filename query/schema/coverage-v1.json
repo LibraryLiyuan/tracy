@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.26.0",
+  "schema_version": "1.28.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
   "domain_status": "complete",
@@ -34,6 +34,7 @@
     { "domain": "hardware_sample", "worker_data": ["hwSamples", "hasBranchRetirement"], "methods": ["hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities"], "status": "complete", "tests": ["FakeTraceSource", "pagination contract"] },
     { "domain": "symbol", "worker_data": ["symbolMap", "symbolCode", "codeSymbolMap"], "methods": ["symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly"], "status": "complete", "tests": ["FakeTraceSource", "bounded resource contract", "native Capstone build"] },
     { "domain": "source", "worker_data": ["sourceLocation", "sourceLocationPayload", "sourceFileCache"], "methods": ["source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw"], "status": "complete", "tests": ["FakeTraceSource", "MCP resource read", "two-trace source diff"] },
+    { "domain": "source.callsite", "worker_data": ["JnTraceData.callsites", "callstackPayload"], "methods": ["source.callsite", "source.callsite.search"], "status": "complete", "tests": ["ProtocolTests", "N25 SiteReuse synthetic/live/save/load/stream/replay"] },
     { "domain": "memory", "worker_data": ["memData", "memNameMap", "memory plots"], "methods": ["memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates"], "status": "complete", "tests": ["deterministic Memory unit", "Fresh1 Worker frame snapshot", "Profiler shared-core build"] },
     { "domain": "memory.gpu", "worker_data": ["D3D12 named memory and allocation callstacks", "logical allocation id", "GTMEM1 owner/reference relations", "GTMEM2 origin/residency records", "DXGI and EngineKnownPhysical plots"], "methods": ["memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn"], "status": "complete", "tests": ["deterministic GTMEM1/GTMEM2 unit", "N10 Worker integration", "snapshot/stream/replay MCP acceptance"] },
     { "domain": "runtime.script", "worker_data": ["binary Script schema 2 frame/stack/marker/zone records", "legacy JNSTK1 capability/frame/stack/marker AppInfo", "legacy JNSZ1 begin/end messages", "normal Tracy CPU zone remains separate"], "methods": ["runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones"], "status": "complete", "tests": ["N11 deterministic Managed/Lua records", "N16 real managed/Lua Evidence source chain", "old trace present=false", "snapshot/stream/replay MCP acceptance"] },

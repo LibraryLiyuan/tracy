@@ -8,7 +8,7 @@ namespace tracy
 {
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
-static constexpr uint16_t JnTraceSchemaVersion = 7;
+static constexpr uint16_t JnTraceSchemaVersion = 8;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -226,6 +226,18 @@ struct JnScriptStackData
     uint8_t kind;
 };
 
+struct JnCallsiteData
+{
+    uint64_t thread;
+    uint32_t callsiteId;
+    uint32_t callstack;
+    int16_t sourceLocation;
+    uint8_t domain;
+    uint8_t provenance;
+    uint8_t flags;
+    uint8_t unavailableReason;
+};
+
 #pragma pack( pop )
 
 struct JnTraceData
@@ -251,6 +263,7 @@ struct JnTraceData
     std::vector<JnGpuReferenceEndData> gpuReferenceEnds;
     std::vector<JnScriptFrameData> scriptFrames;
     std::vector<JnScriptStackData> scriptStacks;
+    std::vector<JnCallsiteData> callsites;
 };
 
 }

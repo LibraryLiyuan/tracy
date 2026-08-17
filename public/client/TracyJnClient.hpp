@@ -17,6 +17,30 @@ static constexpr uint16_t JnScriptSchemaVersion = 2;
 #  define TracyJnOnDemandGuard
 #endif
 
+// Cold-path SiteReuse definition. The native stack is unwound once for the
+// active connection; later CPU/GPU zone events carry only callsiteId.
+tracy_force_inline bool EmitJnCallsiteDefinition( uint64_t sourceLocation, uint32_t callsiteId,
+    uint8_t domain, uint8_t provenance, uint8_t unavailableReason, int32_t depth, uint64_t connectionId )
+{
+    if( sourceLocation == 0 || callsiteId == 0 || connectionId == 0 ) return false;
+    const bool withCallstack = depth > 0 && has_callstack();
+    auto item = withCallstack ?
+        Profiler::QueueSerialCallstackForConnection( Callstack( depth ), connectionId ) :
+        Profiler::QueueSerialForConnection( connectionId );
+    if( item == nullptr ) return false;
+    MemWrite( &item->hdr.type, QueueType::JnCallsiteDefinition );
+    MemWrite( &item->jnCallsiteDefinition.srcloc, sourceLocation );
+    MemWrite( &item->jnCallsiteDefinition.callsiteId, callsiteId );
+    MemWrite( &item->jnCallsiteDefinition.thread, GetThreadHandle() );
+    MemWrite( &item->jnCallsiteDefinition.domain, domain );
+    MemWrite( &item->jnCallsiteDefinition.provenance, provenance );
+    MemWrite( &item->jnCallsiteDefinition.flags,
+        withCallstack ? uint8_t( JnCallsiteFlags::HasCallstack ) : uint8_t( JnCallsiteFlags::None ) );
+    MemWrite( &item->jnCallsiteDefinition.unavailableReason, unavailableReason );
+    Profiler::QueueSerialFinish();
+    return true;
+}
+
 tracy_force_inline void EmitJnJobType( const char* name, uint32_t typeId, uint8_t kind, uint8_t flags )
 {
     TracyJnOnDemandGuard;
@@ -419,6 +443,7 @@ tracy_force_inline void EmitJnScriptMarker( const char* name, uint32_t markerId,
 #else
 
 tracy_force_inline void EmitJnJobType( const char*, uint32_t, uint8_t, uint8_t ) {}
+tracy_force_inline bool EmitJnCallsiteDefinition( uint64_t, uint32_t, uint8_t, uint8_t, uint8_t, int32_t, uint64_t ) { return false; }
 tracy_force_inline void EmitJnJobSchedule( uint64_t, uint64_t, uint16_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnJobConfig( uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnJobDependency( uint64_t, uint64_t, uint64_t, uint8_t ) {}

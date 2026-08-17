@@ -2889,6 +2889,7 @@ Profiler::DequeueStatus Profiler::Dequeue( moodycamel::ConsumerToken& token )
                     }
                     case QueueType::ZoneBegin:
                     case QueueType::ZoneBeginCallstack:
+                    case QueueType::JnZoneBeginCallsite:
                     {
                         int64_t t = MemRead<int64_t>( &item->zoneBegin.time );
                         int64_t dt = t - refThread;
@@ -3426,6 +3427,17 @@ Profiler::DequeueStatus Profiler::DequeueSerial()
                     assert( false );
                     break;
                 }
+            }
+            else if( (QueueType)idx == QueueType::JnGpuZoneBeginCallsite )
+            {
+                // JN GPU callsite zones are serialized after Terminate in the
+                // protocol enum, but share the regular serial GPU-zone clock.
+                // Normalize their absolute client timestamp before the matching
+                // GpuZoneEndSerial advances the same reference clock.
+                int64_t t = MemRead<int64_t>( &item->gpuZoneBegin.cpuTime );
+                int64_t dt = t - refSerial;
+                refSerial = t;
+                MemWrite( &item->gpuZoneBegin.cpuTime, dt );
             }
 #ifdef TRACY_FIBERS
             else

@@ -114,6 +114,7 @@ struct TraceCountsDto
     uint64_t gpuReferencePasses = 0;
     uint64_t gpuReferenceUses = 0;
     uint64_t gpuReferenceEnds = 0;
+    uint64_t callsites = 0;
 };
 
 struct TraceInfoDto
@@ -296,6 +297,10 @@ struct CpuZoneDto
     std::optional<int64_t> endNs;
     uint32_t callstack = 0;
     std::optional<std::string> callstackRef;
+    std::optional<uint32_t> callsiteId;
+    std::optional<std::string> stackRef;
+    std::string stackProvenance = "Unavailable";
+    std::optional<std::string> stackUnavailableReason;
     uint32_t childCount = 0;
     std::optional<int64_t> selfTimeNs;
     std::optional<int64_t> runningTimeNs;
@@ -326,6 +331,10 @@ struct GpuZoneDto
     std::optional<int64_t> cpuEndNs;
     uint32_t callstack = 0;
     std::optional<std::string> callstackRef;
+    std::optional<uint32_t> callsiteId;
+    std::optional<std::string> stackRef;
+    std::string stackProvenance = "Unavailable";
+    std::optional<std::string> stackUnavailableReason;
     uint32_t childCount = 0;
     std::optional<int64_t> selfTimeNs;
     bool complete = true;
@@ -514,6 +523,20 @@ struct PlotPointDto
     std::string plotRef;
     int64_t timeNs = 0;
     double value = 0;
+};
+
+struct CallsiteDto
+{
+    std::string ref;
+    uint32_t callsiteId = 0;
+    std::string threadRef;
+    std::string sourceLocationRef;
+    uint32_t callstack = 0;
+    std::optional<std::string> stackRef;
+    uint8_t domain = 0;
+    std::string provenance;
+    uint8_t flags = 0;
+    std::optional<std::string> unavailableReason;
 };
 
 struct ZoneValidationFindingDto
@@ -945,6 +968,7 @@ public:
     virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
     virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
+    virtual std::vector<CallsiteDto> GetCallsites() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

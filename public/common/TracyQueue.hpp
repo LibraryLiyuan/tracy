@@ -73,6 +73,7 @@ enum class QueueType : uint8_t
     FiberLeave,
     JnGpuReferenceSetDefinitionChunk,
     JnGpuReferenceSetUseFat,
+    JnZoneBeginCallsite,
     Terminate,
     KeepAlive,
     ThreadContext,
@@ -137,6 +138,8 @@ enum class QueueType : uint8_t
     JnGpuReferenceEnd,
     JnScriptFrame,
     JnScriptStack,
+    JnCallsiteDefinition,
+    JnGpuZoneBeginCallsite,
     StringData,
     ThreadName,
     PlotName,
@@ -175,6 +178,13 @@ struct QueueZoneBegin : public QueueZoneBeginLean
 struct QueueZoneBeginThread : public QueueZoneBegin
 {
     uint32_t thread;
+};
+
+// N25 SiteReuse zone event. The callstack is captured once by the matching
+// JnCallsiteDefinition and reused by the Worker for every zone instance.
+struct QueueJnZoneBeginCallsite : public QueueZoneBegin
+{
+    uint32_t callsiteId;
 };
 
 struct QueueZoneEnd
@@ -961,6 +971,38 @@ struct QueueJnScriptStack
     uint8_t kind;
 };
 
+enum class JnStackProvenance : uint8_t
+{
+    ExactSource = 0,
+    SiteReused = 1,
+    PerEventExact = 2,
+    Unavailable = 3
+};
+
+enum class JnCallsiteFlags : uint8_t
+{
+    None = 0,
+    HasCallstack = 1 << 0
+};
+
+struct QueueJnCallsiteDefinition
+{
+    uint64_t srcloc;
+    uint32_t callsiteId;
+    uint32_t thread;
+    uint8_t domain;
+    uint8_t provenance;
+    uint8_t flags;
+    uint8_t unavailableReason;
+};
+
+// QueueGpuZoneBegin is 27 bytes. Adding the 32-bit callsite id consumes the
+// full 31-byte payload without changing Tracy's fixed QueueItem size.
+struct QueueJnGpuZoneBeginCallsite : public QueueGpuZoneBegin
+{
+    uint32_t callsiteId;
+};
+
 struct QueueGpuTime
 {
     int64_t gpuTime;
@@ -1239,6 +1281,7 @@ struct QueueItem
     {
         QueueThreadContext threadCtx;
         QueueZoneBegin zoneBegin;
+        QueueJnZoneBeginCallsite jnZoneBeginCallsite;
         QueueZoneBeginLean zoneBeginLean;
         QueueZoneBeginThread zoneBeginThread;
         QueueZoneEnd zoneEnd;
@@ -1347,6 +1390,8 @@ struct QueueItem
         QueueJnGpuReferenceEnd jnGpuReferenceEnd;
         QueueJnScriptFrame jnScriptFrame;
         QueueJnScriptStack jnScriptStack;
+        QueueJnCallsiteDefinition jnCallsiteDefinition;
+        QueueJnGpuZoneBeginCallsite jnGpuZoneBeginCallsite;
     };
 };
 #pragma pack( pop )
@@ -1419,6 +1464,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueFiberLeave ),
     sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local dictionary chunk - not for wire transfer
     sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local packet - not for wire transfer
+    sizeof( QueueHeader ) + sizeof( QueueJnZoneBeginCallsite ), // JN SiteReuse CPU zone
     // above items must be first
     sizeof( QueueHeader ),                                  // terminate
     sizeof( QueueHeader ),                                  // keep alive
@@ -1484,6 +1530,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnGpuReferenceEnd ),
     sizeof( QueueHeader ) + sizeof( QueueJnScriptFrame ),
     sizeof( QueueHeader ) + sizeof( QueueJnScriptStack ),
+    sizeof( QueueHeader ) + sizeof( QueueJnCallsiteDefinition ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuZoneBeginCallsite ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1532,6 +1580,11 @@ static_assert( uint8_t( QueueType::JnGpuReferenceSetUse ) > uint8_t( QueueType::
 static_assert( sizeof( QueueJnGpuReferenceEnd ) == 31, "JN GPU reference end payload size mismatch" );
 static_assert( sizeof( QueueJnScriptFrame ) == 26, "JN script frame payload size mismatch" );
 static_assert( sizeof( QueueJnScriptStack ) == 31, "JN script stack payload size mismatch" );
+static_assert( sizeof( QueueJnZoneBeginCallsite ) == 20, "JN CPU callsite-zone payload size mismatch" );
+static_assert( sizeof( QueueJnCallsiteDefinition ) == 20, "JN callsite definition payload size mismatch" );
+static_assert( sizeof( QueueJnGpuZoneBeginCallsite ) == 27, "JN GPU callsite-zone payload size mismatch" );
+static_assert( uint8_t( QueueType::JnZoneBeginCallsite ) < uint8_t( QueueType::Terminate ),
+    "JN CPU callsite-zone event must remain thread-context encoded" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );
 static_assert( sizeof( void* ) <= sizeof( uint64_t ), "Pointer size > 8 bytes" );
 static_assert( sizeof( void* ) == sizeof( uintptr_t ), "Pointer size != uintptr_t" );

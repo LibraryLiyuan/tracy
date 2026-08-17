@@ -314,7 +314,7 @@ LoadProgress Worker::s_loadProgress;
 
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
-    uint32_t serverQuerySpaceOverride, bool useRecorderDrainState )
+    uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions )
     : m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
@@ -322,6 +322,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     , m_deferSymbolExpansion( mode == Mode::ProtocolOnly || deferSymbolExpansion )
     , m_serverQuerySpaceOverride( serverQuerySpaceOverride )
     , m_useRecorderDrainState( mode == Mode::ProtocolOnly || useRecorderDrainState )
+    , m_allowEarlyProtocolDefinitions( allowEarlyProtocolDefinitions )
     , m_recorderDefinitionLimit( recorderDefinitionLimit )
     , m_recorderQueryQueueLimit( recorderQueryQueueLimit )
     , m_hasData( false )
@@ -1914,6 +1915,10 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         {
             ReadJnVector( f, jn.scriptFrames, "script frame" );
             ReadJnVector( f, jn.scriptStacks, "script stack" );
+        }
+        if( schemaVersion >= 8 )
+        {
+            ReadJnVector( f, jn.callsites, "callsite" );
         }
     }
 
@@ -4371,6 +4376,10 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
         CheckSourceLocation( ev.zoneBegin.srcloc );
         RecorderCheckCurrentThread();
         break;
+    case QueueType::JnZoneBeginCallsite:
+        CheckSourceLocation( ev.jnZoneBeginCallsite.srcloc );
+        RecorderCheckCurrentThread();
+        break;
     case QueueType::ZoneBeginAllocSrcLoc:
     case QueueType::ZoneBeginAllocSrcLocCallstack:
         if( m_pendingSourceLocationPayload == 0 )
@@ -4693,6 +4702,19 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
             CheckString( ev.jnScriptStack.secondaryId );
         RecorderCheckCurrentThread();
         break;
+    case QueueType::JnCallsiteDefinition:
+        CheckSourceLocation( ev.jnCallsiteDefinition.srcloc );
+        if( ( ev.jnCallsiteDefinition.flags & uint8_t( JnCallsiteFlags::HasCallstack ) ) != 0 )
+        {
+            if( !m_recorderSerialCallstack ) RecorderFail( "JN callsite definition is missing its serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        else if( m_recorderSerialCallstack )
+        {
+            RecorderFail( "JN callsite definition has an unexpected serial callstack." );
+            m_recorderSerialCallstack = false;
+        }
+        break;
     case QueueType::JnJobStage:
         RecorderCheckCurrentThread();
         if( JnJobStage( ev.jnJobStage.stage ) == JnJobStage::ScheduleCallstack ||
@@ -4701,6 +4723,9 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
             if( !m_recorderSerialCallstack ) RecorderFail( "JN Job stage is missing its serial callstack." );
             m_recorderSerialCallstack = false;
         }
+        break;
+    case QueueType::JnGpuZoneBeginCallsite:
+        CheckSourceLocation( ev.jnGpuZoneBeginCallsite.srcloc );
         break;
     case QueueType::JnIoStage:
         RecorderCheckCurrentThread();
@@ -5177,9 +5202,21 @@ void Worker::AddString( uint64_t ptr, const char* str, size_t sz )
 
 void Worker::AddThreadString( uint64_t id, const char* str, size_t sz )
 {
+    auto it = m_data.threadNames.find( id );
+    if( m_allowEarlyProtocolDefinitions && it == m_data.threadNames.end() )
+    {
+        // A stream journal preserves the captured wire order, but Full replay
+        // may discover a thread later than the original recorder. Accept the
+        // already-recorded response without touching the pending counter and
+        // reproduce its query for transcript verification. This mode is only
+        // enabled by the offline converter.
+        const auto sl = StoreString( str, sz );
+        m_data.threadNames.emplace( id, sl.ptr );
+        Query( ServerQueryThreadString, id );
+        return;
+    }
     assert( m_pendingThreads > 0 );
     m_pendingThreads--;
-    auto it = m_data.threadNames.find( id );
     assert( it != m_data.threadNames.end() && strcmp( it->second, "???" ) == 0 );
     const auto sl = StoreString( str, sz );
     it->second = sl.ptr;
@@ -5898,6 +5935,9 @@ bool Worker::Process( const QueueItem& ev )
     case QueueType::ZoneBeginCallstack:
         ProcessZoneBeginCallstack( ev.zoneBegin );
         break;
+    case QueueType::JnZoneBeginCallsite:
+        ProcessJnZoneBeginCallsite( ev.jnZoneBeginCallsite );
+        break;
     case QueueType::ZoneBeginAllocSrcLoc:
         ProcessZoneBeginAllocSrcLoc( ev.zoneBeginLean );
         break;
@@ -6033,6 +6073,9 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::GpuZoneBeginCallstackSerial:
         ProcessGpuZoneBeginCallstack( ev.gpuZoneBegin, true );
+        break;
+    case QueueType::JnGpuZoneBeginCallsite:
+        ProcessJnGpuZoneBeginCallsite( ev.jnGpuZoneBeginCallsite );
         break;
     case QueueType::GpuZoneBeginAllocSrcLocSerial:
         ProcessGpuZoneBeginAllocSrcLoc( ev.gpuZoneBeginLean, true );
@@ -6253,6 +6296,9 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::JnScriptStack:
         ProcessJnScriptStack( ev.jnScriptStack );
+        break;
+    case QueueType::JnCallsiteDefinition:
+        ProcessJnCallsiteDefinition( ev.jnCallsiteDefinition );
         break;
     default:
         assert( false );
@@ -6503,6 +6549,54 @@ void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
+void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
+{
+    CheckSourceLocation( ev.srcloc );
+    uint32_t callstack = 0;
+    if( ( ev.flags & uint8_t( JnCallsiteFlags::HasCallstack ) ) != 0 )
+    {
+        assert( m_serialNextCallstack != 0 );
+        callstack = m_serialNextCallstack;
+        m_serialNextCallstack = 0;
+    }
+    else
+    {
+        assert( m_serialNextCallstack == 0 );
+    }
+
+    const auto sourceLocation = ShrinkSourceLocation( ev.srcloc );
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.callsites.push_back( JnCallsiteData { uint64_t( ev.thread ), ev.callsiteId, callstack,
+        sourceLocation, ev.domain, ev.provenance, ev.flags, ev.unavailableReason } );
+    m_jnCallsiteCallstacks[ev.callsiteId] = callstack;
+
+    const auto cpuPending = m_jnPendingCpuCallsites.find( ev.callsiteId );
+    if( cpuPending != m_jnPendingCpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( auto* zone : cpuPending->second )
+            {
+                auto& extra = RequestZoneExtra( *zone );
+                extra.callstack.SetVal( callstack );
+            }
+        }
+        m_jnPendingCpuCallsites.erase( cpuPending );
+    }
+
+    const auto gpuPending = m_jnPendingGpuCallsites.find( ev.callsiteId );
+    if( gpuPending != m_jnPendingGpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( auto* zone : gpuPending->second ) zone->callstack.SetVal( callstack );
+        }
+        m_jnPendingGpuCallsites.erase( gpuPending );
+    }
+}
+
 static tracy_force_inline int64_t RefTime( int64_t& reference, int64_t delta )
 {
     const auto refTime = reference + delta;
@@ -6575,6 +6669,25 @@ void Worker::ProcessZoneBeginCallstack( const QueueZoneBegin& ev )
     auto& extra = RequestZoneExtra( *zone );
     extra.callstack.SetVal( it->second );
     it->second = 0;
+}
+
+void Worker::ProcessJnZoneBeginCallsite( const QueueJnZoneBeginCallsite& ev )
+{
+    auto zone = AllocZoneEvent();
+    ProcessZoneBeginImpl( zone, ev );
+    const auto found = m_jnCallsiteCallstacks.find( ev.callsiteId );
+    if( found != m_jnCallsiteCallstacks.end() )
+    {
+        if( found->second != 0 )
+        {
+            auto& extra = RequestZoneExtra( *zone );
+            extra.callstack.SetVal( found->second );
+        }
+    }
+    else
+    {
+        m_jnPendingCpuCallsites[ev.callsiteId].push_back( zone );
+    }
 }
 
 void Worker::ProcessZoneBeginAllocSrcLoc( const QueueZoneBeginLean& ev )
@@ -9698,6 +9811,21 @@ void Worker::SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t
     }
 }
 
+void Worker::ProcessJnGpuZoneBeginCallsite( const QueueJnGpuZoneBeginCallsite& ev )
+{
+    auto zone = m_slab.Alloc<GpuEvent>();
+    ProcessGpuZoneBeginImpl( zone, ev, true );
+    const auto found = m_jnCallsiteCallstacks.find( ev.callsiteId );
+    if( found != m_jnCallsiteCallstacks.end() )
+    {
+        if( found->second != 0 ) zone->callstack.SetVal( found->second );
+    }
+    else
+    {
+        m_jnPendingGpuCallsites[ev.callsiteId].push_back( zone );
+    }
+}
+
 void Worker::Disconnect()
 {
     if( m_mode == Mode::Full )
@@ -10040,8 +10168,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = 0;
-    for( auto& v : m_data.gpuData ) sz += v->count;
+    // GpuCtxData::count only advances after a timestamp query has returned. The
+    // serialized timelines also contain zones that began before capture ended but
+    // whose query result was still pending, so use the actual created-zone count.
+    sz = m_data.gpuCnt;
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.gpuChildren.size();
     f.Write( &sz, sizeof( sz ) );
@@ -10411,6 +10541,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
     WriteJnVector( f, m_data.jnTrace.scriptFrames );
     WriteJnVector( f, m_data.jnTrace.scriptStacks );
+    WriteJnVector( f, m_data.jnTrace.callsites );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

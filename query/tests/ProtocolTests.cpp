@@ -76,6 +76,7 @@ static nlohmann::json ValidParams( const std::string& method, const std::string&
     if( method == "symbol.get" || method == "symbol.raw_code" || method == "symbol.disassembly" ) params["ref"] = "fake:symbol:1";
     if( method == "symbol.address" || method == "hardware_sample.address" || method == "hardware_sample.events" ) params["address"] = "0x1";
     if( method == "source.lines" || method == "source.raw" ) params["ref"] = "fake:source-file:0";
+    if( method == "source.callsite" ) params["callsite_id"] = 7;
     if( method == "statistics.compute" ) params["values_ns"] = json::array( { "1", "2", "3" } );
     if( method.rfind( "compare.", 0 ) == 0 ) params["baseline_trace_id"] = baselineId;
     return params;
@@ -138,7 +139,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 7 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 8 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
@@ -154,7 +155,7 @@ int main()
     static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( 0, -1 ) );
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.27.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.28.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -162,7 +163,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 38 );
+    assert( coverage.at( "domains" ).size() == 39 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -474,7 +475,7 @@ int main()
     assert( fake.ScanCpuZones( entire ).size() == 2 && fake.ScanGpuZones( entire ).size() == 2 && fake.ScanFrames( entire ).size() == 1 );
     assert( fake.ScanMemoryEvents( entire ).size() == 1 && fake.ScanMessages( entire ).size() == 1 && fake.ScanPlots( entire ).size() == 1 );
     assert( fake.ScanContextSwitchEvents( entire ).size() == 1 && fake.ScanCpuContextSwitchEvents( entire ).size() == 1 && fake.ScanSampleEvents( entire ).size() == 1 && fake.ScanGhostZones( entire ).size() == 1 );
-    assert( fake.ScanLockEvents( entire ).size() == 2 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 );
+    assert( fake.ScanLockEvents( entire ).size() == 2 && fake.GetHardwareSamples().size() == 1 && fake.GetSymbols().size() == 1 && fake.GetSourceLocations().size() == 1 && fake.GetCallsites().size() == 1 );
     assert( fake.ResolveCallstacks( { 1 }, 1 ).size() == 1 && fake.ResolveParentCallstacks( { 1 }, 1 ).size() == 1 );
     assert( fake.GetSourceResources().size() == 1 && fake.GetSymbolResources().size() == 1 && fake.GetFrameImageResources().size() == 1 );
     assert( fake.GetMemoryFrameSnapshot( 0, 0, {}, false ).valid );
@@ -750,7 +751,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.27.0" );
+    assert( described.at( "schema_version" ) == "1.28.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -762,9 +763,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.27.0" );
+        assert( operation.at( "schema_version" ) == "1.28.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.27.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.28.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {
@@ -1291,6 +1292,17 @@ int main()
     } ) ).at( "data" ).at( "source_locations" )[0];
     assert( sourceLocationFields.at( "native_id" ) == 1 );
     assert( sourceLocationFields.at( "dynamic" ) == false );
+
+    const auto callsiteFields = service.Execute( Request( requestId++, "source.callsite", {
+        { "trace_id", candidateId }, { "callsite_id", 7 }
+    } ) ).at( "data" );
+    assert( callsiteFields.at( "callsite_id" ) == 7 );
+    assert( callsiteFields.at( "provenance" ) == "SiteReused" );
+    assert( callsiteFields.at( "stack_ref" ) == "fake:callstack:1" );
+    const auto callsiteSearch = service.Execute( Request( requestId++, "source.callsite.search", {
+        { "trace_id", candidateId }, { "filter", { { "text", "SiteReused" } } }
+    } ) ).at( "data" ).at( "callsites" );
+    assert( callsiteSearch.size() == 1 && callsiteSearch[0].at( "callsite_id" ) == 7 );
 
     const auto cpuTimelineFields = service.Execute( Request( requestId++, "cpu.timeline", {
         { "trace_id", candidateId }

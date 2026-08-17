@@ -37,6 +37,36 @@ std::string Safe( const char* value )
     return value ? value : "";
 }
 
+const char* StackProvenanceName( uint8_t value )
+{
+    switch( JnStackProvenance( value ) )
+    {
+    case JnStackProvenance::ExactSource: return "ExactSource";
+    case JnStackProvenance::SiteReused: return "SiteReused";
+    case JnStackProvenance::PerEventExact: return "PerEventExact";
+    case JnStackProvenance::Unavailable: return "Unavailable";
+    }
+    return "Unavailable";
+}
+
+const char* StackUnavailableReasonName( uint8_t value )
+{
+    switch( value )
+    {
+    case 0: return "";
+    case 1: return "depth_zero";
+    case 2: return "callstack_unsupported";
+    case 3: return "admission_denied";
+    case 4: return "capacity";
+    default: return "unknown";
+    }
+}
+
+uint64_t CallsiteZoneKey( int16_t sourceLocation, uint32_t callstack )
+{
+    return ( uint64_t( uint16_t( sourceLocation ) ) << 32 ) | callstack;
+}
+
 const char* CpuArchitectureName( CpuArchitecture value )
 {
     switch( value )
@@ -427,6 +457,15 @@ public:
         if( zone->HasChildren() ) dto.childCount = uint32_t( worker->GetZoneChildren( zone->Child() ).size() );
         if( worker->HasValidZoneExtra( *zone ) ) dto.callstack = worker->GetZoneExtra( *zone ).callstack.Val();
         if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
+        const auto callsite = callsitesByZone.find( CallsiteZoneKey( zone->SrcLoc(), dto.callstack ) );
+        if( callsite != callsitesByZone.end() )
+        {
+            dto.callsiteId = callsite->second->callsiteId;
+            dto.stackProvenance = StackProvenanceName( callsite->second->provenance );
+            if( dto.callstack != 0 ) dto.stackRef = MakeRef( "callstack", dto.callstack );
+            const auto reason = StackUnavailableReasonName( callsite->second->unavailableReason );
+            if( *reason != '\0' ) dto.stackUnavailableReason = reason;
+        }
         return dto;
     }
 
@@ -456,6 +495,15 @@ public:
         if( zone->Child() >= 0 ) dto.childCount = uint32_t( worker->GetGpuChildren( zone->Child() ).size() );
         dto.callstack = zone->callstack.Val();
         if( dto.callstack != 0 ) dto.callstackRef = MakeRef( "callstack", dto.callstack );
+        const auto callsite = callsitesByZone.find( CallsiteZoneKey( zone->SrcLoc(), dto.callstack ) );
+        if( callsite != callsitesByZone.end() )
+        {
+            dto.callsiteId = callsite->second->callsiteId;
+            dto.stackProvenance = StackProvenanceName( callsite->second->provenance );
+            if( dto.callstack != 0 ) dto.stackRef = MakeRef( "callstack", dto.callstack );
+            const auto reason = StackUnavailableReasonName( callsite->second->unavailableReason );
+            if( *reason != '\0' ) dto.stackUnavailableReason = reason;
+        }
         dto.complete = zone->GpuEnd() >= 0 && zone->CpuEnd() >= 0;
         dto.queryId = zone->query_id;
         dto.queryIdAvailability.available = worker->GetTraceVersion() >= FileVersion( 0, 12, 4 );
@@ -524,6 +572,8 @@ public:
 
     void BuildIndexes()
     {
+        for( const auto& callsite : worker->GetJnTraceData().callsites )
+            callsitesByZone.emplace( CallsiteZoneKey( callsite.sourceLocation, callsite.callstack ), &callsite );
         std::vector<const ThreadData*> threads;
         for( const auto thread : worker->GetThreadData() ) threads.push_back( thread );
         std::sort( threads.begin(), threads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
@@ -577,6 +627,7 @@ public:
     std::vector<uint64_t> memoryPools;
     std::vector<const char*> sourceFiles;
     std::vector<uint64_t> symbols;
+    std::unordered_map<uint64_t, const JnCallsiteData*> callsitesByZone;
     mutable std::mutex readMutex;
 };
 
@@ -1308,7 +1359,11 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "sample", info.counts.samples != 0 || info.counts.contextSwitchSamples != 0 || info.counts.ghostZones != 0, true, { "sample.list", "sample.ghost_zones", "sample.symbol_statistics", "sample.flamegraph" } ),
         capability( "hardware_sample", info.counts.hardwareSamples != 0, true, { "hardware_sample.address", "hardware_sample.counts", "hardware_sample.events", "hardware_sample.capabilities" } ),
         capability( "symbol", info.counts.symbols != 0, true, { "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code", "symbol.disassembly" } ),
-        capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true, { "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw" } ),
+        capability( "source", info.counts.sourceLocations != 0 || info.counts.sourceCacheFiles != 0, true,
+            { "source.locations", "source.statistics", "source.embedded", "source.lines", "source.raw" } ),
+        capability( "source.callsite", jnTrace.schemaVersion >= 8 && info.counts.callsites != 0, true,
+            { "source.callsite", "source.callsite.search" },
+            jnTrace.schemaVersion >= 8 && info.counts.callsites != 0 ? "SiteReuse callsite definitions are present" : "trace predates JN trace section schema 8 or contains no callsite definitions" ),
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn" } ),
         capability( "runtime.script", hasScriptStack, true, { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" },
@@ -1474,6 +1529,7 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.gpuReferencePasses = jn.gpuReferencePasses.size();
     counts.gpuReferenceUses = jn.gpuReferenceUses.size();
     counts.gpuReferenceEnds = jn.gpuReferenceEnds.size();
+    counts.callsites = jn.callsites.size();
     for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
     return result;
 }
@@ -2345,6 +2401,32 @@ std::vector<ScriptStackEventDto> WorkerTraceSource::GetScriptStackEvents() const
         result.push_back( { m_impl->MakeRef( "script-stack-event", index ), value.primaryId, value.secondaryId,
             value.value, value.time, m_impl->MakeRef( "thread", value.thread ), value.runtime, value.flags, value.kind,
             value.kind == uint8_t( JnScriptRecordKind::Marker ) ? Safe( m_impl->worker->GetString( value.secondaryId ) ) : std::string() } );
+    }
+    return result;
+}
+
+std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().callsites;
+    std::vector<CallsiteDto> result;
+    result.reserve( values.size() );
+    for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        CallsiteDto dto;
+        dto.ref = m_impl->MakeRef( "callsite", value.callsiteId );
+        dto.callsiteId = value.callsiteId;
+        dto.threadRef = m_impl->MakeRef( "thread", value.thread );
+        dto.sourceLocationRef = m_impl->SourceLocation( value.sourceLocation ).ref;
+        dto.callstack = value.callstack;
+        if( value.callstack != 0 ) dto.stackRef = m_impl->MakeRef( "callstack", value.callstack );
+        dto.domain = value.domain;
+        dto.provenance = StackProvenanceName( value.provenance );
+        dto.flags = value.flags;
+        const auto reason = StackUnavailableReasonName( value.unavailableReason );
+        if( *reason != '\0' ) dto.unavailableReason = reason;
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }
