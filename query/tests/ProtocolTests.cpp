@@ -267,6 +267,7 @@ int main()
     assert( attribution.fragmentation[0].coveredBytes == 4096 && attribution.fragmentation[0].freeBytes == 12288 );
     assert( attribution.churn.createdCount == 1 && attribution.churn.createdBytes == 16384 && attribution.churn.peakPhysicalBytes == 16384 );
     assert( attribution.residency.evictedCount == 1 && attribution.residency.evictedBytes == 16384 );
+    assert( attribution.unknownUseOccurrences == 0 && attribution.unknownUses.empty() );
     assert( FormatGpuMemoryUsage( 3 ) == "Read/Write" );
 
     const std::vector<GpuMemoryCpuZoneInput> metadataMarkers = {
@@ -313,6 +314,24 @@ int main()
     assert( parentWorking->inclusiveReferencedPhysicalBytes == 16384 && parentWorking->provenance == "derived-exact-rollup" );
     assert( childWorking != structuredAttribution.workingSets.end() && childWorking->referencedPhysicalBytes == 16384 );
     assert( childWorking->inclusiveReferencedPhysicalBytes == 16384 && childWorking->logicalResourceCount == 1 );
+
+    GpuMemoryReferencePassInput unknownReference = structuredChild;
+    unknownReference.passId = 29;
+    unknownReference.parentPassId = 0;
+    unknownReference.frame = 3;
+    unknownReference.start = 60;
+    unknownReference.end = 70;
+    unknownReference.uses.clear();
+    unknownReference.totalUseCount = 3;
+    unknownReference.uses.push_back( { 9001, 1, 'U' } );
+    unknownReference.uses.push_back( { 9001, 2, 'U' } );
+    unknownReference.uses.push_back( { 42, 4, 'U' } );
+    const auto unknownAttribution = BuildGpuMemoryAttribution( metadataMarkers, {}, gpuAllocations,
+        { 99 }, { 29 }, { unknownReference } );
+    assert( unknownAttribution.unknownUseOccurrences == 2 && unknownAttribution.unknownUses.size() == 1 );
+    assert( unknownAttribution.unknownUses[0].allocationId == 9001 );
+    assert( unknownAttribution.unknownUses[0].classification == "logical_registration_missing" );
+    assert( unknownAttribution.unknownUses[0].occurrenceCount == 2 );
 
     GpuMemoryReferencePassInput structuredBoundary;
     structuredBoundary.passId = 23;

@@ -309,6 +309,26 @@ struct GpuMemoryWorkingSet
     std::string provenance;
 };
 
+// A reason-coded, deterministic summary for pass resource uses which cannot
+// be resolved to a live logical resource and its physical backing at the time
+// the pass was recorded.  Occurrence count is deliberately separate from the
+// number of unique resource ids so validation does not misreport repeated uses
+// as distinct allocations.
+struct GpuMemoryUnknownUse
+{
+    uint64_t allocationId = 0;
+    uint64_t physicalAllocationId = 0;
+    uint64_t occurrenceCount = 0;
+    uint64_t firstFrame = 0;
+    uint64_t lastFrame = 0;
+    uint64_t firstPassId = 0;
+    uint64_t lastPassId = 0;
+    bool logicalMetadataPresent = false;
+    bool logicalPoolEventPresent = false;
+    bool physicalPoolEventPresent = false;
+    std::string classification;
+};
+
 struct GpuMemoryAttribution
 {
     bool protocolPresent = false;
@@ -338,6 +358,8 @@ struct GpuMemoryAttribution
     std::vector<GpuMemoryAllocationOrigin> origins;
     std::vector<GpuMemoryResidencyEvent> residencyEvents;
     std::vector<GpuMemoryFragmentation> fragmentation;
+    std::vector<GpuMemoryUnknownUse> unknownUses;
+    uint64_t unknownUseOccurrences = 0;
     GpuMemoryChurn churn;
     GpuMemoryResidencySummary residency;
     std::unordered_map<uint64_t, size_t> passById;

@@ -6385,6 +6385,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "working_set", "deduplicated by physical allocation within each frame and taxonomy node" },
                         { "sibling_sum", "working sets of sibling taxonomy nodes may overlap and must not be summed as physical total" }
                     };
+                    json unknownUses = json::array();
+                    for( size_t index = 0; index < std::min<size_t>( summary.unknownUses.size(), DefaultPageSize ); index++ )
+                    {
+                        const auto& value = summary.unknownUses[index];
+                        unknownUses.push_back( {
+                            { "allocation_id", Decimal( value.allocationId ) },
+                            { "physical_allocation_id", value.physicalAllocationId == 0 ? json( nullptr ) : json( Decimal( value.physicalAllocationId ) ) },
+                            { "classification", value.classification }, { "occurrence_count", Decimal( value.occurrenceCount ) },
+                            { "first_frame", Decimal( value.firstFrame ) }, { "last_frame", Decimal( value.lastFrame ) },
+                            { "first_pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.firstPassId ) },
+                            { "last_pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.lastPassId ) },
+                            { "logical_metadata_present", value.logicalMetadataPresent }, { "logical_pool_event_present", value.logicalPoolEventPresent },
+                            { "physical_pool_event_present", value.physicalPoolEventPresent }, { "trust", "untrusted_trace_data" }
+                        } );
+                    }
+                    data["unknown_use_occurrences"] = Decimal( summary.unknownUseOccurrences );
+                    data["unknown_unique_resource_classifications"] = Decimal( summary.unknownUses.size() );
+                    data["unknown_uses"] = std::move( unknownUses );
+                    data["unknown_uses_truncated"] = summary.unknownUses.size() > DefaultPageSize;
                 }
                 return Success( id, std::move( data ), trace, PageJson( page, returned, cursor ) );
             }
@@ -6790,6 +6809,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "working_set", "deduplicated by physical allocation within each frame and taxonomy node" },
                 { "sibling_sum", "working sets of sibling taxonomy nodes may overlap and must not be summed as physical total" }
             };
+            json unknownUses = json::array();
+            for( size_t index = 0; index < std::min<size_t>( attribution.unknownUses.size(), DefaultPageSize ); index++ )
+            {
+                const auto& value = attribution.unknownUses[index];
+                unknownUses.push_back( {
+                    { "allocation_id", Decimal( value.allocationId ) },
+                    { "physical_allocation_id", value.physicalAllocationId == 0 ? json( nullptr ) : json( Decimal( value.physicalAllocationId ) ) },
+                    { "classification", value.classification }, { "occurrence_count", Decimal( value.occurrenceCount ) },
+                    { "first_frame", Decimal( value.firstFrame ) }, { "last_frame", Decimal( value.lastFrame ) },
+                    { "first_pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.firstPassId ) },
+                    { "last_pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.lastPassId ) },
+                    { "logical_metadata_present", value.logicalMetadataPresent }, { "logical_pool_event_present", value.logicalPoolEventPresent },
+                    { "physical_pool_event_present", value.physicalPoolEventPresent }, { "trust", "untrusted_trace_data" }
+                } );
+            }
+            data["unknown_use_occurrences"] = Decimal( attribution.unknownUseOccurrences );
+            data["unknown_unique_resource_classifications"] = Decimal( attribution.unknownUses.size() );
+            data["unknown_uses"] = std::move( unknownUses );
+            data["unknown_uses_truncated"] = attribution.unknownUses.size() > DefaultPageSize;
         }
         return Success( id, std::move( data ), trace, PageJson( page, returned, cursor ) );
     }
@@ -9811,7 +9849,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto& attribution = *attributionValue;
                 if( attribution.protocolPresent )
                 {
-                    size_t incompletePasses = 0, missingGpu = 0, ambiguousGpu = 0, unknownUses = 0;
+                    size_t incompletePasses = 0, missingGpu = 0, ambiguousGpu = 0;
                     json incompleteRefs = json::array(), missingRefs = json::array(), ambiguousRefs = json::array();
                     for( const auto& pass : attribution.passes )
                     {
@@ -9823,12 +9861,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         }
                         if( pass.gpuPairing == analysis::GpuZonePairing::Missing ) { missingGpu++; addRef( missingRefs, ref ); }
                         if( pass.gpuPairing == analysis::GpuZonePairing::Ambiguous ) { ambiguousGpu++; addRef( ambiguousRefs, ref ); }
-                        for( const auto& use : pass.uses ) if( attribution.allocationById.find( use.allocationId ) == attribution.allocationById.end() ) unknownUses++;
                     }
                     if( incompletePasses ) addFinding( "warning", "INCOMPLETE_GTMEM_PASS", "GTMEM1 pass payload chunks or use counts are incomplete", incompletePasses, std::move( incompleteRefs ) );
                     if( missingGpu ) addFinding( "warning", "MISSING_GTMEM_GPU_ZONE", "GTMEM1 passes have no matching GPU zone", missingGpu, std::move( missingRefs ) );
                     if( ambiguousGpu ) addFinding( "warning", "AMBIGUOUS_GTMEM_GPU_ZONE", "GTMEM1 passes match more than one GPU zone", ambiguousGpu, std::move( ambiguousRefs ) );
-                    if( unknownUses ) addFinding( "warning", "UNKNOWN_GTMEM_ALLOCATION", "GTMEM1 pass uses reference allocation IDs absent from D3D12 pools", unknownUses );
+                    if( attribution.unknownUseOccurrences )
+                    {
+                        json refs = json::array();
+                        for( const auto& value : attribution.unknownUses )
+                        {
+                            addRef( refs, source->MakeEntityRef( "gpu-memory-pass", value.firstPassId ) );
+                            if( refs.size() >= DefaultPageSize ) break;
+                        }
+                        addFinding( "warning", "UNKNOWN_GTMEM_ALLOCATION",
+                            "GPU pass resource uses are not fully resolvable through a live logical registration and physical backing; inspect memory.gpu.attribution unknown_uses for reason-coded unique resources",
+                            attribution.unknownUseOccurrences, std::move( refs ) );
+                    }
                 }
             }
         }

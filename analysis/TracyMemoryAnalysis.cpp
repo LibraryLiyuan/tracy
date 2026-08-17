@@ -421,6 +421,8 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     for( size_t index = 0; index < result.requestScopes.size(); index++ ) scopesByThread[result.requestScopes[index].thread].emplace_back( index );
 
     result.allocations.reserve( allocations.size() );
+    std::unordered_map<uint64_t, std::vector<size_t>> logicalAllocationLifetimes;
+    std::unordered_map<uint64_t, std::vector<size_t>> physicalAllocationLifetimes;
     for( const auto& allocation : allocations )
     {
         GpuMemoryAllocationAttribution attributed; attributed.allocation = allocation;
@@ -435,10 +437,52 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
             }
         }
         const bool logicalPool = StartsWith( allocation.poolName, "GPU D3D12 Logical " );
+        const bool physicalPool = StartsWith( allocation.poolName, "GPU D3D12 Physical " );
         if( logicalPool || result.allocationById.find( allocation.allocationId ) == result.allocationById.end() )
             result.allocationById[allocation.allocationId] = result.allocations.size();
+        if( logicalPool ) logicalAllocationLifetimes[allocation.allocationId].emplace_back( result.allocations.size() );
+        if( physicalPool ) physicalAllocationLifetimes[allocation.allocationId].emplace_back( result.allocations.size() );
         result.allocations.emplace_back( std::move( attributed ) );
     }
+
+    const auto findOverlappingLifetime = [&result]( const auto& lifetimes, uint64_t allocationId,
+        int64_t begin, int64_t end ) -> std::optional<size_t> {
+        const auto found = lifetimes.find( allocationId );
+        if( found == lifetimes.end() ) return std::nullopt;
+        for( auto it = found->second.rbegin(); it != found->second.rend(); ++it )
+        {
+            const auto& allocation = result.allocations[*it].allocation;
+            if( allocation.allocationNs <= end && ( !allocation.freeNs || begin <= *allocation.freeNs ) ) return *it;
+        }
+        return std::nullopt;
+    };
+
+    std::unordered_map<std::string, size_t> unknownUseByKey;
+    const auto noteUnknownUse = [&result, &unknownUseByKey]( const GpuMemoryPass& pass, const GpuMemoryPassUse& use,
+        const GpuMemoryLogicalResource* logical, const char* classification, bool logicalPoolEvent, bool physicalPoolEvent ) {
+        const std::string key = std::to_string( use.allocationId ) + "|" + classification;
+        const auto inserted = unknownUseByKey.emplace( key, result.unknownUses.size() );
+        if( inserted.second )
+        {
+            GpuMemoryUnknownUse value;
+            value.allocationId = use.allocationId;
+            value.physicalAllocationId = logical ? logical->physicalAllocationId : 0;
+            value.firstFrame = pass.frame;
+            value.lastFrame = pass.frame;
+            value.firstPassId = pass.passId;
+            value.lastPassId = pass.passId;
+            value.logicalMetadataPresent = logical != nullptr;
+            value.logicalPoolEventPresent = logicalPoolEvent;
+            value.physicalPoolEventPresent = physicalPoolEvent;
+            value.classification = classification;
+            result.unknownUses.emplace_back( std::move( value ) );
+        }
+        auto& value = result.unknownUses[inserted.first->second];
+        value.occurrenceCount++;
+        value.lastFrame = pass.frame;
+        value.lastPassId = pass.passId;
+        result.unknownUseOccurrences++;
+    };
 
     for( const auto& resource : result.logicalResources )
     {
@@ -454,14 +498,47 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         for( auto& use : pass.uses )
         {
             const auto logical = result.logicalById.find( use.allocationId );
+            const GpuMemoryLogicalResource* logicalResource = logical != result.logicalById.end()
+                ? &result.logicalResources[logical->second] : nullptr;
             if( logical != result.logicalById.end() )
                 use.kind = result.logicalResources[logical->second].kind;
             else
                 pass.untrackedReferences++;
-            const auto allocation = result.allocationById.find( use.allocationId );
-            if( allocation != result.allocationById.end() ) result.allocations[allocation->second].passIndices.emplace_back( passIndex );
+
+            const auto logicalLifetimes = logicalAllocationLifetimes.find( use.allocationId );
+            const bool logicalPoolEvent = logicalLifetimes != logicalAllocationLifetimes.end();
+            const auto activeLogical = findOverlappingLifetime( logicalAllocationLifetimes, use.allocationId, pass.start, pass.end );
+            uint64_t physicalId = logicalResource ? logicalResource->physicalAllocationId : 0;
+            const auto physicalLifetimes = physicalAllocationLifetimes.find( physicalId );
+            const bool physicalPoolEvent = physicalId != 0 && physicalLifetimes != physicalAllocationLifetimes.end();
+            const auto activePhysical = physicalId != 0
+                ? findOverlappingLifetime( physicalAllocationLifetimes, physicalId, pass.start, pass.end ) : std::nullopt;
+
+            if( !logicalResource && !logicalPoolEvent )
+                noteUnknownUse( pass, use, nullptr, "logical_registration_missing", false, false );
+            else if( !logicalResource )
+                noteUnknownUse( pass, use, nullptr, "logical_metadata_missing", true, false );
+            else if( !logicalPoolEvent )
+                noteUnknownUse( pass, use, logicalResource, "logical_pool_event_missing", false, physicalPoolEvent );
+            else if( !activeLogical )
+            {
+                const char* reason = logicalLifetimes->second.size() > 1
+                    ? "id_reuse_generation_conflict" : "outside_logical_lifetime";
+                noteUnknownUse( pass, use, logicalResource, reason, true, physicalPoolEvent );
+            }
+            else if( !physicalPoolEvent )
+                noteUnknownUse( pass, use, logicalResource, "physical_allocation_missing", true, false );
+            else if( !activePhysical )
+                noteUnknownUse( pass, use, logicalResource, "outside_physical_lifetime", true, true );
+            else
+                result.allocations[*activeLogical].passIndices.emplace_back( passIndex );
         }
     }
+
+    std::sort( result.unknownUses.begin(), result.unknownUses.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.occurrenceCount != rhs.occurrenceCount ? lhs.occurrenceCount > rhs.occurrenceCount :
+            lhs.allocationId != rhs.allocationId ? lhs.allocationId < rhs.allocationId : lhs.classification < rhs.classification;
+    } );
 
     std::unordered_map<uint64_t, uint64_t> physicalSizes;
     std::unordered_map<uint64_t, bool> physicalActive;

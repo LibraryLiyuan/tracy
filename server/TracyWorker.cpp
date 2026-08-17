@@ -2008,15 +2008,16 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                         for( auto& t : m_data.threads )
                         {
                             if( m_shutdown.load( std::memory_order_relaxed ) ) return;
-                            auto cit = t->ctxSwitchSamples.begin();
+                            const auto* context = GetContextSwitchData( t->id );
                             for( auto& sd : t->samples )
                             {
                                 bool isCtxSwitch = false;
-                                if( cit != t->ctxSwitchSamples.end() )
+                                if( context && !context->v.empty() )
                                 {
                                     const auto sdt = sd.time.Val();
-                                    cit = std::lower_bound( cit, t->ctxSwitchSamples.end(), sdt, []( const auto& l, const auto& r ) { return (uint64_t)l.time.Val() < (uint64_t)r; } );
-                                    isCtxSwitch = cit != t->ctxSwitchSamples.end() && cit->time.Val() == sdt;
+                                    const auto event = std::lower_bound( context->v.begin(), context->v.end(), sdt,
+                                        []( const auto& lhs, int64_t rhs ) { return lhs.Start() < rhs; } );
+                                    isCtxSwitch = event != context->v.end() && event->Start() == sdt;
                                 }
                                 if( !isCtxSwitch )
                                 {
@@ -2058,7 +2059,12 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                                 }
                             }
                         }
-                        for( auto& v : counts ) UpdateSampleStatistics( v.first, v.second, false );
+                        std::vector<std::pair<uint32_t, uint32_t>> orderedCounts;
+                        orderedCounts.reserve( counts.size() );
+                        for( const auto& value : counts ) orderedCounts.emplace_back( value.first, value.second );
+                        std::sort( orderedCounts.begin(), orderedCounts.end(),
+                            []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; } );
+                        for( const auto& value : orderedCounts ) UpdateSampleStatistics( value.first, value.second, false );
                     }
                     std::lock_guard<std::mutex> lock( m_data.lock );
                     m_data.callstackSamplesReady = true;
@@ -2965,6 +2971,16 @@ void Worker::NotifyProtocolClose( ProtocolCloseReason reason )
 
 void Worker::FinishProtocol( ProtocolCloseReason reason )
 {
+#ifndef TRACY_NO_STATISTICS
+    // Live processing builds parent-callstack payloads opportunistically as
+    // frame queries resolve. A saved trace rebuilds the same data after every
+    // frame is present, which previously made snapshot and stream replay
+    // return different parent payload counts. Rebuild once from the immutable
+    // raw samples at the terminal protocol boundary so both media use the
+    // same deterministic order and inputs.
+    if( m_mode == Mode::Full && m_hasData.load( std::memory_order_acquire ) )
+        CanonicalizeSampleStatistics();
+#endif
     Shutdown();
     m_netWriteCv.notify_one();
     {
@@ -9197,6 +9213,57 @@ void Worker::UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint
     {
         bit->second += count;
     }
+}
+
+void Worker::CanonicalizeSampleStatistics()
+{
+    std::lock_guard<std::mutex> lock( m_data.lock );
+
+    m_data.callstackSamplesReady = false;
+    m_data.symbolStats.clear();
+    m_data.parentCallstackMap.clear();
+    m_data.parentCallstackPayload.clear();
+    m_data.parentCallstackFrameMap.clear();
+    m_data.revParentFrameMap.clear();
+    m_data.postponedSamples.clear();
+    m_callstackParentNextIdx = 0;
+
+    unordered_flat_map<uint32_t, uint32_t> counts;
+    for( const auto thread : m_data.threads )
+    {
+        const auto* context = GetContextSwitchData( thread->id );
+        for( const auto& sample : thread->samples )
+        {
+            bool isContextSwitch = false;
+            if( context && !context->v.empty() )
+            {
+                const auto sampleTime = sample.time.Val();
+                const auto event = std::lower_bound( context->v.begin(), context->v.end(), sampleTime,
+                    []( const auto& lhs, int64_t rhs ) { return lhs.Start() < rhs; } );
+                isContextSwitch = event != context->v.end() && event->Start() == sampleTime;
+            }
+            if( isContextSwitch )
+                continue;
+
+            const auto callstack = sample.callstack.Val();
+            auto found = counts.find( callstack );
+            if( found == counts.end() )
+                counts.emplace( callstack, 1 );
+            else
+                ++found->second;
+        }
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> orderedCounts;
+    orderedCounts.reserve( counts.size() );
+    for( const auto& count : counts )
+        orderedCounts.emplace_back( count.first, count.second );
+    std::sort( orderedCounts.begin(), orderedCounts.end(),
+        []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; } );
+    for( const auto& count : orderedCounts )
+        UpdateSampleStatistics( count.first, count.second, false );
+
+    m_data.callstackSamplesReady = true;
 }
 #endif
 
