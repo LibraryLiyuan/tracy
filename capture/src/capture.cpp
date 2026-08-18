@@ -103,7 +103,7 @@ void AnsiPrintf( const char* ansiEscape, const char* format, ... ) {
 
 [[noreturn]] void Usage()
 {
-    printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit] [-d drain-idle-seconds]\n" );
+    printf( "Usage: capture [-o output.tracy] [-j output.tracy-stream] [-a address] [-p port] [-f] [-s seconds] [-m memlimit] [-d drain-idle-seconds] [-x stop-file]\n" );
     exit( 1 );
 }
 
@@ -157,13 +157,14 @@ int main( int argc, char** argv )
     const char* address = "127.0.0.1";
     const char* output = nullptr;
     const char* journalOutput = nullptr;
+    const char* stopFile = nullptr;
     int port = 8086;
     int seconds = -1;
     int drainIdleSeconds = 30;
     int64_t memoryLimit = -1;
 
     int c;
-    while( ( c = getopt( argc, argv, "a:o:j:p:fs:m:d:" ) ) != -1 )
+    while( ( c = getopt( argc, argv, "a:o:j:p:fs:m:d:x:" ) ) != -1 )
     {
         switch( c )
         {
@@ -194,6 +195,9 @@ int main( int argc, char** argv )
                 printf( "Protocol drain idle timeout must be a decimal integer.\n" );
                 return 4;
             }
+            break;
+        case 'x':
+            stopFile = optarg;
             break;
         default:
             Usage();
@@ -228,6 +232,18 @@ int main( int argc, char** argv )
         printf( "Snapshot and journal outputs must use different paths.\n" );
         return 4;
     }
+    if( stopFile && stopFile[0] == '\0' )
+    {
+        printf( "Stop-file path must not be empty.\n" );
+        return 4;
+    }
+    if( stopFile && ( ( output && SameOutputPath( stopFile, output ) ) ||
+        ( journalOutput && SameOutputPath( stopFile, journalOutput ) ) ) )
+    {
+        printf( "Stop-file path must differ from snapshot and journal outputs.\n" );
+        return 4;
+    }
+    const auto normalizedStopFile = stopFile ? NormalizeOutputPath( stopFile ) : std::filesystem::path();
 
     if( output )
     {
@@ -312,6 +328,8 @@ int main( int argc, char** argv )
         else
             printf( "Full capture journal drain: %d s idle timeout\n", drainIdleSeconds );
     }
+    if( stopFile )
+        printf( "External stop-file trigger: %s\n", normalizedStopFile.string().c_str() );
 
 #ifdef _WIN32
     signal( SIGINT, SigInt );
@@ -328,6 +346,12 @@ int main( int argc, char** argv )
     const auto t0 = std::chrono::high_resolution_clock::now();
     while( worker.IsConnected() )
     {
+        if( stopFile )
+        {
+            std::error_code stopError;
+            if( std::filesystem::exists( normalizedStopFile, stopError ) )
+                s_disconnect.store( true, std::memory_order_relaxed );
+        }
         // Relaxed order is sufficient here because `s_disconnect` is only ever
         // set by this thread or by the SigInt handler, and that handler does
         // nothing else than storing `s_disconnect`.

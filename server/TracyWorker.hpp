@@ -514,7 +514,7 @@ public:
         Mode mode = Mode::Full, size_t recorderDefinitionLimit = DefaultRecorderDefinitionLimit,
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
-        bool allowEarlyProtocolDefinitions = false );
+        bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
@@ -1163,6 +1163,10 @@ private:
     uint32_t m_serverQuerySpaceOverride = 0;
     bool m_useRecorderDrainState = false;
     bool m_allowEarlyProtocolDefinitions = false;
+    // Offline journal replay writes raw samples to a snapshot. Derived sample
+    // statistics are rebuilt in parallel by the normal snapshot loader, so
+    // building them synchronously here would duplicate expensive work.
+    bool m_deferLiveSampleAnalysis = false;
     size_t m_recorderDefinitionLimit = DefaultRecorderDefinitionLimit;
     size_t m_recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit;
     std::atomic<bool> m_protocolResolverFailed { false };

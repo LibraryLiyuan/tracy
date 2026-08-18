@@ -274,6 +274,23 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     {
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "stream revision does not yet contain a complete Tracy handshake" );
     }
+    std::vector<bool> orderIndependentServerRecords;
+    orderIndependentServerRecords.reserve( serverRecords.size() );
+    {
+        PayloadReader serverReader( view.path );
+        std::vector<uint8_t> payload;
+        std::string error;
+        for( const auto& record : serverRecords )
+        {
+            if( !serverReader.Read( record, payload, error ) )
+            {
+                throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt,
+                    "cannot read server dependency record: " + error );
+            }
+            const stream::ReplayServerPacket packet { record.sequence, record.flags, payload };
+            orderIndependentServerRecords.push_back( stream::IsOrderIndependentServerQuery( packet ) );
+        }
+    }
     bool recordedEndsWithTerminate = false;
     {
         PayloadReader tailReader( view.path );
@@ -376,7 +393,7 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
     Worker worker( "127.0.0.1", port, -1, nullptr, Worker::Mode::Full,
         Worker::DefaultRecorderDefinitionLimit, Worker::DefaultRecorderQueryQueueLimit,
-        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly );
+        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true, true );
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
     std::unique_ptr<Socket, SocketDeleter> peer;
     const auto acceptDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 5 );
@@ -393,6 +410,7 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     }
 
     ReplayError replayError;
+    std::atomic<uint64_t> replayedServerSequence { 0 };
     std::thread verifier( [&] {
         const auto failReplay = [&]( std::string message ) {
             replayError.Set( std::move( message ) );
@@ -412,12 +430,18 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
             }
             stream::ReplayServerPacket replayed { record.sequence, record.flags, {} };
             replayed.payload.resize( recorded.payload.size() );
-            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            // Full replay may need to expand a large first batch of sampling
+            // callstacks before it can reproduce the recorder's first query.
+            // Treat that CPU work separately from a closed server stream.
+            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
             if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
-                failReplay( "Worker server stream ended before record " + std::to_string( record.sequence ) );
+                const auto timedOut = std::chrono::steady_clock::now() >= recordDeadline;
+                failReplay( timedOut ?
+                    "timed out waiting for Worker server record " + std::to_string( record.sequence ) :
+                    "Worker server stream ended before record " + std::to_string( record.sequence ) );
                 return;
             }
             if( !transcriptVerifier.Append( recorded, replayed, error ) )
@@ -425,6 +449,10 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
                 failReplay( error );
                 return;
             }
+            // Preserve the journal's cross-direction causal order. A client
+            // response must not be replayed before Full Worker has reproduced
+            // the earlier server query it answers.
+            replayedServerSequence.store( record.sequence, std::memory_order_release );
         }
         if( !transcriptVerifier.Finish( error ) )
         {
@@ -435,8 +463,33 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
     PayloadReader clientReader( view.path );
     std::vector<uint8_t> payload;
     std::string readError;
+    size_t serverDependencyCursor = 0;
     auto replayClientRecord = [&]( const stream::RecordInfo& record ) {
         if( replayError.Failed() ) return false;
+        uint64_t requiredServerSequence = 0;
+        while( serverDependencyCursor < serverRecords.size() &&
+            serverRecords[serverDependencyCursor].sequence < record.sequence )
+        {
+            if( !orderIndependentServerRecords[serverDependencyCursor] )
+                requiredServerSequence = serverRecords[serverDependencyCursor].sequence;
+            serverDependencyCursor++;
+        }
+        if( requiredServerSequence != 0 )
+        {
+            const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+            while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
+                !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
+            {
+                std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+            }
+            if( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence )
+            {
+                replayError.Set( "client record " + std::to_string( record.sequence ) +
+                    ": timed out waiting for preceding server record " +
+                    std::to_string( requiredServerSequence ) );
+                return false;
+            }
+        }
         if( !clientReader.Read( record, payload, readError ) )
         {
             replayError.Set( "client record " + std::to_string( record.sequence ) + ": " + readError );

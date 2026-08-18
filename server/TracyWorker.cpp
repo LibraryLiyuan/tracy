@@ -314,7 +314,8 @@ LoadProgress Worker::s_loadProgress;
 
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
-    uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions )
+    uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions,
+    bool deferLiveSampleAnalysis )
     : m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
@@ -323,6 +324,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     , m_serverQuerySpaceOverride( serverQuerySpaceOverride )
     , m_useRecorderDrainState( mode == Mode::ProtocolOnly || useRecorderDrainState )
     , m_allowEarlyProtocolDefinitions( allowEarlyProtocolDefinitions )
+    , m_deferLiveSampleAnalysis( deferLiveSampleAnalysis )
     , m_recorderDefinitionLimit( recorderDefinitionLimit )
     , m_recorderQueryQueueLimit( recorderQueryQueueLimit )
     , m_hasData( false )
@@ -3006,7 +3008,7 @@ void Worker::FinishProtocol( ProtocolCloseReason reason )
     // return different parent payload counts. Rebuild once from the immutable
     // raw samples at the terminal protocol boundary so both media use the
     // same deterministic order and inputs.
-    if( m_mode == Mode::Full && m_hasData.load( std::memory_order_acquire ) )
+    if( m_mode == Mode::Full && !m_deferLiveSampleAnalysis && m_hasData.load( std::memory_order_acquire ) )
         CanonicalizeSampleStatistics();
 #endif
     Shutdown();
@@ -5689,6 +5691,7 @@ void Worker::DoPostponedWorkAll()
 void Worker::DoPostponedWork()
 {
 #ifndef TRACY_NO_STATISTICS
+    if( m_deferLiveSampleAnalysis ) return;
     if( m_data.newFramesWereReceived )
     {
         HandlePostponedSamples();
@@ -8191,6 +8194,8 @@ void Worker::ProcessCallstackSampleInsertSample( const SampleData& sd, ThreadDat
 void Worker::ProcessCallstackSampleImpl( const SampleData& sd, ThreadData& td )
 {
     ProcessCallstackSampleInsertSample( sd, td );
+
+    if( m_deferLiveSampleAnalysis ) return;
 
 #ifndef TRACY_NO_STATISTICS
     const auto t = sd.time.Val();

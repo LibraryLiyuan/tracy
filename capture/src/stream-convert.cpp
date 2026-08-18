@@ -398,7 +398,7 @@ int main( int argc, char** argv )
     const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
     tracy::Worker worker( "127.0.0.1", options.port, -1, nullptr, tracy::Worker::Mode::Full,
         tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
-        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true );
+        replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true, true );
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
 
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
@@ -446,12 +446,17 @@ int main( int argc, char** argv )
             }
             tracy::stream::ReplayServerPacket replayed { record.sequence, record.flags, {} };
             replayed.payload.resize( recorded.payload.size() );
-            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            // Full replay may need to expand a large first batch of sampling
+            // callstacks before it can reproduce the recorder's first query.
+            // Treat that CPU work separately from a closed server stream.
+            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
             if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
-                failReplay( "sequence " + std::to_string( record.sequence ) + ": Worker server stream ended early" );
+                const auto timedOut = std::chrono::steady_clock::now() >= recordDeadline;
+                failReplay( "sequence " + std::to_string( record.sequence ) +
+                    ( timedOut ? ": timed out waiting for Worker server stream" : ": Worker server stream ended early" ) );
                 return;
             }
             if( !transcriptVerifier.Append( recorded, replayed, error ) )
@@ -494,7 +499,7 @@ int main( int argc, char** argv )
             }
             if( requiredServerSequence != 0 )
             {
-                const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
                 while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
                     !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
                 {

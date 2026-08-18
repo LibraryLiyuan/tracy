@@ -750,8 +750,13 @@ void TestReplayServerTranscript( TestContext& test )
     };
     auto crossedClient = separatedByClient;
     std::swap( crossedClient[0], crossedClient[1] );
-    test.Check( !VerifyServerTranscript( separatedByClient, crossedClient, error ),
-        "definition queries cannot reorder across an intervening client record" );
+    test.Check( VerifyServerTranscript( separatedByClient, crossedClient, error ),
+        "definition queries may reorder across client compressed-frame boundaries: " + error );
+
+    auto changedAcrossClient = crossedClient;
+    changedAcrossClient[0].payload[1] = 10;
+    test.Check( !VerifyServerTranscript( separatedByClient, changedAcrossClient, error ) && !error.empty(),
+        "cross-frame definition-query multiset still rejects changed query bytes" );
 
     auto reorderedTransfer = recorded;
     std::swap( reorderedTransfer[5], reorderedTransfer[6] );

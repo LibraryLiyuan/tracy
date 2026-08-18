@@ -41,10 +41,10 @@ private:
 
 // ProtocolOnly recording and Full replay intentionally use different event
 // dispatchers. They must emit the same server-query set, but independent
-// definition queries may be scheduled in a different order. This comparison
-// preserves exact ordering for handshakes, disconnect/terminate controls and
-// source-transfer fragments, while comparing each contiguous independent
-// definition-query batch as a byte-exact multiset.
+// definition queries may move across client compressed-frame boundaries. This
+// comparison preserves exact ordering for handshakes, disconnect/terminate
+// controls and source-transfer fragments, while comparing the independent
+// definition-query set as a byte-exact session multiset.
 bool VerifyServerTranscript(
     const std::vector<ReplayServerPacket>& recorded,
     const std::vector<ReplayServerPacket>& replayed,

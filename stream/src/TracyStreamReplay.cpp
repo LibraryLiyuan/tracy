@@ -3,6 +3,7 @@
 #include "../../public/common/TracyProtocol.hpp"
 
 #include <algorithm>
+#include <iterator>
 
 namespace tracy::stream
 {
@@ -35,6 +36,19 @@ std::string SequenceText( uint64_t first, uint64_t last )
 {
     if( first == last ) return std::to_string( first );
     return std::to_string( first ) + "-" + std::to_string( last );
+}
+
+std::string QueryBytesText( const std::array<uint8_t, tracy::ServerQueryPacketSize>& query )
+{
+    static constexpr char Hex[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve( query.size() * 2 );
+    for( const auto value : query )
+    {
+        result.push_back( Hex[value >> 4] );
+        result.push_back( Hex[value & 0x0F] );
+    }
+    return result;
 }
 
 bool VerifyOrderedPacket( const ReplayServerPacket& recorded, const ReplayServerPacket& replayed, std::string& error )
@@ -80,7 +94,6 @@ bool ReplayServerTranscriptVerifier::Append(
                 " instead of " + std::to_string( tracy::ServerQueryPacketSize );
             return false;
         }
-        if( m_hasBatch && recorded.sequence != m_lastSequence + 1 && !FlushBatch( error ) ) return false;
         if( !m_hasBatch )
         {
             m_firstSequence = recorded.sequence;
@@ -114,9 +127,39 @@ bool ReplayServerTranscriptVerifier::FlushBatch( std::string& error )
     const auto matches = m_recordedBatch == m_replayedBatch;
     if( !matches )
     {
-        error = "order-independent server-query batch at sequences " +
+        const auto mismatch = std::mismatch(
+            m_recordedBatch.begin(), m_recordedBatch.end(),
+            m_replayedBatch.begin(), m_replayedBatch.end() );
+        const auto index = size_t( mismatch.first - m_recordedBatch.begin() );
+        std::vector<QueryBytes> recordedOnly;
+        std::vector<QueryBytes> replayOnly;
+        std::set_difference(
+            m_recordedBatch.begin(), m_recordedBatch.end(),
+            m_replayedBatch.begin(), m_replayedBatch.end(),
+            std::back_inserter( recordedOnly ) );
+        std::set_difference(
+            m_replayedBatch.begin(), m_replayedBatch.end(),
+            m_recordedBatch.begin(), m_recordedBatch.end(),
+            std::back_inserter( replayOnly ) );
+        const auto listText = []( const std::vector<QueryBytes>& queries ) {
+            std::string text;
+            const auto limit = std::min<size_t>( queries.size(), 8 );
+            for( size_t i = 0; i < limit; i++ )
+            {
+                if( i != 0 ) text += ',';
+                text += QueryBytesText( queries[i] );
+            }
+            if( queries.size() > limit ) text += ",...";
+            return text;
+        };
+        error = "order-independent server-query set at sequences " +
             SequenceText( m_firstSequence, m_lastSequence ) +
-            " differs in query bytes or multiplicity";
+            " differs at sorted index " + std::to_string( index ) +
+            " (recorded=" + QueryBytesText( *mismatch.first ) +
+            ", replay=" + QueryBytesText( *mismatch.second ) +
+            ", count=" + std::to_string( m_recordedBatch.size() ) +
+            ", recorded-only=" + std::to_string( recordedOnly.size() ) + "[" + listText( recordedOnly ) + "]" +
+            ", replay-only=" + std::to_string( replayOnly.size() ) + "[" + listText( replayOnly ) + "])";
     }
     m_recordedBatch.clear();
     m_replayedBatch.clear();

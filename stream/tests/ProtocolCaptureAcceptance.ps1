@@ -188,6 +188,7 @@ try {
 
     $drainJournalPath = Join-Path $artifactRoot 'protocol-only-drain.tracy-stream'
     $drainReplayPath = Join-Path $artifactRoot 'protocol-only-drain-replayed.tracy'
+    $drainStopPath = Join-Path $artifactRoot 'protocol-only-drain.stop'
     $drainProducer = Start-Process -FilePath (Resolve-Path -LiteralPath $ProducerExe).Path `
         -ArgumentList ([string]($CaptureSeconds + 20)) `
         -WorkingDirectory (Split-Path (Resolve-Path -LiteralPath $ProducerExe).Path) `
@@ -195,14 +196,18 @@ try {
         -PassThru
     Start-Sleep -Milliseconds 300
     $drainCapture = Start-Process -FilePath (Resolve-Path -LiteralPath $CaptureExe).Path `
-        -ArgumentList @('-j', $drainJournalPath, '-s', [string]$CaptureSeconds, '-f') `
+        -ArgumentList @('-j', $drainJournalPath, '-x', $drainStopPath, '-f') `
         -WorkingDirectory (Split-Path (Resolve-Path -LiteralPath $CaptureExe).Path) `
         -WindowStyle Hidden `
         -PassThru
 
+    Start-Sleep -Seconds $CaptureSeconds
+    Assert-Condition (-not $drainCapture.HasExited) 'stop-file capture exited before the marker was created'
+    [IO.File]::WriteAllText($drainStopPath, 'stop', [Text.UTF8Encoding]::new($false))
     Assert-Condition ($drainCapture.WaitForExit(($CaptureSeconds + 15) * 1000)) 'protocol-only capture did not finish its definition drain'
     Assert-Condition ($drainCapture.ExitCode -eq 0) "protocol-only capture failed with exit code $($drainCapture.ExitCode)"
     Assert-Condition (-not $drainProducer.HasExited) 'protocol-only producer exited instead of continuing after recorder disconnect'
+    Assert-Condition (Test-Path -LiteralPath $drainStopPath -PathType Leaf) 'stop-file marker was unexpectedly removed'
     $drainCapture = $null
 
     $drainInspectRaw = (& $InspectorExe inspect $drainJournalPath --records 1000000) -join [Environment]::NewLine

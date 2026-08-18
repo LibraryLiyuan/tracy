@@ -400,8 +400,13 @@ public:
     // JN integration path. The pool is prepared on a cold enable path. Image
     // submission performs one required copy out of Unity-owned readback memory
     // and never allocates or waits for a slot.
+#ifndef TRACY_NO_FRAME_IMAGE
     static bool PrepareFrameImagePool( uint16_t maxW, uint16_t maxH );
     static bool SendFrameImagePooled( const void* image, uint16_t w, uint16_t h, uint8_t offset, bool flip );
+#else
+    static tracy_force_inline bool PrepareFrameImagePool( uint16_t, uint16_t ) { return false; }
+    static tracy_force_inline bool SendFrameImagePooled( const void*, uint16_t, uint16_t, uint8_t, bool ) { return false; }
+#endif
 
     static tracy_force_inline void PlotData( const char* name, int64_t val )
     {
