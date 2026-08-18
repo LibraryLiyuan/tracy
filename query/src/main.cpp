@@ -33,7 +33,16 @@ void ApplyIndexedMemoryBudget()
     constexpr SIZE_T MinimumWorkingSet = SIZE_T( 64 ) * 1024 * 1024;
     constexpr SIZE_T MaximumWorkingSet = SIZE_T( 1900 ) * 1024 * 1024;
     if( !SetProcessWorkingSetSizeEx( GetCurrentProcess(), MinimumWorkingSet, MaximumWorkingSet, QUOTA_LIMITS_HARDWS_MAX_ENABLE ) )
-        throw std::runtime_error( "cannot apply the 1.9 GiB indexed working-set budget (Windows error " + std::to_string( GetLastError() ) + ')' );
+    {
+        // PROCESS_SET_QUOTA is not available to a normal desktop token on all
+        // Windows installations.  Indexed Query must remain usable without an
+        // administrator prompt; its internal cache, page and response budgets
+        // continue to provide the portable memory bound.  The OS hard working
+        // set is therefore an additional best-effort guard, not a start-up
+        // requirement.
+        std::cerr << "warning: could not apply the optional 1.9 GiB indexed working-set guard (Windows error "
+            << GetLastError() << "); continuing with internal query budgets\n";
+    }
 #endif
 }
 

@@ -573,7 +573,10 @@ public:
     void BuildIndexes()
     {
         for( const auto& callsite : worker->GetJnTraceData().callsites )
+        {
             callsitesByZone.emplace( CallsiteZoneKey( callsite.sourceLocation, callsite.callstack ), &callsite );
+            callsitesById.emplace( callsite.callsiteId, &callsite );
+        }
         std::vector<const ThreadData*> threads;
         for( const auto thread : worker->GetThreadData() ) threads.push_back( thread );
         std::sort( threads.begin(), threads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
@@ -628,6 +631,7 @@ public:
     std::vector<const char*> sourceFiles;
     std::vector<uint64_t> symbols;
     std::unordered_map<uint64_t, const JnCallsiteData*> callsitesByZone;
+    std::unordered_map<uint32_t, const JnCallsiteData*> callsitesById;
     mutable std::mutex readMutex;
 };
 
@@ -2097,7 +2101,31 @@ std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> eviden
         case JnJobStage::WaitSpinYieldEnd: closeSpan( spinStarts, stage.jobId, stage.spanId, stage.time, job.waitSpinYieldNs ); break;
         case JnJobStage::WaitSleepBegin: sleepStarts[stage.jobId][stage.spanId] = stage.time; break;
         case JnJobStage::WaitSleepEnd: closeSpan( sleepStarts, stage.jobId, stage.spanId, stage.time, job.waitSleepNs ); break;
-        case JnJobStage::ScheduleCallstack: job.scheduleCallstack = stage.spanId; break;
+        case JnJobStage::ScheduleCallstack:
+            job.scheduleCallstack = stage.spanId;
+            job.scheduleStackProvenance = "PerEventExact";
+            job.stages.back().callstack = stage.spanId;
+            job.stages.back().stackProvenance = "PerEventExact";
+            break;
+        case JnJobStage::ScheduleCallsite:
+        {
+            job.jobSchemaVersion = 3;
+            job.scheduleCallsiteId = stage.spanId;
+            auto& stageDto = job.stages.back();
+            stageDto.callsiteId = stage.spanId;
+            const auto callsite = m_impl->callsitesById.find( stage.spanId );
+            if( callsite != m_impl->callsitesById.end() )
+            {
+                job.scheduleCallstack = callsite->second->callstack;
+                job.scheduleStackProvenance = StackProvenanceName( callsite->second->provenance );
+                const auto reason = StackUnavailableReasonName( callsite->second->unavailableReason );
+                if( *reason != '\0' ) job.scheduleStackUnavailableReason = reason;
+                stageDto.callstack = callsite->second->callstack;
+                stageDto.stackProvenance = job.scheduleStackProvenance;
+                stageDto.stackUnavailableReason = job.scheduleStackUnavailableReason;
+            }
+            break;
+        }
         case JnJobStage::Ready:
             job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
             if( !job.readyNs || stage.time < *job.readyNs )
@@ -2129,8 +2157,32 @@ std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> eviden
             break;
         case JnJobStage::WaitCallstack:
             job.jobSchemaVersion = std::max<uint16_t>( job.jobSchemaVersion, 2 );
-            job.waitCallstacks.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.arg1, stage.spanId } );
+            job.stages.back().callstack = stage.spanId;
+            job.stages.back().stackProvenance = "PerEventExact";
+            job.waitCallstacks.push_back( { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.arg1,
+                stage.spanId, 0, "PerEventExact", std::nullopt } );
             break;
+        case JnJobStage::WaitCallsite:
+        {
+            job.jobSchemaVersion = 3;
+            auto& stageDto = job.stages.back();
+            stageDto.callsiteId = stage.spanId;
+            JobWaitCallstackDto wait { stage.time, m_impl->MakeRef( "thread", stage.thread ), stage.arg1, 0,
+                stage.spanId, {}, std::nullopt };
+            const auto callsite = m_impl->callsitesById.find( stage.spanId );
+            if( callsite != m_impl->callsitesById.end() )
+            {
+                wait.callstack = callsite->second->callstack;
+                wait.stackProvenance = StackProvenanceName( callsite->second->provenance );
+                const auto reason = StackUnavailableReasonName( callsite->second->unavailableReason );
+                if( *reason != '\0' ) wait.stackUnavailableReason = reason;
+                stageDto.callstack = wait.callstack;
+                stageDto.stackProvenance = wait.stackProvenance;
+                stageDto.stackUnavailableReason = wait.stackUnavailableReason;
+            }
+            job.waitCallstacks.emplace_back( std::move( wait ) );
+            break;
+        }
         case JnJobStage::Continuation:
             job.jobSchemaVersion = 3;
             job.continuationCount++;

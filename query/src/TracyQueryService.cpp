@@ -896,7 +896,8 @@ const char* JobStageName( uint8_t stage )
         "wait_active_help_begin", "wait_active_help_end", "wait_spin_yield_begin", "wait_spin_yield_end",
         "wait_sleep_begin", "wait_sleep_end", "wait_end", "flow_begin", "flow_next",
         "flow_parallel_next", "flow_end", "cancelled", "incomplete", "schedule_callstack",
-        "ready", "queue_enter", "dispatch", "steal", "wait_callstack", "continuation"
+        "ready", "queue_enter", "dispatch", "steal", "wait_callstack", "continuation",
+        "schedule_callsite", "wait_callsite"
     };
     return stage < std::size( names ) ? names[stage] : "unknown";
 }
@@ -1047,6 +1048,10 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
         { "job_schema_version", value.jobSchemaVersion },
         { "schedule_callstack", value.scheduleCallstack },
         { "schedule_callstack_ref", value.scheduleCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.scheduleCallstack ) ) },
+        { "schedule_callsite_id", value.scheduleCallsiteId == 0 ? json( nullptr ) : json( value.scheduleCallsiteId ) },
+        { "schedule_stack_ref", value.scheduleCallstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", value.scheduleCallstack ) ) },
+        { "schedule_stack_provenance", value.scheduleStackProvenance.empty() ? json( nullptr ) : json( value.scheduleStackProvenance ) },
+        { "schedule_stack_unavailable_reason", value.scheduleStackUnavailableReason ? json( *value.scheduleStackUnavailableReason ) : json( nullptr ) },
         { "dependency_count", value.dependencies.size() }, { "stage_count", value.stages.size() },
         { "ready_ns", value.readyNs ? json( Decimal( *value.readyNs ) ) : json( nullptr ) },
         { "ready_lane", value.readyNs ? json( value.readyLane ) : json( nullptr ) },
@@ -1122,6 +1127,17 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
             stageJson["wait_span_id"] = stage.arg1;
             stageJson["callstack_kind"] = "native";
         }
+        else if( stage.stage == uint8_t( JnJobStage::ScheduleCallsite ) ||
+            stage.stage == uint8_t( JnJobStage::WaitCallsite ) )
+        {
+            stageJson["callsite_id"] = stage.callsiteId;
+            stageJson["stack_ref"] = stage.callstack == 0 ? json( nullptr ) :
+                json( source.MakeEntityRef( "callstack", stage.callstack ) );
+            stageJson["provenance"] = stage.stackProvenance.empty() ? json( nullptr ) : json( stage.stackProvenance );
+            stageJson["unavailable_reason"] = stage.stackUnavailableReason ?
+                json( *stage.stackUnavailableReason ) : json( nullptr );
+            if( stage.stage == uint8_t( JnJobStage::WaitCallsite ) ) stageJson["wait_span_id"] = stage.arg1;
+        }
         stages.push_back( std::move( stageJson ) );
     }
     json waitCallstacks = json::array();
@@ -1129,6 +1145,10 @@ json JobJson( const analysis::TraceSource& source, const analysis::JobDto& value
         { "time_ns", Decimal( callstack.timeNs ) }, { "thread_ref", callstack.threadRef },
         { "wait_span_id", callstack.waitSpanId }, { "callstack", callstack.callstack },
         { "callstack_ref", callstack.callstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", callstack.callstack ) ) },
+        { "callsite_id", callstack.callsiteId == 0 ? json( nullptr ) : json( callstack.callsiteId ) },
+        { "stack_ref", callstack.callstack == 0 ? json( nullptr ) : json( source.MakeEntityRef( "callstack", callstack.callstack ) ) },
+        { "provenance", callstack.stackProvenance.empty() ? json( nullptr ) : json( callstack.stackProvenance ) },
+        { "unavailable_reason", callstack.stackUnavailableReason ? json( *callstack.stackUnavailableReason ) : json( nullptr ) },
         { "callstack_kind", "native" }
     } );
     result["dependencies"] = std::move( dependencies );
@@ -8186,6 +8206,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t v3 = 0;
             uint64_t missingReady = 0;
             uint64_t missingQueue = 0;
+            uint64_t duplicateReady = 0;
+            uint64_t duplicateQueue = 0;
             uint64_t missingContinuation = 0;
             uint64_t continuationWithoutWait = 0;
             uint64_t continuationBeforeCompletion = 0;
@@ -8204,6 +8226,81 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t orphan = 0;
             uint64_t truncated = 0;
             json invalidOrderExamples = json::array();
+            json missingReadyExamples = json::array();
+            json missingQueueExamples = json::array();
+            json duplicateStageExamples = json::array();
+            const auto recordMissingStage = [&]( json& examples, const analysis::JobDto& job, const char* stage ) {
+                if( examples.size() >= 16 ) return;
+                bool dispatchTraceIdMissing = false;
+                bool dispatchConnectionMissing = false;
+                for( const auto& jobStage : job.stages )
+                {
+                    if( jobStage.stage != uint8_t( JnJobStage::Dispatch ) ) continue;
+                    dispatchTraceIdMissing = dispatchTraceIdMissing || ( jobStage.flags & uint8_t( 1 << 3 ) ) != 0;
+                    dispatchConnectionMissing = dispatchConnectionMissing || ( jobStage.flags & uint8_t( 1 << 4 ) ) != 0;
+                }
+                json sameHandleJobs = json::array();
+                json sameSlotJobs = json::array();
+                if( job.packedHandle != 0 )
+                {
+                    for( const auto& candidate : jobs )
+                    {
+                        if( candidate.jobId == job.jobId || candidate.packedHandle != job.packedHandle ) continue;
+                        sameHandleJobs.push_back( {
+                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
+                            { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
+                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                        } );
+                        if( sameHandleJobs.size() >= 8 ) break;
+                    }
+
+                    std::vector<const analysis::JobDto*> slotCandidates;
+                    const auto slotIndex = uint32_t( job.packedHandle );
+                    for( const auto& candidate : jobs )
+                    {
+                        if( candidate.jobId == job.jobId || uint32_t( candidate.packedHandle ) != slotIndex ) continue;
+                        slotCandidates.push_back( &candidate );
+                    }
+                    std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto* lhs, const auto* rhs ) {
+                        const auto lhsDelta = lhs->jobId > job.jobId ? lhs->jobId - job.jobId : job.jobId - lhs->jobId;
+                        const auto rhsDelta = rhs->jobId > job.jobId ? rhs->jobId - job.jobId : job.jobId - rhs->jobId;
+                        return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs->jobId < rhs->jobId;
+                    } );
+                    for( const auto* candidate : slotCandidates )
+                    {
+                        uint32_t readyCount = 0;
+                        uint32_t queueCount = 0;
+                        for( const auto& candidateStage : candidate->stages )
+                        {
+                            readyCount += candidateStage.stage == uint8_t( JnJobStage::Ready );
+                            queueCount += candidateStage.stage == uint8_t( JnJobStage::QueueEnter );
+                        }
+                        sameSlotJobs.push_back( {
+                            { "job_ref", candidate->ref }, { "job_id", Decimal( candidate->jobId ) },
+                            { "packed_handle", Decimal( candidate->packedHandle ) },
+                            { "generation", uint32_t( candidate->packedHandle >> 32 ) },
+                            { "schedule_ns", Decimal( candidate->scheduleNs ) },
+                            { "capture_boundary", candidate->captureBoundary }, { "orphan", candidate->orphan },
+                            { "ready_count", readyCount }, { "queue_enter_count", queueCount },
+                            { "dispatch_count", candidate->dispatchCount }, { "stage_count", candidate->stages.size() }
+                        } );
+                        if( sameSlotJobs.size() >= 8 ) break;
+                    }
+                }
+                examples.push_back( {
+                    { "job_ref", job.ref }, { "job_id", Decimal( job.jobId ) }, { "name", job.name },
+                    { "packed_handle", Decimal( job.packedHandle ) },
+                    { "missing_stage", stage }, { "flags", job.flags }, { "kind", JobKindName( job.kind ) },
+                    { "count", job.count }, { "grain_size", job.grainSize },
+                    { "expected_dependency_count", job.expectedDependencyCount },
+                    { "dispatch_count", job.dispatchCount }, { "completed", job.completedNs.has_value() },
+                    { "dispatch_trace_id_missing", dispatchTraceIdMissing },
+                    { "dispatch_connection_missing", dispatchConnectionMissing },
+                    { "same_packed_handle_jobs", std::move( sameHandleJobs ) },
+                    { "same_slot_jobs", std::move( sameSlotJobs ) }
+                } );
+            };
             const auto recordInvalidOrder = [&]( const analysis::JobDto& job, const char* relation, int64_t begin, int64_t end ) {
                 if( invalidOrderExamples.size() >= 16 ) return;
                 invalidOrderExamples.push_back( {
@@ -8216,6 +8313,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 checkCancelled();
                 const bool captureBoundary = job.orphan || job.truncated;
+                uint32_t readyStageCount = 0;
+                uint32_t queueStageCount = 0;
+                for( const auto& jobStage : job.stages )
+                {
+                    readyStageCount += jobStage.stage == uint8_t( JnJobStage::Ready );
+                    queueStageCount += jobStage.stage == uint8_t( JnJobStage::QueueEnter ) &&
+                        ( jobStage.flags & uint8_t( 1 << 6 ) ) == 0;
+                }
+                if( readyStageCount > 1 || queueStageCount > 1 )
+                {
+                    duplicateReady += readyStageCount > 1 ? readyStageCount - 1 : 0;
+                    duplicateQueue += queueStageCount > 1 ? queueStageCount - 1 : 0;
+                    if( duplicateStageExamples.size() < 16 ) duplicateStageExamples.push_back( {
+                        { "job_ref", job.ref }, { "job_id", Decimal( job.jobId ) },
+                        { "packed_handle", Decimal( job.packedHandle ) }, { "name", job.name },
+                        { "ready_count", readyStageCount }, { "queue_enter_count", queueStageCount },
+                        { "dispatch_count", job.dispatchCount }, { "stage_count", job.stages.size() }
+                    } );
+                }
                 completed += job.completedNs.has_value();
                 managed += job.kind == uint8_t( JnJobKind::Managed );
                 burst += job.kind == uint8_t( JnJobKind::Burst );
@@ -8233,8 +8349,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( job.jobSchemaVersion >= 2 )
                 {
                     v2++;
-                    if( !captureBoundary && !job.readyNs ) missingReady++;
-                    if( !captureBoundary && job.dispatchCount != 0 && !job.queueEnterNs ) missingQueue++;
+                    if( !captureBoundary && !job.readyNs )
+                    {
+                        missingReady++;
+                        recordMissingStage( missingReadyExamples, job, "ready" );
+                    }
+                    if( !captureBoundary && job.dispatchCount != 0 && !job.queueEnterNs )
+                    {
+                        missingQueue++;
+                        recordMissingStage( missingQueueExamples, job, "queue_enter" );
+                    }
                 }
                 if( job.jobSchemaVersion >= 3 )
                 {
@@ -8327,6 +8451,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "complete", missingReady == 0 && missingQueue == 0 && invalidOrder == 0 &&
                         missingContinuation == 0 && continuationWithoutWait == 0 && continuationBeforeCompletion == 0 },
                     { "missing_ready", Decimal( missingReady ) }, { "missing_queue", Decimal( missingQueue ) },
+                    { "missing_ready_examples", std::move( missingReadyExamples ) },
+                    { "missing_queue_examples", std::move( missingQueueExamples ) },
+                    { "duplicate_ready", Decimal( duplicateReady ) },
+                    { "duplicate_queue", Decimal( duplicateQueue ) },
+                    { "duplicate_stage_examples", std::move( duplicateStageExamples ) },
                     { "missing_continuation", Decimal( missingContinuation ) },
                     { "continuation_without_wait", Decimal( continuationWithoutWait ) },
                     { "continuation_before_completion", Decimal( continuationBeforeCompletion ) },

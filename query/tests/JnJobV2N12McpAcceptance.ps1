@@ -28,7 +28,7 @@ foreach ($path in @($QueryExe, $SnapshotTrace, $StreamTrace, $ReplayTrace, $Allo
 $script:NextRequestId = 1
 $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $startInfo.FileName = $QueryExe
-$startInfo.Arguments = "--mcp --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
+$startInfo.Arguments = "--mcp --indexed --allow-root `"$AllowRoot`" --allow-source-root `"C:\workflow`""
 $startInfo.WorkingDirectory = $AllowRoot
 $startInfo.UseShellExecute = $false
 $startInfo.CreateNoWindow = $true
@@ -222,10 +222,18 @@ function Validate-N12 {
     }
 
     $stageNames = @($detail.data.stages | ForEach-Object { [string]$_.stage } | Sort-Object -Unique)
-    $requiredStages = @('ready', 'queue_enter', 'dispatch', 'wait_callstack')
+    $requiredStages = @('ready', 'queue_enter', 'dispatch')
     if ($ExpectContinuation) { $requiredStages += 'continuation' }
     foreach ($required in $requiredStages) {
         Assert-Condition ($stageNames -contains $required) "job.get is missing stage: $required"
+    }
+    Assert-Condition (($stageNames -contains 'wait_callstack') -or ($stageNames -contains 'wait_callsite')) `
+        'job.get is missing both legacy wait_callstack and SiteReuse wait_callsite'
+    if ($stageNames -contains 'wait_callsite') {
+        $waitSite = @($detail.data.stages | Where-Object { [string]$_.stage -eq 'wait_callsite' } | Select-Object -First 1)
+        Assert-Condition ($waitSite.Count -eq 1 -and $null -ne $waitSite[0].callsite_id) 'Wait SiteReuse callsite ID is missing'
+        Assert-Condition ([string]$waitSite[0].provenance -eq 'SiteReused') 'Wait SiteReuse provenance is missing'
+        Assert-Condition ($null -ne $waitSite[0].stack_ref) 'Wait SiteReuse stack reference is missing'
     }
     $ready = @($detail.data.stages | Where-Object { [string]$_.stage -eq 'ready' } | Select-Object -First 1)
     Assert-Condition ($ready.Count -eq 1 -and [string]$ready[0].reason -ne 'unknown') 'Ready reason is not decoded'

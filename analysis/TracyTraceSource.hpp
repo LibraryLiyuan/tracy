@@ -572,6 +572,10 @@ struct JobStageDto
     uint32_t arg1 = 0;
     uint8_t stage = 0;
     uint8_t flags = 0;
+    uint32_t callsiteId = 0;
+    uint32_t callstack = 0;
+    std::string stackProvenance;
+    std::optional<std::string> stackUnavailableReason;
 };
 
 struct JobWaitCallstackDto
@@ -580,6 +584,9 @@ struct JobWaitCallstackDto
     std::string threadRef;
     uint32_t waitSpanId = 0;
     uint32_t callstack = 0;
+    uint32_t callsiteId = 0;
+    std::string stackProvenance;
+    std::optional<std::string> stackUnavailableReason;
 };
 
 struct JobDto
@@ -599,6 +606,9 @@ struct JobDto
     uint32_t originFrameSequence = 0;
     uint64_t originFrameId = 0;
     uint32_t scheduleCallstack = 0;
+    uint32_t scheduleCallsiteId = 0;
+    std::string scheduleStackProvenance;
+    std::optional<std::string> scheduleStackUnavailableReason;
     uint16_t jobSchemaVersion = 1;
     uint16_t expectedDependencyCount = 0;
     std::optional<int64_t> readyNs;

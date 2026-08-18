@@ -6,7 +6,7 @@
 namespace tracy
 {
 
-static constexpr uint16_t JnJobSchemaVersion = 2;
+static constexpr uint16_t JnJobSchemaVersion = 3;
 static constexpr uint16_t JnScriptSchemaVersion = 2;
 
 #ifdef TRACY_ENABLE
