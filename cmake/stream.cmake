@@ -8,6 +8,8 @@ if(NOT TARGET TracyStreamCore)
         ${TRACY_STREAM_DIR}/src/TracyStreamProtocol.hpp
         ${TRACY_STREAM_DIR}/src/TracyStreamReplay.cpp
         ${TRACY_STREAM_DIR}/src/TracyStreamReplay.hpp
+        ${TRACY_STREAM_DIR}/src/TracyStreamSnapshotMap.cpp
+        ${TRACY_STREAM_DIR}/src/TracyStreamSnapshotMap.hpp
         ${TRACY_STREAM_DIR}/src/TracyStreamStore.cpp
         ${TRACY_STREAM_DIR}/src/TracyStreamStore.hpp
         ${CMAKE_CURRENT_LIST_DIR}/../server/TracyProtocolObserver.hpp

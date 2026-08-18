@@ -1919,10 +1919,26 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         const bool requested = last["requested"].get<bool>();
         const bool compiled = last["compiled"].get<bool>();
         const bool supported = last["supported"].get<bool>();
-        const bool enabled = last["enabled"].get<bool>();
-        const bool effective = last["effective"].get<bool>();
+        bool enabled = last["enabled"].get<bool>();
+        bool effective = last["effective"].get<bool>();
         const bool permissionDenied = last["permission_denied"].get<bool>();
-        const bool deferred = last["deferred"].get<bool>();
+        bool deferred = last["deferred"].get<bool>();
+        std::string producerReason = last.value( "reason", "" );
+        const bool persistedSampling = info.counts.samples != 0 && info.samplingPeriodNs > 0;
+        const bool persistedContextSwitch = info.counts.contextSwitches != 0;
+        const bool systemTracingProducer = key == "sampling.context-switch";
+        const bool persistedSystemTracing = persistedSampling && persistedContextSwitch;
+        const bool persistedSystemTracingPartial = systemTracingProducer && persistedSampling != persistedContextSwitch;
+        if( systemTracingProducer && ( persistedSystemTracing || persistedSystemTracingPartial ) )
+        {
+            // Startup can only report a deferred privilege check. Persisted
+            // samples/context switches are the authoritative evidence that
+            // the Windows tracing session actually ran.
+            enabled = true;
+            effective = true;
+            deferred = false;
+            producerReason = persistedSystemTracing ? "persisted_trace_data_verified" : "persisted_trace_data_partial";
+        }
         std::string state;
         if( deferred ) state = "deferred";
         else if( !compiled ) state = "uncompiled";
@@ -1930,7 +1946,7 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         else if( !supported ) state = "unsupported";
         else if( !requested || !enabled || !effective ) state = "disabled";
         else if( !windowComplete || regression ) state = "unknown";
-        else if( deltas[2] != 0 || deltas[5] != 0 || deltas[6] != 0 || deltas[7] != 0 || deltas[10] != 0 ) state = "degraded";
+        else if( persistedSystemTracingPartial || deltas[2] != 0 || deltas[5] != 0 || deltas[6] != 0 || deltas[7] != 0 || deltas[10] != 0 ) state = "degraded";
         else if( deltas[3] != 0 || deltas[4] != 0 ) state = "filtered";
         else if( deltas[0] == 0 && deltas[1] == 0 ) state = "real_zero";
         else state = "covered";
@@ -1946,6 +1962,7 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
         addFinding( "MISMATCH", deltas[6] );
         addFinding( "UNRESOLVED", deltas[7] );
         addFinding( "TAIL_TRUNCATED", deltas[10] );
+        if( persistedSystemTracingPartial ) findings.push_back( { { "code", "PERSISTED_SYSTEM_TRACING_PARTIAL" }, { "count", "1" } } );
         if( !windowComplete ) findings.push_back( { { "code", "NO_CLOSED_COUNTER_WINDOW" }, { "count", "1" } } );
         if( regression ) findings.push_back( { { "code", "COUNTER_REGRESSION" }, { "count", "1" } } );
         if( !findings.empty() ) globalFindings.push_back( { { "producer", key }, { "findings", findings } } );
@@ -1963,7 +1980,12 @@ json CaptureCoverageJson( const analysis::TraceInfoDto& info )
             { "config_generation", last.value( "config_generation", "0" ) },
             { "requested", requested }, { "compiled", compiled }, { "supported", supported },
             { "enabled", enabled }, { "effective", effective }, { "permission_denied", permissionDenied },
-            { "deferred", deferred }, { "reason", last.value( "reason", "" ) },
+            { "deferred", deferred }, { "reason", producerReason },
+            { "persisted_evidence", systemTracingProducer ? json( {
+                { "verification", "persisted_trace" },
+                { "sampling", { { "present", persistedSampling }, { "count", Decimal( info.counts.samples ) } } },
+                { "context_switch", { { "present", persistedContextSwitch }, { "count", Decimal( info.counts.contextSwitches ) } } }
+            } ) : json( nullptr ) },
             { "filter", last.value( "filter", "" ) }, { "threshold", last.value( "threshold", "0" ) },
             { "budget", last.value( "budget", "0" ) }, { "runtime_policy", last.value( "runtime_policy", json::object() ) },
             { "sample_rate", last.value( "sample_rate", json::object() ) },

@@ -5,6 +5,7 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../stream/src/TracyStreamJournal.hpp"
 #include "../../stream/src/TracyStreamReplay.hpp"
+#include "../../stream/src/TracyStreamSnapshotMap.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -673,6 +674,10 @@ int main( int argc, char** argv )
         return 5;
     }
 
+    {
+        std::error_code ignored;
+        std::filesystem::remove( tracy::stream::ConvertedSnapshotMapPath( options.input ), ignored );
+    }
     auto output = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open( options.output.string().c_str(), tracy::FileCompression::Zstd, 3, 4 ) );
     if( !output )
     {
@@ -682,6 +687,13 @@ int main( int argc, char** argv )
     worker.Write( *output, false );
     output->Finish();
     const auto statistics = output->GetCompressionStatistics();
+    output.reset();
+    std::string snapshotMapError;
+    if( !tracy::stream::WriteConvertedSnapshotMap( options.input, scan, options.output, snapshotMapError ) )
+    {
+        std::fprintf( stderr, "Snapshot was converted but its stream mapping could not be published: %s\n", snapshotMapError.c_str() );
+        return 7;
+    }
     std::printf( "Converted %llu valid journal bytes into %llu snapshot bytes (%.2f%%).\n",
         static_cast<unsigned long long>( scan.validSize ), static_cast<unsigned long long>( statistics.second ),
         statistics.first == 0 ? 0. : 100. * statistics.second / statistics.first );

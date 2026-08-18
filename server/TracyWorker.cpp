@@ -4517,8 +4517,10 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::MemAllocCallstack:
     case QueueType::MemAllocNamed:
     case QueueType::MemAllocCallstackNamed:
+    case QueueType::JnMemAllocCallsiteNamed:
     {
-        const bool named = ev.hdr.type == QueueType::MemAllocNamed || ev.hdr.type == QueueType::MemAllocCallstackNamed;
+        const bool named = ev.hdr.type == QueueType::MemAllocNamed || ev.hdr.type == QueueType::MemAllocCallstackNamed ||
+            ev.hdr.type == QueueType::JnMemAllocCallsiteNamed;
         const bool callstack = ev.hdr.type == QueueType::MemAllocCallstack || ev.hdr.type == QueueType::MemAllocCallstackNamed;
         const uint64_t poolName = named ? m_memNamePayload : 0;
         if( named && poolName == 0 ) RecorderFail( "Named allocation is missing its memory name." );
@@ -6124,6 +6126,9 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::MemAllocCallstackNamed:
         ProcessMemAllocCallstackNamed( ev.memAlloc );
+        break;
+    case QueueType::JnMemAllocCallsiteNamed:
+        ProcessJnMemAllocCallsiteNamed( ev.jnMemAllocCallsite );
         break;
     case QueueType::MemFreeCallstack:
         ProcessMemFreeCallstack( ev.memFree );
@@ -8048,6 +8053,14 @@ void Worker::ProcessMemAllocCallstackNamed( const QueueMemAlloc& ev )
     assert( m_serialNextCallstack != 0 );
     if( mem ) mem->SetCsAlloc( m_serialNextCallstack );
     m_serialNextCallstack = 0;
+}
+
+void Worker::ProcessJnMemAllocCallsiteNamed( const QueueJnMemAllocCallsite& ev )
+{
+    auto mem = ProcessMemAllocNamed( ev );
+    const auto found = m_jnCallsiteCallstacks.find( ev.callsiteId );
+    if( mem && found != m_jnCallsiteCallstacks.end() && found->second != 0 )
+        mem->SetCsAlloc( found->second );
 }
 
 void Worker::ProcessMemFreeCallstack( const QueueMemFree& ev )

@@ -8,6 +8,7 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../stream/src/TracyStreamJournal.hpp"
 #include "../../stream/src/TracyStreamReplay.hpp"
+#include "../../stream/src/TracyStreamSnapshotMap.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -683,6 +684,39 @@ std::unique_ptr<SegmentTraceSource> SegmentTraceSource::OpenRevision(
     {
         if( preferIndex )
         {
+            stream::ConvertedSnapshotMap convertedSnapshot;
+            std::string snapshotMapError;
+            if( stream::ReadConvertedSnapshotMap( view->path, *view, convertedSnapshot, snapshotMapError ) )
+            {
+                try
+                {
+                    snapshotPath = convertedSnapshot.snapshotPath;
+                    persistentSnapshot = true;
+                    auto validation = QueryIndex::Validate( snapshotPath );
+                    if( !validation.manifest )
+                    {
+                        auto buildCallback = stateCallback;
+                        QueryIndex::Build( snapshotPath, std::move( buildCallback ) );
+                        validation = QueryIndex::Validate( snapshotPath );
+                    }
+                    if( validation.manifest )
+                    {
+                        auto openCallback = stateCallback;
+                        auto source = QueryIndex::Open( *validation.manifest, std::move( openCallback ), StreamFingerprint( *view ) );
+                        WriteStreamIndexCache( *view, snapshotPath );
+                        return std::unique_ptr<SegmentTraceSource>( new SegmentTraceSource( std::move( store ), std::move( view ),
+                            std::move( snapshotPath ), std::move( source ), true, true ) );
+                    }
+                }
+                catch( const std::exception& )
+                {
+                    // A sidecar is only an optimization hint. Fall back to replaying the
+                    // committed journal if the converted snapshot or its index is unusable.
+                }
+                snapshotPath.clear();
+                persistentSnapshot = false;
+            }
+
             snapshotPath = MakePersistentSnapshotPath( *view );
             persistentSnapshot = true;
             auto validation = std::filesystem::exists( snapshotPath ) ? QueryIndex::Validate( snapshotPath ) : QueryIndexValidation {};

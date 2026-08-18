@@ -1022,7 +1022,17 @@ int main()
     assert( captureCoverage.at( "present" ) == true );
     assert( captureCoverage.at( "complete" ) == true );
     assert( captureCoverage.at( "evidence_kind" ) == "exact" );
-    assert( captureCoverage.at( "producers" ).size() == 6 );
+    assert( captureCoverage.at( "producers" ).size() == 7 );
+    const auto systemTracingProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
+        []( const auto& value ) { return value.at( "key" ) == "sampling.context-switch"; } );
+    assert( systemTracingProducer != captureCoverage.at( "producers" ).end() );
+    assert( systemTracingProducer->at( "state" ) == "covered" );
+    assert( systemTracingProducer->at( "enabled" ) == true );
+    assert( systemTracingProducer->at( "effective" ) == true );
+    assert( systemTracingProducer->at( "deferred" ) == false );
+    assert( systemTracingProducer->at( "reason" ) == "persisted_trace_data_verified" );
+    assert( systemTracingProducer->at( "persisted_evidence" ).at( "sampling" ).at( "present" ) == true );
+    assert( systemTracingProducer->at( "persisted_evidence" ).at( "context_switch" ).at( "present" ) == true );
     const auto degradedProducer = std::find_if( captureCoverage.at( "producers" ).begin(), captureCoverage.at( "producers" ).end(),
         []( const auto& value ) { return value.at( "key" ) == "test.degraded"; } );
     assert( degradedProducer != captureCoverage.at( "producers" ).end() );

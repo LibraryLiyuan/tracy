@@ -140,6 +140,7 @@ enum class QueueType : uint8_t
     JnScriptStack,
     JnCallsiteDefinition,
     JnGpuZoneBeginCallsite,
+    JnMemAllocCallsiteNamed,
     StringData,
     ThreadName,
     PlotName,
@@ -1069,6 +1070,14 @@ struct QueueMemAlloc
     char size[6];
 };
 
+// N25 allocation-site reuse. The named memory event remains a normal Tracy
+// allocation, while the Worker resolves callsiteId to the single persisted
+// callstack definition instead of requiring a native unwind for every event.
+struct QueueJnMemAllocCallsite : public QueueMemAlloc
+{
+    uint32_t callsiteId;
+};
+
 struct QueueMemFree
 {
     int64_t time;
@@ -1394,6 +1403,7 @@ struct QueueItem
         QueueJnScriptStack jnScriptStack;
         QueueJnCallsiteDefinition jnCallsiteDefinition;
         QueueJnGpuZoneBeginCallsite jnGpuZoneBeginCallsite;
+        QueueJnMemAllocCallsite jnMemAllocCallsite;
     };
 };
 #pragma pack( pop )
@@ -1534,6 +1544,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnScriptStack ),
     sizeof( QueueHeader ) + sizeof( QueueJnCallsiteDefinition ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuZoneBeginCallsite ),
+    sizeof( QueueHeader ) + sizeof( QueueJnMemAllocCallsite ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1585,6 +1596,7 @@ static_assert( sizeof( QueueJnScriptStack ) == 31, "JN script stack payload size
 static_assert( sizeof( QueueJnZoneBeginCallsite ) == 20, "JN CPU callsite-zone payload size mismatch" );
 static_assert( sizeof( QueueJnCallsiteDefinition ) == 20, "JN callsite definition payload size mismatch" );
 static_assert( sizeof( QueueJnGpuZoneBeginCallsite ) == 27, "JN GPU callsite-zone payload size mismatch" );
+static_assert( sizeof( QueueJnMemAllocCallsite ) == 30, "JN allocation callsite payload size mismatch" );
 static_assert( uint8_t( QueueType::JnZoneBeginCallsite ) < uint8_t( QueueType::Terminate ),
     "JN CPU callsite-zone event must remain thread-context encoded" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );

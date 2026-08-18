@@ -3543,6 +3543,13 @@ Profiler::DequeueStatus Profiler::DequeueSerial()
                 refSerial = t;
                 MemWrite( &item->gpuZoneBegin.cpuTime, dt );
             }
+            else if( (QueueType)idx == QueueType::JnMemAllocCallsiteNamed )
+            {
+                int64_t t = MemRead<int64_t>( &item->jnMemAllocCallsite.time );
+                int64_t dt = t - refSerial;
+                refSerial = t;
+                MemWrite( &item->jnMemAllocCallsite.time, dt );
+            }
 #ifdef TRACY_FIBERS
             else
             {

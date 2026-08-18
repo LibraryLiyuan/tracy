@@ -26,6 +26,7 @@ public:
     std::shared_ptr<const stream::JournalReadView> RefreshView();
     const std::shared_ptr<stream::JournalStore>& Store() const { return m_store; }
     bool PreferIndex() const { return m_preferIndex; }
+    const std::filesystem::path& SnapshotPath() const { return m_snapshotPath; }
 
     std::vector<analysis::Capability> GetCapabilities() const override;
     analysis::TraceReadView AcquireReadView() const override;

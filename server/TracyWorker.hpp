@@ -903,6 +903,7 @@ private:
     tracy_force_inline void ProcessMemDiscard( const QueueMemDiscard& ev );
     tracy_force_inline void ProcessMemAllocCallstack( const QueueMemAlloc& ev );
     tracy_force_inline void ProcessMemAllocCallstackNamed( const QueueMemAlloc& ev );
+    tracy_force_inline void ProcessJnMemAllocCallsiteNamed( const QueueJnMemAllocCallsite& ev );
     tracy_force_inline void ProcessMemFreeCallstack( const QueueMemFree& ev );
     tracy_force_inline void ProcessMemFreeCallstackNamed( const QueueMemFree& ev );
     tracy_force_inline void ProcessMemDiscardCallstack( const QueueMemDiscard& ev );

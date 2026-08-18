@@ -1,6 +1,7 @@
 #include "TracyStreamJournal.hpp"
 #include "TracyStreamProtocol.hpp"
 #include "TracyStreamReplay.hpp"
+#include "TracyStreamSnapshotMap.hpp"
 #include "TracyStreamStore.hpp"
 
 #include "../../public/common/TracyProtocol.hpp"
@@ -435,6 +436,49 @@ bool WritePrefix( const std::filesystem::path& path, const std::vector<uint8_t>&
     return bool( file );
 }
 
+void TestConvertedSnapshotMap( TestContext& test )
+{
+    const auto journal = MakeValidJournal( test );
+    if( journal.empty() ) return;
+    const auto directory = UniqueTestDirectory();
+    const auto streamPath = directory / "converted.tracy-stream";
+    const auto snapshotPath = directory / "converted.tracy";
+    std::error_code filesystemError;
+    std::filesystem::create_directories( directory, filesystemError );
+    test.Check( !filesystemError, "create snapshot-map temporary directory" );
+    test.Check( WritePrefix( streamPath, journal, journal.size() ), "write snapshot-map journal" );
+    {
+        std::ofstream snapshot( snapshotPath, std::ios::binary | std::ios::trunc );
+        snapshot << "deterministic snapshot";
+        test.Check( bool( snapshot ), "write snapshot-map snapshot" );
+    }
+
+    const auto scan = ScanJournal( streamPath );
+    std::string error;
+    test.Check( WriteConvertedSnapshotMap( streamPath, scan, snapshotPath, error ), "publish converted snapshot map: " + error );
+    test.Check( std::filesystem::is_regular_file( ConvertedSnapshotMapPath( streamPath ) ), "snapshot map is published beside the stream" );
+
+    auto store = JournalStore::Open( streamPath, error );
+    test.Check( store != nullptr, "open mapped stream: " + error );
+    if( store )
+    {
+        ConvertedSnapshotMap map;
+        const auto view = store->AcquireReadView();
+        test.Check( view && ReadConvertedSnapshotMap( streamPath, *view, map, error ), "read matching converted snapshot map: " + error );
+        test.Check( map.snapshotPath == snapshotPath, "snapshot map resolves only the sibling snapshot" );
+
+        {
+            std::ofstream changed( snapshotPath, std::ios::binary | std::ios::app );
+            changed << '!';
+        }
+        test.Check( !ReadConvertedSnapshotMap( streamPath, *view, map, error ), "snapshot mutation invalidates the map" );
+        test.Check( !error.empty(), "snapshot-map invalidation returns a diagnostic" );
+    }
+
+    std::filesystem::remove_all( directory, filesystemError );
+    test.Check( !filesystemError, "remove snapshot-map temporary directory" );
+}
+
 void TestJournalStore( TestContext& test )
 {
     std::vector<RecordInfo> records;
@@ -793,6 +837,7 @@ int main()
     }
     TestShortWritesAndFailures( test );
     TestFileRecoveryAndResume( test );
+    TestConvertedSnapshotMap( test );
     TestJournalStore( test );
     TestProtocolObserver( test );
     TestProtocolBackpressure( test );

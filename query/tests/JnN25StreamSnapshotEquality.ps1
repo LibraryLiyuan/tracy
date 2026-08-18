@@ -19,6 +19,22 @@ foreach ($path in @($QueryExe, $SnapshotTrace, $StreamTrace, $AllowRoot))
     Assert-Condition (Test-Path -LiteralPath $path) "required path does not exist: $path"
 }
 
+$outputParent = Split-Path -Parent $OutputFile
+if ($outputParent) { New-Item -ItemType Directory -Path $outputParent -Force | Out-Null }
+$script:QueryOutputSequence = 0
+
+$buildIndexWatch = [Diagnostics.Stopwatch]::StartNew()
+$buildIndexOutput = "$OutputFile.build-index.json"
+& $QueryExe --build-index --trace $StreamTrace --allow-root $AllowRoot --output $buildIndexOutput | Out-Null
+$buildIndexExitCode = $LASTEXITCODE
+$buildIndexWatch.Stop()
+Assert-Condition ($buildIndexExitCode -eq 0) "stream build-index failed with exit code $buildIndexExitCode"
+$buildIndexRaw = Get-Content -LiteralPath $buildIndexOutput -Raw
+$buildIndex = $buildIndexRaw | ConvertFrom-Json
+Assert-Condition ([bool]$buildIndex.ok) 'stream build-index returned ok=false'
+Assert-Condition ([string]$buildIndex.input.kind -eq 'stream') 'build-index did not report a stream input'
+Assert-Condition ([string]$buildIndex.input.indexed_snapshot -eq (Get-Item -LiteralPath $SnapshotTrace).FullName) 'build-index did not reuse the supplied converted snapshot'
+
 function Invoke-Query(
     [string]$Trace,
     [string]$Id,
@@ -32,12 +48,16 @@ function Invoke-Query(
         params = $Params
     } | ConvertTo-Json -Compress -Depth 12
 
+    $requestFile = "$OutputFile.request-$script:QueryOutputSequence.json"
+    $responseFile = "$OutputFile.response-$script:QueryOutputSequence.json"
+    $script:QueryOutputSequence++
+    [IO.File]::WriteAllText($requestFile, $request, [Text.UTF8Encoding]::new($false))
     $watch = [Diagnostics.Stopwatch]::StartNew()
-    $raw = $request | & $QueryExe --trace $Trace --request - --indexed --allow-root $AllowRoot
+    & $QueryExe --trace $Trace --request $requestFile --indexed --allow-root $AllowRoot --output $responseFile | Out-Null
     $exitCode = $LASTEXITCODE
     $watch.Stop()
     Assert-Condition ($exitCode -eq 0) "$Method failed for $Trace with exit code $exitCode"
-    $response = $raw | ConvertFrom-Json
+    $response = Get-Content -LiteralPath $responseFile -Raw | ConvertFrom-Json
     Assert-Condition ([bool]$response.ok) "$Method returned ok=false for $Trace"
     return [ordered]@{ elapsed_ms = $watch.ElapsedMilliseconds; data = $response.data }
 }
@@ -141,6 +161,12 @@ $equal = $snapshotCanonical -ceq $streamCanonical
 $result = [ordered]@{
     passed = $equal
     comparison = 'byte-exact canonical JSON over selected persisted evidence domains'
+    stream_index = [ordered]@{
+        elapsed_ms = $buildIndexWatch.ElapsedMilliseconds
+        input_kind = [string]$buildIndex.input.kind
+        indexed_snapshot = [string]$buildIndex.input.indexed_snapshot
+        stream_revision = [string]$buildIndex.input.stream_revision
+    }
     snapshot = [ordered]@{
         path = (Get-Item -LiteralPath $SnapshotTrace).FullName
         sha256 = (Get-FileHash -LiteralPath $SnapshotTrace -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -156,8 +182,6 @@ $result = [ordered]@{
     evidence = $snapshot.summary
 }
 
-$parent = Split-Path -Parent $OutputFile
-if ($parent) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
 $result | ConvertTo-Json -Depth 40 | Set-Content -LiteralPath $OutputFile -Encoding UTF8
 [ordered]@{
     passed = $equal

@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -17,8 +18,8 @@ void Usage()
 {
     std::cerr << "Usage:\n"
                  "  tracy-stream --version\n"
-                 "  tracy-stream inspect <capture.tracy-stream> [--records <count>]\n"
-                 "  tracy-stream recover <capture.tracy-stream> --truncate\n";
+                 "  tracy-stream inspect <capture.tracy-stream> [--records <count>] [--output file.json]\n"
+                 "  tracy-stream recover <capture.tracy-stream> --truncate [--output file.json]\n";
 }
 
 std::string JsonEscape( std::string_view value )
@@ -141,6 +142,7 @@ int main( int argc, char** argv )
     options.maxCollectedRecords = 0;
 
     bool truncate = false;
+    std::filesystem::path outputPath;
     for( int i = 3; i < argc; i++ )
     {
         const std::string_view argument = argv[i];
@@ -156,12 +158,28 @@ int main( int argc, char** argv )
                 return 1;
             }
         }
+        else if( argument == "--output" && i + 1 < argc )
+        {
+            outputPath = std::filesystem::u8path( argv[++i] );
+        }
         else
         {
             std::cerr << "Unknown or incomplete argument: " << argument << '\n';
             Usage();
             return 1;
         }
+    }
+
+    std::ofstream output;
+    if( !outputPath.empty() )
+    {
+        output.open( outputPath, std::ios::binary | std::ios::trunc );
+        if( !output )
+        {
+            std::cerr << "Unable to open output file.\n";
+            return 1;
+        }
+        std::cout.rdbuf( output.rdbuf() );
     }
 
     if( command == "inspect" )

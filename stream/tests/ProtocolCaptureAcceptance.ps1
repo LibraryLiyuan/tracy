@@ -73,6 +73,31 @@ function Read-JournalPayloadUInt32 {
     }
 }
 
+function Invoke-CapturedNative {
+    param(
+        [Parameter(Mandatory = $true)][string] $FilePath,
+        [Parameter()][string[]] $Arguments = @()
+    )
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = (Resolve-Path -LiteralPath $FilePath).Path
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    Assert-Condition $process.Start() "failed to start $FilePath"
+    $stdout = $process.StandardOutput.ReadToEndAsync()
+    $stderr = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    return [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $stdout.GetAwaiter().GetResult()
+        Stderr = $stderr.GetAwaiter().GetResult()
+    }
+}
+
 foreach ($requiredPath in @($ProducerExe, $CaptureExe, $ConverterExe, $InspectorExe, $QueryExe, $OutputRoot)) {
     Assert-Condition (Test-Path -LiteralPath $requiredPath) "required path does not exist: $requiredPath"
 }
@@ -114,7 +139,9 @@ try {
     while (-not $capture.HasExited -and [DateTime]::UtcNow -lt $pollDeadline) {
         if (Test-Path -LiteralPath $journalPath) {
             try {
-                $rawLiveInspect = (& $InspectorExe inspect $journalPath 2>$null) -join [Environment]::NewLine
+                $liveInspectPath = Join-Path $artifactRoot 'live-inspect.json'
+                $liveProcess = Invoke-CapturedNative $InspectorExe @('inspect', $journalPath, '--output', $liveInspectPath)
+                $rawLiveInspect = Get-Content -LiteralPath $liveInspectPath -Raw
                 if (-not [string]::IsNullOrWhiteSpace($rawLiveInspect)) {
                     $liveInspect = $rawLiveInspect | ConvertFrom-Json
                     if ([bool]$liveInspect.recoverable_prefix) {
@@ -142,8 +169,10 @@ try {
         Assert-Condition ($liveWatermarks[$i] -ge $liveWatermarks[$i - 1]) 'live watermark moved backwards'
     }
 
-    $inspectRaw = (& $InspectorExe inspect $journalPath) -join [Environment]::NewLine
-    $inspectExitCode = $LASTEXITCODE
+    $inspectOutputPath = Join-Path $artifactRoot 'inspect.json'
+    $inspectProcess = Invoke-CapturedNative $InspectorExe @('inspect', $journalPath, '--output', $inspectOutputPath)
+    $inspectRaw = Get-Content -LiteralPath $inspectOutputPath -Raw
+    $inspectExitCode = $inspectProcess.ExitCode
     Assert-Condition ($inspectExitCode -eq 0) "journal inspection failed with exit code $inspectExitCode"
     $inspectJson = $inspectRaw | ConvertFrom-Json
     Assert-Condition ([string]$inspectJson.status -eq 'OK') "journal status is $($inspectJson.status)"
@@ -153,6 +182,18 @@ try {
 
     & $ConverterExe -i $journalPath -o $replayedPath -p $ReplayPort -f
     Assert-Condition ($LASTEXITCODE -eq 0) "journal conversion failed with exit code $LASTEXITCODE"
+    $snapshotMapPath = "$journalPath.snapshot-map"
+    Assert-Condition (Test-Path -LiteralPath $snapshotMapPath -PathType Leaf) "converter did not publish the stream snapshot map: $snapshotMapPath"
+
+    $buildIndexOutputPath = Join-Path $artifactRoot 'build-index.json'
+    $buildIndexProcess = Invoke-CapturedNative $QueryExe @('--build-index', '--trace', $journalPath, '--allow-root', $artifactRoot, '--output', $buildIndexOutputPath)
+    $buildIndexRaw = Get-Content -LiteralPath $buildIndexOutputPath -Raw
+    $buildIndexExitCode = $buildIndexProcess.ExitCode
+    Assert-Condition ($buildIndexExitCode -eq 0) "stream build-index failed with exit code $buildIndexExitCode"
+    $buildIndex = $buildIndexRaw | ConvertFrom-Json
+    Assert-Condition ([bool]$buildIndex.ok) 'stream build-index returned ok=false'
+    Assert-Condition ([string]$buildIndex.input.kind -eq 'stream') 'stream build-index did not identify the input kind'
+    Assert-Condition ([string]$buildIndex.input.indexed_snapshot -eq (Get-Item -LiteralPath $replayedPath).FullName) 'stream build-index did not reuse the converted snapshot'
 
     foreach ($trace in @($directPath, $replayedPath)) {
         & $QueryExe --doctor --trace $trace --allow-root $artifactRoot | Out-Null
@@ -162,10 +203,14 @@ try {
     $repositoryRoot = Split-Path (Split-Path $PSScriptRoot)
     $overviewRequest = Join-Path $repositoryRoot 'query\tests\requests\overview.json'
     Assert-Condition (Test-Path -LiteralPath $overviewRequest) "overview request not found: $overviewRequest"
-    $directOverview = (& $QueryExe --allow-root $artifactRoot --trace $directPath --request $overviewRequest | ConvertFrom-Json)
-    Assert-Condition ($LASTEXITCODE -eq 0 -and [bool]$directOverview.ok) 'direct overview failed'
-    $replayedOverview = (& $QueryExe --allow-root $artifactRoot --trace $replayedPath --request $overviewRequest | ConvertFrom-Json)
-    Assert-Condition ($LASTEXITCODE -eq 0 -and [bool]$replayedOverview.ok) 'replayed overview failed'
+    $directOverviewPath = Join-Path $artifactRoot 'direct-overview.json'
+    $directOverviewProcess = Invoke-CapturedNative $QueryExe @('--allow-root', $artifactRoot, '--trace', $directPath, '--request', $overviewRequest, '--output', $directOverviewPath)
+    $directOverview = Get-Content -LiteralPath $directOverviewPath -Raw | ConvertFrom-Json
+    Assert-Condition ($directOverviewProcess.ExitCode -eq 0 -and [bool]$directOverview.ok) 'direct overview failed'
+    $replayedOverviewPath = Join-Path $artifactRoot 'replayed-overview.json'
+    $replayedOverviewProcess = Invoke-CapturedNative $QueryExe @('--allow-root', $artifactRoot, '--trace', $replayedPath, '--request', $overviewRequest, '--output', $replayedOverviewPath)
+    $replayedOverview = Get-Content -LiteralPath $replayedOverviewPath -Raw | ConvertFrom-Json
+    Assert-Condition ($replayedOverviewProcess.ExitCode -eq 0 -and [bool]$replayedOverview.ok) 'replayed overview failed'
 
     $directCounts = $directOverview.data.trace.counts | ConvertTo-Json -Compress
     $replayedCounts = $replayedOverview.data.trace.counts | ConvertTo-Json -Compress
@@ -178,7 +223,7 @@ try {
 
     $mcpAcceptance = Join-Path $repositoryRoot 'query\tests\RealTpsMcpAcceptance.ps1'
     Assert-Condition (Test-Path -LiteralPath $mcpAcceptance) "MCP acceptance script not found: $mcpAcceptance"
-    & $mcpAcceptance -QueryExe $QueryExe -BaselineTrace $directPath -CandidateTrace $replayedPath -AllowRoot $artifactRoot
+    & $mcpAcceptance -QueryExe $QueryExe -BaselineTrace $directPath -CandidateTrace $replayedPath -AllowRoot $artifactRoot -AllowNoResources
     Assert-Condition ($LASTEXITCODE -eq 0) "MCP A/B acceptance failed with exit code $LASTEXITCODE"
 
     if ($null -ne $producer -and -not $producer.HasExited) {
@@ -210,8 +255,10 @@ try {
     Assert-Condition (Test-Path -LiteralPath $drainStopPath -PathType Leaf) 'stop-file marker was unexpectedly removed'
     $drainCapture = $null
 
-    $drainInspectRaw = (& $InspectorExe inspect $drainJournalPath --records 1000000) -join [Environment]::NewLine
-    $drainInspectExitCode = $LASTEXITCODE
+    $drainInspectOutputPath = Join-Path $artifactRoot 'drain-inspect.json'
+    $drainInspectProcess = Invoke-CapturedNative $InspectorExe @('inspect', $drainJournalPath, '--records', '1000000', '--output', $drainInspectOutputPath)
+    $drainInspectRaw = Get-Content -LiteralPath $drainInspectOutputPath -Raw
+    $drainInspectExitCode = $drainInspectProcess.ExitCode
     Assert-Condition ($drainInspectExitCode -eq 0) 'protocol-only journal inspection failed'
     $drainInspect = $drainInspectRaw | ConvertFrom-Json
     Assert-Condition ([bool]$drainInspect.complete) 'protocol-only journal does not have a clean SessionEnd'
@@ -255,6 +302,7 @@ try {
     $drainReplayPort = $ReplayPort + 1
     & $ConverterExe -i $drainJournalPath -o $drainReplayPath -p $drainReplayPort -f
     Assert-Condition ($LASTEXITCODE -eq 0) 'protocol-only drain conversion failed'
+    Assert-Condition (Test-Path -LiteralPath "$drainJournalPath.snapshot-map" -PathType Leaf) 'protocol-only converter did not publish the stream snapshot map'
     foreach ($trace in @($drainJournalPath, $drainReplayPath)) {
         & $QueryExe --doctor --trace $trace --allow-root $artifactRoot | Out-Null
         Assert-Condition ($LASTEXITCODE -eq 0) "tracy-query doctor rejected protocol drain artifact $trace"
@@ -283,7 +331,9 @@ try {
     while (-not $crashCapture.HasExited -and [DateTime]::UtcNow -lt $crashDeadline) {
         if (Test-Path -LiteralPath $crashJournalPath) {
             try {
-                $rawCrashInspect = (& $InspectorExe inspect $crashJournalPath 2>$null) -join [Environment]::NewLine
+                $crashInspectOutputPath = Join-Path $artifactRoot 'crash-live-inspect.json'
+                $crashInspectProcess = Invoke-CapturedNative $InspectorExe @('inspect', $crashJournalPath, '--output', $crashInspectOutputPath)
+                $rawCrashInspect = Get-Content -LiteralPath $crashInspectOutputPath -Raw
                 if (-not [string]::IsNullOrWhiteSpace($rawCrashInspect)) {
                     $candidateCrashInspect = $rawCrashInspect | ConvertFrom-Json
                     if ([bool]$candidateCrashInspect.recoverable_prefix -and [UInt64]$candidateCrashInspect.record_count -ge 15) {
@@ -303,7 +353,9 @@ try {
     $crashCapture.WaitForExit()
     $crashCapture = $null
 
-    $rawCrashFinal = (& $InspectorExe inspect $crashJournalPath 2>$null) -join [Environment]::NewLine
+    $crashFinalOutputPath = Join-Path $artifactRoot 'crash-final-inspect.json'
+    [void](Invoke-CapturedNative $InspectorExe @('inspect', $crashJournalPath, '--output', $crashFinalOutputPath))
+    $rawCrashFinal = Get-Content -LiteralPath $crashFinalOutputPath -Raw
     $crashInspect = $rawCrashFinal | ConvertFrom-Json
     Assert-Condition ([bool]$crashInspect.recoverable_prefix) 'forced-stop journal has no recoverable prefix'
     Assert-Condition (-not [bool]$crashInspect.complete) 'forced-stop journal unexpectedly has SessionEnd'

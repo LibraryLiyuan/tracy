@@ -761,6 +761,51 @@ public:
         return true;
     }
 
+    static tracy_force_inline bool MemAllocNamedAtCallsiteForConnection( uint64_t connectionId, const void* ptr,
+        size_t size, uint32_t callsiteId, bool secure, const char* name )
+    {
+        if( secure && !ProfilerAvailable() ) return false;
+        if( callsiteId == 0 ) return false;
+#ifdef TRACY_ON_DEMAND
+        auto& profiler = GetProfiler();
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId ) return false;
+#else
+        auto& profiler = GetProfiler();
+        (void)connectionId;
+#endif
+        const auto thread = GetThreadHandle();
+
+        profiler.m_serialLock.lock();
+#ifdef TRACY_ON_DEMAND
+        if( !profiler.IsConnected() || profiler.ConnectionId() != connectionId )
+        {
+            profiler.m_serialLock.unlock();
+            return false;
+        }
+#endif
+        SendMemName( name );
+        auto item = profiler.m_serialQueue.prepare_next();
+        MemWrite( &item->hdr.type, QueueType::JnMemAllocCallsiteNamed );
+        MemWrite( &item->jnMemAllocCallsite.time, GetTime() );
+        MemWrite( &item->jnMemAllocCallsite.thread, thread );
+        MemWrite( &item->jnMemAllocCallsite.ptr, (uint64_t)ptr );
+        if( compile_time_condition<sizeof( size ) == 4>::value )
+        {
+            memcpy( &item->jnMemAllocCallsite.size, &size, 4 );
+            memset( ((char*)&item->jnMemAllocCallsite.size)+4, 0, 2 );
+        }
+        else
+        {
+            assert( sizeof( size ) == 8 );
+            memcpy( &item->jnMemAllocCallsite.size, &size, 4 );
+            memcpy( ((char*)&item->jnMemAllocCallsite.size)+4, ((char*)&size)+4, 2 );
+        }
+        MemWrite( &item->jnMemAllocCallsite.callsiteId, callsiteId );
+        profiler.m_serialQueue.commit_next();
+        profiler.m_serialLock.unlock();
+        return true;
+    }
+
     static tracy_force_inline bool MemFreeNamedForConnection( uint64_t connectionId, const void* ptr, int32_t depth, bool secure, const char* name )
     {
         if( secure && !ProfilerAvailable() ) return false;

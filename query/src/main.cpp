@@ -3,13 +3,16 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyQueryService.hpp"
 #include "TracySessionManager.hpp"
+#include "TracySegmentTraceSource.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include "../../public/common/TracyVersion.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -59,6 +62,7 @@ struct Arguments
     std::optional<std::filesystem::path> trace;
     std::optional<std::string> request;
     std::optional<std::string> batch;
+    std::optional<std::filesystem::path> output;
     std::vector<std::filesystem::path> allowRoots;
     std::vector<std::filesystem::path> allowSourceRoots;
     size_t analysisCacheMiB = 512;
@@ -72,9 +76,9 @@ void Usage()
         << "  tracy-query --version\n"
         << "  tracy-query --schema\n"
         << "  tracy-query --doctor [--trace file.tracy] [--compact-index] [--allow-root path]\n"
-        << "  tracy-query --build-index --trace file.tracy [--allow-root path]\n"
-        << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path]\n"
-        << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path]\n"
+        << "  tracy-query --build-index --trace file.tracy [--allow-root path] [--output file.json]\n"
+        << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path] [--output file.json]\n"
+        << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path] [--output file.ndjson]\n"
         << "  tracy-query --mcp [--indexed|--no-indexed] [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
 }
 
@@ -99,6 +103,7 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--trace" ) result.trace = value( "--trace" );
         else if( option == "--request" ) result.request = value( "--request" );
         else if( option == "--batch" ) result.batch = value( "--batch" );
+        else if( option == "--output" ) result.output = value( "--output" );
         else if( option == "--allow-root" ) result.allowRoots.emplace_back( value( "--allow-root" ) );
         else if( option == "--allow-source-root" ) result.allowSourceRoots.emplace_back( value( "--allow-source-root" ) );
         else if( option == "--analysis-cache-mib" )
@@ -299,13 +304,38 @@ int RunBuildIndex( const Arguments& args )
     SessionManager sessions( args.allowRoots );
     const auto path = sessions.ResolveTracePath( *args.trace );
     const auto started = std::chrono::steady_clock::now();
-    const auto index = QueryIndex::Build( path );
-    const auto validation = QueryIndex::Validate( path, true );
+    auto extension = path.extension().string();
+    std::transform( extension.begin(), extension.end(), extension.begin(), []( unsigned char value ) { return char( std::tolower( value ) ); } );
+    const bool streamInput = extension == ".tracy-stream";
+    std::filesystem::path indexedPath = path;
+    uint64_t streamRevision = 0;
+    std::unique_ptr<SegmentTraceSource> streamSource;
+    QueryIndexManifest index;
+    QueryIndexValidation validation;
+    if( streamInput )
+    {
+        streamSource = SegmentTraceSource::Open( path, {}, true );
+        indexedPath = streamSource->SnapshotPath();
+        const auto view = streamSource->RefreshView();
+        if( view ) streamRevision = view->revision;
+        validation = QueryIndex::Validate( indexedPath, true );
+        if( !validation.manifest ) throw std::runtime_error( "stream query index validation failed: " + validation.reason );
+        index = *validation.manifest;
+    }
+    else
+    {
+        index = QueryIndex::Build( indexedPath );
+        validation = QueryIndex::Validate( indexedPath, true );
+    }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
     const json result = {
         { "program", "tracy-query" }, { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
         { "operation", "build-index" }, { "ok", validation.manifest.has_value() },
         { "elapsed_ms", std::to_string( elapsed ) },
+        { "input", {
+            { "kind", streamInput ? "stream" : "snapshot" }, { "path", path.string() },
+            { "indexed_snapshot", indexedPath.string() }, { "stream_revision", std::to_string( streamRevision ) }
+        } },
         { "index", {
             { "schema_version", QueryIndexSchemaVersion }, { "manifest", index.manifestPath.string() },
             { "data", index.dataPath.string() }, { "source_sha256", index.sourceFingerprint },
@@ -333,6 +363,14 @@ int main( int argc, char** argv )
     try
     {
         const auto args = ParseArguments( argc, argv );
+        if( args.output && args.mcp ) throw std::runtime_error( "--output is not valid with --mcp" );
+        std::ofstream output;
+        if( args.output )
+        {
+            output.open( *args.output, std::ios::binary | std::ios::trunc );
+            if( !output ) throw std::runtime_error( "unable to open --output file" );
+            std::cout.rdbuf( output.rdbuf() );
+        }
         if( args.indexed || args.buildIndex ) ApplyIndexedMemoryBudget();
         if( args.compactIndex && ( !args.doctor || !args.trace ) ) throw std::runtime_error( "--compact-index requires --doctor and --trace" );
         if( args.buildIndex && !args.trace ) throw std::runtime_error( "--build-index requires --trace" );

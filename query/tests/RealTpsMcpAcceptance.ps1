@@ -10,7 +10,11 @@ param(
     [string] $CandidateTrace,
 
     [Parameter(Mandatory = $true)]
-    [string] $AllowRoot
+    [string] $AllowRoot,
+
+    [switch] $AllowNoResources,
+
+    [switch] $AllowNoSourceResources
 )
 
 $ErrorActionPreference = 'Stop'
@@ -368,30 +372,42 @@ try {
 
     $resources = Send-Rpc -Method 'resources/list'
     $resourceItems = @($resources.result.resources)
-    Assert-Condition ($resourceItems.Count -gt 0) 'resources/list returned no resources for ready traces'
-    $sourceResource = $resourceItems | Where-Object { $_.uri -match '/source/' } | Select-Object -First 1
-    Assert-Condition ($null -ne $sourceResource) 'first resource page did not contain embedded source'
-    $sourceRead = Send-Rpc -Method 'resources/read' -Params @{ uri = [string]$sourceResource.uri }
-    Assert-Condition ([string]$sourceRead.result.contents[0].mimeType -eq 'text/plain') 'source resource MIME type mismatch'
-    Assert-Condition ($null -ne $sourceRead.result.contents[0].PSObject.Properties['text']) 'source resource omitted text'
-
-    $frameImageCapability = @($overview.data.capabilities) | Where-Object { [string]$_.domain -eq 'frame_image' } | Select-Object -First 1
-    if ($null -ne $frameImageCapability -and [bool]$frameImageCapability.queryable) {
-        $images = Invoke-McpTool -Name 'tracy_inspect' -Arguments @{
-            method = 'frame_image.list'
-            trace_id = $baselineId
-            params = @{ limit = 1 }
-        }
-        Assert-Condition (@($images.data.images).Count -eq 1) 'queryable frame image capability did not return one image'
-        $imageUri = [string]$images.data.images[0].resource_uri
-        $imageRead = Send-Rpc -Method 'resources/read' -Params @{ uri = $imageUri } -TimeoutMilliseconds 60000
-        Assert-Condition ([string]$imageRead.result.contents[0].mimeType -eq 'image/png') 'frame image resource MIME type mismatch'
-        Assert-Condition (([string]$imageRead.result.contents[0].blob).Length -gt 8) 'frame image resource returned an empty blob'
-        [Console]::Out.WriteLine("STAGE resources_ok SOURCE_CHARS=$(([string]$sourceRead.result.contents[0].text).Length) PNG_BASE64_CHARS=$(([string]$imageRead.result.contents[0].blob).Length)")
+    if ($resourceItems.Count -eq 0 -and $AllowNoResources) {
+        [Console]::Out.WriteLine('STAGE resources_skipped REASON=synthetic_trace_has_no_embedded_source_or_frame_image')
     }
     else {
-        $reason = if ($null -ne $frameImageCapability) { [string]$frameImageCapability.reason } else { 'capability not reported' }
-        [Console]::Out.WriteLine("STAGE resources_ok SOURCE_CHARS=$(([string]$sourceRead.result.contents[0].text).Length) FRAME_IMAGES=SKIPPED REASON=$reason")
+        Assert-Condition ($resourceItems.Count -gt 0) 'resources/list returned no resources for ready traces'
+        $sourceResource = $resourceItems | Where-Object { $_.uri -match '/source/' } | Select-Object -First 1
+        $sourceCharacters = 0
+        if ($null -eq $sourceResource -and $AllowNoSourceResources) {
+            [Console]::Out.WriteLine('STAGE source_resource_skipped REASON=trace_declares_no_embedded_source_cache')
+        }
+        else {
+            Assert-Condition ($null -ne $sourceResource) 'first resource page did not contain embedded source'
+            $sourceRead = Send-Rpc -Method 'resources/read' -Params @{ uri = [string]$sourceResource.uri }
+            Assert-Condition ([string]$sourceRead.result.contents[0].mimeType -eq 'text/plain') 'source resource MIME type mismatch'
+            Assert-Condition ($null -ne $sourceRead.result.contents[0].PSObject.Properties['text']) 'source resource omitted text'
+            $sourceCharacters = ([string]$sourceRead.result.contents[0].text).Length
+        }
+
+        $frameImageCapability = @($overview.data.capabilities) | Where-Object { [string]$_.domain -eq 'frame_image' } | Select-Object -First 1
+        if ($null -ne $frameImageCapability -and [bool]$frameImageCapability.queryable) {
+            $images = Invoke-McpTool -Name 'tracy_inspect' -Arguments @{
+                method = 'frame_image.list'
+                trace_id = $baselineId
+                params = @{ limit = 1 }
+            }
+            Assert-Condition (@($images.data.images).Count -eq 1) 'queryable frame image capability did not return one image'
+            $imageUri = [string]$images.data.images[0].resource_uri
+            $imageRead = Send-Rpc -Method 'resources/read' -Params @{ uri = $imageUri } -TimeoutMilliseconds 60000
+            Assert-Condition ([string]$imageRead.result.contents[0].mimeType -eq 'image/png') 'frame image resource MIME type mismatch'
+            Assert-Condition (([string]$imageRead.result.contents[0].blob).Length -gt 8) 'frame image resource returned an empty blob'
+            [Console]::Out.WriteLine("STAGE resources_ok SOURCE_CHARS=$sourceCharacters PNG_BASE64_CHARS=$(([string]$imageRead.result.contents[0].blob).Length)")
+        }
+        else {
+            $reason = if ($null -ne $frameImageCapability) { [string]$frameImageCapability.reason } else { 'capability not reported' }
+            [Console]::Out.WriteLine("STAGE resources_ok SOURCE_CHARS=$sourceCharacters FRAME_IMAGES=SKIPPED REASON=$reason")
+        }
     }
 
     $candidateClose = Invoke-McpTool -Name 'tracy_trace_close' -Arguments @{ trace_id = $candidateId }
