@@ -6590,8 +6590,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                             { "physical_pool_event_present", value.physicalPoolEventPresent }, { "trust", "untrusted_trace_data" }
                         } );
                     }
-                    data["unknown_use_occurrences"] = Decimal( summary.unknownUseOccurrences );
-                    data["unknown_unique_resource_classifications"] = Decimal( summary.unknownUses.size() );
+                    data["unknown_use_quality_available"] = summary.unknownUseQualityAvailable;
+                    data["capture_boundary_reference_uses"] = summary.unknownUseQualityAvailable ?
+                        json( Decimal( summary.captureBoundaryReferenceUses ) ) : json( nullptr );
+                    data["unknown_use_unavailable_reason"] = summary.unknownUseQualityAvailable ? json( nullptr ) :
+                        json( "indexed_summary_does_not_materialize_deep_lifetime_graph" );
+                    data["unknown_use_occurrences"] = summary.unknownUseQualityAvailable ? json( Decimal( summary.unknownUseOccurrences ) ) : json( nullptr );
+                    data["unknown_unique_resource_classifications"] = summary.unknownUseQualityAvailable ? json( Decimal( summary.unknownUses.size() ) ) : json( nullptr );
                     data["unknown_uses"] = std::move( unknownUses );
                     data["unknown_uses_truncated"] = summary.unknownUses.size() > DefaultPageSize;
                 }
@@ -6930,17 +6935,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             else allocationJson["origin"] = nullptr;
             if( logicalPool )
             {
-                const auto logical = attribution.logicalById.find( item.allocation.allocationId );
-                if( logical != attribution.logicalById.end() )
+                const analysis::GpuMemoryLogicalResource* resource = nullptr;
+                const auto generation = attribution.logicalGenerationByKey.find( item.allocation.key );
+                if( generation != attribution.logicalGenerationByKey.end() && generation->second < attribution.logicalGenerations.size() )
+                    resource = &attribution.logicalGenerations[generation->second];
+                if( resource == nullptr )
                 {
-                    const auto& resource = attribution.logicalResources[logical->second];
+                    const auto logical = attribution.logicalById.find( item.allocation.allocationId );
+                    if( logical != attribution.logicalById.end() ) resource = &attribution.logicalResources[logical->second];
+                }
+                if( resource != nullptr )
+                {
                     allocationJson["logical_resource"] = {
-                        { "logical_resource_id", Decimal( resource.logicalResourceId ) },
-                        { "physical_allocation_id", Decimal( resource.physicalAllocationId ) },
-                        { "size_bytes", Decimal( resource.size ) }, { "physical_offset_bytes", Decimal( resource.physicalOffset ) },
-                        { "primary_owner_id", Decimal( uint64_t( resource.primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource.physicalOwnerId ) ) },
-                        { "kind", std::string( 1, resource.kind ) }, { "segment", std::string( 1, resource.segment ) },
-                        { "flags", resource.flags }, { "name", resource.name }, { "trust", "untrusted_trace_data" }
+                        { "logical_resource_id", Decimal( resource->logicalResourceId ) },
+                        { "physical_allocation_id", Decimal( resource->physicalAllocationId ) },
+                        { "size_bytes", Decimal( resource->size ) }, { "physical_offset_bytes", Decimal( resource->physicalOffset ) },
+                        { "primary_owner_id", Decimal( uint64_t( resource->primaryOwnerId ) ) }, { "physical_owner_id", Decimal( uint64_t( resource->physicalOwnerId ) ) },
+                        { "kind", std::string( 1, resource->kind ) }, { "segment", std::string( 1, resource->segment ) },
+                        { "flags", resource->flags }, { "name", resource->name }, { "trust", "untrusted_trace_data" }
                     };
                 }
             }
@@ -7016,6 +7028,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             data["unknown_use_occurrences"] = Decimal( attribution.unknownUseOccurrences );
             data["unknown_unique_resource_classifications"] = Decimal( attribution.unknownUses.size() );
+            data["unknown_use_quality_available"] = attribution.unknownUseQualityAvailable;
+            data["capture_boundary_reference_uses"] = Decimal( attribution.captureBoundaryReferenceUses );
+            data["unknown_use_unavailable_reason"] = attribution.unknownUseQualityAvailable ? json( nullptr ) :
+                json( "deep_lifetime_graph_not_materialized" );
             data["unknown_uses"] = std::move( unknownUses );
             data["unknown_uses_truncated"] = attribution.unknownUses.size() > DefaultPageSize;
         }

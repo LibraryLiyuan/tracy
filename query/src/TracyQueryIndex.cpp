@@ -628,6 +628,20 @@ json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
         { "id", item.logicalResourceId }, { "physical", item.physicalAllocationId }, { "size", item.size },
         { "offset", item.physicalOffset }, { "owner", item.primaryOwnerId }, { "physical_owner", item.physicalOwnerId },
         { "flags", item.flags }, { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name } } );
+    json logicalGenerations = json::array();
+    std::vector<std::pair<analysis::MemoryEventKey, size_t>> generationKeys(
+        value.logicalGenerationByKey.begin(), value.logicalGenerationByKey.end() );
+    std::sort( generationKeys.begin(), generationKeys.end(), []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; } );
+    for( const auto& [key, generationIndex] : generationKeys )
+    {
+        if( generationIndex >= value.logicalGenerations.size() ) continue;
+        const auto& item = value.logicalGenerations[generationIndex];
+        logicalGenerations.push_back( {
+            { "pool", key.pool }, { "index", key.index }, { "id", item.logicalResourceId },
+            { "physical", item.physicalAllocationId }, { "size", item.size }, { "offset", item.physicalOffset },
+            { "owner", item.primaryOwnerId }, { "physical_owner", item.physicalOwnerId }, { "flags", item.flags },
+            { "kind", uint8_t( item.kind ) }, { "segment", uint8_t( item.segment ) }, { "name", item.name } } );
+    }
     json origins = json::array();
     for( const auto& item : value.origins ) origins.push_back( {
         { "allocation", item.allocationId }, { "connection", item.connectionId }, { "cpu_zone", item.cpuZoneIndex },
@@ -657,13 +671,16 @@ json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
         { "emitted", item.emittedUseCount }, { "total", item.totalUseCount }, { "dropped", item.droppedUses },
         { "truncated", item.truncated }, { "complete", item.complete }, { "flags", item.flags }, { "pairing", uint8_t( item.gpuPairing ) } } );
     return {
-        { "schema", 2 }, { "protocol", value.protocolPresent }, { "protocol2", value.protocol2Present },
+        { "schema", 3 }, { "protocol", value.protocolPresent }, { "protocol2", value.protocol2Present },
         { "structured", value.structuredReferencePresent }, { "complete", value.complete },
-        { "capture_boundary", value.captureBoundaryPasses }, { "submission_unobserved", value.submissionUnobservedPasses },
+        { "capture_boundary", value.captureBoundaryPasses }, { "capture_boundary_reference_uses", value.captureBoundaryReferenceUses },
+        { "submission_unobserved", value.submissionUnobservedPasses },
         { "gpu_unavailable", value.gpuResultUnavailablePasses }, { "warnings", value.warnings },
         { "logical_count", value.logicalResources.size() }, { "logical_resources", std::move( logicalResources ) },
+        { "logical_generations", std::move( logicalGenerations ) },
         { "origins", std::move( origins ) }, { "owner_rollups", std::move( ownerRollups ) },
         { "working_count", value.aggregatedWorkingSetCount },
+        { "unknown_use_quality_available", value.unknownUseQualityAvailable },
         { "quality", {
             { "incomplete", value.aggregatedIncompleteReferencePasses },
             { "structured_incomplete", value.aggregatedStructuredIncompleteReferencePasses },
@@ -686,11 +703,13 @@ json GpuMemorySummaryJson( const analysis::GpuMemoryAttribution& value )
 
 analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
 {
-    if( value.at( "schema" ).get<uint32_t>() != 2 ) throw std::runtime_error( "GPU-memory summary schema mismatch" );
+    const auto schema = value.at( "schema" ).get<uint32_t>();
+    if( schema != 2 && schema != 3 ) throw std::runtime_error( "GPU-memory summary schema mismatch" );
     analysis::GpuMemoryAttribution result;
     result.protocolPresent = value.at( "protocol" ).get<bool>(); result.protocol2Present = value.at( "protocol2" ).get<bool>();
     result.structuredReferencePresent = value.at( "structured" ).get<bool>(); result.complete = value.at( "complete" ).get<bool>();
     result.captureBoundaryPasses = value.at( "capture_boundary" ).get<uint64_t>();
+    result.captureBoundaryReferenceUses = schema >= 3 ? value.value( "capture_boundary_reference_uses", uint64_t( 0 ) ) : 0;
     result.submissionUnobservedPasses = value.at( "submission_unobserved" ).get<uint64_t>();
     result.gpuResultUnavailablePasses = value.at( "gpu_unavailable" ).get<uint64_t>(); result.warnings = value.at( "warnings" ).get<std::vector<std::string>>();
     for( const auto& item : value.at( "logical_resources" ) )
@@ -704,6 +723,18 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
         result.logicalById.emplace( resource.logicalResourceId, result.logicalResources.size() ); result.logicalResources.emplace_back( resource );
     }
     if( result.logicalResources.size() != value.at( "logical_count" ).get<size_t>() ) throw std::runtime_error( "GPU-memory logical summary count mismatch" );
+    if( schema >= 3 ) for( const auto& item : value.at( "logical_generations" ) )
+    {
+        analysis::GpuMemoryLogicalResource resource;
+        resource.logicalResourceId = item.at( "id" ).get<uint64_t>(); resource.physicalAllocationId = item.at( "physical" ).get<uint64_t>();
+        resource.size = item.at( "size" ).get<uint64_t>(); resource.physicalOffset = item.at( "offset" ).get<uint64_t>();
+        resource.primaryOwnerId = item.at( "owner" ).get<uint32_t>(); resource.physicalOwnerId = item.at( "physical_owner" ).get<uint32_t>();
+        resource.flags = item.at( "flags" ).get<uint32_t>(); resource.kind = char( item.at( "kind" ).get<uint8_t>() );
+        resource.segment = char( item.at( "segment" ).get<uint8_t>() ); resource.name = item.at( "name" ).get<std::string>();
+        const analysis::MemoryEventKey key { item.at( "pool" ).get<uint64_t>(), item.at( "index" ).get<size_t>() };
+        result.logicalGenerationByKey.emplace( key, result.logicalGenerations.size() );
+        result.logicalGenerations.emplace_back( std::move( resource ) );
+    }
     for( const auto& item : value.at( "origins" ) )
     {
         analysis::GpuMemoryAllocationOrigin origin;
@@ -720,6 +751,7 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
         item.at( "taxonomy" ).get<uint32_t>(), item.at( "physical_bytes" ).get<uint64_t>(),
         item.at( "physical_count" ).get<uint64_t>(), item.at( "logical_count" ).get<uint64_t>() } );
     result.passQualityAggregated = true; result.aggregatedWorkingSetCount = value.at( "working_count" ).get<uint64_t>();
+    result.unknownUseQualityAvailable = schema >= 3 ? value.value( "unknown_use_quality_available", false ) : false;
     const auto& quality = value.at( "quality" );
     result.aggregatedIncompleteReferencePasses = quality.at( "incomplete" ).get<uint64_t>();
     result.aggregatedStructuredIncompleteReferencePasses = quality.at( "structured_incomplete" ).get<uint64_t>();
@@ -1450,8 +1482,15 @@ public:
             const analysis::GpuMemoryLogicalResource* logical = nullptr;
             if( logicalPool && m_precomputedGpuMemorySummary )
             {
-                const auto found = m_precomputedGpuMemorySummary->logicalById.find( allocation.allocationId );
-                if( found != m_precomputedGpuMemorySummary->logicalById.end() ) logical = &m_precomputedGpuMemorySummary->logicalResources[found->second];
+                const auto generation = m_precomputedGpuMemorySummary->logicalGenerationByKey.find( allocation.key );
+                if( generation != m_precomputedGpuMemorySummary->logicalGenerationByKey.end() &&
+                    generation->second < m_precomputedGpuMemorySummary->logicalGenerations.size() )
+                    logical = &m_precomputedGpuMemorySummary->logicalGenerations[generation->second];
+                else
+                {
+                    const auto found = m_precomputedGpuMemorySummary->logicalById.find( allocation.allocationId );
+                    if( found != m_precomputedGpuMemorySummary->logicalById.end() ) logical = &m_precomputedGpuMemorySummary->logicalResources[found->second];
+                }
             }
             std::optional<uint64_t> requestLabel;
             std::optional<uint64_t> requestScopeZone;
@@ -1532,6 +1571,10 @@ public:
             }
         }
         auto result = m_source->GetGpuMemoryAttributionFromExternalZones( cpuInputs, gpuInputs );
+        // The compact sidecar deliberately aggregates structured pass/use
+        // records without materializing the full attribution graph. Never
+        // represent this omitted deep lifetime check as a clean zero.
+        result.unknownUseQualityAvailable = false;
         if( m_gpuReferencePasses.Count() == 0 ) return result;
 
         struct PassAggregate
@@ -2126,7 +2169,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             }
             std::vector<uint64_t> gpuMemoryCpuZones;
             std::vector<uint64_t> gpuMemorySummaryCpuZones;
-            std::unordered_map<uint64_t, uint64_t> latestResourceZoneById;
             for( uint64_t index = 0; index < cpuSection.Count(); index++ )
             {
                 const auto& zone = cpuSection.At<CpuZoneIndexRecord>( index );
@@ -2171,15 +2213,12 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
                 else if( marker->second == analysis::GpuMemoryRequestMarker )
                 {
                     constexpr std::string_view prefix = "GTMEM1|RESOURCE|allocation=";
-                    const auto begin = text->find( prefix );
-                    if( begin != std::string::npos )
-                    {
-                        const auto valueBegin = text->data() + begin + prefix.size();
-                        const auto valueEnd = std::find( valueBegin, text->data() + text->size(), '|' );
-                        uint64_t allocationId = 0;
-                        const auto parsed = std::from_chars( valueBegin, valueEnd, allocationId );
-                        if( parsed.ec == std::errc() && parsed.ptr == valueEnd && allocationId != 0 ) latestResourceZoneById[allocationId] = index;
-                    }
+                    // Pointer values are reused across resource generations.
+                    // Keep every resource metadata record in the compact
+                    // summary so an allocation event can resolve the backing
+                    // that was active in its own lifetime, not the final
+                    // last-writer for that address.
+                    if( text->find( prefix ) != std::string::npos ) gpuMemorySummaryCpuZones.emplace_back( index );
                 }
                 if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
                     result.gpuMemoryProtocol2 = true;
@@ -2217,7 +2256,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             zoneValidation.scanned = cpuSection.Count() + gpuSection.Count();
             result.zoneValidationPrecomputed = true;
             result.zoneValidation = std::move( zoneValidation );
-            for( const auto& [allocationId, index] : latestResourceZoneById ) gpuMemorySummaryCpuZones.emplace_back( index );
             std::sort( gpuMemorySummaryCpuZones.begin(), gpuMemorySummaryCpuZones.end() );
             MappedSection filtered;
             filtered.Open( temporaryGpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, gpuMemoryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint );

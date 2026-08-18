@@ -204,7 +204,13 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     int64_t captureEndNs )
 {
     GpuMemoryAttribution result;
+    struct LogicalMetadataRecord
+    {
+        GpuMemoryLogicalResource resource;
+        int64_t timeNs = 0;
+    };
     std::unordered_map<uint64_t, GpuMemoryLogicalResource> logicalMetadata;
+    std::unordered_map<uint64_t, std::vector<LogicalMetadataRecord>> logicalMetadataHistory;
     for( const auto& zone : cpuZones )
     {
         const bool requestMarker = zone.markerName == GpuMemoryRequestMarker;
@@ -291,7 +297,10 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
                     const auto segment = Field( line, "segment" ); if( !segment.empty() ) resource.segment = segment.front();
                     resource.name = zone.name;
                     if( resource.logicalResourceId != 0 && resource.physicalAllocationId != 0 )
-                        logicalMetadata[resource.logicalResourceId] = std::move( resource );
+                    {
+                        logicalMetadata[resource.logicalResourceId] = resource;
+                        logicalMetadataHistory[resource.logicalResourceId].push_back( { std::move( resource ), zone.startNs } );
+                    }
                 }
                 if( lineEnd == std::string::npos ) break;
                 cursor = lineEnd + 1;
@@ -350,12 +359,12 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         if( header ) result.passes.emplace_back( std::move( pass ) );
     }
 
+    uint64_t earliestStructuredFrame = std::numeric_limits<uint64_t>::max();
     uint64_t latestStructuredFrame = 0;
     if( !structuredReferencePasses.empty() )
     {
         result.protocolPresent = true;
         result.structuredReferencePresent = true;
-        uint64_t earliestStructuredFrame = std::numeric_limits<uint64_t>::max();
         for( const auto& input : structuredReferencePasses )
         {
             earliestStructuredFrame = std::min( earliestStructuredFrame, input.frame );
@@ -413,6 +422,12 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
     } );
     for( size_t index = 0; index < result.logicalResources.size(); index++ )
         result.logicalById[result.logicalResources[index].logicalResourceId] = index;
+    for( auto& [logicalId, history] : logicalMetadataHistory )
+    {
+        std::stable_sort( history.begin(), history.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.timeNs < rhs.timeNs;
+        } );
+    }
 
     std::sort( result.requestScopes.begin(), result.requestScopes.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.thread != rhs.thread ? lhs.thread < rhs.thread : lhs.start < rhs.start;
@@ -443,6 +458,51 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         if( logicalPool ) logicalAllocationLifetimes[allocation.allocationId].emplace_back( result.allocations.size() );
         if( physicalPool ) physicalAllocationLifetimes[allocation.allocationId].emplace_back( result.allocations.size() );
         result.allocations.emplace_back( std::move( attributed ) );
+    }
+
+    const auto logicalMetadataForLifetime = [&logicalMetadataHistory]( uint64_t logicalId,
+        int64_t begin, int64_t end ) -> const GpuMemoryLogicalResource* {
+        const auto found = logicalMetadataHistory.find( logicalId );
+        if( found == logicalMetadataHistory.end() ) return nullptr;
+        const LogicalMetadataRecord* selected = nullptr;
+        for( const auto& record : found->second )
+        {
+            if( record.timeNs > end ) break;
+            if( record.timeNs >= begin ) selected = &record;
+        }
+        // Synthetic traces and pre-capture snapshots may place their sole
+        // metadata marker immediately before the matching allocation event.
+        // Do not use this fallback when an id has multiple generations: doing
+        // so would recreate the historical last-writer-wins bug.
+        if( selected == nullptr && found->second.size() == 1 && found->second.front().timeNs <= end )
+            selected = &found->second.front();
+        return selected ? &selected->resource : nullptr;
+    };
+    const auto latestLogicalMetadataAt = [&logicalMetadataHistory]( uint64_t logicalId,
+        int64_t time ) -> const GpuMemoryLogicalResource* {
+        const auto found = logicalMetadataHistory.find( logicalId );
+        if( found == logicalMetadataHistory.end() ) return nullptr;
+        const LogicalMetadataRecord* selected = nullptr;
+        for( const auto& record : found->second )
+        {
+            if( record.timeNs > time ) break;
+            selected = &record;
+        }
+        return selected ? &selected->resource : nullptr;
+    };
+    for( const auto& [logicalId, lifetimes] : logicalAllocationLifetimes )
+    {
+        for( const auto allocationIndex : lifetimes )
+        {
+            auto& attributed = result.allocations[allocationIndex];
+            const auto end = attributed.allocation.freeNs.value_or( std::numeric_limits<int64_t>::max() );
+            const auto* resource = logicalMetadataForLifetime( logicalId, attributed.allocation.allocationNs, end );
+            if( resource == nullptr ) continue;
+            attributed.logicalGenerationIndex = result.logicalGenerations.size();
+            result.logicalGenerationByKey.emplace( attributed.allocation.key, result.logicalGenerations.size() );
+            result.logicalGenerations.emplace_back( *resource );
+            if( resource->primaryOwnerId != 0 ) attributed.requestLabelId = resource->primaryOwnerId;
+        }
     }
 
     const auto findOverlappingLifetime = [&result]( const auto& lifetimes, uint64_t allocationId,
@@ -484,39 +544,57 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         result.unknownUseOccurrences++;
     };
 
-    for( const auto& resource : result.logicalResources )
-    {
-        if( resource.primaryOwnerId == 0 ) continue;
-        const auto allocation = result.allocationById.find( resource.logicalResourceId );
-        if( allocation != result.allocationById.end() ) result.allocations[allocation->second].requestLabelId = resource.primaryOwnerId;
-    }
-
     for( size_t passIndex = 0; passIndex < result.passes.size(); passIndex++ )
     {
         auto& pass = result.passes[passIndex];
         result.passById[pass.passId] = passIndex;
         for( auto& use : pass.uses )
         {
-            const auto logical = result.logicalById.find( use.allocationId );
-            const GpuMemoryLogicalResource* logicalResource = logical != result.logicalById.end()
-                ? &result.logicalResources[logical->second] : nullptr;
-            if( logical != result.logicalById.end() )
-                use.kind = result.logicalResources[logical->second].kind;
-            else
-                pass.untrackedReferences++;
-
             const auto logicalLifetimes = logicalAllocationLifetimes.find( use.allocationId );
             const bool logicalPoolEvent = logicalLifetimes != logicalAllocationLifetimes.end();
             const auto activeLogical = findOverlappingLifetime( logicalAllocationLifetimes, use.allocationId, pass.start, pass.end );
+            // The authoritative registry snapshot is emitted after the
+            // connection becomes visible to command-list producers. On a busy
+            // attach it may trail the first partial frame plus two completed
+            // frames; keep this explicit and separately counted rather than
+            // reporting those pre-snapshot uses as lifetime failures.
+            const bool captureHead = earliestStructuredFrame != std::numeric_limits<uint64_t>::max() &&
+                pass.frame <= earliestStructuredFrame + 2;
+            const bool registrationSnapshotPending = logicalPoolEvent && !activeLogical &&
+                std::all_of( logicalLifetimes->second.begin(), logicalLifetimes->second.end(), [&]( const auto allocationIndex ) {
+                    return result.allocations[allocationIndex].allocation.allocationNs > pass.end;
+                } );
+            if( captureHead && registrationSnapshotPending )
+            {
+                result.captureBoundaryReferenceUses++;
+                continue;
+            }
+            const GpuMemoryLogicalResource* logicalResource = nullptr;
+            if( activeLogical )
+            {
+                const auto generation = result.allocations[*activeLogical].logicalGenerationIndex;
+                if( generation && *generation < result.logicalGenerations.size() )
+                    logicalResource = &result.logicalGenerations[*generation];
+            }
+            if( logicalResource == nullptr && !activeLogical ) logicalResource = latestLogicalMetadataAt( use.allocationId, pass.end );
+            const bool logicalMetadataPresent = logicalMetadataHistory.find( use.allocationId ) != logicalMetadataHistory.end();
+            if( logicalResource != nullptr )
+            {
+                use.kind = logicalResource->kind;
+                use.resolvedPhysicalAllocationId = logicalResource->physicalAllocationId;
+                use.resolvedPrimaryOwnerId = logicalResource->primaryOwnerId;
+            }
+            else pass.untrackedReferences++;
+
             uint64_t physicalId = logicalResource ? logicalResource->physicalAllocationId : 0;
             const auto physicalLifetimes = physicalAllocationLifetimes.find( physicalId );
             const bool physicalPoolEvent = physicalId != 0 && physicalLifetimes != physicalAllocationLifetimes.end();
             const auto activePhysical = physicalId != 0
                 ? findOverlappingLifetime( physicalAllocationLifetimes, physicalId, pass.start, pass.end ) : std::nullopt;
 
-            if( !logicalResource && !logicalPoolEvent )
+            if( !logicalMetadataPresent && !logicalPoolEvent )
                 noteUnknownUse( pass, use, nullptr, "logical_registration_missing", false, false );
-            else if( !logicalResource )
+            else if( !logicalMetadataPresent )
                 noteUnknownUse( pass, use, nullptr, "logical_metadata_missing", true, false );
             else if( !logicalPoolEvent )
                 noteUnknownUse( pass, use, logicalResource, "logical_pool_event_missing", false, physicalPoolEvent );
@@ -526,6 +604,8 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
                     ? "id_reuse_generation_conflict" : "outside_logical_lifetime";
                 noteUnknownUse( pass, use, logicalResource, reason, true, physicalPoolEvent );
             }
+            else if( logicalResource == nullptr )
+                noteUnknownUse( pass, use, nullptr, "logical_metadata_missing", true, false );
             else if( !physicalPoolEvent )
                 noteUnknownUse( pass, use, logicalResource, "physical_allocation_missing", true, false );
             else if( !activePhysical )
@@ -696,19 +776,17 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         const WorkingSetKey key { pass.frame, uint32_t( pass.labelId ) };
         for( const auto& use : pass.uses )
         {
-            const auto logical = result.logicalById.find( use.allocationId );
-            if( logical == result.logicalById.end() ) continue;
-            const auto& resource = result.logicalResources[logical->second];
-            workingLogicalIds[key].insert( resource.logicalResourceId );
-            workingPhysicalIds[key].insert( resource.physicalAllocationId );
+            if( use.resolvedPhysicalAllocationId == 0 ) continue;
+            workingLogicalIds[key].insert( use.allocationId );
+            workingPhysicalIds[key].insert( use.resolvedPhysicalAllocationId );
 
             const GpuMemoryPass* ancestor = &pass;
             std::set<uint64_t> visited;
             while( ancestor != nullptr && visited.insert( ancestor->passId ).second )
             {
                 const WorkingSetKey ancestorKey { ancestor->frame, uint32_t( ancestor->labelId ) };
-                inclusiveLogicalIds[ancestorKey].insert( resource.logicalResourceId );
-                inclusivePhysicalIds[ancestorKey].insert( resource.physicalAllocationId );
+                inclusiveLogicalIds[ancestorKey].insert( use.allocationId );
+                inclusivePhysicalIds[ancestorKey].insert( use.resolvedPhysicalAllocationId );
                 structuredWorkingSet[ancestorKey] = structuredWorkingSet[ancestorKey] || ancestor->structuredBinary;
                 if( ancestor->parentPassId == 0 ) break;
                 const auto parent = result.passById.find( ancestor->parentPassId );

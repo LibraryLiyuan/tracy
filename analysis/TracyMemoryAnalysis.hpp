@@ -206,6 +206,11 @@ struct GpuMemoryPassUse
     char kind = 'U';
     uint32_t resourceSetId = 0;
     uint8_t encoding = 1;
+    // Analysis-only generation resolution. D3D12 interface pointers are
+    // routinely reused, so the logical id alone cannot identify the physical
+    // backing of an historical pass.
+    uint64_t resolvedPhysicalAllocationId = 0;
+    uint32_t resolvedPrimaryOwnerId = 0;
 };
 
 struct GpuMemoryReferencePassInput
@@ -274,6 +279,7 @@ struct GpuMemoryAllocationAttribution
     GpuMemoryAllocationInput allocation;
     std::optional<uint64_t> requestLabelId;
     std::vector<size_t> passIndices;
+    std::optional<size_t> logicalGenerationIndex;
 };
 
 struct GpuMemoryLogicalResource
@@ -338,6 +344,7 @@ struct GpuMemoryAttribution
     bool structuredReferencePresent = false;
     bool complete = true;
     uint64_t captureBoundaryPasses = 0;
+    uint64_t captureBoundaryReferenceUses = 0;
     uint64_t submissionUnobservedPasses = 0;
     uint64_t gpuResultUnavailablePasses = 0;
     bool passQualityAggregated = false;
@@ -355,6 +362,7 @@ struct GpuMemoryAttribution
     std::vector<GpuMemoryPass> passes;
     std::vector<GpuMemoryAllocationAttribution> allocations;
     std::vector<GpuMemoryLogicalResource> logicalResources;
+    std::vector<GpuMemoryLogicalResource> logicalGenerations;
     std::vector<GpuMemoryOwnerRollup> ownerRollups;
     std::vector<GpuMemoryWorkingSet> workingSets;
     std::vector<GpuMemoryAllocationOrigin> origins;
@@ -362,11 +370,13 @@ struct GpuMemoryAttribution
     std::vector<GpuMemoryFragmentation> fragmentation;
     std::vector<GpuMemoryUnknownUse> unknownUses;
     uint64_t unknownUseOccurrences = 0;
+    bool unknownUseQualityAvailable = true;
     GpuMemoryChurn churn;
     GpuMemoryResidencySummary residency;
     std::unordered_map<uint64_t, size_t> passById;
     std::unordered_map<uint64_t, size_t> allocationById;
     std::unordered_map<uint64_t, size_t> logicalById;
+    std::unordered_map<MemoryEventKey, size_t, MemoryEventKeyHash> logicalGenerationByKey;
     std::unordered_map<uint64_t, size_t> physicalOriginById;
     std::unordered_map<uint64_t, size_t> logicalOriginById;
 };

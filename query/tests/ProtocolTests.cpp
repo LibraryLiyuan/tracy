@@ -139,7 +139,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 8 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 9 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
@@ -341,6 +341,46 @@ int main()
     assert( unknownAttribution.unknownUses[0].allocationId == 9001 );
     assert( unknownAttribution.unknownUses[0].classification == "logical_registration_missing" );
     assert( unknownAttribution.unknownUses[0].occurrenceCount == 2 );
+
+    // A COM interface address is not a generation-stable resource id. Verify
+    // that two lifetimes which reuse the same logical pointer retain their own
+    // physical backing and do not produce false outside-physical-lifetime
+    // findings.
+    const std::vector<GpuMemoryCpuZoneInput> reusedMetadata = {
+        { 10, GpuMemoryRequestMarker, "Generation A", "GTMEM1|RESOURCE|allocation=42|physical=100|bytes=4096|offset=0|owner=7|physical_owner=0|kind=B|segment=L|flags=0", 9, 10, 11 },
+        { 11, GpuMemoryRequestMarker, "Generation B", "GTMEM1|RESOURCE|allocation=42|physical=200|bytes=8192|offset=0|owner=8|physical_owner=0|kind=T|segment=L|flags=0", 9, 110, 111 }
+    };
+    const std::vector<GpuMemoryAllocationInput> reusedAllocations = {
+        { { 20, 0 }, 100, 16384, 9, 0, 90, 0, 0, "GPU D3D12 Physical Local Heap" },
+        { { 21, 0 }, 42, 4096, 9, 5, 80, 0, 0, "GPU D3D12 Logical Buffer" },
+        { { 20, 1 }, 200, 32768, 9, 100, 200, 0, 0, "GPU D3D12 Physical Local Heap" },
+        { { 21, 1 }, 42, 8192, 9, 105, 180, 0, 0, "GPU D3D12 Logical Texture" }
+    };
+    GpuMemoryReferencePassInput generationA;
+    generationA.passId = 30; generationA.frame = 1; generationA.start = 50; generationA.end = 60;
+    generationA.taxonomyId = 7; generationA.totalUseCount = 1; generationA.ended = true;
+    generationA.uses.push_back( { 42, 1, 'U' } );
+    GpuMemoryReferencePassInput generationB = generationA;
+    generationB.passId = 31; generationB.frame = 2; generationB.start = 150; generationB.end = 160;
+    generationB.taxonomyId = 8;
+    const auto reusedAttribution = BuildGpuMemoryAttribution( reusedMetadata, {}, reusedAllocations,
+        {}, { 30, 31 }, { generationA, generationB }, 200 );
+    assert( reusedAttribution.unknownUseOccurrences == 0 && reusedAttribution.unknownUses.empty() );
+    assert( reusedAttribution.logicalGenerations.size() == 2 && reusedAttribution.logicalGenerationByKey.size() == 2 );
+    assert( reusedAttribution.passes[0].uses[0].resolvedPhysicalAllocationId == 100 );
+    assert( reusedAttribution.passes[1].uses[0].resolvedPhysicalAllocationId == 200 );
+    const auto generationAWorking = std::find_if( reusedAttribution.workingSets.begin(), reusedAttribution.workingSets.end(),
+        []( const auto& value ) { return value.frame == 1 && value.taxonomyId == 7; } );
+    const auto generationBWorking = std::find_if( reusedAttribution.workingSets.begin(), reusedAttribution.workingSets.end(),
+        []( const auto& value ) { return value.frame == 2 && value.taxonomyId == 8; } );
+    assert( generationAWorking != reusedAttribution.workingSets.end() && generationAWorking->referencedPhysicalBytes == 16384 );
+    assert( generationBWorking != reusedAttribution.workingSets.end() && generationBWorking->referencedPhysicalBytes == 32768 );
+    GpuMemoryReferencePassInput preSnapshot = generationA;
+    preSnapshot.passId = 32; preSnapshot.frame = 0; preSnapshot.start = 1; preSnapshot.end = 2;
+    const auto preSnapshotAttribution = BuildGpuMemoryAttribution( reusedMetadata, {}, reusedAllocations,
+        {}, { 32 }, { preSnapshot }, 200 );
+    assert( preSnapshotAttribution.unknownUseOccurrences == 0 );
+    assert( preSnapshotAttribution.captureBoundaryReferenceUses == 1 );
 
     GpuMemoryReferencePassInput structuredBoundary;
     structuredBoundary.passId = 23;
