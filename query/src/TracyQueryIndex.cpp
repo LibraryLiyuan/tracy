@@ -1024,6 +1024,10 @@ public:
         result.referencedCallstacks = std::move( callstacks );
         return result;
     }
+    std::optional<analysis::ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override
+    {
+        return m_source->ValidateSystemTrace( allowance );
+    }
 
     std::optional<bool> HasGpuMemoryProtocol2() const override { return m_manifest.gpuMemoryProtocol2; }
 

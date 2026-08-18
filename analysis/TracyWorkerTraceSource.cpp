@@ -2483,6 +2483,95 @@ std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
     return result;
 }
 
+std::optional<ZoneValidationSummaryDto> WorkerTraceSource::ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    auto& worker = *m_impl->worker;
+
+    std::vector<uint64_t> contextThreads;
+    contextThreads.reserve( worker.GetContextSwitchMap().size() );
+    size_t contextCount = 0;
+    for( const auto& [thread, data] : worker.GetContextSwitchMap() )
+    {
+        contextThreads.emplace_back( thread );
+        if( const auto* context = worker.GetContextSwitchData( thread ) ) contextCount += context->v.size();
+    }
+    std::sort( contextThreads.begin(), contextThreads.end() );
+
+    std::vector<const ThreadData*> sampleThreads;
+    sampleThreads.reserve( worker.GetThreadData().size() );
+    size_t sampleCount = 0;
+    for( const auto* thread : worker.GetThreadData() )
+    {
+        sampleThreads.emplace_back( thread );
+        sampleCount += thread->samples.size();
+    }
+    std::sort( sampleThreads.begin(), sampleThreads.end(), []( const auto* lhs, const auto* rhs ) { return lhs->id < rhs->id; } );
+
+    ZoneValidationSummaryDto result;
+    const auto requested = contextCount + sampleCount;
+    if( requested == 0 ) return result;
+    size_t remaining = allowance( requested );
+    result.complete = remaining == requested;
+
+    std::unordered_map<std::string, size_t> issueByCode;
+    const auto note = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
+        auto found = issueByCode.find( code );
+        if( found == issueByCode.end() )
+        {
+            found = issueByCode.emplace( code, result.findings.size() ).first;
+            result.findings.push_back( { severity, code, message, 0, {} } );
+        }
+        auto& issue = result.findings[found->second];
+        issue.count++;
+        if( issue.refs.size() < 20 ) issue.refs.emplace_back( ref );
+    };
+
+    uint64_t ordinal = 0;
+    for( const auto thread : contextThreads )
+    {
+        const auto* context = worker.GetContextSwitchData( thread );
+        if( !context ) continue;
+        for( const auto& event : context->v )
+        {
+            if( remaining == 0 ) break;
+            const auto ref = m_impl->MakeRef( "context-switch", ordinal );
+            if( event.IsEndValid() && event.End() < event.Start() )
+                note( "error", "INVALID_CONTEXT_SWITCH_TIMING", "context-switch running intervals are reversed", ref );
+            if( event.WakeupVal() >= 0 && event.WakeupVal() > event.Start() )
+                note( "warning", "INVALID_WAKEUP_ORDER", "thread wakeup occurs after its running interval begins", ref );
+            ordinal++;
+            remaining--;
+            result.scanned++;
+        }
+        if( remaining == 0 ) break;
+    }
+
+    // Context-switch samples are a derived classification of these same
+    // persisted samples. Validating the underlying sample once preserves all
+    // thread/callstack checks without doubling the scan or rebuilding the
+    // classification for every Query page.
+    std::unordered_set<uint32_t> callstacks;
+    if( remaining != 0 )
+    {
+        for( const auto* thread : sampleThreads )
+        {
+            for( const auto& sample : thread->samples )
+            {
+                if( remaining == 0 ) break;
+                const auto callstack = sample.callstack.Val();
+                if( callstack != 0 ) callstacks.emplace( callstack );
+                remaining--;
+                result.scanned++;
+            }
+            if( remaining == 0 ) break;
+        }
+    }
+    result.referencedCallstacks.assign( callstacks.begin(), callstacks.end() );
+    std::sort( result.referencedCallstacks.begin(), result.referencedCallstacks.end() );
+    return result;
+}
+
 CrashDto WorkerTraceSource::GetCrash() const
 {
     std::lock_guard lock( m_impl->readMutex );

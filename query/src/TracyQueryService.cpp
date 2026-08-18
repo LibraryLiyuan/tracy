@@ -10072,41 +10072,60 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             offset += values.size(); if( values.size() < allowed ) break;
         }
         if( invalidMemory ) addFinding( "error", "INVALID_MEMORY_LIFETIME", "memory events are freed before allocation", invalidMemory, std::move( invalidMemoryRefs ) );
-        size_t invalidContextSwitches = 0, invalidWakeups = 0;
-        json invalidContextRefs = json::array(), invalidWakeupRefs = json::array();
-        offset = 0;
-        while( true )
-        {
+        const auto systemValidation = source->ValidateSystemTrace( [&]( size_t requested ) {
             checkCancelled();
-            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
-            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-            const auto values = source->ScanContextSwitchEvents( range );
-            BudgetScanned( values.size(), chunk, allowed );
-            for( const auto& value : values )
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed != 0 ) BudgetScanned( allowed, requested, allowed );
+            return allowed;
+        } );
+        if( systemValidation )
+        {
+            for( const auto& value : systemValidation->findings )
             {
-                if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
-                if( value.endNs && *value.endNs < value.startNs ) { invalidContextSwitches++; addRef( invalidContextRefs, value.ref ); }
-                if( value.wakeupNs && *value.wakeupNs > value.startNs ) { invalidWakeups++; addRef( invalidWakeupRefs, value.ref ); }
+                json refs = json::array();
+                for( const auto& ref : value.refs ) refs.emplace_back( ref );
+                addFinding( value.severity.c_str(), value.code.c_str(), value.message, value.count, std::move( refs ) );
             }
-            offset += values.size(); if( values.size() < allowed ) break;
+            referencedCallstacks.insert( systemValidation->referencedCallstacks.begin(), systemValidation->referencedCallstacks.end() );
         }
-        if( invalidContextSwitches ) addFinding( "error", "INVALID_CONTEXT_SWITCH_TIMING", "context-switch running intervals are reversed", invalidContextSwitches, std::move( invalidContextRefs ) );
-        if( invalidWakeups ) addFinding( "warning", "INVALID_WAKEUP_ORDER", "thread wakeup occurs after its running interval begins", invalidWakeups, std::move( invalidWakeupRefs ) );
-
-        offset = 0;
-        while( true )
+        else
         {
-            checkCancelled();
-            const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
-            analysis::ScanRange range; range.offset = offset; range.limit = allowed;
-            const auto values = source->ScanSampleEvents( range );
-            BudgetScanned( values.size(), chunk, allowed );
-            for( const auto& value : values )
+            size_t invalidContextSwitches = 0, invalidWakeups = 0;
+            json invalidContextRefs = json::array(), invalidWakeupRefs = json::array();
+            offset = 0;
+            while( true )
             {
-                if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
-                if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange range; range.offset = offset; range.limit = allowed;
+                const auto values = source->ScanContextSwitchEvents( range );
+                BudgetScanned( values.size(), chunk, allowed );
+                for( const auto& value : values )
+                {
+                    if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
+                    if( value.endNs && *value.endNs < value.startNs ) { invalidContextSwitches++; addRef( invalidContextRefs, value.ref ); }
+                    if( value.wakeupNs && *value.wakeupNs > value.startNs ) { invalidWakeups++; addRef( invalidWakeupRefs, value.ref ); }
+                }
+                offset += values.size(); if( values.size() < allowed ) break;
             }
-            offset += values.size(); if( values.size() < allowed ) break;
+            if( invalidContextSwitches ) addFinding( "error", "INVALID_CONTEXT_SWITCH_TIMING", "context-switch running intervals are reversed", invalidContextSwitches, std::move( invalidContextRefs ) );
+            if( invalidWakeups ) addFinding( "warning", "INVALID_WAKEUP_ORDER", "thread wakeup occurs after its running interval begins", invalidWakeups, std::move( invalidWakeupRefs ) );
+
+            offset = 0;
+            while( true )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
+                analysis::ScanRange range; range.offset = offset; range.limit = allowed;
+                const auto values = source->ScanSampleEvents( range );
+                BudgetScanned( values.size(), chunk, allowed );
+                for( const auto& value : values )
+                {
+                    if( !value.threadRef.empty() && threadRefs.find( value.threadRef ) == threadRefs.end() ) noteReference( "THREAD", value.ref );
+                    if( value.callstack != 0 ) referencedCallstacks.emplace( value.callstack );
+                }
+                offset += values.size(); if( values.size() < allowed ) break;
+            }
         }
         if( metadata.samplesInconsistent ) addFinding( "warning", "INCONSISTENT_SAMPLES", "sampling data was marked inconsistent by Worker", 1 );
 

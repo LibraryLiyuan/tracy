@@ -104,6 +104,7 @@ public:
     std::vector<ScriptFrameDto> GetScriptFrames() const override;
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
     std::vector<CallsiteDto> GetCallsites() const override;
+    std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;

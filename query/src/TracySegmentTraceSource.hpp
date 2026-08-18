@@ -94,6 +94,7 @@ public:
     std::optional<std::string> GetCpuZoneRef( uint64_t internalZoneIndex ) const override;
     std::optional<std::string> GetGpuZoneRef( uint64_t internalZoneIndex ) const override;
     std::optional<analysis::ZoneValidationSummaryDto> ValidateZoneIndex( const std::function<size_t( size_t )>& allowance ) const override;
+    std::optional<analysis::ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override;
     std::optional<bool> HasGpuMemoryProtocol2() const override;
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;

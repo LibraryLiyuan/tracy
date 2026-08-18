@@ -879,6 +879,10 @@ std::optional<analysis::ZoneValidationSummaryDto> SegmentTraceSource::ValidateZo
 {
     return m_source->ValidateZoneIndex( allowance );
 }
+std::optional<analysis::ZoneValidationSummaryDto> SegmentTraceSource::ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const
+{
+    return m_source->ValidateSystemTrace( allowance );
+}
 TRACY_SEGMENT_FORWARD0( std::optional<bool>, HasGpuMemoryProtocol2 )
 TRACY_SEGMENT_FORWARD2( std::string, MakeEntityRef, std::string_view, kind, uint64_t, id )
 TRACY_SEGMENT_FORWARD2( std::optional<uint64_t>, ParseEntityRef, std::string_view, ref, std::string_view, kind )

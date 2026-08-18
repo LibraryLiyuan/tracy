@@ -974,6 +974,10 @@ public:
         return std::vector<RelationDto>( values.begin() + begin, values.begin() + end );
     }
     virtual std::optional<ZoneValidationSummaryDto> ValidateZoneIndex( const std::function<size_t( size_t )>& ) const { return std::nullopt; }
+    // Worker-backed sources can validate context-switch and sampling facts in a
+    // single pass. Adapters without raw storage access return nullopt and keep
+    // the paged compatibility path in QueryService.
+    virtual std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& ) const { return std::nullopt; }
     virtual std::optional<bool> HasGpuMemoryProtocol2() const { return std::nullopt; }
     virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
