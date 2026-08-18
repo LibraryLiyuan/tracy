@@ -181,6 +181,16 @@ class Profiler
         uint16_t w;
         uint16_t h;
         bool flip;
+        uint8_t poolSlot;
+    };
+
+    static constexpr uint8_t FrameImagePoolSlotCount = 4;
+    static constexpr uint8_t InvalidFrameImagePoolSlot = 0xFF;
+
+    struct FrameImageStagingSlot
+    {
+        char* image = nullptr;
+        std::atomic<uint8_t> inUse { 0 };
     };
 
     enum class SymbolQueueItemType
@@ -375,6 +385,7 @@ public:
         fi->w = w;
         fi->h = h;
         fi->flip = flip;
+        fi->poolSlot = InvalidFrameImagePoolSlot;
         profiler.m_fiQueue.commit_next();
         profiler.m_fiLock.unlock();
 #else
@@ -385,6 +396,12 @@ public:
         static_cast<void>(flip); // unused
 #endif
     }
+
+    // JN integration path. The pool is prepared on a cold enable path. Image
+    // submission performs one required copy out of Unity-owned readback memory
+    // and never allocates or waits for a slot.
+    static bool PrepareFrameImagePool( uint16_t maxW, uint16_t maxH );
+    static bool SendFrameImagePooled( const void* image, uint16_t w, uint16_t h, uint8_t offset, bool flip );
 
     static tracy_force_inline void PlotData( const char* name, int64_t val )
     {
@@ -1211,6 +1228,8 @@ private:
 #ifndef TRACY_NO_FRAME_IMAGE
     FastVector<FrameImageQueueItem> m_fiQueue, m_fiDequeue;
     TracyMutex m_fiLock;
+    FrameImageStagingSlot m_fiPool[FrameImagePoolSlotCount];
+    size_t m_fiPoolCapacity = 0;
 #endif
 
     SPSCQueue<SymbolQueueItem> m_symbolQueue;

@@ -1684,6 +1684,13 @@ Profiler::~Profiler()
 #ifndef TRACY_NO_FRAME_IMAGE
     s_compressThread->~Thread();
     tracy_free( s_compressThread );
+    for( auto& slot : m_fiPool )
+    {
+        if( slot.image ) tracy_free( slot.image );
+        slot.image = nullptr;
+        slot.inUse.store( 0, std::memory_order_relaxed );
+    }
+    m_fiPoolCapacity = 0;
 #endif
 
     s_thread->~Thread();
@@ -2337,6 +2344,95 @@ void Profiler::Worker()
 #endif
 
 #ifndef TRACY_NO_FRAME_IMAGE
+bool Profiler::PrepareFrameImagePool( uint16_t maxW, uint16_t maxH )
+{
+    if( maxW == 0 || maxH == 0 || ( maxW & 3 ) != 0 || ( maxH & 3 ) != 0 ) return false;
+    const auto capacity = size_t( maxW ) * size_t( maxH ) * 4;
+    auto& profiler = GetProfiler();
+
+    profiler.m_fiLock.lock();
+    for( const auto& slot : profiler.m_fiPool )
+    {
+        if( slot.inUse.load( std::memory_order_acquire ) != 0 )
+        {
+            profiler.m_fiLock.unlock();
+            return false;
+        }
+    }
+    if( profiler.m_fiPoolCapacity >= capacity )
+    {
+        bool complete = true;
+        for( const auto& slot : profiler.m_fiPool ) complete &= slot.image != nullptr;
+        profiler.m_fiLock.unlock();
+        return complete;
+    }
+
+    char* replacement[FrameImagePoolSlotCount] = {};
+    for( uint8_t i = 0; i < FrameImagePoolSlotCount; i++ )
+    {
+        replacement[i] = static_cast<char*>( tracy_malloc( capacity ) );
+        if( replacement[i] == nullptr )
+        {
+            for( uint8_t j = 0; j < i; j++ ) tracy_free( replacement[j] );
+            profiler.m_fiLock.unlock();
+            return false;
+        }
+    }
+    for( uint8_t i = 0; i < FrameImagePoolSlotCount; i++ )
+    {
+        if( profiler.m_fiPool[i].image ) tracy_free( profiler.m_fiPool[i].image );
+        profiler.m_fiPool[i].image = replacement[i];
+        profiler.m_fiPool[i].inUse.store( 0, std::memory_order_relaxed );
+    }
+    profiler.m_fiPoolCapacity = capacity;
+    profiler.m_fiLock.unlock();
+    return true;
+}
+
+bool Profiler::SendFrameImagePooled( const void* image, uint16_t w, uint16_t h, uint8_t offset, bool flip )
+{
+    if( image == nullptr || w == 0 || h == 0 ) return false;
+    auto& profiler = GetProfiler();
+#ifdef TRACY_ON_DEMAND
+    if( !profiler.IsConnected() ) return false;
+#endif
+    assert( profiler.m_frameCount.load( std::memory_order_relaxed ) < (std::numeric_limits<uint32_t>::max)() );
+    const auto size = size_t( w ) * size_t( h ) * 4;
+
+    uint8_t poolSlot = InvalidFrameImagePoolSlot;
+    profiler.m_fiLock.lock();
+    if( size <= profiler.m_fiPoolCapacity )
+    {
+        for( uint8_t i = 0; i < FrameImagePoolSlotCount; i++ )
+        {
+            if( profiler.m_fiPool[i].image != nullptr &&
+                profiler.m_fiPool[i].inUse.load( std::memory_order_relaxed ) == 0 )
+            {
+                profiler.m_fiPool[i].inUse.store( 1, std::memory_order_release );
+                poolSlot = i;
+                break;
+            }
+        }
+    }
+    profiler.m_fiLock.unlock();
+    if( poolSlot == InvalidFrameImagePoolSlot ) return false;
+
+    auto* destination = profiler.m_fiPool[poolSlot].image;
+    memcpy( destination, image, size );
+
+    profiler.m_fiLock.lock();
+    auto fi = profiler.m_fiQueue.prepare_next();
+    fi->image = destination;
+    fi->frame = uint32_t( profiler.m_frameCount.load( std::memory_order_relaxed ) - offset );
+    fi->w = w;
+    fi->h = h;
+    fi->flip = flip;
+    fi->poolSlot = poolSlot;
+    profiler.m_fiQueue.commit_next();
+    profiler.m_fiLock.unlock();
+    return true;
+}
+
 void Profiler::CompressWorker()
 {
     ThreadExitHandler threadExitHandler;
@@ -2392,7 +2488,15 @@ void Profiler::CompressWorker()
                 const auto csz = size_t( w * h / 2 );
                 auto etc1buf = (char*)tracy_malloc( csz );
                 CompressImageDxt1( (const char*)fi->image, etc1buf, w, h );
-                tracy_free( fi->image );
+                if( fi->poolSlot == InvalidFrameImagePoolSlot )
+                {
+                    tracy_free( fi->image );
+                }
+                else
+                {
+                    assert( fi->poolSlot < FrameImagePoolSlotCount );
+                    m_fiPool[fi->poolSlot].inUse.store( 0, std::memory_order_release );
+                }
 
                 TracyLfqPrepare( QueueType::FrameImage );
                 MemWrite( &item->frameImageFat.image, (uint64_t)etc1buf );
@@ -5152,6 +5256,8 @@ TRACY_API void ___tracy_emit_frame_mark( const char* name ) { tracy::Profiler::S
 TRACY_API void ___tracy_emit_frame_mark_start( const char* name ) { tracy::Profiler::SendFrameMark( name, tracy::QueueType::FrameMarkMsgStart ); }
 TRACY_API void ___tracy_emit_frame_mark_end( const char* name ) { tracy::Profiler::SendFrameMark( name, tracy::QueueType::FrameMarkMsgEnd ); }
 TRACY_API void ___tracy_emit_frame_image( const void* image, uint16_t w, uint16_t h, uint8_t offset, int32_t flip ) { tracy::Profiler::SendFrameImage( image, w, h, offset, flip != 0 ); }
+TRACY_API int32_t ___tracy_prepare_frame_image_pool( uint16_t maxW, uint16_t maxH ) { return tracy::Profiler::PrepareFrameImagePool( maxW, maxH ) ? 1 : 0; }
+TRACY_API int32_t ___tracy_emit_frame_image_pooled( const void* image, uint16_t w, uint16_t h, uint8_t offset, int32_t flip ) { return tracy::Profiler::SendFrameImagePooled( image, w, h, offset, flip != 0 ) ? 1 : 0; }
 TRACY_API void ___tracy_emit_plot( const char* name, double val ) { tracy::Profiler::PlotData( name, val ); }
 TRACY_API void ___tracy_emit_plot_float( const char* name, float val ) { tracy::Profiler::PlotData( name, val ); }
 TRACY_API void ___tracy_emit_plot_int( const char* name, int64_t val ) { tracy::Profiler::PlotData( name, val ); }

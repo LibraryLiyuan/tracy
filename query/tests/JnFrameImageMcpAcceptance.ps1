@@ -235,8 +235,11 @@ function Validate-FrameImage([string] $TraceId, [bool] $ExportPng)
     $uniqueManagedIdentity = @($managedIdentity | Sort-Object -Unique)
     Assert-Condition ($uniqueManagedIdentity.Count -eq 1) 'managed FrameImage AppInfo payloads disagree'
     $config = ([string]$uniqueManagedIdentity[0]).Substring(6) | ConvertFrom-Json
-    Assert-Condition ([UInt64]$config.schema_version -eq 1 -and [string]$config.source -eq 'final-color-only') 'managed FrameImage schema/source mismatch'
+    Assert-Condition ([UInt64]$config.schema_version -eq 2 -and [string]$config.source -eq 'final-color-only') 'managed FrameImage schema/source mismatch'
     Assert-Condition ([UInt64]$config.ring -eq 4 -and [bool]$config.async -and -not [bool]$config.present_wait) 'managed FrameImage async policy mismatch'
+    Assert-Condition ([UInt64]$config.native_rgba_pool.slots -eq 4 -and
+        [bool]$config.native_rgba_pool.preallocated -and
+        -not [bool]$config.native_rgba_pool.hot_path_allocations) 'managed FrameImage Native staging-pool policy mismatch'
     if ($ExpectedKind -eq 'HighEvidence')
     {
         Assert-Condition ([int]$config.high_evidence.width -eq $ExpectedWidth -and [int]$config.high_evidence.height -eq $ExpectedHeight) 'HighEvidence config dimensions mismatch'
