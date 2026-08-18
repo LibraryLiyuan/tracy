@@ -414,7 +414,12 @@ int main( int argc, char** argv )
         std::fprintf( stderr, "Worker did not connect to the local replay socket.\n" );
         return 4;
     }
-    if( !peer->SetSendTimeout( 10000 ) )
+    // Full Worker replay applies natural socket backpressure while it expands
+    // dense compressed frames. A fixed send timeout can fire after partially
+    // sending a frame, which cannot be retried without corrupting the stream.
+    // Keep the send blocking; the progress-aware server verifier closes the
+    // socket after 120 seconds with no protocol event or frame progress.
+    if( !peer->SetSendTimeout( 0 ) )
     {
         worker.Shutdown();
         std::fprintf( stderr, "Cannot configure the local replay send timeout.\n" );
@@ -450,14 +455,26 @@ int main( int argc, char** argv )
             // Full replay may need to expand a large first batch of sampling
             // callstacks before it can reproduce the recorder's first query.
             // Treat that CPU work separately from a closed server stream.
-            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+            auto lastEventProgress = worker.GetProtocolEventCount();
+            auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+            auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
             if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
+                const auto eventProgress = worker.GetProtocolEventCount();
+                const auto frameProgress = worker.GetProtocolFramesProcessed();
+                if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+                {
+                    lastEventProgress = eventProgress;
+                    lastFrameProgress = frameProgress;
+                    recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                }
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
                 const auto timedOut = std::chrono::steady_clock::now() >= recordDeadline;
                 failReplay( "sequence " + std::to_string( record.sequence ) +
-                    ( timedOut ? ": timed out waiting for Worker server stream" : ": Worker server stream ended early" ) );
+                    ( timedOut ? ": Worker made no protocol progress for 120 seconds while waiting for server stream; events=" +
+                        std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                        std::to_string( worker.GetProtocolFramesProcessed() ) : ": Worker server stream ended early" ) );
                 return;
             }
             if( !transcriptVerifier.Append( recorded, replayed, error ) )
@@ -500,17 +517,29 @@ int main( int argc, char** argv )
             }
             if( requiredServerSequence != 0 )
             {
-                const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                auto lastEventProgress = worker.GetProtocolEventCount();
+                auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+                auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
                 while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
                     !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
                 {
+                    const auto eventProgress = worker.GetProtocolEventCount();
+                    const auto frameProgress = worker.GetProtocolFramesProcessed();
+                    if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+                    {
+                        lastEventProgress = eventProgress;
+                        lastFrameProgress = frameProgress;
+                        dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                    }
                     std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
                 }
                 if( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence )
                 {
                     replayError.Set( "sequence " + std::to_string( record.sequence ) +
-                        ": timed out waiting for preceding server sequence " +
-                        std::to_string( requiredServerSequence ) );
+                        ": Worker made no protocol progress for 120 seconds while waiting for preceding server sequence " +
+                        std::to_string( requiredServerSequence ) + "; events=" +
+                        std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                        std::to_string( worker.GetProtocolFramesProcessed() ) );
                     return false;
                 }
             }
@@ -521,7 +550,10 @@ int main( int argc, char** argv )
             }
             if( !payload.empty() && peer->Send( payload.data(), int( payload.size() ) ) != int( payload.size() ) )
             {
-                replayError.Set( "sequence " + std::to_string( record.sequence ) + ": cannot send recorded client stream" );
+                replayError.Set( "sequence " + std::to_string( record.sequence ) +
+                    ": recorded client stream send ended while Worker replay was active; events=" +
+                    std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                    std::to_string( worker.GetProtocolFramesProcessed() ) );
                 return false;
             }
             return true;

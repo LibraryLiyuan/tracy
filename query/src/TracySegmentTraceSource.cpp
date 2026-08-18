@@ -404,7 +404,10 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         worker.Shutdown();
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Internal, "Tracy Worker did not connect to the revision replay socket" );
     }
-    if( !peer->SetSendTimeout( 10000 ) )
+    // Dense compressed frames can keep Full Worker busy for longer than a
+    // fixed socket send timeout. Blocking preserves an already-partial frame;
+    // the progress-aware server verifier remains the bounded stall watchdog.
+    if( !peer->SetSendTimeout( 0 ) )
     {
         worker.Shutdown();
         throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Internal, "cannot configure the local replay send timeout" );
@@ -434,14 +437,27 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
             // Full replay may need to expand a large first batch of sampling
             // callstacks before it can reproduce the recorder's first query.
             // Treat that CPU work separately from a closed server stream.
-            const auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+            auto lastEventProgress = worker.GetProtocolEventCount();
+            auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+            auto recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
             if( !replayed.payload.empty() && !peer->Read( replayed.payload.data(), int( replayed.payload.size() ), 100, [&] {
+                const auto eventProgress = worker.GetProtocolEventCount();
+                const auto frameProgress = worker.GetProtocolFramesProcessed();
+                if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+                {
+                    lastEventProgress = eventProgress;
+                    lastFrameProgress = frameProgress;
+                    recordDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                }
                 return replayError.Failed() || std::chrono::steady_clock::now() >= recordDeadline;
             } ) )
             {
                 const auto timedOut = std::chrono::steady_clock::now() >= recordDeadline;
                 failReplay( timedOut ?
-                    "timed out waiting for Worker server record " + std::to_string( record.sequence ) :
+                    "Worker made no protocol progress for 120 seconds while waiting for server record " +
+                        std::to_string( record.sequence ) + "; events=" +
+                        std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                        std::to_string( worker.GetProtocolFramesProcessed() ) :
                     "Worker server stream ended before record " + std::to_string( record.sequence ) );
                 return;
             }
@@ -477,17 +493,29 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         }
         if( requiredServerSequence != 0 )
         {
-            const auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+            auto lastEventProgress = worker.GetProtocolEventCount();
+            auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+            auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
             while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
                 !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
             {
+                const auto eventProgress = worker.GetProtocolEventCount();
+                const auto frameProgress = worker.GetProtocolFramesProcessed();
+                if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+                {
+                    lastEventProgress = eventProgress;
+                    lastFrameProgress = frameProgress;
+                    dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
+                }
                 std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
             }
             if( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence )
             {
                 replayError.Set( "client record " + std::to_string( record.sequence ) +
-                    ": timed out waiting for preceding server record " +
-                    std::to_string( requiredServerSequence ) );
+                    ": Worker made no protocol progress for 120 seconds while waiting for preceding server record " +
+                    std::to_string( requiredServerSequence ) + "; events=" +
+                    std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                    std::to_string( worker.GetProtocolFramesProcessed() ) );
                 return false;
             }
         }
@@ -498,7 +526,10 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         }
         if( !payload.empty() && peer->Send( payload.data(), int( payload.size() ) ) != int( payload.size() ) )
         {
-            replayError.Set( "cannot replay client record " + std::to_string( record.sequence ) );
+            replayError.Set( "client record " + std::to_string( record.sequence ) +
+                " send ended while Worker replay was active; events=" +
+                std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                std::to_string( worker.GetProtocolFramesProcessed() ) );
             return false;
         }
         return true;
