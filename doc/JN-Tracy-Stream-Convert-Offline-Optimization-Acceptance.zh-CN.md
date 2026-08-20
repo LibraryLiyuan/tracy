@@ -148,3 +148,95 @@
 | GPU reference uses | 42,702,705 |
 
 该轮总时间 `32.013 s`（显式 `--no-cache` 的开发 Release），并通过临时输出重开验证。最终 clean Release 三轮基准必须在合入该修复后重新执行；修复前的三轮仅保留为性能参考，不作为最终正确性门禁。
+
+## SC.6 最终 clean Release 验收
+
+### 正式压力基准
+
+测试环境：
+
+- CPU：Intel Core i7-14700，20 cores / 28 logical processors。
+- 物理内存：68,325,130,240 B。
+- 操作系统：Windows NT 10.0.26200.0。
+- 文件系统：本地 NTFS。
+- 正式参数：Offline、fast、27 threads、`--no-cache`。
+- 输入仍为 SC.0 固定副本，大小和 SHA-256 均未改变。
+
+在 `b8bbadabc5ffb30248646542aad5705fbf58d2e9` 修复提交上重新完成三次独立 clean Release 转换：
+
+| Run | Scan | Replay/Build | Write | Validate | Total | Peak commit | 输出大小 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 10.943 s | 17.834 s | 1.599 s | 2.358 s | 33.056 s | 6,992,908,288 B | 769,567,119 B |
+| 2 | 10.757 s | 17.809 s | 1.387 s | 2.346 s | 32.973 s | 6,992,343,040 B | 769,629,102 B |
+| 3 | 10.743 s | 17.794 s | 1.601 s | 2.348 s | 33.132 s | 6,992,179,200 B | 769,635,401 B |
+
+总时间中位数为 **33.056 s**，远低于正式完成门槛 5 分钟，并达到 3 分钟进取目标。三轮均精确得到：
+
+- `protocol_events = offline_decoded_events = 206,023,026`。
+- `client_records = published_client_records = 14,514`。
+- `compressed_frames = published_compressed_frames = worker_compressed_frames = 14,511`。
+- `gpu_reference_passes = 1,693,641`。
+- `gpu_reference_uses = 42,702,705`。
+- `job_stages = 21,176,579`。
+- `capture_complete=true`，无忽略尾部。
+
+最终压力输出：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\PlayerCaptures\StreamConvertOptimization\stress-release-final-fixed.tracy
+SHA-256 BAC8E44D4CA21A1FF5DBE346659DA39619593AECC968BECB319DD7D9DDAE929D
+```
+
+Fast 输出相对 Legacy 压力输出仅大约 4.39%，满足 `≤125%` 大小门禁。
+
+### Query 与 Profiler 配套验收
+
+三件配套正式工具均由同一代码提交 clean Release 构建。新 `tracy-query` 对最终压力输出执行 `--doctor` 成功，schema 1.30，trace fingerprint 为 `bac8e44d...`；快速输出同时通过 MCP 规范化分域比较。
+
+同一快速输入的 Legacy/Fast 输出在全新隔离目录执行冷索引：
+
+| 输出 | 冷索引时间 |
+|---|---:|
+| Legacy | 1.583 s |
+| Fast | 1.603 s |
+
+Fast 回退约 1.26%，满足 `≤10%` 门禁。
+
+Profiler 使用“主窗口标题已包含目标 trace 文件名”作为完成加载判据，各运行三次：
+
+| 输出 | 三次加载时间 | 中位数 |
+|---|---|---:|
+| Legacy quick | 0.404 / 0.374 / 0.373 s | 0.374 s |
+| Fast quick | 0.373 / 0.312 / 0.317 s | 0.317 s |
+
+Fast 没有打开时间回退。小型 7.3 MiB、日常 29.3 MiB、压力 734 MiB 三档均能保持 Profiler 正常运行；734 MiB 最终压力 trace 在约 3.015 s 出现目标 trace 标题，无崩溃或提前退出。
+
+大型 sidecar 索引另行暴露了既有 Query 扩展性问题：最终压力 trace 建索引运行超过 5 分钟仍未完成，工作集约 1.9 GiB、提交量约 16.7 GiB。该进程已按 PID 和绝对路径安全停止，其零字节结果及本次 PID 的临时分片已定点清理。这不影响 converter 的输出正确性、Profiler 打开或 Query doctor，但意味着“超大 trace 完整 sidecar 建索引”仍需作为 Query 子系统的后续优化项，不能宣称已通过大型索引时限。
+
+### 正式工具身份
+
+| 工具 | 大小 | SHA-256 |
+|---|---:|---|
+| `tracy-stream-convert.exe` | 11,161,088 B | `2A118D3055AA6E46239CAECA37AA5467CFF51D261D0C11473CD9F2E8394C8951` |
+| `tracy-query.exe` | 15,040,000 B | `551C0C2277C0F9DFB89CCEC4FFD6DFB65207B10CD511937D03AF959E43E74CC3` |
+| `tracy-profiler.exe` | 26,991,616 B | `BA848D420D640831A3E1823C00AC93234C87DA7D24962622803428AA2CD4F163` |
+
+clean Release 配置没有产生运行所需的外部 DLL，也没有产生 PDB；发布包因此只需三件 EXE 与 build identity manifest。开发验证工具 `tracy-stream-inspect.exe` 不进入正式用户包。
+
+隔离 Release Candidate 目录：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\PlayerCaptures\StreamConvertOptimization\ReleaseCandidate
+```
+
+该目录仅含 `tracy-stream-convert.exe`、`tracy-query.exe`、`tracy-profiler.exe` 和 `build-identity.json`；没有安装或复制到任何现有稳定目录。
+
+### 隔离、发布和结论
+
+- 原仓库仍在 `dev` / `721c3593ac0cd31aa0def367ab246b6b81afcd79`；原有 dirty files 属于实施前基线，未被本 worktree 写入。
+- 原始 capture 与隔离副本 SHA-256 仍均为 `697060EB63A1AA8B4F4057CC8644698242836FE489DC5BF12E0B6953DB747842`。
+- 正式 converter 不接受 `--mode offline/compare/batch-compare`，不会启动 localhost，也不会自动回退 Legacy。
+- 当前稳定 Tracy 目录、PATH、注册表、文件关联、计划任务和全局环境变量均未修改。
+- 优化工具只发布到隔离 release package，尚未替换任何现有稳定二进制。
+
+最终状态：**Offline StreamConvert 的功能、语义、转换性能、Fast 文件大小、快速 Query 冷索引和 Profiler 打开门禁通过，可形成隔离 Release Candidate。** 唯一未通过项是超大 trace 的完整 Query sidecar 建索引时限；它被明确归类为 Query 子系统后续任务，不回退到 Legacy converter，也不阻塞 Offline converter 候选发布。

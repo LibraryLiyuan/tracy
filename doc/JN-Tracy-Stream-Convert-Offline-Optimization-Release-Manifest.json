@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "generated_local_date": "2026-08-20",
+  "branch": "feature/JNTracy-StreamConvert-Performance",
+  "source_code_revision": "b8bbadabc5ffb30248646542aad5705fbf58d2e9",
+  "protocol": 88,
+  "trace_format": "0.13.2-JN",
+  "platform": "Windows x64",
+  "configuration": "Release",
+  "offline_defaults": {
+    "mode": "offline",
+    "compression": "fast",
+    "threads": "auto"
+  },
+  "tools": [
+    {
+      "name": "tracy-stream-convert.exe",
+      "bytes": 11161088,
+      "sha256": "2A118D3055AA6E46239CAECA37AA5467CFF51D261D0C11473CD9F2E8394C8951"
+    },
+    {
+      "name": "tracy-query.exe",
+      "bytes": 15040000,
+      "sha256": "551C0C2277C0F9DFB89CCEC4FFD6DFB65207B10CD511937D03AF959E43E74CC3"
+    },
+    {
+      "name": "tracy-profiler.exe",
+      "bytes": 26991616,
+      "sha256": "BA848D420D640831A3E1823C00AC93234C87DA7D24962622803428AA2CD4F163"
+    }
+  ],
+  "stress_acceptance": {
+    "input_bytes": 1796451880,
+    "input_sha256": "697060EB63A1AA8B4F4057CC8644698242836FE489DC5BF12E0B6953DB747842",
+    "protocol_events": 206023026,
+    "runs_seconds": [33.0564, 32.9726, 33.1318],
+    "median_seconds": 33.0564,
+    "output_sha256": "BAC8E44D4CA21A1FF5DBE346659DA39619593AECC968BECB319DD7D9DDAE929D"
+  },
+  "release_status": "candidate",
+  "known_limitations": [
+    "A full sidecar index for the 734 MiB / 206 million event stress trace did not finish within five minutes; query doctor and quick cold-index compatibility passed."
+  ]
+}
