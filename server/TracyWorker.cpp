@@ -420,8 +420,9 @@ LoadProgress Worker::s_loadProgress;
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
     uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions,
-    bool deferLiveSampleAnalysis )
-    : m_addr( addr )
+    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport )
+    : m_offlineTransport( offlineTransport )
+    , m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
     , m_mode( mode )
@@ -437,7 +438,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     , m_buffer( new char[TargetFrameSize*3 + 1] )
     , m_bufferOffset( 0 )
     , m_inconsistentSamples( false )
-    , m_memoryLimit( memoryLimit > 0 || mode == Mode::Full ? memoryLimit : DefaultRecorderMemoryLimit )
+    , m_memoryLimit( memoryLimit > 0 || mode != Mode::ProtocolOnly ? memoryLimit : DefaultRecorderMemoryLimit )
     , m_callstackFrameStaging( nullptr )
     , m_traceVersion( CurrentVersion )
     , m_loadTime( 0 )
@@ -3102,9 +3103,41 @@ bool Worker::SendProtocol( const void* data, int size, ProtocolChunk chunk )
     }
     const ProtocolDataSpan span { data, size_t( size ) };
     if( !ObserveProtocol( ProtocolDirection::ServerToClient, chunk, std::span<const ProtocolDataSpan>( &span, 1 ) ) ) return false;
-    if( m_sock.Send( data, size ) == size ) return true;
+    if( TransportSend( data, size ) == size ) return true;
     m_protocolTransportError.store( true, std::memory_order_relaxed );
     return false;
+}
+
+bool Worker::TransportConnect()
+{
+    return m_offlineTransport ? m_offlineTransport->Connect() : m_sock.Connect( m_addr.c_str(), m_port );
+}
+
+bool Worker::TransportRead( void* data, int size, int timeoutMs )
+{
+    if( m_offlineTransport ) return m_offlineTransport->Read( data, size, timeoutMs, m_shutdown );
+    return m_sock.Read( data, size, timeoutMs, [this] { return m_shutdown.load( std::memory_order_relaxed ); } );
+}
+
+int Worker::TransportSend( const void* data, int size )
+{
+    return m_offlineTransport ? m_offlineTransport->Send( data, size ) : m_sock.Send( data, size );
+}
+
+int Worker::TransportSendBufferSize()
+{
+    return m_offlineTransport ? m_offlineTransport->GetSendBufferSize() : m_sock.GetSendBufSize();
+}
+
+void Worker::TransportClose()
+{
+    if( m_offlineTransport ) m_offlineTransport->Close();
+    else m_sock.Close();
+}
+
+bool Worker::TransportIsValid() const
+{
+    return m_offlineTransport ? m_offlineTransport->IsValid() : m_sock.IsValid();
 }
 
 bool Worker::RecordProtocolDrainControl()
@@ -3146,7 +3179,7 @@ void Worker::FinishProtocol( ProtocolCloseReason reason )
     // return different parent payload counts. Rebuild once from the immutable
     // raw samples at the terminal protocol boundary so both media use the
     // same deterministic order and inputs.
-    if( m_mode == Mode::Full && !m_deferLiveSampleAnalysis && m_hasData.load( std::memory_order_acquire ) )
+    if( m_mode != Mode::ProtocolOnly && !m_deferLiveSampleAnalysis && m_hasData.load( std::memory_order_acquire ) )
         CanonicalizeSampleStatistics();
 #endif
     Shutdown();
@@ -3160,7 +3193,7 @@ void Worker::FinishProtocol( ProtocolCloseReason reason )
     // terminal record can therefore be written without racing an in-flight
     // observer callback.
     NotifyProtocolClose( reason );
-    if( m_sock.IsValid() ) m_sock.Close();
+    if( TransportIsValid() ) TransportClose();
     m_connected.store( false, std::memory_order_relaxed );
 }
 
@@ -3181,13 +3214,13 @@ void Worker::Network()
 
         auto buf = m_buffer + m_bufferOffset;
         lz4sz_t lz4sz;
-        if( !m_sock.Read( &lz4sz, sizeof( lz4sz ), 10, ShouldExit ) ) goto close;
+        if( !TransportRead( &lz4sz, sizeof( lz4sz ), 10 ) ) goto close;
         if( lz4sz == 0 || lz4sz > LZ4Size )
         {
             m_protocolTransportError.store( true, std::memory_order_relaxed );
             goto close;
         }
-        if( !m_sock.Read( lz4buf.get(), lz4sz, 10, ShouldExit ) ) goto close;
+        if( !TransportRead( lz4buf.get(), lz4sz, 10 ) ) goto close;
         {
             const std::array<ProtocolDataSpan, 2> spans = {
                 ProtocolDataSpan { &lz4sz, sizeof( lz4sz ) },
@@ -3244,7 +3277,7 @@ void Worker::Exec()
             FinishProtocol( ProtocolCloseReason::LocalShutdown );
             return;
         }
-        if( m_sock.Connect( m_addr.c_str(), m_port ) ) break;
+        if( TransportConnect() ) break;
         std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
     }
     if( m_shutdown.load( std::memory_order_relaxed ) )
@@ -3267,7 +3300,7 @@ void Worker::Exec()
         goto close;
     }
     HandshakeStatus handshake;
-    if( !m_sock.Read( &handshake, sizeof( handshake ), 10, ShouldExit ) )
+    if( !TransportRead( &handshake, sizeof( handshake ), 10 ) )
     {
         m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
         closeReason = ProtocolCloseReason::HandshakeDropped;
@@ -3298,7 +3331,7 @@ void Worker::Exec()
         goto close;
     }
 
-    if( m_mode == Mode::Full )
+    if( m_mode != Mode::ProtocolOnly )
     {
         m_data.framesBase = m_data.frames.Retrieve( 0, [this] ( uint64_t name ) {
             auto fd = m_slab.AllocInit<FrameData>();
@@ -3314,7 +3347,7 @@ void Worker::Exec()
 
     {
         WelcomeMessage welcome;
-        if( !m_sock.Read( &welcome, sizeof( welcome ), 10, ShouldExit ) )
+        if( !TransportRead( &welcome, sizeof( welcome ), 10 ) )
         {
             m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
             closeReason = ProtocolCloseReason::HandshakeDropped;
@@ -3332,7 +3365,7 @@ void Worker::Exec()
         m_timerMul = welcome.timerMul;
         m_data.baseTime = welcome.initBegin;
         const auto initEnd = TscTime( welcome.initEnd );
-        if( m_mode == Mode::Full )
+        if( m_mode != Mode::ProtocolOnly )
         {
             m_data.framesBase->frames.push_back( FrameEvent{ 0, -1, -1 } );
             m_data.framesBase->frames.push_back( FrameEvent{ initEnd, -1, -1 } );
@@ -3368,7 +3401,7 @@ void Worker::Exec()
         if( m_onDemand )
         {
             OnDemandPayloadMessage onDemand;
-            if( !m_sock.Read( &onDemand, sizeof( onDemand ), 10, ShouldExit ) )
+            if( !TransportRead( &onDemand, sizeof( onDemand ), 10 ) )
             {
                 m_handshake.store( HandshakeDropped, std::memory_order_relaxed );
                 closeReason = ProtocolCloseReason::HandshakeDropped;
@@ -3382,7 +3415,7 @@ void Worker::Exec()
                 goto close;
             }
             m_data.frameOffset = onDemand.frames;
-            if( m_mode == Mode::Full )
+            if( m_mode != Mode::ProtocolOnly )
             {
                 m_data.framesBase->frames.push_back( FrameEvent{ TscTime( onDemand.currentTime ), -1, -1 } );
             }
@@ -3392,7 +3425,7 @@ void Worker::Exec()
     m_serverQuerySpaceBase = m_serverQuerySpaceLeft =
         m_serverQuerySpaceOverride != 0 ?
         m_serverQuerySpaceOverride :
-        std::min( ( m_sock.GetSendBufSize() / ServerQueryPacketSize ), 8*1024 ) - 4;   // leave space for terminate request
+        std::min( ( TransportSendBufferSize() / ServerQueryPacketSize ), 8*1024 ) - 4;   // leave space for terminate request
     m_hasData.store( true, std::memory_order_release );
 
     LZ4_setStreamDecode( (LZ4_streamDecode_t*)m_stream, nullptr, 0 );
@@ -3544,7 +3577,7 @@ void Worker::Exec()
 
         {
             std::unique_lock<std::mutex> lk( m_data.lock, std::defer_lock );
-            if( m_mode == Mode::Full )
+            if( m_mode != Mode::ProtocolOnly )
             {
                 lk.lock();
                 if( m_data.mainThreadWantsLock )
@@ -3564,7 +3597,7 @@ void Worker::Exec()
                     ( m_mode == Mode::ProtocolOnly ? DispatchRecorder( *ev, ptr ) : DispatchProcess( *ev, ptr ) );
                 if( !processed )
                 {
-                    if( m_mode == Mode::Full )
+                    if( m_mode != Mode::ProtocolOnly )
                     {
                         if( m_failure != Failure::None ) HandleFailure( ptr, end );
                         closeReason = ProtocolCloseReason::InstrumentationFailure;
@@ -3650,7 +3683,7 @@ void Worker::Exec()
             {
                 continue;
             }
-            if( m_mode == Mode::Full && !m_crashed && !m_disconnect.load( std::memory_order_relaxed ) )
+            if( m_mode != Mode::ProtocolOnly && !m_crashed && !m_disconnect.load( std::memory_order_relaxed ) )
             {
                 bool done = true;
                 for( auto& v : m_data.threads )
@@ -3975,6 +4008,28 @@ void Worker::QueryCallstackFrame( uint64_t addr )
 
 bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
 {
+    OfflineEventStat* offlineStat = nullptr;
+    bool sampleOfflineCost = false;
+    std::chrono::steady_clock::time_point offlineSampleStart;
+    if( m_mode == Mode::OfflineConvert )
+    {
+        offlineStat = &m_offlineEventStats[size_t( ev.hdr.idx )];
+        sampleOfflineCost = ( offlineStat->count++ & 1023 ) == 0;
+        m_offlineEventCount++;
+        if( ( m_offlineEventCount & 4095 ) == 0 )
+            m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
+        if( sampleOfflineCost ) offlineSampleStart = std::chrono::steady_clock::now();
+    }
+    const auto finish = [&]( bool result ) {
+        if( sampleOfflineCost )
+        {
+            offlineStat->sampledCount++;
+            offlineStat->sampledNanoseconds += uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - offlineSampleStart ).count() );
+        }
+        return result;
+    };
+
     if( ev.hdr.idx >= (int)QueueType::StringData )
     {
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
@@ -4064,7 +4119,7 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
             }
             ptr += sz;
         }
-        return true;
+        return finish( true );
     }
     else
     {
@@ -4077,17 +4132,17 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
             ptr += sizeof( sz );
             AddSingleString( ptr, sz );
             ptr += sz;
-            return true;
+            return finish( true );
         case QueueType::SecondStringData:
             ptr += sizeof( QueueHeader );
             memcpy( &sz, ptr, sizeof( sz ) );
             ptr += sizeof( sz );
             AddSecondString( ptr, sz );
             ptr += sz;
-            return true;
+            return finish( true );
         default:
             ptr += QueueDataSize[ev.hdr.idx];
-            return Process( ev );
+            return finish( Process( ev ) );
         }
     }
 }
@@ -5234,7 +5289,7 @@ void Worker::CheckThreadString( uint64_t id )
     m_data.threadNames.emplace( id, "???" );
     m_pendingThreads++;
 
-    if( m_sock.IsValid() ) Query( ServerQueryThreadString, id );
+    if( TransportIsValid() ) Query( ServerQueryThreadString, id );
 }
 
 void Worker::CheckFiberName( uint64_t id, uint64_t tid )
@@ -5244,7 +5299,7 @@ void Worker::CheckFiberName( uint64_t id, uint64_t tid )
     m_data.threadNames.emplace( tid, "???" );
     m_pendingFibers++;
 
-    if( m_sock.IsValid() ) Query( ServerQueryFiberName, id );
+    if( TransportIsValid() ) Query( ServerQueryFiberName, id );
 }
 
 void Worker::CheckExternalName( uint64_t id )
@@ -6716,7 +6771,26 @@ void Worker::ProcessJnGpuReferenceSetUse( const QueueJnGpuReferenceSetUse& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gpuReferenceUses.reserve( data.gpuReferenceUses.size() + found->second.size() );
+    // ResourceSetV2 may expand one protocol event into thousands of resource
+    // uses. Reserving exactly the requested size for every set forces a full
+    // vector reallocation and copy for every event, turning replay into
+    // quadratic work. Keep the live/full path unchanged, but let the offline
+    // converter grow geometrically so the expanded trace has identical order
+    // and contents with amortized-linear construction cost.
+    if( m_mode == Mode::OfflineConvert )
+    {
+        const auto required = data.gpuReferenceUses.size() + found->second.size();
+        if( required > data.gpuReferenceUses.capacity() )
+        {
+            const auto capacity = data.gpuReferenceUses.capacity();
+            const auto geometric = capacity == 0 ? size_t( 4096 ) : capacity + capacity / 2;
+            data.gpuReferenceUses.reserve( std::max( required, geometric ) );
+        }
+    }
+    else
+    {
+        data.gpuReferenceUses.reserve( data.gpuReferenceUses.size() + found->second.size() );
+    }
     for( const auto& entry : found->second )
         data.gpuReferenceUses.push_back( JnGpuReferenceUseData { passTime->second, ev.passId,
             entry.resourceId, m_threadCtx, entry.usageMask, ev.resourceSetId, ev.flags, ev.encoding } );
@@ -10691,7 +10765,7 @@ void Worker::ProcessJnGpuZoneBeginCallsite( const QueueJnGpuZoneBeginCallsite& e
 
 void Worker::Disconnect()
 {
-    if( m_mode == Mode::Full )
+    if( m_mode != Mode::ProtocolOnly )
     {
         MarkProtocolDisconnect();
         Shutdown();

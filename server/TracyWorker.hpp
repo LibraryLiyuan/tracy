@@ -2,6 +2,7 @@
 #define __TRACYWORKER_HPP__
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
@@ -34,6 +35,22 @@ namespace tracy
 
 class FileRead;
 class FileWrite;
+
+// Offline conversion uses the normal Full Worker data model without opening a
+// localhost socket.  The transport is deliberately small: the converter owns
+// the recorded protocol transcript and the Worker only consumes or produces
+// the same byte stream it would exchange through Socket.
+class WorkerOfflineTransport
+{
+public:
+    virtual ~WorkerOfflineTransport() = default;
+    virtual bool Connect() = 0;
+    virtual bool Read( void* data, int size, int timeoutMs, const std::atomic<bool>& shutdown ) = 0;
+    virtual int Send( const void* data, int size ) = 0;
+    virtual int GetSendBufferSize() const = 0;
+    virtual void Close() = 0;
+    virtual bool IsValid() const = 0;
+};
 
 namespace EventType
 {
@@ -142,6 +159,13 @@ struct LoadProgress
 class Worker
 {
 public:
+    struct OfflineEventStat
+    {
+        uint64_t count = 0;
+        uint64_t sampledCount = 0;
+        uint64_t sampledNanoseconds = 0;
+    };
+
     struct ImportEventTimeline
     {
         uint64_t tid;
@@ -483,7 +507,8 @@ public:
     enum class Mode : uint8_t
     {
         Full,
-        ProtocolOnly
+        ProtocolOnly,
+        OfflineConvert
     };
 
     static constexpr size_t DefaultRecorderDefinitionLimit = 8000000;
@@ -514,7 +539,8 @@ public:
         Mode mode = Mode::Full, size_t recorderDefinitionLimit = DefaultRecorderDefinitionLimit,
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
-        bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false );
+        bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false,
+        WorkerOfflineTransport* offlineTransport = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
@@ -771,6 +797,7 @@ public:
     size_t GetProtocolDefinitionCount() const { return m_protocolDefinitionCount.load( std::memory_order_relaxed ); }
     uint64_t GetProtocolEventCount() const { return m_protocolEventCount.load( std::memory_order_relaxed ); }
     uint64_t GetProtocolFramesProcessed() const { return m_protocolFramesProcessed.load( std::memory_order_acquire ); }
+    const std::array<OfflineEventStat, size_t( QueueType::NUM_TYPES )>& GetOfflineEventStats() const { return m_offlineEventStats; }
 
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
@@ -820,6 +847,12 @@ private:
     void QueryCallstackFrame( uint64_t addr );
     bool ObserveProtocol( ProtocolDirection direction, ProtocolChunk chunk, std::span<const ProtocolDataSpan> data );
     bool SendProtocol( const void* data, int size, ProtocolChunk chunk );
+    bool TransportConnect();
+    bool TransportRead( void* data, int size, int timeoutMs );
+    int TransportSend( const void* data, int size );
+    int TransportSendBufferSize();
+    void TransportClose();
+    bool TransportIsValid() const;
     bool RecordProtocolDrainControl();
     void NotifyProtocolClose( ProtocolCloseReason reason );
     void FinishProtocol( ProtocolCloseReason reason );
@@ -1161,6 +1194,7 @@ private:
     int64_t TscPeriod( uint64_t tsc ) { return int64_t( tsc * m_timerMul ); }
 
     Socket m_sock;
+    WorkerOfflineTransport* m_offlineTransport = nullptr;
     std::string m_addr;
     uint16_t m_port;
     ProtocolObserver* m_protocolObserver = nullptr;
@@ -1182,6 +1216,8 @@ private:
     std::string m_protocolResolverError;
     std::atomic<size_t> m_protocolDefinitionCount { 0 };
     std::atomic<uint64_t> m_protocolEventCount { 0 };
+    std::array<OfflineEventStat, size_t( QueueType::NUM_TYPES )> m_offlineEventStats {};
+    uint64_t m_offlineEventCount = 0;
 
     std::thread m_thread;
     std::thread m_threadNet;
