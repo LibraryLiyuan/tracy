@@ -420,7 +420,7 @@ LoadProgress Worker::s_loadProgress;
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
     uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions,
-    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport )
+    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport, bool collectOfflineEventStats )
     : m_offlineTransport( offlineTransport )
     , m_addr( addr )
     , m_port( port )
@@ -431,6 +431,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     , m_useRecorderDrainState( mode == Mode::ProtocolOnly || useRecorderDrainState )
     , m_allowEarlyProtocolDefinitions( allowEarlyProtocolDefinitions )
     , m_deferLiveSampleAnalysis( deferLiveSampleAnalysis )
+    , m_collectOfflineEventStats( collectOfflineEventStats )
     , m_recorderDefinitionLimit( recorderDefinitionLimit )
     , m_recorderQueryQueueLimit( recorderQueryQueueLimit )
     , m_hasData( false )
@@ -3194,6 +3195,8 @@ void Worker::FinishProtocol( ProtocolCloseReason reason )
     // observer callback.
     NotifyProtocolClose( reason );
     if( TransportIsValid() ) TransportClose();
+    if( m_mode == Mode::OfflineConvert )
+        m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
     m_connected.store( false, std::memory_order_relaxed );
 }
 
@@ -3592,6 +3595,12 @@ void Worker::Exec()
             while( ptr < end )
             {
                 auto ev = (const QueueItem*)ptr;
+                if( m_mode == Mode::OfflineConvert )
+                {
+                    m_offlineEventCount++;
+                    if( ( m_offlineEventCount & 4095 ) == 0 )
+                        m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
+                }
                 const bool processed = m_protocolDrainOnly.load( std::memory_order_acquire ) ?
                     DispatchProtocolDrain( *ev, ptr ) :
                     ( m_mode == Mode::ProtocolOnly ? DispatchRecorder( *ev, ptr ) : DispatchProcess( *ev, ptr ) );
@@ -4013,12 +4022,12 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
     std::chrono::steady_clock::time_point offlineSampleStart;
     if( m_mode == Mode::OfflineConvert )
     {
-        offlineStat = &m_offlineEventStats[size_t( ev.hdr.idx )];
-        sampleOfflineCost = ( offlineStat->count++ & 1023 ) == 0;
-        m_offlineEventCount++;
-        if( ( m_offlineEventCount & 4095 ) == 0 )
-            m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
-        if( sampleOfflineCost ) offlineSampleStart = std::chrono::steady_clock::now();
+        if( m_collectOfflineEventStats )
+        {
+            offlineStat = &m_offlineEventStats[size_t( ev.hdr.idx )];
+            sampleOfflineCost = ( offlineStat->count++ & 1023 ) == 0;
+            if( sampleOfflineCost ) offlineSampleStart = std::chrono::steady_clock::now();
+        }
     }
     const auto finish = [&]( bool result ) {
         if( sampleOfflineCost )

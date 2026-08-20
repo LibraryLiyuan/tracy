@@ -540,7 +540,7 @@ public:
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
         bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false,
-        WorkerOfflineTransport* offlineTransport = nullptr );
+        WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
@@ -1210,6 +1210,7 @@ private:
     // statistics are rebuilt in parallel by the normal snapshot loader, so
     // building them synchronously here would duplicate expensive work.
     bool m_deferLiveSampleAnalysis = false;
+    bool m_collectOfflineEventStats = false;
     size_t m_recorderDefinitionLimit = DefaultRecorderDefinitionLimit;
     size_t m_recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit;
     std::atomic<bool> m_protocolResolverFailed { false };

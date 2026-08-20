@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 option(NO_ISA_EXTENSIONS "Disable ISA extensions (don't pass -march=native or -mcpu=native to the compiler)" OFF)
 option(NO_STATISTICS "Disable calculation of statistics" ON)
+option(JN_STREAM_CONVERT_DEV_TOOLS "Expose legacy/compare StreamConvert validation modes" OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/version.cmake)
 
@@ -28,6 +29,14 @@ set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${P
 
 add_executable(tracy-stream-convert src/stream-convert.cpp)
 target_link_libraries(tracy-stream-convert PRIVATE TracyServer TracyStreamCore)
+if(JN_STREAM_CONVERT_DEV_TOOLS)
+    target_compile_definitions(tracy-stream-convert PRIVATE JN_STREAM_CONVERT_DEV_TOOLS=1)
+    add_executable(tracy-trace-compare src/trace-compare.cpp)
+    target_link_libraries(tracy-trace-compare PRIVATE TracyServer TracyStreamCore)
+endif()
+if(WIN32)
+    target_link_libraries(tracy-stream-convert PRIVATE Psapi Bcrypt)
+endif()
 
 add_executable(tracy-stream-inspect src/stream-inspect.cpp)
 target_link_libraries(tracy-stream-inspect PRIVATE TracyServer TracyStreamCore)
