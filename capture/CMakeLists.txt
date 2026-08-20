@@ -29,4 +29,7 @@ set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${P
 add_executable(tracy-stream-convert src/stream-convert.cpp)
 target_link_libraries(tracy-stream-convert PRIVATE TracyServer TracyStreamCore)
 
+add_executable(tracy-stream-inspect src/stream-inspect.cpp)
+target_link_libraries(tracy-stream-inspect PRIVATE TracyServer TracyStreamCore)
+
 install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL_BINDIR})
