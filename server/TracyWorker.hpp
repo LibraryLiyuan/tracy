@@ -796,6 +796,7 @@ public:
     const std::string& GetProtocolResolverError() const { return m_protocolResolverError; }
     size_t GetProtocolDefinitionCount() const { return m_protocolDefinitionCount.load( std::memory_order_relaxed ); }
     uint64_t GetProtocolEventCount() const { return m_protocolEventCount.load( std::memory_order_relaxed ); }
+    uint64_t GetOfflineDecodedEventCount() const { return m_offlineEventCount; }
     uint64_t GetProtocolFramesProcessed() const { return m_protocolFramesProcessed.load( std::memory_order_acquire ); }
     const std::array<OfflineEventStat, size_t( QueueType::NUM_TYPES )>& GetOfflineEventStats() const { return m_offlineEventStats; }
 

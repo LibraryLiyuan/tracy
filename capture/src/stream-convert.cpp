@@ -1651,6 +1651,12 @@ int main( int argc, char** argv )
         }
     } );
 
+    const auto inputCompressedFrameCount = uint64_t( std::count_if( clientRecords.begin(), clientRecords.end(), []( const auto& record ) {
+        return ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
+    } ) );
+    uint64_t publishedClientRecordCount = 0;
+    uint64_t publishedCompressedFrameCount = 0;
+    uint64_t lastPublishedClientSequence = 0;
     PayloadReader clientReader( options.input );
     if( !clientReader.IsOpen() )
     {
@@ -1674,6 +1680,12 @@ int main( int argc, char** argv )
                 return false;
             }
             if( replayError.Failed() ) return false;
+            if( publishedClientRecordCount != 0 && record.sequence <= lastPublishedClientSequence )
+            {
+                replayError.Set( "client journal record was replayed twice or out of sequence at " +
+                    std::to_string( record.sequence ) );
+                return false;
+            }
             uint64_t requiredServerSequence = 0;
             while( serverDependencyCursor < serverRecords.size() &&
                 serverRecords[serverDependencyCursor].sequence < record.sequence )
@@ -1731,6 +1743,9 @@ int main( int argc, char** argv )
                     std::to_string( worker.GetProtocolFramesProcessed() ) );
                 return false;
             }
+            lastPublishedClientSequence = record.sequence;
+            publishedClientRecordCount++;
+            if( ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0 ) publishedCompressedFrameCount++;
             progress.Update( ++replayedClientRecordCount, clientRecords.size() );
             if( options.testCancelAfterRecords != 0 && replayedClientRecordCount >= options.testCancelAfterRecords )
                 s_cancelRequests.store( 1, std::memory_order_relaxed );
@@ -1889,6 +1904,14 @@ int main( int argc, char** argv )
     {
         replayError.Set( "Worker rejected the replay before receiving capture metadata" );
     }
+    if( !replayError.Failed() &&
+        ( publishedClientRecordCount != clientRecords.size() || publishedCompressedFrameCount != inputCompressedFrameCount ) )
+    {
+        replayError.Set( "client journal replay coverage mismatch: records=" +
+            std::to_string( publishedClientRecordCount ) + "/" + std::to_string( clientRecords.size() ) +
+            ", compressed_frames=" + std::to_string( publishedCompressedFrameCount ) + "/" +
+            std::to_string( inputCompressedFrameCount ) );
+    }
     if( replayError.Failed() )
     {
         std::fprintf( stderr, "Replay failed: %s\n", replayError.Message().c_str() );
@@ -1910,6 +1933,9 @@ int main( int argc, char** argv )
     }
 
     const auto protocolEventCount = worker.GetProtocolEventCount();
+    const auto offlineDecodedEventCount = options.mode == Options::Mode::Offline ?
+        worker.GetOfflineDecodedEventCount() : 0;
+    const auto workerCompressedFrameCount = worker.GetProtocolFramesProcessed();
     const auto gpuReferenceUseCount = worker.GetJnTraceData().gpuReferenceUses.size();
     const auto gpuReferencePassCount = worker.GetJnTraceData().gpuReferencePasses.size();
     const auto jobStageCount = worker.GetJnTraceData().jobStages.size();
@@ -2068,7 +2094,12 @@ int main( int argc, char** argv )
             << "\",\"capture_complete\":" << ( scan.complete ? "true" : "false" )
             << ",\"scan_cache_used\":" << ( scanCacheUsed ? "true" : "false" )
             << ",\"committed_revision\":\"" << scan.lastSequence << "\",\"client_records\":" << clientRecords.size()
+            << ",\"published_client_records\":" << publishedClientRecordCount
+            << ",\"compressed_frames\":" << inputCompressedFrameCount
+            << ",\"published_compressed_frames\":" << publishedCompressedFrameCount
+            << ",\"worker_compressed_frames\":" << workerCompressedFrameCount
             << ",\"server_records\":" << serverRecords.size() << ",\"protocol_events\":\"" << protocolEventCount
+            << "\",\"offline_decoded_events\":\"" << offlineDecodedEventCount
             << "\",\"gpu_reference_passes\":\"" << gpuReferencePassCount << "\",\"gpu_reference_uses\":\""
             << gpuReferenceUseCount << "\",\"job_stages\":\"" << jobStageCount << "\",\"output_bytes\":\""
             << ( outputSizeError ? 0 : outputSize ) << "\",\"peak_commit_bytes\":\"" << progress.PeakCommitBytes()

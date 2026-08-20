@@ -117,3 +117,34 @@
 - `tracy-trace-compare` 只比较 Worker 重新序列化后的内部表示，已明确标为 diagnostic。内部 ID、哈希表遍历和压缩布局可不同，因此它不能替代 MCP 语义门禁。
 
 一次大型 Query 索引计时与用户已有的长期 Query 分析进程并发，超过 600 秒后停止；该结果环境不洁净，标记为无效测量，未终止或干扰用户进程，也不计为 converter 失败。最终索引性能需在无并发 Query 的窗口复测。
+
+## SC.6 Release 前正确性阻断与修复
+
+首次三轮 clean Release 性能运行得到 `42.976 / 42.332 / 41.470 s`，但暂缓签字，因为报告的 `206,023,276` protocol events 比 Inspector 的 `206,023,026` 多 250。
+
+逐层核对结果：
+
+- journal Client records：输入/发布均为 `14,514`。
+- 压缩帧：输入/发布/Worker 处理均为 `14,511`。
+- 因此不存在 record 或压缩帧重复。
+- 根因是 Protocol 88 的 `JnGpuReferenceSetDefinition` 未加入 `DispatchProtocolDrain` 的定义响应白名单。
+- drain 兜底 `SkipProtocolEvent` 同时遗漏该事件的 32 位 payload 长度规则，错误按 16 位长度跳过，剩余 payload 被解释成 250 个伪事件。
+
+修复：
+
+1. 将 `JnGpuReferenceSetDefinition` 作为 drain 阶段必须保留、处理的定义事件。
+2. 兜底跳过路径按 32 位长度安全前进。
+3. converter 增加发布 record、压缩帧、Worker 帧和离线解码事件计数，覆盖不完整/重复重放门禁。
+
+修复后同一压力输入：
+
+| 项目 | 数值 |
+|---|---:|
+| Inspector protocol events | 206,023,026 |
+| Offline decoded events | 206,023,026 |
+| Published Client records | 14,514 / 14,514 |
+| Published compressed frames | 14,511 / 14,511 |
+| Worker compressed frames | 14,511 |
+| GPU reference uses | 42,702,705 |
+
+该轮总时间 `32.013 s`（显式 `--no-cache` 的开发 Release），并通过临时输出重开验证。最终 clean Release 三轮基准必须在合入该修复后重新执行；修复前的三轮仅保留为性能参考，不作为最终正确性门禁。

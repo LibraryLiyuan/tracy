@@ -4350,6 +4350,7 @@ bool Worker::DispatchProtocolDrain( const QueueItem& ev, const char*& ptr )
     case QueueType::ExternalThreadName:
     case QueueType::SymbolCode:
     case QueueType::SourceCode:
+    case QueueType::JnGpuReferenceSetDefinition:
     case QueueType::SingleStringData:
     case QueueType::SecondStringData:
     case QueueType::SourceLocation:
