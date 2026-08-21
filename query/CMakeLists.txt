@@ -64,6 +64,12 @@ add_executable(tracy-query src/main.cpp)
 target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT tracy-query)
 
+option(JN_STREAM_CONVERT_SEMANTIC_TOOLS "Build local stream-convert semantic acceptance tools" OFF)
+if(JN_STREAM_CONVERT_SEMANTIC_TOOLS)
+    add_executable(tracy-job-semantic-hash tests/JobSemanticHash.cpp)
+    target_link_libraries(tracy-job-semantic-hash PRIVATE TracyQueryProtocol)
+endif()
+
 install(TARGETS tracy-query DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
