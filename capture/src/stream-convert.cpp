@@ -26,6 +26,8 @@
 namespace
 {
 
+constexpr auto ReplayProgressTimeout = std::chrono::seconds( 120 );
+
 struct Options
 {
     std::filesystem::path input;
@@ -569,15 +571,27 @@ int main( int argc, char** argv )
             }
             if( !replayError.Failed() && scan.complete && recordedEndsWithTerminate )
             {
-                const auto replayDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                auto lastEventProgress = worker.GetProtocolEventCount();
+                auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+                auto replayDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
                 while( worker.GetProtocolFramesProcessed() < replayedFrames && !replayError.Failed() &&
                     std::chrono::steady_clock::now() < replayDeadline )
                 {
+                    const auto eventProgress = worker.GetProtocolEventCount();
+                    const auto frameProgress = worker.GetProtocolFramesProcessed();
+                    if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+                    {
+                        lastEventProgress = eventProgress;
+                        lastFrameProgress = frameProgress;
+                        replayDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+                    }
                     std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
                 }
                 if( worker.GetProtocolFramesProcessed() < replayedFrames )
                 {
-                    replayError.Set( "Worker did not process the complete Full-capture client revision" );
+                    replayError.Set( "Worker made no protocol progress for 120 seconds while processing the complete Full-capture client revision; events=" +
+                        std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                        std::to_string( worker.GetProtocolFramesProcessed() ) );
                 }
                 else if( worker.IsConnected() )
                 {
@@ -613,15 +627,27 @@ int main( int argc, char** argv )
                 if( compressed ) sentFrames++;
             }
 
-            const auto prefixDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+            auto lastPrefixEventProgress = worker.GetProtocolEventCount();
+            auto lastPrefixFrameProgress = worker.GetProtocolFramesProcessed();
+            auto prefixDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
             while( worker.GetProtocolFramesProcessed() < prefixFrameTarget &&
                 !replayError.Failed() && std::chrono::steady_clock::now() < prefixDeadline )
             {
+                const auto eventProgress = worker.GetProtocolEventCount();
+                const auto frameProgress = worker.GetProtocolFramesProcessed();
+                if( eventProgress != lastPrefixEventProgress || frameProgress != lastPrefixFrameProgress )
+                {
+                    lastPrefixEventProgress = eventProgress;
+                    lastPrefixFrameProgress = frameProgress;
+                    prefixDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+                }
                 std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
             }
             if( worker.GetProtocolFramesProcessed() < prefixFrameTarget )
             {
-                replayError.Set( "Worker did not process the pre-drain client revision" );
+                replayError.Set( "Worker made no protocol progress for 120 seconds while processing the pre-drain client revision; events=" +
+                    std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                    std::to_string( worker.GetProtocolFramesProcessed() ) );
             }
             else if( !replayError.Failed() )
             {
@@ -632,15 +658,27 @@ int main( int argc, char** argv )
                     if( record.sequence > drainControlSequence ) break;
                     if( !replayClientRecord( record ) ) break;
                 }
-                const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+                auto lastDrainEventProgress = worker.GetProtocolEventCount();
+                auto lastDrainFrameProgress = worker.GetProtocolFramesProcessed();
+                auto drainDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
                 while( !worker.IsProtocolDrainActive() && !replayError.Failed() &&
                     std::chrono::steady_clock::now() < drainDeadline )
                 {
+                    const auto eventProgress = worker.GetProtocolEventCount();
+                    const auto frameProgress = worker.GetProtocolFramesProcessed();
+                    if( eventProgress != lastDrainEventProgress || frameProgress != lastDrainFrameProgress )
+                    {
+                        lastDrainEventProgress = eventProgress;
+                        lastDrainFrameProgress = frameProgress;
+                        drainDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+                    }
                     std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
                 }
                 if( !worker.IsProtocolDrainActive() )
                 {
-                    replayError.Set( "Worker did not enter protocol drain mode" );
+                    replayError.Set( "Worker made no protocol progress for 120 seconds before entering protocol drain mode; events=" +
+                        std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
+                        std::to_string( worker.GetProtocolFramesProcessed() ) );
                 }
                 else
                 {
@@ -674,13 +712,31 @@ int main( int argc, char** argv )
     }
     if( peer->IsValid() ) peer->Close();
 
-    const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
+    auto lastWorkerEventProgress = worker.GetProtocolEventCount();
+    auto lastWorkerFrameProgress = worker.GetProtocolFramesProcessed();
+    auto workerDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
     while( !worker.HasData() && worker.GetHandshakeStatus() == tracy::HandshakePending && std::chrono::steady_clock::now() < workerDeadline )
     {
+        const auto eventProgress = worker.GetProtocolEventCount();
+        const auto frameProgress = worker.GetProtocolFramesProcessed();
+        if( eventProgress != lastWorkerEventProgress || frameProgress != lastWorkerFrameProgress )
+        {
+            lastWorkerEventProgress = eventProgress;
+            lastWorkerFrameProgress = frameProgress;
+            workerDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+        }
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
     }
     while( worker.IsConnected() && std::chrono::steady_clock::now() < workerDeadline )
     {
+        const auto eventProgress = worker.GetProtocolEventCount();
+        const auto frameProgress = worker.GetProtocolFramesProcessed();
+        if( eventProgress != lastWorkerEventProgress || frameProgress != lastWorkerFrameProgress )
+        {
+            lastWorkerEventProgress = eventProgress;
+            lastWorkerFrameProgress = frameProgress;
+            workerDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+        }
         std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
     }
     if( worker.IsConnected() )

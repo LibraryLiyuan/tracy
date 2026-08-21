@@ -234,7 +234,7 @@ try {
 
     [ordered]@{
         ok = $true
-        schema_version = '1.28.0'
+        schema_version = '1.30.0'
         sidecar_schema = 3
         primary = $primaryResult
         script = $scriptResult

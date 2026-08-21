@@ -141,6 +141,21 @@ enum class QueueType : uint8_t
     JnCallsiteDefinition,
     JnGpuZoneBeginCallsite,
     JnMemAllocCallsiteNamed,
+    JnAssetDefine,
+    JnAssetUpdate,
+    JnUnityObjectCreate,
+    JnUnityObjectUpdate,
+    JnUnityObjectDestroy,
+    JnNativeRootDefine,
+    JnGfxResourceBind,
+    JnGfxResourceUnbind,
+    JnResourcePartDefine,
+    JnResourceRange,
+    JnResourceContext,
+    JnResourceRelation,
+    JnResourceMetadata,
+    JnBootstrapState,
+    JnResourceGraphQuality,
     StringData,
     ThreadName,
     PlotName,
@@ -657,7 +672,8 @@ enum class JnRelationNamespace : uint8_t
     Job,
     GpuReference,
     Script,
-    Io
+    Io,
+    Resource
 };
 
 enum class JnRelationKind : uint8_t
@@ -688,7 +704,13 @@ enum class JnEntityKind : uint8_t
     Camera,
     View,
     CommandList,
-    Submission
+    Submission,
+    Asset,
+    UnityObject,
+    NativeRoot,
+    ResourcePart,
+    ResourceContext,
+    SharedOwner
 };
 
 enum class JnRuntimeDomain : uint8_t
@@ -697,7 +719,8 @@ enum class JnRuntimeDomain : uint8_t
     ScriptStack,
     Job,
     GpuPass,
-    Io
+    Io,
+    UnityResourceGraph
 };
 
 enum class JnRuntimeMode : uint8_t
@@ -997,6 +1020,200 @@ struct QueueJnCallsiteDefinition
     uint8_t provenance;
     uint8_t flags;
     uint8_t unavailableReason;
+};
+
+// Resource Graph schema 1. AssetTraceId remains the stable 128-bit identity.
+// assetEntityId is a process-local, non-zero relation key used by the fixed
+// 64-bit relation records; it is never exposed as the stable asset identity.
+struct QueueJnAssetDefine
+{
+    uint64_t assetEntityId;
+    uint64_t assetIdHigh;
+    uint64_t assetIdLow;
+    uint8_t identityNamespace;
+    uint8_t assetKind;
+    uint8_t flags;
+};
+
+enum class JnAssetField : uint8_t
+{
+    Name = 1,
+    SubAssetName = 2,
+    Path = 3,
+    ResourceId = 4,
+    LocalFileId = 5,
+    BundleIdentity = 6,
+    LoadState = 7,
+    IoRequest = 8,
+    MetadataHash = 9
+};
+
+struct QueueJnAssetUpdate
+{
+    int64_t time;
+    uint64_t assetEntityId;
+    uint64_t value;
+    uint32_t revision;
+    uint8_t field;
+    uint8_t flags;
+};
+
+struct QueueJnUnityObjectCreate
+{
+    int64_t time;
+    uint64_t objectId;
+    uint64_t nativePointer;
+    int32_t instanceId;
+    uint16_t runtimeTypeIndex;
+    uint8_t flags;
+};
+
+enum class JnUnityObjectField : uint16_t
+{
+    Name = 1 << 0,
+    TypeName = 1 << 1,
+    AllocationRoot = 1 << 2,
+    NativeSize = 1 << 3,
+    SceneIdentity = 1 << 4,
+    AssetEntity = 1 << 5,
+    HideFlags = 1 << 6,
+    Persistence = 1 << 7
+};
+
+struct QueueJnUnityObjectUpdate
+{
+    int64_t time;
+    uint64_t objectId;
+    uint64_t value;
+    uint32_t revision;
+    uint16_t fieldMask;
+    uint8_t flags;
+};
+
+struct QueueJnUnityObjectDestroy
+{
+    int64_t time;
+    uint64_t objectId;
+    uint8_t flags;
+};
+
+struct QueueJnNativeRootDefine
+{
+    int64_t time;
+    uint64_t rootId;
+    uint64_t objectId;
+    uint8_t flags;
+};
+
+// targetKind selects NativeRoot or GpuResource. The same record therefore
+// persists both Root->Gfx and Gfx->D3D12-generation bindings without pointer
+// or temporal inference.
+struct QueueJnGfxResourceBind
+{
+    int64_t time;
+    uint64_t gfxResourceId;
+    uint64_t targetId;
+    uint32_t generation;
+    uint8_t targetKind;
+    uint8_t resourceKind;
+    uint8_t flags;
+};
+
+struct QueueJnGfxResourceUnbind
+{
+    int64_t time;
+    uint64_t gfxResourceId;
+    uint32_t generation;
+    uint8_t reason;
+    uint8_t flags;
+};
+
+struct QueueJnResourcePartDefine
+{
+    int64_t time;
+    uint64_t partId;
+    uint64_t ownerId;
+    uint32_t index;
+    uint8_t semanticKind;
+    uint8_t ownerKind;
+    uint8_t flags;
+};
+
+struct QueueJnResourceRange
+{
+    uint64_t partId;
+    uint64_t targetId;
+    uint32_t byteOffset;
+    uint32_t byteLength;
+    uint32_t generation;
+    uint8_t targetKind;
+    uint8_t flags;
+};
+
+struct QueueJnResourceContext
+{
+    int64_t time;
+    uint64_t contextId;
+    uint64_t relatedId;
+    uint32_t callsiteId;
+    uint8_t relatedKind;
+    uint8_t stage;
+    uint8_t flags;
+};
+
+struct QueueJnResourceRelation
+{
+    int64_t time;
+    uint64_t sourceId;
+    uint64_t targetId;
+    uint16_t sequence;
+    uint8_t sourceKind;
+    uint8_t targetKind;
+    uint8_t relation;
+    uint8_t provenance;
+    uint8_t flags;
+};
+
+enum class JnResourceMetadataValueKind : uint8_t
+{
+    Unsigned = 0,
+    Signed = 1,
+    FloatBits = 2,
+    String = 3,
+    Hash = 4,
+    Boolean = 5
+};
+
+struct QueueJnResourceMetadata
+{
+    int64_t time;
+    uint64_t entityId;
+    uint64_t value;
+    uint32_t revision;
+    uint8_t key;
+    uint8_t entityKind;
+    uint8_t valueKind;
+};
+
+struct QueueJnBootstrapState
+{
+    int64_t time;
+    uint64_t highWatermark;
+    uint32_t connectionGeneration;
+    uint32_t emittedCount;
+    uint32_t remainingCount;
+    uint8_t phase;
+    uint8_t flags;
+};
+
+struct QueueJnResourceGraphQuality
+{
+    int64_t time;
+    uint64_t relatedId;
+    uint64_t value;
+    uint16_t counter;
+    uint8_t reason;
+    uint8_t flags;
 };
 
 // QueueGpuZoneBegin is 27 bytes. Adding the 32-bit callsite id consumes the
@@ -1404,6 +1621,21 @@ struct QueueItem
         QueueJnCallsiteDefinition jnCallsiteDefinition;
         QueueJnGpuZoneBeginCallsite jnGpuZoneBeginCallsite;
         QueueJnMemAllocCallsite jnMemAllocCallsite;
+        QueueJnAssetDefine jnAssetDefine;
+        QueueJnAssetUpdate jnAssetUpdate;
+        QueueJnUnityObjectCreate jnUnityObjectCreate;
+        QueueJnUnityObjectUpdate jnUnityObjectUpdate;
+        QueueJnUnityObjectDestroy jnUnityObjectDestroy;
+        QueueJnNativeRootDefine jnNativeRootDefine;
+        QueueJnGfxResourceBind jnGfxResourceBind;
+        QueueJnGfxResourceUnbind jnGfxResourceUnbind;
+        QueueJnResourcePartDefine jnResourcePartDefine;
+        QueueJnResourceRange jnResourceRange;
+        QueueJnResourceContext jnResourceContext;
+        QueueJnResourceRelation jnResourceRelation;
+        QueueJnResourceMetadata jnResourceMetadata;
+        QueueJnBootstrapState jnBootstrapState;
+        QueueJnResourceGraphQuality jnResourceGraphQuality;
     };
 };
 #pragma pack( pop )
@@ -1545,6 +1777,21 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnCallsiteDefinition ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuZoneBeginCallsite ),
     sizeof( QueueHeader ) + sizeof( QueueJnMemAllocCallsite ),
+    sizeof( QueueHeader ) + sizeof( QueueJnAssetDefine ),
+    sizeof( QueueHeader ) + sizeof( QueueJnAssetUpdate ),
+    sizeof( QueueHeader ) + sizeof( QueueJnUnityObjectCreate ),
+    sizeof( QueueHeader ) + sizeof( QueueJnUnityObjectUpdate ),
+    sizeof( QueueHeader ) + sizeof( QueueJnUnityObjectDestroy ),
+    sizeof( QueueHeader ) + sizeof( QueueJnNativeRootDefine ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGfxResourceBind ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGfxResourceUnbind ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourcePartDefine ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourceRange ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourceContext ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourceRelation ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourceMetadata ),
+    sizeof( QueueHeader ) + sizeof( QueueJnBootstrapState ),
+    sizeof( QueueHeader ) + sizeof( QueueJnResourceGraphQuality ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1597,6 +1844,21 @@ static_assert( sizeof( QueueJnZoneBeginCallsite ) == 20, "JN CPU callsite-zone p
 static_assert( sizeof( QueueJnCallsiteDefinition ) == 20, "JN callsite definition payload size mismatch" );
 static_assert( sizeof( QueueJnGpuZoneBeginCallsite ) == 27, "JN GPU callsite-zone payload size mismatch" );
 static_assert( sizeof( QueueJnMemAllocCallsite ) == 30, "JN allocation callsite payload size mismatch" );
+static_assert( sizeof( QueueJnAssetDefine ) == 27, "JN asset definition payload size mismatch" );
+static_assert( sizeof( QueueJnAssetUpdate ) == 30, "JN asset update payload size mismatch" );
+static_assert( sizeof( QueueJnUnityObjectCreate ) == 31, "JN UnityObject create payload size mismatch" );
+static_assert( sizeof( QueueJnUnityObjectUpdate ) == 31, "JN UnityObject update payload size mismatch" );
+static_assert( sizeof( QueueJnUnityObjectDestroy ) == 17, "JN UnityObject destroy payload size mismatch" );
+static_assert( sizeof( QueueJnNativeRootDefine ) == 25, "JN native root payload size mismatch" );
+static_assert( sizeof( QueueJnGfxResourceBind ) == 31, "JN Gfx resource bind payload size mismatch" );
+static_assert( sizeof( QueueJnGfxResourceUnbind ) == 22, "JN Gfx resource unbind payload size mismatch" );
+static_assert( sizeof( QueueJnResourcePartDefine ) == 31, "JN resource part payload size mismatch" );
+static_assert( sizeof( QueueJnResourceRange ) == 30, "JN resource range payload size mismatch" );
+static_assert( sizeof( QueueJnResourceContext ) == 31, "JN resource context payload size mismatch" );
+static_assert( sizeof( QueueJnResourceRelation ) == 31, "JN resource relation payload size mismatch" );
+static_assert( sizeof( QueueJnResourceMetadata ) == 31, "JN resource metadata payload size mismatch" );
+static_assert( sizeof( QueueJnBootstrapState ) == 30, "JN bootstrap state payload size mismatch" );
+static_assert( sizeof( QueueJnResourceGraphQuality ) == 28, "JN resource quality payload size mismatch" );
 static_assert( uint8_t( QueueType::JnZoneBeginCallsite ) < uint8_t( QueueType::Terminate ),
     "JN CPU callsite-zone event must remain thread-context encoded" );
 static_assert( sizeof( QueueDataSize ) / sizeof( size_t ) == (uint8_t)QueueType::NUM_TYPES, "QueueDataSize mismatch" );

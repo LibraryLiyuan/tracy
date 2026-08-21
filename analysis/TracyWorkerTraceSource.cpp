@@ -1318,6 +1318,15 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const auto& jnTrace = m_impl->worker->GetJnTraceData();
     const bool hasIo = jnTrace.schemaVersion >= 3 && ( !jnTrace.ioRequests.empty() || !jnTrace.ioStages.empty() );
     const bool hasRelationSchema = jnTrace.schemaVersion >= 4;
+    // A compact sidecar is written with the current physical JN section layout.
+    // Do not mistake an older trace that was layout-upgraded during indexing for
+    // a trace that actually captured Resource Graph schema 1 data.
+    const bool hasResourceGraph = jnTrace.schemaVersion >= 10 &&
+        ( !jnTrace.assets.empty() || !jnTrace.assetUpdates.empty() || !jnTrace.unityObjectCreates.empty() ||
+            !jnTrace.unityObjectUpdates.empty() || !jnTrace.unityObjectDestroys.empty() || !jnTrace.nativeRoots.empty() ||
+            !jnTrace.gfxResourceBinds.empty() || !jnTrace.gfxResourceUnbinds.empty() || !jnTrace.resourceParts.empty() ||
+            !jnTrace.resourceRanges.empty() || !jnTrace.resourceContexts.empty() || !jnTrace.resourceRelations.empty() ||
+            !jnTrace.resourceMetadata.empty() || !jnTrace.bootstrapStates.empty() || !jnTrace.resourceGraphQuality.empty() );
     auto capability = []( std::string domain, bool present, bool indexed, std::vector<std::string> methods, std::string reason = {} ) {
         if( reason.empty() ) reason = present ? "available in the persisted snapshot" : "data is absent from the persisted snapshot";
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
@@ -1347,6 +1356,15 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             hasRelationSchema ? "JN exact relation schema is present in the persisted snapshot" : "trace predates JN trace section schema 4" ),
         capability( "runtime.domain", hasRelationSchema, true, { "runtime.domain.states" },
             hasRelationSchema ? "JN runtime-domain state schema is present in the persisted snapshot" : "trace predates JN trace section schema 4" ),
+        capability( "resource", hasResourceGraph, true,
+            { "resource.summary", "resource.asset.search", "resource.object.search", "resource.part.search",
+                "resource.range.search", "resource.context.search", "resource.metadata.search",
+                "resource.relation.search", "resource.quality", "resource.capability",
+                "object.search", "object.get", "asset.search", "asset.get", "mesh.get", "texture.get",
+                "resource.lifecycle", "resource.relations", "resource.memory_impact", "resource.gpu_usage",
+                "resource.io_history", "resource.evidence_path", "resource.validation" },
+            hasResourceGraph ? "Unity Resource Graph schema 2 is present in the persisted snapshot" :
+                "resource_graph_absent_or_unsupported" ),
         capability( "thread", info.counts.threads != 0, true, { "thread.list", "thread.get", "thread.statistics", "thread.timeline", "thread.migration" }, info.counts.threads ? "" : "trace contains no threads" ),
         capability( "cpu", hasCpu, true, { "cpu.topology", "cpu.usage", "cpu.timeline" }, hasCpu ? "" : "trace contains no CPU topology or scheduling data" ),
         capability( "context_switch", info.counts.contextSwitches != 0, true, { "context_switch.range", "context_switch.thread", "context_switch.statistics" } ),
@@ -2480,6 +2498,201 @@ std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
         if( *reason != '\0' ) dto.unavailableReason = reason;
         result.emplace_back( std::move( dto ) );
     }
+    return result;
+}
+
+std::vector<ResourceAssetDto> WorkerTraceSource::GetResourceAssets() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().assets;
+    std::vector<ResourceAssetDto> result;
+    result.reserve( values.size() );
+    for( const auto& value : values ) result.push_back( { m_impl->MakeRef( "resource-asset", value.assetEntityId ),
+        value.assetEntityId, value.assetIdHigh, value.assetIdLow, m_impl->MakeRef( "thread", value.thread ),
+        value.identityNamespace, value.assetKind, value.flags } );
+    return result;
+}
+
+std::vector<ResourceAssetUpdateDto> WorkerTraceSource::GetResourceAssetUpdates() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().assetUpdates;
+    std::vector<ResourceAssetUpdateDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ )
+    {
+        const auto& value = values[index];
+        ResourceAssetUpdateDto dto;
+        dto.ref = m_impl->MakeRef( "resource-asset-update", index );
+        dto.entityId = value.assetEntityId; dto.value = value.value; dto.timeNs = value.time;
+        dto.threadRef = m_impl->MakeRef( "thread", value.thread ); dto.revision = value.revision;
+        dto.field = value.field; dto.flags = value.flags;
+        if( value.field == uint8_t( JnAssetField::Name ) || value.field == uint8_t( JnAssetField::SubAssetName ) ||
+            value.field == uint8_t( JnAssetField::Path ) || value.field == uint8_t( JnAssetField::BundleIdentity ) )
+            dto.text = Safe( m_impl->worker->GetString( value.value ) );
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+std::vector<UnityObjectEventDto> WorkerTraceSource::GetUnityObjectEvents() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& jn = m_impl->worker->GetJnTraceData();
+    std::vector<UnityObjectEventDto> result;
+    result.reserve( jn.unityObjectCreates.size() + jn.unityObjectUpdates.size() + jn.unityObjectDestroys.size() );
+    for( size_t index=0; index<jn.unityObjectCreates.size(); index++ )
+    {
+        const auto& value = jn.unityObjectCreates[index];
+        UnityObjectEventDto dto;
+        dto.ref = m_impl->MakeRef( "resource-object-event", index ); dto.objectId = value.objectId;
+        dto.nativePointer = value.nativePointer; dto.timeNs = value.time; dto.threadRef = m_impl->MakeRef( "thread", value.thread );
+        dto.instanceId = value.instanceId; dto.runtimeTypeIndex = value.runtimeTypeIndex; dto.eventKind = 1; dto.flags = value.flags;
+        result.emplace_back( std::move( dto ) );
+    }
+    for( size_t index=0; index<jn.unityObjectUpdates.size(); index++ )
+    {
+        const auto& value = jn.unityObjectUpdates[index];
+        UnityObjectEventDto dto;
+        dto.ref = m_impl->MakeRef( "resource-object-update", index ); dto.objectId = value.objectId;
+        dto.timeNs = value.time; dto.threadRef = m_impl->MakeRef( "thread", value.thread ); dto.revision = value.revision;
+        dto.value = value.value; dto.fieldMask = value.fieldMask; dto.eventKind = 2; dto.flags = value.flags;
+        if( ( value.fieldMask & ( uint16_t( JnUnityObjectField::Name ) | uint16_t( JnUnityObjectField::TypeName ) ) ) != 0 )
+            dto.text = Safe( m_impl->worker->GetString( value.value ) );
+        result.emplace_back( std::move( dto ) );
+    }
+    for( size_t index=0; index<jn.unityObjectDestroys.size(); index++ )
+    {
+        const auto& value = jn.unityObjectDestroys[index];
+        UnityObjectEventDto dto;
+        dto.ref = m_impl->MakeRef( "resource-object-destroy", index ); dto.objectId = value.objectId;
+        dto.timeNs = value.time; dto.threadRef = m_impl->MakeRef( "thread", value.thread ); dto.eventKind = 3; dto.flags = value.flags;
+        result.emplace_back( std::move( dto ) );
+    }
+    std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+    return result;
+}
+
+std::vector<NativeRootDto> WorkerTraceSource::GetNativeRoots() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().nativeRoots;
+    std::vector<NativeRootDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-root", index ), value.rootId, value.objectId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.flags } ); }
+    return result;
+}
+
+std::vector<GfxResourceBindingDto> WorkerTraceSource::GetGfxResourceBindings() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& jn = m_impl->worker->GetJnTraceData();
+    std::vector<GfxResourceBindingDto> result;
+    result.reserve( jn.gfxResourceBinds.size() + jn.gfxResourceUnbinds.size() );
+    for( size_t index=0; index<jn.gfxResourceBinds.size(); index++ ) { const auto& value=jn.gfxResourceBinds[index]; result.push_back( {
+        m_impl->MakeRef( "resource-gfx-bind", index ), value.gfxResourceId, value.targetId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.generation, value.targetKind, value.resourceKind, 1, 0, value.flags } ); }
+    for( size_t index=0; index<jn.gfxResourceUnbinds.size(); index++ ) { const auto& value=jn.gfxResourceUnbinds[index]; result.push_back( {
+        m_impl->MakeRef( "resource-gfx-unbind", index ), value.gfxResourceId, 0, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.generation, 0, 0, 2, value.reason, value.flags } ); }
+    std::sort( result.begin(), result.end(), []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+    return result;
+}
+
+std::vector<ResourcePartDto> WorkerTraceSource::GetResourceParts() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceParts;
+    std::vector<ResourcePartDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-part", value.partId ), value.partId, value.ownerId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.index, value.semanticKind, value.ownerKind, value.flags } ); }
+    return result;
+}
+
+std::vector<ResourceRangeDto> WorkerTraceSource::GetResourceRanges() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceRanges;
+    std::vector<ResourceRangeDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-range", index ), value.partId, value.targetId, value.time, value.byteOffset,
+        value.byteLength, value.generation, value.revision, value.targetKind, value.flags } ); }
+    return result;
+}
+
+std::vector<ResourceContextDto> WorkerTraceSource::GetResourceContexts() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceContexts;
+    std::vector<ResourceContextDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-context", index ), value.contextId, value.relatedId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.callsiteId, value.relatedKind, value.stage, value.flags } ); }
+    return result;
+}
+
+std::vector<ResourceMetadataDto> WorkerTraceSource::GetResourceMetadata() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceMetadata;
+    std::vector<ResourceMetadataDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ )
+    {
+        const auto& value=values[index];
+        ResourceMetadataDto dto;
+        dto.ref = m_impl->MakeRef( "resource-metadata", index ); dto.entityId = value.entityId;
+        dto.value = value.value; dto.timeNs = value.time; dto.threadRef = m_impl->MakeRef( "thread", value.thread );
+        dto.revision = value.revision; dto.key = value.key; dto.entityKind = value.entityKind; dto.valueKind = value.valueKind;
+        if( value.valueKind == uint8_t( JnResourceMetadataValueKind::String ) )
+            dto.text = Safe( m_impl->worker->GetString( value.value ) );
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+std::vector<ResourceRelationDto> WorkerTraceSource::GetResourceRelations() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceRelations;
+    std::vector<ResourceRelationDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-relation", index ), value.sourceId, value.targetId, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.revision, value.sourceEpoch, value.targetEpoch,
+        value.sequence, value.sourceKind, value.targetKind,
+        value.relation, value.provenance, value.flags } ); }
+    return result;
+}
+
+std::vector<ResourceBootstrapDto> WorkerTraceSource::GetResourceBootstrapStates() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().bootstrapStates;
+    std::vector<ResourceBootstrapDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-bootstrap", index ), value.highWatermark, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.connectionGeneration, value.emittedCount,
+        value.remainingCount, value.phase, value.flags } ); }
+    return result;
+}
+
+std::vector<ResourceQualityDto> WorkerTraceSource::GetResourceQuality() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().resourceGraphQuality;
+    std::vector<ResourceQualityDto> result;
+    result.reserve( values.size() );
+    for( size_t index=0; index<values.size(); index++ ) { const auto& value=values[index]; result.push_back( {
+        m_impl->MakeRef( "resource-quality", index ), value.relatedId, value.value, value.time,
+        m_impl->MakeRef( "thread", value.thread ), value.counter, value.reason, value.flags } ); }
     return result;
 }
 

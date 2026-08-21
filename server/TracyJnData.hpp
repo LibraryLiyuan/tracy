@@ -8,7 +8,7 @@ namespace tracy
 {
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
-static constexpr uint16_t JnTraceSchemaVersion = 8;
+static constexpr uint16_t JnTraceSchemaVersion = 10;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -238,6 +238,178 @@ struct JnCallsiteData
     uint8_t unavailableReason;
 };
 
+struct JnAssetData
+{
+    uint64_t assetEntityId;
+    uint64_t assetIdHigh;
+    uint64_t assetIdLow;
+    uint64_t thread;
+    uint8_t identityNamespace;
+    uint8_t assetKind;
+    uint8_t flags;
+};
+
+struct JnAssetUpdateData
+{
+    int64_t time;
+    uint64_t assetEntityId;
+    uint64_t value;
+    uint64_t thread;
+    uint32_t revision;
+    uint8_t field;
+    uint8_t flags;
+};
+
+struct JnUnityObjectCreateData
+{
+    int64_t time;
+    uint64_t objectId;
+    uint64_t nativePointer;
+    uint64_t thread;
+    int32_t instanceId;
+    uint16_t runtimeTypeIndex;
+    uint8_t flags;
+};
+
+struct JnUnityObjectUpdateData
+{
+    int64_t time;
+    uint64_t objectId;
+    uint64_t value;
+    uint64_t thread;
+    uint32_t revision;
+    uint16_t fieldMask;
+    uint8_t flags;
+};
+
+struct JnUnityObjectDestroyData
+{
+    int64_t time;
+    uint64_t objectId;
+    uint64_t thread;
+    uint8_t flags;
+};
+
+struct JnNativeRootData
+{
+    int64_t time;
+    uint64_t rootId;
+    uint64_t objectId;
+    uint64_t thread;
+    uint8_t flags;
+};
+
+struct JnGfxResourceBindData
+{
+    int64_t time;
+    uint64_t gfxResourceId;
+    uint64_t targetId;
+    uint64_t thread;
+    uint32_t generation;
+    uint8_t targetKind;
+    uint8_t resourceKind;
+    uint8_t flags;
+};
+
+struct JnGfxResourceUnbindData
+{
+    int64_t time;
+    uint64_t gfxResourceId;
+    uint64_t thread;
+    uint32_t generation;
+    uint8_t reason;
+    uint8_t flags;
+};
+
+struct JnResourcePartData
+{
+    int64_t time;
+    uint64_t partId;
+    uint64_t ownerId;
+    uint64_t thread;
+    uint32_t index;
+    uint8_t semanticKind;
+    uint8_t ownerKind;
+    uint8_t flags;
+};
+
+struct JnResourceRangeData
+{
+    int64_t time;
+    uint64_t partId;
+    uint64_t targetId;
+    uint32_t byteOffset;
+    uint32_t byteLength;
+    uint32_t generation;
+    uint32_t revision;
+    uint8_t targetKind;
+    uint8_t flags;
+};
+
+struct JnResourceContextData
+{
+    int64_t time;
+    uint64_t contextId;
+    uint64_t relatedId;
+    uint64_t thread;
+    uint32_t callsiteId;
+    uint8_t relatedKind;
+    uint8_t stage;
+    uint8_t flags;
+};
+
+struct JnResourceRelationData
+{
+    int64_t time;
+    uint64_t sourceId;
+    uint64_t targetId;
+    uint64_t thread;
+    uint32_t revision;
+    uint32_t sourceEpoch;
+    uint32_t targetEpoch;
+    uint16_t sequence;
+    uint8_t sourceKind;
+    uint8_t targetKind;
+    uint8_t relation;
+    uint8_t provenance;
+    uint8_t flags;
+};
+
+struct JnResourceMetadataData
+{
+    int64_t time;
+    uint64_t entityId;
+    uint64_t value;
+    uint64_t thread;
+    uint32_t revision;
+    uint8_t key;
+    uint8_t entityKind;
+    uint8_t valueKind;
+};
+
+struct JnBootstrapStateData
+{
+    int64_t time;
+    uint64_t highWatermark;
+    uint64_t thread;
+    uint32_t connectionGeneration;
+    uint32_t emittedCount;
+    uint32_t remainingCount;
+    uint8_t phase;
+    uint8_t flags;
+};
+
+struct JnResourceGraphQualityData
+{
+    int64_t time;
+    uint64_t relatedId;
+    uint64_t value;
+    uint64_t thread;
+    uint16_t counter;
+    uint8_t reason;
+    uint8_t flags;
+};
+
 #pragma pack( pop )
 
 struct JnTraceData
@@ -264,6 +436,21 @@ struct JnTraceData
     std::vector<JnScriptFrameData> scriptFrames;
     std::vector<JnScriptStackData> scriptStacks;
     std::vector<JnCallsiteData> callsites;
+    std::vector<JnAssetData> assets;
+    std::vector<JnAssetUpdateData> assetUpdates;
+    std::vector<JnUnityObjectCreateData> unityObjectCreates;
+    std::vector<JnUnityObjectUpdateData> unityObjectUpdates;
+    std::vector<JnUnityObjectDestroyData> unityObjectDestroys;
+    std::vector<JnNativeRootData> nativeRoots;
+    std::vector<JnGfxResourceBindData> gfxResourceBinds;
+    std::vector<JnGfxResourceUnbindData> gfxResourceUnbinds;
+    std::vector<JnResourcePartData> resourceParts;
+    std::vector<JnResourceRangeData> resourceRanges;
+    std::vector<JnResourceContextData> resourceContexts;
+    std::vector<JnResourceRelationData> resourceRelations;
+    std::vector<JnResourceMetadataData> resourceMetadata;
+    std::vector<JnBootstrapStateData> bootstrapStates;
+    std::vector<JnResourceGraphQualityData> resourceGraphQuality;
 };
 
 }

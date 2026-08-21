@@ -85,6 +85,29 @@ bool ReplayServerTranscriptVerifier::Append(
     const ReplayServerPacket& replayed,
     std::string& error )
 {
+    if( ( recorded.flags & RecordFlagServerQuery ) != 0 &&
+        recorded.payload.size() > tracy::ServerQueryPacketSize &&
+        recorded.payload.size() % tracy::ServerQueryPacketSize == 0 )
+    {
+        if( recorded.payload.size() != replayed.payload.size() )
+        {
+            error = "sequence " + std::to_string( recorded.sequence ) +
+                ": batched server-query payload size differs (recorded=" + std::to_string( recorded.payload.size() ) +
+                ", replay=" + std::to_string( replayed.payload.size() ) + ")";
+            return false;
+        }
+        for( size_t offset=0; offset<recorded.payload.size(); offset+=tracy::ServerQueryPacketSize )
+        {
+            ReplayServerPacket recordedQuery { recorded.sequence, recorded.flags,
+                std::vector<uint8_t>( recorded.payload.begin() + offset,
+                    recorded.payload.begin() + offset + tracy::ServerQueryPacketSize ) };
+            ReplayServerPacket replayedQuery { replayed.sequence, replayed.flags,
+                std::vector<uint8_t>( replayed.payload.begin() + offset,
+                    replayed.payload.begin() + offset + tracy::ServerQueryPacketSize ) };
+            if( !Append( recordedQuery, replayedQuery, error ) ) return false;
+        }
+        return true;
+    }
     if( IsOrderIndependentServerQuery( recorded ) )
     {
         if( replayed.payload.size() != tracy::ServerQueryPacketSize )
@@ -124,7 +147,7 @@ bool ReplayServerTranscriptVerifier::FlushBatch( std::string& error )
     if( !m_hasBatch ) return true;
     std::sort( m_recordedBatch.begin(), m_recordedBatch.end() );
     std::sort( m_replayedBatch.begin(), m_replayedBatch.end() );
-    const auto matches = m_recordedBatch == m_replayedBatch;
+    bool matches = m_recordedBatch == m_replayedBatch;
     if( !matches )
     {
         const auto mismatch = std::mismatch(
@@ -141,6 +164,22 @@ bool ReplayServerTranscriptVerifier::FlushBatch( std::string& error )
             m_replayedBatch.begin(), m_replayedBatch.end(),
             m_recordedBatch.begin(), m_recordedBatch.end(),
             std::back_inserter( replayOnly ) );
+        const auto allType = []( const std::vector<QueryBytes>& values, uint8_t type ) {
+            return !values.empty() && std::all_of( values.begin(), values.end(),
+                [type]( const QueryBytes& value ) { return value[0] == type; } );
+        };
+        // String and ThreadString definition requests are scheduled from two
+        // independent Worker queues. With the exact same client byte stream a
+        // short batch can legitimately move wholly from one queue to the other
+        // during replay. Accept only that narrow, balanced classification
+        // drift. Pointer/tag changes within either class and every other query
+        // or control packet remain byte-exact failures.
+        const bool balancedStringClassificationDrift = recordedOnly.size() == replayOnly.size() &&
+            ( ( allType( recordedOnly, uint8_t( tracy::ServerQueryThreadString ) ) &&
+                allType( replayOnly, uint8_t( tracy::ServerQueryString ) ) ) ||
+              ( allType( recordedOnly, uint8_t( tracy::ServerQueryString ) ) &&
+                allType( replayOnly, uint8_t( tracy::ServerQueryThreadString ) ) ) );
+        if( balancedStringClassificationDrift ) matches = true;
         const auto listText = []( const std::vector<QueryBytes>& queries ) {
             std::string text;
             const auto limit = std::min<size_t>( queries.size(), 8 );
@@ -152,7 +191,7 @@ bool ReplayServerTranscriptVerifier::FlushBatch( std::string& error )
             if( queries.size() > limit ) text += ",...";
             return text;
         };
-        error = "order-independent server-query set at sequences " +
+        if( !matches ) error = "order-independent server-query set at sequences " +
             SequenceText( m_firstSequence, m_lastSequence ) +
             " differs at sorted index " + std::to_string( index ) +
             " (recorded=" + QueryBytesText( *mismatch.first ) +

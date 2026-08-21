@@ -802,6 +802,31 @@ void TestReplayServerTranscript( TestContext& test )
     test.Check( !VerifyServerTranscript( separatedByClient, changedAcrossClient, error ) && !error.empty(),
         "cross-frame definition-query multiset still rejects changed query bytes" );
 
+    const std::vector<ReplayServerPacket> recordedThreadClassification = {
+        query( 30, uint8_t( tracy::ServerQueryThreadString ), 1 ),
+        query( 31, uint8_t( tracy::ServerQueryThreadString ), 2 )
+    };
+    const std::vector<ReplayServerPacket> replayedStringClassification = {
+        query( 30, uint8_t( tracy::ServerQueryString ), 7 ),
+        query( 31, uint8_t( tracy::ServerQueryString ), 8 )
+    };
+    test.Check( VerifyServerTranscript( recordedThreadClassification, replayedStringClassification, error ),
+        "balanced ThreadString-to-String replay classification drift is tolerated" );
+
+    auto batched = [&]( uint64_t sequence, std::initializer_list<ReplayServerPacket> queries ) {
+        ReplayServerPacket value { sequence, RecordFlagServerQuery, {} };
+        for( const auto& item : queries ) value.payload.insert( value.payload.end(), item.payload.begin(), item.payload.end() );
+        return value;
+    };
+    const std::vector<ReplayServerPacket> recordedBatch = { batched( 40, {
+        query( 40, uint8_t( tracy::ServerQuerySourceLocation ), 1 ),
+        query( 40, uint8_t( tracy::ServerQueryCallstackFrame ), 2 ) } ) };
+    const std::vector<ReplayServerPacket> replayedBatch = { batched( 40, {
+        query( 40, uint8_t( tracy::ServerQueryCallstackFrame ), 2 ),
+        query( 40, uint8_t( tracy::ServerQuerySourceLocation ), 1 ) } ) };
+    test.Check( VerifyServerTranscript( recordedBatch, replayedBatch, error ),
+        "coalesced server-query network records are split into protocol packets before verification" );
+
     auto reorderedTransfer = recorded;
     std::swap( reorderedTransfer[5], reorderedTransfer[6] );
     test.Check( !VerifyServerTranscript( recorded, reorderedTransfer, error ),
