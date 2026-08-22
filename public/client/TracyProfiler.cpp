@@ -2592,6 +2592,10 @@ static void FreeAssociatedMemory( const QueueItem& item )
         JNTracy_InternalReleaseGpuReferencePacket( (void*)ptr );
 #endif
         break;
+    case QueueType::JnGpuCatalogBatchFat:
+        ptr = MemRead<uint64_t>( &item.jnGpuCatalogBatchFat.ptr );
+        tracy_free( (void*)ptr );
+        break;
     case QueueType::FrameImage:
         ptr = MemRead<uint64_t>( &item.frameImageFat.image );
         tracy_free( (void*)ptr );
@@ -2979,6 +2983,23 @@ Profiler::DequeueStatus Profiler::Dequeue( moodycamel::ConsumerToken& token )
                             ++item;
                             continue;
                         }
+                        break;
+                    }
+                    case QueueType::JnGpuCatalogBatchFat:
+                    {
+                        ptr = MemRead<uint64_t>( &item->jnGpuCatalogBatchFat.ptr );
+                        const auto payloadBytes = MemRead<uint32_t>( &item->jnGpuCatalogBatchFat.payloadBytes );
+                        if( ptr == 0 || payloadBytes == 0 || payloadBytes > TargetFrameSize - 64 )
+                        {
+                            if( ptr != 0 ) tracy_free( (void*)ptr );
+                            ++item;
+                            continue;
+                        }
+                        SendLongString( ptr, (const char*)ptr, payloadBytes, QueueType::JnGpuCatalogBatchData );
+                        MemWrite( &item->jnGpuCatalogBatch.payloadId, ptr );
+                        MemWrite( &item->hdr.type, QueueType::JnGpuCatalogBatch );
+                        idx = uint8_t( QueueType::JnGpuCatalogBatch );
+                        tracy_free( (void*)ptr );
                         break;
                     }
                     case QueueType::FrameImage:
@@ -3753,7 +3774,8 @@ void Profiler::SendLongString( uint64_t str, const char* ptr, size_t len, QueueT
 {
     assert( type == QueueType::FrameImageData ||
             type == QueueType::SymbolCode ||
-            type == QueueType::SourceCode );
+            type == QueueType::SourceCode ||
+            type == QueueType::JnGpuCatalogBatchData );
 
     QueueItem item;
     MemWrite( &item.hdr.type, type );

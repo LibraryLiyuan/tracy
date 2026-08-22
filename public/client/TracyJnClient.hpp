@@ -3,6 +3,8 @@
 
 #include "TracyProfiler.hpp"
 
+#include <string.h>
+
 namespace tracy
 {
 
@@ -402,6 +404,44 @@ tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t passId, uint64_t command
     TracyLfqCommit;
 }
 
+tracy_force_inline bool EmitJnGpuCatalogControl( uint64_t generation, uint64_t value,
+    uint32_t sequence, uint8_t kind, uint8_t state, uint8_t flags )
+{
+    if( generation == 0 || !GetProfiler().IsConnected() ) return false;
+    TracyLfqPrepare( QueueType::JnGpuCatalogControl );
+    MemWrite( &item->jnGpuCatalogControl.time, Profiler::GetTime() );
+    MemWrite( &item->jnGpuCatalogControl.generation, generation );
+    MemWrite( &item->jnGpuCatalogControl.value, value );
+    MemWrite( &item->jnGpuCatalogControl.sequence, sequence );
+    MemWrite( &item->jnGpuCatalogControl.kind, kind );
+    MemWrite( &item->jnGpuCatalogControl.state, state );
+    MemWrite( &item->jnGpuCatalogControl.flags, flags );
+    TracyLfqCommit;
+    return true;
+}
+
+tracy_force_inline bool EmitJnGpuCatalogBatch( uint64_t generation, uint32_t sequence,
+    uint32_t recordCount, uint8_t kind, uint8_t encoding, uint8_t flags,
+    const void* payload, uint32_t payloadBytes )
+{
+    if( generation == 0 || recordCount == 0 || payload == nullptr || payloadBytes == 0 ||
+        payloadBytes > TargetFrameSize - 64 || !GetProfiler().IsConnected() ) return false;
+    auto* copy = static_cast<uint8_t*>( tracy_malloc( payloadBytes ) );
+    if( copy == nullptr ) return false;
+    memcpy( copy, payload, payloadBytes );
+    TracyLfqPrepare( QueueType::JnGpuCatalogBatchFat );
+    MemWrite( &item->jnGpuCatalogBatchFat.generation, generation );
+    MemWrite( &item->jnGpuCatalogBatchFat.ptr, uint64_t( copy ) );
+    MemWrite( &item->jnGpuCatalogBatchFat.sequence, sequence );
+    MemWrite( &item->jnGpuCatalogBatchFat.recordCount, recordCount );
+    MemWrite( &item->jnGpuCatalogBatchFat.payloadBytes, payloadBytes );
+    MemWrite( &item->jnGpuCatalogBatchFat.kind, kind );
+    MemWrite( &item->jnGpuCatalogBatchFat.encoding, encoding );
+    MemWrite( &item->jnGpuCatalogBatchFat.flags, flags );
+    TracyLfqCommit;
+    return true;
+}
+
 tracy_force_inline void EmitJnScriptFrame( const char* function, const char* file, uint32_t frameId, uint32_t line,
     uint8_t runtime, uint8_t flags )
 {
@@ -468,6 +508,8 @@ tracy_force_inline bool EmitJnGpuReferenceSetDefinition( uint64_t, uint32_t, JnG
 tracy_force_inline bool EmitJnGpuReferenceSetReference( uint64_t, uint32_t, uint16_t, uint8_t ) { return false; }
 tracy_force_inline bool EmitJnGpuReferenceSetDefinitionChunk( uint32_t, uint16_t, const JnGpuReferenceSetEntry*, uint8_t ) { return false; }
 tracy_force_inline void EmitJnGpuReferenceEnd( uint64_t, uint64_t, uint32_t, uint16_t, uint8_t ) {}
+tracy_force_inline bool EmitJnGpuCatalogControl( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, uint8_t ) { return false; }
+tracy_force_inline bool EmitJnGpuCatalogBatch( uint64_t, uint32_t, uint32_t, uint8_t, uint8_t, uint8_t, const void*, uint32_t ) { return false; }
 tracy_force_inline void EmitJnScriptFrame( const char*, const char*, uint32_t, uint32_t, uint8_t, uint8_t ) {}
 tracy_force_inline void EmitJnScriptStack( uint64_t, uint64_t, uint32_t, uint8_t, uint8_t, JnScriptRecordKind ) {}
 tracy_force_inline void EmitJnScriptMarker( const char*, uint32_t, uint32_t, uint32_t, uint8_t, uint8_t ) {}
