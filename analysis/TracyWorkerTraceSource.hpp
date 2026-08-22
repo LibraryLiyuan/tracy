@@ -104,18 +104,6 @@ public:
     std::vector<ScriptFrameDto> GetScriptFrames() const override;
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
     std::vector<CallsiteDto> GetCallsites() const override;
-    std::vector<ResourceAssetDto> GetResourceAssets() const override;
-    std::vector<ResourceAssetUpdateDto> GetResourceAssetUpdates() const override;
-    std::vector<UnityObjectEventDto> GetUnityObjectEvents() const override;
-    std::vector<NativeRootDto> GetNativeRoots() const override;
-    std::vector<GfxResourceBindingDto> GetGfxResourceBindings() const override;
-    std::vector<ResourcePartDto> GetResourceParts() const override;
-    std::vector<ResourceRangeDto> GetResourceRanges() const override;
-    std::vector<ResourceContextDto> GetResourceContexts() const override;
-    std::vector<ResourceMetadataDto> GetResourceMetadata() const override;
-    std::vector<ResourceRelationDto> GetResourceRelations() const override;
-    std::vector<ResourceBootstrapDto> GetResourceBootstrapStates() const override;
-    std::vector<ResourceQualityDto> GetResourceQuality() const override;
     std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;

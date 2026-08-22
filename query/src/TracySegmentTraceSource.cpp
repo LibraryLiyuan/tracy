@@ -29,8 +29,6 @@ namespace tracy::query
 namespace
 {
 
-constexpr auto ReplayProgressTimeout = std::chrono::seconds( 120 );
-
 class PayloadReader
 {
 public:
@@ -547,27 +545,15 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
         }
         if( !replayError.Failed() && scan.complete && recordedEndsWithTerminate )
         {
-            auto lastEventProgress = worker.GetProtocolEventCount();
-            auto lastFrameProgress = worker.GetProtocolFramesProcessed();
-            auto replayDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+            const auto replayDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
             while( worker.GetProtocolFramesProcessed() < replayedFrames && !replayError.Failed() &&
                 std::chrono::steady_clock::now() < replayDeadline )
             {
-                const auto eventProgress = worker.GetProtocolEventCount();
-                const auto frameProgress = worker.GetProtocolFramesProcessed();
-                if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
-                {
-                    lastEventProgress = eventProgress;
-                    lastFrameProgress = frameProgress;
-                    replayDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
-                }
                 std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
             }
             if( worker.GetProtocolFramesProcessed() < replayedFrames )
             {
-                replayError.Set( "Worker made no protocol progress for 120 seconds while processing the complete Full-capture stream revision; events=" +
-                    std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
-                    std::to_string( worker.GetProtocolFramesProcessed() ) );
+                replayError.Set( "Worker did not process the complete Full-capture stream revision" );
             }
             else if( worker.IsConnected() )
             {
@@ -599,27 +585,15 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
             if( compressed ) sentFrames++;
         }
 
-        auto lastPrefixEventProgress = worker.GetProtocolEventCount();
-        auto lastPrefixFrameProgress = worker.GetProtocolFramesProcessed();
-        auto prefixDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+        const auto prefixDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
         while( worker.GetProtocolFramesProcessed() < prefixFrameTarget &&
             !replayError.Failed() && std::chrono::steady_clock::now() < prefixDeadline )
         {
-            const auto eventProgress = worker.GetProtocolEventCount();
-            const auto frameProgress = worker.GetProtocolFramesProcessed();
-            if( eventProgress != lastPrefixEventProgress || frameProgress != lastPrefixFrameProgress )
-            {
-                lastPrefixEventProgress = eventProgress;
-                lastPrefixFrameProgress = frameProgress;
-                prefixDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
-            }
             std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
         }
         if( worker.GetProtocolFramesProcessed() < prefixFrameTarget )
         {
-            replayError.Set( "Worker made no protocol progress for 120 seconds while processing the pre-drain client revision; events=" +
-                std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
-                std::to_string( worker.GetProtocolFramesProcessed() ) );
+            replayError.Set( "Worker did not process the pre-drain client revision" );
         }
         else if( !replayError.Failed() )
         {
@@ -630,27 +604,15 @@ std::filesystem::path ReplayRevision( const stream::JournalReadView& view )
                 if( record.sequence > drainControlSequence ) break;
                 if( !replayClientRecord( record ) ) break;
             }
-            auto lastDrainEventProgress = worker.GetProtocolEventCount();
-            auto lastDrainFrameProgress = worker.GetProtocolFramesProcessed();
-            auto drainDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+            const auto drainDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
             while( !worker.IsProtocolDrainActive() && !replayError.Failed() &&
                 std::chrono::steady_clock::now() < drainDeadline )
             {
-                const auto eventProgress = worker.GetProtocolEventCount();
-                const auto frameProgress = worker.GetProtocolFramesProcessed();
-                if( eventProgress != lastDrainEventProgress || frameProgress != lastDrainFrameProgress )
-                {
-                    lastDrainEventProgress = eventProgress;
-                    lastDrainFrameProgress = frameProgress;
-                    drainDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
-                }
                 std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
             }
             if( !worker.IsProtocolDrainActive() )
             {
-                replayError.Set( "Worker made no protocol progress for 120 seconds before entering protocol drain mode; events=" +
-                    std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
-                    std::to_string( worker.GetProtocolFramesProcessed() ) );
+                replayError.Set( "Worker did not enter protocol drain mode" );
             }
             else
             {
@@ -911,19 +873,6 @@ TRACY_SEGMENT_FORWARD2( std::vector<analysis::RelationDto>, ScanRelations, size_
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::CallsiteDto>, GetCallsites )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceAssetDto>, GetResourceAssets )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceAssetUpdateDto>, GetResourceAssetUpdates )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::UnityObjectEventDto>, GetUnityObjectEvents )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::NativeRootDto>, GetNativeRoots )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxResourceBindingDto>, GetGfxResourceBindings )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourcePartDto>, GetResourceParts )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceRangeDto>, GetResourceRanges )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceContextDto>, GetResourceContexts )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceMetadataDto>, GetResourceMetadata )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceRelationDto>, GetResourceRelations )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceBootstrapDto>, GetResourceBootstrapStates )
-TRACY_SEGMENT_FORWARD0( std::vector<analysis::ResourceQualityDto>, GetResourceQuality )
 TRACY_SEGMENT_FORWARD0( analysis::CrashDto, GetCrash )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuTopologyDto>, GetCpuTopology )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )

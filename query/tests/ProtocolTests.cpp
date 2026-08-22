@@ -93,7 +93,6 @@ struct TemporaryTraceFiles
         candidate = root / "candidate.tracy";
         n11 = root / "n11.tracy";
         n16 = root / "n16.tracy";
-        n26 = root / "n26.tracy";
         profileMismatch = root / "profile-mismatch.tracy";
         duplicateIdentity = root / "duplicate-identity.tracy";
         malformedIdentity = root / "malformed-identity.tracy";
@@ -107,7 +106,6 @@ struct TemporaryTraceFiles
         std::ofstream( candidate, std::ios::binary ).put( '\0' );
         std::ofstream( n11, std::ios::binary ).put( '\0' );
         std::ofstream( n16, std::ios::binary ).put( '\0' );
-        std::ofstream( n26, std::ios::binary ).put( '\0' );
         std::ofstream( profileMismatch, std::ios::binary ).put( '\0' );
         std::ofstream( duplicateIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( malformedIdentity, std::ios::binary ).put( '\0' );
@@ -129,7 +127,6 @@ struct TemporaryTraceFiles
     std::filesystem::path candidate;
     std::filesystem::path n11;
     std::filesystem::path n16;
-    std::filesystem::path n26;
     std::filesystem::path profileMismatch;
     std::filesystem::path duplicateIdentity;
     std::filesystem::path malformedIdentity;
@@ -142,7 +139,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 11 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 9 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
@@ -158,7 +155,7 @@ int main()
     static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( 0, -1 ) );
     const auto schema = LoadJson( TRACY_QUERY_SCHEMA_PATH );
     assert( schema.at( "$defs" ).at( "request" ).at( "properties" ).at( "protocol" ).at( "const" ) == "tracy-query/1" );
-    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.30.0" );
+    assert( schema.at( "$defs" ).at( "success" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.28.0" );
     assert( schema.at( "$defs" ).at( "success" ).at( "required" ).size() == 9 );
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
@@ -166,7 +163,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 40 );
+    assert( coverage.at( "domains" ).size() == 39 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -542,7 +539,6 @@ int main()
             if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
             if( filename == "n11.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, true );
             if( filename == "n16.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, false, true );
-            if( filename == "n26.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, false, false, true );
             if( filename == "profile-mismatch.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
@@ -711,61 +707,6 @@ int main()
     assert( hasScriptRelation( "captures_source_stack" ) && hasScriptRelation( "contains_source_frame" ) );
     assert( service.Execute( Request( 1017, "trace.close", { { "trace_id", n16Id } } ) ).at( "ok" ) );
 
-    const auto openN26 = service.Execute( Request( 1020, "trace.open", { { "path", files.n26.string() } } ) );
-    assert( openN26.at( "ok" ) );
-    const auto n26Id = openN26.at( "data" ).at( "trace_id" ).get<std::string>();
-    assert( sessions.WaitReady( n26Id, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
-    const auto n26Capability = service.Execute( Request( 1021, "resource.capability", { { "trace_id", n26Id } } ) ).at( "data" );
-    assert( n26Capability.at( "present" ) == true && n26Capability.at( "resource_graph_schema_version" ) == 2 );
-    assert( n26Capability.at( "features" ).at( "bounded_evidence_path" ) == true &&
-        n26Capability.at( "features" ).at( "bounded_bidirectional_evidence_path" ) == true &&
-        n26Capability.at( "features" ).at( "physical_allocation_occupants" ) == true );
-    const auto epoch1Relations = service.Execute( Request( 1022, "resource.relations", {
-        { "trace_id", n26Id }, { "ref", "object:200" }, { "at_ns", 15 }
-    } ) ).at( "data" ).at( "relations" );
-    const auto epoch2Relations = service.Execute( Request( 1023, "resource.relations", {
-        { "trace_id", n26Id }, { "ref", "object:200" }, { "at_ns", 35 }
-    } ) ).at( "data" ).at( "relations" );
-    const auto hasTargetEpoch = []( const auto& relationsValue, uint32_t epoch ) {
-        return std::any_of( relationsValue.begin(), relationsValue.end(), [epoch]( const auto& relationValue ) {
-            return relationValue.at( "target_kind" ) == 4 && relationValue.at( "target_epoch" ) == epoch;
-        } );
-    };
-    assert( hasTargetEpoch( epoch1Relations, 1 ) && !hasTargetEpoch( epoch1Relations, 2 ) );
-    assert( hasTargetEpoch( epoch2Relations, 2 ) && !hasTargetEpoch( epoch2Relations, 1 ) );
-    const auto epoch1Validation = service.Execute( Request( 1024, "resource.validation", {
-        { "trace_id", n26Id }, { "at_ns", 15 }
-    } ) ).at( "data" );
-    const auto epoch2Validation = service.Execute( Request( 1025, "resource.validation", {
-        { "trace_id", n26Id }, { "at_ns", 35 }
-    } ) ).at( "data" );
-    assert( epoch1Validation.at( "complete" ) == true && epoch2Validation.at( "complete" ) == true );
-    assert( epoch2Validation.at( "counts" ).at( "missing_epoch_relations" ) == "0" );
-    assert( epoch2Validation.at( "counts" ).at( "wrong_epoch_relations" ) == "0" );
-    const auto gpuUsage = service.Execute( Request( 1026, "resource.gpu_usage", {
-        { "trace_id", n26Id }, { "ref", "object:200" }, { "at_ns", 35 }, { "limit", 1 }
-    } ) );
-    assert( gpuUsage.at( "ok" ) && gpuUsage.at( "data" ).at( "matched_count" ) == "1" );
-    assert( gpuUsage.at( "data" ).at( "passes" ).size() == 1 && gpuUsage.at( "page" ).at( "returned" ) == 1 );
-    const auto occupants = service.Execute( Request( 1027, "resource.physical.occupants", {
-        { "trace_id", n26Id }, { "ref", "physical-allocation:70" }, { "at_ns", 35 }, { "limit", 10 }
-    } ) );
-    assert( occupants.at( "ok" ) && occupants.at( "data" ).at( "matched_count" ) == "1" );
-    assert( occupants.at( "data" ).at( "occupants" )[0].at( "object_refs" )[0] == "object:200" );
-    assert( occupants.at( "data" ).at( "occupants" )[0].at( "asset_refs" )[0] == "asset:100" );
-    const auto physicalEvidence = service.Execute( Request( 1028, "resource.evidence_path", {
-        { "trace_id", n26Id }, { "ref", "physical-allocation:70" }, { "at_ns", 35 },
-        { "max_nodes", 100 }, { "max_edges", 200 }
-    } ) ).at( "data" );
-    const auto hasEvidenceNode = [&]( uint8_t kind, const char* ref ) {
-        return std::any_of( physicalEvidence.at( "nodes" ).begin(), physicalEvidence.at( "nodes" ).end(),
-            [&]( const auto& value ) { return value.at( "kind" ) == kind && value.at( "ref" ) == ref; } );
-    };
-    assert( physicalEvidence.at( "complete" ) == true && physicalEvidence.at( "traversal_direction" ) == "reverse_to_origin" );
-    assert( hasEvidenceNode( 1, "asset:100" ) && hasEvidenceNode( 2, "object:200" ) &&
-        hasEvidenceNode( 4, "gfx-resource:4294967297" ) && hasEvidenceNode( 5, "logical-resource:7" ) );
-    assert( service.Execute( Request( 1029, "trace.close", { { "trace_id", n26Id } } ) ).at( "ok" ) );
-
     const auto openN11 = service.Execute( Request( 1002, "trace.open", { { "path", files.n11.string() } } ) );
     assert( openN11.at( "ok" ) );
     const auto n11Id = openN11.at( "data" ).at( "trace_id" ).get<std::string>();
@@ -850,7 +791,7 @@ int main()
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
     assert( described.at( "ok" ) );
-    assert( described.at( "schema_version" ) == "1.30.0" );
+    assert( described.at( "schema_version" ) == "1.28.0" );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );
     assert( described.at( "budget" ).at( "exhausted_by" ).empty() );
     std::set<std::string> describedMethods;
@@ -862,9 +803,9 @@ int main()
     assert( operations.size() == describedMethods.size() );
     for( const auto& operation : operations )
     {
-        assert( operation.at( "schema_version" ) == "1.30.0" );
+        assert( operation.at( "schema_version" ) == "1.28.0" );
         assert( operation.at( "input_schema" ).at( "type" ) == "object" );
-        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.30.0" );
+        assert( operation.at( "output_schema" ).at( "properties" ).at( "schema_version" ).at( "const" ) == "1.28.0" );
         assert( operation.at( "budget_parameters" ).size() == 5 );
     }
     const auto producerGetOperation = std::find_if( operations.begin(), operations.end(), []( const auto& operation ) {

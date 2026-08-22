@@ -19,7 +19,6 @@ class FakeTraceSource final : public analysis::TraceSource
     bool m_truncatedSource = false;
     bool m_n11 = false;
     bool m_n16 = false;
-    bool m_n26 = false;
     std::optional<std::vector<std::string>> m_appInfoOverride;
 
     template<typename T>
@@ -65,12 +64,11 @@ public:
         };
     }
 
-    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false, bool n11 = false, bool n16 = false, bool n26 = false )
+    explicit FakeTraceSource( bool legacyFormat = false, bool truncatedSource = false, bool n11 = false, bool n16 = false )
         : m_legacyFormat( legacyFormat )
         , m_truncatedSource( truncatedSource )
         , m_n11( n11 )
         , m_n16( n16 )
-        , m_n26( n26 )
     {}
 
     explicit FakeTraceSource( std::vector<std::string> appInfoOverride, bool truncatedSource = false )
@@ -88,9 +86,6 @@ public:
         result.push_back( { "evidence", true, true, true, "deterministic N14 evidence graph", { "evidence.graph", "frame.critical_path", "frame.explain" } } );
         result.push_back( { "relation", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 exact relation data" : "JN trace section schema 4 absent", { "relation.search", "relation.get" } } );
         result.push_back( { "runtime.domain", m_n16, m_n16, m_n16, m_n16 ? "deterministic N16 runtime-domain state data" : "JN trace section schema 4 absent", { "runtime.domain.states" } } );
-        result.push_back( { "resource", m_n26, m_n26, m_n26,
-            m_n26 ? "deterministic ResourceGraph v2 epoch-reuse data" : "ResourceGraph schema 2 absent",
-            { "resource.capability", "object.get", "resource.relations", "resource.validation" } } );
         const bool hasScript = m_n11 || m_n16;
         result.push_back( { "runtime.script", hasScript, hasScript, hasScript,
             hasScript ? "deterministic script source-stack data" : "script data absent",
@@ -129,8 +124,6 @@ public:
         if( !m_legacyFormat )
         {
             value.appInfo = m_appInfoOverride.value_or( DefaultIdentityAppInfo() );
-            if( m_n26 )
-                value.appInfo.front() = "JNCI1|{\"schema_version\":1,\"kind\":\"core\",\"producer\":\"jn-native-client\",\"identity\":{\"protocol\":{\"jn_abi_version\":\"0x00010005\",\"jn_config_hash\":\"0x8daf4c01004d0029\",\"tracy_protocol_version\":\"88\",\"jn_trace_section_version\":\"10\",\"resource_graph_schema_version\":\"2\"}}}";
             if( m_n11 )
             {
                 value.appInfo.emplace_back( "JNSTK1|{\"schema_version\":1,\"record\":\"capability\",\"managed_stack\":\"selective\",\"lua_stack\":\"explicit_debug_api\"}" );
@@ -382,89 +375,6 @@ public:
                 uint8_t( JnEntityKind::GpuResource ), uint8_t( JnEntityKind::GpuAllocation ),
                 uint8_t( JnRelationNamespace::Generic ), 4, 1 }
         };
-    }
-    std::vector<analysis::ResourceAssetDto> GetResourceAssets() const override
-    {
-        if( !m_n26 ) return {};
-        analysis::ResourceAssetDto value; value.ref = "asset:100"; value.entityId = 100;
-        value.idHigh = 0x11; value.idLow = 0x22; value.identityNamespace = 1; value.assetKind = 1;
-        return { value };
-    }
-    std::vector<analysis::UnityObjectEventDto> GetUnityObjectEvents() const override
-    {
-        if( !m_n26 ) return {};
-        analysis::UnityObjectEventDto create; create.ref = "resource-object-event:0"; create.objectId = 200;
-        create.nativePointer = 0x2000; create.timeNs = 5; create.threadRef = MakeEntityRef( "thread", 1 );
-        create.instanceId = 20; create.runtimeTypeIndex = 7; create.eventKind = 1;
-        analysis::UnityObjectEventDto type = create; type.ref = "resource-object-event:1"; type.timeNs = 6;
-        type.revision = 1; type.fieldMask = 2; type.text = "Mesh"; type.eventKind = 2;
-        return { create, type };
-    }
-    std::vector<analysis::NativeRootDto> GetNativeRoots() const override
-    {
-        if( !m_n26 ) return {};
-        return { { "native-root:300", 300, 200, 7, MakeEntityRef( "thread", 1 ), 0 } };
-    }
-    std::vector<analysis::GfxResourceBindingDto> GetGfxResourceBindings() const override
-    {
-        if( !m_n26 ) return {};
-        constexpr uint64_t gfxId = 0x100000001ULL;
-        return {
-            { "gfx-bind:0", gfxId, 300, 10, MakeEntityRef( "thread", 1 ), 1, 3, 1, 1, 0, 0 },
-            { "gfx-unbind:1", gfxId, 0, 20, MakeEntityRef( "thread", 1 ), 1, 0, 1, 2, 1, 0 },
-            { "gfx-bind:2", gfxId, 300, 30, MakeEntityRef( "thread", 1 ), 2, 3, 1, 1, 0, 0 }
-        };
-    }
-    std::vector<analysis::ResourcePartDto> GetResourceParts() const override
-    {
-        if( !m_n26 ) return {};
-        return { { "resource-part:400", 400, 200, 8, MakeEntityRef( "thread", 1 ), 0, 1, 2, 0 } };
-    }
-    std::vector<analysis::ResourceRangeDto> GetResourceRanges() const override
-    {
-        if( !m_n26 ) return {};
-        constexpr uint64_t gfxId = 0x100000001ULL;
-        return {
-            { "resource-range:0", 400, gfxId, 10, 0, 1024, 1, 1, 4, 0 },
-            { "resource-range:1", 400, gfxId, 20, 0, 1024, 1, 2, 4, 0x80 },
-            { "resource-range:2", 400, gfxId, 30, 0, 2048, 2, 3, 4, 0 }
-        };
-    }
-    std::vector<analysis::ResourceMetadataDto> GetResourceMetadata() const override
-    {
-        if( !m_n26 ) return {};
-        analysis::ResourceMetadataDto adapter; adapter.ref = "resource-metadata:0"; adapter.entityId = 200;
-        adapter.value = 1; adapter.timeNs = 8; adapter.threadRef = MakeEntityRef( "thread", 1 );
-        adapter.revision = 1; adapter.key = 72; adapter.entityKind = 2;
-        return { adapter };
-    }
-    std::vector<analysis::ResourceRelationDto> GetResourceRelations() const override
-    {
-        if( !m_n26 ) return {};
-        const auto thread = MakeEntityRef( "thread", 1 );
-        constexpr uint64_t gfxId = 0x100000001ULL;
-        analysis::ResourceRelationDto objectRoot; objectRoot.ref = "resource-relation:0";
-        objectRoot.sourceId = 200; objectRoot.targetId = 300; objectRoot.timeNs = 7; objectRoot.threadRef = thread;
-        objectRoot.revision = 1; objectRoot.sequence = 1; objectRoot.sourceKind = 2; objectRoot.targetKind = 3; objectRoot.relation = 2;
-        analysis::ResourceRelationDto assetObject = objectRoot; assetObject.ref = "resource-relation:asset-object";
-        assetObject.sourceId = 100; assetObject.targetId = 200; assetObject.timeNs = 6; assetObject.sourceKind = 1;
-        assetObject.targetKind = 2; assetObject.relation = 1;
-        analysis::ResourceRelationDto epoch1 = objectRoot; epoch1.ref = "resource-relation:1";
-        epoch1.sourceId = 300; epoch1.targetId = gfxId; epoch1.timeNs = 10; epoch1.revision = 1; epoch1.targetEpoch = 1;
-        epoch1.sourceKind = 3; epoch1.targetKind = 4; epoch1.relation = 3;
-        analysis::ResourceRelationDto epoch1End = epoch1; epoch1End.ref = "resource-relation:2";
-        epoch1End.timeNs = 20; epoch1End.revision = 2; epoch1End.sequence = 2; epoch1End.flags = 0x80;
-        analysis::ResourceRelationDto epoch2 = epoch1; epoch2.ref = "resource-relation:3";
-        epoch2.timeNs = 30; epoch2.revision = 3; epoch2.sequence = 3; epoch2.targetEpoch = 2;
-        analysis::ResourceRelationDto gfxLogical = objectRoot; gfxLogical.ref = "resource-relation:gfx-logical";
-        gfxLogical.sourceId = gfxId; gfxLogical.targetId = 7; gfxLogical.timeNs = 30; gfxLogical.revision = 1;
-        gfxLogical.sourceEpoch = 2; gfxLogical.sourceKind = 4; gfxLogical.targetKind = 5; gfxLogical.relation = 6;
-        return { assetObject, objectRoot, epoch1, epoch1End, epoch2, gfxLogical };
-    }
-    std::vector<analysis::ResourceBootstrapDto> GetResourceBootstrapStates() const override
-    {
-        if( !m_n26 ) return {};
-        return { { "resource-bootstrap:0", 200, 40, MakeEntityRef( "thread", 1 ), 1, 12, 0, 4, 0 } };
     }
     std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override
     {

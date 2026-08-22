@@ -35,10 +35,7 @@ namespace
 using nlohmann::json;
 constexpr const char* IndexMagic = "JNTRACY-QUERY-INDEX";
 constexpr uint64_t MaximumManifestBytes = 1024 * 1024;
-// A large Unity resource graph can legitimately produce a precomputed GPU
-// memory summary larger than 64 MiB.  Keep the reader limit bounded, but high
-// enough to reopen sidecars emitted by the index builder for such captures.
-constexpr uint64_t MaximumGpuMemorySummaryBytes = 256 * 1024 * 1024;
+constexpr uint64_t MaximumGpuMemorySummaryBytes = 64 * 1024 * 1024;
 
 uint64_t UnsignedProtocolField( std::string_view line, std::string_view key )
 {
@@ -1195,18 +1192,6 @@ public:
         return result;
     }
     TRACY_INDEX_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceAssetDto>, GetResourceAssets )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceAssetUpdateDto>, GetResourceAssetUpdates )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::UnityObjectEventDto>, GetUnityObjectEvents )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::NativeRootDto>, GetNativeRoots )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::GfxResourceBindingDto>, GetGfxResourceBindings )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourcePartDto>, GetResourceParts )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceRangeDto>, GetResourceRanges )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceContextDto>, GetResourceContexts )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceMetadataDto>, GetResourceMetadata )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceRelationDto>, GetResourceRelations )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceBootstrapDto>, GetResourceBootstrapStates )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::ResourceQualityDto>, GetResourceQuality )
     TRACY_INDEX_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
     TRACY_INDEX_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
     TRACY_INDEX_FORWARD0( analysis::CrashDto, GetCrash )

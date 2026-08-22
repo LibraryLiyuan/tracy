@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.30.0",
+  "schema_version": "1.28.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -711,15 +711,6 @@
       "query_fields": ["ref", "time_ns", "thread_ref", "source_id", "target_id", "source_kind", "source_ref", "target_kind", "target_ref", "namespace", "relation", "flags", "provenance", "evidence_kind"],
       "unmapped_fields": [],
       "methods": ["relation.search", "relation.get"],
-      "status": "complete"
-    },
-    {
-      "entity": "resource.unity_graph",
-      "classification": "persisted_semantic",
-      "persisted_fields": ["asset definitions and identity updates", "UnityObject create/update/destroy", "NativeRoot definitions", "GfxResource bind/unbind", "ResourcePart and byte ranges", "ResourceContext lifecycle", "typed metadata", "typed resource relations", "bootstrap state", "resource graph quality"],
-      "query_fields": ["present", "schema_version", "complete", "reason", "counts", "assets", "asset_updates", "objects", "native_roots", "gfx_resources", "parts", "ranges", "contexts", "metadata", "relations", "bootstrap", "quality", "connection_generation", "provenance", "trust"],
-      "unmapped_fields": [],
-      "methods": ["resource.summary", "resource.asset.search", "resource.object.search", "resource.part.search", "resource.range.search", "resource.context.search", "resource.metadata.search", "resource.relation.search", "resource.quality", "resource.capability", "object.search", "object.get", "asset.search", "asset.get", "mesh.get", "texture.get", "resource.lifecycle", "resource.relations", "resource.memory_impact", "resource.gpu_usage", "resource.physical.occupants", "resource.io_history", "resource.evidence_path", "resource.validation"],
       "status": "complete"
     },
     {

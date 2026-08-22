@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.30.0",
+  "schema_version": "1.28.0",
   "coverage_level": "mcp",
   "status": "complete",
   "public_method_registry": "tracy::query::QueryMethodRegistry",
@@ -50,7 +50,6 @@
     "N16 primary/script/elevated real-trace MCP acceptance for bounded cross-domain evidence, exact Script source stacks, GPU resource ownership, Sampling, and Context Switch",
     "N15 runtime policy, producer budgets, compatibility/common-window, normalized compare, validation, and snapshot/stream/replay equality",
     "N15 compare compatibility and normalized common-frame-window acceptance with explicit warning override",
-    "N25 source.callsite/source.callsite.search discovery, SiteReuse provenance, stack navigation, and old-trace present=false semantics",
-    "N26 resource graph discovery plus Object/Asset/Mesh/Texture detail, lifecycle, memory impact, GPU Pass usage, I/O history, bounded evidence paths, validation, old-trace present=false, and snapshot/stream/replay equality"
+    "N25 source.callsite/source.callsite.search discovery, SiteReuse provenance, stack navigation, and old-trace present=false semantics"
   ]
 }

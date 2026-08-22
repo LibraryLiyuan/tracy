@@ -955,21 +955,6 @@ private:
     tracy_force_inline void ProcessJnScriptFrame( const QueueJnScriptFrame& ev );
     tracy_force_inline void ProcessJnScriptStack( const QueueJnScriptStack& ev );
     tracy_force_inline void ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev );
-    tracy_force_inline void ProcessJnAssetDefine( const QueueJnAssetDefine& ev );
-    tracy_force_inline void ProcessJnAssetUpdate( const QueueJnAssetUpdate& ev );
-    tracy_force_inline void ProcessJnUnityObjectCreate( const QueueJnUnityObjectCreate& ev );
-    tracy_force_inline void ProcessJnUnityObjectUpdate( const QueueJnUnityObjectUpdate& ev );
-    tracy_force_inline void ProcessJnUnityObjectDestroy( const QueueJnUnityObjectDestroy& ev );
-    tracy_force_inline void ProcessJnNativeRootDefine( const QueueJnNativeRootDefine& ev );
-    tracy_force_inline void ProcessJnGfxResourceBind( const QueueJnGfxResourceBind& ev );
-    tracy_force_inline void ProcessJnGfxResourceUnbind( const QueueJnGfxResourceUnbind& ev );
-    tracy_force_inline void ProcessJnResourcePartDefine( const QueueJnResourcePartDefine& ev );
-    tracy_force_inline void ProcessJnResourceRange( const QueueJnResourceRange& ev );
-    tracy_force_inline void ProcessJnResourceContext( const QueueJnResourceContext& ev );
-    tracy_force_inline void ProcessJnResourceRelation( const QueueJnResourceRelation& ev );
-    tracy_force_inline void ProcessJnResourceMetadata( const QueueJnResourceMetadata& ev );
-    tracy_force_inline void ProcessJnBootstrapState( const QueueJnBootstrapState& ev );
-    tracy_force_inline void ProcessJnResourceGraphQuality( const QueueJnResourceGraphQuality& ev );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
@@ -1238,22 +1223,6 @@ private:
     unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
     unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
-    struct JnPendingResourceRelation
-    {
-        struct Epoch
-        {
-            uint64_t entityId = 0;
-            uint32_t value = 0;
-            uint8_t entityKind = 0;
-        };
-
-        uint64_t sourceId = 0;
-        uint32_t revision = 0;
-        uint8_t sourceKind = 0;
-        uint8_t epochCount = 0;
-        Epoch epochs[2] {};
-    };
-    unordered_flat_map<uint64_t, JnPendingResourceRelation> m_jnPendingResourceRelations;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;
     unordered_flat_map<uint64_t, int16_t> m_sourceLocationShrink;
