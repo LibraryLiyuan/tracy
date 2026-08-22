@@ -5133,7 +5133,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             auto result = statusJson();
             uint64_t invalidBatches = 0;
-            uint64_t checksumMismatch = 0;
+            uint64_t checksumFailures = 0;
+            uint64_t transportChecksumsVerified = 0;
+            uint64_t canonicalChecksumsVerified = 0;
+            uint64_t canonicalizationChanges = 0;
             uint64_t sequenceGaps = 0;
             if( catalog )
             {
@@ -5141,7 +5144,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 for( const auto& batch : catalog->gpuCatalogBatches )
                 {
                     invalidBatches += batch.valid == 0;
-                    checksumMismatch += batch.transportChecksum != batch.storedChecksum;
+                    const bool transportVerified = batch.valid != 0 && batch.transportChecksum != 0;
+                    const bool canonicalVerified = batch.valid != 0 && batch.storedChecksum != 0;
+                    transportChecksumsVerified += transportVerified;
+                    canonicalChecksumsVerified += canonicalVerified;
+                    checksumFailures += !transportVerified || !canonicalVerified;
+                    canonicalizationChanges += transportVerified && canonicalVerified &&
+                        batch.transportChecksum != batch.storedChecksum;
                     auto& expected = nextSequence[batch.generation];
                     if( expected != 0 && batch.sequence != expected ) sequenceGaps++;
                     expected = batch.sequence + 1;
@@ -5149,10 +5158,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             result["transport"] = {
                 { "batch_count", Decimal( catalog ? catalog->gpuCatalogBatches.size() : 0 ) },
-                { "invalid_batches", Decimal( invalidBatches ) }, { "checksum_mismatch", Decimal( checksumMismatch ) },
+                { "invalid_batches", Decimal( invalidBatches ) }, { "checksum_failures", Decimal( checksumFailures ) },
+                { "checksum_mismatch", Decimal( checksumFailures ) },
+                { "transport_checksums_verified", Decimal( transportChecksumsVerified ) },
+                { "canonical_checksums_verified", Decimal( canonicalChecksumsVerified ) },
+                { "canonicalization_changes", Decimal( canonicalizationChanges ) },
                 { "sequence_gaps", Decimal( sequenceGaps ) }, { "completed_lifecycle_unresolved", result["unresolved_count"] }
             };
-            result["complete"] = present && catalog->gpuCatalogValid && invalidBatches == 0 && checksumMismatch == 0 && sequenceGaps == 0;
+            result["complete"] = present && catalog->gpuCatalogValid && invalidBatches == 0 && checksumFailures == 0 && sequenceGaps == 0;
             return Success( id, std::move( result ), trace );
         }
         if( !present ) return Success( id, { { "present", false }, { "status", "absent" },
@@ -10514,12 +10527,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
         if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
         {
-            uint64_t invalidBatches = 0, checksumMismatch = 0, sequenceGaps = 0, unresolved = 0;
+            uint64_t invalidBatches = 0, checksumFailures = 0, sequenceGaps = 0, unresolved = 0;
             std::unordered_map<uint64_t, uint32_t> nextSequence;
             for( const auto& batch : catalog->gpuCatalogBatches )
             {
                 invalidBatches += batch.valid == 0;
-                checksumMismatch += batch.transportChecksum != batch.storedChecksum;
+                checksumFailures += batch.valid == 0 || batch.transportChecksum == 0 || batch.storedChecksum == 0;
                 auto& expected = nextSequence[batch.generation];
                 if( expected != 0 && batch.sequence != expected ) sequenceGaps++;
                 expected = batch.sequence + 1;
@@ -10527,7 +10540,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( const auto& generation : catalog->gpuCatalogGenerations ) unresolved += generation.unresolvedCount;
             if( !catalog->gpuCatalogValid ) addFinding( "error", "GPU_CATALOG_INVALID_CORE", "N27 GPU Catalog Core is invalid; dependent Pass-to-Resource evidence is unavailable and no earlier generation may substitute it", 1 );
             if( invalidBatches ) addFinding( "error", "GPU_CATALOG_INVALID_BATCH", "GPU Catalog contains batches rejected by Worker validation", invalidBatches );
-            if( checksumMismatch ) addFinding( "error", "GPU_CATALOG_CHECKSUM_MISMATCH", "GPU Catalog transport and canonical stored checksums differ", checksumMismatch );
+            if( checksumFailures ) addFinding( "error", "GPU_CATALOG_CHECKSUM_FAILURE", "GPU Catalog transport or canonical stored checksum verification failed", checksumFailures );
             if( sequenceGaps ) addFinding( "error", "GPU_CATALOG_SEQUENCE_GAP", "GPU Catalog generation contains a batch sequence gap", sequenceGaps );
             if( unresolved ) addFinding( "error", "GPU_CATALOG_UNRESOLVED_RESOURCE", "completed GPU Catalog lifetimes contain unresolved pointer-token evidence", unresolved );
         }

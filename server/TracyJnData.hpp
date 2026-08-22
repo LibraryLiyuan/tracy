@@ -256,7 +256,10 @@ struct JnGpuCatalogControlData
 struct JnGpuCatalogBatchData
 {
     uint64_t generation;
+    // Checksum of the exact producer payload, verified before Worker timestamp
+    // normalization. This is intentionally not required to equal storedChecksum.
     uint64_t transportChecksum;
+    // Checksum of the canonical persisted records after Worker normalization.
     uint64_t storedChecksum;
     uint64_t firstRecordIndex;
     uint32_t sequence;

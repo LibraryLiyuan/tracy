@@ -1352,7 +1352,8 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         capability( "capture", hasCapture, true, { "capture.context", "capture.coverage", "producer.list", "producer.get" },
             hasCapture ? "" : "trace predates or did not emit JN Capture Context or Producer Quality" ),
         capability( "catalog", hasCatalog, true, { "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality" },
-            hasCatalog ? "" : "trace predates or did not emit JN Catalog schema" ),
+            hasCatalog ? "legacy JN entity Catalog is present" :
+                "legacy JN entity Catalog is absent; this capability is independent from N27 gpu.catalog" ),
         capability( "relation", hasRelationSchema, true, { "relation.search", "relation.get" },
             hasRelationSchema ? "JN exact relation schema is present in the persisted snapshot" : "trace predates JN trace section schema 4" ),
         capability( "runtime.domain", hasRelationSchema, true, { "runtime.domain.states" },

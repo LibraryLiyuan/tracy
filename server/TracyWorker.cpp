@@ -174,6 +174,7 @@ static bool ValidateJnGpuCatalogStoredData( const JnTraceData& data )
     for( const auto& control : data.gpuCatalogControls ) sequences[control.generation].push_back( control.sequence );
     for( const auto& batch : data.gpuCatalogBatches )
     {
+        if( batch.transportChecksum == 0 ) return false;
         sequences[batch.generation].push_back( batch.sequence );
         uint64_t checksum = 0;
         switch( JnGpuCatalogBatchKind( batch.kind ) )
