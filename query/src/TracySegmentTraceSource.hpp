@@ -60,6 +60,7 @@ public:
     std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
     std::vector<analysis::ScriptFrameDto> GetScriptFrames() const override;
     std::vector<analysis::ScriptStackEventDto> GetScriptStackEvents() const override;
+    std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override;
     analysis::CrashDto GetCrash() const override;
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override;
     std::vector<analysis::CpuUsagePointDto> GetCpuUsage() const override;

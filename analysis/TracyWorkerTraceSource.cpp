@@ -322,6 +322,8 @@ public:
         , loadMode( sourceLoadMode )
     {}
 
+    mutable std::shared_ptr<const tracy::JnTraceData> gpuCatalogSnapshot;
+
     std::string MakeRef( const char* kind, uint64_t id ) const
     {
         std::ostringstream out;
@@ -1336,6 +1338,14 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
     const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
         return record.starts_with( "JNGC1|" );
     } );
+    const bool hasGpuCatalog = jnTrace.gpuCatalogPresent;
+    const std::vector<std::string> gpuCatalogMethods = {
+        "gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get",
+        "gpu.resource.explain", "gpu.resource.lifetime", "gpu.resource.allocations", "gpu.resource.references",
+        "gpu.resource.views", "gpu.resource.mesh_buffers", "gpu.resource.raytracing_chain", "gpu.resource.vg_pages",
+        "gpu.pass.resources", "gpu.pass.vg_evidence", "gpu.memory.peak", "gpu.memory.by_type",
+        "gpu.memory.by_pass", "gpu.memory.churn"
+    };
     auto result = std::vector<Capability> {
         capability( "system", true, true, { "system.capabilities", "system.describe", "system.schema" } ),
         capability( "trace", true, true, { "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash" } ),
@@ -1370,6 +1380,15 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
             jnTrace.schemaVersion >= 8 && info.counts.callsites != 0 ? "SiteReuse callsite definitions are present" : "trace predates JN trace section schema 8 or contains no callsite definitions" ),
         capability( "memory", info.counts.memoryEvents != 0, true, { "memory.pools", "memory.events", "memory.get", "memory.active_at_time", "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates" } ),
         capability( "memory.gpu", hasGpuMemory, true, { "memory.gpu.pools", "memory.gpu.allocations", "memory.gpu.request_scopes", "memory.gpu.pass_uses", "memory.gpu.attribution", "memory.gpu.summary", "memory.gpu.residency", "memory.gpu.fragmentation", "memory.gpu.churn" } ),
+        capability( "gpu.catalog", hasGpuCatalog, true, gpuCatalogMethods,
+            hasGpuCatalog ? ( jnTrace.gpuCatalogValid ? "N27 GPU Catalog schema 1 is present" : "N27 GPU Catalog is present but its Core generation is invalid" ) :
+                "trace predates N27 or contains no GPU Catalog section" ),
+        capability( "gpu.resource", hasGpuCatalog, true, gpuCatalogMethods,
+            hasGpuCatalog ? ( jnTrace.gpuCatalogValid ? "N27 GPU resources are queryable" : "GPU resource evidence is unavailable because the Catalog Core is invalid" ) :
+                "trace predates N27 or contains no GPU Catalog section" ),
+        capability( "gpu.memory", hasGpuCatalog, true, gpuCatalogMethods,
+            hasGpuCatalog ? ( jnTrace.gpuCatalogValid ? "N27 GPU allocation and range evidence is queryable" : "GPU Catalog memory evidence is unavailable because the Catalog Core is invalid" ) :
+                "trace predates N27 or contains no GPU Catalog section" ),
         capability( "runtime.script", hasScriptStack, true, { "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones" },
             hasScriptStack ? "" : "trace predates or did not emit Script schema 2 or JNSTK1/JNSZ1" ),
         capability( "memory.gc", hasStructuredGc, true, { "memory.gc.summary", "memory.gc.events" },
@@ -2481,6 +2500,35 @@ std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
         result.emplace_back( std::move( dto ) );
     }
     return result;
+}
+
+std::shared_ptr<const tracy::JnTraceData> WorkerTraceSource::GetGpuCatalogData() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( m_impl->gpuCatalogSnapshot ) return m_impl->gpuCatalogSnapshot;
+    const auto& source = m_impl->worker->GetJnTraceData();
+    auto snapshot = std::make_shared<tracy::JnTraceData>();
+    snapshot->present = source.present;
+    snapshot->schemaVersion = source.schemaVersion;
+    snapshot->gpuCatalogPresent = source.gpuCatalogPresent;
+    snapshot->gpuCatalogValid = source.gpuCatalogValid;
+    snapshot->gpuCatalogSchemaVersion = source.gpuCatalogSchemaVersion;
+    snapshot->gpuDetailedEvidenceSchemaVersion = source.gpuDetailedEvidenceSchemaVersion;
+    snapshot->gpuCatalogControls = source.gpuCatalogControls;
+    snapshot->gpuCatalogBatches = source.gpuCatalogBatches;
+    snapshot->gpuCatalogGenerations = source.gpuCatalogGenerations;
+    snapshot->gpuCatalogStrings = source.gpuCatalogStrings;
+    snapshot->gpuCatalogResources = source.gpuCatalogResources;
+    snapshot->gpuCatalogAllocations = source.gpuCatalogAllocations;
+    snapshot->gpuCatalogViews = source.gpuCatalogViews;
+    snapshot->gpuCatalogLogicals = source.gpuCatalogLogicals;
+    snapshot->gpuCatalogParts = source.gpuCatalogParts;
+    snapshot->gpuCatalogRelations = source.gpuCatalogRelations;
+    snapshot->gpuCatalogVg = source.gpuCatalogVg;
+    snapshot->gpuRangeSets = source.gpuRangeSets;
+    snapshot->gpuDetailedEvidence = source.gpuDetailedEvidence;
+    m_impl->gpuCatalogSnapshot = std::move( snapshot );
+    return m_impl->gpuCatalogSnapshot;
 }
 
 std::optional<ZoneValidationSummaryDto> WorkerTraceSource::ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const

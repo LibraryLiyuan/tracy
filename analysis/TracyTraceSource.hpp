@@ -2,11 +2,13 @@
 #define __TRACYTRACESOURCE_HPP__
 
 #include "TracyMemoryAnalysis.hpp"
+#include "../server/TracyJnData.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <queue>
 #include <set>
@@ -983,6 +985,9 @@ public:
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
     virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
     virtual std::vector<CallsiteDto> GetCallsites() const { return {}; }
+    // Immutable N27 Catalog snapshot. Pointer tokens are retained only for
+    // validation and lifetime resolution and must never reach Query output.
+    virtual std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const { return {}; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }

@@ -333,7 +333,7 @@ json McpServer::ToolsList( const json& id ) const
     tools.emplace_back( Tool( "tracy_overview", "Return bounded trace metadata, counts, capabilities, and primary-frame statistics. Call after the trace is ready.", json { { "trace_id", traceId } }, required( { "trace_id" } ) ) );
 
     json searchProperties = {
-        { "trace_id", traceId }, { "domain", enumeration( { "cpu_zone", "gpu_zone", "message", "memory", "gpu_memory", "thread", "lock", "plot", "frame", "frame_image", "sample", "context_switch", "symbol", "source", "hardware_sample" } ) },
+        { "trace_id", traceId }, { "domain", enumeration( { "cpu_zone", "gpu_zone", "message", "memory", "gpu_memory", "gpu_resource", "thread", "lock", "plot", "frame", "frame_image", "sample", "context_switch", "symbol", "source", "hardware_sample" } ) },
         { "filter", { { "type", "object" } } }, { "start_ns", { { "type", "string" } } }, { "end_ns", { { "type", "string" } } },
         { "limit", integer( 1, 1000 ) }, { "cursor", { { "type", "string" } } },
         { "fields", { { "type", "array" }, { "items", { { "type", "string" } } } } }
@@ -342,8 +342,8 @@ json McpServer::ToolsList( const json& id ) const
         std::move( searchProperties ), required( { "trace_id", "domain" } ), true ) );
 
     json inspectProperties = {
-        { "trace_id", traceId }, { "domain", enumeration( { "frame", "frame_image", "thread", "cpu_zone", "gpu_zone", "memory_event", "memory", "gpu_memory", "callstack", "parent_callstack", "symbol", "source", "lock", "message", "plot", "hardware_sample" } ) },
-        { "operation", enumeration( { "get", "tree", "list", "active_at_time", "frame_snapshot", "diff", "callstack_tree", "leak_candidates", "allocations", "request_scopes", "pass_uses", "attribution", "frames", "raw_code", "disassembly", "lines", "embedded", "timeline", "points", "downsample", "statistics", "resource" } ) },
+        { "trace_id", traceId }, { "domain", enumeration( { "frame", "frame_image", "thread", "cpu_zone", "gpu_zone", "memory_event", "memory", "gpu_memory", "gpu_catalog", "gpu_resource", "gpu_pass_resource", "callstack", "parent_callstack", "symbol", "source", "lock", "message", "plot", "hardware_sample" } ) },
+        { "operation", enumeration( { "get", "tree", "list", "active_at_time", "frame_snapshot", "diff", "callstack_tree", "leak_candidates", "allocations", "request_scopes", "pass_uses", "attribution", "frames", "raw_code", "disassembly", "lines", "embedded", "timeline", "points", "downsample", "statistics", "resource", "status", "validation", "explain", "lifetime", "references", "views", "mesh_buffers", "raytracing_chain", "vg_pages", "vg_evidence" } ) },
         { "ref", { { "type", "string" } } }, { "address", { { "type", "string" } } }, { "frame_set", {} }, { "index", { { "type", "integer" } } }, { "max_depth", { { "type", "integer" } } },
         { "method", { { "type", "string" }, { "enum", QueryMethodRegistry() }, { "description", "Exact public tracy-query method returned by tracy_describe. Use this route when a workflow domain/operation mapping is insufficient." } } },
         { "params", { { "type", "object" }, { "description", "Parameters for method. A top-level trace_id is injected and must not conflict with params.trace_id." } } }
@@ -407,7 +407,7 @@ json McpServer::CallTool( const std::string& name, json arguments )
         const std::string domain = arguments.value( "domain", "" );
         static const std::map<std::string, std::string> methods = {
             { "cpu_zone", "zone.cpu.search" }, { "gpu_zone", "zone.gpu.search" }, { "message", "message.search" },
-            { "memory", "memory.events" }, { "gpu_memory", "memory.gpu.allocations" }, { "thread", "thread.list" },
+            { "memory", "memory.events" }, { "gpu_memory", "memory.gpu.allocations" }, { "gpu_resource", "gpu.resource.search" }, { "thread", "thread.list" },
             { "script_stack", "runtime.script.stacks" }, { "script_zone", "runtime.script.zones" }, { "gc", "memory.gc.events" },
             { "lock", "lock.list" }, { "plot", "plot.list" }, { "frame", "frame.list" }, { "frame_image", "frame_image.list" },
             { "sample", "sample.list" }, { "context_switch", "context_switch.range" }, { "symbol", "symbol.search" },
@@ -475,6 +475,17 @@ json McpServer::CallTool( const std::string& name, json arguments )
             };
             const auto found = operations.find( operation ); if( found == operations.end() ) throw QueryError( "INVALID_PARAMS", "unsupported GPU memory inspect operation" ); method = found->second;
         }
+        else if( domain == "gpu_catalog" ) method = operation == "validation" ? "gpu.catalog.validation" : "gpu.catalog.status";
+        else if( domain == "gpu_resource" )
+        {
+            static const std::map<std::string, std::string> operations = {
+                { "get", "gpu.resource.get" }, { "explain", "gpu.resource.explain" }, { "lifetime", "gpu.resource.lifetime" },
+                { "allocations", "gpu.resource.allocations" }, { "references", "gpu.resource.references" }, { "views", "gpu.resource.views" },
+                { "mesh_buffers", "gpu.resource.mesh_buffers" }, { "raytracing_chain", "gpu.resource.raytracing_chain" }, { "vg_pages", "gpu.resource.vg_pages" }
+            };
+            const auto found = operations.find( operation ); if( found == operations.end() ) throw QueryError( "INVALID_PARAMS", "unsupported GPU resource inspect operation" ); method = found->second;
+        }
+        else if( domain == "gpu_pass_resource" ) method = operation == "vg_evidence" ? "gpu.pass.vg_evidence" : "gpu.pass.resources";
         else if( domain == "script" )
         {
             static const std::map<std::string, std::string> operations = {

@@ -873,6 +873,7 @@ TRACY_SEGMENT_FORWARD2( std::vector<analysis::RelationDto>, ScanRelations, size_
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
+TRACY_SEGMENT_FORWARD0( std::shared_ptr<const tracy::JnTraceData>, GetGpuCatalogData )
 TRACY_SEGMENT_FORWARD0( analysis::CrashDto, GetCrash )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuTopologyDto>, GetCpuTopology )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )

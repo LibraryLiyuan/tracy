@@ -848,6 +848,15 @@ public:
         return result;
     }
 
+    std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override
+    {
+        // Catalog section 12 remains immutable in the authoritative Worker
+        // snapshot.  The sidecar accelerates existing timeline/reference
+        // domains while forwarding Catalog evidence verbatim, so an indexed
+        // open cannot silently report N27 as absent.
+        return m_source->GetGpuCatalogData();
+    }
+
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
     {
         std::vector<analysis::CpuZoneDto> result;
