@@ -365,6 +365,9 @@ struct JnGpuRangeSetRecordV1
 {
     uint64_t passInstanceId;
     uint64_t pointerToken;
+    // Filled by the Worker after resolving pointerToken against the resource
+    // lifetime interval. Producers leave this field zero.
+    uint64_t resourceId;
     uint64_t viewDefinitionId;
     uint64_t offsetBytes;
     uint64_t lengthBytes;
@@ -406,7 +409,7 @@ struct JnGpuCatalogStringRecordHeaderV1
 #pragma pack( pop )
 
 static_assert( sizeof( JnGpuCatalogBatchEnvelopeV1 ) == 28, "GPU Catalog envelope ABI mismatch" );
-static_assert( sizeof( JnGpuRangeSetRecordV1 ) == 56, "GPU RangeSetV1 ABI mismatch" );
+static_assert( sizeof( JnGpuRangeSetRecordV1 ) == 64, "GPU RangeSetV1 ABI mismatch" );
 
 }
 

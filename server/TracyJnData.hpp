@@ -2,6 +2,7 @@
 #define __TRACYJNDATA_HPP__
 
 #include <stdint.h>
+#include <string>
 #include <vector>
 
 #include "../public/common/TracyJnGpuCatalog.hpp"
@@ -11,8 +12,6 @@ namespace tracy
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
 static constexpr uint16_t JnTraceSchemaVersion = 12;
-static constexpr uint16_t JnGpuCatalogSchemaVersion = 1;
-static constexpr uint16_t JnGpuDetailedEvidenceSchemaVersion = 1;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -254,7 +253,48 @@ struct JnGpuCatalogControlData
     uint8_t flags;
 };
 
+struct JnGpuCatalogBatchData
+{
+    uint64_t generation;
+    uint64_t transportChecksum;
+    uint64_t storedChecksum;
+    uint64_t firstRecordIndex;
+    uint32_t sequence;
+    uint32_t recordCount;
+    uint32_t payloadBytes;
+    uint8_t kind;
+    uint8_t encoding;
+    uint8_t flags;
+    uint8_t valid;
+};
+
+struct JnGpuCatalogGenerationData
+{
+    uint64_t generation;
+    uint64_t beginValue;
+    uint64_t endValue;
+    int64_t beginTime;
+    int64_t endTime;
+    uint32_t lastSequence;
+    uint32_t batchCount;
+    uint64_t recordCount;
+    uint64_t payloadBytes;
+    uint64_t unresolvedCount;
+    uint8_t state;
+    uint8_t flags;
+    uint8_t began;
+    uint8_t ended;
+    uint8_t valid;
+};
+
 #pragma pack( pop )
+
+struct JnGpuCatalogStringData
+{
+    uint64_t generation;
+    JnGpuCatalogStringRecordHeaderV1 header;
+    std::string value;
+};
 
 struct JnTraceData
 {
@@ -287,6 +327,9 @@ struct JnTraceData
     std::vector<JnScriptStackData> scriptStacks;
     std::vector<JnCallsiteData> callsites;
     std::vector<JnGpuCatalogControlData> gpuCatalogControls;
+    std::vector<JnGpuCatalogBatchData> gpuCatalogBatches;
+    std::vector<JnGpuCatalogGenerationData> gpuCatalogGenerations;
+    std::vector<JnGpuCatalogStringData> gpuCatalogStrings;
     std::vector<JnGpuCatalogResourceRecordV1> gpuCatalogResources;
     std::vector<JnGpuCatalogAllocationRecordV1> gpuCatalogAllocations;
     std::vector<JnGpuCatalogViewRecordV1> gpuCatalogViews;

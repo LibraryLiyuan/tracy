@@ -13,8 +13,10 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <iterator>
 #include <math.h>
 #include <string.h>
+#include <type_traits>
 
 #ifdef __MINGW32__
 #  define __STDC_FORMAT_MACROS
@@ -113,6 +115,108 @@ static void WriteJnVector( FileWrite& f, const std::vector<T>& source )
     const uint64_t size = source.size();
     f.Write( &size, sizeof( size ) );
     if( size != 0 ) f.Write( source.data(), size * sizeof( T ) );
+}
+
+template<typename T>
+static uint64_t AppendJnCatalogRecords( std::vector<T>& target, const uint8_t* data, uint32_t count )
+{
+    const auto first = uint64_t( target.size() );
+    target.resize( target.size() + count );
+    if( count != 0 ) memcpy( target.data() + first, data, size_t( count ) * sizeof( T ) );
+    return first;
+}
+
+static void ReadJnGpuCatalogStrings( FileRead& f, std::vector<JnGpuCatalogStringData>& target )
+{
+    uint64_t size;
+    f.Read( size );
+    if( size > JnTraceMaxRecordsPerDomain ) throw LoadFailure( "JN trace GPU Catalog string count is invalid." );
+    target.clear();
+    target.reserve( size_t( size ) );
+    for( uint64_t i = 0; i < size; ++i )
+    {
+        uint64_t generation;
+        JnGpuCatalogStringRecordHeaderV1 header;
+        f.Read( generation );
+        f.Read( header );
+        if( generation == 0 || header.stringId == 0 || header.byteLength > 256 )
+            throw LoadFailure( "JN trace GPU Catalog string metadata is invalid." );
+        std::string value( header.byteLength, '\0' );
+        if( header.byteLength != 0 ) f.Read( value.data(), header.byteLength );
+        if( header.byteLength != 0 && header.originalLength == header.byteLength &&
+            JnGpuCatalogChecksum64( value.data(), value.size() ) != header.hash )
+            throw LoadFailure( "JN trace GPU Catalog string checksum is invalid." );
+        target.push_back( JnGpuCatalogStringData { generation, header, std::move( value ) } );
+    }
+}
+
+static void WriteJnGpuCatalogStrings( FileWrite& f, const std::vector<JnGpuCatalogStringData>& source )
+{
+    const uint64_t size = source.size();
+    f.Write( &size, sizeof( size ) );
+    for( const auto& value : source )
+    {
+        f.Write( &value.generation, sizeof( value.generation ) );
+        f.Write( &value.header, sizeof( value.header ) );
+        if( !value.value.empty() ) f.Write( value.value.data(), value.value.size() );
+    }
+}
+
+static bool ValidateJnGpuCatalogStoredData( const JnTraceData& data )
+{
+    auto checksumRecords = []( const auto& values, uint64_t first, uint32_t count ) -> uint64_t
+    {
+        using Value = typename std::decay_t<decltype( values )>::value_type;
+        if( first > values.size() || count > values.size() - size_t( first ) ) return 0;
+        return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+    };
+    unordered_flat_map<uint64_t, std::vector<uint32_t>> sequences;
+    for( const auto& control : data.gpuCatalogControls ) sequences[control.generation].push_back( control.sequence );
+    for( const auto& batch : data.gpuCatalogBatches )
+    {
+        sequences[batch.generation].push_back( batch.sequence );
+        uint64_t checksum = 0;
+        switch( JnGpuCatalogBatchKind( batch.kind ) )
+        {
+        case JnGpuCatalogBatchKind::Resource: checksum = checksumRecords( data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Allocation: checksum = checksumRecords( data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::View: checksum = checksumRecords( data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Logical: checksum = checksumRecords( data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Part: checksum = checksumRecords( data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Relation: checksum = checksumRecords( data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::VirtualGeometry: checksum = checksumRecords( data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::RangeSet: checksum = checksumRecords( data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::DetailedEvidence: checksum = checksumRecords( data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::String:
+        {
+            if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
+                batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) ) return false;
+            std::vector<uint8_t> bytes;
+            for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
+            {
+                const auto& value = data.gpuCatalogStrings[i];
+                const auto offset = bytes.size();
+                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
+                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
+                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+            }
+            checksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            break;
+        }
+        default: return false;
+        }
+        if( batch.valid == 0 || checksum == 0 || checksum != batch.storedChecksum ) return false;
+    }
+    for( const auto& generation : data.gpuCatalogGenerations )
+    {
+        const auto found = sequences.find( generation.generation );
+        if( found == sequences.end() || !generation.began ) return false;
+        auto values = found->second;
+        std::sort( values.begin(), values.end() );
+        if( values.empty() || values.front() != 1 || values.back() != generation.lastSequence ) return false;
+        for( size_t i = 1; i < values.size(); ++i ) if( values[i] != values[i-1] + 1 ) return false;
+    }
+    return true;
 }
 
 
@@ -1924,6 +2028,37 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         {
             ReadJnVector( f, jn.callsites, "callsite" );
         }
+        if( schemaVersion >= 12 )
+        {
+            uint8_t catalogPresent;
+            uint8_t catalogValid;
+            f.Read4( catalogPresent, catalogValid, jn.gpuCatalogSchemaVersion,
+                jn.gpuDetailedEvidenceSchemaVersion );
+            jn.gpuCatalogPresent = catalogPresent != 0;
+            jn.gpuCatalogValid = catalogValid != 0;
+            if( jn.gpuCatalogPresent &&
+                ( jn.gpuCatalogSchemaVersion != JnGpuCatalogSchemaVersion ||
+                    jn.gpuDetailedEvidenceSchemaVersion != JnGpuDetailedEvidenceSchemaVersion ) )
+                throw LoadFailure( "Unsupported JN GPU Catalog or Detailed Evidence schema." );
+            ReadJnVector( f, jn.gpuCatalogControls, "GPU Catalog control" );
+            ReadJnVector( f, jn.gpuCatalogBatches, "GPU Catalog batch" );
+            ReadJnVector( f, jn.gpuCatalogGenerations, "GPU Catalog generation" );
+            ReadJnGpuCatalogStrings( f, jn.gpuCatalogStrings );
+            ReadJnVector( f, jn.gpuCatalogResources, "GPU Catalog resource" );
+            ReadJnVector( f, jn.gpuCatalogAllocations, "GPU Catalog allocation" );
+            ReadJnVector( f, jn.gpuCatalogViews, "GPU Catalog view" );
+            ReadJnVector( f, jn.gpuCatalogLogicals, "GPU Catalog logical resource" );
+            ReadJnVector( f, jn.gpuCatalogParts, "GPU Catalog part" );
+            ReadJnVector( f, jn.gpuCatalogRelations, "GPU Catalog relation" );
+            ReadJnVector( f, jn.gpuCatalogVg, "GPU Catalog virtual geometry" );
+            ReadJnVector( f, jn.gpuRangeSets, "GPU range set" );
+            ReadJnVector( f, jn.gpuDetailedEvidence, "GPU detailed evidence" );
+            if( jn.gpuCatalogPresent && !ValidateJnGpuCatalogStoredData( jn ) )
+            {
+                jn.gpuCatalogValid = false;
+                for( auto& generation : jn.gpuCatalogGenerations ) generation.valid = 0;
+            }
+        }
     }
 
     s_loadProgress.total.store( 0, std::memory_order_relaxed );
@@ -3659,7 +3794,8 @@ void Worker::DispatchFailure( const QueueItem& ev, const char*& ptr )
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
             ev.hdr.type == QueueType::SourceCode ||
-            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition ||
+            ev.hdr.type == QueueType::JnGpuCatalogBatchData )
         {
             if( ev.hdr.type == QueueType::SymbolCode || ev.hdr.type == QueueType::SourceCode )
             {
@@ -3844,7 +3980,8 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
             ev.hdr.type == QueueType::SourceCode ||
-            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition ||
+            ev.hdr.type == QueueType::JnGpuCatalogBatchData )
         {
             uint32_t sz;
             memcpy( &sz, ptr, sizeof( sz ) );
@@ -3864,6 +4001,9 @@ bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
                 break;
             case QueueType::JnGpuReferenceSetDefinition:
                 AddJnGpuResourceSetDefinition( uint32_t( ev.stringTransfer.ptr ), ptr, sz );
+                break;
+            case QueueType::JnGpuCatalogBatchData:
+                AddJnGpuCatalogBatchData( ev.stringTransfer.ptr, ptr, sz );
                 break;
             default:
                 assert( false );
@@ -3959,7 +4099,8 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
             ev.hdr.type == QueueType::SourceCode ||
-            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition )
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition ||
+            ev.hdr.type == QueueType::JnGpuCatalogBatchData )
         {
             uint32_t sz;
             memcpy( &sz, ptr, sizeof( sz ) );
@@ -3986,6 +4127,9 @@ bool Worker::DispatchRecorder( const QueueItem& ev, const char*& ptr )
                     RecorderFail( "Invalid or duplicate GPU ResourceSetV2 definition." );
                 break;
             }
+            case QueueType::JnGpuCatalogBatchData:
+                AddJnGpuCatalogBatchData( ev.stringTransfer.ptr, ptr, sz );
+                break;
             default:
                 break;
             }
@@ -4178,7 +4322,9 @@ void Worker::SkipProtocolEvent( const QueueItem& ev, const char*& ptr )
         ptr += sizeof( QueueHeader ) + sizeof( QueueStringTransfer );
         if( ev.hdr.type == QueueType::FrameImageData ||
             ev.hdr.type == QueueType::SymbolCode ||
-            ev.hdr.type == QueueType::SourceCode )
+            ev.hdr.type == QueueType::SourceCode ||
+            ev.hdr.type == QueueType::JnGpuReferenceSetDefinition ||
+            ev.hdr.type == QueueType::JnGpuCatalogBatchData )
         {
             uint32_t size;
             memcpy( &size, ptr, sizeof( size ) );
@@ -4349,7 +4495,9 @@ bool Worker::RecorderCheckLimits()
         m_recorderFrameNames.size() +
         m_recorderPlotNames.size() +
         m_recorderPowerNames.size() +
-        m_data.fiberToThreadMap.size();
+        m_data.fiberToThreadMap.size() +
+        m_jnGpuCatalogPayloads.size() +
+        m_jnGpuCatalogRuntime.size();
 
     m_protocolDefinitionCount.store( count, std::memory_order_relaxed );
 
@@ -4597,7 +4745,8 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::Terminate:
         if( m_recorderHasSingleString || m_recorderHasSecondString ||
             m_recorderPendingCallstack || m_recorderSerialCallstack ||
-            m_pendingSourceLocationPayload != 0 || m_memNamePayload != 0 )
+            m_pendingSourceLocationPayload != 0 || m_memNamePayload != 0 ||
+            !m_jnGpuCatalogPayloads.empty() )
         {
             RecorderFail( "Protocol terminated with an incomplete staged event." );
         }
@@ -4689,6 +4838,20 @@ bool Worker::ProcessRecorder( const QueueItem& ev )
     case QueueType::JnGpuReferenceEnd:
         RecorderCheckCurrentThread();
         break;
+    case QueueType::JnGpuCatalogControl:
+    {
+        const char* error = nullptr;
+        if( !ValidateJnGpuCatalogControl( ev.jnGpuCatalogControl, false, error ) )
+            RecorderFail( error ? error : "Invalid GPU Catalog control record." );
+        break;
+    }
+    case QueueType::JnGpuCatalogBatch:
+    {
+        const char* error = nullptr;
+        if( !ConsumeJnGpuCatalogBatch( ev.jnGpuCatalogBatch, false, error ) )
+            RecorderFail( error ? error : "Invalid GPU Catalog batch." );
+        break;
+    }
     case QueueType::JnGpuReferenceSetUse:
     {
         RecorderCheckCurrentThread();
@@ -5490,6 +5653,24 @@ void Worker::AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* 
     m_jnGpuResourceSets.emplace( resourceSetId, std::move( entries ) );
 }
 
+void Worker::AddJnGpuCatalogBatchData( uint64_t payloadId, const char* data, size_t sz )
+{
+    static constexpr size_t MaxCatalogBatchBytes = 64 * 1024 * 1024;
+    if( payloadId == 0 || data == nullptr || sz < sizeof( JnGpuCatalogBatchEnvelopeV1 ) ||
+        sz > MaxCatalogBatchBytes || m_jnGpuCatalogPayloads.size() >= 16 ||
+        m_jnGpuCatalogPayloads.find( payloadId ) != m_jnGpuCatalogPayloads.end() )
+    {
+        if( m_mode == Mode::ProtocolOnly ) RecorderFail( "Invalid or duplicate GPU Catalog payload." );
+        else InvalidateJnGpuCatalog( 0, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
+        return;
+    }
+
+    JnGpuCatalogPayload payload;
+    payload.bytes.resize( sz );
+    memcpy( payload.bytes.data(), data, sz );
+    m_jnGpuCatalogPayloads.emplace( payloadId, std::move( payload ) );
+}
+
 void Worker::AddCallstackAllocPayload( const char* data )
 {
     CallstackFrameId stack[64];
@@ -6175,6 +6356,16 @@ bool Worker::Process( const QueueItem& ev )
         m_serverQuerySpaceLeft++;
         break;
     case QueueType::Terminate:
+        if( !m_jnGpuCatalogPayloads.empty() )
+        {
+            InvalidateJnGpuCatalog( 0, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
+            m_jnGpuCatalogPayloads.clear();
+        }
+        for( auto& generation : m_jnGpuCatalogRuntime )
+        {
+            if( !generation.second.ended )
+                InvalidateJnGpuCatalog( generation.first, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
+        }
         m_terminate = true;
         break;
     case QueueType::KeepAlive:
@@ -6309,6 +6500,12 @@ bool Worker::Process( const QueueItem& ev )
         break;
     case QueueType::JnCallsiteDefinition:
         ProcessJnCallsiteDefinition( ev.jnCallsiteDefinition );
+        break;
+    case QueueType::JnGpuCatalogControl:
+        ProcessJnGpuCatalogControl( ev.jnGpuCatalogControl );
+        break;
+    case QueueType::JnGpuCatalogBatch:
+        ProcessJnGpuCatalogBatch( ev.jnGpuCatalogBatch );
         break;
     default:
         assert( false );
@@ -6604,6 +6801,631 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
             for( auto* zone : gpuPending->second ) zone->callstack.SetVal( callstack );
         }
         m_jnPendingGpuCallsites.erase( gpuPending );
+    }
+}
+
+void Worker::InvalidateJnGpuCatalog( uint64_t generation, uint8_t state )
+{
+    auto& data = m_data.jnTrace;
+    data.present = true;
+    data.schemaVersion = JnTraceSchemaVersion;
+    data.gpuCatalogPresent = true;
+    data.gpuCatalogValid = false;
+    data.gpuCatalogSchemaVersion = JnGpuCatalogSchemaVersion;
+    data.gpuDetailedEvidenceSchemaVersion = JnGpuDetailedEvidenceSchemaVersion;
+
+    if( generation == 0 ) return;
+    const auto runtime = m_jnGpuCatalogRuntime.find( generation );
+    if( runtime != m_jnGpuCatalogRuntime.end() ) runtime->second.valid = false;
+    if( runtime != m_jnGpuCatalogRuntime.end() &&
+        runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+    {
+        auto& value = data.gpuCatalogGenerations[runtime->second.dataIndex];
+        value.valid = 0;
+        value.state = state;
+    }
+}
+
+bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bool persist, const char*& error )
+{
+    error = nullptr;
+    if( ev.generation == 0 || ev.kind > uint8_t( JnGpuCatalogControlKind::GenerationEnd ) ||
+        ev.state > uint8_t( JnGpuCatalogGenerationState::InvalidBootstrapTimeout ) )
+    {
+        error = "GPU Catalog control has invalid enum or generation data.";
+        return false;
+    }
+
+    const auto kind = JnGpuCatalogControlKind( ev.kind );
+    auto runtime = m_jnGpuCatalogRuntime.find( ev.generation );
+    if( kind == JnGpuCatalogControlKind::GenerationBegin )
+    {
+        if( runtime != m_jnGpuCatalogRuntime.end() || ev.sequence != 1 )
+        {
+            error = "GPU Catalog generation begin is duplicate or does not start at sequence 1.";
+            return false;
+        }
+        JnGpuCatalogRuntimeGeneration value;
+        value.lastSequence = ev.sequence;
+        value.began = true;
+        value.valid = ev.state == uint8_t( JnGpuCatalogGenerationState::Building ) &&
+            ( ev.flags & uint8_t( JnGpuCatalogControlFlags::CoreInvalid ) ) == 0;
+        runtime = m_jnGpuCatalogRuntime.emplace( ev.generation, value ).first;
+
+        if( persist )
+        {
+            auto& data = m_data.jnTrace;
+            data.present = true;
+            data.schemaVersion = JnTraceSchemaVersion;
+            data.gpuCatalogPresent = true;
+            if( data.gpuCatalogGenerations.empty() ) data.gpuCatalogValid = true;
+            data.gpuCatalogValid = data.gpuCatalogValid && value.valid;
+            data.gpuCatalogSchemaVersion = JnGpuCatalogSchemaVersion;
+            data.gpuDetailedEvidenceSchemaVersion = JnGpuDetailedEvidenceSchemaVersion;
+            const auto time = TscTime( ev.time );
+            runtime->second.dataIndex = data.gpuCatalogGenerations.size();
+            data.gpuCatalogGenerations.push_back( JnGpuCatalogGenerationData {
+                ev.generation, ev.value, 0, time, 0, ev.sequence, 0, 0, 0, 0,
+                ev.state, ev.flags, 1, 0, uint8_t( value.valid ? 1 : 0 ) } );
+            data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
+                ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
+            if( m_data.lastTime < time ) m_data.lastTime = time;
+        }
+        return true;
+    }
+
+    if( runtime == m_jnGpuCatalogRuntime.end() || !runtime->second.began ||
+        ( kind == JnGpuCatalogControlKind::GenerationEnd && runtime->second.ended ) ||
+        ev.sequence != runtime->second.lastSequence + 1 )
+    {
+        error = "GPU Catalog control has a generation or sequence gap.";
+        return false;
+    }
+
+    runtime->second.lastSequence = ev.sequence;
+    const bool controlValid = ( ev.flags & uint8_t( JnGpuCatalogControlFlags::CoreInvalid ) ) == 0 &&
+        ev.state != uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) &&
+        ev.state != uint8_t( JnGpuCatalogGenerationState::InvalidCapacity ) &&
+        ev.state != uint8_t( JnGpuCatalogGenerationState::InvalidBootstrapTimeout );
+    runtime->second.valid = runtime->second.valid && controlValid;
+    if( kind == JnGpuCatalogControlKind::GenerationEnd ) runtime->second.ended = true;
+
+    if( persist )
+    {
+        auto& data = m_data.jnTrace;
+        const auto time = TscTime( ev.time );
+        data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
+            ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
+        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        {
+            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            generation.lastSequence = ev.sequence;
+            generation.state = ev.state;
+            generation.flags |= ev.flags;
+            generation.valid = runtime->second.valid ? 1 : 0;
+            if( kind == JnGpuCatalogControlKind::GenerationEnd )
+            {
+                generation.endValue = ev.value;
+                generation.endTime = time;
+                generation.ended = 1;
+                const auto unresolved = ResolveJnGpuCatalogGeneration( ev.generation );
+                generation.unresolvedCount = unresolved;
+                if( unresolved != 0 )
+                {
+                    generation.valid = 0;
+                    generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
+                    runtime->second.valid = false;
+                }
+            }
+        }
+        data.gpuCatalogValid = data.gpuCatalogValid && runtime->second.valid;
+        if( m_data.lastTime < time ) m_data.lastTime = time;
+    }
+    return true;
+}
+
+bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool persist, const char*& error )
+{
+    error = nullptr;
+    auto payloadIt = m_jnGpuCatalogPayloads.find( ev.payloadId );
+    if( ev.generation == 0 || ev.payloadId == 0 || ev.recordCount == 0 ||
+        ev.kind > uint8_t( JnGpuCatalogBatchKind::String ) || payloadIt == m_jnGpuCatalogPayloads.end() )
+    {
+        error = "GPU Catalog batch references invalid metadata or a missing payload.";
+        return false;
+    }
+
+    auto payload = std::move( payloadIt->second.bytes );
+    m_jnGpuCatalogPayloads.erase( payloadIt );
+    auto runtime = m_jnGpuCatalogRuntime.find( ev.generation );
+    if( runtime == m_jnGpuCatalogRuntime.end() || !runtime->second.began ||
+        ev.sequence != runtime->second.lastSequence + 1 )
+    {
+        error = "GPU Catalog batch has a generation or sequence gap.";
+        return false;
+    }
+    if( payload.size() != ev.payloadBytes || payload.size() < sizeof( JnGpuCatalogBatchEnvelopeV1 ) )
+    {
+        error = "GPU Catalog batch payload size does not match its fixed record.";
+        return false;
+    }
+
+    JnGpuCatalogBatchEnvelopeV1 envelope;
+    memcpy( &envelope, payload.data(), sizeof( envelope ) );
+    const auto* records = payload.data() + sizeof( envelope );
+    const auto recordPayloadBytes = payload.size() - sizeof( envelope );
+    if( envelope.magic != JnGpuCatalogBatchMagic ||
+        envelope.catalogSchema != JnGpuCatalogSchemaVersion ||
+        envelope.evidenceSchema != JnGpuDetailedEvidenceSchemaVersion ||
+        envelope.recordCount != ev.recordCount || envelope.payloadBytes != recordPayloadBytes ||
+        envelope.flags != ev.flags || JnGpuCatalogChecksum64( records, recordPayloadBytes ) != envelope.checksum )
+    {
+        error = "GPU Catalog batch envelope, schema, count, or checksum is invalid.";
+        return false;
+    }
+
+    uint16_t expectedBytes = 0;
+    uint8_t expectedEncoding = uint8_t( JnGpuCatalogBatchEncoding::FixedV1 );
+    switch( JnGpuCatalogBatchKind( ev.kind ) )
+    {
+    case JnGpuCatalogBatchKind::Resource: expectedBytes = sizeof( JnGpuCatalogResourceRecordV1 ); break;
+    case JnGpuCatalogBatchKind::Allocation: expectedBytes = sizeof( JnGpuCatalogAllocationRecordV1 ); break;
+    case JnGpuCatalogBatchKind::View: expectedBytes = sizeof( JnGpuCatalogViewRecordV1 ); break;
+    case JnGpuCatalogBatchKind::Logical: expectedBytes = sizeof( JnGpuCatalogLogicalRecordV1 ); break;
+    case JnGpuCatalogBatchKind::Part: expectedBytes = sizeof( JnGpuCatalogPartRecordV1 ); break;
+    case JnGpuCatalogBatchKind::Relation: expectedBytes = sizeof( JnGpuCatalogRelationRecordV1 ); break;
+    case JnGpuCatalogBatchKind::VirtualGeometry: expectedBytes = sizeof( JnGpuCatalogVgRecordV1 ); break;
+    case JnGpuCatalogBatchKind::RangeSet:
+        expectedBytes = sizeof( JnGpuRangeSetRecordV1 );
+        expectedEncoding = uint8_t( JnGpuCatalogBatchEncoding::RangeSetV1 );
+        break;
+    case JnGpuCatalogBatchKind::DetailedEvidence:
+        expectedBytes = sizeof( JnGpuDetailedEvidenceRecordV1 );
+        expectedEncoding = uint8_t( JnGpuCatalogBatchEncoding::DetailedEvidenceV1 );
+        break;
+    case JnGpuCatalogBatchKind::String:
+        expectedBytes = 0;
+        break;
+    }
+    if( ev.encoding != expectedEncoding || envelope.recordBytes != expectedBytes ||
+        ( expectedBytes != 0 && uint64_t( expectedBytes ) * ev.recordCount != recordPayloadBytes ) )
+    {
+        error = "GPU Catalog batch encoding or record width is invalid.";
+        return false;
+    }
+    if( JnGpuCatalogBatchKind( ev.kind ) == JnGpuCatalogBatchKind::String )
+    {
+        const auto* cursor = records;
+        const auto* end = records + recordPayloadBytes;
+        for( uint32_t i = 0; i < ev.recordCount; ++i )
+        {
+            if( size_t( end - cursor ) < sizeof( JnGpuCatalogStringRecordHeaderV1 ) )
+            {
+                error = "GPU Catalog string batch has a truncated header.";
+                return false;
+            }
+            JnGpuCatalogStringRecordHeaderV1 header;
+            memcpy( &header, cursor, sizeof( header ) );
+            cursor += sizeof( header );
+            if( header.stringId == 0 || header.byteLength > 256 || size_t( end - cursor ) < header.byteLength ||
+                ( header.byteLength != 0 && header.originalLength == header.byteLength &&
+                    JnGpuCatalogChecksum64( cursor, header.byteLength ) != header.hash ) )
+            {
+                error = "GPU Catalog string batch has an invalid id, length, or hash.";
+                return false;
+            }
+            cursor += header.byteLength;
+        }
+        if( cursor != end )
+        {
+            error = "GPU Catalog string batch has trailing bytes.";
+            return false;
+        }
+    }
+
+    uint64_t firstRecordIndex = 0;
+    if( persist )
+    {
+        auto& data = m_data.jnTrace;
+        switch( JnGpuCatalogBatchKind( ev.kind ) )
+        {
+        case JnGpuCatalogBatchKind::Resource:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogResources, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogResources.size(); ++i )
+                data.gpuCatalogResources[i].time = TscTime( data.gpuCatalogResources[i].time );
+            break;
+        case JnGpuCatalogBatchKind::Allocation:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogAllocations, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogAllocations.size(); ++i )
+                data.gpuCatalogAllocations[i].time = TscTime( data.gpuCatalogAllocations[i].time );
+            break;
+        case JnGpuCatalogBatchKind::View:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogViews, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogViews.size(); ++i )
+                data.gpuCatalogViews[i].time = TscTime( data.gpuCatalogViews[i].time );
+            break;
+        case JnGpuCatalogBatchKind::Logical:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogLogicals, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogLogicals.size(); ++i )
+                data.gpuCatalogLogicals[i].time = TscTime( data.gpuCatalogLogicals[i].time );
+            break;
+        case JnGpuCatalogBatchKind::Part:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogParts, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogParts.size(); ++i )
+                data.gpuCatalogParts[i].time = TscTime( data.gpuCatalogParts[i].time );
+            break;
+        case JnGpuCatalogBatchKind::Relation:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogRelations, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogRelations.size(); ++i )
+                data.gpuCatalogRelations[i].time = TscTime( data.gpuCatalogRelations[i].time );
+            break;
+        case JnGpuCatalogBatchKind::VirtualGeometry:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogVg, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogVg.size(); ++i )
+                data.gpuCatalogVg[i].time = TscTime( data.gpuCatalogVg[i].time );
+            break;
+        case JnGpuCatalogBatchKind::RangeSet:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuRangeSets, records, ev.recordCount );
+            break;
+        case JnGpuCatalogBatchKind::DetailedEvidence:
+            firstRecordIndex = AppendJnCatalogRecords( data.gpuDetailedEvidence, records, ev.recordCount );
+            for( size_t i = size_t( firstRecordIndex ); i < data.gpuDetailedEvidence.size(); ++i )
+                data.gpuDetailedEvidence[i].time = TscTime( data.gpuDetailedEvidence[i].time );
+            break;
+        case JnGpuCatalogBatchKind::String:
+        {
+            firstRecordIndex = data.gpuCatalogStrings.size();
+            std::vector<JnGpuCatalogStringData> parsed;
+            parsed.reserve( ev.recordCount );
+            const auto* cursor = records;
+            const auto* end = records + recordPayloadBytes;
+            for( uint32_t i = 0; i < ev.recordCount; ++i )
+            {
+                if( size_t( end - cursor ) < sizeof( JnGpuCatalogStringRecordHeaderV1 ) )
+                {
+                    error = "GPU Catalog string batch has a truncated header.";
+                    return false;
+                }
+                JnGpuCatalogStringRecordHeaderV1 header;
+                memcpy( &header, cursor, sizeof( header ) );
+                cursor += sizeof( header );
+                if( header.stringId == 0 || header.byteLength > 256 || size_t( end - cursor ) < header.byteLength ||
+                    ( header.byteLength != 0 && header.originalLength == header.byteLength &&
+                        JnGpuCatalogChecksum64( cursor, header.byteLength ) != header.hash ) )
+                {
+                    error = "GPU Catalog string batch has an invalid id, length, or hash.";
+                    return false;
+                }
+                parsed.push_back( JnGpuCatalogStringData { ev.generation, header,
+                    std::string( reinterpret_cast<const char*>( cursor ), header.byteLength ) } );
+                cursor += header.byteLength;
+            }
+            if( cursor != end )
+            {
+                error = "GPU Catalog string batch has trailing bytes.";
+                return false;
+            }
+            data.gpuCatalogStrings.insert( data.gpuCatalogStrings.end(),
+                std::make_move_iterator( parsed.begin() ), std::make_move_iterator( parsed.end() ) );
+            break;
+        }
+        }
+
+        data.gpuCatalogBatches.push_back( JnGpuCatalogBatchData { ev.generation, envelope.checksum, 0,
+            firstRecordIndex, ev.sequence, ev.recordCount, envelope.payloadBytes,
+            ev.kind, ev.encoding, ev.flags, 1 } );
+        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        {
+            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            generation.lastSequence = ev.sequence;
+            ++generation.batchCount;
+            generation.recordCount += ev.recordCount;
+            generation.payloadBytes += envelope.payloadBytes;
+        }
+    }
+
+    runtime->second.lastSequence = ev.sequence;
+    if( persist && runtime->second.ended && runtime->second.dataIndex < m_data.jnTrace.gpuCatalogGenerations.size() )
+        m_data.jnTrace.gpuCatalogGenerations[runtime->second.dataIndex].unresolvedCount =
+            ResolveJnGpuCatalogGeneration( ev.generation );
+    return true;
+}
+
+void Worker::ProcessJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev )
+{
+    const char* error = nullptr;
+    if( !ValidateJnGpuCatalogControl( ev, true, error ) )
+        InvalidateJnGpuCatalog( ev.generation, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
+}
+
+void Worker::ProcessJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev )
+{
+    const char* error = nullptr;
+    if( !ConsumeJnGpuCatalogBatch( ev, true, error ) )
+        InvalidateJnGpuCatalog( ev.generation, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
+}
+
+uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
+{
+    struct ResourceInterval
+    {
+        uint64_t resourceId;
+        int64_t begin;
+        int64_t end;
+    };
+    unordered_flat_map<uint64_t, std::vector<ResourceInterval>> intervals;
+    unordered_flat_map<uint64_t, size_t> openIntervals;
+    auto& data = m_data.jnTrace;
+
+    auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
+    {
+        for( const auto& batch : data.gpuCatalogBatches )
+        {
+            if( batch.generation != generation || batch.kind != uint8_t( kind ) || batch.valid == 0 ) continue;
+            fn( size_t( batch.firstRecordIndex ), size_t( batch.recordCount ) );
+        }
+    };
+
+    forBatches( JnGpuCatalogBatchKind::Resource, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuCatalogResources.size() || count > data.gpuCatalogResources.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            const auto& record = data.gpuCatalogResources[i];
+            if( record.pointerToken == 0 || record.resourceId == 0 ) continue;
+            const auto operation = JnGpuCatalogRecordOperation( record.operation );
+            const auto key = record.pointerToken;
+            if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot )
+            {
+                auto& values = intervals[key];
+                const auto begin = operation == JnGpuCatalogRecordOperation::Create ? record.time : std::numeric_limits<int64_t>::min();
+                values.push_back( ResourceInterval { record.resourceId, begin, std::numeric_limits<int64_t>::max() } );
+                openIntervals[key] = values.size() - 1;
+            }
+            else if( operation == JnGpuCatalogRecordOperation::Destroy )
+            {
+                const auto open = openIntervals.find( key );
+                if( open != openIntervals.end() )
+                {
+                    auto& value = intervals[key][open->second];
+                    if( value.resourceId == record.resourceId ) value.end = record.time;
+                    openIntervals.erase( open );
+                }
+            }
+            else if( intervals.find( key ) == intervals.end() )
+            {
+                auto& values = intervals[key];
+                values.push_back( ResourceInterval { record.resourceId, std::numeric_limits<int64_t>::min(),
+                    std::numeric_limits<int64_t>::max() } );
+                openIntervals[key] = values.size() - 1;
+            }
+        }
+    } );
+
+    auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
+    {
+        if( pointerToken == 0 ) return 0;
+        const auto found = intervals.find( pointerToken );
+        if( found == intervals.end() ) return 0;
+        uint64_t result = 0;
+        for( const auto& value : found->second )
+        {
+            if( time != std::numeric_limits<int64_t>::min() && ( time < value.begin || time > value.end ) ) continue;
+            if( result != 0 && result != value.resourceId ) return 0;
+            result = value.resourceId;
+        }
+        return result;
+    };
+
+    unordered_flat_map<uint64_t, int64_t> passTimes;
+    for( const auto& pass : data.gpuReferencePasses )
+        if( pass.passId != 0 ) passTimes[pass.passId] = pass.time;
+
+    uint64_t unresolved = 0;
+    forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuCatalogViews.size() || count > data.gpuCatalogViews.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuCatalogViews[i];
+            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
+            if( record.pointerToken != 0 && record.resourceId == 0 )
+            {
+                ++unresolved;
+                record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+            }
+            if( record.resourceId != 0 ) record.pointerToken = 0;
+        }
+    } );
+    forBatches( JnGpuCatalogBatchKind::Logical, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuCatalogLogicals.size() || count > data.gpuCatalogLogicals.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuCatalogLogicals[i];
+            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
+            if( record.pointerToken != 0 && record.resourceId == 0 )
+            {
+                ++unresolved;
+                record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+            }
+            if( record.resourceId != 0 ) record.pointerToken = 0;
+        }
+    } );
+    forBatches( JnGpuCatalogBatchKind::VirtualGeometry, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuCatalogVg.size() || count > data.gpuCatalogVg.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuCatalogVg[i];
+            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
+            if( record.pointerToken != 0 && record.resourceId == 0 )
+            {
+                ++unresolved;
+                record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+            }
+            if( record.resourceId != 0 ) record.pointerToken = 0;
+        }
+    } );
+    forBatches( JnGpuCatalogBatchKind::RangeSet, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuRangeSets.size() || count > data.gpuRangeSets.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuRangeSets[i];
+            auto time = std::numeric_limits<int64_t>::min();
+            const auto pass = passTimes.find( record.passInstanceId );
+            if( pass != passTimes.end() ) time = pass->second;
+            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, time );
+            if( record.pointerToken != 0 && record.resourceId == 0 )
+            {
+                ++unresolved;
+                record.exactness = uint8_t( JnGpuCatalogExactness::Unknown );
+            }
+            if( record.resourceId != 0 ) record.pointerToken = 0;
+        }
+    } );
+    forBatches( JnGpuCatalogBatchKind::Relation, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuCatalogRelations.size() || count > data.gpuCatalogRelations.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuCatalogRelations[i];
+            if( ( record.flags & 1 ) != 0 )
+            {
+                const auto resolved = resolve( record.sourceId, record.time );
+                if( resolved == 0 ) { ++unresolved; record.exactness = uint8_t( JnGpuCatalogExactness::Partial ); }
+                if( resolved != 0 )
+                {
+                    record.sourceId = resolved;
+                    record.flags &= ~uint8_t( 1 );
+                }
+            }
+            if( ( record.flags & 2 ) != 0 )
+            {
+                const auto resolved = resolve( record.targetId, record.time );
+                if( resolved == 0 ) { ++unresolved; record.exactness = uint8_t( JnGpuCatalogExactness::Partial ); }
+                if( resolved != 0 )
+                {
+                    record.targetId = resolved;
+                    record.flags &= ~uint8_t( 2 );
+                }
+            }
+        }
+    } );
+    forBatches( JnGpuCatalogBatchKind::DetailedEvidence, [&]( size_t first, size_t count )
+    {
+        if( first > data.gpuDetailedEvidence.size() || count > data.gpuDetailedEvidence.size() - first ) return;
+        for( size_t i = first; i < first + count; ++i )
+        {
+            auto& record = data.gpuDetailedEvidence[i];
+            if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer ) ) != 0 )
+            {
+                const auto resolved = resolve( record.sourceId, record.time );
+                if( resolved == 0 ) { ++unresolved; record.flags |= uint32_t( JnGpuDetailedEvidenceFlags::Incomplete ); }
+                if( resolved != 0 )
+                {
+                    record.sourceId = resolved;
+                    record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer );
+                }
+            }
+            if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::TargetResourcePointer ) ) != 0 )
+            {
+                const auto resolved = resolve( record.targetId, record.time );
+                if( resolved == 0 ) { ++unresolved; record.flags |= uint32_t( JnGpuDetailedEvidenceFlags::Incomplete ); }
+                if( resolved != 0 )
+                {
+                    record.targetId = resolved;
+                    record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::TargetResourcePointer );
+                }
+            }
+            auto anonymizeDescriptor = [&]( uint64_t token )
+            {
+                const auto found = m_jnGpuCatalogDescriptorHeaps.find( token );
+                if( found != m_jnGpuCatalogDescriptorHeaps.end() ) return found->second;
+                const auto id = 0xD000000000000000ull | m_jnGpuCatalogNextDescriptorHeapId++;
+                m_jnGpuCatalogDescriptorHeaps.emplace( token, id );
+                return id;
+            };
+            if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::SourceDescriptorHeapPointer ) ) != 0 )
+            {
+                record.sourceId = anonymizeDescriptor( record.sourceId );
+                record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::SourceDescriptorHeapPointer );
+            }
+            if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer ) ) != 0 )
+            {
+                record.targetId = anonymizeDescriptor( record.targetId );
+                record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer );
+            }
+        }
+    } );
+
+    return unresolved;
+}
+
+void Worker::FinalizeJnGpuCatalogForSave()
+{
+    auto& data = m_data.jnTrace;
+    if( !data.gpuCatalogPresent ) return;
+    for( auto& generation : data.gpuCatalogGenerations )
+    {
+        const auto unresolved = ResolveJnGpuCatalogGeneration( generation.generation );
+        generation.unresolvedCount = unresolved;
+        if( !generation.ended || unresolved != 0 )
+        {
+            generation.valid = 0;
+            generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
+            data.gpuCatalogValid = false;
+        }
+    }
+
+    auto checksumRecords = []( const auto& values, uint64_t first, uint32_t count ) -> uint64_t
+    {
+        using Value = typename std::decay_t<decltype( values )>::value_type;
+        if( first > values.size() || count > values.size() - size_t( first ) ) return 0;
+        return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+    };
+    for( auto& batch : data.gpuCatalogBatches )
+    {
+        switch( JnGpuCatalogBatchKind( batch.kind ) )
+        {
+        case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords( data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Allocation: batch.storedChecksum = checksumRecords( data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::View: batch.storedChecksum = checksumRecords( data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Logical: batch.storedChecksum = checksumRecords( data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Part: batch.storedChecksum = checksumRecords( data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Relation: batch.storedChecksum = checksumRecords( data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::VirtualGeometry: batch.storedChecksum = checksumRecords( data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::RangeSet: batch.storedChecksum = checksumRecords( data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::DetailedEvidence: batch.storedChecksum = checksumRecords( data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::String:
+        {
+            if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
+                batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) )
+            {
+                batch.valid = 0;
+                data.gpuCatalogValid = false;
+                break;
+            }
+            std::vector<uint8_t> bytes;
+            for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
+            {
+                const auto& value = data.gpuCatalogStrings[i];
+                const auto offset = bytes.size();
+                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
+                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
+                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+            }
+            batch.storedChecksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            break;
+        }
+        }
+        if( batch.storedChecksum == 0 && batch.recordCount != 0 )
+        {
+            batch.valid = 0;
+            data.gpuCatalogValid = false;
+        }
     }
 }
 
@@ -10537,6 +11359,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( v.second.data, v.second.len );
     }
 
+    FinalizeJnGpuCatalogForSave();
     f.Write( &JnTraceSectionMagic, sizeof( JnTraceSectionMagic ) );
     const uint16_t schemaVersion = JnTraceSchemaVersion;
     f.Write( &schemaVersion, sizeof( schemaVersion ) );
@@ -10562,6 +11385,25 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.scriptFrames );
     WriteJnVector( f, m_data.jnTrace.scriptStacks );
     WriteJnVector( f, m_data.jnTrace.callsites );
+    const uint8_t gpuCatalogPresent = m_data.jnTrace.gpuCatalogPresent ? 1 : 0;
+    const uint8_t gpuCatalogValid = m_data.jnTrace.gpuCatalogValid ? 1 : 0;
+    f.Write( &gpuCatalogPresent, sizeof( gpuCatalogPresent ) );
+    f.Write( &gpuCatalogValid, sizeof( gpuCatalogValid ) );
+    f.Write( &m_data.jnTrace.gpuCatalogSchemaVersion, sizeof( m_data.jnTrace.gpuCatalogSchemaVersion ) );
+    f.Write( &m_data.jnTrace.gpuDetailedEvidenceSchemaVersion, sizeof( m_data.jnTrace.gpuDetailedEvidenceSchemaVersion ) );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogControls );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogBatches );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogGenerations );
+    WriteJnGpuCatalogStrings( f, m_data.jnTrace.gpuCatalogStrings );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogResources );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogAllocations );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogViews );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogLogicals );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogParts );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogRelations );
+    WriteJnVector( f, m_data.jnTrace.gpuCatalogVg );
+    WriteJnVector( f, m_data.jnTrace.gpuRangeSets );
+    WriteJnVector( f, m_data.jnTrace.gpuDetailedEvidence );
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

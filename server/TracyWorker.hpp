@@ -955,6 +955,13 @@ private:
     tracy_force_inline void ProcessJnScriptFrame( const QueueJnScriptFrame& ev );
     tracy_force_inline void ProcessJnScriptStack( const QueueJnScriptStack& ev );
     tracy_force_inline void ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev );
+    tracy_force_inline void ProcessJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev );
+    tracy_force_inline void ProcessJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev );
+    bool ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool persist, const char*& error );
+    bool ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bool persist, const char*& error );
+    uint64_t ResolveJnGpuCatalogGeneration( uint64_t generation );
+    void FinalizeJnGpuCatalogForSave();
+    void InvalidateJnGpuCatalog( uint64_t generation, uint8_t state );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
@@ -1074,6 +1081,7 @@ private:
     tracy_force_inline void AddCallstackPayload( const char* data, size_t sz );
     tracy_force_inline void AddCallstackSampleDictionary( uint32_t stackId, const char* data, size_t sz );
     void AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* data, size_t sz );
+    void AddJnGpuCatalogBatchData( uint64_t payloadId, const char* data, size_t sz );
     tracy_force_inline void AddCallstackAllocPayload( const char* data );
     uint32_t MergeCallstacks( uint32_t first, uint32_t second );
 
@@ -1219,6 +1227,23 @@ private:
     uint32_t m_pendingCallstackId = 0;
     unordered_flat_map<uint32_t, uint32_t> m_callstackSampleDictionary;
     unordered_flat_map<uint32_t, std::vector<JnGpuReferenceSetEntry>> m_jnGpuResourceSets;
+    struct JnGpuCatalogPayload
+    {
+        std::vector<uint8_t> bytes;
+    };
+    struct JnGpuCatalogRuntimeGeneration
+    {
+        size_t dataIndex = std::numeric_limits<size_t>::max();
+        uint32_t lastSequence = 0;
+        bool began = false;
+        bool ended = false;
+        bool valid = true;
+    };
+    unordered_flat_map<uint64_t, JnGpuCatalogPayload> m_jnGpuCatalogPayloads;
+    unordered_flat_map<uint64_t, JnGpuCatalogRuntimeGeneration> m_jnGpuCatalogRuntime;
+    unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogLiveResources;
+    unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogDescriptorHeaps;
+    uint64_t m_jnGpuCatalogNextDescriptorHeapId = 1;
     unordered_flat_map<uint32_t, uint32_t> m_jnCallsiteCallstacks;
     unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
     unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
