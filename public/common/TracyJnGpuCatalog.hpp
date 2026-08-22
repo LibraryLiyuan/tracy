@@ -287,6 +287,10 @@ struct JnGpuCatalogPartRecordV1
     uint32_t subresourceCount;
     uint32_t definitionRevision;
     uint32_t semanticIndex;
+    uint32_t elementCount;
+    uint32_t strideBytes;
+    uint32_t format;
+    uint32_t reserved;
     uint8_t operation;
     uint8_t partKind;
     uint8_t exactness;
