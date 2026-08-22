@@ -152,6 +152,36 @@ enum class JnGpuEvidenceState : uint8_t
     UnavailableUnsafeResourceState = 7
 };
 
+enum class JnGpuCatalogVgPageKind : uint8_t
+{
+    Streaming = 0,
+    Root = 1
+};
+
+enum class JnGpuDetailedEvidenceKind : uint8_t
+{
+    Request = 0,
+    VgPage = 1,
+    VgCluster = 2,
+    VgDescriptor = 3,
+    RtasInstance = 4,
+    Completion = 5,
+    Descriptor = 6
+};
+
+enum class JnGpuDetailedEvidenceFlags : uint32_t
+{
+    None = 0,
+    SourceResourcePointer = 1u << 0,
+    TargetResourcePointer = 1u << 1,
+    SourceDescriptorHeapPointer = 1u << 2,
+    TargetDescriptorHeapPointer = 1u << 3,
+    DescriptorRangePersistent = 1u << 4,
+    DescriptorRangeTransient = 1u << 5,
+    DescriptorRangeHitGroup = 1u << 6,
+    Incomplete = 1u << 7
+};
+
 enum class JnGpuCatalogGenerationState : uint8_t
 {
     Building = 0,
@@ -318,6 +348,7 @@ struct JnGpuCatalogVgRecordV1
     uint64_t pageDefinitionId;
     uint64_t episodeId;
     uint64_t resourceId;
+    uint64_t pointerToken;
     uint64_t offsetBytes;
     uint64_t lengthBytes;
     uint64_t frameId;
