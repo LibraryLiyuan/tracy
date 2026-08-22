@@ -215,6 +215,7 @@ struct JnGpuCatalogAllocationRecordV1
 {
     int64_t time;
     uint64_t allocationId;
+    uint64_t pointerToken;
     uint64_t heapId;
     uint64_t parentAllocationId;
     uint64_t sizeBytes;
