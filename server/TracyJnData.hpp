@@ -4,11 +4,15 @@
 #include <stdint.h>
 #include <vector>
 
+#include "../public/common/TracyJnGpuCatalog.hpp"
+
 namespace tracy
 {
 
 static constexpr uint32_t JnTraceSectionMagic = 0x314E4A54;
-static constexpr uint16_t JnTraceSchemaVersion = 8;
+static constexpr uint16_t JnTraceSchemaVersion = 12;
+static constexpr uint16_t JnGpuCatalogSchemaVersion = 1;
+static constexpr uint16_t JnGpuDetailedEvidenceSchemaVersion = 1;
 static constexpr uint64_t JnTraceMaxRecordsPerDomain = 100000000;
 
 #pragma pack( push, 1 )
@@ -238,12 +242,30 @@ struct JnCallsiteData
     uint8_t unavailableReason;
 };
 
+struct JnGpuCatalogControlData
+{
+    int64_t time;
+    uint64_t generation;
+    uint64_t value;
+    uint64_t thread;
+    uint32_t sequence;
+    uint8_t kind;
+    uint8_t state;
+    uint8_t flags;
+};
+
 #pragma pack( pop )
 
 struct JnTraceData
 {
     bool present = false;
     uint16_t schemaVersion = 0;
+    // Sections <=8 predate N27 and therefore retain gpuCatalogPresent=false.
+    // Sections 9-11 are rejected by the loader instead of being reinterpreted.
+    bool gpuCatalogPresent = false;
+    bool gpuCatalogValid = false;
+    uint16_t gpuCatalogSchemaVersion = 0;
+    uint16_t gpuDetailedEvidenceSchemaVersion = 0;
     std::vector<JnJobTypeData> jobTypes;
     std::vector<JnJobScheduleData> jobSchedules;
     std::vector<JnJobConfigData> jobConfigs;
@@ -264,6 +286,16 @@ struct JnTraceData
     std::vector<JnScriptFrameData> scriptFrames;
     std::vector<JnScriptStackData> scriptStacks;
     std::vector<JnCallsiteData> callsites;
+    std::vector<JnGpuCatalogControlData> gpuCatalogControls;
+    std::vector<JnGpuCatalogResourceRecordV1> gpuCatalogResources;
+    std::vector<JnGpuCatalogAllocationRecordV1> gpuCatalogAllocations;
+    std::vector<JnGpuCatalogViewRecordV1> gpuCatalogViews;
+    std::vector<JnGpuCatalogLogicalRecordV1> gpuCatalogLogicals;
+    std::vector<JnGpuCatalogPartRecordV1> gpuCatalogParts;
+    std::vector<JnGpuCatalogRelationRecordV1> gpuCatalogRelations;
+    std::vector<JnGpuCatalogVgRecordV1> gpuCatalogVg;
+    std::vector<JnGpuRangeSetRecordV1> gpuRangeSets;
+    std::vector<JnGpuDetailedEvidenceRecordV1> gpuDetailedEvidence;
 };
 
 }

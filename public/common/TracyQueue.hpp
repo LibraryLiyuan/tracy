@@ -73,6 +73,7 @@ enum class QueueType : uint8_t
     FiberLeave,
     JnGpuReferenceSetDefinitionChunk,
     JnGpuReferenceSetUseFat,
+    JnGpuCatalogBatchFat,
     JnZoneBeginCallsite,
     Terminate,
     KeepAlive,
@@ -141,6 +142,8 @@ enum class QueueType : uint8_t
     JnCallsiteDefinition,
     JnGpuZoneBeginCallsite,
     JnMemAllocCallsiteNamed,
+    JnGpuCatalogControl,
+    JnGpuCatalogBatch,
     StringData,
     ThreadName,
     PlotName,
@@ -148,6 +151,7 @@ enum class QueueType : uint8_t
     CallstackPayload,
     CallstackSampleDictionary,
     JnGpuReferenceSetDefinition,
+    JnGpuCatalogBatchData,
     CallstackAllocPayload,
     FrameName,
     FrameImageData,
@@ -950,6 +954,83 @@ struct QueueJnGpuReferenceEnd
     uint8_t flags;
 };
 
+// N27 GPU Resource Catalog schema 1. Queue control records stay below the
+// 31-byte payload limit; binary record arrays travel in a paired long-string
+// payload identified by payloadId. The local fat form replaces payloadId with
+// an owned packet pointer and is canonicalized by the Tracy client worker.
+enum class JnGpuCatalogControlKind : uint8_t
+{
+    GenerationBegin = 0,
+    QualityCheckpoint = 1,
+    GenerationEnd = 2
+};
+
+enum class JnGpuCatalogBatchKind : uint8_t
+{
+    Resource = 0,
+    Allocation = 1,
+    View = 2,
+    Logical = 3,
+    Part = 4,
+    Relation = 5,
+    VirtualGeometry = 6,
+    RangeSet = 7,
+    DetailedEvidence = 8,
+    String = 9
+};
+
+enum class JnGpuCatalogBatchEncoding : uint8_t
+{
+    FixedV1 = 0,
+    DeltaV1 = 1,
+    RangeSetV1 = 2,
+    DetailedEvidenceV1 = 3
+};
+
+enum class JnGpuCatalogControlFlags : uint8_t
+{
+    None = 0,
+    CoreInvalid = 1 << 0,
+    EnrichmentIncomplete = 1 << 1,
+    Bootstrap = 1 << 2,
+    OpenBoundary = 1 << 3
+};
+
+struct QueueJnGpuCatalogControl
+{
+    int64_t time;
+    uint64_t generation;
+    uint64_t value;
+    uint32_t sequence;
+    uint8_t kind;
+    uint8_t state;
+    uint8_t flags;
+};
+
+struct QueueJnGpuCatalogBatch
+{
+    uint64_t generation;
+    uint64_t payloadId;
+    uint32_t sequence;
+    uint32_t recordCount;
+    uint32_t payloadBytes;
+    uint8_t kind;
+    uint8_t encoding;
+    uint8_t flags;
+};
+
+struct QueueJnGpuCatalogBatchFat
+{
+    uint64_t generation;
+    uint64_t ptr;
+    uint32_t sequence;
+    uint32_t recordCount;
+    uint32_t payloadBytes;
+    uint8_t kind;
+    uint8_t encoding;
+    uint8_t flags;
+};
+
 // Script schema 2 keeps strings on the cold definition path and represents
 // high-frequency stack/zone relations with fixed-size ids.  Both payloads
 // remain within Tracy's 31-byte queue payload limit.
@@ -1399,6 +1480,9 @@ struct QueueItem
         QueueJnGpuReferenceSetDefinitionChunk jnGpuReferenceSetDefinitionChunk;
         QueueJnGpuReferenceSetUseFat jnGpuReferenceSetUseFat;
         QueueJnGpuReferenceEnd jnGpuReferenceEnd;
+        QueueJnGpuCatalogControl jnGpuCatalogControl;
+        QueueJnGpuCatalogBatch jnGpuCatalogBatch;
+        QueueJnGpuCatalogBatchFat jnGpuCatalogBatchFat;
         QueueJnScriptFrame jnScriptFrame;
         QueueJnScriptStack jnScriptStack;
         QueueJnCallsiteDefinition jnCallsiteDefinition;
@@ -1476,6 +1560,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueFiberLeave ),
     sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local dictionary chunk - not for wire transfer
     sizeof( QueueHeader ),                                  // JN GPU ResourceSetV2 local packet - not for wire transfer
+    sizeof( QueueHeader ),                                  // JN GPU Catalog local binary batch - not for wire transfer
     sizeof( QueueHeader ) + sizeof( QueueJnZoneBeginCallsite ), // JN SiteReuse CPU zone
     // above items must be first
     sizeof( QueueHeader ),                                  // terminate
@@ -1545,6 +1630,8 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueJnCallsiteDefinition ),
     sizeof( QueueHeader ) + sizeof( QueueJnGpuZoneBeginCallsite ),
     sizeof( QueueHeader ) + sizeof( QueueJnMemAllocCallsite ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuCatalogControl ),
+    sizeof( QueueHeader ) + sizeof( QueueJnGpuCatalogBatch ),
     // keep all QueueStringTransfer below
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // string data
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // thread name
@@ -1553,6 +1640,7 @@ static constexpr size_t QueueDataSize[] = {
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // callstack payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // sample callstack dictionary payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // GPU ResourceSetV2 dictionary payload
+    sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // GPU Catalog binary batch payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // callstack alloc payload
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // frame name
     sizeof( QueueHeader ) + sizeof( QueueStringTransfer ),  // frame image data
@@ -1591,6 +1679,13 @@ static_assert( uint8_t( QueueType::JnGpuReferenceSetUseFat ) < uint8_t( QueueTyp
 static_assert( uint8_t( QueueType::JnGpuReferenceSetUse ) > uint8_t( QueueType::Terminate ),
     "JN GPU resource-set wire event must remain serializable" );
 static_assert( sizeof( QueueJnGpuReferenceEnd ) == 31, "JN GPU reference end payload size mismatch" );
+static_assert( sizeof( QueueJnGpuCatalogControl ) == 31, "JN GPU Catalog control payload size mismatch" );
+static_assert( sizeof( QueueJnGpuCatalogBatch ) == 31, "JN GPU Catalog batch payload size mismatch" );
+static_assert( sizeof( QueueJnGpuCatalogBatchFat ) == 31, "JN GPU Catalog local batch payload size mismatch" );
+static_assert( uint8_t( QueueType::JnGpuCatalogBatchFat ) < uint8_t( QueueType::Terminate ),
+    "JN GPU Catalog fat batch must remain local-only" );
+static_assert( uint8_t( QueueType::JnGpuCatalogBatch ) > uint8_t( QueueType::Terminate ),
+    "JN GPU Catalog wire batch must remain serializable" );
 static_assert( sizeof( QueueJnScriptFrame ) == 26, "JN script frame payload size mismatch" );
 static_assert( sizeof( QueueJnScriptStack ) == 31, "JN script stack payload size mismatch" );
 static_assert( sizeof( QueueJnZoneBeginCallsite ) == 20, "JN CPU callsite-zone payload size mismatch" );

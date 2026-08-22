@@ -1836,6 +1836,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         uint8_t present;
         f.Read3( magic, schemaVersion, present );
         if( magic != JnTraceSectionMagic ) throw LoadFailure( "JN trace section magic mismatch." );
+        if( schemaVersion >= 9 && schemaVersion <= 11 )
+            throw LoadFailure( "Archived ResourceGraph JN trace schema 9-11 requires its matching archived toolchain." );
         if( schemaVersion < 1 || schemaVersion > JnTraceSchemaVersion ) throw LoadFailure( "Unsupported JN trace schema version." );
 
         auto& jn = m_data.jnTrace;
