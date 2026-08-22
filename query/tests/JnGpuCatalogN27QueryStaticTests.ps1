@@ -10,6 +10,8 @@ $mcp = Get-Content -Raw (Join-Path $root 'query\src\TracyMcpServer.cpp')
 $traceSource = Get-Content -Raw (Join-Path $root 'analysis\TracyTraceSource.hpp')
 $workerSource = Get-Content -Raw (Join-Path $root 'analysis\TracyWorkerTraceSource.cpp')
 $queryIndex = Get-Content -Raw (Join-Path $root 'query\src\TracyQueryIndex.cpp')
+$segmentReplay = Get-Content -Raw (Join-Path $root 'query\src\TracySegmentTraceSource.cpp')
+$converterReplay = Get-Content -Raw (Join-Path $root 'capture\src\stream-convert.cpp')
 
 $methods = @(
     'gpu.catalog.status', 'gpu.catalog.validation', 'gpu.resource.search',
@@ -31,6 +33,12 @@ Require ($service.Contains('not_sampled')) 'Periodic evidence does not distingui
 Require ($service.Contains('unavailable_n27_gpu_layer_only')) 'N27 high-level ownership boundary is not explicit.'
 Require ($service.Contains('ResourceSetV2')) 'ResourceSetV2 is not joined with Catalog range evidence.'
 Require ($mcp.Contains('gpu_resource')) 'MCP search route for GPU resources is missing.'
+foreach ($replaySource in @($segmentReplay, $converterReplay)) {
+    Require ($replaySource.Contains('waitForWorkerProgress')) 'Large replay tail is not progress-aware.'
+    Require ($replaySource.Contains('made no protocol progress for 120 seconds while processing the pre-drain')) 'Large pre-drain replay does not report a bounded no-progress timeout.'
+    Require (-not $replaySource.Contains('const auto prefixDeadline')) 'Large pre-drain replay still uses a fixed wall-clock deadline.'
+    Require (-not $replaySource.Contains('const auto drainDeadline')) 'Protocol drain activation still uses a fixed wall-clock deadline.'
+}
 
 $coverage = Get-Content -Raw (Join-Path $root 'query\schema\coverage-v1.json') | ConvertFrom-Json
 $fields = Get-Content -Raw (Join-Path $root 'query\schema\coverage-fields-v1.json') | ConvertFrom-Json
