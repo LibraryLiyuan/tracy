@@ -199,6 +199,8 @@ try {
         warmup_frames = 0
         window_frames = [Math]::Max(1, $frameCount - 1)
         allow_warnings = $true
+        max_scan_events = 100000000
+        max_cpu_ms = 60000
         limit = 100
     }
     $normalizedPerformed = [bool]$normalized.available -and [bool]$normalized.data.performed

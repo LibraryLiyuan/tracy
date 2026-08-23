@@ -37,6 +37,8 @@
 namespace
 {
 
+constexpr auto ReplayProgressTimeout = std::chrono::seconds( 120 );
+
 struct Options
 {
     enum class Mode
@@ -1198,7 +1200,8 @@ const char* QueueTypeName( tracy::QueueType type )
     case tracy::QueueType::JnGpuReferencePass: return "JnGpuReferencePass";
     case tracy::QueueType::JnGpuReferenceSetUse: return "JnGpuReferenceSetUse";
     case tracy::QueueType::JnGpuReferenceEnd: return "JnGpuReferenceEnd";
-    case tracy::QueueType::JnResourceMetadata: return "JnResourceMetadata";
+    case tracy::QueueType::JnGpuCatalogControl: return "JnGpuCatalogControl";
+    case tracy::QueueType::JnGpuCatalogBatch: return "JnGpuCatalogBatch";
     case tracy::QueueType::SingleStringData: return "SingleStringData";
     case tracy::QueueType::SecondStringData: return "SecondStringData";
     case tracy::QueueType::MemNamePayload: return "MemNamePayload";
@@ -1582,6 +1585,34 @@ int main( int argc, char** argv )
 
     auto& worker = *workerStorage;
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
+
+    const auto waitForWorkerProgress = [&]( auto&& complete ) {
+        auto lastEventProgress = worker.GetProtocolEventCount();
+        auto lastFrameProgress = worker.GetProtocolFramesProcessed();
+        auto progressDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+        while( !complete() && !replayError.Failed() )
+        {
+            if( CancelRequested() )
+            {
+                replayError.Set( "conversion cancelled" );
+                break;
+            }
+            const auto eventProgress = worker.GetProtocolEventCount();
+            const auto frameProgress = worker.GetProtocolFramesProcessed();
+            if( eventProgress != lastEventProgress || frameProgress != lastFrameProgress )
+            {
+                lastEventProgress = eventProgress;
+                lastFrameProgress = frameProgress;
+                progressDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
+            }
+            else if( std::chrono::steady_clock::now() >= progressDeadline )
+            {
+                return false;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+        }
+        return complete() && !replayError.Failed();
+    };
 
     std::thread verifier;
     if( options.mode == Options::Mode::Legacy ) verifier = std::thread( [&] {
