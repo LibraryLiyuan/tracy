@@ -191,6 +191,8 @@ tracy_force_inline void EmitJnGfxLink( uint64_t sourceId, uint64_t targetId, uin
     case JnGfxRelation::ClassifiesAsTaxonomy: sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::GpuTaxonomy; break;
     case JnGfxRelation::GpuSegmentReferencesResources:
         sourceKind = JnEntityKind::GpuSegment; targetKind = JnEntityKind::GpuPass; break;
+    case JnGfxRelation::RangeEvidenceComplete:
+        sourceKind = JnEntityKind::GpuPass; targetKind = JnEntityKind::CommandList; break;
     default: break;
     }
     EmitJnRelation( sourceId, targetId, uint8_t( sourceKind ), uint8_t( targetKind ),

@@ -7222,6 +7222,26 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
     unordered_flat_map<uint64_t, int64_t> passTimes;
     for( const auto& pass : data.gpuReferencePasses )
         if( pass.passId != 0 ) passTimes[pass.passId] = pass.time;
+    // N27 RangeSet records are keyed by the authoritative explicit GPU pass
+    // entity whenever a direct pass exists. GPU-reference passes are optional
+    // (for example, GPU Reference may be disabled while Catalog ranges remain
+    // enabled), so their timeline cannot be the only lifetime-resolution clock.
+    // The Gfx entity is emitted at pass recording time and carries the same
+    // process-scoped passInstanceId stored in JnGpuRangeSetRecordV1.
+    for( const auto& entity : data.gfxEntities )
+    {
+        if( entity.entityId != 0 && entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+            passTimes[entity.entityId] = entity.time;
+    }
+    // A resource may be created while a pass is being recorded. In that case
+    // the pass-begin time falls between two pointer lifetimes. N27 emits one
+    // completion link per explicit pass after RangeSet collection; prefer that
+    // timestamp without adding a timestamp to every individual range record.
+    for( const auto& link : data.gfxLinks )
+    {
+        if( link.sourceId != 0 && link.relation == uint8_t( JnGfxRelation::RangeEvidenceComplete ) )
+            passTimes[link.sourceId] = link.time;
+    }
 
     uint64_t unresolved = 0;
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )

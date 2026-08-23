@@ -12,6 +12,7 @@ $workerSource = Get-Content -Raw (Join-Path $root 'analysis\TracyWorkerTraceSour
 $queryIndex = Get-Content -Raw (Join-Path $root 'query\src\TracyQueryIndex.cpp')
 $segmentReplay = Get-Content -Raw (Join-Path $root 'query\src\TracySegmentTraceSource.cpp')
 $converterReplay = Get-Content -Raw (Join-Path $root 'capture\src\stream-convert.cpp')
+$tracyWorker = Get-Content -Raw (Join-Path $root 'server\TracyWorker.cpp')
 
 $methods = @(
     'gpu.catalog.status', 'gpu.catalog.validation', 'gpu.resource.search',
@@ -32,6 +33,16 @@ Require ($service.Contains('unavailable_catalog_invalid')) 'Catalog Core invalid
 Require ($service.Contains('not_sampled')) 'Periodic evidence does not distinguish not-sampled from empty.'
 Require ($service.Contains('unavailable_n27_gpu_layer_only')) 'N27 high-level ownership boundary is not explicit.'
 Require ($service.Contains('ResourceSetV2')) 'ResourceSetV2 is not joined with Catalog range evidence.'
+Require ($service.Contains('source->GetTraceInfo().counts.gpuReferencePasses')) `
+    'Catalog validation does not preserve GPU-reference pass counts for indexed traces.'
+Require ($service.Contains('referencePassIds.emplace( value.targetId )')) `
+    'Catalog validation does not recover typed ReferencesResources targets in indexed traces.'
+Require ($service -match 'gpu\.pass\.vg_evidence[\s\S]{0,4096}"page"[\s\S]{0,512}"has_more"') `
+    'Detailed GPU evidence query is not paginated.'
+Require ($tracyWorker.Contains('entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass )')) `
+    'RangeSet lifetime resolution does not use the authoritative explicit GPU pass time.'
+Require ($tracyWorker.Contains('link.relation == uint8_t( JnGfxRelation::RangeEvidenceComplete )')) `
+    'RangeSet lifetime resolution does not prefer the authoritative pass-completion time.'
 Require ($mcp.Contains('gpu_resource')) 'MCP search route for GPU resources is missing.'
 foreach ($replaySource in @($segmentReplay, $converterReplay)) {
     Require ($replaySource.Contains('waitForWorkerProgress')) 'Large replay tail is not progress-aware.'

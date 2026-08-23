@@ -566,7 +566,11 @@ enum class JnGfxRelation : uint8_t
     BelongsToView,
     ReferencesResources,
     ClassifiesAsTaxonomy,
-    GpuSegmentReferencesResources
+    GpuSegmentReferencesResources,
+    // Emitted once when an explicit GPU pass has finished recording its
+    // RangeSet. The source is the pass and the target is its command list;
+    // the event timestamp is the authoritative CPU lifetime-resolution point.
+    RangeEvidenceComplete
 };
 
 enum class JnFrameDomain : uint8_t

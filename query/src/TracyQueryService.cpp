@@ -1048,7 +1048,7 @@ const char* GfxRelationName( uint8_t relation )
 {
     static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits", "runs_on_gpu", "depends_on",
         "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera", "belongs_to_view", "references_resources", "classifies_as_taxonomy",
-        "gpu_segment_references_resources" };
+        "gpu_segment_references_resources", "range_evidence_complete" };
     return relation < std::size( names ) ? names[relation] : "unknown";
 }
 
@@ -5138,9 +5138,41 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t canonicalChecksumsVerified = 0;
             uint64_t canonicalizationChanges = 0;
             uint64_t sequenceGaps = 0;
+            uint64_t sequenceDuplicates = 0;
+            json sequenceGapDetails = json::array();
+            uint64_t unresolvedViews = 0;
+            uint64_t unresolvedLogicals = 0;
+            uint64_t unresolvedVg = 0;
+            uint64_t unresolvedRanges = 0;
+            uint64_t unresolvedRelationSources = 0;
+            uint64_t unresolvedRelationTargets = 0;
+            uint64_t unresolvedEvidenceSources = 0;
+            uint64_t unresolvedEvidenceTargets = 0;
+            uint64_t unresolvedRangesOnReferencePass = 0;
+            uint64_t unresolvedRangesOnExplicitPassLink = 0;
+            uint64_t unresolvedRangesOnExplicitGpuPass = 0;
+            uint64_t unresolvedRangesOnGfxEntity = 0;
+            uint64_t unresolvedRangesOnUnknownPass = 0;
+            uint64_t unresolvedRangeUniquePointers = 0;
+            uint64_t unresolvedRangeUniquePasses = 0;
+            uint64_t referencesResourceLinkCount = 0;
+            uint64_t gpuReferencePassCount = 0;
+            uint64_t gfxEntityCount = 0;
+            uint64_t gfxLinkCount = 0;
+            uint64_t rangesResolvableWithExplicitPassTime = 0;
+            uint64_t rangesMissingPointerLifetime = 0;
+            uint64_t rangesOutsidePointerLifetime = 0;
+            uint64_t rangesBeforeFirstPointerLifetime = 0;
+            uint64_t rangesAfterLastPointerLifetime = 0;
+            uint64_t rangesBetweenPointerLifetimes = 0;
+            uint64_t rangesAmbiguousPointerLifetime = 0;
+            uint64_t logicalMissingPointerLifetime = 0;
+            uint64_t logicalOutsidePointerLifetime = 0;
+            uint64_t logicalAmbiguousPointerLifetime = 0;
+            json unresolvedLogicalSamples = json::array();
+            json unresolvedRangeSamples = json::array();
             if( catalog )
             {
-                std::unordered_map<uint64_t, uint32_t> nextSequence;
                 for( const auto& batch : catalog->gpuCatalogBatches )
                 {
                     invalidBatches += batch.valid == 0;
@@ -5151,11 +5183,280 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     checksumFailures += !transportVerified || !canonicalVerified;
                     canonicalizationChanges += transportVerified && canonicalVerified &&
                         batch.transportChecksum != batch.storedChecksum;
-                    auto& expected = nextSequence[batch.generation];
-                    if( expected != 0 && batch.sequence != expected ) sequenceGaps++;
-                    expected = batch.sequence + 1;
+                }
+
+                struct SequencedCatalogRecord
+                {
+                    uint64_t generation;
+                    uint32_t sequence;
+                    const char* type;
+                    uint8_t kind;
+                };
+                std::vector<SequencedCatalogRecord> sequenceRecords;
+                sequenceRecords.reserve( catalog->gpuCatalogControls.size() + catalog->gpuCatalogBatches.size() );
+                for( const auto& control : catalog->gpuCatalogControls )
+                    sequenceRecords.push_back( { control.generation, control.sequence, "control", control.kind } );
+                for( const auto& batch : catalog->gpuCatalogBatches )
+                    sequenceRecords.push_back( { batch.generation, batch.sequence, "batch", batch.kind } );
+                std::sort( sequenceRecords.begin(), sequenceRecords.end(), []( const auto& lhs, const auto& rhs ) {
+                    if( lhs.generation != rhs.generation ) return lhs.generation < rhs.generation;
+                    if( lhs.sequence != rhs.sequence ) return lhs.sequence < rhs.sequence;
+                    return strcmp( lhs.type, rhs.type ) < 0;
+                } );
+                uint64_t activeGeneration = 0;
+                uint32_t expectedSequence = 1;
+                for( const auto& record : sequenceRecords )
+                {
+                    if( record.generation != activeGeneration )
+                    {
+                        activeGeneration = record.generation;
+                        expectedSequence = 1;
+                    }
+                    if( record.sequence > expectedSequence )
+                    {
+                        const auto missing = uint64_t( record.sequence - expectedSequence );
+                        sequenceGaps += missing;
+                        if( sequenceGapDetails.size() < 16 ) sequenceGapDetails.push_back( {
+                            { "generation", Decimal( record.generation ) }, { "expected_sequence", expectedSequence },
+                            { "observed_sequence", record.sequence }, { "missing_count", Decimal( missing ) },
+                            { "observed_type", record.type }, { "observed_kind", record.kind }
+                        } );
+                    }
+                    else if( record.sequence < expectedSequence )
+                    {
+                        sequenceDuplicates++;
+                        if( sequenceGapDetails.size() < 16 ) sequenceGapDetails.push_back( {
+                            { "generation", Decimal( record.generation ) }, { "expected_sequence", expectedSequence },
+                            { "observed_sequence", record.sequence }, { "missing_count", "0" },
+                            { "observed_type", record.type }, { "observed_kind", record.kind }, { "duplicate", true }
+                        } );
+                    }
+                    expectedSequence = std::max<uint32_t>( expectedSequence, record.sequence + 1 );
+                }
+
+                for( const auto& value : catalog->gpuCatalogViews )
+                    unresolvedViews += value.pointerToken != 0 && value.resourceId == 0;
+                for( const auto& value : catalog->gpuCatalogLogicals )
+                    unresolvedLogicals += value.pointerToken != 0 && value.resourceId == 0;
+                for( const auto& value : catalog->gpuCatalogVg )
+                    unresolvedVg += value.pointerToken != 0 && value.resourceId == 0;
+                std::unordered_set<uint64_t> referencePassIds;
+                const auto gpuMemoryAttribution = source->GetGpuMemoryAttribution();
+                referencePassIds.reserve( gpuMemoryAttribution.passes.size() );
+                for( const auto& value : gpuMemoryAttribution.passes )
+                    if( value.passId != 0 ) referencePassIds.emplace( value.passId );
+                // The indexed source intentionally avoids materializing the
+                // complete pass graph in GetGpuMemoryAttribution(). Use the
+                // trace-domain count as the authoritative count and retain
+                // materialized IDs only for diagnostics that need identity.
+                gpuReferencePassCount = std::max<uint64_t>( referencePassIds.size(),
+                    source->GetTraceInfo().counts.gpuReferencePasses );
+                const auto gfxLinks = source->GetGfxLinks();
+                gfxLinkCount = gfxLinks.size();
+                std::unordered_set<uint64_t> explicitPassesWithReferenceLink;
+                explicitPassesWithReferenceLink.reserve( gfxLinks.size() );
+                for( const auto& value : gfxLinks )
+                    if( value.relation == uint8_t( JnGfxRelation::ReferencesResources ) &&
+                        value.sourceId != 0 && value.targetId != 0 )
+                    {
+                        explicitPassesWithReferenceLink.emplace( value.sourceId );
+                        // The typed relation itself proves that targetId is a
+                        // GPU-reference pass even when an indexed source has
+                        // deliberately omitted the deep attribution vector.
+                        referencePassIds.emplace( value.targetId );
+                        referencesResourceLinkCount++;
+                    }
+                const auto gfxEntities = source->GetGfxEntities();
+                std::unordered_set<uint64_t> gfxEntityIds;
+                std::unordered_set<uint64_t> explicitGpuPassIds;
+                std::unordered_map<uint64_t, int64_t> explicitGpuPassTimes;
+                gfxEntityIds.reserve( gfxEntities.size() );
+                for( const auto& value : gfxEntities )
+                    if( value.entityId != 0 )
+                    {
+                        gfxEntityIds.emplace( value.entityId );
+                        if( value.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+                        {
+                            explicitGpuPassIds.emplace( value.entityId );
+                            explicitGpuPassTimes.emplace( value.entityId, value.timeNs );
+                        }
+                    }
+                gfxEntityCount = gfxEntityIds.size();
+
+                struct DiagnosticResourceInterval
+                {
+                    uint64_t resourceId;
+                    int64_t begin;
+                    int64_t end;
+                };
+                std::unordered_map<uint64_t, std::vector<DiagnosticResourceInterval>> resourceIntervals;
+                std::unordered_map<uint64_t, size_t> openResourceIntervals;
+                resourceIntervals.reserve( catalog->gpuCatalogResources.size() );
+                for( const auto& value : catalog->gpuCatalogResources )
+                {
+                    if( value.pointerToken == 0 || value.resourceId == 0 ) continue;
+                    const auto operation = JnGpuCatalogRecordOperation( value.operation );
+                    if( operation == JnGpuCatalogRecordOperation::Create ||
+                        operation == JnGpuCatalogRecordOperation::Open ||
+                        operation == JnGpuCatalogRecordOperation::Snapshot )
+                    {
+                        auto& intervals = resourceIntervals[value.pointerToken];
+                        intervals.push_back( { value.resourceId,
+                            operation == JnGpuCatalogRecordOperation::Create ? value.time : std::numeric_limits<int64_t>::min(),
+                            std::numeric_limits<int64_t>::max() } );
+                        openResourceIntervals[value.pointerToken] = intervals.size() - 1;
+                    }
+                    else if( operation == JnGpuCatalogRecordOperation::Destroy )
+                    {
+                        const auto open = openResourceIntervals.find( value.pointerToken );
+                        if( open != openResourceIntervals.end() )
+                        {
+                            auto& interval = resourceIntervals[value.pointerToken][open->second];
+                            if( interval.resourceId == value.resourceId ) interval.end = value.time;
+                            openResourceIntervals.erase( open );
+                        }
+                    }
+                }
+                enum class DiagnosticResolution : uint8_t { Missing, Unique, Outside, Ambiguous };
+                const auto diagnoseResolution = [&]( uint64_t pointerToken, int64_t time )
+                {
+                    const auto found = resourceIntervals.find( pointerToken );
+                    if( found == resourceIntervals.end() ) return DiagnosticResolution::Missing;
+                    uint64_t resourceId = 0;
+                    bool matched = false;
+                    for( const auto& interval : found->second )
+                    {
+                        if( time < interval.begin || time > interval.end ) continue;
+                        matched = true;
+                        if( resourceId != 0 && resourceId != interval.resourceId ) return DiagnosticResolution::Ambiguous;
+                        resourceId = interval.resourceId;
+                    }
+                    return matched && resourceId != 0 ? DiagnosticResolution::Unique : DiagnosticResolution::Outside;
+                };
+                const auto diagnoseOutsidePosition = [&]( uint64_t pointerToken, int64_t time )
+                {
+                    const auto found = resourceIntervals.find( pointerToken );
+                    if( found == resourceIntervals.end() ) return uint8_t( 0 );
+                    bool before = false;
+                    bool after = false;
+                    for( const auto& interval : found->second )
+                    {
+                        before = before || time < interval.begin;
+                        after = after || time > interval.end;
+                    }
+                    if( before && after ) return uint8_t( 3 );
+                    if( before ) return uint8_t( 1 );
+                    if( after ) return uint8_t( 2 );
+                    return uint8_t( 0 );
+                };
+
+                std::unordered_map<uint32_t, std::string> catalogStrings;
+                catalogStrings.reserve( catalog->gpuCatalogStrings.size() );
+                for( const auto& value : catalog->gpuCatalogStrings )
+                    catalogStrings.emplace( value.header.stringId, value.value );
+                std::unordered_map<uint64_t, const JnGpuCatalogLogicalRecordV1*> logicalDefinitions;
+                logicalDefinitions.reserve( catalog->gpuCatalogLogicals.size() );
+                for( const auto& value : catalog->gpuCatalogLogicals )
+                    if( value.logicalResourceId != 0 && value.nameId != 0 ) logicalDefinitions[value.logicalResourceId] = &value;
+                for( const auto& value : catalog->gpuCatalogLogicals )
+                {
+                    if( value.pointerToken == 0 || value.resourceId != 0 ) continue;
+                    const auto reason = diagnoseResolution( value.pointerToken, value.time );
+                    switch( reason )
+                    {
+                    case DiagnosticResolution::Missing: logicalMissingPointerLifetime++; break;
+                    case DiagnosticResolution::Outside: logicalOutsidePointerLifetime++; break;
+                    case DiagnosticResolution::Ambiguous: logicalAmbiguousPointerLifetime++; break;
+                    case DiagnosticResolution::Unique: break;
+                    }
+                    if( unresolvedLogicalSamples.size() < 16 )
+                    {
+                        std::string name;
+                        uint64_t stableKey = 0;
+                        uint16_t primaryKind = 0;
+                        const auto definition = logicalDefinitions.find( value.logicalResourceId );
+                        if( definition != logicalDefinitions.end() )
+                        {
+                            stableKey = definition->second->stableKey;
+                            primaryKind = definition->second->primaryKind;
+                            const auto text = catalogStrings.find( definition->second->nameId );
+                            if( text != catalogStrings.end() ) name = text->second;
+                        }
+                        const char* reasonName = reason == DiagnosticResolution::Missing ? "missing_pointer_lifetime" :
+                            reason == DiagnosticResolution::Outside ? "outside_pointer_lifetime" :
+                            reason == DiagnosticResolution::Ambiguous ? "ambiguous_pointer_lifetime" : "resolvable";
+                        unresolvedLogicalSamples.push_back( {
+                            { "logical_resource_id", Decimal( value.logicalResourceId ) },
+                            { "stable_key", Decimal( stableKey ) }, { "frame_id", Decimal( value.frameId ) },
+                            { "primary_kind", primaryKind }, { "operation", value.operation },
+                            { "name", name.empty() ? json( nullptr ) : json( name ) }, { "reason", reasonName }
+                        } );
+                    }
+                }
+                std::unordered_set<uint64_t> unresolvedRangePointers;
+                std::unordered_set<uint64_t> unresolvedRangePasses;
+                for( const auto& value : catalog->gpuRangeSets )
+                {
+                    if( value.pointerToken == 0 || value.resourceId != 0 ) continue;
+                    unresolvedRanges++;
+                    unresolvedRangePointers.emplace( value.pointerToken );
+                    unresolvedRangePasses.emplace( value.passInstanceId );
+                    if( referencePassIds.contains( value.passInstanceId ) ) unresolvedRangesOnReferencePass++;
+                    else if( explicitPassesWithReferenceLink.contains( value.passInstanceId ) ) unresolvedRangesOnExplicitPassLink++;
+                    else if( explicitGpuPassIds.contains( value.passInstanceId ) ) unresolvedRangesOnExplicitGpuPass++;
+                    else if( gfxEntityIds.contains( value.passInstanceId ) ) unresolvedRangesOnGfxEntity++;
+                    else unresolvedRangesOnUnknownPass++;
+                    const auto passTime = explicitGpuPassTimes.find( value.passInstanceId );
+                    if( passTime != explicitGpuPassTimes.end() )
+                    {
+                        switch( diagnoseResolution( value.pointerToken, passTime->second ) )
+                        {
+                        case DiagnosticResolution::Missing: rangesMissingPointerLifetime++; break;
+                        case DiagnosticResolution::Unique: rangesResolvableWithExplicitPassTime++; break;
+                        case DiagnosticResolution::Outside:
+                            rangesOutsidePointerLifetime++;
+                            switch( diagnoseOutsidePosition( value.pointerToken, passTime->second ) )
+                            {
+                            case 1: rangesBeforeFirstPointerLifetime++; break;
+                            case 2: rangesAfterLastPointerLifetime++; break;
+                            case 3: rangesBetweenPointerLifetimes++; break;
+                            default: break;
+                            }
+                            break;
+                        case DiagnosticResolution::Ambiguous: rangesAmbiguousPointerLifetime++; break;
+                        }
+                    }
+                    if( unresolvedRangeSamples.size() < 16 )
+                    {
+                        const auto reason = passTime == explicitGpuPassTimes.end() ? "missing_pass_time" :
+                            diagnoseResolution( value.pointerToken, passTime->second ) == DiagnosticResolution::Missing ? "missing_pointer_lifetime" :
+                            diagnoseResolution( value.pointerToken, passTime->second ) == DiagnosticResolution::Outside ? "outside_pointer_lifetime" :
+                            diagnoseResolution( value.pointerToken, passTime->second ) == DiagnosticResolution::Ambiguous ? "ambiguous_pointer_lifetime" : "resolvable";
+                        unresolvedRangeSamples.push_back( {
+                            { "pass_id", Decimal( value.passInstanceId ) },
+                            { "view_id", value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( value.viewDefinitionId ) ) },
+                            { "range_kind", value.rangeKind }, { "offset_bytes", Decimal( value.offsetBytes ) },
+                            { "length_bytes", Decimal( value.lengthBytes ) }, { "first_subresource", value.firstSubresource },
+                            { "subresource_count", value.subresourceCount }, { "usage_mask", value.usageMask },
+                            { "reason", reason }
+                        } );
+                    }
+                }
+                unresolvedRangeUniquePointers = unresolvedRangePointers.size();
+                unresolvedRangeUniquePasses = unresolvedRangePasses.size();
+                for( const auto& value : catalog->gpuCatalogRelations )
+                {
+                    unresolvedRelationSources += ( value.flags & 1 ) != 0;
+                    unresolvedRelationTargets += ( value.flags & 2 ) != 0;
+                }
+                for( const auto& value : catalog->gpuDetailedEvidence )
+                {
+                    unresolvedEvidenceSources += ( value.flags & uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer ) ) != 0;
+                    unresolvedEvidenceTargets += ( value.flags & uint32_t( JnGpuDetailedEvidenceFlags::TargetResourcePointer ) ) != 0;
                 }
             }
+            const auto unresolvedBreakdownTotal = unresolvedViews + unresolvedLogicals + unresolvedVg + unresolvedRanges +
+                unresolvedRelationSources + unresolvedRelationTargets + unresolvedEvidenceSources + unresolvedEvidenceTargets;
             result["transport"] = {
                 { "batch_count", Decimal( catalog ? catalog->gpuCatalogBatches.size() : 0 ) },
                 { "invalid_batches", Decimal( invalidBatches ) }, { "checksum_failures", Decimal( checksumFailures ) },
@@ -5163,9 +5464,44 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "transport_checksums_verified", Decimal( transportChecksumsVerified ) },
                 { "canonical_checksums_verified", Decimal( canonicalChecksumsVerified ) },
                 { "canonicalization_changes", Decimal( canonicalizationChanges ) },
-                { "sequence_gaps", Decimal( sequenceGaps ) }, { "completed_lifecycle_unresolved", result["unresolved_count"] }
+                { "sequence_gaps", Decimal( sequenceGaps ) }, { "sequence_duplicates", Decimal( sequenceDuplicates ) },
+                { "sequence_gap_details", std::move( sequenceGapDetails ) },
+                { "completed_lifecycle_unresolved", result["unresolved_count"] }
             };
-            result["complete"] = present && catalog->gpuCatalogValid && invalidBatches == 0 && checksumFailures == 0 && sequenceGaps == 0;
+            result["unresolved_breakdown"] = {
+                { "view", Decimal( unresolvedViews ) }, { "logical", Decimal( unresolvedLogicals ) },
+                { "virtual_geometry", Decimal( unresolvedVg ) }, { "range_set", Decimal( unresolvedRanges ) },
+                { "range_set_unique_pointer_tokens", Decimal( unresolvedRangeUniquePointers ) },
+                { "range_set_unique_pass_ids", Decimal( unresolvedRangeUniquePasses ) },
+                { "range_set_on_reference_pass", Decimal( unresolvedRangesOnReferencePass ) },
+                { "range_set_on_explicit_pass_reference_link", Decimal( unresolvedRangesOnExplicitPassLink ) },
+                { "range_set_on_explicit_gpu_pass", Decimal( unresolvedRangesOnExplicitGpuPass ) },
+                { "range_set_on_gfx_entity_without_reference_link", Decimal( unresolvedRangesOnGfxEntity ) },
+                { "range_set_on_unknown_pass", Decimal( unresolvedRangesOnUnknownPass ) },
+                { "range_set_resolvable_with_explicit_pass_time", Decimal( rangesResolvableWithExplicitPassTime ) },
+                { "range_set_missing_pointer_lifetime", Decimal( rangesMissingPointerLifetime ) },
+                { "range_set_outside_pointer_lifetime", Decimal( rangesOutsidePointerLifetime ) },
+                { "range_set_before_first_pointer_lifetime", Decimal( rangesBeforeFirstPointerLifetime ) },
+                { "range_set_after_last_pointer_lifetime", Decimal( rangesAfterLastPointerLifetime ) },
+                { "range_set_between_pointer_lifetimes", Decimal( rangesBetweenPointerLifetimes ) },
+                { "range_set_ambiguous_pointer_lifetime", Decimal( rangesAmbiguousPointerLifetime ) },
+                { "logical_missing_pointer_lifetime", Decimal( logicalMissingPointerLifetime ) },
+                { "logical_outside_pointer_lifetime", Decimal( logicalOutsidePointerLifetime ) },
+                { "logical_ambiguous_pointer_lifetime", Decimal( logicalAmbiguousPointerLifetime ) },
+                { "logical_samples", std::move( unresolvedLogicalSamples ) },
+                { "range_set_samples", std::move( unresolvedRangeSamples ) },
+                { "gpu_reference_pass_count", Decimal( gpuReferencePassCount ) },
+                { "gfx_entity_count", Decimal( gfxEntityCount ) },
+                { "gfx_link_count", Decimal( gfxLinkCount ) },
+                { "references_resources_link_count", Decimal( referencesResourceLinkCount ) },
+                { "relation_source", Decimal( unresolvedRelationSources ) }, { "relation_target", Decimal( unresolvedRelationTargets ) },
+                { "detailed_evidence_source", Decimal( unresolvedEvidenceSources ) },
+                { "detailed_evidence_target", Decimal( unresolvedEvidenceTargets ) },
+                { "total", Decimal( unresolvedBreakdownTotal ) },
+                { "matches_generation_total", result["unresolved_count"] == Decimal( unresolvedBreakdownTotal ) }
+            };
+            result["complete"] = present && catalog->gpuCatalogValid && invalidBatches == 0 && checksumFailures == 0 &&
+                sequenceGaps == 0 && sequenceDuplicates == 0;
             return Success( id, std::move( result ), trace );
         }
         if( !present ) return Success( id, { { "present", false }, { "status", "absent" },
@@ -5502,21 +5838,31 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "gpu.pass.vg_evidence" )
         {
             const auto passId = UnsignedParameter( params, "pass_id", 0, std::numeric_limits<uint64_t>::max() );
+            const auto offset = size_t( UnsignedParameter( params, "offset", 0, MaximumCatalogEntities ) );
+            const auto limit = size_t( UnsignedParameter( params, "limit", DefaultPageSize, MaximumPageSize ) );
             json records = json::array();
             std::string sampleStatus = "not_sampled";
+            size_t total = 0;
             for( size_t index = 0; index < catalog->gpuDetailedEvidence.size(); ++index )
             {
                 const auto& value = catalog->gpuDetailedEvidence[index];
                 if( value.frameId != passId && value.evidenceFrameId != passId && value.sourceId != passId ) continue;
                 sampleStatus = GpuEvidenceStateName( value.state );
-                records.push_back( { { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::DetailedEvidence, index ) ) },
-                    { "request_id", Decimal( value.requestId ) }, { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
-                    { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
-                    { "kind", value.kind }, { "state", GpuEvidenceStateName( value.state ) }, { "sequence", value.sequence },
-                    { "time_ns", Decimal( value.time ) } } );
+                if( total >= offset && records.size() < limit )
+                {
+                    records.push_back( { { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::DetailedEvidence, index ) ) },
+                        { "request_id", Decimal( value.requestId ) }, { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                        { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+                        { "kind", value.kind }, { "state", GpuEvidenceStateName( value.state ) }, { "sequence", value.sequence },
+                        { "time_ns", Decimal( value.time ) } } );
+                }
+                total++;
             }
+            const auto returned = records.size();
             return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", sampleStatus },
-                { "sampled", sampleStatus != "not_sampled" }, { "records", std::move( records ) } }, trace );
+                { "sampled", sampleStatus != "not_sampled" }, { "records", std::move( records ) },
+                { "page", { { "offset", offset }, { "limit", limit }, { "returned", returned },
+                    { "total", total }, { "has_more", offset + returned < total } } } }, trace );
         }
 
         if( method == "gpu.memory.by_type" )
