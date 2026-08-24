@@ -2533,7 +2533,7 @@ void View::DrawAllocList()
             ImGui::Text( "Free thread: %s", m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadFree() ) ) );
             if( event.csFree.Val() ) SmallCallstackButton( "Free call stack", event.csFree.Val(), callstackButtonId );
         }
-        if( ImGui::Button( "Focus lifetime" ) ) ZoomToRange( event.TimeAlloc(), event.TimeFree() >= 0 ? event.TimeFree() : m_worker.GetLastTime() );
+        if( ImGui::Button( "Focus lifetime" ) ) { PushEvidenceNavigation(); ZoomToRange( event.TimeAlloc(), event.TimeFree() >= 0 ? event.TimeFree() : m_worker.GetLastTime() ); }
     }
     else TextDisabledUnformatted( "Select an allocation from the virtualized table." );
     ImGui::EndChild();

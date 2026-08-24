@@ -64,6 +64,23 @@ uint32_t StageColor( JnJobStage stage )
     }
 }
 
+const char* StackProvenanceName( uint8_t value )
+{
+    switch( JnStackProvenance( value ) )
+    {
+    case JnStackProvenance::ExactSource: return "C#/Lua ExactSource";
+    case JnStackProvenance::SiteReused: return "Native SiteReuse";
+    case JnStackProvenance::PerEventExact: return "Native PerEventExact";
+    case JnStackProvenance::Unavailable: return "Unavailable";
+    }
+    return "Unavailable";
+}
+
+const char* StackUnavailableReasonName( uint8_t value )
+{
+    switch( value ) { case 0: return ""; case 1: return "depth_zero"; case 2: return "callstack_unsupported"; case 3: return "admission_denied"; case 4: return "capacity"; default: return "unknown"; }
+}
+
 }
 
 void View::RebuildJnJobView()
@@ -185,6 +202,7 @@ const char* View::GetJnJobName( const JnJobViewData& job ) const
 
 void View::NavigateToJnJobTime( uint64_t jobId, int64_t time, uint64_t thread, int64_t rangeStart, int64_t rangeEnd )
 {
+    PushEvidenceNavigation();
     m_jnJobNavigation.push_back( JnJobNavigationState { m_selectedJnJob, m_selectedThread, m_vd.zvStart, m_vd.zvEnd, m_jnTimelineScrollY } );
     m_selectedJnJob = jobId;
     m_showJnJobs = true;
@@ -304,6 +322,15 @@ void View::DrawJnJobWindow()
         ImGui::SameLine();
         if( ImGui::Button( "Schedule call stack" ) ) m_callstackInfoWindow = job.scheduleCallstack;
     }
+    const JnCallsiteData* scheduleSite = nullptr;
+    for( const auto& callsite : data.callsites ) if( callsite.callstack == job.scheduleCallstack && job.scheduleCallstack != 0 ) { scheduleSite = &callsite; break; }
+    ImGui::SameLine();
+    if( scheduleSite )
+    {
+        ImGui::TextDisabled( "Source: %s / callsite %u%s%s", StackProvenanceName( scheduleSite->provenance ), scheduleSite->callsiteId,
+            scheduleSite->unavailableReason ? " / " : "", scheduleSite->unavailableReason ? StackUnavailableReasonName( scheduleSite->unavailableReason ) : "" );
+    }
+    else ImGui::TextDisabled( "Source: Unity ProfilerMarker-only or unavailable_pre_capture" );
 
     ImGui::Columns( 2, "jn-job-summary", false );
     TextFocused( "Schedule:", TimeToStringExact( job.scheduleTime ) );

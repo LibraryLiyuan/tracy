@@ -92,6 +92,7 @@ set(SERVER_FILES
     TracyView_ConnectionState.cpp
     TracyView_ContextSwitch.cpp
     TracyView_CpuData.cpp
+    TracyView_EvidenceNavigation.cpp
     TracyView_JnCaptureOverview.cpp
     TracyView_FindZone.cpp
     TracyView_FlameGraph.cpp

@@ -322,6 +322,23 @@ private:
         float scrollY = 0;
     };
 
+    struct EvidenceNavigationState
+    {
+        const FrameData* frameSet = nullptr;
+        int64_t viewStart = 0;
+        int64_t viewEnd = 0;
+        uint64_t selectedThread = 0;
+        uint64_t selectedJob = 0;
+        uint64_t selectedResource = 0;
+        uint64_t selectedAllocation = 0;
+        uint64_t selectedPass = 0;
+        int gpuTab = 0;
+        float timelineScrollY = 0;
+        bool showJobs = false;
+        bool showGpu = false;
+        bool showCpuMemory = false;
+    };
+
     struct MemoryFrameSelection
     {
         bool active = false;
@@ -464,6 +481,11 @@ private:
     void DrawJnJobTimelineOverlay( const ImVec2& timelinePos, double pxns, bool hover );
     void NavigateToJnJobTime( uint64_t jobId, int64_t time, uint64_t thread, int64_t rangeStart, int64_t rangeEnd );
     void RestoreJnJobNavigation();
+    void PushEvidenceNavigation();
+    void EvidenceNavigateBack();
+    void EvidenceNavigateForward();
+    EvidenceNavigationState CaptureEvidenceNavigation() const;
+    void ApplyEvidenceNavigation( const EvidenceNavigationState& state );
     const char* GetJnJobName( const JnJobViewData& job ) const;
     bool DrawGpuMemoryPassLink( const GpuMemoryPass& pass, int& widgetId );
     std::string FormatGpuMemoryUsage( uint32_t usageMask ) const;
@@ -773,6 +795,8 @@ private:
     unordered_flat_map<uint32_t, uint64_t> m_jnJobTypeNames;
     unordered_flat_map<uint64_t, JnJobThreadBounds> m_jnJobThreadBounds;
     std::vector<JnJobNavigationState> m_jnJobNavigation;
+    std::vector<EvidenceNavigationState> m_evidenceBack;
+    std::vector<EvidenceNavigationState> m_evidenceForward;
     ImGuiTextFilter m_jnJobFilter;
     uint64_t m_selectedJnJob = 0;
     size_t m_jnJobTypeCount = std::numeric_limits<size_t>::max();

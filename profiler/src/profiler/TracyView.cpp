@@ -911,6 +911,10 @@ bool View::DrawImpl()
         ImGui::PopStyleColor( 3 );
     }
     ImGui::SameLine();
+    if( ButtonDisablable( ICON_FA_ARROW_LEFT " Back", m_evidenceBack.empty() ) ) EvidenceNavigateBack();
+    ImGui::SameLine();
+    if( ButtonDisablable( ICON_FA_ARROW_RIGHT " Forward", m_evidenceForward.empty() ) ) EvidenceNavigateForward();
+    ImGui::SameLine();
     ToggleButton( ICON_FA_GEAR, m_showOptions );
     ImGui::SameLine();
     ToggleButton( ICON_FA_TAGS " Messages", m_showMessages );

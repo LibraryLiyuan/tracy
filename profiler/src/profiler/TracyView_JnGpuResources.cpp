@@ -340,7 +340,7 @@ void View::DrawJnGpuResources()
         {
             ImGui::Text( "%s", pass->name.empty() ? "Unnamed pass" : pass->name.c_str() ); ImGui::TextDisabled( "Pass %llu / Frame %llu / CommandList %llu",
                 static_cast<unsigned long long>( pass->passId ), static_cast<unsigned long long>( pass->frameId ), static_cast<unsigned long long>( pass->commandListId ) );
-            if( ImGui::Button( "Focus timeline" ) && pass->endNs > pass->startNs ) ZoomToRange( pass->startNs, pass->endNs );
+            if( ImGui::Button( "Focus timeline" ) && pass->endNs > pass->startNs ) { PushEvidenceNavigation(); ZoomToRange( pass->startNs, pass->endNs ); }
             ImGui::SameLine(); if( ImGui::Button( "Set A" ) ) m_jnGpuUi.frameA = pass->frameId; ImGui::SameLine(); if( ImGui::Button( "Set B" ) ) m_jnGpuUi.frameB = pass->frameId;
             ImGui::SeparatorText( "Working set" );
             ImGui::Text( "Direct %zu / %s", pass->directResources.size(), ByteText( pass->directPhysicalBytes, m_jnGpuUi.decimalUnits ).c_str() );
