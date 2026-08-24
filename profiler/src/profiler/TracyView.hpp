@@ -719,6 +719,7 @@ private:
         double projectBudgetGb = 6.4;
         bool decimalUnits = false;
         bool advanced = false;
+        std::string exportStatus;
     } m_jnGpuUi;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
