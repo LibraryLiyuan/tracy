@@ -925,6 +925,8 @@ bool View::DrawImpl()
     ImGui::SameLine();
     ToggleButton( ICON_FA_GAUGE_HIGH " JN Overview", m_showJnCaptureOverview );
     ImGui::SameLine();
+    ToggleButton( ICON_FA_MICROCHIP " GPU Resources", m_showJnGpuResources );
+    ImGui::SameLine();
     ToggleButton( ICON_FA_SCALE_BALANCED " Compare", m_compare.show );
     ImGui::SameLine();
     ToggleButton( ICON_FA_FINGERPRINT " Info", m_showInfo );
@@ -1184,6 +1186,7 @@ bool View::DrawImpl()
     if( m_showManual ) DrawManual();
     if( m_showJnJobs ) DrawJnJobWindow();
     if( m_showJnCaptureOverview ) DrawJnCaptureOverview();
+    if( m_showJnGpuResources ) DrawJnGpuResources();
 #ifndef __EMSCRIPTEN__
     if( m_llm.m_show ) m_llm.Draw();
 #endif

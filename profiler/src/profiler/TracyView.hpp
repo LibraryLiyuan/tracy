@@ -460,6 +460,7 @@ private:
     void RebuildJnJobView();
     void DrawJnJobWindow();
     void DrawJnCaptureOverview();
+    void DrawJnGpuResources();
     void DrawJnJobTimelineOverlay( const ImVec2& timelinePos, double pxns, bool hover );
     void NavigateToJnJobTime( uint64_t jobId, int64_t time, uint64_t thread, int64_t rangeStart, int64_t rangeEnd );
     void RestoreJnJobNavigation();
@@ -703,6 +704,22 @@ private:
     bool m_showManual = false;
     bool m_showJnJobs = false;
     bool m_showJnCaptureOverview = true;
+    bool m_showJnGpuResources = false;
+
+    struct JnGpuResourcesUi
+    {
+        int tab = 0;
+        char search[256] = {};
+        uint64_t selectedResource = 0;
+        uint64_t selectedAllocation = 0;
+        uint64_t selectedPass = 0;
+        uint64_t selectedHeap = 0;
+        uint64_t frameA = 0;
+        uint64_t frameB = 0;
+        double projectBudgetGb = 6.4;
+        bool decimalUnits = false;
+        bool advanced = false;
+    } m_jnGpuUi;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
     bool m_statSampleTime = true;
