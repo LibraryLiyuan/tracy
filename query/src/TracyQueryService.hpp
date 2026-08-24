@@ -2,6 +2,7 @@
 #define __TRACYQUERYSERVICE_HPP__
 
 #include "TracySessionManager.hpp"
+#include "TracyGpuAnalysis.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -75,11 +76,19 @@ private:
         size_t bytes = 0;
         uint64_t access = 0;
     };
+    struct GpuSnapshotCacheEntry
+    {
+        std::shared_ptr<const analysis::GpuAnalysisSnapshot> value;
+        size_t bytes = 0;
+        uint64_t access = 0;
+    };
 
     nlohmann::json Dispatch( const nlohmann::json& id, const std::string& method, const nlohmann::json& params, const std::optional<std::string>& defaultTraceId, std::stop_token stopToken );
     std::shared_ptr<const analysis::GpuMemoryAttribution> CachedGpuAttribution( const std::string& traceId,
         const std::shared_ptr<analysis::TraceSource>& source, bool summaryOnly = false );
     std::shared_ptr<const analysis::MemoryFrameSnapshot> CachedMemorySnapshot( const std::string& traceId, const std::shared_ptr<analysis::TraceSource>& source, size_t frameSet, size_t frame, std::vector<std::string> poolRefs, bool allGpu );
+    std::shared_ptr<const analysis::GpuAnalysisSnapshot> CachedGpuSnapshot( const std::string& traceId,
+        const std::shared_ptr<analysis::TraceSource>& source );
     void EvictCache( size_t incomingBytes );
     void EraseTraceCache( const std::string& traceId );
 
@@ -89,6 +98,7 @@ private:
     size_t m_cacheBytes = 0;
     uint64_t m_cacheClock = 0;
     std::unordered_map<std::string, GpuCacheEntry> m_gpuCache;
+    std::unordered_map<std::string, GpuSnapshotCacheEntry> m_gpuSnapshotCache;
     std::unordered_map<std::string, MemoryCacheEntry> m_memoryCache;
 };
 

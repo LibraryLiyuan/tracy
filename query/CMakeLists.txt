@@ -97,6 +97,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-query-contract-tests)
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)
 
+    add_executable(tracy-gpu-analysis-tests tests/GpuAnalysisTests.cpp)
+    target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-gpu-analysis-tests)
+    add_test(NAME tracy-gpu-analysis COMMAND tracy-gpu-analysis-tests)
+
     add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-mcp-transcript-tests)

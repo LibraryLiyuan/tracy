@@ -4258,9 +4258,16 @@ void QueryService::EvictCache( size_t incomingBytes )
         std::string oldestKey;
         uint64_t oldestAccess = std::numeric_limits<uint64_t>::max();
         for( const auto& [key, entry] : m_gpuCache ) if( entry.value.use_count() == 1 && entry.access < oldestAccess ) { gpu = true; oldestKey = key; oldestAccess = entry.access; }
+        for( const auto& [key, entry] : m_gpuSnapshotCache ) if( entry.value.use_count() == 1 && entry.access < oldestAccess ) { gpu = true; oldestKey = "snapshot:" + key; oldestAccess = entry.access; }
         for( const auto& [key, entry] : m_memoryCache ) if( entry.value.use_count() == 1 && entry.access < oldestAccess ) { gpu = false; oldestKey = key; oldestAccess = entry.access; }
         if( oldestKey.empty() ) break;
-        if( gpu ) { m_cacheBytes -= m_gpuCache.at( oldestKey ).bytes; m_gpuCache.erase( oldestKey ); }
+        if( gpu && oldestKey.rfind( "snapshot:", 0 ) == 0 )
+        {
+            const auto key = oldestKey.substr( 9 );
+            m_cacheBytes -= m_gpuSnapshotCache.at( key ).bytes;
+            m_gpuSnapshotCache.erase( key );
+        }
+        else if( gpu ) { m_cacheBytes -= m_gpuCache.at( oldestKey ).bytes; m_gpuCache.erase( oldestKey ); }
         else { m_cacheBytes -= m_memoryCache.at( oldestKey ).bytes; m_memoryCache.erase( oldestKey ); }
     }
 }
@@ -4271,6 +4278,10 @@ void QueryService::EraseTraceCache( const std::string& traceId )
     for( auto it = m_gpuCache.begin(); it != m_gpuCache.end(); )
     {
         if( it->first.rfind( prefix, 0 ) == 0 ) { m_cacheBytes -= it->second.bytes; it = m_gpuCache.erase( it ); } else ++it;
+    }
+    for( auto it = m_gpuSnapshotCache.begin(); it != m_gpuSnapshotCache.end(); )
+    {
+        if( it->first.rfind( prefix, 0 ) == 0 ) { m_cacheBytes -= it->second.bytes; it = m_gpuSnapshotCache.erase( it ); } else ++it;
     }
     for( auto it = m_memoryCache.begin(); it != m_memoryCache.end(); )
     {
@@ -4296,6 +4307,34 @@ std::shared_ptr<const analysis::GpuMemoryAttribution> QueryService::CachedGpuAtt
     {
         m_cacheBytes += bytes;
         m_gpuCache.emplace( key, GpuCacheEntry { value, bytes, ++m_cacheClock } );
+    }
+    return value;
+}
+
+std::shared_ptr<const analysis::GpuAnalysisSnapshot> QueryService::CachedGpuSnapshot( const std::string& traceId,
+    const std::shared_ptr<analysis::TraceSource>& source )
+{
+    const auto key = traceId + "|gpu-analysis-snapshot-v1";
+    if( const auto found = m_gpuSnapshotCache.find( key ); found != m_gpuSnapshotCache.end() )
+    {
+        found->second.access = ++m_cacheClock;
+        return found->second.value;
+    }
+    const auto catalog = source->GetGpuCatalogData();
+    if( !catalog ) return std::make_shared<analysis::GpuAnalysisSnapshot>();
+    auto value = std::make_shared<analysis::GpuAnalysisSnapshot>( analysis::BuildGpuAnalysisSnapshot( *catalog ) );
+    size_t bytes = sizeof( *value ) + value->resources.capacity() * sizeof( analysis::GpuResourceAnalysisRecord ) +
+        value->allocations.capacity() * sizeof( analysis::GpuAllocationAnalysisRecord ) + value->passes.capacity() * sizeof( analysis::GpuPassWorkingSet ) +
+        value->residency.capacity() * sizeof( analysis::GpuResidencyInterval ) + value->churnCandidates.capacity() * sizeof( analysis::GpuChurnCandidate );
+    for( const auto& resource : value->resources ) bytes += resource.name.capacity() + resource.history.capacity() * sizeof( size_t ) +
+        ( resource.views.capacity() + resource.parts.capacity() + resource.relations.capacity() + resource.ranges.capacity() ) * sizeof( size_t );
+    for( const auto& pass : value->passes ) bytes += pass.name.capacity() +
+        ( pass.directResources.capacity() + pass.inclusiveResources.capacity() ) * sizeof( uint64_t );
+    EvictCache( bytes );
+    if( bytes <= m_cacheBudget && m_cacheBytes <= m_cacheBudget - bytes )
+    {
+        m_cacheBytes += bytes;
+        m_gpuSnapshotCache.emplace( key, GpuSnapshotCacheEntry { value, bytes, ++m_cacheClock } );
     }
     return value;
 }
@@ -6263,11 +6302,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             struct Totals { uint64_t count = 0; uint64_t capacity = 0; };
             std::map<std::string, Totals> totals;
-            for( const auto& [unused, state] : resources ) if( state.latest && state.destroyTime == 0 )
+            const auto snapshot = CachedGpuSnapshot( trace.id, source );
+            for( const auto& resource : snapshot->resources ) if( resource.aliveAtEnd )
             {
-                auto& value = totals[GpuPrimaryKindName( state.latest->primaryKind )];
+                auto& value = totals[GpuPrimaryKindName( resource.primaryKind )];
                 value.count++;
-                value.capacity += state.latest->capacityBytes;
+                value.capacity += resource.capacityBytes;
             }
             json values = json::array();
             for( const auto& [kind, value] : totals ) values.push_back( { { "primary_kind", kind }, { "live_resource_count", Decimal( value.count ) },
@@ -6278,47 +6318,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "gpu.memory.peak" || method == "gpu.memory.churn" )
         {
-            std::vector<const JnGpuCatalogAllocationRecordV1*> events;
-            events.reserve( catalog->gpuCatalogAllocations.size() );
-            for( const auto& value : catalog->gpuCatalogAllocations ) events.emplace_back( &value );
-            std::sort( events.begin(), events.end(), []( const auto* lhs, const auto* rhs ) { return lhs->time < rhs->time; } );
-            std::unordered_map<uint64_t, uint64_t> live;
-            uint64_t current = 0, peak = 0, allocated = 0, freed = 0, creates = 0, destroys = 0;
-            int64_t peakTime = 0;
-            for( const auto* value : events )
-            {
-                const auto operation = JnGpuCatalogRecordOperation( value->operation );
-                const bool physicalRoot = value->parentAllocationId == 0;
-                if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
-                    operation == JnGpuCatalogRecordOperation::Snapshot )
-                {
-                    if( const auto found = live.find( value->allocationId ); found != live.end() ) current -= found->second;
-                    const auto physicalBytes = physicalRoot ? value->sizeBytes : 0;
-                    live[value->allocationId] = physicalBytes;
-                    current += physicalBytes;
-                    allocated += physicalBytes;
-                    creates++;
-                }
-                else if( operation == JnGpuCatalogRecordOperation::Update )
-                {
-                    const auto previous = live.find( value->allocationId );
-                    if( previous != live.end() ) current -= previous->second;
-                    const auto physicalBytes = physicalRoot ? value->sizeBytes : 0;
-                    live[value->allocationId] = physicalBytes;
-                    current += physicalBytes;
-                }
-                else if( operation == JnGpuCatalogRecordOperation::Destroy )
-                {
-                    if( const auto found = live.find( value->allocationId ); found != live.end() ) { current -= found->second; freed += found->second; live.erase( found ); }
-                    destroys++;
-                }
-                if( current > peak ) { peak = current; peakTime = value->time; }
-            }
-            if( method == "gpu.memory.peak" ) return Success( id, { { "present", true }, { "engine_known_physical_peak_bytes", Decimal( peak ) },
-                { "peak_time_ns", Decimal( peakTime ) }, { "peak_provenance", "event_exact" },
+            const auto snapshot = CachedGpuSnapshot( trace.id, source );
+            if( method == "gpu.memory.peak" ) return Success( id, { { "present", true }, { "engine_known_physical_peak_bytes", Decimal( snapshot->engineKnownPhysicalPeakBytes ) },
+                { "peak_time_ns", Decimal( snapshot->engineKnownPhysicalPeakTimeNs ) }, { "peak_provenance", "event_exact" },
                 { "dxgi_peak", nullptr }, { "dxgi_peak_provenance", "sampled_4hz_unavailable_in_catalog_section" } }, trace );
-            return Success( id, { { "present", true }, { "create_count", Decimal( creates ) }, { "destroy_count", Decimal( destroys ) },
-                { "allocated_bytes", Decimal( allocated ) }, { "freed_bytes", Decimal( freed ) }, { "live_bytes_at_end", Decimal( current ) },
+            return Success( id, { { "present", true }, { "create_count", Decimal( snapshot->allocationCreateCount ) }, { "destroy_count", Decimal( snapshot->allocationDestroyCount ) },
+                { "allocated_bytes", Decimal( snapshot->allocatedPhysicalBytes ) }, { "freed_bytes", Decimal( snapshot->freedPhysicalBytes ) }, { "live_bytes_at_end", Decimal( snapshot->engineKnownPhysicalBytes ) },
                 { "semantics", "snapshot/open-boundary allocations are included in baseline and are not proof of within-capture churn" } }, trace );
         }
 

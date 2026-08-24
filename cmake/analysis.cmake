@@ -3,6 +3,7 @@ set(TRACY_ANALYSIS_DIR ${CMAKE_CURRENT_LIST_DIR}/../analysis)
 set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyHash.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.cpp
 )
@@ -10,6 +11,7 @@ set(TRACY_ANALYSIS_SOURCES
 set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyHash.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.hpp
