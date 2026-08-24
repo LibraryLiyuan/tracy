@@ -103,6 +103,8 @@ public:
     analysis::GpuMemoryAttribution GetGpuMemorySummaryAttribution() const override;
     std::optional<analysis::GpuMemoryPassPage> ScanGpuMemoryPasses( size_t offset, size_t limit,
         std::optional<uint64_t> requestedPassId, size_t useOffset, size_t useLimit ) const override;
+    std::optional<analysis::GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t resourceId,
+        size_t offset, size_t limit ) const override;
     std::optional<analysis::GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t offset, size_t limit ) const override;
     std::optional<analysis::GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t offset, size_t limit,
         std::optional<uint64_t> allocationId, const std::string& poolRef, const std::string& relationState ) const override;

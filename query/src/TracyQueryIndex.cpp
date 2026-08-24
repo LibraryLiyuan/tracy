@@ -1448,6 +1448,20 @@ public:
         }
         return page;
     }
+    std::optional<analysis::GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t resourceId,
+        size_t offset, size_t limit ) const override
+    {
+        EnsureGpuResourcePassRefs();
+        analysis::GpuMemoryUseReferencePage page;
+        const auto found = m_gpuResourcePassRefs.find( resourceId );
+        if( found == m_gpuResourcePassRefs.end() ) return page;
+        page.totalUses = found->second.references.size();
+        const auto begin = std::min( offset, found->second.references.size() );
+        const auto end = begin + std::min( limit, found->second.references.size() - begin );
+        page.references.insert( page.references.end(), found->second.references.begin() + begin,
+            found->second.references.begin() + end );
+        return page;
+    }
     std::optional<analysis::GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t offset, size_t limit ) const override
     {
         EnsureGpuRequestScopes();
@@ -1514,7 +1528,7 @@ public:
                 }
             }
             const auto passRefs = m_gpuResourcePassRefs.find( allocation.allocationId );
-            const bool hasPassRefs = passRefs != m_gpuResourcePassRefs.end() && passRefs->second.count != 0;
+            const bool hasPassRefs = passRefs != m_gpuResourcePassRefs.end() && !passRefs->second.references.empty();
             const std::string currentState = requestLabel && hasPassRefs ? "request_and_uses" : requestLabel ? "request_only" : hasPassRefs ? "uses_only" : "unattributed";
             if( !relationState.empty() && currentState != relationState ) continue;
             if( matched++ < offset ) continue;
@@ -1523,7 +1537,14 @@ public:
             analysis::GpuMemoryAllocationPageItem item;
             item.attribution.allocation = allocation;
             item.attribution.requestLabelId = requestLabel;
-            if( passRefs != m_gpuResourcePassRefs.end() ) { item.passRefCount = passRefs->second.count; item.passIds = passRefs->second.preview; }
+            if( passRefs != m_gpuResourcePassRefs.end() )
+            {
+                item.passRefCount = passRefs->second.references.size();
+                const auto previewCount = std::min<size_t>( 100, passRefs->second.references.size() );
+                item.passIds.reserve( previewCount );
+                for( size_t index = 0; index < previewCount; ++index )
+                    item.passIds.emplace_back( passRefs->second.references[index].passId );
+            }
             if( logical ) item.logicalResource = *logical;
             if( m_precomputedGpuMemorySummary )
             {
@@ -1757,8 +1778,7 @@ private:
     static bool Intersects( int64_t begin, int64_t end, const analysis::ScanRange& range ) { return begin < range.endNs && end > range.startNs; }
     struct ResourcePassRefs
     {
-        uint64_t count = 0;
-        std::vector<uint64_t> preview;
+        std::vector<analysis::GpuMemoryUseReference> references;
     };
     void EnsureGpuRequestScopes() const
     {
@@ -1826,15 +1846,27 @@ private:
     void EnsureGpuResourcePassRefs() const
     {
         std::call_once( m_gpuResourcePassRefsOnce, [&] {
-            std::unordered_set<uint64_t> validPasses;
-            validPasses.reserve( size_t( m_gpuReferencePasses.Count() ) );
-            for( uint64_t index = 0; index < m_gpuReferencePasses.Count(); index++ ) validPasses.emplace( m_gpuReferencePasses.At<JnGpuReferencePassData>( index ).passId );
+            std::unordered_map<uint64_t, std::pair<int64_t, int64_t>> passTimes;
+            passTimes.reserve( size_t( m_gpuReferencePasses.Count() ) );
+            for( uint64_t index = 0; index < m_gpuReferencePasses.Count(); index++ )
+            {
+                const auto& value = m_gpuReferencePasses.At<JnGpuReferencePassData>( index );
+                passTimes.emplace( value.passId, std::pair<int64_t, int64_t> { value.time, value.time } );
+            }
+            for( uint64_t index = 0; index < m_gpuReferenceEnds.Count(); index++ )
+            {
+                const auto& value = m_gpuReferenceEnds.At<JnGpuReferenceEndData>( index );
+                const auto pass = passTimes.find( value.passId );
+                if( pass != passTimes.end() ) pass->second.second = value.time;
+            }
             for( uint64_t index = 0; index < m_gpuReferenceUses.Count(); index++ )
             {
                 const auto& value = m_gpuReferenceUses.At<JnGpuReferenceUseData>( index );
-                if( value.resourceId == 0 || validPasses.find( value.passId ) == validPasses.end() ) continue;
-                auto& refs = m_gpuResourcePassRefs[value.resourceId]; refs.count++;
-                if( refs.preview.size() < 100 ) refs.preview.emplace_back( value.passId );
+                const auto pass = passTimes.find( value.passId );
+                if( value.resourceId == 0 || pass == passTimes.end() ) continue;
+                auto& refs = m_gpuResourcePassRefs[value.resourceId].references;
+                refs.push_back( { value.passId, pass->second.first, pass->second.second,
+                    { value.resourceId, value.usageMask, 'U', value.resourceSetId, value.encoding } } );
             }
         } );
     }

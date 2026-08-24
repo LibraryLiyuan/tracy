@@ -1031,6 +1031,7 @@ public:
     virtual GpuMemoryAttribution GetGpuMemoryAttribution() const = 0;
     virtual GpuMemoryAttribution GetGpuMemorySummaryAttribution() const { return GetGpuMemoryAttribution(); }
     virtual std::optional<GpuMemoryPassPage> ScanGpuMemoryPasses( size_t, size_t, std::optional<uint64_t>, size_t, size_t ) const { return std::nullopt; }
+    virtual std::optional<GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t, size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t, size_t ) const { return std::nullopt; }
     virtual std::optional<GpuMemoryAllocationPage> ScanGpuMemoryAllocations( size_t, size_t, std::optional<uint64_t>, const std::string&, const std::string& ) const { return std::nullopt; }
     virtual GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passIds, size_t maxUses ) const

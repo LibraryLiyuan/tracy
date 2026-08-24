@@ -361,6 +361,23 @@ const char* GpuExactnessName( uint8_t value )
     return "unknown";
 }
 
+const char* GpuCatalogRelationName( uint8_t value )
+{
+    switch( JnGpuCatalogRelationKind( value ) )
+    {
+    case JnGpuCatalogRelationKind::BackedBy: return "backed_by";
+    case JnGpuCatalogRelationKind::ViewOf: return "view_of";
+    case JnGpuCatalogRelationKind::LogicalBinds: return "logical_binds";
+    case JnGpuCatalogRelationKind::FamilyContains: return "family_contains";
+    case JnGpuCatalogRelationKind::PartOf: return "part_of";
+    case JnGpuCatalogRelationKind::AliasParticipant: return "alias_participant";
+    case JnGpuCatalogRelationKind::RtasUses: return "rtas_uses";
+    case JnGpuCatalogRelationKind::VgResidency: return "vg_residency";
+    case JnGpuCatalogRelationKind::PrimaryOwner: return "primary_owner";
+    }
+    return "unknown";
+}
+
 const char* GpuEvidenceStateName( uint8_t value )
 {
     switch( JnGpuEvidenceState( value ) )
@@ -385,6 +402,19 @@ uint64_t GpuCatalogRecordGeneration( const tracy::JnTraceData& data, JnGpuCatalo
         return batch.generation;
     }
     return 0;
+}
+
+std::vector<uint64_t> GpuCatalogRecordGenerations( const tracy::JnTraceData& data,
+    JnGpuCatalogBatchKind kind, size_t recordCount )
+{
+    std::vector<uint64_t> generations( recordCount, 0 );
+    for( const auto& batch : data.gpuCatalogBatches )
+    {
+        if( batch.kind != uint8_t( kind ) || batch.firstRecordIndex >= recordCount ) continue;
+        const auto end = std::min( recordCount, batch.firstRecordIndex + size_t( batch.recordCount ) );
+        std::fill( generations.begin() + batch.firstRecordIndex, generations.begin() + end, batch.generation );
+    }
+    return generations;
 }
 
 std::string GpuCatalogString( const tracy::JnTraceData& data, uint64_t generation, uint32_t stringId )
@@ -5105,6 +5135,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 } );
             }
             const std::string state = !present ? "absent" : ( catalog->gpuCatalogValid ? ( building ? "building" : "complete" ) : "invalid_core_gap" );
+            json evidencePreview = json::array();
+            std::unordered_set<uint64_t> previewFrames;
+            if( catalog ) for( const auto& value : catalog->gpuDetailedEvidence )
+            {
+                const auto checkpointId = value.evidenceFrameId != 0 ? value.evidenceFrameId : value.frameId;
+                if( checkpointId == 0 || !previewFrames.emplace( checkpointId ).second ) continue;
+                evidencePreview.push_back( { { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                    { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) },
+                    { "request_id", Decimal( value.requestId ) }, { "state", GpuEvidenceStateName( value.state ) },
+                    { "kind", value.kind } } );
+                if( evidencePreview.size() >= 16 ) break;
+            }
             return json {
                 { "present", present }, { "valid", present && catalog->gpuCatalogValid }, { "status", state },
                 { "reason", present ? ( catalog->gpuCatalogValid ? json( nullptr ) : json( "Catalog Core transport/lifetime validation failed; dependent evidence is unavailable" ) ) :
@@ -5114,6 +5156,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "generation_count", Decimal( catalog ? catalog->gpuCatalogGenerations.size() : 0 ) },
                 { "record_count", Decimal( recordCount ) }, { "payload_bytes", Decimal( payloadBytes ) },
                 { "unresolved_count", Decimal( unresolved ) }, { "generations", std::move( generations ) },
+                { "detailed_evidence_checkpoint_preview", std::move( evidencePreview ) },
                 { "counts", {
                     { "resources", Decimal( catalog ? catalog->gpuCatalogResources.size() : 0 ) },
                     { "allocations", Decimal( catalog ? catalog->gpuCatalogAllocations.size() : 0 ) },
@@ -5509,6 +5552,19 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( !catalog->gpuCatalogValid ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
             { "reason", "Catalog Core gap/capacity/checksum failure invalidated resource evidence; no previous generation was substituted" } }, trace );
 
+        // Batch generation is a transport property shared by a contiguous
+        // record range. Resolve it once per record kind. The previous helper
+        // scanned every batch for every record, turning a single resource
+        // query into O(records * batches) work on large captures.
+        const auto resourceGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::Resource, catalog->gpuCatalogResources.size() );
+        const auto allocationGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::Allocation, catalog->gpuCatalogAllocations.size() );
+        const auto viewGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::View, catalog->gpuCatalogViews.size() );
+        const auto logicalGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::Logical, catalog->gpuCatalogLogicals.size() );
+        const auto partGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::Part, catalog->gpuCatalogParts.size() );
+        const auto relationGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::Relation, catalog->gpuCatalogRelations.size() );
+        const auto rangeGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::RangeSet, catalog->gpuRangeSets.size() );
+        const auto vgGenerations = GpuCatalogRecordGenerations( *catalog, JnGpuCatalogBatchKind::VirtualGeometry, catalog->gpuCatalogVg.size() );
+
         struct ResourceState
         {
             const JnGpuCatalogResourceRecordV1* latest = nullptr;
@@ -5526,6 +5582,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( value.resourceId == 0 ) continue;
             auto& state = resources[value.resourceId];
             const auto operation = JnGpuCatalogRecordOperation( value.operation );
+            const bool definitionRecord = operation == JnGpuCatalogRecordOperation::Create ||
+                operation == JnGpuCatalogRecordOperation::Update ||
+                operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot;
             if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
                 operation == JnGpuCatalogRecordOperation::Snapshot )
             {
@@ -5534,13 +5594,72 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     value.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
             }
             if( operation == JnGpuCatalogRecordOperation::Destroy ) state.destroyTime = std::max( state.destroyTime, value.time );
-            if( !state.latest || value.time >= state.latest->time )
+            // Destroy records are lifecycle tombstones. They deliberately do
+            // not repeat the resource definition, so treating one as the
+            // latest definition erases the resource kind, name, allocation,
+            // and callsite for every short-lived resource (notably BLAS/TLAS).
+            if( definitionRecord && ( !state.latest || value.time >= state.latest->time ) )
             {
                 state.latest = &value;
                 state.latestIndex = index;
-                state.generation = GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::Resource, index );
+                state.generation = resourceGenerations[index];
             }
         }
+
+        struct ResourcePointerInterval
+        {
+            uint64_t pointerToken = 0;
+            uint64_t resourceId = 0;
+            int64_t begin = std::numeric_limits<int64_t>::min();
+            int64_t end = std::numeric_limits<int64_t>::max();
+        };
+        // Resource metadata and resource identity are deliberately separate:
+        // the latest name/classification update need not repeat pointerToken.
+        std::unordered_map<uint64_t, std::vector<ResourcePointerInterval>> resourcesByPointer;
+        std::unordered_map<uint64_t, std::pair<uint64_t, size_t>> openPointerIntervals;
+        resourcesByPointer.reserve( resources.size() );
+        openPointerIntervals.reserve( resources.size() );
+        for( const auto& value : catalog->gpuCatalogResources )
+        {
+            if( value.pointerToken == 0 || value.resourceId == 0 ) continue;
+            const auto operation = JnGpuCatalogRecordOperation( value.operation );
+            if( operation == JnGpuCatalogRecordOperation::Create ||
+                operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot )
+            {
+                auto& intervals = resourcesByPointer[value.pointerToken];
+                intervals.push_back( { value.pointerToken, value.resourceId,
+                    operation == JnGpuCatalogRecordOperation::Create ? value.time : std::numeric_limits<int64_t>::min(),
+                    std::numeric_limits<int64_t>::max() } );
+                openPointerIntervals[value.resourceId] = { value.pointerToken, intervals.size() - 1 };
+            }
+            else if( operation == JnGpuCatalogRecordOperation::Destroy )
+            {
+                const auto open = openPointerIntervals.find( value.resourceId );
+                if( open == openPointerIntervals.end() ) continue;
+                const auto intervals = resourcesByPointer.find( open->second.first );
+                if( intervals != resourcesByPointer.end() && open->second.second < intervals->second.size() )
+                    intervals->second[open->second.second].end = value.time;
+                openPointerIntervals.erase( open );
+            }
+        }
+        std::unordered_map<uint64_t, std::vector<ResourcePointerInterval>> pointerIntervalsByResource;
+        pointerIntervalsByResource.reserve( resources.size() );
+        for( const auto& [unused, intervals] : resourcesByPointer )
+            for( const auto& interval : intervals ) pointerIntervalsByResource[interval.resourceId].emplace_back( interval );
+        const auto resolvePointerResource = [&]( uint64_t pointerToken, int64_t time )
+        {
+            const auto found = resourcesByPointer.find( pointerToken );
+            if( found == resourcesByPointer.end() ) return uint64_t( 0 );
+            uint64_t resolved = 0;
+            for( const auto& interval : found->second )
+            {
+                if( time < interval.begin || time > interval.end ) continue;
+                if( resolved != 0 && resolved != interval.resourceId ) return uint64_t( 0 );
+                resolved = interval.resourceId;
+            }
+            return resolved;
+        };
 
         const auto resourceJson = [&]( uint64_t resourceId, const ResourceState& state, bool details ) {
             const auto& value = *state.latest;
@@ -5587,6 +5706,34 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto nameFilter = filter.value( "name", std::string() );
             const auto kindFilter = filter.value( "primary_kind", std::string() );
             const auto classFilter = filter.value( "resource_class", std::string() );
+            const auto requireMeshParts = filter.value( "has_mesh_parts", false );
+            const auto requireRanges = filter.value( "has_ranges", false );
+            const auto requireLogicalBindings = filter.value( "has_logical_bindings", false );
+            const auto requireAliasGroup = filter.value( "has_alias_group", false );
+            const auto requireSharedAllocation = filter.value( "has_shared_allocation", false );
+            std::unordered_map<uint64_t, size_t> meshPartCounts;
+            std::unordered_map<uint64_t, size_t> rangeCounts;
+            std::unordered_map<uint64_t, size_t> logicalBindingCounts;
+            std::unordered_map<uint64_t, size_t> allocationResourceCounts;
+            std::unordered_set<uint64_t> aliasLogicalIds;
+            std::unordered_set<uint64_t> aliasResources;
+            if( requireMeshParts ) for( const auto& value : catalog->gpuCatalogParts )
+            {
+                const auto kind = JnGpuCatalogPartKind( value.partKind );
+                if( kind == JnGpuCatalogPartKind::MeshVertexStream || kind == JnGpuCatalogPartKind::MeshIndex )
+                    ++meshPartCounts[value.resourceId];
+            }
+            if( requireRanges ) for( const auto& value : catalog->gpuRangeSets ) ++rangeCounts[value.resourceId];
+            if( requireLogicalBindings || requireAliasGroup ) for( const auto& value : catalog->gpuCatalogLogicals )
+            {
+                if( value.aliasGroupId != 0 ) aliasLogicalIds.emplace( value.logicalResourceId );
+                if( value.resourceId != 0 ) ++logicalBindingCounts[value.resourceId];
+            }
+            if( requireAliasGroup ) for( const auto& value : catalog->gpuCatalogLogicals )
+                if( value.resourceId != 0 && aliasLogicalIds.find( value.logicalResourceId ) != aliasLogicalIds.end() )
+                    aliasResources.emplace( value.resourceId );
+            if( requireSharedAllocation ) for( const auto& [unused, state] : resources )
+                if( state.latest != nullptr && state.latest->allocationId != 0 ) ++allocationResourceCounts[state.latest->allocationId];
             for( const auto& [resourceId, state] : resources )
             {
                 if( state.latest == nullptr ) continue;
@@ -5594,13 +5741,28 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !nameFilter.empty() && name.find( nameFilter ) == std::string::npos ) continue;
                 if( !kindFilter.empty() && kindFilter != GpuPrimaryKindName( state.latest->primaryKind ) ) continue;
                 if( !classFilter.empty() && classFilter != GpuResourceClassName( state.latest->resourceClass ) ) continue;
+                if( requireMeshParts && meshPartCounts.find( resourceId ) == meshPartCounts.end() ) continue;
+                if( requireRanges && rangeCounts.find( resourceId ) == rangeCounts.end() ) continue;
+                if( requireLogicalBindings && logicalBindingCounts.find( resourceId ) == logicalBindingCounts.end() ) continue;
+                if( requireAliasGroup && aliasResources.find( resourceId ) == aliasResources.end() ) continue;
+                if( requireSharedAllocation && allocationResourceCounts[state.latest->allocationId] <= 1 ) continue;
                 selected.emplace_back( resourceId );
             }
             std::sort( selected.begin(), selected.end() );
             const auto begin = std::min( page.offset, selected.size() );
             const auto end = begin + std::min( page.limit, selected.size() - begin );
             json values = json::array();
-            for( size_t index = begin; index < end; ++index ) values.push_back( resourceJson( selected[index], resources.at( selected[index] ), false ) );
+            for( size_t index = begin; index < end; ++index )
+            {
+                const auto resourceId = selected[index];
+                auto value = resourceJson( resourceId, resources.at( resourceId ), false );
+                if( requireMeshParts ) value["mesh_part_count"] = Decimal( meshPartCounts[resourceId] );
+                if( requireRanges ) value["pass_range_count"] = Decimal( rangeCounts[resourceId] );
+                if( requireLogicalBindings || requireAliasGroup ) value["logical_binding_count"] = Decimal( logicalBindingCounts[resourceId] );
+                if( requireSharedAllocation ) value["allocation_resource_count"] =
+                    Decimal( allocationResourceCounts[resources.at( resourceId ).latest->allocationId] );
+                values.push_back( std::move( value ) );
+            }
             const auto cursor = NextCursor( page, method, trace, end - begin, end < selected.size() );
             return Success( id, { { "present", true }, { "resources", std::move( values ) }, { "total", Decimal( selected.size() ) } },
                 trace, PageJson( page, end - begin, cursor ) );
@@ -5644,7 +5806,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 const auto& value = catalog->gpuCatalogAllocations[index];
                 if( value.allocationId != resourceState->latest->allocationId ) continue;
-                values.push_back( allocationJson( value, GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::Allocation, index ) ) );
+                values.push_back( allocationJson( value, allocationGenerations[index] ) );
             }
             return values;
         };
@@ -5656,7 +5818,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto& value = catalog->gpuCatalogViews[index];
                 if( value.resourceId != resourceId ) continue;
                 values.push_back( {
-                    { "view_id", Decimal( value.viewId ) }, { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::View, index ) ) },
+                    { "view_id", Decimal( value.viewId ) }, { "generation", Decimal( viewGenerations[index] ) },
                     { "operation", GpuCatalogOperationName( value.operation ) }, { "view_kind", value.viewKind }, { "format", value.format },
                     { "buffer_offset_bytes", Decimal( value.bufferOffsetBytes ) }, { "buffer_length_bytes", Decimal( value.bufferLengthBytes ) },
                     { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
@@ -5675,7 +5837,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto partKind = JnGpuCatalogPartKind( value.partKind );
                 if( meshOnly && partKind != JnGpuCatalogPartKind::MeshVertexStream && partKind != JnGpuCatalogPartKind::MeshIndex ) continue;
                 values.push_back( {
-                    { "part_id", Decimal( value.partId ) }, { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::Part, index ) ) },
+                    { "part_id", Decimal( value.partId ) }, { "generation", Decimal( partGenerations[index] ) },
                     { "part_kind", value.partKind }, { "operation", GpuCatalogOperationName( value.operation ) },
                     { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
                     { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
@@ -5686,15 +5848,98 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return values;
         };
 
-        const auto resourceRanges = [&]( std::optional<uint64_t> passFilter = std::nullopt ) {
+        const auto resourceLogicalBindings = [&]( size_t limit, size_t& total ) {
+            json values = json::array();
+            std::unordered_map<uint64_t, std::vector<std::pair<size_t, const JnGpuCatalogLogicalRecordV1*>>> definitions;
+            definitions.reserve( catalog->gpuCatalogLogicals.size() / 4 );
+            for( size_t index = 0; index < catalog->gpuCatalogLogicals.size(); ++index )
+            {
+                const auto& candidate = catalog->gpuCatalogLogicals[index];
+                if( candidate.logicalResourceId == 0 ) continue;
+                const auto operation = JnGpuCatalogRecordOperation( candidate.operation );
+                if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Update ||
+                    operation == JnGpuCatalogRecordOperation::Open || operation == JnGpuCatalogRecordOperation::Snapshot )
+                    definitions[candidate.logicalResourceId].emplace_back( index, &candidate );
+            }
+            for( size_t index = 0; index < catalog->gpuCatalogLogicals.size(); ++index )
+            {
+                const auto& value = catalog->gpuCatalogLogicals[index];
+                if( value.resourceId != resourceId ) continue;
+                ++total;
+                if( values.size() >= limit ) continue;
+                const auto generation = logicalGenerations[index];
+                const JnGpuCatalogLogicalRecordV1* definition = nullptr;
+                size_t definitionIndex = 0;
+                const auto found = definitions.find( value.logicalResourceId );
+                if( found != definitions.end() ) for( const auto& candidate : found->second )
+                {
+                    if( candidate.second->time > value.time ) continue;
+                    if( definition == nullptr || candidate.second->time >= definition->time )
+                    {
+                        definition = candidate.second;
+                        definitionIndex = candidate.first;
+                    }
+                }
+                const auto definitionGeneration = definition ? logicalGenerations[definitionIndex] : generation;
+                const auto nameId = value.nameId != 0 ? value.nameId : ( definition ? definition->nameId : 0 );
+                const auto name = GpuCatalogString( *catalog, value.nameId != 0 ? generation : definitionGeneration, nameId );
+                const auto stableKey = value.stableKey != 0 ? value.stableKey : ( definition ? definition->stableKey : 0 );
+                const auto familyId = value.familyId != 0 ? value.familyId : ( definition ? definition->familyId : 0 );
+                const auto physicalOffset = value.physicalOffsetBytes != 0 ? value.physicalOffsetBytes : ( definition ? definition->physicalOffsetBytes : 0 );
+                const auto length = value.lengthBytes != 0 ? value.lengthBytes : ( definition ? definition->lengthBytes : 0 );
+                const auto aliasGroupId = value.aliasGroupId != 0 ? value.aliasGroupId : ( definition ? definition->aliasGroupId : 0 );
+                const auto primaryKind = value.primaryKind != 0 ? value.primaryKind : ( definition ? definition->primaryKind : 0 );
+                const auto definitionRevision = value.definitionRevision != 0 ? value.definitionRevision : ( definition ? definition->definitionRevision : 0 );
+                values.push_back( {
+                    { "logical_resource_id", Decimal( value.logicalResourceId ) }, { "stable_key", Decimal( stableKey ) },
+                    { "generation", Decimal( generation ) }, { "definition_generation", Decimal( definitionGeneration ) },
+                    { "family_id", Decimal( familyId ) },
+                    { "operation", GpuCatalogOperationName( value.operation ) },
+                    { "name", name.empty() ? json( nullptr ) : json( name ) },
+                    { "name_provenance", value.nameId != 0 ? value.nameProvenance : ( definition ? definition->nameProvenance : 0 ) },
+                    { "physical_offset_bytes", Decimal( physicalOffset ) }, { "length_bytes", Decimal( length ) },
+                    { "alias_group_id", aliasGroupId == 0 ? json( nullptr ) : json( Decimal( aliasGroupId ) ) },
+                    { "frame_id", value.frameId == 0 ? json( nullptr ) : json( Decimal( value.frameId ) ) },
+                    { "definition_revision", definitionRevision }, { "primary_kind", GpuPrimaryKindName( primaryKind ) },
+                    { "definition_status", definition ? "resolved" : "unavailable" },
+                    { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
+                } );
+            }
+            return values;
+        };
+
+        const auto resourceRelations = [&]( size_t limit, size_t& total ) {
+            json values = json::array();
+            for( size_t index = 0; index < catalog->gpuCatalogRelations.size(); ++index )
+            {
+                const auto& value = catalog->gpuCatalogRelations[index];
+                if( value.sourceId != resourceId && value.targetId != resourceId ) continue;
+                ++total;
+                if( values.size() >= limit ) continue;
+                values.push_back( {
+                    { "generation", Decimal( relationGenerations[index] ) },
+                    { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+                    { "relation", GpuCatalogRelationName( value.relation ) }, { "operation", GpuCatalogOperationName( value.operation ) },
+                    { "frame_id", value.frameId == 0 ? json( nullptr ) : json( Decimal( value.frameId ) ) },
+                    { "value0", Decimal( value.value0 ) }, { "value1", Decimal( value.value1 ) },
+                    { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
+                } );
+            }
+            return values;
+        };
+
+        const auto resourceRanges = [&]( size_t offset, size_t limit, size_t& total,
+            std::optional<uint64_t> passFilter = std::nullopt ) {
             json values = json::array();
             for( size_t index = 0; index < catalog->gpuRangeSets.size(); ++index )
             {
                 const auto& value = catalog->gpuRangeSets[index];
                 if( value.resourceId != resourceId || ( passFilter && value.passInstanceId != *passFilter ) ) continue;
+                const auto position = total++;
+                if( position < offset || values.size() >= limit ) continue;
                 values.push_back( {
                     { "pass_id", Decimal( value.passInstanceId ) }, { "resource_ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
-                    { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::RangeSet, index ) ) },
+                    { "generation", Decimal( rangeGenerations[index] ) },
                     { "view_id", value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( value.viewDefinitionId ) ) },
                     { "range_kind", value.rangeKind }, { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
                     { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
@@ -5704,20 +5949,52 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return values;
         };
 
-        const auto resourceSetUses = [&]() {
+        const auto resourceSetUses = [&]( size_t offset, size_t limit, size_t& total ) {
             json values = json::array();
-            if( resourceState->latest->allocationId == 0 ) return values;
-            const auto attribution = source->GetGpuMemoryAttribution();
-            for( const auto& pass : attribution.passes ) for( const auto& use : pass.uses )
+            const auto append = [&]( const analysis::GpuMemoryUseReference& reference )
             {
-                if( use.allocationId != resourceState->latest->allocationId ) continue;
+                const auto position = total++;
+                if( position < offset || values.size() >= limit ) return;
+                const auto physicalAllocationId = resourceState->latest->allocationId;
+                const auto& use = reference.use;
                 values.push_back( {
-                    { "pass_id", Decimal( pass.passId ) }, { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", pass.passId ) },
-                    { "allocation_id", Decimal( use.allocationId ) }, { "usage_mask", use.usageMask },
+                    { "pass_id", Decimal( reference.passId ) }, { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", reference.passId ) },
+                    { "allocation_id", Decimal( physicalAllocationId ) }, { "logical_resource_id", Decimal( use.allocationId ) },
+                    { "catalog_resource_id", Decimal( resourceId ) },
+                    { "resolved_physical_allocation_id", physicalAllocationId == 0 ? json( nullptr ) : json( Decimal( physicalAllocationId ) ) },
+                    { "usage_mask", use.usageMask },
                     { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
                     { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
-                    { "range_status", "unknown_without_GpuRangeSetV1" }
+                    { "resolution", "pointer_lifetime_exact" }, { "range_status", "query_gpu_range_set_for_exact_range" }
                 } );
+            };
+            bool indexedReverseScan = false;
+            const auto intervals = pointerIntervalsByResource.find( resourceId );
+            if( intervals != pointerIntervalsByResource.end() )
+            {
+                std::unordered_set<uint64_t> pointerTokens;
+                for( const auto& interval : intervals->second ) pointerTokens.emplace( interval.pointerToken );
+                for( const auto pointerToken : pointerTokens )
+                {
+                    size_t useOffset = 0;
+                    while( true )
+                    {
+                        const auto page = source->ScanGpuMemoryUsesByResource( pointerToken, useOffset, MaximumPageSize );
+                        if( !page ) break;
+                        indexedReverseScan = true;
+                        for( const auto& reference : page->references )
+                            if( resolvePointerResource( pointerToken, reference.passEnd ) == resourceId ) append( reference );
+                        useOffset += page->references.size();
+                        if( page->references.empty() || useOffset >= page->totalUses ) break;
+                    }
+                }
+            }
+            if( !indexedReverseScan )
+            {
+                const auto attribution = CachedGpuAttribution( trace.id, source );
+                for( const auto& pass : attribution->passes ) for( const auto& use : pass.uses )
+                    if( resolvePointerResource( use.allocationId, pass.end ) == resourceId )
+                        append( { pass.passId, pass.start, pass.end, use } );
             }
             return values;
         };
@@ -5725,18 +6002,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "gpu.resource.allocations" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "allocations", resourceAllocations() } }, trace );
         if( method == "gpu.resource.views" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "views", resourceViews() } }, trace );
         if( method == "gpu.resource.mesh_buffers" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "parts", resourceParts( true ) } }, trace );
-        if( method == "gpu.resource.references" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
-            { "ranges", resourceRanges() }, { "resource_set_uses", resourceSetUses() } }, trace );
+        if( method == "gpu.resource.references" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            size_t rangeTotal = 0, useTotal = 0;
+            auto ranges = resourceRanges( page.offset, page.limit, rangeTotal );
+            auto uses = resourceSetUses( page.offset, page.limit, useTotal );
+            return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                { "ranges", std::move( ranges ) }, { "resource_set_uses", std::move( uses ) },
+                { "ranges_page", { { "offset", page.offset }, { "limit", page.limit }, { "returned", std::min( page.limit, rangeTotal > page.offset ? rangeTotal - page.offset : 0 ) },
+                    { "total", rangeTotal }, { "has_more", page.offset + page.limit < rangeTotal } } },
+                { "resource_set_page", { { "offset", page.offset }, { "limit", page.limit }, { "returned", std::min( page.limit, useTotal > page.offset ? useTotal - page.offset : 0 ) },
+                    { "total", useTotal }, { "has_more", page.offset + page.limit < useTotal } } } }, trace );
+        }
 
         if( method == "gpu.resource.vg_pages" )
         {
+            const auto page = ParsePage( params, method, trace );
             json values = json::array();
+            size_t total = 0;
             for( size_t index = 0; index < catalog->gpuCatalogVg.size(); ++index )
             {
                 const auto& value = catalog->gpuCatalogVg[index];
                 if( value.resourceId != resourceId ) continue;
+                const auto position = total++;
+                if( position < page.offset || values.size() >= page.limit ) continue;
                 values.push_back( {
-                    { "generation", Decimal( GpuCatalogRecordGeneration( *catalog, JnGpuCatalogBatchKind::VirtualGeometry, index ) ) },
+                    { "generation", Decimal( vgGenerations[index] ) },
                     { "runtime_resource_id", Decimal( value.runtimeResourceId ) }, { "page_definition_id", Decimal( value.pageDefinitionId ) },
                     { "episode_id", Decimal( value.episodeId ) }, { "page_index", value.pageIndex }, { "gpu_page_index", value.gpuPageIndex },
                     { "cluster_index", value.clusterIndex }, { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
@@ -5744,19 +6036,29 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
                 } );
             }
-            return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "pages", std::move( values ) } }, trace );
+            const auto returned = values.size();
+            return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "pages", std::move( values ) },
+                { "page", { { "offset", page.offset }, { "limit", page.limit }, { "returned", returned },
+                    { "total", total }, { "has_more", page.offset + returned < total } } } }, trace );
         }
 
         if( method == "gpu.resource.raytracing_chain" )
         {
+            const auto page = ParsePage( params, method, trace );
             json relations = json::array();
+            size_t total = 0;
             for( const auto& value : catalog->gpuCatalogRelations ) if( value.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
                 ( value.sourceId == resourceId || value.targetId == resourceId ) )
             {
+                const auto position = total++;
+                if( position < page.offset || relations.size() >= page.limit ) continue;
                 relations.push_back( { { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
                     { "relation", "rtas_uses" }, { "time_ns", Decimal( value.time ) }, { "exactness", GpuExactnessName( value.exactness ) } } );
             }
-            return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "relations", std::move( relations ) } }, trace );
+            const auto returned = relations.size();
+            return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "relations", std::move( relations ) },
+                { "page", { { "offset", page.offset }, { "limit", page.limit }, { "returned", returned },
+                    { "total", total }, { "has_more", page.offset + returned < total } } } }, trace );
         }
 
         if( method == "gpu.resource.explain" )
@@ -5766,8 +6068,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             result["allocations"] = resourceAllocations();
             result["views"] = resourceViews();
             result["parts"] = resourceParts( false );
-            result["pass_ranges"] = resourceRanges();
-            result["resource_set_uses"] = resourceSetUses();
+            size_t rangeTotal = 0, useTotal = 0;
+            result["pass_ranges"] = resourceRanges( 0, DefaultPageSize, rangeTotal );
+            result["resource_set_uses"] = resourceSetUses( 0, DefaultPageSize, useTotal );
+            result["pass_range_count"] = Decimal( rangeTotal );
+            result["resource_set_use_count"] = Decimal( useTotal );
+            result["pass_ranges_truncated"] = rangeTotal > DefaultPageSize;
+            result["resource_set_uses_truncated"] = useTotal > DefaultPageSize;
+            size_t logicalTotal = 0, relationTotal = 0;
+            result["logical_bindings"] = resourceLogicalBindings( DefaultPageSize, logicalTotal );
+            result["relations"] = resourceRelations( DefaultPageSize, relationTotal );
+            result["logical_binding_count"] = Decimal( logicalTotal );
+            result["relation_count"] = Decimal( relationTotal );
+            result["logical_bindings_truncated"] = logicalTotal > DefaultPageSize;
+            result["relations_truncated"] = relationTotal > DefaultPageSize;
             result["provenance"] = { { "identity", "exact_gpu_resource_lifetime" }, { "high_level_owner", "unavailable_n27_gpu_layer_only" } };
             result["unavailable"] = { "unity_object", "asset_guid", "asset_path", "prefab", "scene", "load_instance" };
             return Success( id, std::move( result ), trace );
@@ -5776,16 +6090,48 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "gpu.pass.resources" || method == "gpu.memory.by_pass" )
         {
             const auto passId = UnsignedParameter( params, "pass_id", 0, std::numeric_limits<uint64_t>::max() );
+            // Explicit GPU pass entities and GPU-reference passes are separate
+            // identities. RangeSet/ResourceSet records use the reference-pass
+            // identity, while callers navigate here with the explicit pass
+            // identity returned by gpu.pass.search. Preserve both identities
+            // and follow only the typed ReferencesResources relation.
+            std::unordered_set<uint64_t> evidencePassIds { passId };
+            for( const auto& link : source->GetGfxLinks() )
+                if( link.relation == uint8_t( JnGfxRelation::ReferencesResources ) &&
+                    link.sourceId == passId && link.targetId != 0 )
+                    evidencePassIds.emplace( link.targetId );
             std::unordered_set<uint64_t> uniqueResources;
             std::unordered_set<uint64_t> uniqueAllocations;
             std::unordered_set<uint64_t> rangedResources;
+            std::unordered_map<uint64_t, std::vector<const JnGpuCatalogLogicalRecordV1*>> logicalHistory;
+            logicalHistory.reserve( catalog->gpuCatalogLogicals.size() );
+            for( const auto& value : catalog->gpuCatalogLogicals )
+                if( value.logicalResourceId != 0 ) logicalHistory[value.logicalResourceId].push_back( &value );
+            for( auto& [unused, history] : logicalHistory )
+                std::stable_sort( history.begin(), history.end(), []( const auto* lhs, const auto* rhs ) { return lhs->time < rhs->time; } );
+            const auto resolveLogicalResource = [&]( uint64_t logicalResourceId, int64_t time )
+            {
+                const auto found = logicalHistory.find( logicalResourceId );
+                if( found == logicalHistory.end() ) return uint64_t( 0 );
+                uint64_t resolved = 0;
+                for( const auto* value : found->second )
+                {
+                    if( value->time > time ) break;
+                    const auto operation = JnGpuCatalogRecordOperation( value->operation );
+                    if( operation == JnGpuCatalogRecordOperation::Unbind ||
+                        operation == JnGpuCatalogRecordOperation::Destroy ||
+                        operation == JnGpuCatalogRecordOperation::Close ) resolved = 0;
+                    else if( value->resourceId != 0 ) resolved = value->resourceId;
+                }
+                return resolved;
+            };
             uint64_t directRangeBytes = 0;
             json ranges = json::array();
             json resourceSetUses = json::array();
             for( size_t index = 0; index < catalog->gpuRangeSets.size(); ++index )
             {
                 const auto& value = catalog->gpuRangeSets[index];
-                if( value.passInstanceId != passId ) continue;
+                if( !evidencePassIds.contains( value.passInstanceId ) ) continue;
                 uniqueResources.emplace( value.resourceId );
                 rangedResources.emplace( value.resourceId );
                 directRangeBytes += value.lengthBytes;
@@ -5797,37 +6143,85 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
                     { "usage_mask", value.usageMask }, { "exactness", GpuExactnessName( value.exactness ) } } );
             }
-            const auto attribution = source->GetGpuMemoryAttribution();
-            for( const auto& pass : attribution.passes )
+            const auto appendResourceSetUse = [&]( const analysis::GpuMemoryPass& pass, const analysis::GpuMemoryPassUse& use )
             {
-                if( pass.passId != passId ) continue;
-                for( const auto& use : pass.uses )
+                const auto logicalResourceId = use.allocationId;
+                auto catalogResourceId = resolvePointerResource( logicalResourceId, pass.end );
+                const bool pointerLifetimeResolved = catalogResourceId != 0;
+                if( catalogResourceId == 0 ) catalogResourceId = resolveLogicalResource( logicalResourceId, pass.end );
+                uint64_t physicalAllocationId = use.resolvedPhysicalAllocationId;
+                size_t matchedResources = 0;
+                if( catalogResourceId != 0 )
                 {
-                    uniqueAllocations.emplace( use.allocationId );
-                    size_t matchedResources = 0;
-                    for( const auto& [candidateId, state] : resources )
+                    const auto found = resources.find( catalogResourceId );
+                    if( found != resources.end() && found->second.latest != nullptr )
                     {
-                        if( state.latest && state.latest->allocationId == use.allocationId )
+                        uniqueResources.emplace( catalogResourceId );
+                        physicalAllocationId = found->second.latest->allocationId;
+                        matchedResources = 1;
+                    }
+                }
+                if( catalogResourceId == 0 && physicalAllocationId != 0 )
+                    for( const auto& [candidateId, state] : resources )
+                        if( state.latest && state.latest->allocationId == physicalAllocationId &&
+                            ( state.openBoundary || state.createTime <= pass.end ) &&
+                            ( state.destroyTime == 0 || pass.start <= state.destroyTime ) )
                         {
                             uniqueResources.emplace( candidateId );
                             matchedResources++;
                         }
-                    }
-                    resourceSetUses.push_back( {
-                        { "allocation_id", Decimal( use.allocationId ) },
-                        { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
-                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
-                        { "usage_mask", use.usageMask }, { "resolved_resource_count", Decimal( matchedResources ) }
-                    } );
+                if( physicalAllocationId != 0 ) uniqueAllocations.emplace( physicalAllocationId );
+                resourceSetUses.push_back( {
+                    { "allocation_id", physicalAllocationId == 0 ? json( nullptr ) : json( Decimal( physicalAllocationId ) ) },
+                    { "logical_resource_id", Decimal( logicalResourceId ) },
+                    { "catalog_resource_id", catalogResourceId == 0 ? json( nullptr ) : json( Decimal( catalogResourceId ) ) },
+                    { "resolved_physical_allocation_id", use.resolvedPhysicalAllocationId == 0 ? json( nullptr ) : json( Decimal( use.resolvedPhysicalAllocationId ) ) },
+                    { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                    { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                    { "usage_mask", use.usageMask }, { "resolved_resource_count", Decimal( matchedResources ) },
+                    { "resolution", pointerLifetimeResolved ? "pointer_lifetime_exact" :
+                        ( catalogResourceId != 0 ? "logical_catalog_exact" :
+                        ( physicalAllocationId != 0 ? "physical_allocation_fallback" : "unresolved_logical_resource" ) ) }
+                } );
+            };
+            bool indexedPassScanSupported = false;
+            for( const auto evidencePassId : evidencePassIds )
+            {
+                size_t useOffset = 0;
+                while( true )
+                {
+                    const auto page = source->ScanGpuMemoryPasses( 0, 1, evidencePassId, useOffset, MaximumPageSize );
+                    if( !page ) break;
+                    indexedPassScanSupported = true;
+                    if( page->passes.empty() ) break;
+                    const auto& pass = page->passes.front();
+                    for( const auto& use : pass.uses ) appendResourceSetUse( pass, use );
+                    useOffset += pass.uses.size();
+                    if( pass.uses.empty() || useOffset >= page->totalUses ) break;
                 }
-                break;
+            }
+            if( !indexedPassScanSupported )
+            {
+                const auto attribution = CachedGpuAttribution( trace.id, source );
+                for( const auto evidencePassId : evidencePassIds )
+                {
+                    const auto passIndex = attribution->passById.find( evidencePassId );
+                    if( passIndex == attribution->passById.end() || passIndex->second >= attribution->passes.size() ) continue;
+                    const auto& pass = attribution->passes[passIndex->second];
+                    for( const auto& use : pass.uses ) appendResourceSetUse( pass, use );
+                }
             }
             uint64_t physicalBytes = 0;
             std::unordered_map<uint64_t, const JnGpuCatalogAllocationRecordV1*> latestAllocations;
             for( const auto& value : catalog->gpuCatalogAllocations )
                 if( uniqueAllocations.contains( value.allocationId ) && ( !latestAllocations[value.allocationId] || value.time >= latestAllocations[value.allocationId]->time ) ) latestAllocations[value.allocationId] = &value;
             for( const auto& [allocationId, value] : latestAllocations ) if( value->operation != uint8_t( JnGpuCatalogRecordOperation::Destroy ) ) physicalBytes += value->sizeBytes;
-            return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", "continuous_exact" },
+            json evidencePassIdValues = json::array();
+            std::vector<uint64_t> sortedEvidencePassIds( evidencePassIds.begin(), evidencePassIds.end() );
+            std::sort( sortedEvidencePassIds.begin(), sortedEvidencePassIds.end() );
+            for( const auto value : sortedEvidencePassIds ) evidencePassIdValues.push_back( Decimal( value ) );
+            return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
+                { "evidence_pass_ids", std::move( evidencePassIdValues ) }, { "sample_status", "continuous_exact" },
                 { "resource_count", Decimal( uniqueResources.size() ) }, { "allocation_count", Decimal( uniqueAllocations.size() ) },
                 { "direct_range_bytes", Decimal( directRangeBytes ) }, { "referenced_physical_bytes", Decimal( physicalBytes ) },
                 { "range_coverage", uniqueResources.empty() ? 1.0 : double( rangedResources.size() ) / double( uniqueResources.size() ) },
@@ -10004,8 +10398,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "source.locations" )
     {
         auto locations = source->GetSourceLocations();
+        const auto requestedRef = params.value( "ref", std::string() );
         locations.erase( std::remove_if( locations.begin(), locations.end(), [&]( const auto& value ) {
-            return !TextMatches( value.name + " " + value.function + " " + value.file, params );
+            return ( !requestedRef.empty() && value.ref != requestedRef ) ||
+                !TextMatches( value.name + " " + value.function + " " + value.file, params );
         } ), locations.end() );
         const auto page = ParsePage( params, method, trace );
         const size_t begin = std::min( page.offset, locations.size() );
@@ -10874,14 +11270,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
         {
             uint64_t invalidBatches = 0, checksumFailures = 0, sequenceGaps = 0, unresolved = 0;
-            std::unordered_map<uint64_t, uint32_t> nextSequence;
+            std::map<uint64_t, std::vector<uint32_t>> sequences;
+            for( const auto& control : catalog->gpuCatalogControls )
+                sequences[control.generation].push_back( control.sequence );
             for( const auto& batch : catalog->gpuCatalogBatches )
             {
                 invalidBatches += batch.valid == 0;
                 checksumFailures += batch.valid == 0 || batch.transportChecksum == 0 || batch.storedChecksum == 0;
-                auto& expected = nextSequence[batch.generation];
-                if( expected != 0 && batch.sequence != expected ) sequenceGaps++;
-                expected = batch.sequence + 1;
+                sequences[batch.generation].push_back( batch.sequence );
+            }
+            for( auto& [generation, values] : sequences )
+            {
+                std::sort( values.begin(), values.end() );
+                uint32_t expected = 1;
+                for( const auto sequence : values )
+                {
+                    if( sequence > expected ) sequenceGaps += sequence - expected;
+                    expected = std::max<uint32_t>( expected, sequence + 1 );
+                }
             }
             for( const auto& generation : catalog->gpuCatalogGenerations ) unresolved += generation.unresolvedCount;
             if( !catalog->gpuCatalogValid ) addFinding( "error", "GPU_CATALOG_INVALID_CORE", "N27 GPU Catalog Core is invalid; dependent Pass-to-Resource evidence is unavailable and no earlier generation may substitute it", 1 );

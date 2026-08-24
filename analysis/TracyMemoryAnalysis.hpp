@@ -390,6 +390,20 @@ struct GpuMemoryPassPage
     std::vector<GpuMemoryPass> passes;
 };
 
+struct GpuMemoryUseReference
+{
+    uint64_t passId = 0;
+    int64_t passStart = 0;
+    int64_t passEnd = 0;
+    GpuMemoryPassUse use;
+};
+
+struct GpuMemoryUseReferencePage
+{
+    uint64_t totalUses = 0;
+    std::vector<GpuMemoryUseReference> references;
+};
+
 struct GpuMemoryRequestScopePage
 {
     uint64_t totalScopes = 0;
