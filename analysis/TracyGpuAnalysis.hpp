@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <functional>
+#include <stop_token>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -186,6 +188,12 @@ struct GpuAnalysisBudget
     uint64_t hardBytes = 6ull * 1024 * 1024 * 1024;
 };
 
+struct GpuAnalysisBuildControl
+{
+    std::stop_token stopToken;
+    std::function<void( float, const char* )> progress;
+};
+
 struct GpuAnalysisSnapshot
 {
     GpuAnalysisManifest manifest;
@@ -213,7 +221,7 @@ struct GpuAnalysisSnapshot
 };
 
 GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const GpuMemoryAttribution* attribution = nullptr,
-    const GpuAnalysisBudget& budget = {} );
+    const GpuAnalysisBudget& budget = {}, const GpuAnalysisBuildControl& control = {} );
 GpuFrameComparison CompareGpuFrames( const GpuAnalysisSnapshot& snapshot, uint64_t frameA, uint64_t frameB );
 
 const char* GpuAnalysisStateName( GpuAnalysisState value );

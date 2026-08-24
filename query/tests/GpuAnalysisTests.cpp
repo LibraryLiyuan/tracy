@@ -1,7 +1,9 @@
 #include "TracyGpuAnalysis.hpp"
+#include "TracyGpuAnalysisCache.hpp"
 #include "../../public/common/TracyQueue.hpp"
 
 #include <cassert>
+#include <filesystem>
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -78,5 +80,18 @@ int main()
 
     JnTraceData missing;
     assert( BuildGpuAnalysisSnapshot( missing ).manifest.state == GpuAnalysisState::NotPresent );
+
+    const auto cachePath = std::filesystem::temp_directory_path() / "jn-tracy-gpu-analysis-test.cache";
+    GpuAnalysisCacheIdentity identity { "0123456789abcdef", 1234, "test-build" };
+    std::string error;
+    assert( SaveGpuAnalysisCache( cachePath, identity, snapshot, error ) );
+    const auto loaded = LoadGpuAnalysisCache( cachePath, identity, error );
+    assert( loaded );
+    assert( loaded->engineKnownPhysicalBytes == snapshot.engineKnownPhysicalBytes );
+    assert( loaded->resources.size() == snapshot.resources.size() );
+    assert( loaded->passes.size() == snapshot.passes.size() );
+    auto wrongIdentity = identity; wrongIdentity.traceSize++;
+    assert( !LoadGpuAnalysisCache( cachePath, wrongIdentity, error ) );
+    std::error_code ec; std::filesystem::remove( cachePath, ec );
     return 0;
 }

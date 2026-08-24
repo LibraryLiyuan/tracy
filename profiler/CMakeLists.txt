@@ -98,6 +98,7 @@ set(SERVER_FILES
     TracyView_FrameTimeline.cpp
     TracyView_FrameTree.cpp
     TracyView_GpuTimeline.cpp
+    TracyGpuAnalysisController.cpp
     TracyView_Jobs.cpp
     TracyView_Locks.cpp
     TracyView_Manual.cpp

@@ -77,9 +77,20 @@ const GpuPassWorkingSet* GpuAnalysisSnapshot::FindPass( uint64_t passId ) const
     return it == passById.end() ? nullptr : &passes[it->second];
 }
 
-GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const GpuMemoryAttribution* attribution, const GpuAnalysisBudget& budget )
+GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const GpuMemoryAttribution* attribution,
+    const GpuAnalysisBudget& budget, const GpuAnalysisBuildControl& control )
 {
     GpuAnalysisSnapshot out;
+    const auto report = [&]( float value, const char* stage ) { if( control.progress ) control.progress( value, stage ); };
+    const auto cancelled = [&]()
+    {
+        if( !control.stopToken.stop_requested() ) return false;
+        out.manifest.state = GpuAnalysisState::Cancelled;
+        out.manifest.complete = false;
+        out.manifest.reason = "cancelled";
+        return true;
+    };
+    report( 0.02f, "manifest" );
     auto& manifest = out.manifest;
     manifest.catalogSchema = data.gpuCatalogSchemaVersion;
     manifest.evidenceSchema = data.gpuDetailedEvidenceSchemaVersion;
@@ -141,9 +152,13 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
         manifest.reason = "analysis_soft_memory_limit";
     }
 
+    if( cancelled() ) return out;
+    report( 0.10f, "resources" );
+
     out.resources.reserve( data.gpuCatalogResources.size() );
     for( size_t index = 0; index < data.gpuCatalogResources.size(); ++index )
     {
+        if( ( index & 4095 ) == 0 && cancelled() ) return out;
         const auto& value = data.gpuCatalogResources[index];
         if( value.resourceId == 0 ) { manifest.invalidRecordCount++; continue; }
         auto [it, inserted] = out.resourceById.emplace( value.resourceId, out.resources.size() );
@@ -195,11 +210,13 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     }
 
     out.allocations.reserve( data.gpuCatalogAllocations.size() );
+    report( 0.28f, "allocations" );
     struct AllocationEvent { int64_t time; const JnGpuCatalogAllocationRecordV1* value; };
     std::vector<AllocationEvent> allocationEvents;
     allocationEvents.reserve( data.gpuCatalogAllocations.size() );
     for( size_t index = 0; index < data.gpuCatalogAllocations.size(); ++index )
     {
+        if( ( index & 4095 ) == 0 && cancelled() ) return out;
         const auto& value = data.gpuCatalogAllocations[index];
         if( value.allocationId == 0 ) { manifest.invalidRecordCount++; continue; }
         allocationEvents.push_back( { value.time, &value } );
@@ -250,6 +267,7 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     }
 
     std::sort( allocationEvents.begin(), allocationEvents.end(), []( const auto& lhs, const auto& rhs ) { return lhs.time < rhs.time; } );
+    report( 0.46f, "physical-memory" );
     std::unordered_map<uint64_t, uint64_t> livePhysical;
     uint64_t currentPhysical = 0;
     for( const auto& event : allocationEvents )
@@ -299,6 +317,8 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     for( size_t index = 0; index < data.gpuRangeSets.size(); ++index )
         if( const auto it = out.resourceById.find( data.gpuRangeSets[index].resourceId ); it != out.resourceById.end() ) out.resources[it->second].ranges.emplace_back( index );
 
+    if( cancelled() ) return out;
+    report( 0.62f, "passes" );
     if( attribution )
     {
         out.passes.reserve( attribution->passes.size() );
@@ -352,6 +372,7 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     }
     for( size_t index = 0; index < data.gpuRangeSets.size(); ++index )
     {
+        if( ( index & 4095 ) == 0 && cancelled() ) return out;
         const auto& value = data.gpuRangeSets[index];
         auto it = out.passById.find( value.passInstanceId );
         if( it == out.passById.end() )
@@ -393,6 +414,8 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
         visit[index] = 2;
     };
     for( size_t index = 0; index < out.passes.size(); ++index ) buildInclusive( index );
+    if( cancelled() ) return out;
+    report( 0.86f, "lifetime-churn" );
     for( auto& pass : out.passes )
     {
         pass.inclusivePhysicalBytes = PhysicalBytesForResources( out, pass.inclusiveResources );
@@ -414,6 +437,7 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
         out.churnCandidates.push_back( { GpuChurnCandidateKind::RepeatedRecreate, group.front()->resourceId, group.front()->allocationId,
             bytes, group.size(), double( group.size() ), "same stable name hash was created more than once" } );
     }
+    report( 1.0f, "ready" );
     return out;
 }
 
