@@ -1704,18 +1704,35 @@ void View::DrawMemory()
         ImGui::SetNextWindowFocus();
         m_memInfo.focus = false;
     }
-    ImGui::Begin( "Memory", &m_memInfo.show, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse );
+    ImGui::Begin( "CPU Memory", &m_memInfo.show );
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
 
     auto& memNameMap = m_worker.GetMemNameMap();
-    if( memNameMap.size() > 1 )
+    if( IsGpuD3D12MemoryPool( m_memInfo.pool ) || memNameMap.find( m_memInfo.pool ) == memNameMap.end() )
     {
-        TextDisabledUnformatted( ICON_FA_BOX_ARCHIVE " Memory pool:" );
+        m_memInfo.pool = 0;
+        if( memNameMap.find( 0 ) == memNameMap.end() )
+        {
+            for( const auto& value : memNameMap ) if( !IsGpuD3D12MemoryPool( value.first ) ) { m_memInfo.pool = value.first; break; }
+        }
+        m_memInfo.showAllocList = false;
+    }
+    size_t cpuPoolCount = 0;
+    for( const auto& value : memNameMap ) if( !IsGpuD3D12MemoryPool( value.first ) ) ++cpuPoolCount;
+    TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "TrackedOnly" );
+    ImGui::SameLine(); ImGui::TextDisabled( "Allocation events are not the process/Unity retained-memory total." );
+    ImGui::SameLine(); if( ImGui::SmallButton( "Open GPU Memory & Resources" ) ) m_showJnGpuResources = true;
+    ImGui::SetNextItemWidth( 130 * scale );
+    ImGui::InputDouble( "Project CPU budget (GB)", &m_memInfo.projectBudgetGb, .5, 1, "%.1f" );
+    if( cpuPoolCount > 1 )
+    {
+        TextDisabledUnformatted( ICON_FA_BOX_ARCHIVE " CPU allocation pool:" );
         ImGui::SameLine();
         if( ImGui::BeginCombo( "##memoryPool", m_memInfo.pool == 0 ? "Default allocator" : m_worker.GetString( m_memInfo.pool ) ) )
         {
             for( auto& v : memNameMap )
             {
+                if( IsGpuD3D12MemoryPool( v.first ) ) continue;
                 if( ImGui::Selectable( v.first == 0 ? "Default allocator" : m_worker.GetString( v.first ) ) )
                 {
                     m_memInfo.pool = v.first;
@@ -1728,8 +1745,6 @@ void View::DrawMemory()
         }
         ImGui::Separator();
     }
-
-    DrawMemoryFrameInspector();
 
     auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool );
     if( mem.data.empty() )
@@ -1744,7 +1759,7 @@ void View::DrawMemory()
         return;
     }
 
-    const bool gpuPool = IsGpuD3D12MemoryPool( m_memInfo.pool );
+    const bool gpuPool = false;
 
     TextDisabledUnformatted( "Total allocations:" );
     ImGui::SameLine();
@@ -1757,6 +1772,11 @@ void View::DrawMemory()
     TextDisabledUnformatted( "Memory usage:" );
     ImGui::SameLine();
     ImGui::Text( "%-15s", MemSizeToString( mem.usage ) );
+    const auto projectBudgetBytes = uint64_t( std::max( 0.0, m_memInfo.projectBudgetGb ) * 1000.0 * 1000.0 * 1000.0 );
+    if( projectBudgetBytes != 0 && mem.usage > projectBudgetBytes )
+    {
+        ImGui::SameLine(); TextColoredUnformatted( ImVec4( 1.f, .25f, .25f, 1.f ), "OverProjectBudget (tracked pools only)" );
+    }
     if( gpuPool )
     {
         ImGui::SameLine();
@@ -2480,7 +2500,7 @@ void View::DrawAllocList()
 {
     const auto scale = GetScale();
     ImGui::SetNextWindowSize( ImVec2( 1100 * scale, 500 * scale ), ImGuiCond_FirstUseEver );
-    ImGui::Begin( "Allocations list", &m_memInfo.showAllocList );
+    ImGui::Begin( "CPU Allocations", &m_memInfo.showAllocList );
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
 
     std::vector<const MemEvent*> data;
@@ -2492,9 +2512,31 @@ void View::DrawAllocList()
     }
 
     TextFocused( "Number of allocations:", RealToString( m_memInfo.allocList.size() ) );
-    ListMemData( data, [this]( auto v ) {
-        DrawMemoryIdentifier( m_memInfo.pool, *v );
-        }, -1, m_memInfo.pool );
+    ImGui::SameLine(); TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "TrackedOnly" );
+    ImGui::BeginChild( "cpuAllocationMaster", ImVec2( ImGui::GetContentRegionAvail().x * .62f, 0 ), ImGuiChildFlags_Borders );
+    ListMemData( data, [this]( auto v ) { DrawMemoryIdentifier( m_memInfo.pool, *v ); }, -1, m_memInfo.pool );
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild( "cpuAllocationInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
+    if( m_memoryAllocInfoPool == m_memInfo.pool && m_memoryAllocInfoWindow >= 0 && size_t( m_memoryAllocInfoWindow ) < m_worker.GetMemoryNamed( m_memInfo.pool ).data.size() )
+    {
+        const auto& event = m_worker.GetMemoryNamed( m_memInfo.pool ).data[size_t( m_memoryAllocInfoWindow )];
+        int callstackButtonId = int( m_memoryAllocInfoWindow ) * 2;
+        ImGui::SeparatorText( "Allocation Inspector" ); DrawMemoryIdentifier( m_memInfo.pool, event );
+        ImGui::Text( "Size: %s", MemSizeToString( event.Size() ) ); ImGui::Text( "Allocated: %s", TimeToStringExact( event.TimeAlloc() ) );
+        ImGui::Text( "Lifetime: %s", event.TimeFree() < 0 ? "Alive at capture end" : TimeToString( event.TimeFree() - event.TimeAlloc() ) );
+        ImGui::Text( "Alloc thread: %s", m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadAlloc() ) ) );
+        if( event.CsAlloc() ) SmallCallstackButton( "Allocation call stack", event.CsAlloc(), callstackButtonId );
+        else TextDisabledUnformatted( "Allocation call stack unavailable" );
+        if( event.TimeFree() >= 0 )
+        {
+            ImGui::Text( "Free thread: %s", m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadFree() ) ) );
+            if( event.csFree.Val() ) SmallCallstackButton( "Free call stack", event.csFree.Val(), callstackButtonId );
+        }
+        if( ImGui::Button( "Focus lifetime" ) ) ZoomToRange( event.TimeAlloc(), event.TimeFree() >= 0 ? event.TimeFree() : m_worker.GetLastTime() );
+    }
+    else TextDisabledUnformatted( "Select an allocation from the virtualized table." );
+    ImGui::EndChild();
     ImGui::End();
 }
 

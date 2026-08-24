@@ -921,7 +921,7 @@ bool View::DrawImpl()
     ImGui::SameLine();
     ToggleButton( ICON_FA_FIRE_FLAME_CURVED " Flame", m_showFlameGraph );
     ImGui::SameLine();
-    ToggleButton( ICON_FA_MEMORY " Memory", m_memInfo.show );
+    ToggleButton( ICON_FA_MEMORY " CPU Memory", m_memInfo.show );
     ImGui::SameLine();
     ToggleButton( ICON_FA_GAUGE_HIGH " JN Overview", m_showJnCaptureOverview );
     ImGui::SameLine();

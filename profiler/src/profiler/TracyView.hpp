@@ -1066,6 +1066,7 @@ private:
         MemoryFrameSnapshot frameSnapshot;
         std::vector<MemoryFramePoolStamp> frameSnapshotStamps;
         GpuMemoryAttributionCache gpuAttribution;
+        double projectBudgetGb = 16.0;
     } m_memInfo;
 
     struct {
