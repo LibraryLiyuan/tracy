@@ -130,7 +130,7 @@ static float smoothstep( float x )
 static void SetWindowTitleCallback( const char* title )
 {
     char tmp[1024];
-    sprintf( tmp, "%s - Tracy Profiler %i.%i.%i", title, tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
+    sprintf( tmp, "%s - JN Unity GUI Preview - Tracy Profiler %i.%i.%i", title, tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
     bptr->SetTitle( tmp );
     s_customTitle = true;
 }
@@ -221,7 +221,7 @@ static void ScaleChanged( float scale )
 
 int main( int argc, char** argv )
 {
-    sprintf( title, "Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
+    sprintf( title, "JN Unity GUI Preview - Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
 
     std::unique_ptr<tracy::FileRead> initFileOpen;
 #ifdef __EMSCRIPTEN__
@@ -638,7 +638,7 @@ static void DrawContents()
         style.Colors[ImGuiCol_WindowBg] = ImVec4( 0.129f, 0.137f, 0.11f, 1.f );
         ImGui::Begin( "Get started", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings );
         char buf[128];
-        sprintf( buf, "Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
+        sprintf( buf, "JN Unity GUI Preview - Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
         ImGui::PushFont( g_fonts.bold, FontNormal * 1.6f );
         tracy::TextCentered( buf );
         ImGui::PopFont();

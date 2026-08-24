@@ -17,6 +17,7 @@
 #include "TracyFileRead.hpp"
 #include "TracyFilesystem.hpp"
 #include "TracyImGui.hpp"
+#include "TracyGpuAnalysisController.hpp"
 #include "TracyManualData.hpp"
 #include "TracyPrint.hpp"
 #include "TracySourceView.hpp"
@@ -68,6 +69,7 @@ View::View( void(*cbMainThread)(const std::function<void()>&, bool), const char*
 {
     InitTextEditor();
     SetupConfig();
+    m_gpuAnalysis = std::make_unique<GpuAnalysisController>( m_worker, std::filesystem::path{} );
 }
 
 View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f, SetTitleCallback stcb, SetScaleCallback sscb, AttentionCallback acb, AchievementsMgr* amgr )
@@ -96,6 +98,8 @@ View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f
     , m_llm( m_worker, *m_manualData )
 #endif
 {
+    m_traceFilename = f.GetFilename();
+    m_gpuAnalysis = std::make_unique<GpuAnalysisController>( m_worker, m_traceFilename );
     m_notificationTime = 4;
     m_notificationText = std::string( "Trace loaded in " ) + TimeToString( m_worker.GetLoadTime() );
 
@@ -117,6 +121,7 @@ View::View( void(*cbMainThread)(const std::function<void()>&, bool), FileRead& f
 
 View::~View()
 {
+    m_gpuAnalysis.reset();
     m_worker.Shutdown();
 
     m_userData.SaveState( m_vd );
@@ -918,6 +923,8 @@ bool View::DrawImpl()
     ImGui::SameLine();
     ToggleButton( ICON_FA_MEMORY " Memory", m_memInfo.show );
     ImGui::SameLine();
+    ToggleButton( ICON_FA_GAUGE_HIGH " JN Overview", m_showJnCaptureOverview );
+    ImGui::SameLine();
     ToggleButton( ICON_FA_SCALE_BALANCED " Compare", m_compare.show );
     ImGui::SameLine();
     ToggleButton( ICON_FA_FINGERPRINT " Info", m_showInfo );
@@ -1176,6 +1183,7 @@ bool View::DrawImpl()
     if( m_showWaitStacks ) DrawWaitStacks();
     if( m_showManual ) DrawManual();
     if( m_showJnJobs ) DrawJnJobWindow();
+    if( m_showJnCaptureOverview ) DrawJnCaptureOverview();
 #ifndef __EMSCRIPTEN__
     if( m_llm.m_show ) m_llm.Draw();
 #endif

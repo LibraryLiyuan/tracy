@@ -66,6 +66,7 @@ struct LockDraw;
 struct PlotDraw;
 struct FlameGraphContext;
 class TracyManualData;
+class GpuAnalysisController;
 
 
 class View
@@ -458,6 +459,7 @@ private:
     void DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widgetId );
     void RebuildJnJobView();
     void DrawJnJobWindow();
+    void DrawJnCaptureOverview();
     void DrawJnJobTimelineOverlay( const ImVec2& timelinePos, double pxns, bool hover );
     void NavigateToJnJobTime( uint64_t jobId, int64_t time, uint64_t thread, int64_t rangeStart, int64_t rangeEnd );
     void RestoreJnJobNavigation();
@@ -626,6 +628,8 @@ private:
     static const char* DecodeContextSwitchReasonCode( uint8_t reason );
 
     Worker m_worker;
+    std::unique_ptr<GpuAnalysisController> m_gpuAnalysis;
+    std::string m_traceFilename;
     std::string m_filename, m_filenameStaging;
     bool m_staticView;
     ViewMode m_viewMode;
@@ -698,6 +702,7 @@ private:
     bool m_showFlameGraph = false;
     bool m_showManual = false;
     bool m_showJnJobs = false;
+    bool m_showJnCaptureOverview = true;
 
     AccumulationMode m_statAccumulationMode = AccumulationMode::SelfOnly;
     bool m_statSampleTime = true;
