@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <filesystem>
+#include <fstream>
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -92,6 +93,27 @@ int main()
     assert( loaded->passes.size() == snapshot.passes.size() );
     auto wrongIdentity = identity; wrongIdentity.traceSize++;
     assert( !LoadGpuAnalysisCache( cachePath, wrongIdentity, error ) );
+
+    GpuAnalysisBudget softBudget;
+    softBudget.softBytes = 1;
+    softBudget.hardBytes = UINT64_MAX;
+    const auto softLimited = BuildGpuAnalysisSnapshot( data, &attribution, softBudget );
+    assert( softLimited.manifest.state == GpuAnalysisState::Partial );
+    assert( softLimited.manifest.reason == "analysis_soft_memory_limit" );
+
+    GpuAnalysisBudget hardBudget;
+    hardBudget.softBytes = 1;
+    hardBudget.hardBytes = 1;
+    const auto hardLimited = BuildGpuAnalysisSnapshot( data, &attribution, hardBudget );
+    assert( hardLimited.manifest.state == GpuAnalysisState::ResourceLimit );
+    assert( hardLimited.manifest.reason == "analysis_hard_memory_limit" );
+
+    {
+        std::ofstream corrupt( cachePath, std::ios::binary | std::ios::trunc );
+        corrupt.write( "bad", 3 );
+    }
+    assert( !LoadGpuAnalysisCache( cachePath, identity, error ) );
+    assert( error == "cache_identity_mismatch" );
     std::error_code ec; std::filesystem::remove( cachePath, ec );
     return 0;
 }

@@ -1,0 +1,25 @@
+{
+  "stage": "N27-GUI-G8",
+  "status": "PreviewCandidate",
+  "branch": "feature/JNTracy-Profiler-GUI",
+  "baseline_commit": "bb0616f2db695782d4e52261ee431beb5e4b7ef4",
+  "protocol": 90,
+  "jn_trace_section": 12,
+  "gpu_catalog_schema": 1,
+  "analysis_schema": 1,
+  "cache_schema": 1,
+  "artifacts": [
+    {
+      "path": "build-profiler-gui/Release/tracy-profiler.exe",
+      "size_bytes": 27133952,
+      "sha256": "2A41560767664442AA2AF075635AD9770791BD95C6B266B7ECC74536E93A5BD4"
+    },
+    {
+      "path": "build-profiler-gui-query/Release/tracy-query.exe",
+      "size_bytes": 14987776,
+      "sha256": "206F35A76C14B128546E472901720834DFF81A8166D2963EBF74EA98134987A6"
+    }
+  ],
+  "accepted_tag_created": false,
+  "merged_to_dev": false
+}

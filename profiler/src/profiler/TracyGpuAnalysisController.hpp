@@ -19,6 +19,7 @@ enum class GpuAnalysisControllerState : uint8_t
 {
     Idle,
     Building,
+    NotPresent,
     Ready,
     Partial,
     Cancelled,

@@ -1747,6 +1747,18 @@ void View::DrawMemory()
     }
 
     auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool );
+    if( !mem.data.empty() )
+    {
+        if( ImGui::SmallButton( ICON_FA_LIST " Open allocation browser" ) )
+        {
+            m_memInfo.allocList.clear();
+            m_memInfo.allocList.reserve( mem.data.size() );
+            for( size_t index = 0; index < mem.data.size(); ++index ) m_memInfo.allocList.emplace_back( index );
+            m_memInfo.showAllocList = true;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled( "Virtualized list + allocation inspector" );
+    }
     if( mem.data.empty() )
     {
         const auto ty = ImGui::GetTextLineHeight();

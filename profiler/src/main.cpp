@@ -348,7 +348,30 @@ int main( int argc, char** argv )
 
     if( initFileOpen )
     {
-        view = std::make_unique<tracy::View>( RunOnMainThread, *initFileOpen, SetWindowTitleCallback, SetupScaleCallback, AttentionCallback, s_achievements );
+        try
+        {
+            view = std::make_unique<tracy::View>( RunOnMainThread, *initFileOpen, SetWindowTitleCallback, SetupScaleCallback, AttentionCallback, s_achievements );
+        }
+        catch( const tracy::UnsupportedVersion& e )
+        {
+            badVer.state = tracy::BadVersionState::UnsupportedVersion;
+            badVer.version = e.version;
+        }
+        catch( const tracy::LegacyVersion& e )
+        {
+            badVer.state = tracy::BadVersionState::LegacyVersion;
+            badVer.version = e.version;
+        }
+        catch( const tracy::LoadFailure& e )
+        {
+            badVer.state = tracy::BadVersionState::LoadFailure;
+            badVer.msg = e.msg;
+        }
+        catch( const std::exception& e )
+        {
+            badVer.state = tracy::BadVersionState::LoadFailure;
+            badVer.msg = e.what();
+        }
         initFileOpen.reset();
     }
     else if( connectTo )

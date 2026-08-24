@@ -272,6 +272,12 @@ void View::DrawJnGpuResources()
             ImGui::ProgressBar( current.progress, ImVec2( -90 * GetScale(), 0 ) ); ImGui::SameLine(); if( ImGui::Button( "Cancel" ) ) m_gpuAnalysis->Cancel();
             ImGui::End(); return;
         }
+        if( current.state == GpuAnalysisControllerState::NotPresent )
+        {
+            ImGui::TextColored( ImVec4( 1.f, .75f, .2f, 1.f ), "%s", current.error.empty() ? "N27 GPU Catalog not present" : current.error.c_str() );
+            ImGui::TextDisabled( "Timeline, CPU Memory, Jobs and FrameImage remain available." );
+            ImGui::End(); return;
+        }
         if( current.state == GpuAnalysisControllerState::Failed || current.state == GpuAnalysisControllerState::Cancelled )
         {
             ImGui::TextColored( ImVec4( 1, .25f, .25f, 1 ), "%s", current.error.c_str() );

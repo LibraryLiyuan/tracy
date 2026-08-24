@@ -55,7 +55,7 @@ void GpuAnalysisController::Start()
     {
         std::lock_guard lock( m_mutex );
         if( m_status.state == GpuAnalysisControllerState::Building || m_status.state == GpuAnalysisControllerState::Ready ||
-            m_status.state == GpuAnalysisControllerState::Partial ) return;
+            m_status.state == GpuAnalysisControllerState::Partial || m_status.state == GpuAnalysisControllerState::NotPresent ) return;
         m_status = {}; m_status.state = GpuAnalysisControllerState::Building; m_status.stage = "queued";
         m_snapshot.reset();
     }
@@ -152,7 +152,8 @@ void GpuAnalysisController::Run( std::stop_token stopToken )
         if( built.manifest.state == analysis::GpuAnalysisState::Cancelled || stopToken.stop_requested() )
         { PublishStatus( GpuAnalysisControllerState::Cancelled, 0, "cancelled" ); return; }
         auto value = std::make_shared<analysis::GpuAnalysisSnapshot>( std::move( built ) );
-        const auto finalState = value->manifest.state == analysis::GpuAnalysisState::Complete ? GpuAnalysisControllerState::Ready :
+        const auto finalState = value->manifest.state == analysis::GpuAnalysisState::NotPresent ? GpuAnalysisControllerState::NotPresent :
+            value->manifest.state == analysis::GpuAnalysisState::Complete ? GpuAnalysisControllerState::Ready :
             value->manifest.state == analysis::GpuAnalysisState::Partial || value->manifest.state == analysis::GpuAnalysisState::ResourceLimit ?
             GpuAnalysisControllerState::Partial : GpuAnalysisControllerState::Failed;
         if( !m_cachePath.empty() && finalState != GpuAnalysisControllerState::Failed )
@@ -161,9 +162,10 @@ void GpuAnalysisController::Run( std::stop_token stopToken )
             if( !cacheError.empty() ) { std::lock_guard lock( m_mutex ); m_status.error = "cache:" + cacheError; }
         }
         std::lock_guard lock( m_mutex );
-        m_snapshot = std::move( value ); m_status.state = finalState; m_status.progress = 1; m_status.stage = finalState == GpuAnalysisControllerState::Ready ? "ready" : "partial";
+        m_snapshot = std::move( value ); m_status.state = finalState; m_status.progress = 1;
+        m_status.stage = finalState == GpuAnalysisControllerState::Ready ? "ready" : finalState == GpuAnalysisControllerState::NotPresent ? "not-present" : "partial";
         m_status.estimatedBytes = EstimateSnapshotBytes( *m_snapshot );
-        if( finalState == GpuAnalysisControllerState::Failed ) m_status.error = m_snapshot->manifest.reason;
+        if( finalState == GpuAnalysisControllerState::Failed || finalState == GpuAnalysisControllerState::NotPresent ) m_status.error = m_snapshot->manifest.reason;
     }
     catch( const std::exception& e ) { PublishStatus( GpuAnalysisControllerState::Failed, 0, "failed", e.what() ); }
 }
@@ -173,6 +175,7 @@ const char* GpuAnalysisControllerStateName( GpuAnalysisControllerState value )
     switch( value )
     {
     case GpuAnalysisControllerState::Idle: return "idle"; case GpuAnalysisControllerState::Building: return "building";
+    case GpuAnalysisControllerState::NotPresent: return "not-present";
     case GpuAnalysisControllerState::Ready: return "ready"; case GpuAnalysisControllerState::Partial: return "partial";
     case GpuAnalysisControllerState::Cancelled: return "cancelled"; case GpuAnalysisControllerState::Failed: return "failed";
     }
