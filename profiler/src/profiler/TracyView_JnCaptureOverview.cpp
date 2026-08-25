@@ -7,6 +7,8 @@
 #include "imgui.h"
 #include "IconsFontAwesome6.h"
 
+#include <cstring>
+
 namespace tracy
 {
 namespace
@@ -85,6 +87,22 @@ void View::DrawJnCaptureOverview()
 
     ImGui::SeparatorText( "Capture domains" );
     const auto& jn = m_worker.GetJnTraceData();
+    uint64_t cpuMemoryEventCount = 0;
+    for( const auto& pool : m_worker.GetMemNameMap() )
+        if( !IsGpuD3D12MemoryPool( pool.first ) ) cpuMemoryEventCount += pool.second->data.size();
+    uint64_t cpuMemoryAggregatePoints = 0;
+    uint64_t cpuMemoryAggregateLabels = 0;
+    for( const auto* plot : m_worker.GetPlots() )
+    {
+        const auto* name = plot->name == 0 ? nullptr : m_worker.GetString( plot->name );
+        if( !name || strncmp( name, "JN.CPU.Memory.", 14 ) != 0 ) continue;
+        const auto length = strlen( name );
+        static constexpr const char* suffix = ".ActiveBytes";
+        static constexpr size_t suffixLength = 12;
+        if( length <= suffixLength || strcmp( name + length - suffixLength, suffix ) != 0 ) continue;
+        cpuMemoryAggregateLabels++;
+        cpuMemoryAggregatePoints += plot->data.size();
+    }
     if( ImGui::BeginTable( "jnDomains", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
         ImVec2( 0, 240 * GetScale() ) ) )
     {
@@ -104,8 +122,11 @@ void View::DrawJnCaptureOverview()
             jn.gpuCatalogAllocations.size(), jn.gpuCatalogAllocations.empty() ? "no allocation records" : "allocation/heap records" );
         DomainRow( "GPU Pass References", jn.gpuReferenceUses.empty() ? DomainState::NotCaptured : DomainState::Complete,
             jn.gpuReferenceUses.size(), jn.gpuReferenceUses.empty() ? "not captured" : "ResourceSetV2" );
-        DomainRow( "CPU Memory", m_worker.GetMemNameMap().empty() ? DomainState::NotCaptured : DomainState::Complete,
-            m_worker.GetMemNameMap().size(), "tracked pools; process total may differ" );
+        const auto cpuMemoryState = cpuMemoryEventCount == 0 && cpuMemoryAggregateLabels == 0 ? DomainState::NotCaptured : DomainState::Partial;
+        DomainRow( "CPU Memory", cpuMemoryState, cpuMemoryEventCount + cpuMemoryAggregatePoints,
+            cpuMemoryAggregateLabels == 0 ? "filtered allocation window only; no aggregate baseline" :
+            cpuMemoryEventCount == 0 ? "AggregateBaseline; individual allocation events not captured" :
+            "AggregateBaseline + FilteredAllocationWindow" );
         DomainRow( "Sampling", m_worker.GetCallstackSampleCount() ? DomainState::Complete : DomainState::NotCaptured,
             m_worker.GetCallstackSampleCount(), m_worker.GetCallstackSampleCount() ? "native samples" : "not captured" );
         DomainRow( "Context Switch", m_worker.GetContextSwitchSampleCount() ? DomainState::Complete : DomainState::NotCaptured,

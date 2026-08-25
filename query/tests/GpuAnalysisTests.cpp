@@ -32,6 +32,7 @@ int main()
     JnGpuCatalogResourceRecordV1 resourceA {};
     resourceA.time = 2;
     resourceA.resourceId = 10;
+    resourceA.pointerToken = 5001;
     resourceA.allocationId = 100;
     resourceA.capacityBytes = 4096;
     resourceA.primaryKind = uint16_t( JnGpuCatalogPrimaryKind::Texture );
@@ -40,6 +41,7 @@ int main()
     data.gpuCatalogResources.push_back( resourceA );
     auto resourceB = resourceA;
     resourceB.resourceId = 11;
+    resourceB.pointerToken = 5002;
     resourceB.time = 3;
     data.gpuCatalogResources.push_back( resourceB );
 
@@ -49,8 +51,10 @@ int main()
         uint8_t( JnGpuCatalogBatchKind::Resource ), 1, 0, 1 } );
 
     GpuMemoryAttribution attribution;
-    GpuMemoryPass parent; parent.passId = 1000; parent.frame = 5; parent.name = "Parent"; parent.complete = true;
-    GpuMemoryPass child; child.passId = 1001; child.parentPassId = 1000; child.frame = 5; child.name = "Child"; child.complete = true;
+    GpuMemoryPass parent; parent.passId = 1000; parent.frame = 5; parent.start = 4; parent.end = 5; parent.name = "Parent"; parent.complete = true;
+    parent.uses.push_back( { 5001, 1, 'T', 1, 2 } );
+    GpuMemoryPass child; child.passId = 1001; child.parentPassId = 1000; child.frame = 5; child.start = 4; child.end = 5; child.name = "Child"; child.complete = true;
+    child.uses.push_back( { 5002, 1, 'T', 2, 2 } );
     attribution.passes = { parent, child };
 
     JnGpuRangeSetRecordV1 rangeA {};
@@ -76,8 +80,18 @@ int main()
     assert( parentResult->directResources.size() == 1 );
     assert( parentResult->inclusiveResources.size() == 2 );
     assert( parentResult->inclusivePhysicalBytes == 4096 );
+    assert( snapshot.FindPass( 0 ) == nullptr );
     const auto comparison = CompareGpuFrames( snapshot, 5, 6 );
     assert( !comparison.valid );
+
+    auto orphanRangeData = data;
+    auto orphanRange = rangeA;
+    orphanRange.passInstanceId = 9999;
+    orphanRangeData.gpuRangeSets.push_back( orphanRange );
+    const auto orphanRangeSnapshot = BuildGpuAnalysisSnapshot( orphanRangeData, &attribution );
+    assert( orphanRangeSnapshot.FindPass( 9999 ) == nullptr );
+    assert( orphanRangeSnapshot.manifest.state == GpuAnalysisState::Partial );
+    assert( orphanRangeSnapshot.manifest.unresolvedCount == 1 );
 
     JnTraceData missing;
     assert( BuildGpuAnalysisSnapshot( missing ).manifest.state == GpuAnalysisState::NotPresent );

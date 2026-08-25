@@ -76,6 +76,7 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
     MemoryFrameSnapshot snapshot;
     snapshot.begin = beginNs;
     snapshot.end = endNs;
+    snapshot.peakTime = beginNs;
     snapshot.possibleCaptureBaseline = possibleCaptureBaseline;
     if( endNs <= beginNs || pools.empty() ) return snapshot;
     snapshot.valid = true;
@@ -88,7 +89,7 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
         snapshot.pools.emplace_back( summary );
     }
 
-    struct TimelineEvent { int64_t time; uint64_t size; size_t summary; bool allocation; };
+    struct TimelineEvent { int64_t time; uint64_t size; size_t summary; MemoryEventKey key; bool allocation; };
     std::vector<TimelineEvent> timeline;
     std::unordered_map<MemoryEventKey, const MemoryEventInput*, MemoryEventKeyHash> lookup;
     lookup.reserve( events.size() );
@@ -109,12 +110,12 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
         if( allocated )
         {
             summary.allocatedBytes += event.size; summary.allocatedCount++; snapshot.allocated.emplace_back( event.key );
-            timeline.push_back( { event.allocationNs, event.size, summaryIndex, true } );
+            timeline.push_back( { event.allocationNs, event.size, summaryIndex, event.key, true } );
         }
         if( freed )
         {
             summary.freedBytes += event.size; summary.freedCount++; snapshot.freed.emplace_back( event.key );
-            timeline.push_back( { freeNs, event.size, summaryIndex, false } );
+            timeline.push_back( { freeNs, event.size, summaryIndex, event.key, false } );
         }
         if( activeAtEnd ) { summary.endBytes += event.size; summary.endCount++; snapshot.activeAtEnd.emplace_back( event.key ); }
         if( allocated || freed ) snapshot.transitions.emplace_back( event.key );
@@ -145,6 +146,8 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
     }
     uint64_t totalBytes = snapshot.total.startBytes;
     uint64_t totalCount = snapshot.total.startCount;
+    std::unordered_set<MemoryEventKey, MemoryEventKeyHash> activeAtPeak( snapshot.activeAtStart.begin(), snapshot.activeAtStart.end() );
+    snapshot.activeAtPeak = snapshot.activeAtStart;
     std::sort( timeline.begin(), timeline.end(), []( const auto& lhs, const auto& rhs ) {
         if( lhs.time != rhs.time ) return lhs.time < rhs.time;
         if( lhs.allocation != rhs.allocation ) return !lhs.allocation;
@@ -155,6 +158,7 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
         if( event.allocation )
         {
             currentBytes[event.summary] += event.size; currentCount[event.summary]++; totalBytes += event.size; totalCount++;
+            activeAtPeak.emplace( event.key );
         }
         else
         {
@@ -164,12 +168,22 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
             currentCount[event.summary] = currentCount[event.summary] == 0 ? 0 : currentCount[event.summary] - 1;
             totalBytes = totalBytes < event.size ? 0 : totalBytes - event.size;
             totalCount = totalCount == 0 ? 0 : totalCount - 1;
+            activeAtPeak.erase( event.key );
         }
         auto& summary = snapshot.pools[event.summary];
         summary.peakBytes = std::max( summary.peakBytes, currentBytes[event.summary] );
         summary.peakCount = std::max( summary.peakCount, currentCount[event.summary] );
-        snapshot.total.peakBytes = std::max( snapshot.total.peakBytes, totalBytes );
-        snapshot.total.peakCount = std::max( snapshot.total.peakCount, totalCount );
+        if( totalBytes > snapshot.total.peakBytes )
+        {
+            snapshot.total.peakBytes = totalBytes;
+            snapshot.total.peakCount = totalCount;
+            snapshot.peakTime = event.time;
+            snapshot.activeAtPeak.assign( activeAtPeak.begin(), activeAtPeak.end() );
+        }
+        else if( totalBytes == snapshot.total.peakBytes )
+        {
+            snapshot.total.peakCount = std::max( snapshot.total.peakCount, totalCount );
+        }
     }
     for( const auto& summary : snapshot.pools ) snapshot.consistent &= SummaryConsistent( summary );
     snapshot.consistent &= SummaryConsistent( snapshot.total );
@@ -192,6 +206,7 @@ MemoryFrameSnapshot BuildMemoryFrameSnapshot( int64_t beginNs, int64_t endNs, co
     std::sort( snapshot.activeAtEnd.begin(), snapshot.activeAtEnd.end(), allocOrder );
     std::sort( snapshot.allocated.begin(), snapshot.allocated.end(), allocOrder );
     std::sort( snapshot.freed.begin(), snapshot.freed.end(), freeOrder );
+    std::sort( snapshot.activeAtPeak.begin(), snapshot.activeAtPeak.end(), allocOrder );
     std::sort( snapshot.transitions.begin(), snapshot.transitions.end(), transitionOrder );
     return snapshot;
 }

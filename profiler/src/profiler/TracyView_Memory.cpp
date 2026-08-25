@@ -20,6 +20,147 @@ constexpr size_t PageSize = 1 << PageBits;
 constexpr size_t PageChunkBits = ChunkBits + PageBits;
 constexpr size_t PageChunkSize = 1 << PageChunkBits;
 
+struct CpuMemoryAggregateRow
+{
+    std::string label;
+    uint64_t currentBytes = 0;
+    uint64_t peakBytes = 0;
+    uint64_t pointCount = 0;
+    int64_t sampleTime = 0;
+    bool sampleInRequestedFrame = false;
+    bool trackedAvailable = false;
+    uint64_t trackedBytes = 0;
+};
+
+std::vector<CpuMemoryAggregateRow> GetCpuMemoryAggregateRows( const Worker& worker, int64_t time, int64_t frameEnd = -1 )
+{
+    static constexpr const char* Prefix = "JN.CPU.Memory.";
+    static constexpr const char* Suffix = ".ActiveBytes";
+    std::vector<CpuMemoryAggregateRow> rows;
+    for( const auto* plot : worker.GetPlots() )
+    {
+        if( plot->name == 0 || plot->data.empty() ) continue;
+        const auto* name = worker.GetString( plot->name );
+        if( !name ) continue;
+        const std::string_view value( name );
+        const std::string_view prefix( Prefix ), suffix( Suffix );
+        if( value.size() <= prefix.size() + suffix.size() || value.substr( 0, prefix.size() ) != prefix ||
+            value.substr( value.size() - suffix.size() ) != suffix ) continue;
+        auto sample = plot->data.end();
+        bool sampleInRequestedFrame = false;
+        if( frameEnd > time )
+        {
+            sample = std::lower_bound( plot->data.begin(), plot->data.end(), time,
+                []( const PlotItem& lhs, int64_t rhs ) { return lhs.time.Val() < rhs; } );
+            sampleInRequestedFrame = sample != plot->data.end() && sample->time.Val() < frameEnd;
+        }
+        if( !sampleInRequestedFrame )
+        {
+            sample = std::upper_bound( plot->data.begin(), plot->data.end(), time,
+                []( int64_t lhs, const PlotItem& rhs ) { return lhs < rhs.time.Val(); } );
+            if( sample == plot->data.begin() ) sample = plot->data.begin(); else --sample;
+        }
+        CpuMemoryAggregateRow row;
+        row.label = std::string( value.substr( prefix.size(), value.size() - prefix.size() - suffix.size() ) );
+        row.currentBytes = uint64_t( std::max( 0.0, sample->val ) );
+        row.peakBytes = uint64_t( std::max( 0.0, plot->max ) );
+        row.pointCount = plot->data.size();
+        row.sampleTime = sample->time.Val();
+        row.sampleInRequestedFrame = sampleInRequestedFrame;
+        rows.emplace_back( std::move( row ) );
+    }
+    std::sort( rows.begin(), rows.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.currentBytes != rhs.currentBytes ? lhs.currentBytes > rhs.currentBytes : lhs.label < rhs.label;
+    } );
+    return rows;
+}
+
+static void DrawSignedMemoryDelta( uint64_t base, uint64_t target );
+
+void DrawCpuMemoryAggregateRows( const std::vector<CpuMemoryAggregateRow>& rows, int64_t requestedTime, bool frameBound, bool defaultOpen )
+{
+    if( !ImGui::CollapsingHeader( "Unity MemLabel counters / coverage cross-check", defaultOpen ? ImGuiTreeNodeFlags_DefaultOpen : 0 ) ) return;
+    uint64_t total = 0;
+    for( const auto& row : rows ) total += row.currentBytes;
+    ImGui::Text( "Unity monitored-label total: %s", MemSizeToString( total ) );
+    ImGui::SameLine();
+    ImGui::TextDisabled( frameBound ? "for selected frame beginning %s (per-label sample times below)" : "at timeline center %s", TimeToStringExact( requestedTime ) );
+    ImGui::TextDisabled( "Supplemental Unity allocator counters sampled once per frame; not the process total and not individual allocations." );
+    if( frameBound )
+    {
+        ImGui::TextDisabled( "Tracked values contain only captured allocation events (HighEvidence: selected labels and allocations >=256 KiB). Difference is coverage, not a leak." );
+        if( ImGui::BeginTable( "cpuMemoryAggregateCoverage", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY,
+            ImVec2( 0, std::min( 250.f * ImGui::GetIO().FontGlobalScale, ImGui::GetContentRegionAvail().y * .45f ) ) ) )
+        {
+            ImGui::TableSetupColumn( "MemLabel", ImGuiTableColumnFlags_WidthFixed, 150 );
+            ImGui::TableSetupColumn( "Unity aggregate @ frame sample" );
+            ImGui::TableSetupColumn( "Tracked >=256 KiB @ same sample" );
+            ImGui::TableSetupColumn( "Unity - tracked" );
+            ImGui::TableSetupColumn( "Tracked coverage" );
+            ImGui::TableSetupColumn( "Capture peak" );
+            ImGui::TableSetupColumn( "Sample time" );
+            ImGui::TableSetupColumn( "Evidence" );
+            ImGui::TableSetupScrollFreeze( 1, 1 ); ImGui::TableHeadersRow();
+            for( const auto& row : rows )
+            {
+                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted( row.label.c_str() );
+                ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.currentBytes ) );
+                ImGui::TableNextColumn();
+                if( row.trackedAvailable ) ImGui::TextUnformatted( MemSizeToString( row.trackedBytes ) ); else TextDisabledUnformatted( "-" );
+                ImGui::TableNextColumn();
+                if( row.trackedAvailable ) DrawSignedMemoryDelta( row.trackedBytes, row.currentBytes ); else TextDisabledUnformatted( "-" );
+                ImGui::TableNextColumn();
+                if( row.trackedAvailable && row.currentBytes != 0 ) ImGui::Text( "%.1f%%", double( row.trackedBytes ) * 100.0 / double( row.currentBytes ) );
+                else if( row.trackedAvailable && row.trackedBytes == 0 ) ImGui::TextUnformatted( "100.0%" );
+                else if( row.trackedAvailable ) TextDisabledUnformatted( "n/a (aggregate is zero)" );
+                else TextDisabledUnformatted( "Aggregate-only" );
+                ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.peakBytes ) );
+                ImGui::TableNextColumn(); ImGui::TextUnformatted( TimeToStringExact( row.sampleTime ) );
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted( row.trackedAvailable ? "In-frame counter + filtered allocation events" :
+                    row.sampleInRequestedFrame ? "In-frame counter; no matching event pool" : "Previous counter sample; comparison unavailable" );
+            }
+            ImGui::EndTable();
+        }
+    }
+    else if( ImGui::BeginTable( "cpuMemoryAggregates", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2( 0, std::min( 250.f * ImGui::GetIO().FontGlobalScale,
+            ImGui::GetContentRegionAvail().y * .45f ) ) ) )
+    {
+        ImGui::TableSetupColumn( "MemLabel" ); ImGui::TableSetupColumn( "Active at timeline center" );
+        ImGui::TableSetupColumn( "Capture peak" ); ImGui::TableSetupColumn( "Samples" ); ImGui::TableSetupColumn( "Evidence" );
+        ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
+        for( const auto& row : rows )
+        {
+            ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted( row.label.c_str() );
+            ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.currentBytes ) );
+            ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.peakBytes ) );
+            ImGui::TableNextColumn(); ImGui::Text( "%llu", static_cast<unsigned long long>( row.pointCount ) );
+            ImGui::TableNextColumn(); ImGui::TextUnformatted( "Unity allocator counter" );
+        }
+        ImGui::EndTable();
+    }
+}
+
+static void DrawSignedMemoryDelta( uint64_t base, uint64_t target )
+{
+    const bool positive = target >= base;
+    const uint64_t magnitude = positive ? target - base : base - target;
+    if( magnitude == 0 ) ImGui::TextUnformatted( "0 B" );
+    else ImGui::TextColored( positive ? ImVec4( 1.f, .45f, .35f, 1.f ) : ImVec4( .45f, 1.f, .55f, 1.f ),
+        "%c%s", positive ? '+' : '-', MemSizeToString( magnitude ) );
+}
+
+static void DrawSignedCountDelta( uint64_t base, uint64_t target )
+{
+    const bool positive = target >= base;
+    const uint64_t magnitude = positive ? target - base : base - target;
+    if( magnitude == 0 ) ImGui::TextUnformatted( "0" );
+    else ImGui::TextColored( positive ? ImVec4( 1.f, .45f, .35f, 1.f ) : ImVec4( .45f, 1.f, .55f, 1.f ),
+        "%c%s", positive ? '+' : '-', RealToString( magnitude ) );
+}
+
 uint32_t MemDecayColor[256] = {
     0x0, 0xFF077F07, 0xFF078007, 0xFF078207, 0xFF078307, 0xFF078507, 0xFF078707, 0xFF078807,
     0xFF078A07, 0xFF078B07, 0xFF078D07, 0xFF078F07, 0xFF079007, 0xFF089208, 0xFF089308, 0xFF089508,
@@ -120,7 +261,22 @@ std::vector<MemoryPage> View::GetMemoryPages() const
     const auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool );
     const auto memlow = mem.low;
 
-    if( m_memInfo.range.active )
+    if( m_memInfo.frameFilterActive )
+    {
+        const auto referenceTime = m_memInfo.frame.tab == MemoryFrameTab::PeakInFrame ? m_memInfo.frameSnapshot.peakTime : m_memInfo.frameSnapshot.end;
+        for( const auto* alloc : m_memInfo.frameFilteredEvents )
+        {
+            if( !alloc ) continue;
+            const auto a0 = alloc->Ptr() - memlow;
+            const auto a1 = a0 + alloc->Size();
+            const bool alive = alloc->TimeAlloc() <= referenceTime && ( alloc->TimeFree() < 0 || alloc->TimeFree() >= referenceTime );
+            const auto age = referenceTime - std::min( referenceTime, alive ? alloc->TimeAlloc() : alloc->TimeFree() );
+            const int8_t val = alive ? int8_t( std::max( int64_t( 1 ), 127 - ( age >> 24 ) ) ) :
+                int8_t( -std::max( int64_t( 1 ), 127 - ( age >> 24 ) ) );
+            FillPages( memmap, a0 >> ChunkBits, a1 >> ChunkBits, val );
+        }
+    }
+    else if( m_memInfo.range.active )
     {
         auto it = std::lower_bound( mem.data.begin(), mem.data.end(), m_memInfo.range.min, []( const auto& lhs, const auto& rhs ) { return lhs.TimeAlloc() < rhs; } );
         if( it != mem.data.end() )
@@ -206,12 +362,88 @@ std::vector<uint64_t> View::GetMemoryFramePools() const
 
     for( const auto& v : memNameMap )
     {
-        if( IsGpuD3D12MemoryPool( v.first ) ) pools.emplace_back( v.first );
+        const bool gpu = IsGpuD3D12MemoryPool( v.first );
+        if( ( m_memInfo.frame.scope == MemoryFrameScope::AllGpuD3D12Pools && gpu ) ||
+            ( m_memInfo.frame.scope == MemoryFrameScope::AllCpuPools && !gpu ) ) pools.emplace_back( v.first );
     }
     std::sort( pools.begin(), pools.end(), [this]( uint64_t lhs, uint64_t rhs ) {
         return strcmp( GetMemoryPoolName( lhs ), GetMemoryPoolName( rhs ) ) < 0;
     } );
     return pools;
+}
+
+const std::vector<View::MemoryEventRef>& View::GetSelectedMemoryFrameRefs() const
+{
+    static const std::vector<MemoryEventRef> Empty;
+    const auto& snapshot = m_memInfo.frameSnapshot;
+    if( !m_memInfo.frame.active || !snapshot.valid ) return Empty;
+    switch( m_memInfo.frame.tab )
+    {
+    case MemoryFrameTab::ActiveAtStart: return snapshot.activeAtStart;
+    case MemoryFrameTab::ActiveAtEnd: return snapshot.activeAtEnd;
+    case MemoryFrameTab::AllocatedInFrame: return snapshot.allocated;
+    case MemoryFrameTab::FreedInFrame: return snapshot.freed;
+    case MemoryFrameTab::PeakInFrame: return snapshot.activeAtPeak;
+    case MemoryFrameTab::AllTransitions: return snapshot.transitions;
+    }
+    return Empty;
+}
+
+const View::MemoryFramePoolSummary* View::GetSelectedMemoryFramePoolSummary() const
+{
+    if( !m_memInfo.frame.active || !m_memInfo.frameSnapshot.valid ) return nullptr;
+    for( const auto& summary : m_memInfo.frameSnapshot.pools ) if( summary.pool == m_memInfo.pool ) return &summary;
+    return nullptr;
+}
+
+const char* View::GetSelectedMemoryFrameMetricName() const
+{
+    switch( m_memInfo.frame.tab )
+    {
+    case MemoryFrameTab::ActiveAtStart: return "Active at frame start";
+    case MemoryFrameTab::ActiveAtEnd: return "Active at frame end";
+    case MemoryFrameTab::AllocatedInFrame: return "Allocated in frame";
+    case MemoryFrameTab::FreedInFrame: return "Freed in frame";
+    case MemoryFrameTab::PeakInFrame: return "Active at frame peak";
+    case MemoryFrameTab::AllTransitions: return "All frame transitions";
+    }
+    return "Frame metric";
+}
+
+void View::RefreshSelectedMemoryFrameEvents()
+{
+    auto& info = m_memInfo;
+    const auto& selection = info.frame;
+    const auto& mem = m_worker.GetMemoryNamed( info.pool );
+    const bool active = selection.active && selection.mapping == MemoryFrameMapping::Valid && info.frameSnapshot.valid;
+    if( !active )
+    {
+        info.frameFilterActive = false;
+        info.frameFilteredEvents.clear();
+        info.frameFilteredAllocations.clear();
+        return;
+    }
+
+    if( info.frameFilterActive && info.frameFilterSet == selection.frameSet && info.frameFilterIndex == selection.frameIndex &&
+        info.frameFilterPool == info.pool && info.frameFilterTab == selection.tab && info.frameFilterPoolEvents == mem.data.size() ) return;
+
+    info.frameFilterActive = true;
+    info.frameFilterSet = selection.frameSet;
+    info.frameFilterIndex = selection.frameIndex;
+    info.frameFilterPool = info.pool;
+    info.frameFilterTab = selection.tab;
+    info.frameFilterPoolEvents = mem.data.size();
+    info.frameFilteredEvents.clear();
+    info.frameFilteredAllocations.clear();
+    const auto& refs = GetSelectedMemoryFrameRefs();
+    info.frameFilteredEvents.reserve( refs.size() );
+    info.frameFilteredAllocations.reserve( refs.size() );
+    for( const auto& ref : refs )
+    {
+        if( ref.pool != info.pool || ref.index >= mem.data.size() ) continue;
+        info.frameFilteredEvents.emplace_back( &mem.data[ref.index] );
+        info.frameFilteredAllocations.emplace_back( ref.index );
+    }
 }
 
 size_t View::GetMemoryFrameCount( const FrameData& frameSet ) const
@@ -1073,7 +1305,16 @@ void View::DrawGpuMemoryAllocationAttribution( uint64_t allocationId, int& widge
 void View::DrawMemoryFrameSummary()
 {
     const auto& snapshot = m_memInfo.frameSnapshot;
-    const auto& total = snapshot.total;
+    const auto* selected = GetSelectedMemoryFramePoolSummary();
+    const auto& total = selected ? *selected : snapshot.total;
+    ImGui::Text( "Selected Allocator / MemLabel: %s", GetMemoryPoolName( m_memInfo.pool ) );
+    if( selected )
+    {
+        const std::string allEnd = MemSizeToString( snapshot.total.endBytes );
+        const std::string allPeak = MemSizeToString( snapshot.total.peakBytes );
+        ImGui::SameLine();
+        ImGui::TextDisabled( "All captured CPU pools: end %s / peak %s", allEnd.c_str(), allPeak.c_str() );
+    }
     if( ImGui::BeginTable( "##memoryFrameSummary", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp ) )
     {
         ImGui::TableSetupColumn( "State" );
@@ -1110,111 +1351,232 @@ void View::DrawMemoryFrameSummary()
         ImGui::EndTable();
     }
 
-    if( snapshot.pools.size() > 1 && ImGui::TreeNode( "Per-pool frame summary" ) )
+}
+
+void View::DrawCpuMemoryPoolTree()
+{
+    if( !ImGui::CollapsingHeader( "Allocator / MemLabel pools", ImGuiTreeNodeFlags_DefaultOpen ) ) return;
+
+    struct PoolRow
     {
-        const auto height = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( snapshot.pools.size() + 2, 12 );
-        if( ImGui::BeginTable( "##memoryFramePoolSummary", 10, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY, ImVec2( 0, height ) ) )
+        uint64_t pool = 0;
+        std::string label;
+        uint64_t start = 0;
+        uint64_t allocated = 0;
+        uint64_t freed = 0;
+        uint64_t end = 0;
+        uint64_t peak = 0;
+        uint64_t selected = 0;
+        size_t events = 0;
+    };
+    const bool frameReady = m_memInfo.frame.active && m_memInfo.frameSnapshot.valid;
+    std::vector<PoolRow> rows;
+    for( const auto& value : m_worker.GetMemNameMap() )
+    {
+        if( IsGpuD3D12MemoryPool( value.first ) ) continue;
+        const auto& mem = m_worker.GetMemoryNamed( value.first );
+        PoolRow row;
+        row.pool = value.first;
+        row.label = GetMemoryPoolName( value.first );
+        row.events = mem.data.size();
+        if( frameReady )
         {
-            ImGui::TableSetupColumn( "Pool", ImGuiTableColumnFlags_WidthFixed, 260 );
-            ImGui::TableSetupColumn( "Start" );
-            ImGui::TableSetupColumn( "Allocated" );
-            ImGui::TableSetupColumn( "Freed" );
-            ImGui::TableSetupColumn( "End" );
-            ImGui::TableSetupColumn( "Net" );
-            ImGui::TableSetupColumn( "Peak" );
-            ImGui::TableSetupColumn( "Start count" );
-            ImGui::TableSetupColumn( "End count" );
-            ImGui::TableSetupColumn( "Peak count" );
-            ImGui::TableHeadersRow();
-            for( const auto& summary : snapshot.pools )
+            const auto it = std::find_if( m_memInfo.frameSnapshot.pools.begin(), m_memInfo.frameSnapshot.pools.end(),
+                [&]( const auto& summary ) { return summary.pool == value.first; } );
+            if( it != m_memInfo.frameSnapshot.pools.end() )
             {
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( GetMemoryPoolName( summary.pool ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( MemSizeToString( summary.startBytes ) );
-                ImGui::TableNextColumn();
-                ImGui::Text( "+%s", MemSizeToString( summary.allocatedBytes ) );
-                ImGui::TableNextColumn();
-                ImGui::Text( "-%s", MemSizeToString( summary.freedBytes ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( MemSizeToString( summary.endBytes ) );
-                ImGui::TableNextColumn();
-                if( summary.endBytes >= summary.startBytes ) ImGui::Text( "+%s", MemSizeToString( summary.endBytes - summary.startBytes ) );
-                else ImGui::Text( "-%s", MemSizeToString( summary.startBytes - summary.endBytes ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( MemSizeToString( summary.peakBytes ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( RealToString( summary.startCount ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( RealToString( summary.endCount ) );
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted( RealToString( summary.peakCount ) );
+                row.start = it->startBytes;
+                row.allocated = it->allocatedBytes;
+                row.freed = it->freedBytes;
+                row.end = it->endBytes;
+                row.peak = it->peakBytes;
+                switch( m_memInfo.frame.tab )
+                {
+                case MemoryFrameTab::ActiveAtStart: row.selected = row.start; break;
+                case MemoryFrameTab::ActiveAtEnd: row.selected = row.end; break;
+                case MemoryFrameTab::AllocatedInFrame: row.selected = row.allocated; break;
+                case MemoryFrameTab::FreedInFrame: row.selected = row.freed; break;
+                case MemoryFrameTab::PeakInFrame: row.selected = row.peak; break;
+                case MemoryFrameTab::AllTransitions: row.selected = row.allocated + row.freed; break;
+                }
             }
-            ImGui::EndTable();
         }
-        ImGui::TreePop();
+        else
+        {
+            row.end = mem.usage;
+            row.selected = mem.usage;
+        }
+        rows.emplace_back( std::move( row ) );
     }
+    if( rows.empty() )
+    {
+        TextDisabledUnformatted( "No named CPU allocation pools were captured." );
+        return;
+    }
+    std::sort( rows.begin(), rows.end(), []( const auto& lhs, const auto& rhs ) {
+        if( lhs.selected != rhs.selected ) return lhs.selected > rhs.selected;
+        return lhs.label < rhs.label;
+    } );
+
+    const auto flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+    if( !ImGui::BeginTable( "cpuAllocatorMemLabelTree", 8, flags, ImVec2( 0, std::min( 260.f * GetScale(), ImGui::GetContentRegionAvail().y * .45f ) ) ) ) return;
+    ImGui::TableSetupScrollFreeze( 0, 1 );
+    ImGui::TableSetupColumn( "Allocator / MemLabel" );
+    ImGui::TableSetupColumn( "Start", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableSetupColumn( "Allocated", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableSetupColumn( "Freed", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableSetupColumn( "End", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableSetupColumn( "Peak", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableSetupColumn( "Selected", ImGuiTableColumnFlags_WidthFixed, 105 * GetScale() );
+    ImGui::TableSetupColumn( "Capture events", ImGuiTableColumnFlags_WidthFixed, 95 * GetScale() );
+    ImGui::TableHeadersRow();
+
+    for( const auto& row : rows )
+    {
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        const std::string id = row.label + "##cpuPool" + std::to_string( row.pool );
+        if( ImGui::Selectable( id.c_str(), row.pool == m_memInfo.pool, ImGuiSelectableFlags_SpanAllColumns ) )
+        {
+            m_memInfo.pool = row.pool;
+            m_memInfo.showAllocList = false;
+        }
+        auto value = [&]( uint64_t bytes ) { if( frameReady ) ImGui::TextUnformatted( MemSizeToString( bytes ) ); else TextDisabledUnformatted( "-" ); };
+        ImGui::TableNextColumn(); value( row.start );
+        ImGui::TableNextColumn(); value( row.allocated );
+        ImGui::TableNextColumn(); value( row.freed );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.end ) );
+        ImGui::TableNextColumn(); value( row.peak );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( row.selected ) );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( RealToString( row.events ) );
+    }
+    ImGui::EndTable();
+    ImGui::TextDisabled( "TrackedOnly | Selected = %s | totals cover captured Tracy allocation pools, not the complete process heap.",
+        frameReady ? GetSelectedMemoryFrameMetricName() : "Capture End" );
+}
+
+void View::DrawCpuMemoryLeakCandidates()
+{
+    if( !ImGui::CollapsingHeader( "Lifetime at selected frame / candidates" ) ) return;
+    const auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool );
+    const bool frameReady = m_memInfo.frame.active && m_memInfo.frameSnapshot.valid;
+    const auto begin = frameReady ? m_memInfo.frameSnapshot.begin : m_worker.GetFirstTime();
+    const auto end = frameReady ? m_memInfo.frameSnapshot.end : m_worker.GetLastTime();
+    std::vector<size_t> indices;
+    indices.reserve( frameReady ? mem.data.size() : mem.active.size() );
+    if( frameReady )
+    {
+        for( size_t index = 0; index < mem.data.size(); ++index )
+        {
+            const auto& event = mem.data[index];
+            if( event.TimeAlloc() < end && ( event.TimeFree() < 0 || event.TimeFree() >= begin ) ) indices.emplace_back( index );
+        }
+    }
+    else
+    {
+        for( const auto& value : mem.active ) if( value.second < mem.data.size() ) indices.emplace_back( value.second );
+    }
+    if( indices.empty() )
+    {
+        TextDisabledUnformatted( frameReady ? "No allocation lifetime intersects the selected frame in this pool." : "No allocations are active at capture end in this pool." );
+        return;
+    }
+
+    std::vector<int64_t> lifetimes;
+    lifetimes.reserve( indices.size() );
+    for( const auto index : indices ) lifetimes.emplace_back( std::max<int64_t>( 0, std::min( end, mem.data[index].TimeFree() < 0 ? end : mem.data[index].TimeFree() ) - mem.data[index].TimeAlloc() ) );
+    const size_t p95Index = lifetimes.empty() ? 0 : std::min( lifetimes.size() - 1, size_t( double( lifetimes.size() - 1 ) * .95 ) );
+    if( !lifetimes.empty() ) std::nth_element( lifetimes.begin(), lifetimes.begin() + p95Index, lifetimes.end() );
+    const int64_t p95Lifetime = lifetimes.empty() ? 0 : lifetimes[p95Index];
+    std::sort( indices.begin(), indices.end(), [&]( size_t lhs, size_t rhs ) {
+        if( mem.data[lhs].Size() != mem.data[rhs].Size() ) return mem.data[lhs].Size() > mem.data[rhs].Size();
+        return mem.data[lhs].TimeAlloc() < mem.data[rhs].TimeAlloc();
+    } );
+
+    ImGui::Text( "%s allocations intersect %s; lifetime P95 %s", RealToString( indices.size() ), frameReady ? "the selected frame" : "capture end", TimeToString( p95Lifetime ) );
+    ImGui::SameLine(); TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "heuristic only, not proof of a leak" );
+    const auto flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+        ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
+    if( !ImGui::BeginTable( "cpuMemoryLeakCandidates", 6, flags, ImVec2( 0, std::min( 320.f * GetScale(), ImGui::GetContentRegionAvail().y * .5f ) ) ) ) return;
+    ImGui::TableSetupScrollFreeze( 0, 1 );
+    ImGui::TableSetupColumn( "Address" ); ImGui::TableSetupColumn( "Size", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending );
+    ImGui::TableSetupColumn( "Lifetime" ); ImGui::TableSetupColumn( "Alloc thread" ); ImGui::TableSetupColumn( "Call stack" ); ImGui::TableSetupColumn( "Candidate reason" );
+    ImGui::TableHeadersRow();
+    ImGuiListClipper clipper; clipper.Begin( int( indices.size() ) );
+    while( clipper.Step() ) for( int rowIndex = clipper.DisplayStart; rowIndex < clipper.DisplayEnd; ++rowIndex )
+    {
+        const auto index = indices[size_t( rowIndex )];
+        const auto& event = mem.data[index];
+        const auto lifetime = std::max<int64_t>( 0, std::min( end, event.TimeFree() < 0 ? end : event.TimeFree() ) - event.TimeAlloc() );
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        char address[32]; sprintf( address, "0x%" PRIx64, event.Ptr() );
+        if( ImGui::Selectable( address, m_memoryAllocInfoPool == m_memInfo.pool && m_memoryAllocInfoWindow == int( index ), ImGuiSelectableFlags_SpanAllColumns ) )
+        {
+            m_memoryAllocInfoPool = m_memInfo.pool;
+            m_memoryAllocInfoWindow = int( index );
+        }
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( MemSizeToString( event.Size() ) );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( TimeToString( lifetime ) );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadAlloc() ) ) );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( event.CsAlloc() ? "Available" : "Unavailable" );
+        ImGui::TableNextColumn();
+        if( frameReady )
+        {
+            const bool born = event.TimeAlloc() >= begin;
+            const bool freed = event.TimeFree() >= begin && event.TimeFree() < end;
+            if( born && freed ) ImGui::TextUnformatted( "BornAndFreed" );
+            else if( born ) ImGui::TextUnformatted( "BornAndAlive" );
+            else if( freed ) ImGui::TextUnformatted( "HistoricalFreed" );
+            else if( lifetime >= p95Lifetime ) ImGui::TextUnformatted( "HistoricalAlive / LongLived(P95)" );
+            else ImGui::TextUnformatted( "HistoricalAlive" );
+        }
+        else if( event.TimeAlloc() <= 100 * 1000 * 1000 ) ImGui::TextUnformatted( "OpenCreateBoundary / alive" );
+        else if( lifetime >= p95Lifetime ) ImGui::TextUnformatted( "LongLived(P95) / alive" );
+        else ImGui::TextUnformatted( "AliveAtCaptureEnd" );
+    }
+    ImGui::EndTable();
 }
 
 void View::DrawMemoryFrameInspector()
 {
     auto& selection = m_memInfo.frame;
     ImGui::Separator();
-    ImGui::TextUnformatted( ICON_FA_FILM " Frame memory inspector" );
+    ImGui::TextUnformatted( ICON_FA_FILM " CPU memory time scope" );
     ImGui::SameLine();
-    if( ImGui::Checkbox( "Enabled##memoryFrame", &selection.active ) && selection.active )
+    if( ImGui::RadioButton( "Frame", selection.active ) && !selection.active )
     {
+        selection.active = true;
         if( !selection.frameSet ) selection.frameSet = m_frames ? m_frames : m_worker.GetFramesBase();
         const auto time = m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2;
         SelectMemoryFrameAtTime( time );
-        if( selection.mapping != MemoryFrameMapping::Valid && selection.frameSet && GetMemoryFrameCount( *selection.frameSet ) != 0 ) SelectMemoryFrame( selection.frameSet, 0 );
+        if( selection.mapping != MemoryFrameMapping::Valid && selection.frameSet && GetMemoryFrameCount( *selection.frameSet ) != 0 )
+            SelectMemoryFrame( selection.frameSet, int( GetMemoryFrameCount( *selection.frameSet ) - 1 ) );
     }
-    if( !selection.active ) return;
-
-    const bool gpuScope = selection.scope == MemoryFrameScope::AllGpuD3D12Pools || IsGpuD3D12MemoryPool( m_memInfo.pool );
-    if( gpuScope ) EnsureGpuMemoryAttribution();
-
-    const auto gpuPools = [&]() {
-        const auto oldScope = selection.scope;
-        selection.scope = MemoryFrameScope::AllGpuD3D12Pools;
-        auto pools = GetMemoryFramePools();
-        selection.scope = oldScope;
-        return pools;
-    }();
-
-    TextDisabledUnformatted( "Scope:" );
     ImGui::SameLine();
-    const auto scopeName = selection.scope == MemoryFrameScope::AllGpuD3D12Pools ? "All GPU D3D12 pools" : GetMemoryPoolName( m_memInfo.pool );
-    ImGui::SetNextItemWidth( 300 * GetScale() );
-    if( ImGui::BeginCombo( "##memoryFrameScope", scopeName ) )
+    if( ImGui::RadioButton( "Global / Capture End", !selection.active ) && selection.active )
     {
-        if( !gpuPools.empty() && ImGui::Selectable( "All GPU D3D12 pools", selection.scope == MemoryFrameScope::AllGpuD3D12Pools ) )
-        {
-            selection.scope = MemoryFrameScope::AllGpuD3D12Pools;
-            selection.dirty = true;
-        }
-
-        std::vector<uint64_t> pools;
-        for( const auto& v : m_worker.GetMemNameMap() ) pools.emplace_back( v.first );
-        std::sort( pools.begin(), pools.end(), [this]( uint64_t lhs, uint64_t rhs ) { return strcmp( GetMemoryPoolName( lhs ), GetMemoryPoolName( rhs ) ) < 0; } );
-        for( const auto pool : pools )
-        {
-            const bool selected = selection.scope == MemoryFrameScope::SinglePool && m_memInfo.pool == pool;
-            if( ImGui::Selectable( GetMemoryPoolName( pool ), selected ) )
-            {
-                m_memInfo.pool = pool;
-                selection.scope = MemoryFrameScope::SinglePool;
-                selection.dirty = true;
-            }
-        }
-        ImGui::EndCombo();
+        selection.active = false;
+        m_memInfo.range.active = false;
+        selection.dirty = true;
+    }
+    if( !selection.active )
+    {
+        TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "Global mode shows capture-end state. Select Frame for per-frame pools, allocations, call stacks and lifetime." );
+        return;
+    }
+    if( selection.scope != MemoryFrameScope::AllCpuPools ) { selection.scope = MemoryFrameScope::AllCpuPools; selection.dirty = true; }
+    const bool gpuScope = false;
+    if( !selection.frameSet )
+    {
+        selection.frameSet = m_frames ? m_frames : m_worker.GetFramesBase();
+        const auto time = m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2;
+        SelectMemoryFrameAtTime( time );
+        if( selection.mapping != MemoryFrameMapping::Valid && selection.frameSet && GetMemoryFrameCount( *selection.frameSet ) != 0 )
+            SelectMemoryFrame( selection.frameSet, int( GetMemoryFrameCount( *selection.frameSet ) - 1 ) );
     }
 
-    ImGui::SameLine();
     TextDisabledUnformatted( "Frame set:" );
     ImGui::SameLine();
-    if( !selection.frameSet ) selection.frameSet = m_frames ? m_frames : m_worker.GetFramesBase();
     ImGui::SetNextItemWidth( 180 * GetScale() );
     if( ImGui::BeginCombo( "##memoryFrameSet", selection.frameSet ? GetFrameSetName( *selection.frameSet ) : "No frames" ) )
     {
@@ -1226,10 +1588,17 @@ void View::DrawMemoryFrameInspector()
                 selection.frameSet = frameSet;
                 const auto time = selection.triggerActive && selection.syncFromPlot ? selection.triggerTime : m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2;
                 SelectMemoryFrameAtTime( time );
-                if( selection.mapping != MemoryFrameMapping::Valid && GetMemoryFrameCount( *frameSet ) != 0 ) SelectMemoryFrame( frameSet, 0 );
+                if( selection.mapping != MemoryFrameMapping::Valid && GetMemoryFrameCount( *frameSet ) != 0 )
+                    SelectMemoryFrame( frameSet, int( GetMemoryFrameCount( *frameSet ) - 1 ) );
             }
         }
         ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    if( ImGui::SmallButton( "Use timeline center" ) )
+    {
+        SelectMemoryFrameAtTime( m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2 );
     }
 
     const auto frameCount = selection.frameSet ? GetMemoryFrameCount( *selection.frameSet ) : 0;
@@ -1260,6 +1629,25 @@ void View::DrawMemoryFrameInspector()
     if( !hasNext ) ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Checkbox( "Sync from plot/timeline", &selection.syncFromPlot );
+
+    TextDisabledUnformatted( "Allocator / MemLabel:" );
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth( 300 * GetScale() );
+    if( ImGui::BeginCombo( "##memoryFrameScope", GetMemoryPoolName( m_memInfo.pool ) ) )
+    {
+        std::vector<uint64_t> pools;
+        for( const auto& v : m_worker.GetMemNameMap() ) if( !IsGpuD3D12MemoryPool( v.first ) ) pools.emplace_back( v.first );
+        std::sort( pools.begin(), pools.end(), [this]( uint64_t lhs, uint64_t rhs ) { return strcmp( GetMemoryPoolName( lhs ), GetMemoryPoolName( rhs ) ) < 0; } );
+        for( const auto pool : pools )
+        {
+            if( ImGui::Selectable( GetMemoryPoolName( pool ), m_memInfo.pool == pool ) )
+            {
+                m_memInfo.pool = pool;
+                m_memInfo.showAllocList = false;
+            }
+        }
+        ImGui::EndCombo();
+    }
 
     if( selection.triggerActive )
     {
@@ -1315,7 +1703,67 @@ void View::DrawMemoryFrameInspector()
     }
 
     DrawMemoryFrameSummary();
-    if( gpuScope ) DrawGpuMemoryPassesForSelectedFrame();
+    if( ImGui::SmallButton( "Set current frame as A" ) )
+    {
+        m_memInfo.frameBaselineValid = true;
+        m_memInfo.frameBaselineSet = selection.frameSet;
+        m_memInfo.frameBaselineIndex = selection.frameIndex;
+        m_memInfo.frameBaselinePool = m_memInfo.pool;
+        m_memInfo.frameBaselineTab = selection.tab;
+        m_memInfo.frameBaselineSnapshot = snapshot;
+    }
+    if( m_memInfo.frameBaselineValid )
+    {
+        ImGui::SameLine();
+        if( ImGui::SmallButton( "Clear A" ) ) m_memInfo.frameBaselineValid = false;
+        const bool comparable = m_memInfo.frameBaselineValid && m_memInfo.frameBaselineSet == selection.frameSet &&
+            m_memInfo.frameBaselinePool == m_memInfo.pool && m_memInfo.frameBaselineTab == selection.tab;
+        if( comparable )
+        {
+            const auto findPool = []( const MemoryFrameSnapshot& value, uint64_t pool ) -> const MemoryFramePoolSummary* {
+                for( const auto& summary : value.pools ) if( summary.pool == pool ) return &summary;
+                return nullptr;
+            };
+            const auto* aPtr = findPool( m_memInfo.frameBaselineSnapshot, m_memInfo.pool );
+            const auto* bPtr = findPool( snapshot, m_memInfo.pool );
+            if( aPtr && bPtr )
+            {
+                const auto& a = *aPtr;
+                const auto& b = *bPtr;
+                ImGui::Text( "%s | %s | Frame A internal index %d -> Frame B internal index %d", GetMemoryPoolName( m_memInfo.pool ), GetSelectedMemoryFrameMetricName(), m_memInfo.frameBaselineIndex, selection.frameIndex );
+                if( ImGui::BeginTable( "cpuMemoryFrameAB", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable ) )
+                {
+                    ImGui::TableSetupColumn( "Metric" ); ImGui::TableSetupColumn( "Frame A" ); ImGui::TableSetupColumn( "Frame B" );
+                    ImGui::TableSetupColumn( "Delta bytes" ); ImGui::TableSetupColumn( "Delta count" ); ImGui::TableHeadersRow();
+                    const auto row = []( const char* name, uint64_t aBytes, uint64_t bBytes, uint64_t aCount, uint64_t bCount ) {
+                        ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted( name );
+                        ImGui::TableNextColumn(); ImGui::Text( "%s / %s", MemSizeToString( aBytes ), RealToString( aCount ) );
+                        ImGui::TableNextColumn(); ImGui::Text( "%s / %s", MemSizeToString( bBytes ), RealToString( bCount ) );
+                        ImGui::TableNextColumn(); DrawSignedMemoryDelta( aBytes, bBytes );
+                        ImGui::TableNextColumn(); DrawSignedCountDelta( aCount, bCount );
+                    };
+                    switch( selection.tab )
+                    {
+                    case MemoryFrameTab::ActiveAtStart: row( "Active at start", a.startBytes, b.startBytes, a.startCount, b.startCount ); break;
+                    case MemoryFrameTab::AllocatedInFrame: row( "Allocated", a.allocatedBytes, b.allocatedBytes, a.allocatedCount, b.allocatedCount ); break;
+                    case MemoryFrameTab::FreedInFrame: row( "Freed", a.freedBytes, b.freedBytes, a.freedCount, b.freedCount ); break;
+                    case MemoryFrameTab::ActiveAtEnd: row( "Active at end", a.endBytes, b.endBytes, a.endCount, b.endCount ); break;
+                    case MemoryFrameTab::PeakInFrame: row( "Frame peak", a.peakBytes, b.peakBytes, a.peakCount, b.peakCount ); break;
+                    case MemoryFrameTab::AllTransitions:
+                        row( "All transitions", a.allocatedBytes + a.freedBytes, b.allocatedBytes + b.freedBytes,
+                            a.allocatedCount + a.freedCount, b.allocatedCount + b.freedCount );
+                        break;
+                    }
+                    ImGui::EndTable();
+                }
+            }
+            else TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "Selected pool was not present in both Frame A and Frame B snapshots." );
+        }
+        else if( m_memInfo.frameBaselineValid )
+        {
+            TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "Frame A belongs to a different FrameSet, CPU allocation pool or metric." );
+        }
+    }
     const auto requestedTab = selection.tab;
     const bool forceTabSelection = selection.forceTabSelection;
     selection.forceTabSelection = false;
@@ -1345,6 +1793,12 @@ void View::DrawMemoryFrameInspector()
             DrawMemoryFrameTable( "##memoryFrameFreed", snapshot.freed, selection.tab );
             ImGui::EndTabItem();
         }
+        if( ImGui::BeginTabItem( "Peak in frame", nullptr, forceTabSelection && requestedTab == MemoryFrameTab::PeakInFrame ? ImGuiTabItemFlags_SetSelected : 0 ) )
+        {
+            selection.tab = MemoryFrameTab::PeakInFrame;
+            DrawMemoryFrameTable( "##memoryFramePeak", snapshot.activeAtPeak, selection.tab );
+            ImGui::EndTabItem();
+        }
         if( ImGui::BeginTabItem( "All frame transitions", nullptr, forceTabSelection && requestedTab == MemoryFrameTab::AllTransitions ? ImGuiTabItemFlags_SetSelected : 0 ) )
         {
             selection.tab = MemoryFrameTab::AllTransitions;
@@ -1357,9 +1811,12 @@ void View::DrawMemoryFrameInspector()
 
 void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRef>& data, MemoryFrameTab tab )
 {
-    if( data.empty() )
+    std::vector<MemoryEventRef> filtered;
+    filtered.reserve( data.size() );
+    for( const auto& ref : data ) if( ref.pool == m_memInfo.pool ) filtered.emplace_back( ref );
+    if( filtered.empty() )
     {
-        TextDisabledUnformatted( "No allocations in this category" );
+        TextDisabledUnformatted( "No allocations in this category for the selected Allocator / MemLabel" );
         return;
     }
 
@@ -1368,7 +1825,7 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
     const bool logicalIdentifier = selection.scope == MemoryFrameScope::AllGpuD3D12Pools || IsGpuD3D12MemoryPool( m_memInfo.pool );
     if( logicalIdentifier ) EnsureGpuMemoryAttribution();
     const auto& attribution = m_memInfo.gpuAttribution;
-    const auto tableHeight = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( data.size() + 2, 18 );
+    const auto tableHeight = ImGui::GetTextLineHeightWithSpacing() * std::min<size_t>( filtered.size() + 2, 18 );
     const auto flags = ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable |
         ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY;
     if( !ImGui::BeginTable( id, logicalIdentifier ? 22 : 15, flags, ImVec2( 0, tableHeight ) ) ) return;
@@ -1403,12 +1860,12 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
 
     int widgetId = 0;
     ImGuiListClipper clipper;
-    clipper.Begin( int( data.size() ) );
+    clipper.Begin( int( filtered.size() ) );
     while( clipper.Step() )
     {
         for( int row=clipper.DisplayStart; row<clipper.DisplayEnd; row++ )
         {
-            const auto& ref = data[row];
+            const auto& ref = filtered[row];
             const auto& mem = m_worker.GetMemoryNamed( ref.pool );
             if( ref.index >= mem.data.size() ) continue;
             const auto& event = mem.data[ref.index];
@@ -1422,6 +1879,10 @@ void View::DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRe
             if( snapshot.possibleCaptureBaseline && allocated )
             {
                 state = "Capture baseline?";
+            }
+            else if( tab == MemoryFrameTab::PeakInFrame )
+            {
+                state = "Active at peak";
             }
             else if( allocated && freed )
             {
@@ -1708,6 +2169,19 @@ void View::DrawMemory()
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
 
     auto& memNameMap = m_worker.GetMemNameMap();
+    if( !m_memInfo.cpuPoolInitialized )
+    {
+        size_t bestEventCount = 0;
+        uint64_t bestPool = 0;
+        for( const auto& value : memNameMap )
+        {
+            if( IsGpuD3D12MemoryPool( value.first ) || value.second->data.size() <= bestEventCount ) continue;
+            bestEventCount = value.second->data.size();
+            bestPool = value.first;
+        }
+        if( bestEventCount != 0 ) m_memInfo.pool = bestPool;
+        m_memInfo.cpuPoolInitialized = true;
+    }
     if( IsGpuD3D12MemoryPool( m_memInfo.pool ) || memNameMap.find( m_memInfo.pool ) == memNameMap.end() )
     {
         m_memInfo.pool = 0;
@@ -1717,34 +2191,56 @@ void View::DrawMemory()
         }
         m_memInfo.showAllocList = false;
     }
-    size_t cpuPoolCount = 0;
-    for( const auto& value : memNameMap ) if( !IsGpuD3D12MemoryPool( value.first ) ) ++cpuPoolCount;
-    TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "TrackedOnly" );
-    ImGui::SameLine(); ImGui::TextDisabled( "Allocation events are not the process/Unity retained-memory total." );
+    const bool aggregateFrameBound = m_memInfo.frame.active && m_memInfo.frameSnapshot.valid;
+    const int64_t aggregateTime = aggregateFrameBound ? m_memInfo.frameSnapshot.begin :
+        m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2;
+    auto aggregateRows = GetCpuMemoryAggregateRows( m_worker, aggregateTime,
+        aggregateFrameBound ? m_memInfo.frameSnapshot.end : -1 );
+    if( aggregateFrameBound )
+    {
+        for( auto& row : aggregateRows )
+        {
+            for( const auto& summary : m_memInfo.frameSnapshot.pools )
+            {
+                if( row.label != GetMemoryPoolName( summary.pool ) ) continue;
+                if( !row.sampleInRequestedFrame ) break;
+                uint64_t allocatedBeforeSample = 0;
+                uint64_t freedBeforeSample = 0;
+                const auto& poolData = m_worker.GetMemoryNamed( summary.pool ).data;
+                for( const auto& ref : m_memInfo.frameSnapshot.allocated )
+                {
+                    if( ref.pool != summary.pool || ref.index >= poolData.size() ) continue;
+                    const auto& event = poolData[ref.index];
+                    if( event.TimeAlloc() <= row.sampleTime ) allocatedBeforeSample += event.Size();
+                }
+                for( const auto& ref : m_memInfo.frameSnapshot.freed )
+                {
+                    if( ref.pool != summary.pool || ref.index >= poolData.size() ) continue;
+                    const auto& event = poolData[ref.index];
+                    if( event.TimeFree() >= 0 && event.TimeFree() <= row.sampleTime ) freedBeforeSample += event.Size();
+                }
+                const uint64_t beforeFree = summary.startBytes + allocatedBeforeSample;
+                row.trackedAvailable = beforeFree >= freedBeforeSample;
+                row.trackedBytes = row.trackedAvailable ? beforeFree - freedBeforeSample : 0;
+                break;
+            }
+        }
+    }
+    const bool hasCpuAllocationEvents = std::any_of( memNameMap.begin(), memNameMap.end(), [this]( const auto& value ) {
+        return !IsGpuD3D12MemoryPool( value.first ) && !value.second->data.empty();
+    } );
+    TextColoredUnformatted( hasCpuAllocationEvents ? ImVec4( .45f, 1.f, .55f, 1.f ) : ImVec4( 1.f, .8f, .2f, 1.f ),
+        hasCpuAllocationEvents ? "NativeAllocationEvents + UnityAggregate" : aggregateRows.empty() ? "NotCaptured" : "UnityAggregateOnly" );
+    ImGui::SameLine(); ImGui::TextDisabled( "The native Tracy allocation UI is primary; Unity MemLabel counters are supplemental." );
     ImGui::SameLine(); if( ImGui::SmallButton( "Open GPU Memory & Resources" ) ) m_showJnGpuResources = true;
     ImGui::SetNextItemWidth( 130 * scale );
     ImGui::InputDouble( "Project CPU budget (GB)", &m_memInfo.projectBudgetGb, .5, 1, "%.1f" );
-    if( cpuPoolCount > 1 )
-    {
-        TextDisabledUnformatted( ICON_FA_BOX_ARCHIVE " CPU allocation pool:" );
-        ImGui::SameLine();
-        if( ImGui::BeginCombo( "##memoryPool", m_memInfo.pool == 0 ? "Default allocator" : m_worker.GetString( m_memInfo.pool ) ) )
-        {
-            for( auto& v : memNameMap )
-            {
-                if( IsGpuD3D12MemoryPool( v.first ) ) continue;
-                if( ImGui::Selectable( v.first == 0 ? "Default allocator" : m_worker.GetString( v.first ) ) )
-                {
-                    m_memInfo.pool = v.first;
-                    m_memInfo.showAllocList = false;
-                    m_memInfo.frame.scope = MemoryFrameScope::SinglePool;
-                    m_memInfo.frame.dirty = true;
-                }
-            }
-            ImGui::EndCombo();
-        }
-        ImGui::Separator();
-    }
+    ImGui::Separator();
+    ImGui::BeginChild( "##cpuMemoryMainScroll", ImVec2( 0, 0 ), false, ImGuiWindowFlags_AlwaysVerticalScrollbar );
+    if( hasCpuAllocationEvents ) DrawMemoryFrameInspector();
+    DrawCpuMemoryPoolTree();
+    if( !aggregateRows.empty() ) DrawCpuMemoryAggregateRows( aggregateRows, aggregateTime, aggregateFrameBound, false );
+    RefreshSelectedMemoryFrameEvents();
 
     auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool );
     if( !mem.data.empty() )
@@ -1752,8 +2248,12 @@ void View::DrawMemory()
         if( ImGui::SmallButton( ICON_FA_LIST " Open allocation browser" ) )
         {
             m_memInfo.allocList.clear();
-            m_memInfo.allocList.reserve( mem.data.size() );
-            for( size_t index = 0; index < mem.data.size(); ++index ) m_memInfo.allocList.emplace_back( index );
+            if( m_memInfo.frameFilterActive ) m_memInfo.allocList = m_memInfo.frameFilteredAllocations;
+            else
+            {
+                m_memInfo.allocList.reserve( mem.data.size() );
+                for( size_t index = 0; index < mem.data.size(); ++index ) m_memInfo.allocList.emplace_back( index );
+            }
             m_memInfo.showAllocList = true;
         }
         ImGui::SameLine();
@@ -1761,31 +2261,50 @@ void View::DrawMemory()
     }
     if( mem.data.empty() )
     {
+        ImGui::SeparatorText( "Native Tracy allocation events" );
         const auto ty = ImGui::GetTextLineHeight();
         ImGui::PushFont( g_fonts.normal, FontBig );
-        ImGui::Dummy( ImVec2( 0, ( ImGui::GetContentRegionAvail().y - ImGui::GetTextLineHeight() * 2 ) * 0.5f ) );
+        ImGui::Dummy( ImVec2( 0, std::max( 0.f, ( ImGui::GetContentRegionAvail().y - ty * 3 ) * .35f ) ) );
         TextCentered( ICON_FA_DOG );
-        TextCentered( "No memory data collected" );
+        TextCentered( "No individual CPU allocation events captured for this pool" );
         ImGui::PopFont();
+        TextCentered( aggregateRows.empty() ? "The native Tracy view has no allocation data to display." :
+            "Unity aggregate counters remain available above; addresses, lifetimes and call stacks cannot be reconstructed from counters." );
+        ImGui::EndChild();
         ImGui::End();
         return;
     }
 
     const bool gpuPool = false;
 
-    TextDisabledUnformatted( "Total allocations:" );
+    const auto* selectedSummary = GetSelectedMemoryFramePoolSummary();
+    uint64_t selectedBytes = mem.usage;
+    uint64_t selectedCount = mem.active.size();
+    if( selectedSummary )
+    {
+        switch( m_memInfo.frame.tab )
+        {
+        case MemoryFrameTab::ActiveAtStart: selectedBytes = selectedSummary->startBytes; selectedCount = selectedSummary->startCount; break;
+        case MemoryFrameTab::ActiveAtEnd: selectedBytes = selectedSummary->endBytes; selectedCount = selectedSummary->endCount; break;
+        case MemoryFrameTab::AllocatedInFrame: selectedBytes = selectedSummary->allocatedBytes; selectedCount = selectedSummary->allocatedCount; break;
+        case MemoryFrameTab::FreedInFrame: selectedBytes = selectedSummary->freedBytes; selectedCount = selectedSummary->freedCount; break;
+        case MemoryFrameTab::PeakInFrame: selectedBytes = selectedSummary->peakBytes; selectedCount = selectedSummary->peakCount; break;
+        case MemoryFrameTab::AllTransitions: selectedBytes = selectedSummary->allocatedBytes + selectedSummary->freedBytes; selectedCount = selectedSummary->allocatedCount + selectedSummary->freedCount; break;
+        }
+    }
+    TextDisabledUnformatted( m_memInfo.frameFilterActive ? "Selected frame metric:" : "Capture-end state:" );
     ImGui::SameLine();
-    ImGui::Text( "%-15s", RealToString( mem.data.size() ) );
+    ImGui::Text( "%-22s", m_memInfo.frameFilterActive ? GetSelectedMemoryFrameMetricName() : "Global / Capture End" );
     ImGui::SameLine();
-    TextDisabledUnformatted( "Active allocations:" );
+    TextDisabledUnformatted( "Allocations:" );
     ImGui::SameLine();
-    ImGui::Text( "%-15s", RealToString( mem.active.size() ) );
+    ImGui::Text( "%-15s", RealToString( selectedCount ) );
     ImGui::SameLine();
-    TextDisabledUnformatted( "Memory usage:" );
+    TextDisabledUnformatted( "Bytes:" );
     ImGui::SameLine();
-    ImGui::Text( "%-15s", MemSizeToString( mem.usage ) );
+    ImGui::Text( "%-15s", MemSizeToString( selectedBytes ) );
     const auto projectBudgetBytes = uint64_t( std::max( 0.0, m_memInfo.projectBudgetGb ) * 1000.0 * 1000.0 * 1000.0 );
-    if( projectBudgetBytes != 0 && mem.usage > projectBudgetBytes )
+    if( projectBudgetBytes != 0 && selectedBytes > projectBudgetBytes )
     {
         ImGui::SameLine(); TextColoredUnformatted( ImVec4( 1.f, .25f, .25f, 1.f ), "OverProjectBudget (tracked pools only)" );
     }
@@ -1821,25 +2340,33 @@ void View::DrawMemory()
     ImGui::Spacing();
     ImGui::SameLine();
     ImGui::PushStyleVar( ImGuiStyleVar_FramePadding, ImVec2( 2, 2 ) );
-    if( ImGui::Checkbox( "Limit range", &m_memInfo.range.active ) )
+    if( m_memInfo.frameFilterActive )
     {
-        if( m_memInfo.range.active && m_memInfo.range.min == 0 && m_memInfo.range.max == 0 )
-        {
-            m_memInfo.range.min = m_vd.zvStart;
-            m_memInfo.range.max = m_vd.zvEnd;
-        }
+        TextColoredUnformatted( ImVec4( .45f, 1.f, .55f, 1.f ), "Frame-filtered" );
     }
-    if( m_memInfo.range.active )
+    else
     {
-        ImGui::SameLine();
-        TextColoredUnformatted( 0xFF00FFFF, ICON_FA_TRIANGLE_EXCLAMATION );
-        ImGui::SameLine();
-        ToggleButton( ICON_FA_RULER " Limits", m_showRanges );
+        if( ImGui::Checkbox( "Limit range", &m_memInfo.range.active ) )
+        {
+            if( m_memInfo.range.active && m_memInfo.range.min == 0 && m_memInfo.range.max == 0 )
+            {
+                m_memInfo.range.min = m_vd.zvStart;
+                m_memInfo.range.max = m_vd.zvEnd;
+            }
+        }
+        if( m_memInfo.range.active )
+        {
+            ImGui::SameLine();
+            TextColoredUnformatted( 0xFF00FFFF, ICON_FA_TRIANGLE_EXCLAMATION );
+            ImGui::SameLine();
+            ToggleButton( ICON_FA_RULER " Limits", m_showRanges );
+        }
     }
     ImGui::PopStyleVar();
 
     ImGui::Separator();
-    ImGui::BeginChild( "##memory" );
+    DrawCpuMemoryLeakCandidates();
+    ImGui::Separator();
     if( ImGui::TreeNode( ICON_FA_AT " Allocations" ) )
     {
         const char* findHint = gpuPool ? "Enter logical allocation ID to search for" : "Enter memory address to search for";
@@ -1860,8 +2387,15 @@ void View::DrawMemory()
         if( m_memInfo.ptrFind != 0 )
         {
             std::vector<const MemEvent*> match;
-            match.reserve( mem.active.size() );     // heuristic
-            if( m_memInfo.range.active )
+            match.reserve( m_memInfo.frameFilterActive ? m_memInfo.frameFilteredEvents.size() : mem.active.size() );
+            if( m_memInfo.frameFilterActive )
+            {
+                for( const auto* event : m_memInfo.frameFilteredEvents )
+                {
+                    if( event && event->Ptr() <= m_memInfo.ptrFind && event->Ptr() + event->Size() > m_memInfo.ptrFind ) match.emplace_back( event );
+                }
+            }
+            else if( m_memInfo.range.active )
             {
                 auto it = std::lower_bound( mem.data.begin(), mem.data.end(), m_memInfo.range.min, [] ( const auto& lhs, const auto& rhs ) { return lhs.TimeAlloc() < rhs; } );
                 if( it != mem.data.end() )
@@ -1914,12 +2448,20 @@ void View::DrawMemory()
     }
 
     ImGui::Separator();
-    if( ImGui::TreeNode( ICON_FA_HEART_PULSE " Active allocations" ) )
+    const auto allocationNodeLabel = m_memInfo.frameFilterActive ?
+        ( std::string( ICON_FA_HEART_PULSE " " ) + GetSelectedMemoryFrameMetricName() + " allocations" ) :
+        std::string( ICON_FA_HEART_PULSE " Active allocations" );
+    if( ImGui::TreeNode( allocationNodeLabel.c_str() ) )
     {
         uint64_t total = 0;
         std::vector<const MemEvent*> items;
-        items.reserve( mem.active.size() );
-        if( m_memInfo.range.active )
+        items.reserve( m_memInfo.frameFilterActive ? m_memInfo.frameFilteredEvents.size() : mem.active.size() );
+        if( m_memInfo.frameFilterActive )
+        {
+            items = m_memInfo.frameFilteredEvents;
+            for( const auto* event : items ) if( event ) total += event->Size();
+        }
+        else if( m_memInfo.range.active )
         {
             auto it = std::lower_bound( mem.data.begin(), mem.data.end(), m_memInfo.range.min, [] ( const auto& lhs, const auto& rhs ) { return lhs.TimeAlloc() < rhs; } );
             if( it != mem.data.end() )
@@ -2036,18 +2578,16 @@ void View::DrawMemory()
         SmallCheckbox( ICON_FA_LAYER_GROUP " Group by function name", &m_groupCallstackTreeByNameBottomUp );
         ImGui::SameLine();
         DrawHelpMarker( "If enabled, only one source location will be displayed (which may be incorrect)." );
-        ImGui::SameLine();
-        ImGui::Spacing();
-        ImGui::SameLine();
-        bool activeOnlyBottomUp = m_memRangeBottomUp == MemRange::Active;
-        if( SmallCheckbox( "Only active allocations", &activeOnlyBottomUp ) )
-            m_memRangeBottomUp = activeOnlyBottomUp ? MemRange::Active : MemRange::Full;
-        ImGui::SameLine();
-        ImGui::Spacing();
-        ImGui::SameLine();
-        bool inactiveOnlyBottomUp = m_memRangeBottomUp == MemRange::Inactive;
-        if( SmallCheckbox( "Only inactive allocations", &inactiveOnlyBottomUp ) )
-            m_memRangeBottomUp = inactiveOnlyBottomUp ? MemRange::Inactive : MemRange::Full;
+        ImGui::SameLine(); ImGui::Spacing(); ImGui::SameLine();
+        if( m_memInfo.frameFilterActive ) ImGui::TextDisabled( "Frame metric: %s", GetSelectedMemoryFrameMetricName() );
+        else
+        {
+            bool activeOnlyBottomUp = m_memRangeBottomUp == MemRange::Active;
+            if( SmallCheckbox( "Only active allocations", &activeOnlyBottomUp ) ) m_memRangeBottomUp = activeOnlyBottomUp ? MemRange::Active : MemRange::Full;
+            ImGui::SameLine(); ImGui::Spacing(); ImGui::SameLine();
+            bool inactiveOnlyBottomUp = m_memRangeBottomUp == MemRange::Inactive;
+            if( SmallCheckbox( "Only inactive allocations", &inactiveOnlyBottomUp ) ) m_memRangeBottomUp = inactiveOnlyBottomUp ? MemRange::Inactive : MemRange::Full;
+        }
 
         auto tree = GetCallstackFrameTreeBottomUp( mem );
         if( !tree.empty() )
@@ -2074,18 +2614,16 @@ void View::DrawMemory()
         SmallCheckbox( ICON_FA_LAYER_GROUP " Group by function name", &m_groupCallstackTreeByNameTopDown );
         ImGui::SameLine();
         DrawHelpMarker( "If enabled, only one source location will be displayed (which may be incorrect)." );
-        ImGui::SameLine();
-        ImGui::Spacing();
-        ImGui::SameLine();
-        bool activeOnlyTopDown = m_memRangeTopDown == MemRange::Active;
-        if( SmallCheckbox( "Only active allocations", &activeOnlyTopDown ) )
-            m_memRangeTopDown = activeOnlyTopDown ? MemRange::Active : MemRange::Full;
-        ImGui::SameLine();
-        ImGui::Spacing();
-        ImGui::SameLine();
-        bool inactiveOnlyTopDown = m_memRangeTopDown == MemRange::Inactive;
-        if( SmallCheckbox( "Only inactive allocations", &inactiveOnlyTopDown ) )
-            m_memRangeTopDown = inactiveOnlyTopDown ? MemRange::Inactive : MemRange::Full;
+        ImGui::SameLine(); ImGui::Spacing(); ImGui::SameLine();
+        if( m_memInfo.frameFilterActive ) ImGui::TextDisabled( "Frame metric: %s", GetSelectedMemoryFrameMetricName() );
+        else
+        {
+            bool activeOnlyTopDown = m_memRangeTopDown == MemRange::Active;
+            if( SmallCheckbox( "Only active allocations", &activeOnlyTopDown ) ) m_memRangeTopDown = activeOnlyTopDown ? MemRange::Active : MemRange::Full;
+            ImGui::SameLine(); ImGui::Spacing(); ImGui::SameLine();
+            bool inactiveOnlyTopDown = m_memRangeTopDown == MemRange::Inactive;
+            if( SmallCheckbox( "Only inactive allocations", &inactiveOnlyTopDown ) ) m_memRangeTopDown = inactiveOnlyTopDown ? MemRange::Inactive : MemRange::Full;
+        }
 
         auto tree = GetCallstackFrameTreeTopDown( mem );
         if( !tree.empty() )
@@ -2512,7 +3050,7 @@ void View::DrawAllocList()
 {
     const auto scale = GetScale();
     ImGui::SetNextWindowSize( ImVec2( 1100 * scale, 500 * scale ), ImGuiCond_FirstUseEver );
-    ImGui::Begin( "CPU Allocations", &m_memInfo.showAllocList );
+    ImGui::Begin( "Allocations list", &m_memInfo.showAllocList );
     if( ImGui::GetCurrentWindowRead()->SkipItems ) { ImGui::End(); return; }
 
     std::vector<const MemEvent*> data;
@@ -2525,30 +3063,7 @@ void View::DrawAllocList()
 
     TextFocused( "Number of allocations:", RealToString( m_memInfo.allocList.size() ) );
     ImGui::SameLine(); TextColoredUnformatted( ImVec4( 1.f, .8f, .2f, 1.f ), "TrackedOnly" );
-    ImGui::BeginChild( "cpuAllocationMaster", ImVec2( ImGui::GetContentRegionAvail().x * .62f, 0 ), ImGuiChildFlags_Borders );
     ListMemData( data, [this]( auto v ) { DrawMemoryIdentifier( m_memInfo.pool, *v ); }, -1, m_memInfo.pool );
-    ImGui::EndChild();
-    ImGui::SameLine();
-    ImGui::BeginChild( "cpuAllocationInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
-    if( m_memoryAllocInfoPool == m_memInfo.pool && m_memoryAllocInfoWindow >= 0 && size_t( m_memoryAllocInfoWindow ) < m_worker.GetMemoryNamed( m_memInfo.pool ).data.size() )
-    {
-        const auto& event = m_worker.GetMemoryNamed( m_memInfo.pool ).data[size_t( m_memoryAllocInfoWindow )];
-        int callstackButtonId = int( m_memoryAllocInfoWindow ) * 2;
-        ImGui::SeparatorText( "Allocation Inspector" ); DrawMemoryIdentifier( m_memInfo.pool, event );
-        ImGui::Text( "Size: %s", MemSizeToString( event.Size() ) ); ImGui::Text( "Allocated: %s", TimeToStringExact( event.TimeAlloc() ) );
-        ImGui::Text( "Lifetime: %s", event.TimeFree() < 0 ? "Alive at capture end" : TimeToString( event.TimeFree() - event.TimeAlloc() ) );
-        ImGui::Text( "Alloc thread: %s", m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadAlloc() ) ) );
-        if( event.CsAlloc() ) SmallCallstackButton( "Allocation call stack", event.CsAlloc(), callstackButtonId );
-        else TextDisabledUnformatted( "Allocation call stack unavailable" );
-        if( event.TimeFree() >= 0 )
-        {
-            ImGui::Text( "Free thread: %s", m_worker.GetThreadName( m_worker.DecompressThread( event.ThreadFree() ) ) );
-            if( event.csFree.Val() ) SmallCallstackButton( "Free call stack", event.csFree.Val(), callstackButtonId );
-        }
-        if( ImGui::Button( "Focus lifetime" ) ) { PushEvidenceNavigation(); ZoomToRange( event.TimeAlloc(), event.TimeFree() >= 0 ? event.TimeFree() : m_worker.GetLastTime() ); }
-    }
-    else TextDisabledUnformatted( "Select an allocation from the virtualized table." );
-    ImGui::EndChild();
     ImGui::End();
 }
 

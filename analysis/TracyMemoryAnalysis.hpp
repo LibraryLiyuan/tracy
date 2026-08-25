@@ -71,12 +71,14 @@ struct MemoryFrameSnapshot
     bool possibleCaptureBaseline = false;
     int64_t begin = 0;
     int64_t end = 0;
+    int64_t peakTime = 0;
     MemoryFramePoolSummary total;
     std::vector<MemoryFramePoolSummary> pools;
     std::vector<MemoryEventKey> activeAtStart;
     std::vector<MemoryEventKey> activeAtEnd;
     std::vector<MemoryEventKey> allocated;
     std::vector<MemoryEventKey> freed;
+    std::vector<MemoryEventKey> activeAtPeak;
     std::vector<MemoryEventKey> transitions;
 };
 

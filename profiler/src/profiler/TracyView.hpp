@@ -213,6 +213,7 @@ private:
     enum class MemoryFrameScope : uint8_t
     {
         SinglePool,
+        AllCpuPools,
         AllGpuD3D12Pools
     };
 
@@ -222,6 +223,7 @@ private:
         ActiveAtEnd,
         AllocatedInFrame,
         FreedInFrame,
+        PeakInFrame,
         AllTransitions
     };
 
@@ -341,7 +343,7 @@ private:
 
     struct MemoryFrameSelection
     {
-        bool active = false;
+        bool active = true;
         bool syncFromPlot = true;
         bool dirty = true;
         bool forceTabSelection = true;
@@ -428,6 +430,12 @@ private:
     void DrawMemoryFrameInspector();
     void DrawMemoryFrameSummary();
     void DrawMemoryFrameTable( const char* id, const std::vector<MemoryEventRef>& data, MemoryFrameTab tab );
+    void DrawCpuMemoryPoolTree();
+    void DrawCpuMemoryLeakCandidates();
+    const std::vector<MemoryEventRef>& GetSelectedMemoryFrameRefs() const;
+    const MemoryFramePoolSummary* GetSelectedMemoryFramePoolSummary() const;
+    const char* GetSelectedMemoryFrameMetricName() const;
+    void RefreshSelectedMemoryFrameEvents();
     void DrawAllocList();
     void DrawCompare();
     void DrawCallstackWindow();
@@ -491,6 +499,7 @@ private:
     std::string FormatGpuMemoryUsage( uint32_t usageMask ) const;
 
     unordered_flat_map<uint32_t, MemPathData> GetCallstackPaths( const MemData& mem, MemRange memRange ) const;
+    unordered_flat_map<uint32_t, MemPathData> GetCallstackPaths( const std::vector<const MemEvent*>& events ) const;
     unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeBottomUp( const MemData& mem ) const;
     unordered_flat_map<uint64_t, MemCallstackFrameTree> GetCallstackFrameTreeTopDown( const MemData& mem ) const;
     void DrawFrameTreeLevel( const unordered_flat_map<uint64_t, MemCallstackFrameTree>& tree, int& idx );
@@ -736,11 +745,25 @@ private:
         uint64_t selectedAllocation = 0;
         uint64_t selectedPass = 0;
         uint64_t selectedHeap = 0;
+        uint64_t currentFrame = 0;
+        int currentFrameIndex = -1;
         uint64_t frameA = 0;
         uint64_t frameB = 0;
+        int passScope = 0;
         double projectBudgetGb = 6.4;
         bool decimalUnits = false;
         bool advanced = false;
+        bool followTimelineFrame = true;
+        bool showZeroBytePasses = false;
+        size_t hiddenZeroBytePasses = 0;
+        std::vector<size_t> resourceOrder;
+        std::vector<size_t> allocationOrder;
+        std::vector<size_t> passOrder;
+        int64_t passOrderBegin = 0;
+        int64_t passOrderEnd = 0;
+        int passOrderScope = -1;
+        bool passOrderFrameValid = false;
+        bool passOrderShowZero = false;
         std::string exportStatus;
     } m_jnGpuUi;
 
@@ -1083,12 +1106,27 @@ private:
         char pattern[1024] = {};
         uint64_t ptrFind = 0;
         uint64_t pool = 0;
+        bool cpuPoolInitialized = false;
         bool showAllocList = false;
         std::vector<size_t> allocList;
         Range range;
         MemoryFrameSelection frame;
         MemoryFrameSnapshot frameSnapshot;
         std::vector<MemoryFramePoolStamp> frameSnapshotStamps;
+        bool frameFilterActive = false;
+        const FrameData* frameFilterSet = nullptr;
+        int frameFilterIndex = -1;
+        uint64_t frameFilterPool = 0;
+        MemoryFrameTab frameFilterTab = MemoryFrameTab::ActiveAtEnd;
+        size_t frameFilterPoolEvents = 0;
+        std::vector<const MemEvent*> frameFilteredEvents;
+        std::vector<size_t> frameFilteredAllocations;
+        bool frameBaselineValid = false;
+        const FrameData* frameBaselineSet = nullptr;
+        int frameBaselineIndex = -1;
+        uint64_t frameBaselinePool = 0;
+        MemoryFrameTab frameBaselineTab = MemoryFrameTab::ActiveAtEnd;
+        MemoryFrameSnapshot frameBaselineSnapshot;
         GpuMemoryAttributionCache gpuAttribution;
         double projectBudgetGb = 16.0;
     } m_memInfo;

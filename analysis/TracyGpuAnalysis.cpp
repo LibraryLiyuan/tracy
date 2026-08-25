@@ -317,6 +317,99 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     for( size_t index = 0; index < data.gpuRangeSets.size(); ++index )
         if( const auto it = out.resourceById.find( data.gpuRangeSets[index].resourceId ); it != out.resourceById.end() ) out.resources[it->second].ranges.emplace_back( index );
 
+    struct ResourcePointerInterval
+    {
+        uint64_t resourceId = 0;
+        int64_t begin = std::numeric_limits<int64_t>::min();
+        int64_t end = std::numeric_limits<int64_t>::max();
+    };
+    std::unordered_map<uint64_t, std::vector<ResourcePointerInterval>> resourcesByPointer;
+    std::unordered_map<uint64_t, std::pair<uint64_t, size_t>> openPointerIntervals;
+    resourcesByPointer.reserve( out.resources.size() );
+    openPointerIntervals.reserve( out.resources.size() );
+    for( const auto& value : data.gpuCatalogResources )
+    {
+        if( value.pointerToken == 0 || value.resourceId == 0 ) continue;
+        const auto operation = JnGpuCatalogRecordOperation( value.operation );
+        if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
+            operation == JnGpuCatalogRecordOperation::Snapshot )
+        {
+            auto& intervals = resourcesByPointer[value.pointerToken];
+            intervals.push_back( { value.resourceId,
+                operation == JnGpuCatalogRecordOperation::Create ? value.time : std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::max() } );
+            openPointerIntervals[value.resourceId] = { value.pointerToken, intervals.size() - 1 };
+        }
+        else if( operation == JnGpuCatalogRecordOperation::Destroy || operation == JnGpuCatalogRecordOperation::Close )
+        {
+            const auto open = openPointerIntervals.find( value.resourceId );
+            if( open == openPointerIntervals.end() ) continue;
+            const auto intervals = resourcesByPointer.find( open->second.first );
+            if( intervals != resourcesByPointer.end() && open->second.second < intervals->second.size() )
+                intervals->second[open->second.second].end = value.time;
+            openPointerIntervals.erase( open );
+        }
+    }
+    const auto resolvePointerResource = [&resourcesByPointer]( uint64_t pointerToken, int64_t time )
+    {
+        const auto found = resourcesByPointer.find( pointerToken );
+        if( found == resourcesByPointer.end() ) return uint64_t( 0 );
+        uint64_t resolved = 0;
+        for( const auto& interval : found->second )
+        {
+            if( time < interval.begin || time > interval.end ) continue;
+            if( resolved != 0 && resolved != interval.resourceId ) return uint64_t( 0 );
+            resolved = interval.resourceId;
+        }
+        return resolved;
+    };
+    std::unordered_map<uint64_t, std::vector<const JnGpuCatalogLogicalRecordV1*>> logicalHistory;
+    logicalHistory.reserve( data.gpuCatalogLogicals.size() );
+    for( const auto& value : data.gpuCatalogLogicals )
+        if( value.logicalResourceId != 0 ) logicalHistory[value.logicalResourceId].push_back( &value );
+    for( auto& [unused, history] : logicalHistory )
+        std::stable_sort( history.begin(), history.end(), []( const auto* lhs, const auto* rhs ) { return lhs->time < rhs->time; } );
+    const auto resolveLogicalResource = [&logicalHistory]( uint64_t logicalResourceId, int64_t time )
+    {
+        const auto found = logicalHistory.find( logicalResourceId );
+        if( found == logicalHistory.end() ) return uint64_t( 0 );
+        uint64_t resolved = 0;
+        for( const auto* value : found->second )
+        {
+            if( value->time > time ) break;
+            const auto operation = JnGpuCatalogRecordOperation( value->operation );
+            if( operation == JnGpuCatalogRecordOperation::Unbind || operation == JnGpuCatalogRecordOperation::Destroy ||
+                operation == JnGpuCatalogRecordOperation::Close ) resolved = 0;
+            else if( value->resourceId != 0 ) resolved = value->resourceId;
+        }
+        return resolved;
+    };
+    const auto appendResolvedUse = [&]( GpuPassWorkingSet& pass, const GpuMemoryPassUse& use )
+    {
+        if( use.allocationId == 0 ) return;
+        auto resourceId = resolvePointerResource( use.allocationId, pass.endNs );
+        if( resourceId == 0 ) resourceId = resolveLogicalResource( use.allocationId, pass.endNs );
+        if( resourceId != 0 && out.resourceById.find( resourceId ) != out.resourceById.end() )
+        {
+            pass.directResources.emplace_back( resourceId );
+            return;
+        }
+        if( use.resolvedPhysicalAllocationId != 0 )
+        {
+            size_t matched = 0;
+            for( const auto& resource : out.resources )
+            {
+                if( resource.allocationId != use.resolvedPhysicalAllocationId ) continue;
+                if( resource.createTime != 0 && pass.endNs < int64_t( resource.createTime ) ) continue;
+                if( resource.destroyTime != 0 && pass.startNs > int64_t( resource.destroyTime ) ) continue;
+                pass.directResources.emplace_back( resource.resourceId );
+                matched++;
+            }
+            if( matched != 0 ) return;
+        }
+        manifest.unresolvedCount++;
+    };
+
     if( cancelled() ) return out;
     report( 0.62f, "passes" );
     if( attribution )
@@ -334,6 +427,8 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
             pass.complete = value.complete;
             pass.truncated = value.truncated;
             pass.name = value.name;
+            pass.directResources.reserve( value.uses.size() );
+            for( const auto& use : value.uses ) appendResolvedUse( pass, use );
             out.passById[pass.passId] = out.passes.size();
             out.passes.emplace_back( std::move( pass ) );
         }
@@ -370,6 +465,24 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
             if( const auto found = out.passById.find( relation.sourceId ); found != out.passById.end() ) out.passes[found->second].parentPassId = relation.targetId;
         }
     }
+    if( !attribution )
+    {
+        for( const auto& value : data.gpuReferenceUses )
+        {
+            const auto pass = out.passById.find( value.passId );
+            if( pass == out.passById.end() )
+            {
+                manifest.unresolvedCount++;
+                continue;
+            }
+            GpuMemoryPassUse use;
+            use.allocationId = value.resourceId;
+            use.usageMask = value.usageMask;
+            use.resourceSetId = value.resourceSetId;
+            use.encoding = value.encoding;
+            appendResolvedUse( out.passes[pass->second], use );
+        }
+    }
     for( size_t index = 0; index < data.gpuRangeSets.size(); ++index )
     {
         if( ( index & 4095 ) == 0 && cancelled() ) return out;
@@ -377,9 +490,11 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
         auto it = out.passById.find( value.passInstanceId );
         if( it == out.passById.end() )
         {
-            GpuPassWorkingSet pass; pass.passId = value.passInstanceId;
-            out.passById[pass.passId] = out.passes.size(); out.passes.emplace_back( std::move( pass ) );
-            it = out.passById.find( value.passInstanceId );
+            // A RangeSet without its authoritative ResourceSet pass cannot be
+            // assigned to a frame or GPU zone. Keep the missing relation
+            // explicit instead of manufacturing a misleading Frame 0 pass.
+            manifest.unresolvedCount++;
+            continue;
         }
         auto& pass = out.passes[it->second];
         if( value.resourceId != 0 ) pass.directResources.emplace_back( value.resourceId );
@@ -389,6 +504,8 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
     {
         std::sort( pass.directResources.begin(), pass.directResources.end() );
         pass.directResources.erase( std::unique( pass.directResources.begin(), pass.directResources.end() ), pass.directResources.end() );
+        for( const auto resourceId : pass.directResources )
+            if( out.resourceById.find( resourceId ) == out.resourceById.end() ) manifest.unresolvedCount++;
         pass.inclusiveResources = pass.directResources;
         pass.directPhysicalBytes = PhysicalBytesForResources( out, pass.directResources );
     }
@@ -414,6 +531,12 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const Gpu
         visit[index] = 2;
     };
     for( size_t index = 0; index < out.passes.size(); ++index ) buildInclusive( index );
+    if( manifest.unresolvedCount != 0 && manifest.state == GpuAnalysisState::Complete )
+    {
+        manifest.state = GpuAnalysisState::Partial;
+        manifest.complete = false;
+        manifest.reason = "unresolved_gpu_resource_relations";
+    }
     if( cancelled() ) return out;
     report( 0.86f, "lifetime-churn" );
     for( auto& pass : out.passes )

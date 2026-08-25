@@ -2,6 +2,7 @@
 
 #include "TracyGpuAnalysisController.hpp"
 #include "TracyImGui.hpp"
+#include "TracyPrint.hpp"
 
 #include "imgui.h"
 #include "IconsFontAwesome6.h"
@@ -46,6 +47,17 @@ bool ResourceMatches( const analysis::GpuResourceAnalysisRecord& item, const cha
     if( ContainsInsensitive( item.name, search ) || ContainsInsensitive( analysis::GpuPrimaryKindName( item.primaryKind ), search ) ) return true;
     char id[32]; std::snprintf( id, sizeof( id ), "%llu", static_cast<unsigned long long>( item.resourceId ) );
     return ContainsInsensitive( id, search );
+}
+
+ImGuiTableColumnSortSpecs SortSpecOrDefault( ImGuiTableSortSpecs* specs, ImGuiID column, ImGuiSortDirection direction )
+{
+    if( specs && specs->SpecsCount ) return specs->Specs[0];
+    ImGuiTableColumnSortSpecs result;
+    result.ColumnUserID = column;
+    result.ColumnIndex = -1;
+    result.SortOrder = 0;
+    result.SortDirection = direction;
+    return result;
 }
 
 void Metric( const char* name, uint64_t bytes, bool decimal, const char* quality )
@@ -95,11 +107,45 @@ void DrawResourceTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui 
 {
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
         ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
-    if( !ImGui::BeginTable( "gpuResources", 6, flags ) ) return;
-    ImGui::TableSetupColumn( "ID", ImGuiTableColumnFlags_WidthFixed, 75 ); ImGui::TableSetupColumn( "Name", ImGuiTableColumnFlags_WidthStretch );
-    ImGui::TableSetupColumn( "Kind", ImGuiTableColumnFlags_WidthFixed, 120 ); ImGui::TableSetupColumn( "Capacity", ImGuiTableColumnFlags_WidthFixed, 95 );
-    ImGui::TableSetupColumn( "Allocation", ImGuiTableColumnFlags_WidthFixed, 85 ); ImGui::TableSetupColumn( "Quality", ImGuiTableColumnFlags_WidthFixed, 90 );
+    // The table identity intentionally changes with the sortable N27 layout.  Reusing the
+    // pre-sort identity would restore an old ID ordering from imgui.ini and defeat the new
+    // capacity-descending default on an existing workstation.
+    if( !ImGui::BeginTable( "gpuResourcesN27Sortable", 7, flags ) ) return;
+    ImGui::TableSetupColumn( "ID", ImGuiTableColumnFlags_WidthFixed, 75, 0 ); ImGui::TableSetupColumn( "Name", ImGuiTableColumnFlags_WidthStretch, 0, 1 );
+    ImGui::TableSetupColumn( "Kind", ImGuiTableColumnFlags_WidthFixed, 120, 2 );
+    ImGui::TableSetupColumn( "Capacity", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 95, 3 );
+    ImGui::TableSetupColumn( "Physical", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_PreferSortDescending, 95, 4 );
+    ImGui::TableSetupColumn( "Allocation", ImGuiTableColumnFlags_WidthFixed, 85, 5 ); ImGui::TableSetupColumn( "Quality", ImGuiTableColumnFlags_WidthFixed, 90, 6 );
     ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
+    auto* sort = ImGui::TableGetSortSpecs();
+    if( ui.resourceOrder.size() != snapshot.resources.size() || ( sort && sort->SpecsDirty ) )
+    {
+        ui.resourceOrder.resize( snapshot.resources.size() );
+        for( size_t i = 0; i < ui.resourceOrder.size(); ++i ) ui.resourceOrder[i] = i;
+        const auto spec = SortSpecOrDefault( sort, 3, ImGuiSortDirection_Descending );
+        std::stable_sort( ui.resourceOrder.begin(), ui.resourceOrder.end(), [&]( size_t lhsIndex, size_t rhsIndex ) {
+            const auto& lhs = snapshot.resources[lhsIndex]; const auto& rhs = snapshot.resources[rhsIndex];
+            int cmp = 0;
+            switch( spec.ColumnUserID )
+            {
+            case 0: cmp = lhs.resourceId < rhs.resourceId ? -1 : lhs.resourceId > rhs.resourceId ? 1 : 0; break;
+            case 1: cmp = lhs.name.compare( rhs.name ); break;
+            case 2: cmp = int( lhs.primaryKind ) - int( rhs.primaryKind ); break;
+            case 4:
+            {
+                const auto* la = snapshot.FindAllocation( lhs.allocationId ); const auto* ra = snapshot.FindAllocation( rhs.allocationId );
+                const uint64_t lv = la ? la->sizeBytes : 0, rv = ra ? ra->sizeBytes : 0;
+                cmp = lv < rv ? -1 : lv > rv ? 1 : 0; break;
+            }
+            case 5: cmp = lhs.allocationId < rhs.allocationId ? -1 : lhs.allocationId > rhs.allocationId ? 1 : 0; break;
+            case 6: cmp = lhs.invalid != rhs.invalid ? ( lhs.invalid ? 1 : -1 ) : int( lhs.exactness ) - int( rhs.exactness ); break;
+            default: cmp = lhs.capacityBytes < rhs.capacityBytes ? -1 : lhs.capacityBytes > rhs.capacityBytes ? 1 : 0; break;
+            }
+            if( cmp == 0 ) cmp = lhs.resourceId < rhs.resourceId ? -1 : lhs.resourceId > rhs.resourceId ? 1 : 0;
+            return spec.SortDirection == ImGuiSortDirection_Ascending ? cmp < 0 : cmp > 0;
+        } );
+        if( sort ) sort->SpecsDirty = false;
+    }
     const bool filtered = ui.search[0] != '\0';
     auto row = [&]( const analysis::GpuResourceAnalysisRecord& item )
     {
@@ -110,27 +156,53 @@ void DrawResourceTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui 
         ImGui::TableNextColumn(); ImGui::TextUnformatted( item.name.empty() ? "<unnamed>" : item.name.c_str() );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( analysis::GpuPrimaryKindName( item.primaryKind ) );
         ImGui::TableNextColumn(); const auto capacity = ByteText( item.capacityBytes, ui.decimalUnits ); ImGui::TextUnformatted( capacity.c_str() );
+        ImGui::TableNextColumn(); const auto* allocation = snapshot.FindAllocation( item.allocationId );
+        ImGui::TextUnformatted( ByteText( allocation ? allocation->sizeBytes : 0, ui.decimalUnits ).c_str() );
         ImGui::TableNextColumn(); ImGui::Text( "%llu", static_cast<unsigned long long>( item.allocationId ) );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( item.invalid ? "Invalid" : analysis::GpuExactnessName( item.exactness ) );
     };
-    if( filtered ) { for( const auto& item : snapshot.resources ) if( ResourceMatches( item, ui.search ) ) row( item ); }
+    if( filtered ) { for( const auto index : ui.resourceOrder ) { const auto& item = snapshot.resources[index]; if( ResourceMatches( item, ui.search ) ) row( item ); } }
     else
     {
-        ImGuiListClipper clipper; clipper.Begin( int( snapshot.resources.size() ) );
-        while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i ) row( snapshot.resources[size_t( i )] );
+        ImGuiListClipper clipper; clipper.Begin( int( ui.resourceOrder.size() ) );
+        while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i ) row( snapshot.resources[ui.resourceOrder[size_t( i )]] );
     }
     ImGui::EndTable();
 }
 
 void DrawAllocationTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui )
 {
-    if( !ImGui::BeginTable( "gpuAllocations", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY ) ) return;
-    ImGui::TableSetupColumn( "Allocation" ); ImGui::TableSetupColumn( "Heap" ); ImGui::TableSetupColumn( "Offset" ); ImGui::TableSetupColumn( "Size" );
-    ImGui::TableSetupColumn( "Resident" ); ImGui::TableSetupColumn( "Resources" ); ImGui::TableSetupColumn( "State" ); ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
-    ImGuiListClipper clipper; clipper.Begin( int( snapshot.allocations.size() ) );
+    if( !ImGui::BeginTable( "gpuAllocationsN27Sortable", 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable ) ) return;
+    ImGui::TableSetupColumn( "Allocation", 0, 0, 0 ); ImGui::TableSetupColumn( "Heap", 0, 0, 1 ); ImGui::TableSetupColumn( "Offset", 0, 0, 2 );
+    ImGui::TableSetupColumn( "Size", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 0, 3 );
+    ImGui::TableSetupColumn( "Resident", ImGuiTableColumnFlags_PreferSortDescending, 0, 4 ); ImGui::TableSetupColumn( "Resources", 0, 0, 5 ); ImGui::TableSetupColumn( "State", 0, 0, 6 );
+    ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
+    auto* sort = ImGui::TableGetSortSpecs();
+    if( ui.allocationOrder.size() != snapshot.allocations.size() || ( sort && sort->SpecsDirty ) )
+    {
+        ui.allocationOrder.resize( snapshot.allocations.size() );
+        for( size_t i = 0; i < ui.allocationOrder.size(); ++i ) ui.allocationOrder[i] = i;
+        const auto spec = SortSpecOrDefault( sort, 3, ImGuiSortDirection_Descending );
+        std::stable_sort( ui.allocationOrder.begin(), ui.allocationOrder.end(), [&]( size_t lhsIndex, size_t rhsIndex ) {
+            const auto& lhs = snapshot.allocations[lhsIndex]; const auto& rhs = snapshot.allocations[rhsIndex]; int cmp = 0;
+            const auto compare = [&]( uint64_t lv, uint64_t rv ) { return lv < rv ? -1 : lv > rv ? 1 : 0; };
+            switch( spec.ColumnUserID )
+            {
+            case 0: cmp = compare( lhs.allocationId, rhs.allocationId ); break; case 1: cmp = compare( lhs.heapId, rhs.heapId ); break;
+            case 2: cmp = compare( lhs.offsetBytes, rhs.offsetBytes ); break; case 4: cmp = compare( lhs.residentBytes, rhs.residentBytes ); break;
+            case 5: cmp = compare( lhs.resources.size(), rhs.resources.size() ); break;
+            case 6: cmp = lhs.invalid != rhs.invalid ? ( lhs.invalid ? 1 : -1 ) : lhs.aliveAtEnd != rhs.aliveAtEnd ? ( lhs.aliveAtEnd ? -1 : 1 ) : 0; break;
+            default: cmp = compare( lhs.sizeBytes, rhs.sizeBytes ); break;
+            }
+            if( cmp == 0 ) cmp = compare( lhs.allocationId, rhs.allocationId );
+            return spec.SortDirection == ImGuiSortDirection_Ascending ? cmp < 0 : cmp > 0;
+        } );
+        if( sort ) sort->SpecsDirty = false;
+    }
+    ImGuiListClipper clipper; clipper.Begin( int( ui.allocationOrder.size() ) );
     while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i )
     {
-        const auto& item = snapshot.allocations[size_t( i )]; ImGui::TableNextRow(); ImGui::TableNextColumn();
+        const auto& item = snapshot.allocations[ui.allocationOrder[size_t( i )]]; ImGui::TableNextRow(); ImGui::TableNextColumn();
         char id[64]; std::snprintf( id, sizeof( id ), "%llu##gpuAlloc", static_cast<unsigned long long>( item.allocationId ) );
         if( ImGui::Selectable( id, ui.selectedAllocation == item.allocationId, ImGuiSelectableFlags_SpanAllColumns ) )
         { ui.selectedAllocation = item.allocationId; ui.selectedHeap = item.heapId; if( !item.resources.empty() ) ui.selectedResource = item.resources.front(); }
@@ -164,27 +236,144 @@ void DrawHeapMap( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui )
     }
 }
 
-void DrawPassTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui )
+void DrawPassTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui, bool frameValid, int64_t frameBegin, int64_t frameEnd )
 {
-    if( !ImGui::BeginTable( "gpuPasses", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY ) ) return;
-    ImGui::TableSetupColumn( "Pass" ); ImGui::TableSetupColumn( "Frame" ); ImGui::TableSetupColumn( "Direct #" ); ImGui::TableSetupColumn( "Direct WS" );
-    ImGui::TableSetupColumn( "Inclusive #" ); ImGui::TableSetupColumn( "Inclusive WS" ); ImGui::TableSetupColumn( "Range" ); ImGui::TableSetupColumn( "Quality" );
+    const bool globalScope = ui.passScope == 1;
+    ImGui::Checkbox( "Show zero-byte / unresolved passes", &ui.showZeroBytePasses );
+    ImGui::SameLine(); ImGui::TextDisabled( "%zu hidden; still available in Quality", ui.hiddenZeroBytePasses );
+    if( !ImGui::BeginTable( "gpuPassesN27Sortable", globalScope ? 8 : 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable ) ) return;
+    ImGui::TableSetupColumn( "Pass", 0, 0, 0 ); if( globalScope ) ImGui::TableSetupColumn( "Producer frame", 0, 0, 1 );
+    ImGui::TableSetupColumn( "Direct #", 0, 0, 2 ); ImGui::TableSetupColumn( "Direct WS", ImGuiTableColumnFlags_PreferSortDescending, 0, 3 );
+    ImGui::TableSetupColumn( "Inclusive #", 0, 0, 4 );
+    ImGui::TableSetupColumn( "Inclusive WS", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_PreferSortDescending, 0, 5 );
+    ImGui::TableSetupColumn( "Range", ImGuiTableColumnFlags_PreferSortDescending, 0, 6 ); ImGui::TableSetupColumn( "Quality", 0, 0, 7 );
     ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
-    ImGuiListClipper clipper; clipper.Begin( int( snapshot.passes.size() ) );
-    while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i )
+    auto* sort = ImGui::TableGetSortSpecs();
+    const bool contextChanged = ui.passOrder.size() > snapshot.passes.size() || ui.passOrderScope != ui.passScope ||
+        ui.passOrderFrameValid != frameValid || ui.passOrderBegin != frameBegin || ui.passOrderEnd != frameEnd ||
+        ui.passOrderShowZero != ui.showZeroBytePasses;
+    if( contextChanged || ( sort && sort->SpecsDirty ) || ui.passOrder.empty() )
     {
-        const auto& pass = snapshot.passes[size_t( i )]; ImGui::TableNextRow(); ImGui::TableNextColumn();
+        ui.passOrder.clear(); ui.hiddenZeroBytePasses = 0;
+        for( size_t i = 0; i < snapshot.passes.size(); ++i )
+        {
+            const auto& pass = snapshot.passes[i];
+            if( !globalScope && ( !frameValid || pass.endNs < frameBegin || pass.startNs > frameEnd ) ) continue;
+            const bool zeroPlaceholder = pass.directPhysicalBytes == 0 && pass.inclusivePhysicalBytes == 0 && pass.directResources.empty() && pass.inclusiveResources.empty();
+            if( zeroPlaceholder && !ui.showZeroBytePasses ) { ++ui.hiddenZeroBytePasses; continue; }
+            ui.passOrder.emplace_back( i );
+        }
+        const auto spec = SortSpecOrDefault( sort, 5, ImGuiSortDirection_Descending );
+        std::stable_sort( ui.passOrder.begin(), ui.passOrder.end(), [&]( size_t lhsIndex, size_t rhsIndex ) {
+            const auto& lhs = snapshot.passes[lhsIndex]; const auto& rhs = snapshot.passes[rhsIndex]; int cmp = 0;
+            const auto compare = [&]( uint64_t lv, uint64_t rv ) { return lv < rv ? -1 : lv > rv ? 1 : 0; };
+            switch( spec.ColumnUserID )
+            {
+            case 0: cmp = lhs.name.compare( rhs.name ); break; case 1: cmp = compare( lhs.frameId, rhs.frameId ); break;
+            case 2: cmp = compare( lhs.directResources.size(), rhs.directResources.size() ); break; case 3: cmp = compare( lhs.directPhysicalBytes, rhs.directPhysicalBytes ); break;
+            case 4: cmp = compare( lhs.inclusiveResources.size(), rhs.inclusiveResources.size() ); break; case 6: cmp = compare( lhs.directRangeBytes, rhs.directRangeBytes ); break;
+            case 7: cmp = lhs.truncated != rhs.truncated ? ( lhs.truncated ? 1 : -1 ) : lhs.complete != rhs.complete ? ( lhs.complete ? -1 : 1 ) : 0; break;
+            default: cmp = compare( lhs.inclusivePhysicalBytes, rhs.inclusivePhysicalBytes ); break;
+            }
+            if( cmp == 0 ) cmp = compare( lhs.passId, rhs.passId );
+            return spec.SortDirection == ImGuiSortDirection_Ascending ? cmp < 0 : cmp > 0;
+        } );
+        ui.passOrderScope = ui.passScope; ui.passOrderFrameValid = frameValid; ui.passOrderBegin = frameBegin; ui.passOrderEnd = frameEnd;
+        ui.passOrderShowZero = ui.showZeroBytePasses; if( sort ) sort->SpecsDirty = false;
+    }
+    const auto row = [&]( const analysis::GpuPassWorkingSet& pass )
+    {
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
         std::string label = pass.name.empty() ? "Pass " + std::to_string( pass.passId ) : pass.name; label += "##pass" + std::to_string( pass.passId );
         if( ImGui::Selectable( label.c_str(), ui.selectedPass == pass.passId, ImGuiSelectableFlags_SpanAllColumns ) ) ui.selectedPass = pass.passId;
-        ImGui::TableNextColumn(); ImGui::Text( "%llu", static_cast<unsigned long long>( pass.frameId ) );
+        if( globalScope ) { ImGui::TableNextColumn(); ImGui::Text( "%llu", static_cast<unsigned long long>( pass.frameId ) ); }
         ImGui::TableNextColumn(); ImGui::Text( "%zu", pass.directResources.size() );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( pass.directPhysicalBytes, ui.decimalUnits ).c_str() );
         ImGui::TableNextColumn(); ImGui::Text( "%zu", pass.inclusiveResources.size() );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( pass.inclusivePhysicalBytes, ui.decimalUnits ).c_str() );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( pass.directRangeBytes, ui.decimalUnits ).c_str() );
         ImGui::TableNextColumn(); ImGui::TextUnformatted( pass.truncated ? "Truncated" : pass.complete ? "Exact" : "Partial" );
+    };
+    ImGuiListClipper clipper; clipper.Begin( int( ui.passOrder.size() ) );
+    while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i ) row( snapshot.passes[ui.passOrder[size_t( i )]] );
+    ImGui::EndTable();
+}
+
+void DrawPassResourceTable( const analysis::GpuAnalysisSnapshot& snapshot, const analysis::GpuPassWorkingSet& pass, auto& ui )
+{
+    if( !ImGui::BeginTable( "gpuPassResources", 8, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY ) ) return;
+    ImGui::TableSetupColumn( "Resource" ); ImGui::TableSetupColumn( "Name" ); ImGui::TableSetupColumn( "Kind" );
+    ImGui::TableSetupColumn( "Capacity" ); ImGui::TableSetupColumn( "Physical" ); ImGui::TableSetupColumn( "Resident" );
+    ImGui::TableSetupColumn( "Allocation" ); ImGui::TableSetupColumn( "Range evidence" );
+    ImGui::TableSetupScrollFreeze( 0, 1 ); ImGui::TableHeadersRow();
+    ImGuiListClipper clipper; clipper.Begin( int( pass.directResources.size() ) );
+    while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i )
+    {
+        const auto id = pass.directResources[size_t( i )];
+        const auto* resource = snapshot.FindResource( id );
+        const auto* allocation = resource ? snapshot.FindAllocation( resource->allocationId ) : nullptr;
+        ImGui::TableNextRow(); ImGui::TableNextColumn();
+        const auto label = std::to_string( id ) + "##passResource" + std::to_string( pass.passId );
+        if( ImGui::Selectable( label.c_str(), ui.selectedResource == id, ImGuiSelectableFlags_SpanAllColumns ) )
+        { ui.selectedResource = id; ui.selectedAllocation = resource ? resource->allocationId : 0; }
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( !resource ? "<unresolved>" : resource->name.empty() ? "<unnamed>" : resource->name.c_str() );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( resource ? analysis::GpuPrimaryKindName( resource->primaryKind ) : "Unavailable" );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( resource ? resource->capacityBytes : 0, ui.decimalUnits ).c_str() );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( allocation ? allocation->sizeBytes : 0, ui.decimalUnits ).c_str() );
+        ImGui::TableNextColumn(); ImGui::TextUnformatted( ByteText( allocation ? allocation->residentBytes : 0, ui.decimalUnits ).c_str() );
+        ImGui::TableNextColumn(); if( allocation ) ImGui::Text( "%llu", static_cast<unsigned long long>( allocation->allocationId ) ); else ImGui::TextDisabled( "Unavailable" );
+        ImGui::TableNextColumn();
+        if( resource && !resource->ranges.empty() ) ImGui::Text( "%zu RangeSet record(s)", resource->ranges.size() );
+        else ImGui::TextDisabled( "Unknown / whole-resource evidence" );
     }
     ImGui::EndTable();
+}
+
+analysis::GpuFrameComparison CompareGpuFrameIntervals( const analysis::GpuAnalysisSnapshot& snapshot,
+    uint64_t frameA, int64_t beginA, int64_t endA, uint64_t frameB, int64_t beginB, int64_t endB )
+{
+    const auto collect = [&]( int64_t begin, int64_t end )
+    {
+        std::vector<uint64_t> resources;
+        for( const auto& pass : snapshot.passes )
+        {
+            if( pass.endNs < begin || pass.startNs > end ) continue;
+            resources.insert( resources.end(), pass.directResources.begin(), pass.directResources.end() );
+        }
+        std::sort( resources.begin(), resources.end() );
+        resources.erase( std::unique( resources.begin(), resources.end() ), resources.end() );
+        return resources;
+    };
+    const auto physical = [&]( const std::vector<uint64_t>& resources )
+    {
+        std::vector<uint64_t> allocations;
+        uint64_t bytes = 0;
+        for( const auto resourceId : resources )
+        {
+            const auto* resource = snapshot.FindResource( resourceId );
+            if( resource && resource->allocationId != 0 ) allocations.emplace_back( resource->allocationId );
+        }
+        std::sort( allocations.begin(), allocations.end() );
+        allocations.erase( std::unique( allocations.begin(), allocations.end() ), allocations.end() );
+        for( const auto allocationId : allocations )
+            if( const auto* allocation = snapshot.FindAllocation( allocationId ) ) bytes += allocation->sizeBytes;
+        return bytes;
+    };
+    analysis::GpuFrameComparison result;
+    result.frameA = frameA; result.frameB = frameB;
+    const auto resourcesA = collect( beginA, endA );
+    const auto resourcesB = collect( beginB, endB );
+    if( resourcesA.empty() && resourcesB.empty() )
+    {
+        result.unavailableReason = "No GPU pass/resource evidence overlaps either selected Trace frame";
+        return result;
+    }
+    std::set_difference( resourcesB.begin(), resourcesB.end(), resourcesA.begin(), resourcesA.end(), std::back_inserter( result.addedResources ) );
+    std::set_difference( resourcesA.begin(), resourcesA.end(), resourcesB.begin(), resourcesB.end(), std::back_inserter( result.removedResources ) );
+    result.referencedPhysicalDelta = int64_t( physical( resourcesB ) ) - int64_t( physical( resourcesA ) );
+    result.valid = true;
+    return result;
 }
 
 void DrawChurnTable( const analysis::GpuAnalysisSnapshot& snapshot, auto& ui )
@@ -286,6 +475,61 @@ void View::DrawJnGpuResources()
     }
     const auto snapshot = m_gpuAnalysis ? m_gpuAnalysis->Snapshot() : nullptr;
     if( !snapshot ) { ImGui::TextDisabled( "GPU analysis is not ready. Live sessions become analyzable after disconnect/freeze." ); ImGui::End(); return; }
+    bool selectedFrameValid = false;
+    int64_t selectedFrameBegin = 0;
+    int64_t selectedFrameEnd = 0;
+    if( m_frames && !m_frames->frames.empty() )
+    {
+        const int64_t center = m_vd.zvStart + ( m_vd.zvEnd - m_vd.zvStart ) / 2;
+        if( m_jnGpuUi.followTimelineFrame || m_jnGpuUi.currentFrameIndex < 0 ||
+            m_jnGpuUi.currentFrameIndex >= int( m_frames->frames.size() ) )
+        {
+            int frameIndex = -1;
+            if( FindMemoryFrameAtTime( *m_frames, center, frameIndex ) == MemoryFrameMapping::Valid )
+            {
+                m_jnGpuUi.currentFrameIndex = frameIndex;
+                m_jnGpuUi.currentFrame = GetFrameNumber( *m_frames, frameIndex );
+            }
+        }
+        if( m_jnGpuUi.currentFrameIndex >= 0 && m_jnGpuUi.currentFrameIndex < int( m_frames->frames.size() ) )
+        {
+            selectedFrameValid = true;
+            selectedFrameBegin = m_worker.GetFrameBegin( *m_frames, m_jnGpuUi.currentFrameIndex );
+            selectedFrameEnd = m_worker.GetFrameEnd( *m_frames, m_jnGpuUi.currentFrameIndex );
+        }
+    }
+    ImGui::Separator();
+    ImGui::SetNextItemWidth( 155 * GetScale() );
+    ImGui::Combo( "Scope", &m_jnGpuUi.passScope, "Current Frame\0Global / Lifetime\0" ); ImGui::SameLine();
+    if( m_jnGpuUi.passScope == 0 )
+    {
+        ImGui::SetNextItemWidth( 135 * GetScale() );
+        if( ImGui::InputScalar( "Frame", ImGuiDataType_U64, &m_jnGpuUi.currentFrame ) && m_frames )
+        {
+            m_jnGpuUi.followTimelineFrame = false;
+            m_jnGpuUi.currentFrameIndex = -1;
+            for( size_t index = 0; index < m_frames->frames.size(); ++index )
+                if( GetFrameNumber( *m_frames, int( index ) ) == m_jnGpuUi.currentFrame )
+                { m_jnGpuUi.currentFrameIndex = int( index ); break; }
+            if( m_jnGpuUi.currentFrameIndex >= 0 )
+            {
+                selectedFrameValid = true;
+                selectedFrameBegin = m_worker.GetFrameBegin( *m_frames, m_jnGpuUi.currentFrameIndex );
+                selectedFrameEnd = m_worker.GetFrameEnd( *m_frames, m_jnGpuUi.currentFrameIndex );
+            }
+            else selectedFrameValid = false;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox( "Follow timeline", &m_jnGpuUi.followTimelineFrame ); ImGui::SameLine();
+    }
+    if( m_jnGpuUi.passScope == 0 )
+        ImGui::TextDisabled( "FrameSet: %s | Trace frame %llu | interval %s - %s%s",
+            m_frames ? GetFrameSetName( *m_frames ) : "No frame set", static_cast<unsigned long long>( m_jnGpuUi.currentFrame ),
+            selectedFrameValid ? TimeToStringExact( selectedFrameBegin ) : "Unavailable",
+            selectedFrameValid ? TimeToStringExact( selectedFrameEnd ) : "Unavailable",
+            selectedFrameValid ? "" : " (no matching frame)" );
+    else ImGui::TextDisabled( "FrameSet: %s | scope=global / lifetime | per-pass column is producer frame identity",
+        m_frames ? GetFrameSetName( *m_frames ) : "No frame set" );
     const char* tabs[] = { "Overview", "Resources", "Physical", "Passes", "Lifetime & Churn", "Quality" };
     if( ImGui::BeginTabBar( "gpuResourceTabs" ) )
     {
@@ -335,33 +579,49 @@ void View::DrawJnGpuResources()
         ImGui::SetNextItemWidth( 130 * GetScale() ); ImGui::InputScalar( "Frame B", ImGuiDataType_U64, &m_jnGpuUi.frameB );
         if( m_jnGpuUi.frameA && m_jnGpuUi.frameB )
         {
-            const auto comparison = analysis::CompareGpuFrames( *snapshot, m_jnGpuUi.frameA, m_jnGpuUi.frameB ); ImGui::SameLine();
-            if( comparison.valid ) ImGui::Text( "B-A referenced physical: %+.3f MiB / +%zu -%zu resources",
-                double( comparison.referencedPhysicalDelta ) / ( 1024.0 * 1024.0 ), comparison.addedResources.size(), comparison.removedResources.size() );
-            else ImGui::TextColored( ImVec4( 1.f, .75f, .2f, 1.f ), "%s", comparison.unavailableReason.c_str() );
+            const auto frameInterval = [&]( uint64_t frameNumber, int64_t& begin, int64_t& end )
+            {
+                if( !m_frames ) return false;
+                for( size_t index = 0; index < m_frames->frames.size(); ++index )
+                {
+                    if( GetFrameNumber( *m_frames, int( index ) ) != frameNumber ) continue;
+                    begin = m_worker.GetFrameBegin( *m_frames, index ); end = m_worker.GetFrameEnd( *m_frames, index ); return true;
+                }
+                return false;
+            };
+            int64_t beginA = 0, endA = 0, beginB = 0, endB = 0;
+            ImGui::SameLine();
+            if( frameInterval( m_jnGpuUi.frameA, beginA, endA ) && frameInterval( m_jnGpuUi.frameB, beginB, endB ) )
+            {
+                const auto comparison = CompareGpuFrameIntervals( *snapshot, m_jnGpuUi.frameA, beginA, endA,
+                    m_jnGpuUi.frameB, beginB, endB );
+                if( comparison.valid ) ImGui::Text( "B-A referenced physical: %+.3f MiB / +%zu -%zu resources",
+                    double( comparison.referencedPhysicalDelta ) / ( 1024.0 * 1024.0 ), comparison.addedResources.size(), comparison.removedResources.size() );
+                else ImGui::TextColored( ImVec4( 1.f, .75f, .2f, 1.f ), "%s", comparison.unavailableReason.c_str() );
+            }
+            else ImGui::TextColored( ImVec4( 1.f, .75f, .2f, 1.f ), "Frame A/B is not present in the selected FrameSet" );
         }
-        ImGui::BeginChild( "gpuPassList", ImVec2( ImGui::GetContentRegionAvail().x * .60f, 0 ), ImGuiChildFlags_Borders ); DrawPassTable( *snapshot, m_jnGpuUi ); ImGui::EndChild();
+        ImGui::BeginChild( "gpuPassList", ImVec2( ImGui::GetContentRegionAvail().x * .60f, 0 ), ImGuiChildFlags_Borders );
+        DrawPassTable( *snapshot, m_jnGpuUi, selectedFrameValid, selectedFrameBegin, selectedFrameEnd ); ImGui::EndChild();
         ImGui::SameLine(); ImGui::BeginChild( "gpuPassInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
         if( const auto pass = snapshot->FindPass( m_jnGpuUi.selectedPass ) )
         {
-            ImGui::Text( "%s", pass->name.empty() ? "Unnamed pass" : pass->name.c_str() ); ImGui::TextDisabled( "Pass %llu / Frame %llu / CommandList %llu",
-                static_cast<unsigned long long>( pass->passId ), static_cast<unsigned long long>( pass->frameId ), static_cast<unsigned long long>( pass->commandListId ) );
+            int passFrameIndex = -1;
+            const bool hasTraceFrame = m_frames && FindMemoryFrameAtTime( *m_frames, pass->startNs, passFrameIndex ) == MemoryFrameMapping::Valid;
+            ImGui::Text( "%s", pass->name.empty() ? "Unnamed pass" : pass->name.c_str() );
+            ImGui::TextDisabled( "Pass %llu / Trace frame %s / Producer frame %llu / CommandList %llu",
+                static_cast<unsigned long long>( pass->passId ), hasTraceFrame ? RealToString( GetFrameNumber( *m_frames, passFrameIndex ) ) : "Unavailable",
+                static_cast<unsigned long long>( pass->frameId ), static_cast<unsigned long long>( pass->commandListId ) );
             if( ImGui::Button( "Focus timeline" ) && pass->endNs > pass->startNs ) { PushEvidenceNavigation(); ZoomToRange( pass->startNs, pass->endNs ); }
-            ImGui::SameLine(); if( ImGui::Button( "Set A" ) ) m_jnGpuUi.frameA = pass->frameId; ImGui::SameLine(); if( ImGui::Button( "Set B" ) ) m_jnGpuUi.frameB = pass->frameId;
+            ImGui::SameLine(); if( ImGui::Button( "Set A" ) && hasTraceFrame ) m_jnGpuUi.frameA = GetFrameNumber( *m_frames, passFrameIndex );
+            ImGui::SameLine(); if( ImGui::Button( "Set B" ) && hasTraceFrame ) m_jnGpuUi.frameB = GetFrameNumber( *m_frames, passFrameIndex );
             ImGui::SeparatorText( "Working set" );
             ImGui::Text( "Direct %zu / %s", pass->directResources.size(), ByteText( pass->directPhysicalBytes, m_jnGpuUi.decimalUnits ).c_str() );
             ImGui::Text( "Inclusive %zu / %s", pass->inclusiveResources.size(), ByteText( pass->inclusivePhysicalBytes, m_jnGpuUi.decimalUnits ).c_str() );
             ImGui::Text( "Direct range %s / unknown range resources %u", ByteText( pass->directRangeBytes, m_jnGpuUi.decimalUnits ).c_str(), pass->unknownRangeResourceCount );
             ImGui::Text( "Quality: %s%s", pass->complete ? "Exact" : "Partial", pass->truncated ? " / Truncated" : "" );
-            ImGui::SeparatorText( "Direct resources" );
-            const size_t limit = std::min<size_t>( pass->directResources.size(), 256 );
-            for( size_t i = 0; i < limit; ++i )
-            {
-                const auto id = pass->directResources[i]; const auto resource = snapshot->FindResource( id );
-                std::string label = resource && !resource->name.empty() ? resource->name : "Resource " + std::to_string( id ); label += "##passResource" + std::to_string( id );
-                if( ImGui::Selectable( label.c_str() ) ) { m_jnGpuUi.selectedResource = id; m_jnGpuUi.tab = 1; }
-            }
-            if( pass->directResources.size() > limit ) ImGui::TextDisabled( "%zu more; use paged Query/export", pass->directResources.size() - limit );
+            ImGui::SeparatorText( "Direct resources (select a row, then open Resources tab for full evidence)" );
+            DrawPassResourceTable( *snapshot, *pass, m_jnGpuUi );
         }
         else ImGui::TextDisabled( "Select a pass." ); ImGui::EndChild();
     }

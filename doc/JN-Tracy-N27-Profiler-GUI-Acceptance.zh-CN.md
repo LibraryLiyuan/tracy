@@ -107,12 +107,23 @@ Overview 正确显示 Engine/Project/AppInfo、Protocol、section、捕获域质
 
 - 原 Memory 窗口更名为 `CPU Memory`。
 - 删除旧 GPU Pool/GTMEM1 UI 入口，但保留 N27 仍需要的底层数据。
-- 修复 `NoScrollbar/NoScrollWithMouse` 导致的不可滚动结构。
-- 增加固定工具栏和 `Open allocation browser`。
+- 默认使用 Frame-first 语义：`FrameSet → Frame → Allocator/MemLabel → Metric → Allocation → Callstack → Lifetime`。
+- `Global / Capture End` 保留为明确的非默认模式，不再把捕获结束状态伪装成某一帧。
+- 每帧提供 `Active at start`、`Allocated`、`Freed`、`Active at end`、`Peak` 和 `All transitions` 六种精确事件集合。
+- Pool 汇总、Allocation、内存页、Lifetime candidate、Bottom-up/Top-down Call Stack 均由相同 Frame、Pool 和 Metric 过滤集合驱动。
+- Frame A/B 冻结并校验相同 FrameSet、Pool 和 Metric；维度不一致时拒绝比较。
+- 修复 `NoScrollbar/NoScrollWithMouse` 和滚动子区起点过晚导致的不可滚动结构。
+- 状态/预算工具栏固定；其下建立唯一主纵向滚动区，覆盖 Frame、Pool、Allocation、Lifetime 和两棵 Call Stack 树。
+- 增加 `Open allocation browser`。
 - Allocation Browser 使用左侧虚拟化主表和右侧 Inspector。
 - 支持 pool、活动状态、搜索、排序、callstack、source、Focus lifetime 和全局 Back/Forward。
 - 项目 CPU 预算默认 16 GB；tracked allocation 与进程总量概念分开。
 - 数据只覆盖跟踪池时明确显示 `TrackedOnly`。
+- 删除重复的 `All CPU pools / per-pool frame summary`；CPU Memory 现在只保留一张可交互的 `Allocator / MemLabel pools` 表，顶部只显示当前选中 Pool 的紧凑摘要。
+- 将原 `Unity MemLabel aggregate baseline` 改名为 `Unity MemLabel counters / coverage cross-check`，明确它是 Unity `MemoryManager::GetAllocatedMemory(label)` 每帧采样的补充计数，不是 Allocation 列表、调用栈或生命周期来源。
+- Frame 模式下，MemLabel counter 选择所选帧区间内的首个实际样本；Global 模式下才使用时间线中心附近的样本，二者不再混用。
+- Frame 模式的交叉核对按同一个 counter sample time 计算 `Unity aggregate`、`Tracked >=256 KiB`、差值和覆盖率；差值表示 HighEvidence 过滤口径的覆盖差，不标记为泄漏。
+- 每个 MemLabel 显示 sample time、capture peak 和 evidence 状态；若所选帧内不存在 counter sample，则明确显示 previous sample/comparison unavailable，不把旧样本伪装成当前帧数据。
 
 使用 Protocol 90 / section 8 的 StartupIOMemory Trace 验证：
 
@@ -122,6 +133,10 @@ Overview 正确显示 Engine/Project/AppInfo、Protocol、section、捕获域质
 - Texture pool：976 条事件、886 条 active。
 - 选中 Allocation 后可显示 16 MiB 大小、生命周期、线程和调用栈。
 - 左侧列表滚动时右侧 Inspector 保持稳定。
+- Frame 468 / Texture / Active-at-end 精确显示 537 个 Allocation、1310.21 MiB；帧开始为 524 个 / 1248.88 MiB，帧内新增 13 个 / 61.33 MiB。
+- Frame 468 选择 Texture 后，主滚动条可从帧表和 Pool 表连续滚动至 Allocation、Lifetime 和 Call Stack，不再出现下部内容不可达。
+- Frame 803 的范围为 `5:44 117,501,697 ns - 5:44 145,165,517 ns`；Texture 和 Physics 的 MemLabel counter 分别采样于约 `5:44 117,563,935 ns` 和 `5:44 117,565,412 ns`，均落在所选帧内。
+- Frame 803 的 Texture 交叉核对显示 Unity aggregate `3053.49 MB`、同一时刻 tracked `3024.8 MB`、coverage `99.1%`；Physics 显示 Unity aggregate `81.24 MB`、tracked `74.01 MB`、coverage `91.1%`。
 
 ### 3.5 Job、Source Stack 与导航
 
@@ -213,6 +228,9 @@ N27-C8-Final-HighEvidence-Reconnect.tracy
 - 示例 Texture `ResourceId=944` 可显示名称、类型、10.7 MiB、Allocation 944、2048×1024、Mip 12、format 29、open boundary 和 exactness。
 - Passes 大表可打开和滚动。
 - CPU Memory Allocation Browser 可滚动、筛选和选择。
+- CPU Memory 的 Frame 468 / Texture 数据、Pool 汇总和帧过滤 Call Stack 采用同一选择上下文；右侧主滚动条始终可见。
+- CPU Memory 的 Pool 入口已收敛为一张 `Allocator / MemLabel pools` 表；`Unity MemLabel counters / coverage cross-check` 作为独立、可折叠的覆盖核对区存在，不再形成三个相似的 Pool 汇总入口。
+- Frame 803 的 MemLabel counter 使用帧内样本并与同一时刻的 tracked allocation 事件比较，sample time、差值、coverage 和 evidence 均可见。
 - Protocol 90 / section 8 Trace 在 GPU 页显示黄色 `N27 GPU Catalog not present`，CPU/Job/Timeline 保持可用。
 - Protocol 88 / section 9～11 归档 Trace 显示不兼容提示，Preview 不崩溃。
 
@@ -250,7 +268,7 @@ N27-C8-Final-HighEvidence-Reconnect.tracy
 
 | 产物 | 路径 | SHA-256 |
 |---|---|---|
-| Profiler Preview | `build-profiler-gui\Release\tracy-profiler.exe` | `2A41560767664442AA2AF075635AD9770791BD95C6B266B7ECC74536E93A5BD4` |
+| Profiler Preview | `build-profiler-gui\Release\tracy-profiler.exe` | `9288F2B977A6CB4A3C9254D5C4BD1A6BA4C27721325400AD6BA9EC18633BF155` |
 | Query Preview | `build-profiler-gui-query\Release\tracy-query.exe` | `206F35A76C14B128546E472901720834DFF81A8166D2963EBF74EA98134987A6` |
 
 当前结论：Preview 已具备用户对 N27 Trace 做正式体验验收的条件。用户明确接受后，才允许创建 accepted 标签并讨论合并到 `dev`。

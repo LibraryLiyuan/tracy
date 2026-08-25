@@ -242,6 +242,7 @@ int main()
     assert( snapshot.total.endBytes == 70 && snapshot.total.endCount == 2 );
     assert( snapshot.total.peakBytes == 200 && snapshot.total.peakCount == 4 );
     assert( snapshot.activeAtStart.size() == 2 && snapshot.activeAtEnd.size() == 2 );
+    assert( snapshot.peakTime == 12 && snapshot.activeAtPeak.size() == 4 );
     assert( snapshot.allocated.size() == 2 && snapshot.freed.size() == 2 && snapshot.transitions.size() == 3 );
 
     const std::vector<GpuMemoryCpuZoneInput> cpuMarkers = {

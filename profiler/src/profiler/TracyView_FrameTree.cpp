@@ -149,10 +149,24 @@ unordered_flat_map<uint32_t, View::MemPathData> View::GetCallstackPaths( const M
     return pathSum;
 }
 
+unordered_flat_map<uint32_t, View::MemPathData> View::GetCallstackPaths( const std::vector<const MemEvent*>& events ) const
+{
+    unordered_flat_map<uint32_t, MemPathData> pathSum;
+    pathSum.reserve( std::min( events.size(), m_worker.GetCallstackPayloadCount() ) );
+    for( const auto* event : events )
+    {
+        if( !event || event->CsAlloc() == 0 ) continue;
+        auto it = pathSum.find( event->CsAlloc() );
+        if( it == pathSum.end() ) pathSum.emplace( event->CsAlloc(), MemPathData { 1, event->Size() } );
+        else { it->second.cnt++; it->second.mem += event->Size(); }
+    }
+    return pathSum;
+}
+
 unordered_flat_map<uint64_t, MemCallstackFrameTree> View::GetCallstackFrameTreeBottomUp( const MemData& mem ) const
 {
     unordered_flat_map<uint64_t, MemCallstackFrameTree> root;
-    auto pathSum = GetCallstackPaths( mem, m_memRangeBottomUp );
+    auto pathSum = m_memInfo.frameFilterActive ? GetCallstackPaths( m_memInfo.frameFilteredEvents ) : GetCallstackPaths( mem, m_memRangeBottomUp );
     if( m_groupCallstackTreeByNameBottomUp )
     {
         for( auto& path : pathSum )
@@ -282,7 +296,7 @@ unordered_flat_map<uint64_t, CallstackFrameTree> View::GetParentsCallstackFrameT
 unordered_flat_map<uint64_t, MemCallstackFrameTree> View::GetCallstackFrameTreeTopDown( const MemData& mem ) const
 {
     unordered_flat_map<uint64_t, MemCallstackFrameTree> root;
-    auto pathSum = GetCallstackPaths( mem, m_memRangeTopDown );
+    auto pathSum = m_memInfo.frameFilterActive ? GetCallstackPaths( m_memInfo.frameFilteredEvents ) : GetCallstackPaths( mem, m_memRangeTopDown );
     if( m_groupCallstackTreeByNameTopDown )
     {
         for( auto& path : pathSum )
@@ -495,16 +509,16 @@ void View::DrawFrameTreeLevel( const unordered_flat_map<uint64_t, MemCallstackFr
             if( ImGui::IsItemClicked( 1 ) )
             {
                 auto& mem = m_worker.GetMemoryNamed( m_memInfo.pool ).data;
-                const auto sz = mem.size();
                 m_memInfo.showAllocList = true;
                 m_memInfo.allocList.clear();
-                for( size_t i=0; i<sz; i++ )
+                if( m_memInfo.frameFilterActive )
                 {
-                    if( v.callstacks.find( mem[i].CsAlloc() ) != v.callstacks.end() )
+                    for( const auto index : m_memInfo.frameFilteredAllocations )
                     {
-                        m_memInfo.allocList.emplace_back( i );
+                        if( index < mem.size() && v.callstacks.find( mem[index].CsAlloc() ) != v.callstacks.end() ) m_memInfo.allocList.emplace_back( index );
                     }
                 }
+                else for( size_t i=0; i<mem.size(); i++ ) if( v.callstacks.find( mem[i].CsAlloc() ) != v.callstacks.end() ) m_memInfo.allocList.emplace_back( i );
             }
 
             if( io.KeyCtrl && ImGui::IsItemHovered() )
