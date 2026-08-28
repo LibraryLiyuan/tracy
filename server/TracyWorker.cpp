@@ -6993,13 +6993,11 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
                 generation.endValue = ev.value;
                 generation.endTime = time;
                 generation.ended = 1;
-                const auto unresolved = ResolveJnGpuCatalogGeneration( ev.generation );
-                generation.unresolvedCount = unresolved;
-                if( unresolved != 0 )
+                if( m_mode != Mode::OfflineConvert )
                 {
-                    generation.valid = 0;
-                    generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
-                    runtime->second.valid = false;
+                    const auto resolved = ResolveJnGpuCatalogGeneration( ev.generation,
+                        JnGpuCatalogResolveReason::GenerationEnd );
+                    generation.unresolvedCount = resolved.totalUnresolved;
                 }
             }
         }
@@ -7210,9 +7208,11 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
     }
 
     runtime->second.lastSequence = ev.sequence;
-    if( persist && runtime->second.ended && runtime->second.dataIndex < m_data.jnTrace.gpuCatalogGenerations.size() )
+    if( persist && m_mode != Mode::OfflineConvert && runtime->second.ended &&
+        runtime->second.dataIndex < m_data.jnTrace.gpuCatalogGenerations.size() )
         m_data.jnTrace.gpuCatalogGenerations[runtime->second.dataIndex].unresolvedCount =
-            ResolveJnGpuCatalogGeneration( ev.generation );
+            ResolveJnGpuCatalogGeneration( ev.generation,
+                JnGpuCatalogResolveReason::PostEndBatch ).totalUnresolved;
     return true;
 }
 
@@ -7230,8 +7230,19 @@ void Worker::ProcessJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev )
         InvalidateJnGpuCatalog( ev.generation, uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap ) );
 }
 
-uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
+Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_t generation,
+    JnGpuCatalogResolveReason reason )
 {
+    const auto resolveStart = std::chrono::steady_clock::now();
+    auto& stats = m_jnGpuCatalogResolveStats;
+    ++stats.fullResolveCalls;
+    switch( reason )
+    {
+    case JnGpuCatalogResolveReason::GenerationEnd: ++stats.generationEndCalls; break;
+    case JnGpuCatalogResolveReason::PostEndBatch: ++stats.postEndBatchCalls; break;
+    case JnGpuCatalogResolveReason::FinalizeSave: ++stats.finalizeSaveCalls; break;
+    }
+
     struct ResourceInterval
     {
         uint64_t resourceId;
@@ -7241,6 +7252,12 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
     unordered_flat_map<uint64_t, std::vector<ResourceInterval>> intervals;
     unordered_flat_map<uint64_t, size_t> openIntervals;
     auto& data = m_data.jnTrace;
+    stats.fullResolveInputUnits += uint64_t( data.gpuCatalogBatches.size() ) * 7 +
+        data.gpuCatalogResources.size() + data.gpuCatalogViews.size() +
+        data.gpuCatalogLogicals.size() + data.gpuCatalogVg.size() +
+        data.gpuRangeSets.size() + data.gpuCatalogRelations.size() +
+        data.gpuDetailedEvidence.size() + data.gpuReferencePasses.size() +
+        data.gfxEntities.size() + data.gfxLinks.size();
 
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
@@ -7328,6 +7345,7 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
     }
 
     uint64_t unresolved = 0;
+    uint64_t coreUnresolved = 0;
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
     {
         if( first > data.gpuCatalogViews.size() || count > data.gpuCatalogViews.size() - first ) return;
@@ -7400,7 +7418,13 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
             if( ( record.flags & 1 ) != 0 )
             {
                 const auto resolved = resolve( record.sourceId, record.time );
-                if( resolved == 0 ) { ++unresolved; record.exactness = uint8_t( JnGpuCatalogExactness::Partial ); }
+                if( resolved == 0 )
+                {
+                    ++unresolved;
+                    if( record.relation == uint8_t( JnGpuCatalogRelationKind::BackedBy ) ||
+                        record.relation == uint8_t( JnGpuCatalogRelationKind::PrimaryOwner ) ) ++coreUnresolved;
+                    record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+                }
                 if( resolved != 0 )
                 {
                     record.sourceId = resolved;
@@ -7410,7 +7434,13 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
             if( ( record.flags & 2 ) != 0 )
             {
                 const auto resolved = resolve( record.targetId, record.time );
-                if( resolved == 0 ) { ++unresolved; record.exactness = uint8_t( JnGpuCatalogExactness::Partial ); }
+                if( resolved == 0 )
+                {
+                    ++unresolved;
+                    if( record.relation == uint8_t( JnGpuCatalogRelationKind::BackedBy ) ||
+                        record.relation == uint8_t( JnGpuCatalogRelationKind::PrimaryOwner ) ) ++coreUnresolved;
+                    record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+                }
                 if( resolved != 0 )
                 {
                     record.targetId = resolved;
@@ -7466,7 +7496,11 @@ uint64_t Worker::ResolveJnGpuCatalogGeneration( uint64_t generation )
         }
     } );
 
-    return unresolved;
+    stats.fullResolveNanoseconds += uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - resolveStart ).count() );
+    stats.totalUnresolved += unresolved;
+    stats.coreUnresolved += coreUnresolved;
+    return { unresolved, coreUnresolved };
 }
 
 void Worker::FinalizeJnGpuCatalogForSave()
@@ -7475,9 +7509,10 @@ void Worker::FinalizeJnGpuCatalogForSave()
     if( !data.gpuCatalogPresent ) return;
     for( auto& generation : data.gpuCatalogGenerations )
     {
-        const auto unresolved = ResolveJnGpuCatalogGeneration( generation.generation );
-        generation.unresolvedCount = unresolved;
-        if( !generation.ended || unresolved != 0 )
+        const auto resolved = ResolveJnGpuCatalogGeneration( generation.generation,
+            JnGpuCatalogResolveReason::FinalizeSave );
+        generation.unresolvedCount = resolved.totalUnresolved;
+        if( !generation.ended || resolved.coreUnresolved != 0 )
         {
             generation.valid = 0;
             generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );

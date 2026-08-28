@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string] $BaselineTrace,
     [Parameter(Mandatory = $true)][string] $CandidateTrace,
     [Parameter(Mandatory = $true)][string] $AllowRoot,
-    [Parameter(Mandatory = $true)][string] $ReportJson
+    [Parameter(Mandatory = $true)][string] $ReportJson,
+    [switch] $AllowSyntheticIncompleteContext
 )
 
 $ErrorActionPreference = 'Stop'
@@ -155,6 +156,9 @@ try {
         capture_context = @{ method = 'capture.context'; params = @{} }
         capture_coverage = @{ method = 'capture.coverage'; params = @{} }
         gpu_memory = @{ method = 'memory.gpu.summary'; params = @{} }
+        gpu_catalog_status = @{ method = 'gpu.catalog.status'; params = @{} }
+        gpu_catalog_validation = @{ method = 'gpu.catalog.validation'; params = @{} }
+        gpu_resource_search = @{ method = 'gpu.resource.search'; params = @{ limit = 1000 } }
         resource_graph = @{ method = 'resource.summary'; params = @{} }
         jobs = @{ method = 'job.statistics'; params = @{ max_cpu_ms = 60000 } }
         io = @{ method = 'io.statistics'; params = @{} }
@@ -215,8 +219,21 @@ try {
         $hardFailures = @($normalized.data.compatibility.checks | Where-Object { -not [bool]$_.matched -and [string]$_.severity -eq 'hard' })
         $onlyPreexistingIdentityGap = $hardFailures.Count -eq 1 -and [string]$hardFailures[0].id -eq 'identity.complete' -and
             -not [bool]$hardFailures[0].baseline -and -not [bool]$hardFailures[0].candidate
-        $normalizedOk = $onlyPreexistingIdentityGap
-        $normalizedStatus = if ($onlyPreexistingIdentityGap) { 'skipped_preexisting_capture_identity_incomplete' } else { 'refused' }
+        $symmetricSyntheticGaps = $AllowSyntheticIncompleteContext -and $hardFailures.Count -gt 0 -and
+            @($hardFailures | Where-Object {
+                $_.baseline -ne $_.candidate -or
+                ($null -ne $_.baseline -and [bool]$_.baseline)
+            }).Count -eq 0
+        $normalizedOk = $onlyPreexistingIdentityGap -or $symmetricSyntheticGaps
+        $normalizedStatus = if ($onlyPreexistingIdentityGap) {
+            'skipped_preexisting_capture_identity_incomplete'
+        }
+        elseif ($symmetricSyntheticGaps) {
+            'skipped_synthetic_context_incomplete'
+        }
+        else {
+            'refused'
+        }
     }
     if (-not $normalizedOk) { $allEqual = $false }
 

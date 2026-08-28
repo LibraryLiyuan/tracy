@@ -5188,7 +5188,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             return json {
                 { "present", present }, { "valid", present && catalog->gpuCatalogValid }, { "status", state },
-                { "reason", present ? ( catalog->gpuCatalogValid ? json( nullptr ) : json( "Catalog Core transport/lifetime validation failed; dependent evidence is unavailable" ) ) :
+                { "partial", present && catalog->gpuCatalogValid && unresolved != 0 },
+                { "enrichment_complete", present && catalog->gpuCatalogValid && unresolved == 0 },
+                { "reason", present ? ( catalog->gpuCatalogValid ?
+                    ( unresolved == 0 ? json( nullptr ) : json( "Catalog Core is valid; some enrichment records remain unresolved" ) ) :
+                    json( "Catalog Core transport/lifetime validation failed; dependent evidence is unavailable" ) ) :
                     json( "trace predates N27 or contains no GPU Resource Catalog" ) },
                 { "catalog_schema", catalog ? catalog->gpuCatalogSchemaVersion : 0 },
                 { "detailed_evidence_schema", catalog ? catalog->gpuDetailedEvidenceSchemaVersion : 0 },
@@ -5228,6 +5232,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t unresolvedRanges = 0;
             uint64_t unresolvedRelationSources = 0;
             uint64_t unresolvedRelationTargets = 0;
+            uint64_t unresolvedCoreRelationEndpoints = 0;
             uint64_t unresolvedEvidenceSources = 0;
             uint64_t unresolvedEvidenceTargets = 0;
             uint64_t unresolvedRangesOnReferencePass = 0;
@@ -5528,8 +5533,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 unresolvedRangeUniquePasses = unresolvedRangePasses.size();
                 for( const auto& value : catalog->gpuCatalogRelations )
                 {
-                    unresolvedRelationSources += ( value.flags & 1 ) != 0;
-                    unresolvedRelationTargets += ( value.flags & 2 ) != 0;
+                    const auto unresolvedSource = uint64_t( ( value.flags & 1 ) != 0 );
+                    const auto unresolvedTarget = uint64_t( ( value.flags & 2 ) != 0 );
+                    unresolvedRelationSources += unresolvedSource;
+                    unresolvedRelationTargets += unresolvedTarget;
+                    if( value.relation == uint8_t( JnGpuCatalogRelationKind::BackedBy ) ||
+                        value.relation == uint8_t( JnGpuCatalogRelationKind::PrimaryOwner ) )
+                        unresolvedCoreRelationEndpoints += unresolvedSource + unresolvedTarget;
                 }
                 for( const auto& value : catalog->gpuDetailedEvidence )
                 {
@@ -5548,7 +5558,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "canonicalization_changes", Decimal( canonicalizationChanges ) },
                 { "sequence_gaps", Decimal( sequenceGaps ) }, { "sequence_duplicates", Decimal( sequenceDuplicates ) },
                 { "sequence_gap_details", std::move( sequenceGapDetails ) },
-                { "completed_lifecycle_unresolved", result["unresolved_count"] }
+                { "completed_lifecycle_unresolved", result["unresolved_count"] },
+                { "core_unresolved", Decimal( unresolvedCoreRelationEndpoints ) },
+                { "enrichment_unresolved", Decimal( unresolvedBreakdownTotal - unresolvedCoreRelationEndpoints ) }
             };
             result["unresolved_breakdown"] = {
                 { "view", Decimal( unresolvedViews ) }, { "logical", Decimal( unresolvedLogicals ) },
@@ -5577,6 +5589,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "gfx_link_count", Decimal( gfxLinkCount ) },
                 { "references_resources_link_count", Decimal( referencesResourceLinkCount ) },
                 { "relation_source", Decimal( unresolvedRelationSources ) }, { "relation_target", Decimal( unresolvedRelationTargets ) },
+                { "relation_core_endpoints", Decimal( unresolvedCoreRelationEndpoints ) },
+                { "relation_enrichment_endpoints", Decimal( unresolvedRelationSources + unresolvedRelationTargets - unresolvedCoreRelationEndpoints ) },
                 { "detailed_evidence_source", Decimal( unresolvedEvidenceSources ) },
                 { "detailed_evidence_target", Decimal( unresolvedEvidenceTargets ) },
                 { "total", Decimal( unresolvedBreakdownTotal ) },
@@ -5584,6 +5598,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             };
             result["complete"] = present && catalog->gpuCatalogValid && invalidBatches == 0 && checksumFailures == 0 &&
                 sequenceGaps == 0 && sequenceDuplicates == 0;
+            result["enrichment_complete"] = unresolvedBreakdownTotal == 0;
             return Success( id, std::move( result ), trace );
         }
         if( !present ) return Success( id, { { "present", false }, { "status", "absent" },

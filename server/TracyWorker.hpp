@@ -166,6 +166,18 @@ public:
         uint64_t sampledNanoseconds = 0;
     };
 
+    struct JnGpuCatalogResolveStats
+    {
+        uint64_t fullResolveCalls = 0;
+        uint64_t fullResolveInputUnits = 0;
+        uint64_t fullResolveNanoseconds = 0;
+        uint64_t generationEndCalls = 0;
+        uint64_t postEndBatchCalls = 0;
+        uint64_t finalizeSaveCalls = 0;
+        uint64_t totalUnresolved = 0;
+        uint64_t coreUnresolved = 0;
+    };
+
     struct ImportEventTimeline
     {
         uint64_t tid;
@@ -799,6 +811,7 @@ public:
     uint64_t GetOfflineDecodedEventCount() const { return m_offlineEventCount; }
     uint64_t GetProtocolFramesProcessed() const { return m_protocolFramesProcessed.load( std::memory_order_acquire ); }
     const std::array<OfflineEventStat, size_t( QueueType::NUM_TYPES )>& GetOfflineEventStats() const { return m_offlineEventStats; }
+    const JnGpuCatalogResolveStats& GetJnGpuCatalogResolveStats() const { return m_jnGpuCatalogResolveStats; }
 
     void Write( FileWrite& f, bool fiDict );
     int GetTraceVersion() const { return m_traceVersion; }
@@ -993,7 +1006,18 @@ private:
     tracy_force_inline void ProcessJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev );
     bool ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool persist, const char*& error );
     bool ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bool persist, const char*& error );
-    uint64_t ResolveJnGpuCatalogGeneration( uint64_t generation );
+    enum class JnGpuCatalogResolveReason : uint8_t
+    {
+        GenerationEnd,
+        PostEndBatch,
+        FinalizeSave
+    };
+    struct JnGpuCatalogResolveResult
+    {
+        uint64_t totalUnresolved = 0;
+        uint64_t coreUnresolved = 0;
+    };
+    JnGpuCatalogResolveResult ResolveJnGpuCatalogGeneration( uint64_t generation, JnGpuCatalogResolveReason reason );
     void FinalizeJnGpuCatalogForSave();
     void InvalidateJnGpuCatalog( uint64_t generation, uint8_t state );
 
@@ -1279,6 +1303,7 @@ private:
     };
     unordered_flat_map<uint64_t, JnGpuCatalogPayload> m_jnGpuCatalogPayloads;
     unordered_flat_map<uint64_t, JnGpuCatalogRuntimeGeneration> m_jnGpuCatalogRuntime;
+    JnGpuCatalogResolveStats m_jnGpuCatalogResolveStats;
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogLiveResources;
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogDescriptorHeaps;
     uint64_t m_jnGpuCatalogNextDescriptorHeapId = 1;

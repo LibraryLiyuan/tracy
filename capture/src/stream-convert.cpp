@@ -2008,6 +2008,7 @@ int main( int argc, char** argv )
     TemporaryOutputGuard temporaryGuard( temporaryOutput, options.keepFailedOutput );
     progress.SetStage( ProgressStage::Write, 0, "bytes" );
     progress.SetTemporaryPath( temporaryOutput );
+    tracy::Worker::JnGpuCatalogResolveStats gpuCatalogResolveStats {};
     {
         std::error_code ignored;
         std::filesystem::remove( temporaryOutput, ignored );
@@ -2021,10 +2022,23 @@ int main( int argc, char** argv )
         return 6;
     }
     worker.Write( *output, false );
+    gpuCatalogResolveStats = worker.GetJnGpuCatalogResolveStats();
     output->Finish();
     const auto statistics = output->GetCompressionStatistics();
     output.reset();
     const auto writeSeconds = ElapsedSeconds( writeStart );
+    if( options.diagnostics )
+    {
+        std::printf( "GPU Catalog resolver: calls=%llu generation_end=%llu post_end_batch=%llu finalize_save=%llu input_units=%llu unresolved=%llu core_unresolved=%llu time=%.3fs\n",
+            static_cast<unsigned long long>( gpuCatalogResolveStats.fullResolveCalls ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.generationEndCalls ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.postEndBatchCalls ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.finalizeSaveCalls ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.fullResolveInputUnits ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.totalUnresolved ),
+            static_cast<unsigned long long>( gpuCatalogResolveStats.coreUnresolved ),
+            double( gpuCatalogResolveStats.fullResolveNanoseconds ) / 1'000'000'000.0 );
+    }
     if( options.testFailBeforeValidate )
     {
         std::fprintf( stderr, "Injected failure before validation.\n" );
@@ -2134,7 +2148,16 @@ int main( int argc, char** argv )
             << "\",\"gpu_reference_passes\":\"" << gpuReferencePassCount << "\",\"gpu_reference_uses\":\""
             << gpuReferenceUseCount << "\",\"job_stages\":\"" << jobStageCount << "\",\"output_bytes\":\""
             << ( outputSizeError ? 0 : outputSize ) << "\",\"peak_commit_bytes\":\"" << progress.PeakCommitBytes()
-            << "\",\"peak_working_set_bytes\":\"" << progress.PeakWorkingSetBytes() << "\",\"stages_seconds\":{"
+            << "\",\"peak_working_set_bytes\":\"" << progress.PeakWorkingSetBytes()
+            << "\",\"gpu_catalog_resolver\":{\"full_resolve_calls\":\"" << gpuCatalogResolveStats.fullResolveCalls
+            << "\",\"generation_end_calls\":\"" << gpuCatalogResolveStats.generationEndCalls
+            << "\",\"post_end_batch_calls\":\"" << gpuCatalogResolveStats.postEndBatchCalls
+            << "\",\"finalize_save_calls\":\"" << gpuCatalogResolveStats.finalizeSaveCalls
+            << "\",\"input_units\":\"" << gpuCatalogResolveStats.fullResolveInputUnits
+            << "\",\"total_unresolved\":\"" << gpuCatalogResolveStats.totalUnresolved
+            << "\",\"core_unresolved\":\"" << gpuCatalogResolveStats.coreUnresolved
+            << "\",\"nanoseconds\":\"" << gpuCatalogResolveStats.fullResolveNanoseconds
+            << "\"},\"stages_seconds\":{"
             << "\"scan\":" << scanSeconds << ",\"analysis\":" << analysisSeconds << ",\"replay\":" << replaySeconds
             << ",\"write\":" << writeSeconds << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
             << mapSeconds << ",\"total\":" << totalSeconds << "}}";
