@@ -1,4 +1,5 @@
 #include "TracyGpuAnalysisCache.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 
 #include <fstream>
 #include <limits>
@@ -63,6 +64,25 @@ template<typename T> bool ReadVector( std::ifstream& in, std::vector<T>& value )
     return bool( in );
 }
 
+bool WriteLogicalRecords( std::ofstream& out, const std::vector<GpuLogicalAnalysisRecord>& values )
+{
+    const uint64_t size = values.size();
+    if( !WritePod( out, size ) ) return false;
+    for( const auto& value : values )
+        if( !WritePod( out, value.generation ) || !WritePod( out, value.value ) || !WriteString( out, value.name ) ) return false;
+    return true;
+}
+
+bool ReadLogicalRecords( std::ifstream& in, std::vector<GpuLogicalAnalysisRecord>& values )
+{
+    uint64_t size = 0;
+    if( !ReadPod( in, size ) || size > MaximumCacheItems ) return false;
+    values.resize( size_t( size ) );
+    for( auto& value : values )
+        if( !ReadPod( in, value.generation ) || !ReadPod( in, value.value ) || !ReadString( in, value.name ) ) return false;
+    return true;
+}
+
 #define W( field ) if( !WritePod( out, value.field ) ) return false
 #define R( field ) if( !ReadPod( in, value.field ) ) return false
 
@@ -88,37 +108,39 @@ bool WriteResource( std::ofstream& out, const GpuResourceAnalysisRecord& value )
 {
     W( generation ); W( resourceId ); W( familyId ); W( allocationId ); W( capacityBytes ); W( allocationOffsetBytes );
     W( createTime ); W( destroyTime ); W( lastUpdateTime ); W( nameHash ); W( createCallsiteId ); W( definitionRevision );
-    W( declaredUsageMask ); W( observedUsageMask ); W( format ); W( width ); W( height ); W( depthOrArraySize ); W( mipLevels );
+    W( declaredUsageMask ); W( observedUsageMask ); W( backendFlags ); W( sampleCount ); W( nameOriginalLength ); W( format ); W( width ); W( height ); W( depthOrArraySize ); W( mipLevels );
     W( primaryKind ); W( resourceClass ); W( dimension ); W( memoryDomain ); W( allocationKind ); W( classificationProvenance );
-    W( nameProvenance ); W( stackProvenance ); W( exactness ); W( openBoundary ); W( aliveAtEnd ); W( invalid );
+    W( nameProvenance ); W( stackProvenance ); W( exactness ); W( flags ); W( openBoundary ); W( aliveAtEnd ); W( invalid );
     return WriteString( out, value.name ) && WriteVector( out, value.history ) && WriteVector( out, value.views ) &&
-        WriteVector( out, value.parts ) && WriteVector( out, value.relations ) && WriteVector( out, value.ranges );
+        WriteLogicalRecords( out, value.logicals ) && WriteVector( out, value.parts ) && WriteVector( out, value.relations ) &&
+        WriteVector( out, value.ranges ) && WriteVector( out, value.virtualGeometry );
 }
 
 bool ReadResource( std::ifstream& in, GpuResourceAnalysisRecord& value )
 {
     R( generation ); R( resourceId ); R( familyId ); R( allocationId ); R( capacityBytes ); R( allocationOffsetBytes );
     R( createTime ); R( destroyTime ); R( lastUpdateTime ); R( nameHash ); R( createCallsiteId ); R( definitionRevision );
-    R( declaredUsageMask ); R( observedUsageMask ); R( format ); R( width ); R( height ); R( depthOrArraySize ); R( mipLevels );
+    R( declaredUsageMask ); R( observedUsageMask ); R( backendFlags ); R( sampleCount ); R( nameOriginalLength ); R( format ); R( width ); R( height ); R( depthOrArraySize ); R( mipLevels );
     R( primaryKind ); R( resourceClass ); R( dimension ); R( memoryDomain ); R( allocationKind ); R( classificationProvenance );
-    R( nameProvenance ); R( stackProvenance ); R( exactness ); R( openBoundary ); R( aliveAtEnd ); R( invalid );
+    R( nameProvenance ); R( stackProvenance ); R( exactness ); R( flags ); R( openBoundary ); R( aliveAtEnd ); R( invalid );
     return ReadString( in, value.name ) && ReadVector( in, value.history ) && ReadVector( in, value.views ) &&
-        ReadVector( in, value.parts ) && ReadVector( in, value.relations ) && ReadVector( in, value.ranges );
+        ReadLogicalRecords( in, value.logicals ) && ReadVector( in, value.parts ) && ReadVector( in, value.relations ) &&
+        ReadVector( in, value.ranges ) && ReadVector( in, value.virtualGeometry );
 }
 
 bool WriteAllocation( std::ofstream& out, const GpuAllocationAnalysisRecord& value )
 {
-    W( generation ); W( allocationId ); W( heapId ); W( parentAllocationId ); W( sizeBytes ); W( offsetBytes ); W( residentBytes );
+    W( generation ); W( allocationId ); W( heapId ); W( parentAllocationId ); W( sizeBytes ); W( offsetBytes ); W( residentBytes ); W( alignmentBytes );
     W( createTime ); W( destroyTime ); W( lastUpdateTime ); W( primaryKind ); W( memoryDomain ); W( allocationKind );
-    W( residencyState ); W( exactness ); W( openBoundary ); W( aliveAtEnd ); W( invalid );
+    W( residencyState ); W( exactness ); W( flags ); W( openBoundary ); W( aliveAtEnd ); W( invalid );
     return WriteVector( out, value.history ) && WriteVector( out, value.resources );
 }
 
 bool ReadAllocation( std::ifstream& in, GpuAllocationAnalysisRecord& value )
 {
-    R( generation ); R( allocationId ); R( heapId ); R( parentAllocationId ); R( sizeBytes ); R( offsetBytes ); R( residentBytes );
+    R( generation ); R( allocationId ); R( heapId ); R( parentAllocationId ); R( sizeBytes ); R( offsetBytes ); R( residentBytes ); R( alignmentBytes );
     R( createTime ); R( destroyTime ); R( lastUpdateTime ); R( primaryKind ); R( memoryDomain ); R( allocationKind );
-    R( residencyState ); R( exactness ); R( openBoundary ); R( aliveAtEnd ); R( invalid );
+    R( residencyState ); R( exactness ); R( flags ); R( openBoundary ); R( aliveAtEnd ); R( invalid );
     return ReadVector( in, value.history ) && ReadVector( in, value.resources );
 }
 
@@ -126,14 +148,16 @@ bool WritePass( std::ofstream& out, const GpuPassWorkingSet& value )
 {
     W( passId ); W( parentPassId ); W( frameId ); W( commandListId ); W( startNs ); W( endNs ); W( directRangeBytes );
     W( directPhysicalBytes ); W( inclusivePhysicalBytes ); W( unknownRangeResourceCount ); W( complete ); W( truncated );
-    return WriteString( out, value.name ) && WriteVector( out, value.directResources ) && WriteVector( out, value.inclusiveResources );
+    return WriteString( out, value.name ) && WriteVector( out, value.directResources ) && WriteVector( out, value.inclusiveResources ) &&
+        WriteVector( out, value.detailedEvidence );
 }
 
 bool ReadPass( std::ifstream& in, GpuPassWorkingSet& value )
 {
     R( passId ); R( parentPassId ); R( frameId ); R( commandListId ); R( startNs ); R( endNs ); R( directRangeBytes );
     R( directPhysicalBytes ); R( inclusivePhysicalBytes ); R( unknownRangeResourceCount ); R( complete ); R( truncated );
-    return ReadString( in, value.name ) && ReadVector( in, value.directResources ) && ReadVector( in, value.inclusiveResources );
+    return ReadString( in, value.name ) && ReadVector( in, value.directResources ) && ReadVector( in, value.inclusiveResources ) &&
+        ReadVector( in, value.detailedEvidence );
 }
 
 bool WriteCandidate( std::ofstream& out, const GpuChurnCandidate& value )
@@ -159,9 +183,9 @@ bool SaveGpuAnalysisCache( const std::filesystem::path& path, const GpuAnalysisC
     error.clear();
     try
     {
-        std::filesystem::create_directories( path.parent_path() );
+        std::filesystem::create_directories( GpuAnalysisIoPath( path.parent_path() ) );
         auto temporary = path; temporary += ".tmp";
-        std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+        std::ofstream out( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
         if( !out ) { error = "cache_open_failed"; return false; }
         if( !WritePod( out, CacheMagic ) || !WritePod( out, GpuAnalysisCacheSchemaVersion ) || !WritePod( out, GpuAnalysisSchemaVersion ) ||
             !WritePod( out, identity.traceSize ) || !WriteString( out, identity.traceSha256 ) || !WriteString( out, identity.guiBuild ) ||
@@ -182,7 +206,8 @@ bool SaveGpuAnalysisCache( const std::filesystem::path& path, const GpuAnalysisC
             !writeComplex( snapshot.churnCandidates, WriteCandidate ) ) { error = "cache_write_failed"; return false; }
         out.close();
         if( !out ) { error = "cache_flush_failed"; return false; }
-        std::error_code ec; std::filesystem::remove( path, ec ); ec.clear(); std::filesystem::rename( temporary, path, ec );
+        std::error_code ec; std::filesystem::remove( GpuAnalysisIoPath( path ), ec ); ec.clear();
+        std::filesystem::rename( GpuAnalysisIoPath( temporary ), GpuAnalysisIoPath( path ), ec );
         if( ec ) { error = "cache_publish_failed:" + ec.message(); return false; }
         return true;
     }
@@ -195,7 +220,7 @@ std::optional<GpuAnalysisSnapshot> LoadGpuAnalysisCache( const std::filesystem::
     error.clear();
     try
     {
-        std::ifstream in( path, std::ios::binary );
+        std::ifstream in( GpuAnalysisIoPath( path ), std::ios::binary );
         if( !in ) { error = "cache_not_found"; return std::nullopt; }
         uint64_t magic = 0, traceSize = 0; uint32_t cacheSchema = 0, analysisSchema = 0; std::string sha, build;
         if( !ReadPod( in, magic ) || !ReadPod( in, cacheSchema ) || !ReadPod( in, analysisSchema ) || !ReadPod( in, traceSize ) ||

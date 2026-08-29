@@ -1,4 +1,5 @@
 #include "TracyHash.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 
 #include <algorithm>
 #include <array>
@@ -127,9 +128,41 @@ private:
 
 }
 
+struct Sha256Builder::Impl
+{
+    Sha256 value;
+    std::string finalHex;
+};
+
+Sha256Builder::Sha256Builder()
+    : m_impl( std::make_unique<Impl>() )
+{}
+
+Sha256Builder::~Sha256Builder() = default;
+Sha256Builder::Sha256Builder( Sha256Builder&& ) noexcept = default;
+Sha256Builder& Sha256Builder::operator=( Sha256Builder&& ) noexcept = default;
+
+void Sha256Builder::Update( const void* data, size_t size )
+{
+    if( !m_impl || !m_impl->finalHex.empty() ) throw std::runtime_error( "sha256_builder_already_finalized" );
+    if( size != 0 ) m_impl->value.Update( static_cast<const uint8_t*>( data ), size );
+}
+
+std::string Sha256Builder::FinalHex()
+{
+    if( !m_impl ) throw std::runtime_error( "sha256_builder_moved" );
+    if( !m_impl->finalHex.empty() ) return m_impl->finalHex;
+    const auto digest = m_impl->value.Final();
+    std::ostringstream output;
+    output << std::hex << std::setfill( '0' );
+    for( const auto byte : digest ) output << std::setw( 2 ) << unsigned( byte );
+    m_impl->finalHex = output.str();
+    return m_impl->finalHex;
+}
+
 std::string Sha256File( const std::filesystem::path& path )
 {
-    std::ifstream stream( path, std::ios::binary );
+    std::ifstream stream( GpuAnalysisIoPath( path ), std::ios::binary );
     if( !stream ) throw std::runtime_error( "unable to open trace for fingerprint" );
 
     Sha256 hash;

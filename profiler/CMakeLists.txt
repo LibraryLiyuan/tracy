@@ -260,6 +260,13 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${md4c_SOURCE_DIR}/src
 )
 
+# The GPU Resource window starts the resumable low-priority builder from the
+# Profiler directory. Keep the matching binary in the same build/install set
+# so a Protocol 90 Profiler can never accidentally launch an older tool.
+add_executable(tracy-gpu-analysis-build ../query/src/gpu-analysis-build.cpp)
+target_link_libraries(tracy-gpu-analysis-build PRIVATE TracyAnalysis TracyServer)
+add_dependencies(${PROJECT_NAME} tracy-gpu-analysis-build)
+
 if(NOT EMSCRIPTEN)
     target_link_libraries(${PROJECT_NAME} PRIVATE
         TracyLibcurl
@@ -313,4 +320,4 @@ if(EMSCRIPTEN)
     file(COPY_FILE ${CMAKE_CURRENT_LIST_DIR}/../icon/icon.svg ${CMAKE_CURRENT_BINARY_DIR}/favicon.svg)
 endif()
 
-install(TARGETS ${PROJECT_NAME} DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS ${PROJECT_NAME} tracy-gpu-analysis-build DESTINATION ${CMAKE_INSTALL_BINDIR})

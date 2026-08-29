@@ -2,6 +2,9 @@
 
 #include "TracyAnalysis.hpp"
 #include "TracyEmbeddedData.hpp"
+#include "TracyGpuAnalysisSidecar.hpp"
+#include "TracyGpuAnalysisStore.hpp"
+#include "TracyWorkerTraceSource.hpp"
 #include "../../public/common/TracyQueue.hpp"
 
 #include "../../dtl/dtl.hpp"
@@ -44,7 +47,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
         "gpu.catalog.status", "gpu.catalog.validation",
         "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain", "gpu.resource.lifetime",
         "gpu.resource.allocations", "gpu.resource.references", "gpu.resource.views", "gpu.resource.mesh_buffers",
-        "gpu.resource.raytracing_chain", "gpu.resource.vg_pages", "gpu.pass.resources", "gpu.pass.vg_evidence",
+        "gpu.resource.raytracing_chain", "gpu.resource.vg_pages", "gpu.pass.by_frame", "gpu.pass.resources", "gpu.pass.vg_evidence",
         "gpu.memory.peak", "gpu.memory.by_type", "gpu.memory.by_pass", "gpu.memory.churn",
         "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones",
         "memory.gc.summary", "memory.gc.events",
@@ -73,6 +76,7 @@ nlohmann::json RequiredParametersFor( const std::string& method )
     if( method == "gpu.resource.explain" || method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
         method == "gpu.resource.references" || method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
         method == "gpu.resource.raytracing_chain" || method == "gpu.resource.vg_pages" ) required.emplace_back( "ref" );
+    if( method == "gpu.pass.by_frame" ) required.emplace_back( "frame_id" );
     if( method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence" || method == "gpu.memory.by_pass" ) required.emplace_back( "pass_id" );
     if( method == "memory.diff" ) { required.emplace_back( "base_frame_index" ); required.emplace_back( "target_frame_index" ); }
     if( method == "memory.active_at_time" ) required.emplace_back( "time_ns" );
@@ -92,6 +96,7 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
     using nlohmann::json;
     if( name == "limit" ) return { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumPageSize } };
     if( name == "frame_index" || name == "base_frame_index" || name == "target_frame_index" || name == "index" || name == "warmup_frames" || name == "window_frames" ) return { { "type", "integer" }, { "minimum", 0 }, { "maximum", 1000000 } };
+    if( name == "frame_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 0 } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "callsite_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", std::numeric_limits<uint32_t>::max() } }, json { { "type", "string" }, { "pattern", "^[1-9][0-9]*$" } } } ) } };
     if( name == "pass_id" || name == "resource_id" || name == "allocation_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 } }, json { { "type", "string" }, { "pattern", "^[1-9][0-9]*$" } } } ) } };
     if( name == "allow_warnings" ) return { { "type", "boolean" } };
@@ -4320,14 +4325,58 @@ std::shared_ptr<const analysis::GpuAnalysisSnapshot> QueryService::CachedGpuSnap
         found->second.access = ++m_cacheClock;
         return found->second.value;
     }
-    const auto catalog = source->GetGpuCatalogData();
-    if( !catalog ) return std::make_shared<analysis::GpuAnalysisSnapshot>();
-    auto value = std::make_shared<analysis::GpuAnalysisSnapshot>( analysis::BuildGpuAnalysisSnapshot( *catalog ) );
+    const auto workerSource = std::dynamic_pointer_cast<analysis::WorkerTraceSource>( source );
+    if( !workerSource )
+    {
+        // Keep the bounded in-memory implementation as a correctness oracle for
+        // synthetic/fake sources. Production .tracy queries must use the sidecar.
+        const auto catalog = source->GetGpuCatalogData();
+        if( !catalog ) return std::make_shared<analysis::GpuAnalysisSnapshot>();
+        constexpr uint64_t SyntheticOracleRecordLimit = 1000000;
+        const uint64_t records = catalog->gpuCatalogResources.size() + catalog->gpuCatalogAllocations.size() +
+            catalog->gpuReferenceUses.size() + catalog->gpuRangeSets.size();
+        if( records > SyntheticOracleRecordLimit )
+            throw QueryError( "GPU_ANALYSIS_SIDECAR_UNAVAILABLE", "Large GPU Resource Analysis inputs require a completed .tracy sidecar", true,
+                { { "reason", "non_worker_source_too_large" }, { "record_count", Decimal( records ) } } );
+        auto value = std::make_shared<analysis::GpuAnalysisSnapshot>( analysis::BuildGpuAnalysisSnapshot( *catalog ) );
+        const size_t bytes = sizeof( *value ) + value->resources.capacity() * sizeof( analysis::GpuResourceAnalysisRecord ) +
+            value->allocations.capacity() * sizeof( analysis::GpuAllocationAnalysisRecord ) +
+            value->passes.capacity() * sizeof( analysis::GpuPassWorkingSet );
+        EvictCache( bytes );
+        if( bytes <= m_cacheBudget && m_cacheBytes <= m_cacheBudget - bytes )
+        {
+            m_cacheBytes += bytes;
+            m_gpuSnapshotCache.emplace( key, GpuSnapshotCacheEntry { value, bytes, ++m_cacheClock } );
+        }
+        return value;
+    }
+    m_gpuStoreCache.erase( traceId );
+    std::string sidecarError;
+    analysis::GpuAnalysisSidecarManifest sidecarManifest;
+    auto loaded = analysis::LoadGpuAnalysisSidecarSnapshot( workerSource->Path(), false, &sidecarManifest, sidecarError );
+    if( !loaded )
+    {
+        const bool retryable = sidecarError == "gpu_analysis_derived_building" || sidecarError == "gpu_analysis_sidecar_not_found";
+        throw QueryError( retryable ? "GPU_ANALYSIS_INDEX_BUILDING" : "GPU_ANALYSIS_SIDECAR_INVALID",
+            "GPU Resource Analysis sidecar is not ready", retryable,
+            { { "reason", sidecarError }, { "state", analysis::GpuAnalysisSidecarStateName( sidecarManifest.state ) },
+              { "identity", analysis::GpuAnalysisIdentityStateName( sidecarManifest.identityState ) },
+              { "raw_complete", sidecarManifest.rawComplete }, { "derived_complete", sidecarManifest.derivedComplete } } );
+    }
+    auto value = std::make_shared<analysis::GpuAnalysisSnapshot>( std::move( *loaded ) );
     size_t bytes = sizeof( *value ) + value->resources.capacity() * sizeof( analysis::GpuResourceAnalysisRecord ) +
         value->allocations.capacity() * sizeof( analysis::GpuAllocationAnalysisRecord ) + value->passes.capacity() * sizeof( analysis::GpuPassWorkingSet ) +
         value->residency.capacity() * sizeof( analysis::GpuResidencyInterval ) + value->churnCandidates.capacity() * sizeof( analysis::GpuChurnCandidate );
-    for( const auto& resource : value->resources ) bytes += resource.name.capacity() + resource.history.capacity() * sizeof( size_t ) +
-        ( resource.views.capacity() + resource.parts.capacity() + resource.relations.capacity() + resource.ranges.capacity() ) * sizeof( size_t );
+    for( const auto& resource : value->resources )
+    {
+        bytes += resource.name.capacity() + resource.history.capacity() * sizeof( size_t ) +
+            resource.views.capacity() * sizeof( analysis::GpuViewAnalysisRecord ) +
+            resource.parts.capacity() * sizeof( analysis::GpuPartAnalysisRecord ) +
+            resource.relations.capacity() * sizeof( analysis::GpuRelationAnalysisRecord ) +
+            resource.ranges.capacity() * sizeof( analysis::GpuRangeAnalysisRecord ) +
+            resource.virtualGeometry.capacity() * sizeof( analysis::GpuVgAnalysisRecord );
+        for( const auto& logical : resource.logicals ) bytes += sizeof( logical ) + logical.name.capacity();
+    }
     for( const auto& pass : value->passes ) bytes += pass.name.capacity() +
         ( pass.directResources.capacity() + pass.inclusiveResources.capacity() ) * sizeof( uint64_t );
     EvictCache( bytes );
@@ -4336,6 +4385,24 @@ std::shared_ptr<const analysis::GpuAnalysisSnapshot> QueryService::CachedGpuSnap
         m_cacheBytes += bytes;
         m_gpuSnapshotCache.emplace( key, GpuSnapshotCacheEntry { value, bytes, ++m_cacheClock } );
     }
+    return value;
+}
+
+std::shared_ptr<analysis::GpuAnalysisStoreReader> QueryService::CachedGpuStoreReader( const std::string& traceId,
+    const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error )
+{
+    if( const auto found = m_gpuStoreCache.find( traceId ); found != m_gpuStoreCache.end() && found->second.path == tracePath )
+    {
+        found->second.access = ++m_cacheClock;
+        if( manifest )
+        {
+            std::string manifestError;
+            if( const auto current = analysis::LoadGpuAnalysisSidecarManifest( analysis::GpuAnalysisSidecarPath( tracePath ), manifestError ) ) *manifest = *current;
+        }
+        return found->second.value;
+    }
+    auto value = analysis::GpuAnalysisStoreReader::Open( tracePath, false, manifest, error );
+    if( value ) m_gpuStoreCache[traceId] = GpuStoreCacheEntry { value, tracePath, ++m_cacheClock };
     return value;
 }
 
@@ -4492,6 +4559,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
     const auto trace = m_sessions.Status( *maybeTraceId );
     const auto source = m_sessions.GetReadySource( *maybeTraceId );
+    source->PrepareForQuery( method );
     const auto parseCallstack = [&]( const json& value, bool parent = false ) -> uint32_t {
         uint64_t parsed = 0;
         if( value.is_string() )
@@ -5120,7 +5188,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     const auto requiredDomain = [&]() -> std::string {
         if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" ) return {};
         if( method.rfind( "gpu.catalog.", 0 ) == 0 || method.rfind( "gpu.resource.", 0 ) == 0 ||
-            method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence" ) return {};
+            method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.by_frame" || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence" ) return {};
         if( method == "job.gfx.statistics" || method == "job.gfx_chain" ) return "job.gfx";
         if( method.rfind( "memory.gpu.", 0 ) == 0 ) return "memory.gpu";
         if( method.rfind( "frame_image.", 0 ) == 0 ) return "frame_image";
@@ -5147,12 +5215,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     const bool gpuCatalogMethod = method.rfind( "gpu.catalog.", 0 ) == 0 || method.rfind( "gpu.resource.", 0 ) == 0 ||
-        method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence";
+        method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.by_frame" || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence";
     if( gpuCatalogMethod )
     {
         const auto catalog = source->GetGpuCatalogData();
         const bool present = catalog && catalog->gpuCatalogPresent;
         const auto statusJson = [&]() {
+            std::optional<analysis::GpuAnalysisSidecarManifest> sidecarStatus;
+            std::string sidecarStatusError;
+            if( const auto tracePath = source->BackingPath() ) sidecarStatus = analysis::LoadGpuAnalysisSidecarManifest(
+                analysis::GpuAnalysisSidecarPath( *tracePath ), sidecarStatusError );
             json generations = json::array();
             uint64_t recordCount = 0;
             uint64_t payloadBytes = 0;
@@ -5173,6 +5245,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "last_sequence", generation.lastSequence }
                 } );
             }
+            // A sidecar-only source deliberately does not materialize the raw
+            // vectors. Use its exact conversion-time summary rather than
+            // presenting an internally inconsistent zero-count Catalog.
+            if( sidecarStatus && catalog && catalog->gpuCatalogGenerations.empty() )
+            {
+                const auto& summary = sidecarStatus->summary;
+                recordCount = summary.resourceRecordCount + summary.allocationRecordCount + summary.passCount + summary.referenceUseCount +
+                    summary.referenceEndCount + summary.rangeCount + summary.relationCount + summary.viewRecordCount + summary.logicalRecordCount +
+                    summary.partRecordCount + summary.vgRecordCount + summary.evidenceRecordCount;
+                unresolved = summary.unresolvedCount;
+                payloadBytes = summary.payloadBytes;
+            }
             const std::string state = !present ? "absent" : ( catalog->gpuCatalogValid ? ( building ? "building" : "complete" ) : "invalid_core_gap" );
             json evidencePreview = json::array();
             std::unordered_set<uint64_t> previewFrames;
@@ -5186,6 +5270,36 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "kind", value.kind } } );
                 if( evidencePreview.size() >= 16 ) break;
             }
+            json analysisSidecar = {
+                { "present", false }, { "state", "unavailable" }, { "identity", "identity_pending" },
+                { "raw_complete", false }, { "derived_complete", false }, { "reason", "completed_snapshot_required" }
+            };
+            if( sidecarStatus )
+            {
+                const auto& sidecar = *sidecarStatus;
+                    analysisSidecar = {
+                        { "present", true }, { "state", analysis::GpuAnalysisSidecarStateName( sidecar.state ) },
+                        { "identity", analysis::GpuAnalysisIdentityStateName( sidecar.identityState ) },
+                        { "raw_complete", sidecar.rawComplete }, { "derived_complete", sidecar.derivedComplete },
+                        { "reason", sidecar.reason }, { "manifest_schema", sidecar.manifestSchema },
+                        { "raw_schema", sidecar.rawSchema }, { "derived_schema", sidecar.derivedSchema },
+                        { "algorithm_id", sidecar.algorithmId },
+                        { "summary", {
+                            { "resources", Decimal( sidecar.summary.resourceRecordCount ) },
+                            { "allocations", Decimal( sidecar.summary.allocationRecordCount ) },
+                            { "passes", Decimal( sidecar.summary.passCount ) },
+                            { "reference_uses", Decimal( sidecar.summary.referenceUseCount ) },
+                            { "engine_known_physical_peak_bytes", Decimal( sidecar.summary.engineKnownPhysicalPeakBytes ) },
+                            { "engine_known_physical_peak_time_ns", Decimal( sidecar.summary.engineKnownPhysicalPeakTimeNs ) },
+                            { "exact", sidecar.summary.exact }
+                        } }
+                    };
+            }
+            else if( !sidecarStatusError.empty() ) analysisSidecar["reason"] = sidecarStatusError;
+            const auto sidecarResources = sidecarStatus ? sidecarStatus->summary.resourceRecordCount : 0;
+            const auto sidecarAllocations = sidecarStatus ? sidecarStatus->summary.allocationRecordCount : 0;
+            const auto sidecarRanges = sidecarStatus ? sidecarStatus->summary.rangeCount : 0;
+            const auto sidecarRelations = sidecarStatus ? sidecarStatus->summary.relationCount : 0;
             return json {
                 { "present", present }, { "valid", present && catalog->gpuCatalogValid }, { "status", state },
                 { "partial", present && catalog->gpuCatalogValid && unresolved != 0 },
@@ -5196,20 +5310,27 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     json( "trace predates N27 or contains no GPU Resource Catalog" ) },
                 { "catalog_schema", catalog ? catalog->gpuCatalogSchemaVersion : 0 },
                 { "detailed_evidence_schema", catalog ? catalog->gpuDetailedEvidenceSchemaVersion : 0 },
-                { "generation_count", Decimal( catalog ? catalog->gpuCatalogGenerations.size() : 0 ) },
+                { "generation_count", Decimal( catalog && !catalog->gpuCatalogGenerations.empty() ? catalog->gpuCatalogGenerations.size() :
+                    sidecarStatus ? sidecarStatus->summary.generationCount : 0 ) },
                 { "record_count", Decimal( recordCount ) }, { "payload_bytes", Decimal( payloadBytes ) },
                 { "unresolved_count", Decimal( unresolved ) }, { "generations", std::move( generations ) },
                 { "detailed_evidence_checkpoint_preview", std::move( evidencePreview ) },
+                { "analysis_sidecar", std::move( analysisSidecar ) },
                 { "counts", {
-                    { "resources", Decimal( catalog ? catalog->gpuCatalogResources.size() : 0 ) },
-                    { "allocations", Decimal( catalog ? catalog->gpuCatalogAllocations.size() : 0 ) },
-                    { "views", Decimal( catalog ? catalog->gpuCatalogViews.size() : 0 ) },
-                    { "logical_resources", Decimal( catalog ? catalog->gpuCatalogLogicals.size() : 0 ) },
-                    { "parts", Decimal( catalog ? catalog->gpuCatalogParts.size() : 0 ) },
-                    { "relations", Decimal( catalog ? catalog->gpuCatalogRelations.size() : 0 ) },
-                    { "vg_records", Decimal( catalog ? catalog->gpuCatalogVg.size() : 0 ) },
-                    { "range_records", Decimal( catalog ? catalog->gpuRangeSets.size() : 0 ) },
-                    { "detailed_evidence", Decimal( catalog ? catalog->gpuDetailedEvidence.size() : 0 ) }
+                    { "resources", Decimal( catalog && !catalog->gpuCatalogResources.empty() ? catalog->gpuCatalogResources.size() : sidecarResources ) },
+                    { "allocations", Decimal( catalog && !catalog->gpuCatalogAllocations.empty() ? catalog->gpuCatalogAllocations.size() : sidecarAllocations ) },
+                    { "views", Decimal( catalog && !catalog->gpuCatalogViews.empty() ? catalog->gpuCatalogViews.size() :
+                        sidecarStatus ? sidecarStatus->summary.viewRecordCount : 0 ) },
+                    { "logical_resources", Decimal( catalog && !catalog->gpuCatalogLogicals.empty() ? catalog->gpuCatalogLogicals.size() :
+                        sidecarStatus ? sidecarStatus->summary.logicalRecordCount : 0 ) },
+                    { "parts", Decimal( catalog && !catalog->gpuCatalogParts.empty() ? catalog->gpuCatalogParts.size() :
+                        sidecarStatus ? sidecarStatus->summary.partRecordCount : 0 ) },
+                    { "relations", Decimal( catalog && !catalog->gpuCatalogRelations.empty() ? catalog->gpuCatalogRelations.size() : sidecarRelations ) },
+                    { "vg_records", Decimal( catalog && !catalog->gpuCatalogVg.empty() ? catalog->gpuCatalogVg.size() :
+                        sidecarStatus ? sidecarStatus->summary.vgRecordCount : 0 ) },
+                    { "range_records", Decimal( catalog && !catalog->gpuRangeSets.empty() ? catalog->gpuRangeSets.size() : sidecarRanges ) },
+                    { "detailed_evidence", Decimal( catalog && !catalog->gpuDetailedEvidence.empty() ? catalog->gpuDetailedEvidence.size() :
+                        sidecarStatus ? sidecarStatus->summary.evidenceRecordCount : 0 ) }
                 } }
             };
         };
@@ -5605,6 +5726,358 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
         if( !catalog->gpuCatalogValid ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
             { "reason", "Catalog Core gap/capacity/checksum failure invalidated resource evidence; no previous generation was substituted" } }, trace );
+
+        // N29 production queries use the paged sidecar before constructing any
+        // full-capture ResourceState maps. Detailed N27-only records that have
+        // not yet moved to a derived index continue through the compatibility
+        // path below, without changing their semantics.
+        const bool sidecarCoreMethod = method.rfind( "gpu.resource.", 0 ) == 0 ||
+            method == "gpu.pass.by_frame" || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence" || method == "gpu.memory.by_pass" ||
+            method == "gpu.memory.by_type" || method == "gpu.memory.peak" || method == "gpu.memory.churn";
+        if( sidecarCoreMethod )
+        {
+            const auto tracePath = source->BackingPath();
+            if( tracePath )
+            {
+                std::string sidecarError; analysis::GpuAnalysisSidecarManifest sidecarManifest;
+                auto reader = CachedGpuStoreReader( trace.id, *tracePath, &sidecarManifest, sidecarError );
+                if( !reader )
+                {
+                    const bool retryable = sidecarError == "gpu_analysis_derived_building" || sidecarError == "gpu_analysis_sidecar_not_found";
+                    throw QueryError( retryable ? "GPU_ANALYSIS_INDEX_BUILDING" : "GPU_ANALYSIS_SIDECAR_INVALID",
+                        "GPU Resource Analysis sidecar is not ready", retryable,
+                        { { "reason", sidecarError }, { "state", analysis::GpuAnalysisSidecarStateName( sidecarManifest.state ) } } );
+                }
+                const auto resourceJsonFromStore = [&]( const analysis::GpuResourceAnalysisRecord& value, bool details )
+                {
+                    json result = {
+                        { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) }, { "resource_id", Decimal( value.resourceId ) },
+                        { "generation", Decimal( value.generation ) }, { "definition_revision", value.definitionRevision },
+                        { "resource_class", GpuResourceClassName( value.resourceClass ) }, { "primary_kind", analysis::GpuPrimaryKindName( value.primaryKind ) },
+                        { "name", value.name.empty() ? json( nullptr ) : json( value.name ) }, { "name_hash", Decimal( value.nameHash ) },
+                        { "name_provenance", value.nameProvenance }, { "name_truncated", value.nameOriginalLength > value.name.size() },
+                        { "capacity_bytes", Decimal( value.capacityBytes ) },
+                        { "allocation_id", value.allocationId == 0 ? json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                        { "allocation_offset_bytes", Decimal( value.allocationOffsetBytes ) }, { "memory_domain", value.memoryDomain },
+                        { "allocation_kind", value.allocationKind }, { "exactness", analysis::GpuExactnessName( value.exactness ) },
+                        { "create_time_ns", value.openBoundary ? json( nullptr ) : json( Decimal( value.createTime ) ) },
+                        { "create_time_boundary", value.openBoundary ? "open" : "closed" },
+                        { "destroy_time_ns", value.destroyTime == 0 ? json( nullptr ) : json( Decimal( value.destroyTime ) ) },
+                        { "alive_at_capture_end", value.aliveAtEnd },
+                        { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
+                        { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
+                        { "stack_provenance", value.stackProvenance }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" }
+                    };
+                    if( details ) result["description"] = {
+                        { "width", Decimal( value.width ) }, { "height", value.height }, { "depth_or_array_size", value.depthOrArraySize },
+                        { "mip_levels", value.mipLevels }, { "format", value.format }, { "sample_count", value.sampleCount },
+                        { "declared_usage_mask", value.declaredUsageMask }, { "observed_usage_mask", value.observedUsageMask },
+                        { "backend_flags", value.backendFlags }, { "classification_provenance", value.classificationProvenance }, { "view_count", Decimal( value.views.size() ) },
+                        { "logical_binding_count", Decimal( value.logicals.size() ) }, { "part_count", Decimal( value.parts.size() ) },
+                        { "range_count", Decimal( value.ranges.size() ) }, { "relation_count", Decimal( value.relations.size() ) },
+                        { "vg_record_count", Decimal( value.virtualGeometry.size() ) }
+                    };
+                    return result;
+                };
+                if( method == "gpu.memory.peak" )
+                {
+                    const auto& overview = reader->Overview();
+                    return Success( id, { { "present", true }, { "engine_known_physical_peak_bytes", Decimal( overview.engineKnownPhysicalPeakBytes ) },
+                        { "peak_time_ns", Decimal( overview.engineKnownPhysicalPeakTimeNs ) }, { "peak_provenance", "event_exact" },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace );
+                }
+                if( method == "gpu.memory.by_type" )
+                {
+                    json groups = json::array(); for( const auto& total : reader->Manifest().typeSummaries ) groups.push_back( {
+                        { "primary_kind", analysis::GpuPrimaryKindName( total.primaryKind ) }, { "live_resource_count", Decimal( total.liveResourceCount ) },
+                        { "resource_capacity_bytes", Decimal( total.resourceCapacityBytes ) } } );
+                    return Success( id, { { "present", true }, { "groups", std::move( groups ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" },
+                        { "note", "resource capacity is not physical allocation ownership and must not be summed across aliases" } }, trace );
+                }
+                if( method == "gpu.memory.churn" )
+                {
+                    const auto& overview = reader->Overview();
+                    return Success( id, { { "present", true }, { "create_count", Decimal( overview.allocationCreateCount ) },
+                        { "destroy_count", Decimal( overview.allocationDestroyCount ) }, { "allocated_bytes", Decimal( overview.allocatedPhysicalBytes ) },
+                        { "freed_bytes", Decimal( overview.freedPhysicalBytes ) }, { "live_bytes_at_end", Decimal( overview.engineKnownPhysicalBytes ) },
+                        { "semantics", "snapshot/open-boundary allocations are included in baseline and are not proof of within-capture churn" },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace );
+                }
+                if( method == "gpu.pass.by_frame" )
+                {
+                    const auto frameId = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
+                    const auto page = ParsePage( params, method, trace );
+                    std::vector<analysis::GpuPassWorkingSet> passes; bool hasMore = false;
+                    if( !reader->PassesForFrame( frameId, page.offset, page.limit, passes, hasMore, sidecarError ) )
+                        throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                    json values = json::array();
+                    for( const auto& pass : passes ) values.push_back( {
+                        { "pass_id", Decimal( pass.passId ) },
+                        { "parent_pass_id", pass.parentPassId == 0 ? json( nullptr ) : json( Decimal( pass.parentPassId ) ) },
+                        { "frame_id", Decimal( pass.frameId ) },
+                        { "command_list_id", pass.commandListId == 0 ? json( nullptr ) : json( Decimal( pass.commandListId ) ) },
+                        { "name", pass.name.empty() ? json( nullptr ) : json( pass.name ) },
+                        { "start_ns", Decimal( pass.startNs ) }, { "end_ns", Decimal( pass.endNs ) },
+                        { "complete", pass.complete }, { "truncated", pass.truncated },
+                        { "direct_resource_count", Decimal( pass.directResources.size() ) },
+                        { "inclusive_resource_count", Decimal( pass.inclusiveResources.size() ) },
+                        { "direct_range_bytes", Decimal( pass.directRangeBytes ) },
+                        { "direct_physical_bytes", Decimal( pass.directPhysicalBytes ) },
+                        { "inclusive_physical_bytes", Decimal( pass.inclusivePhysicalBytes ) },
+                        { "unknown_range_resource_count", pass.unknownRangeResourceCount },
+                        { "exactness", pass.complete && !pass.truncated ? "exact" : "partial" }
+                    } );
+                    const auto returned = values.size();
+                    return Success( id, { { "present", true }, { "frame_id", Decimal( frameId ) },
+                        { "passes", std::move( values ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace,
+                        PageJson( page, returned, NextCursor( page, method, trace, returned, hasMore ) ) );
+                }
+                if( method == "gpu.resource.search" )
+                {
+                    const auto page = ParsePage( params, method, trace ); const auto filter = params.value( "filter", json::object() );
+                    const auto nameFilter = filter.value( "name", std::string() ); const auto kindFilter = filter.value( "primary_kind", std::string() );
+                    const auto classFilter = filter.value( "resource_class", std::string() );
+                    const bool requireMeshParts = filter.value( "has_mesh_parts", false ); const bool requireRanges = filter.value( "has_ranges", false );
+                    const bool requireLogicalBindings = filter.value( "has_logical_bindings", false );
+                    const bool requireAliasGroup = filter.value( "has_alias_group", false );
+                    const bool requireSharedAllocation = filter.value( "has_shared_allocation", false );
+                    json values = json::array(); size_t total = 0;
+                    for( size_t pageIndex = 0; pageIndex < reader->ResourcePageCount(); ++pageIndex )
+                    {
+                        std::vector<analysis::GpuResourceAnalysisRecord> records;
+                        if( !reader->LoadResourcePage( pageIndex, records, sidecarError ) ) throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                        for( const auto& value : records )
+                        {
+                            if( !nameFilter.empty() && value.name.find( nameFilter ) == std::string::npos ) continue;
+                            if( !kindFilter.empty() && kindFilter != analysis::GpuPrimaryKindName( value.primaryKind ) ) continue;
+                            if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
+                            if( requireMeshParts && value.parts.empty() ) continue; if( requireRanges && value.ranges.empty() ) continue;
+                            if( requireLogicalBindings && value.logicals.empty() ) continue;
+                            if( requireAliasGroup && std::none_of( value.logicals.begin(), value.logicals.end(), []( const auto& item ) { return item.value.aliasGroupId != 0; } ) ) continue;
+                            if( requireSharedAllocation )
+                            {
+                                auto allocation = value.allocationId == 0 ? std::optional<analysis::GpuAllocationAnalysisRecord>() : reader->FindAllocation( value.allocationId, sidecarError );
+                                if( !allocation || allocation->resources.size() <= 1 ) continue;
+                            }
+                            const auto position = total++; if( position < page.offset || values.size() >= page.limit ) continue;
+                            auto result = resourceJsonFromStore( value, false );
+                            if( requireMeshParts ) result["mesh_part_count"] = Decimal( value.parts.size() );
+                            if( requireRanges ) result["pass_range_count"] = Decimal( value.ranges.size() );
+                            if( requireLogicalBindings || requireAliasGroup ) result["logical_binding_count"] = Decimal( value.logicals.size() );
+                            if( requireSharedAllocation ) if( auto allocation = reader->FindAllocation( value.allocationId, sidecarError ) )
+                                result["allocation_resource_count"] = Decimal( allocation->resources.size() );
+                            values.push_back( std::move( result ) );
+                        }
+                    }
+                    const auto returned = values.size(); const auto cursor = NextCursor( page, method, trace, returned, page.offset + returned < total );
+                    return Success( id, { { "present", true }, { "resources", std::move( values ) }, { "total", Decimal( total ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace, PageJson( page, returned, cursor ) );
+                }
+
+                const auto parseStoreResourceId = [&]() -> uint64_t {
+                    if( params.contains( "resource_id" ) ) return UnsignedParameter( params, "resource_id", 0, std::numeric_limits<uint64_t>::max() );
+                    if( !params.contains( "ref" ) || !params["ref"].is_string() ) throw QueryError( "INVALID_PARAMS", "ref or resource_id is required" );
+                    const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "gpu-resource" );
+                    if( !parsed ) throw QueryError( "INVALID_PARAMS", "resource ref does not belong to this trace" ); return *parsed;
+                };
+                if( method == "gpu.pass.resources" || method == "gpu.memory.by_pass" )
+                {
+                    const auto passId = UnsignedParameter( params, "pass_id", 0, std::numeric_limits<uint64_t>::max() );
+                    auto pass = reader->FindPass( passId, sidecarError ); if( !pass ) throw QueryError( "ENTITY_NOT_FOUND", sidecarError );
+                    const auto page = ParsePage( params, method, trace ); json resourcesJson = json::array();
+                    const auto begin = std::min( page.offset, pass->directResources.size() ); const auto end = begin + std::min( page.limit, pass->directResources.size() - begin );
+                    std::vector<uint64_t> resourceIds( pass->directResources.begin() + begin, pass->directResources.begin() + end );
+                    std::vector<analysis::GpuResourceAnalysisRecord> resources;
+                    if( !reader->FindResources( std::move( resourceIds ), resources, sidecarError ) )
+                        throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                    for( const auto& resource : resources )
+                    {
+                        auto value = resourceJsonFromStore( resource, false ); json ranges = json::array();
+                        for( const auto& range : resource.ranges ) if( range.value.passInstanceId == passId ) ranges.push_back( {
+                            { "view_id", range.value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.value.viewDefinitionId ) ) },
+                            { "range_kind", range.value.rangeKind }, { "offset_bytes", Decimal( range.value.offsetBytes ) },
+                            { "length_bytes", Decimal( range.value.lengthBytes ) }, { "first_subresource", range.value.firstSubresource },
+                            { "subresource_count", range.value.subresourceCount }, { "usage_mask", range.value.usageMask },
+                            { "exactness", GpuExactnessName( range.value.exactness ) } } );
+                        value["ranges"] = std::move( ranges ); resourcesJson.push_back( std::move( value ) );
+                    }
+                    return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", "continuous_exact" },
+                        { "resource_count", Decimal( pass->directResources.size() ) }, { "direct_range_bytes", Decimal( pass->directRangeBytes ) },
+                        { "referenced_physical_bytes", Decimal( pass->directPhysicalBytes ) }, { "unknown_range_resource_count", pass->unknownRangeResourceCount },
+                        { "resources", std::move( resourcesJson ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } },
+                        trace, PageJson( page, end - begin, NextCursor( page, method, trace, end - begin, end < pass->directResources.size() ) ) );
+                }
+                if( method == "gpu.pass.vg_evidence" )
+                {
+                    const auto passId = UnsignedParameter( params, "pass_id", 0, std::numeric_limits<uint64_t>::max() );
+                    auto pass = reader->FindPass( passId, sidecarError ); if( !pass ) throw QueryError( "ENTITY_NOT_FOUND", sidecarError );
+                    const auto page = ParsePage( params, method, trace ); const auto total = pass->detailedEvidence.size();
+                    const auto begin = std::min( page.offset, total ); const auto end = begin + std::min( page.limit, total - begin );
+                    json records = json::array(); std::string sampleStatus = pass->detailedEvidence.empty() ? "not_sampled" : GpuEvidenceStateName( pass->detailedEvidence.front().value.state );
+                    for( auto index = begin; index < end; ++index )
+                    {
+                        const auto& item = pass->detailedEvidence[index]; const auto& value = item.value; sampleStatus = GpuEvidenceStateName( value.state );
+                        records.push_back( { { "generation", Decimal( item.generation ) }, { "request_id", Decimal( value.requestId ) },
+                            { "evidence_frame_id", Decimal( value.evidenceFrameId ) }, { "frame_id", Decimal( value.frameId ) },
+                            { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+                            { "kind", value.kind }, { "state", GpuEvidenceStateName( value.state ) }, { "sequence", value.sequence },
+                            { "time_ns", Decimal( value.time ) } } );
+                    }
+                    return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", sampleStatus },
+                        { "sampled", sampleStatus != "not_sampled" }, { "records", std::move( records ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace,
+                        PageJson( page, end - begin, NextCursor( page, method, trace, end - begin, end < total ) ) );
+                }
+
+                const auto resourceId = parseStoreResourceId(); auto resource = reader->FindResource( resourceId, sidecarError );
+                if( !resource ) throw QueryError( "ENTITY_NOT_FOUND", "GPU resource was not found", false, { { "reason", sidecarError } } );
+                const auto viewsFromStore = [&]() {
+                    json values = json::array(); for( const auto& item : resource->views )
+                    {
+                        const auto& value = item.value; values.push_back( {
+                            { "view_id", Decimal( value.viewId ) }, { "generation", Decimal( item.generation ) },
+                            { "operation", GpuCatalogOperationName( value.operation ) }, { "view_kind", value.viewKind }, { "format", value.format },
+                            { "buffer_offset_bytes", Decimal( value.bufferOffsetBytes ) }, { "buffer_length_bytes", Decimal( value.bufferLengthBytes ) },
+                            { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
+                            { "stride_bytes", value.strideBytes }, { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
+                        } );
+                    } return values;
+                };
+                const auto partsFromStore = [&]( bool meshOnly ) {
+                    json values = json::array(); for( const auto& item : resource->parts )
+                    {
+                        const auto& value = item.value; const auto kind = JnGpuCatalogPartKind( value.partKind );
+                        if( meshOnly && kind != JnGpuCatalogPartKind::MeshVertexStream && kind != JnGpuCatalogPartKind::MeshIndex ) continue;
+                        values.push_back( {
+                            { "part_id", Decimal( value.partId ) }, { "generation", Decimal( item.generation ) }, { "part_kind", value.partKind },
+                            { "operation", GpuCatalogOperationName( value.operation ) }, { "offset_bytes", Decimal( value.offsetBytes ) },
+                            { "length_bytes", Decimal( value.lengthBytes ) }, { "first_subresource", value.firstSubresource },
+                            { "subresource_count", value.subresourceCount }, { "semantic_index", value.semanticIndex },
+                            { "element_count", value.elementCount }, { "stride_bytes", value.strideBytes }, { "format", value.format },
+                            { "definition_revision", value.definitionRevision }, { "exactness", GpuExactnessName( value.exactness ) }
+                        } );
+                    } return values;
+                };
+                const auto rangesFromStore = [&]( size_t offset, size_t limit, size_t& total ) {
+                    json values = json::array(); for( const auto& item : resource->ranges )
+                    {
+                        const auto position = total++; if( position < offset || values.size() >= limit ) continue; const auto& value = item.value;
+                        values.push_back( { { "pass_id", Decimal( value.passInstanceId ) },
+                            { "resource_ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) }, { "generation", Decimal( item.generation ) },
+                            { "view_id", value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( value.viewDefinitionId ) ) },
+                            { "range_kind", value.rangeKind }, { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
+                            { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
+                            { "usage_mask", value.usageMask }, { "exactness", GpuExactnessName( value.exactness ) } } );
+                    } return values;
+                };
+                const auto logicalsFromStore = [&]( size_t limit, size_t& total ) {
+                    json values = json::array(); for( const auto& item : resource->logicals )
+                    {
+                        ++total; if( values.size() >= limit ) continue; const auto& value = item.value;
+                        values.push_back( { { "logical_resource_id", Decimal( value.logicalResourceId ) }, { "stable_key", Decimal( value.stableKey ) },
+                            { "generation", Decimal( item.generation ) }, { "family_id", Decimal( value.familyId ) },
+                            { "operation", GpuCatalogOperationName( value.operation ) }, { "name", item.name.empty() ? json( nullptr ) : json( item.name ) },
+                            { "name_provenance", value.nameProvenance }, { "physical_offset_bytes", Decimal( value.physicalOffsetBytes ) },
+                            { "length_bytes", Decimal( value.lengthBytes ) }, { "alias_group_id", value.aliasGroupId == 0 ? json( nullptr ) : json( Decimal( value.aliasGroupId ) ) },
+                            { "frame_id", value.frameId == 0 ? json( nullptr ) : json( Decimal( value.frameId ) ) },
+                            { "definition_revision", value.definitionRevision }, { "primary_kind", analysis::GpuPrimaryKindName( value.primaryKind ) },
+                            { "definition_status", "resolved_at_capture" }, { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) } } );
+                    } return values;
+                };
+                const auto relationsFromStore = [&]( size_t limit, size_t& total, bool rtasOnly ) {
+                    json values = json::array(); for( const auto& item : resource->relations )
+                    {
+                        const auto& value = item.value; if( rtasOnly && value.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) ) continue;
+                        ++total; if( values.size() >= limit ) continue;
+                        values.push_back( { { "generation", Decimal( item.generation ) }, { "source_id", Decimal( value.sourceId ) },
+                            { "target_id", Decimal( value.targetId ) }, { "relation", GpuCatalogRelationName( value.relation ) },
+                            { "operation", GpuCatalogOperationName( value.operation ) }, { "frame_id", value.frameId == 0 ? json( nullptr ) : json( Decimal( value.frameId ) ) },
+                            { "value0", Decimal( value.value0 ) }, { "value1", Decimal( value.value1 ) },
+                            { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) } } );
+                    } return values;
+                };
+                if( method == "gpu.resource.get" || method == "gpu.resource.lifetime" )
+                { auto result = resourceJsonFromStore( *resource, method == "gpu.resource.get" ); result["present"] = true; return Success( id, std::move( result ), trace ); }
+                if( method == "gpu.resource.allocations" )
+                {
+                    json allocationsJson = json::array();
+                    if( resource->allocationId != 0 ) if( auto allocation = reader->FindAllocation( resource->allocationId, sidecarError ) )
+                        allocationsJson.push_back( { { "allocation_id", Decimal( allocation->allocationId ) }, { "heap_id", Decimal( allocation->heapId ) },
+                            { "size_bytes", Decimal( allocation->sizeBytes ) }, { "resident_bytes", Decimal( allocation->residentBytes ) },
+                            { "alignment_bytes", Decimal( allocation->alignmentBytes ) }, { "flags", allocation->flags },
+                            { "alive_at_capture_end", allocation->aliveAtEnd }, { "exactness", analysis::GpuExactnessName( allocation->exactness ) } } );
+                    return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "allocations", std::move( allocationsJson ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace );
+                }
+                if( method == "gpu.resource.views" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "views", viewsFromStore() }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace );
+                if( method == "gpu.resource.mesh_buffers" ) return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "parts", partsFromStore( true ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace );
+                if( method == "gpu.resource.vg_pages" )
+                {
+                    const auto page = ParsePage( params, method, trace ); json values = json::array(); const auto total = resource->virtualGeometry.size();
+                    const auto begin = std::min( page.offset, total ); const auto end = begin + std::min( page.limit, total - begin );
+                    for( auto index = begin; index < end; ++index ) { const auto& item = resource->virtualGeometry[index]; const auto& value = item.value;
+                        values.push_back( { { "generation", Decimal( item.generation ) }, { "runtime_resource_id", Decimal( value.runtimeResourceId ) },
+                            { "page_definition_id", Decimal( value.pageDefinitionId ) }, { "episode_id", Decimal( value.episodeId ) },
+                            { "page_index", value.pageIndex }, { "gpu_page_index", value.gpuPageIndex }, { "cluster_index", value.clusterIndex },
+                            { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
+                            { "frame_id", Decimal( value.frameId ) }, { "page_kind", value.pageKind },
+                            { "operation", GpuCatalogOperationName( value.operation ) }, { "exactness", GpuExactnessName( value.exactness ) },
+                            { "time_ns", Decimal( value.time ) } } ); }
+                    return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "pages", std::move( values ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace,
+                        PageJson( page, end - begin, NextCursor( page, method, trace, end - begin, end < total ) ) );
+                }
+                if( method == "gpu.resource.raytracing_chain" )
+                {
+                    const auto page = ParsePage( params, method, trace ); size_t total = 0; auto values = relationsFromStore( page.offset + page.limit, total, true );
+                    if( page.offset != 0 && values.is_array() ) values.erase( values.begin(), values.begin() + std::min( page.offset, values.size() ) );
+                    const auto returned = values.size(); return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                        { "relations", std::move( values ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace,
+                        PageJson( page, returned, NextCursor( page, method, trace, returned, page.offset + returned < total ) ) );
+                }
+                if( method == "gpu.resource.references" )
+                {
+                    const auto page = ParsePage( params, method, trace ); std::vector<analysis::GpuPassWorkingSet> passes; bool hasMore = false;
+                    if( !reader->PassesForResource( resourceId, page.offset, page.limit, passes, hasMore, sidecarError ) )
+                        throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                    json references = json::array(); for( const auto& pass : passes ) references.push_back( {
+                        { "pass_id", Decimal( pass.passId ) }, { "frame_id", Decimal( pass.frameId ) }, { "name", pass.name },
+                        { "direct", std::binary_search( pass.directResources.begin(), pass.directResources.end(), resourceId ) },
+                        { "direct_physical_bytes", Decimal( pass.directPhysicalBytes ) }, { "inclusive_physical_bytes", Decimal( pass.inclusivePhysicalBytes ) } } );
+                    size_t rangeTotal = 0; auto ranges = rangesFromStore( page.offset, page.limit, rangeTotal );
+                    return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "passes", std::move( references ) },
+                        { "ranges", std::move( ranges ) }, { "range_count", Decimal( rangeTotal ) },
+                        { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } }, trace,
+                        PageJson( page, passes.size(), NextCursor( page, method, trace, passes.size(), hasMore ) ) );
+                }
+                if( method == "gpu.resource.explain" )
+                {
+                    auto result = resourceJsonFromStore( *resource, true ); result["present"] = true;
+                    json allocationsJson = json::array(); if( resource->allocationId != 0 ) if( auto allocation = reader->FindAllocation( resource->allocationId, sidecarError ) )
+                        allocationsJson.push_back( { { "allocation_id", Decimal( allocation->allocationId ) }, { "size_bytes", Decimal( allocation->sizeBytes ) },
+                            { "resident_bytes", Decimal( allocation->residentBytes ) }, { "heap_id", Decimal( allocation->heapId ) } } );
+                    std::vector<analysis::GpuPassWorkingSet> passes; bool hasMore = false; reader->PassesForResource( resourceId, 0, DefaultPageSize, passes, hasMore, sidecarError );
+                    json references = json::array(); for( const auto& pass : passes ) references.push_back( { { "pass_id", Decimal( pass.passId ) },
+                        { "frame_id", Decimal( pass.frameId ) }, { "name", pass.name } } );
+                    result["allocations"] = std::move( allocationsJson ); result["pass_references"] = std::move( references );
+                    result["views"] = viewsFromStore(); result["parts"] = partsFromStore( false );
+                    size_t rangeTotal = 0, logicalTotal = 0, relationTotal = 0;
+                    result["pass_ranges"] = rangesFromStore( 0, DefaultPageSize, rangeTotal );
+                    result["logical_bindings"] = logicalsFromStore( DefaultPageSize, logicalTotal );
+                    result["relations"] = relationsFromStore( DefaultPageSize, relationTotal, false );
+                    result["pass_range_count"] = Decimal( rangeTotal ); result["logical_binding_count"] = Decimal( logicalTotal );
+                    result["relation_count"] = Decimal( relationTotal ); result["pass_ranges_truncated"] = rangeTotal > DefaultPageSize;
+                    result["logical_bindings_truncated"] = logicalTotal > DefaultPageSize; result["relations_truncated"] = relationTotal > DefaultPageSize;
+                    result["pass_references_truncated"] = hasMore; result["provenance"] = { { "identity", "exact_gpu_resource_lifetime" },
+                        { "analysis", "n29_sidecar_exact" }, { "high_level_owner", "unavailable_n27_gpu_layer_only" } };
+                    result["unavailable"] = { "unity_object", "asset_guid", "asset_path", "prefab", "scene", "load_instance" };
+                    return Success( id, std::move( result ), trace );
+                }
+            }
+        }
 
         // Batch generation is a transport property shared by a contiguous
         // record range. Resolve it once per record kind. The previous helper

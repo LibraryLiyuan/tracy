@@ -131,7 +131,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "data", "partial", "omitted_count", "budget", "warnings"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.32.0" },
+        "schema_version": { "const": "1.33.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": true },
         "trace": { "$ref": "#/$defs/trace" },
@@ -158,7 +158,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "error"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.32.0" },
+        "schema_version": { "const": "1.33.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": false },
         "error": {

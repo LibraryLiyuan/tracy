@@ -80,9 +80,9 @@ foreach ($replaySource in @($segmentReplay, $converterReplay)) {
 $coverage = Get-Content -Raw (Join-Path $root 'query\schema\coverage-v1.json') | ConvertFrom-Json
 $fields = Get-Content -Raw (Join-Path $root 'query\schema\coverage-fields-v1.json') | ConvertFrom-Json
 $mcpCoverage = Get-Content -Raw (Join-Path $root 'query\schema\coverage-mcp-v1.json') | ConvertFrom-Json
-Require ($coverage.schema_version -eq '1.32.0') 'Domain coverage schema is not 1.32.0.'
-Require ($fields.schema_version -eq '1.32.0') 'Field coverage schema is not 1.32.0.'
-Require ($mcpCoverage.schema_version -eq '1.32.0') 'MCP coverage schema is not 1.32.0.'
+Require ($coverage.schema_version -eq '1.33.0') 'Domain coverage schema is not 1.33.0.'
+Require ($fields.schema_version -eq '1.33.0') 'Field coverage schema is not 1.33.0.'
+Require ($mcpCoverage.schema_version -eq '1.33.0') 'MCP coverage schema is not 1.33.0.'
 foreach ($domain in @('gpu.catalog', 'gpu.resource', 'gpu.memory')) {
     Require ($coverage.domains.domain -contains $domain) "Coverage domain missing: $domain"
 }

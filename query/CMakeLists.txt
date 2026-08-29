@@ -64,13 +64,16 @@ add_executable(tracy-query src/main.cpp)
 target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT tracy-query)
 
+add_executable(tracy-gpu-analysis-build src/gpu-analysis-build.cpp)
+target_link_libraries(tracy-gpu-analysis-build PRIVATE TracyAnalysis TracyServer)
+
 option(JN_STREAM_CONVERT_SEMANTIC_TOOLS "Build local stream-convert semantic acceptance tools" OFF)
 if(JN_STREAM_CONVERT_SEMANTIC_TOOLS)
     add_executable(tracy-job-semantic-hash tests/JobSemanticHash.cpp)
     target_link_libraries(tracy-job-semantic-hash PRIVATE TracyQueryProtocol)
 endif()
 
-install(TARGETS tracy-query DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS tracy-query tracy-gpu-analysis-build DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 include(CTest)
 if(BUILD_TESTING)
@@ -102,6 +105,9 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-gpu-analysis-tests)
     add_test(NAME tracy-gpu-analysis COMMAND tracy-gpu-analysis-tests)
 
+    add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)
+    target_link_libraries(tracy-gpu-analysis-corpus PRIVATE TracyAnalysis)
+
     add_executable(tracy-query-mcp-transcript-tests tests/McpTranscriptTests.cpp)
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-mcp-transcript-tests)
@@ -109,6 +115,15 @@ if(BUILD_TESTING)
 
     add_test(NAME tracy-query-version COMMAND tracy-query --version)
     add_test(NAME tracy-query-doctor COMMAND tracy-query --doctor)
+
+    if(WIN32)
+        find_program(TRACY_PWSH_EXECUTABLE pwsh)
+        if(TRACY_PWSH_EXECUTABLE)
+            add_test(NAME tracy-gpu-analysis-n29-static
+                COMMAND "${TRACY_PWSH_EXECUTABLE}" -NoProfile -File
+                    "${CMAKE_CURRENT_LIST_DIR}/tests/GpuAnalysisN29StaticTests.ps1")
+        endif()
+    endif()
 
     set(TRACY_ACCEPTANCE_TRACE_ROOT "$ENV{TRACY_ACCEPTANCE_TRACE_ROOT}" CACHE PATH "Directory containing local Tracy acceptance captures")
     if(TRACY_ACCEPTANCE_TRACE_ROOT)

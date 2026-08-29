@@ -746,6 +746,7 @@ private:
         uint64_t selectedPass = 0;
         uint64_t selectedHeap = 0;
         uint64_t currentFrame = 0;
+        uint64_t requestedGpuPassFrame = ~uint64_t( 0 );
         int currentFrameIndex = -1;
         uint64_t frameA = 0;
         uint64_t frameB = 0;

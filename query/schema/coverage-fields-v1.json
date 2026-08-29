@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.32.0",
+  "schema_version": "1.33.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -593,7 +593,7 @@
       "persisted_fields": ["connection_generation", "batch_sequence/count/checksum", "resource_id", "pointer lifetime interval", "definition_revision", "resource classification and provenance", "name dictionary and provenance", "allocation/heap/alias/residency", "view definition", "logical binding", "part/range/subresource", "VG page episode", "RTAS relation", "detailed evidence checkpoint and exactness"],
       "query_fields": ["present", "status", "generation", "valid", "reason", "resource_id", "name", "name_provenance", "classification", "classification_provenance", "capacity_bytes", "physical_bytes", "resident_bytes", "create_time_ns", "destroy_time_ns", "open_boundary", "definition_revision", "callsite_id", "stack_ref", "stack_provenance", "allocations", "views", "parts", "ranges", "logical_bindings", "alias_group", "pass_id", "queue", "frame_id", "VG pages/episodes", "RTAS chain", "exactness", "sample_status", "unavailable_reason"],
       "unmapped_fields": [],
-      "methods": ["gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain", "gpu.resource.lifetime", "gpu.resource.allocations", "gpu.resource.references", "gpu.resource.views", "gpu.resource.mesh_buffers", "gpu.resource.raytracing_chain", "gpu.resource.vg_pages", "gpu.pass.resources", "gpu.pass.vg_evidence", "gpu.memory.peak", "gpu.memory.by_type", "gpu.memory.by_pass", "gpu.memory.churn"],
+      "methods": ["gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain", "gpu.resource.lifetime", "gpu.resource.allocations", "gpu.resource.references", "gpu.resource.views", "gpu.resource.mesh_buffers", "gpu.resource.raytracing_chain", "gpu.resource.vg_pages", "gpu.pass.by_frame", "gpu.pass.resources", "gpu.pass.vg_evidence", "gpu.memory.peak", "gpu.memory.by_type", "gpu.memory.by_pass", "gpu.memory.churn"],
       "status": "complete"
     },
     {

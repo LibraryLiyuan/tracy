@@ -23,6 +23,8 @@ public:
 
     ~SegmentTraceSource() override;
 
+    std::optional<std::filesystem::path> BackingPath() const override { return SnapshotPath(); }
+
     std::shared_ptr<const stream::JournalReadView> RefreshView();
     const std::shared_ptr<stream::JournalStore>& Store() const { return m_store; }
     bool PreferIndex() const { return m_preferIndex; }

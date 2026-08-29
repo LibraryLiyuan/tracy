@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -888,6 +889,13 @@ class TraceSource
 {
 public:
     virtual ~TraceSource() = default;
+
+    // A snapshot may have an independently queryable analysis sidecar. The
+    // default implementation keeps older adapters source-agnostic. Lazy
+    // sources use PrepareForQuery() to materialize the full Worker only when a
+    // requested domain cannot be served by the sidecar.
+    virtual std::optional<std::filesystem::path> BackingPath() const { return std::nullopt; }
+    virtual void PrepareForQuery( std::string_view ) const {}
 
     virtual std::vector<Capability> GetCapabilities() const = 0;
     virtual TraceReadView AcquireReadView() const = 0;

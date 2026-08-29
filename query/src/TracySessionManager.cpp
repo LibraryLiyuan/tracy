@@ -1,6 +1,7 @@
 #include "TracySessionManager.hpp"
 
 #include "TracySegmentTraceSource.hpp"
+#include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
@@ -101,6 +102,10 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
             {
                 return SegmentTraceSource::Open( path, std::move( callback ), preferIndex );
             }
+            // Completed N29 sidecars are self-contained for GPU Resource
+            // Analysis. Open them in milliseconds and defer the full Worker
+            // until a non-sidecar query is actually requested.
+            if( auto source = analysis::GpuAnalysisTraceSource::OpenIfReady( path, callback ) ) return source;
             if( preferIndex )
             {
                 auto validation = QueryIndex::Validate( path );

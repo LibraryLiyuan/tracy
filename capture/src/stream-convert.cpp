@@ -7,6 +7,8 @@
 #include "../../stream/src/TracyStreamJournal.hpp"
 #include "../../stream/src/TracyStreamReplay.hpp"
 #include "../../stream/src/TracyStreamSnapshotMap.hpp"
+#include "../../analysis/TracyGpuAnalysisSidecar.hpp"
+#include "../../analysis/TracyHash.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -67,6 +69,7 @@ struct Options
     bool purgeCache = false;
     bool keepFailedOutput = false;
     bool diagnostics = false;
+    bool noGpuAnalysis = false;
     uint64_t testCancelAfterRecords = 0;
     bool testFailBeforeValidate = false;
     Mode mode = Mode::Offline;
@@ -80,6 +83,7 @@ void Usage()
         "  [--compression fast|balanced|legacy] [--threads auto|N]\n"
         "  [--require-clean-end] [--progress-json path] [--report-json path]\n"
         "  [--no-cache] [--purge-cache] [--keep-failed-output] [--disk-budget bytes]\n"
+        "  [--no-gpu-analysis] (diagnostic: do not emit the N29 GPU analysis sidecar)\n"
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
         "  Development only: [--mode offline|legacy] [-p legacy-port]\n"
         "                    [--diagnostics] [--test-cancel-after-records N] [--test-fail-before-validate]\n"
@@ -201,6 +205,10 @@ bool ParseArguments( int argc, char** argv, Options& options )
         else if( argument == "--keep-failed-output" )
         {
             options.keepFailedOutput = true;
+        }
+        else if( argument == "--no-gpu-analysis" )
+        {
+            options.noGpuAnalysis = true;
         }
         else if( argument == "--disk-budget" && i + 1 < argc )
         {
@@ -543,6 +551,22 @@ public:
 private:
     std::filesystem::path m_path;
     bool m_keep;
+    bool m_published = false;
+};
+
+class TemporaryDirectoryGuard
+{
+public:
+    explicit TemporaryDirectoryGuard( std::filesystem::path path ) : m_path( std::move( path ) ) {}
+    ~TemporaryDirectoryGuard()
+    {
+        if( m_published ) return;
+        std::error_code ignored; std::filesystem::remove_all( m_path, ignored );
+    }
+    void Published() { m_published = true; }
+
+private:
+    std::filesystem::path m_path;
     bool m_published = false;
 };
 
@@ -2014,8 +2038,10 @@ int main( int argc, char** argv )
         std::filesystem::remove( temporaryOutput, ignored );
     }
     const auto compression = GetCompressionSettings( options.compression, options.threads );
+    tracy::analysis::Sha256Builder outputSha256;
     auto output = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open(
-        temporaryOutput.string().c_str(), tracy::FileCompression::Zstd, compression.level, int( compression.streams ) ) );
+        temporaryOutput.string().c_str(), tracy::FileCompression::Zstd, compression.level, int( compression.streams ),
+        [&]( const void* data, size_t size ) { outputSha256.Update( data, size ); } ) );
     if( !output )
     {
         std::fprintf( stderr, "Cannot create output snapshot.\n" );
@@ -2026,7 +2052,40 @@ int main( int argc, char** argv )
     output->Finish();
     const auto statistics = output->GetCompressionStatistics();
     output.reset();
+    const auto outputSha256Hex = outputSha256.FinalHex();
     const auto writeSeconds = ElapsedSeconds( writeStart );
+    const auto finalGpuAnalysisPath = tracy::analysis::GpuAnalysisSidecarPath( options.output );
+    auto temporaryGpuAnalysisPath = finalGpuAnalysisPath;
+    temporaryGpuAnalysisPath += ".converting";
+    TemporaryDirectoryGuard gpuAnalysisGuard( temporaryGpuAnalysisPath );
+    bool gpuAnalysisAttempted = false;
+    bool gpuAnalysisReadyToPublish = false;
+    bool gpuAnalysisPublished = false;
+    std::string gpuAnalysisError;
+    double gpuAnalysisSeconds = 0;
+    if( !options.noGpuAnalysis && worker.GetJnTraceData().gpuCatalogPresent )
+    {
+        gpuAnalysisAttempted = true;
+        const auto gpuAnalysisStart = std::chrono::steady_clock::now();
+        progress.SetStage( ProgressStage::Write, worker.GetJnTraceData().gpuCatalogResources.size(), "gpu_analysis_records" );
+        try
+        {
+            std::error_code ignored; std::filesystem::remove_all( temporaryGpuAnalysisPath, ignored );
+            auto identity = tracy::analysis::ComputeGpuAnalysisQuickIdentity( temporaryOutput );
+            identity.sha256 = outputSha256Hex;
+            tracy::analysis::GpuAnalysisSidecarControl sidecarControl;
+            sidecarControl.progress = [&]( float value, const char* ) {
+                progress.Update( uint64_t( value * worker.GetJnTraceData().gpuCatalogResources.size() ),
+                    worker.GetJnTraceData().gpuCatalogResources.size() );
+            };
+            gpuAnalysisReadyToPublish = tracy::analysis::WriteGpuAnalysisRawSidecar(
+                temporaryGpuAnalysisPath, identity, worker.GetJnTraceData(), sidecarControl, gpuAnalysisError );
+        }
+        catch( const std::exception& exception ) { gpuAnalysisError = exception.what(); }
+        gpuAnalysisSeconds = ElapsedSeconds( gpuAnalysisStart );
+        if( !gpuAnalysisReadyToPublish )
+            std::fprintf( stderr, "Warning: trace conversion will continue, but GPU analysis sidecar generation failed: %s\n", gpuAnalysisError.c_str() );
+    }
     if( options.diagnostics )
     {
         std::printf( "GPU Catalog resolver: calls=%llu generation_end=%llu post_end_batch=%llu finalize_save=%llu input_units=%llu unresolved=%llu core_unresolved=%llu time=%.3fs\n",
@@ -2090,6 +2149,13 @@ int main( int argc, char** argv )
         return 6;
     }
     temporaryGuard.Published();
+    if( gpuAnalysisReadyToPublish )
+    {
+        gpuAnalysisPublished = tracy::analysis::PublishGpuAnalysisSidecar(
+            temporaryGpuAnalysisPath, finalGpuAnalysisPath, options.overwrite, gpuAnalysisError );
+        if( gpuAnalysisPublished ) gpuAnalysisGuard.Published();
+        else std::fprintf( stderr, "Warning: trace is valid, but GPU analysis sidecar publication failed: %s\n", gpuAnalysisError.c_str() );
+    }
 
     const auto mapStart = std::chrono::steady_clock::now();
     std::string snapshotMapError;
@@ -2122,8 +2188,8 @@ int main( int argc, char** argv )
         static_cast<unsigned long long>( scan.validSize ), static_cast<unsigned long long>( statistics.second ),
         statistics.first == 0 ? 0. : 100. * statistics.second / statistics.first,
         CompressionName( options.compression ), options.threads );
-    std::printf( "Stages: scan=%.3fs analysis=%.3fs replay=%.3fs write=%.3fs validate=%.3fs map=%.3fs total=%.3fs.\n",
-        scanSeconds, analysisSeconds, replaySeconds, writeSeconds, validationSeconds, mapSeconds,
+    std::printf( "Stages: scan=%.3fs analysis=%.3fs replay=%.3fs write=%.3fs gpu_analysis=%.3fs validate=%.3fs map=%.3fs total=%.3fs.\n",
+        scanSeconds, analysisSeconds, replaySeconds, writeSeconds, gpuAnalysisSeconds, validationSeconds, mapSeconds,
         totalSeconds );
     if( !options.reportJson.empty() )
     {
@@ -2157,15 +2223,23 @@ int main( int argc, char** argv )
             << "\",\"total_unresolved\":\"" << gpuCatalogResolveStats.totalUnresolved
             << "\",\"core_unresolved\":\"" << gpuCatalogResolveStats.coreUnresolved
             << "\",\"nanoseconds\":\"" << gpuCatalogResolveStats.fullResolveNanoseconds
-            << "\"},\"stages_seconds\":{"
+            << "\"},\"gpu_analysis\":{\"attempted\":" << ( gpuAnalysisAttempted ? "true" : "false" )
+            << ",\"published\":" << ( gpuAnalysisPublished ? "true" : "false" )
+            << ",\"reason\":\"" << JsonEscape( gpuAnalysisError ) << "\"},\"stages_seconds\":{"
             << "\"scan\":" << scanSeconds << ",\"analysis\":" << analysisSeconds << ",\"replay\":" << replaySeconds
-            << ",\"write\":" << writeSeconds << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
+            << ",\"write\":" << writeSeconds << ",\"gpu_analysis\":" << gpuAnalysisSeconds
+            << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
             << mapSeconds << ",\"total\":" << totalSeconds << "}}";
         if( !AtomicWriteText( options.reportJson, report.str() ) )
         {
             std::fprintf( stderr, "Snapshot is valid, but --report-json could not be published.\n" );
             return 7;
         }
+    }
+    if( gpuAnalysisAttempted && !gpuAnalysisPublished )
+    {
+        std::fprintf( stderr, "Trace conversion completed, but GPU analysis failed (trace_complete_analysis_failed): %s\n", gpuAnalysisError.c_str() );
+        return 8;
     }
     return 0;
 }

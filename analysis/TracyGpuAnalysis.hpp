@@ -17,7 +17,7 @@ namespace tracy::analysis
 {
 
 inline constexpr uint32_t GpuAnalysisSchemaVersion = 1;
-inline constexpr uint32_t GpuAnalysisCacheSchemaVersion = 1;
+inline constexpr uint32_t GpuAnalysisCacheSchemaVersion = 2;
 
 enum class GpuAnalysisState : uint8_t
 {
@@ -66,6 +66,27 @@ struct GpuAnalysisManifest
     std::string reason;
 };
 
+template<typename T>
+struct GpuCatalogAnalysisRecord
+{
+    uint64_t generation = 0;
+    T value {};
+};
+
+struct GpuLogicalAnalysisRecord
+{
+    uint64_t generation = 0;
+    JnGpuCatalogLogicalRecordV1 value {};
+    std::string name;
+};
+
+using GpuViewAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuCatalogViewRecordV1>;
+using GpuPartAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuCatalogPartRecordV1>;
+using GpuRelationAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuCatalogRelationRecordV1>;
+using GpuRangeAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuRangeSetRecordV1>;
+using GpuVgAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuCatalogVgRecordV1>;
+using GpuDetailedEvidenceAnalysisRecord = GpuCatalogAnalysisRecord<JnGpuDetailedEvidenceRecordV1>;
+
 struct GpuResourceAnalysisRecord
 {
     uint64_t generation = 0;
@@ -82,6 +103,9 @@ struct GpuResourceAnalysisRecord
     uint32_t definitionRevision = 0;
     uint32_t declaredUsageMask = 0;
     uint32_t observedUsageMask = 0;
+    uint32_t backendFlags = 0;
+    uint32_t sampleCount = 0;
+    uint32_t nameOriginalLength = 0;
     uint32_t format = 0;
     uint64_t width = 0;
     uint32_t height = 0;
@@ -96,15 +120,18 @@ struct GpuResourceAnalysisRecord
     uint8_t nameProvenance = 0;
     uint8_t stackProvenance = 0;
     uint8_t exactness = 0;
+    uint8_t flags = 0;
     bool openBoundary = false;
     bool aliveAtEnd = false;
     bool invalid = false;
     std::string name;
     std::vector<size_t> history;
-    std::vector<size_t> views;
-    std::vector<size_t> parts;
-    std::vector<size_t> relations;
-    std::vector<size_t> ranges;
+    std::vector<GpuViewAnalysisRecord> views;
+    std::vector<GpuLogicalAnalysisRecord> logicals;
+    std::vector<GpuPartAnalysisRecord> parts;
+    std::vector<GpuRelationAnalysisRecord> relations;
+    std::vector<GpuRangeAnalysisRecord> ranges;
+    std::vector<GpuVgAnalysisRecord> virtualGeometry;
 };
 
 struct GpuAllocationAnalysisRecord
@@ -116,6 +143,7 @@ struct GpuAllocationAnalysisRecord
     uint64_t sizeBytes = 0;
     uint64_t offsetBytes = 0;
     uint64_t residentBytes = 0;
+    uint64_t alignmentBytes = 0;
     uint64_t createTime = 0;
     uint64_t destroyTime = 0;
     uint64_t lastUpdateTime = 0;
@@ -124,6 +152,7 @@ struct GpuAllocationAnalysisRecord
     uint8_t allocationKind = 0;
     uint8_t residencyState = 0;
     uint8_t exactness = 0;
+    uint32_t flags = 0;
     bool openBoundary = false;
     bool aliveAtEnd = false;
     bool invalid = false;
@@ -148,6 +177,7 @@ struct GpuPassWorkingSet
     std::string name;
     std::vector<uint64_t> directResources;
     std::vector<uint64_t> inclusiveResources;
+    std::vector<GpuDetailedEvidenceAnalysisRecord> detailedEvidence;
 };
 
 struct GpuResidencyInterval
@@ -221,6 +251,11 @@ struct GpuAnalysisSnapshot
 };
 
 GpuAnalysisSnapshot BuildGpuAnalysisSnapshot( const JnTraceData& data, const GpuMemoryAttribution* attribution = nullptr,
+    const GpuAnalysisBudget& budget = {}, const GpuAnalysisBuildControl& control = {} );
+// Offline sidecar construction owns its raw input. This variant releases raw
+// vectors as soon as their normalized representation has been built, avoiding
+// raw + derived full-capture overlap on large traces.
+GpuAnalysisSnapshot BuildGpuAnalysisSnapshotConsuming( JnTraceData& data, const GpuMemoryAttribution* attribution = nullptr,
     const GpuAnalysisBudget& budget = {}, const GpuAnalysisBuildControl& control = {} );
 GpuFrameComparison CompareGpuFrames( const GpuAnalysisSnapshot& snapshot, uint64_t frameA, uint64_t frameB );
 

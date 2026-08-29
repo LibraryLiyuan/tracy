@@ -530,6 +530,12 @@ void View::DrawJnGpuResources()
             selectedFrameValid ? "" : " (no matching frame)" );
     else ImGui::TextDisabled( "FrameSet: %s | scope=global / lifetime | per-pass column is producer frame identity",
         m_frames ? GetFrameSetName( *m_frames ) : "No frame set" );
+    if( m_jnGpuUi.passScope == 0 && m_gpuAnalysis && m_jnGpuUi.currentFrame != m_jnGpuUi.requestedGpuPassFrame )
+    {
+        std::string frameLoadError;
+        if( m_gpuAnalysis->LoadPassFrame( m_jnGpuUi.currentFrame, frameLoadError ) ) m_jnGpuUi.requestedGpuPassFrame = m_jnGpuUi.currentFrame;
+        else if( !frameLoadError.empty() && frameLoadError != "gpu_analysis_page_load_in_progress" ) m_jnGpuUi.exportStatus = frameLoadError;
+    }
     const char* tabs[] = { "Overview", "Resources", "Physical", "Passes", "Lifetime & Churn", "Quality" };
     if( ImGui::BeginTabBar( "gpuResourceTabs" ) )
     {
@@ -547,13 +553,25 @@ void View::DrawJnGpuResources()
         const double ratio = projectBudget ? double( snapshot->engineKnownPhysicalBytes ) / double( projectBudget ) : 0;
         ImGui::ProgressBar( float( std::min( ratio, 1.0 ) ), ImVec2( -1, 0 ), ratio > 1 ? "OverProjectBudget" : "Project budget" );
         ImGui::SeparatorText( "Capture summary" );
-        ImGui::Text( "Resources %zu / Allocations %zu / Passes %zu / Residency intervals %zu", snapshot->resources.size(), snapshot->allocations.size(), snapshot->passes.size(), snapshot->residency.size() );
+        ImGui::Text( "Resources %llu / Allocations %llu / Passes %llu / Residency intervals %llu",
+            static_cast<unsigned long long>( m_gpuAnalysis->ResourceCount() ),
+            static_cast<unsigned long long>( m_gpuAnalysis->AllocationCount() ),
+            static_cast<unsigned long long>( m_gpuAnalysis->PassCount() ),
+            static_cast<unsigned long long>( m_gpuAnalysis->ResidencyCount() ) );
         ImGui::Text( "DXGI Local Usage/Budget: Unavailable in this snapshot" );
         ImGui::Text( "Untracked DXGI Delta: Unavailable (not coerced to zero)" );
         ImGui::TextDisabled( "Peak time: %lld ns", static_cast<long long>( snapshot->engineKnownPhysicalPeakTimeNs ) );
     }
     else if( m_jnGpuUi.tab == 1 )
     {
+        const auto pageCount = m_gpuAnalysis->ResourcePageCount(); const auto page = m_gpuAnalysis->ResourcePage(); std::string pageError;
+        if( ImGui::Button( "< Resource page" ) && page > 0 )
+        { if( m_gpuAnalysis->LoadResourcePage( page - 1, pageError ) ) { m_jnGpuUi.resourceOrder.clear(); m_jnGpuUi.selectedResource = 0; } }
+        ImGui::SameLine(); ImGui::Text( "Page %zu / %zu (total records %llu)", pageCount ? page + 1 : 0, pageCount,
+            static_cast<unsigned long long>( m_gpuAnalysis->ResourceCount() ) ); ImGui::SameLine();
+        if( ImGui::Button( "Resource page >" ) && page + 1 < pageCount )
+        { if( m_gpuAnalysis->LoadResourcePage( page + 1, pageError ) ) { m_jnGpuUi.resourceOrder.clear(); m_jnGpuUi.selectedResource = 0; } }
+        if( !pageError.empty() ) ImGui::TextColored( ImVec4( 1.f, .3f, .3f, 1.f ), "%s", pageError.c_str() );
         ImGui::SetNextItemWidth( -1 ); ImGui::InputTextWithHint( "##gpuSearch", "Search name, ID or type", m_jnGpuUi.search, sizeof( m_jnGpuUi.search ) );
         ImGui::BeginChild( "gpuResourceList", ImVec2( ImGui::GetContentRegionAvail().x * .60f, 0 ), ImGuiChildFlags_Borders ); DrawResourceTable( *snapshot, m_jnGpuUi ); ImGui::EndChild();
         ImGui::SameLine(); ImGui::BeginChild( "gpuResourceInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
@@ -561,6 +579,14 @@ void View::DrawJnGpuResources()
     }
     else if( m_jnGpuUi.tab == 2 )
     {
+        const auto pageCount = m_gpuAnalysis->AllocationPageCount(); const auto page = m_gpuAnalysis->AllocationPage(); std::string pageError;
+        if( ImGui::Button( "< Allocation page" ) && page > 0 )
+        { if( m_gpuAnalysis->LoadAllocationPage( page - 1, pageError ) ) { m_jnGpuUi.allocationOrder.clear(); m_jnGpuUi.selectedAllocation = 0; } }
+        ImGui::SameLine(); ImGui::Text( "Page %zu / %zu (total records %llu)", pageCount ? page + 1 : 0, pageCount,
+            static_cast<unsigned long long>( m_gpuAnalysis->AllocationCount() ) ); ImGui::SameLine();
+        if( ImGui::Button( "Allocation page >" ) && page + 1 < pageCount )
+        { if( m_gpuAnalysis->LoadAllocationPage( page + 1, pageError ) ) { m_jnGpuUi.allocationOrder.clear(); m_jnGpuUi.selectedAllocation = 0; } }
+        if( !pageError.empty() ) ImGui::TextColored( ImVec4( 1.f, .3f, .3f, 1.f ), "%s", pageError.c_str() );
         DrawHeapMap( *snapshot, m_jnGpuUi ); ImGui::BeginChild( "gpuAllocationList", ImVec2( ImGui::GetContentRegionAvail().x * .60f, 0 ), ImGuiChildFlags_Borders );
         DrawAllocationTable( *snapshot, m_jnGpuUi ); ImGui::EndChild(); ImGui::SameLine(); ImGui::BeginChild( "gpuAllocationInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
         const auto allocation = snapshot->FindAllocation( m_jnGpuUi.selectedAllocation );
@@ -575,6 +601,13 @@ void View::DrawJnGpuResources()
     }
     else if( m_jnGpuUi.tab == 3 )
     {
+        const auto pageCount = m_gpuAnalysis->PassPageCount(); const auto page = m_gpuAnalysis->PassPage(); std::string pageError;
+        if( ImGui::Button( "< Pass page" ) && page > 0 )
+        { if( m_gpuAnalysis->LoadPassPage( page - 1, pageError ) ) { m_jnGpuUi.requestedGpuPassFrame = ~uint64_t( 0 ); m_jnGpuUi.passOrder.clear(); m_jnGpuUi.selectedPass = 0; } }
+        ImGui::SameLine(); ImGui::Text( "Page %zu / %zu", pageCount ? page + 1 : 0, pageCount ); ImGui::SameLine();
+        if( ImGui::Button( "Pass page >" ) && page + 1 < pageCount )
+        { if( m_gpuAnalysis->LoadPassPage( page + 1, pageError ) ) { m_jnGpuUi.requestedGpuPassFrame = ~uint64_t( 0 ); m_jnGpuUi.passOrder.clear(); m_jnGpuUi.selectedPass = 0; } }
+        if( !pageError.empty() ) ImGui::TextColored( ImVec4( 1.f, .3f, .3f, 1.f ), "%s", pageError.c_str() );
         ImGui::SetNextItemWidth( 130 * GetScale() ); ImGui::InputScalar( "Frame A", ImGuiDataType_U64, &m_jnGpuUi.frameA ); ImGui::SameLine();
         ImGui::SetNextItemWidth( 130 * GetScale() ); ImGui::InputScalar( "Frame B", ImGuiDataType_U64, &m_jnGpuUi.frameB );
         if( m_jnGpuUi.frameA && m_jnGpuUi.frameB )

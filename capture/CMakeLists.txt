@@ -18,6 +18,7 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server_vendor.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
 set(PROGRAM_FILES
     src/capture.cpp
@@ -28,7 +29,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE TracyServer TracyStreamCore TracyG
 set_property(DIRECTORY ${CMAKE_CURRENT_LIST_DIR} PROPERTY VS_STARTUP_PROJECT ${PROJECT_NAME})
 
 add_executable(tracy-stream-convert src/stream-convert.cpp)
-target_link_libraries(tracy-stream-convert PRIVATE TracyServer TracyStreamCore)
+target_link_libraries(tracy-stream-convert PRIVATE TracyServer TracyStreamCore TracyAnalysis)
 if(JN_STREAM_CONVERT_DEV_TOOLS)
     target_compile_definitions(tracy-stream-convert PRIVATE JN_STREAM_CONVERT_DEV_TOOLS=1)
     add_executable(tracy-trace-compare src/trace-compare.cpp)

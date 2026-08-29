@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <stdio.h>
 #include <string.h>
@@ -135,13 +136,16 @@ class FileWrite
     };
 
 public:
-    static FileWrite* Open( const char* fn, FileCompression comp = FileCompression::Fast, int level = 1, int streams = -1 )
+    using WriteObserver = std::function<void( const void*, size_t )>;
+
+    static FileWrite* Open( const char* fn, FileCompression comp = FileCompression::Fast, int level = 1, int streams = -1,
+        WriteObserver observer = {} )
     {
         auto f = fopen( fn, "wb" );
         if( !f ) return nullptr;
         if( streams <= 0 ) streams = std::max<int>( 1, std::thread::hardware_concurrency() );
         if( streams > 255 ) streams = 255;
-        return new FileWrite( f, comp, level, streams );
+        return new FileWrite( f, comp, level, streams, std::move( observer ) );
     }
 
     ~FileWrite()
@@ -179,20 +183,21 @@ public:
     std::pair<size_t, size_t> GetCompressionStatistics() const { return std::make_pair( m_srcBytes, m_dstBytes ); }
 
 private:
-    FileWrite( FILE* f, FileCompression comp, int level, int streams )
+    FileWrite( FILE* f, FileCompression comp, int level, int streams, WriteObserver observer )
         : m_offset( 0 )
         , m_file( f )
+        , m_observer( std::move( observer ) )
         , m_srcBytes( 0 )
         , m_dstBytes( 0 )
     {
         assert( streams > 0 );
         assert( streams < 256 );
 
-        fwrite( TracyHeader, 1, sizeof( TracyHeader ), m_file );
+        WritePhysical( TracyHeader, sizeof( TracyHeader ) );
         uint8_t u8 = comp == FileCompression::Zstd ? 1 : 0;
-        fwrite( &u8, 1, 1, m_file );
+        WritePhysical( &u8, 1 );
         u8 = streams;
-        fwrite( &u8, 1, 1, m_file );
+        WritePhysical( &u8, 1 );
 
         m_streams.reserve( streams );
         for( int i=0; i<streams; i++ )
@@ -264,8 +269,14 @@ private:
         hnd.outputReady = false;
         const uint32_t size = hnd.stream.GetSize();
         m_dstBytes += size;
-        fwrite( &size, 1, sizeof( size ), m_file );
-        fwrite( hnd.stream.GetCompressedData(), 1, size, m_file );
+        WritePhysical( &size, sizeof( size ) );
+        WritePhysical( hnd.stream.GetCompressedData(), size );
+    }
+
+    void WritePhysical( const void* data, size_t size )
+    {
+        const auto written = fwrite( data, 1, size, m_file );
+        if( written == size && m_observer ) m_observer( data, size );
     }
 
     static void Worker( StreamHandle* hnd )
@@ -293,6 +304,7 @@ private:
     int m_streamPending = 0;
     std::vector<std::unique_ptr<StreamHandle>> m_streams;
     FILE* m_file;
+    WriteObserver m_observer;
 
     size_t m_srcBytes;
     size_t m_dstBytes;

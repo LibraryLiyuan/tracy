@@ -1,76 +1,27 @@
-#ifndef __TRACYWORKERTRACESOURCE_HPP__
-#define __TRACYWORKERTRACESOURCE_HPP__
+#ifndef __TRACYGPUANALYSISTRACESOURCE_HPP__
+#define __TRACYGPUANALYSISTRACESOURCE_HPP__
 
-#include "TracyTraceSource.hpp"
-#include "TracyMemoryAnalysis.hpp"
+#include "TracyGpuAnalysisStore.hpp"
+#include "TracyWorkerTraceSource.hpp"
 
-#include <filesystem>
-#include <functional>
-#include <memory>
-#include <stdexcept>
-
-namespace tracy { class SerializedZoneSink; }
+#include <mutex>
 
 namespace tracy::analysis
 {
 
-enum class TraceLoadErrorCode
-{
-    NotFound,
-    OpenFailed,
-    UnsupportedVersion,
-    LegacyVersion,
-    Corrupt,
-    ResourceLimit,
-    Internal
-};
-
-class TraceLoadError : public std::runtime_error
+// Lightweight snapshot adapter used when a completed N29 sidecar is present.
+// GPU Resource Analysis queries never construct a Worker. Any other query
+// explicitly calls PrepareForQuery(), which materializes and then delegates to
+// the regular WorkerTraceSource.
+class GpuAnalysisTraceSource final : public TraceSource
 {
 public:
-    TraceLoadError( TraceLoadErrorCode code, std::string message, int traceVersion = 0 )
-        : std::runtime_error( std::move( message ) )
-        , code( code )
-        , traceVersion( traceVersion )
-    {}
+    static std::unique_ptr<GpuAnalysisTraceSource> OpenIfReady( const std::filesystem::path& path,
+        WorkerTraceSource::StateCallback stateCallback = {} );
 
-    TraceLoadErrorCode code;
-    int traceVersion;
-};
-
-struct WorkerLoadProgress
-{
-    std::string stage;
-    uint64_t completed = 0;
-    uint64_t total = 0;
-    uint64_t subCompleted = 0;
-    uint64_t subTotal = 0;
-};
-
-enum class WorkerTraceLoadMode
-{
-    Full,
-    CompactIndex,
-    IndexedSidecar
-};
-
-class WorkerTraceSource final : public TraceSource
-{
-public:
-    using StateCallback = std::function<void( TraceSourceState )>;
-
-    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full, SerializedZoneSink* serializedZoneSink = nullptr );
-    static WorkerLoadProgress GetLoadProgress();
-    static std::string ComputeFingerprint( const std::filesystem::path& path );
-    ~WorkerTraceSource() override;
-
-    std::optional<std::filesystem::path> BackingPath() const override { return Path(); }
-
-    void WriteCompactSnapshot( const std::filesystem::path& path );
-    std::optional<std::string> ResolveStringIndex( uint32_t index ) const;
-
-    WorkerTraceSource( const WorkerTraceSource& ) = delete;
-    WorkerTraceSource& operator=( const WorkerTraceSource& ) = delete;
+    std::optional<std::filesystem::path> BackingPath() const override { return m_path; }
+    void PrepareForQuery( std::string_view method ) const override;
+    bool WorkerLoaded() const;
 
     std::vector<Capability> GetCapabilities() const override;
     TraceReadView AcquireReadView() const override;
@@ -81,19 +32,16 @@ public:
     std::vector<MemoryPoolDto> GetMemoryPools() const override;
     std::vector<PlotDto> GetPlotList() const override;
     std::vector<LockDto> GetLocks() const override;
-
     std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const override;
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
-
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
     std::vector<JobDto> GetJobs() const override;
-    std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
@@ -107,7 +55,6 @@ public:
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
     std::vector<CallsiteDto> GetCallsites() const override;
     std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override;
-    std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
@@ -122,15 +69,10 @@ public:
     std::vector<SymbolAddressMappingDto> GetSymbolAddressMappings( size_t offset, size_t limit ) const override;
     std::optional<SymbolAddressMappingDto> ResolveSymbolAddress( uint64_t address ) const override;
     std::vector<SourceLocationDto> GetSourceLocations() const override;
-
     std::vector<CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override;
-    std::vector<CallstackFrameDto> ResolveParentCallstacks( const std::vector<uint32_t>& callstacks, size_t maxDepth ) const override;
     std::vector<SourceTextDto> ResolveSources( const std::vector<std::string>& sourceRefs, size_t maxBytes ) const override;
     std::vector<SymbolCodeDto> ResolveSymbols( const std::vector<std::string>& symbolRefs, size_t maxBytes ) const override;
     std::vector<FrameImageDto> ResolveFrameImages( const std::vector<std::string>& imageRefs, size_t maxBytes ) const override;
-
-    const std::filesystem::path& Path() const;
-    const std::string& Fingerprint() const;
     std::vector<FrameDto> GetFramesForSet( size_t frameSetIndex, size_t offset, size_t limit ) const override;
     std::vector<int64_t> GetFrameDurations( size_t frameSetIndex ) const override;
     std::vector<SourceResourceDto> GetSourceResources() const override;
@@ -148,10 +90,6 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
-    GpuMemoryAttribution GetGpuMemoryAttributionFromExternalZones(
-        const std::vector<GpuMemoryCpuZoneInput>& cpuInputs,
-        const std::vector<GpuMemoryGpuZoneInput>& gpuInputs ) const;
-    std::vector<GpuMemoryAllocationInput> GetGpuMemoryAllocationInputs() const;
     SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
     BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;
@@ -161,13 +99,18 @@ public:
     BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
-    std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId ) const;
-    class Impl;
-    explicit WorkerTraceSource( std::unique_ptr<Impl> impl );
-    std::unique_ptr<Impl> m_impl;
-};
+    GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
+        std::shared_ptr<GpuAnalysisStoreReader> reader );
+    WorkerTraceSource& Worker() const;
+    bool IsSidecarMethod( std::string_view method ) const;
 
-const char* ToString( TraceLoadErrorCode code );
+    std::filesystem::path m_path;
+    GpuAnalysisSidecarManifest m_manifest;
+    std::shared_ptr<GpuAnalysisStoreReader> m_reader;
+    std::shared_ptr<JnTraceData> m_catalogSummary;
+    mutable std::mutex m_workerMutex;
+    mutable std::unique_ptr<WorkerTraceSource> m_worker;
+};
 
 }
 

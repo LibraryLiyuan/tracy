@@ -3,6 +3,7 @@
 
 #include "TracySessionManager.hpp"
 #include "TracyGpuAnalysis.hpp"
+#include "TracyGpuAnalysisStore.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -20,7 +21,7 @@ namespace tracy::query
 {
 
 inline constexpr const char* QueryProtocol = "tracy-query/1";
-inline constexpr const char* QuerySchemaVersion = "1.32.0";
+inline constexpr const char* QuerySchemaVersion = "1.33.0";
 inline constexpr size_t DefaultPageSize = 100;
 inline constexpr size_t MaximumPageSize = 1000;
 inline constexpr size_t DefaultTopN = 20;
@@ -82,6 +83,12 @@ private:
         size_t bytes = 0;
         uint64_t access = 0;
     };
+    struct GpuStoreCacheEntry
+    {
+        std::shared_ptr<analysis::GpuAnalysisStoreReader> value;
+        std::filesystem::path path;
+        uint64_t access = 0;
+    };
 
     nlohmann::json Dispatch( const nlohmann::json& id, const std::string& method, const nlohmann::json& params, const std::optional<std::string>& defaultTraceId, std::stop_token stopToken );
     std::shared_ptr<const analysis::GpuMemoryAttribution> CachedGpuAttribution( const std::string& traceId,
@@ -89,6 +96,8 @@ private:
     std::shared_ptr<const analysis::MemoryFrameSnapshot> CachedMemorySnapshot( const std::string& traceId, const std::shared_ptr<analysis::TraceSource>& source, size_t frameSet, size_t frame, std::vector<std::string> poolRefs, bool allGpu );
     std::shared_ptr<const analysis::GpuAnalysisSnapshot> CachedGpuSnapshot( const std::string& traceId,
         const std::shared_ptr<analysis::TraceSource>& source );
+    std::shared_ptr<analysis::GpuAnalysisStoreReader> CachedGpuStoreReader( const std::string& traceId,
+        const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error );
     void EvictCache( size_t incomingBytes );
     void EraseTraceCache( const std::string& traceId );
 
@@ -99,6 +108,7 @@ private:
     uint64_t m_cacheClock = 0;
     std::unordered_map<std::string, GpuCacheEntry> m_gpuCache;
     std::unordered_map<std::string, GpuSnapshotCacheEntry> m_gpuSnapshotCache;
+    std::unordered_map<std::string, GpuStoreCacheEntry> m_gpuStoreCache;
     std::unordered_map<std::string, MemoryCacheEntry> m_memoryCache;
 };
 
