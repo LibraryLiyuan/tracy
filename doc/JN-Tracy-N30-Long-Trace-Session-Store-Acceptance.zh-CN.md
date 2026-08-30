@@ -475,6 +475,11 @@ GREEN：
 - `JnMemAllocCallsiteNamed`使用已注册SiteReuse Callsite的全局Callstack ID；传统`MemAlloc/FreeCallstack*`保留逐事件栈。命名池StringData允许延迟到达，最终按稳定名称、再按native pool id排序。
 - `memory.pools/events/get/active_at_time/frame_snapshot/diff/callstack_tree/leak_candidates`现由Session Memory Reader提供，不实例化Worker；`memory.gpu`只在至少一个`GPU D3D12 `命名池存在时声明可查询。
 - `memory.bin`保存source SHA-256、source size、固定manifest generation、Pool/Event/Active计数与独立SHA-256；Final Audit核对五类alloc、四类free、两类discard的Inventory源事件守恒，并拒绝同尺寸payload篡改。
+- Sampling域新增`sampling-index/1/exact/samples.bin`：构建时按native thread使用独立顺序work file，普通Sample与ContextSwitch Sample立即落盘；内存仅保留线程文件状态、Callstack内容字典和Sample Dictionary，不保存与总样本数成比例的事件容器。
+- Sampling Reader严格保持Worker的输出顺序：native thread升序，每线程先普通Sample、再ContextSwitch Sample；时间复用`m_refTimeCtx`语义，Sample、ContextSwitch Sample、ContextSwitch和ThreadWakeup共同推进同一delta时钟。
+- `CallstackPayload`与`CallstackSampleDictionary`进入统一内容寻址Callstack ID空间；普通Sample消费pending callstack，Ref Sample只接受已经声明的dictionary id，未知、重复或协议状态冲突均阻止构建。
+- `sample.list`现由Session Sampling Reader直接分页扫描固定宽度记录，不实例化Worker；能力只声明已经实现的`sample.list`，Ghost Zone、Flamegraph和Symbol Statistics仍保持不可用，禁止过度宣称。
+- `samples.bin`保存source强身份、generation、普通/ContextSwitch Sample、dictionary与Callstack payload计数；Final Audit执行完整SHA-256并与Inventory四类Sample QueueType逐项守恒。
 
 ### TDD证据
 
@@ -485,6 +490,7 @@ RED：
 - Frame Canonical fact存在但磁盘语义Reader尚未实现时，测试按预期失败于`Session advertises Frame only after its disk-backed semantic reader is ready`。
 - Job Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Job only after its disk-backed semantic reader is ready`。
 - Memory Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Memory only after its disk-backed semantic reader is ready`。
+- Sampling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Sampling only after its disk-backed semantic reader is ready`。
 
 GREEN：
 
@@ -506,11 +512,14 @@ GREEN：
 - Memory GREEN恢复默认池3个allocation与1个free：`0xdead`第一代为`[18,22]ns/4096 B`，第二代从24ns开放；`0xbeef`从26ns开放。首帧`[12,36]ns`统计为allocated 13,312 B、freed 5,120 B、end 8,192 B。
 - 命名池`GPU D3D12 Texture`恢复1个allocation/free；allocation使用全局Callstack ID 4和SiteReuse Callsite 79，free使用逐事件Callstack ID 5，直接Reader与Query 1.34一致。
 - Final Audit在`memory.bin`同尺寸内容被篡改后返回`session_memory_file_sha256_mismatch`。
+- Sampling GREEN恢复thread 42的普通Sample=14ns与ContextSwitch Sample=16ns；两者都由Sample Dictionary解析到全局Callstack ID 1，直接Reader和Query 1.34 `sample.list`结果一致。
+- Final Audit在`samples.bin`同尺寸内容被篡改后返回`session_sampling_file_sha256_mismatch`。
 - Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- GPU Zone、Sampling和FrameImage的语义分页Reader。
+- GPU Zone、Context Switch调度区间和FrameImage的语义分页Reader。
+- Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation磁盘Reader尚未完成，因此Sample目前能返回稳定`callstack_ref`，但不能在Session路径解析到完整符号帧。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
@@ -534,6 +543,29 @@ tracy-query-contract              Passed
 tracy-gpu-analysis                Passed
 tracy-trace-session-store         Passed
 tracy-trace-session-inventory     Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Sampling Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `5C4AAAA311C0D539006147F20E10507CB6B10B67049670D9F403E0DE7AE4D85C` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `F273B497BBFEC64435C5E30747447E217DCDB9097154BD05B2204548D5CDD191` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
 tracy-query-version               Passed
 tracy-query-doctor                Passed
 tracy-gpu-analysis-n29-static     Passed

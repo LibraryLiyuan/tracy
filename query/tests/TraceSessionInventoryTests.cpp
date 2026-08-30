@@ -5,6 +5,7 @@
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyTraceSessionMemory.hpp"
+#include "TracyTraceSessionSampling.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -971,6 +972,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::CallstackSampleDictionary, 1,
         std::string( reinterpret_cast<const char*>( sampleDictionaryStack.data() ),
             sizeof( sampleDictionaryStack ) ) );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackSampleRef;
+    item.callstackSampleRef = { { 107, 42 }, 1 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackSampleContextSwitchRef;
+    item.callstackSampleRef = { { 1, 42 }, 1 };
+    AppendQueueItem( frame, item );
     const std::array<uint64_t, 2> jobCallstack { 0x20202020, 0x30303030 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x3333,
         std::string( reinterpret_cast<const char*>( jobCallstack.data() ), sizeof( jobCallstack ) ) );
@@ -1362,6 +1371,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         memoryCapability->present && memoryCapability->indexed && memoryCapability->queryable;
     test.Check( sessionMemoryReady,
         "Session advertises Memory only after its disk-backed semantic reader is ready" );
+    const auto sampleCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "sample"; } );
+    const bool sessionSamplesReady = sampleCapability != sessionCapabilities.end() &&
+        sampleCapability->present && sampleCapability->indexed && sampleCapability->queryable;
+    test.Check( sessionSamplesReady,
+        "Session advertises Sampling only after its disk-backed semantic reader is ready" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1410,6 +1425,16 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             memorySnapshot.total.allocatedBytes == 13312 && memorySnapshot.total.freedBytes == 5120 &&
             memorySnapshot.total.endBytes == 8192 && memorySnapshot.activeAtEnd.size() == 2,
             "Session Memory reader builds the exact first-frame allocation snapshot" );
+    }
+    if( sessionSamplesReady )
+    {
+        const auto samples = sessionSource->ScanSampleEvents( {} );
+        test.Check( samples.size() == 2 && samples[0].timeNs == 14 &&
+            samples[0].threadRef == sessionSource->MakeEntityRef( "thread", 42 ) &&
+            samples[0].callstack == 1 && samples[0].kind == "sample" &&
+            samples[1].timeNs == 16 && samples[1].callstack == 1 &&
+            samples[1].kind == "context_switch",
+            "Session Sampling reader restores dictionary callstacks and shared context time" );
     }
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
@@ -1533,6 +1558,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         {
             test.Check( false, std::string( "Query 1.34 Session Memory Reader is unavailable: " ) + exception.what() );
         }
+        if( sessionSamplesReady ) try
+        {
+            const auto samples = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-samples" }, { "method", "sample.list" },
+                { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( samples.value( "ok", false ) && samples["data"]["samples"].size() == 2 &&
+                samples["data"]["samples"][0]["time_ns"] == "14" &&
+                samples["data"]["samples"][0]["callstack"] == "1" &&
+                samples["data"]["samples"][1]["kind"] == "context_switch",
+                "Query 1.34 reads Session Sampling events without a Worker" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session Sampling Reader is unavailable: " ) + exception.what() );
+        }
     }
     const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
         publishedSession, manifest ) / "frames.bin";
@@ -1578,6 +1619,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedMemoryStats, error ) &&
         error == "session_memory_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Memory semantic index" );
+    const auto samplingFile = tracy::analysis::TraceSessionSamplingIndexRoot(
+        publishedSession, manifest ) / "samples.bin";
+    {
+        std::fstream damaged( samplingFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x2d );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionSamplingStats rejectedSamplingStats;
+    test.Check( !tracy::analysis::AuditTraceSessionSamplingDerived(
+        publishedSession, manifest, rejectedSamplingStats, error ) &&
+        error == "session_sampling_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Sampling semantic index" );
 }
 
 }

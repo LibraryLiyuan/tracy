@@ -7,6 +7,7 @@
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
 #include "TracyTraceSessionMemory.hpp"
+#include "TracyTraceSessionSampling.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -190,6 +191,10 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "memory_frees " << value.stats.memoryFrees << '\n';
     out << "memory_discards " << value.stats.memoryDiscards << '\n';
     out << "memory_unknown_frees " << value.stats.memoryUnknownFrees << '\n';
+    out << "sample_events " << value.stats.sampleEvents << '\n';
+    out << "context_switch_sample_events " << value.stats.contextSwitchSampleEvents << '\n';
+    out << "sample_dictionary_entries " << value.stats.sampleDictionaryEntries << '\n';
+    out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -257,6 +262,10 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "memory_frees" ) in >> value.stats.memoryFrees;
         else if( key == "memory_discards" ) in >> value.stats.memoryDiscards;
         else if( key == "memory_unknown_frees" ) in >> value.stats.memoryUnknownFrees;
+        else if( key == "sample_events" ) in >> value.stats.sampleEvents;
+        else if( key == "context_switch_sample_events" ) in >> value.stats.contextSwitchSampleEvents;
+        else if( key == "sample_dictionary_entries" ) in >> value.stats.sampleDictionaryEntries;
+        else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -440,6 +449,13 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.memoryDiscards = memoryStats.discardEvents;
     index.stats.memoryUnknownFrees = memoryStats.unknownFrees;
 
+    TraceSessionSamplingStats samplingStats;
+    if( !BuildTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, error ) ) return false;
+    index.stats.sampleEvents = samplingStats.samples;
+    index.stats.contextSwitchSampleEvents = samplingStats.contextSwitchSamples;
+    index.stats.sampleDictionaryEntries = samplingStats.dictionaryEntries;
+    index.stats.callstackPayloads = samplingStats.callstackPayloads;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -526,6 +542,13 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         memoryStats.discardEvents != index.stats.memoryDiscards ||
         memoryStats.unknownFrees != index.stats.memoryUnknownFrees )
     { if( error.empty() ) error = "session_memory_derived_audit_mismatch"; return false; }
+    TraceSessionSamplingStats samplingStats;
+    if( !AuditTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, error ) ||
+        samplingStats.samples != index.stats.sampleEvents ||
+        samplingStats.contextSwitchSamples != index.stats.contextSwitchSampleEvents ||
+        samplingStats.dictionaryEntries != index.stats.sampleDictionaryEntries ||
+        samplingStats.callstackPayloads != index.stats.callstackPayloads )
+    { if( error.empty() ) error = "session_sampling_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
@@ -559,6 +582,16 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         memoryDiscards != index.stats.memoryDiscards ||
         index.stats.memoryEvents != index.stats.memoryAllocations )
     { error = "session_memory_source_count_mismatch"; return false; }
+    const auto samples = queueCounts[size_t( QueueType::CallstackSample )].count +
+        queueCounts[size_t( QueueType::CallstackSampleRef )].count;
+    const auto contextSwitchSamples =
+        queueCounts[size_t( QueueType::CallstackSampleContextSwitch )].count +
+        queueCounts[size_t( QueueType::CallstackSampleContextSwitchRef )].count;
+    if( samples != index.stats.sampleEvents ||
+        contextSwitchSamples != index.stats.contextSwitchSampleEvents ||
+        queueCounts[size_t( QueueType::CallstackSampleDictionary )].count != index.stats.sampleDictionaryEntries ||
+        queueCounts[size_t( QueueType::CallstackPayload )].count != index.stats.callstackPayloads )
+    { error = "session_sampling_source_count_mismatch"; return false; }
     stats = index.stats;
     return true;
 }

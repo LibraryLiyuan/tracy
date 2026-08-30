@@ -52,6 +52,10 @@ struct TraceSessionDerivedStats
     uint64_t memoryFrees = 0;
     uint64_t memoryDiscards = 0;
     uint64_t memoryUnknownFrees = 0;
+    uint64_t sampleEvents = 0;
+    uint64_t contextSwitchSampleEvents = 0;
+    uint64_t sampleDictionaryEntries = 0;
+    uint64_t callstackPayloads = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

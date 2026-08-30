@@ -37,6 +37,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !cpuZoneReader ) return {};
     auto memoryReader = TraceSessionMemoryReader::Open( path, *session, error );
     if( !memoryReader ) return {};
+    auto samplingReader = TraceSessionSamplingReader::Open( path, *session, error );
+    if( !samplingReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -62,7 +64,7 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
         std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ),
-        std::move( memoryReader ) ) );
+        std::move( memoryReader ), std::move( samplingReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -70,11 +72,12 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader,
     std::shared_ptr<TraceSessionJobReader> jobReader,
     std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader,
-    std::shared_ptr<TraceSessionMemoryReader> memoryReader )
+    std::shared_ptr<TraceSessionMemoryReader> memoryReader,
+    std::shared_ptr<TraceSessionSamplingReader> samplingReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
       m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
-      m_memoryReader( std::move( memoryReader ) )
+      m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -183,7 +186,11 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         gpuMemoryPresent ? "available from the N30 Session mandatory Memory index" :
             "The source Session contains no GPU D3D12 memory pools", MemoryMethods } );
     addPending( "io", TraceSessionProtocolDomain::Io );
-    addPending( "sample", TraceSessionProtocolDomain::Sampling );
+    static const std::vector<std::string> SampleMethods = { "sample.list" };
+    const auto samplesPresent = m_samplingReader && m_samplingReader->Stats().events != 0;
+    result.push_back( Capability { "sample", samplesPresent, samplesPresent, true,
+        samplesPresent ? "available from the N30 Session mandatory Sampling index" :
+            "The source Session contains no Sampling facts", SampleMethods } );
     addPending( "hardware_sample", TraceSessionProtocolDomain::Sampling );
     addPending( "thread", TraceSessionProtocolDomain::Scheduling );
     addPending( "cpu", TraceSessionProtocolDomain::Scheduling );
@@ -242,6 +249,12 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     {
         out.counts.memoryPools = m_memoryReader->Stats().pools;
         out.counts.memoryEvents = m_memoryReader->Stats().events;
+    }
+    if( m_samplingReader )
+    {
+        out.counts.samples = m_samplingReader->Stats().samples;
+        out.counts.contextSwitchSamples = m_samplingReader->Stats().contextSwitchSamples;
+        out.counts.callstackPayloads = m_samplingReader->Stats().callstackPayloads;
     }
     return out;
 }
@@ -395,7 +408,11 @@ D0(std::vector<CpuTopologyDto>, GetCpuTopology)
 D0(std::vector<CpuUsagePointDto>, GetCpuUsage)
 D1(std::vector<ContextSwitchDto>, ScanContextSwitchEvents, const ScanRange&, range)
 D1(std::vector<CpuContextSwitchDto>, ScanCpuContextSwitchEvents, const ScanRange&, range)
-D1(std::vector<SampleDto>, ScanSampleEvents, const ScanRange&, range)
+std::vector<SampleDto> GpuAnalysisTraceSource::ScanSampleEvents( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanSampleEvents( range );
+    return m_samplingReader ? m_samplingReader->Scan( range ) : std::vector<SampleDto> {};
+}
 D1(std::vector<GhostZoneDto>, ScanGhostZones, const ScanRange&, range)
 D0(std::vector<HardwareSampleDto>, GetHardwareSamples)
 D4(std::vector<HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit)
