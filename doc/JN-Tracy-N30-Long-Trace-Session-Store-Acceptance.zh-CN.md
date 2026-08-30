@@ -78,8 +78,8 @@ Projected full replay: approximately 90–100 GiB
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
-| N30.3 Canonical/Checkpoint | InProgress | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic；完整生命周期状态待N30.4域解析补齐。 |
-| N30.4 全Canonical域 | InProgress | 全部QueueType已按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic，生命周期/质量解析继续补齐。 |
+| N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
+| N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
 | N30.7 LTS-1 | NotStarted | — |
@@ -368,14 +368,14 @@ tracy-stream-journal           Passed
 
 一次联合回归在N29 GPU Analysis固定temp目录发布时出现Windows `Access is denied`，随后可稳定复现为测试隔离与generation发布的组合缺陷：测试忽略固定temp根目录清理失败，可能复用上次中断留下的generation；Store又仅以微秒时间命名generation，并以`create_directories`接受已存在目录，最终到目录rename时才失败。修复后测试使用PID+单调nonce独立根目录；生产generation使用时间、PID和进程内原子序号，并以原子`create_directory`占位；Windows目录发布对短暂sharing/access冲突执行有界重试，已存在目标则明确返回`store_generation_collision`。同一CTest连续5次通过，不再把该问题归类为“不可复现”。
 
-### 尚未完成
+### 后续派生阶段负责
 
-- GPU calibration、staged dictionary/payload和各域生命周期的完整解析状态。
-- 跨Shard Zone、Job、Allocation、Resource、I/O状态。
+- GPU calibration、staged dictionary/payload和各域生命周期不会复制进Canonical转换checkpoint；N30.5从Canonical原始事实构建可重建索引。
+- 跨Shard Zone、Job、Allocation、Resource、I/O状态由Mandatory Derived保存，并通过Canonical事件计数与Final Audit校验。
 - 磁盘压力运行中暂停；内存硬停止与writer lease已经通过。
 - Converter级第一次/第二次Ctrl+C交互与进程级故障注入（Canonical API层的安全停止/恢复已经通过）。
 
-## 6. N30.4 全 Canonical 域（进行中）
+## 6. N30.4 全 Canonical 域（通过）
 
 ### 已完成基础
 
@@ -384,6 +384,8 @@ tracy-stream-journal           Passed
 - `TraceSessionCanonicalAudit`从已落盘Shard重新读取，不复用构建期计数器。
 - Audit逐项重算QueueType事件数、encoded bytes、variable payload bytes、17域统计、Protocol frame数、transport record数和semantic-time覆盖。
 - Audit要求所有结果与Source Inventory完全守恒；缺少一个合法Shard也会返回明确count/domain mismatch，不允许发布为完整。
+- 新增Protocol 90完整QueueType矩阵：从`0`到`NUM_TYPES-1`逐一构造合法零payload事件，要求每种类型恰好出现一次、全部落入稳定域，域总数与事件总数严格相等。
+- Canonical只保存可直接证明的协议事实；生命周期、inclusive集合等派生状态不写回Canonical，也不与Canonical并列成为第二事实来源。
 
 ### TDD证据
 
@@ -395,5 +397,6 @@ GREEN：
 - Canonical总记录额外包含2个显式ProtocolFrame事实，空frame语义不再依赖事件推断。
 - protocol frame/event/encoded bytes/transport records与Inventory逐项一致。
 - QueueType和17域的count/encoded/variable payload统计完全一致。
+- Protocol 90的全部QueueType逐项各计数1次，域分区总数与`NUM_TYPES`完全一致。
 - semantic-time覆盖只统计可证明拥有CPU语义时间的事件。
 - 从manifest删除Frame shard后，`AuditTraceSessionCanonical`明确失败，不使用其他域推测补齐。

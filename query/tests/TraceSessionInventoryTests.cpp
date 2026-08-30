@@ -337,6 +337,55 @@ void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type, cons
     std::memcpy( frame.data() + previous + fixed + sizeof( length ), value.data(), value.size() );
 }
 
+void AppendZeroProtocolEvent( std::vector<uint8_t>& frame, tracy::QueueType type )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = type;
+    const auto fixed = tracy::QueueDataSize[size_t( type )];
+    const auto previous = frame.size();
+    frame.resize( previous + fixed );
+    std::memcpy( frame.data() + previous, &item, fixed );
+    if( uint8_t( type ) >= uint8_t( tracy::QueueType::StringData ) )
+    {
+        const bool large = type == tracy::QueueType::FrameImageData ||
+            type == tracy::QueueType::SymbolCode || type == tracy::QueueType::SourceCode ||
+            type == tracy::QueueType::JnGpuReferenceSetDefinition ||
+            type == tracy::QueueType::JnGpuCatalogBatchData;
+        frame.resize( frame.size() + ( large ? sizeof( uint32_t ) : sizeof( uint16_t ) ), 0 );
+    }
+    else if( type == tracy::QueueType::SingleStringData ||
+        type == tracy::QueueType::SecondStringData )
+    {
+        frame.resize( frame.size() + sizeof( uint16_t ), 0 );
+    }
+}
+
+void TestAllProtocolQueueTypesAreCanonicalFacts( TestContext& test )
+{
+    std::vector<uint8_t> frame;
+    for( uint16_t index = 0; index < uint16_t( tracy::QueueType::NUM_TYPES ); index++ )
+        AppendZeroProtocolEvent( frame, tracy::QueueType( index ) );
+
+    tracy::analysis::TraceSessionProtocolInventory inventory;
+    std::string error;
+    test.Check( tracy::analysis::CountTraceProtocolFrame( frame, inventory, error ),
+        "decode one canonical fact for every QueueType: " + error );
+    test.Check( inventory.eventCount == uint16_t( tracy::QueueType::NUM_TYPES ),
+        "every QueueType contributes exactly one canonical source fact" );
+    uint64_t classified = 0;
+    for( uint16_t index = 0; index < uint16_t( tracy::QueueType::NUM_TYPES ); index++ )
+    {
+        test.Check( inventory.events[index].count == 1,
+            "QueueType is neither omitted nor duplicated: " + std::to_string( index ) );
+        const auto domain = tracy::analysis::ClassifyTraceProtocolEvent( uint8_t( index ) );
+        test.Check( domain < tracy::analysis::TraceSessionProtocolDomain::Count,
+            "QueueType has a stable canonical domain: " + std::to_string( index ) );
+    }
+    for( const auto& domain : inventory.domains ) classified += domain.count;
+    test.Check( classified == inventory.eventCount,
+        "stable canonical domains partition the complete protocol without loss" );
+}
+
 void TestProtocolFrameInventory( TestContext& test )
 {
     std::vector<uint8_t> frame;
@@ -778,6 +827,7 @@ int main()
         TestRecoverableTail( test, directory );
         TestBoundedMetadata( test, directory );
         TestCapacityPreflight( test );
+        TestAllProtocolQueueTypesAreCanonicalFacts( test );
         TestProtocolFrameInventory( test );
         TestCompressedProtocolInventory( test );
         TestProtocolDecoderCheckpoint( test );
