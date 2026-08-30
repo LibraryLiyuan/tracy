@@ -87,6 +87,7 @@ private:
     {
         std::shared_ptr<analysis::GpuAnalysisStoreReader> value;
         std::filesystem::path path;
+        std::optional<analysis::GpuAnalysisSidecarManifest> manifest;
         uint64_t access = 0;
     };
 
@@ -97,7 +98,8 @@ private:
     std::shared_ptr<const analysis::GpuAnalysisSnapshot> CachedGpuSnapshot( const std::string& traceId,
         const std::shared_ptr<analysis::TraceSource>& source );
     std::shared_ptr<analysis::GpuAnalysisStoreReader> CachedGpuStoreReader( const std::string& traceId,
-        const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error );
+        const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error,
+        const std::shared_ptr<analysis::TraceSource>& source = {} );
     void EvictCache( size_t incomingBytes );
     void EraseTraceCache( const std::string& traceId );
 

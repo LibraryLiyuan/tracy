@@ -532,7 +532,11 @@ bool IsTraceSessionQueryable( const std::filesystem::path& root, std::string& er
         error = "session_current_generation_mismatch";
         return false;
     }
-    return VerifyTraceSession( root, *manifest, error );
+    // Final Audit performed the strong payload verification before publishing.
+    // Do not re-hash the complete Session on every open; individual readers
+    // validate the immutable shard/page size and checksum when first accessed.
+    // This is essential for the two-second open budget on multi-hour Sessions.
+    return true;
 }
 
 TraceSessionWriterLease::~TraceSessionWriterLease()

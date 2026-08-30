@@ -80,8 +80,8 @@ Projected full replay: approximately 90–100 GiB
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
-| N30.5 Derived/N29整合 | InProgress | Canonical GPU事实可直接重建并发布N29 derived Store；pointer生命周期解析已与传统Worker共用。其余强制索引和Final Audit待完成。 |
-| N30.6 Query/MCP/导出 | NotStarted | — |
+| N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态和有序Canonical Reader已完成，语义分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -303,7 +303,7 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 - producer在JN质量事件中声明drop时的逐域映射属于N30.4 Canonical domain decode；N30.2已完成SessionEnd关闭原因映射。
 - Inventory/Canonical统一build-state、GracefulCancel/Resume属于N30.3。
 
-## 5. N30.3 Canonical 与 Checkpoint（进行中）
+## 5. N30.3 Canonical 与 Checkpoint（通过）
 
 ### 已完成基础
 
@@ -321,6 +321,7 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 - 当前实现为正确性优先：恢复时重新顺序验证source前缀，但跳过已提交记录的payload读取和Canonical重建；后续可由持久Inventory run优化seek，不改变恢复语义。
 - 同一全局segment内按17个稳定域分别写Shard；Frame、CPU/GPU Zone、Job、Memory、Catalog、Sampling等不再混在单一`protocol`文件，所有域Shard共享该segment的source/time边界。
 - `VisitTraceSessionCanonicalShard`作为后续Derived、Query和Exporter的共享有界Reader，逐Shard验证SHA-256、header、record framing、domain、source range和record count。
+- `VisitTraceSessionCanonicalOrdered`按Checkpoint分段合并同一segment内的域Shard，并按`source sequence + protocol frame ordinal + frame offset`恢复全局顺序；只持有一个segment，内存不随录制总时长增长。
 - `TraceSessionWriterLease`使用原子目录、PID、process creation time、lease generation和heartbeat保证单writer；活跃writer被拒绝，malformed/dead lease被隔离后恢复。
 - Canonical默认soft/hard内存门禁为12/16 GiB；每次追加前先做整数安全预算检查，超过硬上限时标记`InvalidCapacity/resource_limit`并保留上一个已提交Checkpoint。
 - Shard提交后释放各域buffer capacity，避免不同域的历史峰值在长录制中永久累积。
@@ -355,6 +356,7 @@ GREEN：
 - 人工64-byte hard-memory fixture在已有Checkpoint后触发`canonical_memory_hard_limit`，manifest明确进入`InvalidCapacity/resource_limit`且保留Checkpoint。
 - 取消/恢复跨两个LZ4 frame时，第二帧Job事件继承Checkpoint中的ThreadContext=77；FrameVsync原始TSC=123456逐字保持。
 - 注入式磁盘探针在第二个Shard前耗尽reserve，返回`canonical_disk_pressure`和`InsufficientDisk/insufficient_disk`，第一个Checkpoint保持可验证。
+- 有序Reader无需调用方排序即可逐字恢复跨域事件顺序，且每个Canonical fact恰好访问一次；每段的数据Shard和Checkpoint均在暴露记录前完成校验。
 
 阶段回归：
 
@@ -403,7 +405,7 @@ GREEN：
 - semantic-time覆盖只统计可证明拥有CPU语义时间的事件。
 - 从manifest删除Frame shard后，`AuditTraceSessionCanonical`明确失败，不使用其他域推测补齐。
 
-## 7. N30.5 Mandatory Derived与N29整合（进行中）
+## 7. N30.5 Mandatory Derived与N29整合（通过）
 
 ### Canonical GPU Reader
 
@@ -449,7 +451,12 @@ GREEN：
 - `GpuAnalysisTraceSource::OpenSessionIfReady`直接打开Session GPU派生层，不实例化完整Worker；Legacy `.tracy + .jn-gpu-resource-analysis`路径保持不变。
 - Query的GPU Reader cache识别Session目录，固定读取同一个manifest generation的`derived/gpu-resource-analysis`。
 - `gpu.memory.peak`及已有N29 GPU分页查询复用同一Store Reader；Session不会生成第二份Raw GPU sidecar，也不会回退到完整内存Snapshot。
-- `session.build.status`可以在不打开Trace数据的情况下读取`.building`或已发布Session的state、generation、source identity、Canonical shard/bytes、mandatory derived、Final Audit和reason；路径仍受`--allow-root`约束。
+- Query打开Session后固定该次`manifest generation`和GPU Store Reader；即使之后`CURRENT`切换，新旧请求也不会跨generation混读。
+- Session能力区分`present`、`indexed`和`queryable`：Canonical已有事实但尚无磁盘语义Reader的域明确返回`CAPABILITY_UNAVAILABLE`，禁止伪装成空结果或回退完整Worker。
+- Session打开为O(manifest)：发布前Final Audit执行全量强校验；打开时不重算全部Shard SHA，实际读取的immutable shard/page仍在首次访问时校验大小与SHA-256。
+- `session.build.status`可以在不打开Trace数据的情况下读取`.building`或已发布Session的state、generation、source identity、Canonical shard/bytes、当前Shard、最后Checkpoint、已处理source record、阶段进度、mandatory derived、Final Audit和reason；路径仍受`--allow-root`约束。
+- Inventory支持在完整Journal record边界响应Ctrl+C并返回`cancelled_safe_restart`；不会发布部分Inventory。Derived使用`stop_token`，第二次Ctrl+C只等待安全收尾，不走进程内强杀。
+- 多个同名`.building`目录不再依赖目录枚举顺序：按source大小/强SHA筛选，再按已提交source record、manifest时间和目录名确定恢复候选。
 
 ### TDD证据
 
@@ -464,6 +471,10 @@ GREEN：
 - `OpenSessionIfReady`返回`source_kind=session`、正确source fingerprint，且`WorkerLoaded=false`。
 - Query 1.34通过`trace.open`直接打开Session目录，再执行`gpu.memory.peak`成功；结果明确来自Session mandatory N29派生层。
 - 构建中的Synthetic Session返回`CanonicalBuilding/published=false`；方法注册表、domain coverage和参数schema逐项一致。
+- `CURRENT`在`trace.open`后切换到另一generation，既有Trace ID仍从原generation查询成功。
+- Synthetic中存在CPU Zone Canonical fact但语义Reader未完成时，能力为`present=true/indexed=true/queryable=false`，`zone.cpu.search`返回`CAPABILITY_UNAVAILABLE`。
+- 发布后人工破坏一个未访问Canonical Shard，Session manifest仍可快速打开；第一次实际读取该Shard返回`session_shard_size_mismatch`，证明快速打开没有取消数据完整性门禁。
+- 有序Canonical Reader先RED为接口不存在，GREEN后恢复跨域全序且记录数完全守恒。
 - `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
 
 ### 尚未完成，不能提前通过N30.6

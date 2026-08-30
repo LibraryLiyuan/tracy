@@ -242,6 +242,29 @@ std::filesystem::path TraceSessionDomainIndexRoot( const std::filesystem::path& 
     return sessionRoot / "generations" / manifest.generation / "derived" / "session-index";
 }
 
+bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionDerivedStats& stats,
+    std::string& error )
+{
+    error.clear();
+    stats = {};
+    IndexManifest index;
+    // Final Audit already verified every immutable index file before the
+    // generation was published. Opening a Session must remain O(manifest), so
+    // payload checksums are verified lazily by the page that is actually read.
+    if( !LoadIndexManifest( TraceSessionDomainIndexRoot( sessionRoot, manifest ),
+        index, error ) ) return false;
+    if( index.sourceSha256 != manifest.source.sha256 ||
+        index.sourceSize != manifest.source.fileSize ||
+        index.generation != manifest.generation )
+    {
+        error = "session_index_identity_mismatch";
+        return false;
+    }
+    stats = index.stats;
+    return true;
+}
+
 bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot,
     TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     const TraceSessionDerivedControl& control, TraceSessionDerivedStats& stats,

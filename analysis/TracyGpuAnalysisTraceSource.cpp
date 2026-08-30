@@ -26,6 +26,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !IsTraceSessionQueryable( path, error ) ) return {};
     const auto session = LoadTraceSessionManifest( path, error );
     if( !session ) return {};
+    TraceSessionDerivedStats sessionStats;
+    if( !LoadTraceSessionDerivedStats( path, *session, sessionStats, error ) ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -49,13 +51,14 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     facade.summary.engineKnownPhysicalPeakTimeNs = reader->Overview().engineKnownPhysicalPeakTimeNs;
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
-        path, std::move( facade ), std::move( reader ), true ) );
+        path, std::move( facade ), std::move( reader ), true, sessionStats ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
-    std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode )
+    std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
+    TraceSessionDerivedStats sessionStats )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
-      m_sessionMode( sessionMode )
+      m_sessionMode( sessionMode ), m_sessionStats( sessionStats )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -68,7 +71,7 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
 
 bool GpuAnalysisTraceSource::IsSidecarMethod( std::string_view method ) const
 {
-    if( method == "gpu.catalog.status" ) return true;
+    if( method == "gpu.catalog.status" || method == "gpu.catalog.validation" ) return true;
     if( method.rfind( "gpu.resource.", 0 ) == 0 ) return true;
     if( method == "gpu.pass.by_frame" || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence" ) return true;
     return method == "gpu.memory.peak" || method == "gpu.memory.by_type" ||
@@ -99,16 +102,61 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
 {
     if( WorkerLoaded() ) return Worker().GetCapabilities();
     const std::vector<std::string> methods = {
-        "gpu.catalog.status", "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain",
+        "gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get", "gpu.resource.explain",
         "gpu.resource.lifetime", "gpu.resource.allocations", "gpu.resource.references", "gpu.resource.views",
         "gpu.resource.mesh_buffers", "gpu.resource.raytracing_chain", "gpu.resource.vg_pages",
         "gpu.pass.by_frame", "gpu.pass.resources", "gpu.pass.vg_evidence", "gpu.memory.peak", "gpu.memory.by_type",
         "gpu.memory.by_pass", "gpu.memory.churn"
     };
-    const auto capability = [&]( const char* domain ) { return Capability { domain, true, true, true,
+    const auto gpuCapability = [&]( const char* domain ) { return Capability { domain, true, true, true,
         m_sessionMode ? "available from the N30 Session mandatory GPU Resource Analysis index" :
             "available from the N29 GPU Resource Analysis sidecar", methods }; };
-    return { capability( "gpu.catalog" ), capability( "gpu.resource" ), capability( "gpu.memory" ), capability( "gpu.pass" ) };
+    std::vector<Capability> result = {
+        Capability { "system", true, true, true, "Session metadata is queryable without a Worker",
+            { "system.capabilities", "system.describe", "system.schema" } },
+        Capability { "trace", true, true, true, "Session identity and exact aggregate counts are queryable without a Worker",
+            { "trace.info", "trace.counts", "trace.overview" } },
+        gpuCapability( "gpu.catalog" ), gpuCapability( "gpu.resource" ),
+        gpuCapability( "gpu.memory" ), gpuCapability( "gpu.pass" )
+    };
+    if( !m_sessionMode ) return result;
+
+    const auto addPending = [&]( const char* domain, TraceSessionProtocolDomain sourceDomain ) {
+        const auto count = m_sessionStats.domains[size_t( sourceDomain )];
+        result.push_back( Capability { domain, count != 0, false, count != 0,
+            count != 0 ? "Canonical facts are present and indexed, but the disk-backed semantic reader is not implemented yet" :
+                "The source Session contains no Canonical facts for this domain", {} } );
+    };
+    addPending( "frame", TraceSessionProtocolDomain::Frame );
+    addPending( "zone.cpu", TraceSessionProtocolDomain::CpuZone );
+    addPending( "zone.gpu", TraceSessionProtocolDomain::GpuZone );
+    addPending( "job", TraceSessionProtocolDomain::Job );
+    addPending( "job.gfx", TraceSessionProtocolDomain::Job );
+    addPending( "memory", TraceSessionProtocolDomain::CpuMemory );
+    addPending( "memory.gpu", TraceSessionProtocolDomain::GpuMemory );
+    addPending( "io", TraceSessionProtocolDomain::Io );
+    addPending( "sample", TraceSessionProtocolDomain::Sampling );
+    addPending( "hardware_sample", TraceSessionProtocolDomain::Sampling );
+    addPending( "thread", TraceSessionProtocolDomain::Scheduling );
+    addPending( "cpu", TraceSessionProtocolDomain::Scheduling );
+    addPending( "context_switch", TraceSessionProtocolDomain::Scheduling );
+    addPending( "message", TraceSessionProtocolDomain::MessagePlotLock );
+    addPending( "plot", TraceSessionProtocolDomain::MessagePlotLock );
+    addPending( "lock", TraceSessionProtocolDomain::MessagePlotLock );
+    addPending( "source", TraceSessionProtocolDomain::SourceCallstack );
+    addPending( "symbol", TraceSessionProtocolDomain::SourceCallstack );
+    addPending( "callstack", TraceSessionProtocolDomain::SourceCallstack );
+    addPending( "runtime.script", TraceSessionProtocolDomain::ScriptRuntime );
+    addPending( "relation", TraceSessionProtocolDomain::Relation );
+    const auto timelineCount = m_sessionStats.domains[size_t( TraceSessionProtocolDomain::Frame )] +
+        m_sessionStats.domains[size_t( TraceSessionProtocolDomain::CpuZone )] +
+        m_sessionStats.domains[size_t( TraceSessionProtocolDomain::GpuZone )] +
+        m_sessionStats.domains[size_t( TraceSessionProtocolDomain::Scheduling )] +
+        m_sessionStats.domains[size_t( TraceSessionProtocolDomain::MessagePlotLock )];
+    result.push_back( Capability { "timeline", timelineCount != 0, false, timelineCount != 0,
+        timelineCount != 0 ? "Canonical timeline facts are present and indexed, but the disk-backed semantic reader is not implemented yet" :
+            "The source Session contains no Canonical timeline facts", {} } );
+    return result;
 }
 
 TraceReadView GpuAnalysisTraceSource::AcquireReadView() const

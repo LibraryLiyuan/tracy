@@ -62,6 +62,15 @@ struct CanonicalReadState
     std::vector<std::tuple<uint64_t, uint64_t, uint32_t, uint8_t>> protocolOrder;
 };
 
+struct CanonicalOrderedReadState
+{
+    uint64_t records = 0;
+    bool monotonic = true;
+    bool havePrevious = false;
+    std::tuple<uint64_t, uint64_t, uint32_t> previous {};
+    std::vector<uint8_t> protocolTypes;
+};
+
 bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& record,
     void* userData, std::string& )
 {
@@ -82,6 +91,21 @@ bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& r
     {
         state.jobThreadContext = record.threadContext;
     }
+    return true;
+}
+
+bool CountCanonicalRecordOrdered( const tracy::analysis::TraceSessionCanonicalRecord& record,
+    void* userData, std::string& )
+{
+    auto& state = *static_cast<CanonicalOrderedReadState*>( userData );
+    const auto key = std::make_tuple( record.sourceSequence,
+        record.protocolFrameOrdinal, record.protocolFrameOffset );
+    if( state.havePrevious && key < state.previous ) state.monotonic = false;
+    state.previous = key;
+    state.havePrevious = true;
+    state.records++;
+    if( record.kind == tracy::analysis::TraceSessionCanonicalRecordKind::ProtocolEvent )
+        state.protocolTypes.push_back( record.type );
     return true;
 }
 
@@ -228,6 +252,17 @@ void TestCompleteInventory( TestContext& test, const std::filesystem::path& dire
             loaded->captureEndReason == inventory.captureEndReason,
             "capture end quality round-trip" );
     }
+
+    CanonicalCancelState cancel { 0, 1 };
+    tracy::analysis::TraceSessionInventory cancelled;
+    auto cancelOptions = options;
+    cancelOptions.progress = nullptr;
+    cancelOptions.progressUserData = nullptr;
+    cancelOptions.shouldCancel = RequestCanonicalCancel;
+    cancelOptions.cancelUserData = &cancel;
+    test.Check( !tracy::analysis::BuildTraceSessionInventory(
+        path, cancelOptions, cancelled, error ) && error == "cancelled_safe_restart",
+        "Inventory Ctrl+C stops only after a committed record and never publishes a partial inventory" );
 }
 
 void TestDegradedCaptureEnd( TestContext& test, const std::filesystem::path& directory )
@@ -705,6 +740,14 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     };
     test.Check( restoredTypes == expectedTypes,
         "domain shards restore exact cross-domain protocol order using frame offsets" );
+    CanonicalOrderedReadState orderedRead;
+    test.Check( tracy::analysis::VisitTraceSessionCanonicalOrdered( sessionRoot, manifest,
+        CountCanonicalRecordOrdered, &orderedRead, error ),
+        "ordered canonical reader merges every checkpoint-bounded domain group: " + error );
+    test.Check( orderedRead.records == canonicalRecords && orderedRead.monotonic,
+        "ordered canonical reader visits every fact once in exact source order" );
+    test.Check( orderedRead.protocolTypes == expectedTypes,
+        "ordered canonical reader restores protocol event order without caller-side sorting" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
     tracy::analysis::TraceSessionCanonicalAudit audit;
@@ -908,6 +951,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     std::vector<uint8_t> frame;
     AppendThreadContextEvent( frame, 42 );
     tracy::QueueItem item {};
+    item.hdr.type = tracy::QueueType::ZoneBegin;
+    item.zoneBegin = { 104, 0x1000 };
+    AppendQueueItem( frame, item );
+    item = {};
     item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
     item.jnGpuCatalogControl = { 105, Generation, 0, 1,
         uint8_t( tracy::JnGpuCatalogControlKind::GenerationBegin ),
@@ -1060,6 +1107,25 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionSource->GetTraceInfo().fingerprint == manifest.source.sha256 &&
         !sessionSource->WorkerLoaded(),
         "open a published Session without materializing a full Worker" );
+    const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
+        []( const auto& shard ) { return shard.domain != "checkpoint"; } );
+    test.Check( corruptShard != manifest.shards.end(), "lazy checksum fixture has a Canonical data shard" );
+    if( corruptShard != manifest.shards.end() )
+    {
+        std::ofstream damaged( publishedSession / corruptShard->relativePath,
+            std::ios::binary | std::ios::app );
+        damaged.put( '\x7f' );
+        damaged.close();
+        test.Check( tracy::analysis::IsTraceSessionQueryable( publishedSession, error ),
+            "Session open stays O(manifest) after publication instead of hashing every unused shard" );
+        CanonicalReadState rejected;
+        test.Check( !tracy::analysis::VisitTraceSessionCanonicalShard( publishedSession,
+            *corruptShard, CountCanonicalRecord, &rejected, error ),
+            "the first real read still rejects a corrupted immutable Canonical shard" );
+        test.Check( error == "session_shard_size_mismatch" ||
+            error == "session_shard_sha256_mismatch",
+            "lazy payload verification reports an explicit integrity failure: " + error );
+    }
 
     tracy::query::SessionManager sessions( { directory } );
     tracy::query::QueryService query( sessions );
@@ -1074,6 +1140,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state ==
             tracy::analysis::TraceSourceState::Ready,
             "SessionTraceSource becomes ready without full Worker materialization" );
+        {
+            std::ofstream switched( publishedSession / "CURRENT", std::ios::binary | std::ios::trunc );
+            switched << "newer-generation-published-after-trace-open\n";
+        }
         const auto peak = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-peak" }, { "method", "gpu.memory.peak" },
             { "params", { { "trace_id", traceId } } }
@@ -1081,7 +1151,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( peak.value( "ok", false ) && peak["trace"]["source_kind"] == "session" &&
             peak["data"]["present"] == true &&
             peak["data"]["analysis_backend"] == "n29_gpu_resource_analysis_sidecar",
-            "Query reads exact GPU analysis from Session mandatory derived storage" );
+            "Query reads exact GPU analysis from its pinned Session generation after CURRENT changes" );
+        const auto capabilities = sessionSource->GetCapabilities();
+        const auto cpuZones = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) {
+            return value.domain == "zone.cpu";
+        } );
+        test.Check( cpuZones != capabilities.end() && cpuZones->present && !cpuZones->queryable && cpuZones->indexed,
+            "Session distinguishes present Canonical CPU-zone facts from a completed semantic reader" );
+        const auto cpuSearch = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
+            { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( !cpuSearch.value( "ok", true ) && cpuSearch["error"]["code"] == "CAPABILITY_UNAVAILABLE",
+            "Session returns capability_unavailable instead of an empty result or Worker fallback" );
     }
 }
 

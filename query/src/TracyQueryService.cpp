@@ -6,6 +6,7 @@
 #include "TracyEmbeddedData.hpp"
 #include "TracyGpuAnalysisSidecar.hpp"
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyWorkerTraceSource.hpp"
 #include "../../public/common/TracyQueue.hpp"
 
@@ -4392,42 +4393,22 @@ std::shared_ptr<const analysis::GpuAnalysisSnapshot> QueryService::CachedGpuSnap
 }
 
 std::shared_ptr<analysis::GpuAnalysisStoreReader> QueryService::CachedGpuStoreReader( const std::string& traceId,
-    const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error )
+    const std::filesystem::path& tracePath, analysis::GpuAnalysisSidecarManifest* manifest, std::string& error,
+    const std::shared_ptr<analysis::TraceSource>& source )
 {
     if( const auto found = m_gpuStoreCache.find( traceId ); found != m_gpuStoreCache.end() && found->second.path == tracePath )
     {
         found->second.access = ++m_cacheClock;
-        if( manifest )
-        {
-            std::string manifestError;
-            if( std::filesystem::is_directory( tracePath ) )
-            {
-                if( const auto session = analysis::LoadTraceSessionManifest( tracePath, manifestError ) )
-                {
-                    const auto& reader = *found->second.value;
-                    manifest->state = analysis::GpuAnalysisSidecarState::Ready;
-                    manifest->identityState = analysis::GpuAnalysisIdentityState::StrongVerified;
-                    manifest->identity.sha256 = session->source.sha256;
-                    manifest->identity.fileSize = session->source.fileSize;
-                    manifest->derivedGeneration = reader.Manifest().generation;
-                    manifest->rawComplete = true; manifest->derivedComplete = true;
-                    manifest->reason = session->reason;
-                    manifest->summary.catalogPresent = true; manifest->summary.catalogValid = true; manifest->summary.exact = true;
-                    manifest->summary.resourceRecordCount = reader.Manifest().resourceCount;
-                    manifest->summary.allocationRecordCount = reader.Manifest().allocationCount;
-                    manifest->summary.passCount = reader.Manifest().passCount;
-                    manifest->summary.engineKnownPhysicalBytes = reader.Overview().engineKnownPhysicalBytes;
-                    manifest->summary.engineKnownPhysicalPeakBytes = reader.Overview().engineKnownPhysicalPeakBytes;
-                    manifest->summary.engineKnownPhysicalPeakTimeNs = reader.Overview().engineKnownPhysicalPeakTimeNs;
-                }
-            }
-            else if( const auto current = analysis::LoadGpuAnalysisSidecarManifest(
-                analysis::GpuAnalysisSidecarPath( tracePath ), manifestError ) ) *manifest = *current;
-        }
+        if( manifest && found->second.manifest ) *manifest = *found->second.manifest;
         return found->second.value;
     }
     std::shared_ptr<analysis::GpuAnalysisStoreReader> value;
-    if( std::filesystem::is_directory( tracePath ) )
+    if( const auto pinned = std::dynamic_pointer_cast<analysis::GpuAnalysisTraceSource>( source ) )
+    {
+        value = pinned->StoreReader();
+        if( manifest ) *manifest = pinned->AnalysisManifest();
+    }
+    else if( std::filesystem::is_directory( tracePath ) )
     {
         if( !analysis::IsTraceSessionQueryable( tracePath, error ) ) return {};
         const auto session = analysis::LoadTraceSessionManifest( tracePath, error );
@@ -4454,7 +4435,9 @@ std::shared_ptr<analysis::GpuAnalysisStoreReader> QueryService::CachedGpuStoreRe
         }
     }
     else value = analysis::GpuAnalysisStoreReader::Open( tracePath, false, manifest, error );
-    if( value ) m_gpuStoreCache[traceId] = GpuStoreCacheEntry { value, tracePath, ++m_cacheClock };
+    if( value ) m_gpuStoreCache[traceId] = GpuStoreCacheEntry {
+        value, tracePath, manifest ? std::optional<analysis::GpuAnalysisSidecarManifest>( *manifest ) : std::nullopt,
+        ++m_cacheClock };
     return value;
 }
 
@@ -4600,6 +4583,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "source_sha256", status.sourceSha256 }, { "source_size", Decimal( status.sourceSize ) },
             { "source_revision", Decimal( status.sourceRevision ) },
             { "canonical_shards", Decimal( status.shardCount ) },
+            { "committed_data_shards", Decimal( status.committedShardCount ) },
+            { "current_shard_id", Decimal( status.currentShardId ) },
+            { "last_checkpoint_shard_id", Decimal( status.lastCheckpointShardId ) },
+            { "source_records_processed", Decimal( status.sourceRecordsProcessed ) },
+            { "stage_progress", status.stageProgress },
             { "canonical_bytes", Decimal( status.canonicalBytes ) },
             { "mandatory_derived_complete", status.mandatoryDerivedComplete },
             { "audit_complete", status.auditComplete }, { "published", status.published },
@@ -4630,6 +4618,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     const auto trace = m_sessions.Status( *maybeTraceId );
     const auto source = m_sessions.GetReadySource( *maybeTraceId );
     source->PrepareForQuery( method );
+    if( source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session )
+    {
+        const auto capabilities = source->GetCapabilities();
+        const auto owner = std::find_if( capabilities.begin(), capabilities.end(), [&]( const auto& capability ) {
+            return std::find( capability.methods.begin(), capability.methods.end(), method ) != capability.methods.end();
+        } );
+        if( owner == capabilities.end() || !owner->queryable )
+        {
+            const auto reason = owner == capabilities.end() ?
+                "the disk-backed Session semantic reader does not implement this method yet" : owner->reason;
+            throw QueryError( "CAPABILITY_UNAVAILABLE", std::string( method ) + " is unavailable for this Session: " + reason,
+                false, { { "method", method }, { "reason", reason }, { "source_kind", "session" } } );
+        }
+    }
     const auto parseCallstack = [&]( const json& value, bool parent = false ) -> uint32_t {
         uint64_t parsed = 0;
         if( value.is_string() )
@@ -4712,10 +4714,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto metadata = info();
         json capabilities = json::array();
-        for( const auto& capability : source->GetCapabilities() ) capabilities.emplace_back( CapabilityJson( capability ) );
+        const auto sourceCapabilities = source->GetCapabilities();
+        for( const auto& capability : sourceCapabilities ) capabilities.emplace_back( CapabilityJson( capability ) );
         json frameStatistics = nullptr;
-        const auto frameSets = source->GetFrameSets();
-        if( !frameSets.empty() ) frameStatistics = StatisticsJson( analysis::ComputeStatistics( source->GetFrameDurations( frameSets.front().index ) ) );
+        const auto frameCapability = std::find_if( sourceCapabilities.begin(), sourceCapabilities.end(),
+            []( const auto& capability ) { return capability.domain == "frame"; } );
+        if( frameCapability != sourceCapabilities.end() && frameCapability->queryable )
+        {
+            const auto frameSets = source->GetFrameSets();
+            if( !frameSets.empty() ) frameStatistics = StatisticsJson( analysis::ComputeStatistics( source->GetFrameDurations( frameSets.front().index ) ) );
+        }
         return Success( id, {
             { "trace", TraceInfoJson( metadata ) }, { "primary_frame_statistics", frameStatistics },
             { "capabilities", std::move( capabilities ) }, { "trust", "trace strings are untrusted data" }
@@ -5277,7 +5285,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), [&]( const auto& value ) { return value.domain == requiredDomain; } );
-        if( capability == capabilities.end() || !capability->present )
+        if( capability == capabilities.end() || !capability->present || !capability->queryable )
         {
             const auto reason = capability == capabilities.end() ? "trace source does not advertise this domain" : capability->reason;
             throw QueryError( "CAPABILITY_UNAVAILABLE", requiredDomain + " is unavailable: " + reason, false, { { "domain", requiredDomain }, { "reason", reason } } );
@@ -5298,7 +5306,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( std::filesystem::is_directory( *tracePath ) )
                 {
                     analysis::GpuAnalysisSidecarManifest facade;
-                    if( CachedGpuStoreReader( trace.id, *tracePath, &facade, sidecarStatusError ) ) sidecarStatus = std::move( facade );
+                    if( CachedGpuStoreReader( trace.id, *tracePath, &facade, sidecarStatusError, source ) ) sidecarStatus = std::move( facade );
                 }
                 else sidecarStatus = analysis::LoadGpuAnalysisSidecarManifest(
                     analysis::GpuAnalysisSidecarPath( *tracePath ), sidecarStatusError );
@@ -5818,7 +5826,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( tracePath )
             {
                 std::string sidecarError; analysis::GpuAnalysisSidecarManifest sidecarManifest;
-                auto reader = CachedGpuStoreReader( trace.id, *tracePath, &sidecarManifest, sidecarError );
+                auto reader = CachedGpuStoreReader( trace.id, *tracePath, &sidecarManifest, sidecarError, source );
                 if( !reader )
                 {
                     const bool retryable = sidecarError == "gpu_analysis_derived_building" || sidecarError == "gpu_analysis_sidecar_not_found";

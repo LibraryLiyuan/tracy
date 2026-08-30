@@ -1,9 +1,11 @@
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionDerived.hpp"
+#include "TracyHash.hpp"
 #include "TracyTraceSessionInventory.hpp"
 #include "TracyTraceSessionStore.hpp"
 #include "TracyProtocol.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -11,8 +13,10 @@
 #include <fstream>
 #include <iomanip>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -109,14 +113,57 @@ void PrintDerivedProgress( float value, const char* stage )
     std::fflush( stderr );
 }
 
-std::optional<std::filesystem::path> FindBuilding( const std::filesystem::path& finalPath )
+std::optional<std::filesystem::path> FindBuilding( const std::filesystem::path& finalPath,
+    const std::optional<std::filesystem::path>& sourcePath = std::nullopt )
 {
     const auto parent = finalPath.has_parent_path() ? finalPath.parent_path() : std::filesystem::current_path();
     const auto prefix = finalPath.filename().string() + ".building.";
+    struct Candidate
+    {
+        std::filesystem::path path;
+        tracy::analysis::TraceSessionManifest manifest;
+        uint64_t progress = 0;
+        std::filesystem::file_time_type writeTime {};
+    };
+    std::vector<Candidate> candidates;
     std::error_code ec;
     for( const auto& entry : std::filesystem::directory_iterator( parent, ec ) )
-        if( entry.is_directory() && entry.path().filename().string().starts_with( prefix ) ) return entry.path();
-    return std::nullopt;
+    {
+        if( !entry.is_directory() || !entry.path().filename().string().starts_with( prefix ) ) continue;
+        std::string manifestError;
+        const auto manifest = tracy::analysis::LoadTraceSessionManifest( entry.path(), manifestError );
+        if( !manifest ) continue;
+        uint64_t progress = 0;
+        for( const auto& shard : manifest->shards )
+            progress = std::max( progress, shard.sourceRecordEnd );
+        candidates.push_back( { entry.path(), *manifest, progress,
+            std::filesystem::last_write_time( entry.path() / "manifest", ec ) } );
+        ec.clear();
+    }
+    if( candidates.empty() ) return std::nullopt;
+    if( sourcePath )
+    {
+        const auto sourceBytes = std::filesystem::file_size( *sourcePath, ec );
+        if( ec ) return std::nullopt;
+        std::erase_if( candidates, [&]( const auto& candidate ) {
+            return candidate.manifest.source.fileSize != sourceBytes;
+        } );
+        if( candidates.empty() ) return std::nullopt;
+        if( candidates.size() > 1 )
+        {
+            const auto sourceSha256 = tracy::analysis::Sha256File( *sourcePath );
+            std::erase_if( candidates, [&]( const auto& candidate ) {
+                return candidate.manifest.source.sha256 != sourceSha256;
+            } );
+            if( candidates.empty() ) return std::nullopt;
+        }
+    }
+    std::sort( candidates.begin(), candidates.end(), []( const auto& left, const auto& right ) {
+        if( left.progress != right.progress ) return left.progress > right.progress;
+        if( left.writeTime != right.writeTime ) return left.writeTime > right.writeTime;
+        return left.path.filename().string() > right.path.filename().string();
+    } );
+    return candidates.front().path;
 }
 
 int PrintStatus( const std::filesystem::path& finalPath )
@@ -173,7 +220,7 @@ int main( int argc, char** argv )
     std::string generation;
     if( options.resume && !options.restartGeneration )
     {
-        const auto candidate = FindBuilding( options.output );
+        const auto candidate = FindBuilding( options.output, options.input );
         if( candidate )
         {
             const auto saved = tracy::analysis::LoadTraceSessionManifest( *candidate, error );
@@ -200,8 +247,16 @@ int main( int argc, char** argv )
         tracy::analysis::TraceSessionInventoryOptions inventoryOptions;
         inventoryOptions.runDirectory = temporaryRuns;
         inventoryOptions.progress = PrintInventoryProgress;
+        inventoryOptions.shouldCancel = Cancelled;
         if( !tracy::analysis::BuildTraceSessionInventory( options.input, inventoryOptions, inventory, error ) )
-        { std::fprintf( stderr, "Inventory failed: %s\n", error.c_str() ); return 2; }
+        {
+            if( error == "cancelled_safe_restart" )
+            {
+                std::fprintf( stderr, "Inventory cancelled safely at a committed input boundary; rerun to restart Inventory.\n" );
+                return 130;
+            }
+            std::fprintf( stderr, "Inventory failed: %s\n", error.c_str() ); return 2;
+        }
         if( inventory.protocol != tracy::ProtocolVersion )
         { std::fprintf( stderr, "Protocol mismatch: source=%u converter=%u.\n", inventory.protocol, tracy::ProtocolVersion ); return 2; }
         generation = GenerationName();
@@ -248,10 +303,30 @@ int main( int argc, char** argv )
     if( !tracy::analysis::SaveTraceSessionManifest( building, manifest, error ) )
     { std::fprintf( stderr, "Derived state save failed: %s\n", error.c_str() ); return 5; }
     tracy::analysis::TraceSessionDerivedControl derivedControl;
-    derivedControl.progress = PrintDerivedProgress;
+    std::stop_source derivedStop;
+    std::atomic<bool> derivedFinished { false };
+    std::jthread derivedCancelMonitor( [&]( std::stop_token stop ) {
+        while( !stop.stop_requested() && !derivedFinished.load( std::memory_order_acquire ) )
+        {
+            if( CancelRequests.load( std::memory_order_relaxed ) != 0 )
+            {
+                derivedStop.request_stop();
+                return;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
+        }
+    } );
+    derivedControl.stopToken = derivedStop.get_token();
+    derivedControl.progress = [&]( float value, const char* stage ) {
+        if( CancelRequests.load( std::memory_order_relaxed ) != 0 ) derivedStop.request_stop();
+        PrintDerivedProgress( value, stage );
+    };
     tracy::analysis::TraceSessionDerivedStats derivedStats;
-    if( !tracy::analysis::BuildTraceSessionMandatoryDerived(
-        building, manifest, inventory, derivedControl, derivedStats, error ) )
+    const auto derivedOk = tracy::analysis::BuildTraceSessionMandatoryDerived(
+        building, manifest, inventory, derivedControl, derivedStats, error );
+    derivedFinished.store( true, std::memory_order_release );
+    derivedCancelMonitor.request_stop();
+    if( !derivedOk )
     {
         manifest.state = error == "cancelled_resumable" ?
             tracy::analysis::TraceSessionState::CancelledResumable : tracy::analysis::TraceSessionState::DerivedFailed;

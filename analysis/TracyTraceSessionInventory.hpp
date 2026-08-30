@@ -24,6 +24,7 @@ enum class TraceSessionInventoryPhase : uint8_t
 
 using TraceSessionInventoryProgress = void ( * )( TraceSessionInventoryPhase phase,
     uint64_t completedBytes, uint64_t totalBytes, void* userData );
+using TraceSessionInventoryCancel = bool ( * )( void* userData );
 
 enum TraceSessionJournalClass : size_t
 {
@@ -53,6 +54,8 @@ struct TraceSessionInventoryOptions
     uint32_t temporaryEstimatePermille = 500;
     TraceSessionInventoryProgress progress = nullptr;
     void* progressUserData = nullptr;
+    TraceSessionInventoryCancel shouldCancel = nullptr;
+    void* cancelUserData = nullptr;
     std::filesystem::path runDirectory;
     uint64_t runTargetBytes = 64ull * 1024 * 1024;
 };

@@ -135,6 +135,21 @@ struct TemporaryTraceFiles
         activeManifest.mandatoryDerivedComplete = false;
         activeManifest.auditComplete = false;
         activeManifest.reason = "canonical_in_progress";
+        activeManifest.source.committedRevision = 100;
+        tracy::analysis::TraceSessionShard activeData;
+        activeData.shardId = 4;
+        activeData.domain = "zone_cpu";
+        activeData.sourceRecordBegin = 1;
+        activeData.sourceRecordEnd = 25;
+        activeData.fileBytes = 4096;
+        activeData.relativePath = "generations/g-active/canonical/zone_cpu/0000000000000004.jnshard";
+        tracy::analysis::TraceSessionShard activeCheckpoint = activeData;
+        activeCheckpoint.shardId = 5;
+        activeCheckpoint.domain = "checkpoint";
+        activeCheckpoint.sourceRecordBegin = 25;
+        activeCheckpoint.fileBytes = 1024;
+        activeCheckpoint.relativePath = "generations/g-active/checkpoints/0000000000000005.jnshard";
+        activeManifest.shards = { activeData, activeCheckpoint };
         assert( tracy::analysis::SaveTraceSessionManifest( this->sessionBuilding, activeManifest, sessionError ) );
     }
 
@@ -670,7 +685,13 @@ int main()
         { "path", files.sessionBuilding.string() }
     } ) );
     assert( buildStatus.at( "ok" ) && buildStatus.at( "data" ).at( "state" ) == "CanonicalBuilding" &&
-        buildStatus.at( "data" ).at( "published" ) == false );
+        buildStatus.at( "data" ).at( "published" ) == false &&
+        buildStatus.at( "data" ).at( "committed_data_shards" ) == "1" &&
+        buildStatus.at( "data" ).at( "current_shard_id" ) == "5" &&
+        buildStatus.at( "data" ).at( "last_checkpoint_shard_id" ) == "5" &&
+        buildStatus.at( "data" ).at( "source_records_processed" ) == "25" &&
+        buildStatus.at( "data" ).at( "stage_progress" ) == 0.25 &&
+        buildStatus.at( "data" ).at( "canonical_bytes" ) == "5120" );
     expectPathError( files.root / ".." / files.outsideRoot.filename() / files.outside.filename(), tracy::query::SessionErrorCode::PathNotAllowed );
     std::error_code symlinkError;
     const auto escapeLink = files.root / "escape.tracy";

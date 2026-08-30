@@ -451,6 +451,59 @@ struct CanonicalAuditVisitorState
     TraceSessionCanonicalAudit* audit = nullptr;
 };
 
+struct OwnedCanonicalRecord
+{
+    TraceSessionCanonicalRecord record;
+    uint64_t payloadOffset = 0;
+    uint32_t payloadBytes = 0;
+};
+
+struct OrderedCanonicalSegment
+{
+    static constexpr uint64_t HardMemoryBytes = 2ull * 1024 * 1024 * 1024;
+    std::vector<OwnedCanonicalRecord> records;
+    std::vector<uint8_t> payload;
+};
+
+bool CollectOrderedCanonicalRecord( const TraceSessionCanonicalRecord& record,
+    void* userData, std::string& error )
+{
+    auto& state = *static_cast<OrderedCanonicalSegment*>( userData );
+    const auto payloadBytes = uint64_t( record.payload.size() );
+    if( state.records.size() >= std::numeric_limits<uint64_t>::max() / sizeof( OwnedCanonicalRecord ) - 1 )
+    {
+        error = "canonical_ordered_group_memory_limit";
+        return false;
+    }
+    const auto metadataBytes = uint64_t( state.records.size() + 1 ) * sizeof( OwnedCanonicalRecord );
+    if( payloadBytes > std::numeric_limits<uint32_t>::max() ||
+        payloadBytes > OrderedCanonicalSegment::HardMemoryBytes ||
+        state.payload.size() > OrderedCanonicalSegment::HardMemoryBytes - payloadBytes ||
+        metadataBytes > OrderedCanonicalSegment::HardMemoryBytes - state.payload.size() - payloadBytes )
+    {
+        error = "canonical_ordered_group_memory_limit";
+        return false;
+    }
+    OwnedCanonicalRecord owned;
+    owned.record = record;
+    owned.payloadOffset = state.payload.size();
+    owned.payloadBytes = uint32_t( payloadBytes );
+    owned.record.payload = {};
+    state.payload.insert( state.payload.end(), record.payload.begin(), record.payload.end() );
+    state.records.emplace_back( std::move( owned ) );
+    return true;
+}
+
+bool CanonicalOrderLess( const OwnedCanonicalRecord& left,
+    const OwnedCanonicalRecord& right )
+{
+    if( left.record.sourceSequence != right.record.sourceSequence )
+        return left.record.sourceSequence < right.record.sourceSequence;
+    if( left.record.protocolFrameOrdinal != right.record.protocolFrameOrdinal )
+        return left.record.protocolFrameOrdinal < right.record.protocolFrameOrdinal;
+    return left.record.protocolFrameOffset < right.record.protocolFrameOffset;
+}
+
 bool VisitCanonicalForAudit( const TraceSessionCanonicalRecord& record,
     void* userData, std::string& error )
 {
@@ -741,6 +794,121 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     if( recordCount != shard.recordCount )
     {
         error = "canonical_shard_record_count_mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool VisitTraceSessionCanonicalOrdered( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionCanonicalRecordVisitor visitor,
+    void* userData, std::string& error )
+{
+    error.clear();
+    std::vector<const TraceSessionShard*> group;
+    uint64_t previousShardId = 0;
+    bool havePreviousShard = false;
+    const auto flushGroup = [&]( const TraceSessionShard& checkpoint ) -> bool {
+        if( group.empty() )
+        {
+            error = "canonical_ordered_checkpoint_without_data";
+            return false;
+        }
+        const auto sourceBegin = group.front()->sourceRecordBegin;
+        const auto sourceEnd = group.front()->sourceRecordEnd;
+        OrderedCanonicalSegment segment;
+        uint64_t groupFileBytes = 0;
+        uint64_t largestShardBytes = 0;
+        for( const auto* shard : group )
+        {
+            if( shard->fileBytes > OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes )
+            {
+                error = "canonical_ordered_group_memory_limit";
+                return false;
+            }
+            groupFileBytes += shard->fileBytes;
+            largestShardBytes = std::max( largestShardBytes, shard->fileBytes );
+        }
+        constexpr uint64_t CanonicalRecordHeaderBytes = 56;
+        const auto maximumRecords = groupFileBytes / CanonicalRecordHeaderBytes + group.size();
+        const auto maximumRecordBytes = maximumRecords * sizeof( OwnedCanonicalRecord );
+        if( maximumRecords > std::numeric_limits<size_t>::max() ||
+            maximumRecords > ( OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes ) /
+                sizeof( OwnedCanonicalRecord ) ||
+            largestShardBytes > OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes - maximumRecordBytes )
+        {
+            error = "canonical_ordered_group_memory_limit";
+            return false;
+        }
+        // Reserve from immutable shard metadata so vector growth cannot create
+        // an unaccounted transient peak while merging a large segment.
+        segment.payload.reserve( size_t( groupFileBytes ) );
+        segment.records.reserve( size_t( maximumRecords ) );
+        for( const auto* shard : group )
+        {
+            if( shard->sourceRecordBegin != sourceBegin || shard->sourceRecordEnd != sourceEnd )
+            {
+                error = "canonical_ordered_group_source_range_mismatch";
+                return false;
+            }
+            if( !VisitTraceSessionCanonicalShard( sessionRoot, *shard,
+                CollectOrderedCanonicalRecord, &segment, error ) ) return false;
+        }
+        if( checkpoint.sourceRecordBegin != sourceEnd || checkpoint.sourceRecordEnd != sourceEnd )
+        {
+            error = "canonical_ordered_checkpoint_source_range_mismatch";
+            return false;
+        }
+        std::vector<uint8_t> checkpointPayload;
+        if( !ReadTraceSessionShardPayload( sessionRoot, checkpoint, checkpointPayload, error ) ) return false;
+        std::sort( segment.records.begin(), segment.records.end(), CanonicalOrderLess );
+        for( size_t i = 1; i < segment.records.size(); ++i )
+        {
+            const auto& previous = segment.records[i - 1];
+            const auto& current = segment.records[i];
+            if( !CanonicalOrderLess( previous, current ) )
+            {
+                error = "canonical_ordered_duplicate_or_reversed_key";
+                return false;
+            }
+        }
+        for( auto& owned : segment.records )
+        {
+            if( owned.payloadOffset > segment.payload.size() ||
+                owned.payloadBytes > segment.payload.size() - owned.payloadOffset )
+            {
+                error = "canonical_ordered_payload_range_invalid";
+                return false;
+            }
+            owned.record.payload = owned.payloadBytes == 0 ? std::span<const uint8_t>() :
+                std::span<const uint8_t>( segment.payload.data() + owned.payloadOffset, owned.payloadBytes );
+            if( visitor && !visitor( owned.record, userData, error ) )
+            {
+                if( error.empty() ) error = "canonical_ordered_visitor_failed";
+                return false;
+            }
+        }
+        group.clear();
+        return true;
+    };
+
+    for( const auto& shard : manifest.shards )
+    {
+        if( havePreviousShard && shard.shardId <= previousShardId )
+        {
+            error = "canonical_ordered_shard_id_not_monotonic";
+            return false;
+        }
+        previousShardId = shard.shardId;
+        havePreviousShard = true;
+        if( shard.domain == "checkpoint" )
+        {
+            if( !flushGroup( shard ) ) return false;
+        }
+        else group.push_back( &shard );
+    }
+    if( !group.empty() )
+    {
+        error = "canonical_ordered_group_missing_checkpoint";
         return false;
     }
     return true;

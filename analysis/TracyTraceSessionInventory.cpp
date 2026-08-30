@@ -389,6 +389,11 @@ bool HashSource( const std::filesystem::path& sourcePath, uint64_t sourceFileSiz
         0, sourceFileSize, options.progressUserData );
     while( input )
     {
+        if( options.shouldCancel && options.shouldCancel( options.cancelUserData ) )
+        {
+            error = "cancelled_safe_restart";
+            return false;
+        }
         input.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( buffer.size() ) );
         const auto bytes = size_t( input.gcount() );
         if( bytes == 0 ) break;
@@ -500,6 +505,8 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
     scanOptions.maxCollectedRecords = 0;
     scanOptions.recordVisitor = VisitRecord;
     scanOptions.recordVisitorUserData = &visitor;
+    scanOptions.stopRequested = options.shouldCancel;
+    scanOptions.stopRequestedUserData = options.cancelUserData;
     const auto scan = tracy::stream::ScanJournal( sourcePath, scanOptions );
     if( !scan.HasRecoverablePrefix() )
     {
@@ -509,6 +516,11 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
     if( visitor.protocolFailed )
     {
         error = visitor.protocolError;
+        return false;
+    }
+    if( scan.code == tracy::stream::ScanCode::Stopped )
+    {
+        error = "cancelled_safe_restart";
         return false;
     }
     if( runWriter && !runWriter->Finish( error ) ) return false;

@@ -95,6 +95,13 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
 bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     const TraceSessionShard& shard, TraceSessionCanonicalRecordVisitor visitor,
     void* userData, std::string& error );
+// Restores the exact source order across domain-partitioned shards. Memory is
+// bounded by one checkpoint-delimited canonical segment and released before
+// the next segment is opened. Every data shard and checkpoint is checksum
+// verified before any record in that segment is exposed to the caller.
+bool VisitTraceSessionCanonicalOrdered( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionCanonicalRecordVisitor visitor,
+    void* userData, std::string& error );
 bool AuditTraceSessionCanonical( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     TraceSessionCanonicalAudit& audit, std::string& error );

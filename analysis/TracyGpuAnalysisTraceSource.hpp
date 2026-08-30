@@ -2,6 +2,7 @@
 #define __TRACYGPUANALYSISTRACESOURCE_HPP__
 
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyTraceSessionDerived.hpp"
 #include "TracyTraceSessionStore.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
@@ -25,6 +26,10 @@ public:
     std::optional<std::filesystem::path> BackingPath() const override { return m_path; }
     void PrepareForQuery( std::string_view method ) const override;
     bool WorkerLoaded() const;
+    // The reader is pinned when the TraceSource is opened. Query callers must
+    // reuse it so a later CURRENT switch cannot mix Session generations.
+    std::shared_ptr<GpuAnalysisStoreReader> StoreReader() const { return m_reader; }
+    const GpuAnalysisSidecarManifest& AnalysisManifest() const { return m_manifest; }
 
     std::vector<Capability> GetCapabilities() const override;
     TraceReadView AcquireReadView() const override;
@@ -103,7 +108,8 @@ public:
 
 private:
     GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
-        std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode = false );
+        std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode = false,
+        TraceSessionDerivedStats sessionStats = {} );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
 
@@ -112,6 +118,7 @@ private:
     std::shared_ptr<GpuAnalysisStoreReader> m_reader;
     std::shared_ptr<JnTraceData> m_catalogSummary;
     bool m_sessionMode = false;
+    TraceSessionDerivedStats m_sessionStats;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;
 };

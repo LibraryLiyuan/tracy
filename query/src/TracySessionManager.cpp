@@ -208,7 +208,19 @@ TraceSessionBuildSnapshot SessionManager::InspectBuild( const std::filesystem::p
     result.sourceSize = manifest->source.fileSize;
     result.sourceRevision = manifest->source.committedRevision;
     result.shardCount = manifest->shards.size();
-    for( const auto& shard : manifest->shards ) result.canonicalBytes += shard.fileBytes;
+    for( const auto& shard : manifest->shards )
+    {
+        result.canonicalBytes += shard.fileBytes;
+        result.currentShardId = std::max( result.currentShardId, shard.shardId );
+        result.sourceRecordsProcessed = std::max( result.sourceRecordsProcessed, shard.sourceRecordEnd );
+        if( shard.domain == "checkpoint" ) result.lastCheckpointShardId = std::max( result.lastCheckpointShardId, shard.shardId );
+        else result.committedShardCount++;
+    }
+    if( result.sourceRevision != 0 ) result.stageProgress = std::min( 1.0,
+        double( result.sourceRecordsProcessed ) / double( result.sourceRevision ) );
+    if( manifest->mandatoryDerivedComplete || manifest->auditComplete ||
+        manifest->state == analysis::TraceSessionState::Complete ||
+        manifest->state == analysis::TraceSessionState::CompleteSourceDegraded ) result.stageProgress = 1.0;
     result.mandatoryDerivedComplete = manifest->mandatoryDerivedComplete;
     result.auditComplete = manifest->auditComplete;
     result.published = manifest->state == analysis::TraceSessionState::Complete ||

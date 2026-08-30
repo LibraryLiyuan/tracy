@@ -78,7 +78,12 @@ struct TraceSessionBuildSnapshot
     uint64_t sourceSize = 0;
     uint64_t sourceRevision = 0;
     uint64_t shardCount = 0;
+    uint64_t committedShardCount = 0;
+    uint64_t currentShardId = 0;
+    uint64_t lastCheckpointShardId = 0;
+    uint64_t sourceRecordsProcessed = 0;
     uint64_t canonicalBytes = 0;
+    double stageProgress = 0;
     bool mandatoryDerivedComplete = false;
     bool auditComplete = false;
     bool published = false;

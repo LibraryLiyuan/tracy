@@ -39,6 +39,12 @@ struct TraceSessionDerivedControl
 
 std::filesystem::path TraceSessionDomainIndexRoot( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest );
+// Opens and verifies the immutable Session index generation. This is the
+// bounded metadata path used by SessionTraceSource; it never materializes
+// Canonical events or a traditional Worker.
+bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionDerivedStats& stats,
+    std::string& error );
 bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot,
     TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     const TraceSessionDerivedControl& control, TraceSessionDerivedStats& stats,
