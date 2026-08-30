@@ -78,7 +78,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
-| N30.3 Canonical/Checkpoint | InProgress | Raw Canonical shard、record-boundary安全取消、LZ4字典checkpoint、强身份及损坏拒绝已通过synthetic；完整语义状态、压力暂停与writer lease待完成。 |
+| N30.3 Canonical/Checkpoint | InProgress | 按17域对齐分片、共享Reader、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存硬门禁已通过synthetic；完整语义状态与磁盘压力暂停待完成。 |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
@@ -319,6 +319,11 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 - 第一次取消会封存当前Shard、提交Checkpoint、原子更新manifest为`CancelledResumable`；不会发布Session。
 - 恢复前重新校验source强身份、全部已提交Shard及Checkpoint链；从最后source sequence继续，已提交Shard不重写。
 - 当前实现为正确性优先：恢复时重新顺序验证source前缀，但跳过已提交记录的payload读取和Canonical重建；后续可由持久Inventory run优化seek，不改变恢复语义。
+- 同一全局segment内按17个稳定域分别写Shard；Frame、CPU/GPU Zone、Job、Memory、Catalog、Sampling等不再混在单一`protocol`文件，所有域Shard共享该segment的source/time边界。
+- `VisitTraceSessionCanonicalShard`作为后续Derived、Query和Exporter的共享有界Reader，逐Shard验证SHA-256、header、record framing、domain、source range和record count。
+- `TraceSessionWriterLease`使用原子目录、PID、process creation time、lease generation和heartbeat保证单writer；活跃writer被拒绝，malformed/dead lease被隔离后恢复。
+- Canonical默认soft/hard内存门禁为12/16 GiB；每次追加前先做整数安全预算检查，超过硬上限时标记`InvalidCapacity/resource_limit`并保留上一个已提交Checkpoint。
+- Shard提交后释放各域buffer capacity，避免不同域的历史峰值在长录制中永久累积。
 
 ### TDD证据
 
@@ -340,6 +345,10 @@ GREEN：
 - 同尺寸source内容替换被完整SHA-256拒绝，返回`source_sha256_mismatch`。
 - 已提交Checkpoint追加损坏字节后，恢复返回`session_shard_size_mismatch`，不会越过损坏点猜测继续。
 - Journal停止测试证明`validSize`严格等于第二个完整Record末尾，且停止前缀可恢复、不伪装为完整Session。
+- 17域分片的总记录数与源Inventory守恒；Reader逐项复现Frame=1、Job=1、Dictionary=2、Control=2测试事实。
+- 只有3字节的畸形Canonical payload返回`canonical_shard_record_header_truncated`。
+- 同一Session的第二个writer返回`session_writer_lease_active`；release后可重新获取，malformed stale lease可安全隔离恢复。
+- 人工64-byte hard-memory fixture在已有Checkpoint后触发`canonical_memory_hard_limit`，manifest明确进入`InvalidCapacity/resource_limit`且保留Checkpoint。
 
 阶段回归：
 
@@ -351,9 +360,11 @@ tracy-stream-journal           Passed
 100% tests passed, 0 failed
 ```
 
+一次联合回归曾在N29 GPU Analysis固定temp目录发布时出现Windows `Access is denied`；不涉及Session代码调用。相同二进制单独连续执行两次及随后相同CTest集合复跑均通过，当前归类为不可复现的测试临时目录占用，保留为后续故障注入观察项，不据此掩盖任何可重复失败。
+
 ### 尚未完成
 
 - 可序列化TSC/thread/dictionary/gpu calibration等完整decoder状态。
 - 跨Shard Zone、Job、Allocation、Resource、I/O状态。
-- 内存/磁盘压力暂停和writer lease。
+- 磁盘压力运行中暂停；内存硬停止与writer lease已经通过。
 - Converter级第一次/第二次Ctrl+C交互与进程级故障注入（Canonical API层的安全停止/恢复已经通过）。

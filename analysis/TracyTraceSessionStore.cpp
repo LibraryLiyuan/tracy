@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -11,6 +12,9 @@
 
 #ifdef _WIN32
 #  include <Windows.h>
+#else
+#  include <csignal>
+#  include <unistd.h>
 #endif
 
 namespace tracy::analysis
@@ -20,6 +24,14 @@ namespace
 
 constexpr uint64_t SessionShardMagic = 0x314448534e4aull; // JNSHD1
 constexpr uint64_t SessionManifestMagic = 0x314e414d534e4aull; // JNSMAN1
+
+struct WriterLeaseOwner
+{
+    uint64_t pid = 0;
+    uint64_t processCreation = 0;
+    uint64_t heartbeat = 0;
+    std::string generation;
+};
 
 #pragma pack( push, 1 )
 struct SessionShardHeader
@@ -78,6 +90,82 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary,
     error = "session_atomic_replace_failed:" + ec.message();
 #endif
     return false;
+}
+
+uint64_t CurrentUnixNanoseconds()
+{
+    return uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch() ).count() );
+}
+
+uint64_t CurrentProcessIdValue()
+{
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return uint64_t( getpid() );
+#endif
+}
+
+uint64_t ProcessCreationValue( uint64_t pid )
+{
+#ifdef _WIN32
+    HANDLE process = pid == GetCurrentProcessId() ? GetCurrentProcess() :
+        OpenProcess( PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD( pid ) );
+    if( !process ) return 0;
+    FILETIME creation {}, exit {}, kernel {}, user {};
+    const auto success = GetProcessTimes( process, &creation, &exit, &kernel, &user ) != FALSE;
+    if( process != GetCurrentProcess() ) CloseHandle( process );
+    if( !success ) return 0;
+    return uint64_t( creation.dwLowDateTime ) | ( uint64_t( creation.dwHighDateTime ) << 32 );
+#else
+    (void)pid;
+    return 0;
+#endif
+}
+
+bool ProcessMatches( const WriterLeaseOwner& owner )
+{
+    if( owner.pid == 0 ) return false;
+#ifdef _WIN32
+    const auto creation = ProcessCreationValue( owner.pid );
+    return creation != 0 && creation == owner.processCreation;
+#else
+    return kill( pid_t( owner.pid ), 0 ) == 0;
+#endif
+}
+
+bool ReadLeaseOwner( const std::filesystem::path& directory, WriterLeaseOwner& owner )
+{
+    std::ifstream input( directory / "owner", std::ios::binary );
+    std::string key;
+    while( input >> key )
+    {
+        if( key == "pid" ) input >> owner.pid;
+        else if( key == "process_creation" ) input >> owner.processCreation;
+        else if( key == "heartbeat" ) input >> owner.heartbeat;
+        else if( key == "generation" ) input >> std::quoted( owner.generation );
+        else { std::string ignored; std::getline( input, ignored ); }
+    }
+    return bool( input.eof() ) && owner.pid != 0 && !owner.generation.empty();
+}
+
+bool WriteLeaseOwner( const std::filesystem::path& directory,
+    const WriterLeaseOwner& owner, std::string& error )
+{
+    const auto target = directory / "owner";
+    auto temporary = target;
+    temporary += ".tmp";
+    std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+    if( !output ) { error = "session_writer_lease_owner_open_failed"; return false; }
+    output << "pid " << owner.pid << '\n'
+        << "process_creation " << owner.processCreation << '\n'
+        << "heartbeat " << owner.heartbeat << '\n'
+        << "generation " << std::quoted( owner.generation ) << '\n';
+    output.flush();
+    if( !output ) { error = "session_writer_lease_owner_write_failed"; return false; }
+    output.close();
+    return ReplaceFileAtomically( temporary, target, error );
 }
 
 bool RenameDirectoryAtomically( const std::filesystem::path& source,
@@ -445,6 +533,127 @@ bool IsTraceSessionQueryable( const std::filesystem::path& root, std::string& er
         return false;
     }
     return VerifyTraceSession( root, *manifest, error );
+}
+
+TraceSessionWriterLease::~TraceSessionWriterLease()
+{
+    Release();
+}
+
+TraceSessionWriterLease::TraceSessionWriterLease( TraceSessionWriterLease&& other ) noexcept
+    : m_path( std::move( other.m_path ) )
+    , m_generation( std::move( other.m_generation ) )
+    , m_pid( other.m_pid )
+    , m_processCreation( other.m_processCreation )
+{
+    other.m_path.clear();
+    other.m_pid = 0;
+    other.m_processCreation = 0;
+}
+
+TraceSessionWriterLease& TraceSessionWriterLease::operator=( TraceSessionWriterLease&& other ) noexcept
+{
+    if( this == &other ) return *this;
+    Release();
+    m_path = std::move( other.m_path );
+    m_generation = std::move( other.m_generation );
+    m_pid = other.m_pid;
+    m_processCreation = other.m_processCreation;
+    other.m_path.clear();
+    other.m_pid = 0;
+    other.m_processCreation = 0;
+    return *this;
+}
+
+bool TraceSessionWriterLease::Heartbeat( std::string& error )
+{
+    error.clear();
+    if( !Active() ) { error = "session_writer_lease_not_active"; return false; }
+    WriterLeaseOwner current;
+    if( !ReadLeaseOwner( m_path, current ) || current.pid != m_pid ||
+        current.processCreation != m_processCreation || current.generation != m_generation )
+    {
+        error = "session_writer_lease_lost";
+        return false;
+    }
+    current.heartbeat = CurrentUnixNanoseconds();
+    return WriteLeaseOwner( m_path, current, error );
+}
+
+void TraceSessionWriterLease::Release()
+{
+    if( !Active() ) return;
+    WriterLeaseOwner current;
+    if( ReadLeaseOwner( m_path, current ) && current.pid == m_pid &&
+        current.processCreation == m_processCreation && current.generation == m_generation )
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all( m_path, ignored );
+    }
+    m_path.clear();
+    m_generation.clear();
+    m_pid = 0;
+    m_processCreation = 0;
+}
+
+bool AcquireTraceSessionWriterLease( const std::filesystem::path& sessionRoot,
+    TraceSessionWriterLease& lease, std::string& error )
+{
+    error.clear();
+    if( lease.Active() ) { error = "session_writer_lease_already_owned"; return false; }
+    const auto stateDirectory = sessionRoot / "build-state";
+    const auto leaseDirectory = stateDirectory / "writer.lease";
+    std::error_code ec;
+    std::filesystem::create_directories( stateDirectory, ec );
+    if( ec ) { error = "session_writer_lease_directory_failed:" + ec.message(); return false; }
+
+    const auto pid = CurrentProcessIdValue();
+    const auto creation = ProcessCreationValue( pid );
+    if( pid == 0 ) { error = "session_writer_lease_process_identity_failed"; return false; }
+    const auto generation = std::to_string( pid ) + "-" + std::to_string( creation ) + "-" +
+        std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+
+    for( int attempt = 0; attempt < 3; attempt++ )
+    {
+        ec.clear();
+        if( std::filesystem::create_directory( leaseDirectory, ec ) )
+        {
+            WriterLeaseOwner owner { pid, creation, CurrentUnixNanoseconds(), generation };
+            if( !WriteLeaseOwner( leaseDirectory, owner, error ) )
+            {
+                std::error_code ignored;
+                std::filesystem::remove_all( leaseDirectory, ignored );
+                return false;
+            }
+            lease.m_path = leaseDirectory;
+            lease.m_generation = generation;
+            lease.m_pid = pid;
+            lease.m_processCreation = creation;
+            return true;
+        }
+        if( ec && ec != std::errc::file_exists )
+        {
+            error = "session_writer_lease_create_failed:" + ec.message();
+            return false;
+        }
+
+        WriterLeaseOwner existing;
+        if( ReadLeaseOwner( leaseDirectory, existing ) && ProcessMatches( existing ) )
+        {
+            error = "session_writer_lease_active";
+            return false;
+        }
+        auto stale = stateDirectory / ( "writer.lease.stale." + generation + "." + std::to_string( attempt ) );
+        ec.clear();
+        std::filesystem::rename( leaseDirectory, stale, ec );
+        if( ec && ec != std::errc::no_such_file_or_directory )
+        {
+            error = "session_writer_lease_stale_rename_failed:" + ec.message();
+            return false;
+        }
+    }
+    error = "session_writer_lease_race";
+    return false;
 }
 
 const char* TraceSessionStateName( TraceSessionState state )

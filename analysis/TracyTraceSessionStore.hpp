@@ -81,6 +81,29 @@ struct TraceSessionManifest
     bool auditComplete = false;
 };
 
+class TraceSessionWriterLease
+{
+public:
+    TraceSessionWriterLease() = default;
+    ~TraceSessionWriterLease();
+    TraceSessionWriterLease( TraceSessionWriterLease&& other ) noexcept;
+    TraceSessionWriterLease& operator=( TraceSessionWriterLease&& other ) noexcept;
+    TraceSessionWriterLease( const TraceSessionWriterLease& ) = delete;
+    TraceSessionWriterLease& operator=( const TraceSessionWriterLease& ) = delete;
+
+    bool Active() const { return !m_path.empty(); }
+    bool Heartbeat( std::string& error );
+    void Release();
+
+private:
+    friend bool AcquireTraceSessionWriterLease( const std::filesystem::path&,
+        TraceSessionWriterLease&, std::string& );
+    std::filesystem::path m_path;
+    std::string m_generation;
+    uint64_t m_pid = 0;
+    uint64_t m_processCreation = 0;
+};
+
 std::filesystem::path DefaultTraceSessionPath( const std::filesystem::path& streamPath );
 std::filesystem::path BuildingTraceSessionPath( const std::filesystem::path& finalPath, const std::string& generation );
 
@@ -100,6 +123,8 @@ bool VerifyTraceSessionSourceIdentity( const std::filesystem::path& sourcePath,
 bool PublishTraceSession( const std::filesystem::path& buildingPath,
     const std::filesystem::path& finalPath, const TraceSessionManifest& manifest, std::string& error );
 bool IsTraceSessionQueryable( const std::filesystem::path& root, std::string& error );
+bool AcquireTraceSessionWriterLease( const std::filesystem::path& sessionRoot,
+    TraceSessionWriterLease& lease, std::string& error );
 
 const char* TraceSessionStateName( TraceSessionState state );
 

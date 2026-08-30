@@ -4,6 +4,7 @@
 #include "TracyStreamJournal.hpp"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <limits>
 #include <vector>
@@ -43,13 +44,20 @@ bool Get64( const std::vector<uint8_t>& input, size_t& offset, uint64_t& value )
 
 struct CanonicalBuildState
 {
+    struct DomainBuffer
+    {
+        std::vector<uint8_t> payload;
+        uint64_t recordCount = 0;
+    };
+
     const std::filesystem::path* sessionRoot = nullptr;
     const std::string* generation = nullptr;
     const TraceSessionCanonicalOptions* options = nullptr;
     TraceSessionManifest* manifest = nullptr;
+    TraceSessionWriterLease* lease = nullptr;
     std::ifstream input;
     std::vector<uint8_t> payload;
-    std::vector<uint8_t> shardPayload;
+    std::array<DomainBuffer, size_t( TraceSessionProtocolDomain::Count )> domains;
     TraceSessionProtocolDecoder decoder;
     TraceSessionProtocolInventory decodedInventory;
     tracy::stream::RecordInfo currentRecord;
@@ -57,6 +65,7 @@ struct CanonicalBuildState
     uint64_t protocolEventCount = 0;
     uint64_t transportRecordCount = 0;
     uint64_t shardRecordCount = 0;
+    uint64_t shardPayloadBytes = 0;
     uint64_t shardSourceBegin = 0;
     uint64_t shardSourceEnd = 0;
     uint64_t shardTimeBegin = 0;
@@ -101,6 +110,18 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     uint8_t domain, uint32_t flags, const uint8_t* payload, uint32_t payloadBytes )
 {
     if( payloadBytes != 0 && !payload ) { state.error = "canonical_payload_missing"; return false; }
+    constexpr uint64_t RecordHeaderBytes = 40;
+    const auto recordBytes = RecordHeaderBytes + uint64_t( payloadBytes );
+    if( recordBytes > state.options->hardMemoryBytes ||
+        state.shardPayloadBytes > state.options->hardMemoryBytes - recordBytes )
+    {
+        state.error = "canonical_memory_hard_limit";
+        return false;
+    }
+    auto domainIndex = size_t( domain );
+    if( domainIndex >= state.domains.size() )
+        domainIndex = size_t( TraceSessionProtocolDomain::Other );
+    auto& output = state.domains[domainIndex];
     if( state.shardRecordCount == 0 )
     {
         state.shardSourceBegin = state.currentRecord.sequence;
@@ -108,18 +129,21 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     }
     state.shardSourceEnd = state.currentRecord.sequence;
     state.shardTimeEnd = state.currentRecord.monotonicNs;
-    state.shardPayload.push_back( kind );
-    state.shardPayload.push_back( type );
-    state.shardPayload.push_back( domain );
-    state.shardPayload.push_back( 0 );
-    Put32( state.shardPayload, flags );
-    Put32( state.shardPayload, payloadBytes );
-    Put32( state.shardPayload, 0 );
-    Put64( state.shardPayload, state.currentRecord.sequence );
-    Put64( state.shardPayload, state.currentRecord.monotonicNs );
-    Put64( state.shardPayload, state.protocolFrameOrdinal );
+    const auto before = output.payload.size();
+    output.payload.push_back( kind );
+    output.payload.push_back( type );
+    output.payload.push_back( uint8_t( domainIndex ) );
+    output.payload.push_back( 0 );
+    Put32( output.payload, flags );
+    Put32( output.payload, payloadBytes );
+    Put32( output.payload, 0 );
+    Put64( output.payload, state.currentRecord.sequence );
+    Put64( output.payload, state.currentRecord.monotonicNs );
+    Put64( output.payload, state.protocolFrameOrdinal );
     if( payloadBytes != 0 )
-        state.shardPayload.insert( state.shardPayload.end(), payload, payload + payloadBytes );
+        output.payload.insert( output.payload.end(), payload, payload + payloadBytes );
+    state.shardPayloadBytes += output.payload.size() - before;
+    output.recordCount++;
     state.shardRecordCount++;
     return true;
 }
@@ -142,17 +166,22 @@ bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
 bool FlushShard( CanonicalBuildState& state )
 {
     if( state.shardRecordCount == 0 ) return true;
-    TraceSessionShard shard;
-    shard.shardId = state.nextShardId++;
-    shard.domain = "protocol";
-    shard.timeBeginNs = int64_t( state.shardTimeBegin );
-    shard.timeEndNs = int64_t( state.shardTimeEnd );
-    shard.sourceRecordBegin = state.shardSourceBegin;
-    shard.sourceRecordEnd = state.shardSourceEnd;
-    shard.recordCount = state.shardRecordCount;
-    if( !WriteTraceSessionShard( *state.sessionRoot, *state.generation, shard,
-        state.shardPayload.data(), state.shardPayload.size(), state.error ) ) return false;
-    state.manifest->shards.emplace_back( shard );
+    for( size_t i = 0; i < state.domains.size(); i++ )
+    {
+        auto& domain = state.domains[i];
+        if( domain.recordCount == 0 ) continue;
+        TraceSessionShard shard;
+        shard.shardId = state.nextShardId++;
+        shard.domain = TraceSessionProtocolDomainName( TraceSessionProtocolDomain( i ) );
+        shard.timeBeginNs = int64_t( state.shardTimeBegin );
+        shard.timeEndNs = int64_t( state.shardTimeEnd );
+        shard.sourceRecordBegin = state.shardSourceBegin;
+        shard.sourceRecordEnd = state.shardSourceEnd;
+        shard.recordCount = domain.recordCount;
+        if( !WriteTraceSessionShard( *state.sessionRoot, *state.generation, shard,
+            domain.payload.data(), domain.payload.size(), state.error ) ) return false;
+        state.manifest->shards.emplace_back( std::move( shard ) );
+    }
 
     std::vector<uint8_t> checkpoint;
     static constexpr uint8_t Magic[8] = { 'J', 'N', 'C', 'H', 'K', 'P', 'T', '1' };
@@ -174,23 +203,29 @@ bool FlushShard( CanonicalBuildState& state )
     TraceSessionShard checkpointShard;
     checkpointShard.shardId = state.nextShardId++;
     checkpointShard.domain = "checkpoint";
-    checkpointShard.timeBeginNs = shard.timeEndNs;
-    checkpointShard.timeEndNs = shard.timeEndNs;
-    checkpointShard.sourceRecordBegin = shard.sourceRecordEnd;
-    checkpointShard.sourceRecordEnd = shard.sourceRecordEnd;
+    checkpointShard.timeBeginNs = int64_t( state.shardTimeEnd );
+    checkpointShard.timeEndNs = int64_t( state.shardTimeEnd );
+    checkpointShard.sourceRecordBegin = state.shardSourceEnd;
+    checkpointShard.sourceRecordEnd = state.shardSourceEnd;
     checkpointShard.recordCount = 1;
     if( !WriteTraceSessionShard( *state.sessionRoot, *state.generation, checkpointShard,
         checkpoint.data(), checkpoint.size(), state.error ) ) return false;
     state.previousCheckpointHash = checkpointShard.sha256;
     state.manifest->shards.emplace_back( checkpointShard );
 
-    state.shardPayload.clear();
+    for( auto& domain : state.domains )
+    {
+        std::vector<uint8_t>().swap( domain.payload );
+        domain.recordCount = 0;
+    }
     state.shardRecordCount = 0;
+    state.shardPayloadBytes = 0;
     state.shardSourceBegin = 0;
     state.shardSourceEnd = 0;
     state.shardTimeBegin = 0;
     state.shardTimeEnd = 0;
-    return SaveTraceSessionManifest( *state.sessionRoot, *state.manifest, state.error );
+    if( !SaveTraceSessionManifest( *state.sessionRoot, *state.manifest, state.error ) ) return false;
+    return state.lease->Heartbeat( state.error );
 }
 
 bool RestoreCheckpoint( CanonicalBuildState& state )
@@ -265,10 +300,11 @@ bool RestoreCheckpoint( CanonicalBuildState& state )
 bool ShouldFlush( const CanonicalBuildState& state )
 {
     if( state.shardRecordCount == 0 ) return false;
-    const auto bytes = state.shardPayload.size();
+    const auto bytes = state.shardPayloadBytes;
     const auto span = state.shardTimeEnd >= state.shardTimeBegin ?
         state.shardTimeEnd - state.shardTimeBegin : 0;
     if( bytes >= state.options->hardShardBytes ) return true;
+    if( bytes >= state.options->softMemoryBytes ) return true;
     if( span >= state.options->maximumShardSpanNs ) return true;
     if( bytes >= state.options->softShardBytes ) return true;
     return bytes >= state.options->targetShardBytes && span >= state.options->minimumShardSpanNs;
@@ -341,7 +377,9 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
     error.clear();
     if( generation.empty() || options.targetShardBytes == 0 ||
         options.softShardBytes < options.targetShardBytes ||
-        options.hardShardBytes < options.softShardBytes )
+        options.hardShardBytes < options.softShardBytes ||
+        options.softMemoryBytes < options.hardShardBytes ||
+        options.hardMemoryBytes < options.softMemoryBytes )
     {
         error = "canonical_invalid_options";
         return TraceSessionCanonicalBuildResult::Failed;
@@ -355,11 +393,15 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
         error = "canonical_inventory_record_count_invalid";
         return TraceSessionCanonicalBuildResult::Failed;
     }
+    TraceSessionWriterLease lease;
+    if( !AcquireTraceSessionWriterLease( sessionRoot, lease, error ) )
+        return TraceSessionCanonicalBuildResult::Failed;
     CanonicalBuildState state;
     state.sessionRoot = &sessionRoot;
     state.generation = &generation;
     state.options = &options;
     state.manifest = &manifest;
+    state.lease = &lease;
     state.input.open( sourcePath, std::ios::binary );
     if( !state.input ) { error = "canonical_source_open_failed"; return TraceSessionCanonicalBuildResult::Failed; }
 
@@ -404,6 +446,7 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
     manifest.state = TraceSessionState::CanonicalBuilding;
     manifest.reason.clear();
     if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) ) return TraceSessionCanonicalBuildResult::Failed;
+    if( !lease.Heartbeat( error ) ) return TraceSessionCanonicalBuildResult::Failed;
 
     tracy::stream::ScanOptions scanOptions;
     scanOptions.maxCollectedRecords = 0;
@@ -417,7 +460,20 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
         error = "canonical_source_invalid:" + scan.message;
         return TraceSessionCanonicalBuildResult::Failed;
     }
-    if( state.failed ) { error = state.error; return TraceSessionCanonicalBuildResult::Failed; }
+    if( state.failed )
+    {
+        error = state.error;
+        if( error == "canonical_memory_hard_limit" )
+        {
+            manifest.state = TraceSessionState::InvalidCapacity;
+            manifest.reason = "resource_limit";
+            std::string persistError;
+            if( !SaveTraceSessionManifest( sessionRoot, manifest, persistError ) )
+                error += ":" + persistError;
+            else if( !lease.Heartbeat( persistError ) ) error += ":" + persistError;
+        }
+        return TraceSessionCanonicalBuildResult::Failed;
+    }
     if( !FlushShard( state ) ) { error = state.error; return TraceSessionCanonicalBuildResult::Failed; }
     if( scan.code == tracy::stream::ScanCode::Stopped || state.cancelRequested )
     {
@@ -425,6 +481,7 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
         manifest.reason = "cancelled_resumable";
         if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) )
             return TraceSessionCanonicalBuildResult::Failed;
+        if( !lease.Heartbeat( error ) ) return TraceSessionCanonicalBuildResult::Failed;
         return TraceSessionCanonicalBuildResult::CancelledResumable;
     }
     const auto expectedTransportRecords = inventory.recordCount - inventory.protocolInventory.frameCount;
@@ -436,7 +493,92 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
     }
     if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) )
         return TraceSessionCanonicalBuildResult::Failed;
+    if( !lease.Heartbeat( error ) ) return TraceSessionCanonicalBuildResult::Failed;
     return TraceSessionCanonicalBuildResult::Complete;
+}
+
+bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
+    const TraceSessionShard& shard, TraceSessionCanonicalRecordVisitor visitor,
+    void* userData, std::string& error )
+{
+    error.clear();
+    if( shard.domain == "checkpoint" )
+    {
+        error = "canonical_checkpoint_is_not_event_shard";
+        return false;
+    }
+    std::vector<uint8_t> bytes;
+    if( !ReadTraceSessionShardPayload( sessionRoot, shard, bytes, error ) ) return false;
+    constexpr size_t RecordHeaderBytes = 40;
+    size_t offset = 0;
+    uint64_t recordCount = 0;
+    while( offset < bytes.size() )
+    {
+        if( bytes.size() - offset < RecordHeaderBytes )
+        {
+            error = "canonical_shard_record_header_truncated";
+            return false;
+        }
+        TraceSessionCanonicalRecord record;
+        const auto kind = bytes[offset++];
+        record.type = bytes[offset++];
+        const auto domain = bytes[offset++];
+        const auto reserved8 = bytes[offset++];
+        uint32_t payloadBytes = 0;
+        uint32_t reserved32 = 0;
+        if( ( kind != uint8_t( TraceSessionCanonicalRecordKind::ProtocolEvent ) &&
+              kind != uint8_t( TraceSessionCanonicalRecordKind::TransportRecord ) ) ||
+            domain >= uint8_t( TraceSessionProtocolDomain::Count ) || reserved8 != 0 ||
+            !Get32( bytes, offset, record.flags ) || !Get32( bytes, offset, payloadBytes ) ||
+            !Get32( bytes, offset, reserved32 ) || reserved32 != 0 ||
+            !Get64( bytes, offset, record.sourceSequence ) ||
+            !Get64( bytes, offset, record.journalMonotonicNs ) ||
+            !Get64( bytes, offset, record.protocolFrameOrdinal ) )
+        {
+            error = "canonical_shard_record_header_invalid";
+            return false;
+        }
+        record.kind = TraceSessionCanonicalRecordKind( kind );
+        record.domain = TraceSessionProtocolDomain( domain );
+        if( shard.domain != TraceSessionProtocolDomainName( record.domain ) )
+        {
+            error = "canonical_shard_domain_mismatch";
+            return false;
+        }
+        if( record.kind == TraceSessionCanonicalRecordKind::ProtocolEvent &&
+            record.type >= uint8_t( tracy::QueueType::NUM_TYPES ) )
+        {
+            error = "canonical_shard_queue_type_invalid";
+            return false;
+        }
+        if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord &&
+            record.domain != TraceSessionProtocolDomain::Control )
+        {
+            error = "canonical_transport_domain_invalid";
+            return false;
+        }
+        if( record.sourceSequence < shard.sourceRecordBegin ||
+            record.sourceSequence > shard.sourceRecordEnd ||
+            payloadBytes > bytes.size() - offset )
+        {
+            error = "canonical_shard_record_range_invalid";
+            return false;
+        }
+        record.payload = std::span<const uint8_t>( bytes.data() + offset, payloadBytes );
+        offset += payloadBytes;
+        recordCount++;
+        if( visitor && !visitor( record, userData, error ) )
+        {
+            if( error.empty() ) error = "canonical_shard_visitor_failed";
+            return false;
+        }
+    }
+    if( recordCount != shard.recordCount )
+    {
+        error = "canonical_shard_record_count_mismatch";
+        return false;
+    }
+    return true;
 }
 
 }

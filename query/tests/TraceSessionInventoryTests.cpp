@@ -46,6 +46,21 @@ struct CanonicalCancelState
     uint64_t cancelAfterChecks = 0;
 };
 
+struct CanonicalReadState
+{
+    uint64_t records = 0;
+    std::array<uint64_t, size_t( tracy::analysis::TraceSessionProtocolDomain::Count )> domains {};
+};
+
+bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& record,
+    void* userData, std::string& )
+{
+    auto& state = *static_cast<CanonicalReadState*>( userData );
+    state.records++;
+    state.domains[size_t( record.domain )]++;
+    return true;
+}
+
 bool RequestCanonicalCancel( void* userData )
 {
     auto& state = *static_cast<CanonicalCancelState*>( userData );
@@ -501,15 +516,44 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     }
     uint64_t canonicalRecords = 0;
     uint64_t checkpointRecords = 0;
+    bool sawFrameDomain = false;
+    bool sawJobDomain = false;
+    bool sawDictionaryDomain = false;
+    bool sawControlDomain = false;
     for( const auto& shard : manifest.shards )
     {
-        if( shard.domain == "protocol" ) canonicalRecords += shard.recordCount;
-        else if( shard.domain == "checkpoint" ) checkpointRecords += shard.recordCount;
+        if( shard.domain == "checkpoint" ) checkpointRecords += shard.recordCount;
+        else
+        {
+            canonicalRecords += shard.recordCount;
+            sawFrameDomain |= shard.domain == "frame";
+            sawJobDomain |= shard.domain == "job";
+            sawDictionaryDomain |= shard.domain == "dictionary";
+            sawControlDomain |= shard.domain == "control";
+            test.Check( shard.domain != "protocol", "canonical events are partitioned by stable data domain" );
+        }
     }
     test.Check( canonicalRecords == inventory.protocolInventory.eventCount +
         inventory.recordCount - inventory.protocolInventory.frameCount,
         "canonical records cover decoded events and non-compressed transport records" );
     test.Check( checkpointRecords > 0, "each committed canonical segment has a checkpoint" );
+    test.Check( sawFrameDomain && sawJobDomain && sawDictionaryDomain && sawControlDomain,
+        "canonical segment preserves all source-present domains" );
+    CanonicalReadState canonicalRead;
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        test.Check( tracy::analysis::VisitTraceSessionCanonicalShard( sessionRoot, shard,
+            CountCanonicalRecord, &canonicalRead, error ),
+            "read canonical domain shard: " + error );
+    }
+    test.Check( canonicalRead.records == canonicalRecords,
+        "canonical reader visits every persisted record exactly once" );
+    test.Check( canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Frame )] == 1 &&
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Job )] == 1 &&
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Dictionary )] == 2 &&
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Control )] == 2,
+        "canonical reader reproduces exact per-domain counts" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
 
@@ -559,6 +603,26 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     }
     canonicalOptions.shouldCancel = nullptr;
     canonicalOptions.cancelUserData = nullptr;
+
+    auto limitedOptions = canonicalOptions;
+    limitedOptions.resume = false;
+    limitedOptions.targetShardBytes = 32;
+    limitedOptions.softShardBytes = 40;
+    limitedOptions.hardShardBytes = 48;
+    limitedOptions.softMemoryBytes = 56;
+    limitedOptions.hardMemoryBytes = 64;
+    const auto limitedSessionRoot = directory / "canonical-session-memory-limit";
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( path, limitedSessionRoot,
+        "generation-limited", inventory, limitedOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Failed,
+        "canonical hard memory limit stops without discarding a committed prefix" );
+    test.Check( error == "canonical_memory_hard_limit" &&
+        manifest.state == tracy::analysis::TraceSessionState::InvalidCapacity &&
+        manifest.reason == "resource_limit",
+        "memory limit failure is explicit and resumable from committed files: " + error );
+    test.Check( std::any_of( manifest.shards.begin(), manifest.shards.end(),
+        []( const auto& shard ) { return shard.domain == "checkpoint"; } ),
+        "memory limit preserves the checkpoint committed before the oversized segment" );
 
     const auto inventoryPath = directory / "protocol-inventory";
     test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),

@@ -1,4 +1,5 @@
 #include "TracyHash.hpp"
+#include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionStore.hpp"
 
 #include <array>
@@ -63,6 +64,24 @@ int main()
     manifest.source.configurationHash = std::string( 64, 'b' );
 
     std::string error;
+    const auto leaseRoot = root / "lease-session";
+    TraceSessionWriterLease firstLease;
+    TraceSessionWriterLease secondLease;
+    assert( AcquireTraceSessionWriterLease( leaseRoot, firstLease, error ) );
+    assert( firstLease.Active() );
+    assert( !AcquireTraceSessionWriterLease( leaseRoot, secondLease, error ) );
+    assert( error == "session_writer_lease_active" );
+    assert( firstLease.Heartbeat( error ) );
+    firstLease.Release();
+    assert( AcquireTraceSessionWriterLease( leaseRoot, secondLease, error ) );
+    secondLease.Release();
+
+    const auto staleLeaseDirectory = leaseRoot / "build-state" / "writer.lease";
+    std::filesystem::create_directories( staleLeaseDirectory );
+    WriteBytes( staleLeaseDirectory / "owner", "invalid stale lease", 19 );
+    assert( AcquireTraceSessionWriterLease( leaseRoot, secondLease, error ) );
+    secondLease.Release();
+
     assert( SaveTraceSessionManifest( buildingPath, manifest, error ) );
     assert( !IsTraceSessionQueryable( buildingPath, error ) );
     assert( error == "session_not_published" );
@@ -81,6 +100,17 @@ int main()
     assert( ReadTraceSessionShardPayload( buildingPath, shard, loadedPayload, error ) );
     assert( loadedPayload.size() == sizeof( payload ) );
     assert( std::memcmp( loadedPayload.data(), payload.data(), sizeof( payload ) ) == 0 );
+
+    TraceSessionShard malformedCanonical;
+    malformedCanonical.shardId = 9;
+    malformedCanonical.domain = "frame";
+    malformedCanonical.recordCount = 1;
+    constexpr std::array<uint8_t, 3> malformedPayload { 1, 2, 3 };
+    assert( WriteTraceSessionShard( buildingPath, generation, malformedCanonical,
+        malformedPayload.data(), malformedPayload.size(), error ) );
+    assert( !VisitTraceSessionCanonicalShard( buildingPath, malformedCanonical,
+        nullptr, nullptr, error ) );
+    assert( error == "canonical_shard_record_header_truncated" );
     assert( shard.relativePath == std::filesystem::path( "generations" ) / generation / "canonical" / "frame-000007.bin" );
     assert( shard.uncompressedBytes == sizeof( payload ) );
     assert( shard.sha256.size() == 64 );
