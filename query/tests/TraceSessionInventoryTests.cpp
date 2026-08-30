@@ -1,5 +1,6 @@
 #include "TracyTraceSessionInventory.hpp"
 #include "TracyTraceSessionCanonical.hpp"
+#include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
 #include "TracyStreamJournal.hpp"
@@ -328,6 +329,30 @@ void AppendFrameVsyncEvent( std::vector<uint8_t>& frame, int64_t time, uint32_t 
     const auto previous = frame.size();
     frame.resize( previous + size );
     std::memcpy( frame.data() + previous, &item, size );
+}
+
+void AppendQueueItem( std::vector<uint8_t>& frame, const tracy::QueueItem& item )
+{
+    const auto size = tracy::QueueDataSize[size_t( item.hdr.type )];
+    const auto previous = frame.size();
+    frame.resize( previous + size );
+    std::memcpy( frame.data() + previous, &item, size );
+}
+
+void AppendLargePayloadEvent( std::vector<uint8_t>& frame, tracy::QueueType type,
+    uint64_t payloadId, const std::vector<uint8_t>& payload )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = type;
+    item.stringTransfer.ptr = payloadId;
+    const auto fixed = tracy::QueueDataSize[size_t( type )];
+    const auto previous = frame.size();
+    frame.resize( previous + fixed + sizeof( uint32_t ) + payload.size() );
+    std::memcpy( frame.data() + previous, &item, fixed );
+    const auto size = uint32_t( payload.size() );
+    std::memcpy( frame.data() + previous + fixed, &size, sizeof( size ) );
+    if( !payload.empty() ) std::memcpy( frame.data() + previous + fixed + sizeof( size ),
+        payload.data(), payload.size() );
 }
 
 void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type, const std::string& value )
@@ -828,6 +853,125 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     }
 }
 
+void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& directory )
+{
+    constexpr uint64_t Generation = 7;
+    constexpr uint64_t PayloadId = 99;
+    tracy::JnGpuCatalogResourceRecordV1 resource {};
+    resource.time = 110;
+    resource.resourceId = 10;
+    resource.pointerToken = 0x1234;
+    resource.allocationId = 20;
+    resource.capacityBytes = 4096;
+    resource.operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    resource.exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    tracy::JnGpuCatalogBatchEnvelopeV1 envelope {};
+    envelope.magic = tracy::JnGpuCatalogBatchMagic;
+    envelope.catalogSchema = tracy::JnGpuCatalogSchemaVersion;
+    envelope.evidenceSchema = tracy::JnGpuDetailedEvidenceSchemaVersion;
+    envelope.recordBytes = sizeof( resource );
+    envelope.recordCount = 1;
+    envelope.payloadBytes = sizeof( resource );
+    envelope.checksum = tracy::JnGpuCatalogChecksum64( &resource, sizeof( resource ) );
+    std::vector<uint8_t> catalogPayload( sizeof( envelope ) + sizeof( resource ) );
+    std::memcpy( catalogPayload.data(), &envelope, sizeof( envelope ) );
+    std::memcpy( catalogPayload.data() + sizeof( envelope ), &resource, sizeof( resource ) );
+
+    std::vector<uint8_t> frame;
+    AppendThreadContextEvent( frame, 42 );
+    tracy::QueueItem item {};
+    item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
+    item.jnGpuCatalogControl = { 105, Generation, 0, 1,
+        uint8_t( tracy::JnGpuCatalogControlKind::GenerationBegin ),
+        uint8_t( tracy::JnGpuCatalogGenerationState::Building ), 0 };
+    AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId, catalogPayload );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
+    item.jnGpuCatalogBatch = { Generation, PayloadId, 2, 1, uint32_t( catalogPayload.size() ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::Resource ),
+        uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 111, 1000, 5, 77, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 112, 1000, 10, 3, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 113, 1000, 2000, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
+    item.jnGpuCatalogControl = { 115, Generation, 1, 3,
+        uint8_t( tracy::JnGpuCatalogControlKind::GenerationEnd ),
+        uint8_t( tracy::JnGpuCatalogGenerationState::Complete ), 0 };
+    AppendQueueItem( frame, item );
+
+    auto* compressor = tracy::LZ4_createStream();
+    test.Check( compressor != nullptr, "create GPU canonical compressor" );
+    if( !compressor ) return;
+    const auto compressed = CompressContinuedFrame( compressor, frame, test );
+    tracy::LZ4_freeStream( compressor );
+    if( compressed.empty() ) return;
+
+    const auto source = directory / "gpu-canonical.tracy-stream";
+    tracy::stream::WriterOptions writerOptions; writerOptions.durableHeader = false;
+    std::string error;
+    auto writer = tracy::stream::JournalWriter::CreateFileJournal(
+        source, DeterministicHeader(), false, writerOptions, error );
+    test.Check( writer != nullptr, "create GPU canonical journal: " + error );
+    if( !writer ) return;
+    test.Check( writer->Append( tracy::stream::RecordType::SessionBegin,
+        tracy::stream::RecordFlagHandshake, "begin", 0, error ), "append GPU session begin" );
+    tracy::WelcomeMessage welcome {};
+    welcome.timerMul = 2.0;
+    welcome.initBegin = 100;
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagHandshake,
+        std::span<const uint8_t>( reinterpret_cast<const uint8_t*>( &welcome ), sizeof( welcome ) ),
+        1, error ), "append GPU welcome" );
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, compressed, 2, error ), "append GPU frame" );
+    test.Check( writer->Append( tracy::stream::RecordType::SessionEnd,
+        tracy::stream::RecordFlagTerminal, "end", 3, error ), "append GPU session end" );
+    writer.reset();
+
+    tracy::analysis::TraceSessionInventory inventory;
+    tracy::analysis::TraceSessionInventoryOptions inventoryOptions;
+    inventoryOptions.runDirectory = directory / "gpu-canonical-runs";
+    test.Check( tracy::analysis::BuildTraceSessionInventory(
+        source, inventoryOptions, inventory, error ), "inventory GPU canonical journal: " + error );
+    tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
+    canonicalOptions.minimumFreeReserveBytes = 0;
+    canonicalOptions.minimumFreeReservePercent = 0;
+    tracy::analysis::TraceSessionManifest manifest;
+    const auto sessionRoot = directory / "gpu-canonical-session";
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( source, sessionRoot, "gpu-generation",
+        inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Complete,
+        "build GPU canonical session: " + error );
+    tracy::JnTraceData gpuData;
+    tracy::analysis::TraceSessionTimeTransform transform;
+    tracy::analysis::TraceSessionGpuCanonicalStats stats;
+    test.Check( tracy::analysis::LoadTraceSessionGpuCanonicalData(
+        sessionRoot, manifest, gpuData, transform, stats, error ),
+        "load GPU facts from canonical shards: " + error );
+    test.Check( transform.present && transform.timerMultiplier == 2.0 && transform.baseTime == 100,
+        "GPU reader restores the exact Welcome time transform" );
+    test.Check( gpuData.gpuCatalogValid && gpuData.gpuCatalogResources.size() == 1 &&
+        gpuData.gpuCatalogResources.front().resourceId == 10 &&
+        gpuData.gpuCatalogResources.front().time == 20,
+        "GPU reader validates and restores Catalog records with Worker-equivalent time" );
+    test.Check( gpuData.gpuReferencePasses.size() == 1 &&
+        gpuData.gpuReferenceUses.size() == 1 && gpuData.gpuReferenceEnds.size() == 1 &&
+        gpuData.gpuReferencePasses.front().time == 22 &&
+        gpuData.gpuReferenceUses.front().time == 24 &&
+        gpuData.gpuReferenceEnds.front().time == 26,
+        "GPU reader restores exact pass/resource/end relations" );
+    test.Check( stats.catalogPayloads == 1 && stats.catalogBatches == 1 &&
+        stats.unresolvedPayloads == 0,
+        "GPU reader consumes each Catalog payload exactly once" );
+}
+
 }
 
 int main()
@@ -849,6 +993,7 @@ int main()
         TestCompressedProtocolInventory( test );
         TestProtocolDecoderCheckpoint( test );
         TestProtocolJournalInventory( test, directory );
+        TestGpuCanonicalReader( test, directory );
     }
     std::filesystem::remove_all( directory, filesystemError );
     test.Check( !filesystemError, "remove test directory" );

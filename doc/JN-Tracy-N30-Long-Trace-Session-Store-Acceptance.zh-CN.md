@@ -402,3 +402,27 @@ GREEN：
 - Frame、Dictionary、Job等交错事件从不同域Shard重新归并后，与原始Protocol frame顺序逐项一致。
 - semantic-time覆盖只统计可证明拥有CPU语义时间的事件。
 - 从manifest删除Frame shard后，`AuditTraceSessionCanonical`明确失败，不使用其他域推测补齐。
+
+## 7. N30.5 Mandatory Derived与N29整合（进行中）
+
+### Canonical GPU Reader
+
+- 新增`LoadTraceSessionGpuCanonicalData`，输入只允许同一Session manifest generation的Canonical Shard，不读取原始stream，也不构建完整`Worker`。
+- 从Control Shard中的原始`WelcomeMessage`恢复`timerMul`与`initBegin`，时间换算使用与Worker相同的`(tsc-baseTime)*timerMul`语义；缺失、非法或冲突的Welcome阻止GPU派生。
+- GPU Catalog payload、control和batch重新执行generation、sequence、schema、record width、payload size与checksum验证。
+- Catalog Resource、Allocation、View、Logical、Part、Relation、VG、Range、Detailed Evidence和String均使用同一解析入口；转换器制造的gap或未消费payload直接失败。
+- GPU Reference支持direct use及ResourceSetV2定义/展开；Pass、Use和End保留thread、frame、taxonomy、usage、command list及dropped计数。
+- 连接结束时未闭合Catalog generation被忠实标记为无效，不伪造成Complete。
+
+### 当前TDD证据
+
+- Synthetic Session包含真实Welcome、Catalog Generation Begin/Batch/End和Pass→Resource→End链。
+- 读取结果恢复ResourceId=10、Catalog有效状态及三个关系事件。
+- `timerMul=2`、`initBegin=100`下，原始TSC 110/111/112/113严格换算为20/22/24/26 ns。
+- Catalog payload只消费一次，batch数与unresolved payload计数分别为1和0。
+
+### 尚未完成
+
+- 抽离并复用N29 GPU pointer lifetime resolver，完成pointer token→GpuResourceId和alias/reuse语义。
+- 将N29 Store writer定向到Session generation内的`derived/gpu-resource-analysis`，不生成独立Raw sidecar。
+- 其余Mandatory Derived索引与Final Audit。

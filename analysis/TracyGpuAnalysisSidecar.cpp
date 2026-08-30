@@ -162,6 +162,29 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary, const std::f
     return false;
 }
 
+bool RenameDirectoryWithRetry( const std::filesystem::path& source,
+    const std::filesystem::path& target, const char* reason, std::string& error )
+{
+#ifdef _WIN32
+    DWORD lastError = ERROR_SUCCESS;
+    for( unsigned attempt = 0; attempt < 8; ++attempt )
+    {
+        if( MoveFileExW( GpuAnalysisIoPath( source ).c_str(),
+            GpuAnalysisIoPath( target ).c_str(), MOVEFILE_WRITE_THROUGH ) ) return true;
+        lastError = GetLastError();
+        if( lastError != ERROR_ACCESS_DENIED && lastError != ERROR_SHARING_VIOLATION ) break;
+        Sleep( 1u << attempt );
+    }
+    error = std::string( reason ) + ":" + std::to_string( lastError );
+#else
+    std::error_code ec;
+    std::filesystem::rename( source, target, ec );
+    if( !ec ) return true;
+    error = std::string( reason ) + ":" + ec.message();
+#endif
+    return false;
+}
+
 std::string SafeReason( std::string value )
 {
     for( auto& ch : value ) if( ch == '\r' || ch == '\n' ) ch = ' ';
@@ -635,14 +658,18 @@ bool PublishGpuAnalysisSidecar( const std::filesystem::path& stagingPath,
     {
         if( !overwrite ) { error = "sidecar_output_exists"; return false; }
         previous = finalPath; previous += ".obsolete-" + GenerationName();
-        std::filesystem::rename( GpuAnalysisIoPath( finalPath ), GpuAnalysisIoPath( previous ), ec );
-        if( ec ) { error = "sidecar_previous_retire_failed:" + ec.message(); return false; }
+        if( !RenameDirectoryWithRetry( finalPath, previous,
+            "sidecar_previous_retire_failed", error ) ) return false;
     }
-    std::filesystem::rename( GpuAnalysisIoPath( stagingPath ), GpuAnalysisIoPath( finalPath ), ec );
-    if( ec )
+    if( !RenameDirectoryWithRetry( stagingPath, finalPath, "sidecar_publish_failed", error ) )
     {
-        if( !previous.empty() ) { std::error_code restore; std::filesystem::rename( GpuAnalysisIoPath( previous ), GpuAnalysisIoPath( finalPath ), restore ); }
-        error = "sidecar_publish_failed:" + ec.message(); return false;
+        if( !previous.empty() )
+        {
+            std::string restoreError;
+            RenameDirectoryWithRetry( previous, finalPath,
+                "sidecar_previous_restore_failed", restoreError );
+        }
+        return false;
     }
     if( !previous.empty() ) std::filesystem::remove_all( GpuAnalysisIoPath( previous ), ec );
     return true;
