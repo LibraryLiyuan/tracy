@@ -21,6 +21,10 @@ struct TraceSessionTimeTransform
     int64_t ToNanoseconds( int64_t value ) const;
 };
 
+bool LoadTraceSessionTimeTransform( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
+    std::string& error );
+
 struct TraceSessionGpuCanonicalStats
 {
     uint64_t controlRecords = 0;

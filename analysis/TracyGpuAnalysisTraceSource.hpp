@@ -3,6 +3,7 @@
 
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyTraceSessionDerived.hpp"
+#include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionStore.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
@@ -109,7 +110,8 @@ public:
 private:
     GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
         std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode = false,
-        TraceSessionDerivedStats sessionStats = {} );
+        TraceSessionDerivedStats sessionStats = {},
+        std::shared_ptr<TraceSessionFrameReader> frameReader = {} );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
 
@@ -119,6 +121,7 @@ private:
     std::shared_ptr<JnTraceData> m_catalogSummary;
     bool m_sessionMode = false;
     TraceSessionDerivedStats m_sessionStats;
+    std::shared_ptr<TraceSessionFrameReader> m_frameReader;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;
 };

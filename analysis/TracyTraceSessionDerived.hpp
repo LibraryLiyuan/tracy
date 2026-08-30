@@ -22,11 +22,18 @@ struct TraceSessionDerivedStats
     uint64_t indexedProtocolEvents = 0;
     uint64_t indexedProtocolFrames = 0;
     uint64_t indexedTransportRecords = 0;
+    uint64_t semanticTimeRecords = 0;
+    int64_t firstSemanticTimeRaw = 0;
+    int64_t lastSemanticTimeRaw = 0;
+    bool semanticTimePresent = false;
     uint64_t indexBytes = 0;
     uint64_t indexFiles = 0;
     uint64_t gpuResources = 0;
     uint64_t gpuAllocations = 0;
     uint64_t gpuPasses = 0;
+    uint64_t frameSets = 0;
+    uint64_t frames = 0;
+    uint64_t completeFrames = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

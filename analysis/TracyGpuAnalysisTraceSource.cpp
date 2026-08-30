@@ -1,6 +1,7 @@
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <sstream>
 
@@ -28,6 +29,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !session ) return {};
     TraceSessionDerivedStats sessionStats;
     if( !LoadTraceSessionDerivedStats( path, *session, sessionStats, error ) ) return {};
+    auto frameReader = TraceSessionFrameReader::Open( path, *session, error );
+    if( !frameReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -51,14 +54,15 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     facade.summary.engineKnownPhysicalPeakTimeNs = reader->Overview().engineKnownPhysicalPeakTimeNs;
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
-        path, std::move( facade ), std::move( reader ), true, sessionStats ) );
+        path, std::move( facade ), std::move( reader ), true, sessionStats,
+        std::move( frameReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
     std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
-    TraceSessionDerivedStats sessionStats )
+    TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
-      m_sessionMode( sessionMode ), m_sessionStats( sessionStats )
+      m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -121,13 +125,21 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     };
     if( !m_sessionMode ) return result;
 
+    static const std::vector<std::string> FrameMethods = {
+        "frame.sets", "frame.list", "frame.get", "frame.statistics",
+        "frame.outliers", "frame.range_mapping"
+    };
+    const auto framePresent = m_frameReader && !m_frameReader->Sets().empty();
+    result.push_back( Capability { "frame", framePresent, framePresent, true,
+        framePresent ? "available from the N30 Session mandatory Frame index" :
+            "The source Session contains no Frame facts", FrameMethods } );
+
     const auto addPending = [&]( const char* domain, TraceSessionProtocolDomain sourceDomain ) {
         const auto count = m_sessionStats.domains[size_t( sourceDomain )];
         result.push_back( Capability { domain, count != 0, false, count != 0,
             count != 0 ? "Canonical facts are present and indexed, but the disk-backed semantic reader is not implemented yet" :
                 "The source Session contains no Canonical facts for this domain", {} } );
     };
-    addPending( "frame", TraceSessionProtocolDomain::Frame );
     addPending( "zone.cpu", TraceSessionProtocolDomain::CpuZone );
     addPending( "zone.gpu", TraceSessionProtocolDomain::GpuZone );
     addPending( "job", TraceSessionProtocolDomain::Job );
@@ -173,7 +185,96 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     out.captureName = m_path.filename().string();
     out.counts.gpuReferencePasses = m_manifest.summary.passCount;
     out.counts.gpuReferenceUses = m_manifest.summary.referenceUseCount;
+    if( m_frameReader )
+    {
+        out.counts.frameSets = m_frameReader->Stats().frameSets;
+        out.counts.frames = m_frameReader->Stats().frames;
+        bool haveTime = false;
+        for( const auto& set : m_frameReader->Sets() ) for( const auto& frame : set.frames )
+        {
+            if( !haveTime ) { out.firstTimeNs = frame.beginNs; out.lastTimeNs = frame.complete ? frame.endNs : frame.beginNs; haveTime = true; }
+            else
+            {
+                out.firstTimeNs = std::min( out.firstTimeNs, frame.beginNs );
+                out.lastTimeNs = std::max( out.lastTimeNs, frame.complete ? frame.endNs : frame.beginNs );
+            }
+        }
+    }
     return out;
+}
+
+std::vector<FrameSetDto> GpuAnalysisTraceSource::GetFrameSets() const
+{
+    if( WorkerLoaded() ) return Worker().GetFrameSets();
+    std::vector<FrameSetDto> result;
+    if( !m_frameReader ) return result;
+    result.reserve( m_frameReader->Sets().size() );
+    for( size_t i = 0; i < m_frameReader->Sets().size(); ++i )
+    {
+        const auto& set = m_frameReader->Sets()[i];
+        const auto complete = std::count_if( set.frames.begin(), set.frames.end(),
+            []( const auto& frame ) { return frame.complete; } );
+        result.push_back( { MakeEntityRef( "frame-set", i ), i, set.name,
+            set.continuous, set.frames.size(), size_t( complete ) } );
+    }
+    return result;
+}
+
+std::vector<FrameDto> GpuAnalysisTraceSource::GetFramesForSet(
+    size_t frameSetIndex, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().GetFramesForSet( frameSetIndex, offset, limit );
+    std::vector<FrameDto> result;
+    if( !m_frameReader || frameSetIndex >= m_frameReader->Sets().size() ) return result;
+    const auto& frames = m_frameReader->Sets()[frameSetIndex].frames;
+    const auto begin = std::min( offset, frames.size() );
+    const auto end = begin + std::min( limit, frames.size() - begin );
+    result.reserve( end - begin );
+    for( size_t i = begin; i < end; ++i )
+    {
+        FrameDto dto;
+        dto.ref = MakeEntityRef( "frame", ( uint64_t( frameSetIndex ) << 32 ) | i );
+        dto.frameSetRef = MakeEntityRef( "frame-set", frameSetIndex );
+        dto.index = i;
+        dto.beginNs = frames[i].beginNs;
+        dto.complete = frames[i].complete;
+        if( frames[i].complete ) dto.endNs = frames[i].endNs;
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+std::vector<int64_t> GpuAnalysisTraceSource::GetFrameDurations( size_t frameSetIndex ) const
+{
+    if( WorkerLoaded() ) return Worker().GetFrameDurations( frameSetIndex );
+    std::vector<int64_t> result;
+    if( !m_frameReader || frameSetIndex >= m_frameReader->Sets().size() ) return result;
+    for( const auto& frame : m_frameReader->Sets()[frameSetIndex].frames )
+        if( frame.complete ) result.push_back( frame.endNs - frame.beginNs );
+    return result;
+}
+
+std::vector<FrameDto> GpuAnalysisTraceSource::ScanFrames( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanFrames( range );
+    std::vector<FrameDto> result;
+    if( !m_frameReader ) return result;
+    size_t skipped = 0;
+    for( size_t setIndex = 0; setIndex < m_frameReader->Sets().size(); ++setIndex )
+    {
+        const auto& frames = m_frameReader->Sets()[setIndex].frames;
+        for( size_t frameIndex = 0; frameIndex < frames.size(); ++frameIndex )
+        {
+            const auto& frame = frames[frameIndex];
+            const auto end = frame.complete ? frame.endNs : frame.beginNs;
+            if( end < range.startNs || frame.beginNs > range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            const auto page = GetFramesForSet( setIndex, frameIndex, 1 );
+            if( !page.empty() ) result.emplace_back( page.front() );
+            if( result.size() >= range.limit ) return result;
+        }
+    }
+    return result;
 }
 
 std::shared_ptr<const tracy::JnTraceData> GpuAnalysisTraceSource::GetGpuCatalogData() const
@@ -205,14 +306,12 @@ std::optional<uint64_t> GpuAnalysisTraceSource::ParseEntityRef( std::string_view
 #define D4(Return, Name, T1, A1, T2, A2, T3, A3, T4, A4) Return GpuAnalysisTraceSource::Name( T1 A1, T2 A2, T3 A3, T4 A4 ) const { return Worker().Name( A1, A2, A3, A4 ); }
 
 D0(std::vector<ThreadDto>, GetThreads)
-D0(std::vector<FrameSetDto>, GetFrameSets)
 D0(std::vector<GpuContextDto>, GetGpuContexts)
 D0(std::vector<MemoryPoolDto>, GetMemoryPools)
 D0(std::vector<PlotDto>, GetPlotList)
 D0(std::vector<LockDto>, GetLocks)
 D1(std::vector<CpuZoneDto>, ScanCpuZones, const ScanRange&, range)
 D1(std::vector<GpuZoneDto>, ScanGpuZones, const ScanRange&, range)
-D1(std::vector<FrameDto>, ScanFrames, const ScanRange&, range)
 D1(std::vector<MemoryEventDto>, ScanMemoryEvents, const ScanRange&, range)
 D1(std::vector<MessageDto>, ScanMessages, const ScanRange&, range)
 D1(std::vector<PlotPointDto>, ScanPlots, const ScanRange&, range)
@@ -250,8 +349,6 @@ D2(std::vector<CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t
 D2(std::vector<SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes)
 D2(std::vector<SymbolCodeDto>, ResolveSymbols, const std::vector<std::string>&, symbolRefs, size_t, maxBytes)
 D2(std::vector<FrameImageDto>, ResolveFrameImages, const std::vector<std::string>&, imageRefs, size_t, maxBytes)
-D3(std::vector<FrameDto>, GetFramesForSet, size_t, frameSetIndex, size_t, offset, size_t, limit)
-D1(std::vector<int64_t>, GetFrameDurations, size_t, frameSetIndex)
 D0(std::vector<SourceResourceDto>, GetSourceResources)
 D0(std::vector<SymbolResourceDto>, GetSymbolResources)
 D0(std::vector<FrameImageMetadataDto>, GetFrameImageResources)

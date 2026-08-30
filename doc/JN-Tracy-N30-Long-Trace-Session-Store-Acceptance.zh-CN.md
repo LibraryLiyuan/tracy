@@ -457,6 +457,9 @@ GREEN：
 - `session.build.status`可以在不打开Trace数据的情况下读取`.building`或已发布Session的state、generation、source identity、Canonical shard/bytes、当前Shard、最后Checkpoint、已处理source record、阶段进度、mandatory derived、Final Audit和reason；路径仍受`--allow-root`约束。
 - Inventory支持在完整Journal record边界响应Ctrl+C并返回`cancelled_safe_restart`；不会发布部分Inventory。Derived使用`stop_token`，第二次Ctrl+C只等待安全收尾，不走进程内强杀。
 - 多个同名`.building`目录不再依赖目录枚举顺序：按source大小/强SHA筛选，再按已提交source record、manifest时间和目录名确定恢复候选。
+- Frame域已建立第一个非GPU磁盘语义索引：从Canonical Dictionary和Frame Shard恢复FrameName、连续Frame、显式Begin/End和Vsync FrameSet，使用与Worker一致的Welcome时间换算；最后一个连续Frame只在存在可证明的全局最后语义时间时闭合。
+- `frame.sets`、`frame.list`、`frame.get`、`frame.statistics`、`frame.outliers`和`frame.range_mapping`直接读取Frame索引，不实例化Worker；`frame.identity`依赖JN关联帧语义，当前不声明为可查询。
+- Frame索引包含source/generation强身份、独立文件SHA-256、保留字段和计数审计；Final Audit同时核对Canonical semantic-time事件数和Frame set/frame/complete计数。
 
 ### TDD证据
 
@@ -464,6 +467,7 @@ RED：
 
 - 尚无`GpuAnalysisStoreReader::OpenAt`时，Session GPU Reader测试按预期编译失败。
 - 尚无`OpenSessionIfReady`和`TraceSourceKind::Session`时，SessionTraceSource测试按预期编译失败。
+- Frame Canonical fact存在但磁盘语义Reader尚未实现时，测试按预期失败于`Session advertises Frame only after its disk-backed semantic reader is ready`。
 
 GREEN：
 
@@ -475,10 +479,12 @@ GREEN：
 - Synthetic中存在CPU Zone Canonical fact但语义Reader未完成时，能力为`present=true/indexed=true/queryable=false`，`zone.cpu.search`返回`CAPABILITY_UNAVAILABLE`。
 - 发布后人工破坏一个未访问Canonical Shard，Session manifest仍可快速打开；第一次实际读取该Shard返回`session_shard_size_mismatch`，证明快速打开没有取消数据完整性门禁。
 - 有序Canonical Reader先RED为接口不存在，GREEN后恢复跨域全序且记录数完全守恒。
+- Frame GREEN恢复Synthetic `Vsync 9`的2个完整Frame；Welcome换算后的区间为`[12,36]ns`和`[36,40]ns`，Query 1.34的`frame.sets/frame.list`结果与直接Reader一致。
+- 提交后篡改`frames.bin`会被`session_frame_file_sha256_mismatch`拒绝，损坏的语义索引不能被发布结果静默使用。
 - `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- CPU/Frame/Zone/Job/Sampling/Memory/FrameImage的语义分页Reader。
+- CPU Zone、GPU Zone、Job、Sampling、Memory和FrameImage的语义分页Reader。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。

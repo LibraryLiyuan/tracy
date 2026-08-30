@@ -2,6 +2,7 @@
 
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyHash.hpp"
+#include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 
 #include <algorithm>
@@ -105,6 +106,7 @@ struct IndexVisitorState
 {
     std::vector<DomainIndexEntry>* entries = nullptr;
     DomainIndexHeader* header = nullptr;
+    TraceSessionDerivedStats* stats = nullptr;
 };
 
 bool IndexRecord( const TraceSessionCanonicalRecord& record, void* userData, std::string& )
@@ -119,6 +121,21 @@ bool IndexRecord( const TraceSessionCanonicalRecord& record, void* userData, std
     case TraceSessionCanonicalRecordKind::ProtocolEvent: state.header->protocolEvents++; break;
     case TraceSessionCanonicalRecordKind::ProtocolFrame: state.header->protocolFrames++; break;
     case TraceSessionCanonicalRecordKind::TransportRecord: state.header->transportRecords++; break;
+    }
+    if( record.hasSemanticTime )
+    {
+        if( !state.stats->semanticTimePresent )
+        {
+            state.stats->firstSemanticTimeRaw = record.semanticTime;
+            state.stats->lastSemanticTimeRaw = record.semanticTime;
+            state.stats->semanticTimePresent = true;
+        }
+        else
+        {
+            state.stats->firstSemanticTimeRaw = std::min( state.stats->firstSemanticTimeRaw, record.semanticTime );
+            state.stats->lastSemanticTimeRaw = std::max( state.stats->lastSemanticTimeRaw, record.semanticTime );
+        }
+        state.stats->semanticTimeRecords++;
     }
     return true;
 }
@@ -139,11 +156,18 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "protocol_events " << value.stats.indexedProtocolEvents << '\n';
     out << "protocol_frames " << value.stats.indexedProtocolFrames << '\n';
     out << "transport_records " << value.stats.indexedTransportRecords << '\n';
+    out << "semantic_time_records " << value.stats.semanticTimeRecords << '\n';
+    out << "first_semantic_time_raw " << value.stats.firstSemanticTimeRaw << '\n';
+    out << "last_semantic_time_raw " << value.stats.lastSemanticTimeRaw << '\n';
+    out << "semantic_time_present " << ( value.stats.semanticTimePresent ? 1 : 0 ) << '\n';
     out << "index_bytes " << value.stats.indexBytes << '\n';
     out << "index_files " << value.stats.indexFiles << '\n';
     out << "gpu_resources " << value.stats.gpuResources << '\n';
     out << "gpu_allocations " << value.stats.gpuAllocations << '\n';
     out << "gpu_passes " << value.stats.gpuPasses << '\n';
+    out << "frame_sets " << value.stats.frameSets << '\n';
+    out << "frames " << value.stats.frames << '\n';
+    out << "complete_frames " << value.stats.completeFrames << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -175,11 +199,24 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "protocol_events" ) in >> value.stats.indexedProtocolEvents;
         else if( key == "protocol_frames" ) in >> value.stats.indexedProtocolFrames;
         else if( key == "transport_records" ) in >> value.stats.indexedTransportRecords;
+        else if( key == "semantic_time_records" ) in >> value.stats.semanticTimeRecords;
+        else if( key == "first_semantic_time_raw" ) in >> value.stats.firstSemanticTimeRaw;
+        else if( key == "last_semantic_time_raw" ) in >> value.stats.lastSemanticTimeRaw;
+        else if( key == "semantic_time_present" )
+        {
+            uint32_t present = 0;
+            in >> present;
+            if( present > 1 ) { error = "session_index_semantic_time_flag_invalid"; return false; }
+            value.stats.semanticTimePresent = present != 0;
+        }
         else if( key == "index_bytes" ) in >> value.stats.indexBytes;
         else if( key == "index_files" ) in >> value.stats.indexFiles;
         else if( key == "gpu_resources" ) in >> value.stats.gpuResources;
         else if( key == "gpu_allocations" ) in >> value.stats.gpuAllocations;
         else if( key == "gpu_passes" ) in >> value.stats.gpuPasses;
+        else if( key == "frame_sets" ) in >> value.stats.frameSets;
+        else if( key == "frames" ) in >> value.stats.frames;
+        else if( key == "complete_frames" ) in >> value.stats.completeFrames;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -293,7 +330,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         if( shard.recordCount > uint64_t( std::numeric_limits<size_t>::max() ) )
         { error = "session_index_record_limit"; return false; }
         entries.reserve( size_t( shard.recordCount ) );
-        IndexVisitorState state { &entries, &header };
+        IndexVisitorState state { &entries, &header, &index.stats };
         if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, IndexRecord, &state, error ) ) return false;
         header.recordCount = entries.size();
         std::ostringstream name;
@@ -327,6 +364,14 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         if( control.progress ) control.progress( eventShardCount == 0 ? 1.f :
             float( ++completedShards ) / float( eventShardCount ), "session-domain-index" );
     }
+
+    TraceSessionFrameStats frameStats;
+    if( !BuildTraceSessionFrameDerived( sessionRoot, manifest,
+        index.stats.semanticTimePresent, index.stats.lastSemanticTimeRaw,
+        frameStats, error ) ) return false;
+    index.stats.frameSets = frameStats.frameSets;
+    index.stats.frames = frameStats.frames;
+    index.stats.completeFrames = frameStats.completeFrames;
 
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
@@ -363,7 +408,8 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( index.stats.indexedRecords != expected ||
         index.stats.indexedProtocolEvents != canonical.protocolEvents ||
         index.stats.indexedProtocolFrames != canonical.protocolFrames ||
-        index.stats.indexedTransportRecords != canonical.transportRecords )
+        index.stats.indexedTransportRecords != canonical.transportRecords ||
+        index.stats.semanticTimeRecords != canonical.semanticTimeEvents )
     { error = "session_final_audit_index_count_mismatch"; return false; }
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
@@ -382,6 +428,11 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
             gpu->passCount != index.stats.gpuPasses )
         { if( error.empty() ) error = "session_gpu_derived_audit_mismatch"; return false; }
     }
+    const auto frameReader = TraceSessionFrameReader::Open( sessionRoot, manifest, error );
+    if( !frameReader || frameReader->Stats().frameSets != index.stats.frameSets ||
+        frameReader->Stats().frames != index.stats.frames ||
+        frameReader->Stats().completeFrames != index.stats.completeFrames )
+    { if( error.empty() ) error = "session_frame_derived_audit_mismatch"; return false; }
     stats = index.stats;
     return true;
 }

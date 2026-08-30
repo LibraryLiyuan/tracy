@@ -427,23 +427,34 @@ int64_t TraceSessionTimeTransform::ToNanoseconds( int64_t value ) const
     return present ? int64_t( double( value - baseTime ) * timerMultiplier ) : value;
 }
 
-bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
-    const TraceSessionManifest& manifest, JnTraceData& data,
-    TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
+bool LoadTraceSessionTimeTransform( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
     std::string& error )
 {
-    error.clear(); data = {}; timeTransform = {}; stats = {};
+    error.clear();
+    timeTransform = {};
     MetadataState metadata { &timeTransform };
     for( const auto& shard : manifest.shards )
     {
         if( shard.domain != "control" ) continue;
-        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, VisitMetadata, &metadata, error ) ) return false;
+        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard,
+            VisitMetadata, &metadata, error ) ) return false;
     }
     if( !timeTransform.present )
     {
         error = "session_welcome_time_transform_missing";
         return false;
     }
+    return true;
+}
+
+bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, JnTraceData& data,
+    TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
+    std::string& error )
+{
+    error.clear(); data = {}; timeTransform = {}; stats = {};
+    if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, timeTransform, error ) ) return false;
     GpuLoadState state { &data, &timeTransform, &stats };
     std::vector<const TraceSessionShard*> gpuShards;
     for( const auto& shard : manifest.shards )

@@ -955,6 +955,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.zoneBegin = { 104, 0x1000 };
     AppendQueueItem( frame, item );
     item = {};
+    item.hdr.type = tracy::QueueType::FrameVsync;
+    item.frameVsync = { 106, 9 };
+    AppendQueueItem( frame, item );
+    item = {};
     item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
     item.jnGpuCatalogControl = { 105, Generation, 0, 1,
         uint8_t( tracy::JnGpuCatalogControlKind::GenerationBegin ),
@@ -980,6 +984,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
     item.jnGpuReferenceEnd = { 113, 1000, 2000, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::FrameVsync;
+    item.frameVsync = { 118, 9 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
     item.jnGpuCatalogControl = { 120, Generation, 1, 4,
@@ -1107,6 +1114,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionSource->GetTraceInfo().fingerprint == manifest.source.sha256 &&
         !sessionSource->WorkerLoaded(),
         "open a published Session without materializing a full Worker" );
+    const auto sessionCapabilities = sessionSource->GetCapabilities();
+    const auto frameCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "frame"; } );
+    test.Check( frameCapability != sessionCapabilities.end() && frameCapability->present &&
+        frameCapability->indexed && frameCapability->queryable,
+        "Session advertises Frame only after its disk-backed semantic reader is ready" );
+    const auto sessionFrameSets = sessionSource->GetFrameSets();
+    test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
+        sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
+        sessionFrameSets[0].completeFrameCount == 2,
+        "Session Frame index restores the exact Vsync set and completeness" );
+    const auto sessionFrames = sessionSource->GetFramesForSet( 0, 0, 3 );
+    const auto sessionDurations = sessionSource->GetFrameDurations( 0 );
+    test.Check( sessionFrames.size() == 2 && sessionFrames[0].beginNs == 12 &&
+        sessionFrames[0].endNs == 36 && sessionFrames[1].beginNs == 36 &&
+        sessionFrames[1].endNs == 40 && sessionDurations == std::vector<int64_t>( { 24, 4 } ),
+        "Session Frame reader applies the Welcome transform and closes the offline tail at last semantic time" );
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
     test.Check( corruptShard != manifest.shards.end(), "lazy checksum fixture has a Canonical data shard" );
@@ -1140,6 +1164,24 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state ==
             tracy::analysis::TraceSourceState::Ready,
             "SessionTraceSource becomes ready without full Worker materialization" );
+        const auto frameSets = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-frame-sets" }, { "method", "frame.sets" },
+            { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( frameSets.value( "ok", false ) &&
+            frameSets["data"]["frame_sets"].size() == 1 &&
+            frameSets["data"]["frame_sets"][0]["name"] == "Vsync 9" &&
+            frameSets["data"]["frame_sets"][0]["frame_count"] == 2,
+            "Query 1.34 reads Session Frame sets from the disk semantic index" );
+        const auto frames = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-frame-list" }, { "method", "frame.list" },
+            { "params", { { "trace_id", traceId }, { "frame_set", 0 } } }
+        } );
+        test.Check( frames.value( "ok", false ) && frames["data"]["frames"].size() == 2 &&
+            frames["data"]["frames"][0]["begin_ns"] == "12" &&
+            frames["data"]["frames"][0]["end_ns"] == "36" &&
+            frames["data"]["frames"][1]["duration_ns"] == "4",
+            "Query 1.34 preserves Session Frame timing and pagination semantics" );
         {
             std::ofstream switched( publishedSession / "CURRENT", std::ios::binary | std::ios::trunc );
             switched << "newer-generation-published-after-trace-open\n";
@@ -1165,6 +1207,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( !cpuSearch.value( "ok", true ) && cpuSearch["error"]["code"] == "CAPABILITY_UNAVAILABLE",
             "Session returns capability_unavailable instead of an empty result or Worker fallback" );
     }
+    const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
+        publishedSession, manifest ) / "frames.bin";
+    {
+        std::fstream damaged( frameFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x5a );
+        damaged.write( &byte, 1 );
+    }
+    test.Check( !tracy::analysis::TraceSessionFrameReader::Open(
+        publishedSession, manifest, error ) && error == "session_frame_file_sha256_mismatch",
+        "Session Frame reader rejects a corrupted committed semantic index" );
 }
 
 }
