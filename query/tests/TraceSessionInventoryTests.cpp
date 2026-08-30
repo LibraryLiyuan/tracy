@@ -1,6 +1,7 @@
 #include "TracyTraceSessionInventory.hpp"
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionDerived.hpp"
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -1019,6 +1020,31 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( gpuStore.has_value() && gpuStore->complete &&
         gpuStore->resourceCount == 2 && gpuStore->passCount == 1,
         "Session generation publishes N29 GPU analysis without a duplicate raw sidecar: " + error );
+
+    tracy::analysis::TraceSessionDerivedControl derivedControl;
+    derivedControl.minimumFreeBytes = 0;
+    tracy::analysis::TraceSessionDerivedStats mandatoryStats;
+    test.Check( tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
+        inventory, derivedControl, mandatoryStats, error ),
+        "build all mandatory Session indexes: " + error );
+    tracy::analysis::TraceSessionDerivedStats auditedStats;
+    test.Check( tracy::analysis::AuditTraceSessionFinal(
+        sessionRoot, manifest, inventory, auditedStats, error ),
+        "final audit covers Canonical, mandatory indexes, and GPU derived: " + error );
+    test.Check( mandatoryStats.indexedRecords == auditedStats.indexedRecords &&
+        auditedStats.indexedProtocolEvents == inventory.protocolInventory.eventCount &&
+        auditedStats.gpuResources == 2 && auditedStats.gpuPasses == 1,
+        "mandatory derived counts are exact and reproducible" );
+    manifest.auditComplete = true;
+    manifest.mandatoryDerivedComplete = true;
+    manifest.state = tracy::analysis::TraceSessionState::Complete;
+    manifest.reason = "complete";
+    const auto publishedSession = directory / "gpu-canonical-published.jn-trace-session";
+    test.Check( tracy::analysis::PublishTraceSession(
+        sessionRoot, publishedSession, manifest, error ),
+        "publish only after mandatory derived and Final Audit: " + error );
+    test.Check( tracy::analysis::IsTraceSessionQueryable( publishedSession, error ),
+        "published Session is queryable: " + error );
 }
 
 }

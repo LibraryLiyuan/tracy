@@ -417,6 +417,11 @@ GREEN：
 - pointer token在同一地址Destroy后再次Create时按事件时间解析到不同`GpuResourceId`，歧义区间返回unresolved而不猜测。
 - N29 Store writer新增显式algorithm root入口；Legacy `.tracy` sidecar继续使用原路径，Session直接写入当前generation的`derived/gpu-resource-analysis/<schema>/<algorithm>`。
 - `BuildTraceSessionGpuAnalysisDerived`直接消费Canonical GPU事实并构建N29 Snapshot/索引，不写独立Raw GPU sidecar，也不重读stream。
+- 新增全域`session-index`：每个Canonical事件Shard对应一个immutable索引文件，逐记录保存source sequence、frame ordinal/offset、Journal时间、语义时间、线程、类型和kind；文件及manifest独立SHA-256并原子发布。
+- Mandatory Derived统计Protocol Event、显式ProtocolFrame、Transport Record和17域总数；Final Audit重新读取Canonical与索引文件，不复用构建期计数器。
+- Final Audit要求`Inventory source count = Canonical count = Derived source count`，并验证GPU Store的source SHA/size、Complete状态及Resource/Allocation/Pass数量。
+- `tracy-stream-convert`生产入口已改为只生成`.jn-trace-session`；`-o`只表示Session目录，`.tracy`输出会明确拒绝。旧完整Worker转换只在`JN_STREAM_CONVERT_DEV_TOOLS`下以`tracy-stream-convert-legacy`保留作差分Oracle。
+- 新Converter串联Inventory、容量预检、Canonical、Mandatory Derived、Final Audit和原子Session发布；默认输出无需格式参数，`--status`、`--resume`和`--restart-generation`已接入。
 
 ### 当前TDD证据
 
@@ -425,8 +430,10 @@ GREEN：
 - `timerMul=2`、`initBegin=100`下，原始TSC 110/111/112/113严格换算为20/22/24/26 ns。
 - 两个Catalog payload各消费一次，batch数与unresolved payload计数分别为2和0。
 - 同一Synthetic Session成功生成N29 GPU derived generation；Store manifest为Complete，资源数2、Pass数1，且Session目录中不存在独立Raw sidecar。
+- Synthetic的全部Canonical记录均进入带校验和的全域索引；独立Final Audit数量完全一致后Session才切换为Complete并通过`IsTraceSessionQueryable`。
 - N29 GPU Analysis、Session Store和Session Inventory联合回归通过。
 
 ### 尚未完成
 
-- 其余Mandatory Derived索引与Final Audit。
+- Job/Allocation等生命周期的语义型二级索引；当前全域磁盘索引已保留构建这些索引所需的精确顺序、时间和位置，但不能提前宣称Query语义接口已完成。
+- Converter在Inventory/Derived阶段的细粒度Ctrl+C checkpoint与持久化ETA。
