@@ -325,7 +325,8 @@ const char* TraceSessionProtocolDomainName( TraceSessionProtocolDomain domain )
 }
 
 bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8_t> record,
-    TraceSessionProtocolInventory& inventory, std::string& error )
+    TraceSessionProtocolInventory& inventory, std::string& error,
+    TraceSessionProtocolEventVisitor visitor, void* visitorUserData )
 {
     error.clear();
     if( record.size() < sizeof( tracy::lz4sz_t ) )
@@ -354,7 +355,8 @@ bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8
 
     TraceSessionProtocolInventory frame;
     if( !CountTraceProtocolFrame( std::span<const uint8_t>(
-        reinterpret_cast<const uint8_t*>( output ), size_t( decodedSize ) ), frame, error ) )
+        reinterpret_cast<const uint8_t*>( output ), size_t( decodedSize ) ), frame, error,
+        visitor, visitorUserData ) )
         return false;
     frame.compressedBytes = record.size();
     if( !Merge( inventory, frame, error ) ) return false;
@@ -365,7 +367,8 @@ bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8
 }
 
 bool CountTraceProtocolFrame( std::span<const uint8_t> frame,
-    TraceSessionProtocolInventory& inventory, std::string& error )
+    TraceSessionProtocolInventory& inventory, std::string& error,
+    TraceSessionProtocolEventVisitor visitor, void* visitorUserData )
 {
     error.clear();
     size_t offset = 0;
@@ -407,6 +410,19 @@ bool CountTraceProtocolFrame( std::span<const uint8_t> frame,
         {
             error = "protocol_event_exceeds_frame";
             return false;
+        }
+        if( offset > std::numeric_limits<uint32_t>::max() ||
+            eventBytes > std::numeric_limits<uint32_t>::max() ||
+            variableBytes > std::numeric_limits<uint32_t>::max() )
+        {
+            error = "protocol_event_location_overflow";
+            return false;
+        }
+        if( visitor )
+        {
+            const TraceSessionProtocolEventInfo info {
+                index, uint32_t( offset ), uint32_t( eventBytes ), uint32_t( variableBytes ) };
+            if( !visitor( info, visitorUserData, error ) ) return false;
         }
 
         auto& stats = inventory.events[index];

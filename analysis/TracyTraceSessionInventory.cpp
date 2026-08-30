@@ -1,6 +1,7 @@
 #include "TracyTraceSessionInventory.hpp"
 
 #include "TracyHash.hpp"
+#include "TracyQueue.hpp"
 #include "TracyStreamJournal.hpp"
 
 #include <algorithm>
@@ -24,6 +25,161 @@ namespace tracy::analysis
 {
 namespace
 {
+
+bool AtomicReplaceFile( const std::filesystem::path& temporary,
+    const std::filesystem::path& finalPath, std::string& error );
+
+void AppendU16( std::vector<uint8_t>& output, uint16_t value )
+{
+    output.push_back( uint8_t( value ) );
+    output.push_back( uint8_t( value >> 8 ) );
+}
+
+void AppendU32( std::vector<uint8_t>& output, uint32_t value )
+{
+    for( int i = 0; i < 4; i++ ) output.push_back( uint8_t( value >> ( i * 8 ) ) );
+}
+
+void AppendU64( std::vector<uint8_t>& output, uint64_t value )
+{
+    for( int i = 0; i < 8; i++ ) output.push_back( uint8_t( value >> ( i * 8 ) ) );
+}
+
+class InventoryRunWriter
+{
+public:
+    InventoryRunWriter( std::filesystem::path root, uint64_t targetBytes,
+        TraceSessionInventory& inventory )
+        : m_root( std::move( root ) )
+        , m_targetBytes( std::max<uint64_t>( targetBytes, 1 ) )
+        , m_inventory( inventory )
+    {}
+
+    bool AppendJournalRecord( const tracy::stream::RecordInfo& record, std::string& error )
+    {
+        if( m_journal.count == 0 ) m_journal.recordBegin = record.sequence;
+        m_journal.recordEnd = record.sequence;
+        AppendU64( m_journal.bytes, record.sequence );
+        AppendU64( m_journal.bytes, record.offset );
+        AppendU64( m_journal.bytes, record.monotonicNs );
+        AppendU64( m_journal.bytes, record.payloadSize );
+        AppendU32( m_journal.bytes, record.flags );
+        AppendU16( m_journal.bytes, uint16_t( record.type ) );
+        AppendU16( m_journal.bytes, 0 );
+        m_journal.count++;
+        return m_journal.bytes.size() < m_targetBytes ||
+            Flush( TraceSessionInventoryRunKind::JournalRecord, m_journal, error );
+    }
+
+    bool AppendDependency( const tracy::stream::RecordInfo& record, uint64_t frameOrdinal,
+        const TraceSessionProtocolEventInfo& event, std::string& error )
+    {
+        if( m_dependency.count == 0 ) m_dependency.recordBegin = record.sequence;
+        m_dependency.recordEnd = record.sequence;
+        AppendU64( m_dependency.bytes, record.sequence );
+        AppendU64( m_dependency.bytes, record.offset );
+        AppendU64( m_dependency.bytes, frameOrdinal );
+        AppendU32( m_dependency.bytes, event.frameOffset );
+        AppendU32( m_dependency.bytes, event.encodedBytes );
+        AppendU32( m_dependency.bytes, event.variablePayloadBytes );
+        m_dependency.bytes.push_back( event.queueType );
+        m_dependency.bytes.push_back( uint8_t( ClassifyTraceProtocolEvent( event.queueType ) ) );
+        AppendU16( m_dependency.bytes, 0 );
+        m_dependency.count++;
+        return m_dependency.bytes.size() < m_targetBytes ||
+            Flush( TraceSessionInventoryRunKind::ProtocolDependency, m_dependency, error );
+    }
+
+    bool Finish( std::string& error )
+    {
+        return Flush( TraceSessionInventoryRunKind::JournalRecord, m_journal, error ) &&
+            Flush( TraceSessionInventoryRunKind::ProtocolDependency, m_dependency, error );
+    }
+
+private:
+    struct Buffer
+    {
+        std::vector<uint8_t> bytes;
+        uint64_t count = 0;
+        uint64_t recordBegin = 0;
+        uint64_t recordEnd = 0;
+        uint64_t nextRunId = 0;
+    };
+
+    bool Flush( TraceSessionInventoryRunKind kind, Buffer& buffer, std::string& error )
+    {
+        if( buffer.count == 0 ) return true;
+        const char* kindName = kind == TraceSessionInventoryRunKind::JournalRecord ? "journal" : "dependencies";
+        const uint32_t entryBytes = kind == TraceSessionInventoryRunKind::JournalRecord ? 40 : 40;
+        std::vector<uint8_t> payload;
+        payload.reserve( 32 + buffer.bytes.size() );
+        static constexpr uint8_t Magic[8] = { 'J', 'N', 'I', 'N', 'V', 'R', 'N', '1' };
+        payload.insert( payload.end(), std::begin( Magic ), std::end( Magic ) );
+        AppendU32( payload, 1 );
+        AppendU32( payload, uint32_t( kind ) );
+        AppendU32( payload, entryBytes );
+        AppendU32( payload, 0 );
+        AppendU64( payload, buffer.count );
+        payload.insert( payload.end(), buffer.bytes.begin(), buffer.bytes.end() );
+
+        const auto relative = std::filesystem::path( kindName ) /
+            ( "run-" + std::to_string( buffer.nextRunId ) + ".bin" );
+        const auto finalPath = m_root / relative;
+        auto temporary = finalPath;
+        temporary += ".tmp";
+        std::error_code filesystemError;
+        std::filesystem::create_directories( finalPath.parent_path(), filesystemError );
+        if( filesystemError )
+        {
+            error = "cannot create inventory run directory: " + filesystemError.message();
+            return false;
+        }
+        {
+            std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+            output.write( reinterpret_cast<const char*>( payload.data() ), std::streamsize( payload.size() ) );
+            output.flush();
+            if( !output )
+            {
+                error = "cannot write inventory run";
+                return false;
+            }
+        }
+        if( !AtomicReplaceFile( temporary, finalPath, error ) ) return false;
+
+        TraceSessionInventoryRun run;
+        run.kind = kind;
+        run.runId = buffer.nextRunId++;
+        run.recordBegin = buffer.recordBegin;
+        run.recordEnd = buffer.recordEnd;
+        run.recordCount = buffer.count;
+        run.fileBytes = payload.size();
+        run.sha256 = Sha256File( finalPath );
+        run.relativePath = relative;
+        m_inventory.runs.emplace_back( std::move( run ) );
+        buffer.bytes.clear();
+        buffer.count = 0;
+        buffer.recordBegin = 0;
+        buffer.recordEnd = 0;
+        return true;
+    }
+
+    std::filesystem::path m_root;
+    uint64_t m_targetBytes;
+    TraceSessionInventory& m_inventory;
+    Buffer m_journal;
+    Buffer m_dependency;
+};
+
+bool IsProtocolDependency( uint8_t queueType )
+{
+    const auto domain = ClassifyTraceProtocolEvent( queueType );
+    if( domain == TraceSessionProtocolDomain::Dictionary ||
+        domain == TraceSessionProtocolDomain::SourceCallstack ) return true;
+    const auto type = QueueType( queueType );
+    return type == QueueType::FrameImageData ||
+        type == QueueType::JnGpuReferenceSetDefinition ||
+        type == QueueType::JnGpuCatalogBatchData;
+}
 
 uint64_t SaturatingAdd( uint64_t left, uint64_t right )
 {
@@ -68,7 +224,19 @@ struct InventoryVisitorState
     TraceSessionProtocolDecoder protocolDecoder;
     bool protocolFailed = false;
     std::string protocolError;
+    InventoryRunWriter* runWriter = nullptr;
+    tracy::stream::RecordInfo currentProtocolRecord;
+    uint64_t protocolFrameOrdinal = 0;
 };
+
+bool VisitProtocolEvent( const TraceSessionProtocolEventInfo& event,
+    void* userData, std::string& error )
+{
+    auto& state = *static_cast<InventoryVisitorState*>( userData );
+    if( !state.runWriter || !IsProtocolDependency( event.queueType ) ) return true;
+    return state.runWriter->AppendDependency( state.currentProtocolRecord,
+        state.protocolFrameOrdinal, event, error );
+}
 
 bool ReadRecordPayload( InventoryVisitorState& state,
     const tracy::stream::RecordInfo& record )
@@ -160,17 +328,24 @@ void VisitRecord( const tracy::stream::RecordInfo& record, void* userData )
         state.hasTimestamp = true;
     }
     inventory.lastMonotonicNs = record.monotonicNs;
+    if( state.runWriter && !state.runWriter->AppendJournalRecord( record, state.protocolError ) )
+    {
+        state.protocolFailed = true;
+        return;
+    }
     const bool compressedFrame = record.type == tracy::stream::RecordType::ClientToServer &&
         ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
     const bool terminal = record.type == tracy::stream::RecordType::SessionEnd;
     if( !state.protocolFailed && ( compressedFrame || terminal ) )
     {
+        if( compressedFrame ) state.currentProtocolRecord = record;
         if( !ReadRecordPayload( state, record ) )
         {
             state.protocolFailed = true;
         }
         else if( compressedFrame && !state.protocolDecoder.ConsumeCompressedRecord(
-            state.payload, inventory.protocolInventory, state.protocolError ) )
+            state.payload, inventory.protocolInventory, state.protocolError,
+            VisitProtocolEvent, &state ) )
         {
             state.protocolFailed = true;
             state.protocolError = "protocol record " + std::to_string( record.sequence ) + ": " + state.protocolError;
@@ -187,6 +362,7 @@ void VisitRecord( const tracy::stream::RecordInfo& record, void* userData )
                 inventory.captureEndServerBytes = Read64( state.payload.data() + 16 );
             }
         }
+        if( compressedFrame && !state.protocolFailed ) state.protocolFrameOrdinal++;
     }
     if( state.options->progress )
     {
@@ -300,6 +476,17 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
     visitor.inventory = &inventory;
     visitor.options = &options;
     visitor.sourceFileSize = inventory.sourceFileSize;
+    std::optional<InventoryRunWriter> runWriter;
+    if( !options.runDirectory.empty() )
+    {
+        if( options.runTargetBytes == 0 )
+        {
+            error = "inventory run target must be non-zero";
+            return false;
+        }
+        runWriter.emplace( options.runDirectory, options.runTargetBytes, inventory );
+        visitor.runWriter = &*runWriter;
+    }
     visitor.payloadInput.open( sourcePath, std::ios::binary );
     if( !visitor.payloadInput )
     {
@@ -324,6 +511,7 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
         error = visitor.protocolError;
         return false;
     }
+    if( runWriter && !runWriter->Finish( error ) ) return false;
     inventory.protocolInventoryComplete = true;
     if( options.progress ) options.progress( TraceSessionInventoryPhase::JournalScan,
         inventory.sourceFileSize, inventory.sourceFileSize, options.progressUserData );
@@ -434,6 +622,13 @@ bool SaveTraceSessionInventory( const std::filesystem::path& path,
             output << "protocol_domain " << i << ' ' << domain.count << ' '
                 << domain.encodedBytes << ' ' << domain.variablePayloadBytes << '\n';
         }
+        output << "run_count " << inventory.runs.size() << '\n';
+        for( const auto& run : inventory.runs )
+        {
+            output << "run " << uint32_t( run.kind ) << ' ' << run.runId << ' '
+                << run.recordBegin << ' ' << run.recordEnd << ' ' << run.recordCount << ' '
+                << run.fileBytes << ' ' << run.sha256 << ' ' << run.relativePath.generic_string() << '\n';
+        }
         output.flush();
         if( !output )
         {
@@ -468,6 +663,7 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
     size_t recordsRead = 0;
     size_t protocolEventsRead = 0;
     size_t protocolDomainsRead = 0;
+    size_t declaredRunCount = 0;
     while( input >> key )
     {
         if( key == "schema" ) input >> inventory.schema;
@@ -537,6 +733,24 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
             input >> domain.count >> domain.encodedBytes >> domain.variablePayloadBytes;
             protocolDomainsRead++;
         }
+        else if( key == "run_count" ) input >> declaredRunCount;
+        else if( key == "run" )
+        {
+            uint32_t kind = 0;
+            TraceSessionInventoryRun run;
+            std::string pathValue;
+            input >> kind >> run.runId >> run.recordBegin >> run.recordEnd >> run.recordCount
+                >> run.fileBytes >> run.sha256 >> pathValue;
+            if( kind < uint32_t( TraceSessionInventoryRunKind::JournalRecord ) ||
+                kind > uint32_t( TraceSessionInventoryRunKind::ProtocolDependency ) )
+            {
+                error = "inventory run kind is out of range";
+                return std::nullopt;
+            }
+            run.kind = TraceSessionInventoryRunKind( kind );
+            run.relativePath = pathValue;
+            inventory.runs.emplace_back( std::move( run ) );
+        }
         else
         {
             error = "unknown inventory field: " + key;
@@ -595,6 +809,11 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
         error = "incomplete protocol domain inventory";
         return std::nullopt;
     }
+    if( inventory.runs.size() != declaredRunCount )
+    {
+        error = "incomplete inventory run manifest";
+        return std::nullopt;
+    }
     return inventory;
 }
 
@@ -621,6 +840,41 @@ bool EvaluateTraceSessionCapacity( const TraceSessionInventory& inventory,
     }
     result.accepted = true;
     result.reason = "accepted";
+    return true;
+}
+
+bool VerifyTraceSessionInventoryRuns( const std::filesystem::path& root,
+    const TraceSessionInventory& inventory, std::string& error )
+{
+    error.clear();
+    for( const auto& run : inventory.runs )
+    {
+        if( run.relativePath.empty() || run.relativePath.is_absolute() )
+        {
+            error = "inventory run path is invalid";
+            return false;
+        }
+        for( const auto& component : run.relativePath )
+        {
+            if( component == ".." )
+            {
+                error = "inventory run path escapes root";
+                return false;
+            }
+        }
+        const auto path = root / run.relativePath;
+        std::error_code filesystemError;
+        if( std::filesystem::file_size( path, filesystemError ) != run.fileBytes || filesystemError )
+        {
+            error = "inventory run size mismatch";
+            return false;
+        }
+        if( Sha256File( path ) != run.sha256 )
+        {
+            error = "inventory run checksum mismatch";
+            return false;
+        }
+    }
     return true;
 }
 

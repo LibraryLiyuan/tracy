@@ -76,11 +76,18 @@ int main( int argc, char** argv )
         Usage();
         return 1;
     }
+    if( output.empty() )
+    {
+        output = tracy::analysis::DefaultTraceSessionPath( input );
+        output += ".inventory-v1";
+    }
 
     tracy::analysis::TraceSessionInventory inventory;
     std::string error;
     ProgressState progress;
     tracy::analysis::TraceSessionInventoryOptions inventoryOptions;
+    inventoryOptions.runDirectory = output;
+    inventoryOptions.runDirectory += ".runs";
     inventoryOptions.progress = PrintProgress;
     inventoryOptions.progressUserData = &progress;
     if( !tracy::analysis::BuildTraceSessionInventory(
@@ -89,12 +96,13 @@ int main( int argc, char** argv )
         std::fprintf( stderr, "Inventory failed: %s\n", error.c_str() );
         return 2;
     }
-
-    if( output.empty() )
+    if( !tracy::analysis::VerifyTraceSessionInventoryRuns(
+        inventoryOptions.runDirectory, inventory, error ) )
     {
-        output = tracy::analysis::DefaultTraceSessionPath( input );
-        output += ".inventory-v1";
+        std::fprintf( stderr, "Inventory run verification failed: %s\n", error.c_str() );
+        return 2;
     }
+
     if( !tracy::analysis::SaveTraceSessionInventory( output, inventory, error ) )
     {
         std::fprintf( stderr, "Inventory save failed: %s\n", error.c_str() );
@@ -134,7 +142,8 @@ int main( int argc, char** argv )
         "\"complete\":%s,\"source_degraded\":%s,\"quality_reason\":\"%s\","
         "\"estimated_canonical_bytes\":\"%llu\",\"estimated_total_build_bytes\":\"%llu\","
         "\"capacity_accepted\":%s,\"capacity_reason\":\"%s\","
-        "\"required_available_bytes\":\"%llu\",\"inventory_path\":\"%s\"}\n",
+        "\"required_available_bytes\":\"%llu\",\"inventory_runs\":\"%llu\","
+        "\"inventory_path\":\"%s\"}\n",
         inventory.schema, inventory.protocol,
         static_cast<unsigned long long>( inventory.sourceFileSize ), inventory.sourceSha256.c_str(),
         static_cast<unsigned long long>( inventory.validSize ),
@@ -155,6 +164,7 @@ int main( int argc, char** argv )
         capacityAccepted ? "true" : "false",
         filesystemError ? "space_query_failed" : capacity.reason.c_str(),
         static_cast<unsigned long long>( capacity.requiredAvailableBytes ),
+        static_cast<unsigned long long>( inventory.runs.size() ),
         JsonEscape( output.string() ).c_str() );
     return capacityAccepted ? 0 : 3;
 }

@@ -337,6 +337,7 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     std::vector<uint8_t> frame;
     AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
     AppendFixedEvent( frame, tracy::QueueType::JnJobSchedule );
+    AppendStringEvent( frame, tracy::QueueType::StringData, "dependency" );
     std::vector<char> compressed( tracy::LZ4Size );
     const auto compressedBytes = tracy::LZ4_compress_default(
         reinterpret_cast<const char*>( frame.data() ), compressed.data(), int( frame.size() ), int( compressed.size() ) );
@@ -364,14 +365,31 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     writer.reset();
 
     tracy::analysis::TraceSessionInventory inventory;
+    tracy::analysis::TraceSessionInventoryOptions options;
+    options.runDirectory = directory / "protocol-runs";
+    options.runTargetBytes = 128;
     test.Check( tracy::analysis::BuildTraceSessionInventory(
-        path, tracy::analysis::TraceSessionInventoryOptions {}, inventory, error ),
+        path, options, inventory, error ),
         "build protocol-aware inventory: " + error );
     test.Check( inventory.protocolInventoryComplete, "protocol inventory completes" );
-    test.Check( inventory.protocolInventory.frameCount == 1 && inventory.protocolInventory.eventCount == 2,
+    test.Check( inventory.protocolInventory.frameCount == 1 && inventory.protocolInventory.eventCount == 3,
         "journal inventory contains decoded frame/event counts" );
     test.Check( inventory.protocolInventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
         "journal inventory contains QueueType counts" );
+    test.Check( !inventory.runs.empty(), "inventory emits immutable disk runs" );
+    uint64_t journalRunRecords = 0;
+    uint64_t dependencyRunRecords = 0;
+    for( const auto& run : inventory.runs )
+    {
+        if( run.kind == tracy::analysis::TraceSessionInventoryRunKind::JournalRecord )
+            journalRunRecords += run.recordCount;
+        else if( run.kind == tracy::analysis::TraceSessionInventoryRunKind::ProtocolDependency )
+            dependencyRunRecords += run.recordCount;
+    }
+    test.Check( journalRunRecords == inventory.recordCount, "journal run covers every committed record" );
+    test.Check( dependencyRunRecords > 0, "dependency run indexes protocol definitions" );
+    test.Check( tracy::analysis::VerifyTraceSessionInventoryRuns( options.runDirectory, inventory, error ),
+        "inventory run checksums verify: " + error );
 
     const auto inventoryPath = directory / "protocol-inventory";
     test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),
@@ -379,8 +397,11 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     const auto loaded = tracy::analysis::LoadTraceSessionInventory( inventoryPath, error );
     test.Check( loaded.has_value(), "load protocol inventory: " + error );
     if( loaded )
+    {
         test.Check( loaded->protocolInventory == inventory.protocolInventory,
             "protocol inventory round-trips exactly" );
+        test.Check( loaded->runs.size() == inventory.runs.size(), "inventory run manifest round-trips" );
+    }
 
     auto corruptInventory = inventory;
     corruptInventory.protocolInventory.eventCount++;
@@ -391,6 +412,17 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( !incomplete.has_value(), "inconsistent protocol totals invalidate persisted inventory" );
     test.Check( error == "incomplete protocol event inventory",
         "inconsistent protocol totals have explicit integrity reason: " + error );
+
+    if( !inventory.runs.empty() )
+    {
+        std::ofstream damaged( options.runDirectory / inventory.runs.front().relativePath,
+            std::ios::binary | std::ios::app );
+        damaged.put( '\x7f' );
+        damaged.close();
+        test.Check( !tracy::analysis::VerifyTraceSessionInventoryRuns(
+            options.runDirectory, inventory, error ), "damaged inventory run is rejected" );
+        test.Check( error == "inventory run size mismatch", "damaged run has explicit integrity reason" );
+    }
 }
 
 }

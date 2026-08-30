@@ -56,6 +56,17 @@ struct TraceSessionProtocolInventory
     bool operator==( const TraceSessionProtocolInventory& ) const = default;
 };
 
+struct TraceSessionProtocolEventInfo
+{
+    uint8_t queueType = 0;
+    uint32_t frameOffset = 0;
+    uint32_t encodedBytes = 0;
+    uint32_t variablePayloadBytes = 0;
+};
+
+using TraceSessionProtocolEventVisitor = bool ( * )(
+    const TraceSessionProtocolEventInfo& event, void* userData, std::string& error );
+
 TraceSessionProtocolDomain ClassifyTraceProtocolEvent( uint8_t queueType );
 const char* TraceSessionProtocolDomainName( TraceSessionProtocolDomain domain );
 
@@ -63,7 +74,8 @@ const char* TraceSessionProtocolDomainName( TraceSessionProtocolDomain domain );
 // exactly at an event boundary; malformed or truncated variable payloads are
 // rejected instead of being approximated.
 bool CountTraceProtocolFrame( std::span<const uint8_t> frame,
-    TraceSessionProtocolInventory& inventory, std::string& error );
+    TraceSessionProtocolInventory& inventory, std::string& error,
+    TraceSessionProtocolEventVisitor visitor = nullptr, void* visitorUserData = nullptr );
 
 class TraceSessionProtocolDecoder
 {
@@ -76,7 +88,8 @@ public:
     TraceSessionProtocolDecoder& operator=( const TraceSessionProtocolDecoder& ) = delete;
 
     bool ConsumeCompressedRecord( std::span<const uint8_t> record,
-        TraceSessionProtocolInventory& inventory, std::string& error );
+        TraceSessionProtocolInventory& inventory, std::string& error,
+        TraceSessionProtocolEventVisitor visitor = nullptr, void* visitorUserData = nullptr );
 
 private:
     struct Impl;

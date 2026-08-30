@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace tracy::analysis
 {
@@ -52,6 +53,26 @@ struct TraceSessionInventoryOptions
     uint32_t temporaryEstimatePermille = 500;
     TraceSessionInventoryProgress progress = nullptr;
     void* progressUserData = nullptr;
+    std::filesystem::path runDirectory;
+    uint64_t runTargetBytes = 64ull * 1024 * 1024;
+};
+
+enum class TraceSessionInventoryRunKind : uint8_t
+{
+    JournalRecord = 1,
+    ProtocolDependency = 2
+};
+
+struct TraceSessionInventoryRun
+{
+    TraceSessionInventoryRunKind kind = TraceSessionInventoryRunKind::JournalRecord;
+    uint64_t runId = 0;
+    uint64_t recordBegin = 0;
+    uint64_t recordEnd = 0;
+    uint64_t recordCount = 0;
+    uint64_t fileBytes = 0;
+    std::string sha256;
+    std::filesystem::path relativePath;
 };
 
 struct TraceSessionInventory
@@ -77,6 +98,7 @@ struct TraceSessionInventory
     std::array<TraceSessionInventoryRecordStats, TraceSessionJournalClass::Count> records {};
     bool protocolInventoryComplete = false;
     TraceSessionProtocolInventory protocolInventory;
+    std::vector<TraceSessionInventoryRun> runs;
     // This is deliberately zero for the bounded scanner. Large record/frame
     // directories are emitted as immutable disk runs in later stages.
     uint64_t retainedRecordMetadata = 0;
@@ -111,6 +133,8 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
 bool EvaluateTraceSessionCapacity( const TraceSessionInventory& inventory,
     uint64_t volumeCapacityBytes, uint64_t volumeAvailableBytes,
     const TraceSessionCapacityPolicy& policy, TraceSessionCapacityResult& result );
+bool VerifyTraceSessionInventoryRuns( const std::filesystem::path& root,
+    const TraceSessionInventory& inventory, std::string& error );
 
 }
 

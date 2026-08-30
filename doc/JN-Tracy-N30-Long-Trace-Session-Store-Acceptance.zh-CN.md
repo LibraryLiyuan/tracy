@@ -163,6 +163,8 @@ CPM_SOURCE_CACHE=C:\CodeProjects\GodotProjects\tracy-0.13.1-n29-gpu-analysis\bui
 - 每个压缩帧先在临时计数器中完整验证，再事务性合并；损坏帧不会把半帧计数写入Inventory。
 - 解析Schema 1 `SessionEnd` payload，保存close reason与client/server累计字节。`CaptureComplete`/`LocalShutdown`可完整，其他原因按稳定quality reason标记source degraded。
 - Inventory持久化时对QueueType明细、数据域明细、总事件数和总编码字节做交叉守恒校验；缺行或总量不一致会拒绝加载。
+- 可选run输出将每个已提交Journal Record的位置、序号、到达时间、payload大小、flags和类型写入固定40-byte记录；Dictionary、Source/Callstack、FrameImage Blob、GPU Reference Dictionary和GPU Catalog Blob另写依赖定位run。
+- run采用64 MiB目标、固定Header、相对路径、SHA-256和原子rename；Inventory manifest保存每个run的记录范围、数量、大小和hash。run损坏、越界路径或总数缺失会被拒绝。
 
 ### TDD 证据
 
@@ -173,6 +175,7 @@ RED：
 3. Protocol frame parser尚不存在时，测试因缺少`TracyTraceSessionProtocolInventory.hpp`编译失败。
 4. LZ4连续解码器尚不存在时，测试因缺少`TraceSessionProtocolDecoder`编译失败。
 5. 域分类和CaptureEnd字段尚不存在时，编译按预期失败。
+6. immutable run接口尚不存在时，测试因缺少run options、manifest和验证API而编译失败。
 
 GREEN 覆盖：
 
@@ -189,6 +192,7 @@ GREEN 覆盖：
 - Frame、Job、Scheduling、CPU Memory、GPU Memory、GPU Catalog和Dictionary域分类。
 - CaptureComplete与ProtocolMismatch关闭原因质量映射。
 - QueueType明细、域明细和总量持久化守恒校验。
+- 小目标容量下强制Journal/Dependency多run、manifest round-trip、全记录覆盖、SHA-256验证和损坏拒绝。
 - N30.1 Store 与 N29 GPU Analysis 联合回归。
 
 ```text
@@ -266,8 +270,33 @@ C:\Users\Admin\Documents\JN-Unity-T3\N30-Inventory\
 
 短Trace验证中，Inventory得到的`protocol_events=142,886,374`、`protocol_frames=9,857`，与传统Full Worker转换报告逐项相等。30分钟stream完整解压后`other=0`，未发现非法QueueType、压缩字典错误或事件边界错误。旧转换在42.6%发生的40.83 GiB内存失败不是该位置的源stream损坏。
 
+### 真实30分钟 immutable runs
+
+输出：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\N30-Inventory\
+Admin-HighEvidence-30m-with-runs.inventory
+Admin-HighEvidence-30m-with-runs.inventory.runs\
+```
+
+| 项目 | 结果 |
+|---|---:|
+| Journal runs | 1 |
+| Journal records / bytes | 499,362 / 19,974,512 |
+| Dependency runs | 20 |
+| Dependency records / bytes | 32,420,178 / 1,296,807,760 |
+| Total indexed records | 32,919,540 |
+| Total run bytes | 1,316,782,272 |
+| Inventory SHA-256 | `68A9ECF6DFD7B7BF0321DD4FEB56524AE82F64CE283BF559515172082C598589` |
+| Wall clock | 187.091秒 |
+| Peak Working Set | 157.43 MiB |
+| Peak private/paged | 180.51 MiB |
+
+峰值出现在64 MiB run最终封存时的临时payload复制；即使保留该待优化复制，内存仍由run target硬界定，未随22.8亿协议事件线性增长。run文件全部以相对路径发布，原始stream保持只读且SHA-256未变化。
+
 ### 尚未完成，不能提前通过 N30.2
 
-- Dictionary、Blob、Callstack 依赖和迟到事件分布的磁盘 run。
+- Dictionary、Blob、Callstack依赖磁盘run已完成；协议事件精确时间解码后的迟到分布须与N30.3可序列化decoder/checkpoint状态共同完成，当前不使用Journal到达时间伪装语义时间。
 - producer在JN质量事件中声明drop时的域级质量映射；SessionEnd关闭原因映射已完成。
 - Inventory build-state/checkpoint 与 GracefulCancel/Resume；该状态机与 N30.3 共用实现。
