@@ -13,6 +13,8 @@ namespace tracy::analysis
 {
 
 using TraceSessionCanonicalCancel = bool ( * )( void* userData );
+using TraceSessionCanonicalDiskSpaceProbe = bool ( * )( const std::filesystem::path& path,
+    uint64_t& capacity, uint64_t& available, void* userData, std::string& error );
 
 enum class TraceSessionCanonicalBuildResult : uint8_t
 {
@@ -32,10 +34,13 @@ struct TraceSessionCanonicalRecord
     TraceSessionCanonicalRecordKind kind = TraceSessionCanonicalRecordKind::ProtocolEvent;
     uint8_t type = 0;
     TraceSessionProtocolDomain domain = TraceSessionProtocolDomain::Other;
+    bool hasSemanticTime = false;
     uint32_t flags = 0;
+    uint32_t threadContext = 0;
     uint64_t sourceSequence = 0;
     uint64_t journalMonotonicNs = 0;
     uint64_t protocolFrameOrdinal = 0;
+    int64_t semanticTime = 0;
     std::span<const uint8_t> payload;
 };
 
@@ -51,6 +56,10 @@ struct TraceSessionCanonicalOptions
     uint64_t maximumShardSpanNs = 30ull * 1000 * 1000 * 1000;
     uint64_t softMemoryBytes = 12ull * 1024 * 1024 * 1024;
     uint64_t hardMemoryBytes = 16ull * 1024 * 1024 * 1024;
+    uint64_t minimumFreeReserveBytes = 64ull * 1024 * 1024 * 1024;
+    uint32_t minimumFreeReservePercent = 10;
+    TraceSessionCanonicalDiskSpaceProbe diskSpaceProbe = nullptr;
+    void* diskSpaceUserData = nullptr;
     bool resume = true;
     TraceSessionCanonicalCancel shouldCancel = nullptr;
     void* cancelUserData = nullptr;

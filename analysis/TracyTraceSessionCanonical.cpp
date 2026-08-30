@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <vector>
@@ -64,6 +65,7 @@ struct CanonicalBuildState
     uint64_t protocolFrameOrdinal = 0;
     uint64_t protocolEventCount = 0;
     uint64_t transportRecordCount = 0;
+    uint32_t threadContext = 0;
     uint64_t shardRecordCount = 0;
     uint64_t shardPayloadBytes = 0;
     uint64_t shardSourceBegin = 0;
@@ -107,10 +109,12 @@ bool ReadPayload( CanonicalBuildState& state, const tracy::stream::RecordInfo& r
 }
 
 bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t type,
-    uint8_t domain, uint32_t flags, const uint8_t* payload, uint32_t payloadBytes )
+    uint8_t domain, uint32_t flags, uint32_t threadContext,
+    bool hasSemanticTime, int64_t semanticTime,
+    const uint8_t* payload, uint32_t payloadBytes )
 {
     if( payloadBytes != 0 && !payload ) { state.error = "canonical_payload_missing"; return false; }
-    constexpr uint64_t RecordHeaderBytes = 40;
+    constexpr uint64_t RecordHeaderBytes = 52;
     const auto recordBytes = RecordHeaderBytes + uint64_t( payloadBytes );
     if( recordBytes > state.options->hardMemoryBytes ||
         state.shardPayloadBytes > state.options->hardMemoryBytes - recordBytes )
@@ -133,13 +137,15 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     output.payload.push_back( kind );
     output.payload.push_back( type );
     output.payload.push_back( uint8_t( domainIndex ) );
-    output.payload.push_back( 0 );
+    output.payload.push_back( hasSemanticTime ? 1 : 0 );
     Put32( output.payload, flags );
     Put32( output.payload, payloadBytes );
+    Put32( output.payload, threadContext );
     Put32( output.payload, 0 );
     Put64( output.payload, state.currentRecord.sequence );
     Put64( output.payload, state.currentRecord.monotonicNs );
     Put64( output.payload, state.protocolFrameOrdinal );
+    Put64( output.payload, uint64_t( semanticTime ) );
     if( payloadBytes != 0 )
         output.payload.insert( output.payload.end(), payload, payload + payloadBytes );
     state.shardPayloadBytes += output.payload.size() - before;
@@ -152,8 +158,16 @@ bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
     void* userData, std::string& error )
 {
     auto& state = *static_cast<CanonicalBuildState*>( userData );
+    tracy::QueueItem item {};
+    std::memcpy( &item, event.encodedData,
+        std::min<size_t>( event.encodedBytes, sizeof( item ) ) );
+    if( item.hdr.type == tracy::QueueType::ThreadContext )
+        state.threadContext = item.threadCtx.thread;
+    int64_t semanticTime = 0;
+    const auto hasSemanticTime = TryGetTraceProtocolEventTime( event, semanticTime );
     if( !AppendCanonicalRecord( state, 1, event.queueType,
         uint8_t( ClassifyTraceProtocolEvent( event.queueType ) ), 0,
+        state.threadContext, hasSemanticTime, semanticTime,
         event.encodedData, event.encodedBytes ) )
     {
         error = state.error;
@@ -163,9 +177,49 @@ bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
     return true;
 }
 
+bool HasDiskCapacity( CanonicalBuildState& state )
+{
+    uint64_t capacity = 0;
+    uint64_t available = 0;
+    if( state.options->diskSpaceProbe )
+    {
+        if( !state.options->diskSpaceProbe( *state.sessionRoot, capacity, available,
+            state.options->diskSpaceUserData, state.error ) )
+        {
+            if( state.error.empty() ) state.error = "canonical_disk_space_query_failed";
+            return false;
+        }
+    }
+    else
+    {
+        std::error_code ec;
+        const auto space = std::filesystem::space( *state.sessionRoot, ec );
+        if( ec )
+        {
+            state.error = "canonical_disk_space_query_failed:" + ec.message();
+            return false;
+        }
+        capacity = space.capacity;
+        available = space.available;
+    }
+    const auto percent = state.options->minimumFreeReservePercent;
+    const auto percentReserve = capacity / 100 * percent +
+        capacity % 100 * percent / 100;
+    const auto reserve = std::max( state.options->minimumFreeReserveBytes, percentReserve );
+    constexpr uint64_t TransactionOverhead = 1024 * 1024;
+    if( available < reserve || state.shardPayloadBytes > available - reserve ||
+        TransactionOverhead > available - reserve - state.shardPayloadBytes )
+    {
+        state.error = "canonical_disk_pressure";
+        return false;
+    }
+    return true;
+}
+
 bool FlushShard( CanonicalBuildState& state )
 {
     if( state.shardRecordCount == 0 ) return true;
+    if( !HasDiskCapacity( state ) ) return false;
     for( size_t i = 0; i < state.domains.size(); i++ )
     {
         auto& domain = state.domains[i];
@@ -194,6 +248,8 @@ bool FlushShard( CanonicalBuildState& state )
     Put64( checkpoint, state.protocolFrameOrdinal );
     Put64( checkpoint, state.protocolEventCount );
     Put64( checkpoint, state.transportRecordCount );
+    Put32( checkpoint, state.threadContext );
+    Put32( checkpoint, 0 );
     const auto dictionary = state.decoder.ExportDictionary();
     Put32( checkpoint, uint32_t( dictionary.size() ) );
     Put32( checkpoint, uint32_t( state.previousCheckpointHash.size() ) );
@@ -255,6 +311,7 @@ bool RestoreCheckpoint( CanonicalBuildState& state )
     uint32_t reserved = 0;
     uint32_t dictionaryBytes = 0;
     uint32_t previousHashBytes = 0;
+    uint32_t reservedState = 0;
     if( !Get32( payload, offset, version ) || !Get32( payload, offset, reserved ) ||
         version != 1 || reserved != 0 ||
         !Get64( payload, offset, state.resumeAfterSequence ) ||
@@ -262,6 +319,8 @@ bool RestoreCheckpoint( CanonicalBuildState& state )
         !Get64( payload, offset, state.protocolFrameOrdinal ) ||
         !Get64( payload, offset, state.protocolEventCount ) ||
         !Get64( payload, offset, state.transportRecordCount ) ||
+        !Get32( payload, offset, state.threadContext ) ||
+        !Get32( payload, offset, reservedState ) || reservedState != 0 ||
         !Get32( payload, offset, dictionaryBytes ) ||
         !Get32( payload, offset, previousHashBytes ) ||
         previousHashBytes > 64 || offset > payload.size() ||
@@ -349,6 +408,7 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
         }
         if( !AppendCanonicalRecord( state, 2, uint8_t( record.type ),
             uint8_t( TraceSessionProtocolDomain::Control ), record.flags,
+            state.threadContext, false, 0,
             state.payload.data(), uint32_t( state.payload.size() ) ) )
         {
             state.failed = true;
@@ -379,7 +439,8 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
         options.softShardBytes < options.targetShardBytes ||
         options.hardShardBytes < options.softShardBytes ||
         options.softMemoryBytes < options.hardShardBytes ||
-        options.hardMemoryBytes < options.softMemoryBytes )
+        options.hardMemoryBytes < options.softMemoryBytes ||
+        options.minimumFreeReservePercent > 100 )
     {
         error = "canonical_invalid_options";
         return TraceSessionCanonicalBuildResult::Failed;
@@ -472,6 +533,15 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
                 error += ":" + persistError;
             else if( !lease.Heartbeat( persistError ) ) error += ":" + persistError;
         }
+        else if( error == "canonical_disk_pressure" )
+        {
+            manifest.state = TraceSessionState::InsufficientDisk;
+            manifest.reason = "insufficient_disk";
+            std::string persistError;
+            if( !SaveTraceSessionManifest( sessionRoot, manifest, persistError ) )
+                error += ":" + persistError;
+            else if( !lease.Heartbeat( persistError ) ) error += ":" + persistError;
+        }
         return TraceSessionCanonicalBuildResult::Failed;
     }
     if( !FlushShard( state ) ) { error = state.error; return TraceSessionCanonicalBuildResult::Failed; }
@@ -509,7 +579,7 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     }
     std::vector<uint8_t> bytes;
     if( !ReadTraceSessionShardPayload( sessionRoot, shard, bytes, error ) ) return false;
-    constexpr size_t RecordHeaderBytes = 40;
+    constexpr size_t RecordHeaderBytes = 52;
     size_t offset = 0;
     uint64_t recordCount = 0;
     while( offset < bytes.size() )
@@ -523,13 +593,14 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
         const auto kind = bytes[offset++];
         record.type = bytes[offset++];
         const auto domain = bytes[offset++];
-        const auto reserved8 = bytes[offset++];
+        const auto canonicalFlags = bytes[offset++];
         uint32_t payloadBytes = 0;
         uint32_t reserved32 = 0;
         if( ( kind != uint8_t( TraceSessionCanonicalRecordKind::ProtocolEvent ) &&
               kind != uint8_t( TraceSessionCanonicalRecordKind::TransportRecord ) ) ||
-            domain >= uint8_t( TraceSessionProtocolDomain::Count ) || reserved8 != 0 ||
+            domain >= uint8_t( TraceSessionProtocolDomain::Count ) || ( canonicalFlags & ~1u ) != 0 ||
             !Get32( bytes, offset, record.flags ) || !Get32( bytes, offset, payloadBytes ) ||
+            !Get32( bytes, offset, record.threadContext ) ||
             !Get32( bytes, offset, reserved32 ) || reserved32 != 0 ||
             !Get64( bytes, offset, record.sourceSequence ) ||
             !Get64( bytes, offset, record.journalMonotonicNs ) ||
@@ -540,6 +611,14 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
         }
         record.kind = TraceSessionCanonicalRecordKind( kind );
         record.domain = TraceSessionProtocolDomain( domain );
+        record.hasSemanticTime = ( canonicalFlags & 1 ) != 0;
+        uint64_t semanticTime = 0;
+        if( !Get64( bytes, offset, semanticTime ) )
+        {
+            error = "canonical_shard_record_header_invalid";
+            return false;
+        }
+        record.semanticTime = int64_t( semanticTime );
         if( shard.domain != TraceSessionProtocolDomainName( record.domain ) )
         {
             error = "canonical_shard_domain_mismatch";

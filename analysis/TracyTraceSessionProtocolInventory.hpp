@@ -73,6 +73,7 @@ using TraceSessionProtocolEventVisitor = bool ( * )(
 
 TraceSessionProtocolDomain ClassifyTraceProtocolEvent( uint8_t queueType );
 const char* TraceSessionProtocolDomainName( TraceSessionProtocolDomain domain );
+bool TryGetTraceProtocolEventTime( const TraceSessionProtocolEventInfo& event, int64_t& time );
 
 // Counts one already-decompressed Tracy protocol frame. The frame must end
 // exactly at an event boundary; malformed or truncated variable payloads are

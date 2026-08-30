@@ -50,6 +50,9 @@ struct CanonicalReadState
 {
     uint64_t records = 0;
     std::array<uint64_t, size_t( tracy::analysis::TraceSessionProtocolDomain::Count )> domains {};
+    uint32_t frameThreadContext = 0;
+    uint32_t jobThreadContext = 0;
+    int64_t frameSemanticTime = 0;
 };
 
 bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& record,
@@ -58,6 +61,15 @@ bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& r
     auto& state = *static_cast<CanonicalReadState*>( userData );
     state.records++;
     state.domains[size_t( record.domain )]++;
+    if( record.type == uint8_t( tracy::QueueType::FrameVsync ) )
+    {
+        state.frameThreadContext = record.threadContext;
+        if( record.hasSemanticTime ) state.frameSemanticTime = record.semanticTime;
+    }
+    else if( record.type == uint8_t( tracy::QueueType::JnJobSchedule ) )
+    {
+        state.jobThreadContext = record.threadContext;
+    }
     return true;
 }
 
@@ -66,6 +78,21 @@ bool RequestCanonicalCancel( void* userData )
     auto& state = *static_cast<CanonicalCancelState*>( userData );
     state.checks++;
     return state.cancelAfterChecks != 0 && state.checks >= state.cancelAfterChecks;
+}
+
+struct DiskProbeState
+{
+    uint32_t calls = 0;
+};
+
+bool ExhaustDiskAfterFirstShard( const std::filesystem::path&, uint64_t& capacity,
+    uint64_t& available, void* userData, std::string& )
+{
+    auto& state = *static_cast<DiskProbeState*>( userData );
+    state.calls++;
+    capacity = 1024ull * 1024 * 1024;
+    available = state.calls == 1 ? capacity : 1;
+    return true;
 }
 
 void RecordProgress( tracy::analysis::TraceSessionInventoryPhase phase,
@@ -273,6 +300,29 @@ void AppendFixedEvent( std::vector<uint8_t>& frame, tracy::QueueType type )
     std::memcpy( frame.data() + previous, &item, size );
 }
 
+void AppendThreadContextEvent( std::vector<uint8_t>& frame, uint32_t thread )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = tracy::QueueType::ThreadContext;
+    item.threadCtx.thread = thread;
+    const auto size = tracy::QueueDataSize[size_t( item.hdr.type )];
+    const auto previous = frame.size();
+    frame.resize( previous + size );
+    std::memcpy( frame.data() + previous, &item, size );
+}
+
+void AppendFrameVsyncEvent( std::vector<uint8_t>& frame, int64_t time, uint32_t id )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = tracy::QueueType::FrameVsync;
+    item.frameVsync.time = time;
+    item.frameVsync.id = id;
+    const auto size = tracy::QueueDataSize[size_t( item.hdr.type )];
+    const auto previous = frame.size();
+    frame.resize( previous + size );
+    std::memcpy( frame.data() + previous, &item, size );
+}
+
 void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type, const std::string& value )
 {
     tracy::QueueItem item {};
@@ -421,7 +471,8 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     std::vector<uint8_t> firstFrame;
     std::vector<uint8_t> secondFrame;
     const std::string repeated( 4096, 'R' );
-    AppendFixedEvent( firstFrame, tracy::QueueType::FrameVsync );
+    AppendThreadContextEvent( firstFrame, 77 );
+    AppendFrameVsyncEvent( firstFrame, 123456, 9 );
     AppendStringEvent( firstFrame, tracy::QueueType::StringData, repeated );
     AppendFixedEvent( secondFrame, tracy::QueueType::JnJobSchedule );
     AppendStringEvent( secondFrame, tracy::QueueType::StringData, repeated );
@@ -459,7 +510,7 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         path, options, inventory, error ),
         "build protocol-aware inventory: " + error );
     test.Check( inventory.protocolInventoryComplete, "protocol inventory completes" );
-    test.Check( inventory.protocolInventory.frameCount == 2 && inventory.protocolInventory.eventCount == 4,
+    test.Check( inventory.protocolInventory.frameCount == 2 && inventory.protocolInventory.eventCount == 5,
         "journal inventory contains decoded frame/event counts" );
     test.Check( inventory.protocolInventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
         "journal inventory contains QueueType counts" );
@@ -552,8 +603,13 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Frame )] == 1 &&
         canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Job )] == 1 &&
         canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Dictionary )] == 2 &&
-        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Control )] == 2,
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Control )] == 2 &&
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Scheduling )] == 1,
         "canonical reader reproduces exact per-domain counts" );
+    test.Check( canonicalRead.frameThreadContext == 77 &&
+        canonicalRead.jobThreadContext == 77 &&
+        canonicalRead.frameSemanticTime == 123456,
+        "canonical records carry checkpointed thread context and raw semantic time across shards" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
 
@@ -623,6 +679,29 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( std::any_of( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain == "checkpoint"; } ),
         "memory limit preserves the checkpoint committed before the oversized segment" );
+
+    auto diskLimitedOptions = canonicalOptions;
+    diskLimitedOptions.resume = false;
+    diskLimitedOptions.targetShardBytes = 32;
+    diskLimitedOptions.softShardBytes = 40;
+    diskLimitedOptions.hardShardBytes = 48;
+    diskLimitedOptions.minimumFreeReserveBytes = 128;
+    diskLimitedOptions.minimumFreeReservePercent = 0;
+    DiskProbeState diskProbe;
+    diskLimitedOptions.diskSpaceProbe = ExhaustDiskAfterFirstShard;
+    diskLimitedOptions.diskSpaceUserData = &diskProbe;
+    const auto diskLimitedSessionRoot = directory / "canonical-session-disk-limit";
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( path, diskLimitedSessionRoot,
+        "generation-disk-limited", inventory, diskLimitedOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Failed,
+        "canonical disk reserve stops before an unsafe shard write" );
+    test.Check( error == "canonical_disk_pressure" &&
+        manifest.state == tracy::analysis::TraceSessionState::InsufficientDisk &&
+        manifest.reason == "insufficient_disk",
+        "disk pressure failure is explicit and preserves committed state: " + error );
+    test.Check( std::any_of( manifest.shards.begin(), manifest.shards.end(),
+        []( const auto& shard ) { return shard.domain == "checkpoint"; } ),
+        "disk pressure preserves the checkpoint committed before reserve exhaustion" );
 
     const auto inventoryPath = directory / "protocol-inventory";
     test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),

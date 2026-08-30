@@ -352,6 +352,154 @@ const char* TraceSessionProtocolDomainName( TraceSessionProtocolDomain domain )
     return index < std::size( Names ) ? Names[index] : "invalid";
 }
 
+bool TryGetTraceProtocolEventTime( const TraceSessionProtocolEventInfo& event, int64_t& time )
+{
+    if( !event.encodedData || event.encodedBytes == 0 ) return false;
+    tracy::QueueItem item {};
+    std::memcpy( &item, event.encodedData,
+        std::min<size_t>( event.encodedBytes, sizeof( item ) ) );
+    const auto type = tracy::QueueType( event.queueType );
+    switch( type )
+    {
+    case QueueType::ZoneBeginAllocSrcLoc:
+    case QueueType::ZoneBeginAllocSrcLocCallstack:
+        time = item.zoneBeginLean.time; return true;
+    case QueueType::ZoneBegin:
+    case QueueType::ZoneBeginCallstack:
+    case QueueType::JnZoneBeginCallsite:
+        time = item.zoneBegin.time; return true;
+    case QueueType::ZoneEnd:
+        time = item.zoneEnd.time; return true;
+    case QueueType::Message:
+    case QueueType::MessageColor:
+    case QueueType::MessageCallstack:
+    case QueueType::MessageColorCallstack:
+    case QueueType::MessageAppInfo:
+    case QueueType::MessageLiteral:
+    case QueueType::MessageLiteralColor:
+    case QueueType::MessageLiteralCallstack:
+    case QueueType::MessageLiteralColorCallstack:
+        time = item.message.time; return true;
+    case QueueType::CallstackSample:
+    case QueueType::CallstackSampleContextSwitch:
+    case QueueType::CallstackSampleRef:
+    case QueueType::CallstackSampleContextSwitchRef:
+        time = item.callstackSample.time; return true;
+    case QueueType::FrameMarkMsg:
+    case QueueType::FrameMarkMsgStart:
+    case QueueType::FrameMarkMsgEnd:
+        time = item.frameMark.time; return true;
+    case QueueType::FrameVsync:
+        time = item.frameVsync.time; return true;
+    case QueueType::LockAnnounce:
+        time = item.lockAnnounce.time; return true;
+    case QueueType::LockTerminate:
+        time = item.lockTerminate.time; return true;
+    case QueueType::LockWait:
+    case QueueType::LockSharedWait:
+        time = item.lockWait.time; return true;
+    case QueueType::LockObtain:
+    case QueueType::LockSharedObtain:
+        time = item.lockObtain.time; return true;
+    case QueueType::LockRelease:
+    case QueueType::LockSharedRelease:
+        time = item.lockRelease.time; return true;
+    case QueueType::PlotDataInt:
+        time = item.plotDataInt.time; return true;
+    case QueueType::PlotDataFloat:
+        time = item.plotDataFloat.time; return true;
+    case QueueType::PlotDataDouble:
+        time = item.plotDataDouble.time; return true;
+    case QueueType::FiberEnter:
+        time = item.fiberEnter.time; return true;
+    case QueueType::FiberLeave:
+        time = item.fiberLeave.time; return true;
+    case QueueType::GpuNewContext:
+        time = item.gpuNewContext.cpuTime; return true;
+    case QueueType::GpuZoneBegin:
+    case QueueType::GpuZoneBeginCallstack:
+    case QueueType::GpuZoneBeginSerial:
+    case QueueType::GpuZoneBeginCallstackSerial:
+    case QueueType::JnGpuZoneBeginCallsite:
+        time = item.gpuZoneBegin.cpuTime; return true;
+    case QueueType::GpuZoneBeginAllocSrcLoc:
+    case QueueType::GpuZoneBeginAllocSrcLocCallstack:
+    case QueueType::GpuZoneBeginAllocSrcLocSerial:
+    case QueueType::GpuZoneBeginAllocSrcLocCallstackSerial:
+        time = item.gpuZoneBeginLean.cpuTime; return true;
+    case QueueType::GpuZoneEnd:
+    case QueueType::GpuZoneEndSerial:
+        time = item.gpuZoneEnd.cpuTime; return true;
+    case QueueType::GpuCalibration:
+        time = item.gpuCalibration.cpuTime; return true;
+    case QueueType::GpuTimeSync:
+        time = item.gpuTimeSync.cpuTime; return true;
+    case QueueType::MemAlloc:
+    case QueueType::MemAllocNamed:
+    case QueueType::MemAllocCallstack:
+    case QueueType::MemAllocCallstackNamed:
+    case QueueType::JnMemAllocCallsiteNamed:
+        time = item.memAlloc.time; return true;
+    case QueueType::MemFree:
+    case QueueType::MemFreeNamed:
+    case QueueType::MemFreeCallstack:
+    case QueueType::MemFreeCallstackNamed:
+        time = item.memFree.time; return true;
+    case QueueType::MemDiscard:
+    case QueueType::MemDiscardCallstack:
+        time = item.memDiscard.time; return true;
+    case QueueType::CrashReport:
+        time = item.crashReport.time; return true;
+    case QueueType::SysTimeReport:
+        time = item.sysTime.time; return true;
+    case QueueType::SysPowerReport:
+        time = item.sysPower.time; return true;
+    case QueueType::ContextSwitch:
+        time = item.contextSwitch.time; return true;
+    case QueueType::ThreadWakeup:
+        time = item.threadWakeup.time; return true;
+    case QueueType::HwSampleCpuCycle:
+    case QueueType::HwSampleInstructionRetired:
+    case QueueType::HwSampleCacheReference:
+    case QueueType::HwSampleCacheMiss:
+    case QueueType::HwSampleBranchRetired:
+    case QueueType::HwSampleBranchMiss:
+        time = item.hwSample.time; return true;
+    case QueueType::JnJobSchedule:
+        time = item.jnJobSchedule.time; return true;
+    case QueueType::JnJobStage:
+        time = item.jnJobStage.time; return true;
+    case QueueType::JnGfxDispatch:
+        time = item.jnGfxDispatch.time; return true;
+    case QueueType::JnGfxEntity:
+        time = item.jnGfxEntity.time; return true;
+    case QueueType::JnGfxLink:
+        time = item.jnGfxLink.time; return true;
+    case QueueType::JnFrame:
+        time = item.jnFrame.time; return true;
+    case QueueType::JnIoRequest:
+        time = item.jnIoRequest.time; return true;
+    case QueueType::JnIoStage:
+        time = item.jnIoStage.time; return true;
+    case QueueType::JnRelation:
+        time = item.jnRelation.time; return true;
+    case QueueType::JnRuntimeDomainState:
+        time = item.jnRuntimeDomainState.time; return true;
+    case QueueType::JnGpuReferencePass:
+        time = item.jnGpuReferencePass.time; return true;
+    case QueueType::JnGpuReferenceUse:
+        time = item.jnGpuReferenceUse.time; return true;
+    case QueueType::JnGpuReferenceEnd:
+        time = item.jnGpuReferenceEnd.time; return true;
+    case QueueType::JnGpuCatalogControl:
+        time = item.jnGpuCatalogControl.time; return true;
+    case QueueType::JnScriptStack:
+        time = item.jnScriptStack.time; return true;
+    default:
+        return false;
+    }
+}
+
 bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8_t> record,
     TraceSessionProtocolInventory& inventory, std::string& error,
     TraceSessionProtocolEventVisitor visitor, void* visitorUserData )

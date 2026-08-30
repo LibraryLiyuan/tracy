@@ -78,7 +78,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
-| N30.3 Canonical/Checkpoint | InProgress | 按17域对齐分片、共享Reader、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存硬门禁已通过synthetic；完整语义状态与磁盘压力暂停待完成。 |
+| N30.3 Canonical/Checkpoint | InProgress | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic；完整生命周期状态待N30.4域解析补齐。 |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
@@ -324,6 +324,10 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 - `TraceSessionWriterLease`使用原子目录、PID、process creation time、lease generation和heartbeat保证单writer；活跃writer被拒绝，malformed/dead lease被隔离后恢复。
 - Canonical默认soft/hard内存门禁为12/16 GiB；每次追加前先做整数安全预算检查，超过硬上限时标记`InvalidCapacity/resource_limit`并保留上一个已提交Checkpoint。
 - Shard提交后释放各域buffer capacity，避免不同域的历史峰值在长录制中永久累积。
+- 每条Protocol Canonical record保存当时的`ThreadContext`、`has_semantic_time`和原始Tracy TSC；Journal monotonic ns继续单独保存，二者不混用。
+- 中央`TryGetTraceProtocolEventTime`按QueueType和正式POD结构提取CPU语义时间；`GpuTime`等只有GPU原始时钟、无法作为CPU时间的事件明确不标记。
+- Checkpoint额外保存当前ThreadContext，取消发生在一个压缩frame之后、恢复到下一个frame时仍能正确关联线程。
+- 每次Shard事务前检查磁盘可用空间，默认保留`max(64 GiB, volume 10%)`；不足时进入`InsufficientDisk/insufficient_disk`，保留上一个Checkpoint，不写不安全Shard。
 
 ### TDD证据
 
@@ -349,6 +353,8 @@ GREEN：
 - 只有3字节的畸形Canonical payload返回`canonical_shard_record_header_truncated`。
 - 同一Session的第二个writer返回`session_writer_lease_active`；release后可重新获取，malformed stale lease可安全隔离恢复。
 - 人工64-byte hard-memory fixture在已有Checkpoint后触发`canonical_memory_hard_limit`，manifest明确进入`InvalidCapacity/resource_limit`且保留Checkpoint。
+- 取消/恢复跨两个LZ4 frame时，第二帧Job事件继承Checkpoint中的ThreadContext=77；FrameVsync原始TSC=123456逐字保持。
+- 注入式磁盘探针在第二个Shard前耗尽reserve，返回`canonical_disk_pressure`和`InsufficientDisk/insufficient_disk`，第一个Checkpoint保持可验证。
 
 阶段回归：
 
@@ -364,7 +370,7 @@ tracy-stream-journal           Passed
 
 ### 尚未完成
 
-- 可序列化TSC/thread/dictionary/gpu calibration等完整decoder状态。
+- GPU calibration、staged dictionary/payload和各域生命周期的完整解析状态。
 - 跨Shard Zone、Job、Allocation、Resource、I/O状态。
 - 磁盘压力运行中暂停；内存硬停止与writer lease已经通过。
 - Converter级第一次/第二次Ctrl+C交互与进程级故障注入（Canonical API层的安全停止/恢复已经通过）。
