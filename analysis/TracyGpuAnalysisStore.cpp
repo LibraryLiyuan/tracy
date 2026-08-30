@@ -488,8 +488,16 @@ bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
     const GpuAnalysisSidecarControl& control, std::string& generation,
     uint64_t& writtenBytes, std::string& error )
 {
+    return WriteGpuAnalysisDerivedStoreAt( GpuAnalysisDerivedPath( sidecarPath ),
+        identity, snapshot, control, generation, writtenBytes, error );
+}
+
+bool WriteGpuAnalysisDerivedStoreAt( const std::filesystem::path& algorithmRoot,
+    const GpuAnalysisTraceIdentity& identity, const GpuAnalysisSnapshot& snapshot,
+    const GpuAnalysisSidecarControl& control, std::string& generation,
+    uint64_t& writtenBytes, std::string& error )
+{
     error.clear(); writtenBytes = 0;
-    const auto algorithmRoot = GpuAnalysisDerivedPath( sidecarPath );
     std::error_code ec; std::filesystem::create_directories( GpuAnalysisIoPath( algorithmRoot ), ec );
     if( ec ) { error = "store_algorithm_directory_failed:" + ec.message(); return false; }
     GpuAnalysisStoreManifest manifest;

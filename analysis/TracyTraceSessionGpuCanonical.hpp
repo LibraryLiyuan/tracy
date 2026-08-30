@@ -2,6 +2,7 @@
 #define __TRACYTRACESESSIONGPUCANONICAL_HPP__
 
 #include "TracyTraceSessionCanonical.hpp"
+#include "TracyGpuAnalysisSidecar.hpp"
 #include "../server/TracyJnData.hpp"
 
 #include <cstdint>
@@ -31,10 +32,25 @@ struct TraceSessionGpuCanonicalStats
     uint64_t unresolvedPayloads = 0;
 };
 
+struct TraceSessionGpuDerivedStats
+{
+    uint64_t resourceCount = 0;
+    uint64_t allocationCount = 0;
+    uint64_t passCount = 0;
+    uint64_t writtenBytes = 0;
+    std::string generation;
+};
+
 bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, JnTraceData& data,
     TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
     std::string& error );
+
+std::filesystem::path TraceSessionGpuAnalysisRoot( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest );
+bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const GpuAnalysisSidecarControl& control,
+    TraceSessionGpuDerivedStats& stats, std::string& error );
 
 }
 

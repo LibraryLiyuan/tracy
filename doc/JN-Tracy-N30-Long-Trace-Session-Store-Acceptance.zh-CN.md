@@ -80,7 +80,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
-| N30.5 Derived/N29整合 | NotStarted | — |
+| N30.5 Derived/N29整合 | InProgress | Canonical GPU事实可直接重建并发布N29 derived Store；pointer生命周期解析已与传统Worker共用。其余强制索引和Final Audit待完成。 |
 | N30.6 Query/MCP/导出 | NotStarted | — |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
@@ -413,16 +413,20 @@ GREEN：
 - Catalog Resource、Allocation、View、Logical、Part、Relation、VG、Range、Detailed Evidence和String均使用同一解析入口；转换器制造的gap或未消费payload直接失败。
 - GPU Reference支持direct use及ResourceSetV2定义/展开；Pass、Use和End保留thread、frame、taxonomy、usage、command list及dropped计数。
 - 连接结束时未闭合Catalog generation被忠实标记为无效，不伪造成Complete。
+- `ResolveJnGpuCatalogGenerationData`成为传统Worker和Session共用的纯数据解析器；View、Logical、VG、Range、Relation和DetailedEvidence使用相同的资源生命周期区间解析，不维护两套易漂移语义。
+- pointer token在同一地址Destroy后再次Create时按事件时间解析到不同`GpuResourceId`，歧义区间返回unresolved而不猜测。
+- N29 Store writer新增显式algorithm root入口；Legacy `.tracy` sidecar继续使用原路径，Session直接写入当前generation的`derived/gpu-resource-analysis/<schema>/<algorithm>`。
+- `BuildTraceSessionGpuAnalysisDerived`直接消费Canonical GPU事实并构建N29 Snapshot/索引，不写独立Raw GPU sidecar，也不重读stream。
 
 ### 当前TDD证据
 
-- Synthetic Session包含真实Welcome、Catalog Generation Begin/Batch/End和Pass→Resource→End链。
-- 读取结果恢复ResourceId=10、Catalog有效状态及三个关系事件。
+- Synthetic Session包含真实Welcome、Catalog Generation Begin/Batch/End、同一pointer的Destroy/Create复用以及Pass→Resource→End链。
+- 读取结果恢复两个资源生命周期；复用前后的View分别精确解析为ResourceId 10和11，pointer token被消解。
 - `timerMul=2`、`initBegin=100`下，原始TSC 110/111/112/113严格换算为20/22/24/26 ns。
-- Catalog payload只消费一次，batch数与unresolved payload计数分别为1和0。
+- 两个Catalog payload各消费一次，batch数与unresolved payload计数分别为2和0。
+- 同一Synthetic Session成功生成N29 GPU derived generation；Store manifest为Complete，资源数2、Pass数1，且Session目录中不存在独立Raw sidecar。
+- N29 GPU Analysis、Session Store和Session Inventory联合回归通过。
 
 ### 尚未完成
 
-- 抽离并复用N29 GPU pointer lifetime resolver，完成pointer token→GpuResourceId和alias/reuse语义。
-- 将N29 Store writer定向到Session generation内的`derived/gpu-resource-analysis`，不生成独立Raw sidecar。
 - 其余Mandatory Derived索引与Final Audit。

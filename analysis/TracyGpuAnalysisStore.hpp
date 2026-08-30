@@ -92,6 +92,10 @@ bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
     const GpuAnalysisTraceIdentity& identity, const GpuAnalysisSnapshot& snapshot,
     const GpuAnalysisSidecarControl& control, std::string& generation,
     uint64_t& writtenBytes, std::string& error );
+bool WriteGpuAnalysisDerivedStoreAt( const std::filesystem::path& algorithmRoot,
+    const GpuAnalysisTraceIdentity& identity, const GpuAnalysisSnapshot& snapshot,
+    const GpuAnalysisSidecarControl& control, std::string& generation,
+    uint64_t& writtenBytes, std::string& error );
 
 class GpuAnalysisStoreReader
 {

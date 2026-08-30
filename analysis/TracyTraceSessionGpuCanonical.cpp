@@ -1,10 +1,12 @@
 #include "TracyTraceSessionGpuCanonical.hpp"
 
 #include "TracyGpuAnalysis.hpp"
+#include "TracyGpuAnalysisStore.hpp"
 #include "TracyJnGpuCatalog.hpp"
 #include "TracyProtocol.hpp"
 #include "TracyQueue.hpp"
 #include "TracyStreamJournal.hpp"
+#include "TracyJnGpuCatalogResolve.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -467,7 +469,66 @@ bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
                 data.gpuCatalogGenerations[runtime.generationIndex].valid = 0;
         }
     }
+    std::unordered_map<uint64_t, uint64_t> descriptorHeaps;
+    uint64_t nextDescriptorHeapId = 1;
+    const auto anonymizeDescriptor = [&]( uint64_t token )
+    {
+        const auto found = descriptorHeaps.find( token );
+        if( found != descriptorHeaps.end() ) return found->second;
+        const auto id = 0xD000000000000000ull | nextDescriptorHeapId++;
+        descriptorHeaps.emplace( token, id );
+        return id;
+    };
+    for( auto& generation : data.gpuCatalogGenerations )
+    {
+        const auto resolved = ResolveJnGpuCatalogGenerationData(
+            data, generation.generation, anonymizeDescriptor );
+        generation.unresolvedCount = resolved.totalUnresolved;
+        if( !generation.ended || resolved.coreUnresolved != 0 )
+        {
+            generation.valid = 0;
+            generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
+            data.gpuCatalogValid = false;
+        }
+    }
     return true;
+}
+
+std::filesystem::path TraceSessionGpuAnalysisRoot( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest )
+{
+    return sessionRoot / "generations" / manifest.generation / "derived" /
+        "gpu-resource-analysis" / std::to_string( GpuAnalysisDerivedSchemaVersion ) /
+        GpuAnalysisAlgorithmId;
+}
+
+bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const GpuAnalysisSidecarControl& control,
+    TraceSessionGpuDerivedStats& stats, std::string& error )
+{
+    error.clear(); stats = {};
+    JnTraceData data;
+    TraceSessionTimeTransform transform;
+    TraceSessionGpuCanonicalStats canonicalStats;
+    if( !LoadTraceSessionGpuCanonicalData(
+        sessionRoot, manifest, data, transform, canonicalStats, error ) ) return false;
+    GpuAnalysisBuildControl buildControl;
+    buildControl.stopToken = control.stopToken;
+    buildControl.progress = control.progress;
+    auto snapshot = BuildGpuAnalysisSnapshotConsuming( data, nullptr, {}, buildControl );
+    if( snapshot.manifest.state != GpuAnalysisState::Complete || !snapshot.manifest.complete )
+    {
+        error = "session_gpu_analysis_incomplete:" + snapshot.manifest.reason;
+        return false;
+    }
+    GpuAnalysisTraceIdentity identity;
+    identity.sha256 = manifest.source.sha256;
+    identity.fileSize = manifest.source.fileSize;
+    stats.resourceCount = snapshot.resources.size();
+    stats.allocationCount = snapshot.allocations.size();
+    stats.passCount = snapshot.passes.size();
+    return WriteGpuAnalysisDerivedStoreAt( TraceSessionGpuAnalysisRoot( sessionRoot, manifest ),
+        identity, snapshot, control, stats.generation, stats.writtenBytes, error );
 }
 
 }
