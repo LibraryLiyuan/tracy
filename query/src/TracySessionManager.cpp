@@ -170,6 +170,53 @@ std::filesystem::path SessionManager::ResolveTracePath( const std::filesystem::p
     return canonical;
 }
 
+std::filesystem::path SessionManager::ResolveBuildStatusPath( const std::filesystem::path& requested ) const
+{
+    std::error_code error;
+    auto absolute = requested.is_absolute() ? requested : std::filesystem::current_path() / requested;
+    if( !std::filesystem::exists( absolute, error ) || error )
+        throw SessionError( SessionErrorCode::TraceNotFound, "Trace Session build path does not exist" );
+    const auto canonical = std::filesystem::canonical( absolute, error );
+    if( error || !std::filesystem::is_directory( canonical, error ) || error )
+        throw SessionError( SessionErrorCode::TraceOpenFailed, "Trace Session build path is not a directory" );
+    const auto name = Lower( canonical.filename().string() );
+    const auto suffix = Lower( analysis::TraceSessionSuffix );
+    const bool finalName = name.ends_with( suffix );
+    const bool buildingName = name.find( suffix + ".building." ) != std::string::npos;
+    if( !finalName && !buildingName )
+        throw SessionError( SessionErrorCode::TraceOpenFailed, "path is not a Trace Session or building Session" );
+    const bool allowed = std::any_of( m_allowRoots.begin(), m_allowRoots.end(),
+        [&]( const auto& root ) { return IsWithin( canonical, root ); } );
+    if( !allowed ) throw SessionError( SessionErrorCode::PathNotAllowed,
+        "Trace Session build path is outside every --allow-root" );
+    return canonical;
+}
+
+TraceSessionBuildSnapshot SessionManager::InspectBuild( const std::filesystem::path& requested ) const
+{
+    const auto path = ResolveBuildStatusPath( requested );
+    std::string error;
+    const auto manifest = analysis::LoadTraceSessionManifest( path, error );
+    if( !manifest ) throw SessionError( SessionErrorCode::CorruptTrace,
+        "Trace Session build manifest is unavailable: " + error );
+    TraceSessionBuildSnapshot result;
+    result.path = path;
+    result.state = manifest->state;
+    result.sessionId = manifest->sessionId;
+    result.generation = manifest->generation;
+    result.sourceSha256 = manifest->source.sha256;
+    result.sourceSize = manifest->source.fileSize;
+    result.sourceRevision = manifest->source.committedRevision;
+    result.shardCount = manifest->shards.size();
+    for( const auto& shard : manifest->shards ) result.canonicalBytes += shard.fileBytes;
+    result.mandatoryDerivedComplete = manifest->mandatoryDerivedComplete;
+    result.auditComplete = manifest->auditComplete;
+    result.published = manifest->state == analysis::TraceSessionState::Complete ||
+        manifest->state == analysis::TraceSessionState::CompleteSourceDegraded;
+    result.reason = manifest->reason;
+    return result;
+}
+
 TraceSessionSnapshot SessionManager::Open( const std::filesystem::path& requested )
 {
     const auto path = ResolveTracePath( requested );

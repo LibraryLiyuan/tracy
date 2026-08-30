@@ -2,6 +2,7 @@
 #define __TRACYSESSIONMANAGER_HPP__
 
 #include "TracyTraceSource.hpp"
+#include "TracyTraceSessionStore.hpp"
 
 #include <chrono>
 #include <condition_variable>
@@ -67,6 +68,23 @@ struct TraceSessionSnapshot
     uint64_t loadSubTotal = 0;
 };
 
+struct TraceSessionBuildSnapshot
+{
+    std::filesystem::path path;
+    analysis::TraceSessionState state = analysis::TraceSessionState::InvalidSource;
+    std::string sessionId;
+    std::string generation;
+    std::string sourceSha256;
+    uint64_t sourceSize = 0;
+    uint64_t sourceRevision = 0;
+    uint64_t shardCount = 0;
+    uint64_t canonicalBytes = 0;
+    bool mandatoryDerivedComplete = false;
+    bool auditComplete = false;
+    bool published = false;
+    std::string reason;
+};
+
 class SessionManager
 {
 public:
@@ -87,6 +105,7 @@ public:
 
     std::shared_ptr<analysis::TraceSource> GetReadySource( const std::string& id ) const;
     std::filesystem::path ResolveTracePath( const std::filesystem::path& path ) const;
+    TraceSessionBuildSnapshot InspectBuild( const std::filesystem::path& path ) const;
     const std::vector<std::filesystem::path>& AllowRoots() const { return m_allowRoots; }
 
 private:
@@ -97,6 +116,7 @@ private:
     void RefreshSegmentSession( const std::shared_ptr<Session>& session ) const;
     void LoaderLoop( std::stop_token stopToken );
     void UpdateState( const std::shared_ptr<Session>& session, analysis::TraceSourceState state );
+    std::filesystem::path ResolveBuildStatusPath( const std::filesystem::path& path ) const;
 
     std::vector<std::filesystem::path> m_allowRoots;
     size_t m_maxSessions;

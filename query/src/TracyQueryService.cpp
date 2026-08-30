@@ -35,6 +35,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
+        "session.build.status",
         "capture.context", "capture.coverage", "trace.telemetry_cost", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "relation.search", "relation.get", "runtime.domain.states",
@@ -68,7 +69,7 @@ const std::vector<std::string>& RawQueryMethodRegistry()
 nlohmann::json RequiredParametersFor( const std::string& method )
 {
     nlohmann::json required = nlohmann::json::array();
-    if( method == "trace.open" ) required.emplace_back( "path" );
+    if( method == "trace.open" || method == "session.build.status" ) required.emplace_back( "path" );
     else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
     else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
     if( ( method.ends_with( ".get" ) && method != "frame.get" && method != "producer.get" && method != "catalog.get" ) || method == "job.dependencies" || method == "job.gfx_chain" || method == "io.chain" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" || method == "zone.cpu.tree" || method == "zone.gpu.tree" || method == "source.lines" || method == "source.raw" ||
@@ -4586,6 +4587,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             { "error_code", trace.errorCode.empty() ? json( nullptr ) : json( trace.errorCode ) },
             { "error_message", trace.errorMessage.empty() ? json( nullptr ) : json( trace.errorMessage ) }
         }, trace );
+    }
+    if( method == "session.build.status" )
+    {
+        if( !params.contains( "path" ) || !params["path"].is_string() )
+            throw QueryError( "INVALID_PARAMS", "path is required" );
+        const auto status = m_sessions.InspectBuild( params["path"].get<std::string>() );
+        return Success( id, {
+            { "path", status.path.string() },
+            { "state", analysis::TraceSessionStateName( status.state ) },
+            { "session_id", status.sessionId }, { "generation", status.generation },
+            { "source_sha256", status.sourceSha256 }, { "source_size", Decimal( status.sourceSize ) },
+            { "source_revision", Decimal( status.sourceRevision ) },
+            { "canonical_shards", Decimal( status.shardCount ) },
+            { "canonical_bytes", Decimal( status.canonicalBytes ) },
+            { "mandatory_derived_complete", status.mandatoryDerivedComplete },
+            { "audit_complete", status.auditComplete }, { "published", status.published },
+            { "reason", status.reason.empty() ? json( nullptr ) : json( status.reason ) }
+        } );
     }
     if( method == "trace.close" )
     {

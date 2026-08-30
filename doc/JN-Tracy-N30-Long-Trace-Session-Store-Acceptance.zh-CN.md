@@ -449,6 +449,7 @@ GREEN：
 - `GpuAnalysisTraceSource::OpenSessionIfReady`直接打开Session GPU派生层，不实例化完整Worker；Legacy `.tracy + .jn-gpu-resource-analysis`路径保持不变。
 - Query的GPU Reader cache识别Session目录，固定读取同一个manifest generation的`derived/gpu-resource-analysis`。
 - `gpu.memory.peak`及已有N29 GPU分页查询复用同一Store Reader；Session不会生成第二份Raw GPU sidecar，也不会回退到完整内存Snapshot。
+- `session.build.status`可以在不打开Trace数据的情况下读取`.building`或已发布Session的state、generation、source identity、Canonical shard/bytes、mandatory derived、Final Audit和reason；路径仍受`--allow-root`约束。
 
 ### TDD证据
 
@@ -462,11 +463,11 @@ GREEN：
 - 发布Synthetic Session后，底层Reader直接得到2个Resource和1个Pass。
 - `OpenSessionIfReady`返回`source_kind=session`、正确source fingerprint，且`WorkerLoaded=false`。
 - Query 1.34通过`trace.open`直接打开Session目录，再执行`gpu.memory.peak`成功；结果明确来自Session mandatory N29派生层。
+- 构建中的Synthetic Session返回`CanonicalBuilding/published=false`；方法注册表、domain coverage和参数schema逐项一致。
 - `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
 
 ### 尚未完成，不能提前通过N30.6
 
 - CPU/Frame/Zone/Job/Sampling/Memory/FrameImage的语义分页Reader。
-- `.building`的`session.build.status` MCP入口。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。

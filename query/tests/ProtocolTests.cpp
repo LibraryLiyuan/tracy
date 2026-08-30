@@ -101,6 +101,7 @@ struct TemporaryTraceFiles
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
         session = root / "complete.jn-trace-session";
+        sessionBuilding = root / "active.jn-trace-session.building.g-active";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
@@ -127,6 +128,14 @@ struct TemporaryTraceFiles
         std::string sessionError;
         const auto sessionBuilding = root / "complete.jn-trace-session.building.g-query-contract";
         assert( tracy::analysis::PublishTraceSession( sessionBuilding, session, sessionManifest, sessionError ) );
+        auto activeManifest = sessionManifest;
+        activeManifest.sessionId = "active-query-contract-session";
+        activeManifest.generation = "g-active";
+        activeManifest.state = tracy::analysis::TraceSessionState::CanonicalBuilding;
+        activeManifest.mandatoryDerivedComplete = false;
+        activeManifest.auditComplete = false;
+        activeManifest.reason = "canonical_in_progress";
+        assert( tracy::analysis::SaveTraceSessionManifest( this->sessionBuilding, activeManifest, sessionError ) );
     }
 
     ~TemporaryTraceFiles()
@@ -148,6 +157,7 @@ struct TemporaryTraceFiles
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
     std::filesystem::path session;
+    std::filesystem::path sessionBuilding;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -178,7 +188,7 @@ int main()
     assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 42 );
+    assert( coverage.at( "domains" ).size() == 43 );
     assert( coverage.at( "coverage_level" ) == "domain" );
     assert( coverage.at( "domain_status" ) == "complete" );
     assert( coverage.at( "field_status" ) == "complete" );
@@ -656,6 +666,11 @@ int main()
     const auto directoryTrace = files.root / "directory.tracy"; std::filesystem::create_directory( directoryTrace );
     expectPathError( directoryTrace, tracy::query::SessionErrorCode::TraceOpenFailed );
     assert( sessions.ResolveTracePath( files.session ) == std::filesystem::canonical( files.session ) );
+    const auto buildStatus = service.Execute( Request( 99, "session.build.status", {
+        { "path", files.sessionBuilding.string() }
+    } ) );
+    assert( buildStatus.at( "ok" ) && buildStatus.at( "data" ).at( "state" ) == "CanonicalBuilding" &&
+        buildStatus.at( "data" ).at( "published" ) == false );
     expectPathError( files.root / ".." / files.outsideRoot.filename() / files.outside.filename(), tracy::query::SessionErrorCode::PathNotAllowed );
     std::error_code symlinkError;
     const auto escapeLink = files.root / "escape.tracy";
@@ -843,7 +858,7 @@ int main()
     int requestId = 200;
     for( const auto& method : describedMethods )
     {
-        if( method == "trace.open" || method == "trace.close" ) continue;
+        if( method == "trace.open" || method == "trace.close" || method == "session.build.status" ) continue;
         const auto response = service.Execute( Request( requestId++, method, ValidParams( method, candidateId, baselineId ) ) );
         if( !response.value( "ok", false ) )
         {
