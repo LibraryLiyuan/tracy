@@ -4,6 +4,7 @@
 #include "TracyTraceSessionInventory.hpp"
 #include "TracyTraceSessionStore.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -26,7 +27,8 @@ enum class TraceSessionCanonicalBuildResult : uint8_t
 enum class TraceSessionCanonicalRecordKind : uint8_t
 {
     ProtocolEvent = 1,
-    TransportRecord = 2
+    TransportRecord = 2,
+    ProtocolFrame = 3
 };
 
 struct TraceSessionCanonicalRecord
@@ -37,6 +39,7 @@ struct TraceSessionCanonicalRecord
     bool hasSemanticTime = false;
     uint32_t flags = 0;
     uint32_t threadContext = 0;
+    uint32_t variablePayloadBytes = 0;
     uint64_t sourceSequence = 0;
     uint64_t journalMonotonicNs = 0;
     uint64_t protocolFrameOrdinal = 0;
@@ -46,6 +49,19 @@ struct TraceSessionCanonicalRecord
 
 using TraceSessionCanonicalRecordVisitor = bool ( * )(
     const TraceSessionCanonicalRecord& record, void* userData, std::string& error );
+
+struct TraceSessionCanonicalAudit
+{
+    uint64_t protocolFrames = 0;
+    uint64_t protocolEvents = 0;
+    uint64_t protocolEncodedBytes = 0;
+    uint64_t transportRecords = 0;
+    uint64_t transportPayloadBytes = 0;
+    uint64_t semanticTimeEvents = 0;
+    std::array<TraceSessionProtocolEventStats, TraceSessionProtocolInventory::EventTypeCapacity> events {};
+    std::array<TraceSessionProtocolEventStats,
+        size_t( TraceSessionProtocolDomain::Count )> domains {};
+};
 
 struct TraceSessionCanonicalOptions
 {
@@ -76,6 +92,9 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
 bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     const TraceSessionShard& shard, TraceSessionCanonicalRecordVisitor visitor,
     void* userData, std::string& error );
+bool AuditTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
+    TraceSessionCanonicalAudit& audit, std::string& error );
 
 }
 

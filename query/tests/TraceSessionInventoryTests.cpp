@@ -60,7 +60,8 @@ bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& r
 {
     auto& state = *static_cast<CanonicalReadState*>( userData );
     state.records++;
-    state.domains[size_t( record.domain )]++;
+    if( record.kind == tracy::analysis::TraceSessionCanonicalRecordKind::ProtocolEvent )
+        state.domains[size_t( record.domain )]++;
     if( record.type == uint8_t( tracy::QueueType::FrameVsync ) )
     {
         state.frameThreadContext = record.threadContext;
@@ -584,8 +585,7 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
             test.Check( shard.domain != "protocol", "canonical events are partitioned by stable data domain" );
         }
     }
-    test.Check( canonicalRecords == inventory.protocolInventory.eventCount +
-        inventory.recordCount - inventory.protocolInventory.frameCount,
+    test.Check( canonicalRecords == inventory.protocolInventory.eventCount + inventory.recordCount,
         "canonical records cover decoded events and non-compressed transport records" );
     test.Check( checkpointRecords > 0, "each committed canonical segment has a checkpoint" );
     test.Check( sawFrameDomain && sawJobDomain && sawDictionaryDomain && sawControlDomain,
@@ -603,7 +603,7 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Frame )] == 1 &&
         canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Job )] == 1 &&
         canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Dictionary )] == 2 &&
-        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Control )] == 2 &&
+        canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Control )] == 0 &&
         canonicalRead.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Scheduling )] == 1,
         "canonical reader reproduces exact per-domain counts" );
     test.Check( canonicalRead.frameThreadContext == 77 &&
@@ -612,6 +612,31 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         "canonical records carry checkpointed thread context and raw semantic time across shards" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
+    tracy::analysis::TraceSessionCanonicalAudit audit;
+    test.Check( tracy::analysis::AuditTraceSessionCanonical( sessionRoot, manifest,
+        inventory, audit, error ), "audit all canonical domains: " + error );
+    test.Check( audit.protocolEvents == inventory.protocolInventory.eventCount &&
+        audit.protocolFrames == inventory.protocolInventory.frameCount &&
+        audit.protocolEncodedBytes == inventory.protocolInventory.encodedBytes &&
+        audit.transportRecords == inventory.recordCount - inventory.protocolInventory.frameCount,
+        "canonical audit conserves protocol frames/events/bytes and transport records" );
+    test.Check( audit.semanticTimeEvents >= 2,
+        "canonical audit reports exact semantic-time coverage without inventing timestamps" );
+    auto incompleteManifest = manifest;
+    const auto omitted = std::find_if( incompleteManifest.shards.begin(), incompleteManifest.shards.end(),
+        []( const auto& shard ) { return shard.domain == "frame"; } );
+    test.Check( omitted != incompleteManifest.shards.end(), "audit omission fixture has frame shard" );
+    if( omitted != incompleteManifest.shards.end() )
+    {
+        incompleteManifest.shards.erase( omitted );
+        test.Check( !tracy::analysis::AuditTraceSessionCanonical( sessionRoot,
+            incompleteManifest, inventory, audit, error ),
+            "canonical audit rejects a missing committed domain shard" );
+        test.Check( error == "canonical_audit_global_count_mismatch" ||
+            error == "canonical_audit_event_count_mismatch" ||
+            error == "canonical_audit_domain_count_mismatch",
+            "missing shard has an explicit audit mismatch: " + error );
+    }
 
     const auto changedSource = directory / "protocol-changed.tracy-stream";
     std::filesystem::copy_file( path, changedSource,

@@ -43,6 +43,13 @@ bool Get64( const std::vector<uint8_t>& input, size_t& offset, uint64_t& value )
     return true;
 }
 
+bool Add64( uint64_t& value, uint64_t add )
+{
+    if( add > std::numeric_limits<uint64_t>::max() - value ) return false;
+    value += add;
+    return true;
+}
+
 struct CanonicalBuildState
 {
     struct DomainBuffer
@@ -110,7 +117,7 @@ bool ReadPayload( CanonicalBuildState& state, const tracy::stream::RecordInfo& r
 
 bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t type,
     uint8_t domain, uint32_t flags, uint32_t threadContext,
-    bool hasSemanticTime, int64_t semanticTime,
+    uint32_t variablePayloadBytes, bool hasSemanticTime, int64_t semanticTime,
     const uint8_t* payload, uint32_t payloadBytes )
 {
     if( payloadBytes != 0 && !payload ) { state.error = "canonical_payload_missing"; return false; }
@@ -141,7 +148,7 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     Put32( output.payload, flags );
     Put32( output.payload, payloadBytes );
     Put32( output.payload, threadContext );
-    Put32( output.payload, 0 );
+    Put32( output.payload, variablePayloadBytes );
     Put64( output.payload, state.currentRecord.sequence );
     Put64( output.payload, state.currentRecord.monotonicNs );
     Put64( output.payload, state.protocolFrameOrdinal );
@@ -167,7 +174,7 @@ bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
     const auto hasSemanticTime = TryGetTraceProtocolEventTime( event, semanticTime );
     if( !AppendCanonicalRecord( state, 1, event.queueType,
         uint8_t( ClassifyTraceProtocolEvent( event.queueType ) ), 0,
-        state.threadContext, hasSemanticTime, semanticTime,
+        state.threadContext, event.variablePayloadBytes, hasSemanticTime, semanticTime,
         event.encodedData, event.encodedBytes ) )
     {
         error = state.error;
@@ -396,6 +403,14 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
             state.failed = true;
             return;
         }
+        if( !AppendCanonicalRecord( state,
+            uint8_t( TraceSessionCanonicalRecordKind::ProtocolFrame ), 0,
+            uint8_t( TraceSessionProtocolDomain::Control ), record.flags,
+            state.threadContext, 0, false, 0, nullptr, 0 ) )
+        {
+            state.failed = true;
+            return;
+        }
         state.protocolFrameOrdinal++;
     }
     else
@@ -408,7 +423,7 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
         }
         if( !AppendCanonicalRecord( state, 2, uint8_t( record.type ),
             uint8_t( TraceSessionProtocolDomain::Control ), record.flags,
-            state.threadContext, false, 0,
+            state.threadContext, 0, false, 0,
             state.payload.data(), uint32_t( state.payload.size() ) ) )
         {
             state.failed = true;
@@ -425,6 +440,62 @@ bool StopCanonicalScan( void* userData )
 {
     const auto& state = *static_cast<const CanonicalBuildState*>( userData );
     return state.failed || state.cancelRequested;
+}
+
+struct CanonicalAuditVisitorState
+{
+    TraceSessionCanonicalAudit* audit = nullptr;
+};
+
+bool VisitCanonicalForAudit( const TraceSessionCanonicalRecord& record,
+    void* userData, std::string& error )
+{
+    auto& audit = *static_cast<CanonicalAuditVisitorState*>( userData )->audit;
+    if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord )
+    {
+        if( !Add64( audit.transportRecords, 1 ) ||
+            !Add64( audit.transportPayloadBytes, record.payload.size() ) )
+        {
+            error = "canonical_audit_counter_overflow";
+            return false;
+        }
+        return true;
+    }
+    if( record.kind == TraceSessionCanonicalRecordKind::ProtocolFrame )
+    {
+        if( record.domain != TraceSessionProtocolDomain::Control || !record.payload.empty() ||
+            record.protocolFrameOrdinal == std::numeric_limits<uint64_t>::max() ||
+            !Add64( audit.protocolFrames, 1 ) )
+        {
+            error = "canonical_audit_protocol_frame_invalid";
+            return false;
+        }
+        return true;
+    }
+    if( record.type >= audit.events.size() ||
+        ClassifyTraceProtocolEvent( record.type ) != record.domain )
+    {
+        error = "canonical_audit_event_domain_mismatch";
+        return false;
+    }
+    auto& event = audit.events[record.type];
+    auto& domain = audit.domains[size_t( record.domain )];
+    if( !Add64( event.count, 1 ) || !Add64( event.encodedBytes, record.payload.size() ) ||
+        !Add64( event.variablePayloadBytes, record.variablePayloadBytes ) ||
+        !Add64( domain.count, 1 ) || !Add64( domain.encodedBytes, record.payload.size() ) ||
+        !Add64( domain.variablePayloadBytes, record.variablePayloadBytes ) ||
+        !Add64( audit.protocolEvents, 1 ) ||
+        !Add64( audit.protocolEncodedBytes, record.payload.size() ) )
+    {
+        error = "canonical_audit_counter_overflow";
+        return false;
+    }
+    if( record.hasSemanticTime && !Add64( audit.semanticTimeEvents, 1 ) )
+    {
+        error = "canonical_audit_counter_overflow";
+        return false;
+    }
+    return true;
 }
 
 }
@@ -595,13 +666,13 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
         const auto domain = bytes[offset++];
         const auto canonicalFlags = bytes[offset++];
         uint32_t payloadBytes = 0;
-        uint32_t reserved32 = 0;
         if( ( kind != uint8_t( TraceSessionCanonicalRecordKind::ProtocolEvent ) &&
-              kind != uint8_t( TraceSessionCanonicalRecordKind::TransportRecord ) ) ||
+              kind != uint8_t( TraceSessionCanonicalRecordKind::TransportRecord ) &&
+              kind != uint8_t( TraceSessionCanonicalRecordKind::ProtocolFrame ) ) ||
             domain >= uint8_t( TraceSessionProtocolDomain::Count ) || ( canonicalFlags & ~1u ) != 0 ||
             !Get32( bytes, offset, record.flags ) || !Get32( bytes, offset, payloadBytes ) ||
             !Get32( bytes, offset, record.threadContext ) ||
-            !Get32( bytes, offset, reserved32 ) || reserved32 != 0 ||
+            !Get32( bytes, offset, record.variablePayloadBytes ) ||
             !Get64( bytes, offset, record.sourceSequence ) ||
             !Get64( bytes, offset, record.journalMonotonicNs ) ||
             !Get64( bytes, offset, record.protocolFrameOrdinal ) )
@@ -631,14 +702,23 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
             return false;
         }
         if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord &&
-            record.domain != TraceSessionProtocolDomain::Control )
+            ( record.domain != TraceSessionProtocolDomain::Control ||
+              record.variablePayloadBytes != 0 ) )
         {
             error = "canonical_transport_domain_invalid";
             return false;
         }
+        if( record.kind == TraceSessionCanonicalRecordKind::ProtocolFrame &&
+            ( record.domain != TraceSessionProtocolDomain::Control || payloadBytes != 0 ||
+              record.variablePayloadBytes != 0 ) )
+        {
+            error = "canonical_protocol_frame_record_invalid";
+            return false;
+        }
         if( record.sourceSequence < shard.sourceRecordBegin ||
             record.sourceSequence > shard.sourceRecordEnd ||
-            payloadBytes > bytes.size() - offset )
+            payloadBytes > bytes.size() - offset ||
+            record.variablePayloadBytes > payloadBytes )
         {
             error = "canonical_shard_record_range_invalid";
             return false;
@@ -655,6 +735,42 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     if( recordCount != shard.recordCount )
     {
         error = "canonical_shard_record_count_mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool AuditTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
+    TraceSessionCanonicalAudit& audit, std::string& error )
+{
+    error.clear();
+    audit = {};
+    if( !VerifyTraceSession( sessionRoot, manifest, error ) ) return false;
+    CanonicalAuditVisitorState state { &audit };
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard,
+            VisitCanonicalForAudit, &state, error ) ) return false;
+    }
+    const auto expectedTransportRecords = inventory.recordCount - inventory.protocolInventory.frameCount;
+    if( audit.protocolFrames != inventory.protocolInventory.frameCount ||
+        audit.protocolEvents != inventory.protocolInventory.eventCount ||
+        audit.protocolEncodedBytes != inventory.protocolInventory.encodedBytes ||
+        audit.transportRecords != expectedTransportRecords )
+    {
+        error = "canonical_audit_global_count_mismatch";
+        return false;
+    }
+    if( audit.events != inventory.protocolInventory.events )
+    {
+        error = "canonical_audit_event_count_mismatch";
+        return false;
+    }
+    if( audit.domains != inventory.protocolInventory.domains )
+    {
+        error = "canonical_audit_domain_count_mismatch";
         return false;
     }
     return true;

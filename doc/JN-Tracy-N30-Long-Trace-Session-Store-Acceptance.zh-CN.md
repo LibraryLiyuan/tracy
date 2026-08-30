@@ -79,7 +79,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
 | N30.3 Canonical/Checkpoint | InProgress | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic；完整生命周期状态待N30.4域解析补齐。 |
-| N30.4 全Canonical域 | NotStarted | — |
+| N30.4 全Canonical域 | InProgress | 全部QueueType已按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic，生命周期/质量解析继续补齐。 |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
 | N30.7 LTS-1 | NotStarted | — |
@@ -374,3 +374,26 @@ tracy-stream-journal           Passed
 - 跨Shard Zone、Job、Allocation、Resource、I/O状态。
 - 磁盘压力运行中暂停；内存硬停止与writer lease已经通过。
 - Converter级第一次/第二次Ctrl+C交互与进程级故障注入（Canonical API层的安全停止/恢复已经通过）。
+
+## 6. N30.4 全 Canonical 域（进行中）
+
+### 已完成基础
+
+- Canonical不再依赖“每个压缩frame至少有一个事件”的隐含假设；每个压缩Journal record额外生成零payload的`ProtocolFrame`事实。
+- `ProtocolFrame`保存source sequence、frame ordinal、Journal时间和ThreadContext，即使原Protocol frame为空也能在Canonical中被独立计数和审计。
+- `TraceSessionCanonicalAudit`从已落盘Shard重新读取，不复用构建期计数器。
+- Audit逐项重算QueueType事件数、encoded bytes、variable payload bytes、17域统计、Protocol frame数、transport record数和semantic-time覆盖。
+- Audit要求所有结果与Source Inventory完全守恒；缺少一个合法Shard也会返回明确count/domain mismatch，不允许发布为完整。
+
+### TDD证据
+
+RED：尚无`TraceSessionCanonicalAudit`和`AuditTraceSessionCanonical`时，全域守恒测试按预期编译失败。
+
+GREEN：
+
+- 2个连续压缩frame、5个Protocol事件和2个非压缩transport record全部守恒。
+- Canonical总记录额外包含2个显式ProtocolFrame事实，空frame语义不再依赖事件推断。
+- protocol frame/event/encoded bytes/transport records与Inventory逐项一致。
+- QueueType和17域的count/encoded/variable payload统计完全一致。
+- semantic-time覆盖只统计可证明拥有CPU语义时间的事件。
+- 从manifest删除Frame shard后，`AuditTraceSessionCanonical`明确失败，不使用其他域推测补齐。
