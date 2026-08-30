@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace
@@ -53,6 +54,7 @@ struct CanonicalReadState
     uint32_t frameThreadContext = 0;
     uint32_t jobThreadContext = 0;
     int64_t frameSemanticTime = 0;
+    std::vector<std::tuple<uint64_t, uint64_t, uint32_t, uint8_t>> protocolOrder;
 };
 
 bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& record,
@@ -61,7 +63,11 @@ bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& r
     auto& state = *static_cast<CanonicalReadState*>( userData );
     state.records++;
     if( record.kind == tracy::analysis::TraceSessionCanonicalRecordKind::ProtocolEvent )
+    {
         state.domains[size_t( record.domain )]++;
+        state.protocolOrder.emplace_back( record.sourceSequence,
+            record.protocolFrameOrdinal, record.protocolFrameOffset, record.type );
+    }
     if( record.type == uint8_t( tracy::QueueType::FrameVsync ) )
     {
         state.frameThreadContext = record.threadContext;
@@ -659,6 +665,17 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         canonicalRead.jobThreadContext == 77 &&
         canonicalRead.frameSemanticTime == 123456,
         "canonical records carry checkpointed thread context and raw semantic time across shards" );
+    std::sort( canonicalRead.protocolOrder.begin(), canonicalRead.protocolOrder.end() );
+    std::vector<uint8_t> restoredTypes;
+    restoredTypes.reserve( canonicalRead.protocolOrder.size() );
+    for( const auto& value : canonicalRead.protocolOrder ) restoredTypes.push_back( std::get<3>( value ) );
+    const std::vector<uint8_t> expectedTypes = {
+        uint8_t( tracy::QueueType::ThreadContext ), uint8_t( tracy::QueueType::FrameVsync ),
+        uint8_t( tracy::QueueType::StringData ), uint8_t( tracy::QueueType::JnJobSchedule ),
+        uint8_t( tracy::QueueType::StringData )
+    };
+    test.Check( restoredTypes == expectedTypes,
+        "domain shards restore exact cross-domain protocol order using frame offsets" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
     tracy::analysis::TraceSessionCanonicalAudit audit;

@@ -40,6 +40,9 @@ struct TraceSessionCanonicalRecord
     uint32_t flags = 0;
     uint32_t threadContext = 0;
     uint32_t variablePayloadBytes = 0;
+    // Exact byte position in the decompressed protocol frame. This is the
+    // final tie-breaker when records from different domain shards are merged.
+    uint32_t protocolFrameOffset = 0;
     uint64_t sourceSequence = 0;
     uint64_t journalMonotonicNs = 0;
     uint64_t protocolFrameOrdinal = 0;

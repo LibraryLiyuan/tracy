@@ -385,6 +385,7 @@ tracy-stream-journal           Passed
 - Audit逐项重算QueueType事件数、encoded bytes、variable payload bytes、17域统计、Protocol frame数、transport record数和semantic-time覆盖。
 - Audit要求所有结果与Source Inventory完全守恒；缺少一个合法Shard也会返回明确count/domain mismatch，不允许发布为完整。
 - 新增Protocol 90完整QueueType矩阵：从`0`到`NUM_TYPES-1`逐一构造合法零payload事件，要求每种类型恰好出现一次、全部落入稳定域，域总数与事件总数严格相等。
+- 每个Protocol事件额外持久化其解压frame内的原始byte offset；`source sequence + frame ordinal + frame offset`构成跨域全序键，避免按域分片后丢失同一frame内的真实先后关系。
 - Canonical只保存可直接证明的协议事实；生命周期、inclusive集合等派生状态不写回Canonical，也不与Canonical并列成为第二事实来源。
 
 ### TDD证据
@@ -398,5 +399,6 @@ GREEN：
 - protocol frame/event/encoded bytes/transport records与Inventory逐项一致。
 - QueueType和17域的count/encoded/variable payload统计完全一致。
 - Protocol 90的全部QueueType逐项各计数1次，域分区总数与`NUM_TYPES`完全一致。
+- Frame、Dictionary、Job等交错事件从不同域Shard重新归并后，与原始Protocol frame顺序逐项一致。
 - semantic-time覆盖只统计可证明拥有CPU语义时间的事件。
 - 从manifest删除Frame shard后，`AuditTraceSessionCanonical`明确失败，不使用其他域推测补齐。
