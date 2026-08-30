@@ -4,6 +4,7 @@
 #include "TracyTraceSessionDerived.hpp"
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyGpuAnalysisTraceSource.hpp"
+#include "TracyTraceSessionMemory.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -1104,6 +1105,83 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5003, "Parent.cpp" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5012, "ChildFunction" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5013, "Child.cpp" );
+
+    item = {};
+    item.hdr.type = tracy::QueueType::MemAlloc;
+    item.memAlloc.time = 109;
+    item.memAlloc.thread = 42;
+    item.memAlloc.ptr = 0xDEAD;
+    const uint64_t firstAllocationBytes = 4096;
+    std::memcpy( item.memAlloc.size, &firstAllocationBytes, 6 );
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MemFree;
+    item.memFree = { 2, 42, 0xDEAD };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MemAlloc;
+    item.memAlloc.time = 1;
+    item.memAlloc.thread = 42;
+    item.memAlloc.ptr = 0xDEAD;
+    const uint64_t reusedAllocationBytes = 2048;
+    std::memcpy( item.memAlloc.size, &reusedAllocationBytes, 6 );
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MemAlloc;
+    item.memAlloc.time = 1;
+    item.memAlloc.thread = 42;
+    item.memAlloc.ptr = 0xBEEF;
+    const uint64_t openAllocationBytes = 6144;
+    std::memcpy( item.memAlloc.size, &openAllocationBytes, 6 );
+    AppendQueueItem( frame, item );
+
+    const std::array<uint64_t, 2> memorySiteCallstack { 0x60606060, 0x70707070 };
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x6666,
+        std::string( reinterpret_cast<const char*>( memorySiteCallstack.data() ),
+            sizeof( memorySiteCallstack ) ) );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackSerial;
+    item.callstackFat.ptr = 0x6666;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnCallsiteDefinition;
+    item.jnCallsiteDefinition = { 0x1000, 79, 42, 4,
+        uint8_t( tracy::JnStackProvenance::SiteReused ),
+        uint8_t( tracy::JnCallsiteFlags::HasCallstack ), 0 };
+    AppendQueueItem( frame, item );
+    constexpr uint64_t GpuMemoryPoolName = 0x7000;
+    item = {};
+    item.hdr.type = tracy::QueueType::MemNamePayload;
+    item.memName.name = GpuMemoryPoolName;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnMemAllocCallsiteNamed;
+    item.jnMemAllocCallsite.time = 1;
+    item.jnMemAllocCallsite.thread = 42;
+    item.jnMemAllocCallsite.ptr = 77;
+    const uint64_t gpuAllocationBytes = 1024;
+    std::memcpy( item.jnMemAllocCallsite.size, &gpuAllocationBytes, 6 );
+    item.jnMemAllocCallsite.callsiteId = 79;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::StringData,
+        GpuMemoryPoolName, "GPU D3D12 Texture" );
+    const std::array<uint64_t, 1> memoryFreeCallstack { 0x80808080 };
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x7777,
+        std::string( reinterpret_cast<const char*>( memoryFreeCallstack.data() ),
+            sizeof( memoryFreeCallstack ) ) );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackSerial;
+    item.callstackFat.ptr = 0x7777;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MemNamePayload;
+    item.memName.name = GpuMemoryPoolName;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MemFreeCallstackNamed;
+    item.memFree = { 1, 42, 77 };
+    AppendQueueItem( frame, item );
+
     item = {};
     item.hdr.type = tracy::QueueType::FrameVsync;
     item.frameVsync = { 106, 9 };
@@ -1278,6 +1356,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( jobCapability != sessionCapabilities.end() && jobCapability->present &&
         jobCapability->indexed && jobCapability->queryable,
         "Session advertises Job only after its disk-backed semantic reader is ready" );
+    const auto memoryCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "memory"; } );
+    const bool sessionMemoryReady = memoryCapability != sessionCapabilities.end() &&
+        memoryCapability->present && memoryCapability->indexed && memoryCapability->queryable;
+    test.Check( sessionMemoryReady,
+        "Session advertises Memory only after its disk-backed semantic reader is ready" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1298,6 +1382,35 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionJobs[0].scheduleStackProvenance == "SiteReused" &&
         sessionJobs[0].stages.size() == 5,
         "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
+    if( sessionMemoryReady )
+    {
+        const auto sessionMemoryPools = sessionSource->GetMemoryPools();
+        const auto sessionMemoryEvents = sessionSource->ScanMemoryEvents( {} );
+        test.Check( sessionMemoryPools.size() == 2 && sessionMemoryPools[0].name == "Default allocator" &&
+            sessionMemoryPools[0].eventCount == 3 && sessionMemoryPools[0].activeCount == 2 &&
+            sessionMemoryPools[0].activeBytes == 8192 && sessionMemoryPools[0].freeCount == 1,
+            "Session Memory reader restores pool totals and open allocations" );
+        test.Check( sessionMemoryPools[1].name == "GPU D3D12 Texture" && sessionMemoryPools[1].gpuD3D12 &&
+            sessionMemoryPools[1].eventCount == 1 && sessionMemoryPools[1].activeCount == 0 &&
+            sessionMemoryPools[1].freeCount == 1,
+            "Session Memory reader resolves named GPU D3D12 pools" );
+        test.Check( sessionMemoryEvents.size() == 4 && sessionMemoryEvents[0].address == "0xdead" &&
+            sessionMemoryEvents[0].size == 4096 && sessionMemoryEvents[0].allocationNs == 18 &&
+            sessionMemoryEvents[0].freeNs == 22 && sessionMemoryEvents[0].allocationCallstack == 0 &&
+            sessionMemoryEvents[1].address == "0xdead" && sessionMemoryEvents[1].allocationNs == 24 &&
+            !sessionMemoryEvents[1].freeNs && sessionMemoryEvents[1].allocationCallstack == 0 &&
+            sessionMemoryEvents[2].address == "0xbeef" && sessionMemoryEvents[2].allocationNs == 26 &&
+            !sessionMemoryEvents[2].freeNs && sessionMemoryEvents[2].allocationCallstack == 0 &&
+            sessionMemoryEvents[3].address == "77" && sessionMemoryEvents[3].allocationNs == 28 &&
+            sessionMemoryEvents[3].freeNs == 30 && sessionMemoryEvents[3].allocationCallstack == 4 &&
+            sessionMemoryEvents[3].freeCallstack == 5,
+            "Session Memory reader preserves serial time, address reuse, SiteReuse and exact free callstacks" );
+        const auto memorySnapshot = sessionSource->GetMemoryFrameSnapshot( 0, 0, {}, false );
+        test.Check( memorySnapshot.valid && memorySnapshot.begin == 12 && memorySnapshot.end == 36 &&
+            memorySnapshot.total.allocatedBytes == 13312 && memorySnapshot.total.freedBytes == 5120 &&
+            memorySnapshot.total.endBytes == 8192 && memorySnapshot.activeAtEnd.size() == 2,
+            "Session Memory reader builds the exact first-frame allocation snapshot" );
+    }
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
     test.Check( corruptShard != manifest.shards.end(), "lazy checksum fixture has a Canonical data shard" );
@@ -1396,6 +1509,30 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuSearch["data"]["zones"][2]["end_ns"].is_null() &&
             cpuSearch["data"]["zones"][2]["complete"] == false,
             "Query 1.34 preserves Session CPU-zone hierarchy, shared delta clock, source and SiteReuse semantics" );
+        if( sessionMemoryReady ) try
+        {
+            const auto memoryPools = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-memory-pools" }, { "method", "memory.pools" },
+                { "params", { { "trace_id", traceId } } }
+            } );
+            const auto memoryEvents = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-memory-events" }, { "method", "memory.events" },
+                { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( memoryPools.value( "ok", false ) && memoryPools["data"]["pools"].size() == 2 &&
+                memoryPools["data"]["pools"][0]["active_bytes"] == "8192" &&
+                memoryPools["data"]["pools"][1]["name"] == "GPU D3D12 Texture" &&
+                memoryEvents.value( "ok", false ) && memoryEvents["data"]["events"].size() == 4 &&
+                memoryEvents["data"]["events"][0]["allocation_callstack"].is_null() &&
+                memoryEvents["data"]["events"][1]["complete"] == false &&
+                memoryEvents["data"]["events"][3]["allocation_callstack"] == "4" &&
+                memoryEvents["data"]["events"][3]["free_callstack"] == "5",
+                "Query 1.34 reads Session Memory pools and lifecycle events without a Worker" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session Memory Reader is unavailable: " ) + exception.what() );
+        }
     }
     const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
         publishedSession, manifest ) / "frames.bin";
@@ -1425,6 +1562,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( !tracy::analysis::TraceSessionJobReader::Open(
         publishedSession, manifest, error ) && error == "session_job_file_sha256_mismatch",
         "Session Job reader rejects a corrupted committed semantic index" );
+    const auto memoryFile = tracy::analysis::TraceSessionMemoryIndexRoot(
+        publishedSession, manifest ) / "memory.bin";
+    {
+        std::fstream damaged( memoryFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x69 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionMemoryStats rejectedMemoryStats;
+    test.Check( !tracy::analysis::AuditTraceSessionMemoryDerived(
+        publishedSession, manifest, rejectedMemoryStats, error ) &&
+        error == "session_memory_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Memory semantic index" );
 }
 
 }

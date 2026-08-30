@@ -45,6 +45,13 @@ struct TraceSessionDerivedStats
     uint64_t cpuZoneSources = 0;
     uint64_t cpuZoneBegins = 0;
     uint64_t cpuZoneEnds = 0;
+    uint64_t memoryPools = 0;
+    uint64_t memoryEvents = 0;
+    uint64_t activeMemoryEvents = 0;
+    uint64_t memoryAllocations = 0;
+    uint64_t memoryFrees = 0;
+    uint64_t memoryDiscards = 0;
+    uint64_t memoryUnknownFrees = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

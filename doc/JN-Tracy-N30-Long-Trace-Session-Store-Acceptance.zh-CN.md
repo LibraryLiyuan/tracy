@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job和CPU Zone语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU Zone和Memory语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -469,6 +469,12 @@ GREEN：
 - 标准/动态SourceLocation、延迟StringData、ZoneName、ZoneText、ZoneColor、普通Callstack、Serial Callstack和SiteReuse Callsite均已接入；Callsite晚于Zone闭合到达时原位修补已提交的固定记录。
 - `zone.cpu.search/get/tree/statistics/flamegraph`已从Session CPU Zone Reader读取；最后未闭合Zone返回`complete=false/end=null`，不会伪造捕获结束时间。
 - 快速Session打开只校验CPU Zone文件头、身份和大小；Final Audit独立重算`cpu-zones.bin`完整SHA-256并核对Inventory Begin/End守恒，同尺寸篡改不能被发布。
+- Memory域新增`memory-index/1/exact/memory.bin`：每个Memory Pool使用独立顺序work file，已完成allocation立即持久化，free/discard只原位补齐生命周期；构建期内存仅保留各池当前存活地址表，不随历史alloc/free事件总数增长。
+- Memory Reader恢复默认池与命名池、地址、大小、alloc/free时间、原始线程、Callstack和开放生命周期；地址复用始终建立新的事件代次，不覆盖旧生命周期。
+- Memory串行时间严格复现Worker的共享`m_refTimeSerial`；Lock serial、GPU serial、Memory、Job Wait/Schedule stack和I/O stack消费者保持同一协议状态，避免插入其他域事件后Memory时间漂移。
+- `JnMemAllocCallsiteNamed`使用已注册SiteReuse Callsite的全局Callstack ID；传统`MemAlloc/FreeCallstack*`保留逐事件栈。命名池StringData允许延迟到达，最终按稳定名称、再按native pool id排序。
+- `memory.pools/events/get/active_at_time/frame_snapshot/diff/callstack_tree/leak_candidates`现由Session Memory Reader提供，不实例化Worker；`memory.gpu`只在至少一个`GPU D3D12 `命名池存在时声明可查询。
+- `memory.bin`保存source SHA-256、source size、固定manifest generation、Pool/Event/Active计数与独立SHA-256；Final Audit核对五类alloc、四类free、两类discard的Inventory源事件守恒，并拒绝同尺寸payload篡改。
 
 ### TDD证据
 
@@ -478,6 +484,7 @@ RED：
 - 尚无`OpenSessionIfReady`和`TraceSourceKind::Session`时，SessionTraceSource测试按预期编译失败。
 - Frame Canonical fact存在但磁盘语义Reader尚未实现时，测试按预期失败于`Session advertises Frame only after its disk-backed semantic reader is ready`。
 - Job Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Job only after its disk-backed semantic reader is ready`。
+- Memory Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Memory only after its disk-backed semantic reader is ready`。
 
 GREEN：
 
@@ -496,13 +503,18 @@ GREEN：
 - 提交后篡改`jobs.bin`会被`session_job_file_sha256_mismatch`拒绝。
 - CPU Zone GREEN恢复父Zone`[8,28]ns/self=16ns`、子Zone`[16,20]ns`和开放Zone`start=32ns/end=null`；晚到SiteReuse定义仍关联全局Callstack ID 3，直接Reader与Query 1.34结果一致。
 - CPU Zone索引的大小篡改由Reader拒绝，同尺寸内容篡改由Final Audit的完整SHA-256拒绝。
-- `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
+- Memory GREEN恢复默认池3个allocation与1个free：`0xdead`第一代为`[18,22]ns/4096 B`，第二代从24ns开放；`0xbeef`从26ns开放。首帧`[12,36]ns`统计为allocated 13,312 B、freed 5,120 B、end 8,192 B。
+- 命名池`GPU D3D12 Texture`恢复1个allocation/free；allocation使用全局Callstack ID 4和SiteReuse Callsite 79，free使用逐事件Callstack ID 5，直接Reader与Query 1.34一致。
+- Final Audit在`memory.bin`同尺寸内容被篡改后返回`session_memory_file_sha256_mismatch`。
+- Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- GPU Zone、Sampling、Memory和FrameImage的语义分页Reader。
+- GPU Zone、Sampling和FrameImage的语义分页Reader。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
+- 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
+- Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。
 
@@ -522,6 +534,29 @@ tracy-query-contract              Passed
 tracy-gpu-analysis                Passed
 tracy-trace-session-store         Passed
 tracy-trace-session-inventory     Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Memory Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `921FB679CEE6692B5CBBCCDC8C3686EFDDC5ACFFF97FDB418E11ECA5F6C3114A` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `33F44EE053E98D83DE5223AF7DEFA8A96C4179CE354338D306E340FD2C183513` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
 tracy-query-version               Passed
 tracy-query-doctor                Passed
 tracy-gpu-analysis-n29-static     Passed

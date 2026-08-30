@@ -35,6 +35,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !jobReader ) return {};
     auto cpuZoneReader = TraceSessionCpuZoneReader::Open( path, *session, error );
     if( !cpuZoneReader ) return {};
+    auto memoryReader = TraceSessionMemoryReader::Open( path, *session, error );
+    if( !memoryReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -59,17 +61,20 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
-        std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ) ) );
+        std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ),
+        std::move( memoryReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
     std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
     TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader,
     std::shared_ptr<TraceSessionJobReader> jobReader,
-    std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader )
+    std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader,
+    std::shared_ptr<TraceSessionMemoryReader> memoryReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
-      m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) )
+      m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
+      m_memoryReader( std::move( memoryReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -163,8 +168,20 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         jobPresent ? "available from the N30 Session mandatory Job index" :
             "The source Session contains no Job facts", JobMethods } );
     addPending( "job.gfx", TraceSessionProtocolDomain::Job );
-    addPending( "memory", TraceSessionProtocolDomain::CpuMemory );
-    addPending( "memory.gpu", TraceSessionProtocolDomain::GpuMemory );
+    static const std::vector<std::string> MemoryMethods = {
+        "memory.pools", "memory.events", "memory.get", "memory.active_at_time",
+        "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates"
+    };
+    const auto memoryPresent = m_memoryReader && m_memoryReader->Stats().events != 0;
+    result.push_back( Capability { "memory", memoryPresent, memoryPresent, true,
+        memoryPresent ? "available from the N30 Session mandatory Memory index" :
+            "The source Session contains no Memory facts", MemoryMethods } );
+    const auto gpuMemoryPresent = m_memoryReader && std::any_of(
+        m_memoryReader->Pools().begin(), m_memoryReader->Pools().end(),
+        []( const auto& pool ) { return pool.gpuD3D12; } );
+    result.push_back( Capability { "memory.gpu", gpuMemoryPresent, gpuMemoryPresent, true,
+        gpuMemoryPresent ? "available from the N30 Session mandatory Memory index" :
+            "The source Session contains no GPU D3D12 memory pools", MemoryMethods } );
     addPending( "io", TraceSessionProtocolDomain::Io );
     addPending( "sample", TraceSessionProtocolDomain::Sampling );
     addPending( "hardware_sample", TraceSessionProtocolDomain::Sampling );
@@ -221,6 +238,11 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     }
     if( m_jobReader ) out.counts.jobs = m_jobReader->Stats().jobs;
     if( m_cpuZoneReader ) out.counts.cpuZones = m_cpuZoneReader->Stats().zones;
+    if( m_memoryReader )
+    {
+        out.counts.memoryPools = m_memoryReader->Stats().pools;
+        out.counts.memoryEvents = m_memoryReader->Stats().events;
+    }
     return out;
 }
 
@@ -328,7 +350,11 @@ std::optional<uint64_t> GpuAnalysisTraceSource::ParseEntityRef( std::string_view
 
 D0(std::vector<ThreadDto>, GetThreads)
 D0(std::vector<GpuContextDto>, GetGpuContexts)
-D0(std::vector<MemoryPoolDto>, GetMemoryPools)
+std::vector<MemoryPoolDto> GpuAnalysisTraceSource::GetMemoryPools() const
+{
+    if( WorkerLoaded() ) return Worker().GetMemoryPools();
+    return m_memoryReader ? m_memoryReader->Pools() : std::vector<MemoryPoolDto> {};
+}
 D0(std::vector<PlotDto>, GetPlotList)
 D0(std::vector<LockDto>, GetLocks)
 std::vector<CpuZoneDto> GpuAnalysisTraceSource::ScanCpuZones( const ScanRange& range ) const
@@ -337,7 +363,11 @@ std::vector<CpuZoneDto> GpuAnalysisTraceSource::ScanCpuZones( const ScanRange& r
     return m_cpuZoneReader ? m_cpuZoneReader->Scan( range ) : std::vector<CpuZoneDto> {};
 }
 D1(std::vector<GpuZoneDto>, ScanGpuZones, const ScanRange&, range)
-D1(std::vector<MemoryEventDto>, ScanMemoryEvents, const ScanRange&, range)
+std::vector<MemoryEventDto> GpuAnalysisTraceSource::ScanMemoryEvents( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanMemoryEvents( range );
+    return m_memoryReader ? m_memoryReader->Scan( range ) : std::vector<MemoryEventDto> {};
+}
 D1(std::vector<MessageDto>, ScanMessages, const ScanRange&, range)
 D1(std::vector<PlotPointDto>, ScanPlots, const ScanRange&, range)
 D1(std::vector<std::string>, ScanLocks, const ScanRange&, range)
@@ -396,9 +426,32 @@ std::vector<CpuZoneDto> GpuAnalysisTraceSource::GetCpuZoneChildren(
     return id && m_cpuZoneReader ? m_cpuZoneReader->Children( *id, offset, limit ) : std::vector<CpuZoneDto> {};
 }
 D3(std::vector<GpuZoneDto>, GetGpuZoneChildren, std::string_view, ref, size_t, offset, size_t, limit)
-D4(MemoryFrameSnapshot, GetMemoryFrameSnapshot, size_t, frameSetIndex, size_t, frameIndex, const std::vector<std::string>&, poolRefs, bool, allGpuD3D12Pools)
-D1(std::optional<MemoryEventDto>, GetMemoryEvent, const MemoryEventKey&, key)
-D1(std::optional<std::string>, GetMemoryPoolRef, uint64_t, internalPoolKey)
+MemoryFrameSnapshot GpuAnalysisTraceSource::GetMemoryFrameSnapshot(
+    size_t frameSetIndex, size_t frameIndex, const std::vector<std::string>& poolRefs,
+    bool allGpuD3D12Pools ) const
+{
+    if( WorkerLoaded() ) return Worker().GetMemoryFrameSnapshot(
+        frameSetIndex, frameIndex, poolRefs, allGpuD3D12Pools );
+    if( !m_memoryReader || !m_frameReader || frameSetIndex >= m_frameReader->Sets().size() ) return {};
+    const auto& frames = m_frameReader->Sets()[frameSetIndex].frames;
+    if( frameIndex >= frames.size() || !frames[frameIndex].complete ) return {};
+    return m_memoryReader->Snapshot( frames[frameIndex].beginNs, frames[frameIndex].endNs,
+        poolRefs, allGpuD3D12Pools );
+}
+
+std::optional<MemoryEventDto> GpuAnalysisTraceSource::GetMemoryEvent(
+    const MemoryEventKey& key ) const
+{
+    if( WorkerLoaded() ) return Worker().GetMemoryEvent( key );
+    return m_memoryReader ? m_memoryReader->Get( key ) : std::nullopt;
+}
+
+std::optional<std::string> GpuAnalysisTraceSource::GetMemoryPoolRef(
+    uint64_t internalPoolKey ) const
+{
+    if( WorkerLoaded() ) return Worker().GetMemoryPoolRef( internalPoolKey );
+    return m_memoryReader ? m_memoryReader->PoolRef( internalPoolKey ) : std::nullopt;
+}
 std::optional<std::string> GpuAnalysisTraceSource::GetCpuZoneRef( uint64_t internalZoneIndex ) const
 {
     if( WorkerLoaded() ) return Worker().GetCpuZoneRef( internalZoneIndex );
