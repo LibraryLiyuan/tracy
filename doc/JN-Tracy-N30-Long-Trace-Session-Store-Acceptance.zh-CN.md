@@ -77,7 +77,7 @@ Projected full replay: approximately 90–100 GiB
 |---|---|---|
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
-| N30.2 Inventory与容量预检 | InProgress | Journal/身份/容量核心已通过真实30分钟输入；Protocol QueueType/域计数待完成。 |
+| N30.2 Inventory与容量预检 | InProgress | Journal、强身份、容量、Protocol QueueType、数据域和CaptureEnd质量已通过真实30分钟输入；磁盘run与迟到/依赖清单待完成。 |
 | N30.3 Canonical/Checkpoint | NotStarted | — |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
@@ -158,6 +158,11 @@ CPM_SOURCE_CACHE=C:\CodeProjects\GodotProjects\tracy-0.13.1-n29-gpu-analysis\bui
 - Canonical、Derived 和 temporary 使用整数、溢出保护的保守空间估算。
 - 容量预检执行 256 GiB Session 上限和 `max(64 GiB, volume 10%)` 安全预留。
 - Scan 与 Hash 两个阶段均提供单调 byte progress；诊断工具每5秒输出一次。
+- 对全部 `ClientToServer + CompressedFrame` 顺序执行Protocol 90 LZ4流式解码，严格验证每个事件的QueueType、固定大小、可变payload长度和帧结束边界。
+- 精确保存每个QueueType的事件数、编码字节和可变payload字节；汇总为17个稳定数据域，未知域单独返回`other`。
+- 每个压缩帧先在临时计数器中完整验证，再事务性合并；损坏帧不会把半帧计数写入Inventory。
+- 解析Schema 1 `SessionEnd` payload，保存close reason与client/server累计字节。`CaptureComplete`/`LocalShutdown`可完整，其他原因按稳定quality reason标记source degraded。
+- Inventory持久化时对QueueType明细、数据域明细、总事件数和总编码字节做交叉守恒校验；缺行或总量不一致会拒绝加载。
 
 ### TDD 证据
 
@@ -165,6 +170,9 @@ RED：
 
 1. Inventory 接口尚不存在时，测试因缺少 `TracyTraceSessionInventory.hpp` 编译失败。
 2. Progress API 尚不存在时，测试因缺少 `TraceSessionInventoryPhase` 和 progress callback 编译失败。
+3. Protocol frame parser尚不存在时，测试因缺少`TracyTraceSessionProtocolInventory.hpp`编译失败。
+4. LZ4连续解码器尚不存在时，测试因缺少`TraceSessionProtocolDecoder`编译失败。
+5. 域分类和CaptureEnd字段尚不存在时，编译按预期失败。
 
 GREEN 覆盖：
 
@@ -175,6 +183,12 @@ GREEN 覆盖：
 - Inventory 原子落盘和 round-trip。
 - Session 256 GiB 上限、64 GiB/10% volume reserve。
 - Scan/Hash progress 单调且抵达 source size。
+- 固定事件、16位/32位可变payload和截断帧边界。
+- LZ4连续字典解码和压缩记录长度不匹配。
+- Journal→CompressedFrame→QueueType端到端统计。
+- Frame、Job、Scheduling、CPU Memory、GPU Memory、GPU Catalog和Dictionary域分类。
+- CaptureComplete与ProtocolMismatch关闭原因质量映射。
+- QueueType明细、域明细和总量持久化守恒校验。
 - N30.1 Store 与 N29 GPU Analysis 联合回归。
 
 ```text
@@ -204,19 +218,22 @@ C:\Users\Admin\Documents\JN-Unity-T3\N29-Autonomous-30m\Run-20260830-220012\Admi
 | Client payload bytes | 19,078,853,869 |
 | Server records | 304,425 |
 | Server payload bytes | 3,976,985 |
+| Compressed protocol frames | 193,141 |
+| Protocol events | 2,284,723,486 |
+| Capture end | CaptureComplete (`3`) |
 | Source state | complete / not degraded |
 | Estimated Canonical | 22,947,387,490 bytes |
 | Estimated total build | 51,631,621,852 bytes |
 | Required available incl. reserve | 461,259,618,422 bytes |
 | Capacity | accepted |
-| Observed Working Set | 约8.8 MiB |
-| Observed Private bytes | 约1.8 MiB |
-| 扫描墙钟 | 约2分15秒～2分23秒（两次独立运行） |
+| Protocol-aware peak Working Set | 14.66 MiB |
+| Protocol-aware peak private/paged | 8.06 MiB |
+| Protocol-aware墙钟 | 174.235秒 |
 
-两次输出 Inventory 均为736 bytes，文件 SHA-256 均为：
+最终域级Inventory为4,244 bytes，SHA-256：
 
 ```text
-5EE7CE991FAD448D9386356EC854F67928AC1CF4F5EFFB540F04C88AD5C2235F
+1C811C88EA5989F136D93608E198FC21E4C2C122FB565A4509FF9B2DCDB721AD
 ```
 
 保存位置：
@@ -225,9 +242,32 @@ C:\Users\Admin\Documents\JN-Unity-T3\N29-Autonomous-30m\Run-20260830-220012\Admi
 C:\Users\Admin\Documents\JN-Unity-T3\N30-Inventory\
 ```
 
+30分钟协议事件域计数：
+
+| 域 | 事件数 |
+|---|---:|
+| CPU Zone | 976,556,944 |
+| Job/Gfx | 432,271,644 |
+| Scheduling/Context Switch | 279,606,178 |
+| Sampling/Hardware Sample | 206,187,865 |
+| GPU Zone | 147,490,405 |
+| Relation | 125,513,195 |
+| GPU Memory Reference | 74,883,055 |
+| Dictionary | 20,261,690 |
+| CPU Memory | 7,449,296 |
+| Source/Callstack | 6,377,313 |
+| GPU Catalog | 5,069,734 |
+| Message/Plot/Lock | 1,487,900 |
+| Frame/FrameImage | 1,004,931 |
+| Script Runtime | 563,231 |
+| I/O | 104 |
+| Control | 1 |
+| Other | 0 |
+
+短Trace验证中，Inventory得到的`protocol_events=142,886,374`、`protocol_frames=9,857`，与传统Full Worker转换报告逐项相等。30分钟stream完整解压后`other=0`，未发现非法QueueType、压缩字典错误或事件边界错误。旧转换在42.6%发生的40.83 GiB内存失败不是该位置的源stream损坏。
+
 ### 尚未完成，不能提前通过 N30.2
 
-- Protocol 90 解压后的 QueueType 精确计数与数据域分类。
 - Dictionary、Blob、Callstack 依赖和迟到事件分布的磁盘 run。
-- `last committed revision` 在 producer 已声明 drop/强制退出语义下的域级质量映射。
+- producer在JN质量事件中声明drop时的域级质量映射；SessionEnd关闭原因映射已完成。
 - Inventory build-state/checkpoint 与 GracefulCancel/Resume；该状态机与 N30.3 共用实现。

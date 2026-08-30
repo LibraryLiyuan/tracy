@@ -1,9 +1,15 @@
 #include "TracyTraceSessionInventory.hpp"
+#include "TracyTraceSessionProtocolInventory.hpp"
 
 #include "TracyStreamJournal.hpp"
+#include "TracyProtocolObserver.hpp"
+#include "TracyQueue.hpp"
+#include "TracyProtocol.hpp"
+#include "tracy_lz4.hpp"
 
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -66,7 +72,8 @@ bool AppendBytes( tracy::stream::JournalWriter& writer, tracy::stream::RecordTyp
 }
 
 bool CreateJournal( const std::filesystem::path& path, size_t clientRecords,
-    bool terminal, std::string& error )
+    bool terminal, std::string& error,
+    tracy::ProtocolCloseReason closeReason = tracy::ProtocolCloseReason::CaptureComplete )
 {
     tracy::stream::WriterOptions options;
     options.durableHeader = false;
@@ -78,14 +85,24 @@ bool CreateJournal( const std::filesystem::path& path, size_t clientRecords,
     for( size_t i = 0; i < clientRecords; i++ )
     {
         if( !AppendBytes( *writer, tracy::stream::RecordType::ClientToServer,
-            tracy::stream::RecordFlagCompressedFrame, 100 + i % 7, i + 1, error ) ) return false;
+            tracy::stream::RecordFlagNone, 100 + i % 7, i + 1, error ) ) return false;
     }
     if( !AppendBytes( *writer, tracy::stream::RecordType::ServerToClient,
         tracy::stream::RecordFlagServerQuery, 40, clientRecords + 1, error ) ) return false;
     if( !AppendBytes( *writer, tracy::stream::RecordType::Checkpoint,
         tracy::stream::RecordFlagDurabilityBoundary, 16, clientRecords + 2, error ) ) return false;
-    if( terminal && !AppendBytes( *writer, tracy::stream::RecordType::SessionEnd,
-        tracy::stream::RecordFlagTerminal, 24, clientRecords + 3, error ) ) return false;
+    if( terminal )
+    {
+        std::array<uint8_t, 32> payload {};
+        const uint16_t schema = 1;
+        const uint16_t size = uint16_t( payload.size() );
+        const uint32_t reason = uint32_t( closeReason );
+        std::memcpy( payload.data(), &schema, sizeof( schema ) );
+        std::memcpy( payload.data() + 2, &size, sizeof( size ) );
+        std::memcpy( payload.data() + 4, &reason, sizeof( reason ) );
+        if( !writer->Append( tracy::stream::RecordType::SessionEnd,
+            tracy::stream::RecordFlagTerminal, payload, clientRecords + 3, error ) ) return false;
+    }
     return true;
 }
 
@@ -103,6 +120,9 @@ void TestCompleteInventory( TestContext& test, const std::filesystem::path& dire
     test.Check( tracy::analysis::BuildTraceSessionInventory( path, options, inventory, error ),
         "build complete inventory: " + error );
     test.Check( inventory.protocol == 90, "inventory preserves protocol" );
+    test.Check( inventory.captureEndMetadataPresent, "inventory parses capture end metadata" );
+    test.Check( inventory.captureEndReason == uint32_t( tracy::ProtocolCloseReason::CaptureComplete ),
+        "inventory preserves capture close reason" );
     test.Check( inventory.complete, "terminal journal is complete" );
     test.Check( !inventory.sourceDegraded, "clean source is not degraded" );
     test.Check( inventory.recordCount == 7, "all committed journal records are counted" );
@@ -135,7 +155,25 @@ void TestCompleteInventory( TestContext& test, const std::filesystem::path& dire
     {
         test.Check( loaded->sourceSha256 == inventory.sourceSha256, "inventory identity round-trip" );
         test.Check( loaded->records == inventory.records, "inventory counters round-trip" );
+        test.Check( loaded->captureEndMetadataPresent == inventory.captureEndMetadataPresent &&
+            loaded->captureEndReason == inventory.captureEndReason,
+            "capture end quality round-trip" );
     }
+}
+
+void TestDegradedCaptureEnd( TestContext& test, const std::filesystem::path& directory )
+{
+    const auto path = directory / "protocol-mismatch.tracy-stream";
+    std::string error;
+    test.Check( CreateJournal( path, 1, true, error, tracy::ProtocolCloseReason::ProtocolMismatch ),
+        "create degraded terminal journal: " + error );
+    tracy::analysis::TraceSessionInventory inventory;
+    test.Check( tracy::analysis::BuildTraceSessionInventory(
+        path, tracy::analysis::TraceSessionInventoryOptions {}, inventory, error ),
+        "inventory degraded terminal journal: " + error );
+    test.Check( inventory.complete, "degraded source still preserves committed terminal revision" );
+    test.Check( inventory.sourceDegraded, "protocol mismatch marks source degraded" );
+    test.Check( inventory.qualityReason == "protocol_mismatch", "close reason maps to stable quality reason" );
 }
 
 void TestRecoverableTail( TestContext& test, const std::filesystem::path& directory )
@@ -195,6 +233,166 @@ void TestCapacityPreflight( TestContext& test )
     test.Check( result.reason == "session_store_limit", "store limit rejection reason" );
 }
 
+void AppendFixedEvent( std::vector<uint8_t>& frame, tracy::QueueType type )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = type;
+    const auto size = tracy::QueueDataSize[size_t( type )];
+    const auto previous = frame.size();
+    frame.resize( previous + size );
+    std::memcpy( frame.data() + previous, &item, size );
+}
+
+void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type, const std::string& value )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = type;
+    const auto fixed = tracy::QueueDataSize[size_t( type )];
+    const auto previous = frame.size();
+    frame.resize( previous + fixed + sizeof( uint16_t ) + value.size() );
+    std::memcpy( frame.data() + previous, &item, fixed );
+    const auto length = uint16_t( value.size() );
+    std::memcpy( frame.data() + previous + fixed, &length, sizeof( length ) );
+    std::memcpy( frame.data() + previous + fixed + sizeof( length ), value.data(), value.size() );
+}
+
+void TestProtocolFrameInventory( TestContext& test )
+{
+    std::vector<uint8_t> frame;
+    AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
+    AppendFixedEvent( frame, tracy::QueueType::JnJobSchedule );
+    AppendFixedEvent( frame, tracy::QueueType::ContextSwitch );
+    AppendFixedEvent( frame, tracy::QueueType::MemAlloc );
+    AppendFixedEvent( frame, tracy::QueueType::JnGpuCatalogControl );
+    AppendFixedEvent( frame, tracy::QueueType::JnGpuReferencePass );
+    AppendStringEvent( frame, tracy::QueueType::StringData, "hello" );
+
+    tracy::analysis::TraceSessionProtocolInventory inventory;
+    std::string error;
+    test.Check( tracy::analysis::CountTraceProtocolFrame( frame, inventory, error ),
+        "count valid protocol frame: " + error );
+    test.Check( inventory.eventCount == 7, "protocol event count" );
+    test.Check( inventory.events[size_t( tracy::QueueType::FrameVsync )].count == 1,
+        "fixed event count" );
+    test.Check( inventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
+        "JN Job event count" );
+    test.Check( inventory.events[size_t( tracy::QueueType::StringData )].variablePayloadBytes == 5,
+        "variable payload bytes" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Frame )].count == 1,
+        "frame domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Job )].count == 1,
+        "job domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Scheduling )].count == 1,
+        "scheduling domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::CpuMemory )].count == 1,
+        "CPU memory domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::GpuCatalog )].count == 1,
+        "GPU Catalog domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::GpuMemory )].count == 1,
+        "GPU memory domain count" );
+    test.Check( inventory.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Dictionary )].count == 1,
+        "dictionary domain count" );
+    test.Check( inventory.encodedBytes == frame.size(), "encoded bytes cover the frame exactly" );
+
+    frame.pop_back();
+    tracy::analysis::TraceSessionProtocolInventory corrupt;
+    test.Check( !tracy::analysis::CountTraceProtocolFrame( frame, corrupt, error ),
+        "truncated variable payload is rejected" );
+    test.Check( error == "protocol_event_exceeds_frame", "corrupt frame reason is explicit" );
+}
+
+void TestCompressedProtocolInventory( TestContext& test )
+{
+    std::vector<uint8_t> frame;
+    AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
+    AppendFixedEvent( frame, tracy::QueueType::JnGpuReferenceSetUse );
+    std::vector<char> compressed( tracy::LZ4Size );
+    const auto compressedBytes = tracy::LZ4_compress_default(
+        reinterpret_cast<const char*>( frame.data() ), compressed.data(), int( frame.size() ), int( compressed.size() ) );
+    test.Check( compressedBytes > 0, "compress protocol frame" );
+    if( compressedBytes <= 0 ) return;
+
+    std::vector<uint8_t> record( sizeof( tracy::lz4sz_t ) + size_t( compressedBytes ) );
+    const auto storedSize = tracy::lz4sz_t( compressedBytes );
+    std::memcpy( record.data(), &storedSize, sizeof( storedSize ) );
+    std::memcpy( record.data() + sizeof( storedSize ), compressed.data(), size_t( compressedBytes ) );
+
+    tracy::analysis::TraceSessionProtocolInventory inventory;
+    tracy::analysis::TraceSessionProtocolDecoder decoder;
+    std::string error;
+    test.Check( decoder.ConsumeCompressedRecord( record, inventory, error ),
+        "decode compressed protocol frame: " + error );
+    test.Check( inventory.frameCount == 1 && inventory.eventCount == 2,
+        "compressed frame and event counts" );
+    test.Check( inventory.compressedBytes == record.size(), "compressed record bytes" );
+
+    record[0]++;
+    test.Check( !decoder.ConsumeCompressedRecord( record, inventory, error ),
+        "compressed size mismatch is rejected" );
+    test.Check( error == "compressed_record_size_mismatch", "compressed mismatch reason" );
+}
+
+void TestProtocolJournalInventory( TestContext& test, const std::filesystem::path& directory )
+{
+    std::vector<uint8_t> frame;
+    AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
+    AppendFixedEvent( frame, tracy::QueueType::JnJobSchedule );
+    std::vector<char> compressed( tracy::LZ4Size );
+    const auto compressedBytes = tracy::LZ4_compress_default(
+        reinterpret_cast<const char*>( frame.data() ), compressed.data(), int( frame.size() ), int( compressed.size() ) );
+    test.Check( compressedBytes > 0, "compress journal protocol frame" );
+    if( compressedBytes <= 0 ) return;
+    std::vector<uint8_t> record( sizeof( tracy::lz4sz_t ) + size_t( compressedBytes ) );
+    const auto storedSize = tracy::lz4sz_t( compressedBytes );
+    std::memcpy( record.data(), &storedSize, sizeof( storedSize ) );
+    std::memcpy( record.data() + sizeof( storedSize ), compressed.data(), size_t( compressedBytes ) );
+
+    const auto path = directory / "protocol.tracy-stream";
+    tracy::stream::WriterOptions writerOptions;
+    writerOptions.durableHeader = false;
+    std::string error;
+    auto writer = tracy::stream::JournalWriter::CreateFileJournal(
+        path, DeterministicHeader(), false, writerOptions, error );
+    test.Check( writer != nullptr, "create protocol journal: " + error );
+    if( !writer ) return;
+    test.Check( writer->Append( tracy::stream::RecordType::SessionBegin,
+        tracy::stream::RecordFlagHandshake, "begin", 0, error ), "protocol journal begin" );
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, record, 1, error ), "protocol journal frame" );
+    test.Check( writer->Append( tracy::stream::RecordType::SessionEnd,
+        tracy::stream::RecordFlagTerminal, "end", 2, error ), "protocol journal end" );
+    writer.reset();
+
+    tracy::analysis::TraceSessionInventory inventory;
+    test.Check( tracy::analysis::BuildTraceSessionInventory(
+        path, tracy::analysis::TraceSessionInventoryOptions {}, inventory, error ),
+        "build protocol-aware inventory: " + error );
+    test.Check( inventory.protocolInventoryComplete, "protocol inventory completes" );
+    test.Check( inventory.protocolInventory.frameCount == 1 && inventory.protocolInventory.eventCount == 2,
+        "journal inventory contains decoded frame/event counts" );
+    test.Check( inventory.protocolInventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
+        "journal inventory contains QueueType counts" );
+
+    const auto inventoryPath = directory / "protocol-inventory";
+    test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),
+        "save protocol inventory: " + error );
+    const auto loaded = tracy::analysis::LoadTraceSessionInventory( inventoryPath, error );
+    test.Check( loaded.has_value(), "load protocol inventory: " + error );
+    if( loaded )
+        test.Check( loaded->protocolInventory == inventory.protocolInventory,
+            "protocol inventory round-trips exactly" );
+
+    auto corruptInventory = inventory;
+    corruptInventory.protocolInventory.eventCount++;
+    const auto corruptPath = directory / "protocol-inventory-bad-total";
+    test.Check( tracy::analysis::SaveTraceSessionInventory( corruptPath, corruptInventory, error ),
+        "save inconsistent protocol inventory: " + error );
+    const auto incomplete = tracy::analysis::LoadTraceSessionInventory( corruptPath, error );
+    test.Check( !incomplete.has_value(), "inconsistent protocol totals invalidate persisted inventory" );
+    test.Check( error == "incomplete protocol event inventory",
+        "inconsistent protocol totals have explicit integrity reason: " + error );
+}
+
 }
 
 int main()
@@ -207,9 +405,13 @@ int main()
     if( !filesystemError )
     {
         TestCompleteInventory( test, directory );
+        TestDegradedCaptureEnd( test, directory );
         TestRecoverableTail( test, directory );
         TestBoundedMetadata( test, directory );
         TestCapacityPreflight( test );
+        TestProtocolFrameInventory( test );
+        TestCompressedProtocolInventory( test );
+        TestProtocolJournalInventory( test, directory );
     }
     std::filesystem::remove_all( directory, filesystemError );
     test.Check( !filesystemError, "remove test directory" );

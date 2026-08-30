@@ -63,7 +63,87 @@ struct InventoryVisitorState
     const TraceSessionInventoryOptions* options = nullptr;
     uint64_t sourceFileSize = 0;
     bool hasTimestamp = false;
+    std::ifstream payloadInput;
+    std::vector<uint8_t> payload;
+    TraceSessionProtocolDecoder protocolDecoder;
+    bool protocolFailed = false;
+    std::string protocolError;
 };
+
+bool ReadRecordPayload( InventoryVisitorState& state,
+    const tracy::stream::RecordInfo& record )
+{
+    if( !state.payloadInput )
+    {
+        state.protocolError = "cannot open source for inventory payload";
+        return false;
+    }
+    constexpr auto HeaderBytes = uint64_t( tracy::stream::RecordHeaderSize );
+    const auto maxOffset = uint64_t( std::numeric_limits<std::streamoff>::max() );
+    if( record.payloadSize > std::numeric_limits<size_t>::max() ||
+        record.offset > maxOffset || HeaderBytes > maxOffset - record.offset )
+    {
+        state.protocolError = "inventory record exceeds platform limits";
+        return false;
+    }
+    state.payload.resize( size_t( record.payloadSize ) );
+    state.payloadInput.clear();
+    state.payloadInput.seekg( std::streamoff( record.offset + HeaderBytes ), std::ios::beg );
+    if( !state.payloadInput )
+    {
+        state.protocolError = "cannot seek inventory record";
+        return false;
+    }
+    if( state.payload.empty() ) return true;
+    if( state.payload.size() > size_t( std::numeric_limits<std::streamsize>::max() ) )
+    {
+        state.protocolError = "inventory payload exceeds stream limits";
+        return false;
+    }
+    state.payloadInput.read( reinterpret_cast<char*>( state.payload.data() ),
+        std::streamsize( state.payload.size() ) );
+    if( !state.payloadInput || state.payloadInput.gcount() != std::streamsize( state.payload.size() ) )
+    {
+        state.protocolError = "cannot read inventory record";
+        return false;
+    }
+    return true;
+}
+
+uint16_t Read16( const uint8_t* data )
+{
+    return uint16_t( data[0] ) | uint16_t( uint16_t( data[1] ) << 8 );
+}
+
+uint32_t Read32( const uint8_t* data )
+{
+    return uint32_t( data[0] ) | uint32_t( data[1] ) << 8 |
+        uint32_t( data[2] ) << 16 | uint32_t( data[3] ) << 24;
+}
+
+uint64_t Read64( const uint8_t* data )
+{
+    return uint64_t( Read32( data ) ) | uint64_t( Read32( data + 4 ) ) << 32;
+}
+
+std::string CaptureEndReasonName( uint32_t reason )
+{
+    switch( reason )
+    {
+    case 1: return "local_shutdown";
+    case 2: return "peer_disconnected";
+    case 3: return "capture_complete";
+    case 4: return "protocol_mismatch";
+    case 5: return "not_available";
+    case 6: return "handshake_dropped";
+    case 7: return "memory_limit";
+    case 8: return "instrumentation_failure";
+    case 9: return "recorder_failure";
+    case 10: return "transport_error";
+    case 11: return "observer_destroyed";
+    default: return "unknown_capture_end_reason";
+    }
+}
 
 void VisitRecord( const tracy::stream::RecordInfo& record, void* userData )
 {
@@ -80,6 +160,34 @@ void VisitRecord( const tracy::stream::RecordInfo& record, void* userData )
         state.hasTimestamp = true;
     }
     inventory.lastMonotonicNs = record.monotonicNs;
+    const bool compressedFrame = record.type == tracy::stream::RecordType::ClientToServer &&
+        ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
+    const bool terminal = record.type == tracy::stream::RecordType::SessionEnd;
+    if( !state.protocolFailed && ( compressedFrame || terminal ) )
+    {
+        if( !ReadRecordPayload( state, record ) )
+        {
+            state.protocolFailed = true;
+        }
+        else if( compressedFrame && !state.protocolDecoder.ConsumeCompressedRecord(
+            state.payload, inventory.protocolInventory, state.protocolError ) )
+        {
+            state.protocolFailed = true;
+            state.protocolError = "protocol record " + std::to_string( record.sequence ) + ": " + state.protocolError;
+        }
+        else if( terminal && state.payload.size() >= 24 )
+        {
+            const auto schema = Read16( state.payload.data() );
+            const auto declaredSize = Read16( state.payload.data() + 2 );
+            if( schema == 1 && declaredSize == state.payload.size() )
+            {
+                inventory.captureEndMetadataPresent = true;
+                inventory.captureEndReason = Read32( state.payload.data() + 4 );
+                inventory.captureEndClientBytes = Read64( state.payload.data() + 8 );
+                inventory.captureEndServerBytes = Read64( state.payload.data() + 16 );
+            }
+        }
+    }
     if( state.options->progress )
     {
         const auto completed = record.offset + tracy::stream::RecordHeaderSize +
@@ -188,7 +296,16 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
         return false;
     }
 
-    InventoryVisitorState visitor { &inventory, &options, inventory.sourceFileSize };
+    InventoryVisitorState visitor;
+    visitor.inventory = &inventory;
+    visitor.options = &options;
+    visitor.sourceFileSize = inventory.sourceFileSize;
+    visitor.payloadInput.open( sourcePath, std::ios::binary );
+    if( !visitor.payloadInput )
+    {
+        error = "cannot open source for protocol inventory";
+        return false;
+    }
     if( options.progress ) options.progress( TraceSessionInventoryPhase::JournalScan,
         0, inventory.sourceFileSize, options.progressUserData );
     tracy::stream::ScanOptions scanOptions;
@@ -202,6 +319,12 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
         error = "source journal has no recoverable committed prefix: " + scan.message;
         return false;
     }
+    if( visitor.protocolFailed )
+    {
+        error = visitor.protocolError;
+        return false;
+    }
+    inventory.protocolInventoryComplete = true;
     if( options.progress ) options.progress( TraceSessionInventoryPhase::JournalScan,
         inventory.sourceFileSize, inventory.sourceFileSize, options.progressUserData );
     if( !HashSource( sourcePath, inventory.sourceFileSize, options, inventory.sourceSha256, error ) ) return false;
@@ -216,6 +339,20 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
     inventory.complete = scan.complete;
     inventory.sourceDegraded = scan.code != tracy::stream::ScanCode::Ok || !scan.complete;
     inventory.qualityReason = QualityReason( scan.code, scan.complete );
+    if( scan.complete )
+    {
+        if( !inventory.captureEndMetadataPresent )
+        {
+            inventory.sourceDegraded = true;
+            inventory.qualityReason = "terminal_metadata_unavailable";
+        }
+        else
+        {
+            inventory.qualityReason = CaptureEndReasonName( inventory.captureEndReason );
+            if( inventory.captureEndReason != 1 && inventory.captureEndReason != 3 )
+                inventory.sourceDegraded = true;
+        }
+    }
     inventory.retainedRecordMetadata = scan.records.size();
 
     inventory.estimatedCanonicalBytes = std::max( inventory.validSize,
@@ -264,6 +401,15 @@ bool SaveTraceSessionInventory( const std::filesystem::path& path,
             << "complete " << ( inventory.complete ? 1 : 0 ) << '\n'
             << "source_degraded " << ( inventory.sourceDegraded ? 1 : 0 ) << '\n'
             << "quality_reason " << inventory.qualityReason << '\n'
+            << "capture_end_metadata_present " << ( inventory.captureEndMetadataPresent ? 1 : 0 ) << '\n'
+            << "capture_end_reason " << inventory.captureEndReason << '\n'
+            << "capture_end_client_bytes " << inventory.captureEndClientBytes << '\n'
+            << "capture_end_server_bytes " << inventory.captureEndServerBytes << '\n'
+            << "protocol_inventory_complete " << ( inventory.protocolInventoryComplete ? 1 : 0 ) << '\n'
+            << "protocol_frames " << inventory.protocolInventory.frameCount << '\n'
+            << "protocol_events " << inventory.protocolInventory.eventCount << '\n'
+            << "protocol_encoded_bytes " << inventory.protocolInventory.encodedBytes << '\n'
+            << "protocol_compressed_bytes " << inventory.protocolInventory.compressedBytes << '\n'
             << "retained_record_metadata " << inventory.retainedRecordMetadata << '\n'
             << "estimated_canonical_bytes " << inventory.estimatedCanonicalBytes << '\n'
             << "estimated_derived_bytes " << inventory.estimatedDerivedBytes << '\n'
@@ -274,6 +420,19 @@ bool SaveTraceSessionInventory( const std::filesystem::path& path,
             const auto& record = inventory.records[i];
             output << "record " << i << ' ' << record.count << ' '
                 << record.payloadBytes << ' ' << record.committedBytes << '\n';
+        }
+        for( size_t i = 0; i < inventory.protocolInventory.events.size(); i++ )
+        {
+            const auto& event = inventory.protocolInventory.events[i];
+            if( event.count == 0 ) continue;
+            output << "protocol_event " << i << ' ' << event.count << ' '
+                << event.encodedBytes << ' ' << event.variablePayloadBytes << '\n';
+        }
+        for( size_t i = 0; i < inventory.protocolInventory.domains.size(); i++ )
+        {
+            const auto& domain = inventory.protocolInventory.domains[i];
+            output << "protocol_domain " << i << ' ' << domain.count << ' '
+                << domain.encodedBytes << ' ' << domain.variablePayloadBytes << '\n';
         }
         output.flush();
         if( !output )
@@ -307,6 +466,8 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
     TraceSessionInventory inventory;
     std::string key;
     size_t recordsRead = 0;
+    size_t protocolEventsRead = 0;
+    size_t protocolDomainsRead = 0;
     while( input >> key )
     {
         if( key == "schema" ) input >> inventory.schema;
@@ -323,6 +484,15 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
         else if( key == "complete" ) { int value = 0; input >> value; inventory.complete = value != 0; }
         else if( key == "source_degraded" ) { int value = 0; input >> value; inventory.sourceDegraded = value != 0; }
         else if( key == "quality_reason" ) input >> inventory.qualityReason;
+        else if( key == "capture_end_metadata_present" ) { int value = 0; input >> value; inventory.captureEndMetadataPresent = value != 0; }
+        else if( key == "capture_end_reason" ) input >> inventory.captureEndReason;
+        else if( key == "capture_end_client_bytes" ) input >> inventory.captureEndClientBytes;
+        else if( key == "capture_end_server_bytes" ) input >> inventory.captureEndServerBytes;
+        else if( key == "protocol_inventory_complete" ) { int value = 0; input >> value; inventory.protocolInventoryComplete = value != 0; }
+        else if( key == "protocol_frames" ) input >> inventory.protocolInventory.frameCount;
+        else if( key == "protocol_events" ) input >> inventory.protocolInventory.eventCount;
+        else if( key == "protocol_encoded_bytes" ) input >> inventory.protocolInventory.encodedBytes;
+        else if( key == "protocol_compressed_bytes" ) input >> inventory.protocolInventory.compressedBytes;
         else if( key == "retained_record_metadata" ) input >> inventory.retainedRecordMetadata;
         else if( key == "estimated_canonical_bytes" ) input >> inventory.estimatedCanonicalBytes;
         else if( key == "estimated_derived_bytes" ) input >> inventory.estimatedDerivedBytes;
@@ -341,6 +511,32 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
             input >> record.count >> record.payloadBytes >> record.committedBytes;
             recordsRead++;
         }
+        else if( key == "protocol_event" )
+        {
+            size_t index = 0;
+            input >> index;
+            if( index >= inventory.protocolInventory.events.size() )
+            {
+                error = "inventory protocol event type is out of range";
+                return std::nullopt;
+            }
+            auto& event = inventory.protocolInventory.events[index];
+            input >> event.count >> event.encodedBytes >> event.variablePayloadBytes;
+            protocolEventsRead++;
+        }
+        else if( key == "protocol_domain" )
+        {
+            size_t index = 0;
+            input >> index;
+            if( index >= inventory.protocolInventory.domains.size() )
+            {
+                error = "inventory protocol domain is out of range";
+                return std::nullopt;
+            }
+            auto& domain = inventory.protocolInventory.domains[index];
+            input >> domain.count >> domain.encodedBytes >> domain.variablePayloadBytes;
+            protocolDomainsRead++;
+        }
         else
         {
             error = "unknown inventory field: " + key;
@@ -355,6 +551,48 @@ std::optional<TraceSessionInventory> LoadTraceSessionInventory(
     if( inventory.schema != TraceSessionInventorySchemaVersion || recordsRead != inventory.records.size() )
     {
         error = "unsupported or incomplete inventory schema";
+        return std::nullopt;
+    }
+    size_t expectedProtocolEventTypes = 0;
+    uint64_t protocolEventCount = 0;
+    uint64_t protocolEncodedBytes = 0;
+    for( const auto& event : inventory.protocolInventory.events )
+    {
+        if( event.count != 0 ) expectedProtocolEventTypes++;
+        if( event.count > std::numeric_limits<uint64_t>::max() - protocolEventCount ||
+            event.encodedBytes > std::numeric_limits<uint64_t>::max() - protocolEncodedBytes )
+        {
+            error = "protocol event inventory counter overflow";
+            return std::nullopt;
+        }
+        protocolEventCount += event.count;
+        protocolEncodedBytes += event.encodedBytes;
+    }
+    if( protocolEventsRead != expectedProtocolEventTypes ||
+        protocolEventCount != inventory.protocolInventory.eventCount ||
+        protocolEncodedBytes != inventory.protocolInventory.encodedBytes )
+    {
+        error = "incomplete protocol event inventory";
+        return std::nullopt;
+    }
+    uint64_t protocolDomainCount = 0;
+    uint64_t protocolDomainBytes = 0;
+    for( const auto& domain : inventory.protocolInventory.domains )
+    {
+        if( domain.count > std::numeric_limits<uint64_t>::max() - protocolDomainCount ||
+            domain.encodedBytes > std::numeric_limits<uint64_t>::max() - protocolDomainBytes )
+        {
+            error = "protocol domain inventory counter overflow";
+            return std::nullopt;
+        }
+        protocolDomainCount += domain.count;
+        protocolDomainBytes += domain.encodedBytes;
+    }
+    if( protocolDomainsRead != inventory.protocolInventory.domains.size() ||
+        protocolDomainCount != inventory.protocolInventory.eventCount ||
+        protocolDomainBytes != inventory.protocolInventory.encodedBytes )
+    {
+        error = "incomplete protocol domain inventory";
         return std::nullopt;
     }
     return inventory;

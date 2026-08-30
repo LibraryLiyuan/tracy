@@ -111,12 +111,26 @@ int main( int argc, char** argv )
 
     const auto& client = inventory.records[tracy::analysis::TraceSessionJournalClass::ClientToServer];
     const auto& server = inventory.records[tracy::analysis::TraceSessionJournalClass::ServerToClient];
+    std::string domainCounts = "{";
+    for( size_t i = 0; i < inventory.protocolInventory.domains.size(); i++ )
+    {
+        if( i != 0 ) domainCounts += ',';
+        domainCounts += '"';
+        domainCounts += tracy::analysis::TraceSessionProtocolDomainName(
+            tracy::analysis::TraceSessionProtocolDomain( i ) );
+        domainCounts += "\":\"";
+        domainCounts += std::to_string( inventory.protocolInventory.domains[i].count );
+        domainCounts += '"';
+    }
+    domainCounts += '}';
     std::printf(
         "{\"schema\":%u,\"protocol\":%u,\"source_size\":\"%llu\","
         "\"source_sha256\":\"%s\",\"valid_size\":\"%llu\","
         "\"committed_revision\":\"%llu\",\"record_count\":\"%llu\","
         "\"client_records\":\"%llu\",\"client_payload_bytes\":\"%llu\","
         "\"server_records\":\"%llu\",\"server_payload_bytes\":\"%llu\","
+        "\"protocol_frames\":\"%llu\",\"protocol_events\":\"%llu\",\"domain_counts\":%s,"
+        "\"capture_end_metadata_present\":%s,\"capture_end_reason\":%u,"
         "\"complete\":%s,\"source_degraded\":%s,\"quality_reason\":\"%s\","
         "\"estimated_canonical_bytes\":\"%llu\",\"estimated_total_build_bytes\":\"%llu\","
         "\"capacity_accepted\":%s,\"capacity_reason\":\"%s\","
@@ -130,6 +144,10 @@ int main( int argc, char** argv )
         static_cast<unsigned long long>( client.payloadBytes ),
         static_cast<unsigned long long>( server.count ),
         static_cast<unsigned long long>( server.payloadBytes ),
+        static_cast<unsigned long long>( inventory.protocolInventory.frameCount ),
+        static_cast<unsigned long long>( inventory.protocolInventory.eventCount ),
+        domainCounts.c_str(), inventory.captureEndMetadataPresent ? "true" : "false",
+        inventory.captureEndReason,
         inventory.complete ? "true" : "false", inventory.sourceDegraded ? "true" : "false",
         inventory.qualityReason.c_str(),
         static_cast<unsigned long long>( inventory.estimatedCanonicalBytes ),

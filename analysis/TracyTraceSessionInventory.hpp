@@ -1,6 +1,8 @@
 #ifndef __TRACYTRACESESSIONINVENTORY_HPP__
 #define __TRACYTRACESESSIONINVENTORY_HPP__
 
+#include "TracyTraceSessionProtocolInventory.hpp"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -68,7 +70,13 @@ struct TraceSessionInventory
     bool complete = false;
     bool sourceDegraded = false;
     std::string qualityReason;
+    bool captureEndMetadataPresent = false;
+    uint32_t captureEndReason = 0;
+    uint64_t captureEndClientBytes = 0;
+    uint64_t captureEndServerBytes = 0;
     std::array<TraceSessionInventoryRecordStats, TraceSessionJournalClass::Count> records {};
+    bool protocolInventoryComplete = false;
+    TraceSessionProtocolInventory protocolInventory;
     // This is deliberately zero for the bounded scanner. Large record/frame
     // directories are emitted as immutable disk runs in later stages.
     uint64_t retainedRecordMetadata = 0;
