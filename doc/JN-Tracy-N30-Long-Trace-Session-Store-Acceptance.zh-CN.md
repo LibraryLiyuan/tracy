@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame和Job语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job和CPU Zone语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -464,6 +464,11 @@ GREEN：
 - Job调用栈严格复现Tracy协议的两类状态：普通`Callstack`按线程消费，`CallstackSerial`可跨无关事件保持到对应Job/Callsite消费者；Sampling字典栈也参与全局Callstack ID去重，避免Job的`stack_ref`与后续Source/Callstack索引错位。
 - Job索引包含source SHA-256、source size、固定manifest generation、文件SHA-256及Type/Schedule/Config/Dependency/Stage计数；Final Audit逐项与Inventory的QueueType计数核对，不能用已构造Job数量替代源事件守恒。
 - `job.search/get/dependencies/critical_path/statistics`已从Session Job Reader读取且不会回退完整Worker；`job.gfx`仍保持不可查询，直到Gfx Dispatch/Entity/Link语义Reader完成。
+- CPU Zone域新增`cpu-zone-index/1/exact/cpu-zones.bin`：只在构建期保留各逻辑线程的活动Zone栈，闭合Zone立即写固定宽度磁盘记录；父子关系、child count、self time和开放捕获边界均由Canonical事实重建。
+- CPU Zone时间严格复现Worker的共享`m_refTimeThread`语义；Plot、非serial GPU CPU时间和Fiber切换会推进同一线程时钟，避免跨域事件插入后Zone时间漂移。
+- 标准/动态SourceLocation、延迟StringData、ZoneName、ZoneText、ZoneColor、普通Callstack、Serial Callstack和SiteReuse Callsite均已接入；Callsite晚于Zone闭合到达时原位修补已提交的固定记录。
+- `zone.cpu.search/get/tree/statistics/flamegraph`已从Session CPU Zone Reader读取；最后未闭合Zone返回`complete=false/end=null`，不会伪造捕获结束时间。
+- 快速Session打开只校验CPU Zone文件头、身份和大小；Final Audit独立重算`cpu-zones.bin`完整SHA-256并核对Inventory Begin/End守恒，同尺寸篡改不能被发布。
 
 ### TDD证据
 
@@ -489,21 +494,24 @@ GREEN：
 - Job GREEN恢复`SyntheticJob #500`的Schedule=16ns、Ready=20ns、首个Worker Slice=22ns、Complete=32ns、执行时长=8ns；直接Reader和Query `job.search`结果一致。
 - Synthetic先注册Sampling字典栈、再注册Job SiteReuse栈；Job必须得到全局Callstack ID 2、Callsite ID 77和`SiteReused` provenance，证明不同调用栈生产者不会串栈。
 - 提交后篡改`jobs.bin`会被`session_job_file_sha256_mismatch`拒绝。
+- CPU Zone GREEN恢复父Zone`[8,28]ns/self=16ns`、子Zone`[16,20]ns`和开放Zone`start=32ns/end=null`；晚到SiteReuse定义仍关联全局Callstack ID 3，直接Reader与Query 1.34结果一致。
+- CPU Zone索引的大小篡改由Reader拒绝，同尺寸内容篡改由Final Audit的完整SHA-256拒绝。
 - `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- CPU Zone、GPU Zone、Sampling、Memory和FrameImage的语义分页Reader。
+- GPU Zone、Sampling、Memory和FrameImage的语义分页Reader。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
+- 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。
 
-### 2026-08-31 Job Reader 构建身份与回归
+### 2026-08-31 CPU Zone Reader 构建身份与回归
 
 | 工具 | SHA-256 |
 |---|---|
-| `build-n30-query\Release\tracy-query.exe` | `23718E97D9ED85ED54FD3FD1A336D1FB28A4530A49E2481046472777CF6BE7A4` |
-| `build-n30-capture\Release\tracy-stream-convert.exe` | `85EBF91042F50A6F996100846A4B73F7A7A4343C90E5BF8003BF06A4279FD267` |
+| `build-n30-query\Release\tracy-query.exe` | `CF1D09B7050E4B45CC83A10EA24034963130CC4C1F76E052B737A9EDAB5FB038` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `44A4F7EF292BD60D8A34DF5C65BE904E12127773DEC2B57CFF2130C1ACE6816E` |
 
 `tracy-query --version`：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

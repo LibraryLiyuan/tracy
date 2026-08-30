@@ -40,6 +40,11 @@ struct TraceSessionDerivedStats
     uint64_t jobConfigs = 0;
     uint64_t jobDependencies = 0;
     uint64_t jobStages = 0;
+    uint64_t cpuZones = 0;
+    uint64_t completeCpuZones = 0;
+    uint64_t cpuZoneSources = 0;
+    uint64_t cpuZoneBegins = 0;
+    uint64_t cpuZoneEnds = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

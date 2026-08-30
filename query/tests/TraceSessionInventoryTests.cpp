@@ -1017,10 +1017,93 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::JnJobStage;
     item.jnJobStage = { 116, 500, 3, 0, 0, uint8_t( tracy::JnJobStage::Completed ), 0 };
     AppendQueueItem( frame, item );
+
+    const std::array<uint64_t, 2> zoneCallstack { 0x40404040, 0x50505050 };
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5555,
+        std::string( reinterpret_cast<const char*>( zoneCallstack.data() ), sizeof( zoneCallstack ) ) );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackSerial;
+    item.callstackFat.ptr = 0x5555;
+    AppendQueueItem( frame, item );
+
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 100;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnZoneBeginCallsite;
+    item.jnZoneBeginCallsite = { { 104, 0x1000 }, 78 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::PlotDataInt;
+    item.plotDataInt = { { 0x6000, 2 }, 1 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 101;
+    AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::ZoneBegin;
-    item.zoneBegin = { 104, 0x1000 };
+    item.zoneBegin = { 2, 0x1001 };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 101;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneEnd;
+    item.zoneEnd.time = 2;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Parent Override" );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneName;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Parent text" );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneText;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 100;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneEnd;
+    item.zoneEnd.time = 4;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnCallsiteDefinition;
+    item.jnCallsiteDefinition = { 0x1000, 78, 42, 0,
+        uint8_t( tracy::JnStackProvenance::SiteReused ),
+        uint8_t( tracy::JnCallsiteFlags::HasCallstack ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 102;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneBegin;
+    item.zoneBegin = { 2, 0x1001 };
+    AppendQueueItem( frame, item );
+
+    item = {};
+    item.hdr.type = tracy::QueueType::SourceLocation;
+    item.srcloc = { 0, 0x5022, 0x5023, 77, 0, 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::SourceLocation;
+    item.srcloc = { 0x5001, 0x5002, 0x5003, 123, 0x11, 0x22, 0x33 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::SourceLocation;
+    item.srcloc = { 0, 0x5012, 0x5013, 456, 0x44, 0x55, 0x66 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5022, "JobFunction" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5023, "Job.cpp" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5001, "Parent Source" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5002, "ParentFunction" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5003, "Parent.cpp" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5012, "ChildFunction" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5013, "Child.cpp" );
     item = {};
     item.hdr.type = tracy::QueueType::FrameVsync;
     item.frameVsync = { 106, 9 };
@@ -1290,14 +1373,29 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto cpuZones = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) {
             return value.domain == "zone.cpu";
         } );
-        test.Check( cpuZones != capabilities.end() && cpuZones->present && !cpuZones->queryable && cpuZones->indexed,
-            "Session distinguishes present Canonical CPU-zone facts from a completed semantic reader" );
+        test.Check( cpuZones != capabilities.end() && cpuZones->present && cpuZones->queryable && cpuZones->indexed,
+            "Session advertises CPU zones only after its disk-backed semantic reader is ready" );
         const auto cpuSearch = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
             { "params", { { "trace_id", traceId } } }
         } );
-        test.Check( !cpuSearch.value( "ok", true ) && cpuSearch["error"]["code"] == "CAPABILITY_UNAVAILABLE",
-            "Session returns capability_unavailable instead of an empty result or Worker fallback" );
+        test.Check( cpuSearch.value( "ok", false ) && cpuSearch["data"]["zones"].size() == 3 &&
+            cpuSearch["data"]["zones"][0]["name"] == "Parent Override" &&
+            cpuSearch["data"]["zones"][0]["start_ns"] == "8" &&
+            cpuSearch["data"]["zones"][0]["end_ns"] == "28" &&
+            cpuSearch["data"]["zones"][0]["self_time_ns"] == "16" &&
+            cpuSearch["data"]["zones"][0]["child_count"] == 1 &&
+            cpuSearch["data"]["zones"][0]["callsite_id"] == 78 &&
+            cpuSearch["data"]["zones"][0]["callstack"] == "3" &&
+            cpuSearch["data"]["zones"][0]["provenance"] == "SiteReused" &&
+            cpuSearch["data"]["zones"][0]["extra_text"] == "Parent text" &&
+            cpuSearch["data"]["zones"][1]["function"] == "ChildFunction" &&
+            cpuSearch["data"]["zones"][1]["start_ns"] == "16" &&
+            cpuSearch["data"]["zones"][1]["end_ns"] == "20" &&
+            cpuSearch["data"]["zones"][2]["start_ns"] == "32" &&
+            cpuSearch["data"]["zones"][2]["end_ns"].is_null() &&
+            cpuSearch["data"]["zones"][2]["complete"] == false,
+            "Query 1.34 preserves Session CPU-zone hierarchy, shared delta clock, source and SiteReuse semantics" );
     }
     const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
         publishedSession, manifest ) / "frames.bin";

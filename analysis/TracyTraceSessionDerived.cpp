@@ -5,6 +5,7 @@
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionJobs.hpp"
+#include "TracyTraceSessionCpuZones.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -176,6 +177,11 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "job_configs " << value.stats.jobConfigs << '\n';
     out << "job_dependencies " << value.stats.jobDependencies << '\n';
     out << "job_stages " << value.stats.jobStages << '\n';
+    out << "cpu_zones " << value.stats.cpuZones << '\n';
+    out << "complete_cpu_zones " << value.stats.completeCpuZones << '\n';
+    out << "cpu_zone_sources " << value.stats.cpuZoneSources << '\n';
+    out << "cpu_zone_begins " << value.stats.cpuZoneBegins << '\n';
+    out << "cpu_zone_ends " << value.stats.cpuZoneEnds << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -231,6 +237,11 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "job_configs" ) in >> value.stats.jobConfigs;
         else if( key == "job_dependencies" ) in >> value.stats.jobDependencies;
         else if( key == "job_stages" ) in >> value.stats.jobStages;
+        else if( key == "cpu_zones" ) in >> value.stats.cpuZones;
+        else if( key == "complete_cpu_zones" ) in >> value.stats.completeCpuZones;
+        else if( key == "cpu_zone_sources" ) in >> value.stats.cpuZoneSources;
+        else if( key == "cpu_zone_begins" ) in >> value.stats.cpuZoneBegins;
+        else if( key == "cpu_zone_ends" ) in >> value.stats.cpuZoneEnds;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -396,6 +407,14 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.jobDependencies = jobStats.dependencies;
     index.stats.jobStages = jobStats.stages;
 
+    TraceSessionCpuZoneStats cpuZoneStats;
+    if( !BuildTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ) return false;
+    index.stats.cpuZones = cpuZoneStats.zones;
+    index.stats.completeCpuZones = cpuZoneStats.completeZones;
+    index.stats.cpuZoneSources = cpuZoneStats.sourceLocations;
+    index.stats.cpuZoneBegins = cpuZoneStats.beginEvents;
+    index.stats.cpuZoneEnds = cpuZoneStats.endEvents;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -464,6 +483,14 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         jobReader->Stats().dependencies != index.stats.jobDependencies ||
         jobReader->Stats().stages != index.stats.jobStages )
     { if( error.empty() ) error = "session_job_derived_audit_mismatch"; return false; }
+    TraceSessionCpuZoneStats cpuZoneStats;
+    if( !AuditTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ||
+        cpuZoneStats.zones != index.stats.cpuZones ||
+        cpuZoneStats.completeZones != index.stats.completeCpuZones ||
+        cpuZoneStats.sourceLocations != index.stats.cpuZoneSources ||
+        cpuZoneStats.beginEvents != index.stats.cpuZoneBegins ||
+        cpuZoneStats.endEvents != index.stats.cpuZoneEnds )
+    { if( error.empty() ) error = "session_cpu_zone_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
@@ -471,6 +498,16 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         queueCounts[size_t( QueueType::JnJobDependency )].count != index.stats.jobDependencies ||
         queueCounts[size_t( QueueType::JnJobStage )].count != index.stats.jobStages )
     { error = "session_job_source_count_mismatch"; return false; }
+    const auto cpuBegins = queueCounts[size_t( QueueType::ZoneBegin )].count +
+        queueCounts[size_t( QueueType::ZoneBeginCallstack )].count +
+        queueCounts[size_t( QueueType::ZoneBeginAllocSrcLoc )].count +
+        queueCounts[size_t( QueueType::ZoneBeginAllocSrcLocCallstack )].count +
+        queueCounts[size_t( QueueType::JnZoneBeginCallsite )].count;
+    if( cpuBegins != index.stats.cpuZoneBegins ||
+        queueCounts[size_t( QueueType::ZoneEnd )].count != index.stats.cpuZoneEnds ||
+        index.stats.cpuZones != index.stats.cpuZoneBegins ||
+        index.stats.completeCpuZones != index.stats.cpuZoneEnds )
+    { error = "session_cpu_zone_source_count_mismatch"; return false; }
     stats = index.stats;
     return true;
 }

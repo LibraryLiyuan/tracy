@@ -33,6 +33,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !frameReader ) return {};
     auto jobReader = TraceSessionJobReader::Open( path, *session, error );
     if( !jobReader ) return {};
+    auto cpuZoneReader = TraceSessionCpuZoneReader::Open( path, *session, error );
+    if( !cpuZoneReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -57,16 +59,17 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
-        std::move( frameReader ), std::move( jobReader ) ) );
+        std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
     std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
     TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader,
-    std::shared_ptr<TraceSessionJobReader> jobReader )
+    std::shared_ptr<TraceSessionJobReader> jobReader,
+    std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
-      m_jobReader( std::move( jobReader ) )
+      m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -144,7 +147,13 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
             count != 0 ? "Canonical facts are present and indexed, but the disk-backed semantic reader is not implemented yet" :
                 "The source Session contains no Canonical facts for this domain", {} } );
     };
-    addPending( "zone.cpu", TraceSessionProtocolDomain::CpuZone );
+    static const std::vector<std::string> CpuZoneMethods = {
+        "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph"
+    };
+    const auto cpuZonePresent = m_cpuZoneReader && m_cpuZoneReader->Stats().zones != 0;
+    result.push_back( Capability { "zone.cpu", cpuZonePresent, cpuZonePresent, true,
+        cpuZonePresent ? "available from the N30 Session mandatory CPU Zone index" :
+            "The source Session contains no CPU Zone facts", CpuZoneMethods } );
     addPending( "zone.gpu", TraceSessionProtocolDomain::GpuZone );
     static const std::vector<std::string> JobMethods = {
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"
@@ -211,6 +220,7 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
         }
     }
     if( m_jobReader ) out.counts.jobs = m_jobReader->Stats().jobs;
+    if( m_cpuZoneReader ) out.counts.cpuZones = m_cpuZoneReader->Stats().zones;
     return out;
 }
 
@@ -321,7 +331,11 @@ D0(std::vector<GpuContextDto>, GetGpuContexts)
 D0(std::vector<MemoryPoolDto>, GetMemoryPools)
 D0(std::vector<PlotDto>, GetPlotList)
 D0(std::vector<LockDto>, GetLocks)
-D1(std::vector<CpuZoneDto>, ScanCpuZones, const ScanRange&, range)
+std::vector<CpuZoneDto> GpuAnalysisTraceSource::ScanCpuZones( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanCpuZones( range );
+    return m_cpuZoneReader ? m_cpuZoneReader->Scan( range ) : std::vector<CpuZoneDto> {};
+}
 D1(std::vector<GpuZoneDto>, ScanGpuZones, const ScanRange&, range)
 D1(std::vector<MemoryEventDto>, ScanMemoryEvents, const ScanRange&, range)
 D1(std::vector<MessageDto>, ScanMessages, const ScanRange&, range)
@@ -367,14 +381,30 @@ D2(std::vector<FrameImageDto>, ResolveFrameImages, const std::vector<std::string
 D0(std::vector<SourceResourceDto>, GetSourceResources)
 D0(std::vector<SymbolResourceDto>, GetSymbolResources)
 D0(std::vector<FrameImageMetadataDto>, GetFrameImageResources)
-D1(std::optional<CpuZoneDto>, GetCpuZone, std::string_view, ref)
+std::optional<CpuZoneDto> GpuAnalysisTraceSource::GetCpuZone( std::string_view ref ) const
+{
+    if( WorkerLoaded() ) return Worker().GetCpuZone( ref );
+    const auto id = ParseEntityRef( ref, "cpu-zone" );
+    return id && m_cpuZoneReader ? m_cpuZoneReader->Get( *id ) : std::nullopt;
+}
 D1(std::optional<GpuZoneDto>, GetGpuZone, std::string_view, ref)
-D3(std::vector<CpuZoneDto>, GetCpuZoneChildren, std::string_view, ref, size_t, offset, size_t, limit)
+std::vector<CpuZoneDto> GpuAnalysisTraceSource::GetCpuZoneChildren(
+    std::string_view ref, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().GetCpuZoneChildren( ref, offset, limit );
+    const auto id = ParseEntityRef( ref, "cpu-zone" );
+    return id && m_cpuZoneReader ? m_cpuZoneReader->Children( *id, offset, limit ) : std::vector<CpuZoneDto> {};
+}
 D3(std::vector<GpuZoneDto>, GetGpuZoneChildren, std::string_view, ref, size_t, offset, size_t, limit)
 D4(MemoryFrameSnapshot, GetMemoryFrameSnapshot, size_t, frameSetIndex, size_t, frameIndex, const std::vector<std::string>&, poolRefs, bool, allGpuD3D12Pools)
 D1(std::optional<MemoryEventDto>, GetMemoryEvent, const MemoryEventKey&, key)
 D1(std::optional<std::string>, GetMemoryPoolRef, uint64_t, internalPoolKey)
-D1(std::optional<std::string>, GetCpuZoneRef, uint64_t, internalZoneIndex)
+std::optional<std::string> GpuAnalysisTraceSource::GetCpuZoneRef( uint64_t internalZoneIndex ) const
+{
+    if( WorkerLoaded() ) return Worker().GetCpuZoneRef( internalZoneIndex );
+    return m_cpuZoneReader && internalZoneIndex < m_cpuZoneReader->Stats().zones ?
+        std::optional<std::string>( MakeEntityRef( "cpu-zone", internalZoneIndex ) ) : std::nullopt;
+}
 D1(std::optional<std::string>, GetGpuZoneRef, uint64_t, internalZoneIndex)
 D0(GpuMemoryAttribution, GetGpuMemoryAttribution)
 D2(SourceTextDto, ReadEmbeddedSource, size_t, sourceId, size_t, maxBytes)
