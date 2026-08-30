@@ -9,6 +9,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.cpp
 )
 
@@ -22,6 +23,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSource.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStore.hpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.hpp
 )
 

@@ -105,6 +105,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-gpu-analysis-tests)
     add_test(NAME tracy-gpu-analysis COMMAND tracy-gpu-analysis-tests)
 
+    add_executable(tracy-trace-session-store-tests tests/TraceSessionStoreTests.cpp)
+    target_link_libraries(tracy-trace-session-store-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-trace-session-store-tests)
+    add_test(NAME tracy-trace-session-store COMMAND tracy-trace-session-store-tests)
+
     add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)
     target_link_libraries(tracy-gpu-analysis-corpus PRIVATE TracyAnalysis)
 
