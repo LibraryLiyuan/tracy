@@ -4,6 +4,7 @@
 #include "TracyProtocol.hpp"
 #include "tracy_lz4.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -109,6 +110,7 @@ struct TraceSessionProtocolDecoder::Impl
     tracy::LZ4_streamDecode_t* stream = nullptr;
     std::vector<char> buffer;
     size_t bufferOffset = 0;
+    std::vector<uint8_t> dictionary;
 };
 
 TraceSessionProtocolDecoder::TraceSessionProtocolDecoder()
@@ -118,6 +120,32 @@ TraceSessionProtocolDecoder::TraceSessionProtocolDecoder()
 TraceSessionProtocolDecoder::~TraceSessionProtocolDecoder() = default;
 TraceSessionProtocolDecoder::TraceSessionProtocolDecoder( TraceSessionProtocolDecoder&& ) noexcept = default;
 TraceSessionProtocolDecoder& TraceSessionProtocolDecoder::operator=( TraceSessionProtocolDecoder&& ) noexcept = default;
+
+std::vector<uint8_t> TraceSessionProtocolDecoder::ExportDictionary() const
+{
+    return m_impl->dictionary;
+}
+
+bool TraceSessionProtocolDecoder::RestoreDictionary(
+    std::span<const uint8_t> dictionary, std::string& error )
+{
+    error.clear();
+    if( dictionary.size() > 64 * 1024 )
+    {
+        error = "protocol_dictionary_exceeds_lz4_limit";
+        return false;
+    }
+    m_impl->dictionary.assign( dictionary.begin(), dictionary.end() );
+    m_impl->bufferOffset = 0;
+    const auto* data = m_impl->dictionary.empty() ? nullptr :
+        reinterpret_cast<const char*>( m_impl->dictionary.data() );
+    if( tracy::LZ4_setStreamDecode( m_impl->stream, data, int( m_impl->dictionary.size() ) ) == 0 )
+    {
+        error = "protocol_dictionary_restore_failed";
+        return false;
+    }
+    return true;
+}
 
 TraceSessionProtocolDomain ClassifyTraceProtocolEvent( uint8_t queueType )
 {
@@ -361,6 +389,24 @@ bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8
     frame.compressedBytes = record.size();
     if( !Merge( inventory, frame, error ) ) return false;
 
+    static constexpr size_t DictionaryLimit = 64 * 1024;
+    const auto decodedBytes = size_t( decodedSize );
+    if( decodedBytes >= DictionaryLimit )
+    {
+        const auto* begin = reinterpret_cast<const uint8_t*>( output ) + decodedBytes - DictionaryLimit;
+        m_impl->dictionary.assign( begin, begin + DictionaryLimit );
+    }
+    else
+    {
+        const auto keep = std::min( m_impl->dictionary.size(), DictionaryLimit - decodedBytes );
+        std::vector<uint8_t> next;
+        next.reserve( keep + decodedBytes );
+        next.insert( next.end(), m_impl->dictionary.end() - keep, m_impl->dictionary.end() );
+        const auto* begin = reinterpret_cast<const uint8_t*>( output );
+        next.insert( next.end(), begin, begin + decodedBytes );
+        m_impl->dictionary = std::move( next );
+    }
+
     m_impl->bufferOffset += size_t( decodedSize );
     if( m_impl->bufferOffset > tracy::TargetFrameSize * 2 ) m_impl->bufferOffset = 0;
     return true;
@@ -421,7 +467,8 @@ bool CountTraceProtocolFrame( std::span<const uint8_t> frame,
         if( visitor )
         {
             const TraceSessionProtocolEventInfo info {
-                index, uint32_t( offset ), uint32_t( eventBytes ), uint32_t( variableBytes ) };
+                frame.data() + offset, index, uint32_t( offset ),
+                uint32_t( eventBytes ), uint32_t( variableBytes ) };
             if( !visitor( info, visitorUserData, error ) ) return false;
         }
 

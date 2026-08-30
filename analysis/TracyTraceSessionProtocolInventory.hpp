@@ -6,6 +6,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace tracy::analysis
 {
@@ -58,6 +59,9 @@ struct TraceSessionProtocolInventory
 
 struct TraceSessionProtocolEventInfo
 {
+    // Valid only for the duration of the visitor call. Consumers must copy
+    // bytes they need before returning.
+    const uint8_t* encodedData = nullptr;
     uint8_t queueType = 0;
     uint32_t frameOffset = 0;
     uint32_t encodedBytes = 0;
@@ -90,6 +94,8 @@ public:
     bool ConsumeCompressedRecord( std::span<const uint8_t> record,
         TraceSessionProtocolInventory& inventory, std::string& error,
         TraceSessionProtocolEventVisitor visitor = nullptr, void* visitorUserData = nullptr );
+    std::vector<uint8_t> ExportDictionary() const;
+    bool RestoreDictionary( std::span<const uint8_t> dictionary, std::string& error );
 
 private:
     struct Impl;

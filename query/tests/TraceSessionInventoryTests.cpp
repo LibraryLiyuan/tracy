@@ -1,4 +1,5 @@
 #include "TracyTraceSessionInventory.hpp"
+#include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
 #include "TracyStreamJournal.hpp"
@@ -332,6 +333,60 @@ void TestCompressedProtocolInventory( TestContext& test )
     test.Check( error == "compressed_record_size_mismatch", "compressed mismatch reason" );
 }
 
+std::vector<uint8_t> CompressContinuedFrame( tracy::LZ4_stream_t* stream,
+    const std::vector<uint8_t>& frame, TestContext& test )
+{
+    std::vector<char> compressed( tracy::LZ4Size );
+    const auto compressedBytes = tracy::LZ4_compress_fast_continue( stream,
+        reinterpret_cast<const char*>( frame.data() ), compressed.data(),
+        int( frame.size() ), int( compressed.size() ), 1 );
+    test.Check( compressedBytes > 0, "compress continued protocol frame" );
+    if( compressedBytes <= 0 ) return {};
+    std::vector<uint8_t> record( sizeof( tracy::lz4sz_t ) + size_t( compressedBytes ) );
+    const auto storedSize = tracy::lz4sz_t( compressedBytes );
+    std::memcpy( record.data(), &storedSize, sizeof( storedSize ) );
+    std::memcpy( record.data() + sizeof( storedSize ), compressed.data(), size_t( compressedBytes ) );
+    return record;
+}
+
+void TestProtocolDecoderCheckpoint( TestContext& test )
+{
+    std::vector<uint8_t> firstFrame;
+    std::vector<uint8_t> secondFrame;
+    const std::string repeated( 60000, 'Q' );
+    AppendStringEvent( firstFrame, tracy::QueueType::StringData, repeated );
+    AppendFixedEvent( firstFrame, tracy::QueueType::FrameVsync );
+    AppendStringEvent( secondFrame, tracy::QueueType::StringData, repeated );
+    AppendFixedEvent( secondFrame, tracy::QueueType::JnJobSchedule );
+
+    auto* compressor = tracy::LZ4_createStream();
+    test.Check( compressor != nullptr, "create continued compressor" );
+    if( !compressor ) return;
+    const auto firstRecord = CompressContinuedFrame( compressor, firstFrame, test );
+    const auto secondRecord = CompressContinuedFrame( compressor, secondFrame, test );
+    tracy::LZ4_freeStream( compressor );
+    if( firstRecord.empty() || secondRecord.empty() ) return;
+
+    tracy::analysis::TraceSessionProtocolDecoder decoder;
+    tracy::analysis::TraceSessionProtocolInventory firstInventory;
+    std::string error;
+    test.Check( decoder.ConsumeCompressedRecord( firstRecord, firstInventory, error ),
+        "decode first continued frame: " + error );
+    const auto checkpoint = decoder.ExportDictionary();
+    test.Check( !checkpoint.empty() && checkpoint.size() <= 64 * 1024,
+        "decoder checkpoint exports bounded LZ4 dictionary" );
+
+    tracy::analysis::TraceSessionProtocolDecoder resumed;
+    test.Check( resumed.RestoreDictionary( checkpoint, error ),
+        "restore LZ4 decoder dictionary: " + error );
+    tracy::analysis::TraceSessionProtocolInventory secondInventory;
+    test.Check( resumed.ConsumeCompressedRecord( secondRecord, secondInventory, error ),
+        "decode dictionary-dependent frame after restore: " + error );
+    test.Check( secondInventory.eventCount == 2 &&
+        secondInventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
+        "resumed decoder preserves second frame facts" );
+}
+
 void TestProtocolJournalInventory( TestContext& test, const std::filesystem::path& directory )
 {
     std::vector<uint8_t> frame;
@@ -391,6 +446,30 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( tracy::analysis::VerifyTraceSessionInventoryRuns( options.runDirectory, inventory, error ),
         "inventory run checksums verify: " + error );
 
+    tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
+    canonicalOptions.targetShardBytes = 128;
+    canonicalOptions.softShardBytes = 256;
+    canonicalOptions.hardShardBytes = 512;
+    canonicalOptions.minimumShardSpanNs = 0;
+    canonicalOptions.maximumShardSpanNs = 100;
+    tracy::analysis::TraceSessionManifest manifest;
+    const auto sessionRoot = directory / "canonical-session";
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( path, sessionRoot, "generation-1",
+        inventory, canonicalOptions, manifest, error ), "build canonical session: " + error );
+    uint64_t canonicalRecords = 0;
+    uint64_t checkpointRecords = 0;
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "protocol" ) canonicalRecords += shard.recordCount;
+        else if( shard.domain == "checkpoint" ) checkpointRecords += shard.recordCount;
+    }
+    test.Check( canonicalRecords == inventory.protocolInventory.eventCount +
+        inventory.recordCount - inventory.protocolInventory.frameCount,
+        "canonical records cover decoded events and non-compressed transport records" );
+    test.Check( checkpointRecords > 0, "each committed canonical segment has a checkpoint" );
+    test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
+        "canonical session shards verify: " + error );
+
     const auto inventoryPath = directory / "protocol-inventory";
     test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),
         "save protocol inventory: " + error );
@@ -443,6 +522,7 @@ int main()
         TestCapacityPreflight( test );
         TestProtocolFrameInventory( test );
         TestCompressedProtocolInventory( test );
+        TestProtocolDecoderCheckpoint( test );
         TestProtocolJournalInventory( test, directory );
     }
     std::filesystem::remove_all( directory, filesystemError );

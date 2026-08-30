@@ -77,8 +77,8 @@ Projected full replay: approximately 90–100 GiB
 |---|---|---|
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
-| N30.2 Inventory与容量预检 | InProgress | Journal、强身份、容量、Protocol QueueType、数据域和CaptureEnd质量已通过真实30分钟输入；磁盘run与迟到/依赖清单待完成。 |
-| N30.3 Canonical/Checkpoint | NotStarted | — |
+| N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
+| N30.3 Canonical/Checkpoint | InProgress | Raw Canonical event/transport shard、LZ4字典checkpoint和强身份门禁已通过synthetic；取消/恢复与语义时间状态待完成。 |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
@@ -146,7 +146,7 @@ CPM_SOURCE_CACHE=C:\CodeProjects\GodotProjects\tracy-0.13.1-n29-gpu-analysis\bui
 - 当前文件提交具备临时文件、校验和与原子 rename；完整故障注入和恢复矩阵在 N30.3 执行。
 - `FlushFileBuffers` 级耐久性、孤立 generation 清理和杀进程恢复在 Checkpoint/Recovery 实现时统一完成。
 
-## 4. N30.2 Source Inventory 与容量预检（进行中）
+## 4. N30.2 Source Inventory 与容量预检（通过）
 
 ### 已完成的有界 Journal Inventory
 
@@ -297,6 +297,41 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 
 ### 尚未完成，不能提前通过 N30.2
 
-- Dictionary、Blob、Callstack依赖磁盘run已完成；协议事件精确时间解码后的迟到分布须与N30.3可序列化decoder/checkpoint状态共同完成，当前不使用Journal到达时间伪装语义时间。
-- producer在JN质量事件中声明drop时的域级质量映射；SessionEnd关闭原因映射已完成。
-- Inventory build-state/checkpoint 与 GracefulCancel/Resume；该状态机与 N30.3 共用实现。
+以下内容按其状态所有权进入后续阶段，不再阻塞N30.2：
+
+- 协议事件精确时间解码后的迟到分布属于N30.3可序列化decoder/checkpoint状态；当前明确不使用Journal到达时间伪装语义时间。
+- producer在JN质量事件中声明drop时的逐域映射属于N30.4 Canonical domain decode；N30.2已完成SessionEnd关闭原因映射。
+- Inventory/Canonical统一build-state、GracefulCancel/Resume属于N30.3。
+
+## 5. N30.3 Canonical 与 Checkpoint（进行中）
+
+### 已完成基础
+
+- `TraceSessionProtocolDecoder`可导出和恢复最近64 KiB LZ4字典。
+- 测试使用两个连续压缩帧，第二帧依赖第一帧字典；新decoder从checkpoint恢复后精确得到第二帧事件。
+- Canonical sink不构建传统Worker；逐记录读取stream，经共享Protocol parser解压后复制事件原始编码字节。
+- 非压缩的SessionBegin、ServerToClient、Checkpoint、SessionEnd和Diagnostic以transport record保留，避免新Session丢失服务端请求及录制控制事实。
+- Canonical record保存kind、QueueType/RecordType、数据域、flags、source sequence、Journal到达时间、protocol frame ordinal和原始payload。
+- Shard只在完整Journal record边界提交；每个Shard后提交checkpoint。
+- Checkpoint保存source sequence、下一source offset、protocol frame ordinal、累计事件数、LZ4 dictionary和前一checkpoint hash。
+- Canonical开始前重新执行source强身份验证，防止Inventory后同尺寸替换源文件。
+
+### TDD证据
+
+RED：decoder尚无`ExportDictionary/RestoreDictionary`时编译失败。
+
+GREEN：
+
+- 连续字典压缩帧恢复。
+- 小Shard阈值强制多Shard。
+- decoded protocol events + non-compressed transport records总数守恒。
+- 每个Canonical segment存在checkpoint。
+- Canonical和Checkpoint文件大小、manifest及SHA-256全部通过`VerifyTraceSession`。
+
+### 尚未完成
+
+- GracefulCancel、扫描提前停止和`CancelledResumable`。
+- 从最后checkpoint恢复而不重写已提交Shard。
+- 可序列化TSC/thread/dictionary/gpu calibration等完整decoder状态。
+- 跨Shard Zone、Job、Allocation、Resource、I/O状态。
+- 内存/磁盘压力暂停和writer lease。
