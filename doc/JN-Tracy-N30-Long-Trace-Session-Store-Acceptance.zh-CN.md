@@ -437,3 +437,36 @@ GREEN：
 
 - Job/Allocation等生命周期的语义型二级索引；当前全域磁盘索引已保留构建这些索引所需的精确顺序、时间和位置，但不能提前宣称Query语义接口已完成。
 - Converter在Inventory/Derived阶段的细粒度Ctrl+C checkpoint与持久化ETA。
+
+## 8. N30.6 Query/MCP 与 SessionTraceSource（进行中）
+
+### 已完成的第一条生产查询链
+
+- Query API从`1.33.0`升级为`1.34.0`，协议schema与三份coverage文档同步升级。
+- `TraceSourceKind`新增`Session`，Query能力声明新增`source_kind=session`。
+- `SessionManager`只接受已经原子发布并通过`IsTraceSessionQueryable`的`.jn-trace-session`目录；普通目录、伪装成`.tracy`的目录和`.building`均不能作为Trace打开。
+- `GpuAnalysisStoreReader::OpenAt`可以从Session generation的mandatory derived algorithm root读取N29索引，并强制校验source SHA-256和size。
+- `GpuAnalysisTraceSource::OpenSessionIfReady`直接打开Session GPU派生层，不实例化完整Worker；Legacy `.tracy + .jn-gpu-resource-analysis`路径保持不变。
+- Query的GPU Reader cache识别Session目录，固定读取同一个manifest generation的`derived/gpu-resource-analysis`。
+- `gpu.memory.peak`及已有N29 GPU分页查询复用同一Store Reader；Session不会生成第二份Raw GPU sidecar，也不会回退到完整内存Snapshot。
+
+### TDD证据
+
+RED：
+
+- 尚无`GpuAnalysisStoreReader::OpenAt`时，Session GPU Reader测试按预期编译失败。
+- 尚无`OpenSessionIfReady`和`TraceSourceKind::Session`时，SessionTraceSource测试按预期编译失败。
+
+GREEN：
+
+- 发布Synthetic Session后，底层Reader直接得到2个Resource和1个Pass。
+- `OpenSessionIfReady`返回`source_kind=session`、正确source fingerprint，且`WorkerLoaded=false`。
+- Query 1.34通过`trace.open`直接打开Session目录，再执行`gpu.memory.peak`成功；结果明确来自Session mandatory N29派生层。
+- `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
+
+### 尚未完成，不能提前通过N30.6
+
+- CPU/Frame/Zone/Job/Sampling/Memory/FrameImage的语义分页Reader。
+- `.building`的`session.build.status` MCP入口。
+- 局部`.tracy`导出器及开放边界语义。
+- Query/MCP全域结果与传统Worker的短Trace逐项差分。

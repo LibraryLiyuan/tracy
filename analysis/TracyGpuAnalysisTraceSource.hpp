@@ -2,6 +2,7 @@
 #define __TRACYGPUANALYSISTRACESOURCE_HPP__
 
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyTraceSessionStore.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <mutex>
@@ -17,6 +18,8 @@ class GpuAnalysisTraceSource final : public TraceSource
 {
 public:
     static std::unique_ptr<GpuAnalysisTraceSource> OpenIfReady( const std::filesystem::path& path,
+        WorkerTraceSource::StateCallback stateCallback = {} );
+    static std::unique_ptr<GpuAnalysisTraceSource> OpenSessionIfReady( const std::filesystem::path& path,
         WorkerTraceSource::StateCallback stateCallback = {} );
 
     std::optional<std::filesystem::path> BackingPath() const override { return m_path; }
@@ -100,7 +103,7 @@ public:
 
 private:
     GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
-        std::shared_ptr<GpuAnalysisStoreReader> reader );
+        std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode = false );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
 
@@ -108,6 +111,7 @@ private:
     GpuAnalysisSidecarManifest m_manifest;
     std::shared_ptr<GpuAnalysisStoreReader> m_reader;
     std::shared_ptr<JnTraceData> m_catalogSummary;
+    bool m_sessionMode = false;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;
 };

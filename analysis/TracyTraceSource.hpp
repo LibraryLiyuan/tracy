@@ -24,7 +24,8 @@ namespace tracy::analysis
 enum class TraceSourceKind : uint8_t
 {
     Snapshot,
-    Segment
+    Segment,
+    Session
 };
 
 enum class TraceSourceState : uint8_t

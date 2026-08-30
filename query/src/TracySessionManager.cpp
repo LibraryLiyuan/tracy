@@ -3,6 +3,7 @@
 #include "TracySegmentTraceSource.hpp"
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyQueryIndex.hpp"
+#include "TracyTraceSessionStore.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <algorithm>
@@ -98,6 +99,12 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
     if( !m_sourceLoader )
     {
         m_sourceLoader = [preferIndex]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
+            if( std::filesystem::is_directory( path ) )
+            {
+                if( auto source = analysis::GpuAnalysisTraceSource::OpenSessionIfReady( path, callback ) ) return source;
+                throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt,
+                    "Trace Session is incomplete or its mandatory derived indexes are invalid" );
+            }
             if( Lower( path.extension().string() ) == ".tracy-stream" )
             {
                 return SegmentTraceSource::Open( path, std::move( callback ), preferIndex );
@@ -140,11 +147,22 @@ std::filesystem::path SessionManager::ResolveTracePath( const std::filesystem::p
     if( !std::filesystem::exists( absolute, error ) || error ) throw SessionError( SessionErrorCode::TraceNotFound, "trace file does not exist" );
     const auto canonical = std::filesystem::canonical( absolute, error );
     if( error ) throw SessionError( SessionErrorCode::TraceOpenFailed, "unable to resolve final trace path" );
-    if( !std::filesystem::is_regular_file( canonical, error ) || error ) throw SessionError( SessionErrorCode::TraceOpenFailed, "trace path is not a regular file" );
+    const bool regularFile = std::filesystem::is_regular_file( canonical, error );
+    if( error ) throw SessionError( SessionErrorCode::TraceOpenFailed, "unable to inspect trace path" );
+    const bool sessionDirectory = std::filesystem::is_directory( canonical, error ) &&
+        Lower( canonical.extension().string() ) == analysis::TraceSessionSuffix;
+    if( error || ( !regularFile && !sessionDirectory ) )
+        throw SessionError( SessionErrorCode::TraceOpenFailed, "trace path is neither a supported file nor a completed Trace Session" );
     const auto extension = Lower( canonical.extension().string() );
-    if( extension != ".tracy" && extension != ".tracy-stream" )
+    if( sessionDirectory )
     {
-        throw SessionError( SessionErrorCode::TraceOpenFailed, "only .tracy and .tracy-stream files may be opened" );
+        std::string sessionError;
+        if( !analysis::IsTraceSessionQueryable( canonical, sessionError ) )
+            throw SessionError( SessionErrorCode::TraceOpenFailed, "Trace Session is not queryable: " + sessionError );
+    }
+    else if( extension != ".tracy" && extension != ".tracy-stream" )
+    {
+        throw SessionError( SessionErrorCode::TraceOpenFailed, "only .tracy, .tracy-stream, and completed .jn-trace-session inputs may be opened" );
     }
 
     const bool allowed = std::any_of( m_allowRoots.begin(), m_allowRoots.end(), [&]( const auto& root ) { return IsWithin( canonical, root ); } );

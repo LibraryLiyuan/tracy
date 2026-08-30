@@ -14,6 +14,7 @@ const char* ToString( TraceSourceKind value )
     {
     case TraceSourceKind::Snapshot: return "snapshot";
     case TraceSourceKind::Segment: return "segment";
+    case TraceSourceKind::Session: return "session";
     }
     return "unknown";
 }

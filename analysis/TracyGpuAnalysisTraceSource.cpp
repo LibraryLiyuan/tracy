@@ -1,4 +1,5 @@
 #include "TracyGpuAnalysisTraceSource.hpp"
+#include "TracyTraceSessionGpuCanonical.hpp"
 
 #include <charconv>
 #include <sstream>
@@ -17,9 +18,44 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenIfReady(
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource( path, std::move( manifest ), std::move( reader ) ) );
 }
 
+std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfReady(
+    const std::filesystem::path& path, WorkerTraceSource::StateCallback stateCallback )
+{
+    if( stateCallback ) stateCallback( TraceSourceState::Loading );
+    std::string error;
+    if( !IsTraceSessionQueryable( path, error ) ) return {};
+    const auto session = LoadTraceSessionManifest( path, error );
+    if( !session ) return {};
+    auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
+        session->source.sha256, session->source.fileSize, error );
+    if( !reader ) return {};
+    GpuAnalysisSidecarManifest facade;
+    facade.state = GpuAnalysisSidecarState::Ready;
+    facade.identityState = GpuAnalysisIdentityState::StrongVerified;
+    facade.identity.sha256 = session->source.sha256;
+    facade.identity.fileSize = session->source.fileSize;
+    facade.derivedGeneration = reader->Manifest().generation;
+    facade.rawComplete = true;
+    facade.derivedComplete = true;
+    facade.reason = session->reason;
+    facade.summary.catalogPresent = true;
+    facade.summary.catalogValid = true;
+    facade.summary.exact = true;
+    facade.summary.resourceRecordCount = reader->Manifest().resourceCount;
+    facade.summary.allocationRecordCount = reader->Manifest().allocationCount;
+    facade.summary.passCount = reader->Manifest().passCount;
+    facade.summary.engineKnownPhysicalBytes = reader->Overview().engineKnownPhysicalBytes;
+    facade.summary.engineKnownPhysicalPeakBytes = reader->Overview().engineKnownPhysicalPeakBytes;
+    facade.summary.engineKnownPhysicalPeakTimeNs = reader->Overview().engineKnownPhysicalPeakTimeNs;
+    if( stateCallback ) stateCallback( TraceSourceState::Ready );
+    return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
+        path, std::move( facade ), std::move( reader ), true ) );
+}
+
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
-    std::shared_ptr<GpuAnalysisStoreReader> reader )
-    : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) )
+    std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode )
+    : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
+      m_sessionMode( sessionMode )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -41,6 +77,7 @@ bool GpuAnalysisTraceSource::IsSidecarMethod( std::string_view method ) const
 
 void GpuAnalysisTraceSource::PrepareForQuery( std::string_view method ) const
 {
+    if( m_sessionMode ) return;
     if( !IsSidecarMethod( method ) ) (void)Worker();
 }
 
@@ -52,6 +89,8 @@ bool GpuAnalysisTraceSource::WorkerLoaded() const
 WorkerTraceSource& GpuAnalysisTraceSource::Worker() const
 {
     std::lock_guard lock( m_workerMutex );
+    if( m_sessionMode ) throw TraceLoadError( TraceLoadErrorCode::UnsupportedVersion,
+        "Session domain is not yet available through the disk-backed reader" );
     if( !m_worker ) m_worker = WorkerTraceSource::Open( m_path, {}, m_manifest.identity.sha256 );
     return *m_worker;
 }
@@ -67,13 +106,16 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         "gpu.memory.by_pass", "gpu.memory.churn"
     };
     const auto capability = [&]( const char* domain ) { return Capability { domain, true, true, true,
-        "available from the N29 GPU Resource Analysis sidecar", methods }; };
+        m_sessionMode ? "available from the N30 Session mandatory GPU Resource Analysis index" :
+            "available from the N29 GPU Resource Analysis sidecar", methods }; };
     return { capability( "gpu.catalog" ), capability( "gpu.resource" ), capability( "gpu.memory" ), capability( "gpu.pass" ) };
 }
 
 TraceReadView GpuAnalysisTraceSource::AcquireReadView() const
 {
-    return WorkerLoaded() ? Worker().AcquireReadView() : TraceReadView { TraceSourceKind::Snapshot, TraceSourceState::Ready, 0, 0, true };
+    return WorkerLoaded() ? Worker().AcquireReadView() : TraceReadView {
+        m_sessionMode ? TraceSourceKind::Session : TraceSourceKind::Snapshot,
+        TraceSourceState::Ready, 0, 0, true };
 }
 
 TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const

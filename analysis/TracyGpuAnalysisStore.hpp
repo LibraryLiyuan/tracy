@@ -102,6 +102,11 @@ class GpuAnalysisStoreReader
 public:
     static std::shared_ptr<GpuAnalysisStoreReader> Open( const std::filesystem::path& tracePath,
         bool strongIdentity, GpuAnalysisSidecarManifest* sidecarManifest, std::string& error );
+    // Opens a derived store whose algorithm root already contains `current`
+    // and immutable generations. This is the N30 Session path; unlike Open(),
+    // it does not require or synthesize an N29 raw sidecar manifest.
+    static std::shared_ptr<GpuAnalysisStoreReader> OpenAt( const std::filesystem::path& algorithmRoot,
+        std::string_view expectedTraceSha256, uint64_t expectedTraceSize, std::string& error );
 
     const GpuAnalysisStoreManifest& Manifest() const { return m_manifest; }
     const GpuAnalysisSnapshot& Overview() const { return m_overview; }

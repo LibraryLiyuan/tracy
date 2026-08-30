@@ -680,6 +680,38 @@ std::shared_ptr<GpuAnalysisStoreReader> GpuAnalysisStoreReader::Open( const std:
     return reader;
 }
 
+std::shared_ptr<GpuAnalysisStoreReader> GpuAnalysisStoreReader::OpenAt(
+    const std::filesystem::path& algorithmRoot, std::string_view expectedTraceSha256,
+    uint64_t expectedTraceSize, std::string& error )
+{
+    error.clear();
+    std::ifstream current( GpuAnalysisIoPath( algorithmRoot / "current" ), std::ios::binary );
+    std::string generation;
+    if( !current || !std::getline( current, generation ) || generation.empty() )
+    { error = "gpu_analysis_derived_current_missing"; return {}; }
+    if( generation.back() == '\r' ) generation.pop_back();
+    if( generation.empty() || generation.find( '/' ) != std::string::npos ||
+        generation.find( '\\' ) != std::string::npos || generation.find( ".." ) != std::string::npos )
+    { error = "gpu_analysis_derived_current_invalid"; return {}; }
+    const auto root = algorithmRoot / generation;
+    auto store = LoadGpuAnalysisStoreManifest( root, error );
+    if( !store ) return {};
+    if( store->traceSha256 != expectedTraceSha256 || store->traceSize != expectedTraceSize )
+    { error = "gpu_analysis_store_identity_mismatch"; return {}; }
+    const auto* metadata = NthPage( *store, GpuAnalysisStorePageKind::Metadata, 0 );
+    if( !metadata || !VerifyPageFile( root / metadata->relativePath, *metadata, error ) ) return {};
+    GpuAnalysisCacheIdentity cacheIdentity { store->traceSha256, store->traceSize,
+        std::string( GpuAnalysisAlgorithmId ) + "-store1" };
+    auto overview = LoadGpuAnalysisCache( root / metadata->relativePath, cacheIdentity, error );
+    if( !overview ) return {};
+    auto reader = std::shared_ptr<GpuAnalysisStoreReader>( new GpuAnalysisStoreReader );
+    reader->m_root = root;
+    reader->m_identity = std::move( cacheIdentity );
+    reader->m_manifest = std::move( *store );
+    reader->m_overview = std::move( *overview );
+    return reader;
+}
+
 size_t GpuAnalysisStoreReader::ResourcePageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Resource ); }
 size_t GpuAnalysisStoreReader::AllocationPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Allocation ); }
 size_t GpuAnalysisStoreReader::PassPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Pass ); }

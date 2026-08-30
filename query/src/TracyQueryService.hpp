@@ -21,7 +21,7 @@ namespace tracy::query
 {
 
 inline constexpr const char* QueryProtocol = "tracy-query/1";
-inline constexpr const char* QuerySchemaVersion = "1.33.0";
+inline constexpr const char* QuerySchemaVersion = "1.34.0";
 inline constexpr size_t DefaultPageSize = 100;
 inline constexpr size_t MaximumPageSize = 1000;
 inline constexpr size_t DefaultTopN = 20;

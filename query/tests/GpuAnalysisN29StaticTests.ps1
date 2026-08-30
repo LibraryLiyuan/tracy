@@ -52,8 +52,8 @@ Require (-not $view.Contains('BuildGpuAnalysisSnapshot(')) 'GPU Memory & Resourc
 $coverage = Get-Content -Raw (Join-Path $root 'query\schema\coverage-v1.json') | ConvertFrom-Json
 $fields = Get-Content -Raw (Join-Path $root 'query\schema\coverage-fields-v1.json') | ConvertFrom-Json
 $mcp = Get-Content -Raw (Join-Path $root 'query\schema\coverage-mcp-v1.json') | ConvertFrom-Json
-Require ($coverage.schema_version -eq '1.33.0') 'Domain coverage schema is not 1.33.0.'
-Require ($fields.schema_version -eq '1.33.0') 'Field coverage schema is not 1.33.0.'
-Require ($mcp.schema_version -eq '1.33.0') 'MCP coverage schema is not 1.33.0.'
+Require ($coverage.schema_version -eq '1.34.0') 'Domain coverage schema is not 1.34.0.'
+Require ($fields.schema_version -eq '1.34.0') 'Field coverage schema is not 1.34.0.'
+Require ($mcp.schema_version -eq '1.34.0') 'MCP coverage schema is not 1.34.0.'
 
 Write-Host 'N29 GPU Resource Analysis Sidecar static checks passed.'

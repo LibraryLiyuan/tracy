@@ -3,6 +3,8 @@
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionDerived.hpp"
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyGpuAnalysisTraceSource.hpp"
+#include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
 #include "TracyStreamJournal.hpp"
@@ -1045,6 +1047,42 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "publish only after mandatory derived and Final Audit: " + error );
     test.Check( tracy::analysis::IsTraceSessionQueryable( publishedSession, error ),
         "published Session is queryable: " + error );
+    auto sessionGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
+        tracy::analysis::TraceSessionGpuAnalysisRoot( publishedSession, manifest ),
+        manifest.source.sha256, manifest.source.fileSize, error );
+    test.Check( sessionGpuReader &&
+        sessionGpuReader->Manifest().resourceCount == 2 &&
+        sessionGpuReader->Manifest().passCount == 1,
+        "open mandatory GPU analysis directly from a published Session: " + error );
+    auto sessionSource = tracy::analysis::GpuAnalysisTraceSource::OpenSessionIfReady( publishedSession );
+    test.Check( sessionSource &&
+        sessionSource->AcquireReadView().sourceKind == tracy::analysis::TraceSourceKind::Session &&
+        sessionSource->GetTraceInfo().fingerprint == manifest.source.sha256 &&
+        !sessionSource->WorkerLoaded(),
+        "open a published Session without materializing a full Worker" );
+
+    tracy::query::SessionManager sessions( { directory } );
+    tracy::query::QueryService query( sessions );
+    const auto open = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-open" }, { "method", "trace.open" },
+        { "params", { { "path", publishedSession.string() } } }
+    } );
+    test.Check( open.value( "ok", false ), "Query 1.34 accepts a completed Session directory" );
+    if( open.value( "ok", false ) )
+    {
+        const auto traceId = open["data"]["trace_id"].get<std::string>();
+        test.Check( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state ==
+            tracy::analysis::TraceSourceState::Ready,
+            "SessionTraceSource becomes ready without full Worker materialization" );
+        const auto peak = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-peak" }, { "method", "gpu.memory.peak" },
+            { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( peak.value( "ok", false ) && peak["trace"]["source_kind"] == "session" &&
+            peak["data"]["present"] == true &&
+            peak["data"]["analysis_backend"] == "n29_gpu_resource_analysis_sidecar",
+            "Query reads exact GPU analysis from Session mandatory derived storage" );
+    }
 }
 
 }

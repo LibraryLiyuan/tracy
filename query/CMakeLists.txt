@@ -111,7 +111,7 @@ if(BUILD_TESTING)
     add_test(NAME tracy-trace-session-store COMMAND tracy-trace-session-store-tests)
 
     add_executable(tracy-trace-session-inventory-tests tests/TraceSessionInventoryTests.cpp)
-    target_link_libraries(tracy-trace-session-inventory-tests PRIVATE TracyAnalysis TracyStreamCore TracyServer)
+    target_link_libraries(tracy-trace-session-inventory-tests PRIVATE TracyQueryProtocol TracyStreamCore TracyServer)
     tracy_query_enable_assertions(tracy-trace-session-inventory-tests)
     add_test(NAME tracy-trace-session-inventory COMMAND tracy-trace-session-inventory-tests)
 

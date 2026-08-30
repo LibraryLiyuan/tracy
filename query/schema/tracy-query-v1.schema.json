@@ -93,7 +93,7 @@
       "properties": {
         "id": { "$ref": "#/$defs/opaqueRef" },
         "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
-        "source_kind": { "enum": ["snapshot", "segment"] },
+        "source_kind": { "enum": ["snapshot", "segment", "session"] },
         "state": { "enum": ["queued", "loading", "indexing", "ready", "failed", "closing", "closed"] },
         "revision": { "$ref": "#/$defs/decimal64" },
         "watermark_ns": { "$ref": "#/$defs/decimal64" },
@@ -131,7 +131,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "data", "partial", "omitted_count", "budget", "warnings"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.33.0" },
+        "schema_version": { "const": "1.34.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": true },
         "trace": { "$ref": "#/$defs/trace" },
@@ -158,7 +158,7 @@
       "required": ["protocol", "schema_version", "id", "ok", "error"],
       "properties": {
         "protocol": { "const": "tracy-query/1" },
-        "schema_version": { "const": "1.33.0" },
+        "schema_version": { "const": "1.34.0" },
         "id": { "type": ["string", "number", "null"] },
         "ok": { "const": false },
         "error": {

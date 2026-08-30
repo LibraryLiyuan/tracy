@@ -2,6 +2,7 @@
 #include "TracyMemoryAnalysis.hpp"
 #include "TracyQueryIndex.hpp"
 #include "TracyQueryService.hpp"
+#include "TracyTraceSessionStore.hpp"
 #include "FakeTraceSource.hpp"
 
 #include <nlohmann/json.hpp>
@@ -99,6 +100,7 @@ struct TemporaryTraceFiles
         conflictingIdentity = root / "conflicting-identity.tracy";
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
+        session = root / "complete.jn-trace-session";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
@@ -113,6 +115,18 @@ struct TemporaryTraceFiles
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
+        tracy::analysis::TraceSessionManifest sessionManifest;
+        sessionManifest.sessionId = "query-contract-session";
+        sessionManifest.generation = "g-query-contract";
+        sessionManifest.state = tracy::analysis::TraceSessionState::Complete;
+        sessionManifest.source.sha256 = std::string( 64, 'a' );
+        sessionManifest.source.fileSize = 1;
+        sessionManifest.source.protocol = 90;
+        sessionManifest.mandatoryDerivedComplete = true;
+        sessionManifest.auditComplete = true;
+        std::string sessionError;
+        const auto sessionBuilding = root / "complete.jn-trace-session.building.g-query-contract";
+        assert( tracy::analysis::PublishTraceSession( sessionBuilding, session, sessionManifest, sessionError ) );
     }
 
     ~TemporaryTraceFiles()
@@ -133,6 +147,7 @@ struct TemporaryTraceFiles
     std::filesystem::path conflictingIdentity;
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
+    std::filesystem::path session;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -640,6 +655,7 @@ int main()
     expectPathError( wrongExtension, tracy::query::SessionErrorCode::TraceOpenFailed );
     const auto directoryTrace = files.root / "directory.tracy"; std::filesystem::create_directory( directoryTrace );
     expectPathError( directoryTrace, tracy::query::SessionErrorCode::TraceOpenFailed );
+    assert( sessions.ResolveTracePath( files.session ) == std::filesystem::canonical( files.session ) );
     expectPathError( files.root / ".." / files.outsideRoot.filename() / files.outside.filename(), tracy::query::SessionErrorCode::PathNotAllowed );
     std::error_code symlinkError;
     const auto escapeLink = files.root / "escape.tracy";

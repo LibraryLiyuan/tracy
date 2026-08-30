@@ -1,4 +1,6 @@
 #include "TracyQueryService.hpp"
+#include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionStore.hpp"
 
 #include "TracyAnalysis.hpp"
 #include "TracyEmbeddedData.hpp"
@@ -4397,11 +4399,60 @@ std::shared_ptr<analysis::GpuAnalysisStoreReader> QueryService::CachedGpuStoreRe
         if( manifest )
         {
             std::string manifestError;
-            if( const auto current = analysis::LoadGpuAnalysisSidecarManifest( analysis::GpuAnalysisSidecarPath( tracePath ), manifestError ) ) *manifest = *current;
+            if( std::filesystem::is_directory( tracePath ) )
+            {
+                if( const auto session = analysis::LoadTraceSessionManifest( tracePath, manifestError ) )
+                {
+                    const auto& reader = *found->second.value;
+                    manifest->state = analysis::GpuAnalysisSidecarState::Ready;
+                    manifest->identityState = analysis::GpuAnalysisIdentityState::StrongVerified;
+                    manifest->identity.sha256 = session->source.sha256;
+                    manifest->identity.fileSize = session->source.fileSize;
+                    manifest->derivedGeneration = reader.Manifest().generation;
+                    manifest->rawComplete = true; manifest->derivedComplete = true;
+                    manifest->reason = session->reason;
+                    manifest->summary.catalogPresent = true; manifest->summary.catalogValid = true; manifest->summary.exact = true;
+                    manifest->summary.resourceRecordCount = reader.Manifest().resourceCount;
+                    manifest->summary.allocationRecordCount = reader.Manifest().allocationCount;
+                    manifest->summary.passCount = reader.Manifest().passCount;
+                    manifest->summary.engineKnownPhysicalBytes = reader.Overview().engineKnownPhysicalBytes;
+                    manifest->summary.engineKnownPhysicalPeakBytes = reader.Overview().engineKnownPhysicalPeakBytes;
+                    manifest->summary.engineKnownPhysicalPeakTimeNs = reader.Overview().engineKnownPhysicalPeakTimeNs;
+                }
+            }
+            else if( const auto current = analysis::LoadGpuAnalysisSidecarManifest(
+                analysis::GpuAnalysisSidecarPath( tracePath ), manifestError ) ) *manifest = *current;
         }
         return found->second.value;
     }
-    auto value = analysis::GpuAnalysisStoreReader::Open( tracePath, false, manifest, error );
+    std::shared_ptr<analysis::GpuAnalysisStoreReader> value;
+    if( std::filesystem::is_directory( tracePath ) )
+    {
+        if( !analysis::IsTraceSessionQueryable( tracePath, error ) ) return {};
+        const auto session = analysis::LoadTraceSessionManifest( tracePath, error );
+        if( !session ) return {};
+        value = analysis::GpuAnalysisStoreReader::OpenAt(
+            analysis::TraceSessionGpuAnalysisRoot( tracePath, *session ),
+            session->source.sha256, session->source.fileSize, error );
+        if( value && manifest )
+        {
+            manifest->state = analysis::GpuAnalysisSidecarState::Ready;
+            manifest->identityState = analysis::GpuAnalysisIdentityState::StrongVerified;
+            manifest->identity.sha256 = session->source.sha256;
+            manifest->identity.fileSize = session->source.fileSize;
+            manifest->derivedGeneration = value->Manifest().generation;
+            manifest->rawComplete = true; manifest->derivedComplete = true;
+            manifest->reason = session->reason;
+            manifest->summary.catalogPresent = true; manifest->summary.catalogValid = true; manifest->summary.exact = true;
+            manifest->summary.resourceRecordCount = value->Manifest().resourceCount;
+            manifest->summary.allocationRecordCount = value->Manifest().allocationCount;
+            manifest->summary.passCount = value->Manifest().passCount;
+            manifest->summary.engineKnownPhysicalBytes = value->Overview().engineKnownPhysicalBytes;
+            manifest->summary.engineKnownPhysicalPeakBytes = value->Overview().engineKnownPhysicalPeakBytes;
+            manifest->summary.engineKnownPhysicalPeakTimeNs = value->Overview().engineKnownPhysicalPeakTimeNs;
+        }
+    }
+    else value = analysis::GpuAnalysisStoreReader::Open( tracePath, false, manifest, error );
     if( value ) m_gpuStoreCache[traceId] = GpuStoreCacheEntry { value, tracePath, ++m_cacheClock };
     return value;
 }
@@ -4551,7 +4602,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         limits["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         return Success( id, {
             { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.2-JN" } },
-            { "source_kinds", { "snapshot", "segment" } }, { "statistics_required", true },
+            { "source_kinds", { "snapshot", "segment", "session" } }, { "statistics_required", true },
             { "limits", std::move( limits ) }
         } );
     }
@@ -5223,8 +5274,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto statusJson = [&]() {
             std::optional<analysis::GpuAnalysisSidecarManifest> sidecarStatus;
             std::string sidecarStatusError;
-            if( const auto tracePath = source->BackingPath() ) sidecarStatus = analysis::LoadGpuAnalysisSidecarManifest(
-                analysis::GpuAnalysisSidecarPath( *tracePath ), sidecarStatusError );
+            if( const auto tracePath = source->BackingPath() )
+            {
+                if( std::filesystem::is_directory( *tracePath ) )
+                {
+                    analysis::GpuAnalysisSidecarManifest facade;
+                    if( CachedGpuStoreReader( trace.id, *tracePath, &facade, sidecarStatusError ) ) sidecarStatus = std::move( facade );
+                }
+                else sidecarStatus = analysis::LoadGpuAnalysisSidecarManifest(
+                    analysis::GpuAnalysisSidecarPath( *tracePath ), sidecarStatusError );
+            }
             json generations = json::array();
             uint64_t recordCount = 0;
             uint64_t payloadBytes = 0;
