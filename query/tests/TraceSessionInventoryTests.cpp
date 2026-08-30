@@ -407,6 +407,21 @@ void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type, cons
     std::memcpy( frame.data() + previous + fixed + sizeof( length ), value.data(), value.size() );
 }
 
+void AppendStringEvent( std::vector<uint8_t>& frame, tracy::QueueType type,
+    uint64_t pointer, const std::string& value )
+{
+    tracy::QueueItem item {};
+    item.hdr.type = type;
+    item.stringTransfer.ptr = pointer;
+    const auto fixed = tracy::QueueDataSize[size_t( type )];
+    const auto previous = frame.size();
+    frame.resize( previous + fixed + sizeof( uint16_t ) + value.size() );
+    std::memcpy( frame.data() + previous, &item, fixed );
+    const auto length = uint16_t( value.size() );
+    std::memcpy( frame.data() + previous + fixed, &length, sizeof( length ) );
+    std::memcpy( frame.data() + previous + fixed + sizeof( length ), value.data(), value.size() );
+}
+
 void AppendZeroProtocolEvent( std::vector<uint8_t>& frame, tracy::QueueType type )
 {
     tracy::QueueItem item {};
@@ -951,6 +966,58 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     std::vector<uint8_t> frame;
     AppendThreadContextEvent( frame, 42 );
     tracy::QueueItem item {};
+    const std::array<uint64_t, 1> sampleDictionaryStack { 0x10101010 };
+    AppendStringEvent( frame, tracy::QueueType::CallstackSampleDictionary, 1,
+        std::string( reinterpret_cast<const char*>( sampleDictionaryStack.data() ),
+            sizeof( sampleDictionaryStack ) ) );
+    const std::array<uint64_t, 2> jobCallstack { 0x20202020, 0x30303030 };
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x3333,
+        std::string( reinterpret_cast<const char*>( jobCallstack.data() ), sizeof( jobCallstack ) ) );
+    item.hdr.type = tracy::QueueType::CallstackSerial;
+    item.callstackFat.ptr = 0x3333;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnCallsiteDefinition;
+    item.jnCallsiteDefinition = { 0x4444, 77, 42, 3,
+        uint8_t( tracy::JnStackProvenance::SiteReused ),
+        uint8_t( tracy::JnCallsiteFlags::HasCallstack ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    constexpr uint64_t JobNamePointer = 0x2222;
+    item.hdr.type = tracy::QueueType::JnJobType;
+    item.jnJobType = { JobNamePointer, 17, 2, 0 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::StringData, JobNamePointer, "SyntheticJob" );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobSchedule;
+    item.jnJobSchedule = { 108, 500, 0xABC, 0, 2, uint8_t( 1 << 6 ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobConfig;
+    item.jnJobConfig = { 500, 17, 64, 8, 31, 9, 2, uint8_t( 1 << 6 ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 108, 500, 77, 0, 0,
+        uint8_t( tracy::JnJobStage::ScheduleCallsite ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 110, 500, 1, 3, 0, uint8_t( tracy::JnJobStage::Ready ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 111, 500, 2, 0, 32, uint8_t( tracy::JnJobStage::WorkerSliceBegin ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 115, 500, 2, 0, 32, uint8_t( tracy::JnJobStage::WorkerSliceEnd ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 116, 500, 3, 0, 0, uint8_t( tracy::JnJobStage::Completed ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
     item.hdr.type = tracy::QueueType::ZoneBegin;
     item.zoneBegin = { 104, 0x1000 };
     AppendQueueItem( frame, item );
@@ -1089,7 +1156,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "final audit covers Canonical, mandatory indexes, and GPU derived: " + error );
     test.Check( mandatoryStats.indexedRecords == auditedStats.indexedRecords &&
         auditedStats.indexedProtocolEvents == inventory.protocolInventory.eventCount &&
-        auditedStats.gpuResources == 2 && auditedStats.gpuPasses == 1,
+        auditedStats.gpuResources == 2 && auditedStats.gpuPasses == 1 &&
+        auditedStats.jobTypes == 1 && auditedStats.jobs == 1 &&
+        auditedStats.jobSchedules == 1 && auditedStats.jobConfigs == 1 &&
+        auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5,
         "mandatory derived counts are exact and reproducible" );
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
@@ -1120,6 +1190,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( frameCapability != sessionCapabilities.end() && frameCapability->present &&
         frameCapability->indexed && frameCapability->queryable,
         "Session advertises Frame only after its disk-backed semantic reader is ready" );
+    const auto jobCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "job"; } );
+    test.Check( jobCapability != sessionCapabilities.end() && jobCapability->present &&
+        jobCapability->indexed && jobCapability->queryable,
+        "Session advertises Job only after its disk-backed semantic reader is ready" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1131,6 +1206,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionFrames[0].endNs == 36 && sessionFrames[1].beginNs == 36 &&
         sessionFrames[1].endNs == 40 && sessionDurations == std::vector<int64_t>( { 24, 4 } ),
         "Session Frame reader applies the Welcome transform and closes the offline tail at last semantic time" );
+    const auto sessionJobs = sessionSource->GetJobs();
+    test.Check( sessionJobs.size() == 1 && sessionJobs[0].jobId == 500 &&
+        sessionJobs[0].name == "SyntheticJob" && sessionJobs[0].scheduleNs == 16 &&
+        sessionJobs[0].readyNs == 20 && sessionJobs[0].firstRunNs == 22 &&
+        sessionJobs[0].completedNs == 32 && sessionJobs[0].executionNs == 8 &&
+        sessionJobs[0].scheduleCallsiteId == 77 && sessionJobs[0].scheduleCallstack == 2 &&
+        sessionJobs[0].scheduleStackProvenance == "SiteReused" &&
+        sessionJobs[0].stages.size() == 5,
+        "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
     test.Check( corruptShard != manifest.shards.end(), "lazy checksum fixture has a Canonical data shard" );
@@ -1182,6 +1266,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             frames["data"]["frames"][0]["end_ns"] == "36" &&
             frames["data"]["frames"][1]["duration_ns"] == "4",
             "Query 1.34 preserves Session Frame timing and pagination semantics" );
+        const auto jobs = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-job-search" }, { "method", "job.search" },
+            { "params", { { "trace_id", traceId }, { "query", "SyntheticJob" } } }
+        } );
+        test.Check( jobs.value( "ok", false ) && jobs["data"]["jobs"].size() == 1 &&
+            jobs["data"]["jobs"][0]["job_id"] == "500" &&
+            jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
+            "Query 1.34 searches the Session Job semantic index without a Worker" );
         {
             std::ofstream switched( publishedSession / "CURRENT", std::ios::binary | std::ios::trunc );
             switched << "newer-generation-published-after-trace-open\n";
@@ -1221,6 +1313,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( !tracy::analysis::TraceSessionFrameReader::Open(
         publishedSession, manifest, error ) && error == "session_frame_file_sha256_mismatch",
         "Session Frame reader rejects a corrupted committed semantic index" );
+    const auto jobFile = tracy::analysis::TraceSessionJobIndexRoot(
+        publishedSession, manifest ) / "jobs.bin";
+    {
+        std::fstream damaged( jobFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x3c );
+        damaged.write( &byte, 1 );
+    }
+    test.Check( !tracy::analysis::TraceSessionJobReader::Open(
+        publishedSession, manifest, error ) && error == "session_job_file_sha256_mismatch",
+        "Session Job reader rejects a corrupted committed semantic index" );
 }
 
 }

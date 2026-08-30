@@ -34,6 +34,12 @@ struct TraceSessionDerivedStats
     uint64_t frameSets = 0;
     uint64_t frames = 0;
     uint64_t completeFrames = 0;
+    uint64_t jobTypes = 0;
+    uint64_t jobs = 0;
+    uint64_t jobSchedules = 0;
+    uint64_t jobConfigs = 0;
+    uint64_t jobDependencies = 0;
+    uint64_t jobStages = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

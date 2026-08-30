@@ -4,6 +4,8 @@
 #include "TracyHash.hpp"
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionJobs.hpp"
+#include "TracyQueue.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -168,6 +170,12 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "frame_sets " << value.stats.frameSets << '\n';
     out << "frames " << value.stats.frames << '\n';
     out << "complete_frames " << value.stats.completeFrames << '\n';
+    out << "job_types " << value.stats.jobTypes << '\n';
+    out << "jobs " << value.stats.jobs << '\n';
+    out << "job_schedules " << value.stats.jobSchedules << '\n';
+    out << "job_configs " << value.stats.jobConfigs << '\n';
+    out << "job_dependencies " << value.stats.jobDependencies << '\n';
+    out << "job_stages " << value.stats.jobStages << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -217,6 +225,12 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "frame_sets" ) in >> value.stats.frameSets;
         else if( key == "frames" ) in >> value.stats.frames;
         else if( key == "complete_frames" ) in >> value.stats.completeFrames;
+        else if( key == "job_types" ) in >> value.stats.jobTypes;
+        else if( key == "jobs" ) in >> value.stats.jobs;
+        else if( key == "job_schedules" ) in >> value.stats.jobSchedules;
+        else if( key == "job_configs" ) in >> value.stats.jobConfigs;
+        else if( key == "job_dependencies" ) in >> value.stats.jobDependencies;
+        else if( key == "job_stages" ) in >> value.stats.jobStages;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -373,6 +387,15 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.frames = frameStats.frames;
     index.stats.completeFrames = frameStats.completeFrames;
 
+    TraceSessionJobStats jobStats;
+    if( !BuildTraceSessionJobDerived( sessionRoot, manifest, jobStats, error ) ) return false;
+    index.stats.jobTypes = jobStats.jobTypes;
+    index.stats.jobs = jobStats.jobs;
+    index.stats.jobSchedules = jobStats.schedules;
+    index.stats.jobConfigs = jobStats.configs;
+    index.stats.jobDependencies = jobStats.dependencies;
+    index.stats.jobStages = jobStats.stages;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -433,6 +456,21 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         frameReader->Stats().frames != index.stats.frames ||
         frameReader->Stats().completeFrames != index.stats.completeFrames )
     { if( error.empty() ) error = "session_frame_derived_audit_mismatch"; return false; }
+    const auto jobReader = TraceSessionJobReader::Open( sessionRoot, manifest, error );
+    if( !jobReader || jobReader->Stats().jobTypes != index.stats.jobTypes ||
+        jobReader->Stats().jobs != index.stats.jobs ||
+        jobReader->Stats().schedules != index.stats.jobSchedules ||
+        jobReader->Stats().configs != index.stats.jobConfigs ||
+        jobReader->Stats().dependencies != index.stats.jobDependencies ||
+        jobReader->Stats().stages != index.stats.jobStages )
+    { if( error.empty() ) error = "session_job_derived_audit_mismatch"; return false; }
+    const auto& queueCounts = inventory.protocolInventory.events;
+    if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
+        queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
+        queueCounts[size_t( QueueType::JnJobConfig )].count != index.stats.jobConfigs ||
+        queueCounts[size_t( QueueType::JnJobDependency )].count != index.stats.jobDependencies ||
+        queueCounts[size_t( QueueType::JnJobStage )].count != index.stats.jobStages )
+    { error = "session_job_source_count_mismatch"; return false; }
     stats = index.stats;
     return true;
 }

@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态和有序Canonical Reader已完成，语义分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame和Job语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -460,6 +460,10 @@ GREEN：
 - Frame域已建立第一个非GPU磁盘语义索引：从Canonical Dictionary和Frame Shard恢复FrameName、连续Frame、显式Begin/End和Vsync FrameSet，使用与Worker一致的Welcome时间换算；最后一个连续Frame只在存在可证明的全局最后语义时间时闭合。
 - `frame.sets`、`frame.list`、`frame.get`、`frame.statistics`、`frame.outliers`和`frame.range_mapping`直接读取Frame索引，不实例化Worker；`frame.identity`依赖JN关联帧语义，当前不声明为可查询。
 - Frame索引包含source/generation强身份、独立文件SHA-256、保留字段和计数审计；Final Audit同时核对Canonical semantic-time事件数和Frame set/frame/complete计数。
+- Job域新增`job-index/1/exact/jobs.bin`：从有序Canonical事实恢复Job Type、Schedule、Config、Dependency、Stage、关联Frame和SiteReuse Callsite；时间统一使用Welcome换算，Schedule/Ready/Queue/Slice/Complete/Wait及其子状态沿用传统Worker语义。
+- Job调用栈严格复现Tracy协议的两类状态：普通`Callstack`按线程消费，`CallstackSerial`可跨无关事件保持到对应Job/Callsite消费者；Sampling字典栈也参与全局Callstack ID去重，避免Job的`stack_ref`与后续Source/Callstack索引错位。
+- Job索引包含source SHA-256、source size、固定manifest generation、文件SHA-256及Type/Schedule/Config/Dependency/Stage计数；Final Audit逐项与Inventory的QueueType计数核对，不能用已构造Job数量替代源事件守恒。
+- `job.search/get/dependencies/critical_path/statistics`已从Session Job Reader读取且不会回退完整Worker；`job.gfx`仍保持不可查询，直到Gfx Dispatch/Entity/Link语义Reader完成。
 
 ### TDD证据
 
@@ -468,6 +472,7 @@ RED：
 - 尚无`GpuAnalysisStoreReader::OpenAt`时，Session GPU Reader测试按预期编译失败。
 - 尚无`OpenSessionIfReady`和`TraceSourceKind::Session`时，SessionTraceSource测试按预期编译失败。
 - Frame Canonical fact存在但磁盘语义Reader尚未实现时，测试按预期失败于`Session advertises Frame only after its disk-backed semantic reader is ready`。
+- Job Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Job only after its disk-backed semantic reader is ready`。
 
 GREEN：
 
@@ -481,10 +486,36 @@ GREEN：
 - 有序Canonical Reader先RED为接口不存在，GREEN后恢复跨域全序且记录数完全守恒。
 - Frame GREEN恢复Synthetic `Vsync 9`的2个完整Frame；Welcome换算后的区间为`[12,36]ns`和`[36,40]ns`，Query 1.34的`frame.sets/frame.list`结果与直接Reader一致。
 - 提交后篡改`frames.bin`会被`session_frame_file_sha256_mismatch`拒绝，损坏的语义索引不能被发布结果静默使用。
+- Job GREEN恢复`SyntheticJob #500`的Schedule=16ns、Ready=20ns、首个Worker Slice=22ns、Complete=32ns、执行时长=8ns；直接Reader和Query `job.search`结果一致。
+- Synthetic先注册Sampling字典栈、再注册Job SiteReuse栈；Job必须得到全局Callstack ID 2、Callsite ID 77和`SiteReused` provenance，证明不同调用栈生产者不会串栈。
+- 提交后篡改`jobs.bin`会被`session_job_file_sha256_mismatch`拒绝。
 - `tracy-query-contract`与`tracy-trace-session-inventory`联合回归通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- CPU Zone、GPU Zone、Job、Sampling、Memory和FrameImage的语义分页Reader。
+- CPU Zone、GPU Zone、Sampling、Memory和FrameImage的语义分页Reader。
+- 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。
+
+### 2026-08-31 Job Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `23718E97D9ED85ED54FD3FD1A336D1FB28A4530A49E2481046472777CF6BE7A4` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `85EBF91042F50A6F996100846A4B73F7A7A4343C90E5BF8003BF06A4279FD267` |
+
+`tracy-query --version`：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+七项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```

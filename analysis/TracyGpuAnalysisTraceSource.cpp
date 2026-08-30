@@ -31,6 +31,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !LoadTraceSessionDerivedStats( path, *session, sessionStats, error ) ) return {};
     auto frameReader = TraceSessionFrameReader::Open( path, *session, error );
     if( !frameReader ) return {};
+    auto jobReader = TraceSessionJobReader::Open( path, *session, error );
+    if( !jobReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -55,14 +57,16 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
-        std::move( frameReader ) ) );
+        std::move( frameReader ), std::move( jobReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
     std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
-    TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader )
+    TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader,
+    std::shared_ptr<TraceSessionJobReader> jobReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
-      m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) )
+      m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
+      m_jobReader( std::move( jobReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -142,7 +146,13 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     };
     addPending( "zone.cpu", TraceSessionProtocolDomain::CpuZone );
     addPending( "zone.gpu", TraceSessionProtocolDomain::GpuZone );
-    addPending( "job", TraceSessionProtocolDomain::Job );
+    static const std::vector<std::string> JobMethods = {
+        "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"
+    };
+    const auto jobPresent = m_jobReader && !m_jobReader->Jobs().empty();
+    result.push_back( Capability { "job", jobPresent, jobPresent, true,
+        jobPresent ? "available from the N30 Session mandatory Job index" :
+            "The source Session contains no Job facts", JobMethods } );
     addPending( "job.gfx", TraceSessionProtocolDomain::Job );
     addPending( "memory", TraceSessionProtocolDomain::CpuMemory );
     addPending( "memory.gpu", TraceSessionProtocolDomain::GpuMemory );
@@ -200,6 +210,7 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
             }
         }
     }
+    if( m_jobReader ) out.counts.jobs = m_jobReader->Stats().jobs;
     return out;
 }
 
@@ -318,7 +329,11 @@ D1(std::vector<PlotPointDto>, ScanPlots, const ScanRange&, range)
 D1(std::vector<std::string>, ScanLocks, const ScanRange&, range)
 D1(std::vector<std::string>, ScanContextSwitches, const ScanRange&, range)
 D1(std::vector<std::string>, ScanSamples, const ScanRange&, range)
-D0(std::vector<JobDto>, GetJobs)
+std::vector<JobDto> GpuAnalysisTraceSource::GetJobs() const
+{
+    if( WorkerLoaded() ) return Worker().GetJobs();
+    return m_jobReader ? m_jobReader->Jobs() : std::vector<JobDto> {};
+}
 D0(std::vector<IoRequestDto>, GetIoRequests)
 D0(std::vector<GfxDispatchDto>, GetGfxDispatches)
 D0(std::vector<GfxEntityDto>, GetGfxEntities)
