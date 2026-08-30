@@ -2,6 +2,7 @@
 #include "TracyGpuAnalysisPath.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
@@ -16,6 +17,8 @@
 #ifdef _WIN32
 #  include <Windows.h>
 #  undef FindResource
+#else
+#  include <unistd.h>
 #endif
 
 namespace tracy::analysis
@@ -190,8 +193,50 @@ uint64_t ChurnBytes( const GpuChurnCandidate& value ) { return sizeof( value ) +
 
 std::string GenerationName()
 {
-    return "g" + std::to_string( std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::system_clock::now().time_since_epoch() ).count() );
+    static std::atomic<uint64_t> sequence { 0 };
+    const auto now = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch() ).count();
+#ifdef _WIN32
+    const auto processId = GetCurrentProcessId();
+#else
+    const auto processId = getpid();
+#endif
+    return "g" + std::to_string( now ) + "-p" + std::to_string( processId ) +
+        "-s" + std::to_string( sequence.fetch_add( 1, std::memory_order_relaxed ) );
+}
+
+bool PublishGenerationDirectory( const std::filesystem::path& staging,
+    const std::filesystem::path& committed, std::string& error )
+{
+    std::error_code existsError;
+    if( std::filesystem::exists( GpuAnalysisIoPath( committed ), existsError ) )
+    {
+        error = "store_generation_collision";
+        return false;
+    }
+    if( existsError )
+    {
+        error = "store_generation_publish_probe_failed:" + existsError.message();
+        return false;
+    }
+#ifdef _WIN32
+    DWORD lastError = ERROR_SUCCESS;
+    for( unsigned attempt = 0; attempt < 8; ++attempt )
+    {
+        if( MoveFileExW( GpuAnalysisIoPath( staging ).c_str(), GpuAnalysisIoPath( committed ).c_str(), MOVEFILE_WRITE_THROUGH ) ) return true;
+        lastError = GetLastError();
+        if( lastError != ERROR_ACCESS_DENIED && lastError != ERROR_SHARING_VIOLATION ) break;
+        Sleep( 1u << attempt );
+    }
+    error = "store_generation_publish_failed:" + std::to_string( lastError );
+    return false;
+#else
+    std::error_code ec;
+    std::filesystem::rename( staging, committed, ec );
+    if( !ec ) return true;
+    error = "store_generation_publish_failed:" + ec.message();
+    return false;
+#endif
 }
 
 bool SaveStoreManifest( const std::filesystem::path& root, const GpuAnalysisStoreManifest& value, std::string& error )
@@ -470,9 +515,14 @@ bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
     }
     if( staging.empty() )
     {
-        generation = GenerationName(); staging = algorithmRoot / ( generation + ".building" );
-        std::filesystem::create_directories( GpuAnalysisIoPath( staging ), ec );
-        if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
+        for( unsigned attempt = 0; attempt < 256; ++attempt )
+        {
+            generation = GenerationName(); staging = algorithmRoot / ( generation + ".building" );
+            if( std::filesystem::create_directory( GpuAnalysisIoPath( staging ), ec ) ) break;
+            if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
+            staging.clear();
+        }
+        if( staging.empty() ) { error = "store_generation_name_exhausted"; return false; }
         manifest.generation = generation; manifest.traceSha256 = identity.sha256; manifest.traceSize = identity.fileSize;
         manifest.resourceCount = snapshot.resources.size(); manifest.allocationCount = snapshot.allocations.size();
         manifest.passCount = snapshot.passes.size(); manifest.residencyCount = snapshot.residency.size(); manifest.churnCount = snapshot.churnCandidates.size();
@@ -543,7 +593,7 @@ bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
 
     manifest.totalBytes = writtenBytes; manifest.complete = true; manifest.reason = snapshot.manifest.reason;
     if( !SaveStoreManifest( staging, manifest, error ) ) return false;
-    std::filesystem::rename( GpuAnalysisIoPath( staging ), GpuAnalysisIoPath( committed ), ec ); if( ec ) { error = "store_generation_publish_failed:" + ec.message(); return false; }
+    if( !PublishGenerationDirectory( staging, committed, error ) ) return false;
     auto currentTmp = algorithmRoot / "current.tmp"; const auto current = algorithmRoot / "current";
     { std::ofstream out( GpuAnalysisIoPath( currentTmp ), std::ios::binary | std::ios::trunc ); out << generation << '\n'; }
     if( !AtomicReplace( currentTmp, current, error ) ) return false;

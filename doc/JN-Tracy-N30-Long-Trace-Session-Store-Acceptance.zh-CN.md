@@ -366,7 +366,7 @@ tracy-stream-journal           Passed
 100% tests passed, 0 failed
 ```
 
-一次联合回归曾在N29 GPU Analysis固定temp目录发布时出现Windows `Access is denied`；不涉及Session代码调用。相同二进制单独连续执行两次及随后相同CTest集合复跑均通过，当前归类为不可复现的测试临时目录占用，保留为后续故障注入观察项，不据此掩盖任何可重复失败。
+一次联合回归在N29 GPU Analysis固定temp目录发布时出现Windows `Access is denied`，随后可稳定复现为测试隔离与generation发布的组合缺陷：测试忽略固定temp根目录清理失败，可能复用上次中断留下的generation；Store又仅以微秒时间命名generation，并以`create_directories`接受已存在目录，最终到目录rename时才失败。修复后测试使用PID+单调nonce独立根目录；生产generation使用时间、PID和进程内原子序号，并以原子`create_directory`占位；Windows目录发布对短暂sharing/access冲突执行有界重试，已存在目标则明确返回`store_generation_collision`。同一CTest连续5次通过，不再把该问题归类为“不可复现”。
 
 ### 尚未完成
 

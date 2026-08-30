@@ -6,6 +6,7 @@
 #include "../../public/common/TracyQueue.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -182,9 +183,21 @@ int main()
     sidecarData.gpuReferencePasses.push_back( { 4, 1000, 5, 1, 0, 0, 0 } );
     sidecarData.gpuReferenceUses.push_back( { 4, 1000, 10, 1, 1, 1, 0, 1 } );
     sidecarData.gpuReferenceEnds.push_back( { 5, 1000, 77, 1, 1, 0, 0 } );
-    const auto testRoot = std::filesystem::temp_directory_path() / "jn-tracy-gpu-analysis-sidecar-test";
+    // Keep independent test processes and interrupted prior runs from sharing
+    // a fixed sidecar directory. Windows may temporarily retain directory
+    // handles after a process exits, so cleanup of a fixed root is not a safe
+    // prerequisite for the next run.
+#ifdef _WIN32
+    const auto testProcessId = GetCurrentProcessId();
+#else
+    const auto testProcessId = getpid();
+#endif
+    const auto testNonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto testRoot = std::filesystem::temp_directory_path() /
+        ( "jn-tracy-gpu-analysis-sidecar-test-p" + std::to_string( testProcessId ) + "-" + std::to_string( testNonce ) );
     std::filesystem::remove_all( testRoot, ec );
     std::filesystem::create_directories( testRoot, ec );
+    assert( !ec && std::filesystem::is_directory( testRoot ) );
     const auto tracePath = testRoot / "test.tracy";
     {
         std::ofstream trace( tracePath, std::ios::binary | std::ios::trunc );
@@ -284,11 +297,6 @@ int main()
     // generation are retained.
     const auto writerLease = sidecarPath / ".writer-lease";
     std::filesystem::create_directory( writerLease, ec );
-#ifdef _WIN32
-    const auto testProcessId = GetCurrentProcessId();
-#else
-    const auto testProcessId = getpid();
-#endif
     { std::ofstream heartbeat( writerLease / "heartbeat" ); heartbeat << "pid=" << testProcessId << "\n"; }
     assert( !BuildGpuAnalysisDerived( tracePath, sidecarControl, error ) );
     assert( error == "writer_lease_active" );
