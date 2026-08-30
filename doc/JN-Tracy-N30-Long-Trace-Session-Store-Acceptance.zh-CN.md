@@ -77,7 +77,7 @@ Projected full replay: approximately 90–100 GiB
 |---|---|---|
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
-| N30.2 Inventory与容量预检 | NotStarted | — |
+| N30.2 Inventory与容量预检 | InProgress | Journal/身份/容量核心已通过真实30分钟输入；Protocol QueueType/域计数待完成。 |
 | N30.3 Canonical/Checkpoint | NotStarted | — |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
@@ -145,3 +145,89 @@ CPM_SOURCE_CACHE=C:\CodeProjects\GodotProjects\tracy-0.13.1-n29-gpu-analysis\bui
 
 - 当前文件提交具备临时文件、校验和与原子 rename；完整故障注入和恢复矩阵在 N30.3 执行。
 - `FlushFileBuffers` 级耐久性、孤立 generation 清理和杀进程恢复在 Checkpoint/Recovery 实现时统一完成。
+
+## 4. N30.2 Source Inventory 与容量预检（进行中）
+
+### 已完成的有界 Journal Inventory
+
+- `ScanJournal` 增加提交后 Record visitor；visitor 只接收已经通过 Header、Payload、Trailer 和全部 CRC 的记录。
+- Inventory 将 `maxCollectedRecords` 固定为 0，不在内存保留逐 Record 元数据。
+- 精确统计 SessionBegin、ClientToServer、ServerToClient、Checkpoint、SessionEnd 和 Diagnostic 的数量、payload bytes 与 committed bytes。
+- 保存 Protocol、Capture Session ID、committed revision、valid prefix、CRC、完整/降级状态和明确质量原因。
+- 完整 SHA-256 覆盖原始文件全部字节，包括 committed prefix 之外的尾部；committed 统计只覆盖验证通过的 prefix。
+- Canonical、Derived 和 temporary 使用整数、溢出保护的保守空间估算。
+- 容量预检执行 256 GiB Session 上限和 `max(64 GiB, volume 10%)` 安全预留。
+- Scan 与 Hash 两个阶段均提供单调 byte progress；诊断工具每5秒输出一次。
+
+### TDD 证据
+
+RED：
+
+1. Inventory 接口尚不存在时，测试因缺少 `TracyTraceSessionInventory.hpp` 编译失败。
+2. Progress API 尚不存在时，测试因缺少 `TraceSessionInventoryPhase` 和 progress callback 编译失败。
+
+GREEN 覆盖：
+
+- clean terminal journal。
+- committed revision 和按方向 bytes/count。
+- recoverable truncated tail。
+- 10,000 records 下 retained metadata 恒为0。
+- Inventory 原子落盘和 round-trip。
+- Session 256 GiB 上限、64 GiB/10% volume reserve。
+- Scan/Hash progress 单调且抵达 source size。
+- N30.1 Store 与 N29 GPU Analysis 联合回归。
+
+```text
+tracy-gpu-analysis             Passed
+tracy-trace-session-store      Passed
+tracy-trace-session-inventory  Passed
+100% tests passed, 0 failed
+```
+
+### 真实30分钟输入
+
+输入：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\N29-Autonomous-30m\Run-20260830-220012\Admin-HighEvidence-30m.tracy-stream
+```
+
+结果：
+
+| 项目 | 数值 |
+|---|---:|
+| Source bytes | 19,122,822,908 |
+| Source SHA-256 | `2AC46C53257CE9027EC67E098FC15070FB911243F6CD311A166EB97547848068` |
+| Valid committed bytes | 19,122,822,908 |
+| Committed revision / records | 499,362 |
+| Client records | 193,144 |
+| Client payload bytes | 19,078,853,869 |
+| Server records | 304,425 |
+| Server payload bytes | 3,976,985 |
+| Source state | complete / not degraded |
+| Estimated Canonical | 22,947,387,490 bytes |
+| Estimated total build | 51,631,621,852 bytes |
+| Required available incl. reserve | 461,259,618,422 bytes |
+| Capacity | accepted |
+| Observed Working Set | 约8.8 MiB |
+| Observed Private bytes | 约1.8 MiB |
+| 扫描墙钟 | 约2分15秒～2分23秒（两次独立运行） |
+
+两次输出 Inventory 均为736 bytes，文件 SHA-256 均为：
+
+```text
+5EE7CE991FAD448D9386356EC854F67928AC1CF4F5EFFB540F04C88AD5C2235F
+```
+
+保存位置：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\N30-Inventory\
+```
+
+### 尚未完成，不能提前通过 N30.2
+
+- Protocol 90 解压后的 QueueType 精确计数与数据域分类。
+- Dictionary、Blob、Callstack 依赖和迟到事件分布的磁盘 run。
+- `last committed revision` 在 producer 已声明 drop/强制退出语义下的域级质量映射。
+- Inventory build-state/checkpoint 与 GracefulCancel/Resume；该状态机与 N30.3 共用实现。

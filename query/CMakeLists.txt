@@ -110,6 +110,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-trace-session-store-tests)
     add_test(NAME tracy-trace-session-store COMMAND tracy-trace-session-store-tests)
 
+    add_executable(tracy-trace-session-inventory-tests tests/TraceSessionInventoryTests.cpp)
+    target_link_libraries(tracy-trace-session-inventory-tests PRIVATE TracyAnalysis TracyStreamCore)
+    tracy_query_enable_assertions(tracy-trace-session-inventory-tests)
+    add_test(NAME tracy-trace-session-inventory COMMAND tracy-trace-session-inventory-tests)
+
     add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)
     target_link_libraries(tracy-gpu-analysis-corpus PRIVATE TracyAnalysis)
 

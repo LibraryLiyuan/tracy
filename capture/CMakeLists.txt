@@ -42,4 +42,7 @@ endif()
 add_executable(tracy-stream-inspect src/stream-inspect.cpp)
 target_link_libraries(tracy-stream-inspect PRIVATE TracyServer TracyStreamCore)
 
+add_executable(tracy-session-inventory src/session-inventory.cpp)
+target_link_libraries(tracy-session-inventory PRIVATE TracyAnalysis TracyStreamCore)
+
 install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL_BINDIR})

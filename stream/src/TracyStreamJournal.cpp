@@ -727,15 +727,17 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         candidatePrefixState.Update( trailerBytes.data(), trailerBytes.size() );
 
         const auto type = RecordType( Get16( headerBytes.data(), 6 ) );
+        const RecordInfo record {
+            offset,
+            sequence,
+            monotonicNs,
+            payloadSize,
+            Get32( headerBytes.data(), 8 ),
+            type };
+        if( options.recordVisitor ) options.recordVisitor( record, options.recordVisitorUserData );
         if( result.records.size() < options.maxCollectedRecords )
         {
-            result.records.emplace_back( RecordInfo {
-                offset,
-                sequence,
-                monotonicNs,
-                payloadSize,
-                Get32( headerBytes.data(), 8 ),
-                type } );
+            result.records.emplace_back( record );
         }
         result.recordCount++;
         result.lastSequence = sequence;

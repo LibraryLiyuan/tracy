@@ -9,6 +9,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionInventory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.cpp
 )
@@ -23,6 +24,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSource.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionInventory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStore.hpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.hpp
 )
@@ -30,4 +32,4 @@ set(TRACY_ANALYSIS_HEADERS
 add_library(TracyAnalysis STATIC ${TRACY_ANALYSIS_SOURCES} ${TRACY_ANALYSIS_HEADERS})
 target_include_directories(TracyAnalysis PUBLIC ${TRACY_ANALYSIS_DIR})
 target_compile_features(TracyAnalysis PUBLIC cxx_std_20)
-target_link_libraries(TracyAnalysis PRIVATE TracyServer)
+target_link_libraries(TracyAnalysis PRIVATE TracyServer TracyStreamCore)

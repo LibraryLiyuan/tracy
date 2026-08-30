@@ -142,10 +142,18 @@ struct RecordInfo
     RecordType type = RecordType::Diagnostic;
 };
 
+using ScanRecordVisitor = void ( * )( const RecordInfo& record, void* userData );
+
 struct ScanOptions
 {
     uint64_t maxPayloadSize = DefaultMaxPayloadSize;
     size_t maxCollectedRecords = 256;
+    // Called only after the complete record header, payload, trailer and all
+    // checksums have been validated. The callback must not retain pointers to
+    // scanner-owned buffers. It enables bounded-memory inventory consumers
+    // without duplicating the journal validation rules.
+    ScanRecordVisitor recordVisitor = nullptr;
+    void* recordVisitorUserData = nullptr;
 };
 
 struct ScanResult
