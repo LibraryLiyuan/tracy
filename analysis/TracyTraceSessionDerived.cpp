@@ -8,6 +8,7 @@
 #include "TracyTraceSessionCpuZones.hpp"
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
+#include "TracyTraceSessionScheduling.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -195,6 +196,12 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "context_switch_sample_events " << value.stats.contextSwitchSampleEvents << '\n';
     out << "sample_dictionary_entries " << value.stats.sampleDictionaryEntries << '\n';
     out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
+    out << "context_switch_records " << value.stats.contextSwitchRecords << '\n';
+    out << "thread_wakeup_records " << value.stats.threadWakeupRecords << '\n';
+    out << "context_switch_events " << value.stats.contextSwitchEvents << '\n';
+    out << "complete_context_switch_events " << value.stats.completeContextSwitchEvents << '\n';
+    out << "cpu_context_switch_events " << value.stats.cpuContextSwitchEvents << '\n';
+    out << "complete_cpu_context_switch_events " << value.stats.completeCpuContextSwitchEvents << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -266,6 +273,12 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "context_switch_sample_events" ) in >> value.stats.contextSwitchSampleEvents;
         else if( key == "sample_dictionary_entries" ) in >> value.stats.sampleDictionaryEntries;
         else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
+        else if( key == "context_switch_records" ) in >> value.stats.contextSwitchRecords;
+        else if( key == "thread_wakeup_records" ) in >> value.stats.threadWakeupRecords;
+        else if( key == "context_switch_events" ) in >> value.stats.contextSwitchEvents;
+        else if( key == "complete_context_switch_events" ) in >> value.stats.completeContextSwitchEvents;
+        else if( key == "cpu_context_switch_events" ) in >> value.stats.cpuContextSwitchEvents;
+        else if( key == "complete_cpu_context_switch_events" ) in >> value.stats.completeCpuContextSwitchEvents;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -456,6 +469,15 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.sampleDictionaryEntries = samplingStats.dictionaryEntries;
     index.stats.callstackPayloads = samplingStats.callstackPayloads;
 
+    TraceSessionSchedulingStats schedulingStats;
+    if( !BuildTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ) return false;
+    index.stats.contextSwitchRecords = schedulingStats.contextSwitchRecords;
+    index.stats.threadWakeupRecords = schedulingStats.wakeupRecords;
+    index.stats.contextSwitchEvents = schedulingStats.threadEvents;
+    index.stats.completeContextSwitchEvents = schedulingStats.completeThreadEvents;
+    index.stats.cpuContextSwitchEvents = schedulingStats.cpuEvents;
+    index.stats.completeCpuContextSwitchEvents = schedulingStats.completeCpuEvents;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -549,6 +571,15 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         samplingStats.dictionaryEntries != index.stats.sampleDictionaryEntries ||
         samplingStats.callstackPayloads != index.stats.callstackPayloads )
     { if( error.empty() ) error = "session_sampling_derived_audit_mismatch"; return false; }
+    TraceSessionSchedulingStats schedulingStats;
+    if( !AuditTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ||
+        schedulingStats.contextSwitchRecords != index.stats.contextSwitchRecords ||
+        schedulingStats.wakeupRecords != index.stats.threadWakeupRecords ||
+        schedulingStats.threadEvents != index.stats.contextSwitchEvents ||
+        schedulingStats.completeThreadEvents != index.stats.completeContextSwitchEvents ||
+        schedulingStats.cpuEvents != index.stats.cpuContextSwitchEvents ||
+        schedulingStats.completeCpuEvents != index.stats.completeCpuContextSwitchEvents )
+    { if( error.empty() ) error = "session_scheduling_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
@@ -592,6 +623,9 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         queueCounts[size_t( QueueType::CallstackSampleDictionary )].count != index.stats.sampleDictionaryEntries ||
         queueCounts[size_t( QueueType::CallstackPayload )].count != index.stats.callstackPayloads )
     { error = "session_sampling_source_count_mismatch"; return false; }
+    if( queueCounts[size_t( QueueType::ContextSwitch )].count != index.stats.contextSwitchRecords ||
+        queueCounts[size_t( QueueType::ThreadWakeup )].count != index.stats.threadWakeupRecords )
+    { error = "session_scheduling_source_count_mismatch"; return false; }
     stats = index.stats;
     return true;
 }

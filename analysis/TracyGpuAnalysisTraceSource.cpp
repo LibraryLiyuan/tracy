@@ -39,6 +39,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !memoryReader ) return {};
     auto samplingReader = TraceSessionSamplingReader::Open( path, *session, error );
     if( !samplingReader ) return {};
+    auto schedulingReader = TraceSessionSchedulingReader::Open( path, *session, error );
+    if( !schedulingReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -64,7 +66,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
         std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ),
-        std::move( memoryReader ), std::move( samplingReader ) ) );
+        std::move( memoryReader ), std::move( samplingReader ),
+        std::move( schedulingReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -73,11 +76,13 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionJobReader> jobReader,
     std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader,
     std::shared_ptr<TraceSessionMemoryReader> memoryReader,
-    std::shared_ptr<TraceSessionSamplingReader> samplingReader )
+    std::shared_ptr<TraceSessionSamplingReader> samplingReader,
+    std::shared_ptr<TraceSessionSchedulingReader> schedulingReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
       m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
-      m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) )
+      m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
+      m_schedulingReader( std::move( schedulingReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -193,8 +198,18 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
             "The source Session contains no Sampling facts", SampleMethods } );
     addPending( "hardware_sample", TraceSessionProtocolDomain::Sampling );
     addPending( "thread", TraceSessionProtocolDomain::Scheduling );
-    addPending( "cpu", TraceSessionProtocolDomain::Scheduling );
-    addPending( "context_switch", TraceSessionProtocolDomain::Scheduling );
+    static const std::vector<std::string> CpuSchedulingMethods = { "cpu.timeline" };
+    const auto cpuSchedulingPresent = m_schedulingReader && m_schedulingReader->Stats().cpuEvents != 0;
+    result.push_back( Capability { "cpu", cpuSchedulingPresent, cpuSchedulingPresent, true,
+        cpuSchedulingPresent ? "CPU timeline is available from the N30 Session mandatory Scheduling index" :
+            "The source Session contains no CPU scheduling intervals", CpuSchedulingMethods } );
+    static const std::vector<std::string> ContextSwitchMethods = {
+        "context_switch.range", "context_switch.thread", "context_switch.statistics"
+    };
+    const auto contextSwitchPresent = m_schedulingReader && m_schedulingReader->Stats().threadEvents != 0;
+    result.push_back( Capability { "context_switch", contextSwitchPresent, contextSwitchPresent, true,
+        contextSwitchPresent ? "available from the N30 Session mandatory Scheduling index" :
+            "The source Session contains no Context Switch intervals", ContextSwitchMethods } );
     addPending( "message", TraceSessionProtocolDomain::MessagePlotLock );
     addPending( "plot", TraceSessionProtocolDomain::MessagePlotLock );
     addPending( "lock", TraceSessionProtocolDomain::MessagePlotLock );
@@ -256,6 +271,8 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
         out.counts.contextSwitchSamples = m_samplingReader->Stats().contextSwitchSamples;
         out.counts.callstackPayloads = m_samplingReader->Stats().callstackPayloads;
     }
+    if( m_schedulingReader ) out.counts.contextSwitches =
+        m_schedulingReader->Stats().threadEvents;
     return out;
 }
 
@@ -406,8 +423,20 @@ D0(std::vector<CallsiteDto>, GetCallsites)
 D0(CrashDto, GetCrash)
 D0(std::vector<CpuTopologyDto>, GetCpuTopology)
 D0(std::vector<CpuUsagePointDto>, GetCpuUsage)
-D1(std::vector<ContextSwitchDto>, ScanContextSwitchEvents, const ScanRange&, range)
-D1(std::vector<CpuContextSwitchDto>, ScanCpuContextSwitchEvents, const ScanRange&, range)
+std::vector<ContextSwitchDto> GpuAnalysisTraceSource::ScanContextSwitchEvents(
+    const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanContextSwitchEvents( range );
+    return m_schedulingReader ? m_schedulingReader->ScanThreads( range ) :
+        std::vector<ContextSwitchDto> {};
+}
+std::vector<CpuContextSwitchDto> GpuAnalysisTraceSource::ScanCpuContextSwitchEvents(
+    const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanCpuContextSwitchEvents( range );
+    return m_schedulingReader ? m_schedulingReader->ScanCpus( range ) :
+        std::vector<CpuContextSwitchDto> {};
+}
 std::vector<SampleDto> GpuAnalysisTraceSource::ScanSampleEvents( const ScanRange& range ) const
 {
     if( WorkerLoaded() ) return Worker().ScanSampleEvents( range );

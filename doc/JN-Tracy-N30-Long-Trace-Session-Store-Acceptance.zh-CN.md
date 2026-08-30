@@ -480,6 +480,11 @@ GREEN：
 - `CallstackPayload`与`CallstackSampleDictionary`进入统一内容寻址Callstack ID空间；普通Sample消费pending callstack，Ref Sample只接受已经声明的dictionary id，未知、重复或协议状态冲突均阻止构建。
 - `sample.list`现由Session Sampling Reader直接分页扫描固定宽度记录，不实例化Worker；能力只声明已经实现的`sample.list`，Ghost Zone、Flamegraph和Symbol Statistics仍保持不可用，禁止过度宣称。
 - `samples.bin`保存source强身份、generation、普通/ContextSwitch Sample、dictionary与Callstack payload计数；Final Audit执行完整SHA-256并与Inventory四类Sample QueueType逐项守恒。
+- Scheduling域新增`scheduling-index/1/exact/scheduling.bin`：每个native thread和CPU使用独立顺序work file，切入立即追加，切出只原位补齐End/Reason/State；构建期内存仅保留每线程/每CPU最后一个开放区间和pending wakeup。
+- `ThreadWakeup`、`ContextSwitch`以及两类Sample共享Worker的`m_refTimeCtx` delta时钟；wakeup时间/CPU和实际run时间/CPU分别保存，跨CPU唤醒不会被误写成实际运行CPU。
+- 线程区间严格恢复Wakeup→Start→End、wait reason/state和开放边界；CPU区间独立恢复实际占用线程，外部线程压缩索引按Worker首次切入顺序生成。
+- `context_switch.range/thread/statistics`和`cpu.timeline`直接读取Scheduling Reader，不实例化Worker；`thread`、CPU topology和CPU usage尚未具备磁盘语义Reader，仍保持不可查询。
+- Final Audit对`scheduling.bin`执行完整SHA-256，逐项核对源`ContextSwitch`与`ThreadWakeup` QueueType计数；派生线程/CPU区间计数不能替代源记录守恒。
 
 ### TDD证据
 
@@ -491,6 +496,7 @@ RED：
 - Job Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Job only after its disk-backed semantic reader is ready`。
 - Memory Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Memory only after its disk-backed semantic reader is ready`。
 - Sampling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Sampling only after its disk-backed semantic reader is ready`。
+- Scheduling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Context Switch only after its disk-backed semantic reader is ready`。
 
 GREEN：
 
@@ -514,11 +520,15 @@ GREEN：
 - Final Audit在`memory.bin`同尺寸内容被篡改后返回`session_memory_file_sha256_mismatch`。
 - Sampling GREEN恢复thread 42的普通Sample=14ns与ContextSwitch Sample=16ns；两者都由Sample Dictionary解析到全局Callstack ID 1，直接Reader和Query 1.34 `sample.list`结果一致。
 - Final Audit在`samples.bin`同尺寸内容被篡改后返回`session_sampling_file_sha256_mismatch`。
+- Scheduling GREEN恢复thread 42的`[18,28]ns`运行区间和thread 43的`wakeup=22ns/start=28ns/end=36ns`区间；后者保留wakeup CPU 1、实际CPU 0以及`delay_execution/ready`结束状态。
+- CPU timeline GREEN恢复CPU 0上thread 42与43的两个连续区间；直接Reader和Query 1.34 `context_switch.range`结果一致。
+- Final Audit在`scheduling.bin`同尺寸内容被篡改后返回`session_scheduling_file_sha256_mismatch`。
 - Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- GPU Zone、Context Switch调度区间和FrameImage的语义分页Reader。
+- GPU Zone和FrameImage的语义分页Reader。
+- Scheduling当前以线程/CPU固定宽度区域线性扫描；在N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。Thread identity/name、CPU topology和CPU usage磁盘Reader尚未完成。
 - Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation磁盘Reader尚未完成，因此Sample目前能返回稳定`callstack_ref`，但不能在Session路径解析到完整符号帧。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
@@ -578,6 +588,29 @@ tracy-gpu-analysis-n29-static     Passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `921FB679CEE6692B5CBBCCDC8C3686EFDDC5ACFFF97FDB418E11ECA5F6C3114A` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `33F44EE053E98D83DE5223AF7DEFA8A96C4179CE354338D306E340FD2C183513` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Context Switch Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `F55DE8046A0F73202EC42298CCF93A6B0A10D2D8CDF3511292B3ECF87CCF1E89` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `2A3A806F3246C191784838C5A0DF2AF634EFAFB670EDCC4D011354E8898BDFE5` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

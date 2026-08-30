@@ -6,6 +6,7 @@
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
+#include "TracyTraceSessionScheduling.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -980,6 +981,37 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::CallstackSampleContextSwitchRef;
     item.callstackSampleRef = { { 1, 42 }, 1 };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 1;
+    item.contextSwitch.oldThread = 0;
+    item.contextSwitch.newThread = 42;
+    item.contextSwitch.cpu = 0;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ThreadWakeup;
+    item.threadWakeup.time = 2;
+    item.threadWakeup.thread = 43;
+    item.threadWakeup.cpu = 1;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 3;
+    item.contextSwitch.oldThread = 42;
+    item.contextSwitch.newThread = 43;
+    item.contextSwitch.cpu = 0;
+    item.contextSwitch.oldThreadWaitReason = 5;
+    item.contextSwitch.oldThreadState = 5;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 4;
+    item.contextSwitch.oldThread = 43;
+    item.contextSwitch.newThread = 0;
+    item.contextSwitch.cpu = 0;
+    item.contextSwitch.oldThreadWaitReason = 4;
+    item.contextSwitch.oldThreadState = 1;
+    AppendQueueItem( frame, item );
     const std::array<uint64_t, 2> jobCallstack { 0x20202020, 0x30303030 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x3333,
         std::string( reinterpret_cast<const char*>( jobCallstack.data() ), sizeof( jobCallstack ) ) );
@@ -1377,6 +1409,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sampleCapability->present && sampleCapability->indexed && sampleCapability->queryable;
     test.Check( sessionSamplesReady,
         "Session advertises Sampling only after its disk-backed semantic reader is ready" );
+    const auto schedulingCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "context_switch"; } );
+    const bool sessionSchedulingReady = schedulingCapability != sessionCapabilities.end() &&
+        schedulingCapability->present && schedulingCapability->indexed && schedulingCapability->queryable;
+    test.Check( sessionSchedulingReady,
+        "Session advertises Context Switch only after its disk-backed semantic reader is ready" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1435,6 +1473,25 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             samples[1].timeNs == 16 && samples[1].callstack == 1 &&
             samples[1].kind == "context_switch",
             "Session Sampling reader restores dictionary callstacks and shared context time" );
+    }
+    if( sessionSchedulingReady )
+    {
+        const auto contexts = sessionSource->ScanContextSwitchEvents( {} );
+        const auto cpuContexts = sessionSource->ScanCpuContextSwitchEvents( {} );
+        test.Check( contexts.size() == 2 && contexts[0].startNs == 18 &&
+            contexts[0].endNs == 28 && contexts[0].wakeupNs == 18 &&
+            contexts[0].cpu == 0 && contexts[0].wakeupCpu == 0 &&
+            contexts[0].reason == 5 && contexts[0].state == 5 &&
+            contexts[1].startNs == 28 && contexts[1].endNs == 36 &&
+            contexts[1].wakeupNs == 22 && contexts[1].wakeupCpu == 1 &&
+            contexts[1].reason == 4 && contexts[1].state == 1,
+            "Session Context Switch reader restores wakeup, run and wait-state semantics" );
+        test.Check( cpuContexts.size() == 2 && cpuContexts[0].startNs == 18 &&
+            cpuContexts[0].endNs == 28 && cpuContexts[0].threadRef ==
+                sessionSource->MakeEntityRef( "thread", 42 ) &&
+            cpuContexts[1].startNs == 28 && cpuContexts[1].endNs == 36 &&
+            cpuContexts[1].threadRef == sessionSource->MakeEntityRef( "thread", 43 ),
+            "Session CPU scheduling reader restores exact CPU occupancy intervals" );
     }
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
@@ -1574,6 +1631,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         {
             test.Check( false, std::string( "Query 1.34 Session Sampling Reader is unavailable: " ) + exception.what() );
         }
+        if( sessionSchedulingReady ) try
+        {
+            const auto contexts = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-contexts" },
+                { "method", "context_switch.range" }, { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( contexts.value( "ok", false ) &&
+                contexts["data"]["context_switches"].size() == 2 &&
+                contexts["data"]["context_switches"][1]["wakeup_ns"] == "22" &&
+                contexts["data"]["context_switches"][1]["reason_name"] == "delay_execution",
+                "Query 1.34 reads Session Context Switch intervals without a Worker" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session Context Switch Reader is unavailable: " ) + exception.what() );
+        }
     }
     const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
         publishedSession, manifest ) / "frames.bin";
@@ -1635,6 +1708,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedSamplingStats, error ) &&
         error == "session_sampling_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Sampling semantic index" );
+    const auto schedulingFile = tracy::analysis::TraceSessionSchedulingIndexRoot(
+        publishedSession, manifest ) / "scheduling.bin";
+    {
+        std::fstream damaged( schedulingFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x47 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionSchedulingStats rejectedSchedulingStats;
+    test.Check( !tracy::analysis::AuditTraceSessionSchedulingDerived(
+        publishedSession, manifest, rejectedSchedulingStats, error ) &&
+        error == "session_scheduling_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Scheduling semantic index" );
 }
 
 }

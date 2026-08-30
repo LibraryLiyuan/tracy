@@ -56,6 +56,12 @@ struct TraceSessionDerivedStats
     uint64_t contextSwitchSampleEvents = 0;
     uint64_t sampleDictionaryEntries = 0;
     uint64_t callstackPayloads = 0;
+    uint64_t contextSwitchRecords = 0;
+    uint64_t threadWakeupRecords = 0;
+    uint64_t contextSwitchEvents = 0;
+    uint64_t completeContextSwitchEvents = 0;
+    uint64_t cpuContextSwitchEvents = 0;
+    uint64_t completeCpuContextSwitchEvents = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 
