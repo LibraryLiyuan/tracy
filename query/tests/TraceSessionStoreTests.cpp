@@ -4,9 +4,11 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <vector>
 
 using namespace tracy::analysis;
 
@@ -75,6 +77,10 @@ int main()
     shard.sourceRecordEnd = 15;
     shard.recordCount = payload.size();
     assert( WriteTraceSessionShard( buildingPath, generation, shard, payload.data(), sizeof( payload ), error ) );
+    std::vector<uint8_t> loadedPayload;
+    assert( ReadTraceSessionShardPayload( buildingPath, shard, loadedPayload, error ) );
+    assert( loadedPayload.size() == sizeof( payload ) );
+    assert( std::memcmp( loadedPayload.data(), payload.data(), sizeof( payload ) ) == 0 );
     assert( shard.relativePath == std::filesystem::path( "generations" ) / generation / "canonical" / "frame-000007.bin" );
     assert( shard.uncompressedBytes == sizeof( payload ) );
     assert( shard.sha256.size() == 64 );

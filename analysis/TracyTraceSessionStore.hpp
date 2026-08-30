@@ -91,6 +91,8 @@ std::optional<TraceSessionManifest> LoadTraceSessionManifest(
 
 bool WriteTraceSessionShard( const std::filesystem::path& root, const std::string& generation,
     TraceSessionShard& shard, const void* payload, size_t payloadBytes, std::string& error );
+bool ReadTraceSessionShardPayload( const std::filesystem::path& root,
+    const TraceSessionShard& shard, std::vector<uint8_t>& payload, std::string& error );
 bool VerifyTraceSession( const std::filesystem::path& root,
     const TraceSessionManifest& manifest, std::string& error );
 bool VerifyTraceSessionSourceIdentity( const std::filesystem::path& sourcePath,

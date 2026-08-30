@@ -750,6 +750,12 @@ ScanResult Scan( ScanSource& source, const ScanOptions& options )
         previousTimestamp = monotonicNs;
         expectedSequence++;
         offset = result.validSize;
+        if( !ended && options.stopRequested && options.stopRequested( options.stopRequestedUserData ) )
+        {
+            result.code = ScanCode::Stopped;
+            result.message = "journal scan stopped at a committed record boundary";
+            return result;
+        }
     }
 
     result.message = result.complete ? "journal is complete" : "journal has a valid incomplete session";
@@ -1040,12 +1046,12 @@ bool JournalWriter::Flush( FlushMode mode, std::string& error )
 
 bool ScanResult::HasValidHeader() const
 {
-    return ( code == ScanCode::Ok || code == ScanCode::TruncatedTail || code == ScanCode::CorruptTail || code == ScanCode::IoError ) && validSize >= FileHeaderSize;
+    return ( code == ScanCode::Ok || code == ScanCode::Stopped || code == ScanCode::TruncatedTail || code == ScanCode::CorruptTail || code == ScanCode::IoError ) && validSize >= FileHeaderSize;
 }
 
 bool ScanResult::HasRecoverablePrefix() const
 {
-    return ( code == ScanCode::Ok || code == ScanCode::TruncatedTail || code == ScanCode::CorruptTail ) && validSize >= FileHeaderSize;
+    return ( code == ScanCode::Ok || code == ScanCode::Stopped || code == ScanCode::TruncatedTail || code == ScanCode::CorruptTail ) && validSize >= FileHeaderSize;
 }
 
 ScanResult ScanJournal( const std::filesystem::path& path, const ScanOptions& options )
@@ -1132,6 +1138,7 @@ const char* ScanCodeName( ScanCode code )
     switch( code )
     {
     case ScanCode::Ok: return "OK";
+    case ScanCode::Stopped: return "STOPPED";
     case ScanCode::TruncatedFileHeader: return "TRUNCATED_FILE_HEADER";
     case ScanCode::InvalidFileHeader: return "INVALID_FILE_HEADER";
     case ScanCode::TruncatedTail: return "TRUNCATED_TAIL";

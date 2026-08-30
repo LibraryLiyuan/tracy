@@ -154,6 +154,38 @@ std::vector<uint8_t> MakeValidJournal( TestContext& test, std::vector<RecordInfo
     return sink->bytes;
 }
 
+struct StopAfterState
+{
+    size_t checks = 0;
+    size_t limit = 0;
+};
+
+bool StopAfterCommittedRecords( void* userData )
+{
+    auto& state = *static_cast<StopAfterState*>( userData );
+    return ++state.checks >= state.limit;
+}
+
+void TestScanStopAtCommittedBoundary( TestContext& test,
+    const std::vector<uint8_t>& valid, const std::vector<RecordInfo>& records )
+{
+    StopAfterState stop { 0, 2 };
+    ScanOptions options;
+    options.maxCollectedRecords = 0;
+    options.stopRequested = StopAfterCommittedRecords;
+    options.stopRequestedUserData = &stop;
+    const auto scan = ScanJournal( valid, options );
+    test.Check( scan.code == ScanCode::Stopped, "scan reports an intentional committed-boundary stop" );
+    test.Check( scan.HasRecoverablePrefix(), "stopped scan exposes a recoverable prefix" );
+    test.Check( scan.recordCount == 2 && scan.lastSequence == 2,
+        "stopped scan commits exactly the requested records" );
+    const auto expectedValidSize = records[1].offset + RecordHeaderSize +
+        records[1].payloadSize + RecordTrailerSize;
+    test.Check( scan.validSize == expectedValidSize,
+        "stopped scan prefix ends after the complete second record" );
+    test.Check( !scan.complete, "stopping before SessionEnd is not reported as complete" );
+}
+
 void Put64( std::vector<uint8_t>& bytes, size_t offset, uint64_t value )
 {
     for( size_t i = 0; i < 8; i++ ) bytes[offset + i] = uint8_t( value >> ( i * 8 ) );
@@ -832,6 +864,7 @@ int main()
     const auto valid = MakeValidJournal( test, &records );
     if( !valid.empty() && records.size() == 4 )
     {
+        TestScanStopAtCommittedBoundary( test, valid, records );
         TestEveryTruncation( test, valid, records );
         TestCorruption( test, valid, records );
     }

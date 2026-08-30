@@ -78,7 +78,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.0 隔离、计划与Oracle | Passed | 独立分支/worktree、正式计划、Oracle和30分钟失败基线已提交。 |
 | N30.1 Schema与原子存储 | Passed | Schema 1、强身份、Shard校验、多generation原子发布和查询门禁通过。 |
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
-| N30.3 Canonical/Checkpoint | InProgress | Raw Canonical event/transport shard、LZ4字典checkpoint和强身份门禁已通过synthetic；取消/恢复与语义时间状态待完成。 |
+| N30.3 Canonical/Checkpoint | InProgress | Raw Canonical shard、record-boundary安全取消、LZ4字典checkpoint、强身份及损坏拒绝已通过synthetic；完整语义状态、压力暂停与writer lease待完成。 |
 | N30.4 全Canonical域 | NotStarted | — |
 | N30.5 Derived/N29整合 | NotStarted | — |
 | N30.6 Query/MCP/导出 | NotStarted | — |
@@ -313,12 +313,19 @@ Admin-HighEvidence-30m-with-runs.inventory.runs\
 - 非压缩的SessionBegin、ServerToClient、Checkpoint、SessionEnd和Diagnostic以transport record保留，避免新Session丢失服务端请求及录制控制事实。
 - Canonical record保存kind、QueueType/RecordType、数据域、flags、source sequence、Journal到达时间、protocol frame ordinal和原始payload。
 - Shard只在完整Journal record边界提交；每个Shard后提交checkpoint。
-- Checkpoint保存source sequence、下一source offset、protocol frame ordinal、累计事件数、LZ4 dictionary和前一checkpoint hash。
+- Checkpoint保存source sequence、下一source offset、protocol frame ordinal、累计协议事件数、累计transport record数、LZ4 dictionary和前一checkpoint hash。
 - Canonical开始前重新执行source强身份验证，防止Inventory后同尺寸替换源文件。
+- Journal scanner新增`Stopped`状态，只在完整Record Header、Payload、Trailer和全部CRC校验通过后响应停止请求。
+- 第一次取消会封存当前Shard、提交Checkpoint、原子更新manifest为`CancelledResumable`；不会发布Session。
+- 恢复前重新校验source强身份、全部已提交Shard及Checkpoint链；从最后source sequence继续，已提交Shard不重写。
+- 当前实现为正确性优先：恢复时重新顺序验证source前缀，但跳过已提交记录的payload读取和Canonical重建；后续可由持久Inventory run优化seek，不改变恢复语义。
 
 ### TDD证据
 
-RED：decoder尚无`ExportDictionary/RestoreDictionary`时编译失败。
+RED：
+
+1. decoder尚无`ExportDictionary/RestoreDictionary`时编译失败。
+2. Canonical尚无cancel callback、三态BuildResult与resume状态时，取消/恢复测试按预期编译失败。
 
 GREEN：
 
@@ -327,11 +334,26 @@ GREEN：
 - decoded protocol events + non-compressed transport records总数守恒。
 - 每个Canonical segment存在checkpoint。
 - Canonical和Checkpoint文件大小、manifest及SHA-256全部通过`VerifyTraceSession`。
+- 在第一个连续压缩帧后取消，manifest进入`CancelledResumable`，且已提交Shard可验证。
+- 从Checkpoint恢复LZ4连续字典并解析依赖第一帧字典的第二帧；累计事件和transport记录无重复、无丢失。
+- 恢复后原有Shard ID与SHA-256完全不变，只追加新Shard。
+- 同尺寸source内容替换被完整SHA-256拒绝，返回`source_sha256_mismatch`。
+- 已提交Checkpoint追加损坏字节后，恢复返回`session_shard_size_mismatch`，不会越过损坏点猜测继续。
+- Journal停止测试证明`validSize`严格等于第二个完整Record末尾，且停止前缀可恢复、不伪装为完整Session。
+
+阶段回归：
+
+```text
+tracy-gpu-analysis             Passed
+tracy-trace-session-store      Passed
+tracy-trace-session-inventory  Passed
+tracy-stream-journal           Passed
+100% tests passed, 0 failed
+```
 
 ### 尚未完成
 
-- GracefulCancel、扫描提前停止和`CancelledResumable`。
-- 从最后checkpoint恢复而不重写已提交Shard。
 - 可序列化TSC/thread/dictionary/gpu calibration等完整decoder状态。
 - 跨Shard Zone、Job、Allocation、Resource、I/O状态。
 - 内存/磁盘压力暂停和writer lease。
+- Converter级第一次/第二次Ctrl+C交互与进程级故障注入（Canonical API层的安全停止/恢复已经通过）。

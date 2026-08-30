@@ -8,6 +8,7 @@
 #include "TracyProtocol.hpp"
 #include "tracy_lz4.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -38,6 +39,19 @@ struct ProgressState
     std::array<uint64_t, 2> total {};
     bool monotonic = true;
 };
+
+struct CanonicalCancelState
+{
+    uint64_t checks = 0;
+    uint64_t cancelAfterChecks = 0;
+};
+
+bool RequestCanonicalCancel( void* userData )
+{
+    auto& state = *static_cast<CanonicalCancelState*>( userData );
+    state.checks++;
+    return state.cancelAfterChecks != 0 && state.checks >= state.cancelAfterChecks;
+}
 
 void RecordProgress( tracy::analysis::TraceSessionInventoryPhase phase,
     uint64_t completed, uint64_t total, void* userData )
@@ -389,19 +403,20 @@ void TestProtocolDecoderCheckpoint( TestContext& test )
 
 void TestProtocolJournalInventory( TestContext& test, const std::filesystem::path& directory )
 {
-    std::vector<uint8_t> frame;
-    AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
-    AppendFixedEvent( frame, tracy::QueueType::JnJobSchedule );
-    AppendStringEvent( frame, tracy::QueueType::StringData, "dependency" );
-    std::vector<char> compressed( tracy::LZ4Size );
-    const auto compressedBytes = tracy::LZ4_compress_default(
-        reinterpret_cast<const char*>( frame.data() ), compressed.data(), int( frame.size() ), int( compressed.size() ) );
-    test.Check( compressedBytes > 0, "compress journal protocol frame" );
-    if( compressedBytes <= 0 ) return;
-    std::vector<uint8_t> record( sizeof( tracy::lz4sz_t ) + size_t( compressedBytes ) );
-    const auto storedSize = tracy::lz4sz_t( compressedBytes );
-    std::memcpy( record.data(), &storedSize, sizeof( storedSize ) );
-    std::memcpy( record.data() + sizeof( storedSize ), compressed.data(), size_t( compressedBytes ) );
+    std::vector<uint8_t> firstFrame;
+    std::vector<uint8_t> secondFrame;
+    const std::string repeated( 4096, 'R' );
+    AppendFixedEvent( firstFrame, tracy::QueueType::FrameVsync );
+    AppendStringEvent( firstFrame, tracy::QueueType::StringData, repeated );
+    AppendFixedEvent( secondFrame, tracy::QueueType::JnJobSchedule );
+    AppendStringEvent( secondFrame, tracy::QueueType::StringData, repeated );
+    auto* compressor = tracy::LZ4_createStream();
+    test.Check( compressor != nullptr, "create protocol journal compressor" );
+    if( !compressor ) return;
+    const auto firstRecord = CompressContinuedFrame( compressor, firstFrame, test );
+    const auto secondRecord = CompressContinuedFrame( compressor, secondFrame, test );
+    tracy::LZ4_freeStream( compressor );
+    if( firstRecord.empty() || secondRecord.empty() ) return;
 
     const auto path = directory / "protocol.tracy-stream";
     tracy::stream::WriterOptions writerOptions;
@@ -414,9 +429,11 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( writer->Append( tracy::stream::RecordType::SessionBegin,
         tracy::stream::RecordFlagHandshake, "begin", 0, error ), "protocol journal begin" );
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
-        tracy::stream::RecordFlagCompressedFrame, record, 1, error ), "protocol journal frame" );
+        tracy::stream::RecordFlagCompressedFrame, firstRecord, 1, error ), "protocol journal first frame" );
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, secondRecord, 2, error ), "protocol journal second frame" );
     test.Check( writer->Append( tracy::stream::RecordType::SessionEnd,
-        tracy::stream::RecordFlagTerminal, "end", 2, error ), "protocol journal end" );
+        tracy::stream::RecordFlagTerminal, "end", 3, error ), "protocol journal end" );
     writer.reset();
 
     tracy::analysis::TraceSessionInventory inventory;
@@ -427,7 +444,7 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         path, options, inventory, error ),
         "build protocol-aware inventory: " + error );
     test.Check( inventory.protocolInventoryComplete, "protocol inventory completes" );
-    test.Check( inventory.protocolInventory.frameCount == 1 && inventory.protocolInventory.eventCount == 3,
+    test.Check( inventory.protocolInventory.frameCount == 2 && inventory.protocolInventory.eventCount == 4,
         "journal inventory contains decoded frame/event counts" );
     test.Check( inventory.protocolInventory.events[size_t( tracy::QueueType::JnJobSchedule )].count == 1,
         "journal inventory contains QueueType counts" );
@@ -454,8 +471,34 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     canonicalOptions.maximumShardSpanNs = 100;
     tracy::analysis::TraceSessionManifest manifest;
     const auto sessionRoot = directory / "canonical-session";
+    CanonicalCancelState cancelState { 0, 2 };
+    canonicalOptions.shouldCancel = RequestCanonicalCancel;
+    canonicalOptions.cancelUserData = &cancelState;
     test.Check( tracy::analysis::BuildTraceSessionCanonical( path, sessionRoot, "generation-1",
-        inventory, canonicalOptions, manifest, error ), "build canonical session: " + error );
+        inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::CancelledResumable,
+        "cancel canonical session at a complete journal record: " + error );
+    test.Check( manifest.state == tracy::analysis::TraceSessionState::CancelledResumable,
+        "cancelled canonical session is resumable" );
+    test.Check( !manifest.shards.empty(), "cancel commits a bounded canonical shard and checkpoint" );
+    const auto cancelledShards = manifest.shards;
+
+    canonicalOptions.shouldCancel = nullptr;
+    canonicalOptions.cancelUserData = nullptr;
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( path, sessionRoot, "generation-1",
+        inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Complete,
+        "resume canonical session from checkpoint: " + error );
+    test.Check( manifest.state == tracy::analysis::TraceSessionState::CanonicalBuilding,
+        "completed canonical facts remain in canonical-building state until derived work" );
+    test.Check( manifest.shards.size() > cancelledShards.size(),
+        "resume appends shards instead of replacing the committed prefix" );
+    for( size_t i = 0; i < cancelledShards.size() && i < manifest.shards.size(); i++ )
+    {
+        test.Check( manifest.shards[i].shardId == cancelledShards[i].shardId &&
+            manifest.shards[i].sha256 == cancelledShards[i].sha256,
+            "resume preserves committed shard identity" );
+    }
     uint64_t canonicalRecords = 0;
     uint64_t checkpointRecords = 0;
     for( const auto& shard : manifest.shards )
@@ -469,6 +512,53 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( checkpointRecords > 0, "each committed canonical segment has a checkpoint" );
     test.Check( tracy::analysis::VerifyTraceSession( sessionRoot, manifest, error ),
         "canonical session shards verify: " + error );
+
+    const auto changedSource = directory / "protocol-changed.tracy-stream";
+    std::filesystem::copy_file( path, changedSource,
+        std::filesystem::copy_options::overwrite_existing );
+    {
+        std::fstream changed( changedSource, std::ios::binary | std::ios::in | std::ios::out );
+        char byte = 0;
+        changed.read( &byte, 1 );
+        byte ^= 0x5a;
+        changed.seekp( 0 );
+        changed.write( &byte, 1 );
+    }
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( changedSource, sessionRoot, "generation-1",
+        inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Failed,
+        "resume rejects a changed source identity" );
+    test.Check( error == "source_sha256_mismatch",
+        "changed source has an explicit strong-identity error: " + error );
+
+    const auto damagedSessionRoot = directory / "canonical-session-damaged-checkpoint";
+    cancelState = { 0, 2 };
+    canonicalOptions.shouldCancel = RequestCanonicalCancel;
+    canonicalOptions.cancelUserData = &cancelState;
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( path, damagedSessionRoot, "generation-damaged",
+        inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::CancelledResumable,
+        "create resumable fixture for checkpoint corruption: " + error );
+    const auto checkpointIt = std::find_if( manifest.shards.rbegin(), manifest.shards.rend(),
+        []( const auto& shard ) { return shard.domain == "checkpoint"; } );
+    test.Check( checkpointIt != manifest.shards.rend(), "resumable fixture contains checkpoint" );
+    if( checkpointIt != manifest.shards.rend() )
+    {
+        std::ofstream damaged( damagedSessionRoot / checkpointIt->relativePath,
+            std::ios::binary | std::ios::app );
+        damaged.put( '\x7f' );
+        damaged.close();
+        canonicalOptions.shouldCancel = nullptr;
+        canonicalOptions.cancelUserData = nullptr;
+        test.Check( tracy::analysis::BuildTraceSessionCanonical( path, damagedSessionRoot,
+            "generation-damaged", inventory, canonicalOptions, manifest, error ) ==
+            tracy::analysis::TraceSessionCanonicalBuildResult::Failed,
+            "resume rejects a damaged committed checkpoint" );
+        test.Check( error == "session_shard_size_mismatch",
+            "damaged checkpoint has an explicit integrity error: " + error );
+    }
+    canonicalOptions.shouldCancel = nullptr;
+    canonicalOptions.cancelUserData = nullptr;
 
     const auto inventoryPath = directory / "protocol-inventory";
     test.Check( tracy::analysis::SaveTraceSessionInventory( inventoryPath, inventory, error ),

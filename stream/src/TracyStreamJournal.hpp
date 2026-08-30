@@ -125,6 +125,7 @@ private:
 enum class ScanCode
 {
     Ok,
+    Stopped,
     TruncatedFileHeader,
     InvalidFileHeader,
     TruncatedTail,
@@ -143,6 +144,7 @@ struct RecordInfo
 };
 
 using ScanRecordVisitor = void ( * )( const RecordInfo& record, void* userData );
+using ScanStopRequested = bool ( * )( void* userData );
 
 struct ScanOptions
 {
@@ -154,6 +156,10 @@ struct ScanOptions
     // without duplicating the journal validation rules.
     ScanRecordVisitor recordVisitor = nullptr;
     void* recordVisitorUserData = nullptr;
+    // Checked only after a complete record has been validated and committed to
+    // ScanResult. This makes cancellation a recoverable record-boundary stop.
+    ScanStopRequested stopRequested = nullptr;
+    void* stopRequestedUserData = nullptr;
 };
 
 struct ScanResult

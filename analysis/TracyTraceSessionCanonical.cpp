@@ -23,6 +23,24 @@ void Put64( std::vector<uint8_t>& output, uint64_t value )
     for( int i = 0; i < 8; i++ ) output.push_back( uint8_t( value >> ( i * 8 ) ) );
 }
 
+bool Get32( const std::vector<uint8_t>& input, size_t& offset, uint32_t& value )
+{
+    if( offset > input.size() || input.size() - offset < 4 ) return false;
+    value = 0;
+    for( int i = 0; i < 4; i++ ) value |= uint32_t( input[offset + i] ) << ( i * 8 );
+    offset += 4;
+    return true;
+}
+
+bool Get64( const std::vector<uint8_t>& input, size_t& offset, uint64_t& value )
+{
+    if( offset > input.size() || input.size() - offset < 8 ) return false;
+    value = 0;
+    for( int i = 0; i < 8; i++ ) value |= uint64_t( input[offset + i] ) << ( i * 8 );
+    offset += 8;
+    return true;
+}
+
 struct CanonicalBuildState
 {
     const std::filesystem::path* sessionRoot = nullptr;
@@ -44,7 +62,11 @@ struct CanonicalBuildState
     uint64_t shardTimeBegin = 0;
     uint64_t shardTimeEnd = 0;
     uint64_t nextShardId = 0;
+    uint64_t resumeAfterSequence = 0;
+    uint64_t resumeOffset = tracy::stream::FileHeaderSize;
     std::string previousCheckpointHash;
+    bool cancelRequested = false;
+    bool firstResumedRecord = true;
     bool failed = false;
     std::string error;
 };
@@ -142,6 +164,7 @@ bool FlushShard( CanonicalBuildState& state )
         state.currentRecord.payloadSize + tracy::stream::RecordTrailerSize );
     Put64( checkpoint, state.protocolFrameOrdinal );
     Put64( checkpoint, state.protocolEventCount );
+    Put64( checkpoint, state.transportRecordCount );
     const auto dictionary = state.decoder.ExportDictionary();
     Put32( checkpoint, uint32_t( dictionary.size() ) );
     Put32( checkpoint, uint32_t( state.previousCheckpointHash.size() ) );
@@ -170,6 +193,75 @@ bool FlushShard( CanonicalBuildState& state )
     return SaveTraceSessionManifest( *state.sessionRoot, *state.manifest, state.error );
 }
 
+bool RestoreCheckpoint( CanonicalBuildState& state )
+{
+    const TraceSessionShard* checkpointShard = nullptr;
+    const TraceSessionShard* previousCheckpointShard = nullptr;
+    for( const auto& shard : state.manifest->shards )
+    {
+        state.nextShardId = std::max( state.nextShardId, shard.shardId + 1 );
+        if( shard.domain == "checkpoint" )
+        {
+            previousCheckpointShard = checkpointShard;
+            checkpointShard = &shard;
+        }
+    }
+    if( !checkpointShard ) return true;
+    std::vector<uint8_t> payload;
+    if( !ReadTraceSessionShardPayload( *state.sessionRoot, *checkpointShard, payload, state.error ) ) return false;
+    static constexpr uint8_t Magic[8] = { 'J', 'N', 'C', 'H', 'K', 'P', 'T', '1' };
+    if( payload.size() < sizeof( Magic ) || !std::equal( std::begin( Magic ), std::end( Magic ), payload.begin() ) )
+    {
+        state.error = "canonical_checkpoint_magic_mismatch";
+        return false;
+    }
+    size_t offset = sizeof( Magic );
+    uint32_t version = 0;
+    uint32_t reserved = 0;
+    uint32_t dictionaryBytes = 0;
+    uint32_t previousHashBytes = 0;
+    if( !Get32( payload, offset, version ) || !Get32( payload, offset, reserved ) ||
+        version != 1 || reserved != 0 ||
+        !Get64( payload, offset, state.resumeAfterSequence ) ||
+        !Get64( payload, offset, state.resumeOffset ) ||
+        !Get64( payload, offset, state.protocolFrameOrdinal ) ||
+        !Get64( payload, offset, state.protocolEventCount ) ||
+        !Get64( payload, offset, state.transportRecordCount ) ||
+        !Get32( payload, offset, dictionaryBytes ) ||
+        !Get32( payload, offset, previousHashBytes ) ||
+        previousHashBytes > 64 || offset > payload.size() ||
+        dictionaryBytes > payload.size() - offset ||
+        previousHashBytes > payload.size() - offset - dictionaryBytes ||
+        offset + dictionaryBytes + previousHashBytes != payload.size() )
+    {
+        state.error = "canonical_checkpoint_payload_invalid";
+        return false;
+    }
+    if( state.resumeAfterSequence != checkpointShard->sourceRecordEnd )
+    {
+        state.error = "canonical_checkpoint_sequence_mismatch";
+        return false;
+    }
+    std::vector<uint8_t> dictionary( payload.begin() + offset,
+        payload.begin() + offset + dictionaryBytes );
+    offset += dictionaryBytes;
+    const std::string storedPreviousHash( payload.begin() + offset, payload.end() );
+    if( previousHashBytes != 0 && previousHashBytes != 64 )
+    {
+        state.error = "canonical_checkpoint_chain_hash_invalid";
+        return false;
+    }
+    const std::string expectedPreviousHash = previousCheckpointShard ? previousCheckpointShard->sha256 : std::string {};
+    if( storedPreviousHash != expectedPreviousHash )
+    {
+        state.error = "canonical_checkpoint_chain_hash_mismatch";
+        return false;
+    }
+    if( !state.decoder.RestoreDictionary( dictionary, state.error ) ) return false;
+    state.previousCheckpointHash = checkpointShard->sha256;
+    return true;
+}
+
 bool ShouldFlush( const CanonicalBuildState& state )
 {
     if( state.shardRecordCount == 0 ) return false;
@@ -186,6 +278,17 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
 {
     auto& state = *static_cast<CanonicalBuildState*>( userData );
     if( state.failed ) return;
+    if( record.sequence <= state.resumeAfterSequence ) return;
+    if( state.firstResumedRecord )
+    {
+        state.firstResumedRecord = false;
+        if( record.offset != state.resumeOffset )
+        {
+            state.error = "canonical_resume_offset_mismatch";
+            state.failed = true;
+            return;
+        }
+    }
     state.currentRecord = record;
     if( !ReadPayload( state, record ) ) { state.failed = true; return; }
     const bool compressed = record.type == tracy::stream::RecordType::ClientToServer &&
@@ -218,11 +321,19 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
         state.transportRecordCount++;
     }
     if( ShouldFlush( state ) && !FlushShard( state ) ) state.failed = true;
+    if( !state.failed && state.options->shouldCancel &&
+        state.options->shouldCancel( state.options->cancelUserData ) ) state.cancelRequested = true;
+}
+
+bool StopCanonicalScan( void* userData )
+{
+    const auto& state = *static_cast<const CanonicalBuildState*>( userData );
+    return state.failed || state.cancelRequested;
 }
 
 }
 
-bool BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
+TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
     const std::filesystem::path& sessionRoot, const std::string& generation,
     const TraceSessionInventory& inventory, const TraceSessionCanonicalOptions& options,
     TraceSessionManifest& manifest, std::string& error )
@@ -233,16 +344,16 @@ bool BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
         options.hardShardBytes < options.softShardBytes )
     {
         error = "canonical_invalid_options";
-        return false;
+        return TraceSessionCanonicalBuildResult::Failed;
     }
     TraceSessionSourceIdentity expectedSource;
     expectedSource.sha256 = inventory.sourceSha256;
     expectedSource.fileSize = inventory.sourceFileSize;
-    if( !VerifyTraceSessionSourceIdentity( sourcePath, expectedSource, error ) ) return false;
+    if( !VerifyTraceSessionSourceIdentity( sourcePath, expectedSource, error ) ) return TraceSessionCanonicalBuildResult::Failed;
     if( inventory.recordCount < inventory.protocolInventory.frameCount )
     {
         error = "canonical_inventory_record_count_invalid";
-        return false;
+        return TraceSessionCanonicalBuildResult::Failed;
     }
     CanonicalBuildState state;
     state.sessionRoot = &sessionRoot;
@@ -250,40 +361,82 @@ bool BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
     state.options = &options;
     state.manifest = &manifest;
     state.input.open( sourcePath, std::ios::binary );
-    if( !state.input ) { error = "canonical_source_open_failed"; return false; }
+    if( !state.input ) { error = "canonical_source_open_failed"; return TraceSessionCanonicalBuildResult::Failed; }
 
-    manifest = {};
-    manifest.sessionId = inventory.captureIdentity;
-    manifest.generation = generation;
+    std::error_code manifestEc;
+    const bool canResume = options.resume && std::filesystem::exists( sessionRoot / "manifest", manifestEc );
+    if( canResume )
+    {
+        const auto loaded = LoadTraceSessionManifest( sessionRoot, error );
+        if( !loaded ) return TraceSessionCanonicalBuildResult::Failed;
+        manifest = *loaded;
+        if( manifest.generation != generation || manifest.source.sha256 != inventory.sourceSha256 ||
+            manifest.source.fileSize != inventory.sourceFileSize ||
+            manifest.source.committedRevision != inventory.committedRevision ||
+            manifest.source.protocol != inventory.protocol ||
+            manifest.source.captureIdentity != inventory.captureIdentity )
+        {
+            error = "canonical_resume_identity_mismatch";
+            return TraceSessionCanonicalBuildResult::Failed;
+        }
+        if( manifest.state != TraceSessionState::CancelledResumable &&
+            manifest.state != TraceSessionState::CanonicalBuilding &&
+            manifest.state != TraceSessionState::CanonicalPaused )
+        {
+            error = "canonical_resume_state_invalid";
+            return TraceSessionCanonicalBuildResult::Failed;
+        }
+        if( !VerifyTraceSession( sessionRoot, manifest, error ) || !RestoreCheckpoint( state ) )
+            return TraceSessionCanonicalBuildResult::Failed;
+    }
+    else
+    {
+        manifest = {};
+        manifest.sessionId = inventory.captureIdentity;
+        manifest.generation = generation;
+        manifest.source.sha256 = inventory.sourceSha256;
+        manifest.source.fileSize = inventory.sourceFileSize;
+        manifest.source.committedRevision = inventory.committedRevision;
+        manifest.source.protocol = inventory.protocol;
+        manifest.source.captureIdentity = inventory.captureIdentity;
+        manifest.source.captureEndState = inventory.qualityReason;
+    }
     manifest.state = TraceSessionState::CanonicalBuilding;
-    manifest.source.sha256 = inventory.sourceSha256;
-    manifest.source.fileSize = inventory.sourceFileSize;
-    manifest.source.committedRevision = inventory.committedRevision;
-    manifest.source.protocol = inventory.protocol;
-    manifest.source.captureIdentity = inventory.captureIdentity;
-    manifest.source.captureEndState = inventory.qualityReason;
-    if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) ) return false;
+    manifest.reason.clear();
+    if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) ) return TraceSessionCanonicalBuildResult::Failed;
 
     tracy::stream::ScanOptions scanOptions;
     scanOptions.maxCollectedRecords = 0;
     scanOptions.recordVisitor = VisitCanonicalJournalRecord;
     scanOptions.recordVisitorUserData = &state;
+    scanOptions.stopRequested = StopCanonicalScan;
+    scanOptions.stopRequestedUserData = &state;
     const auto scan = tracy::stream::ScanJournal( sourcePath, scanOptions );
     if( !scan.HasRecoverablePrefix() )
     {
         error = "canonical_source_invalid:" + scan.message;
-        return false;
+        return TraceSessionCanonicalBuildResult::Failed;
     }
-    if( state.failed ) { error = state.error; return false; }
-    if( !FlushShard( state ) ) { error = state.error; return false; }
+    if( state.failed ) { error = state.error; return TraceSessionCanonicalBuildResult::Failed; }
+    if( !FlushShard( state ) ) { error = state.error; return TraceSessionCanonicalBuildResult::Failed; }
+    if( scan.code == tracy::stream::ScanCode::Stopped || state.cancelRequested )
+    {
+        manifest.state = TraceSessionState::CancelledResumable;
+        manifest.reason = "cancelled_resumable";
+        if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) )
+            return TraceSessionCanonicalBuildResult::Failed;
+        return TraceSessionCanonicalBuildResult::CancelledResumable;
+    }
     const auto expectedTransportRecords = inventory.recordCount - inventory.protocolInventory.frameCount;
     if( state.protocolEventCount != inventory.protocolInventory.eventCount ||
         state.transportRecordCount != expectedTransportRecords )
     {
         error = "canonical_inventory_count_mismatch";
-        return false;
+        return TraceSessionCanonicalBuildResult::Failed;
     }
-    return SaveTraceSessionManifest( sessionRoot, manifest, error );
+    if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) )
+        return TraceSessionCanonicalBuildResult::Failed;
+    return TraceSessionCanonicalBuildResult::Complete;
 }
 
 }

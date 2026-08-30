@@ -11,6 +11,15 @@
 namespace tracy::analysis
 {
 
+using TraceSessionCanonicalCancel = bool ( * )( void* userData );
+
+enum class TraceSessionCanonicalBuildResult : uint8_t
+{
+    Complete,
+    CancelledResumable,
+    Failed
+};
+
 struct TraceSessionCanonicalOptions
 {
     uint64_t targetShardBytes = 256ull * 1024 * 1024;
@@ -18,9 +27,12 @@ struct TraceSessionCanonicalOptions
     uint64_t hardShardBytes = 512ull * 1024 * 1024;
     uint64_t minimumShardSpanNs = 5ull * 1000 * 1000 * 1000;
     uint64_t maximumShardSpanNs = 30ull * 1000 * 1000 * 1000;
+    bool resume = true;
+    TraceSessionCanonicalCancel shouldCancel = nullptr;
+    void* cancelUserData = nullptr;
 };
 
-bool BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
+TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
     const std::filesystem::path& sessionRoot, const std::string& generation,
     const TraceSessionInventory& inventory, const TraceSessionCanonicalOptions& options,
     TraceSessionManifest& manifest, std::string& error );

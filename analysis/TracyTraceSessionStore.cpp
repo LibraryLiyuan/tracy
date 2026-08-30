@@ -302,6 +302,59 @@ bool WriteTraceSessionShard( const std::filesystem::path& root, const std::strin
     return ReplaceFileAtomically( temporary, target, error );
 }
 
+bool ReadTraceSessionShardPayload( const std::filesystem::path& root,
+    const TraceSessionShard& shard, std::vector<uint8_t>& payload, std::string& error )
+{
+    error.clear();
+    payload.clear();
+    if( !IsSafeRelativePath( shard.relativePath ) )
+    {
+        error = "session_manifest_unsafe_shard_path";
+        return false;
+    }
+    const auto path = root / shard.relativePath;
+    std::error_code ec;
+    const auto fileBytes = std::filesystem::file_size( path, ec );
+    if( ec || fileBytes != shard.fileBytes || fileBytes < sizeof( SessionShardHeader ) )
+    {
+        error = "session_shard_size_mismatch";
+        return false;
+    }
+    if( Sha256File( path ) != shard.sha256 )
+    {
+        error = "session_shard_sha256_mismatch";
+        return false;
+    }
+    std::ifstream input( path, std::ios::binary );
+    SessionShardHeader header;
+    input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+    if( !input || header.magic != SessionShardMagic ||
+        header.storeSchema != TraceSessionStoreSchemaVersion ||
+        header.canonicalSchema != TraceSessionCanonicalSchemaVersion ||
+        header.shardId != shard.shardId || header.timeBeginNs != shard.timeBeginNs ||
+        header.timeEndNs != shard.timeEndNs ||
+        header.sourceRecordBegin != shard.sourceRecordBegin ||
+        header.sourceRecordEnd != shard.sourceRecordEnd ||
+        header.recordCount != shard.recordCount ||
+        header.payloadBytes != fileBytes - sizeof( header ) ||
+        header.payloadBytes > std::numeric_limits<size_t>::max() ||
+        header.payloadBytes > uint64_t( std::numeric_limits<std::streamsize>::max() ) )
+    {
+        error = "session_shard_header_mismatch";
+        return false;
+    }
+    payload.resize( size_t( header.payloadBytes ) );
+    if( !payload.empty() )
+        input.read( reinterpret_cast<char*>( payload.data() ), std::streamsize( payload.size() ) );
+    if( !input && !payload.empty() )
+    {
+        error = "session_shard_payload_read_failed";
+        payload.clear();
+        return false;
+    }
+    return true;
+}
+
 bool VerifyTraceSession( const std::filesystem::path& root,
     const TraceSessionManifest& manifest, std::string& error )
 {
