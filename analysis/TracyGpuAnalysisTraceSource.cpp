@@ -50,6 +50,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !relationReader ) return {};
     auto runtimeReader = TraceSessionRuntimeReader::Open( path, *session, error );
     if( !runtimeReader ) return {};
+    auto ioGfxReader = TraceSessionIoGfxReader::Open( path, *session, error );
+    if( !ioGfxReader ) return {};
     auto symbolReader = TraceSessionSymbolReader::Open( path, *session, error );
     if( !symbolReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
@@ -81,7 +83,7 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
         std::move( gpuZoneReader ),
         std::move( memoryReader ), std::move( samplingReader ),
         std::move( schedulingReader ), std::move( relationReader ),
-        std::move( runtimeReader ), std::move( symbolReader ) ) );
+        std::move( runtimeReader ), std::move( ioGfxReader ), std::move( symbolReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -96,6 +98,7 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionSchedulingReader> schedulingReader,
     std::shared_ptr<TraceSessionRelationReader> relationReader,
     std::shared_ptr<TraceSessionRuntimeReader> runtimeReader,
+    std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader,
     std::shared_ptr<TraceSessionSymbolReader> symbolReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
@@ -105,6 +108,7 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
       m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
       m_schedulingReader( std::move( schedulingReader ) ),
       m_relationReader( std::move( relationReader ) ), m_runtimeReader( std::move( runtimeReader ) ),
+      m_ioGfxReader( std::move( ioGfxReader ) ),
       m_symbolReader( std::move( symbolReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
@@ -211,7 +215,12 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     result.push_back( Capability { "job", jobPresent, jobPresent, true,
         jobPresent ? "available from the N30 Session mandatory Job index" :
             "The source Session contains no Job facts", JobMethods } );
-    addPending( "job.gfx", TraceSessionProtocolDomain::Job );
+    static const std::vector<std::string> GfxMethods = { "job.gfx.statistics", "job.gfx_chain" };
+    const auto gfxPresent = m_ioGfxReader && ( m_ioGfxReader->Stats().gfxDispatches != 0 ||
+        m_ioGfxReader->Stats().gfxEntities != 0 || m_ioGfxReader->Stats().gfxLinks != 0 );
+    result.push_back( Capability { "job.gfx", gfxPresent, gfxPresent, true,
+        gfxPresent ? "available from the N30 Session mandatory I/O/Gfx index" :
+            "The source Session contains no Gfx evidence facts", GfxMethods } );
     static const std::vector<std::string> MemoryMethods = {
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time",
         "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates"
@@ -226,7 +235,14 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     result.push_back( Capability { "memory.gpu", gpuMemoryPresent, gpuMemoryPresent, true,
         gpuMemoryPresent ? "available from the N30 Session mandatory Memory index" :
             "The source Session contains no GPU D3D12 memory pools", MemoryMethods } );
-    addPending( "io", TraceSessionProtocolDomain::Io );
+    static const std::vector<std::string> IoMethods = {
+        "io.search", "io.get", "io.statistics", "io.chain"
+    };
+    const auto ioPresent = m_ioGfxReader && ( m_ioGfxReader->Stats().ioRequests != 0 ||
+        m_ioGfxReader->Stats().ioConfigs != 0 || m_ioGfxReader->Stats().ioStages != 0 );
+    result.push_back( Capability { "io", ioPresent, ioPresent, true,
+        ioPresent ? "available from the N30 Session mandatory I/O/Gfx index" :
+            "The source Session contains no structured I/O facts", IoMethods } );
     static const std::vector<std::string> SampleMethods = { "sample.list" };
     const auto samplesPresent = m_samplingReader && m_samplingReader->Stats().events != 0;
     result.push_back( Capability { "sample", samplesPresent, samplesPresent, true,
@@ -350,6 +366,16 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     if( m_relationReader ) out.counts.relations = m_relationReader->Stats().relations;
     if( m_runtimeReader )
         out.counts.runtimeDomainStates = m_runtimeReader->Stats().domainStates;
+    if( m_ioGfxReader )
+    {
+        out.counts.ioRequests = m_ioGfxReader->Stats().ioRequests;
+        out.counts.ioConfigs = m_ioGfxReader->Stats().ioConfigs;
+        out.counts.ioStages = m_ioGfxReader->Stats().ioStages;
+        out.counts.gfxDispatches = m_ioGfxReader->Stats().gfxDispatches;
+        out.counts.gfxEntities = m_ioGfxReader->Stats().gfxEntities;
+        out.counts.gfxLinks = m_ioGfxReader->Stats().gfxLinks;
+        out.counts.correlatedFrameEvents = m_ioGfxReader->Stats().correlatedFrames;
+    }
     if( m_cpuZoneReader )
     {
         out.counts.sourceLocations = m_cpuZoneReader->Stats().sourceLocations;
@@ -514,11 +540,32 @@ std::vector<JobDto> GpuAnalysisTraceSource::GetJobs() const
     if( WorkerLoaded() ) return Worker().GetJobs();
     return m_jobReader ? m_jobReader->Jobs() : std::vector<JobDto> {};
 }
-D0(std::vector<IoRequestDto>, GetIoRequests)
-D0(std::vector<GfxDispatchDto>, GetGfxDispatches)
-D0(std::vector<GfxEntityDto>, GetGfxEntities)
-D0(std::vector<GfxLinkDto>, GetGfxLinks)
-D0(std::vector<CorrelatedFrameEventDto>, GetCorrelatedFrameEvents)
+std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoRequests() const
+{
+    if( WorkerLoaded() ) return Worker().GetIoRequests();
+    return m_ioGfxReader ? m_ioGfxReader->IoRequests() : std::vector<IoRequestDto> {};
+}
+std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
+{
+    if( WorkerLoaded() ) return Worker().GetGfxDispatches();
+    return m_ioGfxReader ? m_ioGfxReader->GfxDispatches() : std::vector<GfxDispatchDto> {};
+}
+std::vector<GfxEntityDto> GpuAnalysisTraceSource::GetGfxEntities() const
+{
+    if( WorkerLoaded() ) return Worker().GetGfxEntities();
+    return m_ioGfxReader ? m_ioGfxReader->GfxEntities() : std::vector<GfxEntityDto> {};
+}
+std::vector<GfxLinkDto> GpuAnalysisTraceSource::GetGfxLinks() const
+{
+    if( WorkerLoaded() ) return Worker().GetGfxLinks();
+    return m_ioGfxReader ? m_ioGfxReader->GfxLinks() : std::vector<GfxLinkDto> {};
+}
+std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEvents() const
+{
+    if( WorkerLoaded() ) return Worker().GetCorrelatedFrameEvents();
+    return m_ioGfxReader ? m_ioGfxReader->CorrelatedFrames() :
+        std::vector<CorrelatedFrameEventDto> {};
+}
 std::vector<RelationDto> GpuAnalysisTraceSource::GetRelations() const
 {
     if( WorkerLoaded() ) return Worker().GetRelations();

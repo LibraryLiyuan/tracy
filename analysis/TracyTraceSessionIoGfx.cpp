@@ -1,0 +1,794 @@
+#include "TracyTraceSessionIoGfx.hpp"
+
+#include "TracyHash.hpp"
+#include "TracyTraceSessionCanonical.hpp"
+#include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyQueue.hpp"
+
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <limits>
+#include <map>
+#include <sstream>
+
+#ifdef _WIN32
+#  include <Windows.h>
+#endif
+
+namespace tracy::analysis
+{
+namespace
+{
+
+constexpr uint64_t FileMagic = 0x3147464f494e4aull;     // JNIOFG1
+constexpr uint64_t ManifestMagic = 0x314d464f494e4aull; // JNIOFM1
+constexpr const char* FileName = "io-gfx.bin";
+
+#pragma pack( push, 1 )
+struct FileHeader
+{
+    uint64_t magic = FileMagic;
+    uint32_t schema = TraceSessionIoGfxIndexSchemaVersion;
+    uint32_t endian = 0x01020304;
+    uint64_t sourceSize = 0;
+    uint64_t ioRequests = 0;
+    uint64_t ioConfigs = 0;
+    uint64_t ioStages = 0;
+    uint64_t gfxDispatches = 0;
+    uint64_t gfxEntities = 0;
+    uint64_t gfxLinks = 0;
+    uint64_t correlatedFrames = 0;
+    uint64_t ioRequestOffset = 0;
+    uint64_t ioConfigOffset = 0;
+    uint64_t ioStageOffset = 0;
+    uint64_t gfxDispatchOffset = 0;
+    uint64_t gfxEntityOffset = 0;
+    uint64_t gfxLinkOffset = 0;
+    uint64_t frameOffset = 0;
+    uint32_t generationBytes = 0;
+    uint32_t reserved = 0;
+};
+
+struct StoredIoRequest
+{
+    int64_t timeNs = 0;
+    uint64_t requestId = 0;
+    uint64_t resourceId = 0;
+    uint32_t thread = 0;
+    uint8_t operation = 0;
+    uint8_t source = 0;
+    uint8_t priority = 0;
+    uint8_t subsystem = 0;
+    uint8_t flags = 0;
+    uint8_t reserved[3] {};
+};
+
+struct StoredIoConfig
+{
+    uint64_t requestId = 0;
+    uint64_t parentId = 0;
+    uint64_t requestedBytes = 0;
+    uint32_t originFrameSequence = 0;
+    uint8_t parentKind = 0;
+    uint8_t flags = 0;
+    uint8_t reserved[2] {};
+};
+
+struct StoredIoStage
+{
+    int64_t timeNs = 0;
+    uint64_t requestId = 0;
+    uint64_t bytes = 0;
+    uint32_t detail = 0;
+    uint32_t thread = 0;
+    uint8_t stage = 0;
+    uint8_t status = 0;
+    uint8_t flags = 0;
+    uint8_t reserved = 0;
+};
+
+struct StoredGfxDispatch
+{
+    int64_t timeNs = 0;
+    uint64_t dispatchId = 0;
+    uint64_t frameIndex = 0;
+    uint32_t expectedJobs = 0;
+    uint32_t thread = 0;
+    uint8_t threadingMode = 0;
+    uint8_t flags = 0;
+    uint8_t reserved[2] {};
+};
+
+struct StoredGfxEntity
+{
+    int64_t timeNs = 0;
+    uint64_t entityId = 0;
+    uint64_t parentId = 0;
+    uint32_t gpuQueryId = 0;
+    uint32_t thread = 0;
+    uint8_t gpuContext = 0;
+    uint8_t kind = 0;
+    uint8_t flags = 0;
+    uint8_t reserved = 0;
+};
+
+struct StoredGfxLink
+{
+    int64_t timeNs = 0;
+    uint64_t sourceId = 0;
+    uint64_t targetId = 0;
+    uint32_t thread = 0;
+    uint8_t relation = 0;
+    uint8_t flags = 0;
+    uint8_t reserved[2] {};
+};
+
+struct StoredFrame
+{
+    int64_t timeNs = 0;
+    uint64_t frameId = 0;
+    uint64_t domainIndex = 0;
+    uint32_t thread = 0;
+    uint8_t domain = 0;
+    uint8_t phase = 0;
+    uint8_t flags = 0;
+    uint8_t reserved = 0;
+};
+#pragma pack( pop )
+
+static_assert( sizeof( StoredIoRequest ) == 36 );
+static_assert( sizeof( StoredIoConfig ) == 32 );
+static_assert( sizeof( StoredIoStage ) == 36 );
+static_assert( sizeof( StoredGfxDispatch ) == 36 );
+static_assert( sizeof( StoredGfxEntity ) == 36 );
+static_assert( sizeof( StoredGfxLink ) == 32 );
+static_assert( sizeof( StoredFrame ) == 32 );
+
+struct LocalManifest
+{
+    std::string sourceSha256;
+    uint64_t sourceSize = 0;
+    std::string generation;
+    uint64_t fileBytes = 0;
+    std::string fileSha256;
+    TraceSessionIoGfxStats stats;
+};
+
+bool AtomicReplace( const std::filesystem::path& source,
+    const std::filesystem::path& target, std::string& error )
+{
+#ifdef _WIN32
+    if( MoveFileExW( source.c_str(), target.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
+    error = "session_io_gfx_atomic_replace_failed:" + std::to_string( GetLastError() );
+    return false;
+#else
+    std::error_code ec;
+    std::filesystem::rename( source, target, ec );
+    if( !ec ) return true;
+    error = "session_io_gfx_atomic_replace_failed:" + ec.message();
+    return false;
+#endif
+}
+
+bool DecodeItem( const TraceSessionCanonicalRecord& record, QueueItem& item,
+    std::string& error )
+{
+    if( record.kind != TraceSessionCanonicalRecordKind::ProtocolEvent ||
+        record.type >= uint8_t( QueueType::NUM_TYPES ) ||
+        record.payload.size() < QueueDataSize[record.type] )
+    { error = "session_io_gfx_protocol_record_invalid"; return false; }
+    item = {};
+    std::memcpy( &item, record.payload.data(),
+        std::min<size_t>( record.payload.size(), sizeof( item ) ) );
+    if( item.hdr.idx != record.type )
+    { error = "session_io_gfx_protocol_type_mismatch"; return false; }
+    return true;
+}
+
+bool WriteRecord( std::ofstream& out, const void* data, size_t bytes,
+    const char* failure, std::string& error )
+{
+    out.write( static_cast<const char*>( data ), std::streamsize( bytes ) );
+    if( out ) return true;
+    error = failure;
+    return false;
+}
+
+struct BuildState
+{
+    TraceSessionTimeTransform transform;
+    std::ofstream ioRequest;
+    std::ofstream ioConfig;
+    std::ofstream ioStage;
+    std::ofstream gfxDispatch;
+    std::ofstream gfxEntity;
+    std::ofstream gfxLink;
+    std::ofstream frame;
+    TraceSessionIoGfxStats stats;
+};
+
+bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
+    std::string& error )
+{
+    if( record.kind != TraceSessionCanonicalRecordKind::ProtocolEvent ) return true;
+    auto& state = *static_cast<BuildState*>( userData );
+    QueueItem item {};
+    if( !DecodeItem( record, item, error ) ) return false;
+    switch( QueueType( record.type ) )
+    {
+    case QueueType::JnIoRequest:
+    {
+        StoredIoRequest value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnIoRequest.time );
+        value.requestId = item.jnIoRequest.requestId;
+        value.resourceId = item.jnIoRequest.resourceId;
+        value.thread = record.threadContext;
+        value.operation = item.jnIoRequest.operation;
+        value.source = item.jnIoRequest.source;
+        value.priority = item.jnIoRequest.priority;
+        value.subsystem = item.jnIoRequest.subsystem;
+        value.flags = item.jnIoRequest.flags;
+        if( !WriteRecord( state.ioRequest, &value, sizeof( value ),
+            "session_io_request_write_failed", error ) ) return false;
+        ++state.stats.ioRequests;
+        break;
+    }
+    case QueueType::JnIoConfig:
+    {
+        StoredIoConfig value;
+        value.requestId = item.jnIoConfig.requestId;
+        value.parentId = item.jnIoConfig.parentId;
+        value.requestedBytes = item.jnIoConfig.requestedBytes;
+        value.originFrameSequence = item.jnIoConfig.originFrameSequence;
+        value.parentKind = item.jnIoConfig.parentKind;
+        value.flags = item.jnIoConfig.flags;
+        if( !WriteRecord( state.ioConfig, &value, sizeof( value ),
+            "session_io_config_write_failed", error ) ) return false;
+        ++state.stats.ioConfigs;
+        break;
+    }
+    case QueueType::JnIoStage:
+    {
+        StoredIoStage value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnIoStage.time );
+        value.requestId = item.jnIoStage.requestId;
+        value.bytes = item.jnIoStage.bytes;
+        value.detail = item.jnIoStage.detail;
+        value.thread = record.threadContext;
+        value.stage = item.jnIoStage.stage;
+        value.status = item.jnIoStage.status;
+        value.flags = item.jnIoStage.flags;
+        if( !WriteRecord( state.ioStage, &value, sizeof( value ),
+            "session_io_stage_write_failed", error ) ) return false;
+        ++state.stats.ioStages;
+        break;
+    }
+    case QueueType::JnGfxDispatch:
+    {
+        StoredGfxDispatch value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnGfxDispatch.time );
+        value.dispatchId = item.jnGfxDispatch.dispatchId;
+        value.frameIndex = item.jnGfxDispatch.frameIndex;
+        value.expectedJobs = item.jnGfxDispatch.expectedJobs;
+        value.thread = record.threadContext;
+        value.threadingMode = item.jnGfxDispatch.threadingMode;
+        value.flags = item.jnGfxDispatch.flags;
+        if( !WriteRecord( state.gfxDispatch, &value, sizeof( value ),
+            "session_gfx_dispatch_write_failed", error ) ) return false;
+        ++state.stats.gfxDispatches;
+        break;
+    }
+    case QueueType::JnGfxEntity:
+    {
+        StoredGfxEntity value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnGfxEntity.time );
+        value.entityId = item.jnGfxEntity.entityId;
+        value.parentId = item.jnGfxEntity.parentId;
+        value.gpuQueryId = item.jnGfxEntity.gpuQueryId;
+        value.thread = record.threadContext;
+        value.gpuContext = item.jnGfxEntity.gpuContext;
+        value.kind = item.jnGfxEntity.kind;
+        value.flags = item.jnGfxEntity.flags;
+        if( !WriteRecord( state.gfxEntity, &value, sizeof( value ),
+            "session_gfx_entity_write_failed", error ) ) return false;
+        ++state.stats.gfxEntities;
+        break;
+    }
+    case QueueType::JnGfxLink:
+    {
+        StoredGfxLink value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnGfxLink.time );
+        value.sourceId = item.jnGfxLink.sourceId;
+        value.targetId = item.jnGfxLink.targetId;
+        value.thread = record.threadContext;
+        value.relation = item.jnGfxLink.relation;
+        value.flags = item.jnGfxLink.flags;
+        if( !WriteRecord( state.gfxLink, &value, sizeof( value ),
+            "session_gfx_link_write_failed", error ) ) return false;
+        ++state.stats.gfxLinks;
+        break;
+    }
+    case QueueType::JnFrame:
+    {
+        StoredFrame value;
+        value.timeNs = state.transform.ToNanoseconds( item.jnFrame.time );
+        value.frameId = item.jnFrame.frameId;
+        value.domainIndex = item.jnFrame.domainIndex;
+        value.thread = record.threadContext;
+        value.domain = item.jnFrame.domain;
+        value.phase = item.jnFrame.phase;
+        value.flags = item.jnFrame.flags;
+        if( !WriteRecord( state.frame, &value, sizeof( value ),
+            "session_correlated_frame_write_failed", error ) ) return false;
+        ++state.stats.correlatedFrames;
+        break;
+    }
+    default: break;
+    }
+    return true;
+}
+
+bool CopyFile( const std::filesystem::path& path, std::ofstream& out,
+    uint64_t& bytes, std::string& error )
+{
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) { error = "session_io_gfx_work_read_failed"; return false; }
+    std::vector<char> buffer( 1024 * 1024 );
+    bytes = 0;
+    while( in )
+    {
+        in.read( buffer.data(), std::streamsize( buffer.size() ) );
+        const auto count = in.gcount();
+        if( count > 0 )
+        {
+            out.write( buffer.data(), count );
+            bytes += uint64_t( count );
+        }
+    }
+    if( !in.eof() || !out ) { error = "session_io_gfx_work_copy_failed"; return false; }
+    return true;
+}
+
+bool CheckedAppend( uint64_t& value, uint64_t count, uint64_t itemBytes,
+    std::string& error )
+{
+    if( itemBytes != 0 && count > std::numeric_limits<uint64_t>::max() / itemBytes )
+    { error = "session_io_gfx_file_size_overflow"; return false; }
+    const auto bytes = count * itemBytes;
+    if( value > std::numeric_limits<uint64_t>::max() - bytes )
+    { error = "session_io_gfx_file_size_overflow"; return false; }
+    value += bytes;
+    return true;
+}
+
+bool SaveManifest( const std::filesystem::path& root,
+    const LocalManifest& manifest, std::string& error )
+{
+    const auto temporary = root / "manifest.tmp";
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_io_gfx_manifest_open_failed"; return false; }
+    out << "magic " << ManifestMagic << '\n';
+    out << "schema " << TraceSessionIoGfxIndexSchemaVersion << '\n';
+    out << "source_sha256 " << std::quoted( manifest.sourceSha256 ) << '\n';
+    out << "source_size " << manifest.sourceSize << '\n';
+    out << "generation " << std::quoted( manifest.generation ) << '\n';
+    out << "file_bytes " << manifest.fileBytes << '\n';
+    out << "file_sha256 " << std::quoted( manifest.fileSha256 ) << '\n';
+    out << "io_requests " << manifest.stats.ioRequests << '\n';
+    out << "io_configs " << manifest.stats.ioConfigs << '\n';
+    out << "io_stages " << manifest.stats.ioStages << '\n';
+    out << "gfx_dispatches " << manifest.stats.gfxDispatches << '\n';
+    out << "gfx_entities " << manifest.stats.gfxEntities << '\n';
+    out << "gfx_links " << manifest.stats.gfxLinks << '\n';
+    out << "correlated_frames " << manifest.stats.correlatedFrames << '\n';
+    out.flush();
+    if( !out ) { error = "session_io_gfx_manifest_write_failed"; return false; }
+    out.close();
+    return AtomicReplace( temporary, root / "manifest", error );
+}
+
+bool LoadManifest( const std::filesystem::path& root,
+    LocalManifest& manifest, std::string& error )
+{
+    manifest = {};
+    std::ifstream in( root / "manifest", std::ios::binary );
+    if( !in ) { error = "session_io_gfx_manifest_not_found"; return false; }
+    uint64_t magic = 0;
+    uint32_t schema = 0;
+    std::string key;
+    while( in >> key )
+    {
+        if( key == "magic" ) in >> magic;
+        else if( key == "schema" ) in >> schema;
+        else if( key == "source_sha256" ) in >> std::quoted( manifest.sourceSha256 );
+        else if( key == "source_size" ) in >> manifest.sourceSize;
+        else if( key == "generation" ) in >> std::quoted( manifest.generation );
+        else if( key == "file_bytes" ) in >> manifest.fileBytes;
+        else if( key == "file_sha256" ) in >> std::quoted( manifest.fileSha256 );
+        else if( key == "io_requests" ) in >> manifest.stats.ioRequests;
+        else if( key == "io_configs" ) in >> manifest.stats.ioConfigs;
+        else if( key == "io_stages" ) in >> manifest.stats.ioStages;
+        else if( key == "gfx_dispatches" ) in >> manifest.stats.gfxDispatches;
+        else if( key == "gfx_entities" ) in >> manifest.stats.gfxEntities;
+        else if( key == "gfx_links" ) in >> manifest.stats.gfxLinks;
+        else if( key == "correlated_frames" ) in >> manifest.stats.correlatedFrames;
+        else { std::string ignored; std::getline( in, ignored ); }
+        if( !in ) { error = "session_io_gfx_manifest_parse_failed"; return false; }
+    }
+    manifest.stats.fileBytes = manifest.fileBytes;
+    if( magic != ManifestMagic || schema != TraceSessionIoGfxIndexSchemaVersion ||
+        manifest.sourceSha256.size() != 64 || manifest.fileSha256.size() != 64 )
+    { error = "session_io_gfx_manifest_invalid"; return false; }
+    return true;
+}
+
+bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
+    const LocalManifest& manifest, FileHeader& header, std::string& error )
+{
+    in.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+    if( !in || header.magic != FileMagic ||
+        header.schema != TraceSessionIoGfxIndexSchemaVersion || header.endian != 0x01020304 ||
+        header.sourceSize != session.source.fileSize || header.generationBytes != session.generation.size() ||
+        header.reserved != 0 || header.ioRequests != manifest.stats.ioRequests ||
+        header.ioConfigs != manifest.stats.ioConfigs || header.ioStages != manifest.stats.ioStages ||
+        header.gfxDispatches != manifest.stats.gfxDispatches ||
+        header.gfxEntities != manifest.stats.gfxEntities || header.gfxLinks != manifest.stats.gfxLinks ||
+        header.correlatedFrames != manifest.stats.correlatedFrames )
+    { error = "session_io_gfx_file_header_invalid"; return false; }
+    std::string source( 64, '\0' ), generation( header.generationBytes, '\0' );
+    in.read( source.data(), std::streamsize( source.size() ) );
+    if( !generation.empty() ) in.read( generation.data(), std::streamsize( generation.size() ) );
+    uint64_t expected = sizeof( header );
+    bool valid = CheckedAppend( expected, 1, source.size(), error ) &&
+        CheckedAppend( expected, 1, generation.size(), error ) && header.ioRequestOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioRequests, sizeof( StoredIoRequest ), error ) &&
+        header.ioConfigOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioConfigs, sizeof( StoredIoConfig ), error ) &&
+        header.ioStageOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioStages, sizeof( StoredIoStage ), error ) &&
+        header.gfxDispatchOffset == expected;
+    valid = valid && CheckedAppend( expected, header.gfxDispatches, sizeof( StoredGfxDispatch ), error ) &&
+        header.gfxEntityOffset == expected;
+    valid = valid && CheckedAppend( expected, header.gfxEntities, sizeof( StoredGfxEntity ), error ) &&
+        header.gfxLinkOffset == expected;
+    valid = valid && CheckedAppend( expected, header.gfxLinks, sizeof( StoredGfxLink ), error ) &&
+        header.frameOffset == expected;
+    valid = valid && CheckedAppend( expected, header.correlatedFrames, sizeof( StoredFrame ), error ) &&
+        expected == manifest.fileBytes;
+    if( !in || source != session.source.sha256 || generation != session.generation || !valid )
+    {
+        if( error == "session_io_gfx_file_size_overflow" )
+            error = "session_io_gfx_file_identity_or_layout_mismatch";
+        else if( error.empty() ) error = "session_io_gfx_file_identity_or_layout_mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool VerifyFiles( const std::filesystem::path& root, const TraceSessionManifest& session,
+    LocalManifest& manifest, FileHeader& header, std::string& error )
+{
+    if( !LoadManifest( root, manifest, error ) ) return false;
+    if( manifest.sourceSha256 != session.source.sha256 || manifest.sourceSize != session.source.fileSize ||
+        manifest.generation != session.generation )
+    { error = "session_io_gfx_identity_mismatch"; return false; }
+    const auto path = root / FileName;
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size( path, ec );
+    if( ec || bytes != manifest.fileBytes )
+    { error = "session_io_gfx_file_size_mismatch"; return false; }
+    if( Sha256File( path ) != manifest.fileSha256 )
+    { error = "session_io_gfx_file_sha256_mismatch"; return false; }
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) { error = "session_io_gfx_file_open_failed"; return false; }
+    return ValidateFile( in, session, manifest, header, error );
+}
+
+template<typename T>
+std::vector<T> ReadFixed( const std::filesystem::path& path, uint64_t offset,
+    uint64_t count, const char* failure )
+{
+    if( count > std::numeric_limits<size_t>::max() ||
+        count > uint64_t( std::numeric_limits<std::streamsize>::max() ) / sizeof( T ) )
+        throw std::runtime_error( "I/O/Gfx Session result exceeds platform capacity" );
+    std::vector<T> values( static_cast<size_t>( count ) );
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "I/O/Gfx Session index is unavailable" );
+    in.seekg( std::streamoff( offset ), std::ios::beg );
+    if( !values.empty() ) in.read( reinterpret_cast<char*>( values.data() ),
+        std::streamsize( values.size() * sizeof( T ) ) );
+    if( !in && !values.empty() ) throw std::runtime_error( failure );
+    return values;
+}
+
+std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
+{
+    std::ostringstream out;
+    out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
+    return out.str();
+}
+
+}
+
+std::filesystem::path TraceSessionIoGfxIndexRoot( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest )
+{
+    return sessionRoot / "generations" / manifest.generation / "derived" /
+        "io-gfx-index" / "1" / "exact";
+}
+
+bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& session, TraceSessionIoGfxStats& stats,
+    std::string& error )
+{
+    error.clear(); stats = {};
+    if( session.source.sha256.size() != 64 ||
+        session.generation.size() > std::numeric_limits<uint32_t>::max() )
+    { error = "session_io_gfx_identity_invalid"; return false; }
+    const auto root = TraceSessionIoGfxIndexRoot( sessionRoot, session );
+    std::error_code ec;
+    std::filesystem::create_directories( root, ec );
+    if( ec ) { error = "session_io_gfx_directory_failed:" + ec.message(); return false; }
+    const std::array<std::filesystem::path, 7> work = {
+        root / "io-request.work", root / "io-config.work", root / "io-stage.work",
+        root / "gfx-dispatch.work", root / "gfx-entity.work", root / "gfx-link.work",
+        root / "frame.work" };
+    BuildState state;
+    state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
+    state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
+    state.ioStage.open( work[2], std::ios::binary | std::ios::trunc );
+    state.gfxDispatch.open( work[3], std::ios::binary | std::ios::trunc );
+    state.gfxEntity.open( work[4], std::ios::binary | std::ios::trunc );
+    state.gfxLink.open( work[5], std::ios::binary | std::ios::trunc );
+    state.frame.open( work[6], std::ios::binary | std::ios::trunc );
+    if( !state.ioRequest || !state.ioConfig || !state.ioStage || !state.gfxDispatch ||
+        !state.gfxEntity || !state.gfxLink || !state.frame )
+    { error = "session_io_gfx_work_open_failed"; return false; }
+    if( !LoadTraceSessionTimeTransform( sessionRoot, session, state.transform, error ) ||
+        !VisitTraceSessionCanonicalOrdered( sessionRoot, session, Visit, &state, error ) ) return false;
+    state.ioRequest.close(); state.ioConfig.close(); state.ioStage.close();
+    state.gfxDispatch.close(); state.gfxEntity.close(); state.gfxLink.close(); state.frame.close();
+
+    FileHeader header;
+    header.sourceSize = session.source.fileSize;
+    header.ioRequests = state.stats.ioRequests;
+    header.ioConfigs = state.stats.ioConfigs;
+    header.ioStages = state.stats.ioStages;
+    header.gfxDispatches = state.stats.gfxDispatches;
+    header.gfxEntities = state.stats.gfxEntities;
+    header.gfxLinks = state.stats.gfxLinks;
+    header.correlatedFrames = state.stats.correlatedFrames;
+    header.generationBytes = uint32_t( session.generation.size() );
+    uint64_t next = sizeof( header );
+    if( !CheckedAppend( next, 1, 64 + session.generation.size(), error ) ) return false;
+    header.ioRequestOffset = next;
+    if( !CheckedAppend( next, state.stats.ioRequests, sizeof( StoredIoRequest ), error ) ) return false;
+    header.ioConfigOffset = next;
+    if( !CheckedAppend( next, state.stats.ioConfigs, sizeof( StoredIoConfig ), error ) ) return false;
+    header.ioStageOffset = next;
+    if( !CheckedAppend( next, state.stats.ioStages, sizeof( StoredIoStage ), error ) ) return false;
+    header.gfxDispatchOffset = next;
+    if( !CheckedAppend( next, state.stats.gfxDispatches, sizeof( StoredGfxDispatch ), error ) ) return false;
+    header.gfxEntityOffset = next;
+    if( !CheckedAppend( next, state.stats.gfxEntities, sizeof( StoredGfxEntity ), error ) ) return false;
+    header.gfxLinkOffset = next;
+    if( !CheckedAppend( next, state.stats.gfxLinks, sizeof( StoredGfxLink ), error ) ) return false;
+    header.frameOffset = next;
+    if( !CheckedAppend( next, state.stats.correlatedFrames, sizeof( StoredFrame ), error ) ) return false;
+
+    const auto temporary = root / ( std::string( FileName ) + ".tmp" );
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_io_gfx_file_open_failed"; return false; }
+    out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+    out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
+    if( !session.generation.empty() ) out.write( session.generation.data(),
+        std::streamsize( session.generation.size() ) );
+    const std::array<uint64_t, 7> expected = {
+        state.stats.ioRequests * sizeof( StoredIoRequest ),
+        state.stats.ioConfigs * sizeof( StoredIoConfig ),
+        state.stats.ioStages * sizeof( StoredIoStage ),
+        state.stats.gfxDispatches * sizeof( StoredGfxDispatch ),
+        state.stats.gfxEntities * sizeof( StoredGfxEntity ),
+        state.stats.gfxLinks * sizeof( StoredGfxLink ),
+        state.stats.correlatedFrames * sizeof( StoredFrame ) };
+    uint64_t copied = 0;
+    for( size_t i = 0; i < work.size(); ++i )
+        if( !CopyFile( work[i], out, copied, error ) || copied != expected[i] )
+        { if( error.empty() ) error = "session_io_gfx_work_size_mismatch"; return false; }
+    out.flush();
+    if( !out ) { error = "session_io_gfx_file_finalize_failed"; return false; }
+    out.close();
+    const auto target = root / FileName;
+    if( !AtomicReplace( temporary, target, error ) ) return false;
+    for( const auto& path : work ) { ec.clear(); std::filesystem::remove( path, ec ); }
+
+    LocalManifest manifest;
+    manifest.sourceSha256 = session.source.sha256;
+    manifest.sourceSize = session.source.fileSize;
+    manifest.generation = session.generation;
+    manifest.fileBytes = next;
+    manifest.fileSha256 = Sha256File( target );
+    state.stats.fileBytes = next;
+    manifest.stats = state.stats;
+    if( !SaveManifest( root, manifest, error ) ) return false;
+    stats = manifest.stats;
+    return true;
+}
+
+std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
+    const std::filesystem::path& sessionRoot, const TraceSessionManifest& session,
+    std::string& error )
+{
+    error.clear();
+    LocalManifest manifest;
+    FileHeader header;
+    const auto root = TraceSessionIoGfxIndexRoot( sessionRoot, session );
+    if( !VerifyFiles( root, session, manifest, header, error ) ) return {};
+    auto reader = std::make_shared<TraceSessionIoGfxReader>();
+    reader->m_path = root / FileName;
+    reader->m_fingerprint = session.source.sha256;
+    reader->m_ioRequestOffset = header.ioRequestOffset;
+    reader->m_ioConfigOffset = header.ioConfigOffset;
+    reader->m_ioStageOffset = header.ioStageOffset;
+    reader->m_gfxDispatchOffset = header.gfxDispatchOffset;
+    reader->m_gfxEntityOffset = header.gfxEntityOffset;
+    reader->m_gfxLinkOffset = header.gfxLinkOffset;
+    reader->m_frameOffset = header.frameOffset;
+    reader->m_stats = manifest.stats;
+    return reader;
+}
+
+std::vector<IoRequestDto> TraceSessionIoGfxReader::IoRequests() const
+{
+    const auto requests = ReadFixed<StoredIoRequest>( m_path, m_ioRequestOffset,
+        m_stats.ioRequests, "I/O request index read failed" );
+    const auto configs = ReadFixed<StoredIoConfig>( m_path, m_ioConfigOffset,
+        m_stats.ioConfigs, "I/O config index read failed" );
+    const auto stages = ReadFixed<StoredIoStage>( m_path, m_ioStageOffset,
+        m_stats.ioStages, "I/O stage index read failed" );
+    std::map<uint64_t, IoRequestDto> values;
+    const auto ensure = [&]( uint64_t requestId ) -> IoRequestDto& {
+        auto [it, inserted] = values.try_emplace( requestId );
+        if( inserted )
+        {
+            it->second.ref = MakeRef( m_fingerprint, "io-request", requestId );
+            it->second.requestId = requestId;
+            it->second.orphan = true;
+        }
+        return it->second;
+    };
+    for( const auto& value : requests )
+    {
+        auto& request = ensure( value.requestId );
+        request.resourceId = value.resourceId;
+        request.queueThreadRef = MakeRef( m_fingerprint, "thread", value.thread );
+        request.queueNs = value.timeNs;
+        request.operation = value.operation;
+        request.source = value.source;
+        request.priority = value.priority;
+        request.subsystem = value.subsystem;
+        request.flags = value.flags;
+        request.captureBoundary = ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+        request.orphan = false;
+    }
+    for( const auto& value : configs )
+    {
+        auto& request = ensure( value.requestId );
+        request.parentId = value.parentId;
+        request.requestedBytes = value.requestedBytes;
+        request.originFrameSequence = value.originFrameSequence;
+        request.parentKind = value.parentKind;
+        request.configFlags = value.flags;
+        request.captureBoundary = request.captureBoundary ||
+            ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+    }
+    for( const auto& value : stages )
+    {
+        auto& request = ensure( value.requestId );
+        request.stages.push_back( { value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+            value.bytes, value.detail, value.stage, value.status, value.flags } );
+        request.captureBoundary = request.captureBoundary ||
+            ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+        switch( JnIoStage( value.stage ) )
+        {
+        case JnIoStage::Start:
+            if( !request.startNs || value.timeNs < *request.startNs ) request.startNs = value.timeNs;
+            break;
+        case JnIoStage::Complete:
+        case JnIoStage::Error:
+        case JnIoStage::Cancel:
+            ++request.terminalCount;
+            if( !request.endNs || value.timeNs > *request.endNs ) request.endNs = value.timeNs;
+            request.transferredBytes = value.bytes;
+            request.status = value.status;
+            break;
+        case JnIoStage::RequestCallstack: request.requestCallstack = value.detail; break;
+        case JnIoStage::Requeue: request.status = value.status; break;
+        }
+    }
+    std::vector<IoRequestDto> result;
+    result.reserve( values.size() );
+    for( auto& [id, request] : values )
+    {
+        request.truncated = !request.endNs.has_value();
+        std::sort( request.stages.begin(), request.stages.end(),
+            []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+        result.emplace_back( std::move( request ) );
+    }
+    return result;
+}
+
+std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatches() const
+{
+    const auto stored = ReadFixed<StoredGfxDispatch>( m_path, m_gfxDispatchOffset,
+        m_stats.gfxDispatches, "Gfx dispatch index read failed" );
+    std::vector<GfxDispatchDto> result;
+    result.reserve( stored.size() );
+    for( const auto& value : stored ) result.push_back( {
+        MakeRef( m_fingerprint, "gfx-dispatch", value.dispatchId ), value.dispatchId,
+        value.frameIndex, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+        value.expectedJobs, value.threadingMode, value.flags } );
+    return result;
+}
+
+std::vector<GfxEntityDto> TraceSessionIoGfxReader::GfxEntities() const
+{
+    const auto stored = ReadFixed<StoredGfxEntity>( m_path, m_gfxEntityOffset,
+        m_stats.gfxEntities, "Gfx entity index read failed" );
+    std::vector<GfxEntityDto> result;
+    result.reserve( stored.size() );
+    for( const auto& value : stored ) result.push_back( {
+        MakeRef( m_fingerprint, "gfx-entity", value.entityId ), value.entityId, value.parentId,
+        value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ), value.gpuQueryId,
+        value.gpuContext, value.kind, value.flags } );
+    return result;
+}
+
+std::vector<GfxLinkDto> TraceSessionIoGfxReader::GfxLinks() const
+{
+    const auto stored = ReadFixed<StoredGfxLink>( m_path, m_gfxLinkOffset,
+        m_stats.gfxLinks, "Gfx link index read failed" );
+    std::vector<GfxLinkDto> result;
+    result.reserve( stored.size() );
+    for( size_t i = 0; i < stored.size(); ++i )
+    {
+        const auto& value = stored[i];
+        result.push_back( { MakeRef( m_fingerprint, "gfx-link", i ), value.sourceId,
+            value.targetId, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+            value.relation, value.flags } );
+    }
+    return result;
+}
+
+std::vector<CorrelatedFrameEventDto> TraceSessionIoGfxReader::CorrelatedFrames() const
+{
+    const auto stored = ReadFixed<StoredFrame>( m_path, m_frameOffset,
+        m_stats.correlatedFrames, "correlated Frame index read failed" );
+    std::vector<CorrelatedFrameEventDto> result;
+    result.reserve( stored.size() );
+    for( size_t i = 0; i < stored.size(); ++i )
+    {
+        const auto& value = stored[i];
+        result.push_back( { MakeRef( m_fingerprint, "frame-identity-event", i ), value.frameId,
+            value.domainIndex, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+            value.domain, value.phase, value.flags } );
+    }
+    return result;
+}
+
+bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& session, TraceSessionIoGfxStats& stats,
+    std::string& error )
+{
+    LocalManifest manifest;
+    FileHeader header;
+    if( !VerifyFiles( TraceSessionIoGfxIndexRoot( sessionRoot, session ), session,
+        manifest, header, error ) ) return false;
+    stats = manifest.stats;
+    return true;
+}
+
+}

@@ -811,3 +811,46 @@ tracy-query-doctor                Passed
 tracy-gpu-analysis-n29-static     Passed
 100% tests passed, 0 failed
 ```
+
+### 2026-08-31 I/O、Graphics Jobs 与关联 Frame Reader
+
+实现和正确性：
+
+- 新增`derived/io-gfx-index/1/exact/io-gfx.bin`，以单个不可变文件的七个固定宽度区域保存I/O Request/Config/Stage、Gfx Dispatch/Entity/Link和JN Correlated Frame事件。
+- Converter生产路径使用七个有界`.work`流并在提交阶段拼接，不为全部I/O Request或Gfx实体建立随录制时长增长的内存表。
+- Session打开校验source identity、区域布局、文件大小和SHA-256；只有校验成功后才开放`io`和`job.gfx`能力。
+- Synthetic Oracle恢复I/O Request 400的Queue/Start/Complete精确时间36/38/40 ns、4096 bytes和Success终态；恢复Gfx Dispatch 300、Gfx Job实体301以及`Dispatches`关系，并保留Frame 9关联。
+- Final Audit要求七类Canonical QueueType计数、磁盘索引计数和manifest计数完全一致；篡改文件最后一个字节后明确返回`session_io_gfx_file_sha256_mismatch`。
+- `io.search`和`job.gfx.statistics`已通过Session TraceSource读取磁盘索引，不再依赖完整Worker。
+- 当前Query调用仍会把所请求域的I/O Request或Gfx DTO物化为vector；后续需继续改成分页/范围扫描，不能据此宣称长Trace查询内存门禁已经通过。
+- I/O producer quality依赖AppInfo配置；独立AppInfo/Message Reader完成前，Session可返回精确事件，但完整性状态仍保持保守判断。
+
+TDD证据：
+
+```text
+RED:   Session advertises I/O/Gfx only after its disk-backed semantic reader is ready
+GREEN: Trace Session Inventory tests passed
+```
+
+构建身份：
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `D7A136FDF13A5B4A2EA7CE9BE8EC423C86F08A2E0D7A76DF13327B39CE9EDC06` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `0FB325D0754FB0751FC064DEC8442F4110D2057621595AC548F97799790D20BF` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```

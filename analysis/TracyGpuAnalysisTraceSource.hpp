@@ -13,6 +13,7 @@
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionRuntime.hpp"
+#include "TracyTraceSessionIoGfx.hpp"
 #include "TracyTraceSessionStore.hpp"
 #include "TracyTraceSessionSymbols.hpp"
 #include "TracyWorkerTraceSource.hpp"
@@ -131,6 +132,7 @@ private:
         std::shared_ptr<TraceSessionSchedulingReader> schedulingReader = {},
         std::shared_ptr<TraceSessionRelationReader> relationReader = {},
         std::shared_ptr<TraceSessionRuntimeReader> runtimeReader = {},
+        std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader = {},
         std::shared_ptr<TraceSessionSymbolReader> symbolReader = {} );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
@@ -151,6 +153,7 @@ private:
     std::shared_ptr<TraceSessionSchedulingReader> m_schedulingReader;
     std::shared_ptr<TraceSessionRelationReader> m_relationReader;
     std::shared_ptr<TraceSessionRuntimeReader> m_runtimeReader;
+    std::shared_ptr<TraceSessionIoGfxReader> m_ioGfxReader;
     std::shared_ptr<TraceSessionSymbolReader> m_symbolReader;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;

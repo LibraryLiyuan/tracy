@@ -86,6 +86,13 @@ struct TraceSessionDerivedStats
     uint64_t runtimeDomainStates = 0;
     uint64_t scriptFrames = 0;
     uint64_t scriptStackEvents = 0;
+    uint64_t ioRequests = 0;
+    uint64_t ioConfigs = 0;
+    uint64_t ioStages = 0;
+    uint64_t gfxDispatches = 0;
+    uint64_t gfxEntities = 0;
+    uint64_t gfxLinks = 0;
+    uint64_t correlatedFrames = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

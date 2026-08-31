@@ -14,6 +14,7 @@
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionRuntime.hpp"
+#include "TracyTraceSessionIoGfx.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -231,6 +232,13 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "runtime_domain_states " << value.stats.runtimeDomainStates << '\n';
     out << "script_frames " << value.stats.scriptFrames << '\n';
     out << "script_stack_events " << value.stats.scriptStackEvents << '\n';
+    out << "io_requests " << value.stats.ioRequests << '\n';
+    out << "io_configs " << value.stats.ioConfigs << '\n';
+    out << "io_stages " << value.stats.ioStages << '\n';
+    out << "gfx_dispatches " << value.stats.gfxDispatches << '\n';
+    out << "gfx_entities " << value.stats.gfxEntities << '\n';
+    out << "gfx_links " << value.stats.gfxLinks << '\n';
+    out << "correlated_frames " << value.stats.correlatedFrames << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -332,6 +340,13 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "runtime_domain_states" ) in >> value.stats.runtimeDomainStates;
         else if( key == "script_frames" ) in >> value.stats.scriptFrames;
         else if( key == "script_stack_events" ) in >> value.stats.scriptStackEvents;
+        else if( key == "io_requests" ) in >> value.stats.ioRequests;
+        else if( key == "io_configs" ) in >> value.stats.ioConfigs;
+        else if( key == "io_stages" ) in >> value.stats.ioStages;
+        else if( key == "gfx_dispatches" ) in >> value.stats.gfxDispatches;
+        else if( key == "gfx_entities" ) in >> value.stats.gfxEntities;
+        else if( key == "gfx_links" ) in >> value.stats.gfxLinks;
+        else if( key == "correlated_frames" ) in >> value.stats.correlatedFrames;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -573,6 +588,16 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.scriptFrames = runtimeStats.scriptFrames;
     index.stats.scriptStackEvents = runtimeStats.scriptStackEvents;
 
+    TraceSessionIoGfxStats ioGfxStats;
+    if( !BuildTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, error ) ) return false;
+    index.stats.ioRequests = ioGfxStats.ioRequests;
+    index.stats.ioConfigs = ioGfxStats.ioConfigs;
+    index.stats.ioStages = ioGfxStats.ioStages;
+    index.stats.gfxDispatches = ioGfxStats.gfxDispatches;
+    index.stats.gfxEntities = ioGfxStats.gfxEntities;
+    index.stats.gfxLinks = ioGfxStats.gfxLinks;
+    index.stats.correlatedFrames = ioGfxStats.correlatedFrames;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -716,6 +741,14 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         runtimeStats.scriptFrames != index.stats.scriptFrames ||
         runtimeStats.scriptStackEvents != index.stats.scriptStackEvents )
     { if( error.empty() ) error = "session_runtime_derived_audit_mismatch"; return false; }
+    TraceSessionIoGfxStats ioGfxStats;
+    if( !AuditTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, error ) ||
+        ioGfxStats.ioRequests != index.stats.ioRequests ||
+        ioGfxStats.ioConfigs != index.stats.ioConfigs || ioGfxStats.ioStages != index.stats.ioStages ||
+        ioGfxStats.gfxDispatches != index.stats.gfxDispatches ||
+        ioGfxStats.gfxEntities != index.stats.gfxEntities || ioGfxStats.gfxLinks != index.stats.gfxLinks ||
+        ioGfxStats.correlatedFrames != index.stats.correlatedFrames )
+    { if( error.empty() ) error = "session_io_gfx_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
@@ -786,6 +819,14 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         queueCounts[size_t( QueueType::JnScriptFrame )].count != index.stats.scriptFrames ||
         queueCounts[size_t( QueueType::JnScriptStack )].count != index.stats.scriptStackEvents )
     { error = "session_runtime_source_count_mismatch"; return false; }
+    if( queueCounts[size_t( QueueType::JnIoRequest )].count != index.stats.ioRequests ||
+        queueCounts[size_t( QueueType::JnIoConfig )].count != index.stats.ioConfigs ||
+        queueCounts[size_t( QueueType::JnIoStage )].count != index.stats.ioStages ||
+        queueCounts[size_t( QueueType::JnGfxDispatch )].count != index.stats.gfxDispatches ||
+        queueCounts[size_t( QueueType::JnGfxEntity )].count != index.stats.gfxEntities ||
+        queueCounts[size_t( QueueType::JnGfxLink )].count != index.stats.gfxLinks ||
+        queueCounts[size_t( QueueType::JnFrame )].count != index.stats.correlatedFrames )
+    { error = "session_io_gfx_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::FrameImageData )].count != index.stats.frameImageDataEvents ||
         queueCounts[size_t( QueueType::FrameImage )].count != index.stats.frameImageEvents )
     { error = "session_frame_image_source_count_mismatch"; return false; }

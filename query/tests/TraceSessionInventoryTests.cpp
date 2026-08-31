@@ -9,6 +9,7 @@
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionRuntime.hpp"
+#include "TracyTraceSessionIoGfx.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
 #include "TracyQueryService.hpp"
@@ -1100,6 +1101,41 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.jnScriptStack = { 119, 2001, 0, 0, 0, 0,
         uint8_t( tracy::JnScriptRecordKind::ZoneEnd ) };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnGfxDispatch;
+    item.jnGfxDispatch = { 117, 300, 9, 2, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnGfxEntity;
+    item.jnGfxEntity = { 117, 301, 300, 77, 0,
+        uint8_t( tracy::JnGfxEntityKind::GfxJob ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnGfxLink;
+    item.jnGfxLink = { 117, 300, 301, uint8_t( tracy::JnGfxRelation::Dispatches ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnFrame;
+    item.jnFrame = { 118, 9, 9, uint8_t( tracy::JnFrameDomain::Player ),
+        uint8_t( tracy::JnFramePhase::Begin ), uint8_t( tracy::JnFrameFlags::Canonical ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoRequest;
+    item.jnIoRequest = { 118, 400, 500, uint8_t( tracy::JnIoOperation::Read ),
+        uint8_t( tracy::JnIoSource::JnfsNative ), 2, 3, uint8_t( tracy::JnIoFlags::Async ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoConfig;
+    item.jnIoConfig = { 400, 0, 4096, 9, uint8_t( tracy::JnIoParentKind::None ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoStage;
+    item.jnIoStage = { 119, 400, 1024, 0, uint8_t( tracy::JnIoStage::Start ),
+        uint8_t( tracy::JnIoStatus::Unknown ), 0 };
+    AppendQueueItem( frame, item );
+    item.jnIoStage = { 120, 400, 4096, 0, uint8_t( tracy::JnIoStage::Complete ),
+        uint8_t( tracy::JnIoStatus::Success ), 0 };
+    AppendQueueItem( frame, item );
 
     const std::array<uint64_t, 2> zoneCallstack { 0x40404040, 0x50505050 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5555,
@@ -1570,6 +1606,40 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         runtimeScriptCapability->present && runtimeScriptCapability->indexed && runtimeScriptCapability->queryable;
     test.Check( sessionRuntimeScriptReady,
         "Session advertises Script Runtime only after its disk-backed semantic reader is ready" );
+    const auto ioCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "io"; } );
+    const bool sessionIoReady = ioCapability != sessionCapabilities.end() &&
+        ioCapability->present && ioCapability->indexed && ioCapability->queryable;
+    test.Check( sessionIoReady,
+        "Session advertises I/O only after its disk-backed semantic reader is ready" );
+    const auto gfxCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "job.gfx"; } );
+    const bool sessionGfxReady = gfxCapability != sessionCapabilities.end() &&
+        gfxCapability->present && gfxCapability->indexed && gfxCapability->queryable;
+    test.Check( sessionGfxReady,
+        "Session advertises Gfx evidence only after its disk-backed semantic reader is ready" );
+    try
+    {
+        const auto ioRequests = sessionSource->GetIoRequests();
+        const auto gfxDispatches = sessionSource->GetGfxDispatches();
+        const auto gfxEntities = sessionSource->GetGfxEntities();
+        const auto gfxLinks = sessionSource->GetGfxLinks();
+        const auto correlatedFrames = sessionSource->GetCorrelatedFrameEvents();
+        test.Check( ioRequests.size() == 1 && ioRequests[0].requestId == 400 &&
+            ioRequests[0].requestedBytes == 4096 && ioRequests[0].transferredBytes == 4096 &&
+            ioRequests[0].queueNs == 36 && ioRequests[0].startNs == 38 && ioRequests[0].endNs == 40 &&
+            !ioRequests[0].orphan && !ioRequests[0].truncated,
+            "Session I/O reader reconstructs one complete request without a Worker" );
+        test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
+            gfxEntities.size() == 1 && gfxEntities[0].entityId == 301 &&
+            gfxLinks.size() == 1 && gfxLinks[0].sourceId == 300 && gfxLinks[0].targetId == 301 &&
+            correlatedFrames.size() == 1 && correlatedFrames[0].frameId == 9,
+            "Session Gfx/Frame evidence reader preserves fixed binary facts without a Worker" );
+    }
+    catch( const std::exception& exception )
+    {
+        test.Check( false, std::string( "Session I/O/Gfx evidence reader is unavailable: " ) + exception.what() );
+    }
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1808,6 +1878,33 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 scriptSummary["data"]["counts"]["zones"] == "1" &&
                 scriptSummary["data"]["counts"]["complete_zones"] == "1",
                 "Query 1.34 reconstructs exact Session C#/Lua Script evidence without a Worker" );
+        }
+        if( sessionIoReady )
+        {
+            const auto ioSearch = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-io-search" },
+                { "method", "io.search" }, { "params", { { "trace_id", traceId },
+                    { "offset", 0 }, { "limit", 10 } } }
+            } );
+            test.Check( ioSearch.value( "ok", false ) &&
+                ioSearch["data"]["request_count"] == "1" &&
+                ioSearch["data"]["requests"].size() == 1 &&
+                ioSearch["data"]["requests"][0]["request_id"] == "400" &&
+                ioSearch["data"]["requests"][0]["requested_bytes"] == "4096" &&
+                ioSearch["data"]["requests"][0]["transferred_bytes"] == "4096",
+                "Query 1.34 reads exact Session I/O evidence without a Worker" );
+        }
+        if( sessionGfxReady )
+        {
+            const auto gfxStats = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-gfx-stats" },
+                { "method", "job.gfx.statistics" }, { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( gfxStats.value( "ok", false ) &&
+                gfxStats["data"]["counts"]["dispatches"] == "1" &&
+                gfxStats["data"]["counts"]["entities"] == "1" &&
+                gfxStats["data"]["counts"]["links"] == "1",
+                "Query 1.34 reads exact Session Gfx evidence without a Worker" );
         }
         const auto sourceLocations = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-source-locations" },
@@ -2128,6 +2225,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedRuntimeStats, error ) &&
         error == "session_runtime_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Runtime/Script semantic index" );
+    const auto ioGfxFile = tracy::analysis::TraceSessionIoGfxIndexRoot(
+        publishedSession, manifest ) / "io-gfx.bin";
+    {
+        std::fstream damaged( ioGfxFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x4d );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionIoGfxStats rejectedIoGfxStats;
+    test.Check( !tracy::analysis::AuditTraceSessionIoGfxDerived(
+        publishedSession, manifest, rejectedIoGfxStats, error ) &&
+        error == "session_io_gfx_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed I/O/Gfx semantic index" );
     const auto symbolFile = tracy::analysis::TraceSessionSymbolIndexRoot(
         publishedSession, manifest ) / "symbols.bin";
     {
