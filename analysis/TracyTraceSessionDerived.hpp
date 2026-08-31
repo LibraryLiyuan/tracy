@@ -34,6 +34,10 @@ struct TraceSessionDerivedStats
     uint64_t frameSets = 0;
     uint64_t frames = 0;
     uint64_t completeFrames = 0;
+    uint64_t frameImages = 0;
+    uint64_t frameImageDataEvents = 0;
+    uint64_t frameImageEvents = 0;
+    uint64_t frameImageBc1Bytes = 0;
     uint64_t jobTypes = 0;
     uint64_t jobs = 0;
     uint64_t jobSchedules = 0;

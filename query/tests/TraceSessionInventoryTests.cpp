@@ -8,6 +8,7 @@
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
+#include "TracyTraceSessionFrameImages.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -1273,6 +1274,17 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::FrameVsync;
     item.frameVsync = { 106, 9 };
     AppendQueueItem( frame, item );
+    const std::vector<uint8_t> frameImageBc1 { 0x00, 0xf8, 0x00, 0xf8,
+        0x55, 0x55, 0x55, 0x55 };
+    AppendLargePayloadEvent( frame, tracy::QueueType::FrameImageData,
+        0x9000, frameImageBc1 );
+    item = {};
+    item.hdr.type = tracy::QueueType::FrameImage;
+    item.frameImage.frame = 0;
+    item.frameImage.w = 4;
+    item.frameImage.h = 4;
+    item.frameImage.flip = 1;
+    AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
     item.jnGpuCatalogControl = { 105, Generation, 0, 1,
@@ -1472,6 +1484,18 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionFrames[0].endNs == 36 && sessionFrames[1].beginNs == 36 &&
         sessionFrames[1].endNs == 40 && sessionDurations == std::vector<int64_t>( { 24, 4 } ),
         "Session Frame reader applies the Welcome transform and closes the offline tail at last semantic time" );
+    const auto sessionFrameImages = sessionSource->GetFrameImageResources();
+    const auto sessionFrameImageRaw = sessionSource->ReadFrameImageBc1( 0, 2, 3 );
+    const auto sessionFrameImageDecoded = sessionSource->ReadFrameImage( 0, 1024 );
+    test.Check( sessionSource->GetTraceInfo().counts.frameImages == 1 &&
+        sessionFrameImages.size() == 1 && sessionFrameImages[0].width == 4 &&
+        sessionFrameImages[0].height == 4 && sessionFrameImages[0].flipped &&
+        sessionFrameImages[0].rawFrameIndex == 1 && sessionFrameImages[0].rawBc1Bytes == 8 &&
+        sessionFrameImageRaw.offset == 2 && sessionFrameImageRaw.totalBytes == 8 &&
+        sessionFrameImageRaw.bytes.size() == 3 && !sessionFrameImageRaw.eof &&
+        sessionFrameImageDecoded.width == 4 && sessionFrameImageDecoded.height == 4 &&
+        sessionFrameImageDecoded.flipped && sessionFrameImageDecoded.rgba.size() == 64,
+        "Session FrameImage reader preserves metadata, paged BC1 bytes and on-demand RGBA decode" );
     const auto sessionJobs = sessionSource->GetJobs();
     test.Check( sessionJobs.size() == 1 && sessionJobs[0].jobId == 500 &&
         sessionJobs[0].name == "SyntheticJob" && sessionJobs[0].scheduleNs == 16 &&
@@ -1590,6 +1614,27 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             frames["data"]["frames"][0]["end_ns"] == "36" &&
             frames["data"]["frames"][1]["duration_ns"] == "4",
             "Query 1.34 preserves Session Frame timing and pagination semantics" );
+        const auto imageRef = sessionFrameImages.empty() ? std::string {} : sessionFrameImages[0].ref;
+        const auto frameImageList = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-frame-image-list" },
+            { "method", "frame_image.list" }, { "params", { { "trace_id", traceId } } }
+        } );
+        const auto frameImageRaw = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-frame-image-raw" },
+            { "method", "frame_image.raw" }, { "params", { { "trace_id", traceId },
+                { "ref", imageRef }, { "offset_bytes", 2 }, { "max_bytes", 3 } } }
+        } );
+        test.Check( frameImageList.value( "ok", false ) &&
+            frameImageList["data"]["images"].size() == 1 &&
+            frameImageList["data"]["images"][0]["width"] == 4 &&
+            frameImageList["data"]["images"][0]["height"] == 4 &&
+            frameImageList["data"]["images"][0]["flipped"] == true &&
+            frameImageRaw.value( "ok", false ) && frameImageRaw["data"]["format"] == "bc1_dxt1" &&
+            frameImageRaw["data"]["offset_bytes"] == "2" &&
+            frameImageRaw["data"]["returned_bytes"] == "3" &&
+            frameImageRaw["data"]["total_bytes"] == "8" &&
+            frameImageRaw["data"]["eof"] == false,
+            "Query 1.34 lists and pages Session FrameImage evidence without a Worker" );
         const auto jobs = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-job-search" }, { "method", "job.search" },
             { "params", { { "trace_id", traceId }, { "query", "SyntheticJob" } } }
@@ -1623,6 +1668,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         gpuZones->queryable && gpuZones->indexed;
     test.Check( sessionGpuZonesReady,
         "Session advertises GPU Zone only after its disk-backed semantic reader is ready" );
+    const auto frameImages = std::find_if( capabilities.begin(), capabilities.end(),
+        []( const auto& value ) { return value.domain == "frame_image"; } );
+    const bool sessionFrameImagesReady = frameImages != capabilities.end() && frameImages->present &&
+        frameImages->indexed && frameImages->queryable;
+    test.Check( sessionFrameImagesReady,
+        "Session advertises FrameImage only after its disk-backed semantic reader is ready" );
         const auto cpuSearch = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
             { "params", { { "trace_id", traceId } } }
@@ -1789,6 +1840,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedGpuZoneStats, error ) &&
         error == "session_gpu_zone_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed GPU Zone semantic index" );
+    const auto frameImageDataFile = tracy::analysis::TraceSessionFrameImageIndexRoot(
+        publishedSession, manifest ) / "frame-images.bc1";
+    {
+        std::fstream damaged( frameImageDataFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x6b );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionFrameImageStats rejectedFrameImageStats;
+    test.Check( !tracy::analysis::AuditTraceSessionFrameImageDerived(
+        publishedSession, manifest, rejectedFrameImageStats, error ) &&
+        error == "session_frame_image_data_sha256_mismatch",
+        "Session Final Audit rejects corrupted committed FrameImage BC1 evidence" );
     const auto samplingFile = tracy::analysis::TraceSessionSamplingIndexRoot(
         publishedSession, manifest ) / "samples.bin";
     {

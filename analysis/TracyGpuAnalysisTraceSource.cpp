@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <limits>
 #include <sstream>
 
 namespace tracy::analysis
@@ -31,6 +32,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !LoadTraceSessionDerivedStats( path, *session, sessionStats, error ) ) return {};
     auto frameReader = TraceSessionFrameReader::Open( path, *session, error );
     if( !frameReader ) return {};
+    auto frameImageReader = TraceSessionFrameImageReader::Open( path, *session, error );
+    if( !frameImageReader ) return {};
     auto jobReader = TraceSessionJobReader::Open( path, *session, error );
     if( !jobReader ) return {};
     auto cpuZoneReader = TraceSessionCpuZoneReader::Open( path, *session, error );
@@ -67,7 +70,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
     return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
-        std::move( frameReader ), std::move( jobReader ), std::move( cpuZoneReader ),
+        std::move( frameReader ), std::move( frameImageReader ),
+        std::move( jobReader ), std::move( cpuZoneReader ),
         std::move( gpuZoneReader ),
         std::move( memoryReader ), std::move( samplingReader ),
         std::move( schedulingReader ) ) );
@@ -76,6 +80,7 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
     std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode,
     TraceSessionDerivedStats sessionStats, std::shared_ptr<TraceSessionFrameReader> frameReader,
+    std::shared_ptr<TraceSessionFrameImageReader> frameImageReader,
     std::shared_ptr<TraceSessionJobReader> jobReader,
     std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader,
     std::shared_ptr<TraceSessionGpuZoneReader> gpuZoneReader,
@@ -84,6 +89,7 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionSchedulingReader> schedulingReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
+      m_frameImageReader( std::move( frameImageReader ) ),
       m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
       m_gpuZoneReader( std::move( gpuZoneReader ) ),
       m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
@@ -158,6 +164,13 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     result.push_back( Capability { "frame", framePresent, framePresent, true,
         framePresent ? "available from the N30 Session mandatory Frame index" :
             "The source Session contains no Frame facts", FrameMethods } );
+    static const std::vector<std::string> FrameImageMethods = {
+        "frame_image.list", "frame_image.metadata", "frame_image.resource", "frame_image.raw"
+    };
+    const auto frameImagePresent = m_frameImageReader && m_frameImageReader->Stats().images != 0;
+    result.push_back( Capability { "frame_image", frameImagePresent, frameImagePresent, true,
+        frameImagePresent ? "available from the N30 Session mandatory FrameImage index" :
+            "The source Session contains no retained FrameImage facts", FrameImageMethods } );
 
     const auto addPending = [&]( const char* domain, TraceSessionProtocolDomain sourceDomain ) {
         const auto count = m_sessionStats.domains[size_t( sourceDomain )];
@@ -270,6 +283,7 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
         }
     }
     if( m_jobReader ) out.counts.jobs = m_jobReader->Stats().jobs;
+    if( m_frameImageReader ) out.counts.frameImages = m_frameImageReader->Stats().images;
     if( m_cpuZoneReader ) out.counts.cpuZones = m_cpuZoneReader->Stats().zones;
     if( m_gpuZoneReader ) out.counts.gpuZones = m_gpuZoneReader->Stats().zones;
     if( m_memoryReader )
@@ -324,6 +338,15 @@ std::vector<FrameDto> GpuAnalysisTraceSource::GetFramesForSet(
         dto.beginNs = frames[i].beginNs;
         dto.complete = frames[i].complete;
         if( frames[i].complete ) dto.endNs = frames[i].endNs;
+        if( m_frameImageReader && m_frameReader->Sets()[frameSetIndex].name == "Frames" )
+        {
+            const auto found = std::find_if( m_frameImageReader->Images().begin(),
+                m_frameImageReader->Images().end(),
+                [i]( const auto& image ) { return image.rawFrameIndex == i; } );
+            if( found != m_frameImageReader->Images().end() )
+                dto.imageRef = MakeEntityRef( "frame-image",
+                    size_t( found - m_frameImageReader->Images().begin() ) );
+        }
         result.emplace_back( std::move( dto ) );
     }
     return result;
@@ -473,10 +496,52 @@ D0(std::vector<SourceLocationDto>, GetSourceLocations)
 D2(std::vector<CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth)
 D2(std::vector<SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes)
 D2(std::vector<SymbolCodeDto>, ResolveSymbols, const std::vector<std::string>&, symbolRefs, size_t, maxBytes)
-D2(std::vector<FrameImageDto>, ResolveFrameImages, const std::vector<std::string>&, imageRefs, size_t, maxBytes)
+std::vector<FrameImageDto> GpuAnalysisTraceSource::ResolveFrameImages(
+    const std::vector<std::string>& imageRefs, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ResolveFrameImages( imageRefs, maxBytes );
+    std::vector<FrameImageDto> result;
+    if( !m_frameImageReader ) return result;
+    for( const auto& ref : imageRefs )
+    {
+        const auto id = ParseEntityRef( ref, "frame-image" );
+        if( !id || *id >= m_frameImageReader->Images().size() ) continue;
+        auto image = m_frameImageReader->Decode( size_t( *id ), maxBytes );
+        image.ref = ref;
+        result.emplace_back( std::move( image ) );
+    }
+    return result;
+}
 D0(std::vector<SourceResourceDto>, GetSourceResources)
 D0(std::vector<SymbolResourceDto>, GetSymbolResources)
-D0(std::vector<FrameImageMetadataDto>, GetFrameImageResources)
+std::vector<FrameImageMetadataDto> GpuAnalysisTraceSource::GetFrameImageResources() const
+{
+    if( WorkerLoaded() ) return Worker().GetFrameImageResources();
+    std::vector<FrameImageMetadataDto> result;
+    if( !m_frameImageReader ) return result;
+    result.reserve( m_frameImageReader->Images().size() );
+    size_t baseSet = std::numeric_limits<size_t>::max();
+    if( m_frameReader ) for( size_t i = 0; i < m_frameReader->Sets().size(); ++i )
+        if( m_frameReader->Sets()[i].name == "Frames" ) { baseSet = i; break; }
+    for( size_t i = 0; i < m_frameImageReader->Images().size(); ++i )
+    {
+        const auto& image = m_frameImageReader->Images()[i];
+        FrameImageMetadataDto dto;
+        dto.id = i;
+        dto.ref = MakeEntityRef( "frame-image", i );
+        dto.width = image.width;
+        dto.height = image.height;
+        dto.flipped = image.flipped;
+        dto.rawFrameIndex = image.rawFrameIndex;
+        dto.rawBc1Bytes = image.dataBytes;
+        if( baseSet != std::numeric_limits<size_t>::max() &&
+            image.rawFrameIndex < m_frameReader->Sets()[baseSet].frames.size() )
+            dto.frameRef = MakeEntityRef( "frame",
+                ( uint64_t( baseSet ) << 32 ) | image.rawFrameIndex );
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
 std::optional<CpuZoneDto> GpuAnalysisTraceSource::GetCpuZone( std::string_view ref ) const
 {
     if( WorkerLoaded() ) return Worker().GetCpuZone( ref );
@@ -547,8 +612,24 @@ D3(BinaryResourceChunkDto, ReadEmbeddedSourceBytes, size_t, sourceId, size_t, of
 D2(SymbolCodeDto, ReadSymbolCode, uint64_t, symbolId, size_t, maxBytes)
 D3(BinaryResourceChunkDto, ReadSymbolCodeBytes, uint64_t, symbolId, size_t, offset, size_t, maxBytes)
 D3(std::vector<DisassemblyInstructionDto>, DisassembleSymbol, std::string_view, symbolRef, size_t, maxBytes, size_t, maxInstructions)
-D2(FrameImageDto, ReadFrameImage, size_t, imageId, size_t, maxBytes)
-D3(BinaryResourceChunkDto, ReadFrameImageBc1, size_t, imageId, size_t, offset, size_t, maxBytes)
+FrameImageDto GpuAnalysisTraceSource::ReadFrameImage( size_t imageId, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadFrameImage( imageId, maxBytes );
+    if( !m_frameImageReader ) throw std::out_of_range( "frame image resource was not found" );
+    auto image = m_frameImageReader->Decode( imageId, maxBytes );
+    image.ref = MakeEntityRef( "frame-image", imageId );
+    return image;
+}
+
+BinaryResourceChunkDto GpuAnalysisTraceSource::ReadFrameImageBc1(
+    size_t imageId, size_t offset, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadFrameImageBc1( imageId, offset, maxBytes );
+    if( !m_frameImageReader ) throw std::out_of_range( "frame image resource was not found" );
+    auto data = m_frameImageReader->ReadBc1( imageId, offset, maxBytes );
+    data.ref = MakeEntityRef( "frame-image", imageId );
+    return data;
+}
 
 #undef D0
 #undef D1

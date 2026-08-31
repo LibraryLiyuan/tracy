@@ -4,6 +4,7 @@
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyTraceSessionDerived.hpp"
 #include "TracyTraceSessionFrames.hpp"
+#include "TracyTraceSessionFrameImages.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
@@ -118,6 +119,7 @@ private:
         std::shared_ptr<GpuAnalysisStoreReader> reader, bool sessionMode = false,
         TraceSessionDerivedStats sessionStats = {},
         std::shared_ptr<TraceSessionFrameReader> frameReader = {},
+        std::shared_ptr<TraceSessionFrameImageReader> frameImageReader = {},
         std::shared_ptr<TraceSessionJobReader> jobReader = {},
         std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader = {},
         std::shared_ptr<TraceSessionGpuZoneReader> gpuZoneReader = {},
@@ -134,6 +136,7 @@ private:
     bool m_sessionMode = false;
     TraceSessionDerivedStats m_sessionStats;
     std::shared_ptr<TraceSessionFrameReader> m_frameReader;
+    std::shared_ptr<TraceSessionFrameImageReader> m_frameImageReader;
     std::shared_ptr<TraceSessionJobReader> m_jobReader;
     std::shared_ptr<TraceSessionCpuZoneReader> m_cpuZoneReader;
     std::shared_ptr<TraceSessionGpuZoneReader> m_gpuZoneReader;

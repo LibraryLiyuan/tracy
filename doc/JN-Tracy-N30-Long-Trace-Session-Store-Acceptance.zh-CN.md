@@ -490,6 +490,10 @@ GREEN：
 - 父子关系、child count、self time、SourceLocation、Callsite和Callstack均由Canonical事实重建；捕获结束仍缺少GPU timestamp的Zone保留为`complete=false`，不得伪造结束时间，也不因合法在途Query使整个Session失败。
 - `zone.gpu.contexts/search/get/tree/statistics`由Session GPU Zone Reader直接提供；能力只声明已实现方法，Annotation尚未物化时返回明确`unavailable_reason`。
 - `gpu-zones.bin`保存source SHA-256、source size、manifest generation、Context/Zone/Complete/Source及GPU时钟事件计数；Final Audit重算完整SHA-256并逐项核对全部GPU Begin/End/Time/Calibration/Sync/Context QueueType。
+- FrameImage域新增`frame-image-index/1/exact`：`frame-images.bin`只保存固定宽度图片目录，`frame-images.bc1`顺序保存图片块；打开Session只驻留目录，Raw分页或PNG/MCP资源请求时才读取单张BC1并按需解码RGBA。
+- FrameImage转换严格复用传统Worker的`FixOrder + RDO`处理语义；`FrameImageData`和`FrameImage`必须一一配对，尺寸、BC1字节数、重复Frame以及on-demand frame offset均做显式校验。
+- 图片目录保存width、height、flip、raw frame index、数据offset/length；`frame_image.list/metadata/resource/raw`均从Session Reader提供，Frame基础Set可证明时同步返回`frame_ref`，不能证明时保持null。
+- Metadata与BC1数据分别保存source强身份、generation、文件大小和SHA-256；Final Audit完整校验两个文件并核对源`FrameImageData/FrameImage`事件守恒。BC1总量不进入Session打开内存。
 
 ### TDD证据
 
@@ -531,11 +535,14 @@ GREEN：
 - GPU Zone RED按预期失败于`Session advertises GPU Zone only after its disk-backed semantic reader is ready`。
 - GPU Zone GREEN恢复一个D3D12 Context和`Synthetic GPU Zone`：CPU/GPU区间均为`[36,40]ns`、begin query ID为7、self time为4ns，SourceLocation为`GpuFunction (Gpu.cpp:789)`；直接Reader、`zone.gpu.contexts`和`zone.gpu.search`结果一致。
 - Final Audit在`gpu-zones.bin`同尺寸内容被篡改后返回`session_gpu_zone_file_sha256_mismatch`。
+- FrameImage RED按预期失败于`Session advertises FrameImage only after its disk-backed semantic reader is ready`。
+- FrameImage GREEN恢复1张4×4、flip=true、raw frame index=1的BC1图片；直接Reader验证8-byte Raw分页和64-byte RGBA按需解码，Query `frame_image.list/raw`返回相同元数据、offset和字节数。
+- Final Audit在`frame-images.bc1`内容被篡改后返回`session_frame_image_data_sha256_mismatch`。
 - Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- FrameImage的语义分页Reader。
+- FrameImage与基础`Frames` FrameSet的raw index关联已接入；仍需在短Trace传统Worker差分中覆盖On-demand首次连接、pre-capture图片丢弃和初始Frame offset变体。
 - GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
 - Scheduling当前以线程/CPU固定宽度区域线性扫描；在N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。Thread identity/name、CPU topology和CPU usage磁盘Reader尚未完成。
 - Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation磁盘Reader尚未完成，因此Sample目前能返回稳定`callstack_ref`，但不能在Session路径解析到完整符号帧。
@@ -643,6 +650,29 @@ tracy-gpu-analysis-n29-static     Passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `DB3A3AB97032A8F266E3448CA9C154305D1A4CED0E2B5F20902B033C60251B6C` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `A9FE09427B37B1EDD2E94BFEFA6117ED558C480BA997C81EA76E94556CA03E64` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 FrameImage Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `E7C29C096564D2072F87B58225905476371492E9A023C6FBB5AE2D4F9296C580` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `F1AC6E5D9257C3324D5D22C089A1E3688F1F779FCB525BF68BE836D7595BF01C` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

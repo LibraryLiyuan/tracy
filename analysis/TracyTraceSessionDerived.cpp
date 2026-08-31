@@ -3,6 +3,7 @@
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyHash.hpp"
 #include "TracyTraceSessionFrames.hpp"
+#include "TracyTraceSessionFrameImages.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
@@ -175,6 +176,10 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "frame_sets " << value.stats.frameSets << '\n';
     out << "frames " << value.stats.frames << '\n';
     out << "complete_frames " << value.stats.completeFrames << '\n';
+    out << "frame_images " << value.stats.frameImages << '\n';
+    out << "frame_image_data_events " << value.stats.frameImageDataEvents << '\n';
+    out << "frame_image_events " << value.stats.frameImageEvents << '\n';
+    out << "frame_image_bc1_bytes " << value.stats.frameImageBc1Bytes << '\n';
     out << "job_types " << value.stats.jobTypes << '\n';
     out << "jobs " << value.stats.jobs << '\n';
     out << "job_schedules " << value.stats.jobSchedules << '\n';
@@ -261,6 +266,10 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "frame_sets" ) in >> value.stats.frameSets;
         else if( key == "frames" ) in >> value.stats.frames;
         else if( key == "complete_frames" ) in >> value.stats.completeFrames;
+        else if( key == "frame_images" ) in >> value.stats.frameImages;
+        else if( key == "frame_image_data_events" ) in >> value.stats.frameImageDataEvents;
+        else if( key == "frame_image_events" ) in >> value.stats.frameImageEvents;
+        else if( key == "frame_image_bc1_bytes" ) in >> value.stats.frameImageBc1Bytes;
         else if( key == "job_types" ) in >> value.stats.jobTypes;
         else if( key == "jobs" ) in >> value.stats.jobs;
         else if( key == "job_schedules" ) in >> value.stats.jobSchedules;
@@ -454,6 +463,14 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.frames = frameStats.frames;
     index.stats.completeFrames = frameStats.completeFrames;
 
+    TraceSessionFrameImageStats frameImageStats;
+    if( !BuildTraceSessionFrameImageDerived( sessionRoot, manifest,
+        frameImageStats, error ) ) return false;
+    index.stats.frameImages = frameImageStats.images;
+    index.stats.frameImageDataEvents = frameImageStats.imageDataEvents;
+    index.stats.frameImageEvents = frameImageStats.imageEvents;
+    index.stats.frameImageBc1Bytes = frameImageStats.bc1Bytes;
+
     TraceSessionJobStats jobStats;
     if( !BuildTraceSessionJobDerived( sessionRoot, manifest, jobStats, error ) ) return false;
     index.stats.jobTypes = jobStats.jobTypes;
@@ -569,6 +586,13 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         frameReader->Stats().frames != index.stats.frames ||
         frameReader->Stats().completeFrames != index.stats.completeFrames )
     { if( error.empty() ) error = "session_frame_derived_audit_mismatch"; return false; }
+    TraceSessionFrameImageStats frameImageStats;
+    if( !AuditTraceSessionFrameImageDerived( sessionRoot, manifest, frameImageStats, error ) ||
+        frameImageStats.images != index.stats.frameImages ||
+        frameImageStats.imageDataEvents != index.stats.frameImageDataEvents ||
+        frameImageStats.imageEvents != index.stats.frameImageEvents ||
+        frameImageStats.bc1Bytes != index.stats.frameImageBc1Bytes )
+    { if( error.empty() ) error = "session_frame_image_derived_audit_mismatch"; return false; }
     const auto jobReader = TraceSessionJobReader::Open( sessionRoot, manifest, error );
     if( !jobReader || jobReader->Stats().jobTypes != index.stats.jobTypes ||
         jobReader->Stats().jobs != index.stats.jobs ||
@@ -687,6 +711,9 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( queueCounts[size_t( QueueType::ContextSwitch )].count != index.stats.contextSwitchRecords ||
         queueCounts[size_t( QueueType::ThreadWakeup )].count != index.stats.threadWakeupRecords )
     { error = "session_scheduling_source_count_mismatch"; return false; }
+    if( queueCounts[size_t( QueueType::FrameImageData )].count != index.stats.frameImageDataEvents ||
+        queueCounts[size_t( QueueType::FrameImage )].count != index.stats.frameImageEvents )
+    { error = "session_frame_image_source_count_mismatch"; return false; }
     stats = index.stats;
     return true;
 }
