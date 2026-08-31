@@ -1,0 +1,64 @@
+{
+  "kind": "jntracy_performance_budgets",
+  "schema_version": 1,
+  "budget_id": "JN-60FPS-Budget-v3",
+  "units": {
+    "time": "ms",
+    "memory": "bytes",
+    "gigabyte": "decimal"
+  },
+  "frame": {
+    "target_fps": 60.0,
+    "hard_budget_ms": 16.666667,
+    "display_budget_ms": 16.6,
+    "scope": "Player.Frame wall time",
+    "status": "confirmed"
+  },
+  "main_thread_categories": [
+    { "id": "logic", "name": "逻辑脚本相关", "budget_ms": 6.0, "semantics": "independent_alert_ceiling" },
+    { "id": "render", "name": "Render相关", "budget_ms": 7.5, "semantics": "independent_alert_ceiling" },
+    { "id": "ugui", "name": "UGUI", "budget_ms": 0.7, "semantics": "independent_alert_ceiling" },
+    { "id": "animation", "name": "Animation", "budget_ms": 0.5, "semantics": "independent_alert_ceiling" },
+    { "id": "physics", "name": "Physics", "budget_ms": 0.5, "semantics": "independent_alert_ceiling" },
+    { "id": "particles", "name": "ParticleSystem", "budget_ms": 0.3, "semantics": "independent_alert_ceiling" },
+    { "id": "wait_for_job", "name": "WaitForJobGroupId", "budget_ms": 1.5, "semantics": "wall_wait_independent_alert_ceiling" },
+    { "id": "other", "name": "Other", "budget_ms": 0.5, "semantics": "classified_residual_independent_alert_ceiling" }
+  ],
+  "main_thread_category_sum_ms": 17.5,
+  "main_thread_category_sum_semantics": "independent alert ceilings; not an additive frame allocation",
+  "logic_subcategories": [
+    { "id": "logic.lua", "name": "LuaManager", "budget_ms": 1.0 },
+    { "id": "logic.input", "name": "InputManager + EventSystem", "budget_ms": 0.5 },
+    { "id": "logic.load", "name": "Load + Instantiate", "budget_ms": 1.5 },
+    { "id": "logic.view_object", "name": "ViewObjectManager", "budget_ms": 1.0 },
+    { "id": "logic.playable", "name": "PlayableManager", "budget_ms": 0.3 },
+    { "id": "logic.camera", "name": "GameCameraManager", "budget_ms": 0.1 },
+    { "id": "logic.ui", "name": "UIManager", "budget_ms": 0.1 },
+    { "id": "logic.sound", "name": "SoundManager + WWiseBridge", "budget_ms": 0.25 },
+    { "id": "logic.steaming", "name": "SteamingManager", "budget_ms": 0.3 },
+    { "id": "logic.weather", "name": "WeatherSystem", "budget_ms": 0.05 },
+    { "id": "logic.component", "name": "ComponentManager", "budget_ms": 0.6 },
+    { "id": "logic.other", "name": "Other", "budget_ms": 0.3 }
+  ],
+  "capacity": {
+    "gpu_local": {
+      "limit_bytes": 6400000000,
+      "display": "6.4 GB",
+      "preferred_measure": "DXGI Local CurrentUsage",
+      "status": "confirmed"
+    },
+    "process_memory": {
+      "limit_bytes": 16000000000,
+      "display": "16 GB",
+      "preferred_measure": "Process Commit/Private Bytes",
+      "status": "provisional"
+    }
+  },
+  "undefined_time_budgets": [
+    "render_thread",
+    "gpu_total",
+    "gpu_pass",
+    "job_worker",
+    "io"
+  ]
+}

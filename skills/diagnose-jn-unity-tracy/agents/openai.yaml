@@ -1,0 +1,7 @@
+interface:
+  display_name: "JN Unity × Tracy 性能诊断"
+  short_description: "使用常驻 Query MCP 完成单 Trace 深度性能诊断"
+  default_prompt: "使用 $diagnose-jn-unity-tracy 对单次 JN Unity HighEvidence 捕获执行 limiter-first 深度诊断，并生成结构化证据、Markdown 主报告和静态 SVG/PNG 证据附件。"
+
+policy:
+  allow_implicit_invocation: true

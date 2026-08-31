@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jngame.local/schemas/jntracy-report-manifest-v1.json",
+  "title": "JN Tracy deterministic report build manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "report_id", "trace_id", "trace_sha256", "generated_at",
+    "deterministic", "versions", "configuration", "artifacts"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "report_id": { "type": "string" },
+    "trace_id": { "type": "string" },
+    "trace_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+    "generated_at": { "type": "string" },
+    "deterministic": { "type": "boolean" },
+    "versions": { "type": "object" },
+    "configuration": { "type": "object" },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "bytes"],
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

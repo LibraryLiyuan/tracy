@@ -1,0 +1,44 @@
+{
+  "fixture_kind": "sanitized_mcp_frame_explain_excerpt",
+  "source_response": "0048-frame-explain-527-attempt-3.json",
+  "trace": {
+    "id": "trace-1",
+    "fingerprint": "0083175da9ff46f8f92417f6e7fdcc2cf2cf1a36cd28f4eb35b62a74d5085e57",
+    "complete": true
+  },
+  "frame": {
+    "frame_id": "281474976711184",
+    "begin_ns": "133448161153",
+    "end_ns": "133850025884",
+    "duration_ns": "401864731",
+    "complete": true
+  },
+  "critical_path_excerpt": [
+    {
+      "domain": "cpu",
+      "kind": "cpu_zone",
+      "name": "Main.PlayerLoop",
+      "start_ns": "133448171778",
+      "end_ns": "133850025749",
+      "duration_ns": "401853971",
+      "callstack_present": true,
+      "evidence_kind": "derived"
+    }
+  ],
+  "domain_coverage_excerpt": [
+    { "domain": "cpu", "status": "present", "node_count": 4307 },
+    { "domain": "job", "status": "present", "node_count": 1890 },
+    { "domain": "gpu", "status": "present", "node_count": 967 },
+    { "domain": "resource", "status": "present", "node_count": 1866 },
+    { "domain": "lock", "status": "unavailable", "node_count": 0 }
+  ],
+  "quality": {
+    "analysis_confidence": "partial",
+    "complete": false,
+    "truncated": true,
+    "exhausted_by": ["max_edges", "max_nodes"],
+    "omitted_nodes": 919,
+    "omitted_edges": 5407
+  },
+  "contract": "The fixture is evidence of a partial query and cannot alone prove a Primary Limiter."
+}
