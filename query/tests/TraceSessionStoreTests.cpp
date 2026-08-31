@@ -9,7 +9,12 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#ifdef _WIN32
+#  include <Windows.h>
+#endif
 
 using namespace tracy::analysis;
 
@@ -83,6 +88,25 @@ int main()
     secondLease.Release();
 
     assert( SaveTraceSessionManifest( buildingPath, manifest, error ) );
+#ifdef _WIN32
+    // Antivirus, indexing and status readers can transiently hold the current
+    // manifest without delete sharing. A safe atomic commit must wait for that
+    // reader instead of abandoning an otherwise resumable long conversion.
+    const auto manifestPath = buildingPath / "manifest";
+    const auto heldManifest = CreateFileW( manifestPath.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, nullptr );
+    assert( heldManifest != INVALID_HANDLE_VALUE );
+    std::jthread releaseManifest( [heldManifest] {
+        std::this_thread::sleep_for( std::chrono::milliseconds( 75 ) );
+        CloseHandle( heldManifest );
+    } );
+    manifest.reason = "transient-reader-retry";
+    assert( SaveTraceSessionManifest( buildingPath, manifest, error ) );
+    const auto retriedManifest = LoadTraceSessionManifest( buildingPath, error );
+    assert( retriedManifest );
+    assert( retriedManifest->reason == manifest.reason );
+#endif
     assert( !IsTraceSessionQueryable( buildingPath, error ) );
     assert( error == "session_not_published" );
 

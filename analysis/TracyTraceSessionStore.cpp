@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <thread>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -77,12 +78,36 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary,
     const std::filesystem::path& target, std::string& error )
 {
 #ifdef _WIN32
-    const auto targetExists = GetFileAttributesW( target.c_str() ) != INVALID_FILE_ATTRIBUTES;
-    const auto replaced = targetExists
-        ? ReplaceFileW( target.c_str(), temporary.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr ) != FALSE
-        : MoveFileExW( temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH ) != FALSE;
-    if( replaced ) return true;
-    error = "session_atomic_replace_failed:" + std::to_string( GetLastError() );
+    // ReplaceFileW needs delete sharing on the old file. Antivirus, indexing,
+    // status readers and Explorer may transiently omit it. In these cases the
+    // documented result leaves both names unchanged, so a bounded retry is
+    // safe and preserves the previously committed manifest/checkpoint.
+    constexpr auto RetryLimit = std::chrono::milliseconds( 1500 );
+    const auto deadline = std::chrono::steady_clock::now() + RetryLimit;
+    auto delay = std::chrono::milliseconds( 5 );
+    DWORD lastError = ERROR_SUCCESS;
+    for( ;; )
+    {
+        const auto targetExists = GetFileAttributesW( target.c_str() ) != INVALID_FILE_ATTRIBUTES;
+        const auto replaced = targetExists
+            ? ReplaceFileW( target.c_str(), temporary.c_str(), nullptr,
+                REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_ACL_ERRORS,
+                nullptr, nullptr ) != FALSE
+            : MoveFileExW( temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH ) != FALSE;
+        if( replaced ) return true;
+        lastError = GetLastError();
+        const auto retryable = lastError == ERROR_ACCESS_DENIED ||
+            lastError == ERROR_SHARING_VIOLATION || lastError == ERROR_LOCK_VIOLATION ||
+            lastError == ERROR_ALREADY_EXISTS || lastError == ERROR_FILE_EXISTS ||
+            lastError == ERROR_UNABLE_TO_REMOVE_REPLACED;
+        const auto now = std::chrono::steady_clock::now();
+        if( !retryable || now >= deadline ) break;
+        std::this_thread::sleep_for( std::min( delay,
+            std::chrono::duration_cast<std::chrono::milliseconds>( deadline - now ) ) );
+        delay = std::min( delay * 2, std::chrono::milliseconds( 100 ) );
+    }
+    error = "session_atomic_replace_failed:" + std::to_string( lastError ) + ":" +
+        target.filename().string();
 #else
     std::error_code ec;
     std::filesystem::rename( temporary, target, ec );

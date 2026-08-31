@@ -202,6 +202,33 @@ tracy-trace-session-inventory  Passed
 100% tests passed, 0 failed
 ```
 
+### 2026-08-31 Windows 原子 Manifest 提交回归
+
+真实30分钟输入首次进入Canonical后，在第12组Checkpoint之后失败：
+
+```text
+session_atomic_replace_failed:1175
+ERROR_UNABLE_TO_REMOVE_REPLACED
+```
+
+现场保留了旧`manifest`、未发布的`manifest.tmp`以及194个已校验Canonical文件；没有覆盖原始stream，也没有把building目录发布为可查询Session。根因是Windows `ReplaceFileW`要求旧文件的临时读者共享删除，并且会尝试合并旧文件ACL。索引、杀毒或状态读取造成短暂占用时，原实现第一次失败便终止长转换。
+
+修复：
+
+- 对微软保证旧文件和replacement文件仍保持原名的`ERROR_UNABLE_TO_REMOVE_REPLACED`，以及Sharing/Lock/Access类可恢复错误，执行总计不超过1.5秒的指数退避重试。
+- 使用`REPLACEFILE_IGNORE_ACL_ERRORS`；replacement由同目录创建，继承相同目录ACL，ACL合并失败不再破坏数据提交。
+- 重试耗尽后保留旧manifest和`.tmp`，错误增加目标文件名，不删除、不降级、不猜测发布状态。
+- 新增确定性Windows测试：以不共享删除的句柄持有manifest 75 ms，旧实现RED失败，修复后GREEN并验证新manifest内容。
+
+回归：
+
+```text
+tracy-trace-session-store         Passed
+完整CTest                         8/8 Passed
+```
+
+修复版对保留现场执行resume后已越过原故障点；Canonical文件由194继续增长，进程私有内存约0.48 GiB。真实30分钟最终发布与Query/MCP结果在本节后续验收中继续记录。
+
 ### 真实30分钟输入
 
 输入：
