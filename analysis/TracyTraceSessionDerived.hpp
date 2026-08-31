@@ -45,6 +45,15 @@ struct TraceSessionDerivedStats
     uint64_t cpuZoneSources = 0;
     uint64_t cpuZoneBegins = 0;
     uint64_t cpuZoneEnds = 0;
+    uint64_t gpuContexts = 0;
+    uint64_t gpuZones = 0;
+    uint64_t completeGpuZones = 0;
+    uint64_t gpuZoneSources = 0;
+    uint64_t gpuZoneBegins = 0;
+    uint64_t gpuZoneEnds = 0;
+    uint64_t gpuTimeEvents = 0;
+    uint64_t gpuCalibrationEvents = 0;
+    uint64_t gpuSyncEvents = 0;
     uint64_t memoryPools = 0;
     uint64_t memoryEvents = 0;
     uint64_t activeMemoryEvents = 0;

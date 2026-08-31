@@ -6,6 +6,7 @@
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
+#include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
@@ -185,6 +186,15 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "cpu_zone_sources " << value.stats.cpuZoneSources << '\n';
     out << "cpu_zone_begins " << value.stats.cpuZoneBegins << '\n';
     out << "cpu_zone_ends " << value.stats.cpuZoneEnds << '\n';
+    out << "gpu_contexts " << value.stats.gpuContexts << '\n';
+    out << "gpu_zones " << value.stats.gpuZones << '\n';
+    out << "complete_gpu_zones " << value.stats.completeGpuZones << '\n';
+    out << "gpu_zone_sources " << value.stats.gpuZoneSources << '\n';
+    out << "gpu_zone_begins " << value.stats.gpuZoneBegins << '\n';
+    out << "gpu_zone_ends " << value.stats.gpuZoneEnds << '\n';
+    out << "gpu_time_events " << value.stats.gpuTimeEvents << '\n';
+    out << "gpu_calibration_events " << value.stats.gpuCalibrationEvents << '\n';
+    out << "gpu_sync_events " << value.stats.gpuSyncEvents << '\n';
     out << "memory_pools " << value.stats.memoryPools << '\n';
     out << "memory_events " << value.stats.memoryEvents << '\n';
     out << "active_memory_events " << value.stats.activeMemoryEvents << '\n';
@@ -262,6 +272,15 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "cpu_zone_sources" ) in >> value.stats.cpuZoneSources;
         else if( key == "cpu_zone_begins" ) in >> value.stats.cpuZoneBegins;
         else if( key == "cpu_zone_ends" ) in >> value.stats.cpuZoneEnds;
+        else if( key == "gpu_contexts" ) in >> value.stats.gpuContexts;
+        else if( key == "gpu_zones" ) in >> value.stats.gpuZones;
+        else if( key == "complete_gpu_zones" ) in >> value.stats.completeGpuZones;
+        else if( key == "gpu_zone_sources" ) in >> value.stats.gpuZoneSources;
+        else if( key == "gpu_zone_begins" ) in >> value.stats.gpuZoneBegins;
+        else if( key == "gpu_zone_ends" ) in >> value.stats.gpuZoneEnds;
+        else if( key == "gpu_time_events" ) in >> value.stats.gpuTimeEvents;
+        else if( key == "gpu_calibration_events" ) in >> value.stats.gpuCalibrationEvents;
+        else if( key == "gpu_sync_events" ) in >> value.stats.gpuSyncEvents;
         else if( key == "memory_pools" ) in >> value.stats.memoryPools;
         else if( key == "memory_events" ) in >> value.stats.memoryEvents;
         else if( key == "active_memory_events" ) in >> value.stats.activeMemoryEvents;
@@ -452,6 +471,18 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.cpuZoneBegins = cpuZoneStats.beginEvents;
     index.stats.cpuZoneEnds = cpuZoneStats.endEvents;
 
+    TraceSessionGpuZoneStats gpuZoneStats;
+    if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
+    index.stats.gpuContexts = gpuZoneStats.contexts;
+    index.stats.gpuZones = gpuZoneStats.zones;
+    index.stats.completeGpuZones = gpuZoneStats.completeZones;
+    index.stats.gpuZoneSources = gpuZoneStats.sourceLocations;
+    index.stats.gpuZoneBegins = gpuZoneStats.beginEvents;
+    index.stats.gpuZoneEnds = gpuZoneStats.endEvents;
+    index.stats.gpuTimeEvents = gpuZoneStats.gpuTimeEvents;
+    index.stats.gpuCalibrationEvents = gpuZoneStats.calibrationEvents;
+    index.stats.gpuSyncEvents = gpuZoneStats.syncEvents;
+
     TraceSessionMemoryStats memoryStats;
     if( !BuildTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ) return false;
     index.stats.memoryPools = memoryStats.pools;
@@ -554,6 +585,18 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         cpuZoneStats.beginEvents != index.stats.cpuZoneBegins ||
         cpuZoneStats.endEvents != index.stats.cpuZoneEnds )
     { if( error.empty() ) error = "session_cpu_zone_derived_audit_mismatch"; return false; }
+    TraceSessionGpuZoneStats gpuZoneStats;
+    if( !AuditTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ||
+        gpuZoneStats.contexts != index.stats.gpuContexts ||
+        gpuZoneStats.zones != index.stats.gpuZones ||
+        gpuZoneStats.completeZones != index.stats.completeGpuZones ||
+        gpuZoneStats.sourceLocations != index.stats.gpuZoneSources ||
+        gpuZoneStats.beginEvents != index.stats.gpuZoneBegins ||
+        gpuZoneStats.endEvents != index.stats.gpuZoneEnds ||
+        gpuZoneStats.gpuTimeEvents != index.stats.gpuTimeEvents ||
+        gpuZoneStats.calibrationEvents != index.stats.gpuCalibrationEvents ||
+        gpuZoneStats.syncEvents != index.stats.gpuSyncEvents )
+    { if( error.empty() ) error = "session_gpu_zone_derived_audit_mismatch"; return false; }
     TraceSessionMemoryStats memoryStats;
     if( !AuditTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ||
         memoryStats.pools != index.stats.memoryPools ||
@@ -597,6 +640,24 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         index.stats.cpuZones != index.stats.cpuZoneBegins ||
         index.stats.completeCpuZones != index.stats.cpuZoneEnds )
     { error = "session_cpu_zone_source_count_mismatch"; return false; }
+    const auto gpuBegins = queueCounts[size_t( QueueType::GpuZoneBegin )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginCallstack )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginAllocSrcLoc )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginAllocSrcLocCallstack )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginSerial )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginCallstackSerial )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginAllocSrcLocSerial )].count +
+        queueCounts[size_t( QueueType::GpuZoneBeginAllocSrcLocCallstackSerial )].count +
+        queueCounts[size_t( QueueType::JnGpuZoneBeginCallsite )].count;
+    const auto gpuEnds = queueCounts[size_t( QueueType::GpuZoneEnd )].count +
+        queueCounts[size_t( QueueType::GpuZoneEndSerial )].count;
+    if( queueCounts[size_t( QueueType::GpuNewContext )].count != index.stats.gpuContexts ||
+        gpuBegins != index.stats.gpuZoneBegins || gpuEnds != index.stats.gpuZoneEnds ||
+        queueCounts[size_t( QueueType::GpuTime )].count != index.stats.gpuTimeEvents ||
+        queueCounts[size_t( QueueType::GpuCalibration )].count != index.stats.gpuCalibrationEvents ||
+        queueCounts[size_t( QueueType::GpuTimeSync )].count != index.stats.gpuSyncEvents ||
+        index.stats.gpuZones != index.stats.gpuZoneBegins )
+    { error = "session_gpu_zone_source_count_mismatch"; return false; }
     const auto memoryAllocations = queueCounts[size_t( QueueType::MemAlloc )].count +
         queueCounts[size_t( QueueType::MemAllocNamed )].count +
         queueCounts[size_t( QueueType::MemAllocCallstack )].count +

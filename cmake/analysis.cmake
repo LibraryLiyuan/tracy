@@ -14,6 +14,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrames.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionJobs.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionCpuZones.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionGpuZones.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.cpp
@@ -39,6 +40,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrames.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionJobs.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionCpuZones.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionGpuZones.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.hpp

@@ -7,6 +7,7 @@
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
+#include "TracyTraceSessionGpuZones.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -1128,6 +1129,44 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendQueueItem( frame, item );
 
     item = {};
+    item.hdr.type = tracy::QueueType::GpuNewContext;
+    item.gpuNewContext.cpuTime = 100;
+    item.gpuNewContext.gpuTime = 0;
+    item.gpuNewContext.thread = 0;
+    item.gpuNewContext.period = 1.f;
+    item.gpuNewContext.context = 1;
+    item.gpuNewContext.flags = tracy::GpuContextFlags( 0 );
+    item.gpuNewContext.type = tracy::GpuContextType::Direct3D12;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::GpuZoneBegin;
+    item.gpuZoneBegin.cpuTime = 2;
+    item.gpuZoneBegin.thread = 42;
+    item.gpuZoneBegin.queryId = 7;
+    item.gpuZoneBegin.context = 1;
+    item.gpuZoneBegin.srcloc = 0x5030;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::GpuZoneEnd;
+    item.gpuZoneEnd.cpuTime = 2;
+    item.gpuZoneEnd.thread = 42;
+    item.gpuZoneEnd.queryId = 8;
+    item.gpuZoneEnd.context = 1;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::GpuTime;
+    item.gpuTime.gpuTime = 36;
+    item.gpuTime.queryId = 7;
+    item.gpuTime.context = 1;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::GpuTime;
+    item.gpuTime.gpuTime = 4;
+    item.gpuTime.queryId = 8;
+    item.gpuTime.context = 1;
+    AppendQueueItem( frame, item );
+
+    item = {};
     item.hdr.type = tracy::QueueType::SourceLocation;
     item.srcloc = { 0, 0x5022, 0x5023, 77, 0, 0, 0 };
     AppendQueueItem( frame, item );
@@ -1139,6 +1178,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::SourceLocation;
     item.srcloc = { 0, 0x5012, 0x5013, 456, 0x44, 0x55, 0x66 };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::SourceLocation;
+    item.srcloc = { 0x5031, 0x5032, 0x5033, 789, 0x77, 0x88, 0x99 };
+    AppendQueueItem( frame, item );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5022, "JobFunction" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5023, "Job.cpp" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5001, "Parent Source" );
@@ -1146,6 +1189,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5003, "Parent.cpp" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5012, "ChildFunction" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5013, "Child.cpp" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5031, "Synthetic GPU Zone" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5032, "GpuFunction" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x5033, "Gpu.cpp" );
 
     item = {};
     item.hdr.type = tracy::QueueType::MemAlloc;
@@ -1568,8 +1614,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto cpuZones = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) {
             return value.domain == "zone.cpu";
         } );
-        test.Check( cpuZones != capabilities.end() && cpuZones->present && cpuZones->queryable && cpuZones->indexed,
-            "Session advertises CPU zones only after its disk-backed semantic reader is ready" );
+    test.Check( cpuZones != capabilities.end() && cpuZones->present && cpuZones->queryable && cpuZones->indexed,
+        "Session advertises CPU zones only after its disk-backed semantic reader is ready" );
+    const auto gpuZones = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) {
+        return value.domain == "zone.gpu";
+    } );
+    const bool sessionGpuZonesReady = gpuZones != capabilities.end() && gpuZones->present &&
+        gpuZones->queryable && gpuZones->indexed;
+    test.Check( sessionGpuZonesReady,
+        "Session advertises GPU Zone only after its disk-backed semantic reader is ready" );
         const auto cpuSearch = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
             { "params", { { "trace_id", traceId } } }
@@ -1591,6 +1644,34 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuSearch["data"]["zones"][2]["end_ns"].is_null() &&
             cpuSearch["data"]["zones"][2]["complete"] == false,
             "Query 1.34 preserves Session CPU-zone hierarchy, shared delta clock, source and SiteReuse semantics" );
+        if( sessionGpuZonesReady ) try
+        {
+            const auto gpuContexts = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-gpu-context" }, { "method", "zone.gpu.contexts" },
+                { "params", { { "trace_id", traceId } } }
+            } );
+            const auto gpuSearch = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-gpu-zone" }, { "method", "zone.gpu.search" },
+                { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( gpuContexts.value( "ok", false ) && gpuContexts["data"]["contexts"].size() == 1 &&
+                gpuContexts["data"]["contexts"][0]["type_name"] == "direct3d12" &&
+                gpuContexts["data"]["contexts"][0]["zone_count"] == "1" &&
+                gpuSearch.value( "ok", false ) && gpuSearch["data"]["zones"].size() == 1 &&
+                gpuSearch["data"]["zones"][0]["name"] == "Synthetic GPU Zone" &&
+                gpuSearch["data"]["zones"][0]["gpu_start_ns"] == "36" &&
+                gpuSearch["data"]["zones"][0]["gpu_end_ns"] == "40" &&
+                gpuSearch["data"]["zones"][0]["cpu_start_ns"] == "36" &&
+                gpuSearch["data"]["zones"][0]["cpu_end_ns"] == "40" &&
+                gpuSearch["data"]["zones"][0]["self_time_ns"] == "4" &&
+                gpuSearch["data"]["zones"][0]["query_id"] == 7 &&
+                gpuSearch["data"]["zones"][0]["complete"] == true,
+                "Query 1.34 restores Session GPU timestamp, CPU submission, Context and Query ID semantics" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session GPU Zone Reader is unavailable: " ) + exception.what() );
+        }
         if( sessionMemoryReady ) try
         {
             const auto memoryPools = query.Execute( {
@@ -1692,6 +1773,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedMemoryStats, error ) &&
         error == "session_memory_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Memory semantic index" );
+    const auto gpuZoneFile = tracy::analysis::TraceSessionGpuZoneIndexRoot(
+        publishedSession, manifest ) / "gpu-zones.bin";
+    {
+        std::fstream damaged( gpuZoneFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x71 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionGpuZoneStats rejectedGpuZoneStats;
+    test.Check( !tracy::analysis::AuditTraceSessionGpuZoneDerived(
+        publishedSession, manifest, rejectedGpuZoneStats, error ) &&
+        error == "session_gpu_zone_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed GPU Zone semantic index" );
     const auto samplingFile = tracy::analysis::TraceSessionSamplingIndexRoot(
         publishedSession, manifest ) / "samples.bin";
     {

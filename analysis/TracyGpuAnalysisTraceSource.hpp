@@ -6,6 +6,7 @@
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
+#include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
@@ -119,6 +120,7 @@ private:
         std::shared_ptr<TraceSessionFrameReader> frameReader = {},
         std::shared_ptr<TraceSessionJobReader> jobReader = {},
         std::shared_ptr<TraceSessionCpuZoneReader> cpuZoneReader = {},
+        std::shared_ptr<TraceSessionGpuZoneReader> gpuZoneReader = {},
         std::shared_ptr<TraceSessionMemoryReader> memoryReader = {},
         std::shared_ptr<TraceSessionSamplingReader> samplingReader = {},
         std::shared_ptr<TraceSessionSchedulingReader> schedulingReader = {} );
@@ -134,6 +136,7 @@ private:
     std::shared_ptr<TraceSessionFrameReader> m_frameReader;
     std::shared_ptr<TraceSessionJobReader> m_jobReader;
     std::shared_ptr<TraceSessionCpuZoneReader> m_cpuZoneReader;
+    std::shared_ptr<TraceSessionGpuZoneReader> m_gpuZoneReader;
     std::shared_ptr<TraceSessionMemoryReader> m_memoryReader;
     std::shared_ptr<TraceSessionSamplingReader> m_samplingReader;
     std::shared_ptr<TraceSessionSchedulingReader> m_schedulingReader;

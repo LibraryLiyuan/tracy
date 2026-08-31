@@ -485,6 +485,11 @@ GREEN：
 - 线程区间严格恢复Wakeup→Start→End、wait reason/state和开放边界；CPU区间独立恢复实际占用线程，外部线程压缩索引按Worker首次切入顺序生成。
 - `context_switch.range/thread/statistics`和`cpu.timeline`直接读取Scheduling Reader，不实例化Worker；`thread`、CPU topology和CPU usage尚未具备磁盘语义Reader，仍保持不可查询。
 - Final Audit对`scheduling.bin`执行完整SHA-256，逐项核对源`ContextSwitch`与`ThreadWakeup` QueueType计数；派生线程/CPU区间计数不能替代源记录守恒。
+- GPU Zone域新增`gpu-zone-index/1/exact/gpu-zones.bin`：按真实GPU Context保存固定宽度Zone记录；构建期只保留每个Context/Thread的活动Zone栈、尚未收到`GpuTime`的Query ID和少量Context状态，不物化全部GPU Zone。
+- CPU侧Begin/End时间分别复用Worker的`m_refTimeThread`与`m_refTimeSerial`语义；GPU时间由异步`GpuTime`按`Context + QueryId`原位补齐，并保留Context的period、calibration、overflow和time-diff状态。
+- 父子关系、child count、self time、SourceLocation、Callsite和Callstack均由Canonical事实重建；捕获结束仍缺少GPU timestamp的Zone保留为`complete=false`，不得伪造结束时间，也不因合法在途Query使整个Session失败。
+- `zone.gpu.contexts/search/get/tree/statistics`由Session GPU Zone Reader直接提供；能力只声明已实现方法，Annotation尚未物化时返回明确`unavailable_reason`。
+- `gpu-zones.bin`保存source SHA-256、source size、manifest generation、Context/Zone/Complete/Source及GPU时钟事件计数；Final Audit重算完整SHA-256并逐项核对全部GPU Begin/End/Time/Calibration/Sync/Context QueueType。
 
 ### TDD证据
 
@@ -523,11 +528,15 @@ GREEN：
 - Scheduling GREEN恢复thread 42的`[18,28]ns`运行区间和thread 43的`wakeup=22ns/start=28ns/end=36ns`区间；后者保留wakeup CPU 1、实际CPU 0以及`delay_execution/ready`结束状态。
 - CPU timeline GREEN恢复CPU 0上thread 42与43的两个连续区间；直接Reader和Query 1.34 `context_switch.range`结果一致。
 - Final Audit在`scheduling.bin`同尺寸内容被篡改后返回`session_scheduling_file_sha256_mismatch`。
+- GPU Zone RED按预期失败于`Session advertises GPU Zone only after its disk-backed semantic reader is ready`。
+- GPU Zone GREEN恢复一个D3D12 Context和`Synthetic GPU Zone`：CPU/GPU区间均为`[36,40]ns`、begin query ID为7、self time为4ns，SourceLocation为`GpuFunction (Gpu.cpp:789)`；直接Reader、`zone.gpu.contexts`和`zone.gpu.search`结果一致。
+- Final Audit在`gpu-zones.bin`同尺寸内容被篡改后返回`session_gpu_zone_file_sha256_mismatch`。
 - Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
 
-- GPU Zone和FrameImage的语义分页Reader。
+- FrameImage的语义分页Reader。
+- GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
 - Scheduling当前以线程/CPU固定宽度区域线性扫描；在N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。Thread identity/name、CPU topology和CPU usage磁盘Reader尚未完成。
 - Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation磁盘Reader尚未完成，因此Sample目前能返回稳定`callstack_ref`，但不能在Session路径解析到完整符号帧。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
@@ -611,6 +620,29 @@ tracy-gpu-analysis-n29-static     Passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `F55DE8046A0F73202EC42298CCF93A6B0A10D2D8CDF3511292B3ECF87CCF1E89` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `2A3A806F3246C191784838C5A0DF2AF634EFAFB670EDCC4D011354E8898BDFE5` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 GPU Zone Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `DB3A3AB97032A8F266E3448CA9C154305D1A4CED0E2B5F20902B033C60251B6C` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `A9FE09427B37B1EDD2E94BFEFA6117ED558C480BA997C81EA76E94556CA03E64` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 
