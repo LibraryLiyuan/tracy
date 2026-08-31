@@ -256,6 +256,7 @@ public:
         std::vector<char> buffer( 1024 * 1024 );
         while( zonesIn ) { zonesIn.read( buffer.data(), std::streamsize( buffer.size() ) ); const auto n = zonesIn.gcount(); if( n > 0 ) out.write( buffer.data(), n ); }
         if( !zonesIn.eof() ) { error = "session_gpu_zone_copy_failed"; return false; }
+        zonesIn.close();
         for( const auto& context : contexts )
         {
             StoredContext stored;
@@ -279,7 +280,9 @@ public:
         }
         out.flush(); if( !out ) { error = "session_gpu_zone_file_write_failed"; return false; } out.close();
         if( !AtomicReplace( temporary, target, error ) ) return false;
-        std::error_code ec; std::filesystem::remove( m_workPath, ec );
+        std::error_code ec;
+        if( !std::filesystem::remove( m_workPath, ec ) || ec )
+        { error = "session_gpu_zone_work_cleanup_failed:" + ( ec ? ec.message() : m_workPath.string() ); return false; }
         manifest.sourceSha256 = m_session->source.sha256; manifest.sourceSize = m_session->source.fileSize;
         manifest.generation = m_session->generation; manifest.fileBytes = std::filesystem::file_size( target, ec );
         if( ec ) { error = "session_gpu_zone_file_size_failed:" + ec.message(); return false; }
@@ -822,6 +825,20 @@ TraceSessionGpuZoneReader::TraceSessionGpuZoneReader( std::shared_ptr<Impl> impl
 std::filesystem::path TraceSessionGpuZoneIndexRoot( const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" / "gpu-zone-index" / "1" / "exact";
+}
+
+bool CleanupTraceSessionGpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error )
+{
+    error.clear();
+    const auto path = TraceSessionGpuZoneIndexRoot( sessionRoot, manifest ) / "zones.work";
+    std::error_code ec;
+    const auto exists = std::filesystem::exists( path, ec );
+    if( ec ) { error = "session_gpu_zone_work_cleanup_scan_failed:" + ec.message(); return false; }
+    if( !exists ) return true;
+    if( !std::filesystem::remove( path, ec ) || ec )
+    { error = "session_gpu_zone_work_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+    return true;
 }
 
 bool BuildTraceSessionGpuZoneDerived( const std::filesystem::path& sessionRoot,

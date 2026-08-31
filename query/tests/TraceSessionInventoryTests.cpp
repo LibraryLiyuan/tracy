@@ -12,6 +12,8 @@
 #include "TracyTraceSessionIoGfx.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
+#include "TracyTraceSessionJobs.hpp"
+#include "TracyTraceSessionCpuZones.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 
@@ -830,6 +832,13 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         "resume canonical session from checkpoint: " + error );
     test.Check( manifest.state == tracy::analysis::TraceSessionState::CanonicalBuilding,
         "completed canonical facts remain in canonical-building state until derived work" );
+    manifest.state = tracy::analysis::TraceSessionState::DerivedFailed;
+    manifest.reason = "synthetic_derived_failure";
+    test.Check( tracy::analysis::CanReuseCompletedTraceSessionCanonical(
+        sessionRoot, manifest, inventory, error ),
+        "a Derived failure reuses the fully committed Canonical generation instead of resuming Canonical: " + error );
+    manifest.state = tracy::analysis::TraceSessionState::CanonicalBuilding;
+    manifest.reason.clear();
     test.Check( canonicalProgress.calls > 0 && canonicalProgress.monotonic &&
         canonicalProgress.sourceBytes == canonicalProgress.totalSourceBytes &&
         canonicalProgress.sourceRecords == inventory.recordCount &&
@@ -1147,6 +1156,44 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.contextSwitch.oldThreadWaitReason = 4;
     item.contextSwitch.oldThreadState = 1;
     AppendQueueItem( frame, item );
+    // Preserve a source-side scheduling gap instead of rejecting it or
+    // inventing a switch-out time. CPU 2 receives a second switch-in while
+    // the first observed interval is still open and oldThread is unavailable.
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 1;
+    item.contextSwitch.oldThread = 0;
+    item.contextSwitch.newThread = 100;
+    item.contextSwitch.cpu = 2;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 1;
+    item.contextSwitch.oldThread = 0;
+    item.contextSwitch.newThread = 101;
+    item.contextSwitch.cpu = 2;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ContextSwitch;
+    item.contextSwitch.time = 1;
+    item.contextSwitch.oldThread = 101;
+    item.contextSwitch.newThread = 0;
+    item.contextSwitch.cpu = 2;
+    item.contextSwitch.oldThreadWaitReason = 4;
+    item.contextSwitch.oldThreadState = 1;
+    AppendQueueItem( frame, item );
+    // More scheduler identities than the MSVC stdio handle table can keep
+    // open at once.  The Session builder must use a bounded number of work
+    // files instead of one permanently-open file per observed thread.
+    for( uint64_t index = 0; index < 1024; ++index )
+    {
+        item = {};
+        item.hdr.type = tracy::QueueType::ThreadWakeup;
+        item.threadWakeup.time = 0;
+        item.threadWakeup.thread = 0x100000 + index;
+        item.threadWakeup.cpu = uint8_t( index % 32 );
+        AppendQueueItem( frame, item );
+    }
     const std::array<uint64_t, 2> jobCallstack { 0x20202020, 0x30303030 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x3333,
         std::string( reinterpret_cast<const char*>( jobCallstack.data() ), sizeof( jobCallstack ) ) );
@@ -1332,6 +1379,21 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item = {};
     item.hdr.type = tracy::QueueType::ZoneBegin;
     item.zoneBegin = { 2, 0x1001 };
+    AppendQueueItem( frame, item );
+    // The source can contain a completed zone whose producer timestamps move
+    // backwards after a thread-context switch (for example, an unsynchronised
+    // TSC after core migration). Preserve both source facts, but require the
+    // Session derived layer to mark the timing invalid instead of rejecting
+    // the complete capture or fabricating a non-negative duration.
+    AppendThreadContextEvent( frame, 7 );
+    AppendThreadContextEvent( frame, 42 );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneValidation;
+    item.zoneValidation.id = 102;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ZoneEnd;
+    item.zoneEnd.time = 15;
     AppendQueueItem( frame, item );
 
     item = {};
@@ -1648,6 +1710,45 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
         inventory, derivedControl, mandatoryStats, error ),
         "build all mandatory Session indexes: " + error );
+    const auto cpuZoneRoot = tracy::analysis::TraceSessionCpuZoneIndexRoot( sessionRoot, manifest );
+    test.Check( !std::filesystem::exists( cpuZoneRoot / "zones.work" ) &&
+        !std::filesystem::exists( cpuZoneRoot / "extras.work" ),
+        "Session CPU Zone builder removes all temporary streams before publishing the index" );
+    const auto gpuZoneRoot = tracy::analysis::TraceSessionGpuZoneIndexRoot( sessionRoot, manifest );
+    test.Check( !std::filesystem::exists( gpuZoneRoot / "zones.work" ),
+        "Session GPU Zone builder removes its temporary stream before publishing the index" );
+    const auto schedulingRoot = tracy::analysis::TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
+    bool schedulingWorkFound = false;
+    for( const auto& entry : std::filesystem::directory_iterator( schedulingRoot ) )
+        schedulingWorkFound = schedulingWorkFound || entry.path().extension() == ".work";
+    test.Check( !schedulingWorkFound,
+        "Session Scheduling builder removes all temporary streams before publishing the index" );
+    std::vector<std::string> resumedDerivedStages;
+    tracy::analysis::TraceSessionDerivedControl resumeDerivedControl;
+    resumeDerivedControl.minimumFreeBytes = 0;
+    resumeDerivedControl.progress = [&]( float, const char* stage ) {
+        if( stage ) resumedDerivedStages.emplace_back( stage );
+    };
+    tracy::analysis::TraceSessionDerivedStats resumedMandatoryStats;
+    test.Check( tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
+        inventory, resumeDerivedControl, resumedMandatoryStats, error ),
+        "resume mandatory Session indexes from committed domain generations: " + error );
+    test.Check( std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "frames-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "session-domain-index-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "time-transform-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "frame-images-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "jobs-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "job-pages-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "cpu-zones-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "symbols-callstacks-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "gpu-zones-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "memory-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "sampling-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "scheduling-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "relations-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "runtime-script-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "io-gfx-reused" ) != resumedDerivedStages.end(),
+        "Mandatory Derived resume reuses every verified domain generation" );
     tracy::analysis::TraceSessionDerivedStats auditedStats;
     test.Check( tracy::analysis::AuditTraceSessionFinal(
         sessionRoot, manifest, inventory, auditedStats, error ),
@@ -1657,14 +1758,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         auditedStats.gpuResources == 2 && auditedStats.gpuPasses == 1 &&
         auditedStats.jobTypes == 1 && auditedStats.jobs == 1 &&
         auditedStats.jobSchedules == 1 && auditedStats.jobConfigs == 1 &&
-        auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5,
+        auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5 &&
+        auditedStats.invalidCpuZoneTimings == 1 && auditedStats.schedulingSourceGaps == 1,
         "mandatory derived counts are exact and reproducible" );
     test.Check( auditedStats.indexBytes <= auditedStats.indexFiles * 128,
         "generic Session index stores bounded shard summaries instead of one 48-byte row per event" );
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
-    manifest.state = tracy::analysis::TraceSessionState::Complete;
-    manifest.reason = "complete";
+    manifest.state = tracy::analysis::TraceSessionState::CompleteSourceDegraded;
+    manifest.reason = "source_cpu_zone_clock_inversion:1;source_scheduling_gap:1";
     const auto publishedSession = directory / "gpu-canonical-published.jn-trace-session";
     test.Check( tracy::analysis::PublishTraceSession(
         sessionRoot, publishedSession, manifest, error ),
@@ -1804,6 +1906,30 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionJobs[0].scheduleStackProvenance == "SiteReused" &&
         sessionJobs[0].stages.size() == 5,
         "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
+    const auto sessionJobPage = sessionSource->ScanJobs( 0, 1 );
+    const auto sessionJobById = sessionSource->GetJob( 500 );
+    test.Check( sessionSource->GetJobCount() == 1 && sessionJobPage.size() == 1 &&
+        sessionJobPage[0].jobId == 500 && sessionJobById &&
+        sessionJobById->jobId == 500 && sessionJobById->stages.size() == 5,
+        "Session Job reader pages and resolves jobs from the disk index without requiring full materialization" );
+    tracy::analysis::TraceSessionJobBuildOptions spillOptions;
+    spillOptions.maximumBufferedRecords = 2;
+    tracy::analysis::TraceSessionJobStats spilledJobStats;
+    std::string spillError;
+    test.Check( tracy::analysis::BuildTraceSessionJobDerived( publishedSession, manifest,
+        spilledJobStats, spillError, spillOptions ) && spilledJobStats.jobs == 1 &&
+        spilledJobStats.stages == 5 && spilledJobStats.peakBufferedRecords <= 2,
+        "Session Job builder spills exact Stage records to disk instead of enforcing a total-record memory cap: " + spillError );
+    const auto spilledJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
+    size_t spilledJobTemporaryRuns = 0;
+    for( const auto& entry : std::filesystem::directory_iterator( spilledJobRoot ) )
+    {
+        const auto name = entry.path().filename().string();
+        spilledJobTemporaryRuns += entry.is_regular_file() &&
+            name.starts_with( "job-id-run-" ) && name.ends_with( ".work" );
+    }
+    test.Check( spilledJobTemporaryRuns == 0,
+        "Session Job builder removes all external distinct-ID runs before publishing the index" );
     const auto sessionSources = sessionSource->GetSourceLocations();
     const auto sessionCallsites = sessionSource->GetCallsites();
     const auto sessionStack = sessionSource->ResolveCallstacks( { 2 }, 8 );
@@ -1872,20 +1998,24 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     {
         const auto contexts = sessionSource->ScanContextSwitchEvents( {} );
         const auto cpuContexts = sessionSource->ScanCpuContextSwitchEvents( {} );
-        test.Check( contexts.size() == 2 && contexts[0].startNs == 18 &&
+        test.Check( contexts.size() == 100 && contexts[0].startNs == 18 &&
             contexts[0].endNs == 28 && contexts[0].wakeupNs == 18 &&
             contexts[0].cpu == 0 && contexts[0].wakeupCpu == 0 &&
             contexts[0].reason == 5 && contexts[0].state == 5 &&
             contexts[1].startNs == 28 && contexts[1].endNs == 36 &&
             contexts[1].wakeupNs == 22 && contexts[1].wakeupCpu == 1 &&
-            contexts[1].reason == 4 && contexts[1].state == 1,
+            contexts[1].reason == 4 && contexts[1].state == 1 &&
+            contexts[2].startNs == 38 && !contexts[2].endNs && !contexts[2].complete &&
+            contexts[3].startNs == 40 && contexts[3].endNs == 42 && contexts[3].complete,
             "Session Context Switch reader restores wakeup, run and wait-state semantics" );
-        test.Check( cpuContexts.size() == 2 && cpuContexts[0].startNs == 18 &&
+        test.Check( cpuContexts.size() == 4 && cpuContexts[0].startNs == 18 &&
             cpuContexts[0].endNs == 28 && cpuContexts[0].threadRef ==
                 sessionSource->MakeEntityRef( "thread", 42 ) &&
             cpuContexts[1].startNs == 28 && cpuContexts[1].endNs == 36 &&
-            cpuContexts[1].threadRef == sessionSource->MakeEntityRef( "thread", 43 ),
-            "Session CPU scheduling reader restores exact CPU occupancy intervals" );
+            cpuContexts[1].threadRef == sessionSource->MakeEntityRef( "thread", 43 ) &&
+            cpuContexts[2].startNs == 38 && !cpuContexts[2].endNs && !cpuContexts[2].complete &&
+            cpuContexts[3].startNs == 40 && cpuContexts[3].endNs == 42 && cpuContexts[3].complete,
+            "Session CPU scheduling reader preserves source gaps without inventing close times" );
     }
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
@@ -2127,11 +2257,18 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuSearch["data"]["zones"][0]["extra_text"] == "Parent text" &&
             cpuSearch["data"]["zones"][1]["function"] == "ChildFunction" &&
             cpuSearch["data"]["zones"][1]["start_ns"] == "16" &&
-            cpuSearch["data"]["zones"][1]["end_ns"] == "20" &&
+            cpuSearch["data"]["zones"][1]["end_ns"] == "20",
+            "Query 1.34 preserves Session CPU-zone hierarchy, source and SiteReuse semantics" );
+        test.Check( cpuSearch.value( "ok", false ) && cpuSearch["data"]["zones"].size() == 3 &&
             cpuSearch["data"]["zones"][2]["start_ns"] == "32" &&
-            cpuSearch["data"]["zones"][2]["end_ns"].is_null() &&
-            cpuSearch["data"]["zones"][2]["complete"] == false,
-            "Query 1.34 preserves Session CPU-zone hierarchy, shared delta clock, source and SiteReuse semantics" );
+            cpuSearch["data"]["zones"][2]["end_ns"] == "-170" &&
+            cpuSearch["data"]["zones"][2]["duration_ns"].is_null() &&
+            cpuSearch["data"]["zones"][2]["complete"] == true,
+            "Query 1.34 preserves both source endpoints for an inverted CPU-zone clock" );
+        test.Check( cpuSearch.value( "ok", false ) && cpuSearch["data"]["zones"].size() == 3 &&
+            cpuSearch["data"]["zones"][2]["timing_valid"] == false &&
+            cpuSearch["data"]["zones"][2]["timing_invalid_reason"] == "source_clock_inversion",
+            "Query 1.34 exposes source clock inversion without fabricating timing" );
         if( sessionGpuZonesReady ) try
         {
             const auto gpuContexts = query.Execute( {
@@ -2149,8 +2286,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 gpuSearch["data"]["zones"][0]["name"] == "Synthetic GPU Zone" &&
                 gpuSearch["data"]["zones"][0]["gpu_start_ns"] == "36" &&
                 gpuSearch["data"]["zones"][0]["gpu_end_ns"] == "40" &&
-                gpuSearch["data"]["zones"][0]["cpu_start_ns"] == "36" &&
-                gpuSearch["data"]["zones"][0]["cpu_end_ns"] == "40" &&
+                gpuSearch["data"]["zones"][0]["cpu_start_ns"] == "-166" &&
+                gpuSearch["data"]["zones"][0]["cpu_end_ns"] == "-162" &&
                 gpuSearch["data"]["zones"][0]["self_time_ns"] == "4" &&
                 gpuSearch["data"]["zones"][0]["query_id"] == 7 &&
                 gpuSearch["data"]["zones"][0]["complete"] == true,
@@ -2204,12 +2341,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         {
             const auto contexts = query.Execute( {
                 { "protocol", "tracy-query/1" }, { "id", "session-contexts" },
-                { "method", "context_switch.range" }, { "params", { { "trace_id", traceId } } }
+                { "method", "context_switch.range" }, { "params", { { "trace_id", traceId },
+                    { "limit", 4 } } }
             } );
             test.Check( contexts.value( "ok", false ) &&
-                contexts["data"]["context_switches"].size() == 2 &&
+                contexts["data"]["context_switches"].size() == 4 &&
                 contexts["data"]["context_switches"][1]["wakeup_ns"] == "22" &&
-                contexts["data"]["context_switches"][1]["reason_name"] == "delay_execution",
+                contexts["data"]["context_switches"][1]["reason_name"] == "delay_execution" &&
+                contexts["data"]["context_switches"][2]["complete"] == false &&
+                contexts["data"]["context_switches"][2]["end_ns"].is_null(),
                 "Query 1.34 reads Session Context Switch intervals without a Worker" );
         }
         catch( const std::exception& exception )
@@ -2231,8 +2371,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( !tracy::analysis::TraceSessionFrameReader::Open(
         publishedSession, manifest, error ) && error == "session_frame_file_sha256_mismatch",
         "Session Frame reader rejects a corrupted committed semantic index" );
-    const auto jobFile = tracy::analysis::TraceSessionJobIndexRoot(
-        publishedSession, manifest ) / "jobs.bin";
+    const auto jobRoot = tracy::analysis::TraceSessionJobIndexRoot(
+        publishedSession, manifest );
+    test.Check( jobRoot.parent_path().filename() ==
+        std::to_string( tracy::analysis::TraceSessionJobIndexSchemaVersion ),
+        "Session Job index path isolates the current schema from older committed generations" );
+    const auto jobFile = jobRoot / "jobs.bin";
     {
         std::fstream damaged( jobFile, std::ios::binary | std::ios::in | std::ios::out );
         damaged.seekg( -1, std::ios::end );

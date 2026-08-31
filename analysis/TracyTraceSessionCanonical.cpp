@@ -609,6 +609,31 @@ bool CanResumeTraceSessionCanonical( const std::filesystem::path& sessionRoot,
     return true;
 }
 
+bool CanReuseCompletedTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
+    std::string& error )
+{
+    error.clear();
+    if( manifest.generation.empty() ||
+        manifest.source.sha256 != inventory.sourceSha256 ||
+        manifest.source.fileSize != inventory.sourceFileSize ||
+        manifest.source.committedRevision != inventory.committedRevision ||
+        manifest.source.protocol != inventory.protocol ||
+        manifest.source.captureIdentity != inventory.captureIdentity )
+    { error = "canonical_reuse_identity_mismatch"; return false; }
+    if( manifest.shards.size() < 2 || ( manifest.shards.size() & 1 ) != 0 )
+    { error = "canonical_reuse_not_complete"; return false; }
+    const auto& data = manifest.shards[manifest.shards.size() - 2];
+    const auto& checkpoint = manifest.shards.back();
+    if( data.domain == "checkpoint" || checkpoint.domain != "checkpoint" ||
+        checkpoint.sourceRecordBegin != data.sourceRecordEnd ||
+        checkpoint.sourceRecordEnd != data.sourceRecordEnd ||
+        checkpoint.sourceRecordEnd != inventory.recordCount )
+    { error = "canonical_reuse_not_complete"; return false; }
+    if( !CanResumeTraceSessionCanonical( sessionRoot, manifest, error ) ) return false;
+    return VerifyTraceSession( sessionRoot, manifest, error );
+}
+
 TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
     const std::filesystem::path& sessionRoot, const std::string& generation,
     const TraceSessionInventory& inventory, const TraceSessionCanonicalOptions& options,

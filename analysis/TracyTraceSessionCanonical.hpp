@@ -101,6 +101,13 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
 bool CanResumeTraceSessionCanonical( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, std::string& error );
 
+// Verifies that Canonical is already complete and immutable after a later
+// Derived/Audit failure. This is deliberately separate from checkpoint
+// resume: a completed generation must never be appended a second time.
+bool CanReuseCompletedTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
+    std::string& error );
+
 // The record payload is a view into a bounded shard buffer and is valid only
 // for the duration of the callback. The reader validates the shard checksum,
 // framing, domain, record count and source range before returning success.

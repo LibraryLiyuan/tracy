@@ -56,6 +56,8 @@ std::filesystem::path TraceSessionGpuZoneIndexRoot( const std::filesystem::path&
     const TraceSessionManifest& manifest );
 bool BuildTraceSessionGpuZoneDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionGpuZoneStats& stats, std::string& error );
+bool CleanupTraceSessionGpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error );
 bool AuditTraceSessionGpuZoneDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionGpuZoneStats& stats, std::string& error );
 

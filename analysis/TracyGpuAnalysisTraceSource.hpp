@@ -62,6 +62,9 @@ public:
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
     std::vector<JobDto> GetJobs() const override;
+    uint64_t GetJobCount() const override;
+    std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override;
+    std::optional<JobDto> GetJob( uint64_t jobId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;

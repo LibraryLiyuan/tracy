@@ -198,8 +198,12 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         "zone.cpu.search", "zone.cpu.get", "zone.cpu.tree", "zone.cpu.statistics", "zone.cpu.flamegraph"
     };
     const auto cpuZonePresent = m_cpuZoneReader && m_cpuZoneReader->Stats().zones != 0;
+    const auto invalidCpuZoneTimings = m_cpuZoneReader ? m_cpuZoneReader->Stats().invalidTimingZones : 0;
     result.push_back( Capability { "zone.cpu", cpuZonePresent, cpuZonePresent, true,
-        cpuZonePresent ? "available from the N30 Session mandatory CPU Zone index" :
+        cpuZonePresent ? ( invalidCpuZoneTimings == 0 ?
+            "available from the N30 Session mandatory CPU Zone index" :
+            "available with " + std::to_string( invalidCpuZoneTimings ) +
+                " source clock inversion zone(s); invalid timings are retained but excluded from exact statistics" ) :
             "The source Session contains no CPU Zone facts", CpuZoneMethods } );
     static const std::vector<std::string> GpuZoneMethods = {
         "zone.gpu.contexts", "zone.gpu.search", "zone.gpu.get", "zone.gpu.tree", "zone.gpu.statistics"
@@ -211,7 +215,7 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     static const std::vector<std::string> JobMethods = {
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"
     };
-    const auto jobPresent = m_jobReader && !m_jobReader->Jobs().empty();
+    const auto jobPresent = m_jobReader && m_jobReader->Stats().jobs != 0;
     result.push_back( Capability { "job", jobPresent, jobPresent, true,
         jobPresent ? "available from the N30 Session mandatory Job index" :
             "The source Session contains no Job facts", JobMethods } );
@@ -252,15 +256,21 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     addPending( "thread", TraceSessionProtocolDomain::Scheduling );
     static const std::vector<std::string> CpuSchedulingMethods = { "cpu.timeline" };
     const auto cpuSchedulingPresent = m_schedulingReader && m_schedulingReader->Stats().cpuEvents != 0;
+    const auto schedulingSourceGaps = m_schedulingReader ? m_schedulingReader->Stats().sourceGapEvents : 0;
     result.push_back( Capability { "cpu", cpuSchedulingPresent, cpuSchedulingPresent, true,
-        cpuSchedulingPresent ? "CPU timeline is available from the N30 Session mandatory Scheduling index" :
+        cpuSchedulingPresent ? ( schedulingSourceGaps == 0 ?
+            "CPU timeline is available from the N30 Session mandatory Scheduling index" :
+            "CPU timeline is available with " + std::to_string( schedulingSourceGaps ) +
+                " source scheduling gaps; observed intervals are preserved and affected intervals remain incomplete" ) :
             "The source Session contains no CPU scheduling intervals", CpuSchedulingMethods } );
     static const std::vector<std::string> ContextSwitchMethods = {
         "context_switch.range", "context_switch.thread", "context_switch.statistics"
     };
     const auto contextSwitchPresent = m_schedulingReader && m_schedulingReader->Stats().threadEvents != 0;
     result.push_back( Capability { "context_switch", contextSwitchPresent, contextSwitchPresent, true,
-        contextSwitchPresent ? "available from the N30 Session mandatory Scheduling index" :
+        contextSwitchPresent ? ( schedulingSourceGaps == 0 ?
+            "available from the N30 Session mandatory Scheduling index" :
+            "available with source scheduling gaps; incomplete intervals are excluded from exact duration statistics" ) :
             "The source Session contains no Context Switch intervals", ContextSwitchMethods } );
     addPending( "message", TraceSessionProtocolDomain::MessagePlotLock );
     addPending( "plot", TraceSessionProtocolDomain::MessagePlotLock );
@@ -539,6 +549,21 @@ std::vector<JobDto> GpuAnalysisTraceSource::GetJobs() const
 {
     if( WorkerLoaded() ) return Worker().GetJobs();
     return m_jobReader ? m_jobReader->Jobs() : std::vector<JobDto> {};
+}
+uint64_t GpuAnalysisTraceSource::GetJobCount() const
+{
+    if( WorkerLoaded() ) return Worker().GetJobCount();
+    return m_jobReader ? m_jobReader->Count() : 0;
+}
+std::vector<JobDto> GpuAnalysisTraceSource::ScanJobs( size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanJobs( offset, limit );
+    return m_jobReader ? m_jobReader->Scan( offset, limit ) : std::vector<JobDto> {};
+}
+std::optional<JobDto> GpuAnalysisTraceSource::GetJob( uint64_t jobId ) const
+{
+    if( WorkerLoaded() ) return Worker().GetJob( jobId );
+    return m_jobReader ? m_jobReader->Get( jobId ) : std::nullopt;
 }
 std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoRequests() const
 {

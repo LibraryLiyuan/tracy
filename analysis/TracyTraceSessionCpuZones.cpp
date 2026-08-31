@@ -34,7 +34,8 @@ enum StoredZoneFlags : uint32_t
 {
     ZoneComplete = 1u << 0,
     ZoneNameResolved = 1u << 1,
-    ZoneExtraValid = 1u << 2
+    ZoneExtraValid = 1u << 2,
+    ZoneTimingValid = 1u << 3
 };
 
 #pragma pack( push, 1 )
@@ -73,7 +74,7 @@ struct StoredZone
     uint64_t extraTextOffset = 0;
     uint32_t extraNameBytes = 0;
     uint32_t extraTextBytes = 0;
-    uint32_t flags = ZoneNameResolved | ZoneExtraValid;
+    uint32_t flags = ZoneNameResolved | ZoneExtraValid | ZoneTimingValid;
     uint8_t provenance = 3;
     uint8_t unavailableReason = 0;
     uint16_t reserved = 0;
@@ -307,6 +308,8 @@ public:
         std::ifstream zones( m_zonePath, std::ios::binary );
         std::ifstream extras( m_extraPath, std::ios::binary );
         if( !zones || !extras || !CopyFileBytes( zones, out, error ) || !CopyFileBytes( extras, out, error ) ) return false;
+        zones.close();
+        extras.close();
         for( const auto& source : sources )
         {
             StoredSource stored;
@@ -334,8 +337,11 @@ public:
         out.close();
         if( !AtomicReplace( temporary, target, error ) ) return false;
         std::error_code ec;
-        std::filesystem::remove( m_zonePath, ec ); ec.clear();
-        std::filesystem::remove( m_extraPath, ec );
+        if( !std::filesystem::remove( m_zonePath, ec ) || ec )
+        { error = "session_cpu_zone_work_cleanup_failed:" + ( ec ? ec.message() : m_zonePath.string() ); return false; }
+        ec.clear();
+        if( !std::filesystem::remove( m_extraPath, ec ) || ec )
+        { error = "session_cpu_zone_work_cleanup_failed:" + ( ec ? ec.message() : m_extraPath.string() ); return false; }
         manifest.sourceSha256 = m_session->source.sha256;
         manifest.sourceSize = m_session->source.fileSize;
         manifest.generation = m_session->generation;
@@ -384,6 +390,7 @@ struct BuildState
     std::optional<std::string> pendingSingleString;
     uint64_t zoneCount = 0;
     uint64_t completeZones = 0;
+    uint64_t invalidTimingZones = 0;
     uint64_t beginEvents = 0;
     uint64_t endEvents = 0;
     std::string error;
@@ -465,15 +472,15 @@ bool ParseDynamicSource( BuildState& state, const uint8_t* data,
 }
 
 bool WriteClosedZone( BuildState& state, OpenZone zone, int64_t endNs,
-    bool complete, std::string& error )
+    bool complete, bool timingValid, std::string& error )
 {
     if( complete )
     {
-        if( endNs < zone.stored.startNs )
-        { error = "session_cpu_zone_end_before_begin"; return false; }
         zone.stored.endNs = endNs;
-        zone.stored.selfTimeNs = std::max<int64_t>( 0, endNs - zone.stored.startNs - zone.childTimeNs );
+        zone.stored.selfTimeNs = timingValid ?
+            std::max<int64_t>( 0, endNs - zone.stored.startNs - zone.childTimeNs ) : 0;
         zone.stored.flags |= ZoneComplete;
+        if( !timingValid ) zone.stored.flags &= ~ZoneTimingValid;
     }
     else
     {
@@ -521,14 +528,21 @@ bool EndZone( BuildState& state, int64_t delta, std::string& error )
     auto& stack = state.open[logicalThread];
     if( stack.empty() ) { error = "session_cpu_zone_end_without_begin"; return false; }
     if( stack.back().validationId != state.nextValidation[logicalThread] )
-    { error = "session_cpu_zone_validation_mismatch"; return false; }
+    {
+        error = "session_cpu_zone_validation_mismatch:thread=" + std::to_string( logicalThread ) +
+            ":zone=" + std::to_string( stack.back().validationId ) +
+            ":end=" + std::to_string( state.nextValidation[logicalThread] );
+        return false;
+    }
     state.nextValidation[logicalThread] = 0;
     const auto endNs = AdvanceThreadTime( state, delta );
     auto zone = std::move( stack.back() ); stack.pop_back();
     const auto duration = endNs - zone.stored.startNs;
     if( !stack.empty() ) stack.back().childTimeNs += std::max<int64_t>( 0, duration );
-    if( !WriteClosedZone( state, std::move( zone ), endNs, true, error ) ) return false;
+    const auto timingValid = endNs >= zone.stored.startNs;
+    if( !WriteClosedZone( state, std::move( zone ), endNs, true, timingValid, error ) ) return false;
     state.completeZones++;
+    if( !timingValid ) state.invalidTimingZones++;
     state.endEvents++;
     return true;
 }
@@ -836,6 +850,7 @@ bool SaveCpuZoneManifest( const std::filesystem::path& root,
     out << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n';
     out << "zones " << value.stats.zones << '\n';
     out << "complete_zones " << value.stats.completeZones << '\n';
+    out << "invalid_timing_zones " << value.stats.invalidTimingZones << '\n';
     out << "source_locations " << value.stats.sourceLocations << '\n';
     out << "begin_events " << value.stats.beginEvents << '\n';
     out << "end_events " << value.stats.endEvents << '\n';
@@ -863,6 +878,7 @@ bool LoadCpuZoneManifest( const std::filesystem::path& root,
         else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 );
         else if( key == "zones" ) in >> value.stats.zones;
         else if( key == "complete_zones" ) in >> value.stats.completeZones;
+        else if( key == "invalid_timing_zones" ) in >> value.stats.invalidTimingZones;
         else if( key == "source_locations" ) in >> value.stats.sourceLocations;
         else if( key == "begin_events" ) in >> value.stats.beginEvents;
         else if( key == "end_events" ) in >> value.stats.endEvents;
@@ -960,7 +976,13 @@ struct TraceSessionCpuZoneReader::Impl
         if( zone.parent != InvalidZoneId ) dto.parentRef = MakeRef( fingerprint, "cpu-zone", zone.parent );
         dto.startNs = zone.startNs;
         dto.complete = ( zone.flags & ZoneComplete ) != 0;
-        if( dto.complete ) { dto.endNs = zone.endNs; dto.selfTimeNs = zone.selfTimeNs; }
+        dto.timingValid = ( zone.flags & ZoneTimingValid ) != 0;
+        if( !dto.timingValid ) dto.timingInvalidReason = "source_clock_inversion";
+        if( dto.complete )
+        {
+            dto.endNs = zone.endNs;
+            if( dto.timingValid ) dto.selfTimeNs = zone.selfTimeNs;
+        }
         dto.childCount = zone.childCount;
         dto.callstack = zone.callstack;
         if( zone.callstack != 0 ) dto.callstackRef = MakeRef( fingerprint, "callstack", zone.callstack );
@@ -996,6 +1018,24 @@ std::filesystem::path TraceSessionCpuZoneIndexRoot( const std::filesystem::path&
         "cpu-zone-index" / "1" / "exact";
 }
 
+bool CleanupTraceSessionCpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error )
+{
+    error.clear();
+    const auto root = TraceSessionCpuZoneIndexRoot( sessionRoot, manifest );
+    for( const auto* name : { "zones.work", "extras.work" } )
+    {
+        const auto path = root / name;
+        std::error_code ec;
+        const auto exists = std::filesystem::exists( path, ec );
+        if( ec ) { error = "session_cpu_zone_work_cleanup_scan_failed:" + ec.message(); return false; }
+        if( !exists ) continue;
+        if( !std::filesystem::remove( path, ec ) || ec )
+        { error = "session_cpu_zone_work_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+    }
+    return true;
+}
+
 bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionCpuZoneStats& stats, std::string& error )
 {
@@ -1012,7 +1052,7 @@ bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
         while( !stack.empty() )
         {
             auto zone = std::move( stack.back() ); stack.pop_back();
-            if( !WriteClosedZone( state, std::move( zone ), 0, false, error ) ) return false;
+            if( !WriteClosedZone( state, std::move( zone ), 0, false, true, error ) ) return false;
         }
     }
     for( auto& source : state.sources )
@@ -1027,6 +1067,7 @@ bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
         state.zoneCount, state.completeZones, cpuManifest, error ) ) return false;
     cpuManifest.stats.beginEvents = state.beginEvents;
     cpuManifest.stats.endEvents = state.endEvents;
+    cpuManifest.stats.invalidTimingZones = state.invalidTimingZones;
     if( !SaveCpuZoneManifest( root, cpuManifest, error ) ) return false;
     stats = cpuManifest.stats;
     return true;
@@ -1173,7 +1214,9 @@ std::vector<CpuZoneDto> TraceSessionCpuZoneReader::Scan( const ScanRange& range 
         StoredZone zone;
         if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) || zone.id != id ) break;
         const auto end = ( zone.flags & ZoneComplete ) != 0 ? zone.endNs : zone.startNs;
-        if( end < range.startNs || zone.startNs > range.endNs ) continue;
+        const auto lower = std::min( zone.startNs, end );
+        const auto upper = std::max( zone.startNs, end );
+        if( upper < range.startNs || lower > range.endNs ) continue;
         if( skipped++ < range.offset ) continue;
         result.emplace_back( m_impl->ToDto( zone ) );
         if( result.size() >= range.limit ) break;

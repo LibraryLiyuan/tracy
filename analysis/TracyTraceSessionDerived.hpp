@@ -46,6 +46,7 @@ struct TraceSessionDerivedStats
     uint64_t jobStages = 0;
     uint64_t cpuZones = 0;
     uint64_t completeCpuZones = 0;
+    uint64_t invalidCpuZoneTimings = 0;
     uint64_t cpuZoneSources = 0;
     uint64_t cpuZoneBegins = 0;
     uint64_t cpuZoneEnds = 0;
@@ -82,6 +83,7 @@ struct TraceSessionDerivedStats
     uint64_t completeContextSwitchEvents = 0;
     uint64_t cpuContextSwitchEvents = 0;
     uint64_t completeCpuContextSwitchEvents = 0;
+    uint64_t schedulingSourceGaps = 0;
     uint64_t relations = 0;
     uint64_t runtimeDomainStates = 0;
     uint64_t scriptFrames = 0;

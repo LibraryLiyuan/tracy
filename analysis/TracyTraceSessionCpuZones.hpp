@@ -21,6 +21,7 @@ struct TraceSessionCpuZoneStats
 {
     uint64_t zones = 0;
     uint64_t completeZones = 0;
+    uint64_t invalidTimingZones = 0;
     uint64_t sourceLocations = 0;
     uint64_t beginEvents = 0;
     uint64_t endEvents = 0;
@@ -54,6 +55,8 @@ bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionCpuZoneStats& stats, std::string& error );
 bool AuditTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionCpuZoneStats& stats, std::string& error );
+bool CleanupTraceSessionCpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error );
 
 }
 

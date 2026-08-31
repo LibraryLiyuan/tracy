@@ -312,12 +312,45 @@ int main( int argc, char** argv )
     }
 
     tracy::analysis::TraceSessionManifest manifest;
-    tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
-    canonicalOptions.resume = options.resume;
-    canonicalOptions.shouldCancel = Cancelled;
-    canonicalOptions.progress = PrintCanonicalProgress;
-    const auto canonical = tracy::analysis::BuildTraceSessionCanonical( options.input,
-        building, generation, inventory, canonicalOptions, manifest, error );
+    bool reusedCanonical = false;
+    if( options.resume )
+    {
+        const auto saved = tracy::analysis::LoadTraceSessionManifest( building, error );
+        if( saved )
+        {
+            std::string reuseError;
+            if( tracy::analysis::CanReuseCompletedTraceSessionCanonical(
+                building, *saved, inventory, reuseError ) )
+            {
+                manifest = *saved;
+                reusedCanonical = true;
+                std::fprintf( stderr, "Canonical generation is complete and verified; continuing with Derived.\n" );
+            }
+            else
+            {
+                const bool derivedState = saved->state == tracy::analysis::TraceSessionState::DerivedBuilding ||
+                    saved->state == tracy::analysis::TraceSessionState::DerivedFailed ||
+                    saved->state == tracy::analysis::TraceSessionState::FinalAuditing ||
+                    saved->state == tracy::analysis::TraceSessionState::InvalidConverterOutput;
+                if( derivedState )
+                {
+                    std::fprintf( stderr, "Completed Canonical reuse failed: %s\n", reuseError.c_str() );
+                    return 4;
+                }
+            }
+        }
+    }
+    tracy::analysis::TraceSessionCanonicalBuildResult canonical =
+        tracy::analysis::TraceSessionCanonicalBuildResult::Complete;
+    if( !reusedCanonical )
+    {
+        tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
+        canonicalOptions.resume = options.resume;
+        canonicalOptions.shouldCancel = Cancelled;
+        canonicalOptions.progress = PrintCanonicalProgress;
+        canonical = tracy::analysis::BuildTraceSessionCanonical( options.input,
+            building, generation, inventory, canonicalOptions, manifest, error );
+    }
     if( canonical == tracy::analysis::TraceSessionCanonicalBuildResult::CancelledResumable )
     {
         std::fprintf( stderr, "Conversion cancelled safely; rerun the same command to resume.\n" );
@@ -384,9 +417,27 @@ int main( int argc, char** argv )
     }
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
-    manifest.state = inventory.sourceDegraded ? tracy::analysis::TraceSessionState::CompleteSourceDegraded :
+    const auto derivedSourceDegraded = audited.invalidCpuZoneTimings != 0 ||
+        audited.schedulingSourceGaps != 0;
+    manifest.state = inventory.sourceDegraded || derivedSourceDegraded ?
+        tracy::analysis::TraceSessionState::CompleteSourceDegraded :
         tracy::analysis::TraceSessionState::Complete;
-    manifest.reason = inventory.sourceDegraded ? inventory.qualityReason : "complete";
+    if( inventory.sourceDegraded || derivedSourceDegraded )
+    {
+        std::string reason = inventory.sourceDegraded ? inventory.qualityReason : std::string();
+        if( audited.invalidCpuZoneTimings != 0 )
+        {
+            if( !reason.empty() ) reason += ';';
+            reason += "source_cpu_zone_clock_inversion:" + std::to_string( audited.invalidCpuZoneTimings );
+        }
+        if( audited.schedulingSourceGaps != 0 )
+        {
+            if( !reason.empty() ) reason += ';';
+            reason += "source_scheduling_gap:" + std::to_string( audited.schedulingSourceGaps );
+        }
+        manifest.reason = std::move( reason );
+    }
+    else manifest.reason = "complete";
     if( !tracy::analysis::PublishTraceSession( building, options.output, manifest, error ) )
     { std::fprintf( stderr, "Session publish failed: %s\n", error.c_str() ); return 7; }
     std::printf( "Session complete: %s\n", options.output.string().c_str() );

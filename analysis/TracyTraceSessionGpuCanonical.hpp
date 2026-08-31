@@ -24,6 +24,14 @@ struct TraceSessionTimeTransform
 bool LoadTraceSessionTimeTransform( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
     std::string& error );
+std::filesystem::path TraceSessionTimeTransformRoot( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest );
+bool BuildTraceSessionTimeTransformDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
+    std::string& error );
+bool AuditTraceSessionTimeTransformDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
+    std::string& error );
 
 struct TraceSessionGpuCanonicalStats
 {

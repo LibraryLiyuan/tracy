@@ -793,7 +793,7 @@ json CpuZoneJson( const analysis::CpuZoneDto& value )
         { "parent_ref", value.parentRef ? json( *value.parentRef ) : json( nullptr ) }, { "name", value.name },
         { "function", value.function }, { "file", value.file }, { "line", value.line },
         { "start_ns", Decimal( value.startNs ) }, { "end_ns", value.endNs ? json( Decimal( *value.endNs ) ) : json( nullptr ) },
-        { "duration_ns", value.endNs ? json( Decimal( *value.endNs - value.startNs ) ) : json( nullptr ) },
+        { "duration_ns", value.endNs && value.timingValid ? json( Decimal( *value.endNs - value.startNs ) ) : json( nullptr ) },
         { "self_time_ns", value.selfTimeNs ? json( Decimal( *value.selfTimeNs ) ) : json( nullptr ) },
         { "running_time_ns", value.runningTimeNs ? json( Decimal( *value.runningTimeNs ) ) : json( nullptr ) },
         { "running_regions", Decimal( value.runningRegions ) }, { "child_count", value.childCount },
@@ -807,7 +807,9 @@ json CpuZoneJson( const analysis::CpuZoneDto& value )
         { "extra_name", value.extraName ? json( *value.extraName ) : json( nullptr ) },
         { "extra_text", value.extraText ? json( *value.extraText ) : json( nullptr ) },
         { "extra_color", value.extraColor },
-        { "complete", value.complete }, { "name_resolved", value.nameResolved }, { "trust", "untrusted_trace_data" }
+        { "complete", value.complete }, { "timing_valid", value.timingValid },
+        { "timing_invalid_reason", value.timingInvalidReason ? json( *value.timingInvalidReason ) : json( nullptr ) },
+        { "name_resolved", value.nameResolved }, { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -8113,7 +8115,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 const auto values = source->ScanCpuZones( range );
                 BudgetScanned( values.size(), chunk, allowed );
-                for( const auto& value : values ) if( value.endNs && TextMatches( value.name, params ) )
+                for( const auto& value : values ) if( value.endNs && value.timingValid && TextMatches( value.name, params ) )
                 {
                     if( !groups.contains( value.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                     auto& group = groups[value.sourceLocationRef];
@@ -8183,7 +8185,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     const auto parent = zone.parentRef ? pathsByRef.find( *zone.parentRef ) : pathsByRef.end();
                     const auto path = parent == pathsByRef.end() ? zone.name : parent->second + ";" + zone.name;
                     pathsByRef[zone.ref] = path;
-                    if( !zone.endNs || !TextMatches( zone.name, params ) ) continue;
+                    if( !zone.endNs || !zone.timingValid || !TextMatches( zone.name, params ) ) continue;
                     if( !groups.contains( path ) && !BudgetConsumeGroup() ) continue;
                     auto& stats = groups[path]; stats.path = path; stats.count++; stats.inclusive += *zone.endNs - zone.startNs;
                     if( zone.selfTimeNs ) stats.self += *zone.selfTimeNs;
@@ -9758,7 +9760,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             range.limit = allowed;
             const auto zones = source->ScanCpuZones( range );
             BudgetScanned( zones.size(), requested, allowed );
-            for( const auto& zone : zones ) if( zone.endNs )
+            for( const auto& zone : zones ) if( zone.endNs && zone.timingValid )
             {
                 const auto node = graph.AddNode( "cpu-zone:" + zone.ref, zone.ref, "cpu_zone", "cpu", zone.name,
                     zone.startNs, *zone.endNs, zone.threadRef, {}, zone.sourceLocationRef, zone.callstackRef,
@@ -10186,6 +10188,38 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.statistics" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {
+        const auto parsePagedJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
+            if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
+            const auto parsed = source->ParseEntityRef( params[parameter].get<std::string>(), "job" );
+            if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
+            return *parsed;
+        };
+        if( source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session && method == "job.search" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string kind = params.value( "kind", "" );
+            const std::string state = params.value( "state", "" );
+            auto scanPage = ScanFiltered<analysis::JobDto>( *source, params, page,
+                []( const analysis::TraceSource& value, const analysis::ScanRange& range ) {
+                    return value.ScanJobs( range.offset, range.limit ); },
+                [&]( const analysis::JobDto& job ) {
+                    const char* currentState = job.cancelled ? "cancelled" : job.incomplete ? "incomplete" : job.completedNs ? "completed" : job.truncated ? "truncated" : "scheduled";
+                    return TextMatches( job.name, params ) && ( kind.empty() || kind == JobKindName( job.kind ) ) &&
+                        ( state.empty() || state == currentState ); },
+                [&]( const analysis::JobDto& job ) { return JobJson( *source, job, false ); } );
+            scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+            const auto returned = scanPage.values.size();
+            const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+            return Success( id, { { "jobs", std::move( scanPage.values ) },
+                { "total_jobs", Decimal( source->GetJobCount() ) } }, trace,
+                PageJson( page, returned, cursor ) );
+        }
+        if( source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session && method == "job.get" )
+        {
+            const auto job = source->GetJob( parsePagedJobRef() );
+            if( !job ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+            return Success( id, JobJson( *source, *job, true ), trace );
+        }
         auto jobs = source->GetJobs();
         const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
         const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
@@ -11042,7 +11076,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             auto range = ScanRangeFrom( params, offset, allowed );
             const auto zones = source->ScanCpuZones( range );
             BudgetScanned( zones.size(), chunk, allowed );
-            for( const auto& zone : zones ) if( zone.endNs )
+            for( const auto& zone : zones ) if( zone.endNs && zone.timingValid )
             {
                 if( !groups.contains( zone.sourceLocationRef ) && !BudgetConsumeGroup() ) continue;
                 auto& stats = groups[zone.sourceLocationRef]; stats.cpuCount++; stats.cpuInclusive += *zone.endNs - zone.startNs;
@@ -11697,7 +11731,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     {
                         const auto zones = item->ScanCpuZones( range );
                         count = zones.size();
-                        for( const auto& zone : zones ) if( zone.endNs && TextMatches( zone.name + " " + zone.function + " " + zone.file, params ) )
+                        for( const auto& zone : zones ) if( zone.endNs && zone.timingValid &&
+                            TextMatches( zone.name + " " + zone.function + " " + zone.file, params ) )
                         {
                             const auto key = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + zone.name + '|' + zone.function;
                             if( !budgetedGroupKeys.contains( key ) )

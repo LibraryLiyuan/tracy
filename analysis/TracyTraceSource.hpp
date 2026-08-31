@@ -310,6 +310,8 @@ struct CpuZoneDto
     std::optional<int64_t> runningTimeNs;
     uint64_t runningRegions = 0;
     bool complete = true;
+    bool timingValid = true;
+    std::optional<std::string> timingInvalidReason;
     bool nameResolved = true;
     uint32_t extraIndex = 0;
     bool extraValid = true;
@@ -920,6 +922,21 @@ public:
     virtual std::vector<std::string> ScanSamples( const ScanRange& range ) const = 0;
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
+    virtual uint64_t GetJobCount() const { return GetJobs().size(); }
+    virtual std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const
+    {
+        auto values = GetJobs();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<JobDto>( values.begin() + begin, values.begin() + end );
+    }
+    virtual std::optional<JobDto> GetJob( uint64_t jobId ) const
+    {
+        const auto values = GetJobs();
+        const auto found = std::find_if( values.begin(), values.end(),
+            [jobId]( const auto& value ) { return value.jobId == jobId; } );
+        return found == values.end() ? std::nullopt : std::optional<JobDto>( *found );
+    }
     virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
     {
         const auto jobs = GetJobs();

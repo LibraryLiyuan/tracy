@@ -2,6 +2,7 @@
 
 #include "TracyGpuAnalysis.hpp"
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyHash.hpp"
 #include "TracyJnGpuCatalog.hpp"
 #include "TracyProtocol.hpp"
 #include "TracyQueue.hpp"
@@ -11,14 +12,106 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <unordered_map>
 #include <vector>
+
+#ifdef _WIN32
+#  include <Windows.h>
+#endif
 
 namespace tracy::analysis
 {
 namespace
 {
+
+constexpr uint64_t TimeTransformFileMagic = 0x31544653544e4aull; // JNSTF1
+constexpr uint64_t TimeTransformManifestMagic = 0x314d5453544e4aull; // JNSTM1
+constexpr uint32_t TimeTransformSchema = 1;
+
+#pragma pack( push, 1 )
+struct TimeTransformFileHeader
+{
+    uint64_t magic = TimeTransformFileMagic;
+    uint32_t schema = TimeTransformSchema;
+    uint32_t endian = 0x01020304;
+    uint64_t sourceSize = 0;
+    int64_t baseTime = 0;
+    double timerMultiplier = 0;
+    uint64_t welcomeCount = 0;
+    uint32_t generationBytes = 0;
+};
+#pragma pack( pop )
+
+struct TimeTransformManifest
+{
+    std::string sourceSha256;
+    uint64_t sourceSize = 0;
+    std::string generation;
+    uint64_t fileBytes = 0;
+    std::string fileSha256;
+    uint64_t welcomeCount = 0;
+};
+
+bool AtomicReplace( const std::filesystem::path& source,
+    const std::filesystem::path& target, std::string& error )
+{
+#ifdef _WIN32
+    if( MoveFileExW( source.c_str(), target.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
+    error = "session_time_transform_atomic_replace_failed:" + std::to_string( GetLastError() );
+    return false;
+#else
+    std::error_code ec; std::filesystem::rename( source, target, ec );
+    if( !ec ) return true;
+    error = "session_time_transform_atomic_replace_failed:" + ec.message(); return false;
+#endif
+}
+
+bool SaveTimeTransformManifest( const std::filesystem::path& root,
+    const TimeTransformManifest& value, std::string& error )
+{
+    const auto temporary = root / "manifest.tmp";
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_time_transform_manifest_open_failed"; return false; }
+    out << "magic " << TimeTransformManifestMagic << '\n'
+        << "schema " << TimeTransformSchema << '\n'
+        << "source_sha256 " << std::quoted( value.sourceSha256 ) << '\n'
+        << "source_size " << value.sourceSize << '\n'
+        << "generation " << std::quoted( value.generation ) << '\n'
+        << "file_bytes " << value.fileBytes << '\n'
+        << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n'
+        << "welcome_count " << value.welcomeCount << '\n';
+    out.flush(); if( !out ) { error = "session_time_transform_manifest_write_failed"; return false; }
+    out.close(); return AtomicReplace( temporary, root / "manifest", error );
+}
+
+bool LoadTimeTransformManifest( const std::filesystem::path& root,
+    TimeTransformManifest& value, std::string& error )
+{
+    value = {}; std::ifstream in( root / "manifest", std::ios::binary );
+    if( !in ) { error = "session_time_transform_manifest_not_found"; return false; }
+    uint64_t magic = 0; uint32_t schema = 0; std::string key;
+    while( in >> key )
+    {
+        if( key == "magic" ) in >> magic;
+        else if( key == "schema" ) in >> schema;
+        else if( key == "source_sha256" ) in >> std::quoted( value.sourceSha256 );
+        else if( key == "source_size" ) in >> value.sourceSize;
+        else if( key == "generation" ) in >> std::quoted( value.generation );
+        else if( key == "file_bytes" ) in >> value.fileBytes;
+        else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 );
+        else if( key == "welcome_count" ) in >> value.welcomeCount;
+        else { std::string ignored; std::getline( in, ignored ); }
+        if( !in ) { error = "session_time_transform_manifest_parse_failed"; return false; }
+    }
+    if( magic != TimeTransformManifestMagic || schema != TimeTransformSchema ||
+        value.sourceSha256.size() != 64 || value.fileSha256.size() != 64 || value.welcomeCount == 0 )
+    { error = "session_time_transform_manifest_invalid"; return false; }
+    return true;
+}
 
 template<typename T>
 bool AppendFixedRecords( std::vector<T>& output, const uint8_t* records,
@@ -427,12 +520,95 @@ int64_t TraceSessionTimeTransform::ToNanoseconds( int64_t value ) const
     return present ? int64_t( double( value - baseTime ) * timerMultiplier ) : value;
 }
 
+std::filesystem::path TraceSessionTimeTransformRoot( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest )
+{
+    return sessionRoot / "generations" / manifest.generation / "global" /
+        "time-transform" / "1" / "exact";
+}
+
+bool AuditTraceSessionTimeTransformDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& session, TraceSessionTimeTransform& timeTransform,
+    std::string& error )
+{
+    error.clear(); timeTransform = {};
+    const auto root = TraceSessionTimeTransformRoot( sessionRoot, session );
+    TimeTransformManifest manifest;
+    if( !LoadTimeTransformManifest( root, manifest, error ) ) return false;
+    if( manifest.sourceSha256 != session.source.sha256 || manifest.sourceSize != session.source.fileSize ||
+        manifest.generation != session.generation )
+    { error = "session_time_transform_identity_mismatch"; return false; }
+    const auto path = root / "time-transform.bin"; std::error_code ec;
+    if( std::filesystem::file_size( path, ec ) != manifest.fileBytes || ec )
+    { error = "session_time_transform_file_size_mismatch"; return false; }
+    if( Sha256File( path ) != manifest.fileSha256 )
+    { error = "session_time_transform_file_sha256_mismatch"; return false; }
+    std::ifstream in( path, std::ios::binary ); TimeTransformFileHeader header;
+    if( !in.read( reinterpret_cast<char*>( &header ), sizeof( header ) ) ||
+        header.magic != TimeTransformFileMagic || header.schema != TimeTransformSchema ||
+        header.endian != 0x01020304 || header.sourceSize != session.source.fileSize ||
+        header.welcomeCount != manifest.welcomeCount || header.generationBytes != session.generation.size() ||
+        !std::isfinite( header.timerMultiplier ) || header.timerMultiplier <= 0 )
+    { error = "session_time_transform_file_header_invalid"; return false; }
+    std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
+    if( !in.read( sha.data(), std::streamsize( sha.size() ) ) ||
+        !in.read( generation.data(), std::streamsize( generation.size() ) ) ||
+        sha != session.source.sha256 || generation != session.generation ||
+        in.peek() != std::ifstream::traits_type::eof() )
+    { error = "session_time_transform_file_identity_invalid"; return false; }
+    timeTransform.timerMultiplier = header.timerMultiplier;
+    timeTransform.baseTime = header.baseTime;
+    timeTransform.present = true;
+    return true;
+}
+
+bool BuildTraceSessionTimeTransformDerived( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
+    std::string& error )
+{
+    std::string reuseError;
+    if( AuditTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, reuseError ) )
+    { error.clear(); return true; }
+    error.clear(); timeTransform = {}; MetadataState metadata { &timeTransform };
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, VisitMetadata, &metadata, error ) ) return false;
+    }
+    if( !timeTransform.present ) { error = "session_welcome_time_transform_missing"; return false; }
+    const auto root = TraceSessionTimeTransformRoot( sessionRoot, manifest ); std::error_code ec;
+    std::filesystem::create_directories( root, ec );
+    if( ec ) { error = "session_time_transform_directory_failed:" + ec.message(); return false; }
+    const auto target = root / "time-transform.bin"; auto temporary = target; temporary += ".tmp";
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_time_transform_file_open_failed"; return false; }
+    TimeTransformFileHeader header; header.sourceSize = manifest.source.fileSize;
+    header.baseTime = timeTransform.baseTime; header.timerMultiplier = timeTransform.timerMultiplier;
+    header.welcomeCount = metadata.welcomeCount; header.generationBytes = uint32_t( manifest.generation.size() );
+    out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+    out.write( manifest.source.sha256.data(), std::streamsize( manifest.source.sha256.size() ) );
+    out.write( manifest.generation.data(), std::streamsize( manifest.generation.size() ) );
+    out.flush(); if( !out ) { error = "session_time_transform_file_write_failed"; return false; }
+    out.close(); if( !AtomicReplace( temporary, target, error ) ) return false;
+    TimeTransformManifest fileManifest; fileManifest.sourceSha256 = manifest.source.sha256;
+    fileManifest.sourceSize = manifest.source.fileSize; fileManifest.generation = manifest.generation;
+    fileManifest.fileBytes = std::filesystem::file_size( target, ec );
+    if( ec ) { error = "session_time_transform_file_size_failed:" + ec.message(); return false; }
+    fileManifest.fileSha256 = Sha256File( target ); fileManifest.welcomeCount = metadata.welcomeCount;
+    return SaveTimeTransformManifest( root, fileManifest, error );
+}
+
 bool LoadTraceSessionTimeTransform( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionTimeTransform& timeTransform,
     std::string& error )
 {
     error.clear();
     timeTransform = {};
+    const auto root = TraceSessionTimeTransformRoot( sessionRoot, manifest );
+    std::error_code ec;
+    if( std::filesystem::exists( root / "manifest", ec ) )
+        return AuditTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, error );
+    if( ec ) { error = "session_time_transform_manifest_scan_failed:" + ec.message(); return false; }
     MetadataState metadata { &timeTransform };
     for( const auto& shard : manifest.shards )
     {

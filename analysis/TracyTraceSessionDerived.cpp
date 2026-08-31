@@ -177,6 +177,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "job_stages " << value.stats.jobStages << '\n';
     out << "cpu_zones " << value.stats.cpuZones << '\n';
     out << "complete_cpu_zones " << value.stats.completeCpuZones << '\n';
+    out << "invalid_cpu_zone_timings " << value.stats.invalidCpuZoneTimings << '\n';
     out << "cpu_zone_sources " << value.stats.cpuZoneSources << '\n';
     out << "cpu_zone_begins " << value.stats.cpuZoneBegins << '\n';
     out << "cpu_zone_ends " << value.stats.cpuZoneEnds << '\n';
@@ -213,6 +214,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "complete_context_switch_events " << value.stats.completeContextSwitchEvents << '\n';
     out << "cpu_context_switch_events " << value.stats.cpuContextSwitchEvents << '\n';
     out << "complete_cpu_context_switch_events " << value.stats.completeCpuContextSwitchEvents << '\n';
+    out << "scheduling_source_gaps " << value.stats.schedulingSourceGaps << '\n';
     out << "relations " << value.stats.relations << '\n';
     out << "runtime_domain_states " << value.stats.runtimeDomainStates << '\n';
     out << "script_frames " << value.stats.scriptFrames << '\n';
@@ -285,6 +287,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "job_stages" ) in >> value.stats.jobStages;
         else if( key == "cpu_zones" ) in >> value.stats.cpuZones;
         else if( key == "complete_cpu_zones" ) in >> value.stats.completeCpuZones;
+        else if( key == "invalid_cpu_zone_timings" ) in >> value.stats.invalidCpuZoneTimings;
         else if( key == "cpu_zone_sources" ) in >> value.stats.cpuZoneSources;
         else if( key == "cpu_zone_begins" ) in >> value.stats.cpuZoneBegins;
         else if( key == "cpu_zone_ends" ) in >> value.stats.cpuZoneEnds;
@@ -321,6 +324,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "complete_context_switch_events" ) in >> value.stats.completeContextSwitchEvents;
         else if( key == "cpu_context_switch_events" ) in >> value.stats.cpuContextSwitchEvents;
         else if( key == "complete_cpu_context_switch_events" ) in >> value.stats.completeCpuContextSwitchEvents;
+        else if( key == "scheduling_source_gaps" ) in >> value.stats.schedulingSourceGaps;
         else if( key == "relations" ) in >> value.stats.relations;
         else if( key == "runtime_domain_states" ) in >> value.stats.runtimeDomainStates;
         else if( key == "script_frames" ) in >> value.stats.scriptFrames;
@@ -386,6 +390,24 @@ bool VerifyIndexManifest( const std::filesystem::path& root,
     return true;
 }
 
+bool IndexCoversCanonicalShards( const TraceSessionManifest& session,
+    const IndexManifest& index )
+{
+    size_t fileIndex = 0;
+    for( const auto& shard : session.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        if( fileIndex >= index.files.size() ) return false;
+        const auto& file = index.files[fileIndex++];
+        auto domain = uint32_t( DomainFromName( shard.domain ) );
+        if( domain >= uint32_t( TraceSessionProtocolDomain::Count ) )
+            domain = uint32_t( TraceSessionProtocolDomain::Other );
+        if( file.shardId != shard.shardId || file.domain != domain ||
+            file.recordCount != shard.recordCount ) return false;
+    }
+    return fileIndex == index.files.size();
+}
+
 }
 
 std::filesystem::path TraceSessionDomainIndexRoot( const std::filesystem::path& sessionRoot,
@@ -426,57 +448,88 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     const auto root = TraceSessionDomainIndexRoot( sessionRoot, manifest );
     std::error_code ec; std::filesystem::create_directories( root, ec );
     if( ec ) { error = "session_index_directory_failed:" + ec.message(); return false; }
-    IndexManifest index;
-    index.sourceSha256 = manifest.source.sha256;
-    index.sourceSize = manifest.source.fileSize;
-    index.generation = manifest.generation;
     const auto eventShardCount = std::count_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
-    size_t completedShards = 0;
-    for( const auto& shard : manifest.shards )
+    IndexManifest index;
+    std::string reuseError;
+    const bool reuseDomainIndex = VerifyIndexManifest( root, manifest, index, reuseError ) &&
+        IndexCoversCanonicalShards( manifest, index );
+    if( reuseDomainIndex )
     {
-        if( shard.domain == "checkpoint" ) continue;
-        if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
-        DomainIndexHeader header;
-        header.domain = uint32_t( DomainFromName( shard.domain ) );
-        if( header.domain >= uint32_t( TraceSessionProtocolDomain::Count ) ) header.domain = uint32_t( TraceSessionProtocolDomain::Other );
-        header.shardId = shard.shardId;
-        IndexVisitorState state { &header, &index.stats };
-        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, IndexRecord, &state, error ) ) return false;
-        if( header.recordCount != shard.recordCount )
-        { error = "session_index_record_count_mismatch"; return false; }
-        std::ostringstream name;
-        name << SafeDomain( shard.domain ) << '-' << std::setw( 6 ) << std::setfill( '0' ) << shard.shardId << ".idx";
-        const auto relative = std::filesystem::path( "shards" ) / name.str();
-        const auto target = root / relative;
-        std::filesystem::create_directories( target.parent_path(), ec );
-        if( ec ) { error = "session_index_shard_directory_failed:" + ec.message(); return false; }
-        auto temporary = target; temporary += ".tmp";
-        std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
-        if( !out ) { error = "session_index_open_failed"; return false; }
-        out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
-        out.flush();
-        if( !out ) { error = "session_index_write_failed"; return false; }
-        out.close();
-        if( !AtomicReplace( temporary, target, error ) ) return false;
-        IndexFile file;
-        file.domain = header.domain; file.shardId = shard.shardId; file.recordCount = header.recordCount;
-        file.fileBytes = sizeof( header );
-        file.sha256 = Sha256File( target ); file.relativePath = relative;
-        index.files.push_back( file );
-        index.stats.indexedRecords += header.recordCount;
-        index.stats.indexedProtocolEvents += header.protocolEvents;
-        index.stats.indexedProtocolFrames += header.protocolFrames;
-        index.stats.indexedTransportRecords += header.transportRecords;
-        index.stats.indexBytes += file.fileBytes;
-        index.stats.indexFiles++;
-        if( control.progress ) control.progress( eventShardCount == 0 ? 1.f :
-            float( ++completedShards ) / float( eventShardCount ), "session-domain-index" );
+        if( control.progress ) control.progress( 1.f, "session-domain-index-reused" );
     }
+    else
+    {
+        index = {};
+        index.sourceSha256 = manifest.source.sha256;
+        index.sourceSize = manifest.source.fileSize;
+        index.generation = manifest.generation;
+        size_t completedShards = 0;
+        for( const auto& shard : manifest.shards )
+        {
+            if( shard.domain == "checkpoint" ) continue;
+            if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
+            DomainIndexHeader header;
+            header.domain = uint32_t( DomainFromName( shard.domain ) );
+            if( header.domain >= uint32_t( TraceSessionProtocolDomain::Count ) ) header.domain = uint32_t( TraceSessionProtocolDomain::Other );
+            header.shardId = shard.shardId;
+            IndexVisitorState state { &header, &index.stats };
+            if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, IndexRecord, &state, error ) ) return false;
+            if( header.recordCount != shard.recordCount )
+            { error = "session_index_record_count_mismatch"; return false; }
+            std::ostringstream name;
+            name << SafeDomain( shard.domain ) << '-' << std::setw( 6 ) << std::setfill( '0' ) << shard.shardId << ".idx";
+            const auto relative = std::filesystem::path( "shards" ) / name.str();
+            const auto target = root / relative;
+            std::filesystem::create_directories( target.parent_path(), ec );
+            if( ec ) { error = "session_index_shard_directory_failed:" + ec.message(); return false; }
+            auto temporary = target; temporary += ".tmp";
+            std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+            if( !out ) { error = "session_index_open_failed"; return false; }
+            out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+            out.flush();
+            if( !out ) { error = "session_index_write_failed"; return false; }
+            out.close();
+            if( !AtomicReplace( temporary, target, error ) ) return false;
+            IndexFile file;
+            file.domain = header.domain; file.shardId = shard.shardId; file.recordCount = header.recordCount;
+            file.fileBytes = sizeof( header );
+            file.sha256 = Sha256File( target ); file.relativePath = relative;
+            index.files.push_back( file );
+            index.stats.indexedRecords += header.recordCount;
+            index.stats.indexedProtocolEvents += header.protocolEvents;
+            index.stats.indexedProtocolFrames += header.protocolFrames;
+            index.stats.indexedTransportRecords += header.transportRecords;
+            index.stats.indexBytes += file.fileBytes;
+            index.stats.indexFiles++;
+            if( control.progress ) control.progress( eventShardCount == 0 ? 1.f :
+                float( ++completedShards ) / float( eventShardCount ), "session-domain-index" );
+        }
+        // Publish the exact generic index as soon as it is complete. Later
+        // domain failures may then resume without rescanning every Canonical
+        // shard. The same manifest is atomically replaced with final domain
+        // statistics after all mandatory builders finish.
+        if( !SaveIndexManifest( root, index, error ) ) return false;
+    }
+
+    TraceSessionTimeTransform timeTransform;
+    if( control.progress ) control.progress( 0.f, "time-transform" );
+    reuseError.clear();
+    if( AuditTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "time-transform-reused" );
+    }
+    else if( !BuildTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, error ) ) return false;
 
     TraceSessionFrameStats frameStats;
     if( control.progress ) control.progress( 0.f, "frames" );
-    if( !BuildTraceSessionFrameDerived( sessionRoot, manifest,
+    reuseError.clear();
+    if( const auto reader = TraceSessionFrameReader::Open( sessionRoot, manifest, reuseError ) )
+    {
+        frameStats = reader->Stats();
+        if( control.progress ) control.progress( 1.f, "frames-reused" );
+    }
+    else if( !BuildTraceSessionFrameDerived( sessionRoot, manifest,
         index.stats.semanticTimePresent, index.stats.lastSemanticTimeRaw,
         frameStats, error ) ) return false;
     index.stats.frameSets = frameStats.frameSets;
@@ -485,7 +538,13 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionFrameImageStats frameImageStats;
     if( control.progress ) control.progress( 0.f, "frame-images" );
-    if( !BuildTraceSessionFrameImageDerived( sessionRoot, manifest,
+    reuseError.clear();
+    if( AuditTraceSessionFrameImageDerived( sessionRoot, manifest,
+        frameImageStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "frame-images-reused" );
+    }
+    else if( !BuildTraceSessionFrameImageDerived( sessionRoot, manifest,
         frameImageStats, error ) ) return false;
     index.stats.frameImages = frameImageStats.images;
     index.stats.frameImageDataEvents = frameImageStats.imageDataEvents;
@@ -494,7 +553,20 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionJobStats jobStats;
     if( control.progress ) control.progress( 0.f, "jobs" );
-    if( !BuildTraceSessionJobDerived( sessionRoot, manifest, jobStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionJobDerived( sessionRoot, manifest, jobStats, reuseError ) )
+    {
+        if( !CleanupTraceSessionJobTemporaryRuns( sessionRoot, manifest, error ) ) return false;
+        if( control.progress ) control.progress( 1.f, "jobs-reused" );
+    }
+    else if( !BuildTraceSessionJobDerived( sessionRoot, manifest, jobStats, error ) ) return false;
+    if( control.progress ) control.progress( 0.f, "job-pages" );
+    reuseError.clear();
+    if( AuditTraceSessionJobPagingDerived( sessionRoot, manifest, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "job-pages-reused" );
+    }
+    else if( !BuildTraceSessionJobPagingDerived( sessionRoot, manifest, error ) ) return false;
     index.stats.jobTypes = jobStats.jobTypes;
     index.stats.jobs = jobStats.jobs;
     index.stats.jobSchedules = jobStats.schedules;
@@ -504,9 +576,16 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionCpuZoneStats cpuZoneStats;
     if( control.progress ) control.progress( 0.f, "cpu-zones" );
-    if( !BuildTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, reuseError ) )
+    {
+        if( !CleanupTraceSessionCpuZoneTemporaryFiles( sessionRoot, manifest, error ) ) return false;
+        if( control.progress ) control.progress( 1.f, "cpu-zones-reused" );
+    }
+    else if( !BuildTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ) return false;
     index.stats.cpuZones = cpuZoneStats.zones;
     index.stats.completeCpuZones = cpuZoneStats.completeZones;
+    index.stats.invalidCpuZoneTimings = cpuZoneStats.invalidTimingZones;
     index.stats.cpuZoneSources = cpuZoneStats.sourceLocations;
     index.stats.cpuZoneBegins = cpuZoneStats.beginEvents;
     index.stats.cpuZoneEnds = cpuZoneStats.endEvents;
@@ -516,7 +595,12 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionSymbolStats symbolStats;
     if( control.progress ) control.progress( 0.f, "symbols-callstacks" );
-    if( !BuildTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "symbols-callstacks-reused" );
+    }
+    else if( !BuildTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, error ) ) return false;
     index.stats.resolvedCallstacks = symbolStats.callstacks;
     index.stats.callstackEntries = symbolStats.callstackEntries;
     index.stats.callstackFrameAddresses = symbolStats.frameAddresses;
@@ -526,7 +610,13 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionGpuZoneStats gpuZoneStats;
     if( control.progress ) control.progress( 0.f, "gpu-zones" );
-    if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, reuseError ) )
+    {
+        if( !CleanupTraceSessionGpuZoneTemporaryFiles( sessionRoot, manifest, error ) ) return false;
+        if( control.progress ) control.progress( 1.f, "gpu-zones-reused" );
+    }
+    else if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
     index.stats.gpuContexts = gpuZoneStats.contexts;
     index.stats.gpuZones = gpuZoneStats.zones;
     index.stats.completeGpuZones = gpuZoneStats.completeZones;
@@ -539,7 +629,12 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionMemoryStats memoryStats;
     if( control.progress ) control.progress( 0.f, "memory" );
-    if( !BuildTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "memory-reused" );
+    }
+    else if( !BuildTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ) return false;
     index.stats.memoryPools = memoryStats.pools;
     index.stats.memoryEvents = memoryStats.events;
     index.stats.activeMemoryEvents = memoryStats.activeEvents;
@@ -550,7 +645,12 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionSamplingStats samplingStats;
     if( control.progress ) control.progress( 0.f, "sampling" );
-    if( !BuildTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "sampling-reused" );
+    }
+    else if( !BuildTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, error ) ) return false;
     index.stats.sampleEvents = samplingStats.samples;
     index.stats.contextSwitchSampleEvents = samplingStats.contextSwitchSamples;
     index.stats.sampleDictionaryEntries = samplingStats.dictionaryEntries;
@@ -558,29 +658,50 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
 
     TraceSessionSchedulingStats schedulingStats;
     if( control.progress ) control.progress( 0.f, "scheduling" );
-    if( !BuildTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "scheduling-reused" );
+    }
+    else if( !BuildTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ) return false;
     index.stats.contextSwitchRecords = schedulingStats.contextSwitchRecords;
     index.stats.threadWakeupRecords = schedulingStats.wakeupRecords;
     index.stats.contextSwitchEvents = schedulingStats.threadEvents;
     index.stats.completeContextSwitchEvents = schedulingStats.completeThreadEvents;
     index.stats.cpuContextSwitchEvents = schedulingStats.cpuEvents;
     index.stats.completeCpuContextSwitchEvents = schedulingStats.completeCpuEvents;
+    index.stats.schedulingSourceGaps = schedulingStats.sourceGapEvents;
 
     TraceSessionRelationStats relationStats;
     if( control.progress ) control.progress( 0.f, "relations" );
-    if( !BuildTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionRelationDerived( sessionRoot, manifest, relationStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "relations-reused" );
+    }
+    else if( !BuildTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ) return false;
     index.stats.relations = relationStats.relations;
 
     TraceSessionRuntimeStats runtimeStats;
     if( control.progress ) control.progress( 0.f, "runtime-script" );
-    if( !BuildTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "runtime-script-reused" );
+    }
+    else if( !BuildTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, error ) ) return false;
     index.stats.runtimeDomainStates = runtimeStats.domainStates;
     index.stats.scriptFrames = runtimeStats.scriptFrames;
     index.stats.scriptStackEvents = runtimeStats.scriptStackEvents;
 
     TraceSessionIoGfxStats ioGfxStats;
     if( control.progress ) control.progress( 0.f, "io-gfx" );
-    if( !BuildTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, error ) ) return false;
+    reuseError.clear();
+    if( AuditTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "io-gfx-reused" );
+    }
+    else if( !BuildTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, error ) ) return false;
     index.stats.ioRequests = ioGfxStats.ioRequests;
     index.stats.ioConfigs = ioGfxStats.ioConfigs;
     index.stats.ioStages = ioGfxStats.ioStages;
@@ -645,6 +766,8 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
             gpu->passCount != index.stats.gpuPasses )
         { if( error.empty() ) error = "session_gpu_derived_audit_mismatch"; return false; }
     }
+    TraceSessionTimeTransform timeTransform;
+    if( !AuditTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, error ) ) return false;
     const auto frameReader = TraceSessionFrameReader::Open( sessionRoot, manifest, error );
     if( !frameReader || frameReader->Stats().frameSets != index.stats.frameSets ||
         frameReader->Stats().frames != index.stats.frames ||
@@ -669,6 +792,7 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( !AuditTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ||
         cpuZoneStats.zones != index.stats.cpuZones ||
         cpuZoneStats.completeZones != index.stats.completeCpuZones ||
+        cpuZoneStats.invalidTimingZones != index.stats.invalidCpuZoneTimings ||
         cpuZoneStats.sourceLocations != index.stats.cpuZoneSources ||
         cpuZoneStats.beginEvents != index.stats.cpuZoneBegins ||
         cpuZoneStats.endEvents != index.stats.cpuZoneEnds )
@@ -721,7 +845,8 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         schedulingStats.threadEvents != index.stats.contextSwitchEvents ||
         schedulingStats.completeThreadEvents != index.stats.completeContextSwitchEvents ||
         schedulingStats.cpuEvents != index.stats.cpuContextSwitchEvents ||
-        schedulingStats.completeCpuEvents != index.stats.completeCpuContextSwitchEvents )
+        schedulingStats.completeCpuEvents != index.stats.completeCpuContextSwitchEvents ||
+        schedulingStats.sourceGapEvents != index.stats.schedulingSourceGaps )
     { if( error.empty() ) error = "session_scheduling_derived_audit_mismatch"; return false; }
     TraceSessionRelationStats relationStats;
     if( !AuditTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ||

@@ -202,6 +202,185 @@ tracy-trace-session-inventory  Passed
 100% tests passed, 0 failed
 ```
 
+### 2026-08-31 Job 分页索引与 Scheduling 句柄上限修复
+
+真实30分钟录制继续暴露出两个只会在大规模数据下出现的问题。本节只记录已经由代码、合成测试和真实构建产物证明的事实；真实Session尚未完成Final Audit，不能据此将N30.6或LTS-1标记为通过。
+
+#### Scheduling失败根因
+
+旧实现为每个观察到的ThreadId和CPU Id保持一个长期打开的`.work`文件。真实录制产生约3000个此类文件后，Windows/MSVC进程文件句柄达到上限，Converter返回：
+
+```text
+session_scheduling_work_open_failed
+```
+
+这不是源Trace损坏，也不是内存超限；根因是实现的打开文件数量随线程/CPU身份基数线性增长。
+
+修复后每个Scheduling generation只打开两个共享顺序文件：
+
+```text
+thread-events.work
+cpu-events.work
+```
+
+线程/CPU运行时状态只保存最后一条记录和对应全局文件偏移；End事件通过固定宽度记录的全局偏移回填。打开文件数量从`O(thread_count + cpu_count)`降为常数2，最终文件仍保持按Thread/CPU可查询的精确区间语义。Schema根目录使用实际`scheduling-index/2/exact`，不再硬编码旧版本。
+
+合成压力测试增加1024个不同ThreadWakeup身份，并验证：
+
+- 构建成功，不触发句柄耗尽；
+- 默认分页上限返回100条，不把截断结果伪装成全量；
+- Query显式`limit=4`时精确返回4条；
+- Session重开后Scheduling Reader保持可用。
+
+#### Job磁盘分页
+
+真实30分钟Job规模已经超过适合一次性装入Query进程的范围：
+
+```text
+Job count:       18,578,994
+Job stage count: 211,850,865
+raw jobs.bin:     9,644,688,477 bytes
+```
+
+新增`job-pages/1/exact`派生索引，使用有界外排和固定宽度磁盘页生成：
+
+```text
+job-pages.bin: 9,793,320,437 bytes
+```
+
+当前已经完成并验证：
+
+- `TraceSource::GetJobCount()`不物化全量Job；
+- `TraceSource::ScanJobs(offset, limit)`只读取请求页；
+- `TraceSource::GetJob(jobId)`按ID读取目标Job及其直接前置依赖；
+- Session `job.search`和`job.get`使用上述分页路径；
+- page header、区域布局、文件大小、SHA-256和source identity均在开放Reader前验证；
+- resume时已完成的page generation返回`job-pages-reused`，不重复构建。
+
+仍未完成：
+
+- `job.statistics`的分页聚合；
+- 大规模`job.dependencies`反向边索引；
+- `job.critical_path`的磁盘图算法；
+- Frame→Job关联索引；
+- 单个超大Job内部Stage的二级分页；
+- page builder构建中途的细粒度Cancel/Checkpoint。
+
+因此当前只能证明基础Job search/get已摆脱全量vector，不能宣称全部Job Query达到长录制内存门禁。
+
+#### 当前真实运行状态
+
+当前generation：
+
+```text
+n30-1788153528951461-31412
+```
+
+已复用或完成：
+
+```text
+Canonical shard count:   402
+Canonical logical events: 2,284,723,486
+Protocol frames:          193,141
+Job page index:           Complete
+Scheduling build:         DerivedBuilding
+Converter resident memory: approximately 270 MiB during Scheduling
+```
+
+真实运行尚未发布Session；必须继续通过Scheduling、剩余Mandatory Derived和Final Audit后，才能形成LTS-1正确性结论。
+
+TDD证据：
+
+```text
+RED:   Scheduling stress with high identity cardinality exposed per-identity handle growth
+GREEN: Trace Session Inventory tests passed with 1024 scheduling thread identities
+GREEN: Job count/scan/get paging tests passed
+```
+
+### 2026-08-31 真实30分钟派生索引、Source Clock与Scheduling降级语义
+
+固定输入：
+
+```text
+Admin-HighEvidence-30m.tracy-stream
+source bytes: 19,122,822,908
+source SHA-256: 2AC46C53257CE9027EC67E098FC15070FB911243F6CD311A166EB97547848068
+source records: 499,362
+protocol frames: 193,141
+logical protocol events: 2,284,723,486
+canonical shards: 402
+```
+
+截至本记录，真实Mandatory Derived已经产生并校验的正式数据包括：
+
+| 域 | 结果 | 正式文件大小 | 说明 |
+|---|---|---:|---|
+| Job | Passed | 9,644,688,477 bytes | 18,578,994 Jobs、211,850,865 Stages；producer峰值缓存1,048,576条 |
+| CPU Zone | Passed | 25,496,383,848 bytes | 234,691,471 Zones；源时钟倒退不再伪造duration |
+| Source/Symbol | Passed | 201,512,534 bytes | 符号和Callstack磁盘索引 |
+| GPU Zone | Passed | 3,683,879,985 bytes | 正式GPU Zone索引已提交并通过SHA审计 |
+| Memory | Passed | 约0.11 GiB | allocation生命周期磁盘索引 |
+| Sampling | Passed | 约4.61 GiB | 低内存流式构建 |
+| Scheduling | 首次失败后已修复、待真实重跑 | - | 源`oldThread=0`连续switch-in被旧状态机误判 |
+
+#### CPU Source Clock Inversion
+
+真实源中存在一个CPU Zone：End的原始TSC比Begin早49,725 ticks。Canonical保持了原始顺序和数值；Tracy传统Worker在Release中也会保存该事实。N30现在返回：
+
+```text
+complete=true
+timing_valid=false
+timing_invalid_reason=source_clock_inversion
+duration_ns=null
+self_time_ns=null
+```
+
+该Zone仍可导航，但不会进入时间统计、Flamegraph、Evidence Graph或matched-run统计。Session发布状态降级为`CompleteSourceDegraded`并记录精确计数。
+
+#### Scheduling Source Gap
+
+真实源首次触发：
+
+```text
+CPU已有未闭合运行区间
+→ 新ContextSwitch的oldThread=0
+→ 同一CPU再次switch-in
+```
+
+Tracy传统Worker会保留前一未闭合区间并继续记录新switch-in。N30旧状态机错误返回`session_scheduling_cpu_switch_in_while_running`。修复后：
+
+- 不补造SwitchOut时间。
+- 不丢弃任一观测。
+- 前一CPU/Thread区间保持`complete=false`、`end_ns=null`。
+- 后续可证明闭合的区间仍正常闭合。
+- 记录`source_scheduling_gap`计数并使Session成为`CompleteSourceDegraded`。
+- Context Switch duration统计只使用有真实End的完整区间。
+
+Synthetic回归覆盖同一CPU两次`oldThread=0` switch-in，要求质量计数恰好为1，并验证Query 1.34返回4条原始区间、其中缺口区间明确不完整。
+
+#### 恢复与重复成本修复
+
+- CPU/GPU Zone正式文件通过identity、size和SHA-256审计后可以复用。
+- 复用后才删除`zones.work`/`extras.work`；删除失败会阻止继续，不能静默泄漏。
+- 通用Session domain index在自身完成后立即原子发布。后续域失败重试时不再重复扫描全部Canonical。
+- Welcome `timerMul/initBegin`建立独立、带强身份和SHA-256的Global Time Transform表；所有派生域共享，且完整扫描仍检查多个Welcome之间的冲突。
+- Converter恢复过程仍先验证19 GiB source强身份与全部Canonical shard；原始stream只读且未被删除。
+
+当前回归：
+
+```text
+tracy-trace-session-inventory-tests  Passed
+```
+
+当前converter：
+
+```text
+build-n30-capture\Release\tracy-stream-convert.exe
+SHA-256 DA97785F30AB1FBA9FE44D48E55184FB461BE0BA5045B5B645CF9C0E08C92D44
+```
+
+真实30分钟Session正在从已校验Canonical恢复，尚不能在本节标记最终发布通过。
+
 ### 2026-08-31 真实30分钟规模阻断与Packed Canonical修复
 
 真实输入：

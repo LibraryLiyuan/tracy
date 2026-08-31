@@ -13,7 +13,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionSchedulingIndexSchemaVersion = 1;
+inline constexpr uint32_t TraceSessionSchedulingIndexSchemaVersion = 2;
 
 struct TraceSessionSchedulingStats
 {
@@ -23,6 +23,9 @@ struct TraceSessionSchedulingStats
     uint64_t completeThreadEvents = 0;
     uint64_t cpuEvents = 0;
     uint64_t completeCpuEvents = 0;
+    // Observed scheduler records that cannot form a single non-overlapping
+    // timeline. Facts remain queryable and affected intervals stay incomplete.
+    uint64_t sourceGapEvents = 0;
     uint64_t fileBytes = 0;
 };
 

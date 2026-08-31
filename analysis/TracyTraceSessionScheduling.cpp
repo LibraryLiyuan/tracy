@@ -43,6 +43,7 @@ struct SchedulingFileHeader
     uint64_t completeThreadEventCount = 0;
     uint64_t cpuEventCount = 0;
     uint64_t completeCpuEventCount = 0;
+    uint64_t sourceGapEventCount = 0;
     uint64_t threadRecordsOffset = 0;
     uint64_t cpuRecordsOffset = 0;
     uint32_t generationBytes = 0;
@@ -191,7 +192,6 @@ private:
 
 struct ThreadRuntime
 {
-    WorkFile<StoredThreadEvent> work;
     StoredThreadEvent last;
     uint64_t lastIndex = 0;
     bool hasLast = false;
@@ -201,7 +201,6 @@ struct ThreadRuntime
 
 struct CpuRuntime
 {
-    WorkFile<StoredCpuEvent> work;
     StoredCpuEvent last;
     uint64_t lastIndex = 0;
     bool active = false;
@@ -211,6 +210,8 @@ struct BuildState
 {
     TraceSessionTimeTransform transform;
     std::filesystem::path root;
+    WorkFile<StoredThreadEvent> threadWork;
+    WorkFile<StoredCpuEvent> cpuWork;
     std::map<uint64_t, std::unique_ptr<ThreadRuntime>> threads;
     std::map<uint32_t, std::unique_ptr<CpuRuntime>> cpus;
     std::unordered_map<uint64_t, uint16_t> compressedThreads;
@@ -223,9 +224,6 @@ ThreadRuntime* EnsureThread( BuildState& state, uint64_t thread, std::string& er
     const auto found = state.threads.find( thread );
     if( found != state.threads.end() ) return found->second.get();
     auto runtime = std::make_unique<ThreadRuntime>();
-    std::ostringstream name;
-    name << "thread-" << std::hex << std::setw( 16 ) << std::setfill( '0' ) << thread << ".work";
-    if( !runtime->work.Open( state.root / name.str(), error ) ) return nullptr;
     return state.threads.emplace( thread, std::move( runtime ) ).first->second.get();
 }
 
@@ -234,24 +232,21 @@ CpuRuntime* EnsureCpu( BuildState& state, uint32_t cpu, std::string& error )
     const auto found = state.cpus.find( cpu );
     if( found != state.cpus.end() ) return found->second.get();
     auto runtime = std::make_unique<CpuRuntime>();
-    std::ostringstream name;
-    name << "cpu-" << std::setw( 4 ) << std::setfill( '0' ) << cpu << ".work";
-    if( !runtime->work.Open( state.root / name.str(), error ) ) return nullptr;
     return state.cpus.emplace( cpu, std::move( runtime ) ).first->second.get();
 }
 
-bool AppendThreadEvent( ThreadRuntime& runtime, const StoredThreadEvent& value,
-    TraceSessionSchedulingStats& stats, std::string& error )
+bool AppendThreadEvent( BuildState& state, ThreadRuntime& runtime,
+    const StoredThreadEvent& value, std::string& error )
 {
-    if( !runtime.work.Append( value, runtime.lastIndex, error ) ) return false;
-    runtime.last = value; runtime.hasLast = true; ++stats.threadEvents;
+    if( !state.threadWork.Append( value, runtime.lastIndex, error ) ) return false;
+    runtime.last = value; runtime.hasLast = true; ++state.stats.threadEvents;
     return true;
 }
 
-bool PatchThreadEvent( ThreadRuntime& runtime, const StoredThreadEvent& value,
-    std::string& error )
+bool PatchThreadEvent( BuildState& state, ThreadRuntime& runtime,
+    const StoredThreadEvent& value, std::string& error )
 {
-    if( !runtime.hasLast || !runtime.work.Patch( runtime.lastIndex, value, error ) ) return false;
+    if( !runtime.hasLast || !state.threadWork.Patch( runtime.lastIndex, value, error ) ) return false;
     runtime.last = value;
     return true;
 }
@@ -288,7 +283,7 @@ bool ProcessWakeup( BuildState& state, const QueueThreadWakeup& event,
     StoredThreadEvent value;
     value.startNs = timeNs; value.wakeupNs = timeNs; value.thread = event.thread;
     value.wakeupCpu = event.cpu; value.reason = WakeupReason;
-    return AppendThreadEvent( *runtime, value, state.stats, error );
+    return AppendThreadEvent( state, *runtime, value, error );
 }
 
 bool ProcessSwitchOut( BuildState& state, const QueueContextSwitch& event,
@@ -301,24 +296,31 @@ bool ProcessSwitchOut( BuildState& state, const QueueContextSwitch& event,
         {
             auto& runtime = *found->second;
             if( !runtime.hasLast || runtime.last.endNs >= 0 || runtime.last.startNs > timeNs )
-            { error = "session_scheduling_thread_switch_out_invalid"; return false; }
-            auto value = runtime.last;
-            value.endNs = timeNs;
-            value.reason = int8_t( event.oldThreadWaitReason );
-            value.state = int8_t( event.oldThreadState );
-            if( !PatchThreadEvent( runtime, value, error ) ) return false;
-            ++state.stats.completeThreadEvents;
+            { ++state.stats.sourceGapEvents; }
+            else
+            {
+                auto value = runtime.last;
+                value.endNs = timeNs;
+                value.reason = int8_t( event.oldThreadWaitReason );
+                value.state = int8_t( event.oldThreadState );
+                if( !PatchThreadEvent( state, runtime, value, error ) ) return false;
+                ++state.stats.completeThreadEvents;
+            }
         }
         auto* cpu = EnsureCpu( state, event.cpu, error );
         if( !cpu ) return false;
         if( cpu->active )
         {
             if( cpu->last.thread != event.oldThread || cpu->last.startNs > timeNs )
-            { error = "session_scheduling_cpu_switch_out_mismatch"; return false; }
-            auto value = cpu->last; value.endNs = timeNs;
-            if( !cpu->work.Patch( cpu->lastIndex, value, error ) ) return false;
-            cpu->last = value; cpu->active = false; ++state.stats.completeCpuEvents;
+            { ++state.stats.sourceGapEvents; }
+            else
+            {
+                auto value = cpu->last; value.endNs = timeNs;
+                if( !state.cpuWork.Patch( cpu->lastIndex, value, error ) ) return false;
+                cpu->last = value; cpu->active = false; ++state.stats.completeCpuEvents;
+            }
         }
+        else ++state.stats.sourceGapEvents;
     }
     return true;
 }
@@ -340,7 +342,7 @@ bool ProcessSwitchIn( BuildState& state, const QueueContextSwitch& event,
     else
     {
         if( runtime->hasLast && runtime->last.endNs < 0 )
-        { error = "session_scheduling_thread_switch_in_while_running"; return false; }
+            ++state.stats.sourceGapEvents;
         value.startNs = timeNs; value.wakeupNs = timeNs; value.thread = event.newThread;
         value.wakeupCpu = event.cpu;
         if( runtime->pendingWakeupNs != 0 && runtime->hasLast &&
@@ -350,21 +352,21 @@ bool ProcessSwitchIn( BuildState& state, const QueueContextSwitch& event,
             value.wakeupCpu = runtime->pendingWakeupCpu;
             runtime->pendingWakeupNs = 0;
         }
-        if( !AppendThreadEvent( *runtime, value, state.stats, error ) ) return false;
+        if( !AppendThreadEvent( state, *runtime, value, error ) ) return false;
     }
     value.startNs = timeNs; value.endNs = -1; value.cpu = event.cpu;
     value.reason = -1; value.state = -1; value.relatedThreadIndex = 0;
-    if( !PatchThreadEvent( *runtime, value, error ) ) return false;
+    if( !PatchThreadEvent( state, *runtime, value, error ) ) return false;
 
     auto* cpu = EnsureCpu( state, event.cpu, error );
     if( !cpu ) return false;
     if( cpu->active )
-    { error = "session_scheduling_cpu_switch_in_while_running"; return false; }
+        ++state.stats.sourceGapEvents;
     StoredCpuEvent cpuValue;
     cpuValue.startNs = timeNs; cpuValue.thread = event.newThread; cpuValue.cpu = event.cpu;
     cpuValue.rawThreadIndex = CompressExternalThread( state, event.newThread, error );
     if( !error.empty() ) return false;
-    if( !cpu->work.Append( cpuValue, cpu->lastIndex, error ) ) return false;
+    if( !state.cpuWork.Append( cpuValue, cpu->lastIndex, error ) ) return false;
     cpu->last = cpuValue; cpu->active = true; ++state.stats.cpuEvents;
     return true;
 }
@@ -464,6 +466,7 @@ bool SaveSchedulingManifest( const std::filesystem::path& root,
     out << "complete_thread_events " << value.stats.completeThreadEvents << '\n';
     out << "cpu_events " << value.stats.cpuEvents << '\n';
     out << "complete_cpu_events " << value.stats.completeCpuEvents << '\n';
+    out << "source_gap_events " << value.stats.sourceGapEvents << '\n';
     out.flush();
     if( !out ) { error = "session_scheduling_manifest_write_failed"; return false; }
     out.close();
@@ -492,6 +495,7 @@ bool LoadSchedulingManifest( const std::filesystem::path& root,
         else if( key == "complete_thread_events" ) in >> value.stats.completeThreadEvents;
         else if( key == "cpu_events" ) in >> value.stats.cpuEvents;
         else if( key == "complete_cpu_events" ) in >> value.stats.completeCpuEvents;
+        else if( key == "source_gap_events" ) in >> value.stats.sourceGapEvents;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_scheduling_manifest_parse_failed"; return false; }
     }
@@ -507,8 +511,7 @@ bool LoadSchedulingManifest( const std::filesystem::path& root,
 bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& session,
     SchedulingManifest& manifest, std::string& error )
 {
-    for( auto& [_, runtime] : state.threads ) if( !runtime->work.Close( error ) ) return false;
-    for( auto& [_, runtime] : state.cpus ) if( !runtime->work.Close( error ) ) return false;
+    if( !state.threadWork.Close( error ) || !state.cpuWork.Close( error ) ) return false;
     SchedulingFileHeader header;
     header.sourceSize = session.source.fileSize;
     header.contextSwitchRecords = state.stats.contextSwitchRecords;
@@ -517,6 +520,7 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     header.completeThreadEventCount = state.stats.completeThreadEvents;
     header.cpuEventCount = state.stats.cpuEvents;
     header.completeCpuEventCount = state.stats.completeCpuEvents;
+    header.sourceGapEventCount = state.stats.sourceGapEvents;
     header.generationBytes = uint32_t( session.generation.size() );
     header.threadRecordsOffset = sizeof( header ) + session.source.sha256.size() + session.generation.size();
     header.cpuRecordsOffset = header.threadRecordsOffset + header.threadEventCount * sizeof( StoredThreadEvent );
@@ -527,19 +531,21 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     out.write( session.generation.data(), std::streamsize( session.generation.size() ) );
-    for( const auto& [_, runtime] : state.threads )
-        if( !CopyFileBytes( runtime->work.Path(), out, error ) ) return false;
-    for( const auto& [_, runtime] : state.cpus )
-        if( !CopyFileBytes( runtime->work.Path(), out, error ) ) return false;
+    if( !CopyFileBytes( state.threadWork.Path(), out, error ) ||
+        !CopyFileBytes( state.cpuWork.Path(), out, error ) ) return false;
     out.flush();
     if( !out ) { error = "session_scheduling_file_write_failed"; return false; }
     out.close();
     if( !AtomicReplace( temporary, target, error ) ) return false;
     std::error_code ec;
-    for( const auto& [_, runtime] : state.threads )
-    { std::filesystem::remove( runtime->work.Path(), ec ); ec.clear(); }
-    for( const auto& [_, runtime] : state.cpus )
-    { std::filesystem::remove( runtime->work.Path(), ec ); ec.clear(); }
+    const std::array<std::filesystem::path, 2> workFiles = {
+        state.threadWork.Path(), state.cpuWork.Path() };
+    for( const auto& path : workFiles )
+    {
+        if( !std::filesystem::remove( path, ec ) || ec )
+        { error = "session_scheduling_work_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+        ec.clear();
+    }
     manifest.sourceSha256 = session.source.sha256;
     manifest.sourceSize = session.source.fileSize;
     manifest.generation = session.generation;
@@ -570,7 +576,7 @@ std::filesystem::path TraceSessionSchedulingIndexRoot( const std::filesystem::pa
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "scheduling-index" / "1" / "exact";
+        "scheduling-index" / std::to_string( TraceSessionSchedulingIndexSchemaVersion ) / "exact";
 }
 
 bool BuildTraceSessionSchedulingDerived( const std::filesystem::path& sessionRoot,
@@ -581,6 +587,19 @@ bool BuildTraceSessionSchedulingDerived( const std::filesystem::path& sessionRoo
     state.root = TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
     std::error_code ec; std::filesystem::create_directories( state.root, ec );
     if( ec ) { error = "session_scheduling_directory_failed:" + ec.message(); return false; }
+    for( std::filesystem::directory_iterator it( state.root, ec ), end; it != end; it.increment( ec ) )
+    {
+        if( ec ) { error = "session_scheduling_work_cleanup_scan_failed:" + ec.message(); return false; }
+        if( !it->is_regular_file( ec ) )
+        { if( ec ) { error = "session_scheduling_work_cleanup_scan_failed:" + ec.message(); return false; } continue; }
+        if( it->path().extension() != ".work" ) continue;
+        ec.clear();
+        if( !std::filesystem::remove( it->path(), ec ) || ec )
+        { error = "session_scheduling_work_cleanup_failed:" + ( ec ? ec.message() : it->path().string() ); return false; }
+    }
+    if( ec ) { error = "session_scheduling_work_cleanup_scan_failed:" + ec.message(); return false; }
+    if( !state.threadWork.Open( state.root / "thread-events.work", error ) ||
+        !state.cpuWork.Open( state.root / "cpu-events.work", error ) ) return false;
     if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, state.transform, error ) ) return false;
     if( !VisitTraceSessionCanonicalOrdered( sessionRoot, manifest,
         VisitSchedulingRecord, &state, error ) ) return false;
@@ -637,6 +656,7 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
         header.completeThreadEventCount != manifest.stats.completeThreadEvents ||
         header.cpuEventCount != manifest.stats.cpuEvents ||
         header.completeCpuEventCount != manifest.stats.completeCpuEvents ||
+        header.sourceGapEventCount != manifest.stats.sourceGapEvents ||
         header.generationBytes != session.generation.size() )
     { error = "session_scheduling_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
