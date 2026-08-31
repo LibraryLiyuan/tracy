@@ -23,7 +23,7 @@ jnunity
 |---|---|---|---|
 | Unity 引擎源码 | `git@code.byted.org:jng/jnunity.git` | `feature/JNTracy` | `8df2ef2b1e658f4c3d7c0c155f06398b80c64c18` |
 | Unity Package | `git@code.byted.org:jng/jnunity-packages.git` | `feature/Pack-JNTracy` | `313489df3489e9e0fd580baab8b76d6f97b03e9c` |
-| Tracy fork、工具和 AI Skill | `git@code.byted.org:jng/tracy.git` | `dev` | 使用 `jntracy-ai-skill-v1.1.2` 标签或其后续 `dev` |
+| Tracy fork、工具和 AI Skill | `git@code.byted.org:jng/tracy.git` | 合并目标 `dev`；评审分支 `feature/JNTracy-AI-Skill-v1.1.2` | 当前发布候选使用评审分支；合并后使用 `jntracy-ai-skill-v1.1.2` 标签或其后续 `dev` |
 
 运行时合同：
 
@@ -69,7 +69,7 @@ git clone --branch feature/Pack-JNTracy --single-branch `
   git@code.byted.org:jng/jnunity-packages.git `
   "$root\PackageRepo"
 
-git clone --branch dev --single-branch `
+git clone --branch feature/JNTracy-AI-Skill-v1.1.2 --single-branch `
   git@code.byted.org:jng/tracy.git `
   "$root\tracy"
 ```
@@ -301,7 +301,7 @@ git -C 'C:\JNTracy\tracy' switch --detach jntracy-ai-skill-v1.1.2
 & 'C:\JNTracy\tracy\skills\diagnose-jn-unity-tracy\scripts\install-skill.ps1' -Force
 ```
 
-安装器会保留机器私有 `local-profile.json`。如需回到 `dev`：
+安装器会保留机器私有 `local-profile.json`。评审分支合并后，如需回到 `dev`：
 
 ```powershell
 git -C 'C:\JNTracy\tracy' switch dev
