@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jngame.local/schemas/jntracy-analysis-result-v2.json",
+  "title": "JN Tracy single-trace analysis result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "report_identity",
+    "analysis_scope",
+    "trace_quality",
+    "frame_class_summary",
+    "bottleneck_signatures",
+    "evidence_cards",
+    "domain_health",
+    "cpu_memory_findings",
+    "gpu_memory_findings",
+    "tracy_findings",
+    "evidence_gaps",
+    "query_audit_refs",
+    "report_versions"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "report_identity": {
+      "type": "object",
+      "required": ["report_id", "title", "generated_at", "trace_id", "trace_sha256", "configuration"]
+    },
+    "analysis_scope": {
+      "type": "object",
+      "required": ["mode", "start_ns", "end_ns", "valid_frame_count", "excluded_frame_count"]
+    },
+    "trace_quality": { "type": "object", "required": ["status", "warnings", "partial_domains"] },
+    "frame_class_summary": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["class", "count", "ratio", "flags"],
+        "properties": {
+          "class": {
+            "enum": ["StableWithinBudget", "StablePressure", "RecurrentSpike", "IsolatedSpike", "Transition", "Unclassified"]
+          }
+        }
+      }
+    },
+    "bottleneck_signatures": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/signature" }
+    },
+    "evidence_cards": { "type": "array" },
+    "domain_health": { "type": "array" },
+    "cpu_memory_findings": { "type": "array" },
+    "gpu_memory_findings": { "type": "array" },
+    "tracy_findings": {
+      "type": "object",
+      "required": ["total_capture_overhead", "runtime_findings", "analysis_findings"]
+    },
+    "evidence_gaps": { "type": "array" },
+    "query_audit_refs": { "type": "array", "items": { "type": "string" } },
+    "report_versions": {
+      "type": "object",
+      "required": ["analysis_result_schema", "evidence_manifest_schema", "report_builder", "template", "analysis_workflow"]
+    }
+  },
+  "$defs": {
+    "signature": {
+      "type": "object",
+      "required": [
+        "id", "stable_key", "significance_reasons", "affected_frames", "affected_ranges",
+        "frequency", "budget_debt", "severity", "primary_limiter", "secondary_contributors",
+        "representative_instances", "causal_chain", "hypothesis_ledger", "deepest_level",
+        "evidence_refs", "stack_source_provenance", "supported_claims", "unsupported_claims",
+        "optimization_direction", "functional_risk", "theoretical_upper_bound", "retest_metrics",
+        "confidence", "conclusion_status", "evidence_gap"
+      ],
+      "properties": {
+        "stable_key": { "type": "string", "pattern": "^[^/]+/[^/]+/[^/]+$" },
+        "primary_limiter": {
+          "enum": [
+            "IntentionalPacing", "MainThreadCpuWork", "MainWaitsJob", "MainWaitsRender",
+            "RenderThreadCpuWork", "JobWorkerCpuWork", "RenderWaitsGpuFencePresent", "GpuCriticalPath", "LoadingIo",
+            "CpuMemoryPressure", "GpuMemoryPressure", "OsSchedulingCpuContention",
+            "TracyRuntimeOverhead", "TracyAnalysisPressure", "Mixed", "Unknown"
+          ]
+        },
+        "deepest_level": { "enum": ["L0", "L1", "L2", "L3", "L4", "L5", "L6"] },
+        "stack_source_provenance": {
+          "type": "array",
+          "items": {
+            "enum": ["PerEventExactNative", "SiteReusedNative", "ExactManagedSource", "ExactLuaSource", "SymbolOnly", "MarkerOnly", "Unavailable"]
+          }
+        }
+      }
+    }
+  }
+}

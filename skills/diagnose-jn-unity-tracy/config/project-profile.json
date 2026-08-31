@@ -1,0 +1,88 @@
+{
+  "kind": "jntracy_project_profile",
+  "schema_version": 2,
+  "project_id": "jn-unity-t3",
+  "locale": "zh-CN",
+  "trace_contract": {
+    "protocol": 90,
+    "query_schema": "1.32.0",
+    "jn_section": 12,
+    "gpu_catalog_schema": 1,
+    "outer_trace_version": "0.13.2-JN",
+    "unsupported_protocols": [88, 89]
+  },
+  "supported_target": {
+    "platform": "Windows x64",
+    "graphics_api": "D3D12",
+    "graphics_jobs": "off",
+    "editor": true,
+    "player": true
+  },
+  "capture": {
+    "full_analysis_profile": "HighEvidence",
+    "output_mode": "stream_only",
+    "address": "127.0.0.1",
+    "port": 8086,
+    "drain_idle_seconds": 30,
+    "frame_image": {
+      "enabled": true,
+      "default_width": 960,
+      "default_height": 540,
+      "interval_frames": 60,
+      "key_width": 1280,
+      "key_height": 720
+    },
+    "detailed_evidence_profiles": {
+      "baseline": "HighEvidence",
+      "periodic": "JNTracy.Triggered.GpuReference.Periodic60.ini",
+      "manual": "JNTracy.Triggered.GpuReference.ini"
+    }
+  },
+  "analysis": {
+    "single_trace_only": true,
+    "deep_query_batch_size": 12,
+    "main_thread_min_coverage": 0.9,
+    "gpu_explicit_min_coverage": 0.95,
+    "gpu_fallback_unclassified_max": 0.05,
+    "spike_detection": {
+      "mad_multiplier": 6.0,
+      "iqr_multiplier": 3.0,
+      "minimum_delta_ms": 2.0,
+      "recurrent_min_count": 3,
+      "frequent_min_ratio": 0.01,
+      "frequent_max_median_interval_frames": 120
+    },
+    "significance": {
+      "isolated_spike_frame_budget_multiplier": 2.0,
+      "debt_per_minute_frame_budget_multiplier": 1.0,
+      "required_diagnosis_level": "L6"
+    },
+    "query_limits": {
+      "max_process_memory_mib": 2048,
+      "max_single_response_mib": 16,
+      "default_page_size": 100,
+      "max_page_size": 1000,
+      "open_timeout_seconds": 120,
+      "ordinary_query_timeout_seconds": 30,
+      "validation_timeout_seconds": 60,
+      "cancellation_timeout_seconds": 2,
+      "concurrency": 1,
+      "max_attempts": 3
+    },
+    "diagnostic_branches": [
+      "main_script",
+      "job",
+      "render_submission",
+      "gpu_queue_pass",
+      "cpu_memory",
+      "gpu_memory_catalog",
+      "loading_io",
+      "tracy_runtime_sampling_os"
+    ]
+  },
+  "config_files": {
+    "budgets": "performance-budgets.json",
+    "marker_attribution": "marker-attribution.json",
+    "local": "local-profile.json"
+  }
+}
