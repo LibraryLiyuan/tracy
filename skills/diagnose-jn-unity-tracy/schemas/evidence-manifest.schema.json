@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jngame.local/schemas/jntracy-evidence-manifest-v1.json",
+  "title": "JN Tracy evidence manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trace", "evidence"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "trace": {
+      "type": "object",
+      "required": ["trace_id", "sha256"],
+      "properties": {
+        "trace_id": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "evidence_id", "trace_id", "trace_sha256", "type", "mcp", "request", "response",
+          "refs", "partial", "truncated", "next_cursor", "attempt", "quality", "data_path"
+        ],
+        "properties": {
+          "evidence_id": { "type": "string", "minLength": 1 },
+          "trace_id": { "type": "string", "minLength": 1 },
+          "trace_sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "type": { "type": "string", "minLength": 1 },
+          "mcp": { "type": "object", "required": ["method", "params"] },
+          "request": { "type": "object", "required": ["path", "sha256"] },
+          "response": { "type": "object", "required": ["path", "sha256"] },
+          "refs": { "type": "object", "required": ["frames", "time_ranges_ns", "threads", "queues", "entities"] },
+          "partial": { "type": "boolean" },
+          "truncated": { "type": "boolean" },
+          "next_cursor": { "type": ["string", "null"] },
+          "attempt": { "type": "integer", "minimum": 1, "maximum": 3 },
+          "quality": { "enum": ["complete", "partial", "truncated", "unavailable", "degraded"] },
+          "data_path": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

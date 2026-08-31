@@ -1,0 +1,35 @@
+{
+  "kind": "jntracy_marker_attribution",
+  "schema_version": 1,
+  "mapping_revision": 1,
+  "minimum_main_thread_coverage": 0.9,
+  "rules": [
+    { "category": "logic.lua", "priority": 110, "prefixes": ["LuaManager.", "JN.Direct/Lua", "JN.Lua/"] },
+    { "category": "logic.input", "priority": 105, "prefixes": ["InputManager.", "EventSystem."] },
+    { "category": "logic.load", "priority": 100, "prefixes": ["Load.", "Instantiate.", "Scene.Load", "World.Load"] },
+    { "category": "logic.view_object", "priority": 95, "prefixes": ["ViewObjectManager."] },
+    { "category": "logic.playable", "priority": 95, "prefixes": ["PlayableManager."] },
+    { "category": "logic.camera", "priority": 95, "prefixes": ["GameCameraManager."] },
+    { "category": "logic.ui", "priority": 95, "prefixes": ["UIManager."] },
+    { "category": "logic.sound", "priority": 95, "prefixes": ["SoundManager.", "WWiseBridge."] },
+    { "category": "logic.steaming", "priority": 95, "prefixes": ["SteamingManager."] },
+    { "category": "logic.weather", "priority": 95, "prefixes": ["WeatherSystem."] },
+    { "category": "logic.component", "priority": 95, "prefixes": ["ComponentManager."] },
+    { "category": "wait_for_job", "priority": 90, "exact_markers": ["WaitForJobGroupID", "WaitForJobGroupId"] },
+    { "category": "physics", "priority": 80, "prefixes": ["Physics.", "PhysicsFixedUpdate"] },
+    { "category": "animation", "priority": 80, "prefixes": ["DirectorUpdateAnimation", "Animation.", "LegacyAnimation."] },
+    { "category": "particles", "priority": 80, "prefixes": ["ParticleSystem."] },
+    { "category": "ugui", "priority": 80, "prefixes": ["UGUI.", "Canvas.", "UI.Rendering"] },
+    { "category": "render", "priority": 70, "prefixes": ["PipelineManager.", "CullScript.", "UpdateAllRenderer", "Render.", "Camera.Render"] }
+  ],
+  "conflict_policy": "ambiguous",
+  "unmatched_policy": "unclassified",
+  "other_policy": "classified_residual_only",
+  "audit": {
+    "report_new_unmapped": true,
+    "report_stale_rules": true,
+    "report_ambiguous": true,
+    "report_semantic_drift": true,
+    "auto_modify_shared_mapping": false
+  }
+}

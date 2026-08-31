@@ -1,0 +1,35 @@
+{
+  "kind": "jntracy_local_profile",
+  "schema_version": 1,
+  "machine_profile": "replace-with-machine-name",
+  "paths": {
+    "toolchain_root": "C:\\JNTracy\\tracy\\build-latest\\Release",
+    "engine_repo": "C:\\JNTracy\\jnunity",
+    "package_repo": "C:\\JNTracy\\PackageRepo",
+    "tracy_repo": "C:\\JNTracy\\tracy",
+    "capture_output_root": "C:\\JNTracyData\\PlayerCaptures",
+    "analysis_output_root": "C:\\JNTracyData\\Analysis",
+    "query_index_root": "C:\\JNTracyData\\Analysis\\.jnidx",
+    "python_exe": "C:\\Path\\To\\python.exe",
+    "editor_exe": "C:\\JNTracy\\jnunity\\build\\WindowsEditor\\x64\\Release\\Unity.exe",
+    "player_root": ""
+  },
+  "source_roots": ["engine_repo", "package_repo", "tracy_repo"],
+  "target_launch": {
+    "mode": "manual",
+    "command": "",
+    "arguments": [],
+    "ready_log": "",
+    "ready_pattern": "",
+    "failure_pattern": ""
+  },
+  "elevation": {
+    "mode": "manual",
+    "scheduled_task_name": ""
+  },
+  "protection": {
+    "warn_free_disk_gib": 50,
+    "stop_free_disk_gib": 20,
+    "capture_memory_limit_mib": 8192
+  }
+}
