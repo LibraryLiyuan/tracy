@@ -82,6 +82,7 @@ struct TraceSessionDerivedStats
     uint64_t completeContextSwitchEvents = 0;
     uint64_t cpuContextSwitchEvents = 0;
     uint64_t completeCpuContextSwitchEvents = 0;
+    uint64_t relations = 0;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
 };
 

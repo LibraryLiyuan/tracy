@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol和Relation语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -708,6 +708,46 @@ tracy-gpu-analysis-n29-static     Passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `86B92CD1C9C789E5A3BBF9DB428354D7310663D31AA07305B81D34E9877B9C10` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `7DF9EEB900099B4B266DED5B964B973EF62400660669EA30D888808EB2464D8B` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Relation Reader
+
+实现和正确性：
+
+- 新增 `derived/relation-index/1/exact/relations.bin`，按Canonical source order流式写入固定宽度记录；Session打开只校验并加载有界元数据，不物化全量Relation。
+- 每条记录保留转换后的精确时间、source/target ID、线程、Entity Kind、Namespace、Relation Kind和flags。
+- `relation.search`与`relation.get`通过`ScanRelations(offset, limit)`分页读取；能力只有在不可变Relation索引成功打开后才标记`present/indexed/queryable`。
+- Final Audit要求Canonical `JnRelation`计数、Relation索引计数和manifest计数完全一致；文件大小、source identity和SHA-256任一不符均拒绝使用。
+- Synthetic Oracle验证`Job 500 → GPU Pass 900`、`Job/ExecutesPass`、转换时间34 ns；损坏最后一个record字节后返回`session_relation_file_sha256_mismatch`。
+
+TDD证据：
+
+```text
+RED:   Session advertises Relation only after its disk-backed semantic reader is ready
+GREEN: Trace Session Inventory tests passed
+```
+
+构建身份：
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `08CC590771CB36AA40159C5E1C0C66A7810DFF0441209A1AA0FFE53235D4D90E` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `F50AC526C343ADDB710532256E700927ABB787D373E2CCC853C9970E2C373F4E` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

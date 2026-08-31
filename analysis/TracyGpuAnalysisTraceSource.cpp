@@ -46,6 +46,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !samplingReader ) return {};
     auto schedulingReader = TraceSessionSchedulingReader::Open( path, *session, error );
     if( !schedulingReader ) return {};
+    auto relationReader = TraceSessionRelationReader::Open( path, *session, error );
+    if( !relationReader ) return {};
     auto symbolReader = TraceSessionSymbolReader::Open( path, *session, error );
     if( !symbolReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
@@ -76,7 +78,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
         std::move( jobReader ), std::move( cpuZoneReader ),
         std::move( gpuZoneReader ),
         std::move( memoryReader ), std::move( samplingReader ),
-        std::move( schedulingReader ), std::move( symbolReader ) ) );
+        std::move( schedulingReader ), std::move( relationReader ),
+        std::move( symbolReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -89,6 +92,7 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionMemoryReader> memoryReader,
     std::shared_ptr<TraceSessionSamplingReader> samplingReader,
     std::shared_ptr<TraceSessionSchedulingReader> schedulingReader,
+    std::shared_ptr<TraceSessionRelationReader> relationReader,
     std::shared_ptr<TraceSessionSymbolReader> symbolReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
@@ -96,7 +100,8 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
       m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
       m_gpuZoneReader( std::move( gpuZoneReader ) ),
       m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
-      m_schedulingReader( std::move( schedulingReader ) ), m_symbolReader( std::move( symbolReader ) )
+      m_schedulingReader( std::move( schedulingReader ) ),
+      m_relationReader( std::move( relationReader ) ), m_symbolReader( std::move( symbolReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -262,7 +267,13 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         callstackPresent ? "available from the N30 Session mandatory Callstack index" :
             "The source Session contains no Callstack facts", CallstackMethods } );
     addPending( "runtime.script", TraceSessionProtocolDomain::ScriptRuntime );
-    addPending( "relation", TraceSessionProtocolDomain::Relation );
+    static const std::vector<std::string> RelationMethods = {
+        "relation.search", "relation.get"
+    };
+    const auto relationPresent = m_relationReader && m_relationReader->Stats().relations != 0;
+    result.push_back( Capability { "relation", relationPresent, relationPresent, true,
+        relationPresent ? "available from the N30 Session mandatory Relation index" :
+            "The source Session contains no Relation facts", RelationMethods } );
     const auto timelineCount = m_sessionStats.domains[size_t( TraceSessionProtocolDomain::Frame )] +
         m_sessionStats.domains[size_t( TraceSessionProtocolDomain::CpuZone )] +
         m_sessionStats.domains[size_t( TraceSessionProtocolDomain::GpuZone )] +
@@ -320,6 +331,7 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     }
     if( m_schedulingReader ) out.counts.contextSwitches =
         m_schedulingReader->Stats().threadEvents;
+    if( m_relationReader ) out.counts.relations = m_relationReader->Stats().relations;
     if( m_cpuZoneReader )
     {
         out.counts.sourceLocations = m_cpuZoneReader->Stats().sourceLocations;
@@ -489,9 +501,25 @@ D0(std::vector<GfxDispatchDto>, GetGfxDispatches)
 D0(std::vector<GfxEntityDto>, GetGfxEntities)
 D0(std::vector<GfxLinkDto>, GetGfxLinks)
 D0(std::vector<CorrelatedFrameEventDto>, GetCorrelatedFrameEvents)
-D0(std::vector<RelationDto>, GetRelations)
-D0(uint64_t, GetRelationCount)
-D2(std::vector<RelationDto>, ScanRelations, size_t, offset, size_t, limit)
+std::vector<RelationDto> GpuAnalysisTraceSource::GetRelations() const
+{
+    if( WorkerLoaded() ) return Worker().GetRelations();
+    return m_relationReader ? m_relationReader->Scan( 0,
+        size_t( std::min<uint64_t>( m_relationReader->Stats().relations,
+            std::numeric_limits<size_t>::max() ) ) ) : std::vector<RelationDto> {};
+}
+uint64_t GpuAnalysisTraceSource::GetRelationCount() const
+{
+    if( WorkerLoaded() ) return Worker().GetRelationCount();
+    return m_relationReader ? m_relationReader->Stats().relations : 0;
+}
+std::vector<RelationDto> GpuAnalysisTraceSource::ScanRelations(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanRelations( offset, limit );
+    return m_relationReader ? m_relationReader->Scan( offset, limit ) :
+        std::vector<RelationDto> {};
+}
 D0(std::vector<RuntimeDomainStateDto>, GetRuntimeDomainStates)
 D0(std::vector<ScriptFrameDto>, GetScriptFrames)
 D0(std::vector<ScriptStackEventDto>, GetScriptStackEvents)

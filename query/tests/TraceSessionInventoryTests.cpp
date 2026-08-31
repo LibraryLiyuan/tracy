@@ -7,6 +7,7 @@
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
+#include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
 #include "TracyQueryService.hpp"
@@ -1061,6 +1062,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::JnJobStage;
     item.jnJobStage = { 116, 500, 3, 0, 0, uint8_t( tracy::JnJobStage::Completed ), 0 };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnRelation;
+    item.jnRelation = { 117, 500, 900,
+        uint8_t( tracy::JnEntityKind::Job ), uint8_t( tracy::JnEntityKind::GpuPass ),
+        uint8_t( tracy::JnRelationNamespace::Job ), uint8_t( tracy::JnRelationKind::ExecutesPass ), 0 };
+    AppendQueueItem( frame, item );
 
     const std::array<uint64_t, 2> zoneCallstack { 0x40404040, 0x50505050 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5555,
@@ -1506,6 +1513,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         schedulingCapability->present && schedulingCapability->indexed && schedulingCapability->queryable;
     test.Check( sessionSchedulingReady,
         "Session advertises Context Switch only after its disk-backed semantic reader is ready" );
+    const auto relationCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "relation"; } );
+    const bool sessionRelationReady = relationCapability != sessionCapabilities.end() &&
+        relationCapability->present && relationCapability->indexed && relationCapability->queryable;
+    test.Check( sessionRelationReady,
+        "Session advertises Relation only after its disk-backed semantic reader is ready" );
+    const auto sessionRelations = sessionSource->ScanRelations( 0, 4 );
+    test.Check( sessionSource->GetRelationCount() == 1 && sessionRelations.size() == 1 &&
+        sessionRelations[0].timeNs == 34 && sessionRelations[0].sourceId == 500 &&
+        sessionRelations[0].targetId == 900 &&
+        sessionRelations[0].relationNamespace == uint8_t( tracy::JnRelationNamespace::Job ) &&
+        sessionRelations[0].relation == uint8_t( tracy::JnRelationKind::ExecutesPass ),
+        "Session Relation reader pages exact typed relations without a Worker" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1701,6 +1721,21 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             jobs["data"]["jobs"][0]["job_id"] == "500" &&
             jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
             "Query 1.34 searches the Session Job semantic index without a Worker" );
+        if( sessionRelationReady )
+        {
+            const auto relations = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-relation-search" },
+                { "method", "relation.search" }, { "params", { { "trace_id", traceId },
+                    { "namespace", "job" }, { "relation", "executes_pass" } } }
+            } );
+            test.Check( relations.value( "ok", false ) && relations["data"]["present"] == true &&
+                relations["data"]["relation_count"] == "1" &&
+                relations["data"]["relations"].size() == 1 &&
+                relations["data"]["relations"][0]["time_ns"] == "34" &&
+                relations["data"]["relations"][0]["source_id"] == "500" &&
+                relations["data"]["relations"][0]["target_id"] == "900",
+                "Query 1.34 pages exact Session typed relations without a Worker" );
+        }
         const auto sourceLocations = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-source-locations" },
             { "method", "source.locations" }, { "params", { { "trace_id", traceId },
@@ -1988,6 +2023,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedSchedulingStats, error ) &&
         error == "session_scheduling_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Scheduling semantic index" );
+    const auto relationFile = tracy::analysis::TraceSessionRelationIndexRoot(
+        publishedSession, manifest ) / "relations.bin";
+    {
+        std::fstream damaged( relationFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x37 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionRelationStats rejectedRelationStats;
+    test.Check( !tracy::analysis::AuditTraceSessionRelationDerived(
+        publishedSession, manifest, rejectedRelationStats, error ) &&
+        error == "session_relation_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Relation semantic index" );
     const auto symbolFile = tracy::analysis::TraceSessionSymbolIndexRoot(
         publishedSession, manifest ) / "symbols.bin";
     {
