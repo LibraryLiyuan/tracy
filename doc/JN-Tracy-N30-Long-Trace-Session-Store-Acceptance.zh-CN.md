@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol和Relation语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol、Relation、Runtime Domain及C#/Lua Script语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -513,6 +513,7 @@ RED：
 - Memory Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Memory only after its disk-backed semantic reader is ready`。
 - Sampling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Sampling only after its disk-backed semantic reader is ready`。
 - Scheduling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Context Switch only after its disk-backed semantic reader is ready`。
+- Runtime Domain和C#/Lua Script Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于对应Session能力尚不可查询。
 - Source/Callstack/Symbol Reader尚未接入SessionTraceSource时，新增直接Reader断言后Query路径按预期因磁盘能力不可用失败；共享`SingleStringData`仍被CPU Zone当成一次性值时，合法Callstack/Symbol序列按预期暴露`session_cpu_zone_single_string_sequence_invalid`。
 
 GREEN：
@@ -540,6 +541,9 @@ GREEN：
 - Scheduling GREEN恢复thread 42的`[18,28]ns`运行区间和thread 43的`wakeup=22ns/start=28ns/end=36ns`区间；后者保留wakeup CPU 1、实际CPU 0以及`delay_execution/ready`结束状态。
 - CPU timeline GREEN恢复CPU 0上thread 42与43的两个连续区间；直接Reader和Query 1.34 `context_switch.range`结果一致。
 - Final Audit在`scheduling.bin`同尺寸内容被篡改后返回`session_scheduling_file_sha256_mismatch`。
+- Runtime GREEN恢复1个`ScriptStack`域状态、1个Managed Source Frame、1个完整Stack、1个Marker和1个完整Zone；Query 1.34的`runtime.domain.states`与`runtime.script.summary`无需完整Worker即可得到相同结果。
+- 二进制Script Schema 2查询不再误触只用于Schema 1/GC兼容的Message扫描；GC查询仍保留原有语义，不把尚未完成的Message Reader伪装为可用。
+- Final Audit在`runtime-script.bin`同尺寸内容被篡改后返回`session_runtime_file_sha256_mismatch`。
 - GPU Zone RED按预期失败于`Session advertises GPU Zone only after its disk-backed semantic reader is ready`。
 - GPU Zone GREEN恢复一个D3D12 Context和`Synthetic GPU Zone`：CPU/GPU区间均为`[36,40]ns`、begin query ID为7、self time为4ns，SourceLocation为`GpuFunction (Gpu.cpp:789)`；直接Reader、`zone.gpu.contexts`和`zone.gpu.search`结果一致。
 - Final Audit在`gpu-zones.bin`同尺寸内容被篡改后返回`session_gpu_zone_file_sha256_mismatch`。
@@ -562,6 +566,7 @@ GREEN：
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
 - Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
+- Runtime/Script Reader打开时只保留文件偏移和计数，但当前脚本查询仍会物化所请求域的全部Frame/Stack事件；N30.6完成前必须增加分页/范围读取。Legacy GC依赖的Message语义Reader尚未完成，`memory.gc.*`不得提前宣称Session可查。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。
 
@@ -748,6 +753,48 @@ GREEN: Trace Session Inventory tests passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `08CC590771CB36AA40159C5E1C0C66A7810DFF0441209A1AA0FFE53235D4D90E` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `F50AC526C343ADDB710532256E700927ABB787D373E2CCC853C9970E2C373F4E` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Runtime Domain 与 C#/Lua Script Reader
+
+实现和正确性：
+
+- 新增`derived/runtime-index/1/exact/runtime-script.bin`，以固定宽度区域保存Runtime Domain State、Script Frame和Script Stack事件，字符串在同一不可变文件尾部去重保存。
+- Session打开只验证identity、布局、文件大小和SHA-256，并保存各区域偏移；不创建完整Worker，也不在打开阶段物化脚本事件。
+- `runtime.domain.states`恢复Synthetic `ScriptStack`域generation 3、requested frame 20及Enabled状态。
+- `runtime.script.summary`恢复1个Managed Frame、1个Stack、1个Marker、1个完整Zone，并通过Relation索引恢复Script Zone到Frame的精确关联。
+- 修复Schema 2二进制Script查询仍无条件扫描Legacy Message的问题。Script Schema 2不再加载Message；`memory.gc.*`仍保留旧消息语义，等待独立Message Reader后再对Session开放。
+- Header布局计算使用乘法和加法溢出保护；文件内容篡改由Final Audit返回`session_runtime_file_sha256_mismatch`。
+- 当前Reader仍以全量vector返回一次脚本查询所需的Frame/Stack事件，后续必须增加分页/范围读取，不能据此宣称长Trace查询内存门禁通过。
+
+TDD证据：
+
+```text
+RED:   Session advertises Runtime Domain/Script only after its disk-backed semantic reader is ready
+GREEN: Trace Session Inventory tests passed
+```
+
+构建身份：
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `98E88FA6DB449C64DACFEE31558E1E6E40B9407715325852005CE581B6B40E4C` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `B56E0724ADCCED83C3699A23C2E681A5B2E5761729866010E70DF6D677FBB915` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

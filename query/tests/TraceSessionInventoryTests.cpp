@@ -8,6 +8,7 @@
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionRelations.hpp"
+#include "TracyTraceSessionRuntime.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
 #include "TracyQueryService.hpp"
@@ -1068,6 +1069,37 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnEntityKind::Job ), uint8_t( tracy::JnEntityKind::GpuPass ),
         uint8_t( tracy::JnRelationNamespace::Job ), uint8_t( tracy::JnRelationKind::ExecutesPass ), 0 };
     AppendQueueItem( frame, item );
+    constexpr uint64_t ScriptFunctionPointer = 0x7001;
+    constexpr uint64_t ScriptFilePointer = 0x7002;
+    constexpr uint64_t ScriptMarkerPointer = 0x7003;
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFunctionPointer, "Managed.Update" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFilePointer, "Managed.cs" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptMarkerPointer, "ManagedTick" );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnRuntimeDomainState;
+    item.jnRuntimeDomainState = { 117, 3, 20,
+        uint8_t( tracy::JnRuntimeDomain::ScriptStack ), uint8_t( tracy::JnRuntimeMode::Enabled ),
+        uint8_t( tracy::JnRuntimeMode::Enabled ), 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnScriptFrame;
+    item.jnScriptFrame = { ScriptFunctionPointer, ScriptFilePointer, 71, 123, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnScriptStack;
+    item.jnScriptStack = { 117, 1001, 0, 1, 1, 0, uint8_t( tracy::JnScriptRecordKind::StackHeader ) };
+    AppendQueueItem( frame, item );
+    item.jnScriptStack = { 117, 1001, 71, 0, 1, 0, uint8_t( tracy::JnScriptRecordKind::StackFrame ) };
+    AppendQueueItem( frame, item );
+    item.jnScriptStack = { 117, 17, ScriptMarkerPointer, 71, 1, 0,
+        uint8_t( tracy::JnScriptRecordKind::Marker ) };
+    AppendQueueItem( frame, item );
+    item.jnScriptStack = { 117, 2001, 1001, 17, 1, 0,
+        uint8_t( tracy::JnScriptRecordKind::ZoneBegin ) };
+    AppendQueueItem( frame, item );
+    item.jnScriptStack = { 119, 2001, 0, 0, 0, 0,
+        uint8_t( tracy::JnScriptRecordKind::ZoneEnd ) };
+    AppendQueueItem( frame, item );
 
     const std::array<uint64_t, 2> zoneCallstack { 0x40404040, 0x50505050 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5555,
@@ -1526,6 +1558,18 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionRelations[0].relationNamespace == uint8_t( tracy::JnRelationNamespace::Job ) &&
         sessionRelations[0].relation == uint8_t( tracy::JnRelationKind::ExecutesPass ),
         "Session Relation reader pages exact typed relations without a Worker" );
+    const auto runtimeDomainCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "runtime.domain"; } );
+    const bool sessionRuntimeDomainReady = runtimeDomainCapability != sessionCapabilities.end() &&
+        runtimeDomainCapability->present && runtimeDomainCapability->indexed && runtimeDomainCapability->queryable;
+    test.Check( sessionRuntimeDomainReady,
+        "Session advertises Runtime Domain only after its disk-backed semantic reader is ready" );
+    const auto runtimeScriptCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "runtime.script"; } );
+    const bool sessionRuntimeScriptReady = runtimeScriptCapability != sessionCapabilities.end() &&
+        runtimeScriptCapability->present && runtimeScriptCapability->indexed && runtimeScriptCapability->queryable;
+    test.Check( sessionRuntimeScriptReady,
+        "Session advertises Script Runtime only after its disk-backed semantic reader is ready" );
     const auto sessionFrameSets = sessionSource->GetFrameSets();
     test.Check( sessionFrameSets.size() == 1 && sessionFrameSets[0].name == "Vsync 9" &&
         sessionFrameSets[0].continuous && sessionFrameSets[0].frameCount == 2 &&
@@ -1735,6 +1779,35 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 relations["data"]["relations"][0]["source_id"] == "500" &&
                 relations["data"]["relations"][0]["target_id"] == "900",
                 "Query 1.34 pages exact Session typed relations without a Worker" );
+        }
+        if( sessionRuntimeDomainReady )
+        {
+            const auto runtimeStates = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-runtime-domain" },
+                { "method", "runtime.domain.states" }, { "params", { { "trace_id", traceId },
+                    { "domain", "script_stack" } } }
+            } );
+            test.Check( runtimeStates.value( "ok", false ) &&
+                runtimeStates["data"]["state_count"] == "1" &&
+                runtimeStates["data"]["states"].size() == 1 &&
+                runtimeStates["data"]["states"][0]["time_ns"] == "34" &&
+                runtimeStates["data"]["states"][0]["effective_mode"] == "enabled",
+                "Query 1.34 reads exact Session runtime-domain state without a Worker" );
+        }
+        if( sessionRuntimeScriptReady )
+        {
+            const auto scriptSummary = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-script-summary" },
+                { "method", "runtime.script.summary" }, { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( scriptSummary.value( "ok", false ) && scriptSummary["data"]["present"] == true &&
+                scriptSummary["data"]["complete"] == true &&
+                scriptSummary["data"]["counts"]["frames"] == "1" &&
+                scriptSummary["data"]["counts"]["stacks"] == "1" &&
+                scriptSummary["data"]["counts"]["markers"] == "1" &&
+                scriptSummary["data"]["counts"]["zones"] == "1" &&
+                scriptSummary["data"]["counts"]["complete_zones"] == "1",
+                "Query 1.34 reconstructs exact Session C#/Lua Script evidence without a Worker" );
         }
         const auto sourceLocations = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-source-locations" },
@@ -2039,6 +2112,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedRelationStats, error ) &&
         error == "session_relation_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Relation semantic index" );
+    const auto runtimeFile = tracy::analysis::TraceSessionRuntimeIndexRoot(
+        publishedSession, manifest ) / "runtime-script.bin";
+    {
+        std::fstream damaged( runtimeFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x29 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionRuntimeStats rejectedRuntimeStats;
+    test.Check( !tracy::analysis::AuditTraceSessionRuntimeDerived(
+        publishedSession, manifest, rejectedRuntimeStats, error ) &&
+        error == "session_runtime_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Runtime/Script semantic index" );
     const auto symbolFile = tracy::analysis::TraceSessionSymbolIndexRoot(
         publishedSession, manifest ) / "symbols.bin";
     {

@@ -13,6 +13,7 @@
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionRelations.hpp"
+#include "TracyTraceSessionRuntime.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -227,6 +228,9 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "cpu_context_switch_events " << value.stats.cpuContextSwitchEvents << '\n';
     out << "complete_cpu_context_switch_events " << value.stats.completeCpuContextSwitchEvents << '\n';
     out << "relations " << value.stats.relations << '\n';
+    out << "runtime_domain_states " << value.stats.runtimeDomainStates << '\n';
+    out << "script_frames " << value.stats.scriptFrames << '\n';
+    out << "script_stack_events " << value.stats.scriptStackEvents << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -325,6 +329,9 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "cpu_context_switch_events" ) in >> value.stats.cpuContextSwitchEvents;
         else if( key == "complete_cpu_context_switch_events" ) in >> value.stats.completeCpuContextSwitchEvents;
         else if( key == "relations" ) in >> value.stats.relations;
+        else if( key == "runtime_domain_states" ) in >> value.stats.runtimeDomainStates;
+        else if( key == "script_frames" ) in >> value.stats.scriptFrames;
+        else if( key == "script_stack_events" ) in >> value.stats.scriptStackEvents;
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -560,6 +567,12 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     if( !BuildTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ) return false;
     index.stats.relations = relationStats.relations;
 
+    TraceSessionRuntimeStats runtimeStats;
+    if( !BuildTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, error ) ) return false;
+    index.stats.runtimeDomainStates = runtimeStats.domainStates;
+    index.stats.scriptFrames = runtimeStats.scriptFrames;
+    index.stats.scriptStackEvents = runtimeStats.scriptStackEvents;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -697,6 +710,12 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( !AuditTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ||
         relationStats.relations != index.stats.relations )
     { if( error.empty() ) error = "session_relation_derived_audit_mismatch"; return false; }
+    TraceSessionRuntimeStats runtimeStats;
+    if( !AuditTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, error ) ||
+        runtimeStats.domainStates != index.stats.runtimeDomainStates ||
+        runtimeStats.scriptFrames != index.stats.scriptFrames ||
+        runtimeStats.scriptStackEvents != index.stats.scriptStackEvents )
+    { if( error.empty() ) error = "session_runtime_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
@@ -763,6 +782,10 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     { error = "session_scheduling_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::JnRelation )].count != index.stats.relations )
     { error = "session_relation_source_count_mismatch"; return false; }
+    if( queueCounts[size_t( QueueType::JnRuntimeDomainState )].count != index.stats.runtimeDomainStates ||
+        queueCounts[size_t( QueueType::JnScriptFrame )].count != index.stats.scriptFrames ||
+        queueCounts[size_t( QueueType::JnScriptStack )].count != index.stats.scriptStackEvents )
+    { error = "session_runtime_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::FrameImageData )].count != index.stats.frameImageDataEvents ||
         queueCounts[size_t( QueueType::FrameImage )].count != index.stats.frameImageEvents )
     { error = "session_frame_image_source_count_mismatch"; return false; }

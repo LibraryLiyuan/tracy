@@ -3836,7 +3836,7 @@ const char* GcKindName( uint64_t kind )
     }
 }
 
-N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis::TraceInfoDto& info )
+N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis::TraceInfoDto& info, bool includeGc )
 {
     N11TraceData result;
     const auto binaryFrames = source.GetScriptFrames();
@@ -3849,11 +3849,17 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
         result.scriptCapability = true;
         result.scriptSchema = 2;
         std::unordered_map<uint64_t, uint64_t> frameByScriptZone;
-        for( const auto& relation : source.GetRelations() )
+        constexpr size_t RelationPageSize = 64 * 1024;
+        const auto relationCount = source.GetRelationCount();
+        for( uint64_t offset = 0; offset < relationCount; )
         {
-            if( relation.relationNamespace == 4 && relation.relation == 1 &&
-                relation.sourceKind == 1 && relation.targetKind == 11 )
-                frameByScriptZone[relation.targetId] = relation.sourceId;
+            const auto page = source.ScanRelations( size_t( offset ), RelationPageSize );
+            if( page.empty() ) break;
+            for( const auto& relation : page )
+                if( relation.relationNamespace == 4 && relation.relation == 1 &&
+                    relation.sourceKind == 1 && relation.targetKind == 11 )
+                    frameByScriptZone[relation.targetId] = relation.sourceId;
+            offset += page.size();
         }
         for( const auto& frame : binaryFrames )
         {
@@ -4110,9 +4116,13 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
         }
     }
 
+    // Script schema 2 is fully represented by its binary frame/stack events. Do not
+    // scan the legacy Message transport for a script-only query once those events
+    // are present. Apart from avoiding duplicate work, this keeps Session queries
+    // on their disk-backed semantic indexes instead of requiring a full Worker.
     size_t rawOffset = 0;
     constexpr size_t chunk = 4096;
-    while( true )
+    while( !binaryScript || includeGc )
     {
         const auto allowed = BudgetScanAllowance( chunk );
         if( allowed == 0 ) break;
@@ -4873,7 +4883,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method.rfind( "runtime.script.", 0 ) == 0 || method.rfind( "memory.gc.", 0 ) == 0 )
     {
         const auto metadata = info();
-        auto n11 = ParseN11Trace( *source, metadata );
+        auto n11 = ParseN11Trace( *source, metadata, method.rfind( "memory.gc.", 0 ) == 0 );
         const auto runtimeFilter = params.value( "runtime", "" );
         if( !runtimeFilter.empty() && runtimeFilter != "managed" && runtimeFilter != "lua" )
             throw QueryError( "INVALID_PARAMS", "runtime must be managed or lua" );
