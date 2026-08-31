@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU Zone和Memory语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -494,6 +494,13 @@ GREEN：
 - FrameImage转换严格复用传统Worker的`FixOrder + RDO`处理语义；`FrameImageData`和`FrameImage`必须一一配对，尺寸、BC1字节数、重复Frame以及on-demand frame offset均做显式校验。
 - 图片目录保存width、height、flip、raw frame index、数据offset/length；`frame_image.list/metadata/resource/raw`均从Session Reader提供，Frame基础Set可证明时同步返回`frame_ref`，不能证明时保持null。
 - Metadata与BC1数据分别保存source强身份、generation、文件大小和SHA-256；Final Audit完整校验两个文件并核对源`FrameImageData/FrameImage`事件守恒。BC1总量不进入Session打开内存。
+- SourceLocation继续复用CPU Zone索引中与传统Worker一致的静态/动态Native ID排序；Callsite以固定宽度记录附加到同一索引，保留thread、source、全局Callstack ID、domain、flags、provenance和unavailable reason。
+- Source/Callstack/Symbol域新增`symbol-index/1/exact`：`symbols.bin`保存内容寻址Callstack payload、native/managed Frame、inline Frame、Symbol元数据和Address Mapping；`symbol-code.bin`顺序保存机器码，打开Session时不把机器码载入内存。
+- `CallstackPayload`、`CallstackSampleDictionary`和`CallstackAllocPayload`使用同一个确定性内容字典，普通、Sampling、Job、Zone和Memory事件引用相同的全局Callstack ID；未知地址仍保留原始地址，不伪造符号。
+- Native Frame的函数名、image和inline关系以`CallstackFrameSize/CallstackFrame`为权威；`SymbolInformation`只补充Symbol文件和行号，`SymbolCode`只补充机器码。Query不能把补充事件误解为新的函数名来源。
+- `source.locations/source.callsite/search`、`callstack.resolve/frames/batch`、`symbol.search/get/address/address_map/raw_code`现由Session Reader直接提供；逐页机器码读取不会实例化完整Worker。
+- Tracy多个协议域共享`SingleStringData/SecondStringData`暂存槽。CPU/GPU Zone构建器现在允许后续Callstack/Symbol/Message/Lock/GPU Context事件覆盖该槽，并只在实际消费者处读取，避免合法跨域字符串序列被误判为损坏。
+- `symbols.bin`和`symbol-code.bin`分别保存source强身份、generation、文件大小和SHA-256；Final Audit逐项核对Callstack、Frame、Symbol和Code计数。任一文件篡改都会使强制派生层失效并阻止发布。
 
 ### TDD证据
 
@@ -506,6 +513,7 @@ RED：
 - Memory Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Memory only after its disk-backed semantic reader is ready`。
 - Sampling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Sampling only after its disk-backed semantic reader is ready`。
 - Scheduling Canonical fact存在但磁盘语义Reader尚未接入时，测试按预期失败于`Session advertises Context Switch only after its disk-backed semantic reader is ready`。
+- Source/Callstack/Symbol Reader尚未接入SessionTraceSource时，新增直接Reader断言后Query路径按预期因磁盘能力不可用失败；共享`SingleStringData`仍被CPU Zone当成一次性值时，合法Callstack/Symbol序列按预期暴露`session_cpu_zone_single_string_sequence_invalid`。
 
 GREEN：
 
@@ -538,6 +546,10 @@ GREEN：
 - FrameImage RED按预期失败于`Session advertises FrameImage only after its disk-backed semantic reader is ready`。
 - FrameImage GREEN恢复1张4×4、flip=true、raw frame index=1的BC1图片；直接Reader验证8-byte Raw分页和64-byte RGBA按需解码，Query `frame_image.list/raw`返回相同元数据、offset和字节数。
 - Final Audit在`frame-images.bc1`内容被篡改后返回`session_frame_image_data_sha256_mismatch`。
+- Source GREEN恢复4个SourceLocation和3个SiteReuse Callsite；Callsite 77稳定关联Job SourceLocation、全局Callstack ID 2及`SiteReused` provenance。
+- Callstack GREEN将地址`0x20202020`展开为`InlineJob (Inline.cpp:41)`与`JobRoot (Job.cpp:42)`两个inline层，并忠实保留无法解析的`0x30303030`帧。
+- Symbol GREEN恢复`0x2000/0x2100`两个Symbol、地址映射、inline provenance以及`0x2100`的2-byte机器码；直接Reader与Query 1.34的Source、Callsite、Callstack、Symbol和RawCode结果一致。
+- Final Audit在`symbols.bin`同尺寸内容被篡改后返回`session_symbol_metadata_sha256_mismatch`。
 - Query、MCP transcript、Session、GPU Analysis和N29静态一致性共8项回归全部通过。
 
 ### 尚未完成，不能提前通过N30.6
@@ -545,7 +557,7 @@ GREEN：
 - FrameImage与基础`Frames` FrameSet的raw index关联已接入；仍需在短Trace传统Worker差分中覆盖On-demand首次连接、pre-capture图片丢弃和初始Frame offset变体。
 - GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
 - Scheduling当前以线程/CPU固定宽度区域线性扫描；在N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。Thread identity/name、CPU topology和CPU usage磁盘Reader尚未完成。
-- Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation磁盘Reader尚未完成，因此Sample目前能返回稳定`callstack_ref`，但不能在Session路径解析到完整符号帧。
+- Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
@@ -673,6 +685,29 @@ tracy-gpu-analysis-n29-static     Passed
 |---|---|
 | `build-n30-query\Release\tracy-query.exe` | `E7C29C096564D2072F87B58225905476371492E9A023C6FBB5AE2D4F9296C580` |
 | `build-n30-capture\Release\tracy-stream-convert.exe` | `F1AC6E5D9257C3324D5D22C089A1E3688F1F779FCB525BF68BE836D7595BF01C` |
+
+`tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
+
+八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed
+```
+
+### 2026-08-31 Source/Callstack/Symbol Reader 构建身份与回归
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `86B92CD1C9C789E5A3BBF9DB428354D7310663D31AA07305B81D34E9877B9C10` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `7DF9EEB900099B4B266DED5B964B973EF62400660669EA30D888808EB2464D8B` |
 
 `tracy-query --version`保持：`0.13.2 / tracy-query/1 / schema 1.34.0`。
 

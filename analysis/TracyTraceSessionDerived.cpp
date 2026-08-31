@@ -4,6 +4,7 @@
 #include "TracyHash.hpp"
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
+#include "TracyTraceSessionSymbols.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
@@ -191,6 +192,13 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "cpu_zone_sources " << value.stats.cpuZoneSources << '\n';
     out << "cpu_zone_begins " << value.stats.cpuZoneBegins << '\n';
     out << "cpu_zone_ends " << value.stats.cpuZoneEnds << '\n';
+    out << "callsites " << value.stats.callsites << '\n';
+    out << "resolved_callstacks " << value.stats.resolvedCallstacks << '\n';
+    out << "callstack_entries " << value.stats.callstackEntries << '\n';
+    out << "callstack_frame_addresses " << value.stats.callstackFrameAddresses << '\n';
+    out << "callstack_inline_frames " << value.stats.callstackInlineFrames << '\n';
+    out << "symbols " << value.stats.symbols << '\n';
+    out << "symbol_code_bytes " << value.stats.symbolCodeBytes << '\n';
     out << "gpu_contexts " << value.stats.gpuContexts << '\n';
     out << "gpu_zones " << value.stats.gpuZones << '\n';
     out << "complete_gpu_zones " << value.stats.completeGpuZones << '\n';
@@ -281,6 +289,13 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "cpu_zone_sources" ) in >> value.stats.cpuZoneSources;
         else if( key == "cpu_zone_begins" ) in >> value.stats.cpuZoneBegins;
         else if( key == "cpu_zone_ends" ) in >> value.stats.cpuZoneEnds;
+        else if( key == "callsites" ) in >> value.stats.callsites;
+        else if( key == "resolved_callstacks" ) in >> value.stats.resolvedCallstacks;
+        else if( key == "callstack_entries" ) in >> value.stats.callstackEntries;
+        else if( key == "callstack_frame_addresses" ) in >> value.stats.callstackFrameAddresses;
+        else if( key == "callstack_inline_frames" ) in >> value.stats.callstackInlineFrames;
+        else if( key == "symbols" ) in >> value.stats.symbols;
+        else if( key == "symbol_code_bytes" ) in >> value.stats.symbolCodeBytes;
         else if( key == "gpu_contexts" ) in >> value.stats.gpuContexts;
         else if( key == "gpu_zones" ) in >> value.stats.gpuZones;
         else if( key == "complete_gpu_zones" ) in >> value.stats.completeGpuZones;
@@ -487,6 +502,18 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.cpuZoneSources = cpuZoneStats.sourceLocations;
     index.stats.cpuZoneBegins = cpuZoneStats.beginEvents;
     index.stats.cpuZoneEnds = cpuZoneStats.endEvents;
+    const auto cpuZoneReader = TraceSessionCpuZoneReader::Open( sessionRoot, manifest, error );
+    if( !cpuZoneReader ) return false;
+    index.stats.callsites = cpuZoneReader->Callsites().size();
+
+    TraceSessionSymbolStats symbolStats;
+    if( !BuildTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, error ) ) return false;
+    index.stats.resolvedCallstacks = symbolStats.callstacks;
+    index.stats.callstackEntries = symbolStats.callstackEntries;
+    index.stats.callstackFrameAddresses = symbolStats.frameAddresses;
+    index.stats.callstackInlineFrames = symbolStats.inlineFrames;
+    index.stats.symbols = symbolStats.symbols;
+    index.stats.symbolCodeBytes = symbolStats.symbolCodeBytes;
 
     TraceSessionGpuZoneStats gpuZoneStats;
     if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
@@ -609,6 +636,18 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         cpuZoneStats.beginEvents != index.stats.cpuZoneBegins ||
         cpuZoneStats.endEvents != index.stats.cpuZoneEnds )
     { if( error.empty() ) error = "session_cpu_zone_derived_audit_mismatch"; return false; }
+    const auto cpuZoneReader = TraceSessionCpuZoneReader::Open( sessionRoot, manifest, error );
+    if( !cpuZoneReader || cpuZoneReader->Callsites().size() != index.stats.callsites )
+    { if( error.empty() ) error = "session_callsite_derived_audit_mismatch"; return false; }
+    TraceSessionSymbolStats symbolStats;
+    if( !AuditTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, error ) ||
+        symbolStats.callstacks != index.stats.resolvedCallstacks ||
+        symbolStats.callstackEntries != index.stats.callstackEntries ||
+        symbolStats.frameAddresses != index.stats.callstackFrameAddresses ||
+        symbolStats.inlineFrames != index.stats.callstackInlineFrames ||
+        symbolStats.symbols != index.stats.symbols ||
+        symbolStats.symbolCodeBytes != index.stats.symbolCodeBytes )
+    { if( error.empty() ) error = "session_symbol_derived_audit_mismatch"; return false; }
     TraceSessionGpuZoneStats gpuZoneStats;
     if( !AuditTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ||
         gpuZoneStats.contexts != index.stats.gpuContexts ||

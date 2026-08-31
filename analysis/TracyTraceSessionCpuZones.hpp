@@ -35,6 +35,8 @@ public:
         std::string& error );
 
     const TraceSessionCpuZoneStats& Stats() const { return m_stats; }
+    std::vector<SourceLocationDto> Sources() const;
+    std::vector<CallsiteDto> Callsites() const;
     std::vector<CpuZoneDto> Scan( const ScanRange& range ) const;
     std::optional<CpuZoneDto> Get( uint64_t id ) const;
     std::vector<CpuZoneDto> Children( uint64_t id, size_t offset, size_t limit ) const;

@@ -1194,6 +1194,39 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5032, "GpuFunction" );
     AppendStringEvent( frame, tracy::QueueType::StringData, 0x5033, "Gpu.cpp" );
 
+    // Persist one native address with two inline frames. The Session source
+    // index must reproduce the same callstack expansion and symbol mapping as
+    // the traditional Worker without materializing the complete trace.
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "SyntheticGame.dll" );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackFrameSize;
+    item.callstackFrameSize = { 0x20202020, 2 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "InlineJob" );
+    AppendStringEvent( frame, tracy::QueueType::SecondStringData, "Inline.cpp" );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackFrame;
+    item.callstackFrame = { 41, 0x2000, 20 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "JobRoot" );
+    AppendStringEvent( frame, tracy::QueueType::SecondStringData, "Job.cpp" );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackFrame;
+    item.callstackFrame = { 42, 0x2100, 32 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "InlineSymbol.cpp" );
+    item = {};
+    item.hdr.type = tracy::QueueType::SymbolInformation;
+    item.symbolInformation = { 51, 0x2000 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "RootSymbol.cpp" );
+    item = {};
+    item.hdr.type = tracy::QueueType::SymbolInformation;
+    item.symbolInformation = { 52, 0x2100 };
+    AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::SymbolCode, 0x2100,
+        std::vector<uint8_t> { 0x90, 0xC3 } );
+
     item = {};
     item.hdr.type = tracy::QueueType::MemAlloc;
     item.memAlloc.time = 109;
@@ -1505,6 +1538,31 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionJobs[0].scheduleStackProvenance == "SiteReused" &&
         sessionJobs[0].stages.size() == 5,
         "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
+    const auto sessionSources = sessionSource->GetSourceLocations();
+    const auto sessionCallsites = sessionSource->GetCallsites();
+    const auto sessionStack = sessionSource->ResolveCallstacks( { 2 }, 8 );
+    const auto sessionSymbols = sessionSource->GetSymbols();
+    const auto sessionSymbolMapping = sessionSource->ResolveSymbolAddress( 0x20202020 );
+    const auto sessionSymbolCode = sessionSource->ReadSymbolCodeBytes( 0x2100, 1, 1 );
+    test.Check( sessionSources.size() == 4 && sessionSources[0].function == "JobFunction" &&
+        sessionSources[0].file == "Job.cpp" && sessionSources[0].line == 77 &&
+        sessionCallsites.size() == 3 && sessionCallsites[0].callsiteId == 77 &&
+        sessionCallsites[0].callstack == 2 && sessionCallsites[0].provenance == "SiteReused",
+        "Session Source reader preserves static SourceLocation and SiteReuse Callsite identity" );
+    test.Check( sessionStack.size() == 3 && sessionStack[0].address == "0x20202020" &&
+        sessionStack[0].name == "InlineJob" && sessionStack[0].file == "Inline.cpp" &&
+        sessionStack[0].line == 41 && sessionStack[0].inlineFrame &&
+        sessionStack[1].name == "JobRoot" && !sessionStack[1].inlineFrame &&
+        sessionStack[2].address == "0x30303030" && sessionStack[2].name.empty(),
+        "Session Callstack reader expands inline frames and preserves unresolved addresses" );
+    test.Check( sessionSymbols.size() == 2 && sessionSymbols[0].address == "0x2000" &&
+        sessionSymbols[0].file == "InlineSymbol.cpp" && sessionSymbols[0].inlineFrame &&
+        sessionSymbols[1].address == "0x2100" && sessionSymbols[1].hasCode &&
+        sessionSymbolMapping && sessionSymbolMapping->symbolAddress == "0x2000" &&
+        sessionSymbolMapping->offset == 0x20200020 && sessionSymbolMapping->inlineMapping &&
+        sessionSymbolCode.offset == 1 && sessionSymbolCode.totalBytes == 2 &&
+        sessionSymbolCode.bytes == std::vector<uint8_t>( { 0xC3 } ) && sessionSymbolCode.eof,
+        "Session Symbol reader preserves metadata, address mapping and paged machine code" );
     if( sessionMemoryReady )
     {
         const auto sessionMemoryPools = sessionSource->GetMemoryPools();
@@ -1643,6 +1701,48 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             jobs["data"]["jobs"][0]["job_id"] == "500" &&
             jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
             "Query 1.34 searches the Session Job semantic index without a Worker" );
+        const auto sourceLocations = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-source-locations" },
+            { "method", "source.locations" }, { "params", { { "trace_id", traceId },
+                { "filter", { { "text", "JobFunction" } } } } }
+        } );
+        const auto callsite = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-callsite" },
+            { "method", "source.callsite" }, { "params", { { "trace_id", traceId },
+                { "callsite_id", 77 } } }
+        } );
+        const auto callstack = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-callstack" },
+            { "method", "callstack.resolve" }, { "params", { { "trace_id", traceId },
+                { "callstacks", { "2" } }, { "max_depth", 8 } } }
+        } );
+        const auto symbols = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-symbol-search" },
+            { "method", "symbol.search" }, { "params", { { "trace_id", traceId },
+                { "filter", { { "text", "JobRoot" } } } } }
+        } );
+        const auto rootSymbolRef = sessionSymbols.size() > 1 ? sessionSymbols[1].ref : std::string {};
+        const auto symbolCode = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-symbol-code" },
+            { "method", "symbol.raw_code" }, { "params", { { "trace_id", traceId },
+                { "ref", rootSymbolRef }, { "offset_bytes", 1 }, { "max_bytes", 1 } } }
+        } );
+        test.Check( sourceLocations.value( "ok", false ) &&
+            sourceLocations["data"]["source_locations"].size() == 1 &&
+            sourceLocations["data"]["source_locations"][0]["line"] == 77,
+            "Query 1.34 resolves Session SourceLocation without a Worker" );
+        test.Check( callsite.value( "ok", false ) && callsite["data"]["callsite_id"] == 77 &&
+            callsite["data"]["provenance"] == "SiteReused",
+            "Query 1.34 resolves Session Callsite without a Worker" );
+        test.Check( callstack.value( "ok", false ) && callstack["data"]["frames"].size() == 3 &&
+            callstack["data"]["frames"][0]["name"] == "InlineJob",
+            "Query 1.34 resolves Session Callstack without a Worker" );
+        test.Check( symbols.value( "ok", false ) && symbols["data"]["symbols"].size() == 1 &&
+            symbols["data"]["symbols"][0]["name"] == "JobRoot",
+            "Query 1.34 searches Session Symbol metadata without a Worker" );
+        test.Check( symbolCode.value( "ok", false ) && symbolCode["data"]["offset_bytes"] == "1" &&
+            symbolCode["data"]["returned_bytes"] == "1" && symbolCode["data"]["eof"] == true,
+            "Query 1.34 pages Session SymbolCode without a Worker" );
         {
             std::ofstream switched( publishedSession / "CURRENT", std::ios::binary | std::ios::trunc );
             switched << "newer-generation-published-after-trace-open\n";
@@ -1888,6 +1988,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedSchedulingStats, error ) &&
         error == "session_scheduling_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Scheduling semantic index" );
+    const auto symbolFile = tracy::analysis::TraceSessionSymbolIndexRoot(
+        publishedSession, manifest ) / "symbols.bin";
+    {
+        std::fstream damaged( symbolFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end );
+        char byte = 0;
+        damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end );
+        byte ^= char( 0x53 );
+        damaged.write( &byte, 1 );
+    }
+    tracy::analysis::TraceSessionSymbolStats rejectedSymbolStats;
+    test.Check( !tracy::analysis::AuditTraceSessionSymbolDerived(
+        publishedSession, manifest, rejectedSymbolStats, error ) &&
+        error == "session_symbol_metadata_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Source/Callstack/Symbol semantic index" );
 }
 
 }

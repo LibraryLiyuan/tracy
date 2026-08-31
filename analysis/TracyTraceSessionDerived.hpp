@@ -49,6 +49,13 @@ struct TraceSessionDerivedStats
     uint64_t cpuZoneSources = 0;
     uint64_t cpuZoneBegins = 0;
     uint64_t cpuZoneEnds = 0;
+    uint64_t callsites = 0;
+    uint64_t resolvedCallstacks = 0;
+    uint64_t callstackEntries = 0;
+    uint64_t callstackFrameAddresses = 0;
+    uint64_t callstackInlineFrames = 0;
+    uint64_t symbols = 0;
+    uint64_t symbolCodeBytes = 0;
     uint64_t gpuContexts = 0;
     uint64_t gpuZones = 0;
     uint64_t completeGpuZones = 0;

@@ -537,8 +537,10 @@ bool VisitGpuZoneRecord( const TraceSessionCanonicalRecord& record, void* userDa
     case QueueType::SingleStringData:
     {
         const uint8_t* data = nullptr; size_t size = 0;
-        if( !GetShortPayload( record, data, size, error ) || state.pendingSingleString )
-        { if( error.empty() ) error = "session_gpu_zone_single_string_sequence_invalid"; return false; }
+        if( !GetShortPayload( record, data, size, error ) ) return false;
+        // This protocol staging slot is shared by symbol/callstack responses
+        // and GPU context names. Only the immediately following consumer owns
+        // the value; unrelated domains may replace it safely.
         state.pendingSingleString = std::string( reinterpret_cast<const char*>( data ), size ); break;
     }
     case QueueType::SourceLocation:
@@ -829,7 +831,7 @@ bool BuildTraceSessionGpuZoneDerived( const std::filesystem::path& sessionRoot,
     if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, state.transform, error ) ) return false;
     const auto root = TraceSessionGpuZoneIndexRoot( sessionRoot, manifest ); if( !state.writer.Open( root, manifest, error ) ) return false;
     if( !VisitTraceSessionCanonicalOrdered( sessionRoot, manifest, VisitGpuZoneRecord, &state, error ) ) return false;
-    if( state.pendingCallstack != 0 || state.serialNextCallstack != 0 || state.pendingDynamicSource || state.pendingSingleString )
+    if( state.pendingCallstack != 0 || state.serialNextCallstack != 0 || state.pendingDynamicSource )
     { error = "session_gpu_zone_pending_protocol_state"; return false; }
     // A capture may end while timestamp queries are still in flight. Preserve
     // those zones as explicitly incomplete instead of turning a truthful source

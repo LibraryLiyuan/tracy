@@ -50,6 +50,8 @@ struct CpuZoneFileHeader
     uint64_t zonesOffset = 0;
     uint64_t extrasOffset = 0;
     uint64_t sourcesOffset = 0;
+    uint64_t callsitesOffset = 0;
+    uint64_t callsiteCount = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
 };
@@ -87,6 +89,18 @@ struct StoredSource
     uint32_t fileBytes = 0;
     uint32_t flags = 0;
 };
+
+struct StoredCallsite
+{
+    uint64_t thread = 0;
+    uint32_t callsiteId = 0;
+    int32_t sourceNativeId = 0;
+    uint32_t callstack = 0;
+    uint8_t domain = 0;
+    uint8_t provenance = 3;
+    uint8_t flags = 0;
+    uint8_t unavailableReason = 0;
+};
 #pragma pack( pop )
 
 struct CpuZoneManifest
@@ -117,8 +131,13 @@ struct SourceState
 
 struct CallsiteState
 {
+    uint64_t thread = 0;
+    uint32_t callsiteId = 0;
+    int32_t sourceNativeId = 0;
     uint32_t callstack = 0;
+    uint8_t domain = 0;
     uint8_t provenance = 3;
+    uint8_t flags = 0;
     uint8_t unavailableReason = 0;
 };
 
@@ -256,6 +275,7 @@ public:
     }
 
     bool Finalize( const std::vector<SourceState>& sources,
+        const std::vector<CallsiteState>& callsites,
         uint64_t zoneCount, uint64_t completeZones, CpuZoneManifest& manifest,
         std::string& error )
     {
@@ -272,10 +292,15 @@ public:
         header.zoneCount = zoneCount;
         header.completeZoneCount = completeZones;
         header.sourceCount = sources.size();
+        header.callsiteCount = callsites.size();
         header.generationBytes = uint32_t( m_session->generation.size() );
         header.zonesOffset = sizeof( header ) + m_session->source.sha256.size() + m_session->generation.size();
         header.extrasOffset = header.zonesOffset + zoneCount * sizeof( StoredZone );
         header.sourcesOffset = header.extrasOffset + m_extraBytes;
+        uint64_t sourceBytes = 0;
+        for( const auto& source : sources ) sourceBytes += sizeof( StoredSource ) +
+            source.name.size() + source.function.size() + source.file.size();
+        header.callsitesOffset = header.sourcesOffset + sourceBytes;
         out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
         out.write( m_session->source.sha256.data(), std::streamsize( m_session->source.sha256.size() ) );
         out.write( m_session->generation.data(), std::streamsize( m_session->generation.size() ) );
@@ -296,6 +321,13 @@ public:
             out.write( source.name.data(), std::streamsize( source.name.size() ) );
             out.write( source.function.data(), std::streamsize( source.function.size() ) );
             out.write( source.file.data(), std::streamsize( source.file.size() ) );
+        }
+        for( const auto& callsite : callsites )
+        {
+            const StoredCallsite stored { callsite.thread, callsite.callsiteId,
+                callsite.sourceNativeId, callsite.callstack, callsite.domain,
+                callsite.provenance, callsite.flags, callsite.unavailableReason };
+            out.write( reinterpret_cast<const char*>( &stored ), sizeof( stored ) );
         }
         out.flush();
         if( !out ) { error = "session_cpu_zone_file_write_failed"; return false; }
@@ -335,6 +367,7 @@ struct BuildState
     std::deque<size_t> sourceResponseQueue;
     std::vector<SourceState> sources;
     std::unordered_map<uint32_t, CallsiteState> callsites;
+    std::vector<CallsiteState> callsiteRecords;
     std::unordered_map<uint32_t, std::vector<uint64_t>> pendingCallsiteZones;
     std::unordered_map<std::string, uint32_t> callstackIds;
     std::unordered_map<uint64_t, uint32_t> nextCallstack;
@@ -568,8 +601,12 @@ bool VisitCpuZoneRecord( const TraceSessionCanonicalRecord& record,
     case QueueType::SingleStringData:
     {
         const uint8_t* data = nullptr; size_t size = 0;
-        if( !GetShortPayload( record, data, size, error ) || state.pendingSingleString )
-        { if( error.empty() ) error = "session_cpu_zone_single_string_sequence_invalid"; return false; }
+        if( !GetShortPayload( record, data, size, error ) ) return false;
+        // SingleStringData is a shared protocol staging slot. Callstack frame,
+        // symbol, message, lock and GPU-context responses also use it. The
+        // immediately following consumer determines ownership, so a later
+        // string must replace an unrelated value instead of invalidating the
+        // CPU-zone domain.
         state.pendingSingleString = std::string( reinterpret_cast<const char*>( data ), size );
         break;
     }
@@ -631,9 +668,14 @@ bool VisitCpuZoneRecord( const TraceSessionCanonicalRecord& record,
         break;
     case QueueType::JnCallsiteDefinition:
     {
-        EnsureStaticSource( state, item.jnCallsiteDefinition.srcloc );
+        const auto sourceIndex = EnsureStaticSource( state, item.jnCallsiteDefinition.srcloc );
         CallsiteState callsite;
+        callsite.thread = item.jnCallsiteDefinition.thread;
+        callsite.callsiteId = item.jnCallsiteDefinition.callsiteId;
+        callsite.sourceNativeId = state.sources[sourceIndex].nativeId;
+        callsite.domain = item.jnCallsiteDefinition.domain;
         callsite.provenance = item.jnCallsiteDefinition.provenance;
+        callsite.flags = item.jnCallsiteDefinition.flags;
         callsite.unavailableReason = item.jnCallsiteDefinition.unavailableReason;
         if( item.jnCallsiteDefinition.flags & uint8_t( JnCallsiteFlags::HasCallstack ) )
         {
@@ -644,6 +686,7 @@ bool VisitCpuZoneRecord( const TraceSessionCanonicalRecord& record,
         }
         if( !state.callsites.emplace( item.jnCallsiteDefinition.callsiteId, callsite ).second )
         { error = "session_cpu_zone_callsite_duplicate"; return false; }
+        state.callsiteRecords.emplace_back( callsite );
         if( !ResolvePendingCallsite( state, item.jnCallsiteDefinition.callsiteId, callsite, error ) ) return false;
         break;
     }
@@ -875,6 +918,7 @@ struct TraceSessionCpuZoneReader::Impl
     uint64_t extrasOffset = 0;
     uint64_t zoneCount = 0;
     std::unordered_map<int32_t, SourceState> sources;
+    std::vector<StoredCallsite> callsites;
 
     bool ReadZone( uint64_t id, StoredZone& zone ) const
     {
@@ -961,7 +1005,7 @@ bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
     const auto root = TraceSessionCpuZoneIndexRoot( sessionRoot, manifest );
     if( !state.writer.Open( root, manifest, error ) ) return false;
     if( !VisitTraceSessionCanonicalOrdered( sessionRoot, manifest, VisitCpuZoneRecord, &state, error ) ) return false;
-    if( state.pendingCallstack != 0 || state.serialNextCallstack != 0 || state.pendingDynamicSource || state.pendingSingleString )
+    if( state.pendingCallstack != 0 || state.serialNextCallstack != 0 || state.pendingDynamicSource )
     { error = "session_cpu_zone_pending_protocol_state"; return false; }
     for( auto& [thread, stack] : state.open )
     {
@@ -979,7 +1023,8 @@ bool BuildTraceSessionCpuZoneDerived( const std::filesystem::path& sessionRoot,
         if( const auto found = state.strings.find( source.filePointer ); found != state.strings.end() ) source.file = found->second;
     }
     CpuZoneManifest cpuManifest;
-    if( !state.writer.Finalize( state.sources, state.zoneCount, state.completeZones, cpuManifest, error ) ) return false;
+    if( !state.writer.Finalize( state.sources, state.callsiteRecords,
+        state.zoneCount, state.completeZones, cpuManifest, error ) ) return false;
     cpuManifest.stats.beginEvents = state.beginEvents;
     cpuManifest.stats.endEvents = state.endEvents;
     if( !SaveCpuZoneManifest( root, cpuManifest, error ) ) return false;
@@ -1057,11 +1102,56 @@ std::shared_ptr<TraceSessionCpuZoneReader> TraceSessionCpuZoneReader::Open(
         if( !impl->sources.emplace( source.nativeId, std::move( source ) ).second )
         { error = "session_cpu_zone_source_id_duplicate"; return {}; }
     }
+    if( uint64_t( in.tellg() ) != header.callsitesOffset )
+    { error = "session_cpu_zone_callsite_offset_invalid"; return {}; }
+    impl->callsites.resize( size_t( header.callsiteCount ) );
+    if( !impl->callsites.empty() && !in.read( reinterpret_cast<char*>( impl->callsites.data() ),
+        std::streamsize( impl->callsites.size() * sizeof( StoredCallsite ) ) ) )
+    { error = "session_cpu_zone_callsite_record_truncated"; return {}; }
     if( in.peek() != std::char_traits<char>::eof() )
     { error = "session_cpu_zone_file_trailing_bytes"; return {}; }
     auto reader = std::shared_ptr<TraceSessionCpuZoneReader>( new TraceSessionCpuZoneReader( std::move( impl ) ) );
     reader->m_stats = manifest.stats;
     return reader;
+}
+
+std::vector<SourceLocationDto> TraceSessionCpuZoneReader::Sources() const
+{
+    std::vector<SourceLocationDto> result;
+    result.reserve( m_impl->sources.size() );
+    for( const auto& [id, source] : m_impl->sources )
+    {
+        result.push_back( { MakeRef( m_impl->fingerprint, "source", uint16_t( id ) ),
+            source.name, source.function, source.file, source.line, source.color,
+            id, source.dynamic } );
+    }
+    std::sort( result.begin(), result.end(), []( const auto& left, const auto& right ) {
+        return left.nativeId < right.nativeId;
+    } );
+    return result;
+}
+
+std::vector<CallsiteDto> TraceSessionCpuZoneReader::Callsites() const
+{
+    std::vector<CallsiteDto> result;
+    result.reserve( m_impl->callsites.size() );
+    for( const auto& stored : m_impl->callsites )
+    {
+        CallsiteDto dto;
+        dto.ref = MakeRef( m_impl->fingerprint, "callsite", stored.callsiteId );
+        dto.callsiteId = stored.callsiteId;
+        dto.threadRef = MakeRef( m_impl->fingerprint, "thread", stored.thread );
+        dto.sourceLocationRef = MakeRef( m_impl->fingerprint, "source", uint16_t( stored.sourceNativeId ) );
+        dto.callstack = stored.callstack;
+        if( stored.callstack != 0 ) dto.stackRef = MakeRef( m_impl->fingerprint, "callstack", stored.callstack );
+        dto.domain = stored.domain;
+        dto.provenance = ProvenanceName( stored.provenance );
+        dto.flags = stored.flags;
+        if( const auto* reason = UnavailableReasonName( stored.unavailableReason ); *reason != '\0' )
+            dto.unavailableReason = reason;
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
 }
 
 std::optional<CpuZoneDto> TraceSessionCpuZoneReader::Get( uint64_t id ) const

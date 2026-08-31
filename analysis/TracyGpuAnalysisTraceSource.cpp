@@ -46,6 +46,8 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !samplingReader ) return {};
     auto schedulingReader = TraceSessionSchedulingReader::Open( path, *session, error );
     if( !schedulingReader ) return {};
+    auto symbolReader = TraceSessionSymbolReader::Open( path, *session, error );
+    if( !symbolReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
         session->source.sha256, session->source.fileSize, error );
     if( !reader ) return {};
@@ -74,7 +76,7 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
         std::move( jobReader ), std::move( cpuZoneReader ),
         std::move( gpuZoneReader ),
         std::move( memoryReader ), std::move( samplingReader ),
-        std::move( schedulingReader ) ) );
+        std::move( schedulingReader ), std::move( symbolReader ) ) );
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -86,14 +88,15 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionGpuZoneReader> gpuZoneReader,
     std::shared_ptr<TraceSessionMemoryReader> memoryReader,
     std::shared_ptr<TraceSessionSamplingReader> samplingReader,
-    std::shared_ptr<TraceSessionSchedulingReader> schedulingReader )
+    std::shared_ptr<TraceSessionSchedulingReader> schedulingReader,
+    std::shared_ptr<TraceSessionSymbolReader> symbolReader )
     : m_path( std::move( path ) ), m_manifest( std::move( manifest ) ), m_reader( std::move( reader ) ),
       m_sessionMode( sessionMode ), m_sessionStats( sessionStats ), m_frameReader( std::move( frameReader ) ),
       m_frameImageReader( std::move( frameImageReader ) ),
       m_jobReader( std::move( jobReader ) ), m_cpuZoneReader( std::move( cpuZoneReader ) ),
       m_gpuZoneReader( std::move( gpuZoneReader ) ),
       m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
-      m_schedulingReader( std::move( schedulingReader ) )
+      m_schedulingReader( std::move( schedulingReader ) ), m_symbolReader( std::move( symbolReader ) )
 {
     m_catalogSummary = std::make_shared<JnTraceData>();
     m_catalogSummary->present = true;
@@ -237,9 +240,27 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     addPending( "message", TraceSessionProtocolDomain::MessagePlotLock );
     addPending( "plot", TraceSessionProtocolDomain::MessagePlotLock );
     addPending( "lock", TraceSessionProtocolDomain::MessagePlotLock );
-    addPending( "source", TraceSessionProtocolDomain::SourceCallstack );
-    addPending( "symbol", TraceSessionProtocolDomain::SourceCallstack );
-    addPending( "callstack", TraceSessionProtocolDomain::SourceCallstack );
+    static const std::vector<std::string> SourceMethods = {
+        "source.locations", "source.statistics", "source.callsite", "source.callsite.search"
+    };
+    const auto sourcePresent = m_cpuZoneReader && m_cpuZoneReader->Stats().sourceLocations != 0;
+    result.push_back( Capability { "source", sourcePresent, sourcePresent, true,
+        sourcePresent ? "available from the N30 Session mandatory Source index" :
+            "The source Session contains no SourceLocation facts", SourceMethods } );
+    static const std::vector<std::string> SymbolMethods = {
+        "symbol.search", "symbol.get", "symbol.address", "symbol.address_map", "symbol.raw_code"
+    };
+    const auto symbolPresent = m_symbolReader && m_symbolReader->Stats().symbols != 0;
+    result.push_back( Capability { "symbol", symbolPresent, symbolPresent, true,
+        symbolPresent ? "available from the N30 Session mandatory Symbol index" :
+            "The source Session contains no Symbol facts", SymbolMethods } );
+    static const std::vector<std::string> CallstackMethods = {
+        "callstack.resolve", "callstack.frames", "callstack.batch"
+    };
+    const auto callstackPresent = m_symbolReader && m_symbolReader->Stats().callstacks != 0;
+    result.push_back( Capability { "callstack", callstackPresent, callstackPresent, true,
+        callstackPresent ? "available from the N30 Session mandatory Callstack index" :
+            "The source Session contains no Callstack facts", CallstackMethods } );
     addPending( "runtime.script", TraceSessionProtocolDomain::ScriptRuntime );
     addPending( "relation", TraceSessionProtocolDomain::Relation );
     const auto timelineCount = m_sessionStats.domains[size_t( TraceSessionProtocolDomain::Frame )] +
@@ -299,6 +320,18 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     }
     if( m_schedulingReader ) out.counts.contextSwitches =
         m_schedulingReader->Stats().threadEvents;
+    if( m_cpuZoneReader )
+    {
+        out.counts.sourceLocations = m_cpuZoneReader->Stats().sourceLocations;
+        out.counts.callsites = m_cpuZoneReader->Callsites().size();
+    }
+    if( m_symbolReader )
+    {
+        out.counts.callstackPayloads = m_symbolReader->Stats().callstacks;
+        out.counts.callstackFrames = m_symbolReader->Stats().inlineFrames;
+        out.counts.symbols = m_symbolReader->Stats().symbols;
+        out.counts.symbolCodeBytes = m_symbolReader->Stats().symbolCodeBytes;
+    }
     return out;
 }
 
@@ -462,7 +495,11 @@ D2(std::vector<RelationDto>, ScanRelations, size_t, offset, size_t, limit)
 D0(std::vector<RuntimeDomainStateDto>, GetRuntimeDomainStates)
 D0(std::vector<ScriptFrameDto>, GetScriptFrames)
 D0(std::vector<ScriptStackEventDto>, GetScriptStackEvents)
-D0(std::vector<CallsiteDto>, GetCallsites)
+std::vector<CallsiteDto> GpuAnalysisTraceSource::GetCallsites() const
+{
+    if( WorkerLoaded() ) return Worker().GetCallsites();
+    return m_cpuZoneReader ? m_cpuZoneReader->Callsites() : std::vector<CallsiteDto> {};
+}
 D0(CrashDto, GetCrash)
 D0(std::vector<CpuTopologyDto>, GetCpuTopology)
 D0(std::vector<CpuUsagePointDto>, GetCpuUsage)
@@ -489,13 +526,53 @@ D1(std::vector<GhostZoneDto>, ScanGhostZones, const ScanRange&, range)
 D0(std::vector<HardwareSampleDto>, GetHardwareSamples)
 D4(std::vector<HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit)
 D1(std::vector<LockEventDto>, ScanLockEvents, const ScanRange&, range)
-D0(std::vector<SymbolDto>, GetSymbols)
-D2(std::vector<SymbolAddressMappingDto>, GetSymbolAddressMappings, size_t, offset, size_t, limit)
-D1(std::optional<SymbolAddressMappingDto>, ResolveSymbolAddress, uint64_t, address)
-D0(std::vector<SourceLocationDto>, GetSourceLocations)
-D2(std::vector<CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth)
-D2(std::vector<SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes)
-D2(std::vector<SymbolCodeDto>, ResolveSymbols, const std::vector<std::string>&, symbolRefs, size_t, maxBytes)
+std::vector<SymbolDto> GpuAnalysisTraceSource::GetSymbols() const
+{
+    if( WorkerLoaded() ) return Worker().GetSymbols();
+    return m_symbolReader ? m_symbolReader->Symbols() : std::vector<SymbolDto> {};
+}
+std::vector<SymbolAddressMappingDto> GpuAnalysisTraceSource::GetSymbolAddressMappings(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().GetSymbolAddressMappings( offset, limit );
+    return m_symbolReader ? m_symbolReader->AddressMappings( offset, limit ) :
+        std::vector<SymbolAddressMappingDto> {};
+}
+std::optional<SymbolAddressMappingDto> GpuAnalysisTraceSource::ResolveSymbolAddress(
+    uint64_t address ) const
+{
+    if( WorkerLoaded() ) return Worker().ResolveSymbolAddress( address );
+    return m_symbolReader ? m_symbolReader->ResolveAddress( address ) : std::nullopt;
+}
+std::vector<SourceLocationDto> GpuAnalysisTraceSource::GetSourceLocations() const
+{
+    if( WorkerLoaded() ) return Worker().GetSourceLocations();
+    return m_cpuZoneReader ? m_cpuZoneReader->Sources() : std::vector<SourceLocationDto> {};
+}
+std::vector<CallstackFrameDto> GpuAnalysisTraceSource::ResolveCallstacks(
+    const std::vector<uint32_t>& callstacks, size_t maxDepth ) const
+{
+    if( WorkerLoaded() ) return Worker().ResolveCallstacks( callstacks, maxDepth );
+    return m_symbolReader ? m_symbolReader->ResolveCallstacks( callstacks, maxDepth ) :
+        std::vector<CallstackFrameDto> {};
+}
+std::vector<SourceTextDto> GpuAnalysisTraceSource::ResolveSources(
+    const std::vector<std::string>& sourceRefs, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ResolveSources( sourceRefs, maxBytes );
+    return {};
+}
+std::vector<SymbolCodeDto> GpuAnalysisTraceSource::ResolveSymbols(
+    const std::vector<std::string>& symbolRefs, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ResolveSymbols( symbolRefs, maxBytes );
+    std::vector<SymbolCodeDto> result;
+    if( !m_symbolReader ) return result;
+    for( const auto& resource : m_symbolReader->SymbolResources() )
+        if( resource.codeBytes != 0 && std::find( symbolRefs.begin(), symbolRefs.end(), resource.ref ) != symbolRefs.end() )
+            result.emplace_back( m_symbolReader->ReadSymbolCode( resource.id, maxBytes ) );
+    return result;
+}
 std::vector<FrameImageDto> GpuAnalysisTraceSource::ResolveFrameImages(
     const std::vector<std::string>& imageRefs, size_t maxBytes ) const
 {
@@ -512,8 +589,16 @@ std::vector<FrameImageDto> GpuAnalysisTraceSource::ResolveFrameImages(
     }
     return result;
 }
-D0(std::vector<SourceResourceDto>, GetSourceResources)
-D0(std::vector<SymbolResourceDto>, GetSymbolResources)
+std::vector<SourceResourceDto> GpuAnalysisTraceSource::GetSourceResources() const
+{
+    if( WorkerLoaded() ) return Worker().GetSourceResources();
+    return {};
+}
+std::vector<SymbolResourceDto> GpuAnalysisTraceSource::GetSymbolResources() const
+{
+    if( WorkerLoaded() ) return Worker().GetSymbolResources();
+    return m_symbolReader ? m_symbolReader->SymbolResources() : std::vector<SymbolResourceDto> {};
+}
 std::vector<FrameImageMetadataDto> GpuAnalysisTraceSource::GetFrameImageResources() const
 {
     if( WorkerLoaded() ) return Worker().GetFrameImageResources();
@@ -607,11 +692,36 @@ std::optional<std::string> GpuAnalysisTraceSource::GetGpuZoneRef( uint64_t inter
         std::optional<std::string>( MakeEntityRef( "gpu-zone", internalZoneIndex ) ) : std::nullopt;
 }
 D0(GpuMemoryAttribution, GetGpuMemoryAttribution)
-D2(SourceTextDto, ReadEmbeddedSource, size_t, sourceId, size_t, maxBytes)
-D3(BinaryResourceChunkDto, ReadEmbeddedSourceBytes, size_t, sourceId, size_t, offset, size_t, maxBytes)
-D2(SymbolCodeDto, ReadSymbolCode, uint64_t, symbolId, size_t, maxBytes)
-D3(BinaryResourceChunkDto, ReadSymbolCodeBytes, uint64_t, symbolId, size_t, offset, size_t, maxBytes)
-D3(std::vector<DisassemblyInstructionDto>, DisassembleSymbol, std::string_view, symbolRef, size_t, maxBytes, size_t, maxInstructions)
+SourceTextDto GpuAnalysisTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadEmbeddedSource( sourceId, maxBytes );
+    throw std::out_of_range( "embedded source resource was not found" );
+}
+BinaryResourceChunkDto GpuAnalysisTraceSource::ReadEmbeddedSourceBytes(
+    size_t sourceId, size_t offset, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadEmbeddedSourceBytes( sourceId, offset, maxBytes );
+    throw std::out_of_range( "embedded source resource was not found" );
+}
+SymbolCodeDto GpuAnalysisTraceSource::ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadSymbolCode( symbolId, maxBytes );
+    if( !m_symbolReader ) throw std::out_of_range( "symbol code resource was not found" );
+    return m_symbolReader->ReadSymbolCode( symbolId, maxBytes );
+}
+BinaryResourceChunkDto GpuAnalysisTraceSource::ReadSymbolCodeBytes(
+    uint64_t symbolId, size_t offset, size_t maxBytes ) const
+{
+    if( WorkerLoaded() ) return Worker().ReadSymbolCodeBytes( symbolId, offset, maxBytes );
+    if( !m_symbolReader ) throw std::out_of_range( "symbol code resource was not found" );
+    return m_symbolReader->ReadSymbolCodeBytes( symbolId, offset, maxBytes );
+}
+std::vector<DisassemblyInstructionDto> GpuAnalysisTraceSource::DisassembleSymbol(
+    std::string_view symbolRef, size_t maxBytes, size_t maxInstructions ) const
+{
+    if( WorkerLoaded() ) return Worker().DisassembleSymbol( symbolRef, maxBytes, maxInstructions );
+    return {};
+}
 FrameImageDto GpuAnalysisTraceSource::ReadFrameImage( size_t imageId, size_t maxBytes ) const
 {
     if( WorkerLoaded() ) return Worker().ReadFrameImage( imageId, maxBytes );

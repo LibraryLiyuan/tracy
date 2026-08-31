@@ -12,6 +12,7 @@
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
 #include "TracyTraceSessionStore.hpp"
+#include "TracyTraceSessionSymbols.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <mutex>
@@ -125,7 +126,8 @@ private:
         std::shared_ptr<TraceSessionGpuZoneReader> gpuZoneReader = {},
         std::shared_ptr<TraceSessionMemoryReader> memoryReader = {},
         std::shared_ptr<TraceSessionSamplingReader> samplingReader = {},
-        std::shared_ptr<TraceSessionSchedulingReader> schedulingReader = {} );
+        std::shared_ptr<TraceSessionSchedulingReader> schedulingReader = {},
+        std::shared_ptr<TraceSessionSymbolReader> symbolReader = {} );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
 
@@ -143,6 +145,7 @@ private:
     std::shared_ptr<TraceSessionMemoryReader> m_memoryReader;
     std::shared_ptr<TraceSessionSamplingReader> m_samplingReader;
     std::shared_ptr<TraceSessionSchedulingReader> m_schedulingReader;
+    std::shared_ptr<TraceSessionSymbolReader> m_symbolReader;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;
 };

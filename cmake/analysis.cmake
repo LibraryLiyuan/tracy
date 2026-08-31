@@ -19,6 +19,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSymbols.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionGpuCanonical.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionInventory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionProtocolInventory.cpp
@@ -46,6 +47,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSymbols.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionGpuCanonical.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionInventory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionProtocolInventory.hpp
