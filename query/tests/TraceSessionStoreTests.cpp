@@ -134,7 +134,7 @@ int main()
         malformedPayload.data(), malformedPayload.size(), error ) );
     assert( !VisitTraceSessionCanonicalShard( buildingPath, malformedCanonical,
         nullptr, nullptr, error ) );
-    assert( error == "canonical_shard_record_header_truncated" );
+    assert( error == "canonical_packed_encoding_missing" );
     assert( shard.relativePath == std::filesystem::path( "generations" ) / generation / "canonical" / "frame-000007.bin" );
     assert( shard.uncompressedBytes == sizeof( payload ) );
     assert( shard.sha256.size() == 64 );

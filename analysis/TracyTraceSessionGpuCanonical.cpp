@@ -436,7 +436,7 @@ bool LoadTraceSessionTimeTransform( const std::filesystem::path& sessionRoot,
     MetadataState metadata { &timeTransform };
     for( const auto& shard : manifest.shards )
     {
-        if( shard.domain != "control" ) continue;
+        if( shard.domain == "checkpoint" ) continue;
         if( !VisitTraceSessionCanonicalShard( sessionRoot, shard,
             VisitMetadata, &metadata, error ) ) return false;
     }
@@ -456,15 +456,12 @@ bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
     error.clear(); data = {}; timeTransform = {}; stats = {};
     if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, timeTransform, error ) ) return false;
     GpuLoadState state { &data, &timeTransform, &stats };
-    std::vector<const TraceSessionShard*> gpuShards;
     for( const auto& shard : manifest.shards )
-        if( shard.domain == "gpu_catalog" || shard.domain == "gpu_memory" ) gpuShards.push_back( &shard );
-    std::sort( gpuShards.begin(), gpuShards.end(), []( const auto* left, const auto* right ) {
-        if( left->sourceRecordBegin != right->sourceRecordBegin ) return left->sourceRecordBegin < right->sourceRecordBegin;
-        return left->shardId < right->shardId;
-    } );
-    for( const auto* shard : gpuShards )
-        if( !VisitTraceSessionCanonicalShard( sessionRoot, *shard, VisitGpuCanonical, &state, error ) ) return false;
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        if( !VisitTraceSessionCanonicalShard( sessionRoot, shard,
+            VisitGpuCanonical, &state, error ) ) return false;
+    }
     stats.unresolvedPayloads = state.catalogPayloads.size();
     if( stats.unresolvedPayloads != 0 )
     {

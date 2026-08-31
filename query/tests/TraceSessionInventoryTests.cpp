@@ -60,6 +60,16 @@ struct CanonicalCancelState
     uint64_t cancelAfterChecks = 0;
 };
 
+struct CanonicalProgressState
+{
+    uint64_t calls = 0;
+    uint64_t sourceBytes = 0;
+    uint64_t totalSourceBytes = 0;
+    uint64_t sourceRecords = 0;
+    uint64_t committedShards = 0;
+    bool monotonic = true;
+};
+
 struct CanonicalReadState
 {
     uint64_t records = 0;
@@ -122,6 +132,20 @@ bool RequestCanonicalCancel( void* userData )
     auto& state = *static_cast<CanonicalCancelState*>( userData );
     state.checks++;
     return state.cancelAfterChecks != 0 && state.checks >= state.cancelAfterChecks;
+}
+
+void RecordCanonicalProgress( uint64_t sourceBytes, uint64_t totalSourceBytes,
+    uint64_t sourceRecords, uint64_t committedShards, void* userData )
+{
+    auto& state = *static_cast<CanonicalProgressState*>( userData );
+    if( sourceBytes < state.sourceBytes || sourceRecords < state.sourceRecords ||
+        committedShards < state.committedShards || sourceBytes > totalSourceBytes )
+        state.monotonic = false;
+    state.calls++;
+    state.sourceBytes = sourceBytes;
+    state.totalSourceBytes = totalSourceBytes;
+    state.sourceRecords = sourceRecords;
+    state.committedShards = committedShards;
 }
 
 struct DiskProbeState
@@ -609,6 +633,86 @@ void TestProtocolDecoderCheckpoint( TestContext& test )
         "resumed decoder preserves second frame facts" );
 }
 
+void TestCanonicalPackedFrameStorage( TestContext& test, const std::filesystem::path& directory )
+{
+    std::vector<uint8_t> frame;
+    constexpr uint32_t EventCount = 1024;
+    for( uint32_t i = 0; i < EventCount; ++i )
+        AppendFixedEvent( frame, tracy::QueueType::FrameVsync );
+
+    auto* compressor = tracy::LZ4_createStream();
+    test.Check( compressor != nullptr, "create packed canonical compressor" );
+    if( !compressor ) return;
+    const auto compressed = CompressContinuedFrame( compressor, frame, test );
+    tracy::LZ4_freeStream( compressor );
+    if( compressed.empty() ) return;
+
+    const auto source = directory / "canonical-packed.tracy-stream";
+    tracy::stream::WriterOptions writerOptions;
+    writerOptions.durableHeader = false;
+    std::string error;
+    auto writer = tracy::stream::JournalWriter::CreateFileJournal(
+        source, DeterministicHeader(), false, writerOptions, error );
+    test.Check( writer != nullptr, "create packed canonical journal: " + error );
+    if( !writer ) return;
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, compressed, 1, error ),
+        "append dense packed canonical frame" );
+    writer.reset();
+
+    tracy::analysis::TraceSessionInventory inventory;
+    tracy::analysis::TraceSessionInventoryOptions inventoryOptions;
+    inventoryOptions.runDirectory = directory / "canonical-packed-runs";
+    test.Check( tracy::analysis::BuildTraceSessionInventory(
+        source, inventoryOptions, inventory, error ),
+        "inventory dense packed canonical frame: " + error );
+
+    tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
+    canonicalOptions.targetShardBytes = 2 * 1024 * 1024;
+    canonicalOptions.softShardBytes = 3 * 1024 * 1024;
+    canonicalOptions.hardShardBytes = 4 * 1024 * 1024;
+    canonicalOptions.minimumShardSpanNs = 0;
+    canonicalOptions.maximumShardSpanNs = 1000000000;
+    tracy::analysis::TraceSessionManifest manifest;
+    const auto sessionRoot = directory / "canonical-packed-session";
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( source, sessionRoot,
+        "generation-packed", inventory, canonicalOptions, manifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Complete,
+        "build dense packed canonical frame: " + error );
+
+    uint64_t canonicalPayloadBytes = 0;
+    uint64_t canonicalLogicalRecords = 0;
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        canonicalPayloadBytes += shard.uncompressedBytes;
+        canonicalLogicalRecords += shard.recordCount;
+    }
+    test.Check( canonicalLogicalRecords == uint64_t( EventCount ) + 1,
+        "packed canonical manifest preserves logical event and frame counts" );
+    test.Check( canonicalPayloadBytes <= frame.size() + 4096,
+        "packed canonical physical bytes scale with decoded frame bytes, not per-event headers" );
+
+    CanonicalReadState read;
+    for( const auto& shard : manifest.shards )
+    {
+        if( shard.domain == "checkpoint" ) continue;
+        test.Check( tracy::analysis::VisitTraceSessionCanonicalShard( sessionRoot, shard,
+            CountCanonicalRecord, &read, error ), "read dense packed canonical frame: " + error );
+    }
+    test.Check( read.records == canonicalLogicalRecords &&
+        read.domains[size_t( tracy::analysis::TraceSessionProtocolDomain::Frame )] == EventCount,
+        "packed canonical reader lazily restores every logical event" );
+
+    tracy::analysis::TraceSessionCanonicalAudit audit;
+    test.Check( tracy::analysis::AuditTraceSessionCanonical(
+        sessionRoot, manifest, inventory, audit, error ),
+        "audit dense packed canonical frame: " + error );
+    test.Check( audit.protocolEvents == EventCount && audit.protocolFrames == 1 &&
+        audit.protocolEncodedBytes == frame.size(),
+        "packed canonical audit remains byte-for-byte equivalent to inventory" );
+}
+
 void TestProtocolJournalInventory( TestContext& test, const std::filesystem::path& directory )
 {
     std::vector<uint8_t> firstFrame;
@@ -673,6 +777,9 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         "inventory run checksums verify: " + error );
 
     tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
+    CanonicalProgressState canonicalProgress;
+    canonicalOptions.progress = RecordCanonicalProgress;
+    canonicalOptions.progressUserData = &canonicalProgress;
     canonicalOptions.targetShardBytes = 128;
     canonicalOptions.softShardBytes = 256;
     canonicalOptions.hardShardBytes = 512;
@@ -690,7 +797,30 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     test.Check( manifest.state == tracy::analysis::TraceSessionState::CancelledResumable,
         "cancelled canonical session is resumable" );
     test.Check( !manifest.shards.empty(), "cancel commits a bounded canonical shard and checkpoint" );
+    test.Check( tracy::analysis::CanResumeTraceSessionCanonical(
+        sessionRoot, manifest, error ),
+        "packed checkpoint is selected as a compatible resumable generation: " + error );
     const auto cancelledShards = manifest.shards;
+
+    const auto legacyRoot = directory / "canonical-legacy-encoding";
+    std::vector<uint8_t> legacyCheckpoint = {
+        'J', 'N', 'C', 'H', 'K', 'P', 'T', '1',
+        1, 0, 0, 0, 0, 0, 0, 0
+    };
+    tracy::analysis::TraceSessionShard legacyCheckpointShard;
+    legacyCheckpointShard.shardId = 1;
+    legacyCheckpointShard.domain = "checkpoint";
+    legacyCheckpointShard.recordCount = 1;
+    test.Check( tracy::analysis::WriteTraceSessionShard( legacyRoot, "legacy",
+        legacyCheckpointShard, legacyCheckpoint.data(), legacyCheckpoint.size(), error ),
+        "write legacy Canonical checkpoint fixture: " + error );
+    tracy::analysis::TraceSessionManifest legacyManifest;
+    legacyManifest.generation = "legacy";
+    legacyManifest.shards.push_back( legacyCheckpointShard );
+    test.Check( !tracy::analysis::CanResumeTraceSessionCanonical(
+        legacyRoot, legacyManifest, error ) &&
+        error == "canonical_packed_encoding_unsupported",
+        "resume selection rejects the preserved pre-packed experimental generation quickly" );
 
     canonicalOptions.shouldCancel = nullptr;
     canonicalOptions.cancelUserData = nullptr;
@@ -700,6 +830,11 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         "resume canonical session from checkpoint: " + error );
     test.Check( manifest.state == tracy::analysis::TraceSessionState::CanonicalBuilding,
         "completed canonical facts remain in canonical-building state until derived work" );
+    test.Check( canonicalProgress.calls > 0 && canonicalProgress.monotonic &&
+        canonicalProgress.sourceBytes == canonicalProgress.totalSourceBytes &&
+        canonicalProgress.sourceRecords == inventory.recordCount &&
+        canonicalProgress.committedShards == manifest.shards.size(),
+        "canonical progress reports committed monotonic source and shard coverage" );
     test.Check( manifest.shards.size() > cancelledShards.size(),
         "resume appends shards instead of replacing the committed prefix" );
     for( size_t i = 0; i < cancelledShards.size() && i < manifest.shards.size(); i++ )
@@ -710,9 +845,6 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     }
     uint64_t canonicalRecords = 0;
     uint64_t checkpointRecords = 0;
-    bool sawFrameDomain = false;
-    bool sawJobDomain = false;
-    bool sawDictionaryDomain = false;
     bool sawControlDomain = false;
     for( const auto& shard : manifest.shards )
     {
@@ -720,18 +852,16 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         else
         {
             canonicalRecords += shard.recordCount;
-            sawFrameDomain |= shard.domain == "frame";
-            sawJobDomain |= shard.domain == "job";
-            sawDictionaryDomain |= shard.domain == "dictionary";
             sawControlDomain |= shard.domain == "control";
-            test.Check( shard.domain != "protocol", "canonical events are partitioned by stable data domain" );
+            test.Check( shard.domain == "control",
+                "packed canonical keeps each protocol frame in one physical source-order shard" );
         }
     }
     test.Check( canonicalRecords == inventory.protocolInventory.eventCount + inventory.recordCount,
         "canonical records cover decoded events and non-compressed transport records" );
     test.Check( checkpointRecords > 0, "each committed canonical segment has a checkpoint" );
-    test.Check( sawFrameDomain && sawJobDomain && sawDictionaryDomain && sawControlDomain,
-        "canonical segment preserves all source-present domains" );
+    test.Check( sawControlDomain,
+        "packed canonical persists source frames without duplicating bytes across domains" );
     CanonicalReadState canonicalRead;
     for( const auto& shard : manifest.shards )
     {
@@ -785,8 +915,8 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
         "canonical audit reports exact semantic-time coverage without inventing timestamps" );
     auto incompleteManifest = manifest;
     const auto omitted = std::find_if( incompleteManifest.shards.begin(), incompleteManifest.shards.end(),
-        []( const auto& shard ) { return shard.domain == "frame"; } );
-    test.Check( omitted != incompleteManifest.shards.end(), "audit omission fixture has frame shard" );
+        []( const auto& shard ) { return shard.domain == "control"; } );
+    test.Check( omitted != incompleteManifest.shards.end(), "audit omission fixture has packed data shard" );
     if( omitted != incompleteManifest.shards.end() )
     {
         incompleteManifest.shards.erase( omitted );
@@ -851,8 +981,8 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     limitedOptions.targetShardBytes = 32;
     limitedOptions.softShardBytes = 40;
     limitedOptions.hardShardBytes = 48;
-    limitedOptions.softMemoryBytes = 56;
-    limitedOptions.hardMemoryBytes = 64;
+    limitedOptions.softMemoryBytes = 72;
+    limitedOptions.hardMemoryBytes = 80;
     const auto limitedSessionRoot = directory / "canonical-session-memory-limit";
     test.Check( tracy::analysis::BuildTraceSessionCanonical( path, limitedSessionRoot,
         "generation-limited", inventory, limitedOptions, manifest, error ) ==
@@ -1529,6 +1659,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         auditedStats.jobSchedules == 1 && auditedStats.jobConfigs == 1 &&
         auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5,
         "mandatory derived counts are exact and reproducible" );
+    test.Check( auditedStats.indexBytes <= auditedStats.indexFiles * 128,
+        "generic Session index stores bounded shard summaries instead of one 48-byte row per event" );
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
     manifest.state = tracy::analysis::TraceSessionState::Complete;
@@ -2279,6 +2411,7 @@ int main()
         TestProtocolFrameInventory( test );
         TestCompressedProtocolInventory( test );
         TestProtocolDecoderCheckpoint( test );
+        TestCanonicalPackedFrameStorage( test, directory );
         TestProtocolJournalInventory( test, directory );
         TestGpuCanonicalReader( test, directory );
     }

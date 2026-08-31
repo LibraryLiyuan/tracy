@@ -49,18 +49,6 @@ struct DomainIndexHeader
     uint64_t transportRecords = 0;
 };
 
-struct DomainIndexEntry
-{
-    uint64_t sourceSequence = 0;
-    uint64_t journalMonotonicNs = 0;
-    uint64_t protocolFrameOrdinal = 0;
-    int64_t semanticTime = 0;
-    uint32_t protocolFrameOffset = 0;
-    uint32_t threadContext = 0;
-    uint16_t type = 0;
-    uint8_t kind = 0;
-    uint8_t hasSemanticTime = 0;
-};
 #pragma pack( pop )
 
 struct IndexFile
@@ -116,7 +104,6 @@ TraceSessionProtocolDomain DomainFromName( std::string_view name )
 
 struct IndexVisitorState
 {
-    std::vector<DomainIndexEntry>* entries = nullptr;
     DomainIndexHeader* header = nullptr;
     TraceSessionDerivedStats* stats = nullptr;
 };
@@ -124,16 +111,14 @@ struct IndexVisitorState
 bool IndexRecord( const TraceSessionCanonicalRecord& record, void* userData, std::string& )
 {
     auto& state = *static_cast<IndexVisitorState*>( userData );
-    state.entries->push_back( { record.sourceSequence, record.journalMonotonicNs,
-        record.protocolFrameOrdinal, record.semanticTime, record.protocolFrameOffset,
-        record.threadContext, record.type, uint8_t( record.kind ),
-        uint8_t( record.hasSemanticTime ? 1 : 0 ) } );
+    state.header->recordCount++;
     switch( record.kind )
     {
     case TraceSessionCanonicalRecordKind::ProtocolEvent: state.header->protocolEvents++; break;
     case TraceSessionCanonicalRecordKind::ProtocolFrame: state.header->protocolFrames++; break;
     case TraceSessionCanonicalRecordKind::TransportRecord: state.header->transportRecords++; break;
     }
+    state.stats->domains[size_t( record.domain )]++;
     if( record.hasSemanticTime )
     {
         if( !state.stats->semanticTimePresent )
@@ -392,7 +377,7 @@ bool VerifyIndexManifest( const std::filesystem::path& root,
         if( !in || header.magic != DomainIndexMagic || header.schema != TraceSessionDomainIndexSchemaVersion ||
             header.domain != file.domain || header.shardId != file.shardId ||
             header.recordCount != file.recordCount ||
-            file.fileBytes != sizeof( header ) + header.recordCount * sizeof( DomainIndexEntry ) )
+            file.fileBytes != sizeof( header ) )
         { error = "session_index_header_mismatch"; return false; }
         records += header.recordCount; bytes += file.fileBytes;
     }
@@ -456,13 +441,10 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         header.domain = uint32_t( DomainFromName( shard.domain ) );
         if( header.domain >= uint32_t( TraceSessionProtocolDomain::Count ) ) header.domain = uint32_t( TraceSessionProtocolDomain::Other );
         header.shardId = shard.shardId;
-        std::vector<DomainIndexEntry> entries;
-        if( shard.recordCount > uint64_t( std::numeric_limits<size_t>::max() ) )
-        { error = "session_index_record_limit"; return false; }
-        entries.reserve( size_t( shard.recordCount ) );
-        IndexVisitorState state { &entries, &header, &index.stats };
+        IndexVisitorState state { &header, &index.stats };
         if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, IndexRecord, &state, error ) ) return false;
-        header.recordCount = entries.size();
+        if( header.recordCount != shard.recordCount )
+        { error = "session_index_record_count_mismatch"; return false; }
         std::ostringstream name;
         name << SafeDomain( shard.domain ) << '-' << std::setw( 6 ) << std::setfill( '0' ) << shard.shardId << ".idx";
         const auto relative = std::filesystem::path( "shards" ) / name.str();
@@ -473,15 +455,13 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "session_index_open_failed"; return false; }
         out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
-        if( !entries.empty() ) out.write( reinterpret_cast<const char*>( entries.data() ),
-            std::streamsize( entries.size() * sizeof( entries.front() ) ) );
         out.flush();
         if( !out ) { error = "session_index_write_failed"; return false; }
         out.close();
         if( !AtomicReplace( temporary, target, error ) ) return false;
         IndexFile file;
         file.domain = header.domain; file.shardId = shard.shardId; file.recordCount = header.recordCount;
-        file.fileBytes = sizeof( header ) + entries.size() * sizeof( DomainIndexEntry );
+        file.fileBytes = sizeof( header );
         file.sha256 = Sha256File( target ); file.relativePath = relative;
         index.files.push_back( file );
         index.stats.indexedRecords += header.recordCount;
@@ -490,12 +470,12 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         index.stats.indexedTransportRecords += header.transportRecords;
         index.stats.indexBytes += file.fileBytes;
         index.stats.indexFiles++;
-        index.stats.domains[header.domain] += header.recordCount;
         if( control.progress ) control.progress( eventShardCount == 0 ? 1.f :
             float( ++completedShards ) / float( eventShardCount ), "session-domain-index" );
     }
 
     TraceSessionFrameStats frameStats;
+    if( control.progress ) control.progress( 0.f, "frames" );
     if( !BuildTraceSessionFrameDerived( sessionRoot, manifest,
         index.stats.semanticTimePresent, index.stats.lastSemanticTimeRaw,
         frameStats, error ) ) return false;
@@ -504,6 +484,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.completeFrames = frameStats.completeFrames;
 
     TraceSessionFrameImageStats frameImageStats;
+    if( control.progress ) control.progress( 0.f, "frame-images" );
     if( !BuildTraceSessionFrameImageDerived( sessionRoot, manifest,
         frameImageStats, error ) ) return false;
     index.stats.frameImages = frameImageStats.images;
@@ -512,6 +493,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.frameImageBc1Bytes = frameImageStats.bc1Bytes;
 
     TraceSessionJobStats jobStats;
+    if( control.progress ) control.progress( 0.f, "jobs" );
     if( !BuildTraceSessionJobDerived( sessionRoot, manifest, jobStats, error ) ) return false;
     index.stats.jobTypes = jobStats.jobTypes;
     index.stats.jobs = jobStats.jobs;
@@ -521,6 +503,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.jobStages = jobStats.stages;
 
     TraceSessionCpuZoneStats cpuZoneStats;
+    if( control.progress ) control.progress( 0.f, "cpu-zones" );
     if( !BuildTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ) return false;
     index.stats.cpuZones = cpuZoneStats.zones;
     index.stats.completeCpuZones = cpuZoneStats.completeZones;
@@ -532,6 +515,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.callsites = cpuZoneReader->Callsites().size();
 
     TraceSessionSymbolStats symbolStats;
+    if( control.progress ) control.progress( 0.f, "symbols-callstacks" );
     if( !BuildTraceSessionSymbolDerived( sessionRoot, manifest, symbolStats, error ) ) return false;
     index.stats.resolvedCallstacks = symbolStats.callstacks;
     index.stats.callstackEntries = symbolStats.callstackEntries;
@@ -541,6 +525,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.symbolCodeBytes = symbolStats.symbolCodeBytes;
 
     TraceSessionGpuZoneStats gpuZoneStats;
+    if( control.progress ) control.progress( 0.f, "gpu-zones" );
     if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
     index.stats.gpuContexts = gpuZoneStats.contexts;
     index.stats.gpuZones = gpuZoneStats.zones;
@@ -553,6 +538,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.gpuSyncEvents = gpuZoneStats.syncEvents;
 
     TraceSessionMemoryStats memoryStats;
+    if( control.progress ) control.progress( 0.f, "memory" );
     if( !BuildTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ) return false;
     index.stats.memoryPools = memoryStats.pools;
     index.stats.memoryEvents = memoryStats.events;
@@ -563,6 +549,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.memoryUnknownFrees = memoryStats.unknownFrees;
 
     TraceSessionSamplingStats samplingStats;
+    if( control.progress ) control.progress( 0.f, "sampling" );
     if( !BuildTraceSessionSamplingDerived( sessionRoot, manifest, samplingStats, error ) ) return false;
     index.stats.sampleEvents = samplingStats.samples;
     index.stats.contextSwitchSampleEvents = samplingStats.contextSwitchSamples;
@@ -570,6 +557,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.callstackPayloads = samplingStats.callstackPayloads;
 
     TraceSessionSchedulingStats schedulingStats;
+    if( control.progress ) control.progress( 0.f, "scheduling" );
     if( !BuildTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ) return false;
     index.stats.contextSwitchRecords = schedulingStats.contextSwitchRecords;
     index.stats.threadWakeupRecords = schedulingStats.wakeupRecords;
@@ -579,16 +567,19 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.completeCpuContextSwitchEvents = schedulingStats.completeCpuEvents;
 
     TraceSessionRelationStats relationStats;
+    if( control.progress ) control.progress( 0.f, "relations" );
     if( !BuildTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ) return false;
     index.stats.relations = relationStats.relations;
 
     TraceSessionRuntimeStats runtimeStats;
+    if( control.progress ) control.progress( 0.f, "runtime-script" );
     if( !BuildTraceSessionRuntimeDerived( sessionRoot, manifest, runtimeStats, error ) ) return false;
     index.stats.runtimeDomainStates = runtimeStats.domainStates;
     index.stats.scriptFrames = runtimeStats.scriptFrames;
     index.stats.scriptStackEvents = runtimeStats.scriptStackEvents;
 
     TraceSessionIoGfxStats ioGfxStats;
+    if( control.progress ) control.progress( 0.f, "io-gfx" );
     if( !BuildTraceSessionIoGfxDerived( sessionRoot, manifest, ioGfxStats, error ) ) return false;
     index.stats.ioRequests = ioGfxStats.ioRequests;
     index.stats.ioConfigs = ioGfxStats.ioConfigs;
@@ -602,6 +593,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
     {
+        if( control.progress ) control.progress( 0.f, "gpu-resource-analysis" );
         GpuAnalysisSidecarControl gpuControl;
         gpuControl.stopToken = control.stopToken;
         gpuControl.minimumFreeBytes = control.minimumFreeBytes;

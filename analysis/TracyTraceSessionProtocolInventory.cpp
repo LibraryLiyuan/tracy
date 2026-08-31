@@ -502,7 +502,8 @@ bool TryGetTraceProtocolEventTime( const TraceSessionProtocolEventInfo& event, i
 
 bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8_t> record,
     TraceSessionProtocolInventory& inventory, std::string& error,
-    TraceSessionProtocolEventVisitor visitor, void* visitorUserData )
+    TraceSessionProtocolEventVisitor visitor, void* visitorUserData,
+    std::span<const uint8_t>* decodedFrame )
 {
     error.clear();
     if( record.size() < sizeof( tracy::lz4sz_t ) )
@@ -529,13 +530,18 @@ bool TraceSessionProtocolDecoder::ConsumeCompressedRecord( std::span<const uint8
         return false;
     }
 
+    const auto decoded = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>( output ), size_t( decodedSize ) );
     TraceSessionProtocolInventory frame;
-    if( !CountTraceProtocolFrame( std::span<const uint8_t>(
-        reinterpret_cast<const uint8_t*>( output ), size_t( decodedSize ) ), frame, error,
+    if( !CountTraceProtocolFrame( decoded, frame, error,
         visitor, visitorUserData ) )
         return false;
     frame.compressedBytes = record.size();
     if( !Merge( inventory, frame, error ) ) return false;
+    // The span remains valid until the next ConsumeCompressedRecord call on
+    // this decoder. Session Canonical copies it before returning to the
+    // journal scanner, so no full-Worker lifetime is introduced.
+    if( decodedFrame ) *decodedFrame = decoded;
 
     static constexpr size_t DictionaryLimit = 64 * 1024;
     const auto decodedBytes = size_t( decodedSize );

@@ -15,6 +15,12 @@ namespace tracy::analysis
 namespace
 {
 
+static constexpr uint8_t CanonicalPackedMagic[8] = {
+    'J', 'N', 'C', 'P', 'A', 'C', 'K', '1'
+};
+static constexpr uint32_t CanonicalPackedEncoding = 2;
+static constexpr uint64_t CanonicalPhysicalRecordHeaderBytes = 56;
+
 void Put32( std::vector<uint8_t>& output, uint32_t value )
 {
     for( int i = 0; i < 4; i++ ) output.push_back( uint8_t( value >> ( i * 8 ) ) );
@@ -119,21 +125,22 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     uint8_t domain, uint32_t flags, uint32_t threadContext,
     uint32_t variablePayloadBytes, uint32_t protocolFrameOffset,
     bool hasSemanticTime, int64_t semanticTime,
-    const uint8_t* payload, uint32_t payloadBytes )
+    const uint8_t* payload, uint32_t payloadBytes, uint64_t logicalRecordCount = 1 )
 {
     if( payloadBytes != 0 && !payload ) { state.error = "canonical_payload_missing"; return false; }
-    constexpr uint64_t RecordHeaderBytes = 56;
-    const auto recordBytes = RecordHeaderBytes + uint64_t( payloadBytes );
-    if( recordBytes > state.options->hardMemoryBytes ||
-        state.shardPayloadBytes > state.options->hardMemoryBytes - recordBytes )
-    {
-        state.error = "canonical_memory_hard_limit";
-        return false;
-    }
     auto domainIndex = size_t( domain );
     if( domainIndex >= state.domains.size() )
         domainIndex = size_t( TraceSessionProtocolDomain::Other );
     auto& output = state.domains[domainIndex];
+    const auto prefixBytes = output.payload.empty() ? uint64_t( sizeof( CanonicalPackedMagic ) + 8 ) : 0;
+    const auto recordBytes = CanonicalPhysicalRecordHeaderBytes + uint64_t( payloadBytes );
+    if( prefixBytes > state.options->hardMemoryBytes ||
+        recordBytes > state.options->hardMemoryBytes - prefixBytes ||
+        state.shardPayloadBytes > state.options->hardMemoryBytes - prefixBytes - recordBytes )
+    {
+        state.error = "canonical_memory_hard_limit";
+        return false;
+    }
     if( state.shardRecordCount == 0 )
     {
         state.shardSourceBegin = state.currentRecord.sequence;
@@ -142,6 +149,13 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     state.shardSourceEnd = state.currentRecord.sequence;
     state.shardTimeEnd = state.currentRecord.monotonicNs;
     const auto before = output.payload.size();
+    if( output.payload.empty() )
+    {
+        output.payload.insert( output.payload.end(), std::begin( CanonicalPackedMagic ),
+            std::end( CanonicalPackedMagic ) );
+        Put32( output.payload, CanonicalPackedEncoding );
+        Put32( output.payload, 0 );
+    }
     output.payload.push_back( kind );
     output.payload.push_back( type );
     output.payload.push_back( uint8_t( domainIndex ) );
@@ -158,12 +172,18 @@ bool AppendCanonicalRecord( CanonicalBuildState& state, uint8_t kind, uint8_t ty
     if( payloadBytes != 0 )
         output.payload.insert( output.payload.end(), payload, payload + payloadBytes );
     state.shardPayloadBytes += output.payload.size() - before;
-    output.recordCount++;
-    state.shardRecordCount++;
+    if( logicalRecordCount > std::numeric_limits<uint64_t>::max() - output.recordCount ||
+        logicalRecordCount > std::numeric_limits<uint64_t>::max() - state.shardRecordCount )
+    {
+        state.error = "canonical_record_count_overflow";
+        return false;
+    }
+    output.recordCount += logicalRecordCount;
+    state.shardRecordCount += logicalRecordCount;
     return true;
 }
 
-bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
+bool TrackCanonicalProtocolState( const TraceSessionProtocolEventInfo& event,
     void* userData, std::string& error )
 {
     auto& state = *static_cast<CanonicalBuildState*>( userData );
@@ -172,18 +192,7 @@ bool VisitCanonicalProtocolEvent( const TraceSessionProtocolEventInfo& event,
         std::min<size_t>( event.encodedBytes, sizeof( item ) ) );
     if( item.hdr.type == tracy::QueueType::ThreadContext )
         state.threadContext = item.threadCtx.thread;
-    int64_t semanticTime = 0;
-    const auto hasSemanticTime = TryGetTraceProtocolEventTime( event, semanticTime );
-    if( !AppendCanonicalRecord( state, 1, event.queueType,
-        uint8_t( ClassifyTraceProtocolEvent( event.queueType ) ), 0,
-        state.threadContext, event.variablePayloadBytes, event.frameOffset,
-        hasSemanticTime, semanticTime,
-        event.encodedData, event.encodedBytes ) )
-    {
-        error = state.error;
-        return false;
-    }
-    state.protocolEventCount++;
+    (void)error;
     return true;
 }
 
@@ -250,7 +259,7 @@ bool FlushShard( CanonicalBuildState& state )
     std::vector<uint8_t> checkpoint;
     static constexpr uint8_t Magic[8] = { 'J', 'N', 'C', 'H', 'K', 'P', 'T', '1' };
     checkpoint.insert( checkpoint.end(), std::begin( Magic ), std::end( Magic ) );
-    Put32( checkpoint, 1 );
+    Put32( checkpoint, CanonicalPackedEncoding );
     Put32( checkpoint, 0 );
     Put64( checkpoint, state.currentRecord.sequence );
     Put64( checkpoint, state.currentRecord.offset + tracy::stream::RecordHeaderSize +
@@ -291,7 +300,15 @@ bool FlushShard( CanonicalBuildState& state )
     state.shardTimeBegin = 0;
     state.shardTimeEnd = 0;
     if( !SaveTraceSessionManifest( *state.sessionRoot, *state.manifest, state.error ) ) return false;
-    return state.lease->Heartbeat( state.error );
+    if( !state.lease->Heartbeat( state.error ) ) return false;
+    if( state.options->progress )
+    {
+        state.options->progress( state.currentRecord.offset + tracy::stream::RecordHeaderSize +
+            state.currentRecord.payloadSize + tracy::stream::RecordTrailerSize,
+            state.manifest->source.fileSize, state.currentRecord.sequence,
+            state.manifest->shards.size(), state.options->progressUserData );
+    }
+    return true;
 }
 
 bool RestoreCheckpoint( CanonicalBuildState& state )
@@ -323,7 +340,7 @@ bool RestoreCheckpoint( CanonicalBuildState& state )
     uint32_t previousHashBytes = 0;
     uint32_t reservedState = 0;
     if( !Get32( payload, offset, version ) || !Get32( payload, offset, reserved ) ||
-        version != 1 || reserved != 0 ||
+        version != CanonicalPackedEncoding || reserved != 0 ||
         !Get64( payload, offset, state.resumeAfterSequence ) ||
         !Get64( payload, offset, state.resumeOffset ) ||
         !Get64( payload, offset, state.protocolFrameOrdinal ) ||
@@ -400,21 +417,34 @@ void VisitCanonicalJournalRecord( const tracy::stream::RecordInfo& record, void*
         ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0;
     if( compressed )
     {
+        const auto initialThreadContext = state.threadContext;
+        const auto eventCountBefore = state.decodedInventory.eventCount;
+        std::span<const uint8_t> decodedFrame;
         if( !state.decoder.ConsumeCompressedRecord( state.payload, state.decodedInventory,
-            state.error, VisitCanonicalProtocolEvent, &state ) )
+            state.error, TrackCanonicalProtocolState, &state, &decodedFrame ) )
         {
+            state.failed = true;
+            return;
+        }
+        const auto frameEventCount = state.decodedInventory.eventCount - eventCountBefore;
+        if( decodedFrame.size() > std::numeric_limits<uint32_t>::max() ||
+            frameEventCount > std::numeric_limits<uint64_t>::max() - 1 )
+        {
+            state.error = "canonical_protocol_frame_too_large";
             state.failed = true;
             return;
         }
         if( !AppendCanonicalRecord( state,
             uint8_t( TraceSessionCanonicalRecordKind::ProtocolFrame ), 0,
             uint8_t( TraceSessionProtocolDomain::Control ), record.flags,
-            state.threadContext, 0, std::numeric_limits<uint32_t>::max(),
-            false, 0, nullptr, 0 ) )
+            initialThreadContext, 0, std::numeric_limits<uint32_t>::max(),
+            false, 0, decodedFrame.data(), uint32_t( decodedFrame.size() ),
+            frameEventCount + 1 ) )
         {
             state.failed = true;
             return;
         }
+        state.protocolEventCount += frameEventCount;
         state.protocolFrameOrdinal++;
     }
     else
@@ -450,59 +480,6 @@ struct CanonicalAuditVisitorState
 {
     TraceSessionCanonicalAudit* audit = nullptr;
 };
-
-struct OwnedCanonicalRecord
-{
-    TraceSessionCanonicalRecord record;
-    uint64_t payloadOffset = 0;
-    uint32_t payloadBytes = 0;
-};
-
-struct OrderedCanonicalSegment
-{
-    static constexpr uint64_t HardMemoryBytes = 2ull * 1024 * 1024 * 1024;
-    std::vector<OwnedCanonicalRecord> records;
-    std::vector<uint8_t> payload;
-};
-
-bool CollectOrderedCanonicalRecord( const TraceSessionCanonicalRecord& record,
-    void* userData, std::string& error )
-{
-    auto& state = *static_cast<OrderedCanonicalSegment*>( userData );
-    const auto payloadBytes = uint64_t( record.payload.size() );
-    if( state.records.size() >= std::numeric_limits<uint64_t>::max() / sizeof( OwnedCanonicalRecord ) - 1 )
-    {
-        error = "canonical_ordered_group_memory_limit";
-        return false;
-    }
-    const auto metadataBytes = uint64_t( state.records.size() + 1 ) * sizeof( OwnedCanonicalRecord );
-    if( payloadBytes > std::numeric_limits<uint32_t>::max() ||
-        payloadBytes > OrderedCanonicalSegment::HardMemoryBytes ||
-        state.payload.size() > OrderedCanonicalSegment::HardMemoryBytes - payloadBytes ||
-        metadataBytes > OrderedCanonicalSegment::HardMemoryBytes - state.payload.size() - payloadBytes )
-    {
-        error = "canonical_ordered_group_memory_limit";
-        return false;
-    }
-    OwnedCanonicalRecord owned;
-    owned.record = record;
-    owned.payloadOffset = state.payload.size();
-    owned.payloadBytes = uint32_t( payloadBytes );
-    owned.record.payload = {};
-    state.payload.insert( state.payload.end(), record.payload.begin(), record.payload.end() );
-    state.records.emplace_back( std::move( owned ) );
-    return true;
-}
-
-bool CanonicalOrderLess( const OwnedCanonicalRecord& left,
-    const OwnedCanonicalRecord& right )
-{
-    if( left.record.sourceSequence != right.record.sourceSequence )
-        return left.record.sourceSequence < right.record.sourceSequence;
-    if( left.record.protocolFrameOrdinal != right.record.protocolFrameOrdinal )
-        return left.record.protocolFrameOrdinal < right.record.protocolFrameOrdinal;
-    return left.record.protocolFrameOffset < right.record.protocolFrameOffset;
-}
 
 bool VisitCanonicalForAudit( const TraceSessionCanonicalRecord& record,
     void* userData, std::string& error )
@@ -555,6 +532,81 @@ bool VisitCanonicalForAudit( const TraceSessionCanonicalRecord& record,
     return true;
 }
 
+struct PackedFrameReadState
+{
+    const TraceSessionCanonicalRecord* frame = nullptr;
+    TraceSessionCanonicalRecordVisitor visitor = nullptr;
+    void* userData = nullptr;
+    uint32_t threadContext = 0;
+    uint64_t logicalRecords = 0;
+};
+
+bool VisitPackedFrameEvent( const TraceSessionProtocolEventInfo& event,
+    void* userData, std::string& error )
+{
+    auto& state = *static_cast<PackedFrameReadState*>( userData );
+    tracy::QueueItem item {};
+    std::memcpy( &item, event.encodedData,
+        std::min<size_t>( event.encodedBytes, sizeof( item ) ) );
+    if( item.hdr.type == tracy::QueueType::ThreadContext )
+        state.threadContext = item.threadCtx.thread;
+
+    TraceSessionCanonicalRecord logical;
+    logical.kind = TraceSessionCanonicalRecordKind::ProtocolEvent;
+    logical.type = event.queueType;
+    logical.domain = ClassifyTraceProtocolEvent( event.queueType );
+    logical.flags = 0;
+    logical.threadContext = state.threadContext;
+    logical.variablePayloadBytes = event.variablePayloadBytes;
+    logical.protocolFrameOffset = event.frameOffset;
+    logical.sourceSequence = state.frame->sourceSequence;
+    logical.journalMonotonicNs = state.frame->journalMonotonicNs;
+    logical.protocolFrameOrdinal = state.frame->protocolFrameOrdinal;
+    logical.hasSemanticTime = TryGetTraceProtocolEventTime( event, logical.semanticTime );
+    logical.payload = std::span<const uint8_t>( event.encodedData, event.encodedBytes );
+    state.logicalRecords++;
+    if( state.visitor && !state.visitor( logical, state.userData, error ) )
+    {
+        if( error.empty() ) error = "canonical_shard_visitor_failed";
+        return false;
+    }
+    return true;
+}
+
+}
+
+bool CanResumeTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error )
+{
+    error.clear();
+    const TraceSessionShard* checkpoint = nullptr;
+    for( const auto& shard : manifest.shards )
+        if( shard.domain == "checkpoint" ) checkpoint = &shard;
+    if( !checkpoint )
+    {
+        if( manifest.shards.empty() ) return true;
+        error = "canonical_resume_checkpoint_missing";
+        return false;
+    }
+    std::vector<uint8_t> payload;
+    if( !ReadTraceSessionShardPayload( sessionRoot, *checkpoint, payload, error ) ) return false;
+    static constexpr uint8_t Magic[8] = { 'J', 'N', 'C', 'H', 'K', 'P', 'T', '1' };
+    if( payload.size() < sizeof( Magic ) + 8 ||
+        !std::equal( std::begin( Magic ), std::end( Magic ), payload.begin() ) )
+    {
+        error = "canonical_checkpoint_magic_mismatch";
+        return false;
+    }
+    size_t offset = sizeof( Magic );
+    uint32_t version = 0;
+    uint32_t reserved = 0;
+    if( !Get32( payload, offset, version ) || !Get32( payload, offset, reserved ) ||
+        version != CanonicalPackedEncoding || reserved != 0 )
+    {
+        error = "canonical_packed_encoding_unsupported";
+        return false;
+    }
+    return true;
 }
 
 TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesystem::path& sourcePath,
@@ -617,7 +669,16 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
             error = "canonical_resume_state_invalid";
             return TraceSessionCanonicalBuildResult::Failed;
         }
-        if( !VerifyTraceSession( sessionRoot, manifest, error ) || !RestoreCheckpoint( state ) )
+        // Check the small checkpoint encoding before hashing every committed
+        // shard. This rejects the pre-packed experimental generation quickly
+        // instead of re-reading hundreds of GiB only to discover that it
+        // cannot be resumed by this physical encoding.
+        if( !RestoreCheckpoint( state ) )
+        {
+            error = state.error;
+            return TraceSessionCanonicalBuildResult::Failed;
+        }
+        if( !VerifyTraceSession( sessionRoot, manifest, error ) )
             return TraceSessionCanonicalBuildResult::Failed;
     }
     else
@@ -707,12 +768,26 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
     }
     std::vector<uint8_t> bytes;
     if( !ReadTraceSessionShardPayload( sessionRoot, shard, bytes, error ) ) return false;
-    constexpr size_t RecordHeaderBytes = 56;
-    size_t offset = 0;
-    uint64_t recordCount = 0;
+    constexpr size_t PackedHeaderBytes = sizeof( CanonicalPackedMagic ) + 8;
+    if( bytes.size() < PackedHeaderBytes ||
+        !std::equal( std::begin( CanonicalPackedMagic ), std::end( CanonicalPackedMagic ), bytes.begin() ) )
+    {
+        error = "canonical_packed_encoding_missing";
+        return false;
+    }
+    size_t offset = sizeof( CanonicalPackedMagic );
+    uint32_t encoding = 0;
+    uint32_t packedReserved = 0;
+    if( !Get32( bytes, offset, encoding ) || !Get32( bytes, offset, packedReserved ) ||
+        encoding != CanonicalPackedEncoding || packedReserved != 0 )
+    {
+        error = "canonical_packed_encoding_unsupported";
+        return false;
+    }
+    uint64_t logicalRecordCount = 0;
     while( offset < bytes.size() )
     {
-        if( bytes.size() - offset < RecordHeaderBytes )
+        if( bytes.size() - offset < CanonicalPhysicalRecordHeaderBytes )
         {
             error = "canonical_shard_record_header_truncated";
             return false;
@@ -753,10 +828,9 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
             error = "canonical_shard_domain_mismatch";
             return false;
         }
-        if( record.kind == TraceSessionCanonicalRecordKind::ProtocolEvent &&
-            record.type >= uint8_t( tracy::QueueType::NUM_TYPES ) )
+        if( record.kind == TraceSessionCanonicalRecordKind::ProtocolEvent )
         {
-            error = "canonical_shard_queue_type_invalid";
+            error = "canonical_packed_event_record_forbidden";
             return false;
         }
         if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord &&
@@ -767,7 +841,7 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
             return false;
         }
         if( record.kind == TraceSessionCanonicalRecordKind::ProtocolFrame &&
-            ( record.domain != TraceSessionProtocolDomain::Control || payloadBytes != 0 ||
+            ( record.domain != TraceSessionProtocolDomain::Control || payloadBytes == 0 ||
               record.variablePayloadBytes != 0 ||
               record.protocolFrameOffset != std::numeric_limits<uint32_t>::max() ) )
         {
@@ -784,14 +858,46 @@ bool VisitTraceSessionCanonicalShard( const std::filesystem::path& sessionRoot,
         }
         record.payload = std::span<const uint8_t>( bytes.data() + offset, payloadBytes );
         offset += payloadBytes;
-        recordCount++;
+        if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord )
+        {
+            logicalRecordCount++;
+            if( visitor && !visitor( record, userData, error ) )
+            {
+                if( error.empty() ) error = "canonical_shard_visitor_failed";
+                return false;
+            }
+            continue;
+        }
+
+        PackedFrameReadState frameState { &record, visitor, userData,
+            record.threadContext, 0 };
+        TraceSessionProtocolInventory frameInventory;
+        if( !CountTraceProtocolFrame( record.payload, frameInventory, error,
+            VisitPackedFrameEvent, &frameState ) ) return false;
+        if( frameInventory.frameCount != 1 ||
+            frameInventory.encodedBytes != record.payload.size() )
+        {
+            error = "canonical_packed_frame_inventory_mismatch";
+            return false;
+        }
+        if( logicalRecordCount == std::numeric_limits<uint64_t>::max() ||
+            frameState.logicalRecords >
+                std::numeric_limits<uint64_t>::max() - logicalRecordCount - 1 )
+        {
+            error = "canonical_shard_record_count_overflow";
+            return false;
+        }
+        logicalRecordCount += frameState.logicalRecords;
+        record.threadContext = frameState.threadContext;
+        record.payload = {};
+        logicalRecordCount++;
         if( visitor && !visitor( record, userData, error ) )
         {
             if( error.empty() ) error = "canonical_shard_visitor_failed";
             return false;
         }
     }
-    if( recordCount != shard.recordCount )
+    if( logicalRecordCount != shard.recordCount )
     {
         error = "canonical_shard_record_count_mismatch";
         return false;
@@ -804,93 +910,9 @@ bool VisitTraceSessionCanonicalOrdered( const std::filesystem::path& sessionRoot
     void* userData, std::string& error )
 {
     error.clear();
-    std::vector<const TraceSessionShard*> group;
     uint64_t previousShardId = 0;
     bool havePreviousShard = false;
-    const auto flushGroup = [&]( const TraceSessionShard& checkpoint ) -> bool {
-        if( group.empty() )
-        {
-            error = "canonical_ordered_checkpoint_without_data";
-            return false;
-        }
-        const auto sourceBegin = group.front()->sourceRecordBegin;
-        const auto sourceEnd = group.front()->sourceRecordEnd;
-        OrderedCanonicalSegment segment;
-        uint64_t groupFileBytes = 0;
-        uint64_t largestShardBytes = 0;
-        for( const auto* shard : group )
-        {
-            if( shard->fileBytes > OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes )
-            {
-                error = "canonical_ordered_group_memory_limit";
-                return false;
-            }
-            groupFileBytes += shard->fileBytes;
-            largestShardBytes = std::max( largestShardBytes, shard->fileBytes );
-        }
-        constexpr uint64_t CanonicalRecordHeaderBytes = 56;
-        const auto maximumRecords = groupFileBytes / CanonicalRecordHeaderBytes + group.size();
-        const auto maximumRecordBytes = maximumRecords * sizeof( OwnedCanonicalRecord );
-        if( maximumRecords > std::numeric_limits<size_t>::max() ||
-            maximumRecords > ( OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes ) /
-                sizeof( OwnedCanonicalRecord ) ||
-            largestShardBytes > OrderedCanonicalSegment::HardMemoryBytes - groupFileBytes - maximumRecordBytes )
-        {
-            error = "canonical_ordered_group_memory_limit";
-            return false;
-        }
-        // Reserve from immutable shard metadata so vector growth cannot create
-        // an unaccounted transient peak while merging a large segment.
-        segment.payload.reserve( size_t( groupFileBytes ) );
-        segment.records.reserve( size_t( maximumRecords ) );
-        for( const auto* shard : group )
-        {
-            if( shard->sourceRecordBegin != sourceBegin || shard->sourceRecordEnd != sourceEnd )
-            {
-                error = "canonical_ordered_group_source_range_mismatch";
-                return false;
-            }
-            if( !VisitTraceSessionCanonicalShard( sessionRoot, *shard,
-                CollectOrderedCanonicalRecord, &segment, error ) ) return false;
-        }
-        if( checkpoint.sourceRecordBegin != sourceEnd || checkpoint.sourceRecordEnd != sourceEnd )
-        {
-            error = "canonical_ordered_checkpoint_source_range_mismatch";
-            return false;
-        }
-        std::vector<uint8_t> checkpointPayload;
-        if( !ReadTraceSessionShardPayload( sessionRoot, checkpoint, checkpointPayload, error ) ) return false;
-        std::sort( segment.records.begin(), segment.records.end(), CanonicalOrderLess );
-        for( size_t i = 1; i < segment.records.size(); ++i )
-        {
-            const auto& previous = segment.records[i - 1];
-            const auto& current = segment.records[i];
-            if( !CanonicalOrderLess( previous, current ) )
-            {
-                error = "canonical_ordered_duplicate_or_reversed_key";
-                return false;
-            }
-        }
-        for( auto& owned : segment.records )
-        {
-            if( owned.payloadOffset > segment.payload.size() ||
-                owned.payloadBytes > segment.payload.size() - owned.payloadOffset )
-            {
-                error = "canonical_ordered_payload_range_invalid";
-                return false;
-            }
-            owned.record.payload = owned.payloadBytes == 0 ? std::span<const uint8_t>() :
-                std::span<const uint8_t>( segment.payload.data() + owned.payloadOffset, owned.payloadBytes );
-            if( visitor && !visitor( owned.record, userData, error ) )
-            {
-                if( error.empty() ) error = "canonical_ordered_visitor_failed";
-                return false;
-            }
-        }
-        group.clear();
-        return true;
-    };
-
+    const TraceSessionShard* pendingData = nullptr;
     for( const auto& shard : manifest.shards )
     {
         if( havePreviousShard && shard.shardId <= previousShardId )
@@ -902,11 +924,39 @@ bool VisitTraceSessionCanonicalOrdered( const std::filesystem::path& sessionRoot
         havePreviousShard = true;
         if( shard.domain == "checkpoint" )
         {
-            if( !flushGroup( shard ) ) return false;
+            if( !pendingData )
+            {
+                error = "canonical_ordered_checkpoint_without_data";
+                return false;
+            }
+            if( shard.sourceRecordBegin != pendingData->sourceRecordEnd ||
+                shard.sourceRecordEnd != pendingData->sourceRecordEnd )
+            {
+                error = "canonical_ordered_checkpoint_source_range_mismatch";
+                return false;
+            }
+            std::vector<uint8_t> checkpointPayload;
+            if( !ReadTraceSessionShardPayload( sessionRoot, shard, checkpointPayload, error ) ) return false;
+            if( !VisitTraceSessionCanonicalShard( sessionRoot, *pendingData,
+                visitor, userData, error ) ) return false;
+            pendingData = nullptr;
         }
-        else group.push_back( &shard );
+        else
+        {
+            if( pendingData )
+            {
+                error = "canonical_ordered_multiple_data_shards_per_checkpoint";
+                return false;
+            }
+            if( shard.domain != "control" )
+            {
+                error = "canonical_ordered_unsupported_physical_domain";
+                return false;
+            }
+            pendingData = &shard;
+        }
     }
-    if( !group.empty() )
+    if( pendingData )
     {
         error = "canonical_ordered_group_missing_checkpoint";
         return false;

@@ -106,10 +106,24 @@ void PrintInventoryProgress( tracy::analysis::TraceSessionInventoryPhase phase,
 void PrintDerivedProgress( float value, const char* stage )
 {
     static auto last = std::chrono::steady_clock::now() - std::chrono::seconds( 10 );
+    static std::string lastStage;
     const auto now = std::chrono::steady_clock::now();
-    if( value < 1.f && now - last < std::chrono::seconds( 5 ) ) return;
+    const std::string currentStage = stage ? stage : "Build";
+    if( currentStage == lastStage && value < 1.f && now - last < std::chrono::seconds( 5 ) ) return;
     last = now;
+    lastStage = currentStage;
     std::fprintf( stderr, "[Derived.%s] %.1f%%\n", stage ? stage : "Build", value * 100.f );
+    std::fflush( stderr );
+}
+
+void PrintCanonicalProgress( uint64_t completed, uint64_t total,
+    uint64_t records, uint64_t shards, void* )
+{
+    const auto percent = total == 0 ? 100.0 : 100.0 * double( completed ) / double( total );
+    std::fprintf( stderr, "[Canonical] %.1f%% (%llu/%llu bytes, record=%llu, shards=%llu)\n",
+        percent, static_cast<unsigned long long>( completed ),
+        static_cast<unsigned long long>( total ), static_cast<unsigned long long>( records ),
+        static_cast<unsigned long long>( shards ) );
     std::fflush( stderr );
 }
 
@@ -158,6 +172,12 @@ std::optional<std::filesystem::path> FindBuilding( const std::filesystem::path& 
             if( candidates.empty() ) return std::nullopt;
         }
     }
+    std::erase_if( candidates, []( const auto& candidate ) {
+        std::string compatibilityError;
+        return !tracy::analysis::CanResumeTraceSessionCanonical(
+            candidate.path, candidate.manifest, compatibilityError );
+    } );
+    if( candidates.empty() ) return std::nullopt;
     std::sort( candidates.begin(), candidates.end(), []( const auto& left, const auto& right ) {
         if( left.progress != right.progress ) return left.progress > right.progress;
         if( left.writeTime != right.writeTime ) return left.writeTime > right.writeTime;
@@ -178,9 +198,17 @@ int PrintStatus( const std::filesystem::path& finalPath )
     }
     const auto manifest = tracy::analysis::LoadTraceSessionManifest( root, error );
     if( !manifest ) { std::fprintf( stderr, "Status failed: %s\n", error.c_str() ); return 2; }
-    std::printf( "state=%s generation=%s shards=%zu mandatory_derived=%s audit=%s reason=%s root=%s\n",
+    uint64_t sourceRecord = 0;
+    int64_t timeEndNs = 0;
+    for( const auto& shard : manifest->shards )
+    {
+        sourceRecord = std::max( sourceRecord, shard.sourceRecordEnd );
+        timeEndNs = std::max( timeEndNs, shard.timeEndNs );
+    }
+    std::printf( "state=%s generation=%s shards=%zu source_record=%llu time_end_ns=%lld mandatory_derived=%s audit=%s reason=%s root=%s\n",
         tracy::analysis::TraceSessionStateName( manifest->state ), manifest->generation.c_str(),
-        manifest->shards.size(), manifest->mandatoryDerivedComplete ? "true" : "false",
+        manifest->shards.size(), static_cast<unsigned long long>( sourceRecord ),
+        static_cast<long long>( timeEndNs ), manifest->mandatoryDerivedComplete ? "true" : "false",
         manifest->auditComplete ? "true" : "false", manifest->reason.c_str(), root.string().c_str() );
     return 0;
 }
@@ -206,6 +234,7 @@ int main( int argc, char** argv )
     if( options.output.empty() ) options.output = tracy::analysis::DefaultTraceSessionPath( options.input );
 #ifdef _WIN32
     SetConsoleCtrlHandler( ConsoleHandler, TRUE );
+    SetPriorityClass( GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS );
 #endif
     if( options.status ) return PrintStatus( options.output );
     if( options.output.extension() == ".tracy" )
@@ -286,6 +315,7 @@ int main( int argc, char** argv )
     tracy::analysis::TraceSessionCanonicalOptions canonicalOptions;
     canonicalOptions.resume = options.resume;
     canonicalOptions.shouldCancel = Cancelled;
+    canonicalOptions.progress = PrintCanonicalProgress;
     const auto canonical = tracy::analysis::BuildTraceSessionCanonical( options.input,
         building, generation, inventory, canonicalOptions, manifest, error );
     if( canonical == tracy::analysis::TraceSessionCanonicalBuildResult::CancelledResumable )
@@ -306,12 +336,19 @@ int main( int argc, char** argv )
     std::stop_source derivedStop;
     std::atomic<bool> derivedFinished { false };
     std::jthread derivedCancelMonitor( [&]( std::stop_token stop ) {
+        auto nextHeartbeat = std::chrono::steady_clock::now() + std::chrono::seconds( 30 );
         while( !stop.stop_requested() && !derivedFinished.load( std::memory_order_acquire ) )
         {
             if( CancelRequests.load( std::memory_order_relaxed ) != 0 )
             {
                 derivedStop.request_stop();
                 return;
+            }
+            if( std::chrono::steady_clock::now() >= nextHeartbeat )
+            {
+                std::fprintf( stderr, "[Derived] active; use --status for the committed Session state.\n" );
+                std::fflush( stderr );
+                nextHeartbeat = std::chrono::steady_clock::now() + std::chrono::seconds( 30 );
             }
             std::this_thread::sleep_for( std::chrono::milliseconds( 50 ) );
         }

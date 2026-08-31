@@ -202,6 +202,85 @@ tracy-trace-session-inventory  Passed
 100% tests passed, 0 failed
 ```
 
+### 2026-08-31 真实30分钟规模阻断与Packed Canonical修复
+
+真实输入：
+
+```text
+N29-Autonomous-30m\Run-20260830-220012\Admin-HighEvidence-30m.tracy-stream
+source bytes:           19,122,822,908
+protocol frames:             193,141
+protocol events:       2,284,723,486
+decoded protocol bytes: 53,791,117,815
+```
+
+首次实验Canonical在处理约98.5% source record时已占用约165.77 GiB、7,097个文件。根因不是内存泄漏，而是旧物理格式为每个逻辑事件重复写入56字节Canonical头；仅事件头理论值就约127.8 GiB。旧Mandatory Domain Index还计划为每个逻辑事件写48字节索引行，理论上会再增加约102.1 GiB。二者叠加会在其他语义索引之前突破256 GiB Session门禁。
+
+修复：
+
+- Canonical shard改为`PackedProtocolFrame encoding 2`：一个原始压缩journal record只写一份完整解码协议帧和一个固定物理头。
+- 读取时继续调用唯一的`CountTraceProtocolFrame`解析器，惰性恢复每个逻辑事件的QueueType、domain、frame offset、thread context、semantic time和variable payload。
+- `shard.recordCount`继续表示逻辑事件、Protocol Frame和transport record总数；物理记录数不冒充逻辑事实数。
+- Canonical source order不再需要把一个checkpoint段的全部逻辑事件物化到内存；一个packed data shard按原始顺序流式展开。
+- 通用`session-index`删除48字节逐事件重复表，改为每shard固定摘要。Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、Relation、Runtime、I/O/Gfx和GPU Analysis仍由各自的精确语义索引提供查询。
+- Inventory容量估算改为`decoded protocol bytes + non-protocol payload + fixed physical record overhead`再加安全系数。本次数据的新Canonical基数约53.83 GB，默认120%估算约64.60 GB；加Derived和temporary后总预估约93.28 GB，低于256 GiB门禁。
+- checkpoint内部物理编码升级为2；对外Session/Canonical schema仍保持1。旧实验building被保留，但自动恢复只读取最后checkpoint做有界兼容探测并快速排除，不会先哈希约166 GiB，也不会把新旧格式混写。
+- 旧转换在已提交checkpoint处强制停止；原始stream和旧building均未删除、未改写。
+
+TDD证据：
+
+```text
+RED:   packed canonical physical bytes scale with decoded frame bytes, not per-event headers
+GREEN: tracy-trace-session-inventory passed (0.56 sec)
+```
+
+目标回归同时验证：
+
+- 逻辑事件、Protocol Frame、transport record和encoded bytes与Inventory 100%一致。
+- 跨域事件顺序、ThreadContext和semantic time不变。
+- packed frame物理大小不再包含每事件56字节头。
+- generic index bytes只按shard数量增长。
+- 旧encoding 1 checkpoint明确返回`canonical_packed_encoding_unsupported`。
+- 损坏checkpoint仍返回明确integrity错误。
+
+全量重链后的八项回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+100% tests passed, 0 failed (1.84 sec)
+```
+
+Protocol 90 Catalog smoke：
+
+```text
+source bytes:       4,141,179
+logical records:      202,642
+canonical shards:           2（1 data + 1 checkpoint）
+generic index bytes:       56
+GPU resources:              1
+Session state:       Complete
+tracy-query doctor:  ready / schema 1.34.0
+Session files/bytes: 44 / 25,174,213
+```
+
+构建身份：
+
+| 工具 | SHA-256 |
+|---|---|
+| `build-n30-query\Release\tracy-query.exe` | `AFD0FEB173298BEBFDD6C76474864D7DA4B1C86BC4705BBDF7BDF319DEF72C5D` |
+| `build-n30-capture\Release\tracy-stream-convert.exe` | `3A5BD27A452FBF4649E0EE93B311E934EDC5F8602049EC634F2E63FDED0D44A3` |
+
+另一个34.0 MB旧诊断capture完成Inventory和Packed Canonical后，被现有CPU Zone语义门禁以`session_cpu_zone_end_before_begin`拒绝；该capture从已打开Zone中途开始，不能作为完整Session Oracle。拒绝行为证明Mandatory Derived不会为不完整源数据伪造Zone Begin。
+
+真实30分钟compact generation和Mandatory Derived尚未在本小节宣称通过；必须使用上述新版converter重新执行，旧165.77 GiB generation不得作为验收结果。
+
 ### 2026-08-31 Windows 原子 Manifest 提交回归
 
 真实30分钟输入首次进入Canonical后，在第12组Checkpoint之后失败：

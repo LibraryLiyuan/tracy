@@ -187,6 +187,13 @@ uint64_t SaturatingAdd( uint64_t left, uint64_t right )
     return left + right;
 }
 
+uint64_t SaturatingMultiply( uint64_t left, uint64_t right )
+{
+    if( left != 0 && right > std::numeric_limits<uint64_t>::max() / left )
+        return std::numeric_limits<uint64_t>::max();
+    return left * right;
+}
+
 uint64_t SaturatingScalePermille( uint64_t value, uint32_t permille )
 {
     const auto whole = value / 1000;
@@ -555,8 +562,23 @@ bool BuildTraceSessionInventory( const std::filesystem::path& sourcePath,
     }
     inventory.retainedRecordMetadata = scan.records.size();
 
+    uint64_t journalPayloadBytes = 0;
+    for( const auto& record : inventory.records )
+        journalPayloadBytes = SaturatingAdd( journalPayloadBytes, record.payloadBytes );
+    const auto nonProtocolPayloadBytes = journalPayloadBytes >= inventory.protocolInventory.compressedBytes ?
+        journalPayloadBytes - inventory.protocolInventory.compressedBytes : 0;
+    const auto transportRecords = inventory.recordCount >= inventory.protocolInventory.frameCount ?
+        inventory.recordCount - inventory.protocolInventory.frameCount : 0;
+    // Packed Canonical stores the decompressed protocol frame once and adds a
+    // fixed physical header per frame/transport record. It does not multiply
+    // every logical event by the former 56-byte record header.
+    const auto physicalRecords = SaturatingAdd(
+        inventory.protocolInventory.frameCount, transportRecords );
+    const auto packedCanonicalBytes = SaturatingAdd(
+        SaturatingAdd( inventory.protocolInventory.encodedBytes, nonProtocolPayloadBytes ),
+        SaturatingMultiply( physicalRecords, 64 ) );
     inventory.estimatedCanonicalBytes = std::max( inventory.validSize,
-        SaturatingScalePermille( inventory.validSize, options.canonicalEstimatePermille ) );
+        SaturatingScalePermille( packedCanonicalBytes, options.canonicalEstimatePermille ) );
     inventory.estimatedDerivedBytes = SaturatingScalePermille(
         inventory.validSize, options.derivedEstimatePermille );
     inventory.estimatedTemporaryBytes = SaturatingScalePermille(

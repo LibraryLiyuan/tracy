@@ -16,6 +16,9 @@ namespace tracy::analysis
 using TraceSessionCanonicalCancel = bool ( * )( void* userData );
 using TraceSessionCanonicalDiskSpaceProbe = bool ( * )( const std::filesystem::path& path,
     uint64_t& capacity, uint64_t& available, void* userData, std::string& error );
+using TraceSessionCanonicalProgress = void ( * )( uint64_t sourceBytes,
+    uint64_t totalSourceBytes, uint64_t sourceRecords, uint64_t committedShards,
+    void* userData );
 
 enum class TraceSessionCanonicalBuildResult : uint8_t
 {
@@ -79,6 +82,8 @@ struct TraceSessionCanonicalOptions
     uint32_t minimumFreeReservePercent = 10;
     TraceSessionCanonicalDiskSpaceProbe diskSpaceProbe = nullptr;
     void* diskSpaceUserData = nullptr;
+    TraceSessionCanonicalProgress progress = nullptr;
+    void* progressUserData = nullptr;
     bool resume = true;
     TraceSessionCanonicalCancel shouldCancel = nullptr;
     void* cancelUserData = nullptr;
@@ -88,6 +93,13 @@ TraceSessionCanonicalBuildResult BuildTraceSessionCanonical( const std::filesyst
     const std::filesystem::path& sessionRoot, const std::string& generation,
     const TraceSessionInventory& inventory, const TraceSessionCanonicalOptions& options,
     TraceSessionManifest& manifest, std::string& error );
+
+// Performs a bounded compatibility probe using only the latest checkpoint.
+// It is used when multiple preserved building generations exist, so an older
+// experimental physical encoding is never selected merely because it made
+// more source progress.
+bool CanResumeTraceSessionCanonical( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, std::string& error );
 
 // The record payload is a view into a bounded shard buffer and is valid only
 // for the duration of the callback. The reader validates the shard checksum,

@@ -94,7 +94,8 @@ public:
 
     bool ConsumeCompressedRecord( std::span<const uint8_t> record,
         TraceSessionProtocolInventory& inventory, std::string& error,
-        TraceSessionProtocolEventVisitor visitor = nullptr, void* visitorUserData = nullptr );
+        TraceSessionProtocolEventVisitor visitor = nullptr, void* visitorUserData = nullptr,
+        std::span<const uint8_t>* decodedFrame = nullptr );
     std::vector<uint8_t> ExportDictionary() const;
     bool RestoreDictionary( std::span<const uint8_t> dictionary, std::string& error );
 

@@ -385,12 +385,12 @@ bool BuildTraceSessionFrameDerived( const std::filesystem::path& sessionRoot,
     BuildState state;
     for( const auto& shard : manifest.shards )
     {
-        if( shard.domain != "dictionary" ) continue;
+        if( shard.domain == "checkpoint" ) continue;
         if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, VisitFrameName, &state, error ) ) return false;
     }
     for( const auto& shard : manifest.shards )
     {
-        if( shard.domain != "frame" ) continue;
+        if( shard.domain == "checkpoint" ) continue;
         if( !VisitTraceSessionCanonicalShard( sessionRoot, shard, VisitFrameEvent, &state, error ) ) return false;
     }
     FrameManifest frameManifest;
