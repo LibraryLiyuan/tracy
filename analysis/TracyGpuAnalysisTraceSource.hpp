@@ -85,6 +85,8 @@ public:
         uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
+    GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEventsForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const override;

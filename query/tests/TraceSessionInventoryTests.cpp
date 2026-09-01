@@ -2615,6 +2615,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto frameNineEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 9, 0, 8 );
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
+        const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
         test.Check( ioRequests.size() == 1 && ioRequests[0].requestId == 400 &&
             ioRequests[0].requestedBytes == 4096 && ioRequests[0].transferredBytes == 4096 &&
             ioRequests[0].queueNs == 36 && ioRequests[0].startNs == 38 && ioRequests[0].endNs == 40 &&
@@ -2632,6 +2633,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             frameNineEvents.size() == 1 && frameNineEvents[0].frameId == 9 &&
             missingFrameDispatches.empty() && missingFrameEvents.empty(),
             "Session Gfx/Frame posting readers fetch one Frame directly without scanning the full domain" );
+        test.Check( frameNineGfxEvidence.dispatches.size() == 1 &&
+            frameNineGfxEvidence.dispatches[0].dispatchId == 300 &&
+            frameNineGfxEvidence.entities.size() == 1 &&
+            frameNineGfxEvidence.entities[0].entityId == 301 &&
+            frameNineGfxEvidence.links.size() == 1 &&
+            frameNineGfxEvidence.links[0].sourceId == 300 &&
+            frameNineGfxEvidence.links[0].targetId == 301,
+            "Session Gfx adjacency postings traverse only the exact Frame/seed evidence component" );
         bool ioGfxWorkFound = false;
         const auto ioGfxRoot = tracy::analysis::TraceSessionIoGfxIndexRoot( publishedSession, manifest );
         for( const auto& entry : std::filesystem::directory_iterator( ioGfxRoot ) )

@@ -840,6 +840,13 @@ std::vector<GfxLinkDto> GpuAnalysisTraceSource::GetGfxLinks() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->GfxLinks() : std::vector<GfxLinkDto> {};
 }
+GfxEvidenceSlice GpuAnalysisTraceSource::GetEvidenceGfx( uint64_t frameId,
+    const std::vector<uint64_t>& seedIds ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetEvidenceGfx( frameId, seedIds );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->EvidenceGfx( frameId, seedIds ) : GfxEvidenceSlice {};
+}
 std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEvents() const
 {
     if( WorkerLoaded() ) return Worker().GetCorrelatedFrameEvents();

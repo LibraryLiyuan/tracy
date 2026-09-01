@@ -1475,3 +1475,27 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 发布目录不残留I/O/Gfx external-sort `.work` 文件。本子阶段未启动真实30分钟转换。
+
+### 2026-09-01 Gfx 实体与关系邻接 Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- I/O/Gfx index schema从2升级到3，新增`entityId→Entity ordinal`、`parentId→Child Entity ordinal`、`link sourceId→Link ordinal`和`link targetId→Link ordinal`四类精确posting。
+- 四类posting与Frame posting共用64 MiB chunk、最多64路的有界外部排序器；不会把全部Entity或Link装入构建内存。
+- Session `GetEvidenceGfx(frameId, seedIds)`先从Frame→Dispatch posting和seed建立工作集，再通过Parent与Link Source posting做按需BFS；`BelongsToFrame`反向入口通过Link Target posting解析。
+- 返回的Entity和Link仍从固定宽度事实记录读取；posting只决定候选ordinal，Reader不把邻接ID伪装为实体事实。
+- `evidence.graph`自动使用新的Session override；`timeline.correlated_slice`也改用同一Gfx局部证据路径，不再读取全Session Entity/Link。
+- Final Audit逐条验证四类posting排序、ordinal范围和Entity/Link真实字段；identity、layout、SHA-256或语义键不一致均阻止Session发布。
+
+Synthetic证据：
+
+```text
+Frame 9 seed Jobs: 400,500
+Frame Dispatch:     300
+Reachable Entity:   301 (parent=300)
+Reachable Link:     300 -> 301 (Dispatches)
+Excluded:           unrelated ExplicitGpuPass -> Resource link
+Trace Session Inventory tests passed
+```
+
+本子阶段未改动Legacy Worker语义，也未开放尚未完成的全局`correlation.chain`分页能力。

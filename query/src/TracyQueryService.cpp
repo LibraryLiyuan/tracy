@@ -10181,10 +10181,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         const bool targetedSlice = sessionCorrelation && method == "timeline.correlated_slice" && targetedFrame;
         const auto jobs = targetedSlice ? source->GetEvidenceJobs( *targetedFrame ) : source->GetJobs();
-        const auto dispatches = targetedSlice ? source->GetGfxDispatchesForFrame(
-            *targetedFrame, 0, std::numeric_limits<size_t>::max() ) : source->GetGfxDispatches();
-        const auto entities = source->GetGfxEntities();
-        const auto gfxLinks = source->GetGfxLinks();
+        analysis::GfxEvidenceSlice targetedGfx;
+        if( targetedSlice )
+        {
+            std::vector<uint64_t> seedIds;
+            seedIds.reserve( jobs.size() );
+            for( const auto& job : jobs ) seedIds.emplace_back( job.jobId );
+            targetedGfx = source->GetEvidenceGfx( *targetedFrame, seedIds );
+        }
+        const auto dispatches = targetedSlice ? targetedGfx.dispatches : source->GetGfxDispatches();
+        const auto entities = targetedSlice ? targetedGfx.entities : source->GetGfxEntities();
+        const auto gfxLinks = targetedSlice ? targetedGfx.links : source->GetGfxLinks();
         std::unordered_map<uint64_t, std::string> jobRefs;
         std::unordered_map<uint64_t, std::string> dispatchRefs;
         std::unordered_map<uint64_t, std::string> entityRefs;

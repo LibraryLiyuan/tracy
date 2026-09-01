@@ -13,7 +13,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 2;
+inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 3;
 
 struct TraceSessionIoGfxStats
 {
@@ -22,6 +22,7 @@ struct TraceSessionIoGfxStats
     uint64_t ioStages = 0;
     uint64_t gfxDispatches = 0;
     uint64_t gfxEntities = 0;
+    uint64_t gfxParentLinks = 0;
     uint64_t gfxLinks = 0;
     uint64_t correlatedFrames = 0;
     uint64_t fileBytes = 0;
@@ -41,6 +42,8 @@ public:
         uint64_t frameId, size_t offset, size_t limit ) const;
     std::vector<GfxEntityDto> GfxEntities() const;
     std::vector<GfxLinkDto> GfxLinks() const;
+    GfxEvidenceSlice EvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds ) const;
     std::vector<CorrelatedFrameEventDto> CorrelatedFrames() const;
     std::vector<CorrelatedFrameEventDto> CorrelatedFramesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const;
@@ -57,6 +60,10 @@ private:
     uint64_t m_frameOffset = 0;
     uint64_t m_dispatchFramePostingOffset = 0;
     uint64_t m_correlatedFramePostingOffset = 0;
+    uint64_t m_gfxEntityIdPostingOffset = 0;
+    uint64_t m_gfxParentPostingOffset = 0;
+    uint64_t m_gfxLinkSourcePostingOffset = 0;
+    uint64_t m_gfxLinkTargetPostingOffset = 0;
     TraceSessionIoGfxStats m_stats;
 };
 
