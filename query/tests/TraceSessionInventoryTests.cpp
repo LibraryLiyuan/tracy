@@ -2638,6 +2638,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto gfxDispatchPage = sessionSource->ScanGfxDispatches( 0, 1 );
         const auto gfxEntityPage = sessionSource->ScanGfxEntities( 1, 1 );
         const auto gfxLinkPage = sessionSource->ScanGfxLinks( 1, 1 );
+        const auto explicitPassLinks = sessionSource->ScanGfxLinksFrom( ExplicitGpuPassId, 0, 2 );
         const auto gfxDispatch300 = sessionSource->GetGfxDispatch( 300 );
         const auto gfxEntity301 = sessionSource->GetGfxEntity( 301 );
         const auto runtimeDomainPage = sessionSource->ScanRuntimeDomainStates( 0, 1 );
@@ -2683,6 +2684,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             gfxDispatch300 && gfxDispatch300->dispatchId == 300 &&
             gfxEntity301 && gfxEntity301->parentId == 300,
             "Session Gfx count/page/point APIs read bounded exact records from disk" );
+        test.Check( explicitPassLinks.size() == 1 &&
+            explicitPassLinks[0].sourceId == ExplicitGpuPassId &&
+            explicitPassLinks[0].targetId == 1000 &&
+            explicitPassLinks[0].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ),
+            "Session Gfx link source posting pages one Pass adjacency without a full-domain scan" );
         test.Check( sessionSource->GetRuntimeDomainStateCount() == 1 &&
             runtimeDomainPage.size() == 1 && runtimeDomainPage[0].timeNs == 34,
             "Session Runtime Domain reader pages exact state records" );

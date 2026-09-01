@@ -1972,6 +1972,20 @@ std::vector<GfxLinkDto> TraceSessionIoGfxReader::ScanGfxLinks(
     return result;
 }
 
+std::vector<GfxLinkDto> TraceSessionIoGfxReader::ScanGfxLinksFrom(
+    uint64_t sourceId, size_t offset, size_t limit ) const
+{
+    return ReadFramePosting<StoredGfxLink, GfxLinkDto>( m_path,
+        m_gfxLinkSourcePostingOffset, m_stats.gfxLinks, sourceId, offset, limit,
+        m_gfxLinkOffset, m_stats.gfxLinks,
+        [&]( const StoredGfxLink& value, uint64_t ordinal ) {
+            return GfxLinkDto { MakeRef( m_fingerprint, "gfx-link", ordinal ),
+                value.sourceId, value.targetId, value.timeNs,
+                MakeRef( m_fingerprint, "thread", value.thread ),
+                value.relation, value.flags };
+        } );
+}
+
 GfxEvidenceSlice TraceSessionIoGfxReader::EvidenceGfx( uint64_t frameId,
     const std::vector<uint64_t>& seedIds ) const
 {

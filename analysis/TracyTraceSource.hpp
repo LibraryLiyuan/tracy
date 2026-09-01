@@ -1259,6 +1259,22 @@ public:
         const auto end = begin + std::min( limit, values.size() - begin );
         return std::vector<GfxLinkDto>( values.begin() + begin, values.begin() + end );
     }
+    virtual std::vector<GfxLinkDto> ScanGfxLinksFrom(
+        uint64_t sourceId, size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxLinks();
+        std::vector<GfxLinkDto> result;
+        if( limit == 0 ) return result;
+        size_t matched = 0;
+        for( const auto& value : values )
+        {
+            if( value.sourceId != sourceId ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( value );
+            if( result.size() == limit ) break;
+        }
+        return result;
+    }
     virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const
     {
         GfxEvidenceSlice result;

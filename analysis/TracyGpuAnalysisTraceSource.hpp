@@ -106,6 +106,8 @@ public:
     std::vector<GfxLinkDto> GetGfxLinks() const override;
     uint64_t GetGfxLinkCount() const override;
     std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
+    std::vector<GfxLinkDto> ScanGfxLinksFrom(
+        uint64_t sourceId, size_t offset, size_t limit ) const override;
     GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
         const std::vector<uint64_t>& seedIds ) const override;
     GfxEvidenceSlice GetGfxChain( uint64_t rootId, size_t maxNodes ) const override;

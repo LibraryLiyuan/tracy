@@ -6988,10 +6988,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             // identity returned by gpu.pass.search. Preserve both identities
             // and follow only the typed ReferencesResources relation.
             std::unordered_set<uint64_t> evidencePassIds { passId };
-            for( const auto& link : source->GetGfxLinks() )
-                if( link.relation == uint8_t( JnGfxRelation::ReferencesResources ) &&
-                    link.sourceId == passId && link.targetId != 0 )
-                    evidencePassIds.emplace( link.targetId );
+            constexpr size_t GfxLinkPageSize = 256;
+            for( size_t offset = 0; ; )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( GfxLinkPageSize );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "GPU Pass link resolution exceeded the exact scan budget" );
+                const auto links = source->ScanGfxLinksFrom(
+                    passId, offset, allowed );
+                BudgetScanned( links.size(), GfxLinkPageSize, allowed );
+                for( const auto& link : links )
+                    if( link.relation == uint8_t( JnGfxRelation::ReferencesResources ) &&
+                        link.targetId != 0 ) evidencePassIds.emplace( link.targetId );
+                offset += links.size();
+                if( links.size() < allowed ) break;
+            }
             std::unordered_set<uint64_t> uniqueResources;
             std::unordered_set<uint64_t> uniqueAllocations;
             std::unordered_set<uint64_t> rangedResources;

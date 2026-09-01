@@ -964,6 +964,14 @@ std::vector<GfxLinkDto> GpuAnalysisTraceSource::ScanGfxLinks(
     const auto reader = SessionIoGfxReader();
     return reader ? reader->ScanGfxLinks( offset, limit ) : std::vector<GfxLinkDto> {};
 }
+std::vector<GfxLinkDto> GpuAnalysisTraceSource::ScanGfxLinksFrom(
+    uint64_t sourceId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanGfxLinksFrom( sourceId, offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanGfxLinksFrom( sourceId, offset, limit ) :
+        std::vector<GfxLinkDto> {};
+}
 GfxEvidenceSlice GpuAnalysisTraceSource::GetEvidenceGfx( uint64_t frameId,
     const std::vector<uint64_t>& seedIds ) const
 {

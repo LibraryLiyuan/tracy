@@ -55,6 +55,8 @@ public:
     std::optional<GfxEntityDto> GfxEntity( uint64_t entityId ) const;
     std::vector<GfxLinkDto> GfxLinks() const;
     std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const;
+    std::vector<GfxLinkDto> ScanGfxLinksFrom(
+        uint64_t sourceId, size_t offset, size_t limit ) const;
     GfxEvidenceSlice EvidenceGfx( uint64_t frameId,
         const std::vector<uint64_t>& seedIds ) const;
     GfxEvidenceSlice GfxChain( uint64_t rootId, size_t maxNodes ) const;

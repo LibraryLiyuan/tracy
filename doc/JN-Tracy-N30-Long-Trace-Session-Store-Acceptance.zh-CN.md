@@ -1677,6 +1677,26 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 GPU Pass→Gfx Link 邻接分页（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，真实长Trace延迟待N30.7）**。
+
+- `TraceSource`新增`ScanGfxLinksFrom(sourceId, offset, limit)`；Legacy Worker默认实现保持原有过滤语义。
+- Session Reader直接使用schema 9已有的Link Source posting定位目标Source ID，只读取请求页，不扫描或物化全部Gfx Link。
+- `gpu.pass.resources`和`gpu.memory.by_pass`解析Explicit Pass→Reference Pass关系时，改为每页最多256条的目标Pass出边扫描。
+- 每一页接入Query scan/CPU预算；预算不足返回`RESOURCE_LIMIT`，不会把部分Evidence Pass集合伪装成完整结果。
+- 本子阶段没有改变GPU Catalog、ResourceSetV2、Range或显存核算语义，只缩小跨域关系读取范围。
+
+TDD与回归证据：
+
+```text
+RED:       测试先调用不存在的ScanGfxLinksFrom，编译按预期失败
+Reader:    ExplicitGpuPass → ReferencePass 1000仅返回1条ReferencesResources关系
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
 ### 2026-09-01 Runtime/Script 原始记录分页（N30.6B 子阶段）
 
 状态：**Passed（raw-record bounded read；Script语义结果磁盘化仍待后续）**。
