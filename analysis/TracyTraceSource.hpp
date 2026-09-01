@@ -1203,6 +1203,21 @@ public:
         return result;
     }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
+    virtual uint64_t GetGfxDispatchCount() const { return GetGfxDispatches().size(); }
+    virtual std::vector<GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxDispatches();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<GfxDispatchDto>( values.begin() + begin, values.begin() + end );
+    }
+    virtual std::optional<GfxDispatchDto> GetGfxDispatch( uint64_t dispatchId ) const
+    {
+        const auto values = GetGfxDispatches();
+        const auto found = std::find_if( values.begin(), values.end(), [&]( const auto& value ) {
+            return value.dispatchId == dispatchId; } );
+        return found == values.end() ? std::nullopt : std::optional<GfxDispatchDto>( *found );
+    }
     virtual std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const
     {
@@ -1220,7 +1235,30 @@ public:
         return result;
     }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
+    virtual uint64_t GetGfxEntityCount() const { return GetGfxEntities().size(); }
+    virtual std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxEntities();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<GfxEntityDto>( values.begin() + begin, values.begin() + end );
+    }
+    virtual std::optional<GfxEntityDto> GetGfxEntity( uint64_t entityId ) const
+    {
+        const auto values = GetGfxEntities();
+        const auto found = std::find_if( values.begin(), values.end(), [&]( const auto& value ) {
+            return value.entityId == entityId; } );
+        return found == values.end() ? std::nullopt : std::optional<GfxEntityDto>( *found );
+    }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
+    virtual uint64_t GetGfxLinkCount() const { return GetGfxLinks().size(); }
+    virtual std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxLinks();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<GfxLinkDto>( values.begin() + begin, values.begin() + end );
+    }
     virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const
     {
         GfxEvidenceSlice result;

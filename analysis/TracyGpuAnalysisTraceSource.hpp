@@ -94,10 +94,18 @@ public:
     std::vector<IoRequestDto> GetIoChildren(
         uint64_t parentId, size_t offset, size_t limit ) const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
+    uint64_t GetGfxDispatchCount() const override;
+    std::vector<GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const override;
+    std::optional<GfxDispatchDto> GetGfxDispatch( uint64_t dispatchId ) const override;
     std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
+    uint64_t GetGfxEntityCount() const override;
+    std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override;
+    std::optional<GfxEntityDto> GetGfxEntity( uint64_t entityId ) const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
+    uint64_t GetGfxLinkCount() const override;
+    std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
     GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
         const std::vector<uint64_t>& seedIds ) const override;
     GfxEvidenceSlice GetGfxChain( uint64_t rootId, size_t maxNodes ) const override;

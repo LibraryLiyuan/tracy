@@ -2635,6 +2635,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
+        const auto gfxDispatchPage = sessionSource->ScanGfxDispatches( 0, 1 );
+        const auto gfxEntityPage = sessionSource->ScanGfxEntities( 1, 1 );
+        const auto gfxLinkPage = sessionSource->ScanGfxLinks( 1, 1 );
+        const auto gfxDispatch300 = sessionSource->GetGfxDispatch( 300 );
+        const auto gfxEntity301 = sessionSource->GetGfxEntity( 301 );
         const auto correlatedFrames = sessionSource->GetCorrelatedFrameEvents();
         const auto frameNineDispatches = sessionSource->GetGfxDispatchesForFrame( 9, 0, 8 );
         const auto frameNineEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 9, 0, 8 );
@@ -2667,6 +2672,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             gfxLinks[1].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ) &&
             correlatedFrames.size() == 1 && correlatedFrames[0].frameId == 9,
             "Session Gfx/Frame evidence reader preserves fixed binary facts without a Worker" );
+        test.Check( sessionSource->GetGfxDispatchCount() == 1 &&
+            sessionSource->GetGfxEntityCount() == 2 && sessionSource->GetGfxLinkCount() == 2 &&
+            gfxDispatchPage.size() == 1 && gfxDispatchPage[0].dispatchId == 300 &&
+            gfxEntityPage.size() == 1 && gfxEntityPage[0].entityId == ExplicitGpuPassId &&
+            gfxLinkPage.size() == 1 && gfxLinkPage[0].sourceId == ExplicitGpuPassId &&
+            gfxDispatch300 && gfxDispatch300->dispatchId == 300 &&
+            gfxEntity301 && gfxEntity301->parentId == 300,
+            "Session Gfx count/page/point APIs read bounded exact records from disk" );
         test.Check( frameNineDispatches.size() == 1 && frameNineDispatches[0].dispatchId == 300 &&
             frameNineEvents.size() == 1 && frameNineEvents[0].frameId == 9 &&
             missingFrameDispatches.empty() && missingFrameEvents.empty(),

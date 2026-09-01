@@ -11026,6 +11026,110 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }, trace );
         }
 
+        if( pagedSessionJobs && method == "job.gfx.statistics" )
+        {
+            constexpr size_t PageSize = 1024;
+            const auto dispatchCount = source->GetGfxDispatchCount();
+            const auto entityCount = source->GetGfxEntityCount();
+            const auto linkCount = source->GetGfxLinkCount();
+            json sampleDispatchRef = nullptr;
+            json sampleEntityRef = nullptr;
+            json sampleLinkedJobRef = nullptr;
+            std::map<std::string, uint64_t> entityKindCounts;
+            std::map<std::string, uint64_t> linkRelationCounts;
+            uint64_t danglingParents = 0;
+            uint64_t danglingSources = 0;
+            uint64_t danglingTargets = 0;
+            uint64_t capturedExecuteLinks = 0;
+            uint64_t uncapturedExecuteLinks = 0;
+            for( uint64_t offset = 0; offset < dispatchCount; )
+            {
+                checkCancelled();
+                const auto page = source->ScanGfxDispatches( size_t( offset ),
+                    size_t( std::min<uint64_t>( PageSize, dispatchCount - offset ) ) );
+                if( page.empty() ) throw std::runtime_error( "session_gfx_dispatch_page_missing" );
+                const auto allowed = BudgetScanAllowance( page.size() );
+                if( allowed != page.size() ) throw QueryError( "RESOURCE_LIMIT",
+                    "Session Gfx statistics exceeded the exact scan budget" );
+                BudgetScanned( page.size(), page.size(), allowed );
+                if( sampleDispatchRef.is_null() ) sampleDispatchRef = page.front().ref;
+                offset += page.size();
+            }
+            for( uint64_t offset = 0; offset < entityCount; )
+            {
+                checkCancelled();
+                const auto page = source->ScanGfxEntities( size_t( offset ),
+                    size_t( std::min<uint64_t>( PageSize, entityCount - offset ) ) );
+                if( page.empty() ) throw std::runtime_error( "session_gfx_entity_page_missing" );
+                const auto allowed = BudgetScanAllowance( page.size() );
+                if( allowed != page.size() ) throw QueryError( "RESOURCE_LIMIT",
+                    "Session Gfx statistics exceeded the exact scan budget" );
+                BudgetScanned( page.size(), page.size(), allowed );
+                for( const auto& entity : page )
+                {
+                    if( sampleEntityRef.is_null() ) sampleEntityRef = entity.ref;
+                    entityKindCounts[GfxEntityKindName( entity.kind )]++;
+                    if( entity.parentId != 0 && !source->GetGfxDispatch( entity.parentId ) &&
+                        !source->GetGfxEntity( entity.parentId ) ) danglingParents++;
+                }
+                offset += page.size();
+            }
+            for( uint64_t offset = 0; offset < linkCount; )
+            {
+                checkCancelled();
+                const auto page = source->ScanGfxLinks( size_t( offset ),
+                    size_t( std::min<uint64_t>( PageSize, linkCount - offset ) ) );
+                if( page.empty() ) throw std::runtime_error( "session_gfx_link_page_missing" );
+                const auto allowed = BudgetScanAllowance( page.size() );
+                if( allowed != page.size() ) throw QueryError( "RESOURCE_LIMIT",
+                    "Session Gfx statistics exceeded the exact scan budget" );
+                BudgetScanned( page.size(), page.size(), allowed );
+                for( const auto& link : page )
+                {
+                    linkRelationCounts[GfxRelationName( link.relation )]++;
+                    const bool sourceGfxKnown = source->GetGfxDispatch( link.sourceId ).has_value() ||
+                        source->GetGfxEntity( link.sourceId ).has_value();
+                    const bool targetGfxKnown = source->GetGfxDispatch( link.targetId ).has_value() ||
+                        source->GetGfxEntity( link.targetId ).has_value();
+                    const auto sourceJob = source->GetJob( link.sourceId );
+                    const auto targetJob = source->GetJob( link.targetId );
+                    if( !sourceGfxKnown && !sourceJob ) danglingSources++;
+                    if( link.relation != 5 && !targetGfxKnown && !targetJob ) danglingTargets++;
+                    if( link.relation == 2 )
+                    {
+                        if( sourceJob || targetJob )
+                        {
+                            capturedExecuteLinks++;
+                            if( sampleLinkedJobRef.is_null() )
+                                sampleLinkedJobRef = sourceJob ? sourceJob->ref : targetJob->ref;
+                        }
+                        else uncapturedExecuteLinks++;
+                    }
+                }
+                offset += page.size();
+            }
+            json entitiesByKind = json::object();
+            for( const auto& [name, count] : entityKindCounts ) entitiesByKind[name] = Decimal( count );
+            json linksByRelation = json::object();
+            for( const auto& [name, count] : linkRelationCounts ) linksByRelation[name] = Decimal( count );
+            return Success( id, {
+                { "counts", { { "dispatches", Decimal( dispatchCount ) },
+                    { "entities", Decimal( entityCount ) }, { "links", Decimal( linkCount ) },
+                    { "jobs", Decimal( source->GetJobCount() ) } } },
+                { "entities_by_kind", std::move( entitiesByKind ) },
+                { "links_by_relation", std::move( linksByRelation ) },
+                { "integrity", {
+                    { "dangling_parent_entities", Decimal( danglingParents ) },
+                    { "dangling_link_sources", Decimal( danglingSources ) },
+                    { "dangling_link_targets", Decimal( danglingTargets ) },
+                    { "captured_execute_links", Decimal( capturedExecuteLinks ) },
+                    { "uncaptured_execute_links", Decimal( uncapturedExecuteLinks ) } } },
+                { "samples", { { "dispatch_ref", std::move( sampleDispatchRef ) },
+                    { "entity_ref", std::move( sampleEntityRef ) },
+                    { "linked_job_ref", std::move( sampleLinkedJobRef ) } } }
+            }, trace );
+        }
+
         if( pagedSessionJobs ) jobs = source->GetJobs();
 
         if( method == "job.search" )

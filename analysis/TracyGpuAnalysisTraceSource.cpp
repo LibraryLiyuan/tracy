@@ -893,6 +893,25 @@ std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->GfxDispatches() : std::vector<GfxDispatchDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetGfxDispatchCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxDispatchCount();
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->Stats().gfxDispatches : 0;
+}
+std::vector<GfxDispatchDto> GpuAnalysisTraceSource::ScanGfxDispatches(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanGfxDispatches( offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanGfxDispatches( offset, limit ) : std::vector<GfxDispatchDto> {};
+}
+std::optional<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatch( uint64_t dispatchId ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxDispatch( dispatchId );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxDispatch( dispatchId ) : std::nullopt;
+}
 std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatchesForFrame(
     uint64_t frameId, size_t offset, size_t limit ) const
 {
@@ -907,11 +926,43 @@ std::vector<GfxEntityDto> GpuAnalysisTraceSource::GetGfxEntities() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->GfxEntities() : std::vector<GfxEntityDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetGfxEntityCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxEntityCount();
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->Stats().gfxEntities : 0;
+}
+std::vector<GfxEntityDto> GpuAnalysisTraceSource::ScanGfxEntities(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanGfxEntities( offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanGfxEntities( offset, limit ) : std::vector<GfxEntityDto> {};
+}
+std::optional<GfxEntityDto> GpuAnalysisTraceSource::GetGfxEntity( uint64_t entityId ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxEntity( entityId );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxEntity( entityId ) : std::nullopt;
+}
 std::vector<GfxLinkDto> GpuAnalysisTraceSource::GetGfxLinks() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxLinks();
     const auto reader = SessionIoGfxReader();
     return reader ? reader->GfxLinks() : std::vector<GfxLinkDto> {};
+}
+uint64_t GpuAnalysisTraceSource::GetGfxLinkCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxLinkCount();
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->Stats().gfxLinks : 0;
+}
+std::vector<GfxLinkDto> GpuAnalysisTraceSource::ScanGfxLinks(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanGfxLinks( offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanGfxLinks( offset, limit ) : std::vector<GfxLinkDto> {};
 }
 GfxEvidenceSlice GpuAnalysisTraceSource::GetEvidenceGfx( uint64_t frameId,
     const std::vector<uint64_t>& seedIds ) const

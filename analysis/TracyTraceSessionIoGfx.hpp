@@ -46,10 +46,15 @@ public:
     std::vector<IoRequestDto> IoChildren(
         uint64_t parentId, size_t offset, size_t limit ) const;
     std::vector<GfxDispatchDto> GfxDispatches() const;
+    std::vector<GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const;
+    std::optional<GfxDispatchDto> GfxDispatch( uint64_t dispatchId ) const;
     std::vector<GfxDispatchDto> GfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const;
     std::vector<GfxEntityDto> GfxEntities() const;
+    std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const;
+    std::optional<GfxEntityDto> GfxEntity( uint64_t entityId ) const;
     std::vector<GfxLinkDto> GfxLinks() const;
+    std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const;
     GfxEvidenceSlice EvidenceGfx( uint64_t frameId,
         const std::vector<uint64_t>& seedIds ) const;
     GfxEvidenceSlice GfxChain( uint64_t rootId, size_t maxNodes ) const;

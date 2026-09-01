@@ -1845,6 +1845,38 @@ std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatches() const
     return result;
 }
 
+std::vector<GfxDispatchDto> TraceSessionIoGfxReader::ScanGfxDispatches(
+    size_t offset, size_t limit ) const
+{
+    const auto begin = std::min<uint64_t>( offset, m_stats.gfxDispatches );
+    const auto count = std::min<uint64_t>( limit, m_stats.gfxDispatches - begin );
+    const auto stored = ReadFixed<StoredGfxDispatch>( m_path,
+        m_gfxDispatchOffset + begin * sizeof( StoredGfxDispatch ), count,
+        "Gfx dispatch page read failed" );
+    std::vector<GfxDispatchDto> result;
+    result.reserve( stored.size() );
+    for( const auto& value : stored ) result.push_back( {
+        MakeRef( m_fingerprint, "gfx-dispatch", value.dispatchId ), value.dispatchId,
+        value.frameIndex, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+        value.expectedJobs, value.threadingMode, value.flags } );
+    return result;
+}
+
+std::optional<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatch(
+    uint64_t dispatchId ) const
+{
+    const auto values = ReadFramePosting<StoredGfxDispatch, GfxDispatchDto>( m_path,
+        m_gfxDispatchIdPostingOffset, m_stats.gfxDispatches, dispatchId, 0, 1,
+        m_gfxDispatchOffset, m_stats.gfxDispatches,
+        [&]( const StoredGfxDispatch& value, uint64_t ) {
+            return GfxDispatchDto { MakeRef( m_fingerprint, "gfx-dispatch", value.dispatchId ),
+                value.dispatchId, value.frameIndex, value.timeNs,
+                MakeRef( m_fingerprint, "thread", value.thread ), value.expectedJobs,
+                value.threadingMode, value.flags };
+        } );
+    return values.empty() ? std::nullopt : std::optional<GfxDispatchDto>( values.front() );
+}
+
 std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatchesForFrame(
     uint64_t frameId, size_t offset, size_t limit ) const
 {
@@ -1872,6 +1904,38 @@ std::vector<GfxEntityDto> TraceSessionIoGfxReader::GfxEntities() const
     return result;
 }
 
+std::vector<GfxEntityDto> TraceSessionIoGfxReader::ScanGfxEntities(
+    size_t offset, size_t limit ) const
+{
+    const auto begin = std::min<uint64_t>( offset, m_stats.gfxEntities );
+    const auto count = std::min<uint64_t>( limit, m_stats.gfxEntities - begin );
+    const auto stored = ReadFixed<StoredGfxEntity>( m_path,
+        m_gfxEntityOffset + begin * sizeof( StoredGfxEntity ), count,
+        "Gfx entity page read failed" );
+    std::vector<GfxEntityDto> result;
+    result.reserve( stored.size() );
+    for( const auto& value : stored ) result.push_back( {
+        MakeRef( m_fingerprint, "gfx-entity", value.entityId ), value.entityId, value.parentId,
+        value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ), value.gpuQueryId,
+        value.gpuContext, value.kind, value.flags } );
+    return result;
+}
+
+std::optional<GfxEntityDto> TraceSessionIoGfxReader::GfxEntity(
+    uint64_t entityId ) const
+{
+    const auto values = ReadFramePosting<StoredGfxEntity, GfxEntityDto>( m_path,
+        m_gfxEntityIdPostingOffset, m_stats.gfxEntities, entityId, 0, 1,
+        m_gfxEntityOffset, m_stats.gfxEntities,
+        [&]( const StoredGfxEntity& value, uint64_t ) {
+            return GfxEntityDto { MakeRef( m_fingerprint, "gfx-entity", value.entityId ),
+                value.entityId, value.parentId, value.timeNs,
+                MakeRef( m_fingerprint, "thread", value.thread ), value.gpuQueryId,
+                value.gpuContext, value.kind, value.flags };
+        } );
+    return values.empty() ? std::nullopt : std::optional<GfxEntityDto>( values.front() );
+}
+
 std::vector<GfxLinkDto> TraceSessionIoGfxReader::GfxLinks() const
 {
     const auto stored = ReadFixed<StoredGfxLink>( m_path, m_gfxLinkOffset,
@@ -1882,6 +1946,26 @@ std::vector<GfxLinkDto> TraceSessionIoGfxReader::GfxLinks() const
     {
         const auto& value = stored[i];
         result.push_back( { MakeRef( m_fingerprint, "gfx-link", i ), value.sourceId,
+            value.targetId, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+            value.relation, value.flags } );
+    }
+    return result;
+}
+
+std::vector<GfxLinkDto> TraceSessionIoGfxReader::ScanGfxLinks(
+    size_t offset, size_t limit ) const
+{
+    const auto begin = std::min<uint64_t>( offset, m_stats.gfxLinks );
+    const auto count = std::min<uint64_t>( limit, m_stats.gfxLinks - begin );
+    const auto stored = ReadFixed<StoredGfxLink>( m_path,
+        m_gfxLinkOffset + begin * sizeof( StoredGfxLink ), count,
+        "Gfx link page read failed" );
+    std::vector<GfxLinkDto> result;
+    result.reserve( stored.size() );
+    for( size_t i = 0; i < stored.size(); ++i )
+    {
+        const auto& value = stored[i];
+        result.push_back( { MakeRef( m_fingerprint, "gfx-link", begin + i ), value.sourceId,
             value.targetId, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
             value.relation, value.flags } );
     }

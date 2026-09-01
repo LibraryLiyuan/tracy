@@ -1677,6 +1677,29 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Gfx Statistics 分页与点查（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，真实长Trace随机读取墙钟待N30.7集中门禁）**。
+
+- `TraceSource`新增Gfx Dispatch、Entity和Link的精确count/page接口，以及Dispatch/Entity ID点查接口；Legacy Worker默认实现保持原有全量数据语义。
+- Session Reader直接从I/O/Gfx immutable数据页读取最多1024条记录；Dispatch和Entity点查使用N30.6B既有精确posting，不物化完整Gfx集合。
+- Session `job.gfx.statistics`在任何`GetJobs()/GetGfxDispatches()/GetGfxEntities()/GetGfxLinks()`全量读取之前进入专用路径。
+- 统计只保留entity kind、link relation、完整性计数和少量样例；Parent、Link端点及关联Job通过精确点查验证，不维护随Gfx事件总量增长的DTO vector。
+- 全域精确统计必须扫描全部Gfx事实。每页通过Query scan/CPU预算门禁；预算无法覆盖整个输入时返回`RESOURCE_LIMIT`，不得返回局部统计并伪装完整结果。
+- 本次没有升级I/O/Gfx schema：实现复用schema 9已经提供的Dispatch、Entity、Parent及Link双向posting。
+- 点查在大规模真实数据上可能产生较多随机I/O；N30.7必须验证跨域查询`≤5秒`。若失败，应把相同的精确标量摘要移到Derived构建期，而不是使用采样、近似或降低完整性。
+
+TDD与回归证据：
+
+```text
+RED:       测试先调用不存在的Gfx count/page/point API，编译按预期失败
+Reader:    Dispatch/Entity/Link count=1/1/1；page和ID点查均返回精确对象
+Query:     job.gfx.statistics不再建立完整Gfx和Job vector
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
 ### 2026-09-01 Gfx Chain 有界邻接读取（N30.6B 子阶段）
 
 状态：**Passed（synthetic correctness，`job.gfx.statistics`全局摘要仍待独立收敛）**。
@@ -1697,7 +1720,7 @@ Query:     job.gfx_chain(Dispatch 300)返回1 Dispatch、1 Entity、1 Link、2 n
 GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
-本子阶段未启动真实30分钟转换；`job.gfx.statistics`仍读取全域集合，后续必须改为构建期精确摘要，不能以采样或近似替代。
+本子阶段未启动真实30分钟转换；`job.gfx.statistics`已在后续“Gfx Statistics 分页与点查”子阶段改为有界内存的精确分页扫描，其真实长Trace墙钟仍由N30.7验证。
 
 ### 2026-09-01 Job Schedule-Time Posting 与 Search 分页（N30.6B 子阶段）
 
