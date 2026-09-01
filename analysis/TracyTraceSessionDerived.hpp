@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <stop_token>
 #include <string>
 
@@ -109,13 +110,36 @@ struct TraceSessionDerivedStats
     uint64_t gfxEntities = 0;
     uint64_t gfxLinks = 0;
     uint64_t correlatedFrames = 0;
+    uint64_t checkpointWrites = 0;
+    uint64_t writerLeaseHeartbeats = 0;
+    uint64_t peakPrivateBytes = 0;
+    bool softMemoryLimitReached = false;
+    bool hardMemoryLimitReached = false;
     std::array<uint64_t, size_t( TraceSessionProtocolDomain::Count )> domains {};
+};
+
+struct TraceSessionDerivedCheckpoint
+{
+    uint32_t schema = 1;
+    std::string sourceSha256;
+    std::string generation;
+    std::string stage;
+    uint64_t sequence = 0;
+    uint64_t committedStages = 0;
+    uint64_t committedRecords = 0;
+    uint64_t committedBytes = 0;
+    uint64_t previousCheckpointHash = 0;
+    uint64_t checkpointHash = 0;
 };
 
 struct TraceSessionDerivedControl
 {
     std::stop_token stopToken;
     std::function<void( float, const char* )> progress;
+    std::function<uint64_t()> queryPrivateBytes;
+    uint64_t targetPrivateBytes = 8ull * 1024 * 1024 * 1024;
+    uint64_t softPrivateBytes = 12ull * 1024 * 1024 * 1024;
+    uint64_t hardPrivateBytes = 16ull * 1024 * 1024 * 1024;
     uint64_t minimumFreeBytes = 64ull * 1024 * 1024 * 1024;
 };
 
@@ -126,6 +150,9 @@ std::filesystem::path TraceSessionDomainIndexRoot( const std::filesystem::path& 
 // Canonical events or a traditional Worker.
 bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, TraceSessionDerivedStats& stats,
+    std::string& error );
+std::optional<TraceSessionDerivedCheckpoint> LoadTraceSessionDerivedCheckpoint(
+    const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest,
     std::string& error );
 bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot,
     TraceSessionManifest& manifest, const TraceSessionInventory& inventory,

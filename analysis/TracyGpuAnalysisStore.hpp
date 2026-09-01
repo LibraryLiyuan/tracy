@@ -255,6 +255,7 @@ struct GpuAnalysisPassSpool
     std::vector<std::filesystem::path> stableSummaryRuns;
     uint64_t taxonomyCount = 0;
     uint64_t stableSummaryCount = 0;
+    bool reused = false;
 };
 
 // Bounded Session Catalog product. Resource and Allocation pages are immutable
@@ -278,6 +279,14 @@ struct GpuAnalysisCatalogSpool
     uint64_t churnCount = 0;
     uint64_t pageCount = 0;
     uint64_t peakRecordsInMemory = 0;
+    bool reused = false;
+};
+
+struct GpuAnalysisStoreWriteStats
+{
+    uint64_t committedPages = 0;
+    uint64_t resumedPages = 0;
+    uint64_t rebuiltUncommittedPages = 0;
 };
 
 class GpuAnalysisCatalogStringReader
@@ -336,7 +345,8 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     const GpuAnalysisPassSpool& passSpool,
     const std::vector<JnGpuCatalogStringData>& catalogStrings,
     const GpuAnalysisSidecarControl& control,
-    std::string& generation, uint64_t& writtenBytes, std::string& error );
+    std::string& generation, uint64_t& writtenBytes, std::string& error,
+    GpuAnalysisStoreWriteStats* writeStats = nullptr );
 // Creates a new immutable derived generation by hard-linking the currently
 // published pages and adding compact Resource Summary pages.  Existing
 // generations are never mutated and remain a rollback point.

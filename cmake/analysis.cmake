@@ -6,6 +6,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisCache.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisSidecar.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisSpoolCheckpoint.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.cpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
@@ -41,6 +42,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysis.hpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisCache.hpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisSidecar.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisSpoolCheckpoint.hpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisStore.hpp
     ${TRACY_ANALYSIS_DIR}/TracyGpuAnalysisTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.hpp
@@ -76,3 +78,6 @@ add_library(TracyAnalysis STATIC ${TRACY_ANALYSIS_SOURCES} ${TRACY_ANALYSIS_HEAD
 target_include_directories(TracyAnalysis PUBLIC ${TRACY_ANALYSIS_DIR})
 target_compile_features(TracyAnalysis PUBLIC cxx_std_20)
 target_link_libraries(TracyAnalysis PRIVATE TracyServer TracyStreamCore)
+if(WIN32)
+    target_link_libraries(TracyAnalysis PUBLIC Psapi)
+endif()

@@ -3,6 +3,7 @@
 #include "TracyGpuAnalysis.hpp"
 #include "TracyGpuAnalysisCache.hpp"
 #include "TracyGpuAnalysisPath.hpp"
+#include "TracyGpuAnalysisSpoolCheckpoint.hpp"
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyHash.hpp"
 #include "TracyJnGpuCatalog.hpp"
@@ -2319,7 +2320,16 @@ bool BuildBoundedGpuCatalogSpool( const std::filesystem::path& sessionRoot,
     std::string& error )
 {
     error.clear(); spool = {};
-    spool.root = sessionRoot / "checkpoints" / "gpu-catalog-spool";
+    const auto spoolRoot = sessionRoot / "checkpoints" / "gpu-catalog-spool";
+    spool.root = spoolRoot;
+    std::string resumeError;
+    if( LoadGpuCatalogSpoolCheckpoint( spoolRoot, identity, spool, resumeError ) )
+    { spool.reused = true; return true; }
+    // A rejected checkpoint may have populated counters before a later file
+    // identity check failed.  Never let that partially decoded state choose
+    // page ordinals for the clean rebuild.
+    spool = {};
+    spool.root = spoolRoot;
     std::error_code ec; std::filesystem::remove_all( GpuAnalysisIoPath( spool.root ), ec ); ec.clear();
     std::filesystem::create_directories( GpuAnalysisIoPath( spool.root ), ec );
     if( ec ) { error = "session_gpu_catalog_spool_directory_failed:" + ec.message(); return false; }
@@ -2711,7 +2721,7 @@ bool BuildBoundedGpuCatalogSpool( const std::filesystem::path& sessionRoot,
     spool.overview.manifest.vgRecordCount = metadata.gpuCatalogVg.size();
     if( !WriteCatalogSpoolPage( spool, identity, GpuAnalysisStorePageKind::Churn,
         "churn", churnPage, churnFirstIndex, error ) ) return false;
-    return true;
+    return SaveGpuCatalogSpoolCheckpoint( spool, identity, error );
 }
 
 struct PassReferenceToken
@@ -3128,7 +3138,9 @@ bool BuildGlobalPassInclusiveRollup( PassSpoolBuildState& state, std::string& er
     {
         std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
         auto snapshot = LoadGpuAnalysisCache( state.spool->root / name.str(), spoolIdentity, error );
-        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error; return false; }
+        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error +
+            ":path=" + ( state.spool->root / name.str() ).string() +
+            ":page_count=" + std::to_string( state.spool->pageCount ); return false; }
         for( const auto& pass : snapshot->passes )
         {
             if( pass.passId == 0 || pass.passId <= previousPassId )
@@ -3159,7 +3171,9 @@ bool BuildGlobalPassInclusiveRollup( PassSpoolBuildState& state, std::string& er
         if( state.control->stopToken.stop_requested() ) { error = "cancelled"; return false; }
         std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
         auto snapshot = LoadGpuAnalysisCache( state.spool->root / name.str(), spoolIdentity, error );
-        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error; return false; }
+        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error +
+            ":path=" + ( state.spool->root / name.str() ).string() +
+            ":page_count=" + std::to_string( state.spool->pageCount ); return false; }
         for( const auto& pass : snapshot->passes )
         {
             std::vector<uint64_t> ancestors;
@@ -3202,7 +3216,9 @@ bool BuildGlobalPassInclusiveRollup( PassSpoolBuildState& state, std::string& er
         std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
         const auto pagePath = state.spool->root / name.str();
         auto snapshot = LoadGpuAnalysisCache( pagePath, spoolIdentity, error );
-        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error; return false; }
+        if( !snapshot ) { error = "session_gpu_pass_rollup_page_invalid:" + error +
+            ":path=" + pagePath.string() + ":page_count=" +
+            std::to_string( state.spool->pageCount ); return false; }
         for( auto& pass : snapshot->passes )
         {
             const auto entries = inclusive.Find( pass.passId );
@@ -3449,7 +3465,20 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     // a generation, page and temporary suffix are appended.  Spool data is
     // not part of the published schema, so a short checkpoint-local path is
     // both portable and recoverable under the Session writer lease.
-    spool.root = sessionRoot / "checkpoints" / "gpu-pass-spool";
+    const auto spoolRoot = sessionRoot / "checkpoints" / "gpu-pass-spool";
+    spool.root = spoolRoot;
+    std::string resumeError;
+    if( LoadGpuPassSpoolCheckpoint( spoolRoot, identity, spool,
+        appendedResources, resumeError ) )
+    {
+        if( !resolver.AddLogicalFile( spool.root / "logical-lifetimes.bin", error ) )
+            return false;
+        spool.reused = true;
+        return true;
+    }
+    spool = {};
+    spool.root = spoolRoot;
+    appendedResources.clear();
     std::error_code ec;
     std::filesystem::remove_all( GpuAnalysisIoPath( spool.root ), ec ); ec.clear();
     std::filesystem::create_directories( GpuAnalysisIoPath( spool.root ), ec );
@@ -3508,7 +3537,7 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     }
     std::filesystem::remove( GpuAnalysisIoPath( setIndexPath ), ec );
     std::filesystem::remove( GpuAnalysisIoPath( setEntriesPath ), ec );
-    return true;
+    return SaveGpuPassSpoolCheckpoint( spool, appendedResources, identity, error );
 }
 
 }
@@ -3802,6 +3831,14 @@ std::filesystem::path TraceSessionGpuAnalysisRoot( const std::filesystem::path& 
         GpuAnalysisAlgorithmId;
 }
 
+static void NormalizeGpuDerivedFailure( std::string& error )
+{
+    if( error == "cancelled" ) error = "cancelled_resumable";
+    else if( error == "sidecar_size_limit" ) error = "resource_limit_resumable";
+    else if( error == "insufficient_free_space_for_gpu_analysis" )
+        error = "insufficient_disk_resumable";
+}
+
 bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const GpuAnalysisSidecarControl& control,
     TraceSessionGpuDerivedStats& stats, std::string& error )
@@ -3817,7 +3854,8 @@ bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRo
     identity.fileSize = manifest.source.fileSize;
     GpuAnalysisCatalogSpool catalogSpool;
     if( !BuildBoundedGpuCatalogSpool( sessionRoot, manifest, transform,
-        catalogData, identity, control, catalogSpool, error ) ) return false;
+        catalogData, identity, control, catalogSpool, error ) )
+    { NormalizeGpuDerivedFailure( error ); return false; }
     ResourceLifetimeResolver resolver;
     if( !resolver.AddPointerFile( catalogSpool.pointerLifetimePath, error ) ) return false;
     BoundedCatalogLookup catalogLookup;
@@ -3856,7 +3894,8 @@ bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRo
     std::vector<GpuResourceAnalysisRecord> appendedResources;
     if( !BuildGpuPassSpool( sessionRoot, manifest, transform, resolver, catalogLookup,
         catalogSpool.overview, appendedResources,
-        evidence, identity, control, passSpool, error ) ) return false;
+        evidence, identity, control, passSpool, error ) )
+    { NormalizeGpuDerivedFailure( error ); return false; }
     if( passSpool.sourceGapResourceCount != 0 )
     {
         catalogSpool.overview.manifest.reason = "source_gpu_resource_identity_gap:" +
@@ -3871,17 +3910,24 @@ bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRo
     stats.catalogPageCount = catalogSpool.pageCount;
     stats.peakCatalogRecordsInMemory = catalogSpool.peakRecordsInMemory;
     stats.usedPagedCatalog = true;
+    stats.catalogSpoolReused = catalogSpool.reused;
+    stats.passSpoolReused = passSpool.reused;
+    GpuAnalysisStoreWriteStats storeStats;
     const auto result = WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
         TraceSessionGpuAnalysisRoot( sessionRoot, manifest ), identity, catalogSpool,
         appendedResources,
         passSpool, catalogData.gpuCatalogStrings, control, stats.generation,
-        stats.writtenBytes, error );
+        stats.writtenBytes, error, &storeStats );
+    stats.committedStorePages = storeStats.committedPages;
+    stats.resumedStorePages = storeStats.resumedPages;
+    stats.rebuiltUncommittedStorePages = storeStats.rebuiltUncommittedPages;
     if( result )
     {
         std::error_code ec;
         std::filesystem::remove_all( GpuAnalysisIoPath( passSpool.root ), ec );
         std::filesystem::remove_all( GpuAnalysisIoPath( catalogSpool.root ), ec );
     }
+    else NormalizeGpuDerivedFailure( error );
     return result;
 }
 

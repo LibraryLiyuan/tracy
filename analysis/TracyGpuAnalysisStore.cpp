@@ -516,6 +516,14 @@ const GpuAnalysisStorePage* NthPage( const GpuAnalysisStoreManifest& manifest, G
     return nullptr;
 }
 
+const GpuAnalysisStorePage* NthPage( const std::vector<GpuAnalysisStorePage>& pages,
+    GpuAnalysisStorePageKind kind, size_t index )
+{
+    for( const auto& page : pages ) if( page.kind == kind )
+    { if( index-- == 0 ) return &page; }
+    return nullptr;
+}
+
 size_t CountPages( const GpuAnalysisStoreManifest& manifest, GpuAnalysisStorePageKind kind )
 {
     return size_t( std::count_if( manifest.pages.begin(), manifest.pages.end(), [&]( const auto& page ) { return page.kind == kind; } ) );
@@ -601,6 +609,15 @@ bool WriteSortedPassBatch( const std::filesystem::path& root,
     if( !std::is_sorted( input.begin(), input.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.passId < rhs.passId;
     } ) ) { error = "store_spool_pass_order_invalid"; return false; }
+    if( const auto* existing = NthPage( pages, GpuAnalysisStorePageKind::Pass,
+        pageIndex ) )
+    {
+        if( existing->firstIndex != firstIndex || existing->recordCount != input.size() ||
+            existing->firstKey != input.front().passId ||
+            existing->lastKey != input.back().passId )
+        { error = "store_resume_pass_page_mismatch"; return false; }
+        return true;
+    }
     std::error_code ec; const auto pageRoot = root / "passes";
     std::filesystem::create_directories( GpuAnalysisIoPath( pageRoot ), ec );
     if( ec ) { error = "store_pass_directory_failed:" + ec.message(); return false; }
@@ -733,10 +750,20 @@ bool MergeRelationRuns( const std::filesystem::path& root,
     T previous {}; bool havePrevious = false;
     const auto flush = [&]() -> bool {
         if( page.empty() ) return true;
+        const auto committedPageIndex = pageIndex++;
+        if( const auto* existing = NthPage( pages, kind, committedPageIndex ) )
+        {
+            if( existing->firstIndex != firstIndex ||
+                existing->recordCount != page.size() ||
+                existing->firstKey != keyOf( page.front() ) ||
+                existing->lastKey != keyOf( page.back() ) )
+            { error = "store_resume_relation_page_mismatch"; return false; }
+            firstIndex += page.size(); page.clear(); return true;
+        }
         RelationHeader header; header.kind = uint8_t( kind ); header.firstIndex = firstIndex;
         header.recordCount = page.size(); header.payloadBytes = page.size() * sizeof( T );
         header.checksum = HashUpdate( FnvOffset, page.data(), size_t( header.payloadBytes ) );
-        std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex++ << ".bin";
+        std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << committedPageIndex << ".bin";
         const auto path = pageRoot / name.str(); auto temporary = path; temporary += ".tmp";
         std::ofstream out( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
         if( !out ) { error = "store_relation_open_failed"; return false; }
@@ -991,6 +1018,16 @@ bool WriteResourceSummaryPage( const std::filesystem::path& root,
     const std::function<bool()>& checkpoint, std::string& error )
 {
     if( values.empty() ) return true;
+    if( const auto* existing = NthPage( pages,
+        GpuAnalysisStorePageKind::ResourceSummary, pageIndex ) )
+    {
+        if( existing->firstIndex != firstIndex ||
+            existing->recordCount != values.size() ||
+            existing->firstKey != values.front().resourceId ||
+            existing->lastKey != values.back().resourceId )
+        { error = "store_resume_resource_summary_page_mismatch"; return false; }
+        return true;
+    }
     if( values.size() > std::numeric_limits<uint32_t>::max() )
     { error = "store_resource_summary_record_count_overflow"; return false; }
     std::vector<uint8_t> payload;
@@ -1450,34 +1487,78 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     const GpuAnalysisPassSpool& passSpool,
     const std::vector<JnGpuCatalogStringData>& catalogStrings,
     const GpuAnalysisSidecarControl& control,
-    std::string& generation, uint64_t& writtenBytes, std::string& error )
+    std::string& generation, uint64_t& writtenBytes, std::string& error,
+    GpuAnalysisStoreWriteStats* writeStats )
 {
     error.clear(); writtenBytes = 0;
+    if( writeStats ) *writeStats = {};
     std::error_code ec; std::filesystem::create_directories( GpuAnalysisIoPath( algorithmRoot ), ec );
     if( ec ) { error = "store_algorithm_directory_failed:" + ec.message(); return false; }
+    const auto expectedResourceCount = catalogSpool.resourceCount + appendedResources.size();
     std::filesystem::path staging;
-    for( unsigned attempt = 0; attempt < 256; ++attempt )
-    {
-        generation = GenerationName(); staging = algorithmRoot / ( generation + ".building" );
-        if( std::filesystem::create_directory( GpuAnalysisIoPath( staging ), ec ) ) break;
-        if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
-        staging.clear();
-    }
-    if( staging.empty() ) { error = "store_generation_name_exhausted"; return false; }
-
     GpuAnalysisStoreManifest manifest;
-    manifest.generation = generation; manifest.traceSha256 = identity.sha256;
-    manifest.traceSize = identity.fileSize;
-    manifest.resourceCount = catalogSpool.resourceCount + appendedResources.size();
-    manifest.allocationCount = catalogSpool.allocationCount;
-    manifest.passCount = passSpool.passCount;
-    manifest.residencyCount = catalogSpool.residencyCount;
-    manifest.churnCount = catalogSpool.churnCount;
-    manifest.logicalCount = passSpool.logicalCount;
-    manifest.catalogRelationCount = passSpool.catalogRelationCount;
-    manifest.sourceGapResourceCount = passSpool.sourceGapResourceCount;
-    manifest.sourceGapReferenceCount = passSpool.sourceGapReferenceCount;
-    manifest.typeSummaries = catalogSpool.typeSummaries;
+    std::vector<std::filesystem::directory_entry> candidates;
+    for( const auto& entry : std::filesystem::directory_iterator(
+        GpuAnalysisIoPath( algorithmRoot ), ec ) )
+        if( entry.is_directory() &&
+            entry.path().filename().string().ends_with( ".building" ) )
+            candidates.push_back( entry );
+    if( ec ) { error = "store_generation_scan_failed:" + ec.message(); return false; }
+    std::sort( candidates.begin(), candidates.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.last_write_time() > rhs.last_write_time();
+    } );
+    for( const auto& candidate : candidates )
+    {
+        std::string resumeError;
+        auto saved = LoadStoreManifestImpl( candidate.path(), false, resumeError );
+        bool valid = bool( saved ) && saved->traceSha256 == identity.sha256 &&
+            saved->traceSize == identity.fileSize &&
+            saved->resourceCount == expectedResourceCount &&
+            saved->allocationCount == catalogSpool.allocationCount &&
+            saved->passCount == passSpool.passCount &&
+            saved->residencyCount == catalogSpool.residencyCount &&
+            saved->churnCount == catalogSpool.churnCount &&
+            saved->logicalCount == passSpool.logicalCount &&
+            saved->catalogRelationCount == passSpool.catalogRelationCount &&
+            saved->sourceGapResourceCount == passSpool.sourceGapResourceCount &&
+            saved->sourceGapReferenceCount == passSpool.sourceGapReferenceCount;
+        if( valid ) for( const auto& page : saved->pages )
+            if( !VerifyPageFile( candidate.path() / page.relativePath,
+                page, resumeError ) ) { valid = false; break; }
+        if( valid )
+        {
+            manifest = std::move( *saved ); staging = candidate.path();
+            generation = manifest.generation; writtenBytes = manifest.totalBytes;
+            if( writeStats ) writeStats->resumedPages = manifest.pages.size();
+            break;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all( GpuAnalysisIoPath( candidate.path() ), ignored );
+    }
+    if( staging.empty() )
+    {
+        for( unsigned attempt = 0; attempt < 256; ++attempt )
+        {
+            ec.clear(); generation = GenerationName();
+            staging = algorithmRoot / ( generation + ".building" );
+            if( std::filesystem::create_directory( GpuAnalysisIoPath( staging ), ec ) ) break;
+            if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
+            staging.clear();
+        }
+        if( staging.empty() ) { error = "store_generation_name_exhausted"; return false; }
+        manifest.generation = generation; manifest.traceSha256 = identity.sha256;
+        manifest.traceSize = identity.fileSize;
+        manifest.resourceCount = expectedResourceCount;
+        manifest.allocationCount = catalogSpool.allocationCount;
+        manifest.passCount = passSpool.passCount;
+        manifest.residencyCount = catalogSpool.residencyCount;
+        manifest.churnCount = catalogSpool.churnCount;
+        manifest.logicalCount = passSpool.logicalCount;
+        manifest.catalogRelationCount = passSpool.catalogRelationCount;
+        manifest.sourceGapResourceCount = passSpool.sourceGapResourceCount;
+        manifest.sourceGapReferenceCount = passSpool.sourceGapReferenceCount;
+        manifest.typeSummaries = catalogSpool.typeSummaries;
+    }
     const auto committed = algorithmRoot / generation;
     const GpuAnalysisCacheIdentity cacheIdentity { identity.sha256, identity.fileSize,
         std::string( GpuAnalysisAlgorithmId ) + "-store1" };
@@ -1487,18 +1568,23 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
         std::string( GpuAnalysisAlgorithmId ) + "-session-pass-spool1" };
     const auto checkpoint = [&]() {
         manifest.totalBytes = writtenBytes; manifest.complete = false;
-        return SaveStoreManifest( staging, manifest, error );
+        if( !SaveStoreManifest( staging, manifest, error ) ) return false;
+        if( writeStats ) writeStats->committedPages = manifest.pages.size();
+        return true;
     };
     auto overview = catalogSpool.overview;
     overview.manifest.reason = catalogSpool.overview.manifest.reason;
-    const auto metadataPath = staging / "metadata.bin";
-    if( !SaveGpuAnalysisCache( metadataPath, cacheIdentity, overview, error ) ) return false;
-    uint64_t metadataBytes = 0;
-    const auto metadataChecksum = FileChecksum( metadataPath, metadataBytes, error );
-    if( !error.empty() ) return false;
-    manifest.pages.push_back( { GpuAnalysisStorePageKind::Metadata, 0, 1, 0, 0,
-        metadataBytes, metadataChecksum, std::filesystem::relative( metadataPath, staging ) } );
-    writtenBytes += metadataBytes; if( !checkpoint() ) return false;
+    if( CountPages( manifest, GpuAnalysisStorePageKind::Metadata ) == 0 )
+    {
+        const auto metadataPath = staging / "metadata.bin";
+        if( !SaveGpuAnalysisCache( metadataPath, cacheIdentity, overview, error ) ) return false;
+        uint64_t metadataBytes = 0;
+        const auto metadataChecksum = FileChecksum( metadataPath, metadataBytes, error );
+        if( !error.empty() ) return false;
+        manifest.pages.push_back( { GpuAnalysisStorePageKind::Metadata, 0, 1, 0, 0,
+            metadataBytes, metadataChecksum, std::filesystem::relative( metadataPath, staging ) } );
+        writtenBytes += metadataBytes; if( !checkpoint() ) return false;
+    }
 
     struct StringKey { uint64_t generation; uint32_t id;
         bool operator==( const StringKey& rhs ) const { return generation == rhs.generation && id == rhs.id; } };
@@ -1599,16 +1685,28 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
             if( !resource || value.value.resourceId < firstKey ) { error = "store_vg_resource_missing"; return false; }
             resource->virtualGeometry.push_back( value ); ++vgCount;
         }
-        std::ostringstream fileName; fileName << std::setw( 6 ) << std::setfill( '0' )
-            << resourcePageIndex << ".bin";
-        const auto path = resourceRoot / fileName.str();
-        if( !SaveGpuAnalysisCache( path, cacheIdentity, page, error ) ) return false;
-        uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
-        if( !error.empty() ) return false;
-        manifest.pages.push_back( { GpuAnalysisStorePageKind::Resource, resourceIndex,
-            page.resources.size(), firstKey, lastKey, fileBytes, checksum,
-            std::filesystem::relative( path, staging ) } );
-        writtenBytes += fileBytes; if( !checkpoint() ) return false;
+        const auto* existing = NthPage( manifest.pages,
+            GpuAnalysisStorePageKind::Resource, size_t( resourcePageIndex ) );
+        if( existing )
+        {
+            if( existing->firstIndex != resourceIndex ||
+                existing->recordCount != page.resources.size() ||
+                existing->firstKey != firstKey || existing->lastKey != lastKey )
+            { error = "store_resume_resource_page_mismatch"; return false; }
+        }
+        else
+        {
+            std::ostringstream fileName; fileName << std::setw( 6 ) << std::setfill( '0' )
+                << resourcePageIndex << ".bin";
+            const auto path = resourceRoot / fileName.str();
+            if( !SaveGpuAnalysisCache( path, cacheIdentity, page, error ) ) return false;
+            uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
+            if( !error.empty() ) return false;
+            manifest.pages.push_back( { GpuAnalysisStorePageKind::Resource, resourceIndex,
+                page.resources.size(), firstKey, lastKey, fileBytes, checksum,
+                std::filesystem::relative( path, staging ) } );
+            writtenBytes += fileBytes; if( !checkpoint() ) return false;
+        }
         std::vector<GpuAnalysisResourceSummary> summaries; summaries.reserve( page.resources.size() );
         for( const auto& resource : page.resources ) summaries.push_back(
             ResourceSummaryOf( resource, allocationLookup.ResourceCount( resource.allocationId ) ) );
@@ -1656,16 +1754,29 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
             auto snapshot = LoadGpuAnalysisCache( catalogSpool.root / sourcePage.relativePath,
                 catalogIdentity, error );
             if( !snapshot ) { error = "store_catalog_page_invalid:" + error; return false; }
-            std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex++ << ".bin";
-            const auto path = root / name.str();
-            if( !SaveGpuAnalysisCache( path, cacheIdentity, *snapshot, error ) ) return false;
-            uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
-            if( !error.empty() ) return false;
-            manifest.pages.push_back( { kind, firstIndex, sourcePage.recordCount,
-                sourcePage.firstKey, sourcePage.lastKey, fileBytes, checksum,
-                std::filesystem::relative( path, staging ) } );
-            firstIndex += sourcePage.recordCount; writtenBytes += fileBytes;
-            if( !checkpoint() ) return false;
+            const auto* existing = NthPage( manifest.pages, kind, size_t( pageIndex ) );
+            if( existing )
+            {
+                if( existing->firstIndex != firstIndex ||
+                    existing->recordCount != sourcePage.recordCount ||
+                    existing->firstKey != sourcePage.firstKey ||
+                    existing->lastKey != sourcePage.lastKey )
+                { error = "store_resume_catalog_page_mismatch"; return false; }
+            }
+            else
+            {
+                std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
+                const auto path = root / name.str();
+                if( !SaveGpuAnalysisCache( path, cacheIdentity, *snapshot, error ) ) return false;
+                uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
+                if( !error.empty() ) return false;
+                manifest.pages.push_back( { kind, firstIndex, sourcePage.recordCount,
+                    sourcePage.firstKey, sourcePage.lastKey, fileBytes, checksum,
+                    std::filesystem::relative( path, staging ) } );
+                writtenBytes += fileBytes;
+                if( !checkpoint() ) return false;
+            }
+            firstIndex += sourcePage.recordCount; ++pageIndex;
         }
         return true;
     };
@@ -1806,7 +1917,6 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     for( const auto& path : frameRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : summaryRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : childRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
-    for( const auto& path : passSpool.rangeRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     std::filesystem::remove( GpuAnalysisIoPath( runRoot ), ec );
     manifest.totalBytes = writtenBytes; manifest.complete = true;
     manifest.reason = catalogSpool.overview.manifest.reason;
@@ -1816,6 +1926,7 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     { std::ofstream out( GpuAnalysisIoPath( currentTmp ), std::ios::binary | std::ios::trunc );
       out << generation << '\n'; if( !out ) { error = "store_current_write_failed"; return false; } }
     if( !AtomicReplace( currentTmp, current, error ) ) return false;
+    if( writeStats ) writeStats->committedPages = manifest.pages.size();
     if( control.progress ) control.progress( 1.f, "store-complete" );
     return true;
 }

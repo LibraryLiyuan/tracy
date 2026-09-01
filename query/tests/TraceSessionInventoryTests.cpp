@@ -2442,6 +2442,126 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         parentGpuPass && parentGpuPass->directRangeBytes == 256,
         "Session GPU resource preserves the explicit pass Range identity and joins it to reference evidence: " + error );
 
+    std::stop_source gpuStoreCancelSource;
+    tracy::analysis::GpuAnalysisSidecarControl cancelledGpuControl;
+    cancelledGpuControl.minimumFreeBytes = 0;
+    cancelledGpuControl.targetDerivedPageBytes = 1;
+    cancelledGpuControl.stopToken = gpuStoreCancelSource.get_token();
+    bool requestedGpuStoreCancel = false;
+    cancelledGpuControl.progress = [&]( float, const char* stage ) {
+        if( !requestedGpuStoreCancel && stage &&
+            std::string_view( stage ) == "store-page-committed" )
+        {
+            requestedGpuStoreCancel = true;
+            gpuStoreCancelSource.request_stop();
+        }
+    };
+    tracy::analysis::TraceSessionGpuDerivedStats cancelledGpuStats;
+    std::string cancelledGpuError;
+    const auto cancelledGpuBegin = std::chrono::steady_clock::now();
+    const auto cancelledGpuResult = tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
+        sessionRoot, manifest, cancelledGpuControl, cancelledGpuStats, cancelledGpuError );
+    const auto cancelledGpuElapsed = std::chrono::steady_clock::now() - cancelledGpuBegin;
+    test.Check( !cancelledGpuResult &&
+        requestedGpuStoreCancel && cancelledGpuError == "cancelled_resumable" &&
+        cancelledGpuStats.committedStorePages != 0 &&
+        cancelledGpuElapsed < std::chrono::seconds( 2 ),
+        "GPU Derived cancellation preserves at least one atomically committed Store page: error=" +
+        cancelledGpuError + ":pages=" + std::to_string( cancelledGpuStats.committedStorePages ) );
+    auto readerAfterGpuCancel = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
+        gpuRoot, manifest.source.sha256, manifest.source.fileSize, error );
+    test.Check( readerAfterGpuCancel &&
+        readerAfterGpuCancel->Manifest().generation == derivedStats.generation,
+        "cancelled GPU Derived never replaces the previous complete current generation: " + error );
+
+    tracy::analysis::GpuAnalysisSidecarControl resumedGpuControl;
+    resumedGpuControl.minimumFreeBytes = 0;
+    resumedGpuControl.targetDerivedPageBytes = 1;
+    tracy::analysis::TraceSessionGpuDerivedStats resumedGpuStats;
+    std::string resumedGpuError;
+    test.Check( tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
+        sessionRoot, manifest, resumedGpuControl, resumedGpuStats, resumedGpuError ) &&
+        resumedGpuStats.catalogSpoolReused && resumedGpuStats.passSpoolReused &&
+        resumedGpuStats.resumedStorePages != 0 &&
+        resumedGpuStats.rebuiltUncommittedStorePages <= 1,
+        "GPU Derived resumes verified spools/pages and rebuilds at most one uncommitted page: " +
+        resumedGpuError + ":catalog=" + std::to_string( resumedGpuStats.catalogSpoolReused ) +
+        ":pass=" + std::to_string( resumedGpuStats.passSpoolReused ) +
+        ":pages=" + std::to_string( resumedGpuStats.resumedStorePages ) );
+    auto resumedGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
+        gpuRoot, manifest.source.sha256, manifest.source.fileSize, error );
+    std::vector<uint64_t> resumedInclusive; bool resumedInclusiveMore = false;
+    test.Check( resumedGpuReader && resumedGpuReader->Manifest().generation == resumedGpuStats.generation &&
+        resumedGpuReader->PassResources( 1000, true, 0, 16, resumedInclusive,
+            resumedInclusiveMore, error ) && !resumedInclusiveMore &&
+        resumedInclusive == std::vector<uint64_t> { 10, 12, 13 },
+        "resumed GPU generation preserves the exact Direct/Inclusive evidence: " + error );
+
+    std::stop_source corruptRecoveryCancelSource;
+    tracy::analysis::GpuAnalysisSidecarControl corruptRecoveryCancelControl;
+    corruptRecoveryCancelControl.minimumFreeBytes = 0;
+    corruptRecoveryCancelControl.targetDerivedPageBytes = 1;
+    corruptRecoveryCancelControl.stopToken = corruptRecoveryCancelSource.get_token();
+    bool requestedCorruptRecoveryCancel = false;
+    corruptRecoveryCancelControl.progress = [&]( float, const char* stage ) {
+        if( !requestedCorruptRecoveryCancel && stage &&
+            std::string_view( stage ) == "store-page-committed" )
+        {
+            requestedCorruptRecoveryCancel = true;
+            corruptRecoveryCancelSource.request_stop();
+        }
+    };
+    tracy::analysis::TraceSessionGpuDerivedStats corruptRecoveryCancelledStats;
+    std::string corruptRecoveryCancelledError;
+    test.Check( !tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
+        sessionRoot, manifest, corruptRecoveryCancelControl,
+        corruptRecoveryCancelledStats, corruptRecoveryCancelledError ) &&
+        corruptRecoveryCancelledError == "cancelled_resumable",
+        "prepare a resumable GPU spool before corruption injection: " +
+        corruptRecoveryCancelledError );
+    const auto corruptPassPage = sessionRoot / "checkpoints" /
+        "gpu-pass-spool" / "000000.bin";
+    test.Check( std::filesystem::exists( corruptPassPage ),
+        "completed Pass spool page exists before corruption injection" );
+    {
+        std::ofstream corruptOut( corruptPassPage,
+            std::ios::binary | std::ios::trunc );
+        corruptOut.write( "bad", 3 );
+    }
+    tracy::analysis::GpuAnalysisSidecarControl corruptRecoveryControl;
+    corruptRecoveryControl.minimumFreeBytes = 0;
+    corruptRecoveryControl.targetDerivedPageBytes = 1;
+    tracy::analysis::TraceSessionGpuDerivedStats corruptRecoveryStats;
+    std::string corruptRecoveryError;
+    test.Check( tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
+        sessionRoot, manifest, corruptRecoveryControl, corruptRecoveryStats,
+        corruptRecoveryError ) && corruptRecoveryStats.catalogSpoolReused &&
+        !corruptRecoveryStats.passSpoolReused &&
+        corruptRecoveryStats.resumedStorePages != 0,
+        "a checksum-invalid Pass spool is rejected and rebuilt without discarding valid Store pages: " +
+        corruptRecoveryError );
+
+    std::stop_source preCancelledGpuSource;
+    preCancelledGpuSource.request_stop();
+    tracy::analysis::GpuAnalysisSidecarControl preCancelledGpuControl;
+    preCancelledGpuControl.minimumFreeBytes = 0;
+    preCancelledGpuControl.stopToken = preCancelledGpuSource.get_token();
+    tracy::analysis::TraceSessionGpuDerivedStats preCancelledGpuStats;
+    std::string preCancelledGpuError;
+    const auto preCancelledGpuBegin = std::chrono::steady_clock::now();
+    test.Check( !tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
+        sessionRoot, manifest, preCancelledGpuControl, preCancelledGpuStats,
+        preCancelledGpuError ) && preCancelledGpuError == "cancelled_resumable" &&
+        std::chrono::steady_clock::now() - preCancelledGpuBegin <
+            std::chrono::seconds( 2 ),
+        "low-level GPU Canonical scan observes cancellation before publishing: " +
+        preCancelledGpuError );
+    auto readerAfterPreCancel = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
+        gpuRoot, manifest.source.sha256, manifest.source.fileSize, error );
+    test.Check( readerAfterPreCancel && readerAfterPreCancel->Manifest().generation ==
+        corruptRecoveryStats.generation,
+        "pre-Store cancellation preserves the last complete GPU generation: " + error );
+
     tracy::analysis::TraceSessionDerivedControl derivedControl;
     derivedControl.minimumFreeBytes = 0;
     std::string lastDerivedStage;
@@ -2453,6 +2573,47 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionRoot, manifest, inventory, derivedControl, mandatoryStats, error );
     test.Check( mandatoryBuilt,
         "build all mandatory Session indexes at " + lastDerivedStage + ": " + error );
+    const auto derivedCheckpoint = tracy::analysis::LoadTraceSessionDerivedCheckpoint(
+        sessionRoot, manifest, error );
+    test.Check( derivedCheckpoint && derivedCheckpoint->stage == "mandatory-complete" &&
+        derivedCheckpoint->sourceSha256 == manifest.source.sha256 &&
+        derivedCheckpoint->generation == manifest.generation &&
+        derivedCheckpoint->committedStages != 0 &&
+        derivedCheckpoint->checkpointHash != 0,
+        "Mandatory Derived atomically publishes an identity-bound checkpoint: " + error );
+
+    tracy::analysis::TraceSessionWriterLease blockingDerivedLease;
+    test.Check( tracy::analysis::AcquireTraceSessionWriterLease(
+        sessionRoot, blockingDerivedLease, error ),
+        "acquire external Session writer lease before Derived exclusivity test: " + error );
+    tracy::analysis::TraceSessionDerivedStats blockedDerivedStats;
+    test.Check( !tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
+        inventory, derivedControl, blockedDerivedStats, error ) &&
+        error == "session_writer_lease_active",
+        "Mandatory Derived refuses a concurrent writer instead of racing immutable generations" );
+    blockingDerivedLease.Release();
+
+    std::stop_source cancelledDerivedSource;
+    cancelledDerivedSource.request_stop();
+    tracy::analysis::TraceSessionDerivedControl cancelledDerivedControl;
+    cancelledDerivedControl.minimumFreeBytes = 0;
+    cancelledDerivedControl.stopToken = cancelledDerivedSource.get_token();
+    tracy::analysis::TraceSessionDerivedStats cancelledDerivedStats;
+    test.Check( !tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
+        inventory, cancelledDerivedControl, cancelledDerivedStats, error ) &&
+        error == "cancelled_resumable",
+        "a pre-requested Derived cancellation exits through the resumable checkpoint path" );
+
+    tracy::analysis::TraceSessionDerivedControl hardBudgetControl;
+    hardBudgetControl.minimumFreeBytes = 0;
+    hardBudgetControl.hardPrivateBytes = 16ull * 1024 * 1024 * 1024;
+    hardBudgetControl.queryPrivateBytes = [] { return 17ull * 1024 * 1024 * 1024; };
+    tracy::analysis::TraceSessionDerivedStats hardBudgetStats;
+    test.Check( !tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
+        inventory, hardBudgetControl, hardBudgetStats, error ) &&
+        error == "resource_limit_resumable" && hardBudgetStats.hardMemoryLimitReached &&
+        hardBudgetStats.peakPrivateBytes == 17ull * 1024 * 1024 * 1024,
+        "Derived hard-memory pressure checkpoints and fails without publishing partial data" );
     const auto cpuZoneRoot = tracy::analysis::TraceSessionCpuZoneIndexRoot( sessionRoot, manifest );
     test.Check( !std::filesystem::exists( cpuZoneRoot / "zones.work" ) &&
         !std::filesystem::exists( cpuZoneRoot / "extras.work" ),

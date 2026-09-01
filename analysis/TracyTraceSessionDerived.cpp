@@ -29,6 +29,9 @@
 
 #ifdef _WIN32
 #  include <Windows.h>
+#  include <Psapi.h>
+#else
+#  include <sys/resource.h>
 #endif
 
 namespace tracy::analysis
@@ -38,6 +41,10 @@ namespace
 
 constexpr uint64_t DomainIndexMagic = 0x31584449534e4aull; // JNSIDX1
 constexpr uint64_t DomainManifestMagic = 0x314d4449534e4aull; // JNSIDM1
+constexpr uint64_t DerivedCheckpointMagic = 0x31504344534e4aull; // JNSDCP1
+constexpr uint32_t DerivedCheckpointSchema = 1;
+constexpr uint64_t FnvOffset = 14695981039346656037ull;
+constexpr uint64_t FnvPrime = 1099511628211ull;
 
 #pragma pack( push, 1 )
 struct DomainIndexHeader
@@ -72,6 +79,109 @@ struct IndexManifest
     TraceSessionDerivedStats stats;
     std::vector<IndexFile> files;
 };
+
+bool AtomicReplace( const std::filesystem::path& source,
+    const std::filesystem::path& target, std::string& error );
+
+uint64_t HashCheckpoint( const TraceSessionDerivedCheckpoint& value )
+{
+    uint64_t hash = FnvOffset;
+    const auto append = [&]( const void* data, size_t size ) {
+        const auto* bytes = static_cast<const uint8_t*>( data );
+        for( size_t i = 0; i < size; ++i ) { hash ^= bytes[i]; hash *= FnvPrime; }
+    };
+    append( &value.schema, sizeof( value.schema ) );
+    append( value.sourceSha256.data(), value.sourceSha256.size() );
+    append( value.generation.data(), value.generation.size() );
+    append( value.stage.data(), value.stage.size() );
+    append( &value.sequence, sizeof( value.sequence ) );
+    append( &value.committedStages, sizeof( value.committedStages ) );
+    append( &value.committedRecords, sizeof( value.committedRecords ) );
+    append( &value.committedBytes, sizeof( value.committedBytes ) );
+    append( &value.previousCheckpointHash, sizeof( value.previousCheckpointHash ) );
+    return hash;
+}
+
+std::filesystem::path DerivedCheckpointPath( const std::filesystem::path& sessionRoot )
+{
+    return sessionRoot / "build-state" / "derived.checkpoint";
+}
+
+bool LoadDerivedCheckpointFile( const std::filesystem::path& path,
+    TraceSessionDerivedCheckpoint& value, std::string& error )
+{
+    value = {};
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) { error = "session_derived_checkpoint_not_found"; return false; }
+    uint64_t magic = 0; std::string key;
+    while( in >> key )
+    {
+        if( key == "magic" ) in >> magic;
+        else if( key == "schema" ) in >> value.schema;
+        else if( key == "source_sha256" ) in >> std::quoted( value.sourceSha256 );
+        else if( key == "generation" ) in >> std::quoted( value.generation );
+        else if( key == "stage" ) in >> std::quoted( value.stage );
+        else if( key == "sequence" ) in >> value.sequence;
+        else if( key == "committed_stages" ) in >> value.committedStages;
+        else if( key == "committed_records" ) in >> value.committedRecords;
+        else if( key == "committed_bytes" ) in >> value.committedBytes;
+        else if( key == "previous_hash" ) in >> value.previousCheckpointHash;
+        else if( key == "checkpoint_hash" ) in >> value.checkpointHash;
+        else { std::string ignored; std::getline( in, ignored ); }
+        if( !in ) { error = "session_derived_checkpoint_parse_failed"; return false; }
+    }
+    if( magic != DerivedCheckpointMagic || value.schema != DerivedCheckpointSchema ||
+        value.sourceSha256.size() != 64 || value.generation.empty() ||
+        value.stage.empty() || value.checkpointHash == 0 ||
+        HashCheckpoint( value ) != value.checkpointHash )
+    {
+        error = "session_derived_checkpoint_invalid";
+        return false;
+    }
+    return true;
+}
+
+bool SaveDerivedCheckpointFile( const std::filesystem::path& sessionRoot,
+    TraceSessionDerivedCheckpoint& value, std::string& error )
+{
+    const auto path = DerivedCheckpointPath( sessionRoot );
+    std::error_code ec; std::filesystem::create_directories( path.parent_path(), ec );
+    if( ec ) { error = "session_derived_checkpoint_directory_failed:" + ec.message(); return false; }
+    value.schema = DerivedCheckpointSchema;
+    value.checkpointHash = HashCheckpoint( value );
+    auto temporary = path; temporary += ".tmp";
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_derived_checkpoint_open_failed"; return false; }
+    out << "magic " << DerivedCheckpointMagic << '\n'
+        << "schema " << value.schema << '\n'
+        << "source_sha256 " << std::quoted( value.sourceSha256 ) << '\n'
+        << "generation " << std::quoted( value.generation ) << '\n'
+        << "stage " << std::quoted( value.stage ) << '\n'
+        << "sequence " << value.sequence << '\n'
+        << "committed_stages " << value.committedStages << '\n'
+        << "committed_records " << value.committedRecords << '\n'
+        << "committed_bytes " << value.committedBytes << '\n'
+        << "previous_hash " << value.previousCheckpointHash << '\n'
+        << "checkpoint_hash " << value.checkpointHash << '\n';
+    out.flush();
+    if( !out ) { error = "session_derived_checkpoint_write_failed"; return false; }
+    out.close();
+    return AtomicReplace( temporary, path, error );
+}
+
+uint64_t CurrentPrivateBytes()
+{
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters {};
+    counters.cb = sizeof( counters );
+    return GetProcessMemoryInfo( GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>( &counters ), sizeof( counters ) ) ?
+        uint64_t( counters.PrivateUsage ) : 0;
+#else
+    struct rusage usage {};
+    return getrusage( RUSAGE_SELF, &usage ) == 0 ? uint64_t( usage.ru_maxrss ) * 1024 : 0;
+#endif
+}
 
 bool AtomicReplace( const std::filesystem::path& source,
     const std::filesystem::path& target, std::string& error )
@@ -243,6 +353,11 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "gfx_entities " << value.stats.gfxEntities << '\n';
     out << "gfx_links " << value.stats.gfxLinks << '\n';
     out << "correlated_frames " << value.stats.correlatedFrames << '\n';
+    out << "checkpoint_writes " << value.stats.checkpointWrites << '\n';
+    out << "writer_lease_heartbeats " << value.stats.writerLeaseHeartbeats << '\n';
+    out << "peak_private_bytes " << value.stats.peakPrivateBytes << '\n';
+    out << "soft_memory_limit_reached " << ( value.stats.softMemoryLimitReached ? 1 : 0 ) << '\n';
+    out << "hard_memory_limit_reached " << ( value.stats.hardMemoryLimitReached ? 1 : 0 ) << '\n';
     for( size_t i = 0; i < value.stats.domains.size(); ++i )
         out << "domain " << i << ' ' << value.stats.domains[i] << '\n';
     out << "file_count " << value.files.size() << '\n';
@@ -367,6 +482,21 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "gfx_entities" ) in >> value.stats.gfxEntities;
         else if( key == "gfx_links" ) in >> value.stats.gfxLinks;
         else if( key == "correlated_frames" ) in >> value.stats.correlatedFrames;
+        else if( key == "checkpoint_writes" ) in >> value.stats.checkpointWrites;
+        else if( key == "writer_lease_heartbeats" ) in >> value.stats.writerLeaseHeartbeats;
+        else if( key == "peak_private_bytes" ) in >> value.stats.peakPrivateBytes;
+        else if( key == "soft_memory_limit_reached" )
+        {
+            uint32_t flag = 0; in >> flag;
+            if( flag > 1 ) { error = "session_index_soft_memory_flag_invalid"; return false; }
+            value.stats.softMemoryLimitReached = flag != 0;
+        }
+        else if( key == "hard_memory_limit_reached" )
+        {
+            uint32_t flag = 0; in >> flag;
+            if( flag > 1 ) { error = "session_index_hard_memory_flag_invalid"; return false; }
+            value.stats.hardMemoryLimitReached = flag != 0;
+        }
         else if( key == "domain" )
         {
             size_t index = 0; uint64_t count = 0; in >> index >> count;
@@ -470,12 +600,91 @@ bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
     return true;
 }
 
+std::optional<TraceSessionDerivedCheckpoint> LoadTraceSessionDerivedCheckpoint(
+    const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest,
+    std::string& error )
+{
+    error.clear();
+    TraceSessionDerivedCheckpoint value;
+    if( !LoadDerivedCheckpointFile( DerivedCheckpointPath( sessionRoot ), value, error ) )
+        return std::nullopt;
+    if( value.sourceSha256 != manifest.source.sha256 ||
+        value.generation != manifest.generation )
+    {
+        error = "session_derived_checkpoint_identity_mismatch";
+        return std::nullopt;
+    }
+    return value;
+}
+
 bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot,
     TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     const TraceSessionDerivedControl& control, TraceSessionDerivedStats& stats,
     std::string& error )
 {
     error.clear(); stats = {};
+    TraceSessionWriterLease writerLease;
+    if( !AcquireTraceSessionWriterLease( sessionRoot, writerLease, error ) ) return false;
+
+    TraceSessionDerivedCheckpoint checkpoint;
+    std::string checkpointError;
+    if( !LoadDerivedCheckpointFile( DerivedCheckpointPath( sessionRoot ), checkpoint,
+        checkpointError ) )
+    {
+        if( checkpointError != "session_derived_checkpoint_not_found" )
+        { error = checkpointError; return false; }
+        checkpoint = {};
+        checkpoint.sourceSha256 = manifest.source.sha256;
+        checkpoint.generation = manifest.generation;
+    }
+    else if( checkpoint.sourceSha256 != manifest.source.sha256 ||
+        checkpoint.generation != manifest.generation )
+    {
+        error = "session_derived_checkpoint_identity_mismatch";
+        return false;
+    }
+    const auto commitCheckpoint = [&]( const char* stage, uint64_t records,
+        uint64_t bytes ) -> bool {
+        checkpoint.previousCheckpointHash = checkpoint.checkpointHash;
+        checkpoint.checkpointHash = 0;
+        checkpoint.stage = stage;
+        ++checkpoint.sequence;
+        ++checkpoint.committedStages;
+        checkpoint.committedRecords = records;
+        checkpoint.committedBytes = bytes;
+        if( !SaveDerivedCheckpointFile( sessionRoot, checkpoint, error ) ) return false;
+        ++stats.checkpointWrites;
+        if( !writerLease.Heartbeat( error ) ) return false;
+        ++stats.writerLeaseHeartbeats;
+        return true;
+    };
+    const auto checkControl = [&]() -> bool {
+        if( control.stopToken.stop_requested() )
+        { error = "cancelled_resumable"; return false; }
+        const auto privateBytes = control.queryPrivateBytes ?
+            control.queryPrivateBytes() : CurrentPrivateBytes();
+        stats.peakPrivateBytes = std::max( stats.peakPrivateBytes, privateBytes );
+        if( control.softPrivateBytes != 0 && privateBytes > control.softPrivateBytes )
+            stats.softMemoryLimitReached = true;
+        if( control.hardPrivateBytes != 0 && privateBytes > control.hardPrivateBytes )
+        {
+            stats.hardMemoryLimitReached = true;
+            error = "resource_limit_resumable";
+            return false;
+        }
+        if( control.minimumFreeBytes != 0 )
+        {
+            std::error_code spaceError;
+            const auto space = std::filesystem::space( sessionRoot, spaceError );
+            if( spaceError )
+            { error = "derived_disk_space_query_failed:" + spaceError.message(); return false; }
+            if( space.available < control.minimumFreeBytes )
+            { error = "insufficient_disk_resumable"; return false; }
+        }
+        return true;
+    };
+    if( checkpoint.stage.empty() && !commitCheckpoint( "derived-start", 0, 0 ) ) return false;
+    if( !checkControl() ) return false;
     const auto root = TraceSessionDomainIndexRoot( sessionRoot, manifest );
     std::error_code ec; std::filesystem::create_directories( root, ec );
     if( ec ) { error = "session_index_directory_failed:" + ec.message(); return false; }
@@ -499,7 +708,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         for( const auto& shard : manifest.shards )
         {
             if( shard.domain == "checkpoint" ) continue;
-            if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
+            if( !checkControl() ) return false;
             DomainIndexHeader header;
             header.domain = uint32_t( DomainFromName( shard.domain ) );
             if( header.domain >= uint32_t( TraceSessionProtocolDomain::Count ) ) header.domain = uint32_t( TraceSessionProtocolDomain::Other );
@@ -542,6 +751,8 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         // statistics after all mandatory builders finish.
         if( !SaveIndexManifest( root, index, error ) ) return false;
     }
+    if( !commitCheckpoint( "domain-index", index.stats.indexedRecords,
+        index.stats.indexBytes ) || !checkControl() ) return false;
 
     TraceSessionTimeTransform timeTransform;
     if( control.progress ) control.progress( 0.f, "time-transform" );
@@ -780,6 +991,9 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.gfxLinks = ioGfxStats.gfxLinks;
     index.stats.correlatedFrames = ioGfxStats.correlatedFrames;
 
+    if( !commitCheckpoint( "domains-complete", index.stats.indexedRecords,
+        index.stats.indexBytes ) || !checkControl() ) return false;
+
     const auto gpuCatalogEvents = inventory.protocolInventory.domains[
         size_t( TraceSessionProtocolDomain::GpuCatalog )].count;
     if( gpuCatalogEvents != 0 )
@@ -790,18 +1004,44 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         gpuControl.minimumFreeBytes = control.minimumFreeBytes;
         gpuControl.progress = control.progress;
         TraceSessionGpuDerivedStats gpuStats;
-        if( !BuildTraceSessionGpuAnalysisDerived( sessionRoot, manifest, gpuControl, gpuStats, error ) ) return false;
+        if( !BuildTraceSessionGpuAnalysisDerived( sessionRoot, manifest, gpuControl,
+            gpuStats, error ) )
+        {
+            if( error == "cancelled" ) error = "cancelled_resumable";
+            else if( error == "sidecar_size_limit" ) error = "resource_limit_resumable";
+            else if( error == "insufficient_free_space_for_gpu_analysis" )
+                error = "insufficient_disk_resumable";
+            return false;
+        }
         index.stats.gpuResources = gpuStats.resourceCount;
         index.stats.gpuAllocations = gpuStats.allocationCount;
         index.stats.gpuPasses = gpuStats.passCount;
         index.stats.gpuSourceGapResources = gpuStats.sourceGapResourceCount;
         index.stats.gpuSourceGapReferences = gpuStats.sourceGapReferenceCount;
     }
+    if( !commitCheckpoint( "gpu-complete", index.stats.indexedRecords,
+        index.stats.indexBytes ) || !checkControl() ) return false;
+    index.stats.checkpointWrites += stats.checkpointWrites;
+    index.stats.writerLeaseHeartbeats += stats.writerLeaseHeartbeats;
+    index.stats.peakPrivateBytes = std::max( index.stats.peakPrivateBytes,
+        stats.peakPrivateBytes );
+    index.stats.softMemoryLimitReached |= stats.softMemoryLimitReached;
+    index.stats.hardMemoryLimitReached |= stats.hardMemoryLimitReached;
     if( !SaveIndexManifest( root, index, error ) ) return false;
-    stats = index.stats;
     manifest.mandatoryDerivedComplete = true;
     manifest.state = TraceSessionState::FinalAuditing;
-    return SaveTraceSessionManifest( sessionRoot, manifest, error );
+    if( !SaveTraceSessionManifest( sessionRoot, manifest, error ) ) return false;
+    stats = index.stats;
+    if( !commitCheckpoint( "mandatory-complete", index.stats.indexedRecords,
+        index.stats.indexBytes ) ) return false;
+    index.stats.checkpointWrites = stats.checkpointWrites;
+    index.stats.writerLeaseHeartbeats = stats.writerLeaseHeartbeats;
+    index.stats.peakPrivateBytes = stats.peakPrivateBytes;
+    index.stats.softMemoryLimitReached = stats.softMemoryLimitReached;
+    index.stats.hardMemoryLimitReached = stats.hardMemoryLimitReached;
+    if( !SaveIndexManifest( root, index, error ) ) return false;
+    stats = index.stats;
+    return true;
 }
 
 bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,

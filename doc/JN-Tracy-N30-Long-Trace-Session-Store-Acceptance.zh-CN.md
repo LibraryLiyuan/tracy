@@ -2044,3 +2044,33 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 6.70 sec
 ```
 
 本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。
+
+### 2026-09-02 A3 预算、取消与恢复
+
+状态：**Passed（Synthetic/短Trace事务与恢复门禁；真实规模取消延迟、内存峰值和磁盘压力留在A5）**。
+
+- Mandatory Derived现在持有Session单writer lease；并发writer明确返回`session_writer_lease_active`，既有stale lease恢复语义继续由Session Store测试覆盖。
+- 新增身份绑定且带hash chain的`build-state/derived.checkpoint`，记录`derived-start`、`domain-index`、`domains-complete`、`gpu-complete`和`mandatory-complete`。恢复时source SHA-256或generation不一致会被拒绝。
+- 新增8/12/16 GiB Process Private Bytes目标、软上限和硬上限计数；硬上限命中后返回`resource_limit_resumable`，不发布部分Mandatory generation。磁盘安全预留不足返回`insufficient_disk_resumable`。
+- GPU Catalog/Pass中间spool在完成后写入独立identity、文件大小和SHA-256 checkpoint；恢复前逐文件校验。有效spool直接复用，损坏spool只重建对应阶段。
+- GPU Store的`.building` generation可验证并复用已提交Resource、Summary、Allocation、Residency、Churn、Pass和Relation页；`current`只在完整manifest发布后原子切换。
+- 取消发生在页提交之后时，已提交页继续可读，未提交页不进入manifest；恢复最多重做当前未提交页。取消前后的Direct/Inclusive成员集合保持`{10,12,13}`，旧complete generation始终可读。
+- 恢复实现中实际发现并修复“失败checkpoint部分解码污染pageCount”的缺陷：损坏Pass spool曾使重建从`000010.bin`起写、汇总器却读取`000000.bin`。现在任何checkpoint验证失败都会先清空全部内存计数，再从page 0确定性重建。
+- 在Canonical扫描、外排merge、Inclusive union、页面写入和关系merge的低层循环保留/补齐stop检查；所有GPU取消统一归一化为`cancelled_resumable`。
+- checkpoint、lease heartbeat、Private Bytes峰值和软/硬预算状态写入Session index manifest，可由后续Query/MCP质量接口读取。
+
+TDD与回归证据：
+
+```text
+RED-1: 缺少Derived checkpoint/control/统计接口，定向测试编译失败
+RED-2: GPU Store取消未回传committed pages，恢复未复用Catalog/Pass spool
+RED-3: 损坏spool后pageCount残留导致000000.bin缺失
+GREEN: store-page-committed后取消在2秒内返回cancelled_resumable
+GREEN: valid Catalog/Pass spool与Store pages均被复用
+GREEN: checksum-invalid Pass spool被拒绝并单独重建，已有Store pages继续复用
+GREEN: pre-cancel、writer lease冲突、17 GiB注入硬预算均明确失败且不发布部分结果
+GREEN: tracy-trace-session-inventory-tests Passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 7.33 sec
+```
+
+本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。A3的真实规模`Cancel≤2秒`、8/12/16 GiB实际RSS/Private Bytes和磁盘压力暂停仍由A5执行，不能用短Synthetic结果替代。

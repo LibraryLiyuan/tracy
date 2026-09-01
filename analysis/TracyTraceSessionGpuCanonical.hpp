@@ -61,7 +61,12 @@ struct TraceSessionGpuDerivedStats
     uint64_t writtenBytes = 0;
     uint64_t catalogPageCount = 0;
     uint64_t peakCatalogRecordsInMemory = 0;
+    uint64_t committedStorePages = 0;
+    uint64_t resumedStorePages = 0;
+    uint64_t rebuiltUncommittedStorePages = 0;
     bool usedPagedCatalog = false;
+    bool catalogSpoolReused = false;
+    bool passSpoolReused = false;
     std::string generation;
 };
 
