@@ -1074,6 +1074,14 @@ public:
         return result;
     }
     virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
+    virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
+    virtual std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const
+    {
+        const auto values = GetIoRequests();
+        const auto found = std::find_if( values.begin(), values.end(),
+            [requestId]( const auto& value ) { return value.requestId == requestId; } );
+        return found == values.end() ? std::nullopt : std::optional<IoRequestDto>( *found );
+    }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const

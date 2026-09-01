@@ -80,6 +80,8 @@ public:
         uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
+    uint64_t GetIoRequestCount() const override;
+    std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const override;

@@ -13,13 +13,14 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 3;
+inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 4;
 
 struct TraceSessionIoGfxStats
 {
     uint64_t ioRequests = 0;
     uint64_t ioConfigs = 0;
     uint64_t ioStages = 0;
+    uint64_t ioRequestIds = 0;
     uint64_t gfxDispatches = 0;
     uint64_t gfxEntities = 0;
     uint64_t gfxParentLinks = 0;
@@ -37,6 +38,7 @@ public:
 
     const TraceSessionIoGfxStats& Stats() const { return m_stats; }
     std::vector<IoRequestDto> IoRequests() const;
+    std::optional<IoRequestDto> IoRequest( uint64_t requestId ) const;
     std::vector<GfxDispatchDto> GfxDispatches() const;
     std::vector<GfxDispatchDto> GfxDispatchesForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const;
@@ -54,6 +56,8 @@ private:
     uint64_t m_ioRequestOffset = 0;
     uint64_t m_ioConfigOffset = 0;
     uint64_t m_ioStageOffset = 0;
+    uint64_t m_ioRequestIdPostingOffset = 0;
+    uint64_t m_ioRequestIdPostingCount = 0;
     uint64_t m_gfxDispatchOffset = 0;
     uint64_t m_gfxEntityOffset = 0;
     uint64_t m_gfxLinkOffset = 0;

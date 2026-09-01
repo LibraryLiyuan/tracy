@@ -5060,7 +5060,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
     if( method == "io.search" || method == "io.get" || method == "io.statistics" || method == "io.chain" )
     {
-        auto requests = source->GetIoRequests();
+        const bool pagedSessionIo = source->AcquireReadView().sourceKind ==
+            analysis::TraceSourceKind::Session;
+        const auto requestCount = source->GetIoRequestCount();
+        std::vector<analysis::IoRequestDto> requests;
+        if( !pagedSessionIo || method == "io.search" || method == "io.statistics" ||
+            method == "io.chain" ) requests = source->GetIoRequests();
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
         const bool present = capability != capabilities.end() && capability->present;
@@ -5071,7 +5076,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto base = [&]() -> json {
             return {
                 { "present", present }, { "io_schema_version", present ? 1 : 0 }, { "complete", present && producerComplete && !BudgetPartial() },
-                { "reason", reason }, { "request_count", Decimal( requests.size() ) },
+                { "reason", reason }, { "request_count", Decimal( requestCount ) },
                 { "producer_quality", producerQuality },
                 { "lifecycle_contract", {
                     { "request_event", "queue" }, { "config_event", "request_configuration" },
@@ -5113,6 +5118,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref is not an I/O request ref from this trace" );
             return *parsed;
         };
+        if( pagedSessionIo && method == "io.get" )
+        {
+            const auto request = source->GetIoRequest( parseIoRef() );
+            if( !request ) throw QueryError( "ENTITY_NOT_FOUND", "I/O request ref was not found" );
+            auto result = base();
+            result["request"] = IoRequestJson( *source, *request, true );
+            return Success( id, std::move( result ), trace );
+        }
         const auto findRequest = [&]( uint64_t requestId ) { return std::find_if( requests.begin(), requests.end(), [&]( const auto& value ) { return value.requestId == requestId; } ); };
 
         if( method == "io.search" )

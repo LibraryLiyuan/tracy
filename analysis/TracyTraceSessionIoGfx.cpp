@@ -57,6 +57,9 @@ struct FileHeader
     uint64_t gfxParentPostingOffset = 0;
     uint64_t gfxLinkSourcePostingOffset = 0;
     uint64_t gfxLinkTargetPostingOffset = 0;
+    uint64_t ioRequestIdPostingOffset = 0;
+    uint64_t ioRequestIdPostingCount = 0;
+    uint64_t ioRequestIds = 0;
     uint64_t gfxParentLinks = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
@@ -224,6 +227,7 @@ struct BuildState
     std::ofstream gfxParentPosting;
     std::ofstream gfxLinkSourcePosting;
     std::ofstream gfxLinkTargetPosting;
+    std::ofstream ioRequestIdPosting;
     TraceSessionIoGfxStats stats;
 };
 
@@ -238,6 +242,8 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
     {
     case QueueType::JnIoRequest:
     {
+        if( state.stats.ioRequests >= ( uint64_t( 1 ) << 62 ) )
+        { error = "session_io_request_ordinal_overflow"; return false; }
         StoredIoRequest value;
         value.timeNs = state.transform.ToNanoseconds( item.jnIoRequest.time );
         value.requestId = item.jnIoRequest.requestId;
@@ -250,11 +256,17 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         value.flags = item.jnIoRequest.flags;
         if( !WriteRecord( state.ioRequest, &value, sizeof( value ),
             "session_io_request_write_failed", error ) ) return false;
+        const TraceSessionUInt64Pair posting { value.requestId,
+            state.stats.ioRequests };
+        if( !WriteRecord( state.ioRequestIdPosting, &posting, sizeof( posting ),
+            "session_io_request_id_posting_write_failed", error ) ) return false;
         ++state.stats.ioRequests;
         break;
     }
     case QueueType::JnIoConfig:
     {
+        if( state.stats.ioConfigs >= ( uint64_t( 1 ) << 62 ) )
+        { error = "session_io_config_ordinal_overflow"; return false; }
         StoredIoConfig value;
         value.requestId = item.jnIoConfig.requestId;
         value.parentId = item.jnIoConfig.parentId;
@@ -264,11 +276,17 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         value.flags = item.jnIoConfig.flags;
         if( !WriteRecord( state.ioConfig, &value, sizeof( value ),
             "session_io_config_write_failed", error ) ) return false;
+        const TraceSessionUInt64Pair posting { value.requestId,
+            ( uint64_t( 1 ) << 62 ) | state.stats.ioConfigs };
+        if( !WriteRecord( state.ioRequestIdPosting, &posting, sizeof( posting ),
+            "session_io_config_id_posting_write_failed", error ) ) return false;
         ++state.stats.ioConfigs;
         break;
     }
     case QueueType::JnIoStage:
     {
+        if( state.stats.ioStages >= ( uint64_t( 1 ) << 62 ) )
+        { error = "session_io_stage_ordinal_overflow"; return false; }
         StoredIoStage value;
         value.timeNs = state.transform.ToNanoseconds( item.jnIoStage.time );
         value.requestId = item.jnIoStage.requestId;
@@ -280,6 +298,10 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         value.flags = item.jnIoStage.flags;
         if( !WriteRecord( state.ioStage, &value, sizeof( value ),
             "session_io_stage_write_failed", error ) ) return false;
+        const TraceSessionUInt64Pair posting { value.requestId,
+            ( uint64_t( 2 ) << 62 ) | state.stats.ioStages };
+        if( !WriteRecord( state.ioRequestIdPosting, &posting, sizeof( posting ),
+            "session_io_stage_id_posting_write_failed", error ) ) return false;
         ++state.stats.ioStages;
         break;
     }
@@ -391,6 +413,32 @@ bool CopyFile( const std::filesystem::path& path, std::ofstream& out,
     return true;
 }
 
+bool CountDistinctPairKeys( const std::filesystem::path& path,
+    uint64_t expectedCount, uint64_t& distinct, std::string& error )
+{
+    distinct = 0;
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) { error = "session_io_request_id_posting_open_failed"; return false; }
+    uint64_t previous = 0;
+    bool havePrevious = false;
+    for( uint64_t index = 0; index < expectedCount; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        { error = "session_io_request_id_posting_truncated"; return false; }
+        if( !havePrevious || pair.key != previous )
+        {
+            ++distinct;
+            previous = pair.key;
+            havePrevious = true;
+        }
+    }
+    char trailing = 0;
+    if( in.read( &trailing, 1 ) )
+    { error = "session_io_request_id_posting_trailing_bytes"; return false; }
+    return true;
+}
+
 bool CheckedAppend( uint64_t& value, uint64_t count, uint64_t itemBytes,
     std::string& error )
 {
@@ -419,6 +467,7 @@ bool SaveManifest( const std::filesystem::path& root,
     out << "io_requests " << manifest.stats.ioRequests << '\n';
     out << "io_configs " << manifest.stats.ioConfigs << '\n';
     out << "io_stages " << manifest.stats.ioStages << '\n';
+    out << "io_request_ids " << manifest.stats.ioRequestIds << '\n';
     out << "gfx_dispatches " << manifest.stats.gfxDispatches << '\n';
     out << "gfx_entities " << manifest.stats.gfxEntities << '\n';
     out << "gfx_parent_links " << manifest.stats.gfxParentLinks << '\n';
@@ -451,6 +500,7 @@ bool LoadManifest( const std::filesystem::path& root,
         else if( key == "io_requests" ) in >> manifest.stats.ioRequests;
         else if( key == "io_configs" ) in >> manifest.stats.ioConfigs;
         else if( key == "io_stages" ) in >> manifest.stats.ioStages;
+        else if( key == "io_request_ids" ) in >> manifest.stats.ioRequestIds;
         else if( key == "gfx_dispatches" ) in >> manifest.stats.gfxDispatches;
         else if( key == "gfx_entities" ) in >> manifest.stats.gfxEntities;
         else if( key == "gfx_parent_links" ) in >> manifest.stats.gfxParentLinks;
@@ -470,11 +520,19 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
     const LocalManifest& manifest, FileHeader& header, std::string& error )
 {
     in.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+    const bool ioPostingCountValid =
+        header.ioRequests <= std::numeric_limits<uint64_t>::max() - header.ioConfigs &&
+        header.ioRequests + header.ioConfigs <=
+            std::numeric_limits<uint64_t>::max() - header.ioStages &&
+        header.ioRequestIdPostingCount ==
+            header.ioRequests + header.ioConfigs + header.ioStages;
     if( !in || header.magic != FileMagic ||
         header.schema != TraceSessionIoGfxIndexSchemaVersion || header.endian != 0x01020304 ||
         header.sourceSize != session.source.fileSize || header.generationBytes != session.generation.size() ||
         header.reserved != 0 || header.ioRequests != manifest.stats.ioRequests ||
         header.ioConfigs != manifest.stats.ioConfigs || header.ioStages != manifest.stats.ioStages ||
+        !ioPostingCountValid ||
+        header.ioRequestIds != manifest.stats.ioRequestIds ||
         header.gfxDispatches != manifest.stats.gfxDispatches ||
         header.gfxEntities != manifest.stats.gfxEntities ||
         header.gfxParentLinks != manifest.stats.gfxParentLinks ||
@@ -517,6 +575,9 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         header.gfxLinkTargetPostingOffset == expected;
     valid = valid && CheckedAppend( expected, header.gfxLinks,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioRequestIdPostingOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioRequestIdPostingCount,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         expected == manifest.fileBytes;
     if( !in || source != session.source.sha256 || generation != session.generation || !valid )
@@ -619,6 +680,44 @@ std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
     return result;
 }
 
+std::vector<uint64_t> ReadPostingValues( const std::filesystem::path& path,
+    uint64_t postingOffset, uint64_t postingCount, uint64_t key )
+{
+    std::vector<uint64_t> result;
+    if( postingCount == 0 ) return result;
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session I/O posting is unavailable" );
+    const auto lowerBound = [&]( bool upper )
+    {
+        uint64_t first = 0, last = postingCount;
+        while( first < last )
+        {
+            const auto middle = first + ( last - first ) / 2;
+            TraceSessionUInt64Pair pair;
+            in.clear();
+            in.seekg( std::streamoff( postingOffset + middle * sizeof( pair ) ) );
+            if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+                throw std::runtime_error( "Session I/O posting binary search failed" );
+            if( pair.key < key || ( upper && pair.key == key ) ) first = middle + 1;
+            else last = middle;
+        }
+        return first;
+    };
+    const auto begin = lowerBound( false );
+    const auto end = lowerBound( true );
+    result.reserve( size_t( end - begin ) );
+    in.clear();
+    in.seekg( std::streamoff( postingOffset + begin * sizeof( TraceSessionUInt64Pair ) ) );
+    for( uint64_t index = begin; index < end; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) || pair.key != key )
+            throw std::runtime_error( "Session I/O posting is truncated" );
+        result.emplace_back( pair.value );
+    }
+    return result;
+}
+
 template<typename Stored, typename FrameKey>
 bool ValidateFramePosting( const std::filesystem::path& path,
     uint64_t postingOffset, uint64_t postingCount, uint64_t recordOffset,
@@ -654,11 +753,146 @@ bool ValidateFramePosting( const std::filesystem::path& path,
     return true;
 }
 
+bool ValidateIoRequestPosting( const std::filesystem::path& path,
+    const FileHeader& header, std::string& error )
+{
+    std::ifstream in( path, std::ios::binary );
+    std::ifstream records( path, std::ios::binary );
+    if( !in || !records )
+    { error = "session_io_request_id_posting_open_failed"; return false; }
+    in.seekg( std::streamoff( header.ioRequestIdPostingOffset ) );
+    TraceSessionUInt64Pair previous {};
+    bool havePrevious = false;
+    uint64_t distinct = 0;
+    constexpr uint64_t TypeShift = 62;
+    constexpr uint64_t OrdinalMask = ( uint64_t( 1 ) << TypeShift ) - 1;
+    for( uint64_t index = 0; index < header.ioRequestIdPostingCount; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        { error = "session_io_request_id_posting_truncated"; return false; }
+        if( havePrevious && ( pair.key < previous.key ||
+            ( pair.key == previous.key && pair.value < previous.value ) ) )
+        { error = "session_io_request_id_posting_not_sorted"; return false; }
+        if( !havePrevious || pair.key != previous.key ) ++distinct;
+        const auto type = pair.value >> TypeShift;
+        const auto ordinal = pair.value & OrdinalMask;
+        uint64_t targetId = 0;
+        if( type == 0 && ordinal < header.ioRequests )
+        {
+            StoredIoRequest value;
+            records.clear(); records.seekg( std::streamoff(
+                header.ioRequestOffset + ordinal * sizeof( value ) ) );
+            if( !records.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            { error = "session_io_request_id_posting_target_truncated"; return false; }
+            targetId = value.requestId;
+        }
+        else if( type == 1 && ordinal < header.ioConfigs )
+        {
+            StoredIoConfig value;
+            records.clear(); records.seekg( std::streamoff(
+                header.ioConfigOffset + ordinal * sizeof( value ) ) );
+            if( !records.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            { error = "session_io_config_id_posting_target_truncated"; return false; }
+            targetId = value.requestId;
+        }
+        else if( type == 2 && ordinal < header.ioStages )
+        {
+            StoredIoStage value;
+            records.clear(); records.seekg( std::streamoff(
+                header.ioStageOffset + ordinal * sizeof( value ) ) );
+            if( !records.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            { error = "session_io_stage_id_posting_target_truncated"; return false; }
+            targetId = value.requestId;
+        }
+        else
+        { error = "session_io_request_id_posting_record_out_of_range"; return false; }
+        if( targetId != pair.key )
+        { error = "session_io_request_id_posting_key_mismatch"; return false; }
+        previous = pair;
+        havePrevious = true;
+    }
+    if( distinct != header.ioRequestIds )
+    { error = "session_io_request_id_count_mismatch"; return false; }
+    return true;
+}
+
 std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
 {
     std::ostringstream out;
     out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
     return out.str();
+}
+
+IoRequestDto MakeIoRequest( const std::string& fingerprint, uint64_t requestId )
+{
+    IoRequestDto result;
+    result.ref = MakeRef( fingerprint, "io-request", requestId );
+    result.requestId = requestId;
+    result.orphan = true;
+    return result;
+}
+
+void ApplyIoRequest( IoRequestDto& request, const StoredIoRequest& value,
+    const std::string& fingerprint )
+{
+    request.resourceId = value.resourceId;
+    request.queueThreadRef = MakeRef( fingerprint, "thread", value.thread );
+    request.queueNs = value.timeNs;
+    request.operation = value.operation;
+    request.source = value.source;
+    request.priority = value.priority;
+    request.subsystem = value.subsystem;
+    request.flags = value.flags;
+    request.captureBoundary = request.captureBoundary ||
+        ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+    request.orphan = false;
+}
+
+void ApplyIoConfig( IoRequestDto& request, const StoredIoConfig& value )
+{
+    request.parentId = value.parentId;
+    request.requestedBytes = value.requestedBytes;
+    request.originFrameSequence = value.originFrameSequence;
+    request.parentKind = value.parentKind;
+    request.configFlags = value.flags;
+    request.captureBoundary = request.captureBoundary ||
+        ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+}
+
+void ApplyIoStage( IoRequestDto& request, const StoredIoStage& value,
+    const std::string& fingerprint )
+{
+    request.stages.push_back( { value.timeNs,
+        MakeRef( fingerprint, "thread", value.thread ), value.bytes, value.detail,
+        value.stage, value.status, value.flags } );
+    request.captureBoundary = request.captureBoundary ||
+        ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
+    switch( JnIoStage( value.stage ) )
+    {
+    case JnIoStage::Start:
+        if( !request.startNs || value.timeNs < *request.startNs )
+            request.startNs = value.timeNs;
+        break;
+    case JnIoStage::Complete:
+    case JnIoStage::Error:
+    case JnIoStage::Cancel:
+        ++request.terminalCount;
+        if( !request.endNs || value.timeNs > *request.endNs )
+            request.endNs = value.timeNs;
+        request.transferredBytes = value.bytes;
+        request.status = value.status;
+        break;
+    case JnIoStage::RequestCallstack: request.requestCallstack = value.detail; break;
+    case JnIoStage::Requeue: request.status = value.status; break;
+    }
+}
+
+void FinalizeIoRequest( IoRequestDto& request )
+{
+    request.truncated = !request.endNs.has_value();
+    std::sort( request.stages.begin(), request.stages.end(),
+        []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
 }
 
 }
@@ -686,20 +920,22 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "io-request.work", root / "io-config.work", root / "io-stage.work",
         root / "gfx-dispatch.work", root / "gfx-entity.work", root / "gfx-link.work",
         root / "frame.work" };
-    const std::array<std::filesystem::path, 6> postingSource = {
+    const std::array<std::filesystem::path, 7> postingSource = {
         root / "dispatch-frame-posting-source.work",
         root / "correlated-frame-posting-source.work",
         root / "gfx-entity-id-posting-source.work",
         root / "gfx-parent-posting-source.work",
         root / "gfx-link-source-posting-source.work",
-        root / "gfx-link-target-posting-source.work" };
-    const std::array<std::filesystem::path, 6> postingSorted = {
+        root / "gfx-link-target-posting-source.work",
+        root / "io-request-id-posting-source.work" };
+    const std::array<std::filesystem::path, 7> postingSorted = {
         root / "dispatch-frame-posting-sorted.work",
         root / "correlated-frame-posting-sorted.work",
         root / "gfx-entity-id-posting-sorted.work",
         root / "gfx-parent-posting-sorted.work",
         root / "gfx-link-source-posting-sorted.work",
-        root / "gfx-link-target-posting-sorted.work" };
+        root / "gfx-link-target-posting-sorted.work",
+        root / "io-request-id-posting-sorted.work" };
     BuildState state;
     state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
     state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
@@ -714,11 +950,13 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.gfxParentPosting.open( postingSource[3], std::ios::binary | std::ios::trunc );
     state.gfxLinkSourcePosting.open( postingSource[4], std::ios::binary | std::ios::trunc );
     state.gfxLinkTargetPosting.open( postingSource[5], std::ios::binary | std::ios::trunc );
+    state.ioRequestIdPosting.open( postingSource[6], std::ios::binary | std::ios::trunc );
     if( !state.ioRequest || !state.ioConfig || !state.ioStage || !state.gfxDispatch ||
         !state.gfxEntity || !state.gfxLink || !state.frame ||
         !state.dispatchFramePosting || !state.correlatedFramePosting ||
         !state.gfxEntityIdPosting || !state.gfxParentPosting ||
-        !state.gfxLinkSourcePosting || !state.gfxLinkTargetPosting )
+        !state.gfxLinkSourcePosting || !state.gfxLinkTargetPosting ||
+        !state.ioRequestIdPosting )
     { error = "session_io_gfx_work_open_failed"; return false; }
     if( !LoadTraceSessionTimeTransform( sessionRoot, session, state.transform, error ) ||
         !VisitTraceSessionCanonicalOrdered( sessionRoot, session, Visit, &state, error ) ) return false;
@@ -727,6 +965,13 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.dispatchFramePosting.close(); state.correlatedFramePosting.close();
     state.gfxEntityIdPosting.close(); state.gfxParentPosting.close();
     state.gfxLinkSourcePosting.close(); state.gfxLinkTargetPosting.close();
+    state.ioRequestIdPosting.close();
+    if( state.stats.ioRequests > std::numeric_limits<uint64_t>::max() - state.stats.ioConfigs ||
+        state.stats.ioRequests + state.stats.ioConfigs >
+            std::numeric_limits<uint64_t>::max() - state.stats.ioStages )
+    { error = "session_io_request_id_posting_count_overflow"; return false; }
+    const auto ioRequestIdPostingCount = state.stats.ioRequests +
+        state.stats.ioConfigs + state.stats.ioStages;
     constexpr uint64_t MaximumBufferedPostingPairs = 4ull * 1024 * 1024;
     if( !SortTraceSessionUInt64Pairs( postingSource[0], postingSorted[0], root,
             "io-gfx-dispatch-frame-posting", state.stats.gfxDispatches,
@@ -745,7 +990,12 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[5], postingSorted[5], root,
             "io-gfx-link-target-posting", state.stats.gfxLinks,
-            MaximumBufferedPostingPairs, error ) ) return false;
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( postingSource[6], postingSorted[6], root,
+            "io-request-id-posting", ioRequestIdPostingCount,
+            MaximumBufferedPostingPairs, error ) ||
+        !CountDistinctPairKeys( postingSorted[6], ioRequestIdPostingCount,
+            state.stats.ioRequestIds, error ) ) return false;
 
     FileHeader header;
     header.sourceSize = session.source.fileSize;
@@ -757,6 +1007,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.gfxLinks = state.stats.gfxLinks;
     header.correlatedFrames = state.stats.correlatedFrames;
     header.gfxParentLinks = state.stats.gfxParentLinks;
+    header.ioRequestIdPostingCount = ioRequestIdPostingCount;
+    header.ioRequestIds = state.stats.ioRequestIds;
     header.generationBytes = uint32_t( session.generation.size() );
     uint64_t next = sizeof( header );
     if( !CheckedAppend( next, 1, 64 + session.generation.size(), error ) ) return false;
@@ -792,6 +1044,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.gfxLinkTargetPostingOffset = next;
     if( !CheckedAppend( next, state.stats.gfxLinks,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioRequestIdPostingOffset = next;
+    if( !CheckedAppend( next, ioRequestIdPostingCount,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
 
     const auto temporary = root / ( std::string( FileName ) + ".tmp" );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -800,7 +1055,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     if( !session.generation.empty() ) out.write( session.generation.data(),
         std::streamsize( session.generation.size() ) );
-    const std::array<uint64_t, 13> expected = {
+    const std::array<uint64_t, 14> expected = {
         state.stats.ioRequests * sizeof( StoredIoRequest ),
         state.stats.ioConfigs * sizeof( StoredIoConfig ),
         state.stats.ioStages * sizeof( StoredIoStage ),
@@ -813,7 +1068,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         state.stats.gfxEntities * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxParentLinks * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxLinks * sizeof( TraceSessionUInt64Pair ),
-        state.stats.gfxLinks * sizeof( TraceSessionUInt64Pair ) };
+        state.stats.gfxLinks * sizeof( TraceSessionUInt64Pair ),
+        ioRequestIdPostingCount * sizeof( TraceSessionUInt64Pair ) };
     uint64_t copied = 0;
     for( size_t i = 0; i < work.size(); ++i )
         if( !CopyFile( work[i], out, copied, error ) || copied != expected[i] )
@@ -869,6 +1125,8 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_gfxParentPostingOffset = header.gfxParentPostingOffset;
     reader->m_gfxLinkSourcePostingOffset = header.gfxLinkSourcePostingOffset;
     reader->m_gfxLinkTargetPostingOffset = header.gfxLinkTargetPostingOffset;
+    reader->m_ioRequestIdPostingOffset = header.ioRequestIdPostingOffset;
+    reader->m_ioRequestIdPostingCount = header.ioRequestIdPostingCount;
     reader->m_stats = manifest.stats;
     return reader;
 }
@@ -884,72 +1142,69 @@ std::vector<IoRequestDto> TraceSessionIoGfxReader::IoRequests() const
     std::map<uint64_t, IoRequestDto> values;
     const auto ensure = [&]( uint64_t requestId ) -> IoRequestDto& {
         auto [it, inserted] = values.try_emplace( requestId );
-        if( inserted )
-        {
-            it->second.ref = MakeRef( m_fingerprint, "io-request", requestId );
-            it->second.requestId = requestId;
-            it->second.orphan = true;
-        }
+        if( inserted ) it->second = MakeIoRequest( m_fingerprint, requestId );
         return it->second;
     };
-    for( const auto& value : requests )
-    {
-        auto& request = ensure( value.requestId );
-        request.resourceId = value.resourceId;
-        request.queueThreadRef = MakeRef( m_fingerprint, "thread", value.thread );
-        request.queueNs = value.timeNs;
-        request.operation = value.operation;
-        request.source = value.source;
-        request.priority = value.priority;
-        request.subsystem = value.subsystem;
-        request.flags = value.flags;
-        request.captureBoundary = ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
-        request.orphan = false;
-    }
-    for( const auto& value : configs )
-    {
-        auto& request = ensure( value.requestId );
-        request.parentId = value.parentId;
-        request.requestedBytes = value.requestedBytes;
-        request.originFrameSequence = value.originFrameSequence;
-        request.parentKind = value.parentKind;
-        request.configFlags = value.flags;
-        request.captureBoundary = request.captureBoundary ||
-            ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
-    }
-    for( const auto& value : stages )
-    {
-        auto& request = ensure( value.requestId );
-        request.stages.push_back( { value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
-            value.bytes, value.detail, value.stage, value.status, value.flags } );
-        request.captureBoundary = request.captureBoundary ||
-            ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
-        switch( JnIoStage( value.stage ) )
-        {
-        case JnIoStage::Start:
-            if( !request.startNs || value.timeNs < *request.startNs ) request.startNs = value.timeNs;
-            break;
-        case JnIoStage::Complete:
-        case JnIoStage::Error:
-        case JnIoStage::Cancel:
-            ++request.terminalCount;
-            if( !request.endNs || value.timeNs > *request.endNs ) request.endNs = value.timeNs;
-            request.transferredBytes = value.bytes;
-            request.status = value.status;
-            break;
-        case JnIoStage::RequestCallstack: request.requestCallstack = value.detail; break;
-        case JnIoStage::Requeue: request.status = value.status; break;
-        }
-    }
+    for( const auto& value : requests ) ApplyIoRequest( ensure( value.requestId ), value, m_fingerprint );
+    for( const auto& value : configs ) ApplyIoConfig( ensure( value.requestId ), value );
+    for( const auto& value : stages ) ApplyIoStage( ensure( value.requestId ), value, m_fingerprint );
     std::vector<IoRequestDto> result;
     result.reserve( values.size() );
     for( auto& [id, request] : values )
     {
-        request.truncated = !request.endNs.has_value();
-        std::sort( request.stages.begin(), request.stages.end(),
-            []( const auto& lhs, const auto& rhs ) { return lhs.timeNs < rhs.timeNs; } );
+        FinalizeIoRequest( request );
         result.emplace_back( std::move( request ) );
     }
+    return result;
+}
+
+std::optional<IoRequestDto> TraceSessionIoGfxReader::IoRequest( uint64_t requestId ) const
+{
+    const auto records = ReadPostingValues( m_path, m_ioRequestIdPostingOffset,
+        m_ioRequestIdPostingCount, requestId );
+    if( records.empty() ) return std::nullopt;
+    IoRequestDto result = MakeIoRequest( m_fingerprint, requestId );
+    std::ifstream in( m_path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session I/O request index is unavailable" );
+    constexpr uint64_t TypeShift = 62;
+    constexpr uint64_t OrdinalMask = ( uint64_t( 1 ) << TypeShift ) - 1;
+    for( const auto encoded : records )
+    {
+        const auto type = encoded >> TypeShift;
+        const auto ordinal = encoded & OrdinalMask;
+        if( type == 0 )
+        {
+            if( ordinal >= m_stats.ioRequests )
+                throw std::runtime_error( "Session I/O request posting is out of range" );
+            StoredIoRequest value;
+            in.clear(); in.seekg( std::streamoff( m_ioRequestOffset + ordinal * sizeof( value ) ) );
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+                throw std::runtime_error( "Session I/O request posting target is truncated" );
+            ApplyIoRequest( result, value, m_fingerprint );
+        }
+        else if( type == 1 )
+        {
+            if( ordinal >= m_stats.ioConfigs )
+                throw std::runtime_error( "Session I/O config posting is out of range" );
+            StoredIoConfig value;
+            in.clear(); in.seekg( std::streamoff( m_ioConfigOffset + ordinal * sizeof( value ) ) );
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+                throw std::runtime_error( "Session I/O config posting target is truncated" );
+            ApplyIoConfig( result, value );
+        }
+        else if( type == 2 )
+        {
+            if( ordinal >= m_stats.ioStages )
+                throw std::runtime_error( "Session I/O stage posting is out of range" );
+            StoredIoStage value;
+            in.clear(); in.seekg( std::streamoff( m_ioStageOffset + ordinal * sizeof( value ) ) );
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+                throw std::runtime_error( "Session I/O stage posting target is truncated" );
+            ApplyIoStage( result, value, m_fingerprint );
+        }
+        else throw std::runtime_error( "Session I/O request posting type is invalid" );
+    }
+    FinalizeIoRequest( result );
     return result;
 }
 
@@ -1149,7 +1404,8 @@ bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             header.gfxLinkTargetPostingOffset, header.gfxLinks,
             header.gfxLinkOffset, header.gfxLinks,
             []( const StoredGfxLink& value ) { return value.targetId; },
-            "session_gfx_link_target_posting", error ) ) return false;
+            "session_gfx_link_target_posting", error ) ||
+        !ValidateIoRequestPosting( path, header, error ) ) return false;
     stats = manifest.stats;
     return true;
 }

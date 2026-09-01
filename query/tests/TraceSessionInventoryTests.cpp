@@ -2607,6 +2607,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     try
     {
         const auto ioRequests = sessionSource->GetIoRequests();
+        const auto ioRequestCount = sessionSource->GetIoRequestCount();
+        const auto ioRequest400 = sessionSource->GetIoRequest( 400 );
+        const auto missingIoRequest = sessionSource->GetIoRequest( 401 );
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
@@ -2616,7 +2619,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
-        test.Check( ioRequests.size() == 1 && ioRequests[0].requestId == 400 &&
+        test.Check( ioRequests.size() == 1 && ioRequestCount == 1 && ioRequest400 &&
+            !missingIoRequest && ioRequests[0].requestId == 400 &&
+            ioRequest400->requestId == 400 && ioRequest400->stages.size() == 2 &&
             ioRequests[0].requestedBytes == 4096 && ioRequests[0].transferredBytes == 4096 &&
             ioRequests[0].queueNs == 36 && ioRequests[0].startNs == 38 && ioRequests[0].endNs == 40 &&
             !ioRequests[0].orphan && !ioRequests[0].truncated,
@@ -3021,6 +3026,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "method", "io.search" }, { "params", { { "trace_id", traceId },
                     { "offset", 0 }, { "limit", 10 } } }
             } );
+            const auto ioGet = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-io-get" },
+                { "method", "io.get" }, { "params", { { "trace_id", traceId },
+                    { "ref", sessionSource->MakeEntityRef( "io-request", 400 ) } } }
+            } );
             test.Check( ioSearch.value( "ok", false ) &&
                 ioSearch["data"]["request_count"] == "1" &&
                 ioSearch["data"]["requests"].size() == 1 &&
@@ -3028,6 +3038,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 ioSearch["data"]["requests"][0]["requested_bytes"] == "4096" &&
                 ioSearch["data"]["requests"][0]["transferred_bytes"] == "4096",
                 "Query 1.34 reads exact Session I/O evidence without a Worker" );
+            test.Check( ioGet.value( "ok", false ) &&
+                ioGet["data"]["request_count"] == "1" &&
+                ioGet["data"]["request"]["request_id"] == "400" &&
+                ioGet["data"]["request"]["stages"].size() == 2,
+                "Query 1.34 point-reads one Session I/O request through the exact ID posting" );
         }
         if( sessionGfxReady )
         {

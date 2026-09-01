@@ -1520,3 +1520,24 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 测试结束已移除临时Query响应诊断输出；本子阶段未启动真实30分钟转换。
+
+### 2026-09-01 I/O Request ID Posting 与点查（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，I/O Search/Statistics/Chain分页仍待后续）**。
+
+- I/O/Gfx index schema从3升级到4；新增统一的`requestId→(record kind, ordinal)`精确posting，覆盖Request、Config和Stage三类Canonical事实。
+- record kind编码在posting value高2位，低62位保存对应固定宽度事实的ordinal；三类ordinal达到编码上限或总posting数量溢出时构建明确失败，不允许截断。
+- posting使用既有64 MiB有界外部排序器；构建完成后顺序计算唯一Request ID数量，`request_count`不再依赖查询期物化全量DTO。
+- Session Reader通过两次磁盘二分查找定位一个Request的全部事实，再点读Request/Config/Stage并复用与全量Reader相同的状态归并函数。
+- `io.get`的Session路径现在只读取目标Request；Legacy Worker路径保持原有实现。`io.search`、`io.statistics`和`io.chain`仍保留全量路径，未错误宣称完成。
+- Final Audit流式验证posting排序、kind、ordinal边界、目标Request ID和唯一ID总数；正确checksum无法掩盖语义键错误。
+
+TDD与回归证据：
+
+```text
+Reader:    GetIoRequestCount()=1；GetIoRequest(400)恢复2个Stage；401不存在
+Query:     io.get(400)返回requested/transferred bytes及完整Stage
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+发布目录不残留`io-request-id-posting`外排工作文件。本子阶段未启动真实30分钟转换。

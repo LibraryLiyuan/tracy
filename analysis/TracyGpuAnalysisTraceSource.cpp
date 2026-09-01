@@ -814,6 +814,18 @@ std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoRequests() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->IoRequests() : std::vector<IoRequestDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetIoRequestCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetIoRequestCount();
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->Stats().ioRequestIds : 0;
+}
+std::optional<IoRequestDto> GpuAnalysisTraceSource::GetIoRequest( uint64_t requestId ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetIoRequest( requestId );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->IoRequest( requestId ) : std::nullopt;
+}
 std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxDispatches();
