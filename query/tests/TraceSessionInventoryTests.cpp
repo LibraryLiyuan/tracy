@@ -1535,11 +1535,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, JobNamePointer, "SyntheticJob" );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobSchedule;
-    item.jnJobSchedule = { 104, 400, 0x100000ABC, 0, 2, uint8_t( 1 << 6 ) };
+    item.jnJobSchedule = { 104, 600, 0x100000ABC, 0, 2, uint8_t( 1 << 6 ) };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobStage;
-    item.jnJobStage = { 106, 400, 0, 0, 0,
+    item.jnJobStage = { 106, 600, 0, 0, 0,
         uint8_t( tracy::JnJobStage::Completed ), 0 };
     AppendQueueItem( frame, item );
     item = {};
@@ -1552,7 +1552,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobDependency;
-    item.jnJobDependency = { 500, 400, 0xAAA, 0 };
+    item.jnJobDependency = { 500, 600, 0x100000ABC, 0 };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobStage;
@@ -2735,20 +2735,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionJob500->dependencies.size() == 1 && sessionJob500->stages.size() == 5,
         "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
     const auto sessionJobPage = sessionSource->ScanJobs( 1, 1 );
+    const auto sessionJobSchedulePage = sessionSource->ScanJobsBySchedule( 0, 2 );
     const auto sessionJobById = sessionSource->GetJob( 500 );
-    const auto sessionJobDependents = sessionSource->GetJobDependents( 400, 0, 16 );
+    const auto sessionJobDependents = sessionSource->GetJobDependents( 600, 0, 16 );
     const auto sessionFrameJobs = sessionSource->GetJobsForFrame( 9, 0, 16 );
     const auto sessionHandleJobs = sessionSource->GetJobsForPackedHandle( 0xABC, 0, 16 );
-    const auto sessionSlotJobs = sessionSource->GetJobsForHandleSlotNear( 0xABC, 400, 16 );
+    const auto sessionSlotJobs = sessionSource->GetJobsForHandleSlotNear( 0xABC, 600, 16 );
     const auto sessionJobLatency = sessionSource->GetJobLatencyStatistics();
     const auto sessionEvidenceJobs = sessionSource->GetEvidenceJobs( 9 );
     test.Check( sessionSource->GetJobCount() == 2 && sessionJobPage.size() == 1 &&
-        sessionJobPage[0].jobId == 500 && sessionJobById &&
+        sessionJobPage[0].jobId == 600 && sessionJobSchedulePage.size() == 2 &&
+        sessionJobSchedulePage[0].jobId == 600 && sessionJobSchedulePage[1].jobId == 500 &&
+        sessionJobById &&
         sessionJobById->jobId == 500 && sessionJobById->stages.size() == 5 &&
         sessionJobDependents.size() == 1 && sessionJobDependents[0].jobId == 500 &&
         sessionFrameJobs.size() == 1 && sessionFrameJobs[0].jobId == 500 &&
         sessionHandleJobs.size() == 1 && sessionHandleJobs[0].jobId == 500 &&
-        sessionSlotJobs.size() == 2 && sessionSlotJobs[0].jobId == 400 &&
+        sessionSlotJobs.size() == 2 && sessionSlotJobs[0].jobId == 600 &&
         sessionSlotJobs[1].jobId == 500 &&
         sessionJobLatency && sessionJobLatency->scheduleToReady.count == 1 &&
         sessionJobLatency->scheduleToReady.total == 4 &&
@@ -2983,10 +2986,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             jobs["data"]["jobs"][0]["job_id"] == "500" &&
             jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
             "Query 1.34 searches the Session Job semantic index without a Worker" );
+        const auto jobsBySchedule = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-job-schedule-order" },
+            { "method", "job.search" }, { "params", { { "trace_id", traceId },
+                { "limit", 2 } } }
+        } );
+        test.Check( jobsBySchedule.value( "ok", false ) &&
+            jobsBySchedule["data"]["jobs"].size() == 2 &&
+            jobsBySchedule["data"]["jobs"][0]["job_id"] == "600" &&
+            jobsBySchedule["data"]["jobs"][1]["job_id"] == "500",
+            "Query 1.34 pages Session Job search in exact Schedule-time order rather than Job-ID order" );
         const auto jobDependencies = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-job-dependencies" },
             { "method", "job.dependencies" }, { "params", { { "trace_id", traceId },
-                { "ref", sessionSource->MakeEntityRef( "job", 400 ) }, { "limit", 16 } } }
+                { "ref", sessionSource->MakeEntityRef( "job", 600 ) }, { "limit", 16 } } }
         } );
         test.Check( jobDependencies.value( "ok", false ) &&
             jobDependencies["data"]["upstream"].empty() &&

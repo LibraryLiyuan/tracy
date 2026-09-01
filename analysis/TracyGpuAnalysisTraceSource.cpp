@@ -747,6 +747,12 @@ std::vector<JobDto> GpuAnalysisTraceSource::ScanJobs( size_t offset, size_t limi
     const auto reader = SessionJobReader();
     return reader ? reader->Scan( offset, limit ) : std::vector<JobDto> {};
 }
+std::vector<JobDto> GpuAnalysisTraceSource::ScanJobsBySchedule( size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanJobsBySchedule( offset, limit );
+    const auto reader = SessionJobReader();
+    return reader ? reader->ScanBySchedule( offset, limit ) : std::vector<JobDto> {};
+}
 std::optional<JobDto> GpuAnalysisTraceSource::GetJob( uint64_t jobId ) const
 {
     if( WorkerLoaded() ) return Worker().GetJob( jobId );

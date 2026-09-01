@@ -46,6 +46,7 @@ public:
     const std::vector<JobDto>& Jobs() const;
     uint64_t Count() const { return m_stats.jobs; }
     std::vector<JobDto> Scan( size_t offset, size_t limit ) const;
+    std::vector<JobDto> ScanBySchedule( size_t offset, size_t limit ) const;
     std::optional<JobDto> Get( uint64_t jobId ) const;
     std::vector<JobDto> Dependents( uint64_t jobId, size_t offset, size_t limit ) const;
     std::vector<JobDto> FrameJobs( uint64_t frameId, size_t offset, size_t limit ) const;

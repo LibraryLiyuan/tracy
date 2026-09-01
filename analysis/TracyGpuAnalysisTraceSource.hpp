@@ -73,6 +73,7 @@ public:
     std::vector<JobDto> GetJobs() const override;
     uint64_t GetJobCount() const override;
     std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override;
+    std::vector<JobDto> ScanJobsBySchedule( size_t offset, size_t limit ) const override;
     std::optional<JobDto> GetJob( uint64_t jobId ) const override;
     std::vector<JobDto> GetJobDependents(
         uint64_t jobId, size_t offset, size_t limit ) const override;

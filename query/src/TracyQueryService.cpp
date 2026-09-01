@@ -10489,7 +10489,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const std::string state = params.value( "state", "" );
             auto scanPage = ScanFiltered<analysis::JobDto>( *source, params, page,
                 []( const analysis::TraceSource& value, const analysis::ScanRange& range ) {
-                    return value.ScanJobs( range.offset, range.limit ); },
+                    return value.ScanJobsBySchedule( range.offset, range.limit ); },
                 [&]( const analysis::JobDto& job ) {
                     const char* currentState = job.cancelled ? "cancelled" : job.incomplete ? "incomplete" : job.completedNs ? "completed" : job.truncated ? "truncated" : "scheduled";
                     return TextMatches( job.name, params ) && ( kind.empty() || kind == JobKindName( job.kind ) ) &&

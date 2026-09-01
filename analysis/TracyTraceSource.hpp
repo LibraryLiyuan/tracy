@@ -1043,6 +1043,16 @@ public:
         const auto end = begin + std::min( limit, values.size() - begin );
         return std::vector<JobDto>( values.begin() + begin, values.begin() + end );
     }
+    virtual std::vector<JobDto> ScanJobsBySchedule( size_t offset, size_t limit ) const
+    {
+        auto values = GetJobs();
+        std::sort( values.begin(), values.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.scheduleNs != rhs.scheduleNs ? lhs.scheduleNs < rhs.scheduleNs :
+                lhs.jobId < rhs.jobId; } );
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<JobDto>( values.begin() + begin, values.begin() + end );
+    }
     virtual std::optional<JobDto> GetJob( uint64_t jobId ) const
     {
         const auto values = GetJobs();

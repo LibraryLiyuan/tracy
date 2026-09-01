@@ -1645,10 +1645,10 @@ Trace Session Inventory tests passed；固定组合回归6/6
 Synthetic证据：
 
 ```text
-Job 400: packedHandle=0x100000ABC，缺失Ready
+Job 600: packedHandle=0x100000ABC，缺失Ready
 Job 500: packedHandle=0x000000ABC，Ready完整
 Reader exact-handle(0xABC)=[500]
-Reader near-slot(0xABC, 400)=[400,500]
+Reader near-slot(0xABC, 600)=[600,500]
 Query missing_ready_examples[0].same_slot_jobs=[500]
 Trace Session Inventory tests passed；固定组合回归6/6
 ```
@@ -1672,6 +1672,29 @@ Synthetic证据：
 Job 500: Schedule→Ready=4 ns，Dependency Ready=8 ns，Execution=8 ns
 Reader: schedule count=1/total=4；execution count=1/total=8
 Query job.statistics与Reader的count/total一致
+Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
+### 2026-09-01 Job Schedule-Time Posting 与 Search 分页（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，真实长Trace墙钟与容量待N30.7集中门禁）**。
+
+- Job page schema从4升级到5，posting schema从3升级到4；新增按`(scheduleNs, JobId)`严格排序的精确Schedule posting，以及按`(JobId, scheduleNs)`排序的反向审计投影。
+- 有符号Schedule时间通过翻转符号位编码为无符号排序键，保持完整`int64_t`时间顺序；相同时间以Job ID稳定排序。
+- Schedule顺序事实与六类Job延迟在同一次最多4096个Job的有界分页复原中生成，避免为同一批Job执行第二次全量磁盘复原扫描。
+- Session Reader新增`ScanBySchedule(offset, limit)`，只读取目标Schedule posting页，再按Job ID点查并按posting顺序复原DTO；不会为分页结果物化全部Job。
+- Session `job.search`改用Schedule顺序和raw-offset游标执行`ScanFiltered`；文本、kind、state和source过滤仍保持增量扫描。Legacy Worker默认实现显式排序`(scheduleNs, JobId)`，与既有查询语义一致。
+- Final Audit验证forward/inverse布局、严格顺序、Job成员、双向存在关系，并从最终Schedule事实重算每个Job的稳定Schedule时间；checksum正确但时间或成员错误仍会阻止Session发布。
+
+Synthetic使用非单调ID证明查询不是偶然按ID有序：
+
+```text
+Schedule order: Job 600 @ 104 ns → Job 500 @ 110 ns
+Job-ID order:   Job 500 → Job 600
+Reader ScanBySchedule(0,2)=[600,500]
+Query job.search(limit=2)=[600,500]
 Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
