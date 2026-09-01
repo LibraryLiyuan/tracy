@@ -3,6 +3,7 @@
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyTraceSessionGpuVerifier.hpp"
 #include "TracyTraceSessionDerived.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyTraceSessionMemory.hpp"
@@ -2629,6 +2630,44 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             mandatoryGpuReader->Manifest().generation &&
         mandatoryGpuVerifier->mismatchCount == 0,
         "Mandatory Derived publishes an independent identity-pinned GPU verifier report: " + error );
+#ifdef _WIN32
+    const auto longSessionRoot = directory / std::string( 50, 'a' ) /
+        std::string( 50, 'b' ) / "gpu-canonical-session";
+    const std::string longGeneration = "gpu-long-path-generation";
+    tracy::analysis::TraceSessionManifest longManifest;
+    test.Check( tracy::analysis::BuildTraceSessionCanonical( source, longSessionRoot,
+        longGeneration, inventory, canonicalOptions, longManifest, error ) ==
+        tracy::analysis::TraceSessionCanonicalBuildResult::Complete,
+        "build long-path GPU canonical Session: " + error );
+    tracy::analysis::TraceSessionDerivedStats longDerivedStats;
+    std::string longDerivedStage;
+    tracy::analysis::TraceSessionDerivedControl longDerivedControl;
+    longDerivedControl.minimumFreeBytes = 0;
+    longDerivedControl.progress = [&]( float, std::string_view stage ) {
+        longDerivedStage.assign( stage );
+    };
+    const auto longDerivedOk = tracy::analysis::BuildTraceSessionMandatoryDerived(
+        longSessionRoot, longManifest, inventory, longDerivedControl,
+        longDerivedStats, error );
+    test.Check( longDerivedOk,
+        "build Mandatory Derived under a real MAX_PATH-crossing Session root at " +
+            longDerivedStage + ": " + error );
+    tracy::analysis::TraceSessionDerivedStats longLoadedStats;
+    test.Check( longDerivedOk && tracy::analysis::LoadTraceSessionDerivedStats(
+        longSessionRoot, longManifest, longLoadedStats, error ) &&
+        longLoadedStats.indexedRecords == longDerivedStats.indexedRecords,
+        "load committed Derived metadata under a real MAX_PATH-crossing Session root: " +
+            error );
+    tracy::analysis::TraceSessionDerivedStats longAuditedStats;
+    test.Check( longDerivedOk && tracy::analysis::AuditTraceSessionFinal(
+        longSessionRoot, longManifest, inventory, longAuditedStats, error ) &&
+        longAuditedStats.indexedRecords == longDerivedStats.indexedRecords,
+        "final-audit a real MAX_PATH-crossing Session root: " + error );
+    std::error_code longCleanupError;
+    std::filesystem::remove_all( tracy::analysis::GpuAnalysisIoPath(
+        longSessionRoot.parent_path().parent_path() ), longCleanupError );
+    test.Check( !longCleanupError, "remove long-path GPU Session fixture" );
+#endif
     const auto derivedCheckpoint = tracy::analysis::LoadTraceSessionDerivedCheckpoint(
         sessionRoot, manifest, error );
     test.Check( derivedCheckpoint && derivedCheckpoint->stage == "mandatory-complete" &&
@@ -2842,6 +2881,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
         inventory, resumeDerivedControl, resumedMandatoryStats, error ),
         "resume mandatory Session indexes from committed domain generations: " + error );
+    std::string resumedDerivedStageList;
+    for( const auto& stage : resumedDerivedStages )
+    {
+        if( !resumedDerivedStageList.empty() ) resumedDerivedStageList += ',';
+        resumedDerivedStageList += stage;
+    }
     test.Check( std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "frames-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "session-domain-index-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "time-transform-reused" ) != resumedDerivedStages.end() &&
@@ -2858,10 +2903,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "relations-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "runtime-script-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "io-gfx-reused" ) != resumedDerivedStages.end(),
-        "Mandatory Derived resume reuses every verified domain generation" );
+        "Mandatory Derived resume reuses every verified domain generation; observed=" +
+            resumedDerivedStageList );
     tracy::analysis::TraceSessionDerivedStats auditedStats;
-    test.Check( tracy::analysis::AuditTraceSessionFinal(
-        sessionRoot, manifest, inventory, auditedStats, error ),
+    const auto finalAuditOk = tracy::analysis::AuditTraceSessionFinal(
+        sessionRoot, manifest, inventory, auditedStats, error );
+    test.Check( finalAuditOk,
         "final audit covers Canonical, mandatory indexes, and GPU derived: " + error );
     test.Check( mandatoryStats.indexedRecords == auditedStats.indexedRecords &&
         auditedStats.indexedProtocolEvents == inventory.protocolInventory.eventCount &&
@@ -4416,7 +4463,7 @@ int main()
         TestSharedGpuPointerIdentityOutlivesOwnership( test );
         TestGpuCanonicalReader( test, directory );
     }
-    std::filesystem::remove_all( directory, filesystemError );
+    std::filesystem::remove_all( tracy::analysis::GpuAnalysisIoPath( directory ), filesystemError );
     test.Check( !filesystemError, "remove test directory" );
     if( test.failed != 0 )
     {

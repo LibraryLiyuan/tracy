@@ -2108,7 +2108,7 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 7.62 sec
 
 ### 2026-09-02 A5 G05预检：Windows长路径缺陷
 
-状态：**Fixed；G05转换待从已完成Inventory恢复**。
+状态：**Fixed；G05已完成Inventory和50个Canonical shard，待从Mandatory Derived检查点恢复**。
 
 - 固定G05输入为`G05-Player-HighEvidence-20260831-173806.tracy-stream`，大小`2,199,546,075 bytes`，SHA-256为`660AB0207F4F5B18D9B808CD07BC3E8BB1C9EC3104A08E678DBEEA6F97EB0976`。
 - 新Converter约40秒完成Inventory Scan/Hash，随后首个Canonical shard明确失败：`session_shard_directory_failed:The filename or extension is too long`。
@@ -2126,3 +2126,24 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 7.78 sec
 ```
 
 失败现场保留，下一次使用同一命令将复用已校验Inventory而不是重新扫描；尚未宣称G05门禁通过。
+
+#### Mandatory Derived长路径恢复缺陷
+
+- 使用修复后的Release Converter恢复G05后，已校验Inventory被复用，50个Canonical shard在约38秒内全部提交；随后首次进入Mandatory Derived时失败：`session_index_directory_failed:The filename or extension is too long`。
+- 根因仍是Windows扩展长度路径边界遗漏，但与前一缺陷不同：Trace Session Store已修复，`TracyTraceSessionDerived.cpp`的公共入口仍把普通根路径直接交给`create_directories`、`space`和各Domain builder。
+- Derived公共构建、读取checkpoint、读取统计和Final Audit入口现在先使用`GpuAnalysisIoPath`规范化Session根路径，所有下游索引继承同一长路径语义。
+- manifest按设计保存使用`/`的可移植相对路径；恢复读取时必须在完整路径组合之后再次执行native规范化。否则`\\?\`命名空间不会替换`/`，会把已提交index误报为`session_index_size_mismatch`。该问题已由恢复复用测试实际发现并修复。
+- 自动化覆盖从“能够构建”扩展为真实超过`MAX_PATH`的完整链：Canonical构建、Mandatory Derived、metadata读取、resume reuse和Final Audit。
+
+验证：
+
+```text
+RED-1: build Mandatory Derived under a real MAX_PATH-crossing Session root
+       -> session_index_directory_failed
+RED-2: 首次根路径规范化后resume误报session_index_size_mismatch
+GREEN: long-path Canonical/Derived/load/resume/Final Audit全部通过
+GREEN: Trace Session Inventory tests passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 8.82 sec
+```
+
+G05的既有building目录和50个Canonical shard均保留；后续只重编译Release Converter并从Mandatory Derived恢复，不重做Inventory或Canonical。

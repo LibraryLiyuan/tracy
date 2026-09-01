@@ -1,6 +1,7 @@
 #include "TracyTraceSessionDerived.hpp"
 
 #include "TracyGpuAnalysisStore.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 #include "TracyHash.hpp"
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionFrameImages.hpp"
@@ -534,7 +535,10 @@ bool VerifyIndexManifest( const std::filesystem::path& root,
     {
         if( file.relativePath.is_absolute() || file.relativePath.string().find( ".." ) != std::string::npos )
         { error = "session_index_unsafe_path"; return false; }
-        const auto path = root / file.relativePath;
+        // Manifests intentionally persist portable generic ('/') relative
+        // paths.  Normalize only after composing the complete native path:
+        // the Win32 extended-length namespace does not translate separators.
+        const auto path = GpuAnalysisIoPath( root / file.relativePath );
         std::error_code ec; const auto size = std::filesystem::file_size( path, ec );
         if( ec || size != file.fileBytes ) { error = "session_index_size_mismatch"; return false; }
         if( Sha256File( path ) != file.sha256 ) { error = "session_index_checksum_mismatch"; return false; }
@@ -578,10 +582,11 @@ std::filesystem::path TraceSessionDomainIndexRoot( const std::filesystem::path& 
     return sessionRoot / "generations" / manifest.generation / "derived" / "session-index";
 }
 
-bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
+bool LoadTraceSessionDerivedStats( const std::filesystem::path& requestedSessionRoot,
     const TraceSessionManifest& manifest, TraceSessionDerivedStats& stats,
     std::string& error )
 {
+    const auto sessionRoot = GpuAnalysisIoPath( requestedSessionRoot );
     error.clear();
     stats = {};
     IndexManifest index;
@@ -602,9 +607,10 @@ bool LoadTraceSessionDerivedStats( const std::filesystem::path& sessionRoot,
 }
 
 std::optional<TraceSessionDerivedCheckpoint> LoadTraceSessionDerivedCheckpoint(
-    const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest,
+    const std::filesystem::path& requestedSessionRoot, const TraceSessionManifest& manifest,
     std::string& error )
 {
+    const auto sessionRoot = GpuAnalysisIoPath( requestedSessionRoot );
     error.clear();
     TraceSessionDerivedCheckpoint value;
     if( !LoadDerivedCheckpointFile( DerivedCheckpointPath( sessionRoot ), value, error ) )
@@ -618,11 +624,12 @@ std::optional<TraceSessionDerivedCheckpoint> LoadTraceSessionDerivedCheckpoint(
     return value;
 }
 
-bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot,
+bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& requestedSessionRoot,
     TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     const TraceSessionDerivedControl& control, TraceSessionDerivedStats& stats,
     std::string& error )
 {
+    const auto sessionRoot = GpuAnalysisIoPath( requestedSessionRoot );
     error.clear(); stats = {};
     TraceSessionWriterLease writerLease;
     if( !AcquireTraceSessionWriterLease( sessionRoot, writerLease, error ) ) return false;
@@ -1069,10 +1076,11 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     return true;
 }
 
-bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
+bool AuditTraceSessionFinal( const std::filesystem::path& requestedSessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionInventory& inventory,
     TraceSessionDerivedStats& stats, std::string& error )
 {
+    const auto sessionRoot = GpuAnalysisIoPath( requestedSessionRoot );
     error.clear(); stats = {};
     TraceSessionCanonicalAudit canonical;
     if( !AuditTraceSessionCanonical( sessionRoot, manifest, inventory, canonical, error ) ) return false;
