@@ -1591,6 +1591,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnRuntimeMode::Enabled ), 0, 0 };
     AppendQueueItem( frame, item );
     item = {};
+    item.hdr.type = tracy::QueueType::JnRuntimeDomainState;
+    item.jnRuntimeDomainState = { 118, 4, 21,
+        uint8_t( tracy::JnRuntimeDomain::GpuReference ), uint8_t( tracy::JnRuntimeMode::Enabled ),
+        uint8_t( tracy::JnRuntimeMode::Enabled ), 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
     item.hdr.type = tracy::QueueType::JnScriptFrame;
     item.jnScriptFrame = { ScriptFunctionPointer, ScriptFilePointer, 71, 123, 1, 0 };
     AppendQueueItem( frame, item );
@@ -2691,7 +2697,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             explicitPassLinks[0].targetId == 1000 &&
             explicitPassLinks[0].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ),
             "Session Gfx link source posting pages one Pass adjacency without a full-domain scan" );
-        test.Check( sessionSource->GetRuntimeDomainStateCount() == 1 &&
+        test.Check( sessionSource->GetRuntimeDomainStateCount() == 2 &&
             runtimeDomainPage.size() == 1 && runtimeDomainPage[0].timeNs == 34,
             "Session Runtime Domain reader pages exact state records" );
         test.Check( sessionSource->GetScriptFrameCount() == 1 &&
@@ -3120,12 +3126,25 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "method", "runtime.domain.states" }, { "params", { { "trace_id", traceId },
                     { "domain", "script_stack" } } }
             } );
+            const auto budgetedRuntimeStates = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-runtime-domain-budget" },
+                { "method", "runtime.domain.states" }, { "params", { { "trace_id", traceId },
+                    { "max_scan_events", 1 } } }
+            } );
             test.Check( runtimeStates.value( "ok", false ) &&
-                runtimeStates["data"]["state_count"] == "1" &&
+                runtimeStates["data"]["state_count"] == "2" &&
                 runtimeStates["data"]["states"].size() == 1 &&
                 runtimeStates["data"]["states"][0]["time_ns"] == "34" &&
                 runtimeStates["data"]["states"][0]["effective_mode"] == "enabled",
                 "Query 1.34 reads exact Session runtime-domain state without a Worker" );
+            test.Check( budgetedRuntimeStates.value( "ok", false ) &&
+                budgetedRuntimeStates["partial"] == true &&
+                budgetedRuntimeStates["data"]["complete"] == false &&
+                budgetedRuntimeStates["data"]["state_count"] == "2" &&
+                budgetedRuntimeStates["data"]["matched_count"].is_null() &&
+                budgetedRuntimeStates["data"]["states"].size() == 1,
+                "Session runtime-domain query pages exact records and reports budget truncation: " +
+                    budgetedRuntimeStates.dump() );
         }
         if( sessionRuntimeScriptReady )
         {

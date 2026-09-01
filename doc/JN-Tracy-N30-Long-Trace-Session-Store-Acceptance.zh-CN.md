@@ -1677,6 +1677,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Runtime Domain State 有界分页（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness；真实长Trace状态基数待N30.7观测）**。
+
+- `runtime.domain.states`不再调用`GetRuntimeDomainStates()`一次性物化全部状态；改为先读取精确总数，再以最多4096条的固定页调用`ScanRuntimeDomainStates()`。
+- 查询只保留当前输出页所需的最早状态，以及每个Runtime Domain的latest状态；内存不再与全部状态数线性增长。
+- 时间与generation排序、domain/text过滤、`state_count`、`matched_count`和`latest`语义保持；新增`latest_complete`明确latest是否遍历了完整输入。
+- `max_scan_events`或CPU预算耗尽时返回成功但明确`partial=true`、`complete=false`、`matched_count=null`、`latest_complete=false`，且不给出不可安全续接的cursor。
+- Session Reader缺页、平台容量溢出或磁盘记录数不一致会显式失败，不把缺失数据发布为完整结果。
+
+TDD与回归证据：
+
+```text
+RED:       2条状态、max_scan_events=1时旧路径仍返回全部2条，scan_events=0、partial=false
+GREEN:     相同预算只扫描1条，partial=true、matched_count=null
+Exact:     默认预算下ScriptStack过滤仍精确返回1条；总state_count=2
+Regression: Trace Session Inventory通过；固定6项回归全部通过（2.90秒）
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Canonical Schema、Unity或Player。
+
 ### 2026-09-01 Evidence Graph 目标 FrameIdentity 有界读取（N30.6B 子阶段）
 
 状态：**Passed（内部正确性与OOM防护；Session Evidence capability仍按完整性门禁保持关闭）**。

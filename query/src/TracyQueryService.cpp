@@ -4871,44 +4871,102 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "runtime.domain"; } );
         const bool present = capability != capabilities.end() && capability->present;
-        const std::string reason = present ? "" : capability == capabilities.end() ?
+        const std::string unavailableReason = present ? "" : capability == capabilities.end() ?
             "trace source does not advertise runtime-domain states" : capability->reason;
-        auto states = source->GetRuntimeDomainStates();
-        const auto totalStateCount = states.size();
-        json base = {
-            { "present", present }, { "runtime_domain_schema_version", present ? 1 : 0 },
-            { "complete", present && !BudgetPartial() }, { "reason", reason },
-            { "state_count", Decimal( totalStateCount ) }, { "provenance", "exact-binary" },
-            { "trust", "untrusted_trace_data" }
-        };
+        const auto totalStateCount = source->GetRuntimeDomainStateCount();
         if( !present )
         {
+            json base = {
+                { "present", false }, { "runtime_domain_schema_version", 0 },
+                { "complete", false }, { "reason", unavailableReason },
+                { "state_count", Decimal( totalStateCount ) }, { "provenance", "exact-binary" },
+                { "trust", "untrusted_trace_data" }
+            };
             base["states"] = json::array();
             base["latest"] = json::object();
+            base["latest_complete"] = false;
             return Success( id, std::move( base ), trace );
         }
+        if( totalStateCount > std::numeric_limits<size_t>::max() )
+            throw QueryError( "RESOURCE_LIMIT", "Runtime Domain state count exceeds the platform addressable range" );
 
         const std::string domainFilter = params.value( "domain", "" );
-        states.erase( std::remove_if( states.begin(), states.end(), [&]( const auto& value ) {
-            return ( !domainFilter.empty() && domainFilter != RuntimeDomainName( value.domain ) ) ||
-                !TextMatches( std::string( RuntimeDomainName( value.domain ) ) + " " + RuntimeModeName( value.effectiveMode ), params );
-        } ), states.end() );
-        std::sort( states.begin(), states.end(), []( const auto& lhs, const auto& rhs ) {
+        const auto matches = [&]( const auto& value ) {
+            return ( domainFilter.empty() || domainFilter == RuntimeDomainName( value.domain ) ) &&
+                TextMatches( std::string( RuntimeDomainName( value.domain ) ) + " " +
+                    RuntimeModeName( value.effectiveMode ), params );
+        };
+        const auto earlier = []( const auto& lhs, const auto& rhs ) {
             return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.generation < rhs.generation;
-        } );
-        json latest = json::object();
-        for( const auto& value : states ) latest[RuntimeDomainName( value.domain )] = RuntimeDomainStateJson( value );
+        };
         const auto page = ParsePage( params, method, trace );
+        const auto retainLimit = page.offset > std::numeric_limits<size_t>::max() - page.limit ?
+            std::numeric_limits<size_t>::max() : page.offset + page.limit;
+        std::priority_queue<analysis::RuntimeDomainStateDto,
+            std::vector<analysis::RuntimeDomainStateDto>, decltype( earlier )> retained( earlier );
+        std::map<uint8_t, analysis::RuntimeDomainStateDto> latestStates;
+        uint64_t matchedCount = 0;
+        constexpr size_t Chunk = 4096;
+        size_t rawOffset = 0;
+        const auto exactCount = size_t( totalStateCount );
+        while( rawOffset < exactCount )
+        {
+            checkCancelled();
+            const auto requested = std::min( Chunk, exactCount - rawOffset );
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed == 0 ) break;
+            const auto states = source->ScanRuntimeDomainStates( rawOffset, allowed );
+            if( states.size() != allowed )
+                throw std::runtime_error( "runtime_domain_state_page_missing" );
+            BudgetScanned( states.size(), requested, allowed );
+            for( const auto& value : states )
+            {
+                if( !matches( value ) ) continue;
+                matchedCount++;
+                const auto latest = latestStates.find( value.domain );
+                if( latest == latestStates.end() || earlier( latest->second, value ) )
+                    latestStates[value.domain] = value;
+                if( retainLimit == 0 ) continue;
+                retained.push( value );
+                if( retained.size() > retainLimit ) retained.pop();
+            }
+            rawOffset += states.size();
+        }
+        std::vector<analysis::RuntimeDomainStateDto> states;
+        states.reserve( retained.size() );
+        while( !retained.empty() )
+        {
+            states.emplace_back( std::move( retained.top() ) );
+            retained.pop();
+        }
+        std::sort( states.begin(), states.end(), earlier );
         const auto begin = std::min( page.offset, states.size() );
         const auto end = std::min( begin + page.limit, states.size() );
         json values = json::array();
         for( size_t index = begin; index < end; index++ ) values.emplace_back( RuntimeDomainStateJson( states[index] ) );
         values = ProjectFields( std::move( values ), params );
-        base["matched_count"] = Decimal( states.size() );
+        json latest = json::object();
+        for( const auto& [domain, value] : latestStates )
+            latest[RuntimeDomainName( domain )] = RuntimeDomainStateJson( value );
+        const bool partial = BudgetPartial();
+        json base = {
+            { "present", true }, { "runtime_domain_schema_version", 1 },
+            { "complete", !partial },
+            { "reason", partial ? "query budget exhausted before all Runtime Domain states were scanned" : "" },
+            { "state_count", Decimal( totalStateCount ) }, { "provenance", "exact-binary" },
+            { "trust", "untrusted_trace_data" }
+        };
+        base["matched_count"] = partial ? json( nullptr ) : json( Decimal( matchedCount ) );
         base["states"] = std::move( values );
         base["latest"] = std::move( latest );
-        const auto cursor = NextCursor( page, method, trace, end - begin, end < states.size() );
-        return Success( id, std::move( base ), trace, PageJson( page, end - begin, cursor, BudgetPartial() ) );
+        base["latest_complete"] = !partial;
+        const auto returned = end - begin;
+        if( page.offset > std::numeric_limits<size_t>::max() - returned )
+            throw QueryError( "RESOURCE_LIMIT", "Runtime Domain page offset exceeds the platform addressable range" );
+        const bool hasMore = !partial && uint64_t( page.offset + returned ) < matchedCount;
+        const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+        return Success( id, std::move( base ), trace,
+            PageJson( page, returned, cursor, partial ) );
     }
 
     if( method.rfind( "runtime.script.", 0 ) == 0 || method.rfind( "memory.gc.", 0 ) == 0 )
