@@ -1586,3 +1586,25 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 本子阶段未把按Request ID排序错误用于`io.search`；其queue-time全局顺序仍待专用posting。
+
+### 2026-09-01 I/O Queue-Time Posting 与 Search 分页（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- I/O/Gfx index schema从6升级到7；新增按`(queueNs, requestId)`严格排序的精确posting，以及按`requestId`排序的反向queue-time posting。
+- 有符号queue time通过翻转符号位编码为无符号排序键，负时间、零时间与正时间的顺序和原始`int64_t`语义一致；没有Request事实的orphan保持既有`queueNs=0`语义。
+- 同一Request出现多个Request事实时，构建器选择ID posting中ordinal最大的最后一个事实，与全量Reader逐事件覆盖后的结果一致。
+- 两类posting使用既有64 MiB有界外部排序器；Session Reader只读取请求页的queue posting，再通过Request ID posting点查目标Request。
+- Session `io.search`使用`ScanFiltered`和raw-offset游标按queue顺序增量扫描；文本、operation、source和status过滤不会触发`GetIoRequests()`全量物化。Legacy Worker路径维持原有排序语义。
+- Final Audit逐项验证queue posting严格顺序、ID posting与唯一ID页表、由Canonical Request事实重算的queue time，以及两个排序投影的精确双向存在关系；任意错序、错时、缺失或多余记录均阻止Session发布。
+
+TDD与回归证据：
+
+```text
+Reader:    ScanIoRequestsByQueue(offset=1, limit=1)=[Request 401]
+Query:     io.search(limit=1)=[Request 400]，返回可继续的next_cursor
+BUILD:     单节点Release目标通过
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换；`io.statistics`的精确分位数外排仍是独立后续任务。

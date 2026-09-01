@@ -2630,6 +2630,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto missingIoRequest = sessionSource->GetIoRequest( 402 );
         const auto ioChildren = sessionSource->GetIoChildren( 400, 0, 8 );
         const auto ioRequestPage = sessionSource->ScanIoRequests( 1, 1 );
+        const auto ioQueuePage = sessionSource->ScanIoRequestsByQueue( 1, 1 );
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
@@ -2650,7 +2651,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             ioRequests[1].parentKind == uint8_t( tracy::JnIoParentKind::IoRequest ) &&
             ioRequests[1].requestedBytes == 1024 && ioRequests[1].transferredBytes == 1024 &&
             ioChildren.size() == 1 && ioChildren[0].requestId == 401 &&
-            ioRequestPage.size() == 1 && ioRequestPage[0].requestId == 401,
+            ioRequestPage.size() == 1 && ioRequestPage[0].requestId == 401 &&
+            ioQueuePage.size() == 1 && ioQueuePage[0].requestId == 401,
             "Session I/O reader preserves an exact parent-child request lifecycle" );
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
             gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
@@ -3050,7 +3052,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             const auto ioSearch = query.Execute( {
                 { "protocol", "tracy-query/1" }, { "id", "session-io-search" },
                 { "method", "io.search" }, { "params", { { "trace_id", traceId },
-                    { "offset", 0 }, { "limit", 10 } } }
+                    { "offset", 0 }, { "limit", 1 } } }
             } );
             const auto ioGet = query.Execute( {
                 { "protocol", "tracy-query/1" }, { "id", "session-io-get" },
@@ -3069,11 +3071,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             } );
             test.Check( ioSearch.value( "ok", false ) &&
                 ioSearch["data"]["request_count"] == "2" &&
-                ioSearch["data"]["requests"].size() == 2 &&
+                ioSearch["data"]["requests"].size() == 1 &&
                 ioSearch["data"]["requests"][0]["request_id"] == "400" &&
                 ioSearch["data"]["requests"][0]["requested_bytes"] == "4096" &&
-                ioSearch["data"]["requests"][0]["transferred_bytes"] == "4096",
-                "Query 1.34 reads exact Session I/O evidence without a Worker" );
+                ioSearch["data"]["requests"][0]["transferred_bytes"] == "4096" &&
+                ioSearch["page"]["next_cursor"].is_string(),
+                "Query 1.34 pages exact queue-ordered Session I/O evidence without a Worker" );
             test.Check( ioGet.value( "ok", false ) &&
                 ioGet["data"]["request_count"] == "2" &&
                 ioGet["data"]["request"]["request_id"] == "400" &&

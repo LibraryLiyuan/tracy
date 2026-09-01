@@ -1084,6 +1084,16 @@ public:
         const auto end = begin + std::min( limit, values.size() - begin );
         return std::vector<IoRequestDto>( values.begin() + begin, values.begin() + end );
     }
+    virtual std::vector<IoRequestDto> ScanIoRequestsByQueue( size_t offset, size_t limit ) const
+    {
+        auto values = GetIoRequests();
+        std::sort( values.begin(), values.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.queueNs != rhs.queueNs ? lhs.queueNs < rhs.queueNs :
+                lhs.requestId < rhs.requestId; } );
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<IoRequestDto>( values.begin() + begin, values.begin() + end );
+    }
     virtual std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const
     {
         const auto values = GetIoRequests();

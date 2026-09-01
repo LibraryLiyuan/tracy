@@ -5064,7 +5064,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             analysis::TraceSourceKind::Session;
         const auto requestCount = source->GetIoRequestCount();
         std::vector<analysis::IoRequestDto> requests;
-        if( !pagedSessionIo || method == "io.search" )
+        if( !pagedSessionIo )
             requests = source->GetIoRequests();
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
@@ -5196,6 +5196,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             result["truncated"] = chainTruncated || BudgetPartial();
             result["evidence_kind"] = "exact";
             return Success( id, std::move( result ), trace );
+        }
+        if( pagedSessionIo && method == "io.search" )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string operation = params.value( "operation", "" );
+            const std::string sourceFilter = params.value( "source", "" );
+            const std::string status = params.value( "status", "" );
+            auto scanPage = ScanFiltered<analysis::IoRequestDto>( *source, params, page,
+                []( const analysis::TraceSource& value, const analysis::ScanRange& range ) {
+                    return value.ScanIoRequestsByQueue( range.offset, range.limit ); },
+                [&]( const analysis::IoRequestDto& value ) {
+                    const std::string searchable = std::string( IoOperationName( value.operation ) ) +
+                        " " + IoSourceName( value.source ) + " " + IoStatusName( value.status );
+                    return TextMatches( searchable, params ) &&
+                        ( operation.empty() || operation == IoOperationName( value.operation ) ) &&
+                        ( sourceFilter.empty() || sourceFilter == IoSourceName( value.source ) ) &&
+                        ( status.empty() || status == IoStatusName( value.status ) ); },
+                [&]( const analysis::IoRequestDto& value ) {
+                    return IoRequestJson( *source, value, false ); } );
+            scanPage.values = ProjectFields( std::move( scanPage.values ), params );
+            const auto returned = scanPage.values.size();
+            const auto cursor = NextCursorAt( page, method, trace,
+                scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
+            auto result = base();
+            result["requests"] = std::move( scanPage.values );
+            return Success( id, std::move( result ), trace,
+                PageJson( page, returned, cursor ) );
         }
         const auto findRequest = [&]( uint64_t requestId ) { return std::find_if( requests.begin(), requests.end(), [&]( const auto& value ) { return value.requestId == requestId; } ); };
 

@@ -828,6 +828,14 @@ std::vector<IoRequestDto> GpuAnalysisTraceSource::ScanIoRequests(
     return reader ? reader->ScanIoRequests( offset, limit ) :
         std::vector<IoRequestDto> {};
 }
+std::vector<IoRequestDto> GpuAnalysisTraceSource::ScanIoRequestsByQueue(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanIoRequestsByQueue( offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanIoRequestsByQueue( offset, limit ) :
+        std::vector<IoRequestDto> {};
+}
 std::optional<IoRequestDto> GpuAnalysisTraceSource::GetIoRequest( uint64_t requestId ) const
 {
     if( WorkerLoaded() ) return TraceSource::GetIoRequest( requestId );
