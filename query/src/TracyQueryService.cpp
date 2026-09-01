@@ -10985,6 +10985,47 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 "upstream_closure", source->GetJobCount(), missingPrerequisites ), trace );
         }
 
+        if( pagedSessionJobs && method == "job.gfx_chain" )
+        {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto rootRef = params["ref"].get<std::string>();
+            uint64_t rootId = 0;
+            for( const auto* kind : { "job", "gfx-dispatch", "gfx-entity" } )
+            {
+                const auto parsed = source->ParseEntityRef( rootRef, kind );
+                if( parsed ) { rootId = *parsed; break; }
+            }
+            if( rootId == 0 ) throw QueryError( "INVALID_PARAMS",
+                "ref must identify a Job, GfxDispatch, or GfxEntity in this trace" );
+            const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+            checkCancelled();
+            auto chain = source->GetGfxChain( rootId, maxNodes );
+            json jobsJson = json::array();
+            bool budgetTruncated = false;
+            for( const auto nodeId : chain.nodeIds )
+            {
+                checkCancelled();
+                if( !BudgetConsumeNode() ) { budgetTruncated = true; break; }
+                const auto job = source->GetJob( nodeId );
+                if( job ) jobsJson.push_back( JobJson( *source, *job, false ) );
+            }
+            json dispatchJson = json::array();
+            for( const auto& dispatch : chain.dispatches )
+                dispatchJson.push_back( GfxDispatchJson( dispatch ) );
+            json entityJson = json::array();
+            for( const auto& entity : chain.entities ) entityJson.push_back( GfxEntityJson( entity ) );
+            json linkJson = json::array();
+            for( const auto& link : chain.links ) linkJson.push_back( GfxLinkJson( link ) );
+            return Success( id, {
+                { "root_ref", rootRef }, { "jobs", std::move( jobsJson ) },
+                { "dispatches", std::move( dispatchJson ) },
+                { "entities", std::move( entityJson ) }, { "links", std::move( linkJson ) },
+                { "visited_nodes", chain.nodeIds.size() },
+                { "truncated", chain.truncated || budgetTruncated }
+            }, trace );
+        }
+
         if( pagedSessionJobs ) jobs = source->GetJobs();
 
         if( method == "job.search" )

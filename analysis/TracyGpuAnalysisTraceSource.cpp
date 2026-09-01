@@ -920,6 +920,13 @@ GfxEvidenceSlice GpuAnalysisTraceSource::GetEvidenceGfx( uint64_t frameId,
     const auto reader = SessionIoGfxReader();
     return reader ? reader->EvidenceGfx( frameId, seedIds ) : GfxEvidenceSlice {};
 }
+GfxEvidenceSlice GpuAnalysisTraceSource::GetGfxChain( uint64_t rootId,
+    size_t maxNodes ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxChain( rootId, maxNodes );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxChain( rootId, maxNodes ) : GfxEvidenceSlice {};
+}
 std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEvents() const
 {
     if( WorkerLoaded() ) return Worker().GetCorrelatedFrameEvents();

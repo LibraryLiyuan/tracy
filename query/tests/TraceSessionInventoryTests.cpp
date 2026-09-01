@@ -2641,6 +2641,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
+        const auto dispatchGfxChain = sessionSource->GetGfxChain( 300, 16 );
         test.Check( ioRequests.size() == 2 && ioRequestCount == 2 && ioRequest400 &&
             childIoRequest && !missingIoRequest && ioRequests[0].requestId == 400 &&
             ioRequest400->requestId == 400 && ioRequest400->stages.size() == 2 &&
@@ -2678,6 +2679,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             frameNineGfxEvidence.links[0].sourceId == 300 &&
             frameNineGfxEvidence.links[0].targetId == 301,
             "Session Gfx adjacency postings traverse only the exact Frame/seed evidence component" );
+        test.Check( dispatchGfxChain.dispatches.size() == 1 &&
+            dispatchGfxChain.dispatches[0].dispatchId == 300 &&
+            dispatchGfxChain.entities.size() == 1 &&
+            dispatchGfxChain.entities[0].entityId == 301 &&
+            dispatchGfxChain.links.size() == 1 &&
+            dispatchGfxChain.links[0].sourceId == 300 &&
+            dispatchGfxChain.links[0].targetId == 301 &&
+            dispatchGfxChain.nodeIds.size() == 2 && !dispatchGfxChain.truncated,
+            "Session Gfx chain walks exact dispatch/entity/link postings without full-domain materialization" );
         bool ioGfxWorkFound = false;
         const auto ioGfxRoot = tracy::analysis::TraceSessionIoGfxIndexRoot( publishedSession, manifest );
         for( const auto& entry : std::filesystem::directory_iterator( ioGfxRoot ) )
@@ -3140,11 +3150,26 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "protocol", "tracy-query/1" }, { "id", "session-gfx-stats" },
                 { "method", "job.gfx.statistics" }, { "params", { { "trace_id", traceId } } }
             } );
+            const auto gfxChain = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-gfx-chain" },
+                { "method", "job.gfx_chain" }, { "params", { { "trace_id", traceId },
+                    { "ref", sessionSource->MakeEntityRef( "gfx-dispatch", 300 ) },
+                    { "max_nodes", 16 } } }
+            } );
             test.Check( gfxStats.value( "ok", false ) &&
                 gfxStats["data"]["counts"]["dispatches"] == "1" &&
                 gfxStats["data"]["counts"]["entities"] == "2" &&
                 gfxStats["data"]["counts"]["links"] == "2",
                 "Query 1.34 reads exact Session Gfx evidence without a Worker" );
+            test.Check( gfxChain.value( "ok", false ) &&
+                gfxChain["data"]["dispatches"].size() == 1 &&
+                gfxChain["data"]["dispatches"][0]["dispatch_id"] == "300" &&
+                gfxChain["data"]["entities"].size() == 1 &&
+                gfxChain["data"]["entities"][0]["entity_id"] == "301" &&
+                gfxChain["data"]["links"].size() == 1 &&
+                gfxChain["data"]["visited_nodes"] == 2 &&
+                gfxChain["data"]["truncated"] == false,
+                "Query 1.34 walks a bounded Session Gfx chain through exact disk adjacency postings" );
         }
         const auto sourceLocations = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-source-locations" },

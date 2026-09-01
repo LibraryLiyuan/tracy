@@ -764,6 +764,8 @@ struct GfxEvidenceSlice
     std::vector<GfxDispatchDto> dispatches;
     std::vector<GfxEntityDto> entities;
     std::vector<GfxLinkDto> links;
+    std::vector<uint64_t> nodeIds;
+    bool truncated = false;
 };
 
 struct CorrelatedFrameEventDto
@@ -1260,6 +1262,45 @@ public:
             result.emplace_back( value );
             if( result.size() >= limit ) break;
         }
+        return result;
+    }
+    virtual GfxEvidenceSlice GetGfxChain( uint64_t rootId, size_t maxNodes ) const
+    {
+        GfxEvidenceSlice result;
+        if( rootId == 0 || maxNodes == 0 ) { result.truncated = rootId != 0; return result; }
+        const auto dispatches = GetGfxDispatches();
+        const auto entities = GetGfxEntities();
+        const auto links = GetGfxLinks();
+        std::set<uint64_t> visited { rootId };
+        std::queue<uint64_t> pending;
+        pending.push( rootId );
+        const auto admit = [&]( uint64_t value ) {
+            if( value == 0 || visited.contains( value ) ) return false;
+            if( visited.size() >= maxNodes ) { result.truncated = true; return false; }
+            visited.emplace( value ); pending.push( value ); return true;
+        };
+        while( !pending.empty() )
+        {
+            const auto current = pending.front(); pending.pop();
+            for( const auto& entity : entities )
+            {
+                if( entity.parentId == current ) admit( entity.entityId );
+                if( entity.entityId == current ) admit( entity.parentId );
+            }
+            for( const auto& link : links )
+            {
+                if( link.sourceId == current ) admit( link.targetId );
+                if( link.targetId == current ) admit( link.sourceId );
+            }
+        }
+        result.nodeIds.assign( visited.begin(), visited.end() );
+        for( const auto& dispatch : dispatches )
+            if( visited.contains( dispatch.dispatchId ) ) result.dispatches.emplace_back( dispatch );
+        for( const auto& entity : entities )
+            if( visited.contains( entity.entityId ) ) result.entities.emplace_back( entity );
+        for( const auto& link : links )
+            if( visited.contains( link.sourceId ) && visited.contains( link.targetId ) )
+                result.links.emplace_back( link );
         return result;
     }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }

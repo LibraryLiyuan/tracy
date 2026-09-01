@@ -54,6 +54,7 @@ struct FileHeader
     uint64_t gfxLinkOffset = 0;
     uint64_t frameOffset = 0;
     uint64_t dispatchFramePostingOffset = 0;
+    uint64_t gfxDispatchIdPostingOffset = 0;
     uint64_t correlatedFramePostingOffset = 0;
     uint64_t gfxEntityIdPostingOffset = 0;
     uint64_t gfxParentPostingOffset = 0;
@@ -235,6 +236,7 @@ struct BuildState
     std::ofstream gfxLink;
     std::ofstream frame;
     std::ofstream dispatchFramePosting;
+    std::ofstream gfxDispatchIdPosting;
     std::ofstream correlatedFramePosting;
     std::ofstream gfxEntityIdPosting;
     std::ofstream gfxParentPosting;
@@ -339,8 +341,11 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         if( !WriteRecord( state.gfxDispatch, &value, sizeof( value ),
             "session_gfx_dispatch_write_failed", error ) ) return false;
         const TraceSessionUInt64Pair posting { value.frameIndex, state.stats.gfxDispatches };
+        const TraceSessionUInt64Pair identity { value.dispatchId, state.stats.gfxDispatches };
         if( !WriteRecord( state.dispatchFramePosting, &posting, sizeof( posting ),
-            "session_gfx_dispatch_frame_posting_write_failed", error ) ) return false;
+                "session_gfx_dispatch_frame_posting_write_failed", error ) ||
+            !WriteRecord( state.gfxDispatchIdPosting, &identity, sizeof( identity ),
+                "session_gfx_dispatch_id_posting_write_failed", error ) ) return false;
         ++state.stats.gfxDispatches;
         break;
     }
@@ -711,6 +716,9 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         header.frameOffset == expected;
     valid = valid && CheckedAppend( expected, header.correlatedFrames, sizeof( StoredFrame ), error ) &&
         header.dispatchFramePostingOffset == expected;
+    valid = valid && CheckedAppend( expected, header.gfxDispatches,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.gfxDispatchIdPostingOffset == expected;
     valid = valid && CheckedAppend( expected, header.gfxDispatches,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         header.correlatedFramePostingOffset == expected;
@@ -1318,8 +1326,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "io-request.work", root / "io-config.work", root / "io-stage.work",
         root / "gfx-dispatch.work", root / "gfx-entity.work", root / "gfx-link.work",
         root / "frame.work" };
-    const std::array<std::filesystem::path, 8> postingSource = {
+    const std::array<std::filesystem::path, 9> postingSource = {
         root / "dispatch-frame-posting-source.work",
+        root / "gfx-dispatch-id-posting-source.work",
         root / "correlated-frame-posting-source.work",
         root / "gfx-entity-id-posting-source.work",
         root / "gfx-parent-posting-source.work",
@@ -1327,8 +1336,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "gfx-link-target-posting-source.work",
         root / "io-request-id-posting-source.work",
         root / "io-parent-posting-source.work" };
-    const std::array<std::filesystem::path, 8> postingSorted = {
+    const std::array<std::filesystem::path, 9> postingSorted = {
         root / "dispatch-frame-posting-sorted.work",
+        root / "gfx-dispatch-id-posting-sorted.work",
         root / "correlated-frame-posting-sorted.work",
         root / "gfx-entity-id-posting-sorted.work",
         root / "gfx-parent-posting-sorted.work",
@@ -1358,16 +1368,17 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.gfxLink.open( work[5], std::ios::binary | std::ios::trunc );
     state.frame.open( work[6], std::ios::binary | std::ios::trunc );
     state.dispatchFramePosting.open( postingSource[0], std::ios::binary | std::ios::trunc );
-    state.correlatedFramePosting.open( postingSource[1], std::ios::binary | std::ios::trunc );
-    state.gfxEntityIdPosting.open( postingSource[2], std::ios::binary | std::ios::trunc );
-    state.gfxParentPosting.open( postingSource[3], std::ios::binary | std::ios::trunc );
-    state.gfxLinkSourcePosting.open( postingSource[4], std::ios::binary | std::ios::trunc );
-    state.gfxLinkTargetPosting.open( postingSource[5], std::ios::binary | std::ios::trunc );
-    state.ioRequestIdPosting.open( postingSource[6], std::ios::binary | std::ios::trunc );
-    state.ioParentPosting.open( postingSource[7], std::ios::binary | std::ios::trunc );
+    state.gfxDispatchIdPosting.open( postingSource[1], std::ios::binary | std::ios::trunc );
+    state.correlatedFramePosting.open( postingSource[2], std::ios::binary | std::ios::trunc );
+    state.gfxEntityIdPosting.open( postingSource[3], std::ios::binary | std::ios::trunc );
+    state.gfxParentPosting.open( postingSource[4], std::ios::binary | std::ios::trunc );
+    state.gfxLinkSourcePosting.open( postingSource[5], std::ios::binary | std::ios::trunc );
+    state.gfxLinkTargetPosting.open( postingSource[6], std::ios::binary | std::ios::trunc );
+    state.ioRequestIdPosting.open( postingSource[7], std::ios::binary | std::ios::trunc );
+    state.ioParentPosting.open( postingSource[8], std::ios::binary | std::ios::trunc );
     if( !state.ioRequest || !state.ioConfig || !state.ioStage || !state.gfxDispatch ||
         !state.gfxEntity || !state.gfxLink || !state.frame ||
-        !state.dispatchFramePosting || !state.correlatedFramePosting ||
+        !state.dispatchFramePosting || !state.gfxDispatchIdPosting || !state.correlatedFramePosting ||
         !state.gfxEntityIdPosting || !state.gfxParentPosting ||
         !state.gfxLinkSourcePosting || !state.gfxLinkTargetPosting ||
         !state.ioRequestIdPosting || !state.ioParentPosting )
@@ -1376,7 +1387,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         !VisitTraceSessionCanonicalOrdered( sessionRoot, session, Visit, &state, error ) ) return false;
     state.ioRequest.close(); state.ioConfig.close(); state.ioStage.close();
     state.gfxDispatch.close(); state.gfxEntity.close(); state.gfxLink.close(); state.frame.close();
-    state.dispatchFramePosting.close(); state.correlatedFramePosting.close();
+    state.dispatchFramePosting.close(); state.gfxDispatchIdPosting.close();
+    state.correlatedFramePosting.close();
     state.gfxEntityIdPosting.close(); state.gfxParentPosting.close();
     state.gfxLinkSourcePosting.close(); state.gfxLinkTargetPosting.close();
     state.ioRequestIdPosting.close();
@@ -1395,29 +1407,32 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             "io-gfx-dispatch-frame-posting", state.stats.gfxDispatches,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[1], postingSorted[1], root,
-            "io-gfx-correlated-frame-posting", state.stats.correlatedFrames,
+            "io-gfx-dispatch-id-posting", state.stats.gfxDispatches,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[2], postingSorted[2], root,
-            "io-gfx-entity-id-posting", state.stats.gfxEntities,
+            "io-gfx-correlated-frame-posting", state.stats.correlatedFrames,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[3], postingSorted[3], root,
-            "io-gfx-parent-posting", state.stats.gfxParentLinks,
+            "io-gfx-entity-id-posting", state.stats.gfxEntities,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[4], postingSorted[4], root,
-            "io-gfx-link-source-posting", state.stats.gfxLinks,
+            "io-gfx-parent-posting", state.stats.gfxParentLinks,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[5], postingSorted[5], root,
-            "io-gfx-link-target-posting", state.stats.gfxLinks,
+            "io-gfx-link-source-posting", state.stats.gfxLinks,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[6], postingSorted[6], root,
+            "io-gfx-link-target-posting", state.stats.gfxLinks,
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( postingSource[7], postingSorted[7], root,
             "io-request-id-posting", ioRequestIdPostingCount,
             MaximumBufferedPostingPairs, error ) ||
-        !BuildDistinctPairKeys( postingSorted[6], ioRequestIds,
+        !BuildDistinctPairKeys( postingSorted[7], ioRequestIds,
             ioRequestIdPostingCount, state.stats.ioRequestIds, error ) ||
-        !SortTraceSessionUInt64Pairs( postingSource[7], postingSorted[7], root,
+        !SortTraceSessionUInt64Pairs( postingSource[8], postingSorted[8], root,
             "io-parent-posting", state.stats.ioParentLinks,
             MaximumBufferedPostingPairs, error ) ||
-        !BuildIoRequestQueuePostings( postingSorted[6], work[0], work[2],
+        !BuildIoRequestQueuePostings( postingSorted[7], work[0], work[2],
             ioRequestQueueSource, ioRequestQueueIdSource,
             ioLatencySource[0], ioLatencySource[1], ioLatencySource[2],
             ioRequestIdPostingCount, state.stats.ioRequestIds,
@@ -1471,6 +1486,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.dispatchFramePostingOffset = next;
     if( !CheckedAppend( next, state.stats.gfxDispatches,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.gfxDispatchIdPostingOffset = next;
+    if( !CheckedAppend( next, state.stats.gfxDispatches,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
     header.correlatedFramePostingOffset = next;
     if( !CheckedAppend( next, state.stats.correlatedFrames,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
@@ -1521,7 +1539,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     if( !session.generation.empty() ) out.write( session.generation.data(),
         std::streamsize( session.generation.size() ) );
-    const std::array<uint64_t, 15> expected = {
+    const std::array<uint64_t, 16> expected = {
         state.stats.ioRequests * sizeof( StoredIoRequest ),
         state.stats.ioConfigs * sizeof( StoredIoConfig ),
         state.stats.ioStages * sizeof( StoredIoStage ),
@@ -1529,6 +1547,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         state.stats.gfxEntities * sizeof( StoredGfxEntity ),
         state.stats.gfxLinks * sizeof( StoredGfxLink ),
         state.stats.correlatedFrames * sizeof( StoredFrame ),
+        state.stats.gfxDispatches * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxDispatches * sizeof( TraceSessionUInt64Pair ),
         state.stats.correlatedFrames * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxEntities * sizeof( TraceSessionUInt64Pair ),
@@ -1607,6 +1626,7 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_gfxLinkOffset = header.gfxLinkOffset;
     reader->m_frameOffset = header.frameOffset;
     reader->m_dispatchFramePostingOffset = header.dispatchFramePostingOffset;
+    reader->m_gfxDispatchIdPostingOffset = header.gfxDispatchIdPostingOffset;
     reader->m_correlatedFramePostingOffset = header.correlatedFramePostingOffset;
     reader->m_gfxEntityIdPostingOffset = header.gfxEntityIdPostingOffset;
     reader->m_gfxParentPostingOffset = header.gfxParentPostingOffset;
@@ -1939,6 +1959,122 @@ GfxEvidenceSlice TraceSessionIoGfxReader::EvidenceGfx( uint64_t frameId,
     return result;
 }
 
+GfxEvidenceSlice TraceSessionIoGfxReader::GfxChain( uint64_t rootId,
+    size_t maxNodes ) const
+{
+    GfxEvidenceSlice result;
+    if( rootId == 0 || maxNodes == 0 )
+    {
+        result.truncated = rootId != 0;
+        return result;
+    }
+    const auto readDispatches = [&]( uint64_t key, size_t limit ) {
+        return ReadFramePosting<StoredGfxDispatch, GfxDispatchDto>( m_path,
+            m_gfxDispatchIdPostingOffset, m_stats.gfxDispatches, key, 0, limit,
+            m_gfxDispatchOffset, m_stats.gfxDispatches,
+            [&]( const StoredGfxDispatch& value, uint64_t ) {
+                return GfxDispatchDto { MakeRef( m_fingerprint, "gfx-dispatch", value.dispatchId ),
+                    value.dispatchId, value.frameIndex, value.timeNs,
+                    MakeRef( m_fingerprint, "thread", value.thread ), value.expectedJobs,
+                    value.threadingMode, value.flags };
+            } );
+    };
+    const auto readEntities = [&]( uint64_t postingOffset, uint64_t postingCount,
+        uint64_t key, size_t limit ) {
+        return ReadFramePosting<StoredGfxEntity, GfxEntityDto>( m_path,
+            postingOffset, postingCount, key, 0, limit,
+            m_gfxEntityOffset, m_stats.gfxEntities,
+            [&]( const StoredGfxEntity& value, uint64_t ) {
+                return GfxEntityDto { MakeRef( m_fingerprint, "gfx-entity", value.entityId ),
+                    value.entityId, value.parentId, value.timeNs,
+                    MakeRef( m_fingerprint, "thread", value.thread ), value.gpuQueryId,
+                    value.gpuContext, value.kind, value.flags };
+            } );
+    };
+    const auto readLinks = [&]( uint64_t postingOffset, uint64_t key, size_t limit ) {
+        return ReadFramePosting<StoredGfxLink, GfxLinkDto>( m_path,
+            postingOffset, m_stats.gfxLinks, key, 0, limit,
+            m_gfxLinkOffset, m_stats.gfxLinks,
+            [&]( const StoredGfxLink& value, uint64_t ordinal ) {
+                return GfxLinkDto { MakeRef( m_fingerprint, "gfx-link", ordinal ),
+                    value.sourceId, value.targetId, value.timeNs,
+                    MakeRef( m_fingerprint, "thread", value.thread ),
+                    value.relation, value.flags };
+            } );
+    };
+
+    std::unordered_set<uint64_t> reachable { rootId };
+    std::queue<uint64_t> pending;
+    pending.push( rootId );
+    std::map<std::string, GfxDispatchDto> selectedDispatches;
+    std::map<std::string, GfxEntityDto> selectedEntities;
+    std::map<std::string, GfxLinkDto> selectedLinks;
+    const auto edgeBudget = maxNodes > std::numeric_limits<size_t>::max() / 4 ?
+        std::numeric_limits<size_t>::max() : maxNodes * 4;
+    const auto postingLimit = edgeBudget == std::numeric_limits<size_t>::max() ?
+        edgeBudget : edgeBudget + 1;
+    const auto admit = [&]( uint64_t value ) {
+        if( value == 0 || reachable.contains( value ) ) return false;
+        if( reachable.size() >= maxNodes ) { result.truncated = true; return false; }
+        reachable.emplace( value ); pending.push( value ); return true;
+    };
+    const auto keepLinks = [&]( std::vector<GfxLinkDto> links, bool outgoing ) {
+        if( links.size() > edgeBudget ) result.truncated = true;
+        for( auto& link : links )
+        {
+            if( selectedLinks.size() >= edgeBudget && !selectedLinks.contains( link.ref ) )
+            { result.truncated = true; break; }
+            const auto neighbour = outgoing ? link.targetId : link.sourceId;
+            selectedLinks.try_emplace( link.ref, link );
+            admit( neighbour );
+        }
+    };
+
+    while( !pending.empty() && !result.truncated )
+    {
+        const auto current = pending.front();
+        pending.pop();
+        for( auto& dispatch : readDispatches( current, 2 ) )
+            selectedDispatches.try_emplace( dispatch.ref, std::move( dispatch ) );
+        for( auto& entity : readEntities( m_gfxEntityIdPostingOffset,
+            m_stats.gfxEntities, current, 2 ) )
+        {
+            admit( entity.parentId );
+            selectedEntities.try_emplace( entity.ref, std::move( entity ) );
+        }
+        for( auto& entity : readEntities( m_gfxParentPostingOffset,
+            m_stats.gfxParentLinks, current, postingLimit ) )
+        {
+            admit( entity.entityId );
+            selectedEntities.try_emplace( entity.ref, std::move( entity ) );
+            if( result.truncated ) break;
+        }
+        if( result.truncated ) break;
+        keepLinks( readLinks( m_gfxLinkSourcePostingOffset, current, postingLimit ), true );
+        if( result.truncated ) break;
+        keepLinks( readLinks( m_gfxLinkTargetPostingOffset, current, postingLimit ), false );
+    }
+
+    result.nodeIds.assign( reachable.begin(), reachable.end() );
+    std::sort( result.nodeIds.begin(), result.nodeIds.end() );
+    for( auto& [ref, dispatch] : selectedDispatches )
+        result.dispatches.emplace_back( std::move( dispatch ) );
+    for( auto& [ref, entity] : selectedEntities )
+        if( reachable.contains( entity.entityId ) ) result.entities.emplace_back( std::move( entity ) );
+    for( auto& [ref, link] : selectedLinks )
+        if( reachable.contains( link.sourceId ) && reachable.contains( link.targetId ) )
+            result.links.emplace_back( std::move( link ) );
+    std::sort( result.dispatches.begin(), result.dispatches.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.dispatchId < rhs.dispatchId; } );
+    std::sort( result.entities.begin(), result.entities.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.entityId < rhs.entityId; } );
+    std::sort( result.links.begin(), result.links.end(), []( const auto& lhs, const auto& rhs ) {
+        if( lhs.timeNs != rhs.timeNs ) return lhs.timeNs < rhs.timeNs;
+        if( lhs.sourceId != rhs.sourceId ) return lhs.sourceId < rhs.sourceId;
+        return lhs.targetId < rhs.targetId; } );
+    return result;
+}
+
 std::vector<CorrelatedFrameEventDto> TraceSessionIoGfxReader::CorrelatedFrames() const
 {
     const auto stored = ReadFixed<StoredFrame>( m_path, m_frameOffset,
@@ -1984,6 +2120,11 @@ bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             header.gfxDispatchOffset, header.gfxDispatches,
             []( const StoredGfxDispatch& value ) { return value.frameIndex; },
             "session_gfx_dispatch_frame_posting", error ) ||
+        !ValidateFramePosting<StoredGfxDispatch>( path,
+            header.gfxDispatchIdPostingOffset, header.gfxDispatches,
+            header.gfxDispatchOffset, header.gfxDispatches,
+            []( const StoredGfxDispatch& value ) { return value.dispatchId; },
+            "session_gfx_dispatch_id_posting", error ) ||
         !ValidateFramePosting<StoredFrame>( path,
             header.correlatedFramePostingOffset, header.correlatedFrames,
             header.frameOffset, header.correlatedFrames,

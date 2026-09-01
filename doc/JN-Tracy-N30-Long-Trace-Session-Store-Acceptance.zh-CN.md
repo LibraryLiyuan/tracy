@@ -1677,6 +1677,28 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Gfx Chain 有界邻接读取（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，`job.gfx.statistics`全局摘要仍待独立收敛）**。
+
+- I/O/Gfx index schema从8升级到9；新增`dispatchId→Dispatch ordinal`精确posting，和既有Entity ID、Parent、Link Source/Target posting共同组成双向邻接读取基础。
+- Session Reader新增`GfxChain(rootId, maxNodes)`；每个已访问节点只点读关联Dispatch、Entity、子Entity及正反向Link，不读取完整Dispatch/Entity/Link vector。
+- Reader同时限制节点数和边数；节点容量或边预算不足时返回`truncated=true`，不把局部结果伪装为完整链。返回Link只包含两端均已进入结果的边。
+- Session `job.gfx_chain`在任何`GetJobs()/GetGfx*()`全量物化之前进入专用路径；Gfx邻接由磁盘posting完成，仅对有界的visited ID执行Job点查。
+- Legacy Worker仍使用通用内存实现；输出继续保持Job、Dispatch、Entity、Link和visited/truncated字段语义。
+- Final Audit新增Dispatch-ID posting的顺序、ordinal边界及实际Dispatch ID校验；错误posting会阻止Session发布。
+
+TDD与回归证据：
+
+```text
+RED:       测试先调用不存在的GetGfxChain，编译按预期失败
+Reader:    root Dispatch 300 → Entity 301 → Link 300→301
+Query:     job.gfx_chain(Dispatch 300)返回1 Dispatch、1 Entity、1 Link、2 nodes
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换；`job.gfx.statistics`仍读取全域集合，后续必须改为构建期精确摘要，不能以采样或近似替代。
+
 ### 2026-09-01 Job Schedule-Time Posting 与 Search 分页（N30.6B 子阶段）
 
 状态：**Passed（synthetic correctness，真实长Trace墙钟与容量待N30.7集中门禁）**。
