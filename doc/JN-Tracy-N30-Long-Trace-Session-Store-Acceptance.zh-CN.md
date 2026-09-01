@@ -2105,3 +2105,24 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 7.62 sec
 ```
 
 本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。真实规模的Verifier墙钟、内存、Cancel≤2秒、generation发布和MCP查询由A5执行。
+
+### 2026-09-02 A5 G05预检：Windows长路径缺陷
+
+状态：**Fixed；G05转换待从已完成Inventory恢复**。
+
+- 固定G05输入为`G05-Player-HighEvidence-20260831-173806.tracy-stream`，大小`2,199,546,075 bytes`，SHA-256为`660AB0207F4F5B18D9B808CD07BC3E8BB1C9EC3104A08E678DBEEA6F97EB0976`。
+- 新Converter约40秒完成Inventory Scan/Hash，随后首个Canonical shard明确失败：`session_shard_directory_failed:The filename or extension is too long`。
+- 失败building根路径长度为210字符；`generations/<generation>/canonical/<shard>.tmp`使实际I/O路径超过Win32 legacy `MAX_PATH`。Inventory文件最长248字符所以此前成功；错误发生在Session Store边界，不是stream损坏、GPU Derived死循环或内存超限。
+- 仓库已有`GpuAnalysisIoPath`扩展长度I/O适配器，GPU Analysis路径已使用，但通用Trace Session Store遗漏了该适配。这是根因。
+- 新增真实布局等价的自动化RED：building shard临时路径必须`>=MAX_PATH`，修复前`SaveTraceSessionManifest`稳定失败。
+- Session Store的manifest、CURRENT、shard、atomic replace、publish rename、source identity与writer lease全部统一走扩展长度native I/O路径；manifest仍只保存可移植相对路径。
+
+验证：
+
+```text
+RED: TraceSessionStoreTests line 229 SaveTraceSessionManifest(longBuilding) failed
+GREEN: long-path Save/Shard/Publish/Load/Verify round-trip passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 7.78 sec
+```
+
+失败现场保留，下一次使用同一命令将复用已校验Inventory而不是重新扫描；尚未宣称G05门禁通过。

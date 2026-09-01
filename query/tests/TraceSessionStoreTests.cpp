@@ -1,4 +1,5 @@
 #include "TracyHash.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionStore.hpp"
 
@@ -206,6 +207,38 @@ int main()
     }
     assert( !VerifyTraceSession( finalPath, *secondLoaded, error ) );
     assert( error == "session_shard_sha256_mismatch" );
+
+#ifdef _WIN32
+    // Reproduces the real G05 layout where the user-facing capture directory
+    // is valid, but the building generation plus canonical shard suffix crosses
+    // the legacy Win32 MAX_PATH boundary.
+    const auto longRoot = root / std::string( 80, 'a' ) / std::string( 80, 'b' );
+    const auto longFinal = longRoot / "capture.jn-trace-session";
+    const std::string longGeneration = "n30-long-path-generation";
+    const auto longBuilding = BuildingTraceSessionPath( longFinal, longGeneration );
+    TraceSessionManifest longManifest = manifest;
+    longManifest.generation = longGeneration;
+    longManifest.state = TraceSessionState::CanonicalBuilding;
+    longManifest.shards.clear();
+    longManifest.mandatoryDerivedComplete = false;
+    longManifest.auditComplete = false;
+    TraceSessionShard longShard = shard;
+    longShard.shardId = 1;
+    assert( ( longBuilding / "generations" / longGeneration / "canonical" /
+        "frame-000001.bin.tmp" ).native().size() >= MAX_PATH );
+    assert( SaveTraceSessionManifest( longBuilding, longManifest, error ) );
+    assert( WriteTraceSessionShard( longBuilding, longGeneration, longShard,
+        payload.data(), sizeof( payload ), error ) );
+    longManifest.shards.push_back( longShard );
+    longManifest.state = TraceSessionState::Complete;
+    longManifest.mandatoryDerivedComplete = true;
+    longManifest.auditComplete = true;
+    assert( PublishTraceSession( longBuilding, longFinal, longManifest, error ) );
+    const auto longLoaded = LoadTraceSessionManifest( longFinal, error );
+    assert( longLoaded && VerifyTraceSession( longFinal, *longLoaded, error ) );
+    std::error_code longIgnored;
+    std::filesystem::remove_all( GpuAnalysisIoPath( longRoot ), longIgnored );
+#endif
 
     std::error_code ignored;
     std::filesystem::remove_all( root, ignored );

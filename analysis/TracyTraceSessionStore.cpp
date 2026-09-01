@@ -1,6 +1,7 @@
 #include "TracyTraceSessionStore.hpp"
 
 #include "TracyHash.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 
 #include <algorithm>
 #include <array>
@@ -78,6 +79,8 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary,
     const std::filesystem::path& target, std::string& error )
 {
 #ifdef _WIN32
+    const auto ioTemporary = GpuAnalysisIoPath( temporary );
+    const auto ioTarget = GpuAnalysisIoPath( target );
     // ReplaceFileW needs delete sharing on the old file. Antivirus, indexing,
     // status readers and Explorer may transiently omit it. In these cases the
     // documented result leaves both names unchanged, so a bounded retry is
@@ -88,12 +91,12 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary,
     DWORD lastError = ERROR_SUCCESS;
     for( ;; )
     {
-        const auto targetExists = GetFileAttributesW( target.c_str() ) != INVALID_FILE_ATTRIBUTES;
+        const auto targetExists = GetFileAttributesW( ioTarget.c_str() ) != INVALID_FILE_ATTRIBUTES;
         const auto replaced = targetExists
-            ? ReplaceFileW( target.c_str(), temporary.c_str(), nullptr,
+            ? ReplaceFileW( ioTarget.c_str(), ioTemporary.c_str(), nullptr,
                 REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_ACL_ERRORS,
                 nullptr, nullptr ) != FALSE
-            : MoveFileExW( temporary.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH ) != FALSE;
+            : MoveFileExW( ioTemporary.c_str(), ioTarget.c_str(), MOVEFILE_WRITE_THROUGH ) != FALSE;
         if( replaced ) return true;
         lastError = GetLastError();
         const auto retryable = lastError == ERROR_ACCESS_DENIED ||
@@ -110,7 +113,7 @@ bool ReplaceFileAtomically( const std::filesystem::path& temporary,
         target.filename().string();
 #else
     std::error_code ec;
-    std::filesystem::rename( temporary, target, ec );
+    std::filesystem::rename( GpuAnalysisIoPath( temporary ), GpuAnalysisIoPath( target ), ec );
     if( !ec ) return true;
     error = "session_atomic_replace_failed:" + ec.message();
 #endif
@@ -162,7 +165,7 @@ bool ProcessMatches( const WriterLeaseOwner& owner )
 
 bool ReadLeaseOwner( const std::filesystem::path& directory, WriterLeaseOwner& owner )
 {
-    std::ifstream input( directory / "owner", std::ios::binary );
+    std::ifstream input( GpuAnalysisIoPath( directory / "owner" ), std::ios::binary );
     std::string key;
     while( input >> key )
     {
@@ -181,7 +184,7 @@ bool WriteLeaseOwner( const std::filesystem::path& directory,
     const auto target = directory / "owner";
     auto temporary = target;
     temporary += ".tmp";
-    std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+    std::ofstream output( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
     if( !output ) { error = "session_writer_lease_owner_open_failed"; return false; }
     output << "pid " << owner.pid << '\n'
         << "process_creation " << owner.processCreation << '\n'
@@ -197,11 +200,12 @@ bool RenameDirectoryAtomically( const std::filesystem::path& source,
     const std::filesystem::path& target, std::string& error )
 {
 #ifdef _WIN32
-    if( MoveFileExW( source.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH ) ) return true;
+    if( MoveFileExW( GpuAnalysisIoPath( source ).c_str(),
+        GpuAnalysisIoPath( target ).c_str(), MOVEFILE_WRITE_THROUGH ) ) return true;
     error = "session_publish_rename_failed:" + std::to_string( GetLastError() );
 #else
     std::error_code ec;
-    std::filesystem::rename( source, target, ec );
+    std::filesystem::rename( GpuAnalysisIoPath( source ), GpuAnalysisIoPath( target ), ec );
     if( !ec ) return true;
     error = "session_publish_rename_failed:" + ec.message();
 #endif
@@ -213,7 +217,7 @@ bool WriteCurrent( const std::filesystem::path& root, const std::string& generat
     const auto target = root / "CURRENT";
     auto temporary = target;
     temporary += ".tmp";
-    std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+    std::ofstream output( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
     if( !output ) { error = "session_current_open_failed"; return false; }
     output << generation << '\n';
     output.flush();
@@ -236,7 +240,7 @@ bool SameSource( const TraceSessionSourceIdentity& left, const TraceSessionSourc
 
 std::optional<std::string> ReadCurrentGeneration( const std::filesystem::path& root )
 {
-    std::ifstream input( root / "CURRENT", std::ios::binary );
+    std::ifstream input( GpuAnalysisIoPath( root / "CURRENT" ), std::ios::binary );
     std::string generation;
     if( !input || !std::getline( input, generation ) || generation.empty() ) return std::nullopt;
     if( !generation.empty() && generation.back() == '\r' ) generation.pop_back();
@@ -269,12 +273,12 @@ bool SaveTraceSessionManifest( const std::filesystem::path& root,
 {
     error.clear();
     std::error_code ec;
-    std::filesystem::create_directories( root, ec );
+    std::filesystem::create_directories( GpuAnalysisIoPath( root ), ec );
     if( ec ) { error = "session_manifest_directory_failed:" + ec.message(); return false; }
     const auto target = root / "manifest";
     auto temporary = target;
     temporary += ".tmp";
-    std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+    std::ofstream output( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
     if( !output ) { error = "session_manifest_open_failed"; return false; }
     output << "magic " << SessionManifestMagic << '\n';
     output << "store_schema " << value.storeSchema << '\n';
@@ -318,9 +322,9 @@ std::optional<TraceSessionManifest> LoadTraceSessionManifest( const std::filesys
     if( const auto current = ReadCurrentGeneration( root ) )
     {
         const auto generationManifest = root / "generations" / *current / "manifest";
-        if( std::filesystem::exists( generationManifest ) ) manifestPath = generationManifest;
+        if( std::filesystem::exists( GpuAnalysisIoPath( generationManifest ) ) ) manifestPath = generationManifest;
     }
-    std::ifstream input( manifestPath, std::ios::binary );
+    std::ifstream input( GpuAnalysisIoPath( manifestPath ), std::ios::binary );
     if( !input ) { error = "session_manifest_missing"; return std::nullopt; }
     TraceSessionManifest result;
     uint64_t magic = 0;
@@ -389,7 +393,7 @@ bool WriteTraceSessionShard( const std::filesystem::path& root, const std::strin
     shard.relativePath = std::filesystem::path( "generations" ) / generation / "canonical" / filename.str();
     const auto target = root / shard.relativePath;
     std::error_code ec;
-    std::filesystem::create_directories( target.parent_path(), ec );
+    std::filesystem::create_directories( GpuAnalysisIoPath( target.parent_path() ), ec );
     if( ec ) { error = "session_shard_directory_failed:" + ec.message(); return false; }
     auto temporary = target;
     temporary += ".tmp";
@@ -401,7 +405,7 @@ bool WriteTraceSessionShard( const std::filesystem::path& root, const std::strin
     header.sourceRecordEnd = shard.sourceRecordEnd;
     header.recordCount = shard.recordCount;
     header.payloadBytes = payloadBytes;
-    std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+    std::ofstream output( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
     if( !output ) { error = "session_shard_open_failed"; return false; }
     output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
     if( payloadBytes ) output.write( static_cast<const char*>( payload ), std::streamsize( payloadBytes ) );
@@ -427,7 +431,7 @@ bool ReadTraceSessionShardPayload( const std::filesystem::path& root,
     }
     const auto path = root / shard.relativePath;
     std::error_code ec;
-    const auto fileBytes = std::filesystem::file_size( path, ec );
+    const auto fileBytes = std::filesystem::file_size( GpuAnalysisIoPath( path ), ec );
     if( ec || fileBytes != shard.fileBytes || fileBytes < sizeof( SessionShardHeader ) )
     {
         error = "session_shard_size_mismatch";
@@ -438,7 +442,7 @@ bool ReadTraceSessionShardPayload( const std::filesystem::path& root,
         error = "session_shard_sha256_mismatch";
         return false;
     }
-    std::ifstream input( path, std::ios::binary );
+    std::ifstream input( GpuAnalysisIoPath( path ), std::ios::binary );
     SessionShardHeader header;
     input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
     if( !input || header.magic != SessionShardMagic ||
@@ -484,7 +488,7 @@ bool VerifyTraceSession( const std::filesystem::path& root,
         if( !IsSafeRelativePath( shard.relativePath ) ) { error = "session_manifest_unsafe_shard_path"; return false; }
         const auto path = root / shard.relativePath;
         std::error_code ec;
-        const auto bytes = std::filesystem::file_size( path, ec );
+        const auto bytes = std::filesystem::file_size( GpuAnalysisIoPath( path ), ec );
         if( ec || bytes != shard.fileBytes ) { error = "session_shard_size_mismatch"; return false; }
         if( Sha256File( path ) != shard.sha256 ) { error = "session_shard_sha256_mismatch"; return false; }
     }
@@ -496,7 +500,7 @@ bool VerifyTraceSessionSourceIdentity( const std::filesystem::path& sourcePath,
 {
     error.clear();
     std::error_code ec;
-    const auto size = std::filesystem::file_size( sourcePath, ec );
+    const auto size = std::filesystem::file_size( GpuAnalysisIoPath( sourcePath ), ec );
     if( ec ) { error = "source_missing"; return false; }
     if( size != expected.fileSize ) { error = "source_size_mismatch"; return false; }
     if( expected.sha256.size() != 64 ) { error = "source_strong_identity_missing"; return false; }
@@ -517,18 +521,18 @@ bool PublishTraceSession( const std::filesystem::path& buildingPath,
     if( !SaveTraceSessionManifest( buildingPath, manifest, error ) ) return false;
     const auto buildingGeneration = buildingPath / "generations" / manifest.generation;
     if( !SaveTraceSessionManifest( buildingGeneration, manifest, error ) ) return false;
-    if( std::filesystem::exists( finalPath ) )
+    if( std::filesystem::exists( GpuAnalysisIoPath( finalPath ) ) )
     {
         const auto current = LoadTraceSessionManifest( finalPath, error );
         if( !current ) return false;
         if( !SameSource( current->source, manifest.source ) ) { error = "identity_mismatch"; return false; }
         const auto finalGeneration = finalPath / "generations" / manifest.generation;
-        if( std::filesystem::exists( finalGeneration ) ) { error = "session_generation_exists"; return false; }
+        if( std::filesystem::exists( GpuAnalysisIoPath( finalGeneration ) ) ) { error = "session_generation_exists"; return false; }
         if( !RenameDirectoryAtomically( buildingGeneration, finalGeneration, error ) ) return false;
         if( !SaveTraceSessionManifest( finalPath, manifest, error ) ) return false;
         if( !WriteCurrent( finalPath, manifest.generation, error ) ) return false;
         std::error_code ignored;
-        std::filesystem::remove_all( buildingPath, ignored );
+        std::filesystem::remove_all( GpuAnalysisIoPath( buildingPath ), ignored );
         return true;
     }
     if( !WriteCurrent( buildingPath, manifest.generation, error ) ) return false;
@@ -550,7 +554,7 @@ bool IsTraceSessionQueryable( const std::filesystem::path& root, std::string& er
         error = "session_not_complete";
         return false;
     }
-    std::ifstream current( root / "CURRENT", std::ios::binary );
+    std::ifstream current( GpuAnalysisIoPath( root / "CURRENT" ), std::ios::binary );
     std::string generation;
     if( !current || !std::getline( current, generation ) || generation != manifest->generation )
     {
@@ -617,7 +621,7 @@ void TraceSessionWriterLease::Release()
         current.processCreation == m_processCreation && current.generation == m_generation )
     {
         std::error_code ignored;
-        std::filesystem::remove_all( m_path, ignored );
+        std::filesystem::remove_all( GpuAnalysisIoPath( m_path ), ignored );
     }
     m_path.clear();
     m_generation.clear();
@@ -633,7 +637,7 @@ bool AcquireTraceSessionWriterLease( const std::filesystem::path& sessionRoot,
     const auto stateDirectory = sessionRoot / "build-state";
     const auto leaseDirectory = stateDirectory / "writer.lease";
     std::error_code ec;
-    std::filesystem::create_directories( stateDirectory, ec );
+    std::filesystem::create_directories( GpuAnalysisIoPath( stateDirectory ), ec );
     if( ec ) { error = "session_writer_lease_directory_failed:" + ec.message(); return false; }
 
     const auto pid = CurrentProcessIdValue();
@@ -645,13 +649,13 @@ bool AcquireTraceSessionWriterLease( const std::filesystem::path& sessionRoot,
     for( int attempt = 0; attempt < 3; attempt++ )
     {
         ec.clear();
-        if( std::filesystem::create_directory( leaseDirectory, ec ) )
+        if( std::filesystem::create_directory( GpuAnalysisIoPath( leaseDirectory ), ec ) )
         {
             WriterLeaseOwner owner { pid, creation, CurrentUnixNanoseconds(), generation };
             if( !WriteLeaseOwner( leaseDirectory, owner, error ) )
             {
                 std::error_code ignored;
-                std::filesystem::remove_all( leaseDirectory, ignored );
+                std::filesystem::remove_all( GpuAnalysisIoPath( leaseDirectory ), ignored );
                 return false;
             }
             lease.m_path = leaseDirectory;
@@ -674,7 +678,7 @@ bool AcquireTraceSessionWriterLease( const std::filesystem::path& sessionRoot,
         }
         auto stale = stateDirectory / ( "writer.lease.stale." + generation + "." + std::to_string( attempt ) );
         ec.clear();
-        std::filesystem::rename( leaseDirectory, stale, ec );
+        std::filesystem::rename( GpuAnalysisIoPath( leaseDirectory ), GpuAnalysisIoPath( stale ), ec );
         if( ec && ec != std::errc::no_such_file_or_directory )
         {
             error = "session_writer_lease_stale_rename_failed:" + ec.message();
