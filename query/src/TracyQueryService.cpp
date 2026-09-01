@@ -10104,9 +10104,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {
-        auto frameEvents = source->GetCorrelatedFrameEvents();
+        const bool sessionCorrelation = source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session;
+        std::optional<uint64_t> targetedFrame;
+        if( sessionCorrelation && params.contains( "frame_id" ) )
+            targetedFrame = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
+        if( sessionCorrelation && params.contains( "ref" ) && params["ref"].is_string() )
+            targetedFrame = source->ParseEntityRef( params["ref"].get<std::string>(), "frame-identity" );
+        auto frameEvents = targetedFrame ? source->GetCorrelatedFrameEventsForFrame(
+            *targetedFrame, 0, std::numeric_limits<size_t>::max() ) : source->GetCorrelatedFrameEvents();
         if( frameEvents.empty() )
+        {
+            if( targetedFrame && source->GetTraceInfo().counts.correlatedFrameEvents != 0 )
+                throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
             return Success( id, { { "present", false }, { "reason", "trace predates or does not contain JN frame correlation" }, { "identities", json::array() } }, trace );
+        }
 
         std::map<uint64_t, std::vector<analysis::CorrelatedFrameEventDto>> frames;
         for( auto& event : frameEvents ) frames[event.frameId].push_back( std::move( event ) );
@@ -10168,8 +10179,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return Success( id, { { "present", true }, { "identities", std::move( values ) } }, trace, PageJson( page, count, cursor ) );
         }
 
-        const auto jobs = source->GetJobs();
-        const auto dispatches = source->GetGfxDispatches();
+        const bool targetedSlice = sessionCorrelation && method == "timeline.correlated_slice" && targetedFrame;
+        const auto jobs = targetedSlice ? source->GetEvidenceJobs( *targetedFrame ) : source->GetJobs();
+        const auto dispatches = targetedSlice ? source->GetGfxDispatchesForFrame(
+            *targetedFrame, 0, std::numeric_limits<size_t>::max() ) : source->GetGfxDispatches();
         const auto entities = source->GetGfxEntities();
         const auto gfxLinks = source->GetGfxLinks();
         std::unordered_map<uint64_t, std::string> jobRefs;

@@ -81,9 +81,13 @@ public:
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
+    std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEventsForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;

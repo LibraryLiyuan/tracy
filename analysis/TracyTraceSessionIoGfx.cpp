@@ -2,6 +2,7 @@
 
 #include "TracyHash.hpp"
 #include "TracyTraceSessionCanonical.hpp"
+#include "TracyTraceSessionExternalSort.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyQueue.hpp"
 
@@ -12,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <stdexcept>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -47,6 +49,8 @@ struct FileHeader
     uint64_t gfxEntityOffset = 0;
     uint64_t gfxLinkOffset = 0;
     uint64_t frameOffset = 0;
+    uint64_t dispatchFramePostingOffset = 0;
+    uint64_t correlatedFramePostingOffset = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
 };
@@ -207,6 +211,8 @@ struct BuildState
     std::ofstream gfxEntity;
     std::ofstream gfxLink;
     std::ofstream frame;
+    std::ofstream dispatchFramePosting;
+    std::ofstream correlatedFramePosting;
     TraceSessionIoGfxStats stats;
 };
 
@@ -278,6 +284,9 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         value.flags = item.jnGfxDispatch.flags;
         if( !WriteRecord( state.gfxDispatch, &value, sizeof( value ),
             "session_gfx_dispatch_write_failed", error ) ) return false;
+        const TraceSessionUInt64Pair posting { value.frameIndex, state.stats.gfxDispatches };
+        if( !WriteRecord( state.dispatchFramePosting, &posting, sizeof( posting ),
+            "session_gfx_dispatch_frame_posting_write_failed", error ) ) return false;
         ++state.stats.gfxDispatches;
         break;
     }
@@ -323,6 +332,9 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
         value.flags = item.jnFrame.flags;
         if( !WriteRecord( state.frame, &value, sizeof( value ),
             "session_correlated_frame_write_failed", error ) ) return false;
+        const TraceSessionUInt64Pair posting { value.frameId, state.stats.correlatedFrames };
+        if( !WriteRecord( state.correlatedFramePosting, &posting, sizeof( posting ),
+            "session_correlated_frame_posting_write_failed", error ) ) return false;
         ++state.stats.correlatedFrames;
         break;
     }
@@ -457,6 +469,12 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
     valid = valid && CheckedAppend( expected, header.gfxLinks, sizeof( StoredGfxLink ), error ) &&
         header.frameOffset == expected;
     valid = valid && CheckedAppend( expected, header.correlatedFrames, sizeof( StoredFrame ), error ) &&
+        header.dispatchFramePostingOffset == expected;
+    valid = valid && CheckedAppend( expected, header.gfxDispatches,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.correlatedFramePostingOffset == expected;
+    valid = valid && CheckedAppend( expected, header.correlatedFrames,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
         expected == manifest.fileBytes;
     if( !in || source != session.source.sha256 || generation != session.generation || !valid )
     {
@@ -504,6 +522,95 @@ std::vector<T> ReadFixed( const std::filesystem::path& path, uint64_t offset,
     return values;
 }
 
+template<typename Stored, typename Dto, typename Decode>
+std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
+    uint64_t postingOffset, uint64_t postingCount, uint64_t frameId,
+    size_t offset, size_t limit, uint64_t recordOffset, uint64_t recordCount,
+    Decode&& decode )
+{
+    std::vector<Dto> result;
+    if( postingCount == 0 || limit == 0 ) return result;
+    std::ifstream pairs( path, std::ios::binary );
+    std::ifstream records( path, std::ios::binary );
+    if( !pairs || !records )
+        throw std::runtime_error( "Session I/O/Gfx Frame posting is unavailable" );
+    const auto lowerBound = [&]( bool upper )
+    {
+        uint64_t first = 0, last = postingCount;
+        while( first < last )
+        {
+            const auto middle = first + ( last - first ) / 2;
+            TraceSessionUInt64Pair pair;
+            pairs.clear();
+            pairs.seekg( std::streamoff( postingOffset + middle * sizeof( pair ) ) );
+            if( !pairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+                throw std::runtime_error( "Session I/O/Gfx Frame posting binary search failed" );
+            if( pair.key < frameId || ( upper && pair.key == frameId ) ) first = middle + 1;
+            else last = middle;
+        }
+        return first;
+    };
+    const auto begin = lowerBound( false );
+    const auto end = lowerBound( true );
+    if( begin >= end ) return result;
+    result.reserve( std::min<uint64_t>( limit, end - begin ) );
+    pairs.clear();
+    pairs.seekg( std::streamoff( postingOffset + begin * sizeof( TraceSessionUInt64Pair ) ) );
+    size_t skipped = 0;
+    for( uint64_t index = begin; index < end; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !pairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) || pair.key != frameId )
+            throw std::runtime_error( "Session I/O/Gfx Frame posting is truncated" );
+        if( pair.value >= recordCount )
+            throw std::runtime_error( "Session I/O/Gfx Frame posting record is out of range" );
+        if( skipped++ < offset ) continue;
+        Stored stored;
+        records.clear();
+        records.seekg( std::streamoff( recordOffset + pair.value * sizeof( Stored ) ) );
+        if( !records.read( reinterpret_cast<char*>( &stored ), sizeof( stored ) ) )
+            throw std::runtime_error( "Session I/O/Gfx Frame posting target is truncated" );
+        result.emplace_back( decode( stored, pair.value ) );
+        if( result.size() >= limit ) break;
+    }
+    return result;
+}
+
+template<typename Stored, typename FrameKey>
+bool ValidateFramePosting( const std::filesystem::path& path,
+    uint64_t postingOffset, uint64_t postingCount, uint64_t recordOffset,
+    uint64_t recordCount, FrameKey&& frameKey, const char* failure,
+    std::string& error )
+{
+    std::ifstream pairs( path, std::ios::binary );
+    std::ifstream records( path, std::ios::binary );
+    if( !pairs || !records ) { error = std::string( failure ) + "_open_failed"; return false; }
+    pairs.seekg( std::streamoff( postingOffset ) );
+    TraceSessionUInt64Pair previous {};
+    bool havePrevious = false;
+    for( uint64_t index = 0; index < postingCount; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !pairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        { error = std::string( failure ) + "_truncated"; return false; }
+        if( havePrevious && ( pair.key < previous.key ||
+            ( pair.key == previous.key && pair.value < previous.value ) ) )
+        { error = std::string( failure ) + "_not_sorted"; return false; }
+        if( pair.value >= recordCount )
+        { error = std::string( failure ) + "_record_out_of_range"; return false; }
+        Stored stored;
+        records.clear();
+        records.seekg( std::streamoff( recordOffset + pair.value * sizeof( Stored ) ) );
+        if( !records.read( reinterpret_cast<char*>( &stored ), sizeof( stored ) ) )
+        { error = std::string( failure ) + "_target_truncated"; return false; }
+        if( frameKey( stored ) != pair.key )
+        { error = std::string( failure ) + "_key_mismatch"; return false; }
+        previous = pair;
+        havePrevious = true;
+    }
+    return true;
+}
+
 std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
 {
     std::ostringstream out;
@@ -517,7 +624,7 @@ std::filesystem::path TraceSessionIoGfxIndexRoot( const std::filesystem::path& s
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "io-gfx-index" / "1" / "exact";
+        "io-gfx-index" / std::to_string( TraceSessionIoGfxIndexSchemaVersion ) / "exact";
 }
 
 bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
@@ -536,6 +643,12 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "io-request.work", root / "io-config.work", root / "io-stage.work",
         root / "gfx-dispatch.work", root / "gfx-entity.work", root / "gfx-link.work",
         root / "frame.work" };
+    const std::array<std::filesystem::path, 2> postingSource = {
+        root / "dispatch-frame-posting-source.work",
+        root / "correlated-frame-posting-source.work" };
+    const std::array<std::filesystem::path, 2> postingSorted = {
+        root / "dispatch-frame-posting-sorted.work",
+        root / "correlated-frame-posting-sorted.work" };
     BuildState state;
     state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
     state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
@@ -544,13 +657,24 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.gfxEntity.open( work[4], std::ios::binary | std::ios::trunc );
     state.gfxLink.open( work[5], std::ios::binary | std::ios::trunc );
     state.frame.open( work[6], std::ios::binary | std::ios::trunc );
+    state.dispatchFramePosting.open( postingSource[0], std::ios::binary | std::ios::trunc );
+    state.correlatedFramePosting.open( postingSource[1], std::ios::binary | std::ios::trunc );
     if( !state.ioRequest || !state.ioConfig || !state.ioStage || !state.gfxDispatch ||
-        !state.gfxEntity || !state.gfxLink || !state.frame )
+        !state.gfxEntity || !state.gfxLink || !state.frame ||
+        !state.dispatchFramePosting || !state.correlatedFramePosting )
     { error = "session_io_gfx_work_open_failed"; return false; }
     if( !LoadTraceSessionTimeTransform( sessionRoot, session, state.transform, error ) ||
         !VisitTraceSessionCanonicalOrdered( sessionRoot, session, Visit, &state, error ) ) return false;
     state.ioRequest.close(); state.ioConfig.close(); state.ioStage.close();
     state.gfxDispatch.close(); state.gfxEntity.close(); state.gfxLink.close(); state.frame.close();
+    state.dispatchFramePosting.close(); state.correlatedFramePosting.close();
+    constexpr uint64_t MaximumBufferedPostingPairs = 4ull * 1024 * 1024;
+    if( !SortTraceSessionUInt64Pairs( postingSource[0], postingSorted[0], root,
+            "io-gfx-dispatch-frame-posting", state.stats.gfxDispatches,
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( postingSource[1], postingSorted[1], root,
+            "io-gfx-correlated-frame-posting", state.stats.correlatedFrames,
+            MaximumBufferedPostingPairs, error ) ) return false;
 
     FileHeader header;
     header.sourceSize = session.source.fileSize;
@@ -578,6 +702,12 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     if( !CheckedAppend( next, state.stats.gfxLinks, sizeof( StoredGfxLink ), error ) ) return false;
     header.frameOffset = next;
     if( !CheckedAppend( next, state.stats.correlatedFrames, sizeof( StoredFrame ), error ) ) return false;
+    header.dispatchFramePostingOffset = next;
+    if( !CheckedAppend( next, state.stats.gfxDispatches,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.correlatedFramePostingOffset = next;
+    if( !CheckedAppend( next, state.stats.correlatedFrames,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
 
     const auto temporary = root / ( std::string( FileName ) + ".tmp" );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -586,24 +716,32 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     if( !session.generation.empty() ) out.write( session.generation.data(),
         std::streamsize( session.generation.size() ) );
-    const std::array<uint64_t, 7> expected = {
+    const std::array<uint64_t, 9> expected = {
         state.stats.ioRequests * sizeof( StoredIoRequest ),
         state.stats.ioConfigs * sizeof( StoredIoConfig ),
         state.stats.ioStages * sizeof( StoredIoStage ),
         state.stats.gfxDispatches * sizeof( StoredGfxDispatch ),
         state.stats.gfxEntities * sizeof( StoredGfxEntity ),
         state.stats.gfxLinks * sizeof( StoredGfxLink ),
-        state.stats.correlatedFrames * sizeof( StoredFrame ) };
+        state.stats.correlatedFrames * sizeof( StoredFrame ),
+        state.stats.gfxDispatches * sizeof( TraceSessionUInt64Pair ),
+        state.stats.correlatedFrames * sizeof( TraceSessionUInt64Pair ) };
     uint64_t copied = 0;
     for( size_t i = 0; i < work.size(); ++i )
         if( !CopyFile( work[i], out, copied, error ) || copied != expected[i] )
         { if( error.empty() ) error = "session_io_gfx_work_size_mismatch"; return false; }
+    for( size_t i = 0; i < postingSorted.size(); ++i )
+        if( !CopyFile( postingSorted[i], out, copied, error ) ||
+            copied != expected[work.size() + i] )
+        { if( error.empty() ) error = "session_io_gfx_posting_size_mismatch"; return false; }
     out.flush();
     if( !out ) { error = "session_io_gfx_file_finalize_failed"; return false; }
     out.close();
     const auto target = root / FileName;
     if( !AtomicReplace( temporary, target, error ) ) return false;
     for( const auto& path : work ) { ec.clear(); std::filesystem::remove( path, ec ); }
+    for( const auto& path : postingSource ) { ec.clear(); std::filesystem::remove( path, ec ); }
+    for( const auto& path : postingSorted ) { ec.clear(); std::filesystem::remove( path, ec ); }
 
     LocalManifest manifest;
     manifest.sourceSha256 = session.source.sha256;
@@ -637,6 +775,8 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_gfxEntityOffset = header.gfxEntityOffset;
     reader->m_gfxLinkOffset = header.gfxLinkOffset;
     reader->m_frameOffset = header.frameOffset;
+    reader->m_dispatchFramePostingOffset = header.dispatchFramePostingOffset;
+    reader->m_correlatedFramePostingOffset = header.correlatedFramePostingOffset;
     reader->m_stats = manifest.stats;
     return reader;
 }
@@ -734,6 +874,20 @@ std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatches() const
     return result;
 }
 
+std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatchesForFrame(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    return ReadFramePosting<StoredGfxDispatch, GfxDispatchDto>( m_path,
+        m_dispatchFramePostingOffset, m_stats.gfxDispatches, frameId, offset, limit,
+        m_gfxDispatchOffset, m_stats.gfxDispatches,
+        [&]( const StoredGfxDispatch& value, uint64_t ) {
+            return GfxDispatchDto { MakeRef( m_fingerprint, "gfx-dispatch", value.dispatchId ),
+                value.dispatchId, value.frameIndex, value.timeNs,
+                MakeRef( m_fingerprint, "thread", value.thread ), value.expectedJobs,
+                value.threadingMode, value.flags };
+        } );
+}
+
 std::vector<GfxEntityDto> TraceSessionIoGfxReader::GfxEntities() const
 {
     const auto stored = ReadFixed<StoredGfxEntity>( m_path, m_gfxEntityOffset,
@@ -779,14 +933,40 @@ std::vector<CorrelatedFrameEventDto> TraceSessionIoGfxReader::CorrelatedFrames()
     return result;
 }
 
+std::vector<CorrelatedFrameEventDto> TraceSessionIoGfxReader::CorrelatedFramesForFrame(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    return ReadFramePosting<StoredFrame, CorrelatedFrameEventDto>( m_path,
+        m_correlatedFramePostingOffset, m_stats.correlatedFrames, frameId, offset, limit,
+        m_frameOffset, m_stats.correlatedFrames,
+        [&]( const StoredFrame& value, uint64_t ordinal ) {
+            return CorrelatedFrameEventDto {
+                MakeRef( m_fingerprint, "frame-identity-event", ordinal ), value.frameId,
+                value.domainIndex, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
+                value.domain, value.phase, value.flags };
+        } );
+}
+
 bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& session, TraceSessionIoGfxStats& stats,
     std::string& error )
 {
     LocalManifest manifest;
     FileHeader header;
-    if( !VerifyFiles( TraceSessionIoGfxIndexRoot( sessionRoot, session ), session,
+    const auto root = TraceSessionIoGfxIndexRoot( sessionRoot, session );
+    if( !VerifyFiles( root, session,
         manifest, header, error ) ) return false;
+    const auto path = root / FileName;
+    if( !ValidateFramePosting<StoredGfxDispatch>( path,
+            header.dispatchFramePostingOffset, header.gfxDispatches,
+            header.gfxDispatchOffset, header.gfxDispatches,
+            []( const StoredGfxDispatch& value ) { return value.frameIndex; },
+            "session_gfx_dispatch_frame_posting", error ) ||
+        !ValidateFramePosting<StoredFrame>( path,
+            header.correlatedFramePostingOffset, header.correlatedFrames,
+            header.frameOffset, header.correlatedFrames,
+            []( const StoredFrame& value ) { return value.frameId; },
+            "session_correlated_frame_posting", error ) ) return false;
     stats = manifest.stats;
     return true;
 }

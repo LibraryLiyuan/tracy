@@ -1450,3 +1450,28 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 发布目录不残留任何Job `.work` 文件。本子阶段未执行真实30分钟转换。
+
+### 2026-09-01 FrameIdentity 与 GfxDispatch Frame Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- I/O/Gfx index schema从1升级到2，在既有固定宽度事实之后追加两类精确posting：`frameId→CorrelatedFrameEvent ordinal`与`frameIndex→GfxDispatch ordinal`。
+- Producer顺序写入16字节Pair工作文件，再使用公共64 MiB有界外部排序器生成immutable posting；构建内存不随Frame事件或Dispatch总量线性增长。
+- Session Reader新增按Frame分页读取接口；两次磁盘二分查找定位Frame区间，只读取请求页的posting和目标固定宽度记录。
+- `frame.identity(ref/frame_id)`在Session中只读取指定Frame事件；`timeline.correlated_slice`只读取指定Frame事件、Frame→Job posting及Frame→Dispatch posting，不再调用全量`GetJobs()`、`GetGfxDispatches()`或`GetCorrelatedFrameEvents()`。
+- `entity.related`和`correlation.chain`仍保留旧完整图语义，尚未错误宣称为长Trace分页实现。
+- Final Audit除强身份、文件大小、布局和SHA-256外，还流式验证posting排序、目标ordinal范围及posting FrameId与目标事实一致；不能以“错误内容自己的正确checksum”通过发布。
+- `frame.identity`与`timeline.correlated_slice`仅在correlated Frame事实和I/O/Gfx磁盘Reader均可用时开放Session capability；索引缺失不会回退到完整Worker。
+
+TDD与系统化诊断证据：
+
+```text
+RED:       timeline.correlated_slice 返回 CAPABILITY_UNAVAILABLE
+ROOT:      新Reader已实现，但Session capability方法表未声明该方法，Query在到达Reader前拒绝请求
+FIX:       增加精确correlation capability；不放宽全局Session门禁
+Reader:    Frame 9 dispatch=[300]，event count=1；Frame 10均为空
+Query:     Frame 9 direct job=[500]，dispatch=[300]
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+发布目录不残留I/O/Gfx external-sort `.work` 文件。本子阶段未启动真实30分钟转换。

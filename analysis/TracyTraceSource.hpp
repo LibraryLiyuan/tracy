@@ -1075,6 +1075,22 @@ public:
     }
     virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
+    virtual std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto values = GetGfxDispatches();
+        std::vector<GfxDispatchDto> result;
+        size_t matched = 0;
+        for( const auto& value : values )
+        {
+            if( value.frameIndex != frameId ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( value );
+            if( result.size() >= limit ) break;
+        }
+        return result;
+    }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }
     virtual std::vector<GfxLinkDto> GetGfxLinks() const { return {}; }
     virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const
@@ -1104,6 +1120,22 @@ public:
         return result;
     }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
+    virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEventsForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto values = GetCorrelatedFrameEvents();
+        std::vector<CorrelatedFrameEventDto> result;
+        size_t matched = 0;
+        for( const auto& value : values )
+        {
+            if( value.frameId != frameId ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( value );
+            if( result.size() >= limit ) break;
+        }
+        return result;
+    }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
     virtual uint64_t GetRelationCount() const { return GetRelations().size(); }
     virtual std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const

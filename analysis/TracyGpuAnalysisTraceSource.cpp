@@ -301,6 +301,16 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     result.push_back( Capability { "job.gfx", gfxPresent, gfxPresent, true,
         gfxPresent ? "available from the N30 Session mandatory I/O/Gfx index" :
             "The source Session contains no Gfx evidence facts", GfxMethods } );
+    static const std::vector<std::string> CorrelationMethods = {
+        "frame.identity", "timeline.correlated_slice"
+    };
+    const auto correlationPresent = m_ioGfxReader && m_sessionStats.correlatedFrames != 0;
+    result.push_back( Capability { "correlation", correlationPresent,
+        correlationPresent, true,
+        correlationPresent ?
+            "Frame identity and correlated slices are available from exact N30 Session postings" :
+            "The source Session contains no correlated Frame identity facts",
+        CorrelationMethods } );
     static const std::vector<std::string> MemoryMethods = {
         "memory.pools", "memory.events", "memory.get", "memory.active_at_time",
         "memory.frame_snapshot", "memory.diff", "memory.callstack_tree", "memory.leak_candidates"
@@ -810,6 +820,14 @@ std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->GfxDispatches() : std::vector<GfxDispatchDto> {};
 }
+std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatchesForFrame(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetGfxDispatchesForFrame( frameId, offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxDispatchesForFrame( frameId, offset, limit ) :
+        std::vector<GfxDispatchDto> {};
+}
 std::vector<GfxEntityDto> GpuAnalysisTraceSource::GetGfxEntities() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxEntities();
@@ -827,6 +845,14 @@ std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameE
     if( WorkerLoaded() ) return Worker().GetCorrelatedFrameEvents();
     const auto reader = SessionIoGfxReader();
     return reader ? reader->CorrelatedFrames() :
+        std::vector<CorrelatedFrameEventDto> {};
+}
+std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEventsForFrame(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetCorrelatedFrameEventsForFrame( frameId, offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->CorrelatedFramesForFrame( frameId, offset, limit ) :
         std::vector<CorrelatedFrameEventDto> {};
 }
 std::vector<RelationDto> GpuAnalysisTraceSource::GetRelations() const

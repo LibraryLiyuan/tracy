@@ -2611,6 +2611,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
         const auto correlatedFrames = sessionSource->GetCorrelatedFrameEvents();
+        const auto frameNineDispatches = sessionSource->GetGfxDispatchesForFrame( 9, 0, 8 );
+        const auto frameNineEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 9, 0, 8 );
+        const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
+        const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         test.Check( ioRequests.size() == 1 && ioRequests[0].requestId == 400 &&
             ioRequests[0].requestedBytes == 4096 && ioRequests[0].transferredBytes == 4096 &&
             ioRequests[0].queueNs == 36 && ioRequests[0].startNs == 38 && ioRequests[0].endNs == 40 &&
@@ -2624,6 +2628,17 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             gfxLinks[1].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ) &&
             correlatedFrames.size() == 1 && correlatedFrames[0].frameId == 9,
             "Session Gfx/Frame evidence reader preserves fixed binary facts without a Worker" );
+        test.Check( frameNineDispatches.size() == 1 && frameNineDispatches[0].dispatchId == 300 &&
+            frameNineEvents.size() == 1 && frameNineEvents[0].frameId == 9 &&
+            missingFrameDispatches.empty() && missingFrameEvents.empty(),
+            "Session Gfx/Frame posting readers fetch one Frame directly without scanning the full domain" );
+        bool ioGfxWorkFound = false;
+        const auto ioGfxRoot = tracy::analysis::TraceSessionIoGfxIndexRoot( publishedSession, manifest );
+        for( const auto& entry : std::filesystem::directory_iterator( ioGfxRoot ) )
+            ioGfxWorkFound = ioGfxWorkFound || ( entry.is_regular_file() &&
+                entry.path().filename().string().ends_with( ".work" ) );
+        test.Check( !ioGfxWorkFound,
+            "Session I/O/Gfx posting build removes every external-sort work file before publication" );
     }
     catch( const std::exception& exception )
     {
@@ -3107,8 +3122,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         []( const auto& value ) { return value.domain == "frame_image"; } );
     const bool sessionFrameImagesReady = frameImages != capabilities.end() && frameImages->present &&
         frameImages->indexed && frameImages->queryable;
-    test.Check( sessionFrameImagesReady,
-        "Session advertises FrameImage only after its disk-backed semantic reader is ready" );
+        test.Check( sessionFrameImagesReady,
+            "Session advertises FrameImage only after its disk-backed semantic reader is ready" );
+        const auto correlatedSlice = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-correlated-slice" },
+            { "method", "timeline.correlated_slice" }, { "params", {
+                { "trace_id", traceId },
+                { "ref", sessionSource->MakeEntityRef( "frame-identity", 9 ) },
+                { "max_nodes", 128 } } }
+        } );
+        test.Check( correlatedSlice.value( "ok", false ) &&
+            correlatedSlice["data"]["identity"]["frame_id"] == "9" &&
+            correlatedSlice["data"]["jobs"].size() == 1 &&
+            correlatedSlice["data"]["jobs"][0]["job_id"] == "500" &&
+            correlatedSlice["data"]["gfx_dispatches"].size() == 1 &&
+            correlatedSlice["data"]["gfx_dispatches"][0]["dispatch_id"] == "300",
+            "Query 1.34 resolves a correlated Session Frame through Frame/Job/Gfx postings" );
         const auto cpuSearch = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
             { "params", { { "trace_id", traceId } } }
