@@ -14,6 +14,7 @@
 #include "TracyTraceSessionFrameImages.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
+#include "TracyTraceSessionExport.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
 #include "TracyJnGpuCatalogResolve.hpp"
@@ -2522,6 +2523,32 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "publish only after mandatory derived and Final Audit: " + error );
     test.Check( tracy::analysis::IsTraceSessionQueryable( publishedSession, error ),
         "published Session is queryable: " + error );
+    tracy::analysis::TraceSessionExportSelection timeSelection;
+    timeSelection.timeBeginNs = 16;
+    timeSelection.timeEndNs = 32;
+    tracy::analysis::TraceSessionExportRange timeRange;
+    test.Check( tracy::analysis::ResolveTraceSessionExportRange( publishedSession,
+        manifest, timeSelection, timeRange, error ) &&
+        timeRange.beginNs == 16 && timeRange.endNs == 32 && !timeRange.frameSelection,
+        "Session export resolves an exact half-open time range: " + error );
+    tracy::analysis::TraceSessionExportSelection frameSelection;
+    frameSelection.frameSet = 0;
+    frameSelection.frameBegin = 0;
+    frameSelection.frameEnd = 1;
+    tracy::analysis::TraceSessionExportRange frameRange;
+    test.Check( tracy::analysis::ResolveTraceSessionExportRange( publishedSession,
+        manifest, frameSelection, frameRange, error ) &&
+        frameRange.beginNs == 12 && frameRange.endNs == 36 && frameRange.frameSelection &&
+        frameRange.frameSet == 0 && frameRange.frameBegin == 0 && frameRange.frameEnd == 1,
+        "Session export resolves a FrameSet range through the mandatory Frame index: " + error );
+    auto mixedSelection = frameSelection;
+    mixedSelection.timeBeginNs = 16;
+    mixedSelection.timeEndNs = 32;
+    tracy::analysis::TraceSessionExportRange rejectedRange;
+    test.Check( !tracy::analysis::ResolveTraceSessionExportRange( publishedSession,
+        manifest, mixedSelection, rejectedRange, error ) &&
+        error == "session_export_selection_mixed",
+        "Session export rejects mixed time and Frame selectors" );
     auto sessionGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
         tracy::analysis::TraceSessionGpuAnalysisRoot( publishedSession, manifest ),
         manifest.source.sha256, manifest.source.fileSize, error );

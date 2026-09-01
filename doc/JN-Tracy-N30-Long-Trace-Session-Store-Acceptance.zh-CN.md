@@ -1677,6 +1677,28 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Session Export Range 解析与Generation门禁（N30.6C 子阶段）
+
+状态：**Passed（选择解析基础；尚未生成或发布局部`.tracy`）**。
+
+- 新增独立`TracyTraceSessionExport`模块；当前只解析导出选择，不创建CLI，不写输出文件，防止半成品被误用。
+- 时间选择采用半开区间`[timeBeginNs,timeEndNs)`，必须同时提供且`begin < end`。
+- Frame选择采用`frameSet + [frameBegin,frameEnd)`，通过Mandatory Frame index解析为第一帧begin到最后一帧end。
+- 时间与Frame选择不得混用；缺字段、空范围、越界FrameSet/Frame和平台宽度溢出均返回稳定错误码。
+- 解析前要求Session状态为`Complete/CompleteSourceDegraded`、Mandatory Derived完成且Final Audit通过；传入manifest必须与`CURRENT`的generation、source SHA-256和size一致。
+
+TDD与回归证据：
+
+```text
+RED:       测试include尚不存在的TracyTraceSessionExport.hpp，编译按预期失败
+Time:      [16,32) → [16,32)
+Frame:     FrameSet 0 [0,1) → [12,36)
+Reject:    同时提供time与frame → session_export_selection_mixed
+GREEN:     Trace Session Inventory tests passed；固定6项回归全部通过（2.63秒）
+```
+
+下一步是保守容量预检、重叠Shard/Checkpoint选择和WindowExportSink；在`.tracy`写入与回读一致性完成前，不会生成正式`tracy-session-export.exe`。
+
 ### 2026-09-01 Runtime Domain State 有界分页（N30.6B 子阶段）
 
 状态：**Passed（synthetic correctness；真实长Trace状态基数待N30.7观测）**。
