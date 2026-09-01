@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -389,7 +390,8 @@ public:
     std::optional<GpuAnalysisStablePassSummary> FindStablePassSummary(
         uint64_t frameId, uint32_t taxonomyId, std::string& error ) const;
     bool PassResources( uint64_t passId, bool inclusive, size_t offset, size_t limit,
-        std::vector<uint64_t>& out, bool& hasMore, std::string& error ) const;
+        std::vector<uint64_t>& out, bool& hasMore, std::string& error,
+        std::stop_token stopToken = {} ) const;
     bool PassRelationsForResource( uint64_t resourceId, size_t offset, size_t limit,
         std::vector<GpuAnalysisResourcePassEntry>& out, bool& hasMore, std::string& error ) const;
     bool PassesForFrame( uint64_t frameId, size_t offset, size_t limit,

@@ -374,6 +374,14 @@ int main()
     assert( sessionStore->PassResources( 1000, true, 1, 1,
         pagedInclusiveResources, inclusiveHasMore, error ) );
     assert( pagedInclusiveResources == std::vector<uint64_t> { 11 } && !inclusiveHasMore );
+    std::stop_source cancelledPassResources;
+    cancelledPassResources.request_stop();
+    error.clear();
+    assert( !sessionStore->PassResources( 1000, true, 0, 1,
+        pagedInclusiveResources, inclusiveHasMore, error,
+        cancelledPassResources.get_token() ) );
+    assert( error == "cancelled" );
+    error.clear();
     std::vector<GpuAnalysisResourcePassEntry> resourceRelations; bool relationHasMore = false;
     assert( sessionStore->PassRelationsForResource( 11, 0, 100,
         resourceRelations, relationHasMore, error ) );

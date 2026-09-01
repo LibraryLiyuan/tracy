@@ -1,5 +1,6 @@
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionGpuVerifier.hpp"
 #include "TracyTraceSessionStore.hpp"
 
 #include "TracyAnalysis.hpp"
@@ -103,6 +104,8 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
     if( name == "frame_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 0 } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "callsite_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", std::numeric_limits<uint32_t>::max() } }, json { { "type", "string" }, { "pattern", "^[1-9][0-9]*$" } } } ) } };
     if( name == "pass_id" || name == "resource_id" || name == "allocation_id" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 } }, json { { "type", "string" }, { "pattern", "^[1-9][0-9]*$" } } } ) } };
+    if( name == "resource_scope" ) return { { "type", "string" },
+        { "enum", { "direct_members", "inclusive_summary", "inclusive_members" } } };
     if( name == "allow_warnings" ) return { { "type", "boolean" } };
     if( name == "comparison_mode" ) return { { "type", "string" }, { "enum", { "performance", "contract" } } };
     if( name == "max_scan_events" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxScanEvents } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
@@ -202,6 +205,10 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["pass_source_id"] = ParameterSchemaFor( "pass_source_id" );
                 properties["taxonomy_id"] = ParameterSchemaFor( "taxonomy_id" );
                 properties["name"] = ParameterSchemaFor( "name" );
+            }
+            else if( method == "gpu.pass.resources" || method == "gpu.memory.by_pass" )
+            {
+                properties["resource_scope"] = ParameterSchemaFor( "resource_scope" );
             }
             else if( method == "relation.search" )
             {
@@ -5676,6 +5683,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     "Published Session has no pinned mandatory GPU Resource Analysis reader", false );
                 const auto& store = reader->Manifest();
                 const auto& facade = sessionSource->AnalysisManifest();
+                const auto& pinnedSession = sessionSource->SessionManifest();
+                const auto backingPath = sessionSource->BackingPath();
+                if( !pinnedSession || !backingPath ) throw QueryError(
+                    "GPU_ANALYSIS_SIDECAR_INVALID",
+                    "Published Session has no pinned manifest for independent verification", false );
+                std::string verifierError;
+                const auto verifier = analysis::LoadTraceSessionGpuVerifierReport(
+                    *backingPath, *pinnedSession, verifierError );
+                if( !verifier || !verifier->complete ||
+                    verifier->sessionGeneration != pinnedSession->generation ||
+                    verifier->gpuGeneration != store.generation ||
+                    verifier->resourceCount != store.resourceCount ||
+                    verifier->allocationCount != store.allocationCount ||
+                    verifier->passCount != store.passCount ||
+                    verifier->rangeCount != store.rangeCount ||
+                    verifier->resourcePassRelationCount != store.resourcePassRelationCount )
+                    throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID",
+                        verifierError.empty() ? "independent_gpu_verifier_mismatch" : verifierError,
+                        false );
                 const bool converterOutputComplete = store.complete && facade.rawComplete &&
                     facade.derivedComplete && facade.summary.catalogValid;
                 const bool sourceDegraded = store.sourceGapResourceCount != 0 ||
@@ -5687,6 +5713,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 result["enrichment_complete"] = store.sourceGapResourceCount == 0 &&
                     store.sourceGapReferenceCount == 0;
                 result["reason"] = facade.reason.empty() ? json( nullptr ) : json( facade.reason );
+                result["independent_verifier"] = {
+                    { "complete", verifier->complete },
+                    { "schema", verifier->schema },
+                    { "session_generation", verifier->sessionGeneration },
+                    { "gpu_generation", verifier->gpuGeneration },
+                    { "source_gpu_catalog_events", Decimal( verifier->sourceGpuCatalogEvents ) },
+                    { "source_catalog_record_count", Decimal( verifier->sourceCatalogRecordCount ) },
+                    { "source_reference_relation_count", Decimal( verifier->sourceReferenceRelationCount ) },
+                    { "source_payload_bytes", Decimal( verifier->sourcePayloadBytes ) },
+                    { "source_record_hash", Decimal( verifier->sourceRecordHash ) },
+                    { "resources", Decimal( verifier->resourceCount ) },
+                    { "allocations", Decimal( verifier->allocationCount ) },
+                    { "passes", Decimal( verifier->passCount ) },
+                    { "ranges", Decimal( verifier->rangeCount ) },
+                    { "resource_pass_relations", Decimal( verifier->resourcePassRelationCount ) },
+                    { "direct_member_count", Decimal( verifier->directMemberCount ) },
+                    { "inclusive_member_count", Decimal( verifier->inclusiveMemberCount ) },
+                    { "forward_relation_hash", Decimal( verifier->forwardRelationHash ) },
+                    { "reverse_relation_hash", Decimal( verifier->reverseRelationHash ) },
+                    { "engine_known_physical_peak_bytes", Decimal( verifier->engineKnownPhysicalPeakBytes ) },
+                    { "engine_known_physical_peak_time_ns", Decimal( verifier->engineKnownPhysicalPeakTimeNs ) },
+                    { "mismatch_count", Decimal( verifier->mismatchCount ) },
+                    { "report_hash", Decimal( verifier->reportHash ) }
+                };
                 result["transport"] = {
                     { "available", false },
                     { "reason", "validated_during_session_final_audit" },
@@ -6301,14 +6351,28 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 {
                     const auto passId = UnsignedParameter( params, "pass_id", 0, std::numeric_limits<uint64_t>::max() );
                     auto pass = reader->FindPass( passId, sidecarError ); if( !pass ) throw QueryError( "ENTITY_NOT_FOUND", sidecarError );
+                    const auto summary = reader->FindPassSummary( passId, sidecarError );
+                    if( !summary ) throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                    const auto scope = params.value( "resource_scope", std::string( "direct_members" ) );
+                    if( scope != "direct_members" && scope != "inclusive_summary" &&
+                        scope != "inclusive_members" ) throw QueryError( "INVALID_PARAMS",
+                            "resource_scope must be direct_members, inclusive_summary, or inclusive_members" );
                     const auto page = ParsePage( params, method, trace ); json resourcesJson = json::array();
-                    const auto begin = std::min( page.offset, pass->directResources.size() ); const auto end = begin + std::min( page.limit, pass->directResources.size() - begin );
-                    std::vector<uint64_t> resourceIds( pass->directResources.begin() + begin, pass->directResources.begin() + end );
+                    std::vector<uint64_t> resourceIds; bool hasMore = false;
+                    if( scope != "inclusive_summary" && !reader->PassResources( passId,
+                        scope == "inclusive_members", page.offset, page.limit, resourceIds,
+                        hasMore, sidecarError, stopToken ) )
+                    {
+                        if( sidecarError == "cancelled" ) throw QueryError( "CANCELLED", "query was cancelled", true );
+                        throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                    }
+                    checkCancelled();
                     std::vector<analysis::GpuResourceAnalysisRecord> resources;
-                    if( !reader->FindResources( std::move( resourceIds ), resources, sidecarError ) )
+                    if( !resourceIds.empty() && !reader->FindResources( std::move( resourceIds ), resources, sidecarError ) )
                         throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
                     for( const auto& resource : resources )
                     {
+                        checkCancelled();
                         auto value = resourceJsonFromStore( resource, false ); json ranges = json::array();
                         for( const auto& range : resource.ranges ) if( range.value.passInstanceId == passId ) ranges.push_back( {
                             { "view_id", range.value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.value.viewDefinitionId ) ) },
@@ -6319,13 +6383,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         value["ranges"] = std::move( ranges ); resourcesJson.push_back( std::move( value ) );
                     }
                     const auto sampleStatus = pass->complete ? "continuous_exact" : "source_incomplete";
+                    const bool inclusiveScope = scope != "direct_members";
+                    const auto selectedCount = inclusiveScope ? summary->inclusiveResourceCount : summary->directResourceCount;
+                    const auto selectedPhysicalBytes = inclusiveScope ? summary->inclusivePhysicalBytes : summary->directPhysicalBytes;
+                    const auto returned = resourcesJson.size();
                     return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", sampleStatus },
+                        { "evidence_scope", scope },
                         { "complete", pass->complete }, { "truncated", pass->truncated },
                         { "unavailable_reason", pass->complete ? json( nullptr ) : json( "source_gpu_resource_identity_gap" ) },
-                        { "resource_count", Decimal( pass->directResources.size() ) }, { "direct_range_bytes", Decimal( pass->directRangeBytes ) },
-                        { "referenced_physical_bytes", Decimal( pass->directPhysicalBytes ) }, { "unknown_range_resource_count", pass->unknownRangeResourceCount },
+                        { "resource_count", Decimal( selectedCount ) }, { "direct_range_bytes", Decimal( summary->directRangeBytes ) },
+                        { "referenced_physical_bytes", Decimal( selectedPhysicalBytes ) }, { "unknown_range_resource_count", summary->unknownRangeResourceCount },
+                        { "direct_summary", {
+                            { "resource_count", Decimal( summary->directResourceCount ) },
+                            { "resource_hash", Decimal( summary->directResourceHash ) },
+                            { "physical_bytes", Decimal( summary->directPhysicalBytes ) },
+                            { "range_bytes", Decimal( summary->directRangeBytes ) }
+                        } },
+                        { "inclusive_summary", {
+                            { "resource_count", Decimal( summary->inclusiveResourceCount ) },
+                            { "resource_hash", Decimal( summary->inclusiveResourceHash ) },
+                            { "physical_bytes", Decimal( summary->inclusivePhysicalBytes ) }
+                        } },
                         { "resources", std::move( resourcesJson ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } },
-                        trace, PageJson( page, end - begin, NextCursor( page, method, trace, end - begin, end < pass->directResources.size() ) ) );
+                        trace, PageJson( page, returned, NextCursor( page, method, trace,
+                            returned, hasMore ) ) );
                 }
                 if( method == "gpu.pass.vg_evidence" )
                 {

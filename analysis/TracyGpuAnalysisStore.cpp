@@ -2437,9 +2437,10 @@ GpuAnalysisStoreReader::FindStablePassSummary( uint64_t frameId,
 
 bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
     size_t offset, size_t limit, std::vector<uint64_t>& out, bool& hasMore,
-    std::string& error ) const
+    std::string& error, std::stop_token stopToken ) const
 {
     out.clear(); hasMore = false;
+    if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
     const auto rootPass = FindPass( passId, error );
     if( !rootPass ) return false;
     std::vector<uint64_t> reconstructed;
@@ -2464,9 +2465,11 @@ bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
         std::unordered_set<uint64_t> seen { passId };
         for( size_t cursor = 0; cursor < passIds.size(); ++cursor )
         {
+            if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
             const auto parentId = passIds[cursor];
             for( const auto& page : m_manifest.pages )
             {
+                if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
                 if( page.kind != GpuAnalysisStorePageKind::PassChildIndex ||
                     parentId < page.firstKey || parentId > page.lastKey ) continue;
                 std::vector<GpuAnalysisPassChildEntry> children;
@@ -2483,17 +2486,23 @@ bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
         }
         std::sort( passIds.begin(), passIds.end() );
         std::vector<GpuPassWorkingSet> passes;
+        if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
         if( !LoadPassesByIds( std::move( passIds ), passes, error ) ) return false;
         size_t memberCount = 0;
         for( const auto& pass : passes )
         {
+            if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
             if( memberCount > std::numeric_limits<size_t>::max() - pass.directResources.size() )
             { error = "gpu_pass_inclusive_member_count_overflow"; return false; }
             memberCount += pass.directResources.size();
         }
         reconstructed.reserve( memberCount );
-        for( const auto& pass : passes ) reconstructed.insert( reconstructed.end(),
-            pass.directResources.begin(), pass.directResources.end() );
+        for( const auto& pass : passes )
+        {
+            if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
+            reconstructed.insert( reconstructed.end(), pass.directResources.begin(),
+                pass.directResources.end() );
+        }
         std::sort( reconstructed.begin(), reconstructed.end() );
         reconstructed.erase( std::unique( reconstructed.begin(), reconstructed.end() ),
             reconstructed.end() );
@@ -2527,6 +2536,7 @@ bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
             else resourcesPtr = &reconstructed;
         }
     }
+    if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
     const auto& resources = *resourcesPtr;
     if( offset >= resources.size() ) return true;
     const auto count = std::min( limit, resources.size() - offset );

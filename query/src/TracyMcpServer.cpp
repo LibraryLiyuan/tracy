@@ -345,6 +345,7 @@ json McpServer::ToolsList( const json& id ) const
         { "trace_id", traceId }, { "domain", enumeration( { "frame", "frame_image", "thread", "cpu_zone", "gpu_zone", "memory_event", "memory", "gpu_memory", "gpu_catalog", "gpu_resource", "gpu_pass_resource", "callstack", "parent_callstack", "symbol", "source", "lock", "message", "plot", "hardware_sample" } ) },
         { "operation", enumeration( { "get", "tree", "list", "active_at_time", "frame_snapshot", "diff", "callstack_tree", "leak_candidates", "allocations", "request_scopes", "pass_uses", "attribution", "frames", "raw_code", "disassembly", "lines", "embedded", "timeline", "points", "downsample", "statistics", "resource", "status", "validation", "explain", "lifetime", "references", "views", "mesh_buffers", "raytracing_chain", "vg_pages", "vg_evidence" } ) },
         { "ref", { { "type", "string" } } }, { "address", { { "type", "string" } } }, { "frame_set", {} }, { "index", { { "type", "integer" } } }, { "max_depth", { { "type", "integer" } } },
+        { "resource_scope", enumeration( { "direct_members", "inclusive_summary", "inclusive_members" } ) },
         { "method", { { "type", "string" }, { "enum", QueryMethodRegistry() }, { "description", "Exact public tracy-query method returned by tracy_describe. Use this route when a workflow domain/operation mapping is insufficient." } } },
         { "params", { { "type", "object" }, { "description", "Parameters for method. A top-level trace_id is injected and must not conflict with params.trace_id." } } }
     };

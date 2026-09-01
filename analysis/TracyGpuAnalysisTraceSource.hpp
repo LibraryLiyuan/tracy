@@ -45,6 +45,9 @@ public:
     // reuse it so a later CURRENT switch cannot mix Session generations.
     std::shared_ptr<GpuAnalysisStoreReader> StoreReader() const { return m_reader; }
     const GpuAnalysisSidecarManifest& AnalysisManifest() const { return m_manifest; }
+    // Pinned together with StoreReader when a Session TraceSource opens. Query
+    // must use this copy instead of following a later CURRENT switch.
+    const std::optional<TraceSessionManifest>& SessionManifest() const { return m_sessionManifest; }
 
     std::vector<Capability> GetCapabilities() const override;
     TraceReadView AcquireReadView() const override;

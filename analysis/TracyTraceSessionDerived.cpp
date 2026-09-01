@@ -6,6 +6,7 @@
 #include "TracyTraceSessionFrameImages.hpp"
 #include "TracyTraceSessionSymbols.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionGpuVerifier.hpp"
 #include "TracyTraceSessionJobs.hpp"
 #include "TracyTraceSessionCpuZones.hpp"
 #include "TracyTraceSessionGpuZones.hpp"
@@ -1018,6 +1019,30 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         index.stats.gpuPasses = gpuStats.passCount;
         index.stats.gpuSourceGapResources = gpuStats.sourceGapResourceCount;
         index.stats.gpuSourceGapReferences = gpuStats.sourceGapReferenceCount;
+
+        if( control.progress ) control.progress( 0.f, "gpu-independent-verifier" );
+        std::string verifierLoadError;
+        const auto savedVerifier = LoadTraceSessionGpuVerifierReport(
+            sessionRoot, manifest, verifierLoadError );
+        const bool verifierReusable = savedVerifier && savedVerifier->complete &&
+            savedVerifier->gpuGeneration == gpuStats.generation &&
+            savedVerifier->resourceCount == gpuStats.resourceCount &&
+            savedVerifier->allocationCount == gpuStats.allocationCount &&
+            savedVerifier->passCount == gpuStats.passCount &&
+            savedVerifier->mismatchCount == 0;
+        if( verifierReusable )
+        {
+            if( control.progress ) control.progress( 1.f, "gpu-independent-verifier-reused" );
+        }
+        else
+        {
+            TraceSessionGpuVerifierControl verifierControl;
+            verifierControl.stopToken = control.stopToken;
+            TraceSessionGpuVerifierReport verifier;
+            if( !VerifyTraceSessionGpuDerived( sessionRoot, manifest, inventory,
+                verifierControl, verifier, error ) ) return false;
+            if( control.progress ) control.progress( 1.f, "gpu-independent-verifier-complete" );
+        }
     }
     if( !commitCheckpoint( "gpu-complete", index.stats.indexedRecords,
         index.stats.indexBytes ) || !checkControl() ) return false;
@@ -1079,6 +1104,16 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
             gpu->sourceGapResourceCount != index.stats.gpuSourceGapResources ||
             gpu->sourceGapReferenceCount != index.stats.gpuSourceGapReferences )
         { if( error.empty() ) error = "session_gpu_derived_audit_mismatch"; return false; }
+        const auto verifier = LoadTraceSessionGpuVerifierReport(
+            sessionRoot, manifest, error );
+        if( !verifier || !verifier->complete || verifier->mismatchCount != 0 ||
+            verifier->gpuGeneration != gpu->generation ||
+            verifier->resourceCount != gpu->resourceCount ||
+            verifier->allocationCount != gpu->allocationCount ||
+            verifier->passCount != gpu->passCount ||
+            verifier->rangeCount != gpu->rangeCount ||
+            verifier->resourcePassRelationCount != gpu->resourcePassRelationCount )
+        { if( error.empty() ) error = "session_gpu_verifier_audit_mismatch"; return false; }
     }
     TraceSessionTimeTransform timeTransform;
     if( !AuditTraceSessionTimeTransformDerived( sessionRoot, manifest, timeTransform, error ) ) return false;

@@ -2074,3 +2074,34 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 7.33 sec
 ```
 
 本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。A3的真实规模`Cancel≤2秒`、8/12/16 GiB实际RSS/Private Bytes和磁盘压力暂停仍由A5执行，不能用短Synthetic结果替代。
+
+### 2026-09-02 A4 GPU Query/MCP与独立Verifier
+
+状态：**Passed（Synthetic/短Trace查询与独立校验门禁；真实G05和30分钟规模门禁留在A5）**。
+
+- 新增独立`TraceSessionGpuVerifier`。它从Canonical事实和已发布GPU Derived分页读取，不调用Builder的集合构建代码，也不把Builder manifest自身当作正确性证明。
+- Verifier独立重算Canonical GPU事件数、Catalog记录数、Reference关系数、payload bytes、source hash、Resource/Allocation/Pass/Range计数、双向关系hash、live physical bytes与EngineKnownPhysical peak/time。
+- Allocation peak使用有界外排run和时间delta归并；Resource、Range与反向关系按Resource页流式核验，不保留全量Resource ID。单个Pass的Direct/Inclusive成员按需重建并与持久化Summary的count/hash/physical bytes复核。
+- Verifier报告固定source SHA-256、source size、Session generation和GPU generation，带独立report hash并原子提交。Mandatory Derived失败时不发布；Final Audit缺少或不匹配报告时拒绝完成。
+- `gpu.catalog.validation`从已经打开的`SessionTraceSource`读取固定generation的Verifier报告，即使磁盘上的`CURRENT`随后切换，也不会把两个generation混在一次查询中。
+- `gpu.pass.resources`和`gpu.memory.by_pass`新增明确`resource_scope`：`direct_members`、`inclusive_summary`、`inclusive_members`。结果始终同时返回Direct与Inclusive精确摘要；只有Members档分页物化成员，Summary档不构建成员集合。
+- Inclusive读取增加协作取消检查，查询取消返回`CANCELLED`。MCP的`tracy_inspect` schema与Query operation schema均公开三种scope。
+- Query现有响应硬限制为8 MiB，比计划16 MiB门禁更严格；分页上限仍为1000。超过限制明确返回`RESOURCE_LIMIT`，不静默截断。
+- Source-degraded中缺失Allocation定义继续作为未知物理归属忠实保留；Verifier不会伪造Allocation，也不会把源缺失误判为Converter缺失。
+
+TDD与回归证据：
+
+```text
+RED-1: 缺少independent_verifier结果，Session验证查询触发JSON字段断言失败
+RED-2: 缺少resource_scope契约，Direct/Inclusive查询结果断言失败
+GREEN: 独立Verifier与Mandatory Derived/Final Audit绑定通过
+GREEN: Direct成员、Inclusive摘要、Inclusive成员三种查询及分页通过
+GREEN: 预取消Inclusive成员重建返回cancelled
+GREEN: MCP schema公开resource_scope且与Query registry一致
+GREEN: tracy-trace-session-inventory-tests Passed
+GREEN: tracy-gpu-analysis-tests Passed
+GREEN: tracy-query-mcp-transcript-tests Passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 7.62 sec
+```
+
+本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。真实规模的Verifier墙钟、内存、Cancel≤2秒、generation发布和MCP查询由A5执行。

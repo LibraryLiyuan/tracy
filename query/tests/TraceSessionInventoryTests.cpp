@@ -1,6 +1,7 @@
 #include "TracyTraceSessionInventory.hpp"
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionGpuVerifier.hpp"
 #include "TracyTraceSessionDerived.hpp"
 #include "TracyGpuAnalysisStore.hpp"
 #include "TracyGpuAnalysisTraceSource.hpp"
@@ -2442,6 +2443,52 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         parentGpuPass && parentGpuPass->directRangeBytes == 256,
         "Session GPU resource preserves the explicit pass Range identity and joins it to reference evidence: " + error );
 
+    tracy::analysis::TraceSessionTimeTransform verifierTransform;
+    test.Check( tracy::analysis::BuildTraceSessionTimeTransformDerived(
+        sessionRoot, manifest, verifierTransform, error ),
+        "build the immutable time transform required by the independent GPU verifier: " + error );
+    tracy::analysis::TraceSessionGpuVerifierReport gpuVerifier;
+    const auto gpuVerified = tracy::analysis::VerifyTraceSessionGpuDerived(
+        sessionRoot, manifest, inventory, {}, gpuVerifier, error );
+    test.Check( gpuVerified &&
+        gpuVerifier.complete && gpuVerifier.mismatchCount == 0 &&
+        gpuVerifier.sourceGpuCatalogEvents == inventory.protocolInventory.domains[
+            size_t( tracy::analysis::TraceSessionProtocolDomain::GpuCatalog )].count &&
+        gpuVerifier.resourceCount == gpuStore->resourceCount &&
+        gpuVerifier.allocationCount == gpuStore->allocationCount &&
+        gpuVerifier.passCount == gpuStore->passCount &&
+        gpuVerifier.resourcePassRelationCount == gpuStore->resourcePassRelationCount &&
+        gpuVerifier.engineKnownPhysicalPeakBytes ==
+            gpuReader->Overview().engineKnownPhysicalPeakBytes,
+        "independent GPU verifier recomputes source counts, relations, hashes, bytes, and physical peak: " + error +
+        ":complete=" + std::to_string( gpuVerifier.complete ) +
+        ":mismatch=" + std::to_string( gpuVerifier.mismatchCount ) +
+        ":source=" + std::to_string( gpuVerifier.sourceGpuCatalogEvents ) + "/" +
+            std::to_string( inventory.protocolInventory.domains[
+                size_t( tracy::analysis::TraceSessionProtocolDomain::GpuCatalog )].count ) +
+        ":resources=" + std::to_string( gpuVerifier.resourceCount ) + "/" +
+            std::to_string( gpuStore ? gpuStore->resourceCount : 0 ) +
+        ":allocations=" + std::to_string( gpuVerifier.allocationCount ) + "/" +
+            std::to_string( gpuStore ? gpuStore->allocationCount : 0 ) +
+        ":passes=" + std::to_string( gpuVerifier.passCount ) + "/" +
+            std::to_string( gpuStore ? gpuStore->passCount : 0 ) +
+        ":relations=" + std::to_string( gpuVerifier.resourcePassRelationCount ) + "/" +
+            std::to_string( gpuStore ? gpuStore->resourcePassRelationCount : 0 ) +
+        ":ranges=" + std::to_string( gpuVerifier.rangeCount ) + "/" +
+            std::to_string( gpuStore ? gpuStore->rangeCount : 0 ) +
+        ":pageBytes=" + std::to_string( gpuVerifier.storePageBytes ) + "/" +
+            std::to_string( gpuStore ? gpuStore->totalBytes : 0 ) +
+        ":members=" + std::to_string( gpuVerifier.directMemberCount ) + "/" +
+            std::to_string( gpuVerifier.inclusiveMemberCount ) +
+        ":relationHash=" + std::to_string( gpuVerifier.forwardRelationHash ) + "/" +
+            std::to_string( gpuVerifier.reverseRelationHash ) +
+        ":live=" + std::to_string( gpuVerifier.livePhysicalBytes ) + "/" +
+            std::to_string( gpuReader ? gpuReader->Overview().engineKnownPhysicalBytes : 0 ) +
+        ":peak=" + std::to_string( gpuVerifier.engineKnownPhysicalPeakBytes ) + "/" +
+            std::to_string( gpuReader ? gpuReader->Overview().engineKnownPhysicalPeakBytes : 0 ) );
+    std::filesystem::remove_all( tracy::analysis::TraceSessionGpuVerifierRoot(
+        sessionRoot, manifest ) );
+
     std::stop_source gpuStoreCancelSource;
     tracy::analysis::GpuAnalysisSidecarControl cancelledGpuControl;
     cancelledGpuControl.minimumFreeBytes = 0;
@@ -2573,6 +2620,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionRoot, manifest, inventory, derivedControl, mandatoryStats, error );
     test.Check( mandatoryBuilt,
         "build all mandatory Session indexes at " + lastDerivedStage + ": " + error );
+    const auto mandatoryGpuVerifier = tracy::analysis::LoadTraceSessionGpuVerifierReport(
+        sessionRoot, manifest, error );
+    const auto mandatoryGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
+        gpuRoot, manifest.source.sha256, manifest.source.fileSize, error );
+    test.Check( mandatoryGpuVerifier && mandatoryGpuVerifier->complete &&
+        mandatoryGpuReader && mandatoryGpuVerifier->gpuGeneration ==
+            mandatoryGpuReader->Manifest().generation &&
+        mandatoryGpuVerifier->mismatchCount == 0,
+        "Mandatory Derived publishes an independent identity-pinned GPU verifier report: " + error );
     const auto derivedCheckpoint = tracy::analysis::LoadTraceSessionDerivedCheckpoint(
         sessionRoot, manifest, error );
     test.Check( derivedCheckpoint && derivedCheckpoint->stage == "mandatory-complete" &&
@@ -3781,8 +3837,49 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( catalogValidation.value( "ok", false ) &&
             catalogValidation["data"]["complete"] == true &&
             catalogValidation["data"]["validation_provenance"] == "session_final_audit" &&
-            catalogValidation["data"]["source_degraded"] == true,
+            catalogValidation["data"]["source_degraded"] == true &&
+            catalogValidation["data"]["independent_verifier"]["complete"] == true &&
+            catalogValidation["data"]["independent_verifier"]["session_generation"] == manifest.generation &&
+            catalogValidation["data"]["independent_verifier"]["gpu_generation"] ==
+                sessionGpuReader->Manifest().generation,
             "Query validates a published Session from Final Audit without materializing legacy Worker vectors" );
+        const auto directPassResources = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-pass-direct" },
+            { "method", "gpu.pass.resources" }, { "params", { { "trace_id", traceId },
+                { "pass_id", 1000 }, { "resource_scope", "direct_members" }, { "limit", 1 } } }
+        } );
+        test.Check( directPassResources.value( "ok", false ) &&
+            directPassResources["data"]["evidence_scope"] == "direct_members" &&
+            directPassResources["data"]["resource_count"] == "2" &&
+            directPassResources["data"]["direct_summary"]["resource_count"] == "2" &&
+            directPassResources["data"]["inclusive_summary"]["resource_count"] == "3" &&
+            directPassResources["data"]["resources"].size() == 1 &&
+            !directPassResources["page"]["next_cursor"].is_null(),
+            "GPU Pass Query explicitly returns paged Direct members plus both exact summaries" );
+        const auto inclusiveSummary = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-pass-inclusive-summary" },
+            { "method", "gpu.pass.resources" }, { "params", { { "trace_id", traceId },
+                { "pass_id", 1000 }, { "resource_scope", "inclusive_summary" } } }
+        } );
+        test.Check( inclusiveSummary.value( "ok", false ) &&
+            inclusiveSummary["data"]["evidence_scope"] == "inclusive_summary" &&
+            inclusiveSummary["data"]["resource_count"] == "3" &&
+            inclusiveSummary["data"]["resources"].empty() &&
+            inclusiveSummary["data"]["inclusive_summary"]["resource_hash"] ==
+                std::to_string( tracy::analysis::GpuAnalysisResourceSetHash(
+                    std::vector<uint64_t> { 10, 12, 13 } ) ),
+            "GPU Pass Query exposes Inclusive Summary without materializing members" );
+        const auto inclusiveMembers = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-pass-inclusive-members" },
+            { "method", "gpu.pass.resources" }, { "params", { { "trace_id", traceId },
+                { "pass_id", 1000 }, { "resource_scope", "inclusive_members" }, { "limit", 2 } } }
+        } );
+        test.Check( inclusiveMembers.value( "ok", false ) &&
+            inclusiveMembers["data"]["evidence_scope"] == "inclusive_members" &&
+            inclusiveMembers["data"]["resource_count"] == "3" &&
+            inclusiveMembers["data"]["resources"].size() == 2 &&
+            !inclusiveMembers["page"]["next_cursor"].is_null(),
+            "GPU Pass Query pages exact Inclusive members without conflating them with Direct evidence" );
         std::vector<tracy::analysis::GpuAnalysisResourceSummary> resourceSummaries;
         test.Check( sessionGpuReader && sessionGpuReader->ResourceSummaryPageCount() != 0 &&
             sessionGpuReader->LoadResourceSummaryPage( 0, resourceSummaries, error ) &&

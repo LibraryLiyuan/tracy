@@ -49,6 +49,8 @@ int main()
     assert( inspect != tools["result"]["tools"].end() );
     assert( ( *inspect )["inputSchema"]["properties"].contains( "method" ) );
     assert( ( *inspect )["inputSchema"]["properties"].contains( "params" ) );
+    assert( ( *inspect )["inputSchema"]["properties"].contains( "resource_scope" ) );
+    assert( ( *inspect )["inputSchema"]["properties"]["resource_scope"]["enum"].size() == 3 );
     assert( ( *inspect )["inputSchema"]["oneOf"].size() == 2 );
     assert( ( *inspect )["inputSchema"]["properties"]["method"]["enum"].size() == tracy::query::QueryMethodRegistry().size() );
     assert( ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] == tracy::query::QueryOperationSchemaRegistry() );
@@ -70,6 +72,11 @@ int main()
     } );
     assert( described["ok"] == true );
     assert( described["data"]["operations"] == ( *inspect )["inputSchema"]["x-tracy-operationSchemas"] );
+    const auto gpuPassResourcesSchema = std::find_if(
+        described["data"]["operations"].begin(), described["data"]["operations"].end(),
+        []( const auto& value ) { return value["method"] == "gpu.pass.resources"; } );
+    assert( gpuPassResourcesSchema != described["data"]["operations"].end() );
+    assert( ( *gpuPassResourcesSchema )["input_schema"]["properties"].contains( "resource_scope" ) );
     std::set<std::string> describedMethods;
     for( const auto& method : described["data"]["methods"] ) describedMethods.emplace( method.get<std::string>() );
     assert( describedMethods.contains( "trace.telemetry_cost" ) );
