@@ -182,7 +182,7 @@ struct StackKeyHash
 };
 
 struct OpenZone { StoredZone stored; };
-struct PendingQuery { uint64_t zone = 0; bool start = false; };
+struct PendingQuery { uint64_t zone = 0; };
 
 bool AtomicReplace( const std::filesystem::path& source,
     const std::filesystem::path& target, std::string& error )
@@ -533,7 +533,7 @@ bool BeginZone( BuildState& state, const QueueGpuZoneBeginLean& event, size_t so
         else state.pendingCallsiteZones[callsite].push_back( zone.stored.id );
     }
     if( !stack.empty() ) stack.back().stored.childCount++;
-    if( !state.pendingQueries.emplace( QueryKey( event.context, event.queryId ), PendingQuery { zone.stored.id, true } ).second )
+    if( !state.pendingQueries.emplace( QueryKey( event.context, event.queryId ), PendingQuery { zone.stored.id } ).second )
     { error = "session_gpu_zone_query_reused_before_time"; return false; }
     stack.emplace_back( std::move( zone ) ); state.beginEvents++; return true;
 }
@@ -548,7 +548,7 @@ bool EndZone( BuildState& state, const QueueGpuZoneEnd& event, bool serial, std:
     zone.stored.cpuEndNs = serial ? AdvanceSerial( state, event.cpuTime ) : AdvanceThread( state, event.cpuTime );
     if( zone.stored.cpuEndNs < zone.stored.cpuStartNs ) { error = "session_gpu_zone_cpu_end_before_begin"; return false; }
     zone.stored.flags |= ZoneCpuComplete;
-    if( !state.pendingQueries.emplace( QueryKey( event.context, event.queryId ), PendingQuery { zone.stored.id, false } ).second )
+    if( !state.pendingQueries.emplace( QueryKey( event.context, event.queryId ), PendingQuery { zone.stored.id } ).second )
     { error = "session_gpu_zone_query_reused_before_time"; return false; }
     MarkComplete( state, zone.stored );
     if( !state.writer.Write( zone.stored, error ) ) return false;
@@ -580,7 +580,7 @@ bool ResolveGpuTime( BuildState& state, const QueueGpuTime& event, std::string& 
     const auto pending = query->second; state.pendingQueries.erase( query );
     if( auto* open = FindOpen( state, pending.zone ) )
     {
-        if( pending.start ) { open->stored.gpuStartNs = gpuNs; open->stored.flags |= ZoneGpuStartValid; context->zoneCount++; }
+        if( ( open->stored.flags & ZoneGpuStartValid ) == 0 ) { open->stored.gpuStartNs = gpuNs; open->stored.flags |= ZoneGpuStartValid; context->zoneCount++; }
         else { open->stored.gpuEndNs = gpuNs; open->stored.flags |= ZoneGpuEndValid; }
         if( !AccountDuration( state, open->stored, error ) ) return false;
         MarkComplete( state, open->stored );
@@ -588,7 +588,7 @@ bool ResolveGpuTime( BuildState& state, const QueueGpuTime& event, std::string& 
     else
     {
         StoredZone zone; if( !state.writer.Read( pending.zone, zone, error ) ) return false;
-        if( pending.start ) { zone.gpuStartNs = gpuNs; zone.flags |= ZoneGpuStartValid; context->zoneCount++; }
+        if( ( zone.flags & ZoneGpuStartValid ) == 0 ) { zone.gpuStartNs = gpuNs; zone.flags |= ZoneGpuStartValid; context->zoneCount++; }
         else { zone.gpuEndNs = gpuNs; zone.flags |= ZoneGpuEndValid; }
         if( !AccountDuration( state, zone, error ) ) return false;
         MarkComplete( state, zone );

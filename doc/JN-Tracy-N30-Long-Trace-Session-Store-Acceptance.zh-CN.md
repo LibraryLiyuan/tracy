@@ -2147,3 +2147,24 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 8.82 sec
 ```
 
 G05的既有building目录和50个Canonical shard均保留；后续只重编译Release Converter并从Mandatory Derived恢复，不重做Inventory或Canonical。
+
+#### GPU timestamp query到达顺序语义漂移
+
+- 长路径修复后，G05继续完成通用Index、Frame、FrameImage、Job、CPU Zone和Source/Symbol，首次在GPU Zone派生停止：`session_gpu_zone_gpu_end_before_begin`。
+- 定向诊断定位到Zone `358415`、Context `1`：End-query的结果先到，Begin-query的结果后到；解析出的两个时间分别为`73,433,751,766 ns`和`73,433,804,374 ns`。
+- 传统Tracy Worker不把query ID固化为Begin/End角色，而是将同一Zone第一个收到的GPU timestamp设为Start、第二个设为End。Session builder此前自行保存`PendingQuery.start`，按producer角色赋值，因而把上述合法源顺序错误转换为负时长。
+- Session builder已改为逐字对齐传统Worker语义：Pending query只保存Zone身份；首个timestamp填Start，第二个填End。真实负时长保护仍保留。
+- 临时的`JN_N30_DIAG_GPU_ZONE_ONLY`入口和`JN_N30_GPU_ZONE_DIAG`打印在定位后全部移除，未进入正式实现。
+
+TDD与回归证据：
+
+```text
+RED: Synthetic按End-query→Begin-query到达，Session稳定失败：
+     session_gpu_zone_gpu_end_before_begin
+G05: zone=358415, context=1, beginQuery=1262,
+     first(end-role)=73433751766, second(begin-role)=73433804374
+GREEN: Synthetic保留同一到达顺序并生成完整、非负GPU Zone
+Regression: Debug CTest 8/8 Passed；Total Test Time 8.97 sec
+```
+
+同时观察到一项尚未收口的A5性能/恢复问题：`job-pages`恢复时未复用已完成工作，需单核重新扫描约`252,997,676`条Canonical记录，运行超过10分钟且只有30秒heartbeat、没有shard百分比。该问题不是死锁或内存膨胀，但会显著放大真实验收迭代时间；在G05正确性收口后必须补充可恢复checkpoint和可观察进度。

@@ -1935,13 +1935,17 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item = {};
     item.hdr.type = tracy::QueueType::GpuTime;
     item.gpuTime.gpuTime = 36;
-    item.gpuTime.queryId = 7;
+    // D3D12 timestamp results may report the End query before the Begin
+    // query. The traditional Worker assigns the first timestamp to GPU start
+    // and the second to GPU end; Session conversion must preserve that exact
+    // protocol semantic instead of assigning by the query's producer role.
+    item.gpuTime.queryId = 8;
     item.gpuTime.context = 1;
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::GpuTime;
     item.gpuTime.gpuTime = 4;
-    item.gpuTime.queryId = 8;
+    item.gpuTime.queryId = 7;
     item.gpuTime.context = 1;
     AppendQueueItem( frame, item );
 
