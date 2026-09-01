@@ -2187,3 +2187,69 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 9.78 sec
 ```
 
 G05仍需使用修复后的Release Converter从Scheduling阶段恢复，成功发布前不宣称A5通过。
+
+#### Job分页恢复的随机I/O放大
+
+- G05在Scheduling修复后恢复时，`job-pages`曾单核运行约13分钟。该阶段不是死锁，而是对约250万个Job和反向posting反复执行磁盘二分查找与小随机seek，复杂度和I/O局部性均不适合真实规模。
+- 修复后一次顺序载入紧凑Schedule、Job ID和排序数组，后续分页/反向posting在有界内存中使用顺序访问；原始Job事实和排序键不变。
+- 同一G05 `job-pages`审计现可在30秒内完成，且恢复不再重复扫描全部Canonical Protocol记录。
+
+#### Plot、Message和Lock构建的Windows栈溢出
+
+- Release Converter连续在Plot、Message和Lock阶段出现`0xc00000fd`。WER与定向复现确认不是输入损坏，而是三个复制辅助函数各自在栈上声明1 MiB临时数组；Windows生产进程默认栈同样约1 MiB。
+- 三处缓冲改为复用堆上`std::vector<char>`。这只改变复制缓冲的存储位置，不改变记录内容、顺序、hash或文件格式。
+- 全仓Analysis/Query/Capture/Server/Profiler路径已检查，不再存在同类1 MiB局部数组。
+
+#### 稳定GPU taxonomy的多父节点语义
+
+- G05首次GPU汇总失败于`session_gpu_stable_taxonomy_parent_conflict`。`VirtualGeometryRaster`同一taxonomy在真实运行中可分别位于`LightingDeferred`和`LightingReflections`下；这是合法的运行时Pass实例关系，不是源损坏。
+- 旧算法错误地把稳定taxonomy ID强制解释为全局单父树。新算法先按实际Pass实例树计算精确Inclusive集合，再按`Frame + taxonomy`聚合。
+- 当同一taxonomy在同一Frame具有多个真实父级时，summary保存`parentTaxonomyId=0`和明确的ambiguous标志；Direct/Inclusive成员、count、bytes和hash仍为Exact，不猜测唯一父级。
+- 新增同一taxonomy分别挂在两个父节点下的RED→GREEN测试。
+
+#### 独立GPU Verifier线性化
+
+- 原独立Verifier在G05上运行超过35分钟仍未完成，单核且约647 MiB驻留。根因是按每个Resource和Pass执行随机索引查询，并递归重建Inclusive集合。
+- 新Verifier按Pass、Range、PassSummary页顺序读取，使用最多1,048,576条关系的有界缓冲和external runs，独立重建`Pass→ancestor→Resource`，去重后外排为Resource顺序，再与Store反向索引逐条比较。
+- 修正Verifier中ResourceSet FNV offset常量与正式ResourceSet hash的语义差异；报告hash仍保持自身独立常量。
+- G05独立Verifier由超过35分钟未完成降为约1分钟完成，得到：
+
+```text
+resources                  348,166
+allocations                348,166
+passes                   2,756,784
+ranges                   5,533,684
+direct members          45,722,908
+inclusive/resource-pass 88,732,370
+source gap resources              0
+source gap references             0
+mismatch_count                     0
+engine physical peak   5,015,470,080 bytes
+peak time              217,414,460,817 ns
+```
+
+#### G05发布、长路径Reader与Query/MCP验收
+
+状态：**G05 correctness Passed；源端退化被忠实保留；真实规模Cancel/RSS独立测量尚未执行。**
+
+- G05最终发布Generation：`n30-1788285440617796-48868`。
+- 发布结果：50个Canonical shard、`252,997,676`条indexed record、`26.497 GiB` Session目录。
+- Session状态为`CompleteSourceDegraded`，唯一原因是源事实：`source_cpu_zone_clock_inversion:863;source_scheduling_gap:1745027`。它们不是Converter创建的gap；GPU Core gap、unresolved和Verifier mismatch均为0。
+- 发布后Query初次打开依次报`session_frame_image_metadata_size_mismatch`和`session_scheduling_file_size_mismatch`。磁盘文件大小和SHA均正确；实际完整路径分别达到264字符以上，Query入口没有像Converter那样统一进入Win32扩展长度命名空间。
+- `OpenSessionIfReady`现在一次性规范化所有必需及lazy Session reader路径；FrameImage build/open/audit也具备独立长路径保护。错误透传保留具体reader原因，不再只返回笼统`CORRUPT_TRACE`。
+- 新增长路径FrameImage回归，修复前稳定RED，修复后元数据、BC1分页和Reader打开全部GREEN。
+- Release Query 1.34 `--doctor`现返回`trace_loader=ok`，源指纹为`660AB0207F4F5B18D9B808CD07BC3E8BB1C9EC3104A08E678DBEEA6F97EB0976`。
+- Query/MCP同源批处理已经验证Frame、CPU/GPU Zone、Job、Sampling原始事件、Context Switch原始区间、CPU/GPU Memory、GPU Catalog、Resource、Pass、Range、FrameImage、I/O、Runtime Script、Relation、Plot和Message等现有Session reader。GPU Catalog validation为`complete=true`、`mismatch_count=0`、`unresolved_count=0`。
+- FrameImage恢复106张960×540 BC1图片，前5张raw frame index为61、121、181、241、301，保持60帧间隔。
+
+回归证据：
+
+```text
+RED: long-path FrameImage Reader -> session_frame_image_metadata_size_mismatch
+GREEN: direct long-path FrameImage Reader passed
+GREEN: G05 tracy-query --doctor -> trace_loader=ok
+GREEN: G05 gpu.catalog.validation -> complete=true, mismatch_count=0
+GREEN: Debug CTest 8/8 passed
+```
+
+A5尚未用真实规模单独注入Cancel并采集Process Private Bytes峰值，因此验收报告不会把这两项伪写为Passed；它们与真实30分钟容量门禁一起留到最终集中验收。A6继续收口剩余全域语义和组合查询，避免再次重复转换G05。

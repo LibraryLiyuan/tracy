@@ -2162,6 +2162,9 @@ size_t GpuAnalysisStoreReader::ResourcePageCount() const { return CountPages( m_
 size_t GpuAnalysisStoreReader::ResourceSummaryPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::ResourceSummary ); }
 size_t GpuAnalysisStoreReader::AllocationPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Allocation ); }
 size_t GpuAnalysisStoreReader::PassPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Pass ); }
+size_t GpuAnalysisStoreReader::RangePageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Range ); }
+size_t GpuAnalysisStoreReader::ResourcePassPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::ResourcePassIndex ); }
+size_t GpuAnalysisStoreReader::PassSummaryPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::PassSummary ); }
 
 bool GpuAnalysisStoreReader::LoadResourcePage( size_t index, std::vector<GpuResourceAnalysisRecord>& out, std::string& error ) const
 {
@@ -2307,6 +2310,32 @@ bool GpuAnalysisStoreReader::LoadPassPage( size_t index, std::vector<GpuPassWork
     }
     if( cursor != end ) { error = "pass_page_trailing_data"; return false; }
     return true;
+}
+
+bool GpuAnalysisStoreReader::LoadRangePage( size_t index,
+    std::vector<GpuAnalysisRangeStoreEntry>& out, std::string& error ) const
+{
+    const auto* page = NthPage( m_manifest, GpuAnalysisStorePageKind::Range, index );
+    if( !page ) { error = "range_page_out_of_range"; return false; }
+    return LoadRelationPage( m_root / page->relativePath, *page, out, error );
+}
+
+bool GpuAnalysisStoreReader::LoadResourcePassPage( size_t index,
+    std::vector<GpuAnalysisResourcePassEntry>& out, std::string& error ) const
+{
+    const auto* page = NthPage( m_manifest,
+        GpuAnalysisStorePageKind::ResourcePassIndex, index );
+    if( !page ) { error = "resource_pass_page_out_of_range"; return false; }
+    return LoadRelationPage( m_root / page->relativePath, *page, out, error );
+}
+
+bool GpuAnalysisStoreReader::LoadPassSummaryPage( size_t index,
+    std::vector<GpuAnalysisPassSummary>& out, std::string& error ) const
+{
+    const auto* page = NthPage( m_manifest,
+        GpuAnalysisStorePageKind::PassSummary, index );
+    if( !page ) { error = "pass_summary_page_out_of_range"; return false; }
+    return LoadRelationPage( m_root / page->relativePath, *page, out, error );
 }
 
 bool GpuAnalysisStoreReader::RangesForResource( uint64_t resourceId, size_t offset,

@@ -1,0 +1,17 @@
+{"protocol":"tracy-query/1","id":"capabilities","method":"system.capabilities","params":{}}
+{"protocol":"tracy-query/1","id":"status","method":"trace.status","params":{}}
+{"protocol":"tracy-query/1","id":"overview","method":"trace.overview","params":{}}
+{"protocol":"tracy-query/1","id":"counts","method":"trace.counts","params":{}}
+{"protocol":"tracy-query/1","id":"trace-info","method":"trace.info","params":{}}
+{"protocol":"tracy-query/1","id":"frames","method":"frame.sets","params":{}}
+{"protocol":"tracy-query/1","id":"cpu-zones","method":"zone.cpu.search","params":{"limit":10}}
+{"protocol":"tracy-query/1","id":"gpu-contexts","method":"zone.gpu.contexts","params":{}}
+{"protocol":"tracy-query/1","id":"jobs","method":"job.search","params":{"limit":10}}
+{"protocol":"tracy-query/1","id":"samples","method":"sample.list","params":{"limit":10}}
+{"protocol":"tracy-query/1","id":"scheduling","method":"context_switch.range","params":{"limit":10}}
+{"protocol":"tracy-query/1","id":"memory","method":"memory.pools","params":{}}
+{"protocol":"tracy-query/1","id":"gpu-catalog","method":"gpu.catalog.status","params":{}}
+{"protocol":"tracy-query/1","id":"gpu-catalog-validation","method":"gpu.catalog.validation","params":{}}
+{"protocol":"tracy-query/1","id":"gpu-resources","method":"gpu.resource.search","params":{"limit":10}}
+{"protocol":"tracy-query/1","id":"gpu-memory-peak","method":"gpu.memory.peak","params":{}}
+{"protocol":"tracy-query/1","id":"frame-images","method":"frame_image.list","params":{"limit":5}}

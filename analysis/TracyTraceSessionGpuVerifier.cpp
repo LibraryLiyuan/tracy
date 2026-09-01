@@ -31,6 +31,7 @@ namespace
 constexpr uint64_t VerifierReportMagic = 0x3156525647504e4aull; // JNPGVRV1
 constexpr uint64_t VerifierRunMagic = 0x31524e5552565047ull;    // GPVRUNR1
 constexpr uint64_t FnvOffset = 1469598103934665603ull;
+constexpr uint64_t ResourceSetFnvOffset = 14695981039346656037ull;
 
 uint64_t FnvUpdate( uint64_t hash, const void* data, size_t size )
 {
@@ -57,6 +58,14 @@ struct PhysicalDelta
     int64_t bytes = 0;
 };
 
+struct PassRelationRaw
+{
+    uint64_t passId = 0;
+    uint64_t resourceId = 0;
+    uint8_t direct = 0;
+    uint8_t reserved[7] {};
+};
+
 struct RunHeader
 {
     uint64_t magic = VerifierRunMagic;
@@ -69,6 +78,7 @@ struct RunHeader
 
 static_assert( std::is_trivially_copyable_v<AllocationRaw> );
 static_assert( std::is_trivially_copyable_v<PhysicalDelta> );
+static_assert( std::is_trivially_copyable_v<PassRelationRaw> );
 
 uint64_t RelationToken( uint64_t resourceId, uint64_t passId, uint8_t inclusive )
 {
@@ -424,48 +434,251 @@ bool ComputePhysicalPeak( SourceState& source, TraceSessionGpuVerifierReport& re
         source.control->stopToken, error );
 }
 
-bool PhysicalBytesForMembers( const GpuAnalysisStoreReader& reader,
-    const std::vector<uint64_t>& members, uint64_t& bytes, std::string& error )
+struct PassAuditFact
 {
-    bytes = 0; std::unordered_set<uint64_t> allocations;
-    constexpr size_t Batch = 4096;
-    for( size_t offset = 0; offset < members.size(); offset += Batch )
-    {
-        const auto end = std::min( members.size(), offset + Batch );
-        std::vector<uint64_t> ids( members.begin() + offset, members.begin() + end );
-        std::vector<GpuResourceAnalysisRecord> resources;
-        if( !reader.FindResources( std::move( ids ), resources, error ) ) return false;
-        for( const auto& resource : resources ) if( resource.allocationId != 0 )
-            allocations.emplace( resource.allocationId );
-    }
-    for( const auto allocationId : allocations )
-    {
-        const auto allocation = reader.FindAllocation( allocationId, error );
-        // A source-degraded Resource may retain the producer's AllocationId
-        // while the Allocation definition itself is absent.  Builder treats
-        // that as unknown physical ownership (zero bytes), not as a fabricated
-        // allocation.  The verifier must preserve and independently check the
-        // same explicit source-gap semantic.
-        if( !allocation ) { error.clear(); continue; }
-        if( allocation->aliveAtEnd ) bytes += allocation->sizeBytes;
-    }
-    return true;
-}
+    uint64_t parentPassId = 0;
+    uint64_t directResourceCount = 0;
+    uint64_t inclusiveResourceCount = 0;
+    uint64_t directResourceHash = 0;
+    uint64_t inclusiveResourceHash = 0;
+    uint64_t directPhysicalBytes = 0;
+    uint64_t inclusivePhysicalBytes = 0;
+};
 
-bool LoadAllPassMembers( const GpuAnalysisStoreReader& reader, uint64_t passId,
-    bool inclusive, std::stop_token stopToken, std::vector<uint64_t>& members,
+bool AuditStoreRelationsLinear( const GpuAnalysisStoreReader& reader,
+    const TraceSessionGpuVerifierControl& control,
+    TraceSessionGpuVerifierReport& report, const std::filesystem::path& runRoot,
     std::string& error )
 {
-    members.clear(); size_t offset = 0; bool more = false;
-    do
+    const auto& store = reader.Manifest();
+    std::unordered_map<uint64_t, PassAuditFact> facts;
+    facts.reserve( size_t( std::min<uint64_t>( store.passCount, 4ull * 1024 * 1024 ) ) );
+    std::vector<PassRelationRaw> relationBuffer;
+    relationBuffer.reserve( size_t( std::min<uint64_t>(
+        control.maximumBufferedPassRelations, 4ull * 1024 * 1024 ) ) );
+    std::vector<std::filesystem::path> passRuns;
+    const auto passCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.passId != rhs.passId ) return lhs.passId < rhs.passId;
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        return lhs.direct > rhs.direct;
+    };
+    const auto flushPassRun = [&]() {
+        return FlushRun( relationBuffer, runRoot / "pass-relation-runs", "pass-relation",
+            passRuns, passCompare, error );
+    };
+
+    uint64_t previousPassId = 0;
+    for( size_t pageIndex = 0; pageIndex < reader.PassPageCount(); ++pageIndex )
     {
-        if( stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
-        std::vector<uint64_t> page;
-        if( !reader.PassResources( passId, inclusive, offset, 65536, page, more,
-            error, stopToken ) ) return false;
-        if( page.empty() && more ) { error = "gpu_verifier_member_pagination_stalled"; return false; }
-        members.insert( members.end(), page.begin(), page.end() ); offset += page.size();
-    } while( more );
+        if( control.stopToken.stop_requested() )
+        { error = "cancelled_resumable"; return false; }
+        std::vector<GpuPassWorkingSet> passes;
+        if( !reader.LoadPassPage( pageIndex, passes, error ) ) return false;
+        for( const auto& pass : passes )
+        {
+            if( pass.passId == 0 || pass.passId <= previousPassId ||
+                !std::is_sorted( pass.directResources.begin(), pass.directResources.end() ) ||
+                std::adjacent_find( pass.directResources.begin(),
+                    pass.directResources.end() ) != pass.directResources.end() ||
+                std::find( pass.directResources.begin(), pass.directResources.end(), 0 ) !=
+                    pass.directResources.end() )
+            { error = "gpu_verifier_pass_source_invalid"; return false; }
+            previousPassId = pass.passId;
+            PassAuditFact fact;
+            fact.parentPassId = pass.parentPassId;
+            fact.directResourceCount = pass.directResources.size();
+            fact.directResourceHash = GpuAnalysisResourceSetHash( pass.directResources );
+            fact.directPhysicalBytes = pass.directPhysicalBytes;
+            fact.inclusivePhysicalBytes = pass.inclusivePhysicalBytes;
+            if( !facts.emplace( pass.passId, fact ).second )
+            { error = "gpu_verifier_pass_duplicate"; return false; }
+            ++report.passCount;
+
+            for( const auto resourceId : pass.directResources )
+            {
+                uint64_t current = pass.passId;
+                uint32_t depth = 0;
+                while( current != 0 )
+                {
+                    if( ++depth > 65 )
+                    { error = "gpu_verifier_pass_parent_depth_exceeded"; return false; }
+                    const auto ancestor = facts.find( current );
+                    if( ancestor == facts.end() )
+                    { error = "gpu_verifier_pass_parent_missing"; return false; }
+                    relationBuffer.push_back( { current, resourceId,
+                        uint8_t( current == pass.passId ), {} } );
+                    if( relationBuffer.size() >= control.maximumBufferedPassRelations &&
+                        !flushPassRun() ) return false;
+                    if( ancestor->second.parentPassId != 0 &&
+                        ancestor->second.parentPassId >= current )
+                    { error = "gpu_verifier_pass_parent_order_invalid"; return false; }
+                    current = ancestor->second.parentPassId;
+                }
+            }
+        }
+    }
+    if( !flushPassRun() ) return false;
+
+    const auto inclusivePath = runRoot / "computed-pass-relations.bin";
+    std::ofstream inclusiveOut( inclusivePath, std::ios::binary | std::ios::trunc );
+    if( !inclusiveOut ) { error = "gpu_verifier_relation_output_open_failed"; return false; }
+    PassRelationRaw pending {};
+    bool hasPending = false;
+    const auto commitPending = [&]() -> bool {
+        if( !hasPending ) return true;
+        const auto fact = facts.find( pending.passId );
+        if( fact == facts.end() )
+        { error = "gpu_verifier_relation_pass_missing"; return false; }
+        GpuAnalysisResourcePassEntry value;
+        value.resourceId = pending.resourceId;
+        value.passId = pending.passId;
+        value.inclusive = uint8_t( !pending.direct );
+        inclusiveOut.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !inclusiveOut )
+        { error = "gpu_verifier_relation_output_write_failed"; return false; }
+        ++fact->second.inclusiveResourceCount;
+        report.forwardRelationHash ^= RelationToken(
+            value.resourceId, value.passId, value.inclusive );
+        return true;
+    };
+    const auto consumePassRelation = [&]( const PassRelationRaw& value,
+        std::string& consumeError ) {
+        if( !hasPending || value.passId != pending.passId ||
+            value.resourceId != pending.resourceId )
+        {
+            if( !commitPending() ) { consumeError = error; return false; }
+            pending = value;
+            hasPending = true;
+        }
+        else pending.direct = uint8_t( pending.direct || value.direct );
+        return true;
+    };
+    if( !MergeRuns<PassRelationRaw>( passRuns, passCompare,
+        consumePassRelation, control.stopToken, error ) || !commitPending() ) return false;
+    inclusiveOut.flush(); inclusiveOut.close();
+    if( !inclusiveOut )
+    { error = "gpu_verifier_relation_output_flush_failed"; return false; }
+
+    for( auto& [_, fact] : facts )
+    {
+        fact.inclusiveResourceHash = ResourceSetFnvOffset;
+        fact.inclusiveResourceHash = FnvUpdate( fact.inclusiveResourceHash,
+            &fact.inclusiveResourceCount, sizeof( fact.inclusiveResourceCount ) );
+    }
+    std::ifstream inclusiveIn( inclusivePath, std::ios::binary );
+    GpuAnalysisResourcePassEntry entry;
+    std::vector<GpuAnalysisResourcePassEntry> resourceBuffer;
+    resourceBuffer.reserve( relationBuffer.capacity() );
+    std::vector<std::filesystem::path> resourceRuns;
+    const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        if( lhs.passId != rhs.passId ) return lhs.passId < rhs.passId;
+        return lhs.inclusive < rhs.inclusive;
+    };
+    const auto flushResourceRun = [&]() {
+        return FlushRun( resourceBuffer, runRoot / "resource-relation-runs",
+            "resource-relation", resourceRuns, resourceCompare, error );
+    };
+    while( inclusiveIn.read( reinterpret_cast<char*>( &entry ), sizeof( entry ) ) )
+    {
+        const auto fact = facts.find( entry.passId );
+        if( fact == facts.end() )
+        { error = "gpu_verifier_relation_hash_pass_missing"; return false; }
+        fact->second.inclusiveResourceHash = FnvUpdate(
+            fact->second.inclusiveResourceHash, &entry.resourceId,
+            sizeof( entry.resourceId ) );
+        resourceBuffer.push_back( entry );
+        if( resourceBuffer.size() >= control.maximumBufferedPassRelations &&
+            !flushResourceRun() ) return false;
+    }
+    if( !inclusiveIn.eof() || !flushResourceRun() )
+    { if( error.empty() ) error = "gpu_verifier_relation_output_read_failed"; return false; }
+
+    size_t storePage = 0, storeIndex = 0;
+    std::vector<GpuAnalysisResourcePassEntry> storeValues;
+    const auto nextStore = [&]( GpuAnalysisResourcePassEntry& value,
+        bool& present ) -> bool {
+        while( storeIndex >= storeValues.size() )
+        {
+            if( storePage >= reader.ResourcePassPageCount() )
+            { present = false; return true; }
+            storeValues.clear(); storeIndex = 0;
+            if( !reader.LoadResourcePassPage( storePage++, storeValues, error ) )
+                return false;
+        }
+        value = storeValues[storeIndex++]; present = true; return true;
+    };
+    const auto compareStore = [&]( const GpuAnalysisResourcePassEntry& computed,
+        std::string& consumeError ) {
+        GpuAnalysisResourcePassEntry stored; bool present = false;
+        if( !nextStore( stored, present ) ) { consumeError = error; return false; }
+        if( !present || stored.resourceId != computed.resourceId ||
+            stored.passId != computed.passId || stored.inclusive != computed.inclusive )
+        { consumeError = "gpu_verifier_resource_pass_exact_mismatch"; return false; }
+        ++report.resourcePassRelationCount;
+        report.reverseRelationHash ^= RelationToken(
+            stored.resourceId, stored.passId, stored.inclusive );
+        return true;
+    };
+    if( !MergeRuns<GpuAnalysisResourcePassEntry>( resourceRuns, resourceCompare,
+        compareStore, control.stopToken, error ) ) return false;
+    GpuAnalysisResourcePassEntry trailing; bool hasTrailing = false;
+    if( !nextStore( trailing, hasTrailing ) ) return false;
+    if( hasTrailing )
+    { error = "gpu_verifier_resource_pass_store_has_extra"; return false; }
+
+    uint64_t summaryCount = 0;
+    report.directMemberHash = FnvOffset;
+    report.inclusiveMemberHash = FnvOffset;
+    for( size_t pageIndex = 0; pageIndex < reader.PassSummaryPageCount(); ++pageIndex )
+    {
+        std::vector<GpuAnalysisPassSummary> summaries;
+        if( !reader.LoadPassSummaryPage( pageIndex, summaries, error ) ) return false;
+        for( const auto& summary : summaries )
+        {
+            const auto fact = facts.find( summary.passId );
+            if( fact == facts.end() )
+            { error = "gpu_verifier_pass_summary_without_pass"; return false; }
+            const auto& value = fact->second;
+            if( summary.directResourceCount != value.directResourceCount ||
+                summary.inclusiveResourceCount != value.inclusiveResourceCount ||
+                summary.directResourceHash != value.directResourceHash ||
+                summary.inclusiveResourceHash != value.inclusiveResourceHash ||
+                summary.directPhysicalBytes != value.directPhysicalBytes ||
+                summary.inclusivePhysicalBytes != value.inclusivePhysicalBytes )
+            {
+                error = "gpu_verifier_pass_summary_mismatch:pass=" +
+                    std::to_string( summary.passId ) + ":count=" +
+                    std::to_string( summary.directResourceCount ) + "/" +
+                    std::to_string( value.directResourceCount ) + "," +
+                    std::to_string( summary.inclusiveResourceCount ) + "/" +
+                    std::to_string( value.inclusiveResourceCount ) + ":hash=" +
+                    std::to_string( summary.directResourceHash ) + "/" +
+                    std::to_string( value.directResourceHash ) + "," +
+                    std::to_string( summary.inclusiveResourceHash ) + "/" +
+                    std::to_string( value.inclusiveResourceHash ) + ":bytes=" +
+                    std::to_string( summary.directPhysicalBytes ) + "/" +
+                    std::to_string( value.directPhysicalBytes ) + "," +
+                    std::to_string( summary.inclusivePhysicalBytes ) + "/" +
+                    std::to_string( value.inclusivePhysicalBytes );
+                return false;
+            }
+            report.directMemberCount += value.directResourceCount;
+            report.inclusiveMemberCount += value.inclusiveResourceCount;
+            report.directMemberHash = FnvUpdate( report.directMemberHash,
+                &summary.passId, sizeof( summary.passId ) );
+            report.directMemberHash = FnvUpdate( report.directMemberHash,
+                &value.directResourceHash, sizeof( value.directResourceHash ) );
+            report.inclusiveMemberHash = FnvUpdate( report.inclusiveMemberHash,
+                &summary.passId, sizeof( summary.passId ) );
+            report.inclusiveMemberHash = FnvUpdate( report.inclusiveMemberHash,
+                &value.inclusiveResourceHash, sizeof( value.inclusiveResourceHash ) );
+            ++summaryCount;
+        }
+    }
+    if( summaryCount != facts.size() )
+    { error = "gpu_verifier_pass_summary_count_mismatch"; return false; }
+    report.verifiedPassCount = summaryCount;
     return true;
 }
 
@@ -513,7 +726,9 @@ bool VerifyTraceSessionGpuDerived( const std::filesystem::path& sessionRoot,
     TraceSessionGpuVerifierReport& report, std::string& error )
 {
     error.clear(); report = {};
-    if( control.maximumBufferedAllocationRecords == 0 || control.maximumBufferedDeltas == 0 )
+    if( control.maximumBufferedAllocationRecords == 0 ||
+        control.maximumBufferedDeltas == 0 ||
+        control.maximumBufferedPassRelations == 0 )
     { error = "gpu_verifier_buffer_limit_invalid"; return false; }
     report.sourceSha256 = manifest.source.sha256; report.sourceSize = manifest.source.fileSize;
     report.sessionGeneration = manifest.generation; report.sourceRecordHash = FnvOffset;
@@ -550,36 +765,15 @@ bool VerifyTraceSessionGpuDerived( const std::filesystem::path& sessionRoot,
         if( !reader->LoadResourcePage( pageIndex, values, error ) ) return false;
         report.resourceCount += values.size();
         for( const auto& value : values )
-        {
             report.resourceCapacityBytes += value.capacityBytes;
-            size_t offset = 0; bool more = false;
-            do
-            {
-                if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
-                std::vector<GpuRangeAnalysisRecord> ranges;
-                if( !reader->RangesForResource( value.resourceId, offset, 65536,
-                    ranges, more, error ) ) return false;
-                if( ranges.empty() && more ) { error = "gpu_verifier_range_pagination_stalled"; return false; }
-                report.rangeCount += ranges.size(); offset += ranges.size();
-            } while( more );
-
-            offset = 0; more = false;
-            do
-            {
-                if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
-                std::vector<GpuAnalysisResourcePassEntry> relations;
-                if( !reader->PassRelationsForResource( value.resourceId, offset, 65536,
-                    relations, more, error ) ) return false;
-                if( relations.empty() && more ) { error = "gpu_verifier_relation_pagination_stalled"; return false; }
-                for( const auto& relation : relations )
-                {
-                    ++report.resourcePassRelationCount;
-                    report.reverseRelationHash ^= RelationToken(
-                        relation.resourceId, relation.passId, relation.inclusive );
-                }
-                offset += relations.size();
-            } while( more );
-        }
+    }
+    for( size_t pageIndex = 0; pageIndex < reader->RangePageCount(); ++pageIndex )
+    {
+        if( control.stopToken.stop_requested() )
+        { error = "cancelled_resumable"; return false; }
+        std::vector<GpuAnalysisRangeStoreEntry> values;
+        if( !reader->LoadRangePage( pageIndex, values, error ) ) return false;
+        report.rangeCount += values.size();
     }
     for( size_t pageIndex = 0; pageIndex < reader->AllocationPageCount(); ++pageIndex )
     {
@@ -591,42 +785,8 @@ bool VerifyTraceSessionGpuDerived( const std::filesystem::path& sessionRoot,
             report.livePhysicalBytes += value.sizeBytes;
     }
 
-    report.directMemberHash = FnvOffset; report.inclusiveMemberHash = FnvOffset;
-    for( size_t pageIndex = 0; pageIndex < reader->PassPageCount(); ++pageIndex )
-    {
-        std::vector<GpuPassWorkingSet> passes;
-        if( !reader->LoadPassPage( pageIndex, passes, error ) ) return false;
-        report.passCount += passes.size();
-        for( const auto& pass : passes )
-        {
-            if( control.stopToken.stop_requested() ) { error = "cancelled_resumable"; return false; }
-            const auto summary = reader->FindPassSummary( pass.passId, error );
-            if( !summary ) return false;
-            std::vector<uint64_t> direct, inclusive;
-            if( !LoadAllPassMembers( *reader, pass.passId, false, control.stopToken, direct, error ) ||
-                !LoadAllPassMembers( *reader, pass.passId, true, control.stopToken, inclusive, error ) ) return false;
-            uint64_t directBytes = 0, inclusiveBytes = 0;
-            if( !PhysicalBytesForMembers( *reader, direct, directBytes, error ) ||
-                !PhysicalBytesForMembers( *reader, inclusive, inclusiveBytes, error ) ) return false;
-            const auto directHash = GpuAnalysisResourceSetHash( direct );
-            const auto inclusiveHash = GpuAnalysisResourceSetHash( inclusive );
-            if( summary->directResourceCount != direct.size() ||
-                summary->inclusiveResourceCount != inclusive.size() ||
-                summary->directResourceHash != directHash || summary->inclusiveResourceHash != inclusiveHash ||
-                summary->directPhysicalBytes != directBytes || summary->inclusivePhysicalBytes != inclusiveBytes )
-                ++report.mismatchCount;
-            report.directMemberCount += direct.size(); report.inclusiveMemberCount += inclusive.size();
-            report.directMemberHash = FnvUpdate( report.directMemberHash, &pass.passId, sizeof( pass.passId ) );
-            report.directMemberHash = FnvUpdate( report.directMemberHash, &directHash, sizeof( directHash ) );
-            report.inclusiveMemberHash = FnvUpdate( report.inclusiveMemberHash, &pass.passId, sizeof( pass.passId ) );
-            report.inclusiveMemberHash = FnvUpdate( report.inclusiveMemberHash, &inclusiveHash, sizeof( inclusiveHash ) );
-            for( const auto resourceId : direct ) report.forwardRelationHash ^=
-                RelationToken( resourceId, pass.passId, 0 );
-            for( const auto resourceId : inclusive ) if( !std::binary_search( direct.begin(), direct.end(), resourceId ) )
-                report.forwardRelationHash ^= RelationToken( resourceId, pass.passId, 1 );
-            ++report.verifiedPassCount;
-        }
-    }
+    if( !AuditStoreRelationsLinear( *reader, control, report, runRoot, error ) )
+        return false;
 
     if( report.resourceCount != store.resourceCount ||
         report.allocationCount != store.allocationCount || report.passCount != store.passCount ||

@@ -17,6 +17,7 @@
 #include <optional>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -416,7 +417,10 @@ bool CopyFile( const std::filesystem::path& path, std::ofstream& out,
 {
     std::ifstream in( path, std::ios::binary );
     if( !in ) { error = "session_lock_work_read_failed"; return false; }
-    std::array<char, 1024 * 1024> buffer;
+    // The converter uses the default Windows 1 MiB stack. Keep bulk-copy
+    // storage on the heap so the lock domain cannot overflow that stack when
+    // reached through the complete Mandatory Derived call chain.
+    std::vector<char> buffer( 1024 * 1024 );
     while( in )
     {
         in.read( buffer.data(), std::streamsize( buffer.size() ) );

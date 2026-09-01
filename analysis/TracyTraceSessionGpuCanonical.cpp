@@ -2900,12 +2900,71 @@ bool BuildStableFrameSummaries( PassSpoolBuildState& state,
         GpuAnalysisStablePassSummary summary;
         std::vector<uint64_t> direct;
         std::vector<uint64_t> inclusive;
-        std::vector<uint32_t> children;
+        std::vector<uint32_t> parents;
         bool seen = false;
     };
-    std::map<uint32_t, Node> nodes;
-    for( const auto& pass : frame.passes )
+    struct PassAggregate
     {
+        std::vector<uint64_t> inclusive;
+        std::vector<size_t> children;
+        uint8_t visit = 0;
+        bool complete = true;
+        bool truncated = false;
+    };
+
+    // Runtime pass nesting is the exact hierarchy. A stable taxonomy id is a
+    // semantic classification and may legitimately appear under more than one
+    // runtime parent in a frame. Compute each pass-instance rollup first, then
+    // fold those exact sets by taxonomy. Folding taxonomy nodes into a tree
+    // loses this distinction and used to reject valid Unity captures.
+    std::vector<PassAggregate> aggregates( frame.passes.size() );
+    for( size_t i = 0; i < frame.passes.size(); ++i )
+    {
+        const auto& pass = frame.passes[i];
+        auto& aggregate = aggregates[i];
+        aggregate.inclusive = pass.directResources;
+        aggregate.complete = pass.complete;
+        aggregate.truncated = pass.truncated;
+        if( pass.parentPassId == 0 ) continue;
+        const auto parent = frame.byId.find( pass.parentPassId );
+        if( parent != frame.byId.end() )
+            aggregates[parent->second].children.push_back( i );
+    }
+    const auto buildPassInclusive = [&]( auto&& self, size_t passIndex ) -> bool {
+        auto& aggregate = aggregates[passIndex];
+        if( aggregate.visit == 2 ) return true;
+        if( aggregate.visit == 1 )
+        {
+            error = "session_gpu_pass_parent_cycle:frame=" +
+                std::to_string( frame.frameId ) + ":pass=" +
+                std::to_string( frame.passes[passIndex].passId );
+            return false;
+        }
+        aggregate.visit = 1;
+        for( const auto childIndex : aggregate.children )
+        {
+            if( !self( self, childIndex ) ) return false;
+            const auto& child = aggregates[childIndex];
+            std::vector<uint64_t> merged;
+            merged.reserve( aggregate.inclusive.size() + child.inclusive.size() );
+            std::set_union( aggregate.inclusive.begin(), aggregate.inclusive.end(),
+                child.inclusive.begin(), child.inclusive.end(),
+                std::back_inserter( merged ) );
+            aggregate.inclusive = std::move( merged );
+            aggregate.complete = aggregate.complete && child.complete;
+            aggregate.truncated = aggregate.truncated || child.truncated;
+        }
+        aggregate.visit = 2;
+        return true;
+    };
+    for( size_t i = 0; i < frame.passes.size(); ++i )
+        if( !buildPassInclusive( buildPassInclusive, i ) ) return false;
+
+    std::map<uint32_t, Node> nodes;
+    for( size_t i = 0; i < frame.passes.size(); ++i )
+    {
+        const auto& pass = frame.passes[i];
+        const auto& aggregate = aggregates[i];
         const auto metadata = frame.taxonomyByPass.find( pass.passId );
         if( metadata == frame.taxonomyByPass.end() )
         { error = "session_gpu_pass_taxonomy_missing:pass=" + std::to_string( pass.passId ); return false; }
@@ -2922,10 +2981,12 @@ bool BuildStableFrameSummaries( PassSpoolBuildState& state,
         }
         else if( node.summary.taxonomyLevel != metadata->second.taxonomyLevel )
         { error = "session_gpu_stable_taxonomy_level_conflict"; return false; }
-        node.summary.complete = uint8_t( node.summary.complete && pass.complete );
-        node.summary.truncated = uint8_t( node.summary.truncated || pass.truncated );
+        node.summary.complete = uint8_t( node.summary.complete && aggregate.complete );
+        node.summary.truncated = uint8_t( node.summary.truncated || aggregate.truncated );
         node.direct.insert( node.direct.end(), pass.directResources.begin(),
             pass.directResources.end() );
+        node.inclusive.insert( node.inclusive.end(), aggregate.inclusive.begin(),
+            aggregate.inclusive.end() );
         if( pass.parentPassId != 0 )
         {
             const auto parentMetadata = frame.taxonomyByPass.find( pass.parentPassId );
@@ -2933,54 +2994,29 @@ bool BuildStableFrameSummaries( PassSpoolBuildState& state,
             // whose parent belongs to another frame.
             if( parentMetadata != frame.taxonomyByPass.end() &&
                 parentMetadata->second.taxonomyId != taxonomyId )
-            {
-                const auto parentTaxonomyId = parentMetadata->second.taxonomyId;
-                if( node.summary.parentTaxonomyId != 0 &&
-                    node.summary.parentTaxonomyId != parentTaxonomyId )
-                { error = "session_gpu_stable_taxonomy_parent_conflict"; return false; }
-                node.summary.parentTaxonomyId = parentTaxonomyId;
-            }
+                node.parents.push_back( parentMetadata->second.taxonomyId );
         }
     }
-    for( auto& [taxonomyId, node] : nodes )
+    for( auto& [_, node] : nodes )
     {
         std::sort( node.direct.begin(), node.direct.end() );
         node.direct.erase( std::unique( node.direct.begin(), node.direct.end() ),
             node.direct.end() );
-        if( node.summary.parentTaxonomyId != 0 )
+        std::sort( node.inclusive.begin(), node.inclusive.end() );
+        node.inclusive.erase( std::unique( node.inclusive.begin(), node.inclusive.end() ),
+            node.inclusive.end() );
+        std::sort( node.parents.begin(), node.parents.end() );
+        node.parents.erase( std::unique( node.parents.begin(), node.parents.end() ),
+            node.parents.end() );
+        if( node.parents.size() == 1 ) node.summary.parentTaxonomyId = node.parents.front();
+        else if( node.parents.size() > 1 )
         {
-            const auto parent = nodes.find( node.summary.parentTaxonomyId );
-            if( parent == nodes.end() )
-            { error = "session_gpu_stable_taxonomy_parent_missing"; return false; }
-            parent->second.children.push_back( taxonomyId );
+            // reserved[0] is the schema-1 exact-parent ambiguity bit. A zero
+            // parent without this bit remains an actual root/no-parent node.
+            node.summary.parentTaxonomyId = 0;
+            node.summary.reserved[0] = 1;
         }
     }
-    std::map<uint32_t, uint8_t> visit;
-    const auto buildInclusive = [&]( auto&& self, uint32_t taxonomyId ) -> bool {
-        auto& mark = visit[taxonomyId];
-        if( mark == 2 ) return true;
-        if( mark == 1 ) { error = "session_gpu_stable_taxonomy_cycle"; return false; }
-        mark = 1;
-        auto& node = nodes[taxonomyId];
-        node.inclusive = node.direct;
-        for( const auto childId : node.children )
-        {
-            if( !self( self, childId ) ) return false;
-            std::vector<uint64_t> merged;
-            const auto& child = nodes[childId];
-            merged.reserve( node.inclusive.size() + child.inclusive.size() );
-            std::set_union( node.inclusive.begin(), node.inclusive.end(),
-                child.inclusive.begin(), child.inclusive.end(),
-                std::back_inserter( merged ) );
-            node.inclusive = std::move( merged );
-            node.summary.complete = uint8_t( node.summary.complete && child.summary.complete );
-            node.summary.truncated = uint8_t( node.summary.truncated || child.summary.truncated );
-        }
-        mark = 2;
-        return true;
-    };
-    for( const auto& [taxonomyId, _] : nodes )
-        if( !buildInclusive( buildInclusive, taxonomyId ) ) return false;
     for( auto& [_, node] : nodes )
     {
         node.summary.directResourceCount = node.direct.size();

@@ -1983,23 +1983,39 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         header.callsiteCount * sizeof( StoredCallsite ) +
         header.jobCount * sizeof( uint64_t );
     std::ifstream page( path, std::ios::binary );
+    const auto idsOffset = globalsEnd + header.frameCount * sizeof( JnFrameData ) +
+        header.callsiteCount * sizeof( StoredCallsite );
+    if( header.scheduleCount > std::numeric_limits<size_t>::max() ||
+        header.jobCount > std::numeric_limits<size_t>::max() ||
+        postingHeader.scheduleOrderCount > std::numeric_limits<size_t>::max() )
+    { error = "session_job_page_audit_capacity_invalid"; return false; }
+    std::vector<JnJobScheduleData> auditSchedules( size_t( header.scheduleCount ) );
+    std::vector<uint64_t> auditJobIds( size_t( header.jobCount ) );
+    std::vector<TraceSessionUInt64Pair> auditScheduleByJob(
+        size_t( postingHeader.scheduleOrderCount ) );
+    page.seekg( std::streamoff( schedulesOffset ) );
+    if( ( !auditSchedules.empty() && !page.read(
+            reinterpret_cast<char*>( auditSchedules.data() ),
+            std::streamsize( auditSchedules.size() * sizeof( JnJobScheduleData ) ) ) ) )
+    { error = "session_job_page_schedule_audit_read_failed"; return false; }
+    page.clear(); page.seekg( std::streamoff( idsOffset ) );
+    if( ( !auditJobIds.empty() && !page.read(
+            reinterpret_cast<char*>( auditJobIds.data() ),
+            std::streamsize( auditJobIds.size() * sizeof( uint64_t ) ) ) ) )
+    { error = "session_job_page_id_audit_read_failed"; return false; }
+    postings.clear(); postings.seekg( std::streamoff( postingHeader.scheduleOrderByJobOffset ) );
+    if( ( !auditScheduleByJob.empty() && !postings.read(
+            reinterpret_cast<char*>( auditScheduleByJob.data() ),
+            std::streamsize( auditScheduleByJob.size() * sizeof( TraceSessionUInt64Pair ) ) ) ) )
+    { error = "session_job_schedule_order_audit_read_failed"; return false; }
     const auto scheduleMatches = [&]( uint64_t jobId, uint64_t key, bool slot ) {
-        uint64_t first = 0, last = header.scheduleCount;
-        while( first < last )
+        const auto first = std::lower_bound( auditSchedules.begin(), auditSchedules.end(), jobId,
+            []( const JnJobScheduleData& value, uint64_t id ) { return value.jobId < id; } );
+        for( auto found = first; found != auditSchedules.end(); ++found )
         {
-            const auto middle = first + ( last - first ) / 2;
-            JnJobScheduleData value;
-            page.clear(); page.seekg( std::streamoff( schedulesOffset + middle * sizeof( value ) ) );
-            if( !page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return false;
-            if( value.jobId < jobId ) first = middle + 1; else last = middle;
-        }
-        for( auto index = first; index < header.scheduleCount; ++index )
-        {
-            JnJobScheduleData value;
-            page.clear(); page.seekg( std::streamoff( schedulesOffset + index * sizeof( value ) ) );
-            if( !page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return false;
-            if( value.jobId != jobId ) return false;
-            const auto actual = slot ? uint64_t( uint32_t( value.packedHandle ) ) : value.packedHandle;
+            if( found->jobId != jobId ) return false;
+            const auto actual = slot ? uint64_t( uint32_t( found->packedHandle ) ) :
+                found->packedHandle;
             if( actual == key ) return true;
         }
         return false;
@@ -2025,21 +2041,7 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
             postingHeader.handleSlotJobCount, true ) )
     { error = "session_job_handle_posting_invalid"; return false; }
     const auto jobExists = [&]( uint64_t jobId ) {
-        uint64_t first = 0, last = header.jobCount;
-        const auto idsOffset = globalsEnd + header.frameCount * sizeof( JnFrameData ) +
-            header.callsiteCount * sizeof( StoredCallsite );
-        while( first < last )
-        {
-            const auto middle = first + ( last - first ) / 2;
-            uint64_t value = 0;
-            page.clear(); page.seekg( std::streamoff( idsOffset + middle * sizeof( value ) ) );
-            if( !page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return false;
-            if( value < jobId ) first = middle + 1; else last = middle;
-        }
-        if( first >= header.jobCount ) return false;
-        uint64_t value = 0;
-        page.clear(); page.seekg( std::streamoff( idsOffset + first * sizeof( value ) ) );
-        return bool( page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) && value == jobId;
+        return std::binary_search( auditJobIds.begin(), auditJobIds.end(), jobId );
     };
     const auto auditLatencySection = [&]( uint64_t offset, uint64_t count ) {
         postings.clear(); postings.seekg( std::streamoff( offset ) );
@@ -2068,27 +2070,14 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
             postingHeader.executionCount ) ||
         !auditLatencySection( postingHeader.waitOffset, postingHeader.waitCount ) )
     { error = "session_job_latency_posting_invalid"; return false; }
-    std::ifstream scheduleLookup( postingPath, std::ios::binary );
     const auto inverseScheduleForJob = [&]( uint64_t jobId, uint64_t& encodedTime ) {
-        uint64_t first = 0, last = postingHeader.scheduleOrderCount;
-        while( first < last )
-        {
-            const auto middle = first + ( last - first ) / 2;
-            TraceSessionUInt64Pair pair;
-            scheduleLookup.clear();
-            scheduleLookup.seekg( std::streamoff( postingHeader.scheduleOrderByJobOffset +
-                middle * sizeof( pair ) ) );
-            if( !scheduleLookup.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) ) return false;
-            if( pair.key < jobId ) first = middle + 1; else last = middle;
-        }
-        if( first >= postingHeader.scheduleOrderCount ) return false;
-        TraceSessionUInt64Pair pair;
-        scheduleLookup.clear();
-        scheduleLookup.seekg( std::streamoff( postingHeader.scheduleOrderByJobOffset +
-            first * sizeof( pair ) ) );
-        if( !scheduleLookup.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) ||
-            pair.key != jobId ) return false;
-        encodedTime = pair.value;
+        const auto found = std::lower_bound( auditScheduleByJob.begin(),
+            auditScheduleByJob.end(), jobId,
+            []( const TraceSessionUInt64Pair& value, uint64_t id ) {
+                return value.key < id;
+            } );
+        if( found == auditScheduleByJob.end() || found->key != jobId ) return false;
+        encodedTime = found->value;
         return true;
     };
     postings.clear(); postings.seekg( std::streamoff( postingHeader.scheduleOrderOffset ) );
@@ -2105,37 +2094,28 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         { error = "session_job_schedule_order_posting_invalid"; return false; }
         previousSchedule = pair; havePreviousSchedule = true;
     }
-    std::ifstream jobIds( path, std::ios::binary );
-    std::ifstream schedules( path, std::ios::binary );
-    const auto idsOffset = globalsEnd + header.frameCount * sizeof( JnFrameData ) +
-        header.callsiteCount * sizeof( StoredCallsite );
-    jobIds.seekg( std::streamoff( idsOffset ) );
-    schedules.seekg( std::streamoff( schedulesOffset ) );
-    JnJobScheduleData schedule {};
-    bool haveSchedule = header.scheduleCount != 0 &&
-        bool( schedules.read( reinterpret_cast<char*>( &schedule ), sizeof( schedule ) ) );
-    for( uint64_t index = 0; index < header.jobCount; ++index )
+    size_t scheduleIndex = 0;
+    for( size_t index = 0; index < auditJobIds.size(); ++index )
     {
-        uint64_t jobId = 0;
-        TraceSessionUInt64Pair inverse;
-        if( !jobIds.read( reinterpret_cast<char*>( &jobId ), sizeof( jobId ) ) )
-        { error = "session_job_schedule_order_ids_truncated"; return false; }
+        const auto jobId = auditJobIds[index];
         int64_t scheduleNs = 0;
-        while( haveSchedule && schedule.jobId < jobId )
-            haveSchedule = bool( schedules.read( reinterpret_cast<char*>( &schedule ), sizeof( schedule ) ) );
-        while( haveSchedule && schedule.jobId == jobId )
+        while( scheduleIndex < auditSchedules.size() &&
+            auditSchedules[scheduleIndex].jobId < jobId )
+            ++scheduleIndex;
+        while( scheduleIndex < auditSchedules.size() &&
+            auditSchedules[scheduleIndex].jobId == jobId )
         {
-            scheduleNs = schedule.time;
-            haveSchedule = bool( schedules.read( reinterpret_cast<char*>( &schedule ), sizeof( schedule ) ) );
+            scheduleNs = auditSchedules[scheduleIndex].time;
+            ++scheduleIndex;
         }
-        postings.clear();
-        postings.seekg( std::streamoff( postingHeader.scheduleOrderByJobOffset +
-            index * sizeof( inverse ) ) );
-        if( !postings.read( reinterpret_cast<char*>( &inverse ), sizeof( inverse ) ) ||
+        const auto& inverse = auditScheduleByJob[index];
+        if(
             inverse.key != jobId ||
             inverse.value != ( uint64_t( scheduleNs ) ^ ( uint64_t( 1 ) << 63 ) ) )
         { error = "session_job_schedule_order_inverse_invalid"; return false; }
     }
+    if( scheduleIndex != auditSchedules.size() )
+    { error = "session_job_schedule_order_schedule_count_invalid"; return false; }
     return true;
 }
 

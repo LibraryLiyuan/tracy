@@ -20,6 +20,7 @@ struct TraceSessionGpuVerifierControl
     std::stop_token stopToken;
     uint64_t maximumBufferedAllocationRecords = 65536;
     uint64_t maximumBufferedDeltas = 65536;
+    uint64_t maximumBufferedPassRelations = 1048576;
 };
 
 // This is an independently recomputed audit product.  It deliberately stores

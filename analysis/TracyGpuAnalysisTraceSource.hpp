@@ -36,7 +36,7 @@ public:
     static std::unique_ptr<GpuAnalysisTraceSource> OpenIfReady( const std::filesystem::path& path,
         WorkerTraceSource::StateCallback stateCallback = {} );
     static std::unique_ptr<GpuAnalysisTraceSource> OpenSessionIfReady( const std::filesystem::path& path,
-        WorkerTraceSource::StateCallback stateCallback = {} );
+        WorkerTraceSource::StateCallback stateCallback = {}, std::string* openError = nullptr );
 
     std::optional<std::filesystem::path> BackingPath() const override { return m_path; }
     void PrepareForQuery( std::string_view method ) const override;

@@ -101,9 +101,12 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
         m_sourceLoader = [preferIndex]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
             if( std::filesystem::is_directory( path ) )
             {
-                if( auto source = analysis::GpuAnalysisTraceSource::OpenSessionIfReady( path, callback ) ) return source;
+                std::string sessionError;
+                if( auto source = analysis::GpuAnalysisTraceSource::OpenSessionIfReady(
+                    path, callback, &sessionError ) ) return source;
                 throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt,
-                    "Trace Session is incomplete or its mandatory derived indexes are invalid" );
+                    "Trace Session is incomplete or its mandatory derived indexes are invalid: " +
+                    sessionError );
             }
             if( Lower( path.extension().string() ) == ".tracy-stream" )
             {

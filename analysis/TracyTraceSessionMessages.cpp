@@ -426,7 +426,11 @@ bool CopyFile( const std::filesystem::path& path, std::ofstream& out,
 {
     std::ifstream in( path, std::ios::binary );
     if( !in ) { error = "session_message_work_read_failed"; return false; }
-    std::array<char, 1024 * 1024> buffer;
+    // Keep large I/O buffers off the thread stack. The production converter
+    // uses the default Windows 1 MiB stack and this helper is called through
+    // the full Mandatory Derived pipeline, so a 1 MiB local array overflows
+    // before the first message byte can be committed on real captures.
+    std::vector<char> buffer( 1024 * 1024 );
     while( in )
     {
         in.read( buffer.data(), std::streamsize( buffer.size() ) );

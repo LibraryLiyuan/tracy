@@ -374,11 +374,17 @@ public:
     size_t ResourceSummaryPageCount() const;
     size_t AllocationPageCount() const;
     size_t PassPageCount() const;
+    size_t RangePageCount() const;
+    size_t ResourcePassPageCount() const;
+    size_t PassSummaryPageCount() const;
 
     bool LoadResourcePage( size_t page, std::vector<GpuResourceAnalysisRecord>& out, std::string& error ) const;
     bool LoadResourceSummaryPage( size_t page, std::vector<GpuAnalysisResourceSummary>& out, std::string& error ) const;
     bool LoadAllocationPage( size_t page, std::vector<GpuAllocationAnalysisRecord>& out, std::string& error ) const;
     bool LoadPassPage( size_t page, std::vector<GpuPassWorkingSet>& out, std::string& error ) const;
+    bool LoadRangePage( size_t page, std::vector<GpuAnalysisRangeStoreEntry>& out, std::string& error ) const;
+    bool LoadResourcePassPage( size_t page, std::vector<GpuAnalysisResourcePassEntry>& out, std::string& error ) const;
+    bool LoadPassSummaryPage( size_t page, std::vector<GpuAnalysisPassSummary>& out, std::string& error ) const;
     bool RangesForResource( uint64_t resourceId, size_t offset, size_t limit,
         std::vector<GpuRangeAnalysisRecord>& out, bool& hasMore, std::string& error ) const;
 

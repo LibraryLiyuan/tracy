@@ -1,5 +1,6 @@
 #include "TracyTraceSessionFrameImages.hpp"
 
+#include "TracyGpuAnalysisPath.hpp"
 #include "TracyHash.hpp"
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyProtocol.hpp"
@@ -371,7 +372,8 @@ bool BuildTraceSessionFrameImageDerived( const std::filesystem::path& sessionRoo
     if( session.source.sha256.size() != 64 ||
         session.generation.size() > std::numeric_limits<uint32_t>::max() )
     { error = "session_frame_image_identity_invalid"; return false; }
-    const auto root = TraceSessionFrameImageIndexRoot( sessionRoot, session );
+    const auto root = GpuAnalysisIoPath(
+        TraceSessionFrameImageIndexRoot( sessionRoot, session ) );
     std::error_code ec;
     std::filesystem::create_directories( root, ec );
     if( ec ) { error = "session_frame_image_directory_failed:" + ec.message(); return false; }
@@ -437,7 +439,8 @@ std::shared_ptr<TraceSessionFrameImageReader> TraceSessionFrameImageReader::Open
     std::string& error )
 {
     error.clear();
-    const auto root = TraceSessionFrameImageIndexRoot( sessionRoot, session );
+    const auto root = GpuAnalysisIoPath(
+        TraceSessionFrameImageIndexRoot( sessionRoot, session ) );
     FrameImageManifest manifest;
     if( !LoadManifest( root, manifest, error ) ) return {};
     if( manifest.sourceSha256 != session.source.sha256 ||
@@ -549,7 +552,8 @@ bool AuditTraceSessionFrameImageDerived( const std::filesystem::path& sessionRoo
     const TraceSessionManifest& session, TraceSessionFrameImageStats& stats,
     std::string& error )
 {
-    const auto root = TraceSessionFrameImageIndexRoot( sessionRoot, session );
+    const auto root = GpuAnalysisIoPath(
+        TraceSessionFrameImageIndexRoot( sessionRoot, session ) );
     FrameImageManifest manifest;
     if( !LoadManifest( root, manifest, error ) ) return false;
     if( manifest.sourceSha256 != session.source.sha256 || manifest.sourceSize != session.source.fileSize ||

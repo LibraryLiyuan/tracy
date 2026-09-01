@@ -1,4 +1,5 @@
 #include "TracyGpuAnalysisTraceSource.hpp"
+#include "TracyGpuAnalysisPath.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 
 #include <algorithm>
@@ -23,49 +24,56 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenIfReady(
 }
 
 std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfReady(
-    const std::filesystem::path& path, WorkerTraceSource::StateCallback stateCallback )
+    const std::filesystem::path& path, WorkerTraceSource::StateCallback stateCallback,
+    std::string* openError )
 {
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
     std::string error;
-    if( !IsTraceSessionQueryable( path, error ) ) return {};
-    const auto session = LoadTraceSessionManifest( path, error );
-    if( !session ) return {};
+    const auto fail = [&]() -> std::unique_ptr<GpuAnalysisTraceSource> {
+        if( openError ) *openError = error.empty() ?
+            "session_open_failed_without_reason" : error;
+        return {};
+    };
+    const auto ioPath = GpuAnalysisIoPath( path );
+    if( !IsTraceSessionQueryable( ioPath, error ) ) return fail();
+    const auto session = LoadTraceSessionManifest( ioPath, error );
+    if( !session ) return fail();
     TraceSessionDerivedStats sessionStats;
-    if( !LoadTraceSessionDerivedStats( path, *session, sessionStats, error ) ) return {};
-    auto frameReader = TraceSessionFrameReader::Open( path, *session, error );
-    if( !frameReader ) return {};
-    auto frameImageReader = TraceSessionFrameImageReader::Open( path, *session, error );
-    if( !frameImageReader ) return {};
+    if( !LoadTraceSessionDerivedStats( ioPath, *session, sessionStats, error ) ) return fail();
+    auto frameReader = TraceSessionFrameReader::Open( ioPath, *session, error );
+    if( !frameReader ) return fail();
+    auto frameImageReader = TraceSessionFrameImageReader::Open( ioPath, *session, error );
+    if( !frameImageReader ) return fail();
     // Delay the largest immutable semantic stores until their domain is first
     // queried. Their normal Open path still performs full SHA-256 validation.
     std::shared_ptr<TraceSessionJobReader> jobReader;
-    auto cpuZoneReader = TraceSessionCpuZoneReader::Open( path, *session, error );
-    if( !cpuZoneReader ) return {};
-    auto gpuZoneReader = TraceSessionGpuZoneReader::Open( path, *session, error );
-    if( !gpuZoneReader ) return {};
-    auto memoryReader = TraceSessionMemoryReader::Open( path, *session, error );
-    if( !memoryReader ) return {};
-    auto samplingReader = TraceSessionSamplingReader::Open( path, *session, error );
-    if( !samplingReader ) return {};
-    auto schedulingReader = TraceSessionSchedulingReader::Open( path, *session, error );
-    if( !schedulingReader ) return {};
+    auto cpuZoneReader = TraceSessionCpuZoneReader::Open( ioPath, *session, error );
+    if( !cpuZoneReader ) return fail();
+    auto gpuZoneReader = TraceSessionGpuZoneReader::Open( ioPath, *session, error );
+    if( !gpuZoneReader ) return fail();
+    auto memoryReader = TraceSessionMemoryReader::Open( ioPath, *session, error );
+    if( !memoryReader ) return fail();
+    auto samplingReader = TraceSessionSamplingReader::Open( ioPath, *session, error );
+    if( !samplingReader ) return fail();
+    auto schedulingReader = TraceSessionSchedulingReader::Open( ioPath, *session, error );
+    if( !schedulingReader ) return fail();
     // Plot was added after the first N30 Session generation was published.
     // Treat its index as optional when opening an older completed generation;
     // newly converted Sessions always build and audit it before publication.
     std::string plotError;
-    auto plotReader = TraceSessionPlotReader::Open( path, *session, plotError );
+    auto plotReader = TraceSessionPlotReader::Open( ioPath, *session, plotError );
     std::string messageError;
-    auto messageReader = TraceSessionMessageReader::Open( path, *session, messageError );
+    auto messageReader = TraceSessionMessageReader::Open( ioPath, *session, messageError );
     std::string lockError;
-    auto lockReader = TraceSessionLockReader::Open( path, *session, lockError );
+    auto lockReader = TraceSessionLockReader::Open( ioPath, *session, lockError );
     std::shared_ptr<TraceSessionRelationReader> relationReader;
     std::shared_ptr<TraceSessionRuntimeReader> runtimeReader;
     std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader;
-    auto symbolReader = TraceSessionSymbolReader::Open( path, *session, error );
-    if( !symbolReader ) return {};
-    auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
+    auto symbolReader = TraceSessionSymbolReader::Open( ioPath, *session, error );
+    if( !symbolReader ) return fail();
+    auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( ioPath, *session ),
         session->source.sha256, session->source.fileSize, error );
-    if( !reader ) return {};
+    if( !reader ) return fail();
     GpuAnalysisSidecarManifest facade;
     facade.state = GpuAnalysisSidecarState::Ready;
     facade.identityState = GpuAnalysisIdentityState::StrongVerified;
@@ -171,7 +179,8 @@ std::shared_ptr<TraceSessionJobReader> GpuAnalysisTraceSource::SessionJobReader(
     if( !m_jobReader && m_sessionManifest )
     {
         std::string error;
-        m_jobReader = TraceSessionJobReader::Open( m_path, *m_sessionManifest, error );
+        m_jobReader = TraceSessionJobReader::Open(
+            GpuAnalysisIoPath( m_path ), *m_sessionManifest, error );
         if( !m_jobReader ) throw std::runtime_error( "Session Job index validation failed: " + error );
     }
     return m_jobReader;
@@ -184,7 +193,8 @@ std::shared_ptr<TraceSessionRelationReader> GpuAnalysisTraceSource::SessionRelat
     if( !m_relationReader && m_sessionManifest )
     {
         std::string error;
-        m_relationReader = TraceSessionRelationReader::Open( m_path, *m_sessionManifest, error );
+        m_relationReader = TraceSessionRelationReader::Open(
+            GpuAnalysisIoPath( m_path ), *m_sessionManifest, error );
         if( !m_relationReader ) throw std::runtime_error( "Session Relation index validation failed: " + error );
     }
     return m_relationReader;
@@ -197,7 +207,8 @@ std::shared_ptr<TraceSessionRuntimeReader> GpuAnalysisTraceSource::SessionRuntim
     if( !m_runtimeReader && m_sessionManifest )
     {
         std::string error;
-        m_runtimeReader = TraceSessionRuntimeReader::Open( m_path, *m_sessionManifest, error );
+        m_runtimeReader = TraceSessionRuntimeReader::Open(
+            GpuAnalysisIoPath( m_path ), *m_sessionManifest, error );
         if( !m_runtimeReader ) throw std::runtime_error( "Session Runtime index validation failed: " + error );
     }
     return m_runtimeReader;
@@ -210,7 +221,8 @@ std::shared_ptr<TraceSessionIoGfxReader> GpuAnalysisTraceSource::SessionIoGfxRea
     if( !m_ioGfxReader && m_sessionManifest )
     {
         std::string error;
-        m_ioGfxReader = TraceSessionIoGfxReader::Open( m_path, *m_sessionManifest, error );
+        m_ioGfxReader = TraceSessionIoGfxReader::Open(
+            GpuAnalysisIoPath( m_path ), *m_sessionManifest, error );
         if( !m_ioGfxReader ) throw std::runtime_error( "Session I/O/Gfx index validation failed: " + error );
     }
     return m_ioGfxReader;

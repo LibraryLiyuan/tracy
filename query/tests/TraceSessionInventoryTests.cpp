@@ -2212,6 +2212,55 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnGpuCatalogBatchKind::RangeSet ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::RangeSetV1 ), 0 };
     AppendQueueItem( frame, item );
+
+    // A stable taxonomy identifies semantic work, not a unique runtime-tree
+    // parent. The same taxonomy may be instantiated below two different
+    // parents in one frame (as real Unity captures do when shared rendering
+    // work is reused by multiple lighting phases). Stable summaries must keep
+    // the exact union and report an ambiguous parent instead of rejecting the
+    // otherwise valid GPU evidence.
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 117, 1010, 12, 90, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 117, 1012, 12, 92, 2, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnRelation;
+    item.jnRelation = { 118, 1012, 1010,
+        uint8_t( tracy::JnEntityKind::GpuPass ), uint8_t( tracy::JnEntityKind::GpuPass ),
+        uint8_t( tracy::JnRelationNamespace::GpuReference ),
+        uint8_t( tracy::JnRelationKind::LogicalParent ), 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 118, 1012, 0x1234, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 119, 1012, 2012, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    item.jnGpuReferenceEnd = { 120, 1010, 2010, 0, 0, 0 };
+    AppendQueueItem( frame, item );
+
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 117, 1011, 12, 91, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 117, 1013, 12, 92, 2, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnRelation;
+    item.jnRelation = { 118, 1013, 1011,
+        uint8_t( tracy::JnEntityKind::GpuPass ), uint8_t( tracy::JnEntityKind::GpuPass ),
+        uint8_t( tracy::JnRelationNamespace::GpuReference ),
+        uint8_t( tracy::JnRelationKind::LogicalParent ), 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 118, 1013, 0x1234, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 119, 1013, 2013, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    item.jnGpuReferenceEnd = { 120, 1011, 2011, 0, 0, 0 };
+    AppendQueueItem( frame, item );
+
     item = {}; item.hdr.type = tracy::QueueType::FrameVsync;
     item.frameVsync = { 118, 9 };
     AppendQueueItem( frame, item );
@@ -2317,8 +2366,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         gpuData.gpuCatalogViews[0].resourceId == 10 && gpuData.gpuCatalogViews[0].pointerToken == 0 &&
         gpuData.gpuCatalogViews[1].resourceId == 11 && gpuData.gpuCatalogViews[1].pointerToken == 0,
         "GPU reader resolves pointer reuse against the exact resource lifetime" );
-    test.Check( gpuData.gpuReferencePasses.size() == 5 &&
-        gpuData.gpuReferenceUses.size() == 7 && gpuData.gpuReferenceEnds.size() == 5 &&
+    test.Check( gpuData.gpuReferencePasses.size() == 9 &&
+        gpuData.gpuReferenceUses.size() == 9 && gpuData.gpuReferenceEnds.size() == 9 &&
         gpuData.gpuReferenceEnds.front().totalReferenceCount == 5 &&
         gpuData.gpuReferencePasses.front().time == 22 &&
         gpuData.gpuReferenceUses.front().time == 22 &&
@@ -2367,7 +2416,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto gpuStore = tracy::analysis::LoadGpuAnalysisStoreManifest(
         gpuRoot / derivedStats.generation, error );
     test.Check( gpuStore.has_value() && gpuStore->complete &&
-        gpuStore->resourceCount == 8 && gpuStore->passCount == 5 &&
+        gpuStore->resourceCount == 8 && gpuStore->passCount == 9 &&
         gpuStore->rangeCount == 1 &&
         gpuStore->sourceGapResourceCount == 2 &&
         gpuStore->sourceGapReferenceCount == 2 &&
@@ -2375,12 +2424,40 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "Session generation publishes N29 GPU analysis without a duplicate raw sidecar: " + error );
     auto gpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt( gpuRoot,
         manifest.source.sha256, manifest.source.fileSize, error );
+    uint64_t sequentialResourcePassRelations = 0;
+    uint64_t sequentialRanges = 0;
+    if( gpuReader )
+    {
+        for( size_t page = 0; page < gpuReader->ResourcePassPageCount(); ++page )
+        {
+            std::vector<tracy::analysis::GpuAnalysisResourcePassEntry> values;
+            test.Check( gpuReader->LoadResourcePassPage( page, values, error ),
+                "sequentially load a Resource/Pass page for bounded independent audit: " + error );
+            sequentialResourcePassRelations += values.size();
+        }
+        for( size_t page = 0; page < gpuReader->RangePageCount(); ++page )
+        {
+            std::vector<tracy::analysis::GpuAnalysisRangeStoreEntry> values;
+            test.Check( gpuReader->LoadRangePage( page, values, error ),
+                "sequentially load a GPU Range page for bounded independent audit: " + error );
+            sequentialRanges += values.size();
+        }
+    }
+    test.Check( gpuStore && sequentialResourcePassRelations ==
+            gpuStore->resourcePassRelationCount && sequentialRanges == gpuStore->rangeCount,
+        "sequential Store page readers cover every exact GPU relation and Range once" );
     const auto gpuResource = gpuReader ? gpuReader->FindResource( 10, error ) : std::nullopt;
     const auto parentGpuPass = gpuReader ? gpuReader->FindPass( 1000, error ) : std::nullopt;
     const auto parentGpuPassSummary = gpuReader ?
         gpuReader->FindPassSummary( 1000, error ) : std::nullopt;
     const auto parentStableSummary = gpuReader ?
         gpuReader->FindStablePassSummary( 5, 77, error ) : std::nullopt;
+    const auto ambiguousStableSummary = gpuReader ?
+        gpuReader->FindStablePassSummary( 12, 92, error ) : std::nullopt;
+    const auto firstAmbiguousParentSummary = gpuReader ?
+        gpuReader->FindStablePassSummary( 12, 90, error ) : std::nullopt;
+    const auto secondAmbiguousParentSummary = gpuReader ?
+        gpuReader->FindStablePassSummary( 12, 91, error ) : std::nullopt;
     const auto delayedGpuPass = gpuReader ? gpuReader->FindPass( 1002, error ) : std::nullopt;
     const auto sourceGapGpuPass = gpuReader ? gpuReader->FindPass( 1003, error ) : std::nullopt;
     const auto sourceGapGpuResource = sourceGapGpuPass && sourceGapGpuPass->directResources.size() == 1 ?
@@ -2409,6 +2486,13 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         parentStableSummary->inclusiveResourceHash ==
             tracy::analysis::GpuAnalysisResourceSetHash( std::vector<uint64_t> { 10, 12 } ),
         "stable Frame/Taxonomy summary is exact and cannot absorb a child from another frame" );
+    test.Check( ambiguousStableSummary && ambiguousStableSummary->parentTaxonomyId == 0 &&
+        ambiguousStableSummary->reserved[0] == 1 &&
+        ambiguousStableSummary->directResourceCount == 1 &&
+        ambiguousStableSummary->inclusiveResourceCount == 1 &&
+        firstAmbiguousParentSummary && firstAmbiguousParentSummary->inclusiveResourceCount == 1 &&
+        secondAmbiguousParentSummary && secondAmbiguousParentSummary->inclusiveResourceCount == 1,
+        "stable taxonomy summaries preserve exact per-instance rollups when one taxonomy has multiple runtime parents" );
     std::vector<uint64_t> parentInclusiveMembers; bool parentInclusiveMore = false;
     const auto loadedParentInclusive = gpuReader && gpuReader->PassResources(
         1000, true, 0, 16, parentInclusiveMembers, parentInclusiveMore, error );
@@ -2918,7 +3002,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "final audit covers Canonical, mandatory indexes, and GPU derived: " + error );
     test.Check( mandatoryStats.indexedRecords == auditedStats.indexedRecords &&
         auditedStats.indexedProtocolEvents == inventory.protocolInventory.eventCount &&
-        auditedStats.gpuResources == 8 && auditedStats.gpuPasses == 5 &&
+        auditedStats.gpuResources == 8 && auditedStats.gpuPasses == 9 &&
         auditedStats.gpuSourceGapResources == 2 &&
         auditedStats.gpuSourceGapReferences == 2 &&
         auditedStats.jobTypes == 1 && auditedStats.jobs == 2 &&
@@ -3108,7 +3192,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         manifest.source.sha256, manifest.source.fileSize, error );
     test.Check( sessionGpuReader &&
         sessionGpuReader->Manifest().resourceCount == 8 &&
-        sessionGpuReader->Manifest().passCount == 5 &&
+        sessionGpuReader->Manifest().passCount == 9 &&
         sessionGpuReader->Manifest().sourceGapResourceCount == 2 &&
         sessionGpuReader->Manifest().sourceGapReferenceCount == 2 &&
         sessionGpuReader->Manifest().reason == "source_gpu_resource_identity_gap:2",
@@ -3178,7 +3262,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( sessionRelationReady,
         "Session advertises Relation only after its disk-backed semantic reader is ready" );
     const auto sessionRelations = sessionSource->ScanRelations( 0, 4 );
-    test.Check( sessionSource->GetRelationCount() == 2 && sessionRelations.size() == 2 &&
+    test.Check( sessionSource->GetRelationCount() == 4 && sessionRelations.size() == 4 &&
         sessionRelations[0].timeNs == 34 && sessionRelations[0].sourceId == 500 &&
         sessionRelations[0].targetId == 900 &&
         sessionRelations[0].relationNamespace == uint8_t( tracy::JnRelationNamespace::Job ) &&
@@ -3343,6 +3427,27 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionFrameImageDecoded.width == 4 && sessionFrameImageDecoded.height == 4 &&
         sessionFrameImageDecoded.flipped && sessionFrameImageDecoded.rgba.size() == 64,
         "Session FrameImage reader preserves metadata, paged BC1 bytes and on-demand RGBA decode" );
+    const auto longFrameImageSession = directory / std::string( 160, 'l' ) /
+        std::string( 80, 's' );
+    const auto sourceFrameImageRoot = tracy::analysis::TraceSessionFrameImageIndexRoot(
+        publishedSession, manifest );
+    const auto longFrameImageRoot = tracy::analysis::TraceSessionFrameImageIndexRoot(
+        longFrameImageSession, manifest );
+    std::error_code longFrameImageError;
+    std::filesystem::create_directories(
+        tracy::analysis::GpuAnalysisIoPath( longFrameImageRoot ), longFrameImageError );
+    for( const auto* file : { "manifest", "frame-images.bin", "frame-images.bc1" } )
+    {
+        std::filesystem::copy_file(
+            tracy::analysis::GpuAnalysisIoPath( sourceFrameImageRoot / file ),
+            tracy::analysis::GpuAnalysisIoPath( longFrameImageRoot / file ),
+            std::filesystem::copy_options::overwrite_existing, longFrameImageError );
+    }
+    const auto longFrameImageReader = tracy::analysis::TraceSessionFrameImageReader::Open(
+        longFrameImageSession, manifest, error );
+    test.Check( !longFrameImageError && longFrameImageReader &&
+        longFrameImageReader->Images().size() == 1,
+        "Session FrameImage reader supports published paths beyond Win32 MAX_PATH" );
     const auto sessionJobs = sessionSource->GetJobs();
     const auto publishedJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
     bool jobPostingWorkFound = false;
@@ -3693,7 +3798,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                     { "namespace", "job" }, { "relation", "executes_pass" } } }
             } );
             test.Check( relations.value( "ok", false ) && relations["data"]["present"] == true &&
-                relations["data"]["relation_count"] == "2" &&
+                relations["data"]["relation_count"] == "4" &&
                 relations["data"]["relations"].size() == 1 &&
                 relations["data"]["relations"][0]["time_ns"] == "34" &&
                 relations["data"]["relations"][0]["source_id"] == "500" &&
