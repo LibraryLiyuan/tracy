@@ -826,6 +826,14 @@ std::optional<IoRequestDto> GpuAnalysisTraceSource::GetIoRequest( uint64_t reque
     const auto reader = SessionIoGfxReader();
     return reader ? reader->IoRequest( requestId ) : std::nullopt;
 }
+std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoChildren(
+    uint64_t parentId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetIoChildren( parentId, offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->IoChildren( parentId, offset, limit ) :
+        std::vector<IoRequestDto> {};
+}
 std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxDispatches();

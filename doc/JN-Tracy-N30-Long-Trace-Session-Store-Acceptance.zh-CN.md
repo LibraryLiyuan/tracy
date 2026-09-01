@@ -1541,3 +1541,26 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 发布目录不残留`io-request-id-posting`外排工作文件。本子阶段未启动真实30分钟转换。
+
+### 2026-09-01 I/O Parent/Child Chain Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，I/O Search/Statistics分页仍待后续）**。
+
+- I/O/Gfx index schema从4升级到5；对`parentKind=IoRequest`且`parentId!=0`的Config事实新增`parentRequestId→child Config ordinal`精确posting。
+- Session Reader通过父ID磁盘二分查找、Config点读和Request ID posting复原直接子Request；重复Config不会重复返回同一子Request。
+- `io.chain`的Session路径从根Request开始，父方向用目标Request的Config点查，子方向用Parent posting，按需双向BFS；不再调用`GetIoRequests()`构建全Session邻接图。
+- BFS受`max_nodes`和Query CPU预算约束；达到预算返回明确`truncated=true`，未访问节点不会伪装为完整链。
+- 默认Worker实现继续使用原有全量扫描；分析层使用固定wire值`IoRequestParentKindValue=1`，避免为了默认兼容实现把协议Queue头耦合进所有TraceSource编译单元。
+- Final Audit验证Parent posting排序、Config ordinal边界和真实`parentKind/parentId`；错误父子键会阻止Session发布。
+
+TDD与回归证据：
+
+```text
+Synthetic: Request 400 → child Request 401，二者均为完整Read生命周期
+Reader:    GetIoChildren(400)=[401]
+Query:     io.chain(401)返回2 nodes、1 exact parent edge、truncated=false
+RED/FIX:   首次编译暴露TraceSource头直接依赖协议枚举；改用分析层固定wire常量
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+新增synthetic事件把开放Frame尾部从40 ns推进到46 ns；Frame Reader与Query期望同步更新，未改变尾部闭合算法。本子阶段未启动真实30分钟转换。

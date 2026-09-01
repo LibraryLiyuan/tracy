@@ -60,6 +60,8 @@ struct FileHeader
     uint64_t ioRequestIdPostingOffset = 0;
     uint64_t ioRequestIdPostingCount = 0;
     uint64_t ioRequestIds = 0;
+    uint64_t ioParentPostingOffset = 0;
+    uint64_t ioParentLinks = 0;
     uint64_t gfxParentLinks = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
@@ -228,6 +230,7 @@ struct BuildState
     std::ofstream gfxLinkSourcePosting;
     std::ofstream gfxLinkTargetPosting;
     std::ofstream ioRequestIdPosting;
+    std::ofstream ioParentPosting;
     TraceSessionIoGfxStats stats;
 };
 
@@ -280,6 +283,13 @@ bool Visit( const TraceSessionCanonicalRecord& record, void* userData,
             ( uint64_t( 1 ) << 62 ) | state.stats.ioConfigs };
         if( !WriteRecord( state.ioRequestIdPosting, &posting, sizeof( posting ),
             "session_io_config_id_posting_write_failed", error ) ) return false;
+        if( value.parentKind == uint8_t( JnIoParentKind::IoRequest ) && value.parentId != 0 )
+        {
+            const TraceSessionUInt64Pair parent { value.parentId, state.stats.ioConfigs };
+            if( !WriteRecord( state.ioParentPosting, &parent, sizeof( parent ),
+                "session_io_parent_posting_write_failed", error ) ) return false;
+            ++state.stats.ioParentLinks;
+        }
         ++state.stats.ioConfigs;
         break;
     }
@@ -468,6 +478,7 @@ bool SaveManifest( const std::filesystem::path& root,
     out << "io_configs " << manifest.stats.ioConfigs << '\n';
     out << "io_stages " << manifest.stats.ioStages << '\n';
     out << "io_request_ids " << manifest.stats.ioRequestIds << '\n';
+    out << "io_parent_links " << manifest.stats.ioParentLinks << '\n';
     out << "gfx_dispatches " << manifest.stats.gfxDispatches << '\n';
     out << "gfx_entities " << manifest.stats.gfxEntities << '\n';
     out << "gfx_parent_links " << manifest.stats.gfxParentLinks << '\n';
@@ -501,6 +512,7 @@ bool LoadManifest( const std::filesystem::path& root,
         else if( key == "io_configs" ) in >> manifest.stats.ioConfigs;
         else if( key == "io_stages" ) in >> manifest.stats.ioStages;
         else if( key == "io_request_ids" ) in >> manifest.stats.ioRequestIds;
+        else if( key == "io_parent_links" ) in >> manifest.stats.ioParentLinks;
         else if( key == "gfx_dispatches" ) in >> manifest.stats.gfxDispatches;
         else if( key == "gfx_entities" ) in >> manifest.stats.gfxEntities;
         else if( key == "gfx_parent_links" ) in >> manifest.stats.gfxParentLinks;
@@ -533,6 +545,7 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         header.ioConfigs != manifest.stats.ioConfigs || header.ioStages != manifest.stats.ioStages ||
         !ioPostingCountValid ||
         header.ioRequestIds != manifest.stats.ioRequestIds ||
+        header.ioParentLinks != manifest.stats.ioParentLinks ||
         header.gfxDispatches != manifest.stats.gfxDispatches ||
         header.gfxEntities != manifest.stats.gfxEntities ||
         header.gfxParentLinks != manifest.stats.gfxParentLinks ||
@@ -578,6 +591,9 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         header.ioRequestIdPostingOffset == expected;
     valid = valid && CheckedAppend( expected, header.ioRequestIdPostingCount,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioParentPostingOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioParentLinks,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         expected == manifest.fileBytes;
     if( !in || source != session.source.sha256 || generation != session.generation || !valid )
@@ -681,7 +697,8 @@ std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
 }
 
 std::vector<uint64_t> ReadPostingValues( const std::filesystem::path& path,
-    uint64_t postingOffset, uint64_t postingCount, uint64_t key )
+    uint64_t postingOffset, uint64_t postingCount, uint64_t key,
+    size_t offset = 0, size_t limit = std::numeric_limits<size_t>::max() )
 {
     std::vector<uint64_t> result;
     if( postingCount == 0 ) return result;
@@ -705,10 +722,13 @@ std::vector<uint64_t> ReadPostingValues( const std::filesystem::path& path,
     };
     const auto begin = lowerBound( false );
     const auto end = lowerBound( true );
-    result.reserve( size_t( end - begin ) );
+    const auto skipped = std::min<uint64_t>( offset, end - begin );
+    const auto count = std::min<uint64_t>( limit, end - begin - skipped );
+    result.reserve( size_t( count ) );
     in.clear();
-    in.seekg( std::streamoff( postingOffset + begin * sizeof( TraceSessionUInt64Pair ) ) );
-    for( uint64_t index = begin; index < end; ++index )
+    in.seekg( std::streamoff( postingOffset + ( begin + skipped ) *
+        sizeof( TraceSessionUInt64Pair ) ) );
+    for( uint64_t index = 0; index < count; ++index )
     {
         TraceSessionUInt64Pair pair;
         if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) || pair.key != key )
@@ -920,22 +940,24 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "io-request.work", root / "io-config.work", root / "io-stage.work",
         root / "gfx-dispatch.work", root / "gfx-entity.work", root / "gfx-link.work",
         root / "frame.work" };
-    const std::array<std::filesystem::path, 7> postingSource = {
+    const std::array<std::filesystem::path, 8> postingSource = {
         root / "dispatch-frame-posting-source.work",
         root / "correlated-frame-posting-source.work",
         root / "gfx-entity-id-posting-source.work",
         root / "gfx-parent-posting-source.work",
         root / "gfx-link-source-posting-source.work",
         root / "gfx-link-target-posting-source.work",
-        root / "io-request-id-posting-source.work" };
-    const std::array<std::filesystem::path, 7> postingSorted = {
+        root / "io-request-id-posting-source.work",
+        root / "io-parent-posting-source.work" };
+    const std::array<std::filesystem::path, 8> postingSorted = {
         root / "dispatch-frame-posting-sorted.work",
         root / "correlated-frame-posting-sorted.work",
         root / "gfx-entity-id-posting-sorted.work",
         root / "gfx-parent-posting-sorted.work",
         root / "gfx-link-source-posting-sorted.work",
         root / "gfx-link-target-posting-sorted.work",
-        root / "io-request-id-posting-sorted.work" };
+        root / "io-request-id-posting-sorted.work",
+        root / "io-parent-posting-sorted.work" };
     BuildState state;
     state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
     state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
@@ -951,12 +973,13 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.gfxLinkSourcePosting.open( postingSource[4], std::ios::binary | std::ios::trunc );
     state.gfxLinkTargetPosting.open( postingSource[5], std::ios::binary | std::ios::trunc );
     state.ioRequestIdPosting.open( postingSource[6], std::ios::binary | std::ios::trunc );
+    state.ioParentPosting.open( postingSource[7], std::ios::binary | std::ios::trunc );
     if( !state.ioRequest || !state.ioConfig || !state.ioStage || !state.gfxDispatch ||
         !state.gfxEntity || !state.gfxLink || !state.frame ||
         !state.dispatchFramePosting || !state.correlatedFramePosting ||
         !state.gfxEntityIdPosting || !state.gfxParentPosting ||
         !state.gfxLinkSourcePosting || !state.gfxLinkTargetPosting ||
-        !state.ioRequestIdPosting )
+        !state.ioRequestIdPosting || !state.ioParentPosting )
     { error = "session_io_gfx_work_open_failed"; return false; }
     if( !LoadTraceSessionTimeTransform( sessionRoot, session, state.transform, error ) ||
         !VisitTraceSessionCanonicalOrdered( sessionRoot, session, Visit, &state, error ) ) return false;
@@ -966,6 +989,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     state.gfxEntityIdPosting.close(); state.gfxParentPosting.close();
     state.gfxLinkSourcePosting.close(); state.gfxLinkTargetPosting.close();
     state.ioRequestIdPosting.close();
+    state.ioParentPosting.close();
     if( state.stats.ioRequests > std::numeric_limits<uint64_t>::max() - state.stats.ioConfigs ||
         state.stats.ioRequests + state.stats.ioConfigs >
             std::numeric_limits<uint64_t>::max() - state.stats.ioStages )
@@ -995,7 +1019,10 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             "io-request-id-posting", ioRequestIdPostingCount,
             MaximumBufferedPostingPairs, error ) ||
         !CountDistinctPairKeys( postingSorted[6], ioRequestIdPostingCount,
-            state.stats.ioRequestIds, error ) ) return false;
+            state.stats.ioRequestIds, error ) ||
+        !SortTraceSessionUInt64Pairs( postingSource[7], postingSorted[7], root,
+            "io-parent-posting", state.stats.ioParentLinks,
+            MaximumBufferedPostingPairs, error ) ) return false;
 
     FileHeader header;
     header.sourceSize = session.source.fileSize;
@@ -1009,6 +1036,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.gfxParentLinks = state.stats.gfxParentLinks;
     header.ioRequestIdPostingCount = ioRequestIdPostingCount;
     header.ioRequestIds = state.stats.ioRequestIds;
+    header.ioParentLinks = state.stats.ioParentLinks;
     header.generationBytes = uint32_t( session.generation.size() );
     uint64_t next = sizeof( header );
     if( !CheckedAppend( next, 1, 64 + session.generation.size(), error ) ) return false;
@@ -1047,6 +1075,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.ioRequestIdPostingOffset = next;
     if( !CheckedAppend( next, ioRequestIdPostingCount,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioParentPostingOffset = next;
+    if( !CheckedAppend( next, state.stats.ioParentLinks,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
 
     const auto temporary = root / ( std::string( FileName ) + ".tmp" );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -1055,7 +1086,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     if( !session.generation.empty() ) out.write( session.generation.data(),
         std::streamsize( session.generation.size() ) );
-    const std::array<uint64_t, 14> expected = {
+    const std::array<uint64_t, 15> expected = {
         state.stats.ioRequests * sizeof( StoredIoRequest ),
         state.stats.ioConfigs * sizeof( StoredIoConfig ),
         state.stats.ioStages * sizeof( StoredIoStage ),
@@ -1069,7 +1100,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         state.stats.gfxParentLinks * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxLinks * sizeof( TraceSessionUInt64Pair ),
         state.stats.gfxLinks * sizeof( TraceSessionUInt64Pair ),
-        ioRequestIdPostingCount * sizeof( TraceSessionUInt64Pair ) };
+        ioRequestIdPostingCount * sizeof( TraceSessionUInt64Pair ),
+        state.stats.ioParentLinks * sizeof( TraceSessionUInt64Pair ) };
     uint64_t copied = 0;
     for( size_t i = 0; i < work.size(); ++i )
         if( !CopyFile( work[i], out, copied, error ) || copied != expected[i] )
@@ -1127,6 +1159,7 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_gfxLinkTargetPostingOffset = header.gfxLinkTargetPostingOffset;
     reader->m_ioRequestIdPostingOffset = header.ioRequestIdPostingOffset;
     reader->m_ioRequestIdPostingCount = header.ioRequestIdPostingCount;
+    reader->m_ioParentPostingOffset = header.ioParentPostingOffset;
     reader->m_stats = manifest.stats;
     return reader;
 }
@@ -1205,6 +1238,48 @@ std::optional<IoRequestDto> TraceSessionIoGfxReader::IoRequest( uint64_t request
         else throw std::runtime_error( "Session I/O request posting type is invalid" );
     }
     FinalizeIoRequest( result );
+    return result;
+}
+
+std::vector<IoRequestDto> TraceSessionIoGfxReader::IoChildren(
+    uint64_t parentId, size_t offset, size_t limit ) const
+{
+    std::vector<IoRequestDto> result;
+    if( limit == 0 ) return result;
+    std::unordered_set<uint64_t> seen;
+    size_t matched = 0;
+    size_t rawOffset = 0;
+    constexpr size_t Chunk = 1024;
+    while( result.size() < limit )
+    {
+        const auto ordinals = ReadPostingValues( m_path, m_ioParentPostingOffset,
+            m_stats.ioParentLinks, parentId, rawOffset, Chunk );
+        if( ordinals.empty() ) break;
+        rawOffset += ordinals.size();
+        std::ifstream in( m_path, std::ios::binary );
+        if( !in ) throw std::runtime_error( "Session I/O parent index is unavailable" );
+        for( const auto ordinal : ordinals )
+        {
+            if( ordinal >= m_stats.ioConfigs )
+                throw std::runtime_error( "Session I/O parent posting is out of range" );
+            StoredIoConfig config;
+            in.clear(); in.seekg( std::streamoff(
+                m_ioConfigOffset + ordinal * sizeof( config ) ) );
+            if( !in.read( reinterpret_cast<char*>( &config ), sizeof( config ) ) )
+                throw std::runtime_error( "Session I/O parent posting target is truncated" );
+            if( config.parentKind != uint8_t( JnIoParentKind::IoRequest ) ||
+                config.parentId != parentId )
+                throw std::runtime_error( "Session I/O parent posting key mismatch" );
+            if( !seen.emplace( config.requestId ).second ) continue;
+            if( matched++ < offset ) continue;
+            const auto child = IoRequest( config.requestId );
+            if( !child )
+                throw std::runtime_error( "Session I/O parent posting child is unavailable" );
+            result.emplace_back( *child );
+            if( result.size() >= limit ) break;
+        }
+        if( ordinals.size() < Chunk ) break;
+    }
     return result;
 }
 
@@ -1405,7 +1480,14 @@ bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             header.gfxLinkOffset, header.gfxLinks,
             []( const StoredGfxLink& value ) { return value.targetId; },
             "session_gfx_link_target_posting", error ) ||
-        !ValidateIoRequestPosting( path, header, error ) ) return false;
+        !ValidateIoRequestPosting( path, header, error ) ||
+        !ValidateFramePosting<StoredIoConfig>( path,
+            header.ioParentPostingOffset, header.ioParentLinks,
+            header.ioConfigOffset, header.ioConfigs,
+            []( const StoredIoConfig& value ) {
+                return value.parentKind == uint8_t( JnIoParentKind::IoRequest ) ?
+                    value.parentId : uint64_t( 0 ); },
+            "session_io_parent_posting", error ) ) return false;
     stats = manifest.stats;
     return true;
 }

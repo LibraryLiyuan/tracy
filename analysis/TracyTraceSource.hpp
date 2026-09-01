@@ -688,6 +688,8 @@ struct IoRequestDto
     std::vector<IoStageDto> stages;
 };
 
+inline constexpr uint8_t IoRequestParentKindValue = 1;
+
 struct GfxDispatchDto
 {
     std::string ref;
@@ -1081,6 +1083,23 @@ public:
         const auto found = std::find_if( values.begin(), values.end(),
             [requestId]( const auto& value ) { return value.requestId == requestId; } );
         return found == values.end() ? std::nullopt : std::optional<IoRequestDto>( *found );
+    }
+    virtual std::vector<IoRequestDto> GetIoChildren(
+        uint64_t parentId, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto values = GetIoRequests();
+        std::vector<IoRequestDto> result;
+        size_t matched = 0;
+        for( const auto& value : values )
+        {
+            if( value.parentKind != IoRequestParentKindValue ||
+                value.parentId != parentId ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( value );
+            if( result.size() >= limit ) break;
+        }
+        return result;
     }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatchesForFrame(

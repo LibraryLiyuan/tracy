@@ -5064,8 +5064,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             analysis::TraceSourceKind::Session;
         const auto requestCount = source->GetIoRequestCount();
         std::vector<analysis::IoRequestDto> requests;
-        if( !pagedSessionIo || method == "io.search" || method == "io.statistics" ||
-            method == "io.chain" ) requests = source->GetIoRequests();
+        if( !pagedSessionIo || method == "io.search" || method == "io.statistics" )
+            requests = source->GetIoRequests();
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
         const bool present = capability != capabilities.end() && capability->present;
@@ -5124,6 +5124,77 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !request ) throw QueryError( "ENTITY_NOT_FOUND", "I/O request ref was not found" );
             auto result = base();
             result["request"] = IoRequestJson( *source, *request, true );
+            return Success( id, std::move( result ), trace );
+        }
+        if( pagedSessionIo && method == "io.chain" )
+        {
+            const auto rootId = parseIoRef();
+            const auto rootRequest = source->GetIoRequest( rootId );
+            if( !rootRequest )
+                throw QueryError( "ENTITY_NOT_FOUND", "I/O request ref was not found" );
+            const auto maxNodes = size_t( UnsignedParameter(
+                params, "max_nodes", 10000, 100000 ) );
+            std::map<uint64_t, analysis::IoRequestDto> nodes;
+            std::set<std::pair<uint64_t, uint64_t>> edges;
+            std::queue<uint64_t> pending;
+            nodes.emplace( rootId, *rootRequest );
+            pending.push( rootId );
+            if( !BudgetConsumeNode() )
+                throw QueryError( "RESOURCE_LIMIT",
+                    "I/O chain root exceeded the query max_nodes or max_cpu_ms budget" );
+            bool chainTruncated = false;
+            while( !pending.empty() )
+            {
+                checkCancelled();
+                const auto currentId = pending.front();
+                pending.pop();
+                const auto& current = nodes.at( currentId );
+                if( current.parentKind == uint8_t( JnIoParentKind::IoRequest ) &&
+                    current.parentId != 0 )
+                {
+                    const auto parent = source->GetIoRequest( current.parentId );
+                    if( parent )
+                    {
+                        edges.emplace( current.parentId, currentId );
+                        if( !nodes.contains( current.parentId ) )
+                        {
+                            if( !BudgetConsumeNode() || nodes.size() >= maxNodes )
+                            { chainTruncated = true; break; }
+                            nodes.emplace( current.parentId, *parent );
+                            pending.push( current.parentId );
+                        }
+                    }
+                }
+                const auto children = source->GetIoChildren(
+                    currentId, 0, maxNodes + 1 );
+                for( const auto& child : children )
+                {
+                    edges.emplace( currentId, child.requestId );
+                    if( nodes.contains( child.requestId ) ) continue;
+                    if( !BudgetConsumeNode() || nodes.size() >= maxNodes )
+                    { chainTruncated = true; break; }
+                    nodes.emplace( child.requestId, child );
+                    pending.push( child.requestId );
+                }
+                if( chainTruncated ) break;
+            }
+            json nodeJson = json::array();
+            for( const auto& [requestId, request] : nodes )
+                nodeJson.push_back( IoRequestJson( *source, request, false ) );
+            json edgeJson = json::array();
+            for( const auto& [parentId, childId] : edges )
+                if( nodes.contains( parentId ) && nodes.contains( childId ) )
+                    edgeJson.push_back( {
+                        { "source_ref", source->MakeEntityRef( "io-request", parentId ) },
+                        { "target_ref", source->MakeEntityRef( "io-request", childId ) },
+                        { "relation", "parent" }, { "evidence_kind", "exact" }
+                    } );
+            auto result = base();
+            result["root_ref"] = source->MakeEntityRef( "io-request", rootId );
+            result["nodes"] = std::move( nodeJson );
+            result["edges"] = std::move( edgeJson );
+            result["truncated"] = chainTruncated || BudgetPartial();
+            result["evidence_kind"] = "exact";
             return Success( id, std::move( result ), trace );
         }
         const auto findRequest = [&]( uint64_t requestId ) { return std::find_if( requests.begin(), requests.end(), [&]( const auto& value ) { return value.requestId == requestId; } ); };

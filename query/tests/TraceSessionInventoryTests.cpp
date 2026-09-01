@@ -1660,6 +1660,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.jnIoStage = { 120, 400, 4096, 0, uint8_t( tracy::JnIoStage::Complete ),
         uint8_t( tracy::JnIoStatus::Success ), 0 };
     AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoRequest;
+    item.jnIoRequest = { 121, 401, 501, uint8_t( tracy::JnIoOperation::Read ),
+        uint8_t( tracy::JnIoSource::JnfsNative ), 2, 3, uint8_t( tracy::JnIoFlags::Async ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoConfig;
+    item.jnIoConfig = { 401, 400, 1024, 9, uint8_t( tracy::JnIoParentKind::IoRequest ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnIoStage;
+    item.jnIoStage = { 122, 401, 256, 0, uint8_t( tracy::JnIoStage::Start ),
+        uint8_t( tracy::JnIoStatus::Unknown ), 0 };
+    AppendQueueItem( frame, item );
+    item.jnIoStage = { 123, 401, 1024, 0, uint8_t( tracy::JnIoStage::Complete ),
+        uint8_t( tracy::JnIoStatus::Success ), 0 };
+    AppendQueueItem( frame, item );
 
     const std::array<uint64_t, 2> zoneCallstack { 0x40404040, 0x50505050 };
     AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5555,
@@ -2609,7 +2626,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto ioRequests = sessionSource->GetIoRequests();
         const auto ioRequestCount = sessionSource->GetIoRequestCount();
         const auto ioRequest400 = sessionSource->GetIoRequest( 400 );
-        const auto missingIoRequest = sessionSource->GetIoRequest( 401 );
+        const auto childIoRequest = sessionSource->GetIoRequest( 401 );
+        const auto missingIoRequest = sessionSource->GetIoRequest( 402 );
+        const auto ioChildren = sessionSource->GetIoChildren( 400, 0, 8 );
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
@@ -2619,13 +2638,18 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
-        test.Check( ioRequests.size() == 1 && ioRequestCount == 1 && ioRequest400 &&
-            !missingIoRequest && ioRequests[0].requestId == 400 &&
+        test.Check( ioRequests.size() == 2 && ioRequestCount == 2 && ioRequest400 &&
+            childIoRequest && !missingIoRequest && ioRequests[0].requestId == 400 &&
             ioRequest400->requestId == 400 && ioRequest400->stages.size() == 2 &&
             ioRequests[0].requestedBytes == 4096 && ioRequests[0].transferredBytes == 4096 &&
             ioRequests[0].queueNs == 36 && ioRequests[0].startNs == 38 && ioRequests[0].endNs == 40 &&
             !ioRequests[0].orphan && !ioRequests[0].truncated,
             "Session I/O reader reconstructs one complete request without a Worker" );
+        test.Check( ioRequests[1].requestId == 401 && ioRequests[1].parentId == 400 &&
+            ioRequests[1].parentKind == uint8_t( tracy::JnIoParentKind::IoRequest ) &&
+            ioRequests[1].requestedBytes == 1024 && ioRequests[1].transferredBytes == 1024 &&
+            ioChildren.size() == 1 && ioChildren[0].requestId == 401,
+            "Session I/O reader preserves an exact parent-child request lifecycle" );
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
             gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
             gfxEntities[1].entityId == ExplicitGpuPassId &&
@@ -2667,7 +2691,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto sessionDurations = sessionSource->GetFrameDurations( 0 );
     test.Check( sessionFrames.size() == 2 && sessionFrames[0].beginNs == 12 &&
         sessionFrames[0].endNs == 36 && sessionFrames[1].beginNs == 36 &&
-        sessionFrames[1].endNs == 40 && sessionDurations == std::vector<int64_t>( { 24, 4 } ),
+        sessionFrames[1].endNs == 46 && sessionDurations == std::vector<int64_t>( { 24, 10 } ),
         "Session Frame reader applies the Welcome transform and closes the offline tail at last semantic time" );
     const auto sessionFrameImages = sessionSource->GetFrameImageResources();
     const auto sessionFrameImageRaw = sessionSource->ReadFrameImageBc1( 0, 2, 3 );
@@ -2903,7 +2927,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( frames.value( "ok", false ) && frames["data"]["frames"].size() == 2 &&
             frames["data"]["frames"][0]["begin_ns"] == "12" &&
             frames["data"]["frames"][0]["end_ns"] == "36" &&
-            frames["data"]["frames"][1]["duration_ns"] == "4",
+            frames["data"]["frames"][1]["duration_ns"] == "10",
             "Query 1.34 preserves Session Frame timing and pagination semantics" );
         TestSessionPlotQuery( test, query, traceId, *sessionSource );
         TestSessionMessageQuery( test, query, traceId );
@@ -3031,18 +3055,31 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "method", "io.get" }, { "params", { { "trace_id", traceId },
                     { "ref", sessionSource->MakeEntityRef( "io-request", 400 ) } } }
             } );
+            const auto ioChain = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-io-chain" },
+                { "method", "io.chain" }, { "params", { { "trace_id", traceId },
+                    { "ref", sessionSource->MakeEntityRef( "io-request", 401 ) },
+                    { "max_nodes", 8 } } }
+            } );
             test.Check( ioSearch.value( "ok", false ) &&
-                ioSearch["data"]["request_count"] == "1" &&
-                ioSearch["data"]["requests"].size() == 1 &&
+                ioSearch["data"]["request_count"] == "2" &&
+                ioSearch["data"]["requests"].size() == 2 &&
                 ioSearch["data"]["requests"][0]["request_id"] == "400" &&
                 ioSearch["data"]["requests"][0]["requested_bytes"] == "4096" &&
                 ioSearch["data"]["requests"][0]["transferred_bytes"] == "4096",
                 "Query 1.34 reads exact Session I/O evidence without a Worker" );
             test.Check( ioGet.value( "ok", false ) &&
-                ioGet["data"]["request_count"] == "1" &&
+                ioGet["data"]["request_count"] == "2" &&
                 ioGet["data"]["request"]["request_id"] == "400" &&
                 ioGet["data"]["request"]["stages"].size() == 2,
                 "Query 1.34 point-reads one Session I/O request through the exact ID posting" );
+            test.Check( ioChain.value( "ok", false ) &&
+                ioChain["data"]["request_count"] == "2" &&
+                ioChain["data"]["nodes"].size() == 2 &&
+                ioChain["data"]["edges"].size() == 1 &&
+                ioChain["data"]["edges"][0]["relation"] == "parent" &&
+                ioChain["data"]["truncated"] == false,
+                "Query 1.34 walks the Session I/O parent chain through exact ID and child postings" );
         }
         if( sessionGfxReady )
         {
