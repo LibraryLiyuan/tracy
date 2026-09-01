@@ -2740,6 +2740,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto sessionFrameJobs = sessionSource->GetJobsForFrame( 9, 0, 16 );
     const auto sessionHandleJobs = sessionSource->GetJobsForPackedHandle( 0xABC, 0, 16 );
     const auto sessionSlotJobs = sessionSource->GetJobsForHandleSlotNear( 0xABC, 400, 16 );
+    const auto sessionJobLatency = sessionSource->GetJobLatencyStatistics();
     const auto sessionEvidenceJobs = sessionSource->GetEvidenceJobs( 9 );
     test.Check( sessionSource->GetJobCount() == 2 && sessionJobPage.size() == 1 &&
         sessionJobPage[0].jobId == 500 && sessionJobById &&
@@ -2749,8 +2750,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionHandleJobs.size() == 1 && sessionHandleJobs[0].jobId == 500 &&
         sessionSlotJobs.size() == 2 && sessionSlotJobs[0].jobId == 400 &&
         sessionSlotJobs[1].jobId == 500 &&
+        sessionJobLatency && sessionJobLatency->scheduleToReady.count == 1 &&
+        sessionJobLatency->scheduleToReady.total == 4 &&
+        sessionJobLatency->execution.count == 1 && sessionJobLatency->execution.total == 8 &&
         sessionEvidenceJobs.size() == 2,
-        "Session Job reader pages jobs, dependency, Frame, packed-handle and nearby-slot evidence from exact disk postings" );
+        "Session Job reader pages jobs, dependency, Frame, packed-handle and nearby-slot evidence from exact disk postings; latency=" +
+            ( sessionJobLatency ? std::to_string( sessionJobLatency->scheduleToReady.count ) + "/" +
+                std::to_string( sessionJobLatency->scheduleToReady.total ) + ",exec=" +
+                std::to_string( sessionJobLatency->execution.count ) + "/" +
+                std::to_string( sessionJobLatency->execution.total ) : std::string( "missing" ) ) );
     tracy::analysis::TraceSessionJobBuildOptions spillOptions;
     spillOptions.maximumBufferedRecords = 2;
     tracy::analysis::TraceSessionJobStats spilledJobStats;
@@ -3011,10 +3019,13 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             jobStatistics["data"]["counts"]["jobs"] == "2" &&
             jobStatistics["data"]["counts"]["completed"] == "2" &&
             jobStatistics["data"]["latency"]["schedule_to_ready"]["count"] == "1" &&
+            jobStatistics["data"]["latency"]["schedule_to_ready"]["total_ns"] == "4" &&
+            jobStatistics["data"]["latency"]["execution"]["total_ns"] == "8" &&
             jobStatistics["data"]["quality"]["missing_ready_examples"].size() == 1 &&
             jobStatistics["data"]["quality"]["missing_ready_examples"][0]["same_slot_jobs"].size() == 1 &&
             jobStatistics["data"]["quality"]["missing_ready_examples"][0]["same_slot_jobs"][0]["job_id"] == "500",
-            "Query 1.34 computes exact Session Job statistics and bounded handle diagnostics from disk postings" );
+            "Query 1.34 computes exact Session Job statistics and bounded handle diagnostics from disk postings: " +
+                jobStatistics.dump() );
         if( sessionRelationReady )
         {
             const auto relations = query.Execute( {

@@ -4,6 +4,7 @@
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionExternalSort.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionStatistics.hpp"
 #include "TracyProtocol.hpp"
 #include "TracyQueue.hpp"
 #include "../server/TracyJnData.hpp"
@@ -34,10 +35,10 @@ constexpr uint64_t JobManifestMagic = 0x31464d4a534e4aull;
 constexpr const char* JobFileName = "jobs.bin";
 constexpr uint64_t JobPageFileMagic = 0x3147504a534e4aull;
 constexpr uint64_t JobPageManifestMagic = 0x314d504a534e4aull;
-constexpr uint32_t JobPageSchemaVersion = 3;
+constexpr uint32_t JobPageSchemaVersion = 4;
 constexpr const char* JobPageFileName = "job-pages.bin";
 constexpr uint64_t JobPostingFileMagic = 0x3154504a534e4aull;
-constexpr uint32_t JobPostingSchemaVersion = 2;
+constexpr uint32_t JobPostingSchemaVersion = 3;
 constexpr const char* JobPostingFileName = "job-postings.bin";
 
 #pragma pack( push, 1 )
@@ -105,10 +106,22 @@ struct JobPostingFileHeader
     uint64_t frameJobCount = 0;
     uint64_t packedHandleJobCount = 0;
     uint64_t handleSlotJobCount = 0;
+    uint64_t scheduleToReadyCount = 0;
+    uint64_t readyToQueueCount = 0;
+    uint64_t queueToFirstRunCount = 0;
+    uint64_t dependencyReadyCount = 0;
+    uint64_t executionCount = 0;
+    uint64_t waitCount = 0;
     uint64_t reverseDependenciesOffset = 0;
     uint64_t frameJobsOffset = 0;
     uint64_t packedHandleJobsOffset = 0;
     uint64_t handleSlotJobsOffset = 0;
+    uint64_t scheduleToReadyOffset = 0;
+    uint64_t readyToQueueOffset = 0;
+    uint64_t queueToFirstRunOffset = 0;
+    uint64_t dependencyReadyOffset = 0;
+    uint64_t executionOffset = 0;
+    uint64_t waitOffset = 0;
     uint32_t generationBytes = 0;
     uint32_t endian = 0x01020304;
 };
@@ -138,6 +151,12 @@ struct JobPageManifest
     uint64_t frameJobs = 0;
     uint64_t packedHandleJobs = 0;
     uint64_t handleSlotJobs = 0;
+    uint64_t scheduleToReady = 0;
+    uint64_t readyToQueue = 0;
+    uint64_t queueToFirstRun = 0;
+    uint64_t dependencyReady = 0;
+    uint64_t execution = 0;
+    uint64_t wait = 0;
 };
 
 struct RawJobStore
@@ -249,6 +268,12 @@ bool SaveJobPageManifest( const std::filesystem::path& root,
     out << "frame_jobs " << value.frameJobs << '\n';
     out << "packed_handle_jobs " << value.packedHandleJobs << '\n';
     out << "handle_slot_jobs " << value.handleSlotJobs << '\n';
+    out << "schedule_to_ready " << value.scheduleToReady << '\n';
+    out << "ready_to_queue " << value.readyToQueue << '\n';
+    out << "queue_to_first_run " << value.queueToFirstRun << '\n';
+    out << "dependency_ready " << value.dependencyReady << '\n';
+    out << "execution " << value.execution << '\n';
+    out << "wait " << value.wait << '\n';
     out.flush();
     if( !out ) { error = "session_job_page_manifest_write_failed"; return false; }
     out.close();
@@ -278,6 +303,12 @@ bool LoadJobPageManifest( const std::filesystem::path& root,
         else if( key == "frame_jobs" ) in >> value.frameJobs;
         else if( key == "packed_handle_jobs" ) in >> value.packedHandleJobs;
         else if( key == "handle_slot_jobs" ) in >> value.handleSlotJobs;
+        else if( key == "schedule_to_ready" ) in >> value.scheduleToReady;
+        else if( key == "ready_to_queue" ) in >> value.readyToQueue;
+        else if( key == "queue_to_first_run" ) in >> value.queueToFirstRun;
+        else if( key == "dependency_ready" ) in >> value.dependencyReady;
+        else if( key == "execution" ) in >> value.execution;
+        else if( key == "wait" ) in >> value.wait;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_job_page_manifest_parse_failed"; return false; }
     }
@@ -1321,6 +1352,8 @@ bool WriteJobPostingFile( const std::filesystem::path& temporary,
     uint64_t reverseCount, const std::filesystem::path& frames, uint64_t frameCount,
     const std::filesystem::path& handles, uint64_t handleCount,
     const std::filesystem::path& slots, uint64_t slotCount,
+    const std::array<std::filesystem::path, 6>& latencies,
+    const std::array<uint64_t, 6>& latencyCounts,
     std::string& error )
 {
     JobPostingFileHeader header;
@@ -1329,6 +1362,12 @@ bool WriteJobPostingFile( const std::filesystem::path& temporary,
     header.frameJobCount = frameCount;
     header.packedHandleJobCount = handleCount;
     header.handleSlotJobCount = slotCount;
+    header.scheduleToReadyCount = latencyCounts[0];
+    header.readyToQueueCount = latencyCounts[1];
+    header.queueToFirstRunCount = latencyCounts[2];
+    header.dependencyReadyCount = latencyCounts[3];
+    header.executionCount = latencyCounts[4];
+    header.waitCount = latencyCounts[5];
     header.generationBytes = uint32_t( session.generation.size() );
     header.reverseDependenciesOffset = sizeof( header ) + 64 + header.generationBytes;
     header.frameJobsOffset = header.reverseDependenciesOffset +
@@ -1337,6 +1376,18 @@ bool WriteJobPostingFile( const std::filesystem::path& temporary,
         frameCount * sizeof( TraceSessionUInt64Pair );
     header.handleSlotJobsOffset = header.packedHandleJobsOffset +
         handleCount * sizeof( TraceSessionUInt64Pair );
+    header.scheduleToReadyOffset = header.handleSlotJobsOffset +
+        slotCount * sizeof( TraceSessionUInt64Pair );
+    header.readyToQueueOffset = header.scheduleToReadyOffset +
+        latencyCounts[0] * sizeof( TraceSessionUInt64Pair );
+    header.queueToFirstRunOffset = header.readyToQueueOffset +
+        latencyCounts[1] * sizeof( TraceSessionUInt64Pair );
+    header.dependencyReadyOffset = header.queueToFirstRunOffset +
+        latencyCounts[2] * sizeof( TraceSessionUInt64Pair );
+    header.executionOffset = header.dependencyReadyOffset +
+        latencyCounts[3] * sizeof( TraceSessionUInt64Pair );
+    header.waitOffset = header.executionOffset +
+        latencyCounts[4] * sizeof( TraceSessionUInt64Pair );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
     if( !out ) { error = "session_job_posting_file_open_failed"; return false; }
     out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
@@ -1352,6 +1403,10 @@ bool WriteJobPostingFile( const std::filesystem::path& temporary,
         !CopyFileBytes( slots, out, copied, error ) ||
         copied != slotCount * sizeof( TraceSessionUInt64Pair ) )
     { if( error.empty() ) error = "session_job_posting_file_size_mismatch"; return false; }
+    for( size_t i = 0; i < latencies.size(); ++i )
+        if( !CopyFileBytes( latencies[i], out, copied, error ) ||
+            copied != latencyCounts[i] * sizeof( TraceSessionUInt64Pair ) )
+        { if( error.empty() ) error = "session_job_latency_file_size_mismatch"; return false; }
     out.flush();
     if( !out ) { error = "session_job_posting_file_write_failed"; return false; }
     return true;
@@ -1372,6 +1427,114 @@ struct TraceSessionJobReader::PageState
     uint64_t stagesOffset = 0;
     RawJobStore globals;
 };
+
+std::vector<JobDto> LoadPagedJobs( const TraceSessionJobReader::PageState& page,
+    const std::string& fingerprint, const std::vector<uint64_t>& ids );
+
+bool LoadJobPageState( const std::filesystem::path& path,
+    TraceSessionJobReader::PageState& page, std::string& error )
+{
+    page = {};
+    page.path = path;
+    std::ifstream in( path, std::ios::binary );
+    if( !in.read( reinterpret_cast<char*>( &page.header ), sizeof( page.header ) ) )
+    { error = "session_job_page_file_header_truncated"; return false; }
+    in.seekg( 64 + page.header.generationBytes, std::ios::cur );
+    if( !in ) { error = "session_job_page_file_identity_truncated"; return false; }
+    page.globals.types.reserve( size_t( page.header.typeCount ) );
+    for( uint64_t i = 0; i < page.header.typeCount; ++i )
+    {
+        StoredJobType stored;
+        if( !in.read( reinterpret_cast<char*>( &stored ), sizeof( stored ) ) )
+        { error = "session_job_page_type_truncated"; return false; }
+        std::string name( stored.nameBytes, '\0' );
+        if( !name.empty() && !in.read( name.data(), std::streamsize( name.size() ) ) )
+        { error = "session_job_page_type_name_truncated"; return false; }
+        page.globals.types.push_back( { JnJobTypeData { 0, stored.typeId,
+            stored.kind, stored.flags }, std::move( name ) } );
+    }
+    if( !ReadVector( in, page.header.frameCount, page.globals.frames ) ||
+        !ReadVector( in, page.header.callsiteCount, page.globals.callsites ) )
+    { error = "session_job_page_globals_truncated"; return false; }
+    page.jobIdsOffset = uint64_t( in.tellg() );
+    page.schedulesOffset = page.jobIdsOffset + page.header.jobCount * sizeof( uint64_t );
+    page.configsOffset = page.schedulesOffset + page.header.scheduleCount * sizeof( JnJobScheduleData );
+    page.dependenciesOffset = page.configsOffset + page.header.configCount * sizeof( JnJobConfigData );
+    page.stagesOffset = page.dependenciesOffset + page.header.dependencyCount * sizeof( JnJobDependencyData );
+    return true;
+}
+
+bool BuildJobLatencyWork( const TraceSessionJobReader::PageState& page,
+    const std::string& fingerprint, const std::filesystem::path& ids,
+    const std::filesystem::path& root, uint64_t maximumBufferedRecords,
+    std::array<std::filesystem::path, 6>& sorted,
+    std::array<uint64_t, 6>& counts, std::string& error )
+{
+    const std::array<const char*, 6> names = { "schedule-ready", "ready-queue",
+        "queue-run", "dependency-ready", "execution", "wait" };
+    std::array<std::filesystem::path, 6> source;
+    std::array<std::ofstream, 6> out;
+    for( size_t i = 0; i < source.size(); ++i )
+    {
+        source[i] = root / ( std::string( "posting-job-latency-" ) + names[i] + "-source.work" );
+        sorted[i] = root / ( std::string( "posting-job-latency-" ) + names[i] + "-sorted.work" );
+        out[i].open( source[i], std::ios::binary | std::ios::trunc );
+        if( !out[i] ) { error = "session_job_latency_work_open_failed"; return false; }
+    }
+    const auto emit = [&]( size_t index, int64_t value, uint64_t jobId ) {
+        const TraceSessionUInt64Pair pair { uint64_t( value ) ^ ( uint64_t( 1 ) << 63 ), jobId };
+        out[index].write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+        ++counts[index];
+        return bool( out[index] );
+    };
+    std::ifstream idInput( ids, std::ios::binary );
+    if( !idInput ) { error = "session_job_latency_ids_open_failed"; return false; }
+    const auto chunkSize = size_t( std::max<uint64_t>( 1,
+        std::min<uint64_t>( maximumBufferedRecords, 4096 ) ) );
+    std::vector<uint64_t> chunk( chunkSize );
+    uint64_t remaining = page.header.jobCount;
+    while( remaining != 0 )
+    {
+        const auto count = size_t( std::min<uint64_t>( remaining, chunk.size() ) );
+        if( !idInput.read( reinterpret_cast<char*>( chunk.data() ),
+            std::streamsize( count * sizeof( uint64_t ) ) ) )
+        { error = "session_job_latency_ids_truncated"; return false; }
+        std::vector<uint64_t> current( chunk.begin(), chunk.begin() + count );
+        const auto jobs = LoadPagedJobs( page, fingerprint, current );
+        if( jobs.size() != count )
+        { error = "session_job_latency_page_count_mismatch"; return false; }
+        for( const auto& job : jobs )
+        {
+            const bool captureBoundary = job.orphan || job.truncated;
+            if( !captureBoundary && job.readyNs && *job.readyNs >= job.scheduleNs &&
+                !emit( 0, *job.readyNs - job.scheduleNs, job.jobId ) ) return false;
+            if( !captureBoundary && job.readyNs && job.queueEnterNs &&
+                *job.queueEnterNs >= *job.readyNs &&
+                !emit( 1, *job.queueEnterNs - *job.readyNs, job.jobId ) ) return false;
+            if( !captureBoundary && job.queueEnterNs && job.firstRunNs &&
+                *job.firstRunNs >= *job.queueEnterNs &&
+                !emit( 2, *job.firstRunNs - *job.queueEnterNs, job.jobId ) ) return false;
+            if( !captureBoundary && job.dependencyReadyLatencyNs &&
+                !emit( 3, *job.dependencyReadyLatencyNs, job.jobId ) ) return false;
+            if( job.executionNs > 0 && !emit( 4, job.executionNs, job.jobId ) ) return false;
+            if( job.waitNs > 0 && !emit( 5, job.waitNs, job.jobId ) ) return false;
+        }
+        remaining -= count;
+    }
+    for( auto& stream : out ) { stream.flush(); if( !stream ) return false; stream.close(); }
+    for( size_t i = 0; i < source.size(); ++i )
+        if( !SortTraceSessionUInt64Pairs( source[i], sorted[i], root,
+            std::string( "job-latency-" ) + names[i], counts[i],
+            maximumBufferedRecords, error ) ) return false;
+    std::error_code ec;
+    for( const auto& path : source )
+    {
+        ec.clear();
+        if( !std::filesystem::remove( path, ec ) || ec )
+        { error = "session_job_latency_source_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+    }
+    return true;
+}
 
 std::filesystem::path TraceSessionJobIndexRoot( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest )
@@ -1552,12 +1715,19 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
     out.flush();
     if( !out ) { error = "session_job_page_file_write_failed"; return false; }
     out.close(); raw.close();
+    TraceSessionJobReader::PageState temporaryPage;
+    if( !LoadJobPageState( temporary, temporaryPage, error ) ) return false;
+    std::array<std::filesystem::path, 6> latencyPostings;
+    std::array<uint64_t, 6> latencyPostingCounts {};
+    if( !BuildJobLatencyWork( temporaryPage, session.source.sha256, ids, root,
+        options.maximumBufferedRecords, latencyPostings, latencyPostingCounts, error ) ) return false;
     const auto target = root / JobPageFileName;
     const auto postingTarget = root / JobPostingFileName;
     auto postingTemporary = postingTarget; postingTemporary += ".tmp";
     if( !WriteJobPostingFile( postingTemporary, session, reversePostings,
         reversePostingCount, framePostings, framePostingCount,
-        handlePostings, handlePostingCount, slotPostings, slotPostingCount, error ) ) return false;
+        handlePostings, handlePostingCount, slotPostings, slotPostingCount,
+        latencyPostings, latencyPostingCounts, error ) ) return false;
     if( !AtomicReplace( temporary, target, error ) ) return false;
     if( !AtomicReplace( postingTemporary, postingTarget, error ) ) return false;
     JobPageManifest pageManifest;
@@ -1573,6 +1743,12 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
     pageManifest.frameJobs = framePostingCount;
     pageManifest.packedHandleJobs = handlePostingCount;
     pageManifest.handleSlotJobs = slotPostingCount;
+    pageManifest.scheduleToReady = latencyPostingCounts[0];
+    pageManifest.readyToQueue = latencyPostingCounts[1];
+    pageManifest.queueToFirstRun = latencyPostingCounts[2];
+    pageManifest.dependencyReady = latencyPostingCounts[3];
+    pageManifest.execution = latencyPostingCounts[4];
+    pageManifest.wait = latencyPostingCounts[5];
     if( !SaveJobPageManifest( root, pageManifest, error ) ) return false;
     for( const auto& path : sorted )
     {
@@ -1588,6 +1764,12 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         ec.clear();
         if( !std::filesystem::remove( path, ec ) || ec )
         { error = "session_job_posting_sorted_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+    }
+    for( const auto& path : latencyPostings )
+    {
+        ec.clear();
+        if( !std::filesystem::remove( path, ec ) || ec )
+        { error = "session_job_latency_sorted_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
     }
     return true;
 }
@@ -1677,7 +1859,13 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         postingHeader.reverseDependencyCount != manifest.reverseDependencies ||
         postingHeader.frameJobCount != manifest.frameJobs ||
         postingHeader.packedHandleJobCount != manifest.packedHandleJobs ||
-        postingHeader.handleSlotJobCount != manifest.handleSlotJobs )
+        postingHeader.handleSlotJobCount != manifest.handleSlotJobs ||
+        postingHeader.scheduleToReadyCount != manifest.scheduleToReady ||
+        postingHeader.readyToQueueCount != manifest.readyToQueue ||
+        postingHeader.queueToFirstRunCount != manifest.queueToFirstRun ||
+        postingHeader.dependencyReadyCount != manifest.dependencyReady ||
+        postingHeader.executionCount != manifest.execution ||
+        postingHeader.waitCount != manifest.wait )
     { error = "session_job_posting_file_header_invalid"; return false; }
     std::string postingSha( 64, '\0' ), postingGeneration( postingHeader.generationBytes, '\0' );
     if( !postings.read( postingSha.data(), 64 ) ||
@@ -1692,12 +1880,30 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         postingHeader.frameJobCount * sizeof( TraceSessionUInt64Pair );
     const auto expectedSlotOffset = expectedHandleOffset +
         postingHeader.packedHandleJobCount * sizeof( TraceSessionUInt64Pair );
-    const auto expectedPostingBytes = expectedSlotOffset +
+    const auto expectedScheduleReadyOffset = expectedSlotOffset +
         postingHeader.handleSlotJobCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedReadyQueueOffset = expectedScheduleReadyOffset +
+        postingHeader.scheduleToReadyCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedQueueRunOffset = expectedReadyQueueOffset +
+        postingHeader.readyToQueueCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedDependencyReadyOffset = expectedQueueRunOffset +
+        postingHeader.queueToFirstRunCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedExecutionOffset = expectedDependencyReadyOffset +
+        postingHeader.dependencyReadyCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedWaitOffset = expectedExecutionOffset +
+        postingHeader.executionCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedPostingBytes = expectedWaitOffset +
+        postingHeader.waitCount * sizeof( TraceSessionUInt64Pair );
     if( postingHeader.reverseDependenciesOffset != expectedReverseOffset ||
         postingHeader.frameJobsOffset != expectedFrameOffset ||
         postingHeader.packedHandleJobsOffset != expectedHandleOffset ||
         postingHeader.handleSlotJobsOffset != expectedSlotOffset ||
+        postingHeader.scheduleToReadyOffset != expectedScheduleReadyOffset ||
+        postingHeader.readyToQueueOffset != expectedReadyQueueOffset ||
+        postingHeader.queueToFirstRunOffset != expectedQueueRunOffset ||
+        postingHeader.dependencyReadyOffset != expectedDependencyReadyOffset ||
+        postingHeader.executionOffset != expectedExecutionOffset ||
+        postingHeader.waitOffset != expectedWaitOffset ||
         expectedPostingBytes != manifest.postingFileBytes )
     { error = "session_job_posting_file_layout_invalid"; return false; }
     const auto schedulesOffset = globalsEnd +
@@ -1746,6 +1952,50 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         !auditHandleSection( postingHeader.handleSlotJobsOffset,
             postingHeader.handleSlotJobCount, true ) )
     { error = "session_job_handle_posting_invalid"; return false; }
+    const auto jobExists = [&]( uint64_t jobId ) {
+        uint64_t first = 0, last = header.jobCount;
+        const auto idsOffset = globalsEnd + header.frameCount * sizeof( JnFrameData ) +
+            header.callsiteCount * sizeof( StoredCallsite );
+        while( first < last )
+        {
+            const auto middle = first + ( last - first ) / 2;
+            uint64_t value = 0;
+            page.clear(); page.seekg( std::streamoff( idsOffset + middle * sizeof( value ) ) );
+            if( !page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return false;
+            if( value < jobId ) first = middle + 1; else last = middle;
+        }
+        if( first >= header.jobCount ) return false;
+        uint64_t value = 0;
+        page.clear(); page.seekg( std::streamoff( idsOffset + first * sizeof( value ) ) );
+        return bool( page.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) && value == jobId;
+    };
+    const auto auditLatencySection = [&]( uint64_t offset, uint64_t count ) {
+        postings.clear(); postings.seekg( std::streamoff( offset ) );
+        TraceSessionUInt64Pair previous {};
+        bool havePrevious = false;
+        for( uint64_t index = 0; index < count; ++index )
+        {
+            TraceSessionUInt64Pair pair;
+            if( !postings.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) ) return false;
+            if( havePrevious && ( pair.key < previous.key ||
+                ( pair.key == previous.key && pair.value < previous.value ) ) ) return false;
+            if( !jobExists( pair.value ) ) return false;
+            previous = pair; havePrevious = true;
+        }
+        return true;
+    };
+    if( !auditLatencySection( postingHeader.scheduleToReadyOffset,
+            postingHeader.scheduleToReadyCount ) ||
+        !auditLatencySection( postingHeader.readyToQueueOffset,
+            postingHeader.readyToQueueCount ) ||
+        !auditLatencySection( postingHeader.queueToFirstRunOffset,
+            postingHeader.queueToFirstRunCount ) ||
+        !auditLatencySection( postingHeader.dependencyReadyOffset,
+            postingHeader.dependencyReadyCount ) ||
+        !auditLatencySection( postingHeader.executionOffset,
+            postingHeader.executionCount ) ||
+        !auditLatencySection( postingHeader.waitOffset, postingHeader.waitCount ) )
+    { error = "session_job_latency_posting_invalid"; return false; }
     return true;
 }
 
@@ -2075,6 +2325,26 @@ std::vector<JobDto> TraceSessionJobReader::SlotJobsNear(
         m_pageState->postingHeader.handleSlotJobsOffset,
         m_pageState->postingHeader.handleSlotJobCount, slotIndex, jobId, limit );
     return LoadPagedJobs( *m_pageState, m_session.source.sha256, ids );
+}
+
+JobLatencyStatisticsDto TraceSessionJobReader::LatencyStatistics() const
+{
+    if( !m_pageState ) return {};
+    const auto& header = m_pageState->postingHeader;
+    return {
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.scheduleToReadyOffset, header.scheduleToReadyCount ),
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.readyToQueueOffset, header.readyToQueueCount ),
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.queueToFirstRunOffset, header.queueToFirstRunCount ),
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.dependencyReadyOffset, header.dependencyReadyCount ),
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.executionOffset, header.executionCount ),
+        ReadTraceSessionExactStatistics( m_pageState->postingPath,
+            header.waitOffset, header.waitCount )
+    };
 }
 
 }

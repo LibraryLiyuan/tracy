@@ -82,6 +82,7 @@ public:
         uint64_t packedHandle, size_t offset, size_t limit ) const override;
     std::vector<JobDto> GetJobsForHandleSlotNear(
         uint32_t slotIndex, uint64_t jobId, size_t limit ) const override;
+    std::optional<JobLatencyStatisticsDto> GetJobLatencyStatistics() const override;
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     uint64_t GetIoRequestCount() const override;

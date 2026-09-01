@@ -10547,6 +10547,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             std::vector<int64_t> dependencyReady;
             std::vector<int64_t> execution;
             std::vector<int64_t> wait;
+            const auto exactJobLatency = pagedSessionJobs ?
+                source->GetJobLatencyStatistics() : std::nullopt;
             std::map<uint32_t, uint64_t> laneDispatches;
             std::map<uint32_t, uint64_t> laneStealsAsThief;
             std::map<uint32_t, uint64_t> laneStealsAsVictim;
@@ -10700,8 +10702,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 waitEnds += job.waitEndCount;
                 continuations += job.continuationCount;
                 jobsWithoutWaiter += job.waitEndCount == 0 && job.continuationCount == 0;
-                if( job.waitNs > 0 ) { waitJobs++; wait.push_back( job.waitNs ); }
-                if( job.executionNs > 0 ) execution.push_back( job.executionNs );
+                if( job.waitNs > 0 )
+                {
+                    waitJobs++;
+                    if( !exactJobLatency ) wait.push_back( job.waitNs );
+                }
+                if( !exactJobLatency && job.executionNs > 0 ) execution.push_back( job.executionNs );
                 if( job.jobSchemaVersion >= 2 )
                 {
                     v2++;
@@ -10745,22 +10751,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !captureBoundary && job.readyNs )
                 {
                     const auto value = *job.readyNs - job.scheduleNs;
-                    if( value >= 0 ) scheduleToReady.push_back( value );
+                    if( value >= 0 ) { if( !exactJobLatency ) scheduleToReady.push_back( value ); }
                     else { invalidOrder++; invalidScheduleToReady++; recordInvalidOrder( job, "schedule_to_ready", job.scheduleNs, *job.readyNs ); }
                 }
                 if( !captureBoundary && job.readyNs && job.queueEnterNs )
                 {
                     const auto value = *job.queueEnterNs - *job.readyNs;
-                    if( value >= 0 ) readyToQueue.push_back( value );
+                    if( value >= 0 ) { if( !exactJobLatency ) readyToQueue.push_back( value ); }
                     else { invalidOrder++; invalidReadyToQueue++; recordInvalidOrder( job, "ready_to_queue", *job.readyNs, *job.queueEnterNs ); }
                 }
                 if( !captureBoundary && job.queueEnterNs && job.firstRunNs )
                 {
                     const auto value = *job.firstRunNs - *job.queueEnterNs;
-                    if( value >= 0 ) queueToFirstRun.push_back( value );
+                    if( value >= 0 ) { if( !exactJobLatency ) queueToFirstRun.push_back( value ); }
                     else { invalidOrder++; invalidQueueToFirstRun++; recordInvalidOrder( job, "queue_to_first_run", *job.queueEnterNs, *job.firstRunNs ); }
                 }
-                if( !captureBoundary && job.dependencyReadyLatencyNs ) dependencyReady.push_back( *job.dependencyReadyLatencyNs );
+                if( !exactJobLatency && !captureBoundary && job.dependencyReadyLatencyNs )
+                    dependencyReady.push_back( *job.dependencyReadyLatencyNs );
                 for( const auto& stage : job.stages )
                 {
                     if( stage.stage == uint8_t( JnJobStage::Dispatch ) ) laneDispatches[stage.arg0]++;
@@ -10795,12 +10802,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "jobs_without_waiter", Decimal( jobsWithoutWaiter ) }
                 } },
                 { "latency", {
-                    { "schedule_to_ready", StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
-                    { "ready_to_queue", StatisticsJson( analysis::ComputeStatistics( readyToQueue ) ) },
-                    { "queue_to_first_run", StatisticsJson( analysis::ComputeStatistics( queueToFirstRun ) ) },
-                    { "dependency_complete_to_ready", StatisticsJson( analysis::ComputeStatistics( dependencyReady ) ) },
-                    { "execution", StatisticsJson( analysis::ComputeStatistics( execution ) ) },
-                    { "wait", StatisticsJson( analysis::ComputeStatistics( wait ) ) }
+                    { "schedule_to_ready", exactJobLatency ? StatisticsJson( exactJobLatency->scheduleToReady ) :
+                        StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
+                    { "ready_to_queue", exactJobLatency ? StatisticsJson( exactJobLatency->readyToQueue ) :
+                        StatisticsJson( analysis::ComputeStatistics( readyToQueue ) ) },
+                    { "queue_to_first_run", exactJobLatency ? StatisticsJson( exactJobLatency->queueToFirstRun ) :
+                        StatisticsJson( analysis::ComputeStatistics( queueToFirstRun ) ) },
+                    { "dependency_complete_to_ready", exactJobLatency ? StatisticsJson( exactJobLatency->dependencyReady ) :
+                        StatisticsJson( analysis::ComputeStatistics( dependencyReady ) ) },
+                    { "execution", exactJobLatency ? StatisticsJson( exactJobLatency->execution ) :
+                        StatisticsJson( analysis::ComputeStatistics( execution ) ) },
+                    { "wait", exactJobLatency ? StatisticsJson( exactJobLatency->wait ) :
+                        StatisticsJson( analysis::ComputeStatistics( wait ) ) }
                 } },
                 { "lanes", std::move( lanes ) },
                 { "quality", {

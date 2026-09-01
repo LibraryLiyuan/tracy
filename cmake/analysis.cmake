@@ -66,6 +66,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionInventory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionProtocolInventory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStore.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionStatistics.hpp
     ${TRACY_ANALYSIS_DIR}/TracyWorkerTraceSource.hpp
 )
 

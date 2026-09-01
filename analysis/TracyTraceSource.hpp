@@ -711,6 +711,16 @@ struct IoLatencyStatisticsDto
     ExactStatisticsDto total;
 };
 
+struct JobLatencyStatisticsDto
+{
+    ExactStatisticsDto scheduleToReady;
+    ExactStatisticsDto readyToQueue;
+    ExactStatisticsDto queueToFirstRun;
+    ExactStatisticsDto dependencyReady;
+    ExactStatisticsDto execution;
+    ExactStatisticsDto wait;
+};
+
 inline constexpr uint8_t IoRequestParentKindValue = 1;
 
 struct GfxDispatchDto
@@ -1104,6 +1114,10 @@ public:
         } );
         if( jobs.size() > limit ) jobs.resize( limit );
         return jobs;
+    }
+    virtual std::optional<JobLatencyStatisticsDto> GetJobLatencyStatistics() const
+    {
+        return std::nullopt;
     }
     virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
     {

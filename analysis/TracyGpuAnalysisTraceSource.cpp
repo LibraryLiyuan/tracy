@@ -786,6 +786,14 @@ std::vector<JobDto> GpuAnalysisTraceSource::GetJobsForHandleSlotNear(
     return reader ? reader->SlotJobsNear( slotIndex, jobId, limit ) : std::vector<JobDto> {};
 }
 
+std::optional<JobLatencyStatisticsDto> GpuAnalysisTraceSource::GetJobLatencyStatistics() const
+{
+    if( WorkerLoaded() ) return std::nullopt;
+    const auto reader = SessionJobReader();
+    return reader ? std::optional<JobLatencyStatisticsDto>( reader->LatencyStatistics() ) :
+        std::nullopt;
+}
+
 std::vector<JobDto> GpuAnalysisTraceSource::GetEvidenceJobs( uint64_t frameId ) const
 {
     if( WorkerLoaded() ) return TraceSource::GetEvidenceJobs( frameId );

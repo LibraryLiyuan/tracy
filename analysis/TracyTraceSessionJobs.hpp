@@ -51,6 +51,7 @@ public:
     std::vector<JobDto> FrameJobs( uint64_t frameId, size_t offset, size_t limit ) const;
     std::vector<JobDto> HandleJobs( uint64_t packedHandle, size_t offset, size_t limit ) const;
     std::vector<JobDto> SlotJobsNear( uint32_t slotIndex, uint64_t jobId, size_t limit ) const;
+    JobLatencyStatisticsDto LatencyStatistics() const;
     const TraceSessionJobStats& Stats() const { return m_stats; }
 
 private:

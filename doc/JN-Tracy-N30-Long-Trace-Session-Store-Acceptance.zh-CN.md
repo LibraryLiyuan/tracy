@@ -1654,3 +1654,25 @@ Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 本子阶段未启动真实30分钟转换；Job statistics的六组延迟数组仍按独立阶段处理。
+
+### 2026-09-01 Job 精确延迟外排统计（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，真实长Trace墙钟与容量待N30.7集中门禁）**。
+
+- Job page schema从3升级到4，posting schema从2升级到3；新增Schedule→Ready、Ready→Queue、Queue→FirstRun、Dependency Ready、Execution和Wait六类精确延迟序列。
+- Page构建期以最多4096个Job为一页从磁盘复原完整Job语义，每页立即生成固定16字节`(signed latency, JobId)`事实；六类事实分别通过既有有界外部排序器生成immutable序列。
+- Query `job.statistics`仍以1024 Job分页计算状态、质量、lane和诊断计数，但Session路径不再向六个随Job数量增长的`int64_t`数组追加数据。
+- Session Reader直接从排序序列计算count、total、min/max、mean、median、P50/P90/P95/P99、stddev和P90截断均值；公式与Legacy `ComputeStatistics`一致，没有使用近似分位数。
+- I/O与Job共用`ReadTraceSessionExactStatistics`，避免两套精确统计公式漂移；I/O既有数值与测试保持不变。
+- Final Audit验证六类序列的header/count/offset、稳定有序性、Job ID存在性、文件长度和SHA-256；构建期测试另行逐值验证synthetic语义。
+
+Synthetic证据：
+
+```text
+Job 500: Schedule→Ready=4 ns，Dependency Ready=8 ns，Execution=8 ns
+Reader: schedule count=1/total=4；execution count=1/total=8
+Query job.statistics与Reader的count/total一致
+Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
