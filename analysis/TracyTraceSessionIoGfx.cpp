@@ -808,15 +808,14 @@ std::vector<T> ReadFixed( const std::filesystem::path& path, uint64_t offset,
 }
 
 template<typename Stored, typename Dto, typename Decode>
-std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
+std::vector<Dto> ReadFramePostingStreams( std::ifstream& pairs,
+    std::ifstream& records,
     uint64_t postingOffset, uint64_t postingCount, uint64_t frameId,
     size_t offset, size_t limit, uint64_t recordOffset, uint64_t recordCount,
     Decode&& decode )
 {
     std::vector<Dto> result;
     if( postingCount == 0 || limit == 0 ) return result;
-    std::ifstream pairs( path, std::ios::binary );
-    std::ifstream records( path, std::ios::binary );
     if( !pairs || !records )
         throw std::runtime_error( "Session I/O/Gfx Frame posting is unavailable" );
     const auto lowerBound = [&]( bool upper )
@@ -859,6 +858,19 @@ std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
         if( result.size() >= limit ) break;
     }
     return result;
+}
+
+template<typename Stored, typename Dto, typename Decode>
+std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
+    uint64_t postingOffset, uint64_t postingCount, uint64_t frameId,
+    size_t offset, size_t limit, uint64_t recordOffset, uint64_t recordCount,
+    Decode&& decode )
+{
+    std::ifstream pairs( path, std::ios::binary );
+    std::ifstream records( path, std::ios::binary );
+    return ReadFramePostingStreams<Stored, Dto>( pairs, records,
+        postingOffset, postingCount, frameId, offset, limit,
+        recordOffset, recordCount, std::forward<Decode>( decode ) );
 }
 
 uint64_t CountPostingKey( const std::filesystem::path& path,
@@ -2012,15 +2024,28 @@ std::vector<GfxLinkDto> TraceSessionIoGfxReader::ScanGfxLinksFrom(
 }
 
 GfxEvidenceSlice TraceSessionIoGfxReader::EvidenceGfx( uint64_t frameId,
-    const std::vector<uint64_t>& seedIds ) const
+    const std::vector<uint64_t>& seedIds, size_t maxNodes ) const
 {
     GfxEvidenceSlice result;
-    result.dispatches = GfxDispatchesForFrame( frameId, 0,
-        std::numeric_limits<size_t>::max() );
+    if( maxNodes == 0 )
+    {
+        result.truncated = !seedIds.empty() ||
+            !GfxDispatchesForFrame( frameId, 0, 1 ).empty();
+        return result;
+    }
+    const auto edgeBudget = maxNodes > std::numeric_limits<size_t>::max() / 4 ?
+        std::numeric_limits<size_t>::max() : maxNodes * 4;
+    const auto postingLimit = edgeBudget == std::numeric_limits<size_t>::max() ?
+        edgeBudget : edgeBudget + 1;
+    std::ifstream postingStream( m_path, std::ios::binary );
+    std::ifstream recordStream( m_path, std::ios::binary );
+    if( !postingStream || !recordStream )
+        throw std::runtime_error( "Session I/O/Gfx evidence index is unavailable" );
     const auto readEntities = [&]( uint64_t postingOffset, uint64_t postingCount,
-        uint64_t key ) {
-        return ReadFramePosting<StoredGfxEntity, GfxEntityDto>( m_path,
-            postingOffset, postingCount, key, 0, std::numeric_limits<size_t>::max(),
+        uint64_t key, size_t limit ) {
+        return ReadFramePostingStreams<StoredGfxEntity, GfxEntityDto>(
+            postingStream, recordStream,
+            postingOffset, postingCount, key, 0, limit,
             m_gfxEntityOffset, m_stats.gfxEntities,
             [&]( const StoredGfxEntity& value, uint64_t ) {
                 return GfxEntityDto { MakeRef( m_fingerprint, "gfx-entity", value.entityId ),
@@ -2029,9 +2054,10 @@ GfxEvidenceSlice TraceSessionIoGfxReader::EvidenceGfx( uint64_t frameId,
                     value.gpuContext, value.kind, value.flags };
             } );
     };
-    const auto readLinks = [&]( uint64_t postingOffset, uint64_t key ) {
-        return ReadFramePosting<StoredGfxLink, GfxLinkDto>( m_path,
-            postingOffset, m_stats.gfxLinks, key, 0, std::numeric_limits<size_t>::max(),
+    const auto readLinks = [&]( uint64_t postingOffset, uint64_t key, size_t limit ) {
+        return ReadFramePostingStreams<StoredGfxLink, GfxLinkDto>(
+            postingStream, recordStream,
+            postingOffset, m_stats.gfxLinks, key, 0, limit,
             m_gfxLinkOffset, m_stats.gfxLinks,
             [&]( const StoredGfxLink& value, uint64_t ordinal ) {
                 return GfxLinkDto { MakeRef( m_fingerprint, "gfx-link", ordinal ),
@@ -2041,38 +2067,82 @@ GfxEvidenceSlice TraceSessionIoGfxReader::EvidenceGfx( uint64_t frameId,
             } );
     };
 
-    std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
+    std::unordered_set<uint64_t> reachable;
     std::queue<uint64_t> pending;
-    for( const auto seed : seedIds ) pending.push( seed );
-    for( const auto& dispatch : result.dispatches )
-        if( reachable.emplace( dispatch.dispatchId ).second ) pending.push( dispatch.dispatchId );
-    for( const auto& link : readLinks( m_gfxLinkTargetPostingOffset, frameId ) )
-        if( link.relation == uint8_t( JnGfxRelation::BelongsToFrame ) &&
-            reachable.emplace( link.sourceId ).second )
-            pending.push( link.sourceId );
+    const auto admit = [&]( uint64_t value ) {
+        if( value == 0 || reachable.contains( value ) ) return false;
+        if( reachable.size() >= maxNodes ) { result.truncated = true; return false; }
+        reachable.emplace( value );
+        pending.push( value );
+        return true;
+    };
+    for( const auto seed : seedIds ) admit( seed );
+    auto frameDispatches = GfxDispatchesForFrame( frameId, 0, postingLimit );
+    if( frameDispatches.size() > edgeBudget )
+    {
+        frameDispatches.resize( edgeBudget );
+        result.truncated = true;
+    }
+    for( auto& dispatch : frameDispatches )
+        if( admit( dispatch.dispatchId ) || reachable.contains( dispatch.dispatchId ) )
+            result.dispatches.emplace_back( std::move( dispatch ) );
 
     std::map<std::string, GfxLinkDto> selectedLinks;
+    auto frameLinks = readLinks( m_gfxLinkTargetPostingOffset, frameId, postingLimit );
+    if( frameLinks.size() > edgeBudget )
+    {
+        frameLinks.resize( edgeBudget );
+        result.truncated = true;
+    }
+    for( auto& link : frameLinks )
+    {
+        if( link.relation != uint8_t( JnGfxRelation::BelongsToFrame ) ) continue;
+        if( admit( link.sourceId ) || reachable.contains( link.sourceId ) )
+            selectedLinks.try_emplace( link.ref, link );
+    }
+    const auto structuralTarget = []( uint8_t relation ) {
+        return relation <= uint8_t( JnGfxRelation::RecordedOnCommandList ) ||
+            relation == uint8_t( JnGfxRelation::RangeEvidenceComplete );
+    };
     while( !pending.empty() )
     {
         const auto current = pending.front();
         pending.pop();
-        for( const auto& entity : readEntities( m_gfxParentPostingOffset,
-            m_stats.gfxParentLinks, current ) )
-            if( reachable.emplace( entity.entityId ).second ) pending.push( entity.entityId );
-        for( auto& link : readLinks( m_gfxLinkSourcePostingOffset, current ) )
+        auto children = readEntities( m_gfxParentPostingOffset,
+            m_stats.gfxParentLinks, current, postingLimit );
+        if( children.size() > edgeBudget )
         {
+            children.resize( edgeBudget );
+            result.truncated = true;
+        }
+        for( const auto& entity : children ) admit( entity.entityId );
+        auto links = readLinks( m_gfxLinkSourcePostingOffset, current, postingLimit );
+        if( links.size() > edgeBudget )
+        {
+            links.resize( edgeBudget );
+            result.truncated = true;
+        }
+        for( auto& link : links )
+        {
+            if( selectedLinks.size() >= edgeBudget && !selectedLinks.contains( link.ref ) )
+            { result.truncated = true; break; }
             selectedLinks.try_emplace( link.ref, link );
-            if( reachable.emplace( link.targetId ).second ) pending.push( link.targetId );
+            if( structuralTarget( link.relation ) ) admit( link.targetId );
         }
     }
 
     std::map<std::string, GfxEntityDto> selectedEntities;
     for( const auto entityId : reachable )
         for( auto& entity : readEntities( m_gfxEntityIdPostingOffset,
-            m_stats.gfxEntities, entityId ) )
+            m_stats.gfxEntities, entityId, 2 ) )
             selectedEntities.try_emplace( entity.ref, std::move( entity ) );
+    result.nodeIds.assign( reachable.begin(), reachable.end() );
+    std::sort( result.nodeIds.begin(), result.nodeIds.end() );
     for( auto& [ref, entity] : selectedEntities ) result.entities.emplace_back( std::move( entity ) );
-    for( auto& [ref, link] : selectedLinks ) result.links.emplace_back( std::move( link ) );
+    for( auto& [ref, link] : selectedLinks )
+        if( reachable.contains( link.sourceId ) &&
+            ( reachable.contains( link.targetId ) || !structuralTarget( link.relation ) ) )
+            result.links.emplace_back( std::move( link ) );
     std::sort( result.entities.begin(), result.entities.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.entityId < rhs.entityId; } );
     std::sort( result.links.begin(), result.links.end(), []( const auto& lhs, const auto& rhs ) {

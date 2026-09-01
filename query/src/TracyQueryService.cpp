@@ -9732,6 +9732,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool includeHeuristic = readBool( "include_heuristic", false );
         const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, MaximumMaxNodes ) );
         const auto maxEdges = size_t( UnsignedParameter( params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+        const auto maxGfxNodes = std::min( maxNodes, size_t( UnsignedParameter(
+            params, "max_gfx_nodes", 128, MaximumMaxNodes ) ) );
         std::set<std::string> selectedDomains;
         if( params.contains( "domains" ) )
         {
@@ -9750,7 +9752,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             true, { { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
                 { "sequence", uint32_t( frameId ) }, { "event_refs", std::move( frameEventRefs ) } }, true );
 
-        const auto jobs = source->GetEvidenceJobs( frameId );
+        const bool requireJobEvidence = graph.DomainAllowed( "job" ) ||
+            graph.DomainAllowed( "wait" ) || graph.DomainAllowed( "io" );
+        const auto jobs = requireJobEvidence ? source->GetEvidenceJobs( frameId ) :
+            std::vector<analysis::JobDto> {};
         std::unordered_map<uint64_t, const analysis::JobDto*> jobsById;
         for( const auto& job : jobs ) jobsById[job.jobId] = &job;
         std::set<uint64_t> selectedJobIds;
@@ -9891,8 +9896,122 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( graph.DomainAllowed( "script" ) )
         {
             checkCancelled();
-            const auto scriptFrames = source->GetScriptFrames();
-            const auto scriptEvents = source->GetScriptStackEvents();
+            std::vector<analysis::ScriptFrameDto> scriptFrames;
+            std::vector<analysis::ScriptStackEventDto> scriptEvents;
+            if( sessionFramePosting )
+            {
+                // Session evidence is deliberately assembled in bounded pages.
+                // Pass one retains only zones that overlap the requested Frame;
+                // pass two resolves only their marker/stack definitions.  This
+                // avoids materializing a long capture's complete Script domain.
+                std::unordered_map<uint64_t, analysis::ScriptStackEventDto> open;
+                std::set<uint64_t> stackIds;
+                std::set<uint32_t> markerIds;
+                size_t selectedZoneCount = 0;
+                uint64_t omittedZones = 0;
+                constexpr size_t ScriptPage = 4096;
+                for( size_t offset = 0; ; )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( ScriptPage );
+                    if( allowed == 0 ) { graph.truncated = true; break; }
+                    const auto page = source->ScanScriptStackEvents( offset, allowed );
+                    BudgetScanned( page.size(), ScriptPage, allowed );
+                    for( const auto& event : page )
+                    {
+                        if( event.kind == uint8_t( JnScriptRecordKind::ZoneBegin ) )
+                        {
+                            if( event.primaryId != 0 && event.secondaryId != 0 && event.value != 0 )
+                                open[event.primaryId] = event;
+                            continue;
+                        }
+                        if( event.kind != uint8_t( JnScriptRecordKind::ZoneEnd ) ) continue;
+                        const auto begin = open.find( event.primaryId );
+                        if( begin == open.end() ) continue;
+                        if( event.timeNs >= begin->second.timeNs && event.timeNs >= frameBegin &&
+                            begin->second.timeNs <= frameEnd )
+                        {
+                            if( selectedZoneCount < maxNodes )
+                            {
+                                scriptEvents.emplace_back( begin->second );
+                                scriptEvents.emplace_back( event );
+                                stackIds.emplace( begin->second.secondaryId );
+                                markerIds.emplace( begin->second.value );
+                                selectedZoneCount++;
+                            }
+                            else omittedZones++;
+                        }
+                        open.erase( begin );
+                    }
+                    offset += page.size();
+                    if( page.size() < allowed ) break;
+                }
+                for( const auto& [zoneId, begin] : open ) if( begin.timeNs <= frameEnd )
+                {
+                    if( selectedZoneCount < maxNodes )
+                    {
+                        scriptEvents.emplace_back( begin );
+                        stackIds.emplace( begin.secondaryId );
+                        markerIds.emplace( begin.value );
+                        selectedZoneCount++;
+                    }
+                    else omittedZones++;
+                }
+                if( omittedZones != 0 )
+                {
+                    graph.truncated = true;
+                    graph.omittedNodes += omittedZones;
+                }
+
+                std::set<uint32_t> sourceFrameIds;
+                if( !stackIds.empty() || !markerIds.empty() ) for( size_t offset = 0; ; )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( ScriptPage );
+                    if( allowed == 0 ) { graph.truncated = true; break; }
+                    const auto page = source->ScanScriptStackEvents( offset, allowed );
+                    BudgetScanned( page.size(), ScriptPage, allowed );
+                    for( const auto& event : page )
+                    {
+                        const auto kind = JnScriptRecordKind( event.kind );
+                        if( ( kind == JnScriptRecordKind::StackHeader ||
+                              kind == JnScriptRecordKind::StackFrame ) &&
+                            stackIds.contains( event.primaryId ) )
+                        {
+                            scriptEvents.emplace_back( event );
+                            if( kind == JnScriptRecordKind::StackFrame && event.secondaryId != 0 &&
+                                event.secondaryId <= std::numeric_limits<uint32_t>::max() )
+                                sourceFrameIds.emplace( uint32_t( event.secondaryId ) );
+                        }
+                        else if( kind == JnScriptRecordKind::Marker && event.primaryId != 0 &&
+                            event.primaryId <= std::numeric_limits<uint32_t>::max() &&
+                            markerIds.contains( uint32_t( event.primaryId ) ) )
+                        {
+                            scriptEvents.emplace_back( event );
+                            if( event.value != 0 ) sourceFrameIds.emplace( event.value );
+                        }
+                    }
+                    offset += page.size();
+                    if( page.size() < allowed ) break;
+                }
+                if( !sourceFrameIds.empty() ) for( size_t offset = 0; ; )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( ScriptPage );
+                    if( allowed == 0 ) { graph.truncated = true; break; }
+                    const auto page = source->ScanScriptFrames( offset, allowed );
+                    BudgetScanned( page.size(), ScriptPage, allowed );
+                    for( const auto& frame : page )
+                        if( sourceFrameIds.contains( frame.frameId ) ) scriptFrames.emplace_back( frame );
+                    offset += page.size();
+                    if( page.size() < allowed ) break;
+                }
+            }
+            else
+            {
+                scriptFrames = source->GetScriptFrames();
+                scriptEvents = source->GetScriptStackEvents();
+            }
             std::unordered_map<uint32_t, const analysis::ScriptFrameDto*> framesById;
             framesById.reserve( scriptFrames.size() );
             for( const auto& scriptFrame : scriptFrames )
@@ -10028,9 +10147,38 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
 
-        const auto ioRequests = source->GetIoRequests();
-        std::unordered_map<uint64_t, size_t> ioNodes;
+        if( graph.DomainAllowed( "io" ) )
+        {
+        std::vector<analysis::IoRequestDto> ioRequests;
         const auto frameSequence = uint32_t( frameId );
+        if( sessionFramePosting )
+        {
+            constexpr size_t IoPage = 1024;
+            for( size_t offset = 0; ; )
+            {
+                checkCancelled();
+                const auto allowed = BudgetScanAllowance( IoPage );
+                if( allowed == 0 ) { graph.truncated = true; break; }
+                const auto page = source->ScanIoRequests( offset, allowed );
+                BudgetScanned( page.size(), IoPage, allowed );
+                for( const auto& request : page )
+                {
+                    const auto requestBegin = request.orphan && request.startNs ?
+                        *request.startNs : request.queueNs;
+                    const auto requestEnd = request.endNs.value_or( frameEnd );
+                    const bool sequenceMatch = request.originFrameSequence != 0 &&
+                        request.originFrameSequence == frameSequence;
+                    const bool overlaps = requestEnd >= frameBegin && requestBegin <= frameEnd;
+                    if( !sequenceMatch && !overlaps ) continue;
+                    if( ioRequests.size() < maxNodes ) ioRequests.emplace_back( request );
+                    else { graph.truncated = true; graph.omittedNodes++; }
+                }
+                offset += page.size();
+                if( page.size() < allowed ) break;
+            }
+        }
+        else ioRequests = source->GetIoRequests();
+        std::unordered_map<uint64_t, size_t> ioNodes;
         for( const auto& request : ioRequests )
         {
             const auto requestBegin = request.orphan && request.startNs ? *request.startNs : request.queueNs;
@@ -10070,11 +10218,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "IoRequestDto.resourceId" } );
             }
         }
+        }
 
         std::vector<uint64_t> gfxSeeds;
         gfxSeeds.reserve( selectedJobIds.size() );
         for( const auto jobId : selectedJobIds ) gfxSeeds.emplace_back( jobId );
-        const auto gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds );
+        const auto gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds, maxGfxNodes );
+        if( gfxEvidence.truncated ) graph.truncated = true;
         const auto& dispatches = gfxEvidence.dispatches;
         const auto& entities = gfxEvidence.entities;
         const auto& gfxLinks = gfxEvidence.links;
@@ -10203,7 +10353,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     true, false, { { "allocation_id", Decimal( use.allocationId ) }, { "bytes", Decimal( bytes ) },
                         { "usage_mask", use.usageMask }, { "usage_kind", std::string( 1, use.kind ) },
                         { "resource_set_id", use.resourceSetId == 0 ? json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
-                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" } } );
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" :
+                            ( use.encoding == 3 ? "GpuAnalysisDirectSetV1" : "PerUseV1" ) },
+                        { "usage_available", use.encoding != 3 } } );
                 graph.AddEdge( explicitPassNodes[match.pass.entityId], resource, "references_resource", "exact",
                     "gpu_reference_token_allocation_id_v1", 1.0, false,
                     { "ExplicitGpuPass.referenceToken", "GpuMemoryPassUse.allocationId" } );
@@ -10220,13 +10372,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         graph.AddEdge( resource, physical, "backed_by", "exact", "gpu_logical_physical_id_v1", 1.0, false,
                             { "GpuMemoryLogicalResource.physicalAllocationId" } );
                     }
-                    const auto owner = graph.AddNode( "gpu-owner:" + std::to_string( metadata->second->primaryOwnerId ),
-                        source->MakeEntityRef( "gpu-owner", metadata->second->primaryOwnerId ), "gpu_primary_owner", "resource",
-                        "GPU Primary Owner", graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
-                        graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
-                        true, false, { { "taxonomy_id", metadata->second->primaryOwnerId } } );
-                    graph.AddEdge( resource, owner, "owned_by", "exact", "gpu_primary_owner_id_v1", 1.0, false,
-                        { "GpuMemoryLogicalResource.primaryOwnerId" } );
+                    if( metadata->second->primaryOwnerId != 0 )
+                    {
+                        const auto owner = graph.AddNode( "gpu-owner:" + std::to_string( metadata->second->primaryOwnerId ),
+                            source->MakeEntityRef( "gpu-owner", metadata->second->primaryOwnerId ), "gpu_primary_owner", "resource",
+                            "GPU Primary Owner", graph.nodes[explicitPassNodes[match.pass.entityId]].startNs,
+                            graph.nodes[explicitPassNodes[match.pass.entityId]].startNs, {}, {}, std::nullopt, std::nullopt,
+                            true, false, { { "taxonomy_id", metadata->second->primaryOwnerId } } );
+                        graph.AddEdge( resource, owner, "owned_by", "exact", "gpu_primary_owner_id_v1", 1.0, false,
+                            { "GpuMemoryLogicalResource.primaryOwnerId" } );
+                    }
                 }
             }
         }
@@ -10378,8 +10533,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 return value.domain == capabilityDomain;
             } );
             const bool available = capability != capabilities.end() && capability->present;
-            const char* status = count != 0 ? "present" : available ? "not_observed_in_selected_frame" : "unavailable";
-            const std::string reason = count != 0 ? "" : available ?
+            const bool requested = graph.DomainAllowed( domain );
+            const char* status = count != 0 ? "present" : !requested ? "not_requested" :
+                available ? "not_observed_in_selected_frame" : "unavailable";
+            const std::string reason = count != 0 ? "" : !requested ?
+                "domain was excluded by the request" : available ?
                 "capability is available, but no matching evidence was observed in the selected frame and query budget" :
                 capability != capabilities.end() ? capability->reason : "required capability was not declared by the trace source";
             domainCoverage.push_back( {
@@ -10394,6 +10552,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json qualityFindings = json::array();
         if( !frameComplete ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "INCOMPLETE_FRAME" }, { "message", "canonical frame begin/end is incomplete" } } );
         if( graph.truncated || BudgetPartial() ) qualityFindings.push_back( { { "severity", "warning" }, { "code", "EVIDENCE_BUDGET_PARTIAL" }, { "message", "node, edge, scan, or CPU budget truncated the evidence graph" } } );
+        if( gfxEvidence.truncated ) qualityFindings.push_back( { { "severity", "warning" },
+            { "code", "GFX_EVIDENCE_BUDGET_PARTIAL" },
+            { "message", "the exact Gfx subgraph exceeded max_gfx_nodes; use targeted Job/Gfx or GPU resource queries for complete local expansion" },
+            { "max_gfx_nodes", Decimal( maxGfxNodes ) } } );
         if( criticalPath.value( "has_cycle", false ) ) qualityFindings.push_back( { { "severity", "error" }, { "code", "CRITICAL_PATH_CYCLE" }, { "message", "critical-eligible evidence contains a cycle" } } );
         if( !contributionValid ) qualityFindings.push_back( { { "severity", "error" }, { "code", "INVALID_WALL_CLOCK_CONTRIBUTION" }, { "message", "critical path contribution exceeds frame wall time" } } );
         if( !includeHeuristic && graph.evidenceCounts["heuristic"] != 0 ) qualityFindings.push_back( { { "severity", "error" }, { "code", "HEURISTIC_LEAK" }, { "message", "heuristic evidence was emitted while disabled" } } );
@@ -10539,6 +10701,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return Success( id, { { "present", true }, { "identities", std::move( values ) } }, trace, PageJson( page, count, cursor ) );
         }
 
+        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+        const auto maxGfxNodes = std::min( maxNodes, size_t( UnsignedParameter(
+            params, "max_gfx_nodes", 128, 100000 ) ) );
         const bool targetedSlice = sessionCorrelation && method == "timeline.correlated_slice" && targetedFrame;
         const auto jobs = targetedSlice ? source->GetEvidenceJobs( *targetedFrame ) : source->GetJobs();
         analysis::GfxEvidenceSlice targetedGfx;
@@ -10547,7 +10712,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             std::vector<uint64_t> seedIds;
             seedIds.reserve( jobs.size() );
             for( const auto& job : jobs ) seedIds.emplace_back( job.jobId );
-            targetedGfx = source->GetEvidenceGfx( *targetedFrame, seedIds );
+            targetedGfx = source->GetEvidenceGfx( *targetedFrame, seedIds, maxGfxNodes );
         }
         const auto dispatches = targetedSlice ? targetedGfx.dispatches : source->GetGfxDispatches();
         const auto entities = targetedSlice ? targetedGfx.entities : source->GetGfxEntities();
@@ -10650,9 +10815,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::set<std::string> visited { rootRef };
         std::queue<std::string> frontier;
         frontier.push( rootRef );
-        const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
         BudgetConsumeNode();
-        bool truncated = false;
+        bool truncated = targetedGfx.truncated;
         while( !frontier.empty() )
         {
             checkCancelled();

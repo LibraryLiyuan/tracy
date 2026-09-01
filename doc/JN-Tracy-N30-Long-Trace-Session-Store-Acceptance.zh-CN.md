@@ -2253,3 +2253,90 @@ GREEN: Debug CTest 8/8 passed
 ```
 
 A5尚未用真实规模单独注入Cancel并采集Process Private Bytes峰值，因此验收报告不会把这两项伪写为Passed；它们与真实30分钟容量门禁一起留到最终集中验收。A6继续收口剩余全域语义和组合查询，避免再次重复转换G05。
+
+### 2026-09-02 A6 全域语义与跨域Evidence收口
+
+状态：**Passed（Synthetic/短Trace全域差分、Release/G05同源查询与真实Frame GPU证据链均通过）。**
+
+- Session现在保存并查询完整Welcome元数据，包括timer multiplier、resolution、capture/executable time、sampling period、CPU ID/架构、On-demand、manufacturer、program和host。
+- Message index升级为Schema 2，按原顺序保存AppInfo。`trace.app_info`、`trace.identity`、`capture.context`、`capture.coverage`、`trace.telemetry_cost`和`producer.list/get`均从Session磁盘Reader提供。
+- `timeline` capability只有在Frame、CPU/GPU Zone、Scheduling、Plot、Message和Lock Reader全部可用时才声明queryable；`timeline.slice`组合这些有界Reader，不创建Full Worker。
+- 定位并修复合成测试夹具的On-demand语义错误：夹具声明`WelcomeFlag::OnDemand`却没有`OnDemandPayloadMessage`，同时把FrameImage绑定到pre-demand frame 0。生产Builder正确丢弃该图片，测试随后读取不存在的image 0并在Windows异常收尾路径表现为等待。夹具现补齐On-demand payload并将图片绑定到有效frame，全部临时诊断输出已移除；这不是生产死锁。
+- 新增Session专用`GetGpuMemoryEvidence`：按请求Pass读取N29/N30 GPU Derived的Direct成员，批量解析Resource与Allocation，建立Pass→Resource→Physical Allocation，不再调用`GetGpuMemoryAttribution()`或物化完整Worker。
+- Session GPU Derived只证明Direct成员，不保存旧GPU Memory producer的逐Use usage mask和PrimaryOwner。结果明确标记`GpuAnalysisDirectSetV1`和`usage_available=false`；PrimaryOwner缺失时不生成虚假`owned_by`关系。
+- `evidence` capability在Frame correlation及Mandatory Reader齐备后开放。合成全域Session已验证Frame→Job/Gfx→GPU Pass→Resource→Physical Allocation。
+- `evidence.graph`的C#/Lua与I/O路径不再调用`GetScriptFrames/GetScriptStackEvents/GetIoRequests`全量接口。Script通过两次有界分页扫描，仅保留目标Frame重叠Zone及其Marker/Stack/Source Frame；I/O分页重建并仅保留origin frame或时间重叠请求。长录制查询的内存由页大小、目标Frame证据和查询budget共同限制。
+- A6验收请求集已加入AppInfo、Identity、Capture Context/Coverage、Telemetry Cost、Producer和综合Timeline检查。
+
+#### 真实G05查询中发现并修复的四个问题
+
+1. **Lazy Reader错误影响capability**：发布Session已经审计并提交Correlation/Gfx索引，但`GetCapabilities()`曾用lazy reader指针是否已实例化判断能力，导致同一Session在“先查询能力”和“先查询数据”两种顺序下返回不同结果。现改为使用已发布Session统计和Mandatory Reader可用性判断，不为轻量capability查询打开大型Reader。
+2. **Gfx证据遍历无界**：`EvidenceGfx`曾在每个节点执行posting读取，且没有独立结构节点上限。现复用一次打开的posting stream，并增加默认`max_gfx_nodes=128`；达到上限返回Exact子集及`GFX_EVIDENCE_BUDGET_PARTIAL`，不伪装完整。
+3. **外部metadata ID污染结构图**：`BelongsToFrame/ReferencesResources/Taxonomy`等关系目标不是Gfx实体，旧遍历却把它们作为结构节点占满预算，使真正的Pass→Resource关系无法到达。现只有结构关系扩展节点，metadata边仍被保留并用于GPU证据联接。
+4. **GPU Pass/Allocation N+1随机读**：真实Frame逐Pass调用`FindPass`、逐Resource调用`FindAllocation`，同一磁盘页被重复解码，查询耗时`103.78 s`且在图预算耗尽前没有资源节点。Store新增批量`FindPasses/FindAllocations`，每个相关页只加载一次。Allocation记录缺失只影响大小补全并显式标记source incomplete，不再隐藏已经证明的Resource→Allocation ID。
+
+#### Release/G05门禁结果
+
+固定Session：
+
+```text
+source fingerprint: 660AB0207F4F5B18D9B808CD07BC3E8BB1C9EC3104A08E678DBEEA6F97EB0976
+Session generation: n30-1788301548050182-64420
+Release tracy-query SHA-256: A67D59D2745EEEEC4964A1A0CD0C75DA348DAEF682F52FA61F3F3B1A3563C7FD
+```
+
+24项同源Release查询矩阵：
+
+```text
+requests=24
+ok=24
+failed=0
+wall=7.768 s
+```
+
+真实首帧`281474976710657`的GPU/Gfx/Resource过滤证据图：
+
+```text
+warm wall time                 3.748 s
+query CPU budget consumed      3.188 s
+nodes                            868
+edges                          2,343
+GPU Pass                         128
+GPU Logical Resource             291
+GPU Physical Allocation          283
+GPU Zone                         165
+references_resource            1,399
+backed_by                        283
+scan events                    2,925
+```
+
+该请求按设计命中`max_gfx_nodes=128`，返回`EVIDENCE_BUDGET_PARTIAL`和`GFX_EVIDENCE_BUDGET_PARTIAL`；节点、边和资源事实均为Exact子集。完整局部展开使用定向Job/Gfx/GPU Resource API。全域默认请求在`max_nodes=2000`时会由真实帧内大量Job先耗尽全局节点预算，结果明确`partial/max_nodes`，不会把未返回GPU域标记为完整。带`domains`过滤的结果现在对排除域返回`not_requested`，不再错误显示为`not_observed`或`unavailable`。
+
+全局高基数Job/Gfx分析在不足的exact预算下已验证为快速拒绝：
+
+```text
+job.critical_path(max_scan_events=1000)
+→ RESOURCE_LIMIT，要求指定root Job或提高exact scan预算
+
+job.gfx.statistics(max_scan_events=1000)
+→ RESOURCE_LIMIT，不进入无界全量扫描
+
+两项批处理总墙钟：1.569 s
+```
+
+TDD与回归证据：
+
+```text
+RED-1: Session evidence.graph -> CAPABILITY_UNAVAILABLE
+RED-2: 开放evidence capability后，GPU Pass只触发legacy Worker fallback，
+       无gpu_logical_resource/gpu_physical_allocation节点
+GREEN: Session专用GPU Derived evidence Reader返回Exact Direct成员与Physical Allocation
+GREEN: Synthetic Gfx夹具补齐ExplicitPass BelongsToFrame事实，跨域关系可达
+GREEN: Script和I/O改为有界分页，查询结果保持一致
+GREEN: 真实G05 GPU证据查询由103.78秒降至3.748秒，并恢复Resource/Physical节点
+GREEN: G05 Release 24/24同源查询通过
+GREEN: tracy-trace-session-inventory-tests Passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 8.94 sec
+```
+
+本阶段没有启动真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。A6通过后提交阶段改动；A7只对固定真实30分钟stream执行一次最终全域转换与审计，避免重复消耗。

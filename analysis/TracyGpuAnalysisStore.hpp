@@ -391,7 +391,11 @@ public:
     std::optional<GpuResourceAnalysisRecord> FindResource( uint64_t resourceId, std::string& error ) const;
     bool FindResources( std::vector<uint64_t> resourceIds, std::vector<GpuResourceAnalysisRecord>& out, std::string& error ) const;
     std::optional<GpuAllocationAnalysisRecord> FindAllocation( uint64_t allocationId, std::string& error ) const;
+    bool FindAllocations( std::vector<uint64_t> allocationIds,
+        std::vector<GpuAllocationAnalysisRecord>& out, std::string& error ) const;
     std::optional<GpuPassWorkingSet> FindPass( uint64_t passId, std::string& error ) const;
+    bool FindPasses( std::vector<uint64_t> passIds,
+        std::vector<GpuPassWorkingSet>& out, std::string& error ) const;
     std::optional<GpuAnalysisPassSummary> FindPassSummary( uint64_t passId, std::string& error ) const;
     std::optional<GpuAnalysisStablePassSummary> FindStablePassSummary(
         uint64_t frameId, uint32_t taxonomyId, std::string& error ) const;
@@ -407,7 +411,6 @@ public:
 
 private:
     struct InclusiveCache;
-    bool LoadPassesByIds( std::vector<uint64_t> ids, std::vector<GpuPassWorkingSet>& out, std::string& error ) const;
     std::filesystem::path m_root;
     GpuAnalysisCacheIdentity m_identity;
     GpuAnalysisStoreManifest m_manifest;

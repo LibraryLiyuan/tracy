@@ -45,6 +45,9 @@ struct MessageFileHeader
     uint64_t literalsOffset = 0;
     uint64_t stringsOffset = 0;
     uint64_t stringBytes = 0;
+    uint64_t appInfoRecordsOffset = 0;
+    uint64_t appInfoStringsOffset = 0;
+    uint64_t appInfoStringBytes = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
 };
@@ -70,6 +73,13 @@ struct StoredLiteral
     uint32_t textBytes = 0;
     uint32_t reserved = 0;
 };
+
+struct StoredAppInfo
+{
+    uint64_t textOffset = 0;
+    uint32_t textBytes = 0;
+    uint32_t reserved = 0;
+};
 #pragma pack( pop )
 
 struct MessageManifest
@@ -89,6 +99,7 @@ struct BuildState
     std::optional<std::string> pendingSingleString;
     std::unordered_map<uint64_t, std::string> literalStrings;
     std::unordered_set<uint64_t> referencedLiteralPointers;
+    std::vector<std::string> appInfo;
     std::unordered_map<std::string, uint32_t> callstackIds;
     std::vector<std::vector<uint64_t>> callstacks { {} };
     std::unordered_map<std::string, uint64_t> managedFrameIds;
@@ -414,6 +425,8 @@ bool VisitMessageRecord( const TraceSessionCanonicalRecord& record,
     {
         if( !state.pendingSingleString )
         { error = "session_message_app_info_string_missing"; return false; }
+        state.stats.appInfoBytes += state.pendingSingleString->size();
+        state.appInfo.emplace_back( std::move( *state.pendingSingleString ) );
         state.pendingSingleString.reset();
         ++state.stats.appInfoEvents;
         return true;
@@ -453,7 +466,8 @@ bool SaveManifest( const std::filesystem::path& root,
         << std::quoted( value.sourceSha256 ) << '\n' << value.sourceSize << '\n'
         << std::quoted( value.generation ) << '\n' << value.fileBytes << '\n'
         << std::quoted( value.fileSha256 ) << '\n' << value.stats.messages << ' '
-        << value.stats.appInfoEvents << ' ' << value.stats.literalStrings;
+        << value.stats.appInfoEvents << ' ' << value.stats.appInfoBytes << ' '
+        << value.stats.literalStrings;
     for( const auto count : value.stats.eventCounts ) out << ' ' << count;
     out << '\n';
     out.flush();
@@ -470,7 +484,8 @@ bool LoadManifest( const std::filesystem::path& root,
     if( !( in >> std::hex >> magic >> std::dec >> schema >> std::quoted( value.sourceSha256 )
         >> value.sourceSize >> std::quoted( value.generation ) >> value.fileBytes
         >> std::quoted( value.fileSha256 ) >> value.stats.messages
-        >> value.stats.appInfoEvents >> value.stats.literalStrings ) )
+        >> value.stats.appInfoEvents >> value.stats.appInfoBytes
+        >> value.stats.literalStrings ) )
     { error = "session_message_manifest_parse_failed"; return false; }
     for( auto& count : value.stats.eventCounts ) if( !( in >> count ) )
     { error = "session_message_manifest_parse_failed"; return false; }
@@ -508,7 +523,7 @@ std::filesystem::path TraceSessionMessageIndexRoot(
     const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "message-index" / "1" / "exact";
+        "message-index" / "2" / "exact";
 }
 
 bool BuildTraceSessionMessageDerived( const std::filesystem::path& sessionRoot,
@@ -551,6 +566,19 @@ bool BuildTraceSessionMessageDerived( const std::filesystem::path& sessionRoot,
         literalStringOffset += text.size();
     }
     state.stats.literalStrings = storedLiterals.size();
+    std::vector<StoredAppInfo> storedAppInfo;
+    storedAppInfo.reserve( state.appInfo.size() );
+    uint64_t appInfoStringOffset = 0;
+    for( const auto& text : state.appInfo )
+    {
+        if( text.size() > std::numeric_limits<uint32_t>::max() )
+        { error = "session_message_app_info_too_large"; return false; }
+        storedAppInfo.push_back( { appInfoStringOffset, uint32_t( text.size() ), 0 } );
+        appInfoStringOffset += text.size();
+    }
+    if( storedAppInfo.size() != state.stats.appInfoEvents ||
+        appInfoStringOffset != state.stats.appInfoBytes )
+    { error = "session_message_app_info_count_mismatch"; return false; }
 
     MessageFileHeader header;
     header.sourceSize = session.source.fileSize;
@@ -565,6 +593,10 @@ bool BuildTraceSessionMessageDerived( const std::filesystem::path& sessionRoot,
     header.stringsOffset = header.literalsOffset +
         storedLiterals.size() * sizeof( StoredLiteral );
     header.stringBytes = literalStringOffset;
+    header.appInfoRecordsOffset = header.stringsOffset + header.stringBytes;
+    header.appInfoStringsOffset = header.appInfoRecordsOffset +
+        storedAppInfo.size() * sizeof( StoredAppInfo );
+    header.appInfoStringBytes = appInfoStringOffset;
 
     const auto temporary = root / "messages.bin.tmp";
     const auto target = root / MessageFileName;
@@ -579,6 +611,11 @@ bool BuildTraceSessionMessageDerived( const std::filesystem::path& sessionRoot,
         std::streamsize( storedLiterals.size() * sizeof( StoredLiteral ) ) );
     if( !CopyFile( state.stringWorkPath, out, error ) ) return false;
     for( const auto& [pointer, text] : literals )
+        out.write( text.data(), std::streamsize( text.size() ) );
+    if( !storedAppInfo.empty() ) out.write(
+        reinterpret_cast<const char*>( storedAppInfo.data() ),
+        std::streamsize( storedAppInfo.size() * sizeof( StoredAppInfo ) ) );
+    for( const auto& text : state.appInfo )
         out.write( text.data(), std::streamsize( text.size() ) );
     out.flush();
     if( !out ) { error = "session_message_file_write_failed"; return false; }
@@ -649,7 +686,12 @@ std::shared_ptr<TraceSessionMessageReader> TraceSessionMessageReader::Open(
         header.stringsOffset != header.literalsOffset +
             stats.literalStrings * sizeof( StoredLiteral ) ||
         header.stringsOffset > stats.fileBytes ||
-        header.stringBytes != stats.fileBytes - header.stringsOffset )
+        header.appInfoRecordsOffset != header.stringsOffset + header.stringBytes ||
+        header.appInfoStringsOffset != header.appInfoRecordsOffset +
+            header.appInfoEvents * sizeof( StoredAppInfo ) ||
+        header.appInfoStringBytes != stats.appInfoBytes ||
+        header.appInfoStringsOffset > stats.fileBytes ||
+        header.appInfoStringBytes != stats.fileBytes - header.appInfoStringsOffset )
     { error = "session_message_file_identity_or_bounds_invalid"; return {}; }
     in.seekg( std::streamoff( header.literalsOffset ) );
     auto impl = std::make_shared<Impl>();
@@ -666,9 +708,28 @@ std::shared_ptr<TraceSessionMessageReader> TraceSessionMessageReader::Open(
             !impl->literals.emplace( value.pointer, value ).second )
         { error = "session_message_literal_record_invalid"; return {}; }
     }
+    in.seekg( std::streamoff( header.appInfoRecordsOffset ) );
+    std::vector<StoredAppInfo> appInfoRecords( size_t( header.appInfoEvents ) );
+    for( auto& value : appInfoRecords )
+    {
+        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ||
+            value.reserved != 0 || value.textOffset > header.appInfoStringBytes ||
+            value.textBytes > header.appInfoStringBytes - value.textOffset )
+        { error = "session_message_app_info_record_invalid"; return {}; }
+    }
     auto reader = std::shared_ptr<TraceSessionMessageReader>(
         new TraceSessionMessageReader( impl ) );
     reader->m_stats = stats;
+    reader->m_appInfo.reserve( appInfoRecords.size() );
+    for( const auto& value : appInfoRecords )
+    {
+        std::string text( value.textBytes, '\0' );
+        in.seekg( std::streamoff( header.appInfoStringsOffset + value.textOffset ) );
+        if( value.textBytes != 0 &&
+            !in.read( text.data(), std::streamsize( value.textBytes ) ) )
+        { error = "session_message_app_info_text_invalid"; return {}; }
+        reader->m_appInfo.emplace_back( std::move( text ) );
+    }
     return reader;
 }
 

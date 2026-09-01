@@ -21,6 +21,16 @@ struct TraceSessionTimeTransform
     double timerMultiplier = 0;
     int64_t baseTime = 0;
     uint64_t processId = 0;
+    int64_t resolutionNs = 0;
+    uint64_t captureTime = 0;
+    uint64_t executableTime = 0;
+    int64_t samplingPeriodNs = 0;
+    uint32_t cpuId = 0;
+    uint8_t cpuArchitecture = 0;
+    bool onDemand = false;
+    std::string cpuManufacturer;
+    std::string captureProgram;
+    std::string hostInfo;
     bool present = false;
 
     int64_t ToNanoseconds( int64_t value ) const;

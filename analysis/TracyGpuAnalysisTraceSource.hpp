@@ -112,7 +112,8 @@ public:
     std::vector<GfxLinkDto> ScanGfxLinksFrom(
         uint64_t sourceId, size_t offset, size_t limit ) const override;
     GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
-        const std::vector<uint64_t>& seedIds ) const override;
+        const std::vector<uint64_t>& seedIds,
+        size_t maxNodes = std::numeric_limits<size_t>::max() ) const override;
     GfxEvidenceSlice GetGfxChain( uint64_t rootId, size_t maxNodes ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     uint64_t GetCorrelatedFrameEventCountForFrame( uint64_t frameId ) const override;
@@ -174,6 +175,8 @@ public:
     std::string MakeEntityRef( std::string_view kind, uint64_t id ) const override;
     std::optional<uint64_t> ParseEntityRef( std::string_view ref, std::string_view kind ) const override;
     GpuMemoryAttribution GetGpuMemoryAttribution() const override;
+    GpuMemoryEvidenceSlice GetGpuMemoryEvidence(
+        const std::vector<uint64_t>& passIds, size_t maxUses ) const override;
     SourceTextDto ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const override;
     BinaryResourceChunkDto ReadEmbeddedSourceBytes( size_t sourceId, size_t offset, size_t maxBytes ) const override;
     SymbolCodeDto ReadSymbolCode( uint64_t symbolId, size_t maxBytes ) const override;

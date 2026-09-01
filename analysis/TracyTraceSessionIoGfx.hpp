@@ -58,7 +58,7 @@ public:
     std::vector<GfxLinkDto> ScanGfxLinksFrom(
         uint64_t sourceId, size_t offset, size_t limit ) const;
     GfxEvidenceSlice EvidenceGfx( uint64_t frameId,
-        const std::vector<uint64_t>& seedIds ) const;
+        const std::vector<uint64_t>& seedIds, size_t maxNodes ) const;
     GfxEvidenceSlice GfxChain( uint64_t rootId, size_t maxNodes ) const;
     std::vector<CorrelatedFrameEventDto> CorrelatedFrames() const;
     uint64_t CorrelatedFrameCountForFrame( uint64_t frameId ) const;

@@ -1,6 +1,7 @@
 #include "TracyGpuAnalysisTraceSource.hpp"
 #include "TracyGpuAnalysisPath.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyProtocol.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -11,6 +12,24 @@
 
 namespace tracy::analysis
 {
+
+namespace
+{
+
+const char* SessionCpuArchitectureName( uint8_t value )
+{
+    switch( CpuArchitecture( value ) )
+    {
+    case CpuArchX86: return "x86";
+    case CpuArchX64: return "x86_64";
+    case CpuArchArm32: return "arm";
+    case CpuArchArm64: return "aarch64";
+    case CpuArchUnknown: break;
+    }
+    return "unknown";
+}
+
+}
 
 std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenIfReady(
     const std::filesystem::path& path, WorkerTraceSource::StateCallback stateCallback )
@@ -253,12 +272,24 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     std::vector<Capability> result = {
         Capability { "system", true, true, true, "Session metadata is queryable without a Worker",
             { "system.capabilities", "system.describe", "system.schema" } },
-        Capability { "trace", true, true, true, "Session identity and exact aggregate counts are queryable without a Worker",
-            { "trace.info", "trace.counts", "trace.overview" } },
+        Capability { "trace", true, true, true, "Session identity, AppInfo, and exact aggregate counts are queryable without a Worker",
+            { "trace.info", "trace.counts", "trace.overview", "trace.app_info", "trace.identity" } },
         gpuCapability( "gpu.catalog" ), gpuCapability( "gpu.resource" ),
         gpuCapability( "gpu.memory" ), gpuCapability( "gpu.pass" )
     };
     if( !m_sessionMode ) return result;
+
+    const auto capturePresent = m_messageReader && std::any_of(
+        m_messageReader->AppInfo().begin(), m_messageReader->AppInfo().end(),
+        []( const auto& record ) {
+            return record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" );
+        } );
+    result.push_back( Capability { "capture", capturePresent, capturePresent,
+        bool( m_messageReader ), capturePresent ?
+            "Capture Context and Producer Quality are available from ordered Session AppInfo" :
+            "The source Session contains no JN Capture Context or Producer Quality AppInfo",
+        { "capture.context", "capture.coverage", "trace.telemetry_cost",
+            "producer.list", "producer.get" } } );
 
     static const std::vector<std::string> FrameMethods = {
         "frame.sets", "frame.list", "frame.get", "frame.statistics",
@@ -316,7 +347,11 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     static const std::vector<std::string> CorrelationMethods = {
         "frame.identity", "timeline.correlated_slice"
     };
-    const auto correlationPresent = m_ioGfxReader && m_sessionStats.correlatedFrames != 0;
+    // A published Session has already audited every mandatory derived index.
+    // Reader instances remain lazy so a lightweight capability query does not
+    // hash/open the potentially very large I/O/Gfx store.  Whether the reader
+    // has already been materialized must therefore never change capability.
+    const auto correlationPresent = m_sessionStats.correlatedFrames != 0;
     result.push_back( Capability { "correlation", correlationPresent,
         correlationPresent, true,
         correlationPresent ?
@@ -459,9 +494,23 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         m_sessionStats.domains[size_t( TraceSessionProtocolDomain::GpuZone )] +
         m_sessionStats.domains[size_t( TraceSessionProtocolDomain::Scheduling )] +
         m_sessionStats.domains[size_t( TraceSessionProtocolDomain::MessagePlotLock )];
-    result.push_back( Capability { "timeline", timelineCount != 0, false, timelineCount != 0,
-        timelineCount != 0 ? "Canonical timeline facts are present and indexed, but the disk-backed semantic reader is not implemented yet" :
-            "The source Session contains no Canonical timeline facts", {} } );
+    const bool timelineReady = m_frameReader && m_cpuZoneReader && m_gpuZoneReader &&
+        m_schedulingReader && m_plotReader && m_messageReader && m_lockReader;
+    result.push_back( Capability { "timeline", timelineCount != 0,
+        timelineCount != 0 && timelineReady, timelineReady,
+        timelineCount != 0 ? ( timelineReady ?
+            "available by bounded composition of the mandatory per-domain Session indexes" :
+            "Canonical timeline facts are present, but one mandatory track reader is unavailable" ) :
+            "The source Session contains no Canonical timeline facts", { "timeline.slice" } } );
+    const bool evidenceReady = correlationPresent && m_sessionManifest.has_value() &&
+        m_reader && m_cpuZoneReader && m_gpuZoneReader;
+    result.push_back( Capability { "evidence", correlationPresent,
+        evidenceReady, evidenceReady,
+        correlationPresent ? ( evidenceReady ?
+            "available by bounded cross-domain composition of mandatory Session indexes" :
+            "Correlated Frame facts are present, but a mandatory evidence reader is unavailable" ) :
+            "The source Session contains no correlated Frame identity facts",
+        { "evidence.graph", "frame.critical_path", "frame.explain" } } );
     return result;
 }
 
@@ -477,6 +526,29 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
     if( WorkerLoaded() ) return Worker().GetTraceInfo();
     TraceInfoDto out; out.fingerprint = m_manifest.identity.sha256;
     out.captureName = m_path.filename().string();
+    if( m_messageReader ) out.appInfo = m_messageReader->AppInfo();
+    if( m_sessionManifest )
+    {
+        TraceSessionTimeTransform transform;
+        std::string error;
+        if( LoadTraceSessionTimeTransform( GpuAnalysisIoPath( m_path ),
+            *m_sessionManifest, transform, error ) && transform.present )
+        {
+            out.timerMultiplier = transform.timerMultiplier;
+            out.processId = transform.processId;
+            out.resolution = transform.resolutionNs;
+            out.captureTime = transform.captureTime;
+            out.executableTime = transform.executableTime;
+            out.samplingPeriodNs = transform.samplingPeriodNs;
+            out.onDemand = transform.onDemand;
+            out.cpuId = transform.cpuId;
+            out.cpuManufacturer = transform.cpuManufacturer;
+            out.cpuArchitecture = SessionCpuArchitectureName(
+                transform.cpuArchitecture );
+            out.captureProgram = transform.captureProgram;
+            out.hostInfo = transform.hostInfo;
+        }
+    }
     out.counts.gpuReferencePasses = m_manifest.summary.passCount;
     out.counts.gpuReferenceUses = m_manifest.summary.referenceUseCount;
     if( m_frameReader )
@@ -985,11 +1057,11 @@ std::vector<GfxLinkDto> GpuAnalysisTraceSource::ScanGfxLinksFrom(
         std::vector<GfxLinkDto> {};
 }
 GfxEvidenceSlice GpuAnalysisTraceSource::GetEvidenceGfx( uint64_t frameId,
-    const std::vector<uint64_t>& seedIds ) const
+    const std::vector<uint64_t>& seedIds, size_t maxNodes ) const
 {
-    if( WorkerLoaded() ) return TraceSource::GetEvidenceGfx( frameId, seedIds );
+    if( WorkerLoaded() ) return TraceSource::GetEvidenceGfx( frameId, seedIds, maxNodes );
     const auto reader = SessionIoGfxReader();
-    return reader ? reader->EvidenceGfx( frameId, seedIds ) : GfxEvidenceSlice {};
+    return reader ? reader->EvidenceGfx( frameId, seedIds, maxNodes ) : GfxEvidenceSlice {};
 }
 GfxEvidenceSlice GpuAnalysisTraceSource::GetGfxChain( uint64_t rootId,
     size_t maxNodes ) const
@@ -1357,6 +1429,157 @@ std::optional<std::string> GpuAnalysisTraceSource::GetGpuZoneRef( uint64_t inter
         std::optional<std::string>( MakeEntityRef( "gpu-zone", internalZoneIndex ) ) : std::nullopt;
 }
 D0(GpuMemoryAttribution, GetGpuMemoryAttribution)
+GpuMemoryEvidenceSlice GpuAnalysisTraceSource::GetGpuMemoryEvidence(
+    const std::vector<uint64_t>& passIds, size_t maxUses ) const
+{
+    if( WorkerLoaded() ) return Worker().GetGpuMemoryEvidence( passIds, maxUses );
+
+    GpuMemoryEvidenceSlice result;
+    if( !m_reader ) return result;
+
+    const auto& store = m_reader->Manifest();
+    const auto& overview = m_reader->Overview();
+    result.protocolPresent = store.passCount != 0 || store.resourceCount != 0 ||
+        overview.manifest.state != GpuAnalysisState::NotPresent;
+    result.complete = store.complete && overview.manifest.complete &&
+        store.sourceGapResourceCount == 0 && store.sourceGapReferenceCount == 0;
+    if( !store.reason.empty() ) result.warnings.emplace_back( store.reason );
+    if( store.sourceGapResourceCount != 0 )
+        result.warnings.emplace_back( "gpu_catalog_source_resource_gap" );
+    if( store.sourceGapReferenceCount != 0 )
+        result.warnings.emplace_back( "gpu_catalog_source_reference_gap" );
+
+    std::vector<uint64_t> resourceIds;
+    size_t keptUses = 0;
+    std::vector<GpuPassWorkingSet> storedPasses;
+    std::string error;
+    if( !m_reader->FindPasses( passIds, storedPasses, error ) )
+    {
+        result.complete = false;
+        result.warnings.emplace_back( "gpu_analysis_pass_read_failed:" + error );
+        return result;
+    }
+    for( const auto& stored : storedPasses )
+    {
+
+        GpuMemoryPass pass;
+        pass.passId = stored.passId;
+        pass.frame = stored.frameId;
+        pass.commandListId = stored.commandListId;
+        pass.parentPassId = stored.parentPassId;
+        pass.start = stored.startNs;
+        pass.end = stored.endNs;
+        pass.totalUseCount = uint32_t( std::min<uint64_t>(
+            stored.directResources.size(), std::numeric_limits<uint32_t>::max() ) );
+        pass.complete = stored.complete;
+        pass.truncated = stored.truncated;
+        pass.structuredBinary = true;
+        pass.name = stored.name;
+
+        const auto available = keptUses >= maxUses ? size_t( 0 ) : maxUses - keptUses;
+        const auto keep = std::min( available, stored.directResources.size() );
+        pass.uses.reserve( keep );
+        for( size_t index = 0; index < keep; ++index )
+        {
+            GpuMemoryPassUse use;
+            use.allocationId = stored.directResources[index];
+            // The Session GPU Analysis store preserves the exact Direct member
+            // set but deliberately does not invent the producer's per-use
+            // usage mask or ResourceSet dictionary id.
+            use.encoding = 3;
+            pass.uses.emplace_back( use );
+            resourceIds.emplace_back( use.allocationId );
+        }
+        pass.emittedUseCount = uint32_t( std::min<uint64_t>(
+            pass.uses.size(), std::numeric_limits<uint32_t>::max() ) );
+        keptUses += keep;
+        if( keep != stored.directResources.size() )
+        {
+            const auto omitted = stored.directResources.size() - keep;
+            result.omittedUses += omitted;
+            result.truncated = true;
+            pass.truncated = true;
+        }
+        result.passes.emplace_back( std::move( pass ) );
+    }
+
+    std::sort( resourceIds.begin(), resourceIds.end() );
+    resourceIds.erase( std::unique( resourceIds.begin(), resourceIds.end() ), resourceIds.end() );
+    if( resourceIds.empty() ) return result;
+
+    std::vector<GpuResourceAnalysisRecord> resources;
+    error.clear();
+    if( !m_reader->FindResources( resourceIds, resources, error ) )
+    {
+        result.complete = false;
+        result.warnings.emplace_back( "gpu_analysis_resource_read_failed:" + error );
+        return result;
+    }
+
+    std::unordered_map<uint64_t, size_t> resourceById;
+    resourceById.reserve( resources.size() );
+    for( size_t index = 0; index < resources.size(); ++index )
+        resourceById.emplace( resources[index].resourceId, index );
+
+    std::vector<uint64_t> allocationIds;
+    allocationIds.reserve( resources.size() );
+    for( const auto& resource : resources )
+        if( resource.allocationId != 0 ) allocationIds.emplace_back( resource.allocationId );
+    std::vector<GpuAllocationAnalysisRecord> allocations;
+    if( !allocationIds.empty() &&
+        !m_reader->FindAllocations( allocationIds, allocations, error ) )
+    {
+        result.complete = false;
+        result.warnings.emplace_back( "gpu_analysis_allocation_read_failed:" + error );
+        // Resource -> Allocation is already an exact Catalog relation.  The
+        // Allocation page is optional enrichment here (used only to fill a
+        // missing resource byte size), so a source-side Allocation gap must
+        // not hide the proven physicalAllocationId or the Resource evidence.
+        allocations.clear();
+    }
+    std::unordered_map<uint64_t, uint64_t> allocationBytes;
+    allocationBytes.reserve( allocations.size() );
+    for( const auto& allocation : allocations )
+        allocationBytes.emplace( allocation.allocationId, allocation.sizeBytes );
+
+    result.resources.reserve( resourceIds.size() );
+    for( const auto resourceId : resourceIds )
+    {
+        const auto found = resourceById.find( resourceId );
+        if( found == resourceById.end() )
+        {
+            result.complete = false;
+            result.warnings.emplace_back( "gpu_analysis_resource_unresolved:" +
+                std::to_string( resourceId ) );
+            continue;
+        }
+        const auto& stored = resources[found->second];
+        GpuMemoryEvidenceResource resource;
+        resource.resourceId = stored.resourceId;
+        resource.physicalAllocationId = stored.allocationId;
+        resource.size = stored.capacityBytes;
+        resource.name = stored.name;
+        if( resource.size == 0 && stored.allocationId != 0 )
+            if( const auto allocation = allocationBytes.find( stored.allocationId );
+                allocation != allocationBytes.end() ) resource.size = allocation->second;
+        result.resources.emplace_back( std::move( resource ) );
+    }
+
+    const std::unordered_map<uint64_t, const GpuMemoryEvidenceResource*> evidenceById = [&]() {
+        std::unordered_map<uint64_t, const GpuMemoryEvidenceResource*> value;
+        value.reserve( result.resources.size() );
+        for( const auto& resource : result.resources ) value.emplace( resource.resourceId, &resource );
+        return value;
+    }();
+    for( auto& pass : result.passes ) for( auto& use : pass.uses )
+    {
+        const auto found = evidenceById.find( use.allocationId );
+        if( found == evidenceById.end() ) continue;
+        use.resolvedPhysicalAllocationId = found->second->physicalAllocationId;
+        use.resolvedPrimaryOwnerId = found->second->primaryOwnerId;
+    }
+    return result;
+}
 SourceTextDto GpuAnalysisTraceSource::ReadEmbeddedSource( size_t sourceId, size_t maxBytes ) const
 {
     if( WorkerLoaded() ) return Worker().ReadEmbeddedSource( sourceId, maxBytes );

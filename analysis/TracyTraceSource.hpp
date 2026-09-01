@@ -1275,27 +1275,38 @@ public:
         }
         return result;
     }
-    virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const
+    virtual GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds,
+        size_t maxNodes = std::numeric_limits<size_t>::max() ) const
     {
         GfxEvidenceSlice result;
+        if( maxNodes == 0 ) { result.truncated = !seedIds.empty(); return result; }
         const auto allDispatches = GetGfxDispatches();
         const auto allEntities = GetGfxEntities();
         const auto allLinks = GetGfxLinks();
-        std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
+        std::unordered_set<uint64_t> reachable;
+        const auto admit = [&]( uint64_t value ) {
+            if( value == 0 || reachable.contains( value ) ) return false;
+            if( reachable.size() >= maxNodes ) { result.truncated = true; return false; }
+            reachable.emplace( value );
+            return true;
+        };
+        for( const auto seed : seedIds ) admit( seed );
         for( const auto& dispatch : allDispatches ) if( dispatch.frameIndex == frameId )
         {
-            result.dispatches.emplace_back( dispatch );
-            reachable.emplace( dispatch.dispatchId );
+            if( admit( dispatch.dispatchId ) || reachable.contains( dispatch.dispatchId ) )
+                result.dispatches.emplace_back( dispatch );
         }
-        for( const auto& link : allLinks ) if( link.relation == 8 && link.targetId == frameId ) reachable.emplace( link.sourceId );
+        for( const auto& link : allLinks )
+            if( link.relation == 8 && link.targetId == frameId ) admit( link.sourceId );
         bool changed = true;
-        while( changed )
+        while( changed && !result.truncated )
         {
             changed = false;
             for( const auto& entity : allEntities ) if( entity.parentId != 0 && reachable.contains( entity.parentId ) )
-                changed |= reachable.emplace( entity.entityId ).second;
+                changed |= admit( entity.entityId );
             for( const auto& link : allLinks ) if( reachable.contains( link.sourceId ) )
-                changed |= reachable.emplace( link.targetId ).second;
+                changed |= admit( link.targetId );
         }
         for( const auto& entity : allEntities ) if( reachable.contains( entity.entityId ) ) result.entities.emplace_back( entity );
         for( const auto& link : allLinks ) if( reachable.contains( link.sourceId ) ) result.links.emplace_back( link );

@@ -43,7 +43,7 @@ namespace
 
 constexpr uint64_t TimeTransformFileMagic = 0x31544653544e4aull; // JNSTF1
 constexpr uint64_t TimeTransformManifestMagic = 0x314d5453544e4aull; // JNSTM1
-constexpr uint32_t TimeTransformSchema = 2;
+constexpr uint32_t TimeTransformSchema = 3;
 constexpr uint64_t SourceGapResourceIdBase = 0xE000000000000000ull;
 
 #pragma pack( push, 1 )
@@ -56,6 +56,17 @@ struct TimeTransformFileHeader
     int64_t baseTime = 0;
     double timerMultiplier = 0;
     uint64_t processId = 0;
+    int64_t resolutionNs = 0;
+    uint64_t captureTime = 0;
+    uint64_t executableTime = 0;
+    int64_t samplingPeriodNs = 0;
+    uint32_t cpuId = 0;
+    uint8_t cpuArchitecture = 0;
+    uint8_t onDemand = 0;
+    uint8_t reserved[2] {};
+    char cpuManufacturer[12] {};
+    char captureProgram[WelcomeMessageProgramNameSize] {};
+    char hostInfo[WelcomeMessageHostInfoSize] {};
     uint64_t welcomeCount = 0;
     uint32_t generationBytes = 0;
 };
@@ -173,6 +184,13 @@ struct MetadataState
     uint64_t welcomeCount = 0;
 };
 
+template<size_t N>
+std::string FixedWelcomeString( const char ( &value )[N] )
+{
+    const auto end = std::find( value, value + N, '\0' );
+    return std::string( value, end );
+}
+
 bool VisitMetadata( const TraceSessionCanonicalRecord& record, void* userData, std::string& error )
 {
     auto& state = *static_cast<MetadataState*>( userData );
@@ -187,18 +205,40 @@ bool VisitMetadata( const TraceSessionCanonicalRecord& record, void* userData, s
         error = "session_welcome_timer_multiplier_invalid";
         return false;
     }
+    TraceSessionTimeTransform observed;
+    observed.timerMultiplier = welcome.timerMul;
+    observed.baseTime = welcome.initBegin;
+    observed.processId = welcome.pid;
+    observed.resolutionNs = int64_t( double( welcome.resolution ) * welcome.timerMul );
+    observed.captureTime = welcome.epoch;
+    observed.executableTime = welcome.exectime;
+    observed.samplingPeriodNs = welcome.samplingPeriod;
+    observed.cpuId = welcome.cpuId;
+    observed.cpuArchitecture = welcome.cpuArch;
+    observed.onDemand = ( welcome.flags & WelcomeFlag::OnDemand ) != 0;
+    observed.cpuManufacturer = FixedWelcomeString( welcome.cpuManufacturer );
+    observed.captureProgram = FixedWelcomeString( welcome.programName );
+    observed.hostInfo = FixedWelcomeString( welcome.hostInfo );
+    observed.present = true;
     if( state.welcomeCount != 0 &&
-        ( state.transform->timerMultiplier != welcome.timerMul ||
-          state.transform->baseTime != welcome.initBegin ||
-          state.transform->processId != welcome.pid ) )
+        ( state.transform->timerMultiplier != observed.timerMultiplier ||
+          state.transform->baseTime != observed.baseTime ||
+          state.transform->processId != observed.processId ||
+          state.transform->resolutionNs != observed.resolutionNs ||
+          state.transform->captureTime != observed.captureTime ||
+          state.transform->executableTime != observed.executableTime ||
+          state.transform->samplingPeriodNs != observed.samplingPeriodNs ||
+          state.transform->cpuId != observed.cpuId ||
+          state.transform->cpuArchitecture != observed.cpuArchitecture ||
+          state.transform->onDemand != observed.onDemand ||
+          state.transform->cpuManufacturer != observed.cpuManufacturer ||
+          state.transform->captureProgram != observed.captureProgram ||
+          state.transform->hostInfo != observed.hostInfo ) )
     {
         error = "session_welcome_time_transform_conflict";
         return false;
     }
-    state.transform->timerMultiplier = welcome.timerMul;
-    state.transform->baseTime = welcome.initBegin;
-    state.transform->processId = welcome.pid;
-    state.transform->present = true;
+    *state.transform = std::move( observed );
     state.welcomeCount++;
     return true;
 }
@@ -3634,7 +3674,7 @@ std::filesystem::path TraceSessionTimeTransformRoot( const std::filesystem::path
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "global" /
-        "time-transform" / "1" / "exact";
+        "time-transform" / "3" / "exact";
 }
 
 bool AuditTraceSessionTimeTransformDerived( const std::filesystem::path& sessionRoot,
@@ -3669,6 +3709,16 @@ bool AuditTraceSessionTimeTransformDerived( const std::filesystem::path& session
     timeTransform.timerMultiplier = header.timerMultiplier;
     timeTransform.baseTime = header.baseTime;
     timeTransform.processId = header.processId;
+    timeTransform.resolutionNs = header.resolutionNs;
+    timeTransform.captureTime = header.captureTime;
+    timeTransform.executableTime = header.executableTime;
+    timeTransform.samplingPeriodNs = header.samplingPeriodNs;
+    timeTransform.cpuId = header.cpuId;
+    timeTransform.cpuArchitecture = header.cpuArchitecture;
+    timeTransform.onDemand = header.onDemand != 0;
+    timeTransform.cpuManufacturer = FixedWelcomeString( header.cpuManufacturer );
+    timeTransform.captureProgram = FixedWelcomeString( header.captureProgram );
+    timeTransform.hostInfo = FixedWelcomeString( header.hostInfo );
     timeTransform.present = true;
     return true;
 }
@@ -3696,6 +3746,19 @@ bool BuildTraceSessionTimeTransformDerived( const std::filesystem::path& session
     TimeTransformFileHeader header; header.sourceSize = manifest.source.fileSize;
     header.baseTime = timeTransform.baseTime; header.timerMultiplier = timeTransform.timerMultiplier;
     header.processId = timeTransform.processId;
+    header.resolutionNs = timeTransform.resolutionNs;
+    header.captureTime = timeTransform.captureTime;
+    header.executableTime = timeTransform.executableTime;
+    header.samplingPeriodNs = timeTransform.samplingPeriodNs;
+    header.cpuId = timeTransform.cpuId;
+    header.cpuArchitecture = timeTransform.cpuArchitecture;
+    header.onDemand = timeTransform.onDemand ? 1 : 0;
+    std::memcpy( header.cpuManufacturer, timeTransform.cpuManufacturer.data(),
+        std::min( timeTransform.cpuManufacturer.size(), sizeof( header.cpuManufacturer ) ) );
+    std::memcpy( header.captureProgram, timeTransform.captureProgram.data(),
+        std::min( timeTransform.captureProgram.size(), sizeof( header.captureProgram ) ) );
+    std::memcpy( header.hostInfo, timeTransform.hostInfo.data(),
+        std::min( timeTransform.hostInfo.size(), sizeof( header.hostInfo ) ) );
     header.welcomeCount = metadata.welcomeCount; header.generationBytes = uint32_t( manifest.generation.size() );
     out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
     out.write( manifest.source.sha256.data(), std::streamsize( manifest.source.sha256.size() ) );

@@ -14,13 +14,14 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionMessageIndexSchemaVersion = 1;
+inline constexpr uint32_t TraceSessionMessageIndexSchemaVersion = 2;
 inline constexpr size_t TraceSessionMessageEventKindCount = 9;
 
 struct TraceSessionMessageStats
 {
     uint64_t messages = 0;
     uint64_t appInfoEvents = 0;
+    uint64_t appInfoBytes = 0;
     uint64_t literalStrings = 0;
     uint64_t fileBytes = 0;
     std::array<uint64_t, TraceSessionMessageEventKindCount> eventCounts {};
@@ -34,6 +35,7 @@ public:
         std::string& error );
 
     const TraceSessionMessageStats& Stats() const { return m_stats; }
+    const std::vector<std::string>& AppInfo() const { return m_appInfo; }
     std::vector<MessageDto> Scan( const ScanRange& range ) const;
 
 private:
@@ -41,6 +43,7 @@ private:
     explicit TraceSessionMessageReader( std::shared_ptr<Impl> impl );
     std::shared_ptr<Impl> m_impl;
     TraceSessionMessageStats m_stats;
+    std::vector<std::string> m_appInfo;
 };
 
 std::filesystem::path TraceSessionMessageIndexRoot(

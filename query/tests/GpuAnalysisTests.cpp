@@ -289,6 +289,13 @@ int main()
         storedResource->virtualGeometry.size() == 1 );
     const auto storedPass = storeReader->FindPass( 1000, error );
     assert( storedPass && storedPass->detailedEvidence.size() == 1 );
+    std::vector<GpuPassWorkingSet> storedPasses;
+    assert( storeReader->FindPasses( { 1000, 1000 }, storedPasses, error ) );
+    assert( storedPasses.size() == 1 && storedPasses.front().passId == 1000 );
+    std::vector<GpuAllocationAnalysisRecord> storedAllocations;
+    assert( storeReader->FindAllocations( { 100, 100 }, storedAllocations, error ) );
+    assert( storedAllocations.size() == 1 &&
+        storedAllocations.front().allocationId == 100 );
     std::vector<GpuPassWorkingSet> framePasses; bool frameHasMore = false;
     assert( storeReader->PassesForFrame( 5, 0, 100, framePasses, frameHasMore, error ) );
     assert( framePasses.size() == 1 && framePasses.front().passId == 1000 && !frameHasMore );

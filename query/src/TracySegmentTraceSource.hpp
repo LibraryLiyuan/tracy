@@ -55,7 +55,8 @@ public:
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
-    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override;
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds, size_t maxNodes ) const override;
     std::vector<analysis::RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override;

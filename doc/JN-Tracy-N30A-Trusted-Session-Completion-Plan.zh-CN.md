@@ -24,6 +24,14 @@ Baseline: b121e58c
 
 N30A不修改Protocol 90、JN section 12、Unity、PackageRepo、Player或录制配置；不自动合并或推送其他分支。
 
+截至2026-09-02的执行状态：
+
+| 阶段 | 状态 |
+|---|---|
+| A0～A5 | 已完成并提交；G05真实规模GPU正确性通过 |
+| A6 | 已完成实现、短Trace全域回归、Release/G05查询验收；等待阶段提交 |
+| A7 | 待执行；A6提交后只启动一次真实30分钟最终验收 |
+
 后续独立里程碑：
 
 ```text
@@ -171,7 +179,8 @@ Converter总体目标   ≤8 GiB
 ### A5——GPU真实规模门禁
 
 - 先执行G05固定压力语料。
-- G05通过后只执行一次真实30分钟GPU生产验收。
+- G05用于GPU生产路径、长路径、恢复和独立Verifier的真实规模门禁。
+- 为避免重复消耗19 GiB语料转换时间，真实30分钟统一留到A7做一次全域最终验收。
 - 记录各阶段耗时、Private Bytes、Working Set、mmap、磁盘、吞吐、取消和Checkpoint。
 
 门禁：Converter≤16 GiB、Cancel≤2秒、Direct/Reverse/Range/Peak/hash 100%一致、Core gap/unresolved=0、GPU generation成功发布。
@@ -219,7 +228,7 @@ Converter总体目标   ≤8 GiB
 重型运行限制：
 
 - G05只在A5使用。
-- 真实30分钟最多两次：A5 GPU门禁和A7全域审计。
+- 真实30分钟只执行一次：A7全域最终审计。
 - 连续120秒无进度且状态不变化时停止。
 - 达到软上限后两个Checkpoint周期内内存不下降时停止。
 - checksum、source ordinal、磁盘安全线或Core gap失败时立即停止。

@@ -1734,6 +1734,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnGfxRelation::ReferencesResources ), 0 };
     AppendQueueItem( frame, item );
     item = {};
+    item.hdr.type = tracy::QueueType::JnGfxLink;
+    item.jnGfxLink = { 117, ExplicitGpuPassId, 9,
+        uint8_t( tracy::JnGfxRelation::BelongsToFrame ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
     item.hdr.type = tracy::QueueType::JnFrame;
     item.jnFrame = { 118, 9, 9, uint8_t( tracy::JnFrameDomain::Player ),
         uint8_t( tracy::JnFramePhase::Begin ), uint8_t( tracy::JnFrameFlags::Canonical ) };
@@ -1845,6 +1850,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::MessageCallstack;
     item.message.time = 2;
     AppendQueueItem( frame, item );
+    const std::array<const char*, 4> appInfoRecords = {
+        "JNCI1|{\"schema_version\":1,\"kind\":\"connection\",\"producer\":\"jn-native-client\",\"identity\":{\"connection\":{\"id\":\"1\",\"instance_cookie\":\"0123456789abcdef\"}}}",
+        "JNCTX1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"0\",\"generation\":\"1\",\"effective_frame\":\"0\",\"effective_qpc\":\"10\",\"snapshot_qpc\":\"20\",\"qpc_frequency\":\"10000000\",\"producer\":\"synthetic-session\",\"context\":{\"runtime\":{\"target_kind\":\"player\",\"graphics_jobs_requested\":\"off\",\"graphics_jobs_effective\":\"off\"},\"workload\":{\"scene\":\"Synthetic\",\"scenario\":\"n30a\",\"warmup_frames\":\"0\"},\"capture_config\":{\"profile\":\"HighEvidence\",\"profile_requested\":\"HighEvidence\",\"profile_effective\":\"HighEvidence\",\"profile_fallback\":false}}}",
+        "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"0\",\"snapshot_qpc\":\"20\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":1,\"key\":\"test.session\",\"source_mode\":\"synthetic\",\"producer_schema\":1,\"config_generation\":\"1\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}",
+        "JNQ1|{\"schema_version\":1,\"connection_id\":\"1\",\"snapshot_sequence\":\"1\",\"snapshot_qpc\":\"30\",\"qpc_frequency\":\"10000000\",\"producer\":{\"id\":1,\"key\":\"test.session\",\"source_mode\":\"synthetic\",\"producer_schema\":1,\"config_generation\":\"1\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"filter\":\"\",\"threshold\":\"0\",\"budget\":\"0\",\"sample_rate\":{\"numerator\":1,\"denominator\":1},\"counters\":{\"observed\":\"4\",\"emitted\":\"4\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"pre_capture\":\"0\",\"replayed\":\"0\",\"tail_truncated\":\"0\"}}}"
+    };
+    for( const auto* appInfo : appInfoRecords )
+    {
+        AppendStringEvent( frame, tracy::QueueType::SingleStringData, appInfo );
+        item = {};
+        item.hdr.type = tracy::QueueType::MessageAppInfo;
+        AppendQueueItem( frame, item );
+    }
     item = {};
     item.hdr.type = tracy::QueueType::ZoneValidation;
     item.zoneValidation.id = 101;
@@ -2095,7 +2113,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         0x9000, frameImageBc1 );
     item = {};
     item.hdr.type = tracy::QueueType::FrameImage;
-    item.frameImage.frame = 0;
+    item.frameImage.frame = 1;
     item.frameImage.w = 4;
     item.frameImage.h = 4;
     item.frameImage.flip = 1;
@@ -2323,17 +2341,34 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     tracy::WelcomeMessage welcome {};
     welcome.timerMul = 2.0;
     welcome.initBegin = 100;
+    welcome.resolution = 5;
+    welcome.epoch = 123456789;
+    welcome.exectime = 987654321;
     welcome.pid = 1001;
+    welcome.samplingPeriod = 500000;
+    welcome.flags = tracy::WelcomeFlag::OnDemand;
+    welcome.cpuArch = tracy::CpuArchX64;
+    std::memcpy( welcome.cpuManufacturer, "SyntheticCPU", 12 );
+    welcome.cpuId = 0x1234;
+    std::memcpy( welcome.programName, "SyntheticPlayer", 15 );
+    std::memcpy( welcome.hostInfo, "SyntheticHost", 13 );
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
         tracy::stream::RecordFlagHandshake,
         std::span<const uint8_t>( reinterpret_cast<const uint8_t*>( &welcome ), sizeof( welcome ) ),
         1, error ), "append GPU welcome" );
+    tracy::OnDemandPayloadMessage onDemandPayload {};
+    onDemandPayload.frames = 0;
+    onDemandPayload.currentTime = 100;
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
-        tracy::stream::RecordFlagCompressedFrame, compressed, 2, error ), "append GPU frame" );
+        tracy::stream::RecordFlagHandshake,
+        std::span<const uint8_t>( reinterpret_cast<const uint8_t*>( &onDemandPayload ),
+            sizeof( onDemandPayload ) ), 2, error ), "append GPU on-demand payload" );
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
-        tracy::stream::RecordFlagCompressedFrame, compressedTail, 3, error ), "append GPU tail frame" );
+        tracy::stream::RecordFlagCompressedFrame, compressed, 3, error ), "append GPU frame" );
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, compressedTail, 4, error ), "append GPU tail frame" );
     test.Check( writer->Append( tracy::stream::RecordType::SessionEnd,
-        tracy::stream::RecordFlagTerminal, "end", 4, error ), "append GPU session end" );
+        tracy::stream::RecordFlagTerminal, "end", 5, error ), "append GPU session end" );
     writer.reset();
 
     tracy::analysis::TraceSessionInventory inventory;
@@ -3198,11 +3233,28 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionGpuReader->Manifest().reason == "source_gpu_resource_identity_gap:2",
         "open mandatory GPU analysis directly from a published Session: " + error );
     auto sessionSource = tracy::analysis::GpuAnalysisTraceSource::OpenSessionIfReady( publishedSession );
+    const auto sessionTraceInfo = sessionSource ? sessionSource->GetTraceInfo() :
+        tracy::analysis::TraceInfoDto {};
     test.Check( sessionSource &&
         sessionSource->AcquireReadView().sourceKind == tracy::analysis::TraceSourceKind::Session &&
-        sessionSource->GetTraceInfo().fingerprint == manifest.source.sha256 &&
+        sessionTraceInfo.fingerprint == manifest.source.sha256 &&
         !sessionSource->WorkerLoaded(),
         "open a published Session without materializing a full Worker" );
+    test.Check( sessionSource && sessionTraceInfo.processId == 1001 &&
+        sessionTraceInfo.timerMultiplier == 2.0 &&
+        sessionTraceInfo.resolution == 10 &&
+        sessionTraceInfo.captureTime == 123456789 &&
+        sessionTraceInfo.executableTime == 987654321 &&
+        sessionTraceInfo.samplingPeriodNs == 500000 && sessionTraceInfo.onDemand &&
+        sessionTraceInfo.captureProgram == "SyntheticPlayer" &&
+        sessionTraceInfo.hostInfo == "SyntheticHost" &&
+        sessionTraceInfo.cpuManufacturer == "SyntheticCPU" &&
+        sessionTraceInfo.cpuArchitecture == "x86_64" &&
+        sessionTraceInfo.cpuId == 0x1234 &&
+        sessionTraceInfo.appInfo.size() == appInfoRecords.size() &&
+        sessionTraceInfo.appInfo.front().starts_with( "JNCI1|" ) &&
+        sessionTraceInfo.appInfo.back().starts_with( "JNQ1|" ),
+        "Session TraceInfo preserves Welcome metadata and ordered AppInfo/quality records without a Worker" );
     test.Check( sessionSource &&
         sessionSource->AnalysisManifest().summary.rangeCount == 1 &&
         sessionSource->AnalysisManifest().summary.logicalRecordCount == logicals.size() &&
@@ -3211,6 +3263,18 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionSource->AnalysisManifest().summary.payloadBytes == sessionGpuReader->Manifest().totalBytes,
         "Session GPU analysis facade preserves exact Range, Logical, Relation, generation, and byte counts" );
     const auto sessionCapabilities = sessionSource->GetCapabilities();
+    const auto initialCorrelationCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "correlation"; } );
+    const auto initialEvidenceCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "evidence"; } );
+    test.Check( initialCorrelationCapability != sessionCapabilities.end() &&
+        initialCorrelationCapability->present && initialCorrelationCapability->indexed &&
+        initialCorrelationCapability->queryable,
+        "Session advertises correlated Frame facts before the lazy I/O/Gfx reader is materialized" );
+    test.Check( initialEvidenceCapability != sessionCapabilities.end() &&
+        initialEvidenceCapability->present && initialEvidenceCapability->indexed &&
+        initialEvidenceCapability->queryable,
+        "Session advertises the bounded Evidence graph before mandatory readers are materialized" );
     const auto frameCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
         []( const auto& value ) { return value.domain == "frame"; } );
     test.Check( frameCapability != sessionCapabilities.end() && frameCapability->present &&
@@ -3323,6 +3387,17 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
+        const auto boundedFrameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 }, 3 );
+        const auto boundedReferenceLink = std::find_if(
+            boundedFrameNineGfxEvidence.links.begin(), boundedFrameNineGfxEvidence.links.end(),
+            []( const auto& value ) {
+                return value.relation == uint8_t( tracy::JnGfxRelation::ReferencesResources );
+            } );
+        test.Check( boundedFrameNineGfxEvidence.truncated &&
+            boundedFrameNineGfxEvidence.nodeIds.size() <= 3 &&
+            boundedReferenceLink != boundedFrameNineGfxEvidence.links.end() &&
+            boundedReferenceLink->targetId == 1000,
+            "Session Frame Gfx evidence bounds structural nodes while retaining external GPU resource metadata edges" );
         const auto dispatchGfxChain = sessionSource->GetGfxChain( 300, 16 );
         test.Check( ioRequests.size() == 2 && ioRequestCount == 2 && ioRequest400 &&
             childIoRequest && !missingIoRequest && ioRequests[0].requestId == 400 &&
@@ -3344,20 +3419,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
             gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
             gfxEntities[1].entityId == ExplicitGpuPassId &&
-            gfxLinks.size() == 2 && gfxLinks[0].sourceId == 300 && gfxLinks[0].targetId == 301 &&
+            gfxLinks.size() == 3 && gfxLinks[0].sourceId == 300 && gfxLinks[0].targetId == 301 &&
             gfxLinks[1].sourceId == ExplicitGpuPassId && gfxLinks[1].targetId == 1000 &&
             gfxLinks[1].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ) &&
             correlatedFrames.size() == 1 && correlatedFrames[0].frameId == 9,
             "Session Gfx/Frame evidence reader preserves fixed binary facts without a Worker" );
         test.Check( sessionSource->GetGfxDispatchCount() == 1 &&
-            sessionSource->GetGfxEntityCount() == 2 && sessionSource->GetGfxLinkCount() == 2 &&
+            sessionSource->GetGfxEntityCount() == 2 && sessionSource->GetGfxLinkCount() == 3 &&
             gfxDispatchPage.size() == 1 && gfxDispatchPage[0].dispatchId == 300 &&
             gfxEntityPage.size() == 1 && gfxEntityPage[0].entityId == ExplicitGpuPassId &&
             gfxLinkPage.size() == 1 && gfxLinkPage[0].sourceId == ExplicitGpuPassId &&
             gfxDispatch300 && gfxDispatch300->dispatchId == 300 &&
             gfxEntity301 && gfxEntity301->parentId == 300,
             "Session Gfx count/page/point APIs read bounded exact records from disk" );
-        test.Check( explicitPassLinks.size() == 1 &&
+        test.Check( explicitPassLinks.size() == 2 &&
             explicitPassLinks[0].sourceId == ExplicitGpuPassId &&
             explicitPassLinks[0].targetId == 1000 &&
             explicitPassLinks[0].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ),
@@ -3377,9 +3452,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             "Session Gfx/Frame posting readers fetch one Frame directly without scanning the full domain" );
         test.Check( frameNineGfxEvidence.dispatches.size() == 1 &&
             frameNineGfxEvidence.dispatches[0].dispatchId == 300 &&
-            frameNineGfxEvidence.entities.size() == 1 &&
+            frameNineGfxEvidence.entities.size() == 2 &&
             frameNineGfxEvidence.entities[0].entityId == 301 &&
-            frameNineGfxEvidence.links.size() == 1 &&
+            frameNineGfxEvidence.entities[1].entityId == ExplicitGpuPassId &&
+            frameNineGfxEvidence.links.size() == 3 &&
             frameNineGfxEvidence.links[0].sourceId == 300 &&
             frameNineGfxEvidence.links[0].targetId == 301,
             "Session Gfx adjacency postings traverse only the exact Frame/seed evidence component" );
@@ -3418,10 +3494,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto sessionFrameImages = sessionSource->GetFrameImageResources();
     const auto sessionFrameImageRaw = sessionSource->ReadFrameImageBc1( 0, 2, 3 );
     const auto sessionFrameImageDecoded = sessionSource->ReadFrameImage( 0, 1024 );
-    test.Check( sessionSource->GetTraceInfo().counts.frameImages == 1 &&
+    const auto frameImageTraceInfo = sessionSource->GetTraceInfo();
+    test.Check( frameImageTraceInfo.counts.frameImages == 1 &&
         sessionFrameImages.size() == 1 && sessionFrameImages[0].width == 4 &&
         sessionFrameImages[0].height == 4 && sessionFrameImages[0].flipped &&
-        sessionFrameImages[0].rawFrameIndex == 1 && sessionFrameImages[0].rawBc1Bytes == 8 &&
+        sessionFrameImages[0].rawFrameIndex == 2 && sessionFrameImages[0].rawBc1Bytes == 8 &&
         sessionFrameImageRaw.offset == 2 && sessionFrameImageRaw.totalBytes == 8 &&
         sessionFrameImageRaw.bytes.size() == 3 && !sessionFrameImageRaw.eof &&
         sessionFrameImageDecoded.width == 4 && sessionFrameImageDecoded.height == 4 &&
@@ -3670,6 +3747,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state ==
             tracy::analysis::TraceSourceState::Ready,
             "SessionTraceSource becomes ready without full Worker materialization" );
+        const auto appInfo = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-app-info" },
+            { "method", "trace.app_info" }, { "params", { { "trace_id", traceId } } }
+        } );
+        const auto captureCoverage = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-capture-coverage" },
+            { "method", "capture.coverage" }, { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( appInfo.value( "ok", false ) &&
+            appInfo["data"]["app_info"].size() == appInfoRecords.size() &&
+            captureCoverage.value( "ok", false ) &&
+            captureCoverage["data"]["present"] == true &&
+            captureCoverage["data"]["complete"] == true &&
+            captureCoverage["data"]["producers"].size() == 1 &&
+            captureCoverage["data"]["producers"][0]["key"] == "test.session" &&
+            captureCoverage["data"]["producers"][0]["state"] == "covered",
+            "Query 1.34 reads ordered Session AppInfo and exact Producer Quality windows without a Worker" );
         const auto frameSets = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-frame-sets" }, { "method", "frame.sets" },
             { "params", { { "trace_id", traceId } } }
@@ -3913,7 +4007,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             test.Check( gfxStats.value( "ok", false ) &&
                 gfxStats["data"]["counts"]["dispatches"] == "1" &&
                 gfxStats["data"]["counts"]["entities"] == "2" &&
-                gfxStats["data"]["counts"]["links"] == "2",
+                gfxStats["data"]["counts"]["links"] == "3",
                 "Query 1.34 reads exact Session Gfx evidence without a Worker" );
             test.Check( gfxChain.value( "ok", false ) &&
                 gfxChain["data"]["dispatches"].size() == 1 &&
@@ -4071,6 +4165,29 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         frameImages->indexed && frameImages->queryable;
         test.Check( sessionFrameImagesReady,
             "Session advertises FrameImage only after its disk-backed semantic reader is ready" );
+        const auto timeline = std::find_if( capabilities.begin(), capabilities.end(),
+            []( const auto& value ) { return value.domain == "timeline"; } );
+        test.Check( timeline != capabilities.end() && timeline->present &&
+            timeline->indexed && timeline->queryable &&
+            std::find( timeline->methods.begin(), timeline->methods.end(), "timeline.slice" ) !=
+                timeline->methods.end(),
+            "Session advertises the bounded composite timeline after every selected track has a disk reader" );
+        const auto timelineSlice = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-timeline-slice" },
+            { "method", "timeline.slice" }, { "params", {
+                { "trace_id", traceId }, { "start_ns", "0" }, { "end_ns", "100" },
+                { "limit", 16 }, { "tracks", { "cpu_zones", "gpu_zones", "frames",
+                    "context_switches", "plot_points", "messages" } } } }
+        } );
+        const auto& timelineData = timelineSlice["data"];
+        test.Check( timelineSlice.value( "ok", false ) &&
+            !timelineSlice["data"]["cpu_zones"].empty() &&
+            !timelineSlice["data"]["gpu_zones"].empty() &&
+            !timelineSlice["data"]["frames"].empty() &&
+            !timelineSlice["data"]["context_switches"].empty() &&
+            timelineData.contains( "plot_points" ) && timelineData["plot_points"].is_array() &&
+            timelineData.contains( "messages" ) && timelineData["messages"].is_array(),
+            "Query 1.34 composes one bounded Session timeline from exact per-domain readers" );
         const auto correlatedSlice = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-correlated-slice" },
             { "method", "timeline.correlated_slice" }, { "params", {
@@ -4085,6 +4202,47 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             correlatedSlice["data"]["gfx_dispatches"].size() == 1 &&
             correlatedSlice["data"]["gfx_dispatches"][0]["dispatch_id"] == "300",
             "Query 1.34 resolves a correlated Session Frame through Frame/Job/Gfx postings" );
+        const auto evidenceGraph = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-evidence-graph" },
+            { "method", "evidence.graph" }, { "params", {
+                { "trace_id", traceId }, { "frame_id", 9 },
+                { "max_nodes", 256 }, { "max_edges", 512 } } }
+        } );
+        bool hasGpuResource = false;
+        bool hasGpuPhysical = false;
+        bool hasGpuReference = false;
+        if( evidenceGraph.value( "ok", false ) )
+        {
+            for( const auto& node : evidenceGraph["data"]["nodes"] )
+            {
+                hasGpuResource |= node.value( "kind", "" ) == "gpu_logical_resource";
+                hasGpuPhysical |= node.value( "kind", "" ) == "gpu_physical_allocation";
+            }
+            for( const auto& edge : evidenceGraph["data"]["edges"] )
+                hasGpuReference |= edge.value( "relation", "" ) == "references_resource";
+        }
+        if( !( evidenceGraph.value( "ok", false ) && hasGpuResource &&
+            hasGpuPhysical && hasGpuReference ) )
+            std::fprintf( stderr, "Session evidence graph response: %s\n",
+                evidenceGraph.dump().c_str() );
+        test.Check( evidenceGraph.value( "ok", false ) && hasGpuResource &&
+            hasGpuPhysical && hasGpuReference,
+            "Query 1.34 builds Session Frame to GPU resource evidence entirely from bounded disk readers" );
+        const auto filteredEvidenceGraph = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-evidence-filtered" },
+            { "method", "evidence.graph" }, { "params", {
+                { "trace_id", traceId }, { "frame_id", 9 },
+                { "domains", { "gpu", "resource" } },
+                { "max_nodes", 256 }, { "max_edges", 512 } } }
+        } );
+        const auto cpuCoverage = std::find_if(
+            filteredEvidenceGraph["data"]["domain_coverage"].begin(),
+            filteredEvidenceGraph["data"]["domain_coverage"].end(),
+            []( const auto& value ) { return value.value( "domain", "" ) == "cpu"; } );
+        test.Check( filteredEvidenceGraph.value( "ok", false ) &&
+            cpuCoverage != filteredEvidenceGraph["data"]["domain_coverage"].end() &&
+            cpuCoverage->value( "status", "" ) == "not_requested",
+            "Evidence domain coverage distinguishes an excluded domain from missing evidence" );
         const auto cpuSearch = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone" }, { "method", "zone.cpu.search" },
             { "params", { { "trace_id", traceId } } }

@@ -1137,33 +1137,42 @@ public:
         }
         return result;
     }
-    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds, size_t maxNodes ) const override
     {
         analysis::GfxEvidenceSlice result;
-        std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
+        if( maxNodes == 0 ) { result.truncated = !seedIds.empty(); return result; }
+        std::unordered_set<uint64_t> reachable;
+        const auto admit = [&]( uint64_t value ) {
+            if( value == 0 || reachable.contains( value ) ) return false;
+            if( reachable.size() >= maxNodes ) { result.truncated = true; return false; }
+            reachable.emplace( value );
+            return true;
+        };
+        for( const auto seed : seedIds ) admit( seed );
         for( const auto& dispatch : m_source->GetGfxDispatches() ) if( dispatch.frameIndex == frameId )
         {
-            result.dispatches.emplace_back( dispatch );
-            reachable.emplace( dispatch.dispatchId );
+            if( admit( dispatch.dispatchId ) || reachable.contains( dispatch.dispatchId ) )
+                result.dispatches.emplace_back( dispatch );
         }
         for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
         {
             const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
-            if( value.relation == 8 && value.targetId == frameId ) reachable.emplace( value.sourceId );
+            if( value.relation == 8 && value.targetId == frameId ) admit( value.sourceId );
         }
         bool changed = true;
-        while( changed )
+        while( changed && !result.truncated )
         {
             changed = false;
             for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
             {
                 const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
-                if( value.parentId != 0 && reachable.contains( value.parentId ) ) changed |= reachable.emplace( value.entityId ).second;
+                if( value.parentId != 0 && reachable.contains( value.parentId ) ) changed |= admit( value.entityId );
             }
             for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
             {
                 const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
-                if( reachable.contains( value.sourceId ) ) changed |= reachable.emplace( value.targetId ).second;
+                if( reachable.contains( value.sourceId ) ) changed |= admit( value.targetId );
             }
         }
         for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
@@ -1180,6 +1189,7 @@ public:
             result.links.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
                 MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
         }
+        result.nodeIds.assign( reachable.begin(), reachable.end() );
         return result;
     }
     TRACY_INDEX_FORWARD0( std::vector<analysis::CorrelatedFrameEventDto>, GetCorrelatedFrameEvents )

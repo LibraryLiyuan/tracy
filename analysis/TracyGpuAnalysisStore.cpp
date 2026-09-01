@@ -2410,6 +2410,38 @@ std::optional<GpuAllocationAnalysisRecord> GpuAnalysisStoreReader::FindAllocatio
     error = "gpu_allocation_not_found"; return std::nullopt;
 }
 
+bool GpuAnalysisStoreReader::FindAllocations( std::vector<uint64_t> ids,
+    std::vector<GpuAllocationAnalysisRecord>& out, std::string& error ) const
+{
+    std::sort( ids.begin(), ids.end() );
+    ids.erase( std::unique( ids.begin(), ids.end() ), ids.end() );
+    out.clear();
+    size_t matched = 0, pageIndex = 0;
+    for( const auto& page : m_manifest.pages ) if( page.kind == GpuAnalysisStorePageKind::Allocation )
+    {
+        const auto begin = std::lower_bound( ids.begin(), ids.end(), page.firstKey );
+        const auto end = std::upper_bound( begin, ids.end(), page.lastKey );
+        if( begin != end )
+        {
+            std::vector<GpuAllocationAnalysisRecord> values;
+            if( !LoadAllocationPage( pageIndex, values, error ) ) return false;
+            for( auto id = begin; id != end; ++id )
+            {
+                const auto found = std::lower_bound( values.begin(), values.end(), *id,
+                    []( const auto& value, uint64_t key ) { return value.allocationId < key; } );
+                if( found == values.end() || found->allocationId != *id )
+                { error = "gpu_allocation_index_target_missing"; return false; }
+                out.push_back( *found );
+                ++matched;
+            }
+        }
+        ++pageIndex;
+    }
+    if( matched != ids.size() )
+    { error = "gpu_allocation_index_unresolved"; return false; }
+    return true;
+}
+
 std::optional<GpuPassWorkingSet> GpuAnalysisStoreReader::FindPass( uint64_t id, std::string& error ) const
 {
     size_t pageIndex = 0; for( const auto& page : m_manifest.pages ) if( page.kind == GpuAnalysisStorePageKind::Pass )
@@ -2516,7 +2548,7 @@ bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
         std::sort( passIds.begin(), passIds.end() );
         std::vector<GpuPassWorkingSet> passes;
         if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
-        if( !LoadPassesByIds( std::move( passIds ), passes, error ) ) return false;
+        if( !FindPasses( std::move( passIds ), passes, error ) ) return false;
         size_t memberCount = 0;
         for( const auto& pass : passes )
         {
@@ -2602,7 +2634,7 @@ bool GpuAnalysisStoreReader::PassesForFrame( uint64_t frameId, size_t offset, si
 {
     std::vector<uint64_t> ids; if( !RelationIds<GpuAnalysisFramePassEntry>( m_root, m_manifest, GpuAnalysisStorePageKind::FramePassIndex,
         frameId, offset, limit, ids, hasMore, []( const auto& value ) { return value.frameId; }, error ) ) return false;
-    return LoadPassesByIds( std::move( ids ), out, error );
+    return FindPasses( std::move( ids ), out, error );
 }
 
 bool GpuAnalysisStoreReader::PassesForResource( uint64_t resourceId, size_t offset, size_t limit,
@@ -2610,10 +2642,11 @@ bool GpuAnalysisStoreReader::PassesForResource( uint64_t resourceId, size_t offs
 {
     std::vector<uint64_t> ids; if( !RelationIds<GpuAnalysisResourcePassEntry>( m_root, m_manifest, GpuAnalysisStorePageKind::ResourcePassIndex,
         resourceId, offset, limit, ids, hasMore, []( const auto& value ) { return value.resourceId; }, error ) ) return false;
-    return LoadPassesByIds( std::move( ids ), out, error );
+    return FindPasses( std::move( ids ), out, error );
 }
 
-bool GpuAnalysisStoreReader::LoadPassesByIds( std::vector<uint64_t> ids, std::vector<GpuPassWorkingSet>& out, std::string& error ) const
+bool GpuAnalysisStoreReader::FindPasses( std::vector<uint64_t> ids,
+    std::vector<GpuPassWorkingSet>& out, std::string& error ) const
 {
     std::sort( ids.begin(), ids.end() ); ids.erase( std::unique( ids.begin(), ids.end() ), ids.end() ); out.clear();
     size_t matched = 0, pageIndex = 0;

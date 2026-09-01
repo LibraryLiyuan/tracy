@@ -3,7 +3,14 @@
 {"protocol":"tracy-query/1","id":"overview","method":"trace.overview","params":{}}
 {"protocol":"tracy-query/1","id":"counts","method":"trace.counts","params":{}}
 {"protocol":"tracy-query/1","id":"trace-info","method":"trace.info","params":{}}
+{"protocol":"tracy-query/1","id":"trace-app-info","method":"trace.app_info","params":{}}
+{"protocol":"tracy-query/1","id":"trace-identity","method":"trace.identity","params":{}}
+{"protocol":"tracy-query/1","id":"capture-context","method":"capture.context","params":{}}
+{"protocol":"tracy-query/1","id":"capture-coverage","method":"capture.coverage","params":{}}
+{"protocol":"tracy-query/1","id":"telemetry-cost","method":"trace.telemetry_cost","params":{}}
+{"protocol":"tracy-query/1","id":"producers","method":"producer.list","params":{}}
 {"protocol":"tracy-query/1","id":"frames","method":"frame.sets","params":{}}
+{"protocol":"tracy-query/1","id":"timeline","method":"timeline.slice","params":{"start_ns":"0","end_ns":"9223372036854775807","limit":10,"tracks":["cpu_zones","gpu_zones","frames","context_switches","plot_points","messages"]}}
 {"protocol":"tracy-query/1","id":"cpu-zones","method":"zone.cpu.search","params":{"limit":10}}
 {"protocol":"tracy-query/1","id":"gpu-contexts","method":"zone.gpu.contexts","params":{}}
 {"protocol":"tracy-query/1","id":"jobs","method":"job.search","params":{"limit":10}}
