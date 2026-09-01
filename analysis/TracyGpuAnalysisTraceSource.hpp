@@ -112,6 +112,7 @@ public:
         const std::vector<uint64_t>& seedIds ) const override;
     GfxEvidenceSlice GetGfxChain( uint64_t rootId, size_t maxNodes ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    uint64_t GetCorrelatedFrameEventCountForFrame( uint64_t frameId ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEventsForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const override;
     std::vector<RelationDto> GetRelations() const override;

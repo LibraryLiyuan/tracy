@@ -1302,6 +1302,12 @@ public:
         return result;
     }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
+    virtual uint64_t GetCorrelatedFrameEventCountForFrame( uint64_t frameId ) const
+    {
+        const auto values = GetCorrelatedFrameEvents();
+        return uint64_t( std::count_if( values.begin(), values.end(),
+            [frameId]( const auto& value ) { return value.frameId == frameId; } ) );
+    }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEventsForFrame(
         uint64_t frameId, size_t offset, size_t limit ) const
     {

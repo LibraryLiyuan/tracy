@@ -993,6 +993,12 @@ std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameE
     return reader ? reader->CorrelatedFrames() :
         std::vector<CorrelatedFrameEventDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetCorrelatedFrameEventCountForFrame( uint64_t frameId ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetCorrelatedFrameEventCountForFrame( frameId );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->CorrelatedFrameCountForFrame( frameId ) : 0;
+}
 std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEventsForFrame(
     uint64_t frameId, size_t offset, size_t limit ) const
 {

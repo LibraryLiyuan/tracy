@@ -9504,12 +9504,6 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
     {
-        const auto frameEvents = source->GetCorrelatedFrameEvents();
-        if( frameEvents.empty() )
-            return Success( id, { { "present", false }, { "complete", false },
-                { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
-                { "evidence_kind", "unavailable" } }, trace );
-
         uint64_t frameId = 0;
         if( params.contains( "ref" ) )
         {
@@ -9523,6 +9517,53 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             frameId = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
         }
         else throw QueryError( "INVALID_PARAMS", "ref or frame_id is required" );
+
+        std::vector<analysis::CorrelatedFrameEventDto> frameEvents;
+        const bool sessionFramePosting = source->AcquireReadView().sourceKind ==
+            analysis::TraceSourceKind::Session;
+        if( sessionFramePosting )
+        {
+            const auto totalForFrame = source->GetCorrelatedFrameEventCountForFrame( frameId );
+            if( totalForFrame == 0 )
+            {
+                if( source->GetTraceInfo().counts.correlatedFrameEvents == 0 )
+                    return Success( id, { { "present", false }, { "complete", false },
+                        { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
+                        { "evidence_kind", "unavailable" } }, trace );
+                throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity was not found" );
+            }
+            if( totalForFrame > std::numeric_limits<size_t>::max() )
+                throw QueryError( "RESOURCE_LIMIT", "FrameIdentity event count exceeds the platform addressable range" );
+            const auto exactCount = size_t( totalForFrame );
+            if( BudgetScanAllowance( exactCount ) != exactCount )
+                throw QueryError( "RESOURCE_LIMIT",
+                    "FrameIdentity evidence exceeds the exact scan budget; increase max_scan_events" );
+            frameEvents.reserve( exactCount );
+            constexpr size_t PageSize = 256;
+            for( size_t offset = 0; offset < exactCount; )
+            {
+                checkCancelled();
+                const auto requested = std::min( PageSize, exactCount - offset );
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed != requested ) throw QueryError( "RESOURCE_LIMIT",
+                    "FrameIdentity evidence exceeded the exact CPU/scan budget while paging" );
+                auto page = source->GetCorrelatedFrameEventsForFrame( frameId, offset, allowed );
+                if( page.size() != allowed )
+                    throw std::runtime_error( "session_frame_identity_page_missing" );
+                BudgetScanned( page.size(), requested, allowed );
+                offset += page.size();
+                frameEvents.insert( frameEvents.end(),
+                    std::make_move_iterator( page.begin() ), std::make_move_iterator( page.end() ) );
+            }
+        }
+        else
+        {
+            frameEvents = source->GetCorrelatedFrameEvents();
+            if( frameEvents.empty() )
+                return Success( id, { { "present", false }, { "complete", false },
+                    { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
+                    { "evidence_kind", "unavailable" } }, trace );
+        }
 
         int64_t frameBegin = std::numeric_limits<int64_t>::max();
         int64_t frameEnd = std::numeric_limits<int64_t>::min();

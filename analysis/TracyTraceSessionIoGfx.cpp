@@ -861,6 +861,31 @@ std::vector<Dto> ReadFramePosting( const std::filesystem::path& path,
     return result;
 }
 
+uint64_t CountPostingKey( const std::filesystem::path& path,
+    uint64_t postingOffset, uint64_t postingCount, uint64_t key )
+{
+    if( postingCount == 0 ) return 0;
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session I/O/Gfx posting is unavailable" );
+    const auto lowerBound = [&]( bool upper )
+    {
+        uint64_t first = 0, last = postingCount;
+        while( first < last )
+        {
+            const auto middle = first + ( last - first ) / 2;
+            TraceSessionUInt64Pair pair;
+            in.clear();
+            in.seekg( std::streamoff( postingOffset + middle * sizeof( pair ) ) );
+            if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+                throw std::runtime_error( "Session I/O/Gfx posting binary search failed" );
+            if( pair.key < key || ( upper && pair.key == key ) ) first = middle + 1;
+            else last = middle;
+        }
+        return first;
+    };
+    return lowerBound( true ) - lowerBound( false );
+}
+
 std::vector<uint64_t> ReadPostingValues( const std::filesystem::path& path,
     uint64_t postingOffset, uint64_t postingCount, uint64_t key,
     size_t offset = 0, size_t limit = std::numeric_limits<size_t>::max() )
@@ -2201,6 +2226,12 @@ std::vector<CorrelatedFrameEventDto> TraceSessionIoGfxReader::CorrelatedFramesFo
                 value.domainIndex, value.timeNs, MakeRef( m_fingerprint, "thread", value.thread ),
                 value.domain, value.phase, value.flags };
         } );
+}
+
+uint64_t TraceSessionIoGfxReader::CorrelatedFrameCountForFrame( uint64_t frameId ) const
+{
+    return CountPostingKey( m_path, m_correlatedFramePostingOffset,
+        m_stats.correlatedFrames, frameId );
 }
 
 bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,

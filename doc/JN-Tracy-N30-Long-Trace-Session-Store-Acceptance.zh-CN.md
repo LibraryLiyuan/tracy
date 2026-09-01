@@ -1677,6 +1677,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Evidence Graph 目标 FrameIdentity 有界读取（N30.6B 子阶段）
+
+状态：**Passed（内部正确性与OOM防护；Session Evidence capability仍按完整性门禁保持关闭）**。
+
+- `TraceSource`新增`GetCorrelatedFrameEventCountForFrame(frameId)`；Legacy实现保持原有语义，Session实现直接对既有Frame posting执行两次二分查找，复杂度为`O(log N)`，不扫描全部FrameIdentity事件。
+- Session Evidence Graph路径先取得目标Frame的精确事件数，并要求`max_scan_events`能够覆盖全部事件；超出平台容量或查询预算时返回`RESOURCE_LIMIT`。
+- 预算通过后按最多256条分页读取同一Frame的事件，并逐页登记Query预算；缺页或处理中预算耗尽均失败，不发布部分Frame为Exact。
+- 不再因分析单个Frame而调用Session的`GetCorrelatedFrameEvents()`全量接口。Legacy `.tracy`仍保持传统Worker路径。
+- 当前没有把`evidence.graph`、`frame.critical_path`或`frame.explain`加入Session capability。Runtime Script语义和其余跨域证据尚未完成磁盘化之前，这三个方法继续明确返回`CAPABILITY_UNAVAILABLE`，避免把局部完成误报为全域可用。
+
+TDD与回归证据：
+
+```text
+RED:       测试先调用不存在的GetCorrelatedFrameEventCountForFrame，编译按预期失败
+Reader:    Frame 9精确计数=1；不存在的Frame 10计数=0
+GREEN:     Trace Session Inventory tests passed
+Regression: 固定6项回归全部通过（2.87秒）
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Canonical Schema、Unity或Player。
+
 ### 2026-09-01 全局 Job Critical Path 有界门禁（N30.6B 子阶段）
 
 状态：**Passed（正确性与OOM防护；超大图的磁盘Derived仍待后续）**。

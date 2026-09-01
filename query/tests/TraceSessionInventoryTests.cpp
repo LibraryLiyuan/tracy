@@ -2646,7 +2646,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto scriptStackPage = sessionSource->ScanScriptStackEvents( 1, 2 );
         const auto correlatedFrames = sessionSource->GetCorrelatedFrameEvents();
         const auto frameNineDispatches = sessionSource->GetGfxDispatchesForFrame( 9, 0, 8 );
+        const auto frameNineEventCount = sessionSource->GetCorrelatedFrameEventCountForFrame( 9 );
         const auto frameNineEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 9, 0, 8 );
+        const auto missingFrameEventCount = sessionSource->GetCorrelatedFrameEventCountForFrame( 10 );
         const auto missingFrameDispatches = sessionSource->GetGfxDispatchesForFrame( 10, 0, 8 );
         const auto missingFrameEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 10, 0, 8 );
         const auto frameNineGfxEvidence = sessionSource->GetEvidenceGfx( 9, { 500 } );
@@ -2698,8 +2700,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             scriptStackPage.size() == 2 && scriptStackPage[0].primaryId == 1001,
             "Session Script reader pages exact frame and stack records" );
         test.Check( frameNineDispatches.size() == 1 && frameNineDispatches[0].dispatchId == 300 &&
+            frameNineEventCount == 1 &&
             frameNineEvents.size() == 1 && frameNineEvents[0].frameId == 9 &&
-            missingFrameDispatches.empty() && missingFrameEvents.empty(),
+            missingFrameEventCount == 0 && missingFrameDispatches.empty() && missingFrameEvents.empty(),
             "Session Gfx/Frame posting readers fetch one Frame directly without scanning the full domain" );
         test.Check( frameNineGfxEvidence.dispatches.size() == 1 &&
             frameNineGfxEvidence.dispatches[0].dispatchId == 300 &&
