@@ -81,6 +81,7 @@ public:
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     uint64_t GetIoRequestCount() const override;
+    std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const override;
     std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const override;
     std::vector<IoRequestDto> GetIoChildren(
         uint64_t parentId, size_t offset, size_t limit ) const override;

@@ -5064,7 +5064,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             analysis::TraceSourceKind::Session;
         const auto requestCount = source->GetIoRequestCount();
         std::vector<analysis::IoRequestDto> requests;
-        if( !pagedSessionIo || method == "io.search" || method == "io.statistics" )
+        if( !pagedSessionIo || method == "io.search" )
             requests = source->GetIoRequests();
         const auto capabilities = source->GetCapabilities();
         const auto capability = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) { return value.domain == "io"; } );
@@ -5234,6 +5234,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "io.statistics" )
         {
+            const auto forEachIoRequest = [&]( auto&& visitor ) {
+                if( !pagedSessionIo )
+                {
+                    for( const auto& request : requests ) visitor( request );
+                    return;
+                }
+                constexpr size_t PageSize = 1024;
+                uint64_t offset = 0;
+                while( offset < requestCount )
+                {
+                    checkCancelled();
+                    const auto page = source->ScanIoRequests( size_t( offset ),
+                        size_t( std::min<uint64_t>( PageSize, requestCount - offset ) ) );
+                    if( page.empty() )
+                        throw std::runtime_error( "session_io_statistics_page_missing" );
+                    for( const auto& request : page ) visitor( request );
+                    offset += page.size();
+                }
+            };
             uint64_t completed = 0, failed = 0, cancelled = 0, requeued = 0;
             uint64_t missingStart = 0, missingTerminal = 0, duplicateTerminal = 0, invalidOrder = 0;
             uint64_t unresolvedParent = 0, bytesOverflow = 0, orphan = 0, truncated = 0, captureBoundary = 0, callstacks = 0;
@@ -5241,10 +5260,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t unexplainedMissingStart = 0, unexplainedMissingTerminal = 0, unexplainedTruncated = 0;
             std::vector<int64_t> queueLatency, execution, total;
             std::set<uint64_t> ids;
-            for( const auto& value : requests ) ids.emplace( value.requestId );
+            if( !pagedSessionIo )
+                for( const auto& value : requests ) ids.emplace( value.requestId );
             json operationCounts = json::object();
-            for( const auto& value : requests )
-            {
+            forEachIoRequest( [&]( const auto& value ) {
                 checkCancelled();
                 operationCounts[IoOperationName( value.operation )] = Decimal( std::stoull( operationCounts.value( IoOperationName( value.operation ), "0" ) ) + 1 );
                 completed += value.status == uint8_t( JnIoStatus::Success );
@@ -5273,7 +5292,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 unexplainedTruncated += value.truncated && !( observedOpenAtCaptureEnd && producerComplete );
                 captureBoundary += value.captureBoundary;
                 callstacks += value.requestCallstack != 0;
-                unresolvedParent += value.parentKind == uint8_t( JnIoParentKind::IoRequest ) && value.parentId != 0 && !ids.contains( value.parentId );
+                unresolvedParent += value.parentKind == uint8_t( JnIoParentKind::IoRequest ) &&
+                    value.parentId != 0 && ( pagedSessionIo ?
+                        !source->GetIoRequest( value.parentId ).has_value() :
+                        !ids.contains( value.parentId ) );
                 bytesOverflow += value.operation == uint8_t( JnIoOperation::Read ) && value.requestedBytes != 0 && value.transferredBytes > value.requestedBytes;
                 const bool badOrder = ( value.startNs && !value.orphan && *value.startNs < value.queueNs ) ||
                     ( value.endNs && value.startNs && *value.endNs < *value.startNs ) || ( value.endNs && !value.orphan && *value.endNs < value.queueNs );
@@ -5281,10 +5303,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( value.startNs && !value.orphan && *value.startNs >= value.queueNs ) queueLatency.push_back( *value.startNs - value.queueNs );
                 if( value.startNs && value.endNs && *value.endNs >= *value.startNs ) execution.push_back( *value.endNs - *value.startNs );
                 if( value.endNs && !value.orphan && *value.endNs >= value.queueNs ) total.push_back( *value.endNs - value.queueNs );
-            }
+            } );
             auto result = base();
             result["counts"] = {
-                { "requests", Decimal( requests.size() ) }, { "completed", Decimal( completed ) }, { "failed", Decimal( failed ) },
+                { "requests", Decimal( requestCount ) }, { "completed", Decimal( completed ) }, { "failed", Decimal( failed ) },
                 { "cancelled", Decimal( cancelled ) }, { "requeue_stages", Decimal( requeued ) }, { "request_callstacks", Decimal( callstacks ) },
                 { "connection_snapshots", Decimal( captureBoundary ) },
                 { "operations", std::move( operationCounts ) }

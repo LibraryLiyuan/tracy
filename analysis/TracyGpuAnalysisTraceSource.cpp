@@ -820,6 +820,14 @@ uint64_t GpuAnalysisTraceSource::GetIoRequestCount() const
     const auto reader = SessionIoGfxReader();
     return reader ? reader->Stats().ioRequestIds : 0;
 }
+std::vector<IoRequestDto> GpuAnalysisTraceSource::ScanIoRequests(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanIoRequests( offset, limit );
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->ScanIoRequests( offset, limit ) :
+        std::vector<IoRequestDto> {};
+}
 std::optional<IoRequestDto> GpuAnalysisTraceSource::GetIoRequest( uint64_t requestId ) const
 {
     if( WorkerLoaded() ) return TraceSource::GetIoRequest( requestId );

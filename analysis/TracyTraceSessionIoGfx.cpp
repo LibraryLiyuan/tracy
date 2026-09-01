@@ -62,6 +62,7 @@ struct FileHeader
     uint64_t ioRequestIds = 0;
     uint64_t ioParentPostingOffset = 0;
     uint64_t ioParentLinks = 0;
+    uint64_t ioRequestIdsOffset = 0;
     uint64_t gfxParentLinks = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
@@ -423,12 +424,15 @@ bool CopyFile( const std::filesystem::path& path, std::ofstream& out,
     return true;
 }
 
-bool CountDistinctPairKeys( const std::filesystem::path& path,
-    uint64_t expectedCount, uint64_t& distinct, std::string& error )
+bool BuildDistinctPairKeys( const std::filesystem::path& path,
+    const std::filesystem::path& output, uint64_t expectedCount,
+    uint64_t& distinct, std::string& error )
 {
     distinct = 0;
     std::ifstream in( path, std::ios::binary );
     if( !in ) { error = "session_io_request_id_posting_open_failed"; return false; }
+    std::ofstream out( output, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_io_request_ids_open_failed"; return false; }
     uint64_t previous = 0;
     bool havePrevious = false;
     for( uint64_t index = 0; index < expectedCount; ++index )
@@ -441,11 +445,15 @@ bool CountDistinctPairKeys( const std::filesystem::path& path,
             ++distinct;
             previous = pair.key;
             havePrevious = true;
+            out.write( reinterpret_cast<const char*>( &pair.key ), sizeof( pair.key ) );
+            if( !out ) { error = "session_io_request_ids_write_failed"; return false; }
         }
     }
     char trailing = 0;
     if( in.read( &trailing, 1 ) )
     { error = "session_io_request_id_posting_trailing_bytes"; return false; }
+    out.flush();
+    if( !out ) { error = "session_io_request_ids_finalize_failed"; return false; }
     return true;
 }
 
@@ -595,6 +603,9 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         header.ioParentPostingOffset == expected;
     valid = valid && CheckedAppend( expected, header.ioParentLinks,
         sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioRequestIdsOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioRequestIds,
+        sizeof( uint64_t ), error ) &&
         expected == manifest.fileBytes;
     if( !in || source != session.source.sha256 || generation != session.generation || !valid )
     {
@@ -837,6 +848,38 @@ bool ValidateIoRequestPosting( const std::filesystem::path& path,
     return true;
 }
 
+bool ValidateIoRequestIds( const std::filesystem::path& path,
+    const FileHeader& header, std::string& error )
+{
+    std::ifstream pairs( path, std::ios::binary );
+    std::ifstream ids( path, std::ios::binary );
+    if( !pairs || !ids )
+    { error = "session_io_request_ids_open_failed"; return false; }
+    pairs.seekg( std::streamoff( header.ioRequestIdPostingOffset ) );
+    ids.seekg( std::streamoff( header.ioRequestIdsOffset ) );
+    uint64_t previous = 0;
+    bool havePrevious = false;
+    uint64_t matched = 0;
+    for( uint64_t index = 0; index < header.ioRequestIdPostingCount; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !pairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        { error = "session_io_request_ids_source_truncated"; return false; }
+        if( havePrevious && pair.key == previous ) continue;
+        uint64_t requestId = 0;
+        if( !ids.read( reinterpret_cast<char*>( &requestId ), sizeof( requestId ) ) )
+        { error = "session_io_request_ids_truncated"; return false; }
+        if( requestId != pair.key )
+        { error = "session_io_request_ids_key_mismatch"; return false; }
+        previous = pair.key;
+        havePrevious = true;
+        ++matched;
+    }
+    if( matched != header.ioRequestIds )
+    { error = "session_io_request_ids_count_mismatch"; return false; }
+    return true;
+}
+
 std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
 {
     std::ostringstream out;
@@ -958,6 +1001,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         root / "gfx-link-target-posting-sorted.work",
         root / "io-request-id-posting-sorted.work",
         root / "io-parent-posting-sorted.work" };
+    const auto ioRequestIds = root / "io-request-ids.work";
     BuildState state;
     state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
     state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
@@ -1018,8 +1062,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         !SortTraceSessionUInt64Pairs( postingSource[6], postingSorted[6], root,
             "io-request-id-posting", ioRequestIdPostingCount,
             MaximumBufferedPostingPairs, error ) ||
-        !CountDistinctPairKeys( postingSorted[6], ioRequestIdPostingCount,
-            state.stats.ioRequestIds, error ) ||
+        !BuildDistinctPairKeys( postingSorted[6], ioRequestIds,
+            ioRequestIdPostingCount, state.stats.ioRequestIds, error ) ||
         !SortTraceSessionUInt64Pairs( postingSource[7], postingSorted[7], root,
             "io-parent-posting", state.stats.ioParentLinks,
             MaximumBufferedPostingPairs, error ) ) return false;
@@ -1078,6 +1122,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.ioParentPostingOffset = next;
     if( !CheckedAppend( next, state.stats.ioParentLinks,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioRequestIdsOffset = next;
+    if( !CheckedAppend( next, state.stats.ioRequestIds,
+        sizeof( uint64_t ), error ) ) return false;
 
     const auto temporary = root / ( std::string( FileName ) + ".tmp" );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -1110,6 +1157,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         if( !CopyFile( postingSorted[i], out, copied, error ) ||
             copied != expected[work.size() + i] )
         { if( error.empty() ) error = "session_io_gfx_posting_size_mismatch"; return false; }
+    if( !CopyFile( ioRequestIds, out, copied, error ) ||
+        copied != state.stats.ioRequestIds * sizeof( uint64_t ) )
+    { if( error.empty() ) error = "session_io_request_ids_size_mismatch"; return false; }
     out.flush();
     if( !out ) { error = "session_io_gfx_file_finalize_failed"; return false; }
     out.close();
@@ -1118,6 +1168,7 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     for( const auto& path : work ) { ec.clear(); std::filesystem::remove( path, ec ); }
     for( const auto& path : postingSource ) { ec.clear(); std::filesystem::remove( path, ec ); }
     for( const auto& path : postingSorted ) { ec.clear(); std::filesystem::remove( path, ec ); }
+    ec.clear(); std::filesystem::remove( ioRequestIds, ec );
 
     LocalManifest manifest;
     manifest.sourceSha256 = session.source.sha256;
@@ -1160,6 +1211,7 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_ioRequestIdPostingOffset = header.ioRequestIdPostingOffset;
     reader->m_ioRequestIdPostingCount = header.ioRequestIdPostingCount;
     reader->m_ioParentPostingOffset = header.ioParentPostingOffset;
+    reader->m_ioRequestIdsOffset = header.ioRequestIdsOffset;
     reader->m_stats = manifest.stats;
     return reader;
 }
@@ -1279,6 +1331,32 @@ std::vector<IoRequestDto> TraceSessionIoGfxReader::IoChildren(
             if( result.size() >= limit ) break;
         }
         if( ordinals.size() < Chunk ) break;
+    }
+    return result;
+}
+
+std::vector<IoRequestDto> TraceSessionIoGfxReader::ScanIoRequests(
+    size_t offset, size_t limit ) const
+{
+    std::vector<IoRequestDto> result;
+    const auto begin = std::min<uint64_t>( offset, m_stats.ioRequestIds );
+    const auto count = std::min<uint64_t>( limit, m_stats.ioRequestIds - begin );
+    if( count == 0 ) return result;
+    std::vector<uint64_t> ids;
+    ids.resize( size_t( count ) );
+    std::ifstream in( m_path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session I/O request ID pages are unavailable" );
+    in.seekg( std::streamoff( m_ioRequestIdsOffset + begin * sizeof( uint64_t ) ) );
+    if( !in.read( reinterpret_cast<char*>( ids.data() ),
+        std::streamsize( ids.size() * sizeof( uint64_t ) ) ) )
+        throw std::runtime_error( "Session I/O request ID page is truncated" );
+    result.reserve( ids.size() );
+    for( const auto requestId : ids )
+    {
+        const auto request = IoRequest( requestId );
+        if( !request )
+            throw std::runtime_error( "Session I/O request ID page target is unavailable" );
+        result.emplace_back( *request );
     }
     return result;
 }
@@ -1487,7 +1565,8 @@ bool AuditTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
             []( const StoredIoConfig& value ) {
                 return value.parentKind == uint8_t( JnIoParentKind::IoRequest ) ?
                     value.parentId : uint64_t( 0 ); },
-            "session_io_parent_posting", error ) ) return false;
+            "session_io_parent_posting", error ) ||
+        !ValidateIoRequestIds( path, header, error ) ) return false;
     stats = manifest.stats;
     return true;
 }

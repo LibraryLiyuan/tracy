@@ -1564,3 +1564,25 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 新增synthetic事件把开放Frame尾部从40 ns推进到46 ns；Frame Reader与Query期望同步更新，未改变尾部闭合算法。本子阶段未启动真实30分钟转换。
+
+### 2026-09-01 I/O Request ID 页表与 Statistics 分页（N30.6B 子阶段）
+
+状态：**Passed（DTO物化有界；精确分位数外排仍待集中优化）**。
+
+- I/O/Gfx index schema从5升级到6；从已排序的Request ID posting顺序生成唯一、严格递增的`io-request-ids`页表。
+- 页表由posting事实确定性派生，不在内存保存全部ID；生成过程顺序读取、顺序写入，最终文件追加到immutable index并纳入SHA-256。
+- Session Reader新增`ScanIoRequests(offset, limit)`，只读取请求页的ID，再通过ID posting点读各自Request/Config/Stage。
+- `io.statistics`的Session路径以1024 Request为一页遍历，不再先调用`GetIoRequests()`生成全量DTO和全量Stage向量；Parent完整性通过目标ID点查验证。
+- 当前延迟`queue/execution/total`的精确P50/P95/P99仍收集三个标量数组，内存与Request数线性但不再与Stage/DTO体量线性；后续使用外部排序或确定性磁盘run替换，不能用近似分位数冒充Exact。
+- Final Audit线性对照唯一ID页表与ID posting的distinct key序列；缺失、重复、错序或键不一致均阻止发布。
+
+TDD与回归证据：
+
+```text
+Reader:    ScanIoRequests(offset=1, limit=1)=[Request 401]
+Query:     io.statistics requests=2，completed=2，unresolved_parent=0
+BUILD FIX: vector声明触发most-vexing-parse，改为显式resize；未改变算法
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未把按Request ID排序错误用于`io.search`；其queue-time全局顺序仍待专用posting。

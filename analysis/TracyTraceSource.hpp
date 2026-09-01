@@ -1077,6 +1077,13 @@ public:
     }
     virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
     virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
+    virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
+    {
+        const auto values = GetIoRequests();
+        const auto begin = std::min( offset, values.size() );
+        const auto end = begin + std::min( limit, values.size() - begin );
+        return std::vector<IoRequestDto>( values.begin() + begin, values.begin() + end );
+    }
     virtual std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const
     {
         const auto values = GetIoRequests();

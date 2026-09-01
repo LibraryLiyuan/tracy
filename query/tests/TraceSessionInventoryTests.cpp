@@ -2629,6 +2629,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto childIoRequest = sessionSource->GetIoRequest( 401 );
         const auto missingIoRequest = sessionSource->GetIoRequest( 402 );
         const auto ioChildren = sessionSource->GetIoChildren( 400, 0, 8 );
+        const auto ioRequestPage = sessionSource->ScanIoRequests( 1, 1 );
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
@@ -2648,7 +2649,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( ioRequests[1].requestId == 401 && ioRequests[1].parentId == 400 &&
             ioRequests[1].parentKind == uint8_t( tracy::JnIoParentKind::IoRequest ) &&
             ioRequests[1].requestedBytes == 1024 && ioRequests[1].transferredBytes == 1024 &&
-            ioChildren.size() == 1 && ioChildren[0].requestId == 401,
+            ioChildren.size() == 1 && ioChildren[0].requestId == 401 &&
+            ioRequestPage.size() == 1 && ioRequestPage[0].requestId == 401,
             "Session I/O reader preserves an exact parent-child request lifecycle" );
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
             gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
@@ -3061,6 +3063,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                     { "ref", sessionSource->MakeEntityRef( "io-request", 401 ) },
                     { "max_nodes", 8 } } }
             } );
+            const auto ioStatistics = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-io-statistics" },
+                { "method", "io.statistics" }, { "params", { { "trace_id", traceId } } }
+            } );
             test.Check( ioSearch.value( "ok", false ) &&
                 ioSearch["data"]["request_count"] == "2" &&
                 ioSearch["data"]["requests"].size() == 2 &&
@@ -3080,6 +3086,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 ioChain["data"]["edges"][0]["relation"] == "parent" &&
                 ioChain["data"]["truncated"] == false,
                 "Query 1.34 walks the Session I/O parent chain through exact ID and child postings" );
+            test.Check( ioStatistics.value( "ok", false ) &&
+                ioStatistics["data"]["counts"]["requests"] == "2" &&
+                ioStatistics["data"]["counts"]["completed"] == "2" &&
+                ioStatistics["data"]["quality"]["unresolved_parent"] == "0",
+                "Query 1.34 computes Session I/O statistics from bounded Request ID pages" );
         }
         if( sessionGfxReady )
         {
