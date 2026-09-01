@@ -1499,3 +1499,24 @@ Trace Session Inventory tests passed
 ```
 
 本子阶段未改动Legacy Worker语义，也未开放尚未完成的全局`correlation.chain`分页能力。
+
+### 2026-09-01 Job 指定根关键路径点查（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- Session 的 `job.critical_path(ref=Job)` 不再调用 `GetJobs()` 或读取完整 `jobs.bin`；从根Job开始，使用 `job-pages` 的ID点查递归构造精确上游依赖闭包。
+- 闭包仍执行原有DAG最长执行时间算法；未改变零执行时长前置Job不进入耗时关键路径的既有规则。
+- 返回增加 `scope=upstream_closure`、`scope_jobs`、`root_job_id`、`complete` 和 `missing_prerequisite_job_ids`，明确区分“根Job上游闭包”与无ref的全局关键路径。
+- Capture边界导致前置Job缺失时不伪造完整结果，返回 `complete=false` 和 `dependency_closure_incomplete`；查询预算不足则返回明确 `RESOURCE_LIMIT`，不输出截断后冒充Exact的路径。
+- 无ref的全局 `job.critical_path` 仍保持原有全Job语义，后续由外部拓扑归并实现长Trace磁盘化，当前不做近似。
+
+TDD证据：
+
+```text
+RED:       隐藏 jobs.bin 后，旧 Session job.critical_path(ref=Job 500) 失败
+FIX:       通过 GetJob(500) → GetJob(400) 磁盘点查构造上游闭包
+RESULT:    processed_jobs=2，scope_jobs=2，关键耗时路径=[Job 500]
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+测试结束已移除临时Query响应诊断输出；本子阶段未启动真实30分钟转换。

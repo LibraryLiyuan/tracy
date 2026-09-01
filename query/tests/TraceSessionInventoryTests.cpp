@@ -2947,11 +2947,24 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto sessionJobRaw = sessionJobRoot / "jobs.bin";
         const auto sessionJobRawHidden = sessionJobRoot / "jobs.bin.statistics-test-hidden";
         std::filesystem::rename( sessionJobRaw, sessionJobRawHidden );
+        const auto jobCriticalPath = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-job-critical-path" },
+            { "method", "job.critical_path" }, { "params", { { "trace_id", traceId },
+                { "ref", sessionSource->MakeEntityRef( "job", 500 ) }, { "max_nodes", 16 } } }
+        } );
         const auto jobStatistics = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-job-statistics" },
             { "method", "job.statistics" }, { "params", { { "trace_id", traceId } } }
         } );
         std::filesystem::rename( sessionJobRawHidden, sessionJobRaw );
+        test.Check( jobCriticalPath.value( "ok", false ) &&
+            jobCriticalPath["data"]["jobs"].size() == 1 &&
+            jobCriticalPath["data"]["jobs"][0]["job_id"] == "500" &&
+            jobCriticalPath["data"]["processed_jobs"] == 2 &&
+            jobCriticalPath["data"]["scope_jobs"] == "2" &&
+            jobCriticalPath["data"]["scope"] == "upstream_closure" &&
+            jobCriticalPath["data"]["root_job_id"] == "500",
+            "Query 1.34 computes a root-scoped Session Job critical path from exact point reads without raw full materialization" );
         test.Check( jobStatistics.value( "ok", false ) &&
             jobStatistics["data"]["counts"]["jobs"] == "2" &&
             jobStatistics["data"]["counts"]["completed"] == "2" &&

@@ -10702,6 +10702,125 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 trace, PageJson( page, downstream.size(), cursor ) );
         }
 
+        const auto buildCriticalPath = [&]( std::vector<analysis::JobDto> scopedJobs,
+            std::optional<uint64_t> requestedJob, const char* scope,
+            uint64_t totalJobs, const std::vector<uint64_t>& missingPrerequisites = {} ) -> json {
+            if( scopedJobs.empty() ) return {
+                { "jobs", json::array() }, { "total_execution_ns", "0" },
+                { "has_cycle", false }, { "processed_jobs", 0 },
+                { "total_jobs", Decimal( totalJobs ) }, { "scope_jobs", "0" },
+                { "scope", scope }, { "complete", missingPrerequisites.empty() }
+            };
+            std::unordered_map<uint64_t, size_t> indexById;
+            indexById.reserve( scopedJobs.size() );
+            for( size_t index = 0; index < scopedJobs.size(); index++ )
+                indexById.emplace( scopedJobs[index].jobId, index );
+            std::vector<std::vector<size_t>> outgoing( scopedJobs.size() );
+            std::vector<size_t> indegree( scopedJobs.size(), 0 );
+            for( size_t index = 0; index < scopedJobs.size(); index++ )
+            {
+                for( const auto& dependency : scopedJobs[index].dependencies )
+                {
+                    const auto prerequisite = indexById.find( dependency.prerequisiteJobId );
+                    if( prerequisite == indexById.end() ) continue;
+                    outgoing[prerequisite->second].push_back( index );
+                    indegree[index]++;
+                }
+            }
+            std::queue<size_t> ready;
+            for( size_t index = 0; index < indegree.size(); index++ )
+                if( indegree[index] == 0 ) ready.push( index );
+            std::vector<int64_t> cost( scopedJobs.size(), 0 );
+            std::vector<std::optional<size_t>> parent( scopedJobs.size() );
+            size_t processed = 0;
+            while( !ready.empty() )
+            {
+                checkCancelled();
+                const auto current = ready.front();
+                ready.pop();
+                processed++;
+                cost[current] += std::max<int64_t>( scopedJobs[current].executionNs, 0 );
+                for( const auto next : outgoing[current] )
+                {
+                    if( cost[next] < cost[current] )
+                    {
+                        cost[next] = cost[current];
+                        parent[next] = current;
+                    }
+                    if( --indegree[next] == 0 ) ready.push( next );
+                }
+            }
+            size_t endIndex = 0;
+            if( requestedJob )
+            {
+                const auto found = indexById.find( *requestedJob );
+                if( found == indexById.end() )
+                    throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+                endIndex = found->second;
+            }
+            else
+            {
+                endIndex = size_t( std::distance( cost.begin(),
+                    std::max_element( cost.begin(), cost.end() ) ) );
+            }
+            std::vector<size_t> path;
+            for( std::optional<size_t> current = endIndex; current;
+                current = parent[*current] ) path.push_back( *current );
+            std::reverse( path.begin(), path.end() );
+            json values = json::array();
+            for( const auto index : path )
+                values.push_back( JobJson( *source, scopedJobs[index], false ) );
+            json missing = json::array();
+            for( const auto jobId : missingPrerequisites ) missing.push_back( Decimal( jobId ) );
+            json result = {
+                { "jobs", std::move( values ) },
+                { "total_execution_ns", Decimal( cost[endIndex] ) },
+                { "has_cycle", processed != scopedJobs.size() },
+                { "processed_jobs", processed }, { "total_jobs", Decimal( totalJobs ) },
+                { "scope_jobs", Decimal( scopedJobs.size() ) }, { "scope", scope },
+                { "complete", missingPrerequisites.empty() },
+                { "missing_prerequisite_job_ids", std::move( missing ) }
+            };
+            if( requestedJob ) result["root_job_id"] = Decimal( *requestedJob );
+            if( !missingPrerequisites.empty() )
+                result["reason"] = "dependency_closure_incomplete";
+            return result;
+        };
+
+        if( pagedSessionJobs && method == "job.critical_path" && params.contains( "ref" ) )
+        {
+            const auto rootJobId = parseJobRef();
+            std::vector<analysis::JobDto> closure;
+            std::vector<uint64_t> missingPrerequisites;
+            std::queue<uint64_t> pending;
+            std::unordered_set<uint64_t> scheduled;
+            pending.push( rootJobId );
+            scheduled.emplace( rootJobId );
+            while( !pending.empty() )
+            {
+                checkCancelled();
+                if( !BudgetConsumeNode() )
+                    throw QueryError( "RESOURCE_LIMIT",
+                        "Job dependency closure exceeded the query max_nodes or max_cpu_ms budget" );
+                const auto jobId = pending.front();
+                pending.pop();
+                const auto job = source->GetJob( jobId );
+                if( !job )
+                {
+                    if( jobId == rootJobId )
+                        throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+                    missingPrerequisites.emplace_back( jobId );
+                    continue;
+                }
+                closure.emplace_back( *job );
+                for( const auto& dependency : job->dependencies )
+                    if( scheduled.emplace( dependency.prerequisiteJobId ).second )
+                        pending.push( dependency.prerequisiteJobId );
+            }
+            return Success( id, buildCriticalPath( std::move( closure ), rootJobId,
+                "upstream_closure", source->GetJobCount(), missingPrerequisites ), trace );
+        }
+
         if( pagedSessionJobs ) jobs = source->GetJobs();
 
         if( method == "job.search" )
@@ -10755,65 +10874,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "job.critical_path" )
         {
-            if( jobs.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
-            std::unordered_map<uint64_t, size_t> indexById;
-            indexById.reserve( jobs.size() );
-            for( size_t index = 0; index < jobs.size(); index++ ) indexById.emplace( jobs[index].jobId, index );
-            std::vector<std::vector<size_t>> outgoing( jobs.size() );
-            std::vector<size_t> indegree( jobs.size(), 0 );
-            for( size_t index = 0; index < jobs.size(); index++ )
-            {
-                for( const auto& dependency : jobs[index].dependencies )
-                {
-                    const auto prerequisite = indexById.find( dependency.prerequisiteJobId );
-                    if( prerequisite == indexById.end() ) continue;
-                    outgoing[prerequisite->second].push_back( index );
-                    indegree[index]++;
-                }
-            }
-            std::queue<size_t> ready;
-            for( size_t index = 0; index < indegree.size(); index++ ) if( indegree[index] == 0 ) ready.push( index );
-            std::vector<int64_t> cost( jobs.size(), 0 );
-            std::vector<std::optional<size_t>> parent( jobs.size() );
-            size_t processed = 0;
-            while( !ready.empty() )
-            {
-                checkCancelled();
-                const auto current = ready.front();
-                ready.pop();
-                processed++;
-                cost[current] += std::max<int64_t>( jobs[current].executionNs, 0 );
-                for( const auto next : outgoing[current] )
-                {
-                    if( cost[next] < cost[current] )
-                    {
-                        cost[next] = cost[current];
-                        parent[next] = current;
-                    }
-                    if( --indegree[next] == 0 ) ready.push( next );
-                }
-            }
-            size_t endIndex;
-            if( params.contains( "ref" ) )
-            {
-                const auto requested = parseJobRef();
-                const auto found = indexById.find( requested );
-                if( found == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
-                endIndex = found->second;
-            }
-            else
-            {
-                endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
-            }
-            std::vector<size_t> path;
-            for( std::optional<size_t> current = endIndex; current; current = parent[*current] ) path.push_back( *current );
-            std::reverse( path.begin(), path.end() );
-            json values = json::array();
-            for( const auto index : path ) values.push_back( JobJson( *source, jobs[index], false ) );
-            return Success( id, {
-                { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
-                { "has_cycle", processed != jobs.size() }, { "processed_jobs", processed }, { "total_jobs", jobs.size() }
-            }, trace );
+            const auto requested = params.contains( "ref" ) ?
+                std::optional<uint64_t>( parseJobRef() ) : std::nullopt;
+            const auto totalJobs = jobs.size();
+            return Success( id, buildCriticalPath( std::move( jobs ), requested,
+                "all_jobs", totalJobs ), trace );
         }
 
         if( method == "job.gfx.statistics" )
