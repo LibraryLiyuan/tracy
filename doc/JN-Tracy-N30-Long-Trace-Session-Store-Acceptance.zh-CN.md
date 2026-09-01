@@ -1677,6 +1677,30 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Session Export 语义时间预检与内存门禁（N30.6C 子阶段）
+
+状态：**Passed（导出预检基础；WindowExportSink与CLI仍待实现）**。
+
+- 导出预检不使用Manifest中的Shard传输时间筛选范围。该字段来自stream journal monotonic time，不等价于Tracy事件语义时间。
+- 预检逐个访问Canonical shard，通过`TraceSessionTimeTransform`把每条记录的`semanticTime`转换为纳秒，再按半开区间`[beginNs,endNs)`判断是否命中。
+- 没有语义时间的字典、定义和其他依赖记录被保守地视为导出依赖来源；当前选择整个相关Shard，优先保证正确性，不进行未经证明的裁剪。
+- 每个候选Shard均经过既有Canonical Reader的header、framing、domain、source range、record count与SHA-256校验；损坏输入会在写输出前失败。
+- 内存预估以选中Shard的完整未压缩字节为基数。默认公式为`512 MiB + CanonicalBytes * 4`，默认硬上限16 GiB；估算参数和算法标识同时写入Plan，避免配置变化后报告仍声称固定公式。
+- 预计超过硬上限时返回`session_export_worker_memory_limit`，且不会创建输出文件或进行降级、采样、截断。
+- Canonical checkpoint当前只保存协议解码/LZ4字典状态，不含完整Unity/Job/Memory存活状态。后续WindowExportSink必须从Mandatory Derived生命周期索引重建导出起点状态，不能把checkpoint误当成生命周期快照。
+- 当前预检扫描全部Canonical数据Shard，但内存峰值受单Shard硬上限约束；N30.7将测量真实30分钟Session的墙钟时间，并决定是否把语义时间envelope持久化进后续schema。
+
+TDD与回归证据：
+
+```text
+RED:       测试先引用不存在的TraceSessionExportControl/Plan与Build API，编译按预期失败
+GREEN:     Trace Session Inventory tests passed
+Regression: 固定组合回归6/6通过
+Memory:    默认512 MiB固定开销 + 4倍Canonical未压缩字节；超限路径按预期拒绝
+```
+
+本子阶段没有生成`.tracy`、没有创建`tracy-session-export.exe`，也未启动真实30分钟转换。
+
 ### 2026-09-01 Session Export Range 解析与Generation门禁（N30.6C 子阶段）
 
 状态：**Passed（选择解析基础；尚未生成或发布局部`.tracy`）**。

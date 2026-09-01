@@ -2549,6 +2549,26 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         manifest, mixedSelection, rejectedRange, error ) &&
         error == "session_export_selection_mixed",
         "Session export rejects mixed time and Frame selectors" );
+    tracy::analysis::TraceSessionExportControl exportControl;
+    tracy::analysis::TraceSessionExportPlan exportPlan;
+    test.Check( tracy::analysis::BuildTraceSessionExportPlan( publishedSession,
+        manifest, timeRange, exportControl, exportPlan, error ) &&
+        !exportPlan.shardIds.empty() && exportPlan.recordCount != 0 &&
+        exportPlan.canonicalUncompressedBytes != 0 &&
+        exportPlan.estimatedWorkerBytes >= exportPlan.canonicalUncompressedBytes &&
+        exportPlan.memoryAllowed &&
+        exportPlan.workerExpansionNumerator == 4 &&
+        exportPlan.workerExpansionDenominator == 1 &&
+        exportPlan.workerFixedOverheadBytes == 512ull * 1024 * 1024 &&
+        exportPlan.estimateMethod == "canonical_uncompressed_x4_over_1_plus_536870912B_v1",
+        "Session export preflight selects exact overlapping Canonical shards and reports a conservative memory estimate: " + error );
+    auto limitedExportControl = exportControl;
+    limitedExportControl.workerMemoryLimitBytes = exportPlan.estimatedWorkerBytes - 1;
+    tracy::analysis::TraceSessionExportPlan limitedExportPlan;
+    test.Check( !tracy::analysis::BuildTraceSessionExportPlan( publishedSession,
+        manifest, timeRange, limitedExportControl, limitedExportPlan, error ) &&
+        error == "session_export_worker_memory_limit" && !limitedExportPlan.memoryAllowed,
+        "Session export refuses a range whose conservative Worker estimate exceeds the configured hard limit" );
     auto sessionGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
         tracy::analysis::TraceSessionGpuAnalysisRoot( publishedSession, manifest ),
         manifest.source.sha256, manifest.source.fileSize, error );
