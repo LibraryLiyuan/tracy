@@ -223,6 +223,9 @@ struct GpuLoadState
     bool loadReferenceEvidence = true;
     bool loadRangeEvidence = true;
     bool loadCatalogEnrichment = true;
+    bool loadCatalogCore = true;
+    bool loadCatalogAuxiliary = true;
+    bool loadCatalogStrings = true;
 };
 
 void MarkCatalogPresent( JnTraceData& data )
@@ -403,19 +406,34 @@ bool ProcessCatalogBatch( const QueueJnGpuCatalogBatch& event,
     uint64_t first = 0;
     switch( JnGpuCatalogBatchKind( event.kind ) )
     {
-    case JnGpuCatalogBatchKind::Resource: first = AppendCatalogRecords( data.gpuCatalogResources, records, event.recordCount, *state.transform ); break;
-    case JnGpuCatalogBatchKind::Allocation: first = AppendCatalogRecords( data.gpuCatalogAllocations, records, event.recordCount, *state.transform ); break;
-    case JnGpuCatalogBatchKind::View: first = AppendCatalogRecords( data.gpuCatalogViews, records, event.recordCount, *state.transform ); break;
+    case JnGpuCatalogBatchKind::Resource:
+        if( state.loadCatalogCore ) first = AppendCatalogRecords(
+            data.gpuCatalogResources, records, event.recordCount, *state.transform );
+        break;
+    case JnGpuCatalogBatchKind::Allocation:
+        if( state.loadCatalogCore ) first = AppendCatalogRecords(
+            data.gpuCatalogAllocations, records, event.recordCount, *state.transform );
+        break;
+    case JnGpuCatalogBatchKind::View:
+        if( state.loadCatalogAuxiliary ) first = AppendCatalogRecords(
+            data.gpuCatalogViews, records, event.recordCount, *state.transform );
+        break;
     case JnGpuCatalogBatchKind::Logical:
         if( state.loadCatalogEnrichment ) first = AppendCatalogRecords(
             data.gpuCatalogLogicals, records, event.recordCount, *state.transform );
         break;
-    case JnGpuCatalogBatchKind::Part: first = AppendCatalogRecords( data.gpuCatalogParts, records, event.recordCount, *state.transform ); break;
+    case JnGpuCatalogBatchKind::Part:
+        if( state.loadCatalogAuxiliary ) first = AppendCatalogRecords(
+            data.gpuCatalogParts, records, event.recordCount, *state.transform );
+        break;
     case JnGpuCatalogBatchKind::Relation:
         if( state.loadCatalogEnrichment ) first = AppendCatalogRecords(
             data.gpuCatalogRelations, records, event.recordCount, *state.transform );
         break;
-    case JnGpuCatalogBatchKind::VirtualGeometry: first = AppendCatalogRecords( data.gpuCatalogVg, records, event.recordCount, *state.transform ); break;
+    case JnGpuCatalogBatchKind::VirtualGeometry:
+        if( state.loadCatalogAuxiliary ) first = AppendCatalogRecords(
+            data.gpuCatalogVg, records, event.recordCount, *state.transform );
+        break;
     case JnGpuCatalogBatchKind::RangeSet:
         if( state.loadRangeEvidence ) first = AppendCatalogRecords(
             data.gpuRangeSets, records, event.recordCount, *state.transform );
@@ -426,6 +444,7 @@ bool ProcessCatalogBatch( const QueueJnGpuCatalogBatch& event,
         break;
     case JnGpuCatalogBatchKind::String:
     {
+        if( !state.loadCatalogStrings ) break;
         first = data.gpuCatalogStrings.size();
         const auto* cursor = records;
         const auto* end = records + recordBytes;
@@ -861,12 +880,24 @@ public:
         std::stable_sort( m_pointer.begin(), m_pointer.end(), order );
         std::stable_sort( m_logical.begin(), m_logical.end(), order );
     }
+    ResourceLifetimeResolver() = default;
+    bool AddPointerFile( const std::filesystem::path& path, std::string& error )
+    {
+        if( !m_pointerFile.Open( path, error ) ) return false;
+        if( m_pointerFile.Size() % sizeof( ResourceLifetimeEntry ) != 0 )
+        { error = "session_gpu_pointer_lifetime_file_size_invalid"; return false; }
+        m_pointerFileCount = m_pointerFile.Size() / sizeof( ResourceLifetimeEntry );
+        if( m_pointerFileCount > uint64_t( std::numeric_limits<size_t>::max() ) )
+        { error = "session_gpu_pointer_lifetime_file_count_overflow"; return false; }
+        return true;
+    }
     std::optional<SourceGap> ResolveSourceGapBeforeFirstDefinition(
         uint64_t token, int64_t time )
     {
-        const auto first = std::lower_bound( m_pointer.begin(), m_pointer.end(), token,
+        const auto pointer = PointerValues();
+        const auto first = std::lower_bound( pointer.begin(), pointer.end(), token,
             []( const auto& value, uint64_t candidate ) { return value.key < candidate; } );
-        const bool absent = first == m_pointer.end() || first->key != token;
+        const bool absent = first == pointer.end() || first->key != token;
         if( !absent && ( time >= first->time ||
             JnGpuCatalogRecordOperation( first->operation ) != JnGpuCatalogRecordOperation::Create ) )
             return std::nullopt;
@@ -899,7 +930,7 @@ public:
     }
     uint64_t Resolve( uint64_t token, int64_t time ) const
     {
-        auto value = ResolveIn( m_pointer, token, time, true );
+        auto value = ResolveIn( PointerValues(), token, time, true );
         if( value != 0 ) return value;
         value = ResolveIn( m_logical, token, time, false );
         if( value != 0 || m_logicalFileCount == 0 ) return value;
@@ -910,11 +941,12 @@ public:
     uint64_t ResolveAtOrUniqueInterval( uint64_t token, int64_t time,
         int64_t intervalBegin, int64_t intervalEnd ) const
     {
-        auto exact = ResolveUniqueIntervalIn( m_pointer, token, time, time, true );
+        const auto pointer = PointerValues();
+        auto exact = ResolveUniqueIntervalIn( pointer, token, time, time, true );
         if( exact.keyPresent )
         {
             if( exact.resourceId != 0 || exact.ambiguous ) return exact.resourceId;
-            return ResolveUniqueIntervalIn( m_pointer, token, intervalBegin,
+            return ResolveUniqueIntervalIn( pointer, token, intervalBegin,
                 intervalEnd, true ).resourceId;
         }
         exact = ResolveUniqueIntervalIn( m_logical, token, time, time, false );
@@ -934,13 +966,20 @@ public:
     }
     std::string Describe( uint64_t token, int64_t time ) const
     {
-        return "pointer{" + DescribeIn( m_pointer, token, time ) + "};logical-memory{" +
+        return "pointer{" + DescribeIn( PointerValues(), token, time ) + "};logical-memory{" +
             DescribeIn( m_logical, token, time ) + "};logical-file{" +
             DescribeIn( std::span<const ResourceLifetimeEntry>(
                 reinterpret_cast<const ResourceLifetimeEntry*>( m_logicalFile.Data() ),
                 size_t( m_logicalFileCount ) ), token, time ) + "}";
     }
 private:
+    std::span<const ResourceLifetimeEntry> PointerValues() const
+    {
+        if( m_pointerFileCount != 0 ) return {
+            reinterpret_cast<const ResourceLifetimeEntry*>( m_pointerFile.Data() ),
+            size_t( m_pointerFileCount ) };
+        return m_pointer;
+    }
     struct IntervalResolution
     {
         bool keyPresent = false;
@@ -1140,6 +1179,8 @@ private:
     uint64_t m_nextSourceGapId = SourceGapResourceIdBase;
     ReadOnlyMappedFile m_logicalFile;
     uint64_t m_logicalFileCount = 0;
+    ReadOnlyMappedFile m_pointerFile;
+    uint64_t m_pointerFileCount = 0;
 };
 
 struct PassEvidenceEntry
@@ -1158,6 +1199,9 @@ struct GpuLogicalRawEntry
 static_assert( std::is_trivially_copyable_v<GpuLogicalRawEntry> );
 static_assert( std::is_trivially_copyable_v<GpuAnalysisLogicalStoreEntry> );
 static_assert( std::is_trivially_copyable_v<GpuAnalysisCatalogRelationStoreEntry> );
+static_assert( std::is_trivially_copyable_v<GpuViewAnalysisRecord> );
+static_assert( std::is_trivially_copyable_v<GpuPartAnalysisRecord> );
+static_assert( std::is_trivially_copyable_v<GpuVgAnalysisRecord> );
 
 template<typename T, typename Compare>
 bool SaveGpuSpoolRun( std::vector<T>& values, const std::filesystem::path& root,
@@ -1179,11 +1223,370 @@ bool SaveGpuSpoolRun( std::vector<T>& values, const std::filesystem::path& root,
     runs.push_back( path ); values.clear(); return true;
 }
 
+struct CatalogResourceRawEntry
+{
+    uint64_t generation = 0;
+    uint64_t ordinal = 0;
+    JnGpuCatalogResourceRecordV1 record {};
+};
+
+struct CatalogAllocationRawEntry
+{
+    uint64_t generation = 0;
+    uint64_t ordinal = 0;
+    JnGpuCatalogAllocationRecordV1 record {};
+};
+
+struct CatalogAllocationDelta
+{
+    int64_t time = 0;
+    uint64_t ordinal = 0;
+    int64_t bytes = 0;
+};
+
+struct CatalogResourceLookupEntry
+{
+    uint64_t resourceId = 0;
+    uint64_t allocationId = 0;
+    uint64_t capacityBytes = 0;
+    uint8_t aliveAtEnd = 0;
+    uint8_t reserved[7] {};
+};
+
+struct CatalogAllocationLookupEntry
+{
+    uint64_t allocationId = 0;
+    uint64_t sizeBytes = 0;
+    uint64_t resourceCount = 0;
+    uint8_t aliveAtEnd = 0;
+    uint8_t reserved[7] {};
+};
+
+struct CatalogAllocationResourceEntry
+{
+    uint64_t allocationId = 0;
+    uint64_t resourceId = 0;
+};
+
+struct CatalogResourceNameEntry
+{
+    uint64_t nameHash = 0;
+    uint64_t resourceId = 0;
+    uint64_t allocationId = 0;
+    uint64_t capacityBytes = 0;
+};
+
+struct CatalogStringRawEntry
+{
+    uint64_t generation = 0;
+    uint64_t ordinal = 0;
+    uint32_t stringId = 0;
+    uint32_t byteLength = 0;
+    char bytes[256] {};
+};
+
+static_assert( std::is_trivially_copyable_v<CatalogResourceRawEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogAllocationRawEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogAllocationDelta> );
+static_assert( std::is_trivially_copyable_v<CatalogResourceLookupEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogAllocationLookupEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogAllocationResourceEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogResourceNameEntry> );
+static_assert( std::is_trivially_copyable_v<CatalogStringRawEntry> );
+
+class BoundedCatalogLookup
+{
+public:
+    bool Open( const GpuAnalysisCatalogSpool& spool, std::string& error )
+    {
+        if( !m_resources.Open( spool.resourceLookupPath, error ) ||
+            !m_allocations.Open( spool.allocationLookupPath, error ) ) return false;
+        if( m_resources.Size() % sizeof( CatalogResourceLookupEntry ) != 0 ||
+            m_allocations.Size() % sizeof( CatalogAllocationLookupEntry ) != 0 )
+        { error = "session_gpu_catalog_lookup_size_invalid"; return false; }
+        m_resourceCount = m_resources.Size() / sizeof( CatalogResourceLookupEntry );
+        m_allocationCount = m_allocations.Size() / sizeof( CatalogAllocationLookupEntry );
+        return true;
+    }
+    bool HasResource( uint64_t id ) const { return FindResource( id ) != nullptr ||
+        std::any_of( m_appended.begin(), m_appended.end(), [=]( const auto& value ) { return value.resourceId == id; } ); }
+    const CatalogResourceLookupEntry* FindResource( uint64_t id ) const
+    {
+        const auto values = std::span<const CatalogResourceLookupEntry>(
+            reinterpret_cast<const CatalogResourceLookupEntry*>( m_resources.Data() ), size_t( m_resourceCount ) );
+        const auto found = std::lower_bound( values.begin(), values.end(), id,
+            []( const auto& value, uint64_t key ) { return value.resourceId < key; } );
+        return found == values.end() || found->resourceId != id ? nullptr : &*found;
+    }
+    const CatalogAllocationLookupEntry* FindAllocation( uint64_t id ) const
+    {
+        const auto values = std::span<const CatalogAllocationLookupEntry>(
+            reinterpret_cast<const CatalogAllocationLookupEntry*>( m_allocations.Data() ), size_t( m_allocationCount ) );
+        const auto found = std::lower_bound( values.begin(), values.end(), id,
+            []( const auto& value, uint64_t key ) { return value.allocationId < key; } );
+        return found == values.end() || found->allocationId != id ? nullptr : &*found;
+    }
+    uint64_t PhysicalBytes( const std::vector<uint64_t>& resources ) const
+    {
+        std::unordered_set<uint64_t> allocations;
+        uint64_t bytes = 0;
+        for( const auto id : resources )
+        {
+            const auto* resource = FindResource( id );
+            if( !resource || resource->allocationId == 0 ||
+                !allocations.emplace( resource->allocationId ).second ) continue;
+            const auto* allocation = FindAllocation( resource->allocationId );
+            if( allocation && allocation->aliveAtEnd ) bytes += allocation->sizeBytes;
+        }
+        return bytes;
+    }
+    void AddResource( const GpuResourceAnalysisRecord& value ) { m_appended.push_back( value ); }
+private:
+    ReadOnlyMappedFile m_resources, m_allocations;
+    uint64_t m_resourceCount = 0, m_allocationCount = 0;
+    std::vector<GpuResourceAnalysisRecord> m_appended;
+};
+
+class BoundedCatalogStringLookup
+{
+public:
+    bool Open( const GpuAnalysisCatalogSpool& spool, std::string& error )
+    {
+        if( !m_index.Open( spool.stringIndexPath, error ) ||
+            !m_data.Open( spool.stringDataPath, error ) ) return false;
+        if( m_index.Size() % sizeof( GpuAnalysisCatalogStringIndexEntry ) != 0 )
+        { error = "session_gpu_catalog_string_index_size_invalid"; return false; }
+        m_count = m_index.Size() / sizeof( GpuAnalysisCatalogStringIndexEntry ); return true;
+    }
+    std::string Find( uint64_t generation, uint32_t stringId ) const
+    {
+        if( stringId == 0 ) return {};
+        const auto values = std::span<const GpuAnalysisCatalogStringIndexEntry>(
+            reinterpret_cast<const GpuAnalysisCatalogStringIndexEntry*>( m_index.Data() ), size_t( m_count ) );
+        const auto found = std::lower_bound( values.begin(), values.end(),
+            std::pair<uint64_t, uint32_t> { generation, stringId }, []( const auto& value, const auto& key ) {
+                return value.generation != key.first ? value.generation < key.first : value.stringId < key.second;
+            } );
+        if( found == values.end() || found->generation != generation || found->stringId != stringId ||
+            found->dataOffset > m_data.Size() || found->byteLength > m_data.Size() - found->dataOffset ) return {};
+        return std::string( reinterpret_cast<const char*>( m_data.Data() + found->dataOffset ), found->byteLength );
+    }
+private:
+    ReadOnlyMappedFile m_index, m_data;
+    uint64_t m_count = 0;
+};
+
+template<typename T, typename Compare>
+class GpuSpoolRunCursor
+{
+public:
+    explicit GpuSpoolRunCursor( Compare compare ) : m_compare( compare ) {}
+    bool Open( const std::vector<std::filesystem::path>& paths, std::string& error )
+    {
+        m_cursors.resize( paths.size() );
+        for( size_t i = 0; i < paths.size(); ++i )
+        {
+            auto& cursor = m_cursors[i];
+            cursor.in.open( GpuAnalysisIoPath( paths[i] ), std::ios::binary );
+            if( !cursor.in ) { error = "session_gpu_catalog_run_open_failed"; return false; }
+            if( cursor.in.read( reinterpret_cast<char*>( &cursor.value ), sizeof( T ) ) )
+                m_heap.push( Node { cursor.value, i } );
+            else if( !cursor.in.eof() )
+            { error = "session_gpu_catalog_run_read_failed"; return false; }
+        }
+        return true;
+    }
+    bool Empty() const { return m_heap.empty(); }
+    const T& Front() const { return m_heap.top().value; }
+    bool Pop( T& value, std::string& error )
+    {
+        if( m_heap.empty() ) { error = "session_gpu_catalog_run_empty"; return false; }
+        const auto node = m_heap.top(); m_heap.pop(); value = node.value;
+        auto& cursor = m_cursors[node.run];
+        if( cursor.in.read( reinterpret_cast<char*>( &cursor.value ), sizeof( T ) ) )
+            m_heap.push( Node { cursor.value, node.run } );
+        else if( !cursor.in.eof() )
+        { error = "session_gpu_catalog_run_read_failed"; return false; }
+        return true;
+    }
+private:
+    struct Cursor { std::ifstream in; T value {}; };
+    struct Node { T value {}; size_t run = 0; };
+    struct Later
+    {
+        Compare compare;
+        bool operator()( const Node& lhs, const Node& rhs ) const
+        { return compare( rhs.value, lhs.value ); }
+    };
+    Compare m_compare;
+    std::vector<Cursor> m_cursors;
+    std::priority_queue<Node, std::vector<Node>, Later> m_heap { Later { m_compare } };
+};
+
+struct CatalogCoreSpoolBuildState
+{
+    const TraceSessionTimeTransform* transform = nullptr;
+    const GpuAnalysisSidecarControl* control = nullptr;
+    GpuAnalysisCatalogSpool* spool = nullptr;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> payloads;
+    std::vector<CatalogResourceRawEntry> resources;
+    std::vector<CatalogAllocationRawEntry> allocations;
+    std::vector<CatalogStringRawEntry> strings;
+    std::vector<std::filesystem::path> resourceRuns;
+    std::vector<std::filesystem::path> allocationRuns;
+    std::vector<std::filesystem::path> stringRuns;
+    uint64_t ordinal = 0;
+};
+
+uint64_t CatalogRunTargetBytes( const GpuAnalysisSidecarControl& control )
+{
+    return std::max<uint64_t>( 1, std::min<uint64_t>(
+        64ull * 1024 * 1024, control.targetDerivedPageBytes ) );
+}
+
+bool FlushCatalogResourceRun( CatalogCoreSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.resources, state.spool->root / "resource-runs",
+        "resource", state.resourceRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.record.resourceId != rhs.record.resourceId )
+                return lhs.record.resourceId < rhs.record.resourceId;
+            if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+            return lhs.ordinal < rhs.ordinal;
+        }, error );
+}
+
+bool FlushCatalogAllocationRun( CatalogCoreSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.allocations, state.spool->root / "allocation-runs",
+        "allocation", state.allocationRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.record.allocationId != rhs.record.allocationId )
+                return lhs.record.allocationId < rhs.record.allocationId;
+            if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+            return lhs.ordinal < rhs.ordinal;
+        }, error );
+}
+
+bool FlushCatalogStringRun( CatalogCoreSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.strings, state.spool->root / "string-runs", "string",
+        state.stringRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.generation != rhs.generation ) return lhs.generation < rhs.generation;
+            if( lhs.stringId != rhs.stringId ) return lhs.stringId < rhs.stringId;
+            return lhs.ordinal < rhs.ordinal;
+        }, error );
+}
+
+bool ProcessCatalogCoreBatch( const QueueJnGpuCatalogBatch& event,
+    CatalogCoreSpoolBuildState& state, std::string& error )
+{
+    const auto found = state.payloads.find( event.payloadId );
+    if( found == state.payloads.end() )
+    { error = "session_gpu_catalog_core_payload_missing"; return false; }
+    auto payload = std::move( found->second ); state.payloads.erase( found );
+    if( payload.size() != event.payloadBytes || payload.size() < sizeof( JnGpuCatalogBatchEnvelopeV1 ) )
+    { error = "session_gpu_catalog_core_payload_size_mismatch"; return false; }
+    JnGpuCatalogBatchEnvelopeV1 envelope {};
+    std::memcpy( &envelope, payload.data(), sizeof( envelope ) );
+    const auto* records = payload.data() + sizeof( envelope );
+    const auto recordBytes = payload.size() - sizeof( envelope );
+    if( envelope.magic != JnGpuCatalogBatchMagic ||
+        envelope.catalogSchema != JnGpuCatalogSchemaVersion ||
+        envelope.evidenceSchema != JnGpuDetailedEvidenceSchemaVersion ||
+        envelope.recordCount != event.recordCount || envelope.payloadBytes != recordBytes ||
+        JnGpuCatalogChecksum64( records, recordBytes ) != envelope.checksum )
+    { error = "session_gpu_catalog_core_envelope_invalid"; return false; }
+    const auto kind = JnGpuCatalogBatchKind( event.kind );
+    if( kind == JnGpuCatalogBatchKind::Resource )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
+            envelope.recordBytes != sizeof( JnGpuCatalogResourceRecordV1 ) ||
+            uint64_t( event.recordCount ) * sizeof( JnGpuCatalogResourceRecordV1 ) != recordBytes )
+        { error = "session_gpu_catalog_resource_batch_invalid"; return false; }
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            JnGpuCatalogResourceRecordV1 value {};
+            std::memcpy( &value, records + size_t( i ) * sizeof( value ), sizeof( value ) );
+            value.time = state.transform->ToNanoseconds( value.time );
+            state.resources.push_back( { event.generation, state.ordinal++, value } );
+            state.spool->peakRecordsInMemory = std::max<uint64_t>(
+                state.spool->peakRecordsInMemory, state.resources.size() );
+            if( state.resources.size() * sizeof( CatalogResourceRawEntry ) >=
+                CatalogRunTargetBytes( *state.control ) && !FlushCatalogResourceRun( state, error ) ) return false;
+        }
+    }
+    else if( kind == JnGpuCatalogBatchKind::Allocation )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
+            envelope.recordBytes != sizeof( JnGpuCatalogAllocationRecordV1 ) ||
+            uint64_t( event.recordCount ) * sizeof( JnGpuCatalogAllocationRecordV1 ) != recordBytes )
+        { error = "session_gpu_catalog_allocation_batch_invalid"; return false; }
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            JnGpuCatalogAllocationRecordV1 value {};
+            std::memcpy( &value, records + size_t( i ) * sizeof( value ), sizeof( value ) );
+            value.time = state.transform->ToNanoseconds( value.time );
+            state.allocations.push_back( { event.generation, state.ordinal++, value } );
+            state.spool->peakRecordsInMemory = std::max<uint64_t>(
+                state.spool->peakRecordsInMemory, state.allocations.size() );
+            if( state.allocations.size() * sizeof( CatalogAllocationRawEntry ) >=
+                CatalogRunTargetBytes( *state.control ) && !FlushCatalogAllocationRun( state, error ) ) return false;
+        }
+    }
+    else if( kind == JnGpuCatalogBatchKind::String )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) || envelope.recordBytes != 0 )
+        { error = "session_gpu_catalog_string_batch_invalid"; return false; }
+        const auto* cursor = records; const auto* end = records + recordBytes;
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            if( size_t( end - cursor ) < sizeof( JnGpuCatalogStringRecordHeaderV1 ) )
+            { error = "session_gpu_catalog_string_header_truncated"; return false; }
+            JnGpuCatalogStringRecordHeaderV1 header {};
+            std::memcpy( &header, cursor, sizeof( header ) ); cursor += sizeof( header );
+            if( header.stringId == 0 || header.byteLength > 256 || size_t( end - cursor ) < header.byteLength )
+            { error = "session_gpu_catalog_string_invalid"; return false; }
+            CatalogStringRawEntry value; value.generation = event.generation;
+            value.ordinal = state.ordinal++; value.stringId = header.stringId;
+            value.byteLength = header.byteLength;
+            if( header.byteLength != 0 ) std::memcpy( value.bytes, cursor, header.byteLength );
+            cursor += header.byteLength; state.strings.push_back( value );
+            state.spool->peakRecordsInMemory = std::max<uint64_t>(
+                state.spool->peakRecordsInMemory, state.strings.size() );
+            if( state.strings.size() * sizeof( CatalogStringRawEntry ) >=
+                CatalogRunTargetBytes( *state.control ) && !FlushCatalogStringRun( state, error ) ) return false;
+        }
+        if( cursor != end ) { error = "session_gpu_catalog_string_trailing_bytes"; return false; }
+    }
+    return true;
+}
+
+bool VisitGpuCatalogCoreSpool( const TraceSessionCanonicalRecord& record,
+    void* userData, std::string& error )
+{
+    if( record.kind != TraceSessionCanonicalRecordKind::ProtocolEvent ) return true;
+    auto& state = *static_cast<CatalogCoreSpoolBuildState*>( userData );
+    if( state.control->stopToken.stop_requested() ) { error = "cancelled"; return false; }
+    QueueItem item {}; if( !DecodeItem( record, item, error ) ) return false;
+    if( item.hdr.type == QueueType::JnGpuCatalogBatchData )
+    {
+        uint64_t payloadId = 0; const uint8_t* bytes = nullptr; uint32_t size = 0;
+        if( !DecodeLargePayload( record, item, payloadId, bytes, size, error ) ) return false;
+        if( payloadId == 0 || size < sizeof( JnGpuCatalogBatchEnvelopeV1 ) ||
+            size > 64u * 1024 * 1024 || !state.payloads.emplace(
+                payloadId, std::vector<uint8_t>( bytes, bytes + size ) ).second )
+        { error = "session_gpu_catalog_core_payload_invalid"; return false; }
+        return true;
+    }
+    if( item.hdr.type == QueueType::JnGpuCatalogBatch )
+        return ProcessCatalogCoreBatch( item.jnGpuCatalogBatch, state, error );
+    return true;
+}
+
 struct EnrichmentSpoolBuildState
 {
     const TraceSessionTimeTransform* transform = nullptr;
     ResourceLifetimeResolver* resolver = nullptr;
-    const GpuAnalysisSnapshot* catalog = nullptr;
+    const BoundedCatalogLookup* catalog = nullptr;
     ResourceSetBuildState* resourceSets = nullptr;
     GpuAnalysisPassSpool* spool = nullptr;
     const GpuAnalysisSidecarControl* control = nullptr;
@@ -1192,11 +1595,44 @@ struct EnrichmentSpoolBuildState
     std::vector<GpuPassRangeRawEntry> rangeRaw;
     std::vector<GpuPassAliasEntry> passAliases;
     std::vector<GpuAnalysisCatalogRelationStoreEntry> relations;
+    std::vector<GpuViewAnalysisRecord> views;
+    std::vector<GpuPartAnalysisRecord> parts;
+    std::vector<GpuVgAnalysisRecord> virtualGeometry;
     std::vector<std::filesystem::path> logicalRawRuns;
     std::vector<std::filesystem::path> rangeRawRuns;
     std::vector<std::filesystem::path> passAliasRuns;
     uint64_t coreUnresolved = 0;
 };
+
+bool FlushViewRun( EnrichmentSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.views, state.spool->root / "view-runs", "view",
+        state.spool->viewRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.value.resourceId != rhs.value.resourceId ) return lhs.value.resourceId < rhs.value.resourceId;
+            if( lhs.value.time != rhs.value.time ) return lhs.value.time < rhs.value.time;
+            return lhs.generation < rhs.generation;
+        }, error );
+}
+
+bool FlushPartRun( EnrichmentSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.parts, state.spool->root / "part-runs", "part",
+        state.spool->partRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.value.resourceId != rhs.value.resourceId ) return lhs.value.resourceId < rhs.value.resourceId;
+            if( lhs.value.time != rhs.value.time ) return lhs.value.time < rhs.value.time;
+            return lhs.generation < rhs.generation;
+        }, error );
+}
+
+bool FlushVirtualGeometryRun( EnrichmentSpoolBuildState& state, std::string& error )
+{
+    return SaveGpuSpoolRun( state.virtualGeometry, state.spool->root / "vg-runs", "vg",
+        state.spool->virtualGeometryRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.value.resourceId != rhs.value.resourceId ) return lhs.value.resourceId < rhs.value.resourceId;
+            if( lhs.value.time != rhs.value.time ) return lhs.value.time < rhs.value.time;
+            return lhs.generation < rhs.generation;
+        }, error );
+}
 
 bool FlushLogicalRawRun( EnrichmentSpoolBuildState& state, std::string& error )
 {
@@ -1269,7 +1705,68 @@ bool ProcessEnrichmentCatalogBatch( const QueueJnGpuCatalogBatch& event,
         JnGpuCatalogChecksum64( records, recordBytes ) != envelope.checksum )
     { error = "session_gpu_enrichment_envelope_invalid"; return false; }
     const auto kind = JnGpuCatalogBatchKind( event.kind );
-    if( kind == JnGpuCatalogBatchKind::Logical )
+    if( kind == JnGpuCatalogBatchKind::View )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
+            envelope.recordBytes != sizeof( JnGpuCatalogViewRecordV1 ) ||
+            uint64_t( event.recordCount ) * sizeof( JnGpuCatalogViewRecordV1 ) != recordBytes )
+        { error = "session_gpu_view_batch_invalid"; return false; }
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            JnGpuCatalogViewRecordV1 value {};
+            std::memcpy( &value, records + size_t( i ) * sizeof( value ), sizeof( value ) );
+            value.time = state.transform->ToNanoseconds( value.time );
+            if( value.resourceId == 0 && value.pointerToken != 0 )
+                value.resourceId = state.resolver->Resolve( value.pointerToken, value.time );
+            if( value.pointerToken != 0 && value.resourceId == 0 )
+                value.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+            if( value.resourceId != 0 ) value.pointerToken = 0;
+            if( value.resourceId != 0 && state.catalog->HasResource( value.resourceId ) )
+            { state.views.push_back( { event.generation, value } ); ++state.spool->viewCount; }
+            if( state.views.size() * sizeof( GpuViewAnalysisRecord ) >= 64ull * 1024 * 1024 &&
+                !FlushViewRun( state, error ) ) return false;
+        }
+    }
+    else if( kind == JnGpuCatalogBatchKind::Part )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
+            envelope.recordBytes != sizeof( JnGpuCatalogPartRecordV1 ) ||
+            uint64_t( event.recordCount ) * sizeof( JnGpuCatalogPartRecordV1 ) != recordBytes )
+        { error = "session_gpu_part_batch_invalid"; return false; }
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            JnGpuCatalogPartRecordV1 value {};
+            std::memcpy( &value, records + size_t( i ) * sizeof( value ), sizeof( value ) );
+            value.time = state.transform->ToNanoseconds( value.time );
+            if( value.resourceId != 0 && state.catalog->HasResource( value.resourceId ) )
+            { state.parts.push_back( { event.generation, value } ); ++state.spool->partCount; }
+            if( state.parts.size() * sizeof( GpuPartAnalysisRecord ) >= 64ull * 1024 * 1024 &&
+                !FlushPartRun( state, error ) ) return false;
+        }
+    }
+    else if( kind == JnGpuCatalogBatchKind::VirtualGeometry )
+    {
+        if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
+            envelope.recordBytes != sizeof( JnGpuCatalogVgRecordV1 ) ||
+            uint64_t( event.recordCount ) * sizeof( JnGpuCatalogVgRecordV1 ) != recordBytes )
+        { error = "session_gpu_vg_batch_invalid"; return false; }
+        for( uint32_t i = 0; i < event.recordCount; ++i )
+        {
+            JnGpuCatalogVgRecordV1 value {};
+            std::memcpy( &value, records + size_t( i ) * sizeof( value ), sizeof( value ) );
+            value.time = state.transform->ToNanoseconds( value.time );
+            if( value.resourceId == 0 && value.pointerToken != 0 )
+                value.resourceId = state.resolver->Resolve( value.pointerToken, value.time );
+            if( value.pointerToken != 0 && value.resourceId == 0 )
+                value.exactness = uint8_t( JnGpuCatalogExactness::Partial );
+            if( value.resourceId != 0 ) value.pointerToken = 0;
+            if( value.resourceId != 0 && state.catalog->HasResource( value.resourceId ) )
+            { state.virtualGeometry.push_back( { event.generation, value } ); ++state.spool->virtualGeometryCount; }
+            if( state.virtualGeometry.size() * sizeof( GpuVgAnalysisRecord ) >= 64ull * 1024 * 1024 &&
+                !FlushVirtualGeometryRun( state, error ) ) return false;
+        }
+    }
+    else if( kind == JnGpuCatalogBatchKind::Logical )
     {
         if( event.encoding != uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ) ||
             envelope.recordBytes != sizeof( JnGpuCatalogLogicalRecordV1 ) ||
@@ -1329,9 +1826,9 @@ bool ProcessEnrichmentCatalogBatch( const QueueJnGpuCatalogBatch& event,
                 }
                 else { value.targetId = resolved; value.flags &= ~uint8_t( 2 ); }
             }
-            if( state.catalog->FindResource( value.sourceId ) )
+            if( state.catalog->HasResource( value.sourceId ) )
             { state.relations.push_back( { value.sourceId, event.generation, value } ); ++state.spool->catalogRelationCount; }
-            if( value.targetId != value.sourceId && state.catalog->FindResource( value.targetId ) )
+            if( value.targetId != value.sourceId && state.catalog->HasResource( value.targetId ) )
             { state.relations.push_back( { value.targetId, event.generation, value } ); ++state.spool->catalogRelationCount; }
             if( state.relations.size() * sizeof( GpuAnalysisCatalogRelationStoreEntry ) >= 64ull * 1024 * 1024 &&
                 !FlushCatalogRelationRun( state, error ) ) return false;
@@ -1543,7 +2040,7 @@ bool NormalizeLogicalRuns( EnrichmentSpoolBuildState& state, std::string& error 
             if( normalized.primaryKind == 0 ) normalized.primaryKind = source.primaryKind;
             if( normalized.definitionRevision == 0 ) normalized.definitionRevision = source.definitionRevision;
         }
-        if( normalized.resourceId != 0 && state.catalog->FindResource( normalized.resourceId ) )
+        if( normalized.resourceId != 0 && state.catalog->HasResource( normalized.resourceId ) )
         {
             output.push_back( { normalized.resourceId, entry.generation, nameGeneration, normalized } );
             ++state.spool->logicalCount;
@@ -1754,6 +2251,469 @@ uint64_t PhysicalBytesForPass( const GpuAnalysisSnapshot& catalog,
     return bytes;
 }
 
+template<typename T>
+bool WriteCatalogSpoolPage( GpuAnalysisCatalogSpool& spool,
+    const GpuAnalysisTraceIdentity& identity, GpuAnalysisStorePageKind kind,
+    const char* directory, std::vector<T>& values, uint64_t firstIndex,
+    std::string& error )
+{
+    if( values.empty() ) return true;
+    std::error_code ec; const auto root = spool.root / directory;
+    std::filesystem::create_directories( GpuAnalysisIoPath( root ), ec );
+    if( ec ) { error = "session_gpu_catalog_page_directory_failed:" + ec.message(); return false; }
+    uint64_t pageIndex = 0;
+    for( const auto& page : spool.pages ) if( page.kind == kind ) ++pageIndex;
+    std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
+    const auto path = root / name.str();
+    GpuAnalysisSnapshot snapshot = spool.overview;
+    if constexpr( std::is_same_v<T, GpuResourceAnalysisRecord> ) snapshot.resources = std::move( values );
+    else if constexpr( std::is_same_v<T, GpuAllocationAnalysisRecord> ) snapshot.allocations = std::move( values );
+    else if constexpr( std::is_same_v<T, GpuChurnCandidate> ) snapshot.churnCandidates = std::move( values );
+    const GpuAnalysisCacheIdentity cacheIdentity { identity.sha256, identity.fileSize,
+        std::string( GpuAnalysisAlgorithmId ) + "-session-catalog-spool1" };
+    if( !SaveGpuAnalysisCache( path, cacheIdentity, snapshot, error ) ) return false;
+    const auto& stored = [&]() -> const auto& {
+        if constexpr( std::is_same_v<T, GpuResourceAnalysisRecord> ) return snapshot.resources;
+        else if constexpr( std::is_same_v<T, GpuAllocationAnalysisRecord> ) return snapshot.allocations;
+        else return snapshot.churnCandidates;
+    }();
+    const auto key = []( const auto& value ) -> uint64_t {
+        if constexpr( std::is_same_v<std::decay_t<decltype( value )>, GpuResourceAnalysisRecord> ) return value.resourceId;
+        else if constexpr( std::is_same_v<std::decay_t<decltype( value )>, GpuAllocationAnalysisRecord> ) return value.allocationId;
+        else return value.resourceId ? value.resourceId : value.allocationId;
+    };
+    const auto bytes = std::filesystem::file_size( GpuAnalysisIoPath( path ), ec );
+    if( ec ) { error = "session_gpu_catalog_page_size_failed:" + ec.message(); return false; }
+    spool.pages.push_back( { kind, firstIndex, uint64_t( stored.size() ),
+        key( stored.front() ), key( stored.back() ), bytes, 0,
+        std::filesystem::relative( path, spool.root ) } );
+    ++spool.pageCount; values.clear(); return true;
+}
+
+template<typename T, typename Compare>
+bool MergeGpuSpoolRunsToFile( const std::vector<std::filesystem::path>& runs,
+    const std::filesystem::path& path, Compare compare, uint64_t& count,
+    std::string& error )
+{
+    GpuSpoolRunCursor<T, Compare> cursor( compare );
+    if( !cursor.Open( runs, error ) ) return false;
+    std::ofstream out( GpuAnalysisIoPath( path ), std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_gpu_catalog_merge_open_failed"; return false; }
+    count = 0; T value {};
+    while( !cursor.Empty() )
+    {
+        if( !cursor.Pop( value, error ) ) return false;
+        out.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !out ) { error = "session_gpu_catalog_merge_write_failed"; return false; }
+        ++count;
+    }
+    out.flush(); out.close();
+    if( !out ) { error = "session_gpu_catalog_merge_flush_failed"; return false; }
+    return true;
+}
+
+bool BuildBoundedGpuCatalogSpool( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionTimeTransform& transform,
+    const JnTraceData& metadata, const GpuAnalysisTraceIdentity& identity,
+    const GpuAnalysisSidecarControl& control, GpuAnalysisCatalogSpool& spool,
+    std::string& error )
+{
+    error.clear(); spool = {};
+    spool.root = sessionRoot / "checkpoints" / "gpu-catalog-spool";
+    std::error_code ec; std::filesystem::remove_all( GpuAnalysisIoPath( spool.root ), ec ); ec.clear();
+    std::filesystem::create_directories( GpuAnalysisIoPath( spool.root ), ec );
+    if( ec ) { error = "session_gpu_catalog_spool_directory_failed:" + ec.message(); return false; }
+    spool.overview.manifest.catalogSchema = metadata.gpuCatalogSchemaVersion;
+    spool.overview.manifest.evidenceSchema = metadata.gpuDetailedEvidenceSchemaVersion;
+    spool.overview.manifest.generationCount = metadata.gpuCatalogGenerations.size();
+    spool.overview.manifest.transportValid = metadata.gpuCatalogValid;
+    spool.overview.manifest.complete = metadata.gpuCatalogPresent && metadata.gpuCatalogValid;
+    spool.overview.manifest.state = spool.overview.manifest.complete ?
+        GpuAnalysisState::Complete : GpuAnalysisState::Invalid;
+    spool.overview.manifest.reason = spool.overview.manifest.complete ? "complete" : "invalid_catalog_generation";
+    if( !spool.overview.manifest.complete )
+    { error = "session_gpu_catalog_analysis_incomplete:" + spool.overview.manifest.reason; return false; }
+
+    CatalogCoreSpoolBuildState state;
+    state.transform = &transform; state.control = &control; state.spool = &spool;
+    if( !VisitTraceSessionCanonicalOrdered( sessionRoot, manifest,
+        VisitGpuCatalogCoreSpool, &state, error ) ) return false;
+    if( !state.payloads.empty() )
+    { error = "session_gpu_catalog_core_payload_unresolved"; return false; }
+    if( !FlushCatalogResourceRun( state, error ) ||
+        !FlushCatalogAllocationRun( state, error ) ||
+        !FlushCatalogStringRun( state, error ) ) return false;
+
+    const auto stringCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.generation != rhs.generation ) return lhs.generation < rhs.generation;
+        if( lhs.stringId != rhs.stringId ) return lhs.stringId < rhs.stringId;
+        return lhs.ordinal < rhs.ordinal;
+    };
+    GpuSpoolRunCursor<CatalogStringRawEntry, decltype( stringCompare )> stringCursor( stringCompare );
+    if( !stringCursor.Open( state.stringRuns, error ) ) return false;
+    spool.stringIndexPath = spool.root / "strings.index";
+    spool.stringDataPath = spool.root / "strings.data";
+    std::ofstream stringIndex( GpuAnalysisIoPath( spool.stringIndexPath ), std::ios::binary | std::ios::trunc );
+    std::ofstream stringData( GpuAnalysisIoPath( spool.stringDataPath ), std::ios::binary | std::ios::trunc );
+    if( !stringIndex || !stringData ) { error = "session_gpu_catalog_string_store_open_failed"; return false; }
+    uint64_t stringOffset = 0; CatalogStringRawEntry pendingString {}; bool hasPendingString = false;
+    const auto flushString = [&]() -> bool {
+        if( !hasPendingString ) return true;
+        const GpuAnalysisCatalogStringIndexEntry index { pendingString.generation,
+            stringOffset, pendingString.stringId, pendingString.byteLength };
+        stringIndex.write( reinterpret_cast<const char*>( &index ), sizeof( index ) );
+        stringData.write( pendingString.bytes, pendingString.byteLength );
+        if( !stringIndex || !stringData ) { error = "session_gpu_catalog_string_store_write_failed"; return false; }
+        stringOffset += pendingString.byteLength; hasPendingString = false; return true;
+    };
+    while( !stringCursor.Empty() )
+    {
+        CatalogStringRawEntry value {}; if( !stringCursor.Pop( value, error ) ) return false;
+        if( hasPendingString && ( value.generation != pendingString.generation || value.stringId != pendingString.stringId ) &&
+            !flushString() ) return false;
+        pendingString = value; hasPendingString = true;
+    }
+    if( !flushString() ) return false;
+    stringIndex.flush(); stringData.flush(); stringIndex.close(); stringData.close();
+    if( !stringIndex || !stringData ) { error = "session_gpu_catalog_string_store_flush_failed"; return false; }
+    BoundedCatalogStringLookup stringLookup;
+    if( !stringLookup.Open( spool, error ) ) return false;
+
+    const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.record.resourceId != rhs.record.resourceId ) return lhs.record.resourceId < rhs.record.resourceId;
+        if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+        return lhs.ordinal < rhs.ordinal;
+    };
+    GpuSpoolRunCursor<CatalogResourceRawEntry, decltype( resourceCompare )> resources( resourceCompare );
+    if( !resources.Open( state.resourceRuns, error ) ) return false;
+    std::ofstream resourceLookup( GpuAnalysisIoPath( spool.root / "resource-lookup.bin" ), std::ios::binary | std::ios::trunc );
+    if( !resourceLookup ) { error = "session_gpu_catalog_resource_lookup_open_failed"; return false; }
+    spool.resourceLookupPath = spool.root / "resource-lookup.bin";
+    std::vector<CatalogAllocationResourceEntry> allocationResources;
+    std::vector<std::filesystem::path> allocationResourceRuns;
+    std::vector<CatalogResourceNameEntry> resourceNames;
+    std::vector<std::filesystem::path> resourceNameRuns;
+    std::vector<ResourceLifetimeEntry> lifetimes;
+    std::vector<std::filesystem::path> lifetimeRuns;
+    std::vector<GpuResourceAnalysisRecord> resourcePage;
+    std::vector<GpuChurnCandidate> churnPage;
+    std::map<uint16_t, GpuAnalysisTypeSummary> typeSummaries;
+    const auto resourcePageTarget = std::max<uint64_t>( 1, control.targetDerivedPageBytes );
+    uint64_t resourcePageBytes = 0, resourceFirstIndex = 0;
+    uint64_t churnPageBytes = 0, churnFirstIndex = 0;
+    auto flushResourcePage = [&]() {
+        if( !WriteCatalogSpoolPage( spool, identity, GpuAnalysisStorePageKind::Resource,
+            "resources", resourcePage, resourceFirstIndex, error ) ) return false;
+        resourceFirstIndex = spool.resourceCount; resourcePageBytes = 0; return true;
+    };
+    auto appendChurn = [&]( GpuChurnCandidate value ) -> bool {
+        churnPageBytes += sizeof( value ) + value.reason.size();
+        churnPage.push_back( std::move( value ) ); ++spool.churnCount;
+        if( churnPageBytes < resourcePageTarget ) return true;
+        if( !WriteCatalogSpoolPage( spool, identity, GpuAnalysisStorePageKind::Churn,
+            "churn", churnPage, churnFirstIndex, error ) ) return false;
+        churnFirstIndex = spool.churnCount; churnPageBytes = 0; return true;
+    };
+    CatalogResourceRawEntry resourceRaw {};
+    uint64_t currentResource = 0;
+    GpuResourceAnalysisRecord resource {};
+    auto flushResource = [&]() -> bool {
+        if( currentResource == 0 ) return true;
+        const CatalogResourceLookupEntry lookup {
+            resource.resourceId, resource.allocationId, resource.capacityBytes,
+            uint8_t( resource.aliveAtEnd ? 1 : 0 ), {} };
+        resourceLookup.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );
+        if( !resourceLookup ) { error = "session_gpu_catalog_resource_lookup_write_failed"; return false; }
+        if( resource.allocationId != 0 )
+        {
+            allocationResources.push_back( { resource.allocationId, resource.resourceId } );
+            if( allocationResources.size() * sizeof( CatalogAllocationResourceEntry ) >= CatalogRunTargetBytes( control ) &&
+                !SaveGpuSpoolRun( allocationResources, spool.root / "allocation-resource-runs", "relation",
+                    allocationResourceRuns, []( const auto& lhs, const auto& rhs ) {
+                        if( lhs.allocationId != rhs.allocationId ) return lhs.allocationId < rhs.allocationId;
+                        return lhs.resourceId < rhs.resourceId;
+                    }, error ) ) return false;
+        }
+        if( resource.aliveAtEnd )
+        {
+            spool.overview.logicalCapacityBytes += resource.capacityBytes;
+            auto& type = typeSummaries[resource.primaryKind]; type.primaryKind = resource.primaryKind;
+            ++type.liveResourceCount; type.resourceCapacityBytes += resource.capacityBytes;
+            if( !appendChurn( { GpuChurnCandidateKind::AliveAtCaptureEnd,
+                resource.resourceId, resource.allocationId, resource.capacityBytes, 1, 0,
+                "resource is alive at capture end; this is not proof of a leak" } ) ) return false;
+        }
+        if( resource.openBoundary && !appendChurn( { GpuChurnCandidateKind::OpenCreateBoundary,
+            resource.resourceId, resource.allocationId, resource.capacityBytes, 1, 0,
+            "resource existed before the capture boundary" } ) ) return false;
+        if( resource.nameHash != 0 )
+        {
+            resourceNames.push_back( { resource.nameHash, resource.resourceId,
+                resource.allocationId, resource.capacityBytes } );
+            if( resourceNames.size() * sizeof( CatalogResourceNameEntry ) >=
+                CatalogRunTargetBytes( control ) && !SaveGpuSpoolRun( resourceNames,
+                    spool.root / "resource-name-runs", "name", resourceNameRuns,
+                    []( const auto& lhs, const auto& rhs ) {
+                        if( lhs.nameHash != rhs.nameHash ) return lhs.nameHash < rhs.nameHash;
+                        return lhs.resourceId < rhs.resourceId;
+                    }, error ) ) return false;
+        }
+        resourcePageBytes += sizeof( resource ) + resource.name.size() +
+            resource.history.size() * sizeof( size_t );
+        resourcePage.push_back( std::move( resource ) ); ++spool.resourceCount;
+        if( resourcePageBytes >= resourcePageTarget && !flushResourcePage() ) return false;
+        resource = {}; currentResource = 0; return true;
+    };
+    while( !resources.Empty() )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        if( !resources.Pop( resourceRaw, error ) ) return false;
+        const auto& value = resourceRaw.record;
+        if( value.resourceId == 0 ) { ++spool.overview.manifest.invalidRecordCount; continue; }
+        if( currentResource != 0 && currentResource != value.resourceId && !flushResource() ) return false;
+        if( currentResource == 0 ) { currentResource = value.resourceId; resource.resourceId = value.resourceId; }
+        if( resourceRaw.ordinal <= uint64_t( std::numeric_limits<size_t>::max() ) )
+            resource.history.push_back( size_t( resourceRaw.ordinal ) );
+        if( value.pointerToken != 0 )
+        {
+            lifetimes.push_back( { value.pointerToken, value.time, value.resourceId, value.operation } );
+            if( lifetimes.size() * sizeof( ResourceLifetimeEntry ) >= CatalogRunTargetBytes( control ) &&
+                !SaveGpuSpoolRun( lifetimes, spool.root / "lifetime-runs", "lifetime", lifetimeRuns,
+                    []( const auto& lhs, const auto& rhs ) {
+                        if( lhs.key != rhs.key ) return lhs.key < rhs.key;
+                        if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+                        return lhs.resourceId < rhs.resourceId;
+                    }, error ) ) return false;
+        }
+        const auto operation = JnGpuCatalogRecordOperation( value.operation );
+        if( operation == JnGpuCatalogRecordOperation::Destroy || operation == JnGpuCatalogRecordOperation::Close )
+        { resource.destroyTime = std::max<uint64_t>( resource.destroyTime, value.time < 0 ? 0 : uint64_t( value.time ) ); resource.aliveAtEnd = false; continue; }
+        if( !IsCatalogDefinition( operation ) ) continue;
+        if( value.time >= int64_t( resource.lastUpdateTime ) )
+        {
+            resource.generation = resourceRaw.generation; resource.familyId = value.familyId;
+            resource.allocationId = value.allocationId; resource.capacityBytes = value.capacityBytes;
+            resource.allocationOffsetBytes = value.allocationOffsetBytes;
+            resource.lastUpdateTime = value.time < 0 ? 0 : uint64_t( value.time );
+            resource.nameHash = value.nameHash; resource.createCallsiteId = value.createCallsiteId;
+            resource.definitionRevision = value.definitionRevision; resource.declaredUsageMask = value.declaredUsageMask;
+            resource.observedUsageMask = value.observedUsageMask; resource.backendFlags = value.backendFlags;
+            resource.sampleCount = value.sampleCount; resource.nameOriginalLength = value.nameOriginalLength;
+            resource.format = value.format; resource.width = value.width; resource.height = value.height;
+            resource.depthOrArraySize = value.depthOrArraySize; resource.mipLevels = value.mipLevels;
+            resource.primaryKind = value.primaryKind; resource.resourceClass = value.resourceClass;
+            resource.dimension = value.dimension; resource.memoryDomain = value.memoryDomain;
+            resource.allocationKind = value.allocationKind;
+            resource.classificationProvenance = value.classificationProvenance;
+            resource.nameProvenance = value.nameProvenance; resource.stackProvenance = value.stackProvenance;
+            resource.exactness = value.exactness; resource.flags = value.flags;
+            resource.invalid = value.exactness == uint8_t( JnGpuCatalogExactness::Invalid );
+            resource.openBoundary |= operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot ||
+                value.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
+            resource.name = stringLookup.Find( resourceRaw.generation, value.nameId ); resource.aliveAtEnd = true;
+        }
+        if( operation == JnGpuCatalogRecordOperation::Create && resource.createTime == 0 )
+            resource.createTime = resource.lastUpdateTime;
+    }
+    if( !flushResource() || !flushResourcePage() ) return false;
+    if( !SaveGpuSpoolRun( resourceNames, spool.root / "resource-name-runs", "name",
+        resourceNameRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.nameHash != rhs.nameHash ) return lhs.nameHash < rhs.nameHash;
+            return lhs.resourceId < rhs.resourceId;
+        }, error ) ) return false;
+    const auto nameCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.nameHash != rhs.nameHash ) return lhs.nameHash < rhs.nameHash;
+        return lhs.resourceId < rhs.resourceId;
+    };
+    GpuSpoolRunCursor<CatalogResourceNameEntry, decltype( nameCompare )> names( nameCompare );
+    if( !names.Open( resourceNameRuns, error ) ) return false;
+    uint64_t groupHash = 0, groupBytes = 0, groupCount = 0;
+    CatalogResourceNameEntry groupFirst {};
+    const auto flushNameGroup = [&]() -> bool {
+        if( groupCount > 1 && !appendChurn( { GpuChurnCandidateKind::RepeatedRecreate,
+            groupFirst.resourceId, groupFirst.allocationId, groupBytes, groupCount,
+            double( groupCount ), "same stable name hash was created more than once" } ) ) return false;
+        groupHash = 0; groupBytes = 0; groupCount = 0; groupFirst = {}; return true;
+    };
+    while( !names.Empty() )
+    {
+        CatalogResourceNameEntry value {};
+        if( !names.Pop( value, error ) ) return false;
+        if( groupCount != 0 && value.nameHash != groupHash && !flushNameGroup() ) return false;
+        if( groupCount == 0 ) { groupHash = value.nameHash; groupFirst = value; }
+        groupBytes += value.capacityBytes; ++groupCount;
+    }
+    if( !flushNameGroup() ) return false;
+    resourceLookup.flush(); resourceLookup.close();
+    if( !resourceLookup ) { error = "session_gpu_catalog_resource_lookup_flush_failed"; return false; }
+    if( !SaveGpuSpoolRun( allocationResources, spool.root / "allocation-resource-runs", "relation",
+        allocationResourceRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.allocationId != rhs.allocationId ) return lhs.allocationId < rhs.allocationId;
+            return lhs.resourceId < rhs.resourceId;
+        }, error ) ) return false;
+    if( !SaveGpuSpoolRun( lifetimes, spool.root / "lifetime-runs", "lifetime", lifetimeRuns,
+        []( const auto& lhs, const auto& rhs ) {
+            if( lhs.key != rhs.key ) return lhs.key < rhs.key;
+            if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+            return lhs.resourceId < rhs.resourceId;
+        }, error ) ) return false;
+    uint64_t lifetimeCount = 0;
+    spool.pointerLifetimePath = spool.root / "pointer-lifetimes.bin";
+    if( !MergeGpuSpoolRunsToFile<ResourceLifetimeEntry>( lifetimeRuns,
+        spool.pointerLifetimePath, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.key != rhs.key ) return lhs.key < rhs.key;
+            if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+            return lhs.resourceId < rhs.resourceId;
+        }, lifetimeCount, error ) ) return false;
+
+    const auto allocationCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.record.allocationId != rhs.record.allocationId ) return lhs.record.allocationId < rhs.record.allocationId;
+        if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+        return lhs.ordinal < rhs.ordinal;
+    };
+    GpuSpoolRunCursor<CatalogAllocationRawEntry, decltype( allocationCompare )> allocations( allocationCompare );
+    if( !allocations.Open( state.allocationRuns, error ) ) return false;
+    const auto relationCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.allocationId != rhs.allocationId ) return lhs.allocationId < rhs.allocationId;
+        return lhs.resourceId < rhs.resourceId;
+    };
+    GpuSpoolRunCursor<CatalogAllocationResourceEntry, decltype( relationCompare )> relations( relationCompare );
+    if( !relations.Open( allocationResourceRuns, error ) ) return false;
+    std::ofstream allocationLookup( GpuAnalysisIoPath( spool.root / "allocation-lookup.bin" ), std::ios::binary | std::ios::trunc );
+    if( !allocationLookup ) { error = "session_gpu_catalog_allocation_lookup_open_failed"; return false; }
+    spool.allocationLookupPath = spool.root / "allocation-lookup.bin";
+    spool.allocationResourceCountPath = spool.allocationLookupPath;
+    std::vector<GpuAllocationAnalysisRecord> allocationPage;
+    std::vector<CatalogAllocationDelta> deltas;
+    std::vector<std::filesystem::path> deltaRuns;
+    uint64_t allocationPageBytes = 0, allocationFirstIndex = 0;
+    auto flushAllocationPage = [&]() {
+        if( !WriteCatalogSpoolPage( spool, identity, GpuAnalysisStorePageKind::Allocation,
+            "allocations", allocationPage, allocationFirstIndex, error ) ) return false;
+        allocationFirstIndex = spool.allocationCount; allocationPageBytes = 0; return true;
+    };
+    CatalogAllocationRawEntry allocationRaw {};
+    uint64_t currentAllocation = 0; GpuAllocationAnalysisRecord allocation {};
+    int64_t physicalSize = 0;
+    auto flushAllocation = [&]() -> bool {
+        if( currentAllocation == 0 ) return true;
+        while( !relations.Empty() && relations.Front().allocationId < currentAllocation )
+        {
+            CatalogAllocationResourceEntry ignored {};
+            if( !relations.Pop( ignored, error ) ) return false;
+        }
+        while( !relations.Empty() && relations.Front().allocationId == currentAllocation )
+        {
+            CatalogAllocationResourceEntry value {};
+            if( !relations.Pop( value, error ) ) return false;
+            if( allocation.resources.empty() || allocation.resources.back() != value.resourceId )
+                allocation.resources.push_back( value.resourceId );
+        }
+        const CatalogAllocationLookupEntry lookup { allocation.allocationId, allocation.sizeBytes,
+            allocation.resources.size(), uint8_t( allocation.aliveAtEnd ? 1 : 0 ), {} };
+        allocationLookup.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );
+        if( !allocationLookup ) { error = "session_gpu_catalog_allocation_lookup_write_failed"; return false; }
+        if( allocation.aliveAtEnd && allocation.parentAllocationId == 0 )
+        { spool.overview.engineKnownPhysicalBytes += allocation.sizeBytes; spool.overview.residentPhysicalBytes += allocation.residentBytes; }
+        allocationPageBytes += sizeof( allocation ) + allocation.history.size() * sizeof( size_t ) +
+            allocation.resources.size() * sizeof( uint64_t );
+        allocationPage.push_back( std::move( allocation ) ); ++spool.allocationCount;
+        if( allocationPageBytes >= resourcePageTarget && !flushAllocationPage() ) return false;
+        allocation = {}; currentAllocation = 0; physicalSize = 0; return true;
+    };
+    while( !allocations.Empty() )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        if( !allocations.Pop( allocationRaw, error ) ) return false;
+        const auto& value = allocationRaw.record;
+        if( value.allocationId == 0 ) { ++spool.overview.manifest.invalidRecordCount; continue; }
+        if( currentAllocation != 0 && currentAllocation != value.allocationId && !flushAllocation() ) return false;
+        if( currentAllocation == 0 ) { currentAllocation = value.allocationId; allocation.allocationId = value.allocationId; }
+        if( allocationRaw.ordinal <= uint64_t( std::numeric_limits<size_t>::max() ) )
+            allocation.history.push_back( size_t( allocationRaw.ordinal ) );
+        const auto operation = JnGpuCatalogRecordOperation( value.operation );
+        if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
+            operation == JnGpuCatalogRecordOperation::Snapshot ) ++spool.overview.allocationCreateCount;
+        else if( operation == JnGpuCatalogRecordOperation::Destroy ) ++spool.overview.allocationDestroyCount;
+        if( value.parentAllocationId == 0 )
+        {
+            int64_t nextSize = physicalSize;
+            if( operation == JnGpuCatalogRecordOperation::Destroy || operation == JnGpuCatalogRecordOperation::Close ) nextSize = 0;
+            else if( IsCatalogDefinition( operation ) ) nextSize = int64_t( value.sizeBytes );
+            if( nextSize != physicalSize ) deltas.push_back( { value.time, allocationRaw.ordinal, nextSize - physicalSize } );
+            if( operation != JnGpuCatalogRecordOperation::Update && IsCatalogDefinition( operation ) )
+                spool.overview.allocatedPhysicalBytes += value.sizeBytes;
+            if( nextSize == 0 && physicalSize > 0 ) spool.overview.freedPhysicalBytes += uint64_t( physicalSize );
+            physicalSize = nextSize;
+            if( deltas.size() * sizeof( CatalogAllocationDelta ) >= CatalogRunTargetBytes( control ) &&
+                !SaveGpuSpoolRun( deltas, spool.root / "allocation-delta-runs", "delta", deltaRuns,
+                    []( const auto& lhs, const auto& rhs ) {
+                        if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+                        return lhs.ordinal < rhs.ordinal;
+                    }, error ) ) return false;
+        }
+        if( operation == JnGpuCatalogRecordOperation::Destroy || operation == JnGpuCatalogRecordOperation::Close )
+        { allocation.destroyTime = std::max<uint64_t>( allocation.destroyTime, value.time < 0 ? 0 : uint64_t( value.time ) ); allocation.aliveAtEnd = false; continue; }
+        if( !IsCatalogDefinition( operation ) ) continue;
+        if( value.time >= int64_t( allocation.lastUpdateTime ) )
+        {
+            allocation.generation = allocationRaw.generation; allocation.heapId = value.heapId;
+            allocation.parentAllocationId = value.parentAllocationId; allocation.sizeBytes = value.sizeBytes;
+            allocation.offsetBytes = value.offsetBytes; allocation.residentBytes = value.residentBytes;
+            allocation.alignmentBytes = value.alignmentBytes;
+            allocation.lastUpdateTime = value.time < 0 ? 0 : uint64_t( value.time );
+            allocation.primaryKind = value.primaryKind; allocation.memoryDomain = value.memoryDomain;
+            allocation.allocationKind = value.allocationKind; allocation.residencyState = value.residencyState;
+            allocation.exactness = value.exactness; allocation.flags = value.flags;
+            allocation.invalid = value.exactness == uint8_t( JnGpuCatalogExactness::Invalid );
+            allocation.openBoundary |= operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot ||
+                value.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
+            allocation.aliveAtEnd = true;
+        }
+        if( operation == JnGpuCatalogRecordOperation::Create && allocation.createTime == 0 )
+            allocation.createTime = allocation.lastUpdateTime;
+    }
+    if( !flushAllocation() || !flushAllocationPage() ) return false;
+    while( !relations.Empty() )
+    {
+        CatalogAllocationResourceEntry ignored {};
+        if( !relations.Pop( ignored, error ) ) return false;
+    }
+    allocationLookup.flush(); allocationLookup.close();
+    if( !allocationLookup ) { error = "session_gpu_catalog_allocation_lookup_flush_failed"; return false; }
+    if( !SaveGpuSpoolRun( deltas, spool.root / "allocation-delta-runs", "delta", deltaRuns,
+        []( const auto& lhs, const auto& rhs ) {
+            if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+            return lhs.ordinal < rhs.ordinal;
+        }, error ) ) return false;
+    const auto deltaCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+        return lhs.ordinal < rhs.ordinal;
+    };
+    GpuSpoolRunCursor<CatalogAllocationDelta, decltype( deltaCompare )> deltaCursor( deltaCompare );
+    if( !deltaCursor.Open( deltaRuns, error ) ) return false;
+    int64_t currentPhysical = 0; CatalogAllocationDelta delta {};
+    while( !deltaCursor.Empty() )
+    {
+        if( !deltaCursor.Pop( delta, error ) ) return false;
+        currentPhysical += delta.bytes;
+        if( currentPhysical < 0 ) { error = "session_gpu_catalog_physical_underflow"; return false; }
+        if( uint64_t( currentPhysical ) > spool.overview.engineKnownPhysicalPeakBytes )
+        { spool.overview.engineKnownPhysicalPeakBytes = uint64_t( currentPhysical ); spool.overview.engineKnownPhysicalPeakTimeNs = delta.time; }
+    }
+    spool.typeSummaries.clear(); for( const auto& [_, value] : typeSummaries ) spool.typeSummaries.push_back( value );
+    spool.overview.manifest.resourceRecordCount = spool.resourceCount;
+    spool.overview.manifest.allocationRecordCount = spool.allocationCount;
+    spool.overview.manifest.viewRecordCount = metadata.gpuCatalogViews.size();
+    spool.overview.manifest.partRecordCount = metadata.gpuCatalogParts.size();
+    spool.overview.manifest.vgRecordCount = metadata.gpuCatalogVg.size();
+    if( !WriteCatalogSpoolPage( spool, identity, GpuAnalysisStorePageKind::Churn,
+        "churn", churnPage, churnFirstIndex, error ) ) return false;
+    return true;
+}
+
 struct PassReferenceToken
 {
     uint64_t token = 0;
@@ -1784,7 +2744,9 @@ struct PassSpoolBuildState
     const TraceSessionTimeTransform* transform = nullptr;
     const ResourceSetReader* resourceSets = nullptr;
     ResourceLifetimeResolver* resolver = nullptr;
-    GpuAnalysisSnapshot* catalog = nullptr;
+    BoundedCatalogLookup* catalog = nullptr;
+    const GpuAnalysisSnapshot* catalogOverview = nullptr;
+    std::vector<GpuResourceAnalysisRecord>* appendedResources = nullptr;
     const RangeByPassReader* ranges = nullptr;
     const std::vector<PassEvidenceEntry>* evidence = nullptr;
     const GpuAnalysisTraceIdentity* identity = nullptr;
@@ -1822,9 +2784,8 @@ uint64_t ResolvePassResource( PassSpoolBuildState& state, uint64_t token,
         resource.openBoundary = true;
         resource.aliveAtEnd = gap->endTime < 0;
         resource.name = "Untracked GPU Resource";
-        state.catalog->resourceById.emplace( resource.resourceId,
-            state.catalog->resources.size() );
-        state.catalog->resources.push_back( std::move( resource ) );
+        state.catalog->AddResource( resource );
+        state.appendedResources->push_back( std::move( resource ) );
         ++state.spool->sourceGapResourceCount;
     }
     ++state.spool->sourceGapReferenceCount;
@@ -1879,7 +2840,7 @@ bool SavePassSpoolPage( PassSpoolBuildState& state, std::string& error )
     { error = "session_gpu_pass_spool_global_order_invalid"; return false; }
     state.emittedMaxPassId = state.page.back().passId;
     GpuAnalysisSnapshot snapshot;
-    snapshot.manifest = state.catalog->manifest;
+    snapshot.manifest = state.catalogOverview->manifest;
     snapshot.passes = std::move( state.page );
     std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' )
         << state.spool->pageCount << ".bin";
@@ -1912,7 +2873,7 @@ bool FinalizePassFrame( PassSpoolBuildState& state,
             if( range.resourceId == 0 && range.pointerToken != 0 )
                 range.resourceId = ResolvePassResource( state, range.pointerToken,
                     pass.startNs, pass.startNs, pass.endNs, pass );
-            if( range.resourceId == 0 || !state.catalog->FindResource( range.resourceId ) )
+            if( range.resourceId == 0 || !state.catalog->HasResource( range.resourceId ) )
             {
                 error = "session_gpu_pass_range_resource_unresolved:pass=" +
                     std::to_string( pass.passId ) + ":token=" +
@@ -1936,7 +2897,7 @@ bool FinalizePassFrame( PassSpoolBuildState& state,
             []( const auto& value, uint64_t id ) { return value.passId < id; } );
         for( auto it = evidenceBegin; it != state.evidence->end() && it->passId == pass.passId; ++it )
             pass.detailedEvidence.push_back( it->evidence );
-        pass.directPhysicalBytes = PhysicalBytesForPass( *state.catalog, pass.directResources );
+        pass.directPhysicalBytes = state.catalog->PhysicalBytes( pass.directResources );
     }
     std::sort( frame.passes.begin(), frame.passes.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.passId < rhs.passId;
@@ -2117,7 +3078,7 @@ bool BuildGlobalPassInclusiveRollup( PassSpoolBuildState& state, std::string& er
                 pass.complete = false;
                 pass.truncated = true;
             }
-            pass.inclusivePhysicalBytes = PhysicalBytesForPass( *state.catalog, pass.inclusiveResources );
+            pass.inclusivePhysicalBytes = state.catalog->PhysicalBytes( pass.inclusiveResources );
         }
         const auto temporary = pagePath.string() + ".rollup.tmp";
         if( !SaveGpuAnalysisCache( temporary, spoolIdentity, *snapshot, error ) ||
@@ -2332,7 +3293,9 @@ bool VisitGpuPassSpool( const TraceSessionCanonicalRecord& record,
 
 bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionTimeTransform& transform,
-    ResourceLifetimeResolver& resolver, GpuAnalysisSnapshot& catalog,
+    ResourceLifetimeResolver& resolver, BoundedCatalogLookup& catalog,
+    const GpuAnalysisSnapshot& catalogOverview,
+    std::vector<GpuResourceAnalysisRecord>& appendedResources,
     const std::vector<PassEvidenceEntry>& evidence,
     const GpuAnalysisTraceIdentity& identity,
     const GpuAnalysisSidecarControl& control, GpuAnalysisPassSpool& spool,
@@ -2366,7 +3329,9 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     if( enrichment.coreUnresolved != 0 )
     { error = "session_gpu_catalog_core_relation_unresolved:" +
         std::to_string( enrichment.coreUnresolved ); return false; }
-    if( !NormalizeLogicalRuns( enrichment, error ) || !NormalizeRangeRuns( enrichment, error ) ) return false;
+    if( !FlushViewRun( enrichment, error ) || !FlushPartRun( enrichment, error ) ||
+        !FlushVirtualGeometryRun( enrichment, error ) ||
+        !NormalizeLogicalRuns( enrichment, error ) || !NormalizeRangeRuns( enrichment, error ) ) return false;
     if( !resolver.AddLogicalFile( spool.root / "logical-lifetimes.bin", error ) ) return false;
     index.flush(); entries.flush();
     if( !index || !entries ) { error = "session_gpu_resource_set_spool_flush_failed"; return false; }
@@ -2377,7 +3342,9 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     if( !rangeReader.Open( spool.root / "ranges-by-pass.bin", error ) ) return false;
     PassSpoolBuildState state;
     state.transform = &transform; state.resourceSets = &setReader;
-    state.resolver = &resolver; state.catalog = &catalog; state.ranges = &rangeReader;
+    state.resolver = &resolver; state.catalog = &catalog;
+    state.catalogOverview = &catalogOverview; state.appendedResources = &appendedResources;
+    state.ranges = &rangeReader;
     state.evidence = &evidence; state.identity = &identity; state.control = &control;
     state.spool = &spool;
     if( !VisitTraceSessionCanonicalOrdered( sessionRoot, manifest,
@@ -2400,6 +3367,53 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     return true;
 }
 
+}
+
+struct GpuAnalysisCatalogStringReader::Impl
+{
+    BoundedCatalogStringLookup reader;
+};
+
+struct GpuAnalysisCatalogAllocationLookupReader::Impl
+{
+    ReadOnlyMappedFile data;
+    uint64_t count = 0;
+};
+
+GpuAnalysisCatalogStringReader::GpuAnalysisCatalogStringReader() : m_impl( std::make_unique<Impl>() ) {}
+GpuAnalysisCatalogStringReader::~GpuAnalysisCatalogStringReader() = default;
+GpuAnalysisCatalogStringReader::GpuAnalysisCatalogStringReader( GpuAnalysisCatalogStringReader&& ) noexcept = default;
+GpuAnalysisCatalogStringReader& GpuAnalysisCatalogStringReader::operator=( GpuAnalysisCatalogStringReader&& ) noexcept = default;
+bool GpuAnalysisCatalogStringReader::Open( const GpuAnalysisCatalogSpool& spool, std::string& error )
+{ return m_impl->reader.Open( spool, error ); }
+std::string GpuAnalysisCatalogStringReader::Find( uint64_t generation, uint32_t stringId ) const
+{ return m_impl->reader.Find( generation, stringId ); }
+
+GpuAnalysisCatalogAllocationLookupReader::GpuAnalysisCatalogAllocationLookupReader()
+    : m_impl( std::make_unique<Impl>() ) {}
+GpuAnalysisCatalogAllocationLookupReader::~GpuAnalysisCatalogAllocationLookupReader() = default;
+GpuAnalysisCatalogAllocationLookupReader::GpuAnalysisCatalogAllocationLookupReader(
+    GpuAnalysisCatalogAllocationLookupReader&& ) noexcept = default;
+GpuAnalysisCatalogAllocationLookupReader& GpuAnalysisCatalogAllocationLookupReader::operator=(
+    GpuAnalysisCatalogAllocationLookupReader&& ) noexcept = default;
+bool GpuAnalysisCatalogAllocationLookupReader::Open(
+    const GpuAnalysisCatalogSpool& spool, std::string& error )
+{
+    if( !m_impl ) m_impl = std::make_unique<Impl>();
+    if( !m_impl->data.Open( spool.allocationResourceCountPath, error ) ) return false;
+    if( m_impl->data.Size() % sizeof( CatalogAllocationLookupEntry ) != 0 )
+    { error = "session_gpu_catalog_allocation_lookup_size_invalid"; return false; }
+    m_impl->count = m_impl->data.Size() / sizeof( CatalogAllocationLookupEntry ); return true;
+}
+uint64_t GpuAnalysisCatalogAllocationLookupReader::ResourceCount( uint64_t allocationId ) const
+{
+    if( !m_impl || allocationId == 0 ) return 0;
+    const auto values = std::span<const CatalogAllocationLookupEntry>(
+        reinterpret_cast<const CatalogAllocationLookupEntry*>( m_impl->data.Data() ),
+        size_t( m_impl->count ) );
+    const auto found = std::lower_bound( values.begin(), values.end(), allocationId,
+        []( const auto& value, uint64_t key ) { return value.allocationId < key; } );
+    return found == values.end() || found->allocationId != allocationId ? 0 : found->resourceCount;
 }
 
 int64_t TraceSessionTimeTransform::ToNanoseconds( int64_t value ) const
@@ -2567,10 +3581,10 @@ bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
     return true;
 }
 
-bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
+bool LoadTraceSessionGpuCatalogDataImpl( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, JnTraceData& data,
     TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
-    std::string& error )
+    bool metadataOnly, std::string& error )
 {
     error.clear(); data = {}; timeTransform = {}; stats = {};
     if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, timeTransform, error ) ) return false;
@@ -2578,6 +3592,9 @@ bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
     state.loadReferenceEvidence = false;
     state.loadRangeEvidence = false;
     state.loadCatalogEnrichment = false;
+    state.loadCatalogCore = !metadataOnly;
+    state.loadCatalogAuxiliary = !metadataOnly;
+    state.loadCatalogStrings = !metadataOnly;
     for( const auto& shard : manifest.shards )
     {
         if( shard.domain == "checkpoint" ) continue;
@@ -2606,12 +3623,12 @@ bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
         const auto found = descriptorHeaps.find( token );
         if( found != descriptorHeaps.end() ) return found->second;
         const auto id = 0xD000000000000000ull | nextDescriptorHeapId++;
-        descriptorHeaps.emplace( token, id );
-        return id;
+        descriptorHeaps.emplace( token, id ); return id;
     };
     for( auto& generation : data.gpuCatalogGenerations )
     {
-        const auto resolved = ResolveJnGpuCatalogGenerationData(
+        JnGpuCatalogResolvedCounts resolved {};
+        if( !metadataOnly ) resolved = ResolveJnGpuCatalogGenerationData(
             data, generation.generation, anonymizeDescriptor );
         generation.unresolvedCount = resolved.totalUnresolved;
         if( !generation.ended || resolved.coreUnresolved != 0 )
@@ -2622,6 +3639,15 @@ bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
         }
     }
     return true;
+}
+
+bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, JnTraceData& data,
+    TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
+    std::string& error )
+{
+    return LoadTraceSessionGpuCatalogDataImpl( sessionRoot, manifest, data,
+        timeTransform, stats, false, error );
 }
 
 std::filesystem::path TraceSessionGpuAnalysisRoot( const std::filesystem::path& sessionRoot,
@@ -2640,9 +3666,18 @@ bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRo
     JnTraceData catalogData;
     TraceSessionTimeTransform transform;
     TraceSessionGpuCanonicalStats canonicalStats;
-    if( !LoadTraceSessionGpuCatalogData(
-        sessionRoot, manifest, catalogData, transform, canonicalStats, error ) ) return false;
-    ResourceLifetimeResolver resolver( catalogData );
+    if( !LoadTraceSessionGpuCatalogDataImpl(
+        sessionRoot, manifest, catalogData, transform, canonicalStats, true, error ) ) return false;
+    GpuAnalysisTraceIdentity identity;
+    identity.sha256 = manifest.source.sha256;
+    identity.fileSize = manifest.source.fileSize;
+    GpuAnalysisCatalogSpool catalogSpool;
+    if( !BuildBoundedGpuCatalogSpool( sessionRoot, manifest, transform,
+        catalogData, identity, control, catalogSpool, error ) ) return false;
+    ResourceLifetimeResolver resolver;
+    if( !resolver.AddPointerFile( catalogSpool.pointerLifetimePath, error ) ) return false;
+    BoundedCatalogLookup catalogLookup;
+    if( !catalogLookup.Open( catalogSpool, error ) ) return false;
     std::vector<uint64_t> evidenceGenerations( catalogData.gpuDetailedEvidence.size() );
     for( const auto& batch : catalogData.gpuCatalogBatches )
     {
@@ -2661,65 +3696,47 @@ bool BuildTraceSessionGpuAnalysisDerived( const std::filesystem::path& sessionRo
     std::sort( evidence.begin(), evidence.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.passId < rhs.passId;
     } );
-    GpuAnalysisBuildControl buildControl;
-    buildControl.stopToken = control.stopToken;
-    buildControl.progress = control.progress;
-    buildControl.catalogOnly = true;
-    buildControl.retainCatalogDictionaries = true;
-    // N29's standalone in-memory sidecar builder deliberately defaults to a
-    // 4/6 GiB budget.  Session conversion has a separately specified 12/16 GiB
-    // soft/hard envelope, and the high-cardinality evidence is externalized
-    // below.  Apply the Session envelope explicitly instead of rejecting a
-    // bounded Catalog Core with the legacy standalone soft limit.
-    GpuAnalysisBudget sessionBudget;
-    sessionBudget.softBytes = 12ull * 1024 * 1024 * 1024;
-    sessionBudget.hardBytes = 16ull * 1024 * 1024 * 1024;
-    auto catalog = BuildGpuAnalysisSnapshotConsuming(
-        catalogData, nullptr, sessionBudget, buildControl );
-    if( catalog.manifest.state != GpuAnalysisState::Complete || !catalog.manifest.complete )
-    {
-        error = "session_gpu_catalog_analysis_incomplete:" + catalog.manifest.reason;
-        if( catalog.manifest.reason == "analysis_hard_memory_limit" ||
-            catalog.manifest.reason == "analysis_soft_memory_limit" )
-        {
-            error += ":records";
-            for( size_t kind = 0; kind < canonicalStats.catalogRecordCounts.size(); ++kind )
-                error += ":" + std::to_string( kind ) + "=" +
-                    std::to_string( canonicalStats.catalogRecordCounts[kind] );
-        }
-        return false;
-    }
-    catalog.manifest.logicalRecordCount = canonicalStats.catalogRecordCounts[
+    catalogSpool.overview.manifest.logicalRecordCount = canonicalStats.catalogRecordCounts[
         size_t( JnGpuCatalogBatchKind::Logical )];
-    catalog.manifest.relationRecordCount = canonicalStats.catalogRecordCounts[
+    catalogSpool.overview.manifest.viewRecordCount = canonicalStats.catalogRecordCounts[
+        size_t( JnGpuCatalogBatchKind::View )];
+    catalogSpool.overview.manifest.partRecordCount = canonicalStats.catalogRecordCounts[
+        size_t( JnGpuCatalogBatchKind::Part )];
+    catalogSpool.overview.manifest.vgRecordCount = canonicalStats.catalogRecordCounts[
+        size_t( JnGpuCatalogBatchKind::VirtualGeometry )];
+    catalogSpool.overview.manifest.relationRecordCount = canonicalStats.catalogRecordCounts[
         size_t( JnGpuCatalogBatchKind::Relation )];
-    catalog.manifest.rangeRecordCount = canonicalStats.catalogRecordCounts[
+    catalogSpool.overview.manifest.rangeRecordCount = canonicalStats.catalogRecordCounts[
         size_t( JnGpuCatalogBatchKind::RangeSet )];
-    GpuAnalysisTraceIdentity identity;
-    identity.sha256 = manifest.source.sha256;
-    identity.fileSize = manifest.source.fileSize;
     GpuAnalysisPassSpool passSpool;
-    if( !BuildGpuPassSpool( sessionRoot, manifest, transform, resolver, catalog,
+    std::vector<GpuResourceAnalysisRecord> appendedResources;
+    if( !BuildGpuPassSpool( sessionRoot, manifest, transform, resolver, catalogLookup,
+        catalogSpool.overview, appendedResources,
         evidence, identity, control, passSpool, error ) ) return false;
     if( passSpool.sourceGapResourceCount != 0 )
     {
-        catalog.manifest.reason = "source_gpu_resource_identity_gap:" +
+        catalogSpool.overview.manifest.reason = "source_gpu_resource_identity_gap:" +
             std::to_string( passSpool.sourceGapResourceCount );
-        catalog.manifest.unresolvedCount += passSpool.sourceGapReferenceCount;
+        catalogSpool.overview.manifest.unresolvedCount += passSpool.sourceGapReferenceCount;
     }
-    stats.resourceCount = catalog.resources.size();
-    stats.allocationCount = catalog.allocations.size();
+    stats.resourceCount = catalogSpool.resourceCount + appendedResources.size();
+    stats.allocationCount = catalogSpool.allocationCount;
     stats.passCount = passSpool.passCount;
     stats.sourceGapResourceCount = passSpool.sourceGapResourceCount;
     stats.sourceGapReferenceCount = passSpool.sourceGapReferenceCount;
-    const auto result = WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
-        TraceSessionGpuAnalysisRoot( sessionRoot, manifest ), identity, catalog,
+    stats.catalogPageCount = catalogSpool.pageCount;
+    stats.peakCatalogRecordsInMemory = catalogSpool.peakRecordsInMemory;
+    stats.usedPagedCatalog = true;
+    const auto result = WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
+        TraceSessionGpuAnalysisRoot( sessionRoot, manifest ), identity, catalogSpool,
+        appendedResources,
         passSpool, catalogData.gpuCatalogStrings, control, stats.generation,
         stats.writtenBytes, error );
     if( result )
     {
         std::error_code ec;
         std::filesystem::remove_all( GpuAnalysisIoPath( passSpool.root ), ec );
+        std::filesystem::remove_all( GpuAnalysisIoPath( catalogSpool.root ), ec );
     }
     return result;
 }

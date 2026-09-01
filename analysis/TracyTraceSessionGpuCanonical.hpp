@@ -59,6 +59,9 @@ struct TraceSessionGpuDerivedStats
     uint64_t sourceGapResourceCount = 0;
     uint64_t sourceGapReferenceCount = 0;
     uint64_t writtenBytes = 0;
+    uint64_t catalogPageCount = 0;
+    uint64_t peakCatalogRecordsInMemory = 0;
+    bool usedPagedCatalog = false;
     std::string generation;
 };
 
@@ -66,9 +69,9 @@ bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, JnTraceData& data,
     TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
     std::string& error );
-// Loads Catalog/Allocation/View facts only. The unbounded Pass, ResourceSet,
-// RangeSet and DetailedEvidence streams deliberately stay on disk for the N30
-// bounded builders.
+// Compatibility/Oracle reader: loads Catalog facts into JnTraceData while the
+// unbounded Pass and ResourceSet streams stay on disk. Session production uses
+// the internal metadata-only reader plus paged Catalog builders instead.
 bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, JnTraceData& data,
     TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,

@@ -153,6 +153,14 @@ struct GpuAnalysisCatalogRelationStoreEntry
     JnGpuCatalogRelationRecordV1 record {};
 };
 
+struct GpuAnalysisCatalogStringIndexEntry
+{
+    uint64_t generation = 0;
+    uint64_t dataOffset = 0;
+    uint32_t stringId = 0;
+    uint32_t byteLength = 0;
+};
+
 // N30 stores globally pass-id ordered, independently checksummed cache pages
 // before publishing the N29-compatible derived store. Only one spool page is
 // materialized while the final pass and reverse-index pages are written.
@@ -166,11 +174,72 @@ struct GpuAnalysisPassSpool
     uint64_t rangeCount = 0;
     uint64_t logicalCount = 0;
     uint64_t catalogRelationCount = 0;
+    uint64_t viewCount = 0;
+    uint64_t partCount = 0;
+    uint64_t virtualGeometryCount = 0;
     uint64_t sourceGapResourceCount = 0;
     uint64_t sourceGapReferenceCount = 0;
     std::vector<std::filesystem::path> rangeRuns;
     std::vector<std::filesystem::path> logicalRuns;
     std::vector<std::filesystem::path> catalogRelationRuns;
+    std::vector<std::filesystem::path> viewRuns;
+    std::vector<std::filesystem::path> partRuns;
+    std::vector<std::filesystem::path> virtualGeometryRuns;
+};
+
+// Bounded Session Catalog product. Resource and Allocation pages are immutable
+// cache pages; the lookup files are compact, sorted fixed-width projections
+// used while Pass evidence is resolved without recreating a full snapshot.
+struct GpuAnalysisCatalogSpool
+{
+    std::filesystem::path root;
+    std::filesystem::path resourceLookupPath;
+    std::filesystem::path allocationLookupPath;
+    std::filesystem::path allocationResourceCountPath;
+    std::filesystem::path pointerLifetimePath;
+    std::filesystem::path stringIndexPath;
+    std::filesystem::path stringDataPath;
+    GpuAnalysisSnapshot overview;
+    std::vector<GpuAnalysisStorePage> pages;
+    std::vector<GpuAnalysisTypeSummary> typeSummaries;
+    uint64_t resourceCount = 0;
+    uint64_t allocationCount = 0;
+    uint64_t residencyCount = 0;
+    uint64_t churnCount = 0;
+    uint64_t pageCount = 0;
+    uint64_t peakRecordsInMemory = 0;
+};
+
+class GpuAnalysisCatalogStringReader
+{
+public:
+    GpuAnalysisCatalogStringReader();
+    ~GpuAnalysisCatalogStringReader();
+    GpuAnalysisCatalogStringReader( GpuAnalysisCatalogStringReader&& ) noexcept;
+    GpuAnalysisCatalogStringReader& operator=( GpuAnalysisCatalogStringReader&& ) noexcept;
+    GpuAnalysisCatalogStringReader( const GpuAnalysisCatalogStringReader& ) = delete;
+    GpuAnalysisCatalogStringReader& operator=( const GpuAnalysisCatalogStringReader& ) = delete;
+    bool Open( const GpuAnalysisCatalogSpool& spool, std::string& error );
+    std::string Find( uint64_t generation, uint32_t stringId ) const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+class GpuAnalysisCatalogAllocationLookupReader
+{
+public:
+    GpuAnalysisCatalogAllocationLookupReader();
+    ~GpuAnalysisCatalogAllocationLookupReader();
+    GpuAnalysisCatalogAllocationLookupReader( GpuAnalysisCatalogAllocationLookupReader&& ) noexcept;
+    GpuAnalysisCatalogAllocationLookupReader& operator=( GpuAnalysisCatalogAllocationLookupReader&& ) noexcept;
+    GpuAnalysisCatalogAllocationLookupReader( const GpuAnalysisCatalogAllocationLookupReader& ) = delete;
+    GpuAnalysisCatalogAllocationLookupReader& operator=( const GpuAnalysisCatalogAllocationLookupReader& ) = delete;
+    bool Open( const GpuAnalysisCatalogSpool& spool, std::string& error );
+    uint64_t ResourceCount( uint64_t allocationId ) const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
@@ -185,6 +254,15 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
     const std::filesystem::path& algorithmRoot,
     const GpuAnalysisTraceIdentity& identity,
     const GpuAnalysisSnapshot& catalogSnapshot,
+    const GpuAnalysisPassSpool& passSpool,
+    const std::vector<JnGpuCatalogStringData>& catalogStrings,
+    const GpuAnalysisSidecarControl& control,
+    std::string& generation, uint64_t& writtenBytes, std::string& error );
+bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
+    const std::filesystem::path& algorithmRoot,
+    const GpuAnalysisTraceIdentity& identity,
+    const GpuAnalysisCatalogSpool& catalogSpool,
+    const std::vector<GpuResourceAnalysisRecord>& appendedResources,
     const GpuAnalysisPassSpool& passSpool,
     const std::vector<JnGpuCatalogStringData>& catalogStrings,
     const GpuAnalysisSidecarControl& control,

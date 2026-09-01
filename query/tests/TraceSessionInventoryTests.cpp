@@ -1323,6 +1323,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     resources[0].pointerToken = 0x1234;
     resources[0].allocationId = 20;
     resources[0].capacityBytes = 4096;
+    resources[0].nameId = 42;
+    resources[0].nameHash = 0xC001CA7A10ull;
     resources[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Snapshot );
     resources[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::OpenBoundary );
     resources[1] = resources[0];
@@ -1404,6 +1406,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     logicals[0].time = 112;
     logicals[0].logicalResourceId = 300;
     logicals[0].resourceId = 10;
+    logicals[0].nameId = 42;
     logicals[0].lengthBytes = 4096;
     logicals[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
     logicals[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
@@ -1450,6 +1453,33 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto logicalPayload = makeCatalogPayload( logicals.data(), uint32_t( logicals.size() ), sizeof( logicals[0] ) );
     const auto relationPayload = makeCatalogPayload( catalogRelations.data(), uint32_t( catalogRelations.size() ), sizeof( catalogRelations[0] ) );
     const auto rangePayload = makeCatalogPayload( ranges.data(), uint32_t( ranges.size() ), sizeof( ranges[0] ) );
+    tracy::JnGpuCatalogStringRecordHeaderV1 catalogStringHeader {};
+    catalogStringHeader.stringId = 42;
+    catalogStringHeader.originalLength = 11;
+    catalogStringHeader.byteLength = 11;
+    const std::string catalogString = "CatalogName";
+    catalogStringHeader.hash = tracy::JnGpuCatalogChecksum64(
+        catalogString.data(), catalogString.size() );
+    std::vector<uint8_t> catalogStringRecords(
+        sizeof( catalogStringHeader ) + catalogString.size() );
+    std::memcpy( catalogStringRecords.data(), &catalogStringHeader,
+        sizeof( catalogStringHeader ) );
+    std::memcpy( catalogStringRecords.data() + sizeof( catalogStringHeader ),
+        catalogString.data(), catalogString.size() );
+    tracy::JnGpuCatalogBatchEnvelopeV1 stringEnvelope {};
+    stringEnvelope.magic = tracy::JnGpuCatalogBatchMagic;
+    stringEnvelope.catalogSchema = tracy::JnGpuCatalogSchemaVersion;
+    stringEnvelope.evidenceSchema = tracy::JnGpuDetailedEvidenceSchemaVersion;
+    stringEnvelope.recordBytes = 0;
+    stringEnvelope.recordCount = 1;
+    stringEnvelope.payloadBytes = uint32_t( catalogStringRecords.size() );
+    stringEnvelope.checksum = tracy::JnGpuCatalogChecksum64(
+        catalogStringRecords.data(), catalogStringRecords.size() );
+    std::vector<uint8_t> stringPayload(
+        sizeof( stringEnvelope ) + catalogStringRecords.size() );
+    std::memcpy( stringPayload.data(), &stringEnvelope, sizeof( stringEnvelope ) );
+    std::memcpy( stringPayload.data() + sizeof( stringEnvelope ),
+        catalogStringRecords.data(), catalogStringRecords.size() );
 
     std::vector<uint8_t> frame;
     AppendThreadContextEvent( frame, 42 );
@@ -2070,27 +2100,33 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnGpuCatalogControlKind::GenerationBegin ),
         uint8_t( tracy::JnGpuCatalogGenerationState::Building ), 0 };
     AppendQueueItem( frame, item );
-    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId, resourcePayload );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId, stringPayload );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
-    item.jnGpuCatalogBatch = { Generation, PayloadId, 2, uint32_t( resources.size() ), uint32_t( resourcePayload.size() ),
+    item.jnGpuCatalogBatch = { Generation, PayloadId, 2, 1, uint32_t( stringPayload.size() ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::String ),
+        uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
+    AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 1, resourcePayload );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 1, 3, uint32_t( resources.size() ), uint32_t( resourcePayload.size() ),
         uint8_t( tracy::JnGpuCatalogBatchKind::Resource ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
     AppendQueueItem( frame, item );
-    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 1, viewPayload );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 2, viewPayload );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
-    item.jnGpuCatalogBatch = { Generation, PayloadId + 1, 3, uint32_t( views.size() ), uint32_t( viewPayload.size() ),
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 2, 4, uint32_t( views.size() ), uint32_t( viewPayload.size() ),
         uint8_t( tracy::JnGpuCatalogBatchKind::View ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
     AppendQueueItem( frame, item );
-    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 2, logicalPayload );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 3, logicalPayload );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
-    item.jnGpuCatalogBatch = { Generation, PayloadId + 2, 4, uint32_t( logicals.size() ), uint32_t( logicalPayload.size() ),
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 3, 5, uint32_t( logicals.size() ), uint32_t( logicalPayload.size() ),
         uint8_t( tracy::JnGpuCatalogBatchKind::Logical ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
     AppendQueueItem( frame, item );
-    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 3, relationPayload );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 4, relationPayload );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
-    item.jnGpuCatalogBatch = { Generation, PayloadId + 3, 5, uint32_t( catalogRelations.size() ), uint32_t( relationPayload.size() ),
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 4, 6, uint32_t( catalogRelations.size() ), uint32_t( relationPayload.size() ),
         uint8_t( tracy::JnGpuCatalogBatchKind::Relation ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
     AppendQueueItem( frame, item );
@@ -2163,9 +2199,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.jnGpuReferenceEnd = { 120, 1004, 2004, 1, 0, 0 };
     AppendQueueItem( frame, item );
     AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData,
-        PayloadId + 4, rangePayload );
+        PayloadId + 5, rangePayload );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
-    item.jnGpuCatalogBatch = { Generation, PayloadId + 4, 6,
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 5, 7,
         uint32_t( ranges.size() ), uint32_t( rangePayload.size() ),
         uint8_t( tracy::JnGpuCatalogBatchKind::RangeSet ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::RangeSetV1 ), 0 };
@@ -2174,7 +2210,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.frameVsync = { 118, 9 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
-    item.jnGpuCatalogControl = { 120, Generation, 1, 7,
+    item.jnGpuCatalogControl = { 120, Generation, 1, 8,
         uint8_t( tracy::JnGpuCatalogControlKind::GenerationEnd ),
         uint8_t( tracy::JnGpuCatalogGenerationState::Complete ), 0 };
     AppendQueueItem( frame, item );
@@ -2282,7 +2318,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         gpuData.gpuReferenceUses.front().time == 22 &&
         gpuData.gpuReferenceEnds.front().time == 26,
         "GPU reader restores exact pass/resource/end relations" );
-    test.Check( stats.catalogPayloads == 5 && stats.catalogBatches == 5 &&
+    test.Check( stats.catalogPayloads == 6 && stats.catalogBatches == 6 &&
         stats.unresolvedPayloads == 0,
         "GPU reader consumes each Catalog payload exactly once" );
 
@@ -2314,6 +2350,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionRoot, manifest, gpuControl, derivedStats, error );
     test.Check( builtGpuDerived,
         "build mandatory GPU analysis from Session Canonical: " + error );
+    test.Check( derivedStats.usedPagedCatalog &&
+        derivedStats.catalogPageCount > 1 &&
+        derivedStats.peakCatalogRecordsInMemory <= 2,
+        "Session GPU derived uses the bounded paged Catalog path rather than a full in-memory snapshot" );
     test.Check( derivedStats.sourceGapResourceCount == 2 &&
         derivedStats.sourceGapReferenceCount == 2,
         "GPU derived reports the exact source-missing identity and reference counts" );
@@ -2366,8 +2406,16 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "a pointer absent from the entire Catalog remains an anonymous open-ended source gap" );
     test.Check( gpuResource && gpuResource->logicals.size() == logicals.size(),
         "Session GPU resource retains externally merged Logical facts" );
+    test.Check( gpuResource && gpuResource->name == "CatalogName" &&
+        !gpuResource->logicals.empty() && gpuResource->logicals.front().name == "CatalogName",
+        "Session GPU resource and Logical facts retain externally paged Catalog strings" );
+    test.Check( gpuResource && gpuResource->views.size() == 1 &&
+        gpuResource->views.front().value.resourceId == 10,
+        "Session GPU resource retains externally merged View facts" );
     test.Check( gpuResource && gpuResource->relations.size() == 1,
         "Session GPU resource retains externally merged Relation facts" );
+    test.Check( gpuStore && gpuStore->churnCount == 7,
+        "Session GPU Catalog preserves Worker-equivalent repeated-recreate churn evidence" );
     test.Check( loadedGpuRanges && gpuRanges.size() == 1 && !gpuRangesMore &&
         gpuRanges.front().value.passInstanceId == ExplicitGpuPassId &&
         parentGpuPass && parentGpuPass->directRangeBytes == 256,

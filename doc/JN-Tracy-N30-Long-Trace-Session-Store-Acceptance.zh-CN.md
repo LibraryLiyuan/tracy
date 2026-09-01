@@ -741,7 +741,7 @@ GREEN：
 - `ResolveJnGpuCatalogGenerationData`成为传统Worker和Session共用的纯数据解析器；View、Logical、VG、Range、Relation和DetailedEvidence使用相同的资源生命周期区间解析，不维护两套易漂移语义。
 - pointer token在同一地址Destroy后再次Create时按事件时间解析到不同`GpuResourceId`，歧义区间返回unresolved而不猜测。
 - N29 Store writer新增显式algorithm root入口；Legacy `.tracy` sidecar继续使用原路径，Session直接写入当前generation的`derived/gpu-resource-analysis/<schema>/<algorithm>`。
-- `BuildTraceSessionGpuAnalysisDerived`直接消费Canonical GPU事实并构建N29 Snapshot/索引，不写独立Raw GPU sidecar，也不重读stream。
+- 历史N30.5曾由`BuildTraceSessionGpuAnalysisDerived`完整物化N29 Snapshot；N30A已重开该门禁，当前生产路径改为分页Catalog与外部归并，完整Snapshot只保留作短Trace Oracle。
 - 新增全域`session-index`：每个Canonical事件Shard对应一个immutable索引文件，逐记录保存source sequence、frame ordinal/offset、Journal时间、语义时间、线程、类型和kind；文件及manifest独立SHA-256并原子发布。
 - Mandatory Derived统计Protocol Event、显式ProtocolFrame、Transport Record和17域总数；Final Audit重新读取Canonical与索引文件，不复用构建期计数器。
 - Final Audit要求`Inventory source count = Canonical count = Derived source count`，并验证GPU Store的source SHA/size、Complete状态及Resource/Allocation/Pass数量。
@@ -1990,3 +1990,30 @@ BA2D43985611CE0DF08B92B277D82F3F5B322EE6331EDE646E79AD11BC32EBB5
 ```
 
 本阶段没有启动G05或真实30分钟转换。
+
+### 2026-09-01 A1 GPU Catalog外存化
+
+状态：**Passed（短Trace与规模门禁；真实G05/30分钟验收留在A5）**。
+
+- RED先证明生产路径缺少分页Catalog统计；随后新增`usedPagedCatalog`、`catalogPageCount`和`peakCatalogRecordsInMemory`门禁。
+- Resource与Allocation原始事实按固定宽度run执行external sort/merge；每次只构建一个immutable cache page，不再生成完整Catalog `GpuAnalysisSnapshot`。
+- String字典拆为`strings.index`与`strings.data`，使用generation/string id二分定位；资源名和Logical名均通过端到端Synthetic验证。
+- pointer lifetime、resource/allocation lookup和allocation resource count均改为只读映射与二分查询；最终writer不再把全部allocation count读入vector。
+- View、Part、Virtual Geometry、Logical与Catalog Relation以外部run按ResourceId归并进当前资源页。
+- EngineKnownPhysical peak通过按时间外排的allocation delta精确重算；资源类型汇总、alive/open-boundary churn与稳定名称重复重建churn均保持Worker语义。
+- pointer reuse、开放创建边界、source identity gap和post-Destroy use继续显式保留，不按未来Resource身份回填。
+- `BuildTraceSessionGpuAnalysisDerived`生产入口不调用`BuildGpuAnalysisSnapshotConsuming`，完整Worker/Catalog reader只保留为短Trace兼容与正确性Oracle。
+
+TDD证据：
+
+```text
+RED-1: TraceSessionGpuDerivedStats缺少分页Catalog字段，测试编译失败
+RED-2: Session GPU Catalog preserves Worker-equivalent repeated-recreate churn evidence
+GREEN: Trace Session Inventory tests passed
+Oracle: tracy-gpu-analysis-tests通过
+Scale: targetDerivedPageBytes=1时catalogPageCount>1且peakCatalogRecordsInMemory<=2
+Strings: Resource/Logical CatalogName从外置字符串页完整恢复
+Regression: Debug CTest 8/8通过；Total Test Time 6.02 sec
+```
+
+本阶段没有启动G05或真实30分钟转换，也没有修改Protocol 90、Unity、PackageRepo或Player。
