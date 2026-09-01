@@ -15,13 +15,14 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionGpuZoneIndexSchemaVersion = 2;
+inline constexpr uint32_t TraceSessionGpuZoneIndexSchemaVersion = 3;
 
 struct TraceSessionGpuZoneStats
 {
     uint64_t contexts = 0;
     uint64_t zones = 0;
     uint64_t zoneBlocks = 0;
+    uint64_t childLinks = 0;
     uint64_t completeZones = 0;
     uint64_t sourceLocations = 0;
     uint64_t beginEvents = 0;

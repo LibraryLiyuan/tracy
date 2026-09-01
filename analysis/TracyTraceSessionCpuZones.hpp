@@ -15,7 +15,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionCpuZoneIndexSchemaVersion = 2;
+inline constexpr uint32_t TraceSessionCpuZoneIndexSchemaVersion = 3;
 
 struct TraceSessionCpuZoneStats
 {
@@ -26,6 +26,7 @@ struct TraceSessionCpuZoneStats
     uint64_t beginEvents = 0;
     uint64_t endEvents = 0;
     uint64_t zoneBlocks = 0;
+    uint64_t childLinks = 0;
     uint64_t fileBytes = 0;
 };
 

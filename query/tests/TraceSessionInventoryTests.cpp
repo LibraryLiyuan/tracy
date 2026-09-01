@@ -2305,7 +2305,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto mainThreadCpuZones = cpuZoneReader ?
         cpuZoneReader->ScanThread( mainThreadZoneRef, allCpuZones ) :
         std::vector<tracy::analysis::CpuZoneDto> {};
+    const auto cpuZoneChildren = cpuZoneReader ? cpuZoneReader->Children( 0, 0, 16 ) :
+        std::vector<tracy::analysis::CpuZoneDto> {};
     test.Check( cpuZoneReader && cpuZoneReader->Stats().zoneBlocks != 0 &&
+        cpuZoneReader->Stats().childLinks == 1 && cpuZoneChildren.size() == 1 &&
+        cpuZoneChildren.front().parentRef == cpuZoneReader->Get( 0 )->ref &&
         narrowCpuZones.size() == 3 && mainThreadCpuZones.size() == 3 &&
         std::all_of( mainThreadCpuZones.begin(), mainThreadCpuZones.end(), [&]( const auto& value ) {
             return value.threadRef == mainThreadZoneRef;
@@ -2327,6 +2331,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto contextGpuZones = gpuZoneReader ? gpuZoneReader->ScanContext(
         gpuContextZeroRef, narrowGpuZoneRange ) : std::vector<tracy::analysis::GpuZoneDto> {};
     test.Check( gpuZoneReader && gpuZoneReader->Stats().zoneBlocks != 0 &&
+        gpuZoneReader->Stats().childLinks == 0 && gpuZoneReader->Children( 0, 0, 16 ).empty() &&
         contextGpuZones.size() == 1 && contextGpuZones.front().contextRef == gpuContextZeroRef,
         "Session GPU Zone publishes exact time/Context block indexes: " + error );
     auto memoryReader = tracy::analysis::TraceSessionMemoryReader::Open(
@@ -3086,6 +3091,15 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuSearch["data"]["zones"][2]["duration_ns"].is_null() &&
             cpuSearch["data"]["zones"][2]["complete"] == true,
             "Query 1.34 preserves both source endpoints for an inverted CPU-zone clock" );
+        const auto cpuTree = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone-tree" },
+            { "method", "zone.cpu.tree" }, { "params", { { "trace_id", traceId },
+                { "ref", cpuSearch["data"]["zones"][0]["ref"] }, { "limit", 16 } } }
+        } );
+        test.Check( cpuTree.value( "ok", false ) &&
+            cpuTree["data"]["children"].size() == 1 &&
+            cpuTree["data"]["children"][0]["ref"] == cpuSearch["data"]["zones"][1]["ref"],
+            "Query 1.34 resolves CPU-zone children through the exact parent posting index" );
         test.Check( cpuSearch.value( "ok", false ) && cpuSearch["data"]["zones"].size() == 3 &&
             cpuSearch["data"]["zones"][2]["timing_valid"] == false &&
             cpuSearch["data"]["zones"][2]["timing_invalid_reason"] == "source_clock_inversion",

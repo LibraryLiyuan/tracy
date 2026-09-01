@@ -878,7 +878,7 @@ GREEN：
 - GPU Zone schema 2已经增加4096条一块的immutable时间包络与256-bit Context Bloom，时间窗口和指定Context可跳过不可能命中的块；父节点查询仍需posting index，并且Annotation及serial/fiber边界仍需传统Worker差分，不能据此提前通过长Trace查询性能门禁。
 - Scheduling schema 5已经为线程/CPU固定宽度记录增加4096条一块的immutable时间包络与256-bit identity Bloom；时间窗口、指定thread和指定CPU可跳过不可能命中的块。仍需在真实长Trace验证查询延迟，若Bloom误命中导致门禁不通过，再升级为压缩posting list。
 - Sampling schema 3已为普通Sample增加4096条一块的immutable时间包络和Thread Bloom；Hardware Sample已按address/kind建立精确offset。仍需对真实长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
-- 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
+- Job schema 2 与 `job-pages/1` 已将 Schedule、Config、Dependency、Stage 及稳定 Job ID 写成有序磁盘区段；Reader 打开时只加载有界的 Type、Frame 和 Callsite 元数据，`Scan/Get` 通过 ID 页读取，不再物化全部 Job DTO。剩余项是反向 Dependency posting、Frame→Job 关联以及真实长 Trace 延迟/内存门禁。
 - CPU Zone schema 2已经增加4096条一块的immutable时间包络与256-bit Thread Bloom，时间窗口和指定thread可跳过不可能命中的块；children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存。在N30.6完成前必须增加parent→children索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - Memory schema 2已经为每个Pool增加4096条一块的immutable生命周期时间包络；`memory.events(pool_ref=...)`、`memory.active_at_time`和Frame Snapshot可跳过不相交Pool block。Frame Snapshot仍会物化最终与目标帧相交的事件集合，必须在真实长Trace验证窗口基数和峰值内存。
 - Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
@@ -1374,7 +1374,7 @@ Trace Session Inventory tests passed
 - 索引根目录使用实际schema版本；header、manifest、Derived Audit同时核对block数量、布局、覆盖范围、文件大小和SHA-256。
 - 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
 
-仍待N30.6集中门禁：parent→children posting index、真实长Trace时间/thread查询延迟和SourceLocation驻留内存评估。
+仍待N30.6集中门禁：真实长Trace时间/thread查询延迟和SourceLocation驻留内存评估。
 
 ### 2026-09-01 GPU Zone 时间与 Context 块索引（N30.6B 子阶段）
 
@@ -1385,7 +1385,7 @@ Trace Session Inventory tests passed
 - header、manifest与Final Audit同时核对block数量、连续覆盖、布局、文件大小和SHA-256；索引根目录跟随schema版本。
 - 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
 
-仍待N30.6集中门禁：GPU parent→children posting index、Annotation、serial/fiber传统Worker差分与真实长Trace延迟。
+仍待N30.6集中门禁：Annotation、serial/fiber传统Worker差分与真实长Trace延迟。
 
 ### 2026-09-01 Memory 时间与 Pool 块索引（N30.6B 子阶段）
 
@@ -1403,3 +1403,25 @@ Synthetic验证thread 42的普通/ContextSwitch Sample、Query thread filter、H
 ```text
 Trace Session Inventory tests passed
 ```
+
+### 2026-09-01 CPU/GPU Zone 父子 Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- CPU/GPU Zone schema统一升级到3；固定宽度Zone与时间块之后追加按`(parentId, childId)`排序的精确posting区段。
+- 构建阶段从既有Zone工作流顺序生成16字节Pair；每4,194,304条（64 MiB）形成一个有序run，最多64路归并，多轮合并时内存和同时打开的文件句柄均有界。
+- Posting按parent、child稳定排序；`zone.cpu.tree`和`zone.gpu.tree`通过两次磁盘二分查找定位父节点区间，只读取请求页的child ID和对应Zone，不再线性扫描整个Zone表。
+- 排序不存在采样、Bloom或近似；Reader读取后仍校验每个child的真实`parent`字段，索引与事实不一致时拒绝返回伪造结果。
+- header、manifest、最终文件布局、child数量、SHA-256和临时run清理由既有Final Audit链保护；Schema 2不会被Schema 3 Reader误读。
+- Job Reader复核确认已使用`job-pages/1`磁盘分页；验收文档中“打开时物化全部Job DTO”的旧描述已纠正，未重复实现已有能力。
+
+TDD与回归证据：
+
+```text
+CPU non-empty parent: child_links=1，zone.cpu.tree返回唯一真实child
+GPU empty parent:     child_links=0，tree返回空集合而不是错误记录
+Trace Session Inventory tests passed
+固定N29/N30组合回归：6/6 passed
+```
+
+下一步：实现Job反向Dependency/Frame关联，继续收敛N30.6B剩余线性查询；本子阶段未启动真实30分钟转换。

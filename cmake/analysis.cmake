@@ -11,6 +11,7 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyMemoryAnalysis.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionCanonical.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionDerived.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionExternalSort.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrames.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrameImages.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionJobs.cpp
@@ -45,6 +46,7 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyTraceSource.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionCanonical.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionDerived.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionExternalSort.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrames.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionFrameImages.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionJobs.hpp
