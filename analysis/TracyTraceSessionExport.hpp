@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -60,6 +61,31 @@ struct TraceSessionExportPlan
     std::string estimateMethod;
 };
 
+struct TraceSessionWindowProtocolRecord
+{
+    uint16_t recordType = 0;
+    uint32_t flags = 0;
+    uint64_t monotonicNs = 0;
+    // Valid only for the duration of the sink callback.
+    std::span<const uint8_t> payload;
+};
+
+using TraceSessionWindowProtocolSink = bool ( * )(
+    const TraceSessionWindowProtocolRecord& record, void* userData,
+    std::string& error );
+
+struct TraceSessionWindowProtocolStats
+{
+    uint64_t scannedProtocolEvents = 0;
+    uint64_t selectedSemanticEvents = 0;
+    uint64_t selectedTimelessEvents = 0;
+    uint64_t omittedSemanticEvents = 0;
+    uint64_t inputFrames = 0;
+    uint64_t outputFrames = 0;
+    uint64_t transportRecords = 0;
+    uint64_t outputBytes = 0;
+};
+
 bool ResolveTraceSessionExportRange( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionExportSelection& selection,
     TraceSessionExportRange& range, std::string& error );
@@ -68,6 +94,16 @@ bool BuildTraceSessionExportPlan( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
     const TraceSessionExportControl& control, TraceSessionExportPlan& plan,
     std::string& error );
+
+// Emits a bounded protocol stream suitable for a later offline Worker replay.
+// Semantic events are selected by the requested half-open time range. Timeless
+// protocol definitions and transport records are retained exactly. Cross-range
+// lifecycle state is deliberately not synthesized here; WindowExportSink adds
+// that state from Mandatory Derived indexes before producing a public .tracy.
+bool BuildTraceSessionWindowProtocol( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
+    TraceSessionWindowProtocolSink sink, void* sinkUserData,
+    TraceSessionWindowProtocolStats& stats, std::string& error );
 
 }
 

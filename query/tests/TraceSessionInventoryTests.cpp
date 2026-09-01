@@ -157,6 +157,62 @@ struct CanonicalOrderedReadState
     std::vector<uint8_t> protocolTypes;
 };
 
+struct ExportProtocolRecordCopy
+{
+    uint16_t recordType = 0;
+    uint32_t flags = 0;
+    uint64_t monotonicNs = 0;
+    std::vector<uint8_t> payload;
+};
+
+struct ExportProtocolCapture
+{
+    std::vector<ExportProtocolRecordCopy> records;
+};
+
+bool CaptureExportProtocolRecord(
+    const tracy::analysis::TraceSessionWindowProtocolRecord& record,
+    void* userData, std::string& )
+{
+    auto& capture = *static_cast<ExportProtocolCapture*>( userData );
+    ExportProtocolRecordCopy copy;
+    copy.recordType = record.recordType;
+    copy.flags = record.flags;
+    copy.monotonicNs = record.monotonicNs;
+    copy.payload.assign( record.payload.begin(), record.payload.end() );
+    capture.records.emplace_back( std::move( copy ) );
+    return true;
+}
+
+struct ExportProtocolEventAudit
+{
+    const tracy::analysis::TraceSessionTimeTransform* transform = nullptr;
+    const tracy::analysis::TraceSessionExportRange* range = nullptr;
+    uint64_t semanticEvents = 0;
+    uint64_t timelessEvents = 0;
+    bool semanticInsideRange = true;
+};
+
+bool AuditExportProtocolEvent(
+    const tracy::analysis::TraceSessionProtocolEventInfo& event,
+    void* userData, std::string& )
+{
+    auto& audit = *static_cast<ExportProtocolEventAudit*>( userData );
+    int64_t rawTime = 0;
+    if( tracy::analysis::TryGetTraceProtocolEventTime( event, rawTime ) )
+    {
+        audit.semanticEvents++;
+        const auto timeNs = audit.transform->ToNanoseconds( rawTime );
+        if( timeNs < audit.range->beginNs || timeNs >= audit.range->endNs )
+            audit.semanticInsideRange = false;
+    }
+    else
+    {
+        audit.timelessEvents++;
+    }
+    return true;
+}
+
 bool CountCanonicalRecord( const tracy::analysis::TraceSessionCanonicalRecord& record,
     void* userData, std::string& )
 {
@@ -2158,8 +2214,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( compressor != nullptr, "create GPU canonical compressor" );
     if( !compressor ) return;
     const auto compressed = CompressContinuedFrame( compressor, frame, test );
+    std::vector<uint8_t> tailFrame;
+    AppendThreadContextEvent( tailFrame, 42 );
+    const auto compressedTail = CompressContinuedFrame( compressor, tailFrame, test );
     tracy::LZ4_freeStream( compressor );
-    if( compressed.empty() ) return;
+    if( compressed.empty() || compressedTail.empty() ) return;
 
     const auto source = directory / "gpu-canonical.tracy-stream";
     tracy::stream::WriterOptions writerOptions; writerOptions.durableHeader = false;
@@ -2180,8 +2239,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         1, error ), "append GPU welcome" );
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
         tracy::stream::RecordFlagCompressedFrame, compressed, 2, error ), "append GPU frame" );
+    test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
+        tracy::stream::RecordFlagCompressedFrame, compressedTail, 3, error ), "append GPU tail frame" );
     test.Check( writer->Append( tracy::stream::RecordType::SessionEnd,
-        tracy::stream::RecordFlagTerminal, "end", 3, error ), "append GPU session end" );
+        tracy::stream::RecordFlagTerminal, "end", 4, error ), "append GPU session end" );
     writer.reset();
 
     tracy::analysis::TraceSessionInventory inventory;
@@ -2569,6 +2630,42 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         manifest, timeRange, limitedExportControl, limitedExportPlan, error ) &&
         error == "session_export_worker_memory_limit" && !limitedExportPlan.memoryAllowed,
         "Session export refuses a range whose conservative Worker estimate exceeds the configured hard limit" );
+    ExportProtocolCapture exportProtocol;
+    tracy::analysis::TraceSessionWindowProtocolStats exportProtocolStats;
+    test.Check( tracy::analysis::BuildTraceSessionWindowProtocol( publishedSession,
+        manifest, timeRange, CaptureExportProtocolRecord, &exportProtocol,
+        exportProtocolStats, error ),
+        "Session export emits a bounded filtered protocol stream: " + error );
+    tracy::analysis::TraceSessionProtocolDecoder exportDecoder;
+    tracy::analysis::TraceSessionProtocolInventory exportInventory;
+    tracy::analysis::TraceSessionTimeTransform exportTransform;
+    test.Check( tracy::analysis::LoadTraceSessionTimeTransform(
+        publishedSession, manifest, exportTransform, error ),
+        "Session export loads the exact source time transform: " + error );
+    ExportProtocolEventAudit exportAudit { &exportTransform, &timeRange };
+    uint64_t exportedTransportRecords = 0;
+    uint64_t exportedCompressedFrames = 0;
+    for( const auto& record : exportProtocol.records )
+    {
+        if( record.recordType == uint16_t( tracy::stream::RecordType::ClientToServer ) &&
+            ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0 )
+        {
+            exportedCompressedFrames++;
+            test.Check( exportDecoder.ConsumeCompressedRecord( record.payload,
+                exportInventory, error, AuditExportProtocolEvent, &exportAudit ),
+                "Session export emits a decodable continued LZ4 protocol frame: " + error );
+        }
+        else
+        {
+            exportedTransportRecords++;
+        }
+    }
+    test.Check( exportedCompressedFrames == exportProtocolStats.outputFrames &&
+        exportedTransportRecords == exportProtocolStats.transportRecords &&
+        exportAudit.semanticEvents == exportProtocolStats.selectedSemanticEvents &&
+        exportAudit.timelessEvents == exportProtocolStats.selectedTimelessEvents &&
+        exportAudit.semanticInsideRange,
+        "Session export protocol stream contains only in-range semantic events plus exact timeless dependencies" );
     auto sessionGpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt(
         tracy::analysis::TraceSessionGpuAnalysisRoot( publishedSession, manifest ),
         manifest.source.sha256, manifest.source.fileSize, error );

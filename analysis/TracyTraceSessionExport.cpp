@@ -3,8 +3,13 @@
 #include "TracyTraceSessionCanonical.hpp"
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyProtocol.hpp"
+#include "TracyStreamJournal.hpp"
+#include "tracy_lz4.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <limits>
 
 namespace tracy::analysis
@@ -77,6 +82,124 @@ bool VerifyCurrentGeneration( const std::filesystem::path& sessionRoot,
         error = "session_export_session_not_complete";
         return false;
     }
+    return true;
+}
+
+struct WindowProtocolState
+{
+    const TraceSessionExportRange* range = nullptr;
+    const TraceSessionTimeTransform* transform = nullptr;
+    TraceSessionWindowProtocolSink sink = nullptr;
+    void* sinkUserData = nullptr;
+    TraceSessionWindowProtocolStats* stats = nullptr;
+    tracy::LZ4_stream_t* compressor = nullptr;
+    std::vector<uint8_t> frame;
+    std::vector<uint8_t> compressed;
+    std::array<char, 64 * 1024> dictionary {};
+};
+
+bool EmitWindowProtocolRecord( WindowProtocolState& state, uint16_t recordType,
+    uint32_t flags, uint64_t monotonicNs, std::span<const uint8_t> payload,
+    std::string& error )
+{
+    TraceSessionWindowProtocolRecord output;
+    output.recordType = recordType;
+    output.flags = flags;
+    output.monotonicNs = monotonicNs;
+    output.payload = payload;
+    if( !state.sink( output, state.sinkUserData, error ) )
+    {
+        if( error.empty() ) error = "session_export_protocol_sink_failed";
+        return false;
+    }
+    AddSaturating( state.stats->outputBytes, payload.size() );
+    return true;
+}
+
+bool FlushWindowProtocolFrame( WindowProtocolState& state,
+    const TraceSessionCanonicalRecord& marker, std::string& error )
+{
+    state.stats->inputFrames++;
+    if( state.frame.empty() ) return true;
+    if( state.frame.size() > tracy::TargetFrameSize )
+    {
+        error = "session_export_protocol_frame_exceeds_limit";
+        return false;
+    }
+    state.compressed.resize( sizeof( tracy::lz4sz_t ) + tracy::LZ4Size );
+    const auto compressedBytes = tracy::LZ4_compress_fast_continue(
+        state.compressor, reinterpret_cast<const char*>( state.frame.data() ),
+        reinterpret_cast<char*>( state.compressed.data() + sizeof( tracy::lz4sz_t ) ),
+        int( state.frame.size() ), tracy::LZ4Size, 1 );
+    if( compressedBytes <= 0 )
+    {
+        error = "session_export_protocol_compress_failed";
+        return false;
+    }
+    const auto storedSize = tracy::lz4sz_t( compressedBytes );
+    std::memcpy( state.compressed.data(), &storedSize, sizeof( storedSize ) );
+    state.compressed.resize( sizeof( storedSize ) + size_t( compressedBytes ) );
+    const auto flags = marker.flags | tracy::stream::RecordFlagCompressedFrame;
+    if( !EmitWindowProtocolRecord( state,
+        uint16_t( tracy::stream::RecordType::ClientToServer ), flags,
+        marker.journalMonotonicNs, state.compressed, error ) ) return false;
+    if( tracy::LZ4_saveDict( state.compressor, state.dictionary.data(),
+        int( state.dictionary.size() ) ) < 0 )
+    {
+        error = "session_export_protocol_dictionary_save_failed";
+        return false;
+    }
+    state.frame.clear();
+    state.stats->outputFrames++;
+    return true;
+}
+
+bool VisitWindowProtocolRecord( const TraceSessionCanonicalRecord& record,
+    void* userData, std::string& error )
+{
+    auto& state = *static_cast<WindowProtocolState*>( userData );
+    if( record.kind == TraceSessionCanonicalRecordKind::TransportRecord )
+    {
+        if( !state.frame.empty() )
+        {
+            error = "session_export_transport_inside_protocol_frame";
+            return false;
+        }
+        const auto type = uint16_t( record.type );
+        if( type < uint16_t( tracy::stream::RecordType::SessionBegin ) ||
+            type > uint16_t( tracy::stream::RecordType::Diagnostic ) )
+        {
+            error = "session_export_transport_type_invalid";
+            return false;
+        }
+        if( !EmitWindowProtocolRecord( state, type, record.flags,
+            record.journalMonotonicNs, record.payload, error ) ) return false;
+        state.stats->transportRecords++;
+        return true;
+    }
+    if( record.kind == TraceSessionCanonicalRecordKind::ProtocolFrame )
+        return FlushWindowProtocolFrame( state, record, error );
+
+    state.stats->scannedProtocolEvents++;
+    bool selected = !record.hasSemanticTime;
+    if( record.hasSemanticTime )
+    {
+        const auto timeNs = state.transform->ToNanoseconds( record.semanticTime );
+        selected = timeNs >= state.range->beginNs && timeNs < state.range->endNs;
+        if( selected ) state.stats->selectedSemanticEvents++;
+        else state.stats->omittedSemanticEvents++;
+    }
+    else
+    {
+        state.stats->selectedTimelessEvents++;
+    }
+    if( !selected ) return true;
+    if( record.payload.size() > tracy::TargetFrameSize - state.frame.size() )
+    {
+        error = "session_export_protocol_frame_exceeds_limit";
+        return false;
+    }
+    state.frame.insert( state.frame.end(), record.payload.begin(), record.payload.end() );
     return true;
 }
 
@@ -238,6 +361,56 @@ bool BuildTraceSessionExportPlan( const std::filesystem::path& sessionRoot,
     if( !plan.memoryAllowed )
     {
         error = "session_export_worker_memory_limit";
+        return false;
+    }
+    return true;
+}
+
+bool BuildTraceSessionWindowProtocol( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
+    TraceSessionWindowProtocolSink sink, void* sinkUserData,
+    TraceSessionWindowProtocolStats& stats, std::string& error )
+{
+    error.clear();
+    stats = {};
+    if( !sink )
+    {
+        error = "session_export_protocol_sink_missing";
+        return false;
+    }
+    if( range.beginNs >= range.endNs )
+    {
+        error = "session_export_time_range_invalid";
+        return false;
+    }
+    if( !VerifyCurrentGeneration( sessionRoot, manifest, error ) ) return false;
+    TraceSessionTimeTransform transform;
+    if( !LoadTraceSessionTimeTransform( sessionRoot, manifest, transform, error ) ) return false;
+    auto* compressor = tracy::LZ4_createStream();
+    if( !compressor )
+    {
+        error = "session_export_protocol_compressor_alloc_failed";
+        return false;
+    }
+    WindowProtocolState state;
+    state.range = &range;
+    state.transform = &transform;
+    state.sink = sink;
+    state.sinkUserData = sinkUserData;
+    state.stats = &stats;
+    state.compressor = compressor;
+    const auto success = VisitTraceSessionCanonicalOrdered( sessionRoot, manifest,
+        VisitWindowProtocolRecord, &state, error );
+    tracy::LZ4_freeStream( compressor );
+    if( !success ) return false;
+    if( !state.frame.empty() )
+    {
+        error = "session_export_protocol_frame_missing_marker";
+        return false;
+    }
+    if( stats.outputFrames == 0 || stats.selectedSemanticEvents == 0 )
+    {
+        error = "session_export_range_has_no_protocol_events";
         return false;
     }
     return true;

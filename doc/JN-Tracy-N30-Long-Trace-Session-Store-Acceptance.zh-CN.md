@@ -1894,3 +1894,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
+### 2026-09-01 Window Protocol 有界筛选与重编码（N30.6C 子阶段）
+
+状态：**Passed（协议流基础；开放生命周期补全、Worker写盘与CLI仍待实现）**。
+
+- 新增`BuildTraceSessionWindowProtocol`。它按Canonical源顺序读取，不建立完整Trace容器；内存仅保留一个原始协议Frame、一个压缩输出Buffer和64 KiB LZ4字典。
+- 每个带语义时间的事件经`TraceSessionTimeTransform`转换后，只在半开区间`[beginNs,endNs)`内保留；无语义时间的字符串、SourceLocation、Callstack等定义事实按原始字节保留。
+- SessionBegin、Welcome、Server query、Checkpoint、SessionEnd及其他transport record保持源顺序、类型、flags、monotonic time和payload。
+- 过滤后的事件不复用源LZ4字典；Exporter建立独立、连续的新LZ4压缩流，并在每帧后把最多64 KiB字典移到稳定内存，避免下一帧覆写前帧输入导致字典悬空。
+- 输出Frame仍受Tracy`TargetFrameSize`硬门禁。压缩失败、frame marker缺失、transport嵌入frame或record type非法都会显式失败。
+- Synthetic fixture增加第二个依赖前帧字典的协议Frame；导出后使用独立`TraceSessionProtocolDecoder`重新解码，证明连续LZ4、事件数量和时间筛选一致。
+- 当前函数明确只生成“供后续离线Worker重放的协议流”。它不伪造跨范围Zone、Job、Allocation、Resource或I/O生命周期；这些开放边界必须由Mandatory Derived索引补入后，才能发布`.tracy`。
+
+TDD与回归证据：
+
+```text
+RED:        缺少TraceSessionWindowProtocolRecord/Stats/Build API，编译按预期失败
+GREEN:      Trace Session Inventory tests passed
+LZ4:        两个连续输出Frame由全新Decoder完整解码
+Range:      所有semantic event均在[begin,end)，timeless dependency数量与stats一致
+Regression: 固定组合回归6/6通过
+```
+
+本子阶段没有生成正式`.tracy`或`tracy-session-export.exe`，也未启动真实30分钟转换。
