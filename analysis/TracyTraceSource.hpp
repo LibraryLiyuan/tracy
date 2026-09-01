@@ -1074,6 +1074,37 @@ public:
         }
         return result;
     }
+    virtual std::vector<JobDto> GetJobsForPackedHandle(
+        uint64_t packedHandle, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto jobs = GetJobs();
+        std::vector<JobDto> result;
+        size_t matched = 0;
+        for( const auto& job : jobs )
+        {
+            if( job.packedHandle != packedHandle ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( job );
+            if( result.size() >= limit ) break;
+        }
+        return result;
+    }
+    virtual std::vector<JobDto> GetJobsForHandleSlotNear(
+        uint32_t slotIndex, uint64_t jobId, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        auto jobs = GetJobs();
+        jobs.erase( std::remove_if( jobs.begin(), jobs.end(), [slotIndex]( const auto& job ) {
+            return uint32_t( job.packedHandle ) != slotIndex; } ), jobs.end() );
+        std::sort( jobs.begin(), jobs.end(), [jobId]( const auto& lhs, const auto& rhs ) {
+            const auto lhsDistance = lhs.jobId > jobId ? lhs.jobId - jobId : jobId - lhs.jobId;
+            const auto rhsDistance = rhs.jobId > jobId ? rhs.jobId - jobId : jobId - rhs.jobId;
+            return lhsDistance != rhsDistance ? lhsDistance < rhsDistance : lhs.jobId < rhs.jobId;
+        } );
+        if( jobs.size() > limit ) jobs.resize( limit );
+        return jobs;
+    }
     virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
     {
         const auto jobs = GetJobs();

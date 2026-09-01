@@ -770,6 +770,22 @@ std::vector<JobDto> GpuAnalysisTraceSource::GetJobsForFrame(
     return reader ? reader->FrameJobs( frameId, offset, limit ) : std::vector<JobDto> {};
 }
 
+std::vector<JobDto> GpuAnalysisTraceSource::GetJobsForPackedHandle(
+    uint64_t packedHandle, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetJobsForPackedHandle( packedHandle, offset, limit );
+    const auto reader = SessionJobReader();
+    return reader ? reader->HandleJobs( packedHandle, offset, limit ) : std::vector<JobDto> {};
+}
+
+std::vector<JobDto> GpuAnalysisTraceSource::GetJobsForHandleSlotNear(
+    uint32_t slotIndex, uint64_t jobId, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetJobsForHandleSlotNear( slotIndex, jobId, limit );
+    const auto reader = SessionJobReader();
+    return reader ? reader->SlotJobsNear( slotIndex, jobId, limit ) : std::vector<JobDto> {};
+}
+
 std::vector<JobDto> GpuAnalysisTraceSource::GetEvidenceJobs( uint64_t frameId ) const
 {
     if( WorkerLoaded() ) return TraceSource::GetEvidenceJobs( frameId );

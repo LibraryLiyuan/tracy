@@ -1535,7 +1535,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, JobNamePointer, "SyntheticJob" );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobSchedule;
-    item.jnJobSchedule = { 104, 400, 0xAAA, 0, 2, 0 };
+    item.jnJobSchedule = { 104, 400, 0x100000ABC, 0, 2, uint8_t( 1 << 6 ) };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobStage;
@@ -2738,14 +2738,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto sessionJobById = sessionSource->GetJob( 500 );
     const auto sessionJobDependents = sessionSource->GetJobDependents( 400, 0, 16 );
     const auto sessionFrameJobs = sessionSource->GetJobsForFrame( 9, 0, 16 );
+    const auto sessionHandleJobs = sessionSource->GetJobsForPackedHandle( 0xABC, 0, 16 );
+    const auto sessionSlotJobs = sessionSource->GetJobsForHandleSlotNear( 0xABC, 400, 16 );
     const auto sessionEvidenceJobs = sessionSource->GetEvidenceJobs( 9 );
     test.Check( sessionSource->GetJobCount() == 2 && sessionJobPage.size() == 1 &&
         sessionJobPage[0].jobId == 500 && sessionJobById &&
         sessionJobById->jobId == 500 && sessionJobById->stages.size() == 5 &&
         sessionJobDependents.size() == 1 && sessionJobDependents[0].jobId == 500 &&
         sessionFrameJobs.size() == 1 && sessionFrameJobs[0].jobId == 500 &&
+        sessionHandleJobs.size() == 1 && sessionHandleJobs[0].jobId == 500 &&
+        sessionSlotJobs.size() == 2 && sessionSlotJobs[0].jobId == 400 &&
+        sessionSlotJobs[1].jobId == 500 &&
         sessionEvidenceJobs.size() == 2,
-        "Session Job reader pages jobs, reverse dependencies and Frame evidence from exact disk postings" );
+        "Session Job reader pages jobs, dependency, Frame, packed-handle and nearby-slot evidence from exact disk postings" );
     tracy::analysis::TraceSessionJobBuildOptions spillOptions;
     spillOptions.maximumBufferedRecords = 2;
     tracy::analysis::TraceSessionJobStats spilledJobStats;
@@ -3005,8 +3010,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         test.Check( jobStatistics.value( "ok", false ) &&
             jobStatistics["data"]["counts"]["jobs"] == "2" &&
             jobStatistics["data"]["counts"]["completed"] == "2" &&
-            jobStatistics["data"]["latency"]["schedule_to_ready"]["count"] == "1",
-            "Query 1.34 computes exact Session Job statistics from disk pages without raw full materialization" );
+            jobStatistics["data"]["latency"]["schedule_to_ready"]["count"] == "1" &&
+            jobStatistics["data"]["quality"]["missing_ready_examples"].size() == 1 &&
+            jobStatistics["data"]["quality"]["missing_ready_examples"][0]["same_slot_jobs"].size() == 1 &&
+            jobStatistics["data"]["quality"]["missing_ready_examples"][0]["same_slot_jobs"][0]["job_id"] == "500",
+            "Query 1.34 computes exact Session Job statistics and bounded handle diagnostics from disk postings" );
         if( sessionRelationReady )
         {
             const auto relations = query.Execute( {

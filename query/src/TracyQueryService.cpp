@@ -10599,9 +10599,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     const auto slotDistance = [&]( const analysis::JobDto& candidate ) {
                         return candidate.jobId > job.jobId ? candidate.jobId - job.jobId : job.jobId - candidate.jobId;
                     };
-                    forEachStatisticsJob( [&]( const analysis::JobDto& candidate )
+                    for( const auto& candidate : source->GetJobsForPackedHandle(
+                        job.packedHandle, 0, 9 ) )
                     {
-                        if( candidate.jobId == job.jobId ) return;
+                        if( candidate.jobId == job.jobId ) continue;
                         if( candidate.packedHandle == job.packedHandle && sameHandleJobs.size() < 8 )
                             sameHandleJobs.push_back( {
                                 { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
@@ -10609,15 +10610,20 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                                 { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
                                 { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
                             } );
-                        if( uint32_t( candidate.packedHandle ) != slotIndex ) return;
+                    }
+                    for( const auto& candidate : source->GetJobsForHandleSlotNear(
+                        slotIndex, job.jobId, 9 ) )
+                    {
+                        if( candidate.jobId == job.jobId ||
+                            uint32_t( candidate.packedHandle ) != slotIndex ) continue;
                         slotCandidates.emplace_back( candidate );
-                        std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto& lhs, const auto& rhs ) {
-                            const auto lhsDelta = slotDistance( lhs );
-                            const auto rhsDelta = slotDistance( rhs );
-                            return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs.jobId < rhs.jobId;
-                        } );
-                        if( slotCandidates.size() > 8 ) slotCandidates.resize( 8 );
+                    }
+                    std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto& lhs, const auto& rhs ) {
+                        const auto lhsDelta = slotDistance( lhs );
+                        const auto rhsDelta = slotDistance( rhs );
+                        return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs.jobId < rhs.jobId;
                     } );
+                    if( slotCandidates.size() > 8 ) slotCandidates.resize( 8 );
                     for( const auto& candidate : slotCandidates )
                     {
                         uint32_t readyCount = 0;

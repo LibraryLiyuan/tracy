@@ -1630,3 +1630,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 本子阶段未启动真实30分钟转换；Job statistics的六组精确延迟数组与诊断中的嵌套全表扫描仍待后续独立收敛。
+
+### 2026-09-01 Job Handle 诊断 Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，Job 精确延迟外排仍待后续）**。
+
+- Job page schema从2升级到3，posting schema从1升级到2；新增`packedHandle→JobId`和`handle slot→JobId`两组精确磁盘posting。
+- 两组posting直接从Schedule事实生成，并使用既有有界外部排序器；不在Session Reader中维护随Job数量增长的handle map。
+- `TraceSessionJobReader`新增exact handle点查与按目标JobId邻近slot点查；后者只读取目标slot中围绕目标ID的有界窗口，再按距离稳定排序。
+- Session `job.statistics`的缺失Ready/Queue诊断不再为每个样例调用`forEachStatisticsJob`扫描全部Job；每个样例最多点读9个exact-handle候选和9个near-slot候选。
+- Legacy Worker保持原有结果语义；默认TraceSource实现仍可全量扫描，但Session路径使用磁盘posting。
+- Final Audit除验证posting header、数量、offset、文件长度和SHA-256外，还逐项验证排序及其对应Schedule事实中的真实`packedHandle`/slot；错误语义键即使checksum正确也不能发布。
+
+Synthetic证据：
+
+```text
+Job 400: packedHandle=0x100000ABC，缺失Ready
+Job 500: packedHandle=0x000000ABC，Ready完整
+Reader exact-handle(0xABC)=[500]
+Reader near-slot(0xABC, 400)=[400,500]
+Query missing_ready_examples[0].same_slot_jobs=[500]
+Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换；Job statistics的六组延迟数组仍按独立阶段处理。
