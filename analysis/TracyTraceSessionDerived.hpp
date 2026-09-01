@@ -81,6 +81,7 @@ struct TraceSessionDerivedStats
     uint64_t callstackPayloads = 0;
     uint64_t hardwareSampleEvents = 0;
     uint64_t hardwareSampleAddresses = 0;
+    uint64_t sampleBlocks = 0;
     uint64_t contextSwitchRecords = 0;
     uint64_t threadWakeupRecords = 0;
     uint64_t contextSwitchEvents = 0;
@@ -92,6 +93,8 @@ struct TraceSessionDerivedStats
     uint64_t cpuTopologyCpus = 0;
     uint64_t threadSummaries = 0;
     uint64_t cpuUsagePoints = 0;
+    uint64_t schedulingThreadBlocks = 0;
+    uint64_t schedulingCpuBlocks = 0;
     uint64_t relations = 0;
     uint64_t runtimeDomainStates = 0;
     uint64_t scriptFrames = 0;

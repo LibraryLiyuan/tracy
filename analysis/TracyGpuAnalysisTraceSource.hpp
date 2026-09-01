@@ -86,8 +86,14 @@ public:
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
     std::vector<CpuUsagePointDto> ScanCpuUsage( size_t offset, size_t limit ) const override;
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override;
+    std::vector<ContextSwitchDto> ScanContextSwitchEventsForThread(
+        std::string_view threadRef, const ScanRange& range ) const override;
     std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
+    std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEventsForCpu(
+        uint32_t cpu, const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
+    std::vector<SampleDto> ScanSampleEventsForThread(
+        std::string_view threadRef, const ScanRange& range ) const override;
     std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& range ) const override;
     std::vector<HardwareSampleDto> GetHardwareSamples() const override;
     std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const override;

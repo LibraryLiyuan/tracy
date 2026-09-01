@@ -7,6 +7,8 @@
 #include "TracyQueue.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -60,8 +62,12 @@ struct SchedulingFileHeader
     uint64_t fiberEnterRecordCount = 0;
     uint64_t fiberLeaveRecordCount = 0;
     uint64_t cpuUsagePointCount = 0;
+    uint64_t threadBlockCount = 0;
+    uint64_t cpuBlockCount = 0;
     uint64_t threadRecordsOffset = 0;
     uint64_t cpuRecordsOffset = 0;
+    uint64_t threadBlocksOffset = 0;
+    uint64_t cpuBlocksOffset = 0;
     uint64_t topologyRecordsOffset = 0;
     uint64_t threadSummariesOffset = 0;
     uint64_t cpuUsageRecordsOffset = 0;
@@ -150,6 +156,17 @@ struct StoredCpuUsageTransition
     int8_t otherDelta = 0;
     uint8_t reserved[6] {};
 };
+
+struct StoredEventBlock
+{
+    uint64_t firstRecord = 0;
+    uint32_t recordCount = 0;
+    uint32_t reserved = 0;
+    int64_t minStartNs = 0;
+    int64_t maxStartNs = 0;
+    int64_t maxEndNs = 0;
+    uint64_t identityBloom[4] {};
+};
 #pragma pack( pop )
 
 struct SchedulingManifest
@@ -215,6 +232,19 @@ std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t 
     std::ostringstream out;
     out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
     return out.str();
+}
+
+std::optional<uint64_t> ParseThreadRef( const std::string& fingerprint,
+    std::string_view ref )
+{
+    const auto prefix = std::string( "tracy:v1:" ) + fingerprint.substr( 0, 16 ) + ":thread:";
+    if( !ref.starts_with( prefix ) ) return std::nullopt;
+    uint64_t value = 0;
+    const auto first = ref.data() + prefix.size();
+    const auto last = ref.data() + ref.size();
+    const auto parsed = std::from_chars( first, last, value, 16 );
+    if( parsed.ec != std::errc {} || parsed.ptr != last || value == 0 ) return std::nullopt;
+    return value;
 }
 
 bool CopyFileBytes( const std::filesystem::path& source, std::ofstream& out,
@@ -777,6 +807,8 @@ bool SaveSchedulingManifest( const std::filesystem::path& root,
     out << "fiber_enter_records " << value.stats.fiberEnterRecords << '\n';
     out << "fiber_leave_records " << value.stats.fiberLeaveRecords << '\n';
     out << "cpu_usage_points " << value.stats.cpuUsagePoints << '\n';
+    out << "thread_blocks " << value.stats.threadBlocks << '\n';
+    out << "cpu_blocks " << value.stats.cpuBlocks << '\n';
     out.flush();
     if( !out ) { error = "session_scheduling_manifest_write_failed"; return false; }
     out.close();
@@ -819,6 +851,8 @@ bool LoadSchedulingManifest( const std::filesystem::path& root,
         else if( key == "fiber_enter_records" ) in >> value.stats.fiberEnterRecords;
         else if( key == "fiber_leave_records" ) in >> value.stats.fiberLeaveRecords;
         else if( key == "cpu_usage_points" ) in >> value.stats.cpuUsagePoints;
+        else if( key == "thread_blocks" ) in >> value.stats.threadBlocks;
+        else if( key == "cpu_blocks" ) in >> value.stats.cpuBlocks;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_scheduling_manifest_parse_failed"; return false; }
     }
@@ -917,6 +951,65 @@ bool BuildCpuUsageFile( BuildState& state, std::filesystem::path& outputPath,
     const auto later = []( const HeapEntry& lhs, const HeapEntry& rhs ) {
         return CpuUsageTransitionLess( rhs.value, lhs.value );
     };
+    constexpr size_t MaxOpenRuns = 64;
+    size_t mergePass = 0;
+    while( runs.size() > MaxOpenRuns )
+    {
+        std::vector<std::filesystem::path> mergedRuns;
+        for( size_t first = 0; first < runs.size(); first += MaxOpenRuns )
+        {
+            const auto groupCount = std::min( MaxOpenRuns, runs.size() - first );
+            std::vector<RunState> group( groupCount );
+            std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )>
+                groupHeap( later );
+            for( size_t index = 0; index < groupCount; ++index )
+            {
+                group[index].stream.open( runs[first + index], std::ios::binary );
+                if( !group[index].stream || !group[index].stream.read(
+                    reinterpret_cast<char*>( &group[index].value ),
+                    sizeof( StoredCpuUsageTransition ) ) )
+                { error = "session_scheduling_cpu_usage_run_read_failed"; return false; }
+                groupHeap.push( { group[index].value, index } );
+            }
+            const auto mergedPath = state.root /
+                ( "cpu-usage-merge-" + std::to_string( mergePass ) + "-" +
+                    std::to_string( mergedRuns.size() ) + ".work" );
+            std::ofstream merged( mergedPath, std::ios::binary | std::ios::trunc );
+            if( !merged )
+            { error = "session_scheduling_cpu_usage_merge_open_failed"; return false; }
+            while( !groupHeap.empty() )
+            {
+                const auto entry = groupHeap.top(); groupHeap.pop();
+                merged.write( reinterpret_cast<const char*>( &entry.value ),
+                    sizeof( StoredCpuUsageTransition ) );
+                auto& reader = group[entry.run];
+                if( reader.stream.read( reinterpret_cast<char*>( &reader.value ),
+                    sizeof( StoredCpuUsageTransition ) ) )
+                    groupHeap.push( { reader.value, entry.run } );
+                else if( !reader.stream.eof() )
+                { error = "session_scheduling_cpu_usage_run_read_failed"; return false; }
+            }
+            merged.flush();
+            if( !merged )
+            { error = "session_scheduling_cpu_usage_merge_write_failed"; return false; }
+            merged.close();
+            for( auto& reader : group ) reader.stream.close();
+            std::error_code removeError;
+            for( size_t index = 0; index < groupCount; ++index )
+            {
+                if( !std::filesystem::remove( runs[first + index], removeError ) || removeError )
+                {
+                    error = "session_scheduling_cpu_usage_merge_cleanup_failed:" +
+                        ( removeError ? removeError.message() : runs[first + index].string() );
+                    return false;
+                }
+                removeError.clear();
+            }
+            mergedRuns.emplace_back( mergedPath );
+        }
+        runs = std::move( mergedRuns );
+        ++mergePass;
+    }
     std::vector<RunState> readers( runs.size() );
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )> heap( later );
     for( size_t index = 0; index < runs.size(); ++index )
@@ -962,6 +1055,74 @@ bool BuildCpuUsageFile( BuildState& state, std::filesystem::path& outputPath,
     std::error_code ec;
     std::filesystem::remove( transitionPath, ec ); ec.clear();
     for( const auto& run : runs ) { std::filesystem::remove( run, ec ); ec.clear(); }
+    return true;
+}
+
+uint64_t MixIdentity( uint64_t value )
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
+void AddIdentity( StoredEventBlock& block, uint64_t identity )
+{
+    const auto mixed = MixIdentity( identity );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits ) block.identityBloom[bit >> 6] |= uint64_t( 1 ) << ( bit & 63 );
+}
+
+bool MayContainIdentity( const StoredEventBlock& block, uint64_t identity )
+{
+    const auto mixed = MixIdentity( identity );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits )
+        if( ( block.identityBloom[bit >> 6] & ( uint64_t( 1 ) << ( bit & 63 ) ) ) == 0 )
+            return false;
+    return true;
+}
+
+template<typename T, typename Identity>
+bool BuildEventBlocks( const std::filesystem::path& source, uint64_t recordCount,
+    std::vector<StoredEventBlock>& blocks, Identity&& identity, std::string& error )
+{
+    constexpr uint32_t RecordsPerBlock = 4096;
+    blocks.clear();
+    if( recordCount == 0 ) return true;
+    std::ifstream in( source, std::ios::binary );
+    if( !in ) { error = "session_scheduling_block_source_open_failed"; return false; }
+    blocks.reserve( size_t( ( recordCount + RecordsPerBlock - 1 ) / RecordsPerBlock ) );
+    uint64_t first = 0;
+    while( first < recordCount )
+    {
+        StoredEventBlock block;
+        block.firstRecord = first;
+        block.recordCount = uint32_t( std::min<uint64_t>(
+            RecordsPerBlock, recordCount - first ) );
+        block.minStartNs = std::numeric_limits<int64_t>::max();
+        block.maxStartNs = std::numeric_limits<int64_t>::min();
+        block.maxEndNs = std::numeric_limits<int64_t>::min();
+        for( uint32_t index = 0; index < block.recordCount; ++index )
+        {
+            T value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            { error = "session_scheduling_block_source_truncated"; return false; }
+            block.minStartNs = std::min( block.minStartNs, value.startNs );
+            block.maxStartNs = std::max( block.maxStartNs, value.startNs );
+            const auto end = value.endNs >= value.startNs ? value.endNs : value.startNs;
+            block.maxEndNs = std::max( block.maxEndNs, end );
+            AddIdentity( block, uint64_t( identity( value ) ) );
+        }
+        blocks.emplace_back( block );
+        first += block.recordCount;
+    }
+    char trailing = 0;
+    if( in.read( &trailing, 1 ) )
+    { error = "session_scheduling_block_source_trailing_bytes"; return false; }
     return true;
 }
 
@@ -1022,6 +1183,15 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     uint64_t cpuUsagePointCount = 0;
     if( !BuildCpuUsageFile( state, cpuUsagePath, cpuUsagePointCount, error ) ) return false;
     state.stats.cpuUsagePoints = cpuUsagePointCount;
+    std::vector<StoredEventBlock> threadBlocks, cpuBlocks;
+    if( !BuildEventBlocks<StoredThreadEvent>( state.threadWork.Path(),
+            state.stats.threadEvents, threadBlocks,
+            []( const auto& value ) { return value.thread; }, error ) ||
+        !BuildEventBlocks<StoredCpuEvent>( state.cpuWork.Path(),
+            state.stats.cpuEvents, cpuBlocks,
+            []( const auto& value ) { return value.cpu; }, error ) ) return false;
+    state.stats.threadBlocks = threadBlocks.size();
+    state.stats.cpuBlocks = cpuBlocks.size();
     SchedulingFileHeader header;
     header.sourceSize = session.source.fileSize;
     header.contextSwitchRecords = state.stats.contextSwitchRecords;
@@ -1047,11 +1217,17 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     header.fiberEnterRecordCount = state.stats.fiberEnterRecords;
     header.fiberLeaveRecordCount = state.stats.fiberLeaveRecords;
     header.cpuUsagePointCount = state.stats.cpuUsagePoints;
+    header.threadBlockCount = state.stats.threadBlocks;
+    header.cpuBlockCount = state.stats.cpuBlocks;
     header.generationBytes = uint32_t( session.generation.size() );
     header.threadRecordsOffset = sizeof( header ) + session.source.sha256.size() + session.generation.size();
     header.cpuRecordsOffset = header.threadRecordsOffset + header.threadEventCount * sizeof( StoredThreadEvent );
-    header.topologyRecordsOffset = header.cpuRecordsOffset +
+    header.threadBlocksOffset = header.cpuRecordsOffset +
         header.cpuEventCount * sizeof( StoredCpuEvent );
+    header.cpuBlocksOffset = header.threadBlocksOffset +
+        header.threadBlockCount * sizeof( StoredEventBlock );
+    header.topologyRecordsOffset = header.cpuBlocksOffset +
+        header.cpuBlockCount * sizeof( StoredEventBlock );
     header.threadSummariesOffset = header.topologyRecordsOffset +
         header.topologyCpuCount * sizeof( StoredCpuTopology );
     header.cpuUsageRecordsOffset = header.threadSummariesOffset +
@@ -1067,6 +1243,12 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     out.write( session.generation.data(), std::streamsize( session.generation.size() ) );
     if( !CopyFileBytes( state.threadWork.Path(), out, error ) ||
         !CopyFileBytes( state.cpuWork.Path(), out, error ) ) return false;
+    if( !threadBlocks.empty() ) out.write(
+        reinterpret_cast<const char*>( threadBlocks.data() ),
+        std::streamsize( threadBlocks.size() * sizeof( StoredEventBlock ) ) );
+    if( !cpuBlocks.empty() ) out.write(
+        reinterpret_cast<const char*>( cpuBlocks.data() ),
+        std::streamsize( cpuBlocks.size() * sizeof( StoredEventBlock ) ) );
     for( const auto& [_, topology] : state.topology )
         out.write( reinterpret_cast<const char*>( &topology ), sizeof( topology ) );
     if( !threadSummaries.empty() ) out.write(
@@ -1110,6 +1292,8 @@ struct TraceSessionSchedulingReader::Impl
     uint64_t cpuEventCount = 0;
     uint64_t cpuUsageRecordsOffset = 0;
     uint64_t cpuUsagePointCount = 0;
+    std::vector<StoredEventBlock> threadBlocks;
+    std::vector<StoredEventBlock> cpuBlocks;
     std::vector<CpuTopologyDto> topology;
     std::vector<ThreadDto> threads;
 };
@@ -1216,6 +1400,8 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
         header.fiberEnterRecordCount != manifest.stats.fiberEnterRecords ||
         header.fiberLeaveRecordCount != manifest.stats.fiberLeaveRecords ||
         header.cpuUsagePointCount != manifest.stats.cpuUsagePoints ||
+        header.threadBlockCount != manifest.stats.threadBlocks ||
+        header.cpuBlockCount != manifest.stats.cpuBlocks ||
         header.generationBytes != session.generation.size() )
     { error = "session_scheduling_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
@@ -1225,8 +1411,12 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
         header.threadRecordsOffset != uint64_t( in.tellg() ) ||
         header.cpuRecordsOffset != header.threadRecordsOffset +
             header.threadEventCount * sizeof( StoredThreadEvent ) ||
-        header.topologyRecordsOffset != header.cpuRecordsOffset +
+        header.threadBlocksOffset != header.cpuRecordsOffset +
             header.cpuEventCount * sizeof( StoredCpuEvent ) ||
+        header.cpuBlocksOffset != header.threadBlocksOffset +
+            header.threadBlockCount * sizeof( StoredEventBlock ) ||
+        header.topologyRecordsOffset != header.cpuBlocksOffset +
+            header.cpuBlockCount * sizeof( StoredEventBlock ) ||
         header.threadSummariesOffset != header.topologyRecordsOffset +
             header.topologyCpuCount * sizeof( StoredCpuTopology ) ||
         header.cpuUsageRecordsOffset != header.threadSummariesOffset +
@@ -1243,6 +1433,27 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
     impl->cpuEventCount = header.cpuEventCount;
     impl->cpuUsageRecordsOffset = header.cpuUsageRecordsOffset;
     impl->cpuUsagePointCount = header.cpuUsagePointCount;
+    const auto loadBlocks = [&]( uint64_t offset, uint64_t count,
+        uint64_t eventCount, std::vector<StoredEventBlock>& blocks ) -> bool {
+        blocks.resize( size_t( count ) );
+        in.clear(); in.seekg( std::streamoff( offset ) );
+        if( count != 0 && !in.read( reinterpret_cast<char*>( blocks.data() ),
+            std::streamsize( count * sizeof( StoredEventBlock ) ) ) ) return false;
+        uint64_t expectedFirst = 0;
+        for( const auto& block : blocks )
+        {
+            if( block.firstRecord != expectedFirst || block.recordCount == 0 ||
+                block.minStartNs > block.maxStartNs ||
+                block.maxEndNs < block.minStartNs ) return false;
+            expectedFirst += block.recordCount;
+        }
+        return expectedFirst == eventCount;
+    };
+    if( !loadBlocks( header.threadBlocksOffset, header.threadBlockCount,
+            header.threadEventCount, impl->threadBlocks ) ||
+        !loadBlocks( header.cpuBlocksOffset, header.cpuBlockCount,
+            header.cpuEventCount, impl->cpuBlocks ) )
+    { error = "session_scheduling_block_index_invalid"; return {}; }
     impl->topology.reserve( size_t( header.topologyCpuCount ) );
     in.seekg( std::streamoff( header.topologyRecordsOffset ) );
     for( uint64_t index = 0; index < header.topologyCpuCount; ++index )
@@ -1321,35 +1532,97 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
     return reader;
 }
 
-std::vector<ContextSwitchDto> TraceSessionSchedulingReader::ScanThreads(
-    const ScanRange& range ) const
+std::vector<ContextSwitchDto> TraceSessionSchedulingReader::ScanThreadsImpl(
+    const ScanRange& range, std::optional<uint64_t> thread ) const
 {
     std::vector<ContextSwitchDto> result;
     std::ifstream in( m_impl->path, std::ios::binary );
     if( !in ) return result;
-    in.seekg( std::streamoff( m_impl->threadRecordsOffset ) );
     size_t skipped = 0;
-    for( uint64_t ordinal = 0; ordinal < m_impl->threadEventCount; ++ordinal )
+    for( const auto& block : m_impl->threadBlocks )
     {
-        StoredThreadEvent value;
-        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
-        const auto end = value.endNs >= 0 ? value.endNs : value.startNs;
-        if( !Intersects( value.startNs, end, range ) ) continue;
-        if( skipped++ < range.offset ) continue;
-        ContextSwitchDto dto;
-        dto.ref = MakeRef( m_impl->fingerprint, "context-switch", ordinal );
-        dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
-        dto.startNs = value.startNs;
-        if( value.endNs >= 0 ) dto.endNs = value.endNs;
-        if( value.wakeupNs >= 0 ) dto.wakeupNs = value.wakeupNs;
-        dto.cpu = value.cpu; dto.wakeupCpu = value.wakeupCpu;
-        dto.reason = value.reason; dto.state = value.state;
-        dto.complete = value.endNs >= 0;
-        dto.reasonName = ReasonName( value.reason ); dto.stateName = StateName( value.state );
-        dto.relatedThreadIndex = value.relatedThreadIndex;
-        dto.wakeupCpuAvailability.available = true;
-        result.emplace_back( std::move( dto ) );
-        if( result.size() >= range.limit ) break;
+        if( block.minStartNs >= range.endNs || block.maxEndNs <= range.startNs ||
+            ( thread && !MayContainIdentity( block, *thread ) ) ) continue;
+        in.clear();
+        in.seekg( std::streamoff( m_impl->threadRecordsOffset +
+            block.firstRecord * sizeof( StoredThreadEvent ) ) );
+        for( uint32_t index = 0; index < block.recordCount; ++index )
+        {
+            StoredThreadEvent value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
+            if( thread && value.thread != *thread ) continue;
+            const auto end = value.endNs >= 0 ? value.endNs : value.startNs;
+            if( !Intersects( value.startNs, end, range ) ) continue;
+            if( skipped++ < range.offset ) continue;
+            const auto ordinal = block.firstRecord + index;
+            ContextSwitchDto dto;
+            dto.ref = MakeRef( m_impl->fingerprint, "context-switch", ordinal );
+            dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
+            dto.startNs = value.startNs;
+            if( value.endNs >= 0 ) dto.endNs = value.endNs;
+            if( value.wakeupNs >= 0 ) dto.wakeupNs = value.wakeupNs;
+            dto.cpu = value.cpu; dto.wakeupCpu = value.wakeupCpu;
+            dto.reason = value.reason; dto.state = value.state;
+            dto.complete = value.endNs >= 0;
+            dto.reasonName = ReasonName( value.reason ); dto.stateName = StateName( value.state );
+            dto.relatedThreadIndex = value.relatedThreadIndex;
+            dto.wakeupCpuAvailability.available = true;
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
+    }
+    return result;
+}
+
+std::vector<ContextSwitchDto> TraceSessionSchedulingReader::ScanThreads(
+    const ScanRange& range ) const
+{
+    return ScanThreadsImpl( range, std::nullopt );
+}
+
+std::vector<ContextSwitchDto> TraceSessionSchedulingReader::ScanThread(
+    std::string_view threadRef, const ScanRange& range ) const
+{
+    const auto thread = ParseThreadRef( m_impl->fingerprint, threadRef );
+    return thread ? ScanThreadsImpl( range, thread ) : std::vector<ContextSwitchDto> {};
+}
+
+std::vector<CpuContextSwitchDto> TraceSessionSchedulingReader::ScanCpusImpl(
+    const ScanRange& range, std::optional<uint32_t> cpu ) const
+{
+    std::vector<CpuContextSwitchDto> result;
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) return result;
+    size_t skipped = 0;
+    for( const auto& block : m_impl->cpuBlocks )
+    {
+        if( block.minStartNs >= range.endNs || block.maxEndNs <= range.startNs ||
+            ( cpu && !MayContainIdentity( block, *cpu ) ) ) continue;
+        in.clear();
+        in.seekg( std::streamoff( m_impl->cpuRecordsOffset +
+            block.firstRecord * sizeof( StoredCpuEvent ) ) );
+        for( uint32_t index = 0; index < block.recordCount; ++index )
+        {
+            StoredCpuEvent value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
+            if( cpu && value.cpu != *cpu ) continue;
+            const auto complete = value.endNs >= 0;
+            const auto end = complete ? value.endNs : value.startNs;
+            const auto intersects = complete ? Intersects( value.startNs, end, range ) :
+                value.startNs >= range.startNs && value.startNs < range.endNs;
+            if( !intersects ) continue;
+            if( skipped++ < range.offset ) continue;
+            const auto ordinal = block.firstRecord + index;
+            CpuContextSwitchDto dto;
+            dto.ref = MakeRef( m_impl->fingerprint, "cpu-context-switch", ordinal );
+            dto.cpu = value.cpu; dto.startNs = value.startNs;
+            if( complete ) dto.endNs = value.endNs;
+            dto.rawThreadIndex = value.rawThreadIndex;
+            dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
+            dto.complete = complete;
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
     }
     return result;
 }
@@ -1357,32 +1630,13 @@ std::vector<ContextSwitchDto> TraceSessionSchedulingReader::ScanThreads(
 std::vector<CpuContextSwitchDto> TraceSessionSchedulingReader::ScanCpus(
     const ScanRange& range ) const
 {
-    std::vector<CpuContextSwitchDto> result;
-    std::ifstream in( m_impl->path, std::ios::binary );
-    if( !in ) return result;
-    in.seekg( std::streamoff( m_impl->cpuRecordsOffset ) );
-    size_t skipped = 0;
-    for( uint64_t ordinal = 0; ordinal < m_impl->cpuEventCount; ++ordinal )
-    {
-        StoredCpuEvent value;
-        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
-        const auto complete = value.endNs >= 0;
-        const auto end = complete ? value.endNs : value.startNs;
-        const auto intersects = complete ? Intersects( value.startNs, end, range ) :
-            value.startNs >= range.startNs && value.startNs < range.endNs;
-        if( !intersects ) continue;
-        if( skipped++ < range.offset ) continue;
-        CpuContextSwitchDto dto;
-        dto.ref = MakeRef( m_impl->fingerprint, "cpu-context-switch", ordinal );
-        dto.cpu = value.cpu; dto.startNs = value.startNs;
-        if( complete ) dto.endNs = value.endNs;
-        dto.rawThreadIndex = value.rawThreadIndex;
-        dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
-        dto.complete = complete;
-        result.emplace_back( std::move( dto ) );
-        if( result.size() >= range.limit ) break;
-    }
-    return result;
+    return ScanCpusImpl( range, std::nullopt );
+}
+
+std::vector<CpuContextSwitchDto> TraceSessionSchedulingReader::ScanCpu(
+    uint32_t cpu, const ScanRange& range ) const
+{
+    return ScanCpusImpl( range, cpu );
 }
 
 const std::vector<CpuTopologyDto>& TraceSessionSchedulingReader::CpuTopology() const

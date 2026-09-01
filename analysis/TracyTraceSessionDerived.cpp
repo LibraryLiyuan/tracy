@@ -215,6 +215,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
     out << "hardware_sample_events " << value.stats.hardwareSampleEvents << '\n';
     out << "hardware_sample_addresses " << value.stats.hardwareSampleAddresses << '\n';
+    out << "sample_blocks " << value.stats.sampleBlocks << '\n';
     out << "context_switch_records " << value.stats.contextSwitchRecords << '\n';
     out << "thread_wakeup_records " << value.stats.threadWakeupRecords << '\n';
     out << "context_switch_events " << value.stats.contextSwitchEvents << '\n';
@@ -226,6 +227,8 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "cpu_topology_cpus " << value.stats.cpuTopologyCpus << '\n';
     out << "thread_summaries " << value.stats.threadSummaries << '\n';
     out << "cpu_usage_points " << value.stats.cpuUsagePoints << '\n';
+    out << "scheduling_thread_blocks " << value.stats.schedulingThreadBlocks << '\n';
+    out << "scheduling_cpu_blocks " << value.stats.schedulingCpuBlocks << '\n';
     out << "relations " << value.stats.relations << '\n';
     out << "runtime_domain_states " << value.stats.runtimeDomainStates << '\n';
     out << "script_frames " << value.stats.scriptFrames << '\n';
@@ -333,6 +336,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
         else if( key == "hardware_sample_events" ) in >> value.stats.hardwareSampleEvents;
         else if( key == "hardware_sample_addresses" ) in >> value.stats.hardwareSampleAddresses;
+        else if( key == "sample_blocks" ) in >> value.stats.sampleBlocks;
         else if( key == "context_switch_records" ) in >> value.stats.contextSwitchRecords;
         else if( key == "thread_wakeup_records" ) in >> value.stats.threadWakeupRecords;
         else if( key == "context_switch_events" ) in >> value.stats.contextSwitchEvents;
@@ -344,6 +348,8 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "cpu_topology_cpus" ) in >> value.stats.cpuTopologyCpus;
         else if( key == "thread_summaries" ) in >> value.stats.threadSummaries;
         else if( key == "cpu_usage_points" ) in >> value.stats.cpuUsagePoints;
+        else if( key == "scheduling_thread_blocks" ) in >> value.stats.schedulingThreadBlocks;
+        else if( key == "scheduling_cpu_blocks" ) in >> value.stats.schedulingCpuBlocks;
         else if( key == "relations" ) in >> value.stats.relations;
         else if( key == "runtime_domain_states" ) in >> value.stats.runtimeDomainStates;
         else if( key == "script_frames" ) in >> value.stats.scriptFrames;
@@ -676,6 +682,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.callstackPayloads = samplingStats.callstackPayloads;
     index.stats.hardwareSampleEvents = samplingStats.hardwareEvents;
     index.stats.hardwareSampleAddresses = samplingStats.hardwareAddresses;
+    index.stats.sampleBlocks = samplingStats.sampleBlocks;
 
     TraceSessionSchedulingStats schedulingStats;
     if( control.progress ) control.progress( 0.f, "scheduling" );
@@ -696,6 +703,8 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.cpuTopologyCpus = schedulingStats.topologyCpus;
     index.stats.threadSummaries = schedulingStats.threadSummaries;
     index.stats.cpuUsagePoints = schedulingStats.cpuUsagePoints;
+    index.stats.schedulingThreadBlocks = schedulingStats.threadBlocks;
+    index.stats.schedulingCpuBlocks = schedulingStats.cpuBlocks;
 
     TraceSessionPlotStats plotStats;
     if( control.progress ) control.progress( 0.f, "plots" );
@@ -894,7 +903,8 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         samplingStats.dictionaryEntries != index.stats.sampleDictionaryEntries ||
         samplingStats.callstackPayloads != index.stats.callstackPayloads ||
         samplingStats.hardwareEvents != index.stats.hardwareSampleEvents ||
-        samplingStats.hardwareAddresses != index.stats.hardwareSampleAddresses )
+        samplingStats.hardwareAddresses != index.stats.hardwareSampleAddresses ||
+        samplingStats.sampleBlocks != index.stats.sampleBlocks )
     { if( error.empty() ) error = "session_sampling_derived_audit_mismatch"; return false; }
     TraceSessionSchedulingStats schedulingStats;
     if( !AuditTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ||
@@ -908,7 +918,9 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         schedulingStats.topologyRecords != index.stats.cpuTopologyRecords ||
         schedulingStats.topologyCpus != index.stats.cpuTopologyCpus ||
         schedulingStats.threadSummaries != index.stats.threadSummaries ||
-        schedulingStats.cpuUsagePoints != index.stats.cpuUsagePoints )
+        schedulingStats.cpuUsagePoints != index.stats.cpuUsagePoints ||
+        schedulingStats.threadBlocks != index.stats.schedulingThreadBlocks ||
+        schedulingStats.cpuBlocks != index.stats.schedulingCpuBlocks )
     { if( error.empty() ) error = "session_scheduling_derived_audit_mismatch"; return false; }
     TraceSessionPlotStats plotStats;
     if( !AuditTraceSessionPlotDerived( sessionRoot, manifest, plotStats, error ) )

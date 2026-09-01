@@ -876,8 +876,8 @@ GREEN：
 
 - FrameImage与基础`Frames` FrameSet的raw index关联已接入；仍需在短Trace传统Worker差分中覆盖On-demand首次连接、pre-capture图片丢弃和初始Frame offset变体。
 - GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
-- Scheduling当前以线程/CPU固定宽度区域线性扫描；Thread identity/name紧凑摘要、CPU topology和CPU usage派生已经完成。N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。
-- Sampling当前以单个固定宽度文件线性扫描普通Sample时间范围；Hardware Sample已按address/kind建立精确offset。在N30.6完成前仍需增加普通Sample的immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
+- Scheduling schema 5已经为线程/CPU固定宽度记录增加4096条一块的immutable时间包络与256-bit identity Bloom；时间窗口、指定thread和指定CPU可跳过不可能命中的块。仍需在真实长Trace验证查询延迟，若Bloom误命中导致门禁不通过，再升级为压缩posting list。
+- Sampling schema 3已为普通Sample增加4096条一块的immutable时间包络和Thread Bloom；Hardware Sample已按address/kind建立精确offset。仍需对真实长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
@@ -1325,7 +1325,7 @@ Synthetic恢复`Main Thread`、PID 1001、group hint 7、普通Sample、ContextS
 
 - Scheduling schema 4保存捕获进程PID，并从已持久化的CPU运行区间构造Worker等价的`own/other`并发曲线。
 - `own`只在该线程存在本地Zone/Sample证据，或其`TidToPid`明确等于非零捕获PID时成立；未知PID不会因`0==0`被误分类。
-- CPU区间只生成固定宽度Begin/End transition；transition以1,048,576条为有界chunk执行外部排序，再按相同时间聚合，构建内存不随总ContextSwitch数线性增长。
+- CPU区间只生成固定宽度Begin/End transition；transition以1,048,576条为有界chunk执行外部排序，再以最多64个输入文件的多轮归并按相同时间聚合，构建内存和同时打开的文件句柄均不随总ContextSwitch数线性增长。
 - 输出包含Worker兼容的`time=0, own=0, other=0`基线点；仅当计数变化时追加记录。
 - `cpu.usage`通过`ScanCpuUsage(offset, limit)`直接分页读取，不再由Query先物化全量曲线。
 - Windows清理前显式关闭全部外部排序run句柄，避免成功发布后残留`cpu-usage-run-*.work`。
@@ -1339,3 +1339,34 @@ GREEN: Trace Session Inventory tests passed
 ```
 
 Synthetic同时包含本进程thread 42与未知外部thread 43/100/101，验证基线点、own/other非零状态、统计计数、Query分页游标及发布前无`.work`残留。
+
+### 2026-09-01 Scheduling 时间与实体块索引（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- 每4096条Thread/CPU运行记录生成一个immutable block，保存first/count、时间包络和256-bit identity Bloom。
+- Bloom只用于排除不可能包含目标thread/CPU的块；命中后仍逐条核对固定宽度事实，因此允许假阳性但绝无假阴性。
+- `context_switch.thread`、`thread.timeline/migration`和带`cpu`参数的`cpu.timeline`已路由到专用Reader；不再先扫描全域再由Query过滤。
+- block表约按事件数的`1/4096`增长；不会复制逐事件posting list。若真实30分钟Trace的Bloom误命中率使查询超过5秒门禁，再增加压缩posting list，不能以牺牲正确性换速度。
+
+Synthetic验证窄时间窗口、thread 42、CPU 0的直接Reader与Query结果，完整回归为：
+
+```text
+Trace Session Inventory tests passed
+```
+
+### 2026-09-01 Sampling 时间与线程块索引（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- Sampling schema升级到3，普通与ContextSwitch Sample保持Worker的thread/kind顺序，并追加4096条一块的时间包络和256-bit Thread Bloom。
+- `sample.list`以及指定Thread的flamegraph扫描直接调用`ScanSampleEventsForThread`；Bloom命中后仍逐条核对Thread与时间，假阳性不会影响正确性。
+- Hardware Sample保留address/kind精确offset，外部排序最终归并限制为最多64个同时打开的run；Windows删除前显式关闭全部reader。
+- 索引根目录使用实际schema版本，不再把Schema 2/3数据错误写入`sampling-index/1`。
+- 发布前测试枚举Sampling目录，任何残留`.work`都使阶段失败。
+
+Synthetic验证thread 42的普通/ContextSwitch Sample、Query thread filter、Hardware六类PMU事件、block计数和临时文件清理：
+
+```text
+Trace Session Inventory tests passed
+```

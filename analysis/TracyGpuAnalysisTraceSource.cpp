@@ -826,6 +826,13 @@ std::vector<ContextSwitchDto> GpuAnalysisTraceSource::ScanContextSwitchEvents(
     return m_schedulingReader ? m_schedulingReader->ScanThreads( range ) :
         std::vector<ContextSwitchDto> {};
 }
+std::vector<ContextSwitchDto> GpuAnalysisTraceSource::ScanContextSwitchEventsForThread(
+    std::string_view threadRef, const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanContextSwitchEventsForThread( threadRef, range );
+    return m_schedulingReader ? m_schedulingReader->ScanThread( threadRef, range ) :
+        std::vector<ContextSwitchDto> {};
+}
 std::vector<CpuContextSwitchDto> GpuAnalysisTraceSource::ScanCpuContextSwitchEvents(
     const ScanRange& range ) const
 {
@@ -833,10 +840,24 @@ std::vector<CpuContextSwitchDto> GpuAnalysisTraceSource::ScanCpuContextSwitchEve
     return m_schedulingReader ? m_schedulingReader->ScanCpus( range ) :
         std::vector<CpuContextSwitchDto> {};
 }
+std::vector<CpuContextSwitchDto> GpuAnalysisTraceSource::ScanCpuContextSwitchEventsForCpu(
+    uint32_t cpu, const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanCpuContextSwitchEventsForCpu( cpu, range );
+    return m_schedulingReader ? m_schedulingReader->ScanCpu( cpu, range ) :
+        std::vector<CpuContextSwitchDto> {};
+}
 std::vector<SampleDto> GpuAnalysisTraceSource::ScanSampleEvents( const ScanRange& range ) const
 {
     if( WorkerLoaded() ) return Worker().ScanSampleEvents( range );
     return m_samplingReader ? m_samplingReader->Scan( range ) : std::vector<SampleDto> {};
+}
+std::vector<SampleDto> GpuAnalysisTraceSource::ScanSampleEventsForThread(
+    std::string_view threadRef, const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanSampleEventsForThread( threadRef, range );
+    return m_samplingReader ? m_samplingReader->ScanThread( threadRef, range ) :
+        std::vector<SampleDto> {};
 }
 D1(std::vector<GhostZoneDto>, ScanGhostZones, const ScanRange&, range)
 std::vector<HardwareSampleDto> GpuAnalysisTraceSource::GetHardwareSamples() const

@@ -7838,7 +7838,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 checkCancelled();
                 const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
                 auto range = ScanRangeFrom( params, scanOffset, allowed );
-                const auto values = source->ScanContextSwitchEvents( range );
+                const auto values = source->ScanContextSwitchEventsForThread( threadRef, range );
                 BudgetScanned( values.size(), chunk, allowed );
                 for( const auto& event : values )
                 {
@@ -7860,8 +7860,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return Success( id, { { "thread_ref", threadRef }, { "migration_count", Decimal( all.size() ) }, { "migrations", std::move( migrations ) } }, trace, PageJson( page, end - begin, cursor ) );
         }
         auto scanPage = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanContextSwitchEvents( range ); },
-            [&]( const auto& event ) { return event.threadRef == threadRef; }, ContextSwitchJson );
+            [&]( const auto& item, const auto& range ) {
+                return item.ScanContextSwitchEventsForThread( threadRef, range );
+            }, []( const auto& ) { return true; }, ContextSwitchJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "thread_ref", threadRef }, { "context_switches", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
@@ -7898,8 +7899,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto page = ParsePage( params, method, trace );
         const auto cpuFilter = params.contains( "cpu" ) ? std::optional<unsigned>( params["cpu"].get<unsigned>() ) : std::nullopt;
         auto scanPage = ScanFiltered<analysis::CpuContextSwitchDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanCpuContextSwitchEvents( range ); },
-            [&]( const auto& event ) { return !cpuFilter || event.cpu == *cpuFilter; }, CpuContextSwitchJson );
+            [&]( const auto& item, const auto& range ) {
+                return cpuFilter ? item.ScanCpuContextSwitchEventsForCpu( *cpuFilter, range ) :
+                    item.ScanCpuContextSwitchEvents( range );
+            }, []( const auto& ) { return true; }, CpuContextSwitchJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "segments", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
@@ -7911,8 +7914,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "context_switch.thread" && threadRef.empty() ) throw QueryError( "INVALID_PARAMS", "thread_ref is required" );
         const auto cpuFilter = params.contains( "cpu" ) ? std::optional<unsigned>( params["cpu"].get<unsigned>() ) : std::nullopt;
         auto scanPage = ScanFiltered<analysis::ContextSwitchDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanContextSwitchEvents( range ); },
-            [&]( const auto& event ) { return ( threadRef.empty() || event.threadRef == threadRef ) && ( !cpuFilter || event.cpu == *cpuFilter ); }, ContextSwitchJson );
+            [&]( const auto& item, const auto& range ) {
+                return threadRef.empty() ? item.ScanContextSwitchEvents( range ) :
+                    item.ScanContextSwitchEventsForThread( threadRef, range );
+            }, [&]( const auto& event ) { return !cpuFilter || event.cpu == *cpuFilter; }, ContextSwitchJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "context_switches", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );
@@ -10921,10 +10926,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::optional<uint32_t> callstack;
         if( params.contains( "callstack" ) ) callstack = parseCallstack( params["callstack"] );
         auto scanPage = ScanFiltered<analysis::SampleDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanSampleEvents( range ); },
+            [&]( const auto& item, const auto& range ) {
+                return threadRef.empty() ? item.ScanSampleEvents( range ) :
+                    item.ScanSampleEventsForThread( threadRef, range );
+            },
             [&]( const auto& sample ) {
-                return ( threadRef.empty() || sample.threadRef == threadRef ) &&
-                    ( kind.empty() || sample.kind == kind ) && ( !callstack || sample.callstack == *callstack );
+                return ( kind.empty() || sample.kind == kind ) &&
+                    ( !callstack || sample.callstack == *callstack );
             }, SampleJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
@@ -10958,9 +10966,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             checkCancelled();
             const auto allowed = BudgetScanAllowance( chunk ); if( allowed == 0 ) break;
             auto range = ScanRangeFrom( params, offset, allowed );
-            const auto samples = source->ScanSampleEvents( range );
+            const auto samples = threadRef.empty() ? source->ScanSampleEvents( range ) :
+                source->ScanSampleEventsForThread( threadRef, range );
             BudgetScanned( samples.size(), chunk, allowed );
-            for( const auto& sample : samples ) if( sample.callstack != 0 && ( threadRef.empty() || sample.threadRef == threadRef ) && ( kind == "all" || sample.kind == kind ) )
+            for( const auto& sample : samples ) if( sample.callstack != 0 &&
+                ( kind == "all" || sample.kind == kind ) )
             {
                 if( !counts.contains( sample.callstack ) && !BudgetConsumeGroup() ) continue;
                 counts[sample.callstack]++;

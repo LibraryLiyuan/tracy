@@ -1026,8 +1026,32 @@ public:
         return { values.begin() + offset, values.begin() + end };
     }
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
+    virtual std::vector<ContextSwitchDto> ScanContextSwitchEventsForThread(
+        std::string_view threadRef, const ScanRange& range ) const
+    {
+        auto values = ScanContextSwitchEvents( range );
+        values.erase( std::remove_if( values.begin(), values.end(),
+            [&]( const auto& value ) { return value.threadRef != threadRef; } ), values.end() );
+        return values;
+    }
     virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
+    virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEventsForCpu(
+        uint32_t cpu, const ScanRange& range ) const
+    {
+        auto values = ScanCpuContextSwitchEvents( range );
+        values.erase( std::remove_if( values.begin(), values.end(),
+            [&]( const auto& value ) { return value.cpu != cpu; } ), values.end() );
+        return values;
+    }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
+    virtual std::vector<SampleDto> ScanSampleEventsForThread(
+        std::string_view threadRef, const ScanRange& range ) const
+    {
+        auto values = ScanSampleEvents( range );
+        values.erase( std::remove_if( values.begin(), values.end(),
+            [&]( const auto& value ) { return value.threadRef != threadRef; } ), values.end() );
+        return values;
+    }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
     virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }

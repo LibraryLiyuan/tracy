@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,7 +15,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionSamplingIndexSchemaVersion = 2;
+inline constexpr uint32_t TraceSessionSamplingIndexSchemaVersion = 3;
 
 struct TraceSessionSamplingStats
 {
@@ -25,6 +26,7 @@ struct TraceSessionSamplingStats
     uint64_t callstackPayloads = 0;
     uint64_t hardwareEvents = 0;
     uint64_t hardwareAddresses = 0;
+    uint64_t sampleBlocks = 0;
     uint64_t fileBytes = 0;
 };
 
@@ -37,6 +39,8 @@ public:
 
     const TraceSessionSamplingStats& Stats() const { return m_stats; }
     std::vector<SampleDto> Scan( const ScanRange& range ) const;
+    std::vector<SampleDto> ScanThread( std::string_view threadRef,
+        const ScanRange& range ) const;
     std::vector<HardwareSampleDto> HardwareSamples() const;
     std::vector<HardwareSampleEventDto> HardwareSampleEvents(
         uint64_t address, std::string_view kind, size_t offset, size_t limit ) const;
@@ -44,6 +48,8 @@ public:
 private:
     struct Impl;
     explicit TraceSessionSamplingReader( std::shared_ptr<Impl> impl );
+    std::vector<SampleDto> ScanImpl( const ScanRange& range,
+        std::optional<uint64_t> thread ) const;
     std::shared_ptr<Impl> m_impl;
     TraceSessionSamplingStats m_stats;
 };

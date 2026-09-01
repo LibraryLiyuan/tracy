@@ -7,6 +7,8 @@
 #include "TracyQueue.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -45,6 +47,8 @@ struct SamplingFileHeader
     uint64_t recordsOffset = 0;
     uint64_t hardwareSummaryCount = 0;
     uint64_t hardwareEventCount = 0;
+    uint64_t sampleBlockCount = 0;
+    uint64_t sampleBlocksOffset = 0;
     uint64_t hardwareSummariesOffset = 0;
     uint64_t hardwareEventsOffset = 0;
     uint32_t generationBytes = 0;
@@ -74,6 +78,16 @@ struct StoredHardwareSummary
     uint64_t address = 0;
     uint64_t counts[6] {};
     uint64_t eventOffsets[6] {};
+};
+
+struct StoredSampleBlock
+{
+    uint64_t firstRecord = 0;
+    uint32_t recordCount = 0;
+    uint32_t reserved = 0;
+    int64_t minTimeNs = 0;
+    int64_t maxTimeNs = 0;
+    uint64_t threadBloom[4] {};
 };
 #pragma pack( pop )
 
@@ -140,6 +154,47 @@ std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t 
     std::ostringstream out;
     out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
     return out.str();
+}
+
+std::optional<uint64_t> ParseThreadRef( const std::string& fingerprint,
+    std::string_view ref )
+{
+    const auto prefix = std::string( "tracy:v1:" ) + fingerprint.substr( 0, 16 ) + ":thread:";
+    if( !ref.starts_with( prefix ) ) return std::nullopt;
+    uint64_t value = 0;
+    const auto first = ref.data() + prefix.size();
+    const auto last = ref.data() + ref.size();
+    const auto parsed = std::from_chars( first, last, value, 16 );
+    if( parsed.ec != std::errc {} || parsed.ptr != last || value == 0 ) return std::nullopt;
+    return value;
+}
+
+uint64_t MixThread( uint64_t value )
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
+void AddThread( StoredSampleBlock& block, uint64_t thread )
+{
+    const auto mixed = MixThread( thread );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits ) block.threadBloom[bit >> 6] |= uint64_t( 1 ) << ( bit & 63 );
+}
+
+bool MayContainThread( const StoredSampleBlock& block, uint64_t thread )
+{
+    const auto mixed = MixThread( thread );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits )
+        if( ( block.threadBloom[bit >> 6] & ( uint64_t( 1 ) << ( bit & 63 ) ) ) == 0 )
+            return false;
+    return true;
 }
 
 bool CopyFileBytes( const std::filesystem::path& source, std::ofstream& out,
@@ -460,6 +515,7 @@ bool SaveSamplingManifest( const std::filesystem::path& root,
     out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
     out << "hardware_events " << value.stats.hardwareEvents << '\n';
     out << "hardware_addresses " << value.stats.hardwareAddresses << '\n';
+    out << "sample_blocks " << value.stats.sampleBlocks << '\n';
     out.flush();
     if( !out ) { error = "session_sampling_manifest_write_failed"; return false; }
     out.close();
@@ -489,6 +545,7 @@ bool LoadSamplingManifest( const std::filesystem::path& root,
         else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
         else if( key == "hardware_events" ) in >> value.stats.hardwareEvents;
         else if( key == "hardware_addresses" ) in >> value.stats.hardwareAddresses;
+        else if( key == "sample_blocks" ) in >> value.stats.sampleBlocks;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_sampling_manifest_parse_failed"; return false; }
     }
@@ -571,6 +628,65 @@ bool BuildHardwareFiles( BuildState& state,
     const auto later = []( const HeapEntry& lhs, const HeapEntry& rhs ) {
         return HardwareSampleLess( rhs.value, lhs.value );
     };
+    constexpr size_t MaxOpenRuns = 64;
+    size_t mergePass = 0;
+    while( runs.size() > MaxOpenRuns )
+    {
+        std::vector<std::filesystem::path> mergedRuns;
+        for( size_t first = 0; first < runs.size(); first += MaxOpenRuns )
+        {
+            const auto groupCount = std::min( MaxOpenRuns, runs.size() - first );
+            std::vector<RunState> group( groupCount );
+            std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )>
+                groupHeap( later );
+            for( size_t index = 0; index < groupCount; ++index )
+            {
+                group[index].stream.open( runs[first + index], std::ios::binary );
+                if( !group[index].stream || !group[index].stream.read(
+                    reinterpret_cast<char*>( &group[index].value ),
+                    sizeof( StoredHardwareSample ) ) )
+                { error = "session_sampling_hardware_run_read_failed"; return false; }
+                groupHeap.push( { group[index].value, index } );
+            }
+            const auto mergedPath = state.root /
+                ( "hardware-merge-" + std::to_string( mergePass ) + "-" +
+                    std::to_string( mergedRuns.size() ) + ".work" );
+            std::ofstream merged( mergedPath, std::ios::binary | std::ios::trunc );
+            if( !merged )
+            { error = "session_sampling_hardware_merge_open_failed"; return false; }
+            while( !groupHeap.empty() )
+            {
+                const auto entry = groupHeap.top(); groupHeap.pop();
+                merged.write( reinterpret_cast<const char*>( &entry.value ),
+                    sizeof( StoredHardwareSample ) );
+                auto& reader = group[entry.run];
+                if( reader.stream.read( reinterpret_cast<char*>( &reader.value ),
+                    sizeof( StoredHardwareSample ) ) )
+                    groupHeap.push( { reader.value, entry.run } );
+                else if( !reader.stream.eof() )
+                { error = "session_sampling_hardware_run_read_failed"; return false; }
+            }
+            merged.flush();
+            if( !merged )
+            { error = "session_sampling_hardware_merge_write_failed"; return false; }
+            merged.close();
+            for( auto& reader : group ) reader.stream.close();
+            std::error_code removeError;
+            for( size_t index = 0; index < groupCount; ++index )
+            {
+                if( !std::filesystem::remove( runs[first + index], removeError ) || removeError )
+                {
+                    error = "session_sampling_hardware_merge_cleanup_failed:" +
+                        ( removeError ? removeError.message() : runs[first + index].string() );
+                    return false;
+                }
+                removeError.clear();
+            }
+            mergedRuns.emplace_back( mergedPath );
+        }
+        runs = std::move( mergedRuns );
+        ++mergePass;
+    }
     std::vector<RunState> readers( runs.size() );
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )> heap( later );
     for( size_t i = 0; i < runs.size(); ++i )
@@ -632,10 +748,48 @@ bool BuildHardwareFiles( BuildState& state,
     if( !summaries || !events || eventOrdinal != state.stats.hardwareEvents )
     { error = "session_sampling_hardware_merge_failed"; return false; }
     summaries.close(); events.close();
+    for( auto& reader : readers ) reader.stream.close();
 
     std::error_code ec;
     std::filesystem::remove( state.hardwareWorkPath, ec ); ec.clear();
     for( const auto& run : runs ) { std::filesystem::remove( run, ec ); ec.clear(); }
+    return true;
+}
+
+bool BuildSampleBlocks( const std::filesystem::path& recordsPath,
+    uint64_t recordCount, std::vector<StoredSampleBlock>& blocks,
+    std::string& error )
+{
+    constexpr uint32_t RecordsPerBlock = 4096;
+    blocks.clear();
+    if( recordCount == 0 ) return true;
+    std::ifstream in( recordsPath, std::ios::binary );
+    if( !in ) { error = "session_sampling_block_source_open_failed"; return false; }
+    blocks.reserve( size_t( ( recordCount + RecordsPerBlock - 1 ) / RecordsPerBlock ) );
+    uint64_t first = 0;
+    while( first < recordCount )
+    {
+        StoredSampleBlock block;
+        block.firstRecord = first;
+        block.recordCount = uint32_t( std::min<uint64_t>(
+            RecordsPerBlock, recordCount - first ) );
+        block.minTimeNs = std::numeric_limits<int64_t>::max();
+        block.maxTimeNs = std::numeric_limits<int64_t>::min();
+        for( uint32_t index = 0; index < block.recordCount; ++index )
+        {
+            StoredSample value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            { error = "session_sampling_block_source_truncated"; return false; }
+            block.minTimeNs = std::min( block.minTimeNs, value.timeNs );
+            block.maxTimeNs = std::max( block.maxTimeNs, value.timeNs );
+            AddThread( block, value.thread );
+        }
+        blocks.emplace_back( block );
+        first += block.recordCount;
+    }
+    char trailing = 0;
+    if( in.read( &trailing, 1 ) )
+    { error = "session_sampling_block_source_trailing_bytes"; return false; }
     return true;
 }
 
@@ -648,6 +802,21 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
     if( !BuildHardwareFiles( state, hardwareSummaryPath, hardwareEventPath,
         hardwareSummaryCount, error ) ) return false;
     state.stats.hardwareAddresses = hardwareSummaryCount;
+    const auto recordsPath = state.root / "sample-records.work";
+    {
+        std::ofstream records( recordsPath, std::ios::binary | std::ios::trunc );
+        if( !records ) { error = "session_sampling_records_open_failed"; return false; }
+        for( const auto& [_, thread] : state.threads )
+        {
+            if( !CopyFileBytes( thread->SamplePath(), records, error ) ||
+                !CopyFileBytes( thread->ContextPath(), records, error ) ) return false;
+        }
+        records.flush();
+        if( !records ) { error = "session_sampling_records_write_failed"; return false; }
+    }
+    std::vector<StoredSampleBlock> sampleBlocks;
+    if( !BuildSampleBlocks( recordsPath, state.stats.events, sampleBlocks, error ) ) return false;
+    state.stats.sampleBlocks = sampleBlocks.size();
     SamplingFileHeader header;
     header.sourceSize = session.source.fileSize;
     header.eventCount = state.stats.events;
@@ -657,10 +826,13 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
     header.callstackPayloads = state.stats.callstackPayloads;
     header.hardwareSummaryCount = state.stats.hardwareAddresses;
     header.hardwareEventCount = state.stats.hardwareEvents;
+    header.sampleBlockCount = state.stats.sampleBlocks;
     header.generationBytes = uint32_t( session.generation.size() );
     header.recordsOffset = sizeof( header ) + session.source.sha256.size() + session.generation.size();
-    header.hardwareSummariesOffset = header.recordsOffset +
+    header.sampleBlocksOffset = header.recordsOffset +
         header.eventCount * sizeof( StoredSample );
+    header.hardwareSummariesOffset = header.sampleBlocksOffset +
+        header.sampleBlockCount * sizeof( StoredSampleBlock );
     header.hardwareEventsOffset = header.hardwareSummariesOffset +
         header.hardwareSummaryCount * sizeof( StoredHardwareSummary );
 
@@ -671,13 +843,12 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
     out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
     out.write( session.source.sha256.data(), std::streamsize( session.source.sha256.size() ) );
     out.write( session.generation.data(), std::streamsize( session.generation.size() ) );
-    // Match WorkerTraceSource ordering exactly: threads by native id, then
-    // regular samples followed by context-switch samples for each thread.
-    for( const auto& [_, thread] : state.threads )
-    {
-        if( !CopyFileBytes( thread->SamplePath(), out, error ) ) return false;
-        if( !CopyFileBytes( thread->ContextPath(), out, error ) ) return false;
-    }
+    // The records work file already matches WorkerTraceSource ordering exactly:
+    // threads by native id, then regular samples followed by context-switch samples.
+    if( !CopyFileBytes( recordsPath, out, error ) ) return false;
+    if( !sampleBlocks.empty() ) out.write(
+        reinterpret_cast<const char*>( sampleBlocks.data() ),
+        std::streamsize( sampleBlocks.size() * sizeof( StoredSampleBlock ) ) );
     if( !CopyFileBytes( hardwareSummaryPath, out, error ) ||
         !CopyFileBytes( hardwareEventPath, out, error ) ) return false;
     out.flush();
@@ -692,6 +863,7 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
     }
     std::filesystem::remove( hardwareSummaryPath, ec ); ec.clear();
     std::filesystem::remove( hardwareEventPath, ec ); ec.clear();
+    std::filesystem::remove( recordsPath, ec ); ec.clear();
 
     manifest.sourceSha256 = session.source.sha256;
     manifest.sourceSize = session.source.fileSize;
@@ -712,6 +884,7 @@ struct TraceSessionSamplingReader::Impl
     std::string fingerprint;
     uint64_t recordsOffset = 0;
     uint64_t eventCount = 0;
+    std::vector<StoredSampleBlock> sampleBlocks;
     uint64_t hardwareEventsOffset = 0;
     std::vector<StoredHardwareSummary> hardwareSummaries;
 };
@@ -724,7 +897,7 @@ std::filesystem::path TraceSessionSamplingIndexRoot( const std::filesystem::path
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "sampling-index" / "1" / "exact";
+        "sampling-index" / std::to_string( TraceSessionSamplingIndexSchemaVersion ) / "exact";
 }
 
 bool BuildTraceSessionSamplingDerived( const std::filesystem::path& sessionRoot,
@@ -793,6 +966,7 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
         header.callstackPayloads != manifest.stats.callstackPayloads ||
         header.hardwareEventCount != manifest.stats.hardwareEvents ||
         header.hardwareSummaryCount != manifest.stats.hardwareAddresses ||
+        header.sampleBlockCount != manifest.stats.sampleBlocks ||
         header.generationBytes != session.generation.size() )
     { error = "session_sampling_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
@@ -801,8 +975,10 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
         sha != session.source.sha256 || generation != session.generation ||
         header.recordsOffset != uint64_t( in.tellg() ) ||
         header.eventCount > ( manifest.fileBytes - header.recordsOffset ) / sizeof( StoredSample ) ||
-        header.hardwareSummariesOffset != header.recordsOffset +
+        header.sampleBlocksOffset != header.recordsOffset +
             header.eventCount * sizeof( StoredSample ) ||
+        header.hardwareSummariesOffset != header.sampleBlocksOffset +
+            header.sampleBlockCount * sizeof( StoredSampleBlock ) ||
         header.hardwareEventsOffset != header.hardwareSummariesOffset +
             header.hardwareSummaryCount * sizeof( StoredHardwareSummary ) ||
         header.hardwareEventsOffset + header.hardwareEventCount *
@@ -812,6 +988,22 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
     impl->path = path; impl->fingerprint = session.source.sha256;
     impl->recordsOffset = header.recordsOffset; impl->eventCount = header.eventCount;
     impl->hardwareEventsOffset = header.hardwareEventsOffset;
+    impl->sampleBlocks.resize( size_t( header.sampleBlockCount ) );
+    in.seekg( std::streamoff( header.sampleBlocksOffset ) );
+    if( header.sampleBlockCount != 0 && !in.read(
+        reinterpret_cast<char*>( impl->sampleBlocks.data() ),
+        std::streamsize( header.sampleBlockCount * sizeof( StoredSampleBlock ) ) ) )
+    { error = "session_sampling_blocks_truncated"; return {}; }
+    uint64_t expectedSampleRecord = 0;
+    for( const auto& block : impl->sampleBlocks )
+    {
+        if( block.firstRecord != expectedSampleRecord || block.recordCount == 0 ||
+            block.minTimeNs > block.maxTimeNs )
+        { error = "session_sampling_block_index_invalid"; return {}; }
+        expectedSampleRecord += block.recordCount;
+    }
+    if( expectedSampleRecord != header.eventCount )
+    { error = "session_sampling_block_index_invalid"; return {}; }
     impl->hardwareSummaries.resize( size_t( header.hardwareSummaryCount ) );
     if( header.hardwareSummaryCount != 0 )
     {
@@ -842,31 +1034,53 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
     return reader;
 }
 
-std::vector<SampleDto> TraceSessionSamplingReader::Scan( const ScanRange& range ) const
+std::vector<SampleDto> TraceSessionSamplingReader::ScanImpl( const ScanRange& range,
+    std::optional<uint64_t> thread ) const
 {
     std::vector<SampleDto> result;
     std::ifstream in( m_impl->path, std::ios::binary );
     if( !in ) return result;
-    in.seekg( std::streamoff( m_impl->recordsOffset ) );
     size_t skipped = 0;
-    for( uint64_t ordinal = 0; ordinal < m_impl->eventCount; ++ordinal )
+    for( const auto& block : m_impl->sampleBlocks )
     {
-        StoredSample value;
-        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
-        if( value.timeNs < range.startNs || value.timeNs >= range.endNs ) continue;
-        if( skipped++ < range.offset ) continue;
-        SampleDto dto;
-        dto.ref = MakeRef( m_impl->fingerprint,
-            value.kind == 0 ? "sample" : "context-switch-sample", ordinal );
-        dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
-        dto.timeNs = value.timeNs; dto.callstack = value.callstack;
-        if( dto.callstack != 0 ) dto.callstackRef =
-            MakeRef( m_impl->fingerprint, "callstack", dto.callstack );
-        dto.kind = value.kind == 0 ? "sample" : "context_switch";
-        result.emplace_back( std::move( dto ) );
-        if( result.size() >= range.limit ) break;
+        if( block.minTimeNs >= range.endNs || block.maxTimeNs < range.startNs ||
+            ( thread && !MayContainThread( block, *thread ) ) ) continue;
+        in.clear();
+        in.seekg( std::streamoff( m_impl->recordsOffset +
+            block.firstRecord * sizeof( StoredSample ) ) );
+        for( uint32_t index = 0; index < block.recordCount; ++index )
+        {
+            StoredSample value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) return result;
+            if( thread && value.thread != *thread ) continue;
+            if( value.timeNs < range.startNs || value.timeNs >= range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            const auto ordinal = block.firstRecord + index;
+            SampleDto dto;
+            dto.ref = MakeRef( m_impl->fingerprint,
+                value.kind == 0 ? "sample" : "context-switch-sample", ordinal );
+            dto.threadRef = MakeRef( m_impl->fingerprint, "thread", value.thread );
+            dto.timeNs = value.timeNs; dto.callstack = value.callstack;
+            if( dto.callstack != 0 ) dto.callstackRef =
+                MakeRef( m_impl->fingerprint, "callstack", dto.callstack );
+            dto.kind = value.kind == 0 ? "sample" : "context_switch";
+            result.emplace_back( std::move( dto ) );
+            if( result.size() >= range.limit ) return result;
+        }
     }
     return result;
+}
+
+std::vector<SampleDto> TraceSessionSamplingReader::Scan( const ScanRange& range ) const
+{
+    return ScanImpl( range, std::nullopt );
+}
+
+std::vector<SampleDto> TraceSessionSamplingReader::ScanThread(
+    std::string_view threadRef, const ScanRange& range ) const
+{
+    const auto thread = ParseThreadRef( m_impl->fingerprint, threadRef );
+    return thread ? ScanImpl( range, thread ) : std::vector<SampleDto> {};
 }
 
 std::vector<HardwareSampleDto> TraceSessionSamplingReader::HardwareSamples() const

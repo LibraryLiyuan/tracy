@@ -2306,6 +2306,31 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( !schedulingWorkFound,
         "Session Scheduling builder removes all temporary streams before publishing the index; residual=" +
             schedulingWorkNames );
+    const auto samplingRoot = tracy::analysis::TraceSessionSamplingIndexRoot( sessionRoot, manifest );
+    bool samplingWorkFound = false;
+    std::string samplingWorkNames;
+    for( const auto& entry : std::filesystem::directory_iterator( samplingRoot ) )
+    {
+        if( entry.path().extension() != ".work" ) continue;
+        samplingWorkFound = true;
+        if( !samplingWorkNames.empty() ) samplingWorkNames += ',';
+        samplingWorkNames += entry.path().filename().string();
+    }
+    test.Check( !samplingWorkFound,
+        "Session Sampling builder removes all temporary streams before publishing the index; residual=" +
+            samplingWorkNames );
+    auto samplingReader = tracy::analysis::TraceSessionSamplingReader::Open(
+        sessionRoot, manifest, error );
+    const auto mainThreadSampleRef = std::string( "tracy:v1:" ) +
+        manifest.source.sha256.substr( 0, 16 ) + ":thread:2a";
+    const auto mainThreadSamples = samplingReader ? samplingReader->ScanThread(
+        mainThreadSampleRef, {} ) : std::vector<tracy::analysis::SampleDto> {};
+    test.Check( samplingReader && samplingReader->Stats().sampleBlocks != 0 &&
+        mainThreadSamples.size() == 2 && std::all_of(
+            mainThreadSamples.begin(), mainThreadSamples.end(), [&]( const auto& value ) {
+                return value.threadRef == mainThreadSampleRef;
+            } ),
+        "Session Sampling publishes exact time/thread block indexes: " + error );
     auto schedulingReader = tracy::analysis::TraceSessionSchedulingReader::Open(
         sessionRoot, manifest, error );
     const auto cpuUsage = schedulingReader ? schedulingReader->ScanCpuUsage( 0, 64 ) :
@@ -2319,6 +2344,41 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         cpuUsage.front().other == 0 && hasOwnCpuUsage && hasOtherCpuUsage &&
         schedulingReader->Stats().cpuUsagePoints == cpuUsage.size(),
         "Session Scheduling persists exact paged own/other CPU usage transitions: " + error );
+    test.Check( schedulingReader && schedulingReader->Stats().threadBlocks != 0 &&
+        schedulingReader->Stats().cpuBlocks != 0,
+        "Session Scheduling publishes bounded immutable time-block indexes" );
+    tracy::analysis::ScanRange narrowSchedulingRange;
+    narrowSchedulingRange.startNs = 27;
+    narrowSchedulingRange.endNs = 29;
+    narrowSchedulingRange.limit = 16;
+    const auto narrowThreadEvents = schedulingReader ?
+        schedulingReader->ScanThreads( narrowSchedulingRange ) :
+        std::vector<tracy::analysis::ContextSwitchDto> {};
+    const auto narrowCpuEvents = schedulingReader ?
+        schedulingReader->ScanCpus( narrowSchedulingRange ) :
+        std::vector<tracy::analysis::CpuContextSwitchDto> {};
+    test.Check( !narrowThreadEvents.empty() && !narrowCpuEvents.empty(),
+        "Session Scheduling time-block indexes preserve exact interval intersection" );
+    const auto mainThreadSummary = schedulingReader ? std::find_if(
+        schedulingReader->Threads().begin(), schedulingReader->Threads().end(),
+        []( const auto& value ) { return value.nativeId == 42; } ) :
+        std::vector<tracy::analysis::ThreadDto>::const_iterator {};
+    tracy::analysis::ScanRange allScheduling;
+    allScheduling.limit = 64;
+    const auto mainThreadEvents = schedulingReader &&
+        mainThreadSummary != schedulingReader->Threads().end() ?
+        schedulingReader->ScanThread( mainThreadSummary->ref, allScheduling ) :
+        std::vector<tracy::analysis::ContextSwitchDto> {};
+    const auto cpuZeroEvents = schedulingReader ? schedulingReader->ScanCpu( 0, allScheduling ) :
+        std::vector<tracy::analysis::CpuContextSwitchDto> {};
+    test.Check( !mainThreadEvents.empty() && std::all_of(
+            mainThreadEvents.begin(), mainThreadEvents.end(), [&]( const auto& value ) {
+                return value.threadRef == mainThreadSummary->ref;
+            } ) && !cpuZeroEvents.empty() && std::all_of(
+            cpuZeroEvents.begin(), cpuZeroEvents.end(), []( const auto& value ) {
+                return value.cpu == 0;
+            } ),
+        "Session Scheduling Bloom filters never lose exact thread or CPU events" );
     std::vector<std::string> resumedDerivedStages;
     tracy::analysis::TraceSessionDerivedControl resumeDerivedControl;
     resumeDerivedControl.minimumFreeBytes = 0;
@@ -2615,11 +2675,13 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     if( sessionSamplesReady )
     {
         const auto samples = sessionSource->ScanSampleEvents( {} );
+        const auto threadSamples = sessionSource->ScanSampleEventsForThread(
+            sessionSource->MakeEntityRef( "thread", 42 ), {} );
         test.Check( samples.size() == 2 && samples[0].timeNs == 14 &&
             samples[0].threadRef == sessionSource->MakeEntityRef( "thread", 42 ) &&
             samples[0].callstack == 1 && samples[0].kind == "sample" &&
             samples[1].timeNs == 16 && samples[1].callstack == 1 &&
-            samples[1].kind == "context_switch",
+            samples[1].kind == "context_switch" && threadSamples.size() == 2,
             "Session Sampling reader restores dictionary callstacks and shared context time" );
     }
     if( sessionHardwareSamplesReady )
@@ -3035,7 +3097,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         {
             const auto samples = query.Execute( {
                 { "protocol", "tracy-query/1" }, { "id", "session-samples" }, { "method", "sample.list" },
-                { "params", { { "trace_id", traceId } } }
+                { "params", { { "trace_id", traceId },
+                    { "thread_ref", sessionSource->MakeEntityRef( "thread", 42 ) } } }
             } );
             test.Check( samples.value( "ok", false ) && samples["data"]["samples"].size() == 2 &&
                 samples["data"]["samples"][0]["time_ns"] == "14" &&
@@ -3083,6 +3146,28 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 contexts["data"]["context_switches"][2]["complete"] == false &&
                 contexts["data"]["context_switches"][2]["end_ns"].is_null(),
                 "Query 1.34 reads Session Context Switch intervals without a Worker" );
+            const auto mainThreadRef = sessionSource->MakeEntityRef( "thread", 42 );
+            const auto threadContexts = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-thread-contexts" },
+                { "method", "context_switch.thread" }, { "params", { { "trace_id", traceId },
+                    { "thread_ref", mainThreadRef }, { "limit", 8 } } }
+            } );
+            const auto cpuTimeline = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-cpu-zero" },
+                { "method", "cpu.timeline" }, { "params", { { "trace_id", traceId },
+                    { "cpu", 0 }, { "limit", 8 } } }
+            } );
+            test.Check( threadContexts.value( "ok", false ) &&
+                !threadContexts["data"]["context_switches"].empty() &&
+                std::all_of( threadContexts["data"]["context_switches"].begin(),
+                    threadContexts["data"]["context_switches"].end(),
+                    [&]( const auto& value ) { return value["thread_ref"] == mainThreadRef; } ) &&
+                cpuTimeline.value( "ok", false ) &&
+                !cpuTimeline["data"]["segments"].empty() &&
+                std::all_of( cpuTimeline["data"]["segments"].begin(),
+                    cpuTimeline["data"]["segments"].end(),
+                    []( const auto& value ) { return value["cpu"] == 0; } ),
+                "Query 1.34 routes thread and CPU filters through immutable Scheduling indexes" );
             const auto topology = query.Execute( {
                 { "protocol", "tracy-query/1" }, { "id", "session-cpu-topology" },
                 { "method", "cpu.topology" }, { "params", { { "trace_id", traceId } } }

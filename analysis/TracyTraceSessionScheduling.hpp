@@ -7,13 +7,15 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionSchedulingIndexSchemaVersion = 4;
+inline constexpr uint32_t TraceSessionSchedulingIndexSchemaVersion = 5;
 
 struct TraceSessionSchedulingStats
 {
@@ -39,6 +41,8 @@ struct TraceSessionSchedulingStats
     uint64_t fiberEnterRecords = 0;
     uint64_t fiberLeaveRecords = 0;
     uint64_t cpuUsagePoints = 0;
+    uint64_t threadBlocks = 0;
+    uint64_t cpuBlocks = 0;
     uint64_t fileBytes = 0;
 };
 
@@ -51,7 +55,11 @@ public:
 
     const TraceSessionSchedulingStats& Stats() const { return m_stats; }
     std::vector<ContextSwitchDto> ScanThreads( const ScanRange& range ) const;
+    std::vector<ContextSwitchDto> ScanThread( std::string_view threadRef,
+        const ScanRange& range ) const;
     std::vector<CpuContextSwitchDto> ScanCpus( const ScanRange& range ) const;
+    std::vector<CpuContextSwitchDto> ScanCpu( uint32_t cpu,
+        const ScanRange& range ) const;
     const std::vector<CpuTopologyDto>& CpuTopology() const;
     const std::vector<ThreadDto>& Threads() const;
     std::vector<CpuUsagePointDto> ScanCpuUsage( size_t offset, size_t limit ) const;
@@ -59,6 +67,10 @@ public:
 private:
     struct Impl;
     explicit TraceSessionSchedulingReader( std::shared_ptr<Impl> impl );
+    std::vector<ContextSwitchDto> ScanThreadsImpl( const ScanRange& range,
+        std::optional<uint64_t> thread ) const;
+    std::vector<CpuContextSwitchDto> ScanCpusImpl( const ScanRange& range,
+        std::optional<uint32_t> cpu ) const;
     std::shared_ptr<Impl> m_impl;
     TraceSessionSchedulingStats m_stats;
 };
