@@ -1677,6 +1677,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 全局 Job Critical Path 有界门禁（N30.6B 子阶段）
+
+状态：**Passed（正确性与OOM防护；超大图的磁盘Derived仍待后续）**。
+
+- 指定根Job的关键路径继续使用既有反向依赖点查，只读取其上游闭包。
+- Session无根全局`job.critical_path`不再直接调用`GetJobs()`；它先读取精确Job总数，并要求`max_scan_events`能够覆盖全部Job。
+- 门禁通过时按1024 Job分页读取后执行原有精确DAG算法；门禁不足或处理中CPU/scan预算耗尽时返回`RESOURCE_LIMIT`。
+- 该行为优先保证正确性和进程稳定：不会对超大图采样、近似或返回伪完整路径。
+- 这不是最终超大Session全局关键路径方案。N30后续仍需把全局DAG结果或等价精确状态放入Mandatory Derived，才能在默认预算内查询30分钟Session。
+
+TDD与回归证据：
+
+```text
+RED:       max_scan_events=1时旧Session路径仍尝试全量GetJobs，测试按预期失败
+Exact:     2个Job、max_scan_events=16时返回scope=all_jobs和total_jobs=2
+Guard:     同一数据max_scan_events=1时返回RESOURCE_LIMIT
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
 ### 2026-09-01 GPU Pass→Gfx Link 邻接分页（N30.6B 子阶段）
 
 状态：**Passed（synthetic correctness，真实长Trace延迟待N30.7）**。

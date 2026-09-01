@@ -11020,6 +11020,37 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 "upstream_closure", source->GetJobCount(), missingPrerequisites ), trace );
         }
 
+        if( pagedSessionJobs && method == "job.critical_path" )
+        {
+            const auto totalJobs = source->GetJobCount();
+            if( totalJobs > std::numeric_limits<size_t>::max() )
+                throw QueryError( "RESOURCE_LIMIT",
+                    "Session Job count exceeds the platform addressable range" );
+            const auto exactCount = size_t( totalJobs );
+            if( BudgetScanAllowance( exactCount ) != exactCount )
+                throw QueryError( "RESOURCE_LIMIT",
+                    "Global Session Job critical path exceeds the exact scan budget; specify a root Job ref or increase max_scan_events" );
+            std::vector<analysis::JobDto> scopedJobs;
+            scopedJobs.reserve( exactCount );
+            constexpr size_t PageSize = 1024;
+            for( size_t offset = 0; offset < exactCount; )
+            {
+                checkCancelled();
+                const auto requested = std::min( PageSize, exactCount - offset );
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed != requested ) throw QueryError( "RESOURCE_LIMIT",
+                    "Global Session Job critical path exceeded the exact CPU/scan budget while paging" );
+                const auto page = source->ScanJobs( offset, allowed );
+                if( page.size() != allowed )
+                    throw std::runtime_error( "session_job_critical_path_page_missing" );
+                BudgetScanned( page.size(), requested, allowed );
+                scopedJobs.insert( scopedJobs.end(), page.begin(), page.end() );
+                offset += page.size();
+            }
+            return Success( id, buildCriticalPath( std::move( scopedJobs ), std::nullopt,
+                "all_jobs", totalJobs ), trace );
+        }
+
         if( pagedSessionJobs && method == "job.gfx_chain" )
         {
             if( !params.contains( "ref" ) || !params["ref"].is_string() )
