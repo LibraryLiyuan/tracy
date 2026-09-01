@@ -206,6 +206,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "gpu_sync_events " << value.stats.gpuSyncEvents << '\n';
     out << "memory_pools " << value.stats.memoryPools << '\n';
     out << "memory_events " << value.stats.memoryEvents << '\n';
+    out << "memory_event_blocks " << value.stats.memoryEventBlocks << '\n';
     out << "active_memory_events " << value.stats.activeMemoryEvents << '\n';
     out << "memory_allocations " << value.stats.memoryAllocations << '\n';
     out << "memory_frees " << value.stats.memoryFrees << '\n';
@@ -329,6 +330,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "gpu_sync_events" ) in >> value.stats.gpuSyncEvents;
         else if( key == "memory_pools" ) in >> value.stats.memoryPools;
         else if( key == "memory_events" ) in >> value.stats.memoryEvents;
+        else if( key == "memory_event_blocks" ) in >> value.stats.memoryEventBlocks;
         else if( key == "active_memory_events" ) in >> value.stats.activeMemoryEvents;
         else if( key == "memory_allocations" ) in >> value.stats.memoryAllocations;
         else if( key == "memory_frees" ) in >> value.stats.memoryFrees;
@@ -668,6 +670,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     else if( !BuildTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ) return false;
     index.stats.memoryPools = memoryStats.pools;
     index.stats.memoryEvents = memoryStats.events;
+    index.stats.memoryEventBlocks = memoryStats.eventBlocks;
     index.stats.activeMemoryEvents = memoryStats.activeEvents;
     index.stats.memoryAllocations = memoryStats.allocationEvents;
     index.stats.memoryFrees = memoryStats.freeEvents;
@@ -898,6 +901,7 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( !AuditTraceSessionMemoryDerived( sessionRoot, manifest, memoryStats, error ) ||
         memoryStats.pools != index.stats.memoryPools ||
         memoryStats.events != index.stats.memoryEvents ||
+        memoryStats.eventBlocks != index.stats.memoryEventBlocks ||
         memoryStats.activeEvents != index.stats.activeMemoryEvents ||
         memoryStats.allocationEvents != index.stats.memoryAllocations ||
         memoryStats.freeEvents != index.stats.memoryFrees ||

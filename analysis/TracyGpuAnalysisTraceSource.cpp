@@ -698,6 +698,13 @@ std::vector<MemoryEventDto> GpuAnalysisTraceSource::ScanMemoryEvents( const Scan
     if( WorkerLoaded() ) return Worker().ScanMemoryEvents( range );
     return m_memoryReader ? m_memoryReader->Scan( range ) : std::vector<MemoryEventDto> {};
 }
+std::vector<MemoryEventDto> GpuAnalysisTraceSource::ScanMemoryEventsForPool(
+    std::string_view poolRef, const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanMemoryEventsForPool( poolRef, range );
+    return m_memoryReader ? m_memoryReader->ScanPool( poolRef, range ) :
+        std::vector<MemoryEventDto> {};
+}
 std::vector<MessageDto> GpuAnalysisTraceSource::ScanMessages( const ScanRange& range ) const
 {
     if( WorkerLoaded() ) return Worker().ScanMessages( range );

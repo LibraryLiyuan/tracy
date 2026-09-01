@@ -8335,7 +8335,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto page = ParsePage( params, method, trace );
         const std::string pool = params.value( "pool_ref", "" );
         auto scanPage = ScanFiltered<analysis::MemoryEventDto>( *source, params, page,
-            []( const auto& source, const auto& range ) { return source.ScanMemoryEvents( range ); },
+            [&]( const auto& source, const auto& range ) {
+                return pool.empty() ? source.ScanMemoryEvents( range ) :
+                    source.ScanMemoryEventsForPool( pool, range );
+            },
             [&]( const auto& value ) { return ( pool.empty() || value.poolRef == pool ) && TextMatches( value.address, params ); }, MemoryEventJson );
         scanPage.values = ProjectFields( std::move( scanPage.values ), params );
         const auto returned = scanPage.values.size();
@@ -8369,7 +8372,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto page = ParsePage( params, method, trace );
         const std::string pool = params.value( "pool_ref", "" );
         auto scanPage = ScanFiltered<analysis::MemoryEventDto>( *source, json::object(), page,
-            []( const auto& item, const auto& range ) { return item.ScanMemoryEvents( range ); },
+            [&]( const auto& item, const auto& range ) {
+                auto indexedRange = range;
+                indexedRange.startNs = time;
+                indexedRange.endNs = time;
+                return pool.empty() ? item.ScanMemoryEvents( indexedRange ) :
+                    item.ScanMemoryEventsForPool( pool, indexedRange );
+            },
             [&]( const auto& event ) { return ( pool.empty() || event.poolRef == pool ) && event.allocationNs <= time && ( !event.freeNs || *event.freeNs > time ); }, MemoryEventJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );

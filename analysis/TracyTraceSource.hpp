@@ -966,6 +966,32 @@ public:
     }
     virtual std::vector<FrameDto> ScanFrames( const ScanRange& range ) const = 0;
     virtual std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const = 0;
+    virtual std::vector<MemoryEventDto> ScanMemoryEventsForPool(
+        std::string_view poolRef, const ScanRange& range ) const
+    {
+        std::vector<MemoryEventDto> result;
+        if( range.limit == 0 ) return result;
+        size_t rawOffset = 0;
+        size_t matched = 0;
+        constexpr size_t Chunk = 4096;
+        while( result.size() < range.limit )
+        {
+            auto sourceRange = range;
+            sourceRange.offset = rawOffset;
+            sourceRange.limit = Chunk;
+            const auto values = ScanMemoryEvents( sourceRange );
+            for( const auto& value : values )
+            {
+                if( value.poolRef != poolRef ) continue;
+                if( matched++ < range.offset ) continue;
+                result.emplace_back( value );
+                if( result.size() == range.limit ) break;
+            }
+            rawOffset += values.size();
+            if( values.size() < Chunk ) break;
+        }
+        return result;
+    }
     virtual std::vector<MessageDto> ScanMessages( const ScanRange& range ) const = 0;
     virtual std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const = 0;
 

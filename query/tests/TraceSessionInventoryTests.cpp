@@ -2329,6 +2329,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( gpuZoneReader && gpuZoneReader->Stats().zoneBlocks != 0 &&
         contextGpuZones.size() == 1 && contextGpuZones.front().contextRef == gpuContextZeroRef,
         "Session GPU Zone publishes exact time/Context block indexes: " + error );
+    auto memoryReader = tracy::analysis::TraceSessionMemoryReader::Open(
+        sessionRoot, manifest, error );
+    const auto indexedMemoryPoolRef = memoryReader && !memoryReader->Pools().empty() ?
+        memoryReader->Pools().front().ref : std::string {};
+    tracy::analysis::ScanRange allMemoryEvents;
+    allMemoryEvents.limit = 16;
+    const auto indexedPoolEvents = memoryReader ? memoryReader->ScanPool(
+        indexedMemoryPoolRef, allMemoryEvents ) : std::vector<tracy::analysis::MemoryEventDto> {};
+    test.Check( memoryReader && memoryReader->Stats().eventBlocks != 0 &&
+        !indexedPoolEvents.empty() && std::all_of( indexedPoolEvents.begin(),
+            indexedPoolEvents.end(), [&]( const auto& value ) {
+                return value.poolRef == indexedMemoryPoolRef;
+            } ), "Session Memory publishes exact time/Pool block indexes: " + error );
     const auto schedulingRoot = tracy::analysis::TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
     bool schedulingWorkFound = false;
     std::string schedulingWorkNames;
@@ -3138,6 +3151,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "protocol", "tracy-query/1" }, { "id", "session-memory-events" }, { "method", "memory.events" },
                 { "params", { { "trace_id", traceId } } }
             } );
+            const auto memoryPoolEvents = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-memory-pool-events" },
+                { "method", "memory.events" }, { "params", { { "trace_id", traceId },
+                    { "pool_ref", indexedMemoryPoolRef }, { "limit", 16 } } }
+            } );
+            const auto memoryActiveTime = memoryPoolEvents.value( "ok", false ) &&
+                !memoryPoolEvents["data"]["events"].empty() ? std::stoll(
+                    memoryPoolEvents["data"]["events"][0]["allocation_ns"].get<std::string>() ) : 0;
+            const auto memoryActive = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-memory-active" },
+                { "method", "memory.active_at_time" }, { "params", { { "trace_id", traceId },
+                    { "pool_ref", indexedMemoryPoolRef }, { "time_ns", memoryActiveTime },
+                    { "limit", 16 } } }
+            } );
             test.Check( memoryPools.value( "ok", false ) && memoryPools["data"]["pools"].size() == 2 &&
                 memoryPools["data"]["pools"][0]["active_bytes"] == "8192" &&
                 memoryPools["data"]["pools"][1]["name"] == "GPU D3D12 Texture" &&
@@ -3145,7 +3172,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 memoryEvents["data"]["events"][0]["allocation_callstack"].is_null() &&
                 memoryEvents["data"]["events"][1]["complete"] == false &&
                 memoryEvents["data"]["events"][3]["allocation_callstack"] == "4" &&
-                memoryEvents["data"]["events"][3]["free_callstack"] == "5",
+                memoryEvents["data"]["events"][3]["free_callstack"] == "5" &&
+                memoryPoolEvents.value( "ok", false ) &&
+                !memoryPoolEvents["data"]["events"].empty() &&
+                std::all_of( memoryPoolEvents["data"]["events"].begin(),
+                    memoryPoolEvents["data"]["events"].end(), [&]( const auto& value ) {
+                        return value["pool_ref"] == indexedMemoryPoolRef;
+                    } ) && memoryActive.value( "ok", false ) &&
+                !memoryActive["data"]["events"].empty(),
                 "Query 1.34 reads Session Memory pools and lifecycle events without a Worker" );
         }
         catch( const std::exception& exception )

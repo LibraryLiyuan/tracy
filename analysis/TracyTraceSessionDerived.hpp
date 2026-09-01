@@ -72,6 +72,7 @@ struct TraceSessionDerivedStats
     uint64_t gpuSyncEvents = 0;
     uint64_t memoryPools = 0;
     uint64_t memoryEvents = 0;
+    uint64_t memoryEventBlocks = 0;
     uint64_t activeMemoryEvents = 0;
     uint64_t memoryAllocations = 0;
     uint64_t memoryFrees = 0;

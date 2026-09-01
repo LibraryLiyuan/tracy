@@ -880,7 +880,7 @@ GREEN：
 - Sampling schema 3已为普通Sample增加4096条一块的immutable时间包络和Thread Bloom；Hardware Sample已按address/kind建立精确offset。仍需对真实长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - CPU Zone schema 2已经增加4096条一块的immutable时间包络与256-bit Thread Bloom，时间窗口和指定thread可跳过不可能命中的块；children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存。在N30.6完成前必须增加parent→children索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
-- 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
+- Memory schema 2已经为每个Pool增加4096条一块的immutable生命周期时间包络；`memory.events(pool_ref=...)`、`memory.active_at_time`和Frame Snapshot可跳过不相交Pool block。Frame Snapshot仍会物化最终与目标帧相交的事件集合，必须在真实长Trace验证窗口基数和峰值内存。
 - Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
 - Runtime/Script Reader打开时只保留文件偏移和计数，但当前脚本查询仍会物化所请求域的全部Frame/Stack事件；N30.6完成前必须增加分页/范围读取。Message Reader已完成，但Legacy GC消息编码与GC聚合语义仍需单独差分，`memory.gc.*`暂不得提前宣称Session可查。
 - 局部`.tracy`导出器及开放边界语义。
@@ -1386,6 +1386,17 @@ Trace Session Inventory tests passed
 - 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
 
 仍待N30.6集中门禁：GPU parent→children posting index、Annotation、serial/fiber传统Worker差分与真实长Trace延迟。
+
+### 2026-09-01 Memory 时间与 Pool 块索引（N30.6B 子阶段）
+
+- Memory schema升级到2；每个Pool的固定宽度allocation生命周期记录按4096条生成immutable block目录。
+- block保存最早allocation时间与最晚free时间；含未释放allocation的block保持开放上界，不能为了加速错误排除仍存活事件。
+- `memory.events`的`pool_ref`下推到`ScanPool`，`memory.active_at_time`将目标时刻作为点窗口下推，之后仍按原语义精确检查`allocation<=time && free>time`。
+- Frame Snapshot按选定Pool和生命周期block跳过不相交磁盘区段；只物化最终相交事件，未改变owned/active统计算法。
+- header、Pool表、block连续覆盖、manifest和Final Audit核对event/block总数、文件大小、身份与SHA-256；索引根目录跟随schema版本。
+- synthetic验证两个Pool、四条生命周期、pointer reuse、开放allocation、allocation/free callstack、Pool过滤和active-at-time；单节点inventory与六项组合回归通过（6/6）。
+
+仍待N30.6集中门禁：allocation/free→CPU Zone交叉关联、真实长Trace时间/Pool查询延迟及高基数Frame Snapshot峰值内存。
 
 Synthetic验证thread 42的普通/ContextSwitch Sample、Query thread filter、Hardware六类PMU事件、block计数和临时文件清理：
 

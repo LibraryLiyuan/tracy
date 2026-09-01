@@ -38,6 +38,7 @@ struct MemoryFileHeader
     uint64_t sourceSize = 0;
     uint64_t poolCount = 0;
     uint64_t eventCount = 0;
+    uint64_t eventBlockCount = 0;
     uint64_t activeCount = 0;
     uint64_t poolTableOffset = 0;
     uint32_t generationBytes = 0;
@@ -55,6 +56,8 @@ struct StoredPool
     uint64_t high = 0;
     uint64_t nameOffset = 0;
     uint64_t eventsOffset = 0;
+    uint64_t blocksOffset = 0;
+    uint64_t blockCount = 0;
     uint32_t nameBytes = 0;
     uint32_t flags = 0;
 };
@@ -71,6 +74,15 @@ struct StoredMemoryEvent
     uint32_t freeCallstack = 0;
     uint32_t allocationCallsiteId = 0;
     uint32_t reserved = 0;
+};
+
+struct StoredMemoryEventBlock
+{
+    uint64_t firstEvent = 0;
+    uint32_t eventCount = 0;
+    uint32_t reserved = 0;
+    int64_t minAllocationNs = 0;
+    int64_t maxFreeNs = 0;
 };
 #pragma pack( pop )
 
@@ -556,6 +568,7 @@ bool SaveMemoryManifest( const std::filesystem::path& root,
     out << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n';
     out << "pools " << value.stats.pools << '\n';
     out << "events " << value.stats.events << '\n';
+    out << "event_blocks " << value.stats.eventBlocks << '\n';
     out << "active_events " << value.stats.activeEvents << '\n';
     out << "allocation_events " << value.stats.allocationEvents << '\n';
     out << "free_events " << value.stats.freeEvents << '\n';
@@ -585,6 +598,7 @@ bool LoadMemoryManifest( const std::filesystem::path& root,
         else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 );
         else if( key == "pools" ) in >> value.stats.pools;
         else if( key == "events" ) in >> value.stats.events;
+        else if( key == "event_blocks" ) in >> value.stats.eventBlocks;
         else if( key == "active_events" ) in >> value.stats.activeEvents;
         else if( key == "allocation_events" ) in >> value.stats.allocationEvents;
         else if( key == "free_events" ) in >> value.stats.freeEvents;
@@ -603,13 +617,19 @@ bool LoadMemoryManifest( const std::filesystem::path& root,
 bool FinalizeMemoryFile( BuildState& state, const TraceSessionManifest& session,
     MemoryManifest& manifest, std::string& error )
 {
-    struct OrderedPool { PoolWork* work; std::string name; StoredPool stored; };
+    struct OrderedPool
+    {
+        PoolWork* work;
+        std::string name;
+        StoredPool stored;
+        std::vector<StoredMemoryEventBlock> blocks;
+    };
     std::vector<OrderedPool> pools;
     pools.reserve( state.pools.size() );
     for( auto& [id, pool] : state.pools )
     {
         if( !pool->Close( error ) ) return false;
-        OrderedPool entry { pool.get(), ResolvePoolName( state, id ), {} };
+        OrderedPool entry { pool.get(), ResolvePoolName( state, id ), {}, {} };
         entry.stored.nativeNameId = id;
         entry.stored.eventCount = pool->EventCount();
         entry.stored.activeCount = pool->ActiveCount();
@@ -620,6 +640,32 @@ bool FinalizeMemoryFile( BuildState& state, const TraceSessionManifest& session,
             std::numeric_limits<uint32_t>::max() ) );
         if( entry.stored.nameBytes != entry.name.size() )
         { error = "session_memory_pool_name_too_large"; return false; }
+        constexpr uint32_t EventsPerBlock = 4096;
+        std::ifstream events( pool->Path(), std::ios::binary );
+        if( !events ) { error = "session_memory_pool_work_read_failed"; return false; }
+        entry.blocks.reserve( size_t( ( entry.stored.eventCount + EventsPerBlock - 1 ) / EventsPerBlock ) );
+        for( uint64_t first = 0; first < entry.stored.eventCount; first += EventsPerBlock )
+        {
+            StoredMemoryEventBlock block;
+            block.firstEvent = first;
+            block.eventCount = uint32_t( std::min<uint64_t>( EventsPerBlock,
+                entry.stored.eventCount - first ) );
+            block.minAllocationNs = std::numeric_limits<int64_t>::max();
+            block.maxFreeNs = std::numeric_limits<int64_t>::min();
+            for( uint32_t index = 0; index < block.eventCount; ++index )
+            {
+                StoredMemoryEvent event;
+                if( !events.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) )
+                { error = "session_memory_block_source_truncated"; return false; }
+                block.minAllocationNs = std::min( block.minAllocationNs, event.allocationNs );
+                block.maxFreeNs = event.freeNs >= 0 ?
+                    std::max( block.maxFreeNs, event.freeNs ) : std::numeric_limits<int64_t>::max();
+            }
+            entry.blocks.emplace_back( block );
+        }
+        if( events.peek() != std::char_traits<char>::eof() )
+        { error = "session_memory_block_source_trailing_bytes"; return false; }
+        entry.stored.blockCount = entry.blocks.size();
         pools.emplace_back( std::move( entry ) );
     }
     std::sort( pools.begin(), pools.end(), []( const auto& left, const auto& right ) {
@@ -641,6 +687,12 @@ bool FinalizeMemoryFile( BuildState& state, const TraceSessionManifest& session,
         header.eventCount += pool.stored.eventCount;
         header.activeCount += pool.stored.activeCount;
     }
+    for( auto& pool : pools )
+    {
+        pool.stored.blocksOffset = cursor;
+        cursor += pool.stored.blockCount * sizeof( StoredMemoryEventBlock );
+        header.eventBlockCount += pool.stored.blockCount;
+    }
 
     const auto temporary = state.root / "memory.bin.tmp";
     const auto target = state.root / MemoryFileName;
@@ -652,6 +704,9 @@ bool FinalizeMemoryFile( BuildState& state, const TraceSessionManifest& session,
     for( const auto& pool : pools ) out.write( reinterpret_cast<const char*>( &pool.stored ), sizeof( pool.stored ) );
     for( const auto& pool : pools ) out.write( pool.name.data(), std::streamsize( pool.name.size() ) );
     for( const auto& pool : pools ) if( !CopyFileBytes( pool.work->Path(), out, error ) ) return false;
+    for( const auto& pool : pools ) if( !pool.blocks.empty() ) out.write(
+        reinterpret_cast<const char*>( pool.blocks.data() ),
+        std::streamsize( pool.blocks.size() * sizeof( StoredMemoryEventBlock ) ) );
     out.flush();
     if( !out ) { error = "session_memory_file_write_failed"; return false; }
     out.close();
@@ -668,6 +723,7 @@ bool FinalizeMemoryFile( BuildState& state, const TraceSessionManifest& session,
     manifest.stats = state.stats;
     manifest.stats.pools = pools.size();
     manifest.stats.events = header.eventCount;
+    manifest.stats.eventBlocks = header.eventBlockCount;
     manifest.stats.activeEvents = header.activeCount;
     manifest.stats.fileBytes = manifest.fileBytes;
     return true;
@@ -682,6 +738,7 @@ struct TraceSessionMemoryReader::Impl
         StoredPool stored;
         std::string name;
         size_t sortedIndex = 0;
+        std::vector<StoredMemoryEventBlock> blocks;
     };
 
     std::filesystem::path path;
@@ -731,7 +788,7 @@ std::filesystem::path TraceSessionMemoryIndexRoot( const std::filesystem::path& 
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "memory-index" / "1" / "exact";
+        "memory-index" / std::to_string( TraceSessionMemoryIndexSchemaVersion ) / "exact";
 }
 
 bool BuildTraceSessionMemoryDerived( const std::filesystem::path& sessionRoot,
@@ -795,6 +852,7 @@ std::shared_ptr<TraceSessionMemoryReader> TraceSessionMemoryReader::Open(
         header.magic != MemoryFileMagic || header.schema != TraceSessionMemoryIndexSchemaVersion ||
         header.endian != 0x01020304 || header.sourceSize != session.source.fileSize ||
         header.poolCount != manifest.stats.pools || header.eventCount != manifest.stats.events ||
+        header.eventBlockCount != manifest.stats.eventBlocks ||
         header.activeCount != manifest.stats.activeEvents ||
         header.generationBytes != session.generation.size() )
     { error = "session_memory_file_header_invalid"; return {}; }
@@ -814,26 +872,45 @@ std::shared_ptr<TraceSessionMemoryReader> TraceSessionMemoryReader::Open(
     auto impl = std::make_shared<Impl>();
     impl->path = path; impl->fingerprint = session.source.sha256;
     impl->pools.reserve( stored.size() );
-    uint64_t eventTotal = 0, activeTotal = 0;
+    uint64_t eventTotal = 0, eventBlockTotal = 0, activeTotal = 0;
     for( size_t index = 0; index < stored.size(); ++index )
     {
         const auto& value = stored[index];
         if( value.nameOffset > manifest.fileBytes || value.nameBytes > manifest.fileBytes - value.nameOffset ||
             value.eventsOffset > manifest.fileBytes ||
-            value.eventCount > ( manifest.fileBytes - value.eventsOffset ) / sizeof( StoredMemoryEvent ) )
+            value.eventCount > ( manifest.fileBytes - value.eventsOffset ) / sizeof( StoredMemoryEvent ) ||
+            value.blocksOffset > manifest.fileBytes ||
+            value.blockCount > ( manifest.fileBytes - value.blocksOffset ) / sizeof( StoredMemoryEventBlock ) )
         { error = "session_memory_pool_bounds_invalid"; return {}; }
         Impl::Pool pool; pool.stored = value; pool.sortedIndex = index;
         pool.name.resize( value.nameBytes );
         in.clear(); in.seekg( std::streamoff( value.nameOffset ) );
         if( !pool.name.empty() && !in.read( pool.name.data(), std::streamsize( pool.name.size() ) ) )
         { error = "session_memory_pool_name_truncated"; return {}; }
+        pool.blocks.resize( size_t( value.blockCount ) );
+        in.clear(); in.seekg( std::streamoff( value.blocksOffset ) );
+        if( !pool.blocks.empty() && !in.read( reinterpret_cast<char*>( pool.blocks.data() ),
+            std::streamsize( pool.blocks.size() * sizeof( StoredMemoryEventBlock ) ) ) )
+        { error = "session_memory_block_records_truncated"; return {}; }
+        uint64_t expectedFirstEvent = 0;
+        for( const auto& block : pool.blocks )
+        {
+            if( block.firstEvent != expectedFirstEvent || block.eventCount == 0 ||
+                block.eventCount > 4096 || block.firstEvent + block.eventCount > value.eventCount ||
+                block.minAllocationNs > block.maxFreeNs )
+            { error = "session_memory_block_record_invalid"; return {}; }
+            expectedFirstEvent += block.eventCount;
+        }
+        if( expectedFirstEvent != value.eventCount )
+        { error = "session_memory_block_coverage_invalid"; return {}; }
         if( !impl->poolByNative.emplace( value.nativeNameId, index ).second )
         { error = "session_memory_pool_native_id_duplicate"; return {}; }
         impl->poolByRef.emplace( MakeRef( impl->fingerprint, "memory-pool", index ), index );
-        eventTotal += value.eventCount; activeTotal += value.activeCount;
+        eventTotal += value.eventCount; eventBlockTotal += value.blockCount; activeTotal += value.activeCount;
         impl->pools.emplace_back( std::move( pool ) );
     }
-    if( eventTotal != header.eventCount || activeTotal != header.activeCount )
+    if( eventTotal != header.eventCount || eventBlockTotal != header.eventBlockCount ||
+        activeTotal != header.activeCount )
     { error = "session_memory_pool_total_mismatch"; return {}; }
     auto reader = std::shared_ptr<TraceSessionMemoryReader>(
         new TraceSessionMemoryReader( std::move( impl ) ) );
@@ -855,22 +932,46 @@ std::shared_ptr<TraceSessionMemoryReader> TraceSessionMemoryReader::Open(
 
 std::vector<MemoryEventDto> TraceSessionMemoryReader::Scan( const ScanRange& range ) const
 {
+    return ScanImpl( range, std::nullopt );
+}
+
+std::vector<MemoryEventDto> TraceSessionMemoryReader::ScanPool(
+    std::string_view poolRef, const ScanRange& range ) const
+{
+    const auto found = m_impl->poolByRef.find( std::string( poolRef ) );
+    return found == m_impl->poolByRef.end() ? std::vector<MemoryEventDto> {} :
+        ScanImpl( range, found->second );
+}
+
+std::vector<MemoryEventDto> TraceSessionMemoryReader::ScanImpl(
+    const ScanRange& range, std::optional<size_t> poolIndex ) const
+{
     std::vector<MemoryEventDto> result;
+    if( range.limit == 0 || ( poolIndex && *poolIndex >= m_impl->pools.size() ) ) return result;
     size_t skipped = 0;
-    for( const auto& pool : m_impl->pools )
+    const auto firstPool = poolIndex.value_or( 0 );
+    const auto lastPool = poolIndex ? *poolIndex + 1 : m_impl->pools.size();
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) return result;
+    for( size_t poolNumber = firstPool; poolNumber < lastPool; ++poolNumber )
     {
-        std::ifstream in( m_impl->path, std::ios::binary );
-        if( !in ) return result;
-        in.seekg( std::streamoff( pool.stored.eventsOffset ) );
-        for( uint64_t index = 0; index < pool.stored.eventCount; ++index )
+        const auto& pool = m_impl->pools[poolNumber];
+        for( const auto& block : pool.blocks )
         {
-            StoredMemoryEvent event;
-            if( !in.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) ) return result;
-            const auto end = event.freeNs >= 0 ? event.freeNs : std::numeric_limits<int64_t>::max();
-            if( end < range.startNs || event.allocationNs > range.endNs ) continue;
-            if( skipped++ < range.offset ) continue;
-            result.emplace_back( m_impl->ToDto( pool, index, event ) );
-            if( result.size() >= range.limit ) return result;
+            if( block.maxFreeNs < range.startNs || block.minAllocationNs > range.endNs ) continue;
+            in.clear();
+            in.seekg( std::streamoff( pool.stored.eventsOffset +
+                block.firstEvent * sizeof( StoredMemoryEvent ) ) );
+            for( uint32_t blockIndex = 0; blockIndex < block.eventCount; ++blockIndex )
+            {
+                StoredMemoryEvent event;
+                if( !in.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) ) return result;
+                const auto end = event.freeNs >= 0 ? event.freeNs : std::numeric_limits<int64_t>::max();
+                if( end < range.startNs || event.allocationNs > range.endNs ) continue;
+                if( skipped++ < range.offset ) continue;
+                result.emplace_back( m_impl->ToDto( pool, block.firstEvent + blockIndex, event ) );
+                if( result.size() >= range.limit ) return result;
+            }
         }
     }
     return result;
@@ -918,21 +1019,27 @@ MemoryFrameSnapshot TraceSessionMemoryReader::Snapshot( int64_t beginNs, int64_t
         nativePools.push_back( pool->stored.nativeNameId );
         std::ifstream in( m_impl->path, std::ios::binary );
         if( !in ) return {};
-        in.seekg( std::streamoff( pool->stored.eventsOffset ) );
-        for( uint64_t index = 0; index < pool->stored.eventCount; ++index )
+        for( const auto& block : pool->blocks )
         {
-            StoredMemoryEvent event;
-            if( !in.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) ) return {};
-            const auto freeNs = event.freeNs >= 0 ? event.freeNs : std::numeric_limits<int64_t>::max();
-            if( event.allocationNs >= endNs || freeNs < beginNs ) continue;
-            MemoryEventInput input;
-            input.key = { pool->stored.nativeNameId, size_t( index ) };
-            input.identifier = event.address; input.size = event.size;
-            input.allocationNs = event.allocationNs;
-            if( event.freeNs >= 0 ) input.freeNs = event.freeNs;
-            input.allocationThread = event.allocationThread; input.freeThread = event.freeThread;
-            input.allocationCallstack = event.allocationCallstack; input.freeCallstack = event.freeCallstack;
-            events.emplace_back( input );
+            if( block.maxFreeNs < beginNs || block.minAllocationNs >= endNs ) continue;
+            in.clear();
+            in.seekg( std::streamoff( pool->stored.eventsOffset +
+                block.firstEvent * sizeof( StoredMemoryEvent ) ) );
+            for( uint32_t blockIndex = 0; blockIndex < block.eventCount; ++blockIndex )
+            {
+                StoredMemoryEvent event;
+                if( !in.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) ) return {};
+                const auto freeNs = event.freeNs >= 0 ? event.freeNs : std::numeric_limits<int64_t>::max();
+                if( event.allocationNs >= endNs || freeNs < beginNs ) continue;
+                MemoryEventInput input;
+                input.key = { pool->stored.nativeNameId, size_t( block.firstEvent + blockIndex ) };
+                input.identifier = event.address; input.size = event.size;
+                input.allocationNs = event.allocationNs;
+                if( event.freeNs >= 0 ) input.freeNs = event.freeNs;
+                input.allocationThread = event.allocationThread; input.freeThread = event.freeThread;
+                input.allocationCallstack = event.allocationCallstack; input.freeCallstack = event.freeCallstack;
+                events.emplace_back( input );
+            }
         }
     }
     return BuildMemoryFrameSnapshot( beginNs, endNs, nativePools, events, false );

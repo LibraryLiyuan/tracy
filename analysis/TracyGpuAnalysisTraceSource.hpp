@@ -63,6 +63,8 @@ public:
         std::string_view contextRef, const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
+    std::vector<MemoryEventDto> ScanMemoryEventsForPool(
+        std::string_view poolRef, const ScanRange& range ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;
     std::vector<PlotPointDto> ScanPlots( const ScanRange& range ) const override;
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
