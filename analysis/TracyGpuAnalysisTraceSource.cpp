@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <charconv>
 #include <limits>
+#include <map>
+#include <queue>
 #include <sstream>
 
 namespace tracy::analysis
@@ -740,6 +742,61 @@ std::optional<JobDto> GpuAnalysisTraceSource::GetJob( uint64_t jobId ) const
     if( WorkerLoaded() ) return Worker().GetJob( jobId );
     const auto reader = SessionJobReader();
     return reader ? reader->Get( jobId ) : std::nullopt;
+}
+
+std::vector<JobDto> GpuAnalysisTraceSource::GetJobDependents(
+    uint64_t jobId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetJobDependents( jobId, offset, limit );
+    const auto reader = SessionJobReader();
+    return reader ? reader->Dependents( jobId, offset, limit ) : std::vector<JobDto> {};
+}
+
+std::vector<JobDto> GpuAnalysisTraceSource::GetJobsForFrame(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetJobsForFrame( frameId, offset, limit );
+    const auto reader = SessionJobReader();
+    return reader ? reader->FrameJobs( frameId, offset, limit ) : std::vector<JobDto> {};
+}
+
+std::vector<JobDto> GpuAnalysisTraceSource::GetEvidenceJobs( uint64_t frameId ) const
+{
+    if( WorkerLoaded() ) return TraceSource::GetEvidenceJobs( frameId );
+    const auto reader = SessionJobReader();
+    if( !reader ) return {};
+    constexpr size_t Chunk = 1024;
+    std::map<uint64_t, JobDto> selected;
+    size_t offset = 0;
+    while( true )
+    {
+        auto page = reader->FrameJobs( frameId, offset, Chunk );
+        if( page.empty() ) break;
+        offset += page.size();
+        for( auto& job : page ) selected.try_emplace( job.jobId, std::move( job ) );
+        if( page.size() < Chunk ) break;
+    }
+    std::queue<uint64_t> pending;
+    for( const auto& [jobId, job] : selected ) pending.push( jobId );
+    while( !pending.empty() )
+    {
+        const auto found = selected.find( pending.front() );
+        pending.pop();
+        if( found == selected.end() ) continue;
+        for( const auto& dependency : found->second.dependencies )
+        {
+            if( dependency.prerequisiteJobId == 0 || selected.contains( dependency.prerequisiteJobId ) ) continue;
+            const auto prerequisite = reader->Get( dependency.prerequisiteJobId );
+            if( !prerequisite ) continue;
+            const auto id = prerequisite->jobId;
+            selected.emplace( id, *prerequisite );
+            pending.push( id );
+        }
+    }
+    std::vector<JobDto> result;
+    result.reserve( selected.size() );
+    for( auto& [jobId, job] : selected ) result.emplace_back( std::move( job ) );
+    return result;
 }
 std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoRequests() const
 {

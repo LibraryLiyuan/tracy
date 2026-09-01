@@ -1535,11 +1535,24 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     AppendStringEvent( frame, tracy::QueueType::StringData, JobNamePointer, "SyntheticJob" );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobSchedule;
-    item.jnJobSchedule = { 108, 500, 0xABC, 0, 2, uint8_t( 1 << 6 ) };
+    item.jnJobSchedule = { 104, 400, 0xAAA, 0, 2, 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobStage;
+    item.jnJobStage = { 106, 400, 0, 0, 0,
+        uint8_t( tracy::JnJobStage::Completed ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobSchedule;
+    item.jnJobSchedule = { 108, 500, 0xABC, 1, 2, uint8_t( 1 << 6 ) };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobConfig;
     item.jnJobConfig = { 500, 17, 64, 8, 31, 9, 2, uint8_t( 1 << 6 ) };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnJobDependency;
+    item.jnJobDependency = { 500, 400, 0xAAA, 0 };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnJobStage;
@@ -2469,9 +2482,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         auditedStats.gpuResources == 8 && auditedStats.gpuPasses == 5 &&
         auditedStats.gpuSourceGapResources == 2 &&
         auditedStats.gpuSourceGapReferences == 2 &&
-        auditedStats.jobTypes == 1 && auditedStats.jobs == 1 &&
-        auditedStats.jobSchedules == 1 && auditedStats.jobConfigs == 1 &&
-        auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5 &&
+        auditedStats.jobTypes == 1 && auditedStats.jobs == 2 &&
+        auditedStats.jobSchedules == 2 && auditedStats.jobConfigs == 1 &&
+        auditedStats.jobDependencies == 1 && auditedStats.jobStages == 6 &&
         auditedStats.invalidCpuZoneTimings == 1 && auditedStats.schedulingSourceGaps == 1,
         "mandatory derived counts are exact and reproducible" );
     test.Check( auditedStats.indexBytes <= auditedStats.indexFiles * 128,
@@ -2640,27 +2653,45 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionFrameImageDecoded.flipped && sessionFrameImageDecoded.rgba.size() == 64,
         "Session FrameImage reader preserves metadata, paged BC1 bytes and on-demand RGBA decode" );
     const auto sessionJobs = sessionSource->GetJobs();
-    test.Check( sessionJobs.size() == 1 && sessionJobs[0].jobId == 500 &&
-        sessionJobs[0].name == "SyntheticJob" && sessionJobs[0].scheduleNs == 16 &&
-        sessionJobs[0].readyNs == 20 && sessionJobs[0].firstRunNs == 22 &&
-        sessionJobs[0].completedNs == 32 && sessionJobs[0].executionNs == 8 &&
-        sessionJobs[0].scheduleCallsiteId == 77 && sessionJobs[0].scheduleCallstack == 2 &&
-        sessionJobs[0].scheduleStackProvenance == "SiteReused" &&
-        sessionJobs[0].stages.size() == 5,
+    const auto publishedJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
+    bool jobPostingWorkFound = false;
+    for( const auto& entry : std::filesystem::directory_iterator( publishedJobRoot ) )
+    {
+        const auto name = entry.path().filename().string();
+        jobPostingWorkFound = jobPostingWorkFound || ( entry.is_regular_file() &&
+            name.ends_with( ".work" ) );
+    }
+    test.Check( !jobPostingWorkFound,
+        "Session Job paging publishes reverse/frame postings without residual work files" );
+    const auto sessionJob500 = std::find_if( sessionJobs.begin(), sessionJobs.end(),
+        []( const auto& value ) { return value.jobId == 500; } );
+    test.Check( sessionJobs.size() == 2 && sessionJob500 != sessionJobs.end() &&
+        sessionJob500->name == "SyntheticJob" && sessionJob500->scheduleNs == 16 &&
+        sessionJob500->readyNs == 20 && sessionJob500->firstRunNs == 22 &&
+        sessionJob500->completedNs == 32 && sessionJob500->executionNs == 8 &&
+        sessionJob500->scheduleCallsiteId == 77 && sessionJob500->scheduleCallstack == 2 &&
+        sessionJob500->scheduleStackProvenance == "SiteReused" &&
+        sessionJob500->dependencies.size() == 1 && sessionJob500->stages.size() == 5,
         "Session Job reader restores Schedule, Ready, Worker Slice and Complete semantics" );
-    const auto sessionJobPage = sessionSource->ScanJobs( 0, 1 );
+    const auto sessionJobPage = sessionSource->ScanJobs( 1, 1 );
     const auto sessionJobById = sessionSource->GetJob( 500 );
-    test.Check( sessionSource->GetJobCount() == 1 && sessionJobPage.size() == 1 &&
+    const auto sessionJobDependents = sessionSource->GetJobDependents( 400, 0, 16 );
+    const auto sessionFrameJobs = sessionSource->GetJobsForFrame( 9, 0, 16 );
+    const auto sessionEvidenceJobs = sessionSource->GetEvidenceJobs( 9 );
+    test.Check( sessionSource->GetJobCount() == 2 && sessionJobPage.size() == 1 &&
         sessionJobPage[0].jobId == 500 && sessionJobById &&
-        sessionJobById->jobId == 500 && sessionJobById->stages.size() == 5,
-        "Session Job reader pages and resolves jobs from the disk index without requiring full materialization" );
+        sessionJobById->jobId == 500 && sessionJobById->stages.size() == 5 &&
+        sessionJobDependents.size() == 1 && sessionJobDependents[0].jobId == 500 &&
+        sessionFrameJobs.size() == 1 && sessionFrameJobs[0].jobId == 500 &&
+        sessionEvidenceJobs.size() == 2,
+        "Session Job reader pages jobs, reverse dependencies and Frame evidence from exact disk postings" );
     tracy::analysis::TraceSessionJobBuildOptions spillOptions;
     spillOptions.maximumBufferedRecords = 2;
     tracy::analysis::TraceSessionJobStats spilledJobStats;
     std::string spillError;
     test.Check( tracy::analysis::BuildTraceSessionJobDerived( publishedSession, manifest,
-        spilledJobStats, spillError, spillOptions ) && spilledJobStats.jobs == 1 &&
-        spilledJobStats.stages == 5 && spilledJobStats.peakBufferedRecords <= 2,
+        spilledJobStats, spillError, spillOptions ) && spilledJobStats.jobs == 2 &&
+        spilledJobStats.stages == 6 && spilledJobStats.peakBufferedRecords <= 2,
         "Session Job builder spills exact Stage records to disk instead of enforcing a total-record memory cap: " + spillError );
     const auto spilledJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
     size_t spilledJobTemporaryRuns = 0;
@@ -2871,12 +2902,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             "Query 1.34 lists and pages Session FrameImage evidence without a Worker" );
         const auto jobs = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-job-search" }, { "method", "job.search" },
-            { "params", { { "trace_id", traceId }, { "query", "SyntheticJob" } } }
+            { "params", { { "trace_id", traceId },
+                { "filter", { { "text", "SyntheticJob" } } } } }
         } );
         test.Check( jobs.value( "ok", false ) && jobs["data"]["jobs"].size() == 1 &&
             jobs["data"]["jobs"][0]["job_id"] == "500" &&
             jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
             "Query 1.34 searches the Session Job semantic index without a Worker" );
+        const auto jobDependencies = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-job-dependencies" },
+            { "method", "job.dependencies" }, { "params", { { "trace_id", traceId },
+                { "ref", sessionSource->MakeEntityRef( "job", 400 ) }, { "limit", 16 } } }
+        } );
+        test.Check( jobDependencies.value( "ok", false ) &&
+            jobDependencies["data"]["upstream"].empty() &&
+            jobDependencies["data"]["downstream"].size() == 1 &&
+            jobDependencies["data"]["downstream"][0]["job_id"] == "500",
+            "Query 1.34 resolves downstream Job dependencies through the exact reverse posting" );
         const auto sessionJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
         const auto sessionJobRaw = sessionJobRoot / "jobs.bin";
         const auto sessionJobRawHidden = sessionJobRoot / "jobs.bin.statistics-test-hidden";
@@ -2887,8 +2929,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         } );
         std::filesystem::rename( sessionJobRawHidden, sessionJobRaw );
         test.Check( jobStatistics.value( "ok", false ) &&
-            jobStatistics["data"]["counts"]["jobs"] == "1" &&
-            jobStatistics["data"]["counts"]["completed"] == "1" &&
+            jobStatistics["data"]["counts"]["jobs"] == "2" &&
+            jobStatistics["data"]["counts"]["completed"] == "2" &&
             jobStatistics["data"]["latency"]["schedule_to_ready"]["count"] == "1",
             "Query 1.34 computes exact Session Job statistics from disk pages without raw full materialization" );
         if( sessionRelationReady )

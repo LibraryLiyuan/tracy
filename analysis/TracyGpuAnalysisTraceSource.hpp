@@ -74,6 +74,11 @@ public:
     uint64_t GetJobCount() const override;
     std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override;
     std::optional<JobDto> GetJob( uint64_t jobId ) const override;
+    std::vector<JobDto> GetJobDependents(
+        uint64_t jobId, size_t offset, size_t limit ) const override;
+    std::vector<JobDto> GetJobsForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const override;
+    std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;

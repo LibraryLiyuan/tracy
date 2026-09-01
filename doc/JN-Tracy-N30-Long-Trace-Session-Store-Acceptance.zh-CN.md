@@ -1424,4 +1424,29 @@ Trace Session Inventory tests passed
 固定N29/N30组合回归：6/6 passed
 ```
 
-下一步：实现Job反向Dependency/Frame关联，继续收敛N30.6B剩余线性查询；本子阶段未启动真实30分钟转换。
+下一步继续收敛N30.6B剩余线性查询；本子阶段未启动真实30分钟转换。
+
+### 2026-09-01 Job 反向依赖与 Frame Posting（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- 保留Job index schema 2；`job-pages` schema升级到2，并新增独立`job-postings.bin` schema 1。
+- Posting保存两种精确映射：`prerequisiteJobId→dependentJobId`与`originFrameId→jobId`。二者来自Canonical Job Dependency、Config和Canonical Frame Begin事实，不使用时间接近猜测。
+- Posting使用16字节固定Pair和有界外部排序；Page manifest同时保存posting文件大小、SHA-256和两类关系数量，Final Audit在Session发布前核对身份、布局与checksum。
+- `job.dependencies`的Session路径不再调用`GetJobs()`；上游只按Job ID读取直接前置Job，下游通过reverse posting分页读取。
+- `GetJobsForFrame`直接通过Frame posting分页；`GetEvidenceJobs`先读取该Frame直接Job，再按每个Job自己的前置依赖逐点扩展，不物化全Session。
+- Legacy Worker继续使用原始全量实现，API语义不变；Job Critical Path和旧Correlation全图仍是后续分页改造项。
+
+TDD证据：
+
+```text
+Synthetic: Job 400 → Job 500，Job 500 originFrameId=9
+Reader:    Dependents(400)=[500]，FrameJobs(9)=[500]
+Evidence:  Frame 9=[400,500]
+Query:     job.dependencies(Job 400).downstream=[Job 500]
+RED:       旧测试使用非协议字段query做文本筛选，被第二个Job暴露
+FIX:       改用正式filter.text；未放宽结果断言
+GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+发布目录不残留任何Job `.work` 文件。本子阶段未执行真实30分钟转换。

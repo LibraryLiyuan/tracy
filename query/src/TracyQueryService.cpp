@@ -10656,6 +10656,32 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }, trace );
         }
 
+        if( pagedSessionJobs && method == "job.dependencies" )
+        {
+            const auto jobId = parseJobRef();
+            const auto job = source->GetJob( jobId );
+            if( !job ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
+            json upstream = json::array();
+            for( const auto& dependency : job->dependencies )
+            {
+                const auto prerequisite = source->GetJob( dependency.prerequisiteJobId );
+                upstream.push_back( prerequisite ? JobJson( *source, *prerequisite, false ) : json {
+                    { "ref", source->MakeEntityRef( "job", dependency.prerequisiteJobId ) },
+                    { "job_id", Decimal( dependency.prerequisiteJobId ) }, { "missing", true }
+                } );
+            }
+            const auto page = ParsePage( params, method, trace );
+            auto downstream = source->GetJobDependents( jobId, page.offset, page.limit + 1 );
+            const bool hasMore = downstream.size() > page.limit;
+            if( hasMore ) downstream.pop_back();
+            json downstreamJson = json::array();
+            for( const auto& value : downstream ) downstreamJson.push_back( JobJson( *source, value, false ) );
+            const auto cursor = NextCursor( page, method, trace, downstream.size(), hasMore );
+            return Success( id, { { "job", JobJson( *source, *job, false ) },
+                { "upstream", std::move( upstream ) }, { "downstream", std::move( downstreamJson ) } },
+                trace, PageJson( page, downstream.size(), cursor ) );
+        }
+
         if( pagedSessionJobs ) jobs = source->GetJobs();
 
         if( method == "job.search" )

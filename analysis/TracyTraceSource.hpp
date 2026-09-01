@@ -1015,6 +1015,40 @@ public:
             [jobId]( const auto& value ) { return value.jobId == jobId; } );
         return found == values.end() ? std::nullopt : std::optional<JobDto>( *found );
     }
+    virtual std::vector<JobDto> GetJobDependents(
+        uint64_t jobId, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto jobs = GetJobs();
+        std::vector<JobDto> result;
+        size_t matched = 0;
+        for( const auto& candidate : jobs )
+        {
+            if( !std::any_of( candidate.dependencies.begin(), candidate.dependencies.end(),
+                [jobId]( const auto& dependency ) {
+                    return dependency.prerequisiteJobId == jobId; } ) ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( candidate );
+            if( result.size() >= limit ) break;
+        }
+        return result;
+    }
+    virtual std::vector<JobDto> GetJobsForFrame(
+        uint64_t frameId, size_t offset, size_t limit ) const
+    {
+        if( limit == 0 ) return {};
+        const auto jobs = GetJobs();
+        std::vector<JobDto> result;
+        size_t matched = 0;
+        for( const auto& job : jobs )
+        {
+            if( job.originFrameId != frameId ) continue;
+            if( matched++ < offset ) continue;
+            result.emplace_back( job );
+            if( result.size() >= limit ) break;
+        }
+        return result;
+    }
     virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
     {
         const auto jobs = GetJobs();

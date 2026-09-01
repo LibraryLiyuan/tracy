@@ -2,6 +2,7 @@
 
 #include "TracyHash.hpp"
 #include "TracyTraceSessionCanonical.hpp"
+#include "TracyTraceSessionExternalSort.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
 #include "TracyProtocol.hpp"
 #include "TracyQueue.hpp"
@@ -33,8 +34,11 @@ constexpr uint64_t JobManifestMagic = 0x31464d4a534e4aull;
 constexpr const char* JobFileName = "jobs.bin";
 constexpr uint64_t JobPageFileMagic = 0x3147504a534e4aull;
 constexpr uint64_t JobPageManifestMagic = 0x314d504a534e4aull;
-constexpr uint32_t JobPageSchemaVersion = 1;
+constexpr uint32_t JobPageSchemaVersion = 2;
 constexpr const char* JobPageFileName = "job-pages.bin";
+constexpr uint64_t JobPostingFileMagic = 0x3154504a534e4aull;
+constexpr uint32_t JobPostingSchemaVersion = 1;
+constexpr const char* JobPostingFileName = "job-postings.bin";
 
 #pragma pack( push, 1 )
 struct JobFileHeader
@@ -90,6 +94,20 @@ struct JobPageFileHeader
     uint32_t generationBytes = 0;
     uint32_t endian = 0x01020304;
 };
+
+struct JobPostingFileHeader
+{
+    uint64_t magic = JobPostingFileMagic;
+    uint32_t schema = JobPostingSchemaVersion;
+    uint32_t reserved = 0;
+    uint64_t sourceSize = 0;
+    uint64_t reverseDependencyCount = 0;
+    uint64_t frameJobCount = 0;
+    uint64_t reverseDependenciesOffset = 0;
+    uint64_t frameJobsOffset = 0;
+    uint32_t generationBytes = 0;
+    uint32_t endian = 0x01020304;
+};
 #pragma pack( pop )
 
 struct JobManifest
@@ -110,6 +128,10 @@ struct JobPageManifest
     uint64_t fileBytes = 0;
     std::string fileSha256;
     uint64_t jobs = 0;
+    uint64_t postingFileBytes = 0;
+    std::string postingFileSha256;
+    uint64_t reverseDependencies = 0;
+    uint64_t frameJobs = 0;
 };
 
 struct RawJobStore
@@ -215,6 +237,10 @@ bool SaveJobPageManifest( const std::filesystem::path& root,
     out << "file_bytes " << value.fileBytes << '\n';
     out << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n';
     out << "jobs " << value.jobs << '\n';
+    out << "posting_file_bytes " << value.postingFileBytes << '\n';
+    out << "posting_file_sha256 " << std::quoted( value.postingFileSha256 ) << '\n';
+    out << "reverse_dependencies " << value.reverseDependencies << '\n';
+    out << "frame_jobs " << value.frameJobs << '\n';
     out.flush();
     if( !out ) { error = "session_job_page_manifest_write_failed"; return false; }
     out.close();
@@ -238,11 +264,16 @@ bool LoadJobPageManifest( const std::filesystem::path& root,
         else if( key == "file_bytes" ) in >> value.fileBytes;
         else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 );
         else if( key == "jobs" ) in >> value.jobs;
+        else if( key == "posting_file_bytes" ) in >> value.postingFileBytes;
+        else if( key == "posting_file_sha256" ) in >> std::quoted( value.postingFileSha256 );
+        else if( key == "reverse_dependencies" ) in >> value.reverseDependencies;
+        else if( key == "frame_jobs" ) in >> value.frameJobs;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_job_page_manifest_parse_failed"; return false; }
     }
     if( magic != JobPageManifestMagic || schema != JobPageSchemaVersion ||
-        value.sourceSha256.size() != 64 || value.fileSha256.size() != 64 )
+        value.sourceSha256.size() != 64 || value.fileSha256.size() != 64 ||
+        value.postingFileSha256.size() != 64 )
     { error = "session_job_page_manifest_invalid"; return false; }
     return true;
 }
@@ -1171,12 +1202,116 @@ bool CopyRange( std::ifstream& in, uint64_t offset, uint64_t bytes,
     return true;
 }
 
+bool BuildJobPostingWork( const std::filesystem::path& source,
+    const JobRawLayout& layout, const std::filesystem::path& root,
+    uint64_t maximumBufferedRecords, std::filesystem::path& reverseSorted,
+    uint64_t& reverseCount, std::filesystem::path& frameSorted,
+    uint64_t& frameCount, std::string& error )
+{
+    const auto reverseSource = root / "posting-reverse-source.work";
+    const auto frameSource = root / "posting-frame-source.work";
+    reverseSorted = root / "posting-reverse-sorted.work";
+    frameSorted = root / "posting-frame-sorted.work";
+    std::ofstream reverseOut( reverseSource, std::ios::binary | std::ios::trunc );
+    std::ofstream frameOut( frameSource, std::ios::binary | std::ios::trunc );
+    std::ifstream in( source, std::ios::binary );
+    if( !reverseOut || !frameOut || !in )
+    { error = "session_job_posting_work_open_failed"; return false; }
+
+    reverseCount = 0;
+    in.seekg( std::streamoff( layout.dependenciesOffset ) );
+    for( uint64_t index = 0; index < layout.header.dependencyCount; ++index )
+    {
+        JnJobDependencyData dependency;
+        if( !in.read( reinterpret_cast<char*>( &dependency ), sizeof( dependency ) ) )
+        { error = "session_job_posting_dependency_truncated"; return false; }
+        if( dependency.prerequisiteJobId == 0 ) continue;
+        const TraceSessionUInt64Pair pair { dependency.prerequisiteJobId, dependency.jobId };
+        reverseOut.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+        ++reverseCount;
+    }
+
+    std::unordered_map<uint32_t, uint64_t> frameIdsBySequence;
+    in.clear(); in.seekg( std::streamoff( layout.framesOffset ) );
+    for( uint64_t index = 0; index < layout.header.frameCount; ++index )
+    {
+        JnFrameData frame;
+        if( !in.read( reinterpret_cast<char*>( &frame ), sizeof( frame ) ) )
+        { error = "session_job_posting_frame_truncated"; return false; }
+        if( frame.phase == uint8_t( JnFramePhase::Begin ) &&
+            ( frame.flags & uint8_t( JnFrameFlags::Canonical ) ) != 0 )
+            frameIdsBySequence[uint32_t( frame.frameId )] = frame.frameId;
+    }
+
+    frameCount = 0;
+    in.clear(); in.seekg( std::streamoff( layout.configsOffset ) );
+    for( uint64_t index = 0; index < layout.header.configCount; ++index )
+    {
+        JnJobConfigData config;
+        if( !in.read( reinterpret_cast<char*>( &config ), sizeof( config ) ) )
+        { error = "session_job_posting_config_truncated"; return false; }
+        if( config.originFrameSequence == 0 ) continue;
+        const auto frame = frameIdsBySequence.find( config.originFrameSequence );
+        if( frame == frameIdsBySequence.end() ) continue;
+        const TraceSessionUInt64Pair pair { frame->second, config.jobId };
+        frameOut.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+        ++frameCount;
+    }
+    reverseOut.flush(); frameOut.flush();
+    if( !reverseOut || !frameOut )
+    { error = "session_job_posting_work_write_failed"; return false; }
+    reverseOut.close(); frameOut.close(); in.close();
+
+    if( !SortTraceSessionUInt64Pairs( reverseSource, reverseSorted, root,
+            "job-reverse-posting", reverseCount, maximumBufferedRecords, error ) ||
+        !SortTraceSessionUInt64Pairs( frameSource, frameSorted, root,
+            "job-frame-posting", frameCount, maximumBufferedRecords, error ) ) return false;
+    std::error_code ec;
+    if( !std::filesystem::remove( reverseSource, ec ) || ec )
+    { error = "session_job_posting_source_cleanup_failed:" + ( ec ? ec.message() : reverseSource.string() ); return false; }
+    ec.clear();
+    if( !std::filesystem::remove( frameSource, ec ) || ec )
+    { error = "session_job_posting_source_cleanup_failed:" + ( ec ? ec.message() : frameSource.string() ); return false; }
+    return true;
+}
+
+bool WriteJobPostingFile( const std::filesystem::path& temporary,
+    const TraceSessionManifest& session, const std::filesystem::path& reverse,
+    uint64_t reverseCount, const std::filesystem::path& frames, uint64_t frameCount,
+    std::string& error )
+{
+    JobPostingFileHeader header;
+    header.sourceSize = session.source.fileSize;
+    header.reverseDependencyCount = reverseCount;
+    header.frameJobCount = frameCount;
+    header.generationBytes = uint32_t( session.generation.size() );
+    header.reverseDependenciesOffset = sizeof( header ) + 64 + header.generationBytes;
+    header.frameJobsOffset = header.reverseDependenciesOffset +
+        reverseCount * sizeof( TraceSessionUInt64Pair );
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "session_job_posting_file_open_failed"; return false; }
+    out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+    out.write( session.source.sha256.data(), 64 );
+    out.write( session.generation.data(), std::streamsize( session.generation.size() ) );
+    uint64_t copied = 0;
+    if( !out || !CopyFileBytes( reverse, out, copied, error ) ||
+        copied != reverseCount * sizeof( TraceSessionUInt64Pair ) ||
+        !CopyFileBytes( frames, out, copied, error ) ||
+        copied != frameCount * sizeof( TraceSessionUInt64Pair ) )
+    { if( error.empty() ) error = "session_job_posting_file_size_mismatch"; return false; }
+    out.flush();
+    if( !out ) { error = "session_job_posting_file_write_failed"; return false; }
+    return true;
+}
+
 }
 
 struct TraceSessionJobReader::PageState
 {
     std::filesystem::path path;
+    std::filesystem::path postingPath;
     JobPageFileHeader header;
+    JobPostingFileHeader postingHeader;
     uint64_t jobIdsOffset = 0;
     uint64_t schedulesOffset = 0;
     uint64_t configsOffset = 0;
@@ -1209,7 +1344,11 @@ bool CleanupTraceSessionJobTemporaryRuns( const std::filesystem::path& sessionRo
             continue;
         }
         const auto name = it->path().filename().string();
-        if( !name.starts_with( "job-id-run-" ) || !name.ends_with( ".work" ) ) continue;
+        const bool knownTemporary = name.starts_with( "job-id-run-" ) ||
+            name.starts_with( "page-" ) || name.starts_with( "posting-" ) ||
+            name.starts_with( "job-reverse-posting-run-" ) ||
+            name.starts_with( "job-frame-posting-run-" );
+        if( !knownTemporary || !name.ends_with( ".work" ) ) continue;
         ec.clear();
         if( !std::filesystem::remove( it->path(), ec ) || ec )
         {
@@ -1322,6 +1461,10 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
     if( !BuildDistinctPagedJobIds( sorted, ids, jobCount, error ) ) return false;
     if( jobCount != sourceManifest.stats.jobs )
     { error = "session_job_page_distinct_count_mismatch"; return false; }
+    std::filesystem::path reversePostings, framePostings;
+    uint64_t reversePostingCount = 0, framePostingCount = 0;
+    if( !BuildJobPostingWork( source, layout, root, options.maximumBufferedRecords,
+        reversePostings, reversePostingCount, framePostings, framePostingCount, error ) ) return false;
 
     JobPageFileHeader header;
     header.sourceSize = session.source.fileSize; header.jobCount = jobCount;
@@ -1355,13 +1498,23 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
     if( !out ) { error = "session_job_page_file_write_failed"; return false; }
     out.close(); raw.close();
     const auto target = root / JobPageFileName;
+    const auto postingTarget = root / JobPostingFileName;
+    auto postingTemporary = postingTarget; postingTemporary += ".tmp";
+    if( !WriteJobPostingFile( postingTemporary, session, reversePostings,
+        reversePostingCount, framePostings, framePostingCount, error ) ) return false;
     if( !AtomicReplace( temporary, target, error ) ) return false;
+    if( !AtomicReplace( postingTemporary, postingTarget, error ) ) return false;
     JobPageManifest pageManifest;
     pageManifest.sourceSha256 = session.source.sha256; pageManifest.sourceSize = session.source.fileSize;
     pageManifest.generation = session.generation; pageManifest.jobs = jobCount;
     pageManifest.fileBytes = std::filesystem::file_size( target, ec );
     if( ec ) { error = "session_job_page_file_size_failed:" + ec.message(); return false; }
     pageManifest.fileSha256 = Sha256File( target );
+    pageManifest.postingFileBytes = std::filesystem::file_size( postingTarget, ec );
+    if( ec ) { error = "session_job_posting_file_size_failed:" + ec.message(); return false; }
+    pageManifest.postingFileSha256 = Sha256File( postingTarget );
+    pageManifest.reverseDependencies = reversePostingCount;
+    pageManifest.frameJobs = framePostingCount;
     if( !SaveJobPageManifest( root, pageManifest, error ) ) return false;
     for( const auto& path : sorted )
     {
@@ -1372,6 +1525,12 @@ bool BuildTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
     ec.clear();
     if( !std::filesystem::remove( ids, ec ) || ec )
     { error = "session_job_page_ids_cleanup_failed:" + ( ec ? ec.message() : ids.string() ); return false; }
+    for( const auto& path : { reversePostings, framePostings } )
+    {
+        ec.clear();
+        if( !std::filesystem::remove( path, ec ) || ec )
+        { error = "session_job_posting_sorted_cleanup_failed:" + ( ec ? ec.message() : path.string() ); return false; }
+    }
     return true;
 }
 
@@ -1443,6 +1602,37 @@ bool AuditTraceSessionJobPagingDerived( const std::filesystem::path& sessionRoot
         !add( header.dependencyCount, sizeof( JnJobDependencyData ) ) ||
         !add( header.stageCount, sizeof( JnJobStageData ) ) || expected != manifest.fileBytes )
     { error = "session_job_page_file_layout_invalid"; return false; }
+    const auto postingPath = root / JobPostingFileName;
+    ec.clear();
+    if( std::filesystem::file_size( postingPath, ec ) != manifest.postingFileBytes || ec )
+    { error = "session_job_posting_file_size_mismatch"; return false; }
+    if( Sha256File( postingPath ) != manifest.postingFileSha256 )
+    { error = "session_job_posting_file_sha256_mismatch"; return false; }
+    std::ifstream postings( postingPath, std::ios::binary );
+    JobPostingFileHeader postingHeader;
+    if( !postings.read( reinterpret_cast<char*>( &postingHeader ), sizeof( postingHeader ) ) ||
+        postingHeader.magic != JobPostingFileMagic || postingHeader.schema != JobPostingSchemaVersion ||
+        postingHeader.reserved != 0 || postingHeader.endian != 0x01020304 ||
+        postingHeader.sourceSize != session.source.fileSize ||
+        postingHeader.generationBytes != session.generation.size() ||
+        postingHeader.reverseDependencyCount != manifest.reverseDependencies ||
+        postingHeader.frameJobCount != manifest.frameJobs )
+    { error = "session_job_posting_file_header_invalid"; return false; }
+    std::string postingSha( 64, '\0' ), postingGeneration( postingHeader.generationBytes, '\0' );
+    if( !postings.read( postingSha.data(), 64 ) ||
+        ( !postingGeneration.empty() && !postings.read( postingGeneration.data(),
+            std::streamsize( postingGeneration.size() ) ) ) ||
+        postingSha != session.source.sha256 || postingGeneration != session.generation )
+    { error = "session_job_posting_file_identity_invalid"; return false; }
+    const auto expectedReverseOffset = sizeof( postingHeader ) + 64 + postingHeader.generationBytes;
+    const auto expectedFrameOffset = expectedReverseOffset +
+        postingHeader.reverseDependencyCount * sizeof( TraceSessionUInt64Pair );
+    const auto expectedPostingBytes = expectedFrameOffset +
+        postingHeader.frameJobCount * sizeof( TraceSessionUInt64Pair );
+    if( postingHeader.reverseDependenciesOffset != expectedReverseOffset ||
+        postingHeader.frameJobsOffset != expectedFrameOffset ||
+        expectedPostingBytes != manifest.postingFileBytes )
+    { error = "session_job_posting_file_layout_invalid"; return false; }
     return true;
 }
 
@@ -1490,6 +1680,10 @@ std::shared_ptr<TraceSessionJobReader> TraceSessionJobReader::Open(
     page->configsOffset = page->schedulesOffset + page->header.scheduleCount * sizeof( JnJobScheduleData );
     page->dependenciesOffset = page->configsOffset + page->header.configCount * sizeof( JnJobConfigData );
     page->stagesOffset = page->dependenciesOffset + page->header.dependencyCount * sizeof( JnJobDependencyData );
+    page->postingPath = root / JobPostingFileName;
+    std::ifstream postings( page->postingPath, std::ios::binary );
+    if( !postings.read( reinterpret_cast<char*>( &page->postingHeader ), sizeof( page->postingHeader ) ) )
+    { error = "session_job_posting_file_header_truncated"; return {}; }
     reader->m_pageState = std::move( page );
     return reader;
 }
@@ -1574,6 +1768,52 @@ std::vector<JobDto> LoadPagedJobs( const TraceSessionJobReader::PageState& page,
     return values;
 }
 
+std::vector<uint64_t> ReadJobPostingIds( const std::filesystem::path& path,
+    uint64_t sectionOffset, uint64_t recordCount, uint64_t key,
+    size_t offset, size_t limit )
+{
+    std::vector<uint64_t> result;
+    if( recordCount == 0 || limit == 0 ) return result;
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "session_job_posting_read_open_failed" );
+    const auto lowerBound = [&]( bool upper )
+    {
+        uint64_t first = 0, last = recordCount;
+        while( first < last )
+        {
+            const auto middle = first + ( last - first ) / 2;
+            TraceSessionUInt64Pair pair;
+            in.clear();
+            in.seekg( std::streamoff( sectionOffset + middle * sizeof( pair ) ) );
+            if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+                throw std::runtime_error( "session_job_posting_binary_search_failed" );
+            if( pair.key < key || ( upper && pair.key == key ) ) first = middle + 1;
+            else last = middle;
+        }
+        return first;
+    };
+    const auto begin = lowerBound( false );
+    const auto end = lowerBound( true );
+    if( begin >= end ) return result;
+    result.reserve( std::min<uint64_t>( limit, end - begin ) );
+    in.clear();
+    in.seekg( std::streamoff( sectionOffset + begin * sizeof( TraceSessionUInt64Pair ) ) );
+    uint64_t skipped = 0, previous = 0;
+    bool havePrevious = false;
+    for( uint64_t index = begin; index < end; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) || pair.key != key )
+            throw std::runtime_error( "session_job_posting_read_truncated" );
+        if( havePrevious && pair.value == previous ) continue;
+        previous = pair.value; havePrevious = true;
+        if( skipped++ < offset ) continue;
+        result.emplace_back( pair.value );
+        if( result.size() >= limit ) break;
+    }
+    return result;
+}
+
 const std::vector<JobDto>& TraceSessionJobReader::Jobs() const
 {
     if( m_jobsLoaded ) return m_jobs;
@@ -1628,6 +1868,26 @@ std::optional<JobDto> TraceSessionJobReader::Get( uint64_t jobId ) const
     if( value != jobId ) return std::nullopt;
     auto jobs = LoadPagedJobs( *m_pageState, m_session.source.sha256, { jobId } );
     return jobs.empty() ? std::nullopt : std::optional<JobDto>( std::move( jobs.front() ) );
+}
+
+std::vector<JobDto> TraceSessionJobReader::Dependents(
+    uint64_t jobId, size_t offset, size_t limit ) const
+{
+    if( !m_pageState ) return {};
+    const auto ids = ReadJobPostingIds( m_pageState->postingPath,
+        m_pageState->postingHeader.reverseDependenciesOffset,
+        m_pageState->postingHeader.reverseDependencyCount, jobId, offset, limit );
+    return LoadPagedJobs( *m_pageState, m_session.source.sha256, ids );
+}
+
+std::vector<JobDto> TraceSessionJobReader::FrameJobs(
+    uint64_t frameId, size_t offset, size_t limit ) const
+{
+    if( !m_pageState ) return {};
+    const auto ids = ReadJobPostingIds( m_pageState->postingPath,
+        m_pageState->postingHeader.frameJobsOffset,
+        m_pageState->postingHeader.frameJobCount, frameId, offset, limit );
+    return LoadPagedJobs( *m_pageState, m_session.source.sha256, ids );
 }
 
 }
