@@ -47,6 +47,7 @@ struct TraceSessionDerivedStats
     uint64_t jobDependencies = 0;
     uint64_t jobStages = 0;
     uint64_t cpuZones = 0;
+    uint64_t cpuZoneBlocks = 0;
     uint64_t completeCpuZones = 0;
     uint64_t invalidCpuZoneTimings = 0;
     uint64_t cpuZoneSources = 0;

@@ -2290,6 +2290,29 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( !std::filesystem::exists( cpuZoneRoot / "zones.work" ) &&
         !std::filesystem::exists( cpuZoneRoot / "extras.work" ),
         "Session CPU Zone builder removes all temporary streams before publishing the index" );
+    auto cpuZoneReader = tracy::analysis::TraceSessionCpuZoneReader::Open(
+        sessionRoot, manifest, error );
+    const auto mainThreadZoneRef = std::string( "tracy:v1:" ) +
+        manifest.source.sha256.substr( 0, 16 ) + ":thread:2a";
+    tracy::analysis::ScanRange narrowCpuZoneRange;
+    narrowCpuZoneRange.startNs = 15;
+    narrowCpuZoneRange.endNs = 21;
+    narrowCpuZoneRange.limit = 16;
+    const auto narrowCpuZones = cpuZoneReader ? cpuZoneReader->Scan( narrowCpuZoneRange ) :
+        std::vector<tracy::analysis::CpuZoneDto> {};
+    tracy::analysis::ScanRange allCpuZones;
+    allCpuZones.limit = 16;
+    const auto mainThreadCpuZones = cpuZoneReader ?
+        cpuZoneReader->ScanThread( mainThreadZoneRef, allCpuZones ) :
+        std::vector<tracy::analysis::CpuZoneDto> {};
+    test.Check( cpuZoneReader && cpuZoneReader->Stats().zoneBlocks != 0 &&
+        narrowCpuZones.size() == 3 && mainThreadCpuZones.size() == 3 &&
+        std::all_of( mainThreadCpuZones.begin(), mainThreadCpuZones.end(), [&]( const auto& value ) {
+            return value.threadRef == mainThreadZoneRef;
+        } ), "Session CPU Zone publishes exact time/thread block indexes: narrow=" +
+            std::to_string( narrowCpuZones.size() ) + ",thread=" +
+            std::to_string( mainThreadCpuZones.size() ) + ",blocks=" +
+            std::to_string( cpuZoneReader ? cpuZoneReader->Stats().zoneBlocks : 0 ) + ":" + error );
     const auto gpuZoneRoot = tracy::analysis::TraceSessionGpuZoneIndexRoot( sessionRoot, manifest );
     test.Check( !std::filesystem::exists( gpuZoneRoot / "zones.work" ),
         "Session GPU Zone builder removes its temporary stream before publishing the index" );
@@ -3041,6 +3064,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuSearch["data"]["zones"][2]["timing_valid"] == false &&
             cpuSearch["data"]["zones"][2]["timing_invalid_reason"] == "source_clock_inversion",
             "Query 1.34 exposes source clock inversion without fabricating timing" );
+        const auto cpuThreadSearch = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-cpu-zone-thread" },
+            { "method", "zone.cpu.search" }, { "params", { { "trace_id", traceId },
+                { "thread_ref", mainThreadZoneRef }, { "start_ns", 15 },
+                { "end_ns", 21 }, { "limit", 16 } } }
+        } );
+        test.Check( cpuThreadSearch.value( "ok", false ) &&
+            cpuThreadSearch["data"]["zones"].size() == 3 &&
+            std::all_of( cpuThreadSearch["data"]["zones"].begin(),
+                cpuThreadSearch["data"]["zones"].end(), [&]( const auto& value ) {
+                    return value["thread_ref"] == mainThreadZoneRef;
+                } ), "Query 1.34 routes CPU-zone time/thread predicates through the immutable block index; count=" +
+                    std::to_string( cpuThreadSearch.value( "ok", false ) ?
+                        cpuThreadSearch["data"]["zones"].size() : 0 ) );
         if( sessionGpuZonesReady ) try
         {
             const auto gpuContexts = query.Execute( {

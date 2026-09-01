@@ -779,7 +779,7 @@ GREEN：
 - Job调用栈严格复现Tracy协议的两类状态：普通`Callstack`按线程消费，`CallstackSerial`可跨无关事件保持到对应Job/Callsite消费者；Sampling字典栈也参与全局Callstack ID去重，避免Job的`stack_ref`与后续Source/Callstack索引错位。
 - Job索引包含source SHA-256、source size、固定manifest generation、文件SHA-256及Type/Schedule/Config/Dependency/Stage计数；Final Audit逐项与Inventory的QueueType计数核对，不能用已构造Job数量替代源事件守恒。
 - `job.search/get/dependencies/critical_path/statistics`已从Session Job Reader读取且不会回退完整Worker；`job.gfx`仍保持不可查询，直到Gfx Dispatch/Entity/Link语义Reader完成。
-- CPU Zone域新增`cpu-zone-index/1/exact/cpu-zones.bin`：只在构建期保留各逻辑线程的活动Zone栈，闭合Zone立即写固定宽度磁盘记录；父子关系、child count、self time和开放捕获边界均由Canonical事实重建。
+- CPU Zone域使用`cpu-zone-index/2/exact/cpu-zones.bin`：只在构建期保留各逻辑线程的活动Zone栈，闭合Zone立即写固定宽度磁盘记录；父子关系、child count、self time和开放捕获边界均由Canonical事实重建。
 - CPU Zone时间严格复现Worker的共享`m_refTimeThread`语义；Plot、非serial GPU CPU时间和Fiber切换会推进同一线程时钟，避免跨域事件插入后Zone时间漂移。
 - 标准/动态SourceLocation、延迟StringData、ZoneName、ZoneText、ZoneColor、普通Callstack、Serial Callstack和SiteReuse Callsite均已接入；Callsite晚于Zone闭合到达时原位修补已提交的固定记录。
 - `zone.cpu.search/get/tree/statistics/flamegraph`已从Session CPU Zone Reader读取；最后未闭合Zone返回`complete=false/end=null`，不会伪造捕获结束时间。
@@ -879,7 +879,7 @@ GREEN：
 - Scheduling schema 5已经为线程/CPU固定宽度记录增加4096条一块的immutable时间包络与256-bit identity Bloom；时间窗口、指定thread和指定CPU可跳过不可能命中的块。仍需在真实长Trace验证查询延迟，若Bloom误命中导致门禁不通过，再升级为压缩posting list。
 - Sampling schema 3已为普通Sample增加4096条一块的immutable时间包络和Thread Bloom；Hardware Sample已按address/kind建立精确offset。仍需对真实长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
-- 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
+- CPU Zone schema 2已经增加4096条一块的immutable时间包络与256-bit Thread Bloom，时间窗口和指定thread可跳过不可能命中的块；children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存。在N30.6完成前必须增加parent→children索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
 - Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
 - Runtime/Script Reader打开时只保留文件偏移和计数，但当前脚本查询仍会物化所请求域的全部Frame/Stack事件；N30.6完成前必须增加分页/范围读取。Message Reader已完成，但Legacy GC消息编码与GC聚合语义仍需单独差分，`memory.gc.*`暂不得提前宣称Session可查。
@@ -1364,6 +1364,17 @@ Trace Session Inventory tests passed
 - Hardware Sample保留address/kind精确offset，外部排序最终归并限制为最多64个同时打开的run；Windows删除前显式关闭全部reader。
 - 索引根目录使用实际schema版本，不再把Schema 2/3数据错误写入`sampling-index/1`。
 - 发布前测试枚举Sampling目录，任何残留`.work`都使阶段失败。
+
+### 2026-09-01 CPU Zone 时间与线程块索引（N30.6B 子阶段）
+
+- CPU Zone schema升级到2，在固定宽度Zone记录后追加4096条一块的immutable block目录。
+- 每个block保存精确记录范围、时间包络和256-bit Thread Bloom；Bloom只用于排除不可能命中的block，Reader仍逐条校验thread和时间交集，因此误命中只增加I/O，不会改变结果或丢失Zone。
+- `zone.cpu.search`在提供`thread_ref`时直接调用磁盘Reader的`ScanThread`，cursor中的raw offset以线程匹配子集为准，分页不会重复或遗漏。
+- inverted source clock仍忠实保留两个源端点并沿用既有交集语义；测试中的`[32,-170]ns`异常Zone会与`[15,21]ns`窗口相交，不能为了索引性能隐藏该源事实。
+- 索引根目录使用实际schema版本；header、manifest、Derived Audit同时核对block数量、布局、覆盖范围、文件大小和SHA-256。
+- 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
+
+仍待N30.6集中门禁：parent→children posting index、真实长Trace时间/thread查询延迟和SourceLocation驻留内存评估。
 
 Synthetic验证thread 42的普通/ContextSwitch Sample、Query thread filter、Hardware六类PMU事件、block计数和临时文件清理：
 

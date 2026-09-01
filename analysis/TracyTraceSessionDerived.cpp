@@ -181,6 +181,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "job_dependencies " << value.stats.jobDependencies << '\n';
     out << "job_stages " << value.stats.jobStages << '\n';
     out << "cpu_zones " << value.stats.cpuZones << '\n';
+    out << "cpu_zone_blocks " << value.stats.cpuZoneBlocks << '\n';
     out << "complete_cpu_zones " << value.stats.completeCpuZones << '\n';
     out << "invalid_cpu_zone_timings " << value.stats.invalidCpuZoneTimings << '\n';
     out << "cpu_zone_sources " << value.stats.cpuZoneSources << '\n';
@@ -302,6 +303,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "job_dependencies" ) in >> value.stats.jobDependencies;
         else if( key == "job_stages" ) in >> value.stats.jobStages;
         else if( key == "cpu_zones" ) in >> value.stats.cpuZones;
+        else if( key == "cpu_zone_blocks" ) in >> value.stats.cpuZoneBlocks;
         else if( key == "complete_cpu_zones" ) in >> value.stats.completeCpuZones;
         else if( key == "invalid_cpu_zone_timings" ) in >> value.stats.invalidCpuZoneTimings;
         else if( key == "cpu_zone_sources" ) in >> value.stats.cpuZoneSources;
@@ -609,6 +611,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     }
     else if( !BuildTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ) return false;
     index.stats.cpuZones = cpuZoneStats.zones;
+    index.stats.cpuZoneBlocks = cpuZoneStats.zoneBlocks;
     index.stats.completeCpuZones = cpuZoneStats.completeZones;
     index.stats.invalidCpuZoneTimings = cpuZoneStats.invalidTimingZones;
     index.stats.cpuZoneSources = cpuZoneStats.sourceLocations;
@@ -856,6 +859,7 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     TraceSessionCpuZoneStats cpuZoneStats;
     if( !AuditTraceSessionCpuZoneDerived( sessionRoot, manifest, cpuZoneStats, error ) ||
         cpuZoneStats.zones != index.stats.cpuZones ||
+        cpuZoneStats.zoneBlocks != index.stats.cpuZoneBlocks ||
         cpuZoneStats.completeZones != index.stats.completeCpuZones ||
         cpuZoneStats.invalidTimingZones != index.stats.invalidCpuZoneTimings ||
         cpuZoneStats.sourceLocations != index.stats.cpuZoneSources ||

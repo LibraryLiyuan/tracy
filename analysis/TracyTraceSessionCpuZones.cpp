@@ -7,6 +7,8 @@
 #include "TracyQueue.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -48,7 +50,9 @@ struct CpuZoneFileHeader
     uint64_t zoneCount = 0;
     uint64_t completeZoneCount = 0;
     uint64_t sourceCount = 0;
+    uint64_t zoneBlockCount = 0;
     uint64_t zonesOffset = 0;
+    uint64_t zoneBlocksOffset = 0;
     uint64_t extrasOffset = 0;
     uint64_t sourcesOffset = 0;
     uint64_t callsitesOffset = 0;
@@ -102,7 +106,20 @@ struct StoredCallsite
     uint8_t flags = 0;
     uint8_t unavailableReason = 0;
 };
+
+struct StoredZoneBlock
+{
+    uint64_t firstZone = 0;
+    uint32_t zoneCount = 0;
+    uint32_t reserved = 0;
+    int64_t minStartNs = 0;
+    int64_t maxEndNs = 0;
+    uint64_t threadBloom[4] {};
+};
 #pragma pack( pop )
+
+void AddThread( StoredZoneBlock& block, uint64_t thread );
+bool MayContainThread( const StoredZoneBlock& block, uint64_t thread );
 
 struct CpuZoneManifest
 {
@@ -284,6 +301,36 @@ public:
         if( !m_zones || !m_extras ) { error = "session_cpu_zone_work_flush_failed"; return false; }
         m_zones.close(); m_extras.close();
 
+        constexpr uint32_t ZonesPerBlock = 4096;
+        std::vector<StoredZoneBlock> blocks;
+        blocks.reserve( size_t( ( zoneCount + ZonesPerBlock - 1 ) / ZonesPerBlock ) );
+        std::ifstream zones( m_zonePath, std::ios::binary );
+        if( !zones ) { error = "session_cpu_zone_work_read_failed"; return false; }
+        for( uint64_t first = 0; first < zoneCount; first += ZonesPerBlock )
+        {
+            StoredZoneBlock block;
+            block.firstZone = first;
+            block.zoneCount = uint32_t( std::min<uint64_t>( ZonesPerBlock, zoneCount - first ) );
+            block.minStartNs = std::numeric_limits<int64_t>::max();
+            block.maxEndNs = std::numeric_limits<int64_t>::min();
+            for( uint32_t index = 0; index < block.zoneCount; ++index )
+            {
+                StoredZone zone;
+                if( !zones.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) ||
+                    zone.id != first + index )
+                { error = "session_cpu_zone_block_source_invalid"; return false; }
+                const auto end = ( zone.flags & ZoneComplete ) != 0 ? zone.endNs : zone.startNs;
+                block.minStartNs = std::min( block.minStartNs, std::min( zone.startNs, end ) );
+                block.maxEndNs = std::max( block.maxEndNs, std::max( zone.startNs, end ) );
+                AddThread( block, zone.thread );
+            }
+            blocks.emplace_back( block );
+        }
+        if( zones.peek() != std::char_traits<char>::eof() )
+        { error = "session_cpu_zone_block_source_trailing_bytes"; return false; }
+        zones.clear();
+        zones.seekg( 0 );
+
         const auto target = m_root / CpuZoneFileName;
         auto temporary = target; temporary += ".tmp";
         std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -293,10 +340,12 @@ public:
         header.zoneCount = zoneCount;
         header.completeZoneCount = completeZones;
         header.sourceCount = sources.size();
+        header.zoneBlockCount = blocks.size();
         header.callsiteCount = callsites.size();
         header.generationBytes = uint32_t( m_session->generation.size() );
         header.zonesOffset = sizeof( header ) + m_session->source.sha256.size() + m_session->generation.size();
-        header.extrasOffset = header.zonesOffset + zoneCount * sizeof( StoredZone );
+        header.zoneBlocksOffset = header.zonesOffset + zoneCount * sizeof( StoredZone );
+        header.extrasOffset = header.zoneBlocksOffset + blocks.size() * sizeof( StoredZoneBlock );
         header.sourcesOffset = header.extrasOffset + m_extraBytes;
         uint64_t sourceBytes = 0;
         for( const auto& source : sources ) sourceBytes += sizeof( StoredSource ) +
@@ -305,9 +354,11 @@ public:
         out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
         out.write( m_session->source.sha256.data(), std::streamsize( m_session->source.sha256.size() ) );
         out.write( m_session->generation.data(), std::streamsize( m_session->generation.size() ) );
-        std::ifstream zones( m_zonePath, std::ios::binary );
         std::ifstream extras( m_extraPath, std::ios::binary );
-        if( !zones || !extras || !CopyFileBytes( zones, out, error ) || !CopyFileBytes( extras, out, error ) ) return false;
+        if( !extras || !CopyFileBytes( zones, out, error ) ) return false;
+        if( !blocks.empty() ) out.write( reinterpret_cast<const char*>( blocks.data() ),
+            std::streamsize( blocks.size() * sizeof( StoredZoneBlock ) ) );
+        if( !out || !CopyFileBytes( extras, out, error ) ) return false;
         zones.close();
         extras.close();
         for( const auto& source : sources )
@@ -349,6 +400,7 @@ public:
         if( ec ) { error = "session_cpu_zone_file_size_failed:" + ec.message(); return false; }
         manifest.fileSha256 = Sha256File( target );
         manifest.stats.zones = zoneCount;
+        manifest.stats.zoneBlocks = blocks.size();
         manifest.stats.completeZones = completeZones;
         manifest.stats.sourceLocations = sources.size();
         manifest.stats.fileBytes = manifest.fileBytes;
@@ -849,6 +901,7 @@ bool SaveCpuZoneManifest( const std::filesystem::path& root,
     out << "file_bytes " << value.fileBytes << '\n';
     out << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n';
     out << "zones " << value.stats.zones << '\n';
+    out << "zone_blocks " << value.stats.zoneBlocks << '\n';
     out << "complete_zones " << value.stats.completeZones << '\n';
     out << "invalid_timing_zones " << value.stats.invalidTimingZones << '\n';
     out << "source_locations " << value.stats.sourceLocations << '\n';
@@ -877,6 +930,7 @@ bool LoadCpuZoneManifest( const std::filesystem::path& root,
         else if( key == "file_bytes" ) in >> value.fileBytes;
         else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 );
         else if( key == "zones" ) in >> value.stats.zones;
+        else if( key == "zone_blocks" ) in >> value.stats.zoneBlocks;
         else if( key == "complete_zones" ) in >> value.stats.completeZones;
         else if( key == "invalid_timing_zones" ) in >> value.stats.invalidTimingZones;
         else if( key == "source_locations" ) in >> value.stats.sourceLocations;
@@ -897,6 +951,48 @@ std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t 
     std::ostringstream out;
     out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
     return out.str();
+}
+
+std::optional<uint64_t> ParseThreadRef( const std::string& fingerprint,
+    std::string_view ref )
+{
+    const auto prefix = std::string( "tracy:v1:" ) + fingerprint.substr( 0, 16 ) + ":thread:";
+    if( !ref.starts_with( prefix ) ) return std::nullopt;
+    uint64_t value = 0;
+    const auto first = ref.data() + prefix.size();
+    const auto last = ref.data() + ref.size();
+    const auto parsed = std::from_chars( first, last, value, 16 );
+    if( parsed.ec != std::errc {} || parsed.ptr != last || value == 0 ) return std::nullopt;
+    return value;
+}
+
+uint64_t MixThread( uint64_t value )
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
+void AddThread( StoredZoneBlock& block, uint64_t thread )
+{
+    const auto mixed = MixThread( thread );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits ) block.threadBloom[bit >> 6] |= uint64_t( 1 ) << ( bit & 63 );
+}
+
+bool MayContainThread( const StoredZoneBlock& block, uint64_t thread )
+{
+    const auto mixed = MixThread( thread );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits )
+    {
+        if( ( block.threadBloom[bit >> 6] & ( uint64_t( 1 ) << ( bit & 63 ) ) ) == 0 ) return false;
+    }
+    return true;
 }
 
 const char* ProvenanceName( uint8_t value )
@@ -933,6 +1029,7 @@ struct TraceSessionCpuZoneReader::Impl
     uint64_t zonesOffset = 0;
     uint64_t extrasOffset = 0;
     uint64_t zoneCount = 0;
+    std::vector<StoredZoneBlock> zoneBlocks;
     std::unordered_map<int32_t, SourceState> sources;
     std::vector<StoredCallsite> callsites;
 
@@ -1015,7 +1112,7 @@ std::filesystem::path TraceSessionCpuZoneIndexRoot( const std::filesystem::path&
     const TraceSessionManifest& manifest )
 {
     return sessionRoot / "generations" / manifest.generation / "derived" /
-        "cpu-zone-index" / "1" / "exact";
+        "cpu-zone-index" / std::to_string( TraceSessionCpuZoneIndexSchemaVersion ) / "exact";
 }
 
 bool CleanupTraceSessionCpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
@@ -1114,17 +1211,42 @@ std::shared_ptr<TraceSessionCpuZoneReader> TraceSessionCpuZoneReader::Open(
         header.magic != CpuZoneFileMagic || header.schema != TraceSessionCpuZoneIndexSchemaVersion ||
         header.endian != 0x01020304 || header.sourceSize != session.source.fileSize ||
         header.zoneCount != manifest.stats.zones || header.completeZoneCount != manifest.stats.completeZones ||
-        header.sourceCount != manifest.stats.sourceLocations || header.generationBytes != session.generation.size() )
+        header.sourceCount != manifest.stats.sourceLocations ||
+        header.zoneBlockCount != manifest.stats.zoneBlocks ||
+        header.generationBytes != session.generation.size() )
     { error = "session_cpu_zone_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
     if( !in.read( sha.data(), std::streamsize( sha.size() ) ) ||
         !in.read( generation.data(), std::streamsize( generation.size() ) ) ||
         sha != session.source.sha256 || generation != session.generation )
     { error = "session_cpu_zone_file_identity_invalid"; return {}; }
+    const auto expectedZonesOffset = sizeof( header ) + sha.size() + generation.size();
+    const auto expectedBlocksOffset = expectedZonesOffset + header.zoneCount * sizeof( StoredZone );
+    const auto expectedExtrasOffset = expectedBlocksOffset + header.zoneBlockCount * sizeof( StoredZoneBlock );
+    if( header.zonesOffset != expectedZonesOffset || header.zoneBlocksOffset != expectedBlocksOffset ||
+        header.extrasOffset != expectedExtrasOffset || header.sourcesOffset < header.extrasOffset ||
+        header.callsitesOffset < header.sourcesOffset ||
+        header.callsitesOffset + header.callsiteCount * sizeof( StoredCallsite ) != manifest.fileBytes )
+    { error = "session_cpu_zone_file_layout_invalid"; return {}; }
     auto impl = std::make_shared<Impl>();
     impl->path = path; impl->fingerprint = session.source.sha256;
     impl->zonesOffset = header.zonesOffset; impl->extrasOffset = header.extrasOffset;
     impl->zoneCount = header.zoneCount;
+    impl->zoneBlocks.resize( size_t( header.zoneBlockCount ) );
+    in.seekg( std::streamoff( header.zoneBlocksOffset ) );
+    if( !impl->zoneBlocks.empty() && !in.read( reinterpret_cast<char*>( impl->zoneBlocks.data() ),
+        std::streamsize( impl->zoneBlocks.size() * sizeof( StoredZoneBlock ) ) ) )
+    { error = "session_cpu_zone_block_records_truncated"; return {}; }
+    uint64_t expectedFirstZone = 0;
+    for( const auto& block : impl->zoneBlocks )
+    {
+        if( block.firstZone != expectedFirstZone || block.zoneCount == 0 || block.zoneCount > 4096 ||
+            block.firstZone + block.zoneCount > header.zoneCount || block.minStartNs > block.maxEndNs )
+        { error = "session_cpu_zone_block_record_invalid"; return {}; }
+        expectedFirstZone += block.zoneCount;
+    }
+    if( expectedFirstZone != header.zoneCount )
+    { error = "session_cpu_zone_block_coverage_invalid"; return {}; }
     in.seekg( std::streamoff( header.sourcesOffset ) );
     for( uint64_t i = 0; i < header.sourceCount; ++i )
     {
@@ -1204,22 +1326,44 @@ std::optional<CpuZoneDto> TraceSessionCpuZoneReader::Get( uint64_t id ) const
 
 std::vector<CpuZoneDto> TraceSessionCpuZoneReader::Scan( const ScanRange& range ) const
 {
+    return ScanImpl( range, std::nullopt );
+}
+
+std::vector<CpuZoneDto> TraceSessionCpuZoneReader::ScanThread(
+    std::string_view threadRef, const ScanRange& range ) const
+{
+    const auto thread = ParseThreadRef( m_impl->fingerprint, threadRef );
+    return thread ? ScanImpl( range, thread ) : std::vector<CpuZoneDto> {};
+}
+
+std::vector<CpuZoneDto> TraceSessionCpuZoneReader::ScanImpl(
+    const ScanRange& range, std::optional<uint64_t> thread ) const
+{
     std::vector<CpuZoneDto> result;
+    if( range.limit == 0 ) return result;
     size_t skipped = 0;
     std::ifstream in( m_impl->path, std::ios::binary );
     if( !in ) return result;
-    in.seekg( std::streamoff( m_impl->zonesOffset ) );
-    for( uint64_t id = 0; id < m_impl->zoneCount; ++id )
+    for( const auto& block : m_impl->zoneBlocks )
     {
-        StoredZone zone;
-        if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) || zone.id != id ) break;
-        const auto end = ( zone.flags & ZoneComplete ) != 0 ? zone.endNs : zone.startNs;
-        const auto lower = std::min( zone.startNs, end );
-        const auto upper = std::max( zone.startNs, end );
-        if( upper < range.startNs || lower > range.endNs ) continue;
-        if( skipped++ < range.offset ) continue;
-        result.emplace_back( m_impl->ToDto( zone ) );
-        if( result.size() >= range.limit ) break;
+        if( block.maxEndNs < range.startNs || block.minStartNs > range.endNs ||
+            ( thread && !MayContainThread( block, *thread ) ) ) continue;
+        in.clear();
+        in.seekg( std::streamoff( m_impl->zonesOffset + block.firstZone * sizeof( StoredZone ) ) );
+        for( uint32_t index = 0; index < block.zoneCount; ++index )
+        {
+            StoredZone zone;
+            const auto id = block.firstZone + index;
+            if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) || zone.id != id ) return result;
+            if( thread && zone.thread != *thread ) continue;
+            const auto end = ( zone.flags & ZoneComplete ) != 0 ? zone.endNs : zone.startNs;
+            const auto lower = std::min( zone.startNs, end );
+            const auto upper = std::max( zone.startNs, end );
+            if( upper < range.startNs || lower > range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            result.emplace_back( m_impl->ToDto( zone ) );
+            if( result.size() >= range.limit ) return result;
+        }
     }
     return result;
 }

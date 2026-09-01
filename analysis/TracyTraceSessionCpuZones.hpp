@@ -15,7 +15,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionCpuZoneIndexSchemaVersion = 1;
+inline constexpr uint32_t TraceSessionCpuZoneIndexSchemaVersion = 2;
 
 struct TraceSessionCpuZoneStats
 {
@@ -25,6 +25,7 @@ struct TraceSessionCpuZoneStats
     uint64_t sourceLocations = 0;
     uint64_t beginEvents = 0;
     uint64_t endEvents = 0;
+    uint64_t zoneBlocks = 0;
     uint64_t fileBytes = 0;
 };
 
@@ -39,12 +40,16 @@ public:
     std::vector<SourceLocationDto> Sources() const;
     std::vector<CallsiteDto> Callsites() const;
     std::vector<CpuZoneDto> Scan( const ScanRange& range ) const;
+    std::vector<CpuZoneDto> ScanThread( std::string_view threadRef,
+        const ScanRange& range ) const;
     std::optional<CpuZoneDto> Get( uint64_t id ) const;
     std::vector<CpuZoneDto> Children( uint64_t id, size_t offset, size_t limit ) const;
 
 private:
     struct Impl;
     explicit TraceSessionCpuZoneReader( std::shared_ptr<Impl> impl );
+    std::vector<CpuZoneDto> ScanImpl( const ScanRange& range,
+        std::optional<uint64_t> thread ) const;
     std::shared_ptr<Impl> m_impl;
     TraceSessionCpuZoneStats m_stats;
 };

@@ -8095,8 +8095,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "zone.cpu.search" )
     {
         const auto page = ParsePage( params, method, trace );
+        const std::string threadRef = params.value( "thread_ref", "" );
         auto scanPage = ScanFiltered<analysis::CpuZoneDto>( *source, params, page,
-            []( const auto& source, const auto& range ) { return source.ScanCpuZones( range ); },
+            [&]( const auto& source, const auto& range ) {
+                return threadRef.empty() ? source.ScanCpuZones( range ) :
+                    source.ScanCpuZonesForThread( threadRef, range );
+            },
             [&]( const auto& value ) { return TextMatches( value.name, params ); }, CpuZoneJson );
         scanPage.values = ProjectFields( std::move( scanPage.values ), params );
         const auto returned = scanPage.values.size();

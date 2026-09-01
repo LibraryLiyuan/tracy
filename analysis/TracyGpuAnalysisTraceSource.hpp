@@ -56,6 +56,8 @@ public:
     std::vector<PlotDto> GetPlotList() const override;
     std::vector<LockDto> GetLocks() const override;
     std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const override;
+    std::vector<CpuZoneDto> ScanCpuZonesForThread(
+        std::string_view threadRef, const ScanRange& range ) const override;
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
