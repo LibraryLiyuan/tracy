@@ -31,6 +31,8 @@ struct TraceSessionDerivedStats
     uint64_t gpuResources = 0;
     uint64_t gpuAllocations = 0;
     uint64_t gpuPasses = 0;
+    uint64_t gpuSourceGapResources = 0;
+    uint64_t gpuSourceGapReferences = 0;
     uint64_t frameSets = 0;
     uint64_t frames = 0;
     uint64_t completeFrames = 0;
@@ -77,6 +79,8 @@ struct TraceSessionDerivedStats
     uint64_t contextSwitchSampleEvents = 0;
     uint64_t sampleDictionaryEntries = 0;
     uint64_t callstackPayloads = 0;
+    uint64_t hardwareSampleEvents = 0;
+    uint64_t hardwareSampleAddresses = 0;
     uint64_t contextSwitchRecords = 0;
     uint64_t threadWakeupRecords = 0;
     uint64_t contextSwitchEvents = 0;
@@ -84,6 +88,10 @@ struct TraceSessionDerivedStats
     uint64_t cpuContextSwitchEvents = 0;
     uint64_t completeCpuContextSwitchEvents = 0;
     uint64_t schedulingSourceGaps = 0;
+    uint64_t cpuTopologyRecords = 0;
+    uint64_t cpuTopologyCpus = 0;
+    uint64_t threadSummaries = 0;
+    uint64_t cpuUsagePoints = 0;
     uint64_t relations = 0;
     uint64_t runtimeDomainStates = 0;
     uint64_t scriptFrames = 0;

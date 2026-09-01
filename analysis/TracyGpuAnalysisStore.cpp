@@ -10,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <numeric>
+#include <queue>
 #include <sstream>
 #include <type_traits>
 #include <unordered_map>
@@ -32,6 +33,7 @@ namespace
 constexpr uint64_t StoreManifestMagic = 0x314d5453474e4aull; // JNGSTM1
 constexpr uint64_t RelationMagic = 0x31584449474e4aull; // JNGIDX1
 constexpr uint64_t PassPageMagic = 0x31534150474e4aull; // JNGPAS1
+constexpr uint64_t ResourceSummaryPageMagic = 0x31525352474e4aull; // JNGRSR1
 constexpr uint64_t FnvOffset = 14695981039346656037ull;
 constexpr uint64_t FnvPrime = 1099511628211ull;
 
@@ -77,6 +79,49 @@ struct PassPageRecord
     uint8_t complete = 0;
     uint8_t truncated = 0;
     uint8_t reserved[2] {};
+};
+
+struct ResourceSummaryPageHeader
+{
+    uint64_t magic = ResourceSummaryPageMagic;
+    uint32_t schema = GpuAnalysisStoreSchemaVersion;
+    uint32_t recordCount = 0;
+    uint64_t payloadBytes = 0;
+    uint64_t checksum = 0;
+};
+
+struct ResourceSummaryPageRecord
+{
+    uint64_t generation = 0;
+    uint64_t resourceId = 0;
+    uint64_t allocationId = 0;
+    uint64_t capacityBytes = 0;
+    uint64_t allocationOffsetBytes = 0;
+    uint64_t createTime = 0;
+    uint64_t destroyTime = 0;
+    uint64_t nameHash = 0;
+    uint64_t viewCount = 0;
+    uint64_t logicalBindingCount = 0;
+    uint64_t partCount = 0;
+    uint64_t rangeCount = 0;
+    uint64_t relationCount = 0;
+    uint64_t vgRecordCount = 0;
+    uint64_t allocationResourceCount = 0;
+    uint32_t createCallsiteId = 0;
+    uint32_t definitionRevision = 0;
+    uint32_t nameOriginalLength = 0;
+    uint32_t nameBytes = 0;
+    uint16_t primaryKind = 0;
+    uint8_t resourceClass = 0;
+    uint8_t memoryDomain = 0;
+    uint8_t allocationKind = 0;
+    uint8_t nameProvenance = 0;
+    uint8_t stackProvenance = 0;
+    uint8_t exactness = 0;
+    uint8_t openBoundary = 0;
+    uint8_t aliveAtEnd = 0;
+    uint8_t hasAliasGroup = 0;
+    uint8_t reserved[5] {};
 };
 #pragma pack( pop )
 
@@ -252,7 +297,9 @@ bool SaveStoreManifest( const std::filesystem::path& root, const GpuAnalysisStor
     out << "trace_size " << value.traceSize << '\n';
 #define W( field ) out << #field " " << value.field << '\n'
     W( resourceCount ); W( allocationCount ); W( passCount ); W( residencyCount ); W( churnCount );
-    W( resourcePassRelationCount ); W( framePassRelationCount ); W( totalBytes );
+    W( resourcePassRelationCount ); W( framePassRelationCount ); W( rangeCount );
+    W( logicalCount ); W( catalogRelationCount ); W( sourceGapResourceCount );
+    W( sourceGapReferenceCount ); W( totalBytes );
 #undef W
     out << "complete " << value.complete << '\n';
     out << "reason " << std::quoted( value.reason ) << '\n';
@@ -492,6 +539,182 @@ bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
         identity, snapshot, control, generation, writtenBytes, error );
 }
 
+bool WriteSortedPassBatch( const std::filesystem::path& root,
+    const std::vector<GpuPassWorkingSet>& input, uint64_t firstIndex,
+    uint32_t pageIndex, std::vector<GpuAnalysisStorePage>& pages,
+    uint64_t& totalBytes, const GpuAnalysisSidecarControl& control,
+    const std::function<bool()>& checkpoint, std::string& error )
+{
+    if( input.empty() ) return true;
+    if( !std::is_sorted( input.begin(), input.end(), []( const auto& lhs, const auto& rhs ) {
+        return lhs.passId < rhs.passId;
+    } ) ) { error = "store_spool_pass_order_invalid"; return false; }
+    std::error_code ec; const auto pageRoot = root / "passes";
+    std::filesystem::create_directories( GpuAnalysisIoPath( pageRoot ), ec );
+    if( ec ) { error = "store_pass_directory_failed:" + ec.message(); return false; }
+    std::vector<std::vector<uint64_t>> dictionary;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> dictionaryByHash;
+    const auto intern = [&]( const std::vector<uint64_t>& value ) -> uint32_t {
+        uint64_t hash = FnvOffset; const uint64_t count = value.size();
+        hash = HashUpdate( hash, &count, sizeof( count ) );
+        if( !value.empty() ) hash = HashUpdate( hash, value.data(), value.size() * sizeof( uint64_t ) );
+        auto& candidates = dictionaryByHash[hash];
+        for( const auto id : candidates ) if( dictionary[id] == value ) return id;
+        const auto id = uint32_t( dictionary.size() ); dictionary.push_back( value );
+        candidates.push_back( id ); return id;
+    };
+    std::vector<PassPageRecord> records; records.reserve( input.size() );
+    for( const auto& value : input )
+    {
+        PassPageRecord record;
+        record.passId = value.passId; record.parentPassId = value.parentPassId;
+        record.frameId = value.frameId; record.commandListId = value.commandListId;
+        record.startNs = value.startNs; record.endNs = value.endNs;
+        record.directRangeBytes = value.directRangeBytes;
+        record.directPhysicalBytes = value.directPhysicalBytes;
+        record.inclusivePhysicalBytes = value.inclusivePhysicalBytes;
+        record.unknownRangeResourceCount = value.unknownRangeResourceCount;
+        record.nameBytes = uint32_t( value.name.size() );
+        record.directSetId = intern( value.directResources );
+        record.inclusiveSetId = intern( value.inclusiveResources );
+        record.evidenceCount = uint32_t( value.detailedEvidence.size() );
+        record.complete = value.complete; record.truncated = value.truncated;
+        records.push_back( record );
+    }
+    std::vector<uint8_t> payload; AppendPod( payload, uint64_t( dictionary.size() ) );
+    for( const auto& set : dictionary )
+    {
+        std::vector<uint8_t> delta; delta.reserve( set.size() * 2 ); uint64_t previous = 0;
+        for( const auto value : set ) { AppendVarint( delta, value - previous ); previous = value; }
+        const uint8_t encoding = delta.size() < set.size() * sizeof( uint64_t ) ? 1 : 0;
+        const uint32_t count = uint32_t( set.size() );
+        const uint64_t bytes = encoding ? delta.size() : set.size() * sizeof( uint64_t );
+        AppendPod( payload, count ); AppendPod( payload, encoding );
+        const uint8_t reserved[3] {}; AppendBytes( payload, reserved, sizeof( reserved ) );
+        AppendPod( payload, bytes );
+        if( encoding ) AppendBytes( payload, delta.data(), delta.size() );
+        else AppendBytes( payload, set.data(), size_t( bytes ) );
+    }
+    AppendPod( payload, uint64_t( records.size() ) );
+    for( size_t index = 0; index < records.size(); ++index )
+    {
+        AppendPod( payload, records[index] );
+        AppendBytes( payload, input[index].name.data(), input[index].name.size() );
+        AppendBytes( payload, input[index].detailedEvidence.data(),
+            input[index].detailedEvidence.size() * sizeof( GpuDetailedEvidenceAnalysisRecord ) );
+    }
+    PassPageHeader header; header.recordCount = uint32_t( records.size() );
+    header.dictionaryCount = dictionary.size(); header.payloadBytes = payload.size();
+    header.checksum = HashUpdate( FnvOffset, payload.data(), payload.size() );
+    std::ostringstream fileName; fileName << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
+    const auto path = pageRoot / fileName.str(); auto temporary = path; temporary += ".tmp";
+    { std::ofstream out( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
+      out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+      out.write( reinterpret_cast<const char*>( payload.data() ), std::streamsize( payload.size() ) );
+      out.flush(); if( !out ) { error = "store_pass_write_failed"; return false; } }
+    if( !AtomicReplace( temporary, path, error ) ) return false;
+    uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
+    if( !error.empty() ) return false;
+    if( totalBytes > control.maximumSidecarBytes - fileBytes )
+    { error = "sidecar_size_limit"; return false; }
+    pages.push_back( { GpuAnalysisStorePageKind::Pass, firstIndex, input.size(),
+        input.front().passId, input.back().passId, fileBytes, checksum,
+        std::filesystem::relative( path, root ) } );
+    totalBytes += fileBytes;
+    if( !checkpoint() ) return false;
+    if( control.progress ) control.progress( 0.f, "store-page-committed" );
+    return true;
+}
+
+template<typename T, typename Compare>
+bool WriteSortedRun( const std::filesystem::path& path, std::vector<T>& values,
+    Compare compare, std::string& error, bool deduplicate = true )
+{
+    static_assert( std::is_trivially_copyable_v<T> );
+    std::sort( values.begin(), values.end(), compare );
+    if( deduplicate ) values.erase( std::unique( values.begin(), values.end(),
+        []( const T& lhs, const T& rhs ) {
+            return std::memcmp( &lhs, &rhs, sizeof( T ) ) == 0;
+        } ), values.end() );
+    std::ofstream out( GpuAnalysisIoPath( path ), std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "store_relation_run_open_failed"; return false; }
+    if( !values.empty() ) out.write( reinterpret_cast<const char*>( values.data() ),
+        std::streamsize( values.size() * sizeof( T ) ) );
+    out.flush(); if( !out ) { error = "store_relation_run_write_failed"; return false; }
+    return true;
+}
+
+template<typename T, typename Compare, typename KeyFn>
+bool MergeRelationRuns( const std::filesystem::path& root,
+    GpuAnalysisStorePageKind kind, const char* directory,
+    const std::vector<std::filesystem::path>& runs, Compare compare, KeyFn keyOf,
+    std::vector<GpuAnalysisStorePage>& pages, uint64_t& totalBytes,
+    const GpuAnalysisSidecarControl& control, const std::function<bool()>& checkpoint,
+    uint64_t& mergedCount, std::string& error, bool deduplicate = true )
+{
+    struct Cursor { std::ifstream in; T value {}; bool valid = false; };
+    struct Node { T value {}; size_t run = 0; };
+    struct Later { Compare compare; bool operator()( const Node& lhs, const Node& rhs ) const {
+        return compare( rhs.value, lhs.value );
+    } };
+    std::vector<Cursor> cursors( runs.size() );
+    std::priority_queue<Node, std::vector<Node>, Later> heap( Later { compare } );
+    for( size_t i = 0; i < runs.size(); ++i )
+    {
+        cursors[i].in.open( GpuAnalysisIoPath( runs[i] ), std::ios::binary );
+        if( !cursors[i].in ) { error = "store_relation_run_read_open_failed"; return false; }
+        cursors[i].valid = bool( cursors[i].in.read(
+            reinterpret_cast<char*>( &cursors[i].value ), sizeof( T ) ) );
+        if( cursors[i].valid ) heap.push( { cursors[i].value, i } );
+    }
+    std::error_code ec; const auto pageRoot = root / directory;
+    std::filesystem::create_directories( GpuAnalysisIoPath( pageRoot ), ec );
+    if( ec ) { error = "store_relation_directory_failed:" + ec.message(); return false; }
+    const size_t perPage = size_t( std::max<uint64_t>( 1,
+        control.targetDerivedPageBytes / sizeof( T ) ) );
+    std::vector<T> page; page.reserve( perPage );
+    uint32_t pageIndex = 0; uint64_t firstIndex = 0; mergedCount = 0;
+    T previous {}; bool havePrevious = false;
+    const auto flush = [&]() -> bool {
+        if( page.empty() ) return true;
+        RelationHeader header; header.kind = uint8_t( kind ); header.firstIndex = firstIndex;
+        header.recordCount = page.size(); header.payloadBytes = page.size() * sizeof( T );
+        header.checksum = HashUpdate( FnvOffset, page.data(), size_t( header.payloadBytes ) );
+        std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex++ << ".bin";
+        const auto path = pageRoot / name.str(); auto temporary = path; temporary += ".tmp";
+        std::ofstream out( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
+        if( !out ) { error = "store_relation_open_failed"; return false; }
+        out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+        out.write( reinterpret_cast<const char*>( page.data() ), std::streamsize( header.payloadBytes ) );
+        out.flush(); if( !out ) { error = "store_relation_write_failed"; return false; }
+        out.close(); if( !AtomicReplace( temporary, path, error ) ) return false;
+        uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
+        if( !error.empty() ) return false;
+        pages.push_back( { kind, firstIndex, page.size(), keyOf( page.front() ),
+            keyOf( page.back() ), fileBytes, checksum, std::filesystem::relative( path, root ) } );
+        totalBytes += fileBytes; firstIndex += page.size(); page.clear();
+        if( !checkpoint() ) return false;
+        if( control.progress ) control.progress( 0.f, "store-page-committed" );
+        return true;
+    };
+    while( !heap.empty() )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        const auto node = heap.top(); heap.pop();
+        if( !deduplicate || !havePrevious ||
+            std::memcmp( &previous, &node.value, sizeof( T ) ) != 0 )
+        {
+            page.push_back( node.value ); previous = node.value; havePrevious = true; ++mergedCount;
+            if( page.size() == perPage && !flush() ) return false;
+        }
+        auto& cursor = cursors[node.run];
+        cursor.valid = bool( cursor.in.read( reinterpret_cast<char*>( &cursor.value ), sizeof( T ) ) );
+        if( cursor.valid ) heap.push( { cursor.value, node.run } );
+        else if( !cursor.in.eof() ) { error = "store_relation_run_read_failed"; return false; }
+    }
+    return flush();
+}
+
 bool WriteGpuAnalysisDerivedStoreAt( const std::filesystem::path& algorithmRoot,
     const GpuAnalysisTraceIdentity& identity, const GpuAnalysisSnapshot& snapshot,
     const GpuAnalysisSidecarControl& control, std::string& generation,
@@ -618,6 +841,620 @@ bool WriteGpuAnalysisDerivedStoreAt( const std::filesystem::path& algorithmRoot,
     progress( 1.f, "store-complete" ); return true;
 }
 
+template<typename T, typename Compare>
+class MergedRunCursor
+{
+    struct Cursor { std::ifstream in; T value {}; };
+    struct Node { T value {}; size_t run = 0; };
+    struct Later
+    {
+        Compare compare;
+        bool operator()( const Node& lhs, const Node& rhs ) const
+        { return compare( rhs.value, lhs.value ); }
+    };
+public:
+    explicit MergedRunCursor( Compare compare )
+        : m_compare( std::move( compare ) ), m_heap( Later { m_compare } ) {}
+
+    bool Open( const std::vector<std::filesystem::path>& runs, std::string& error )
+    {
+        m_cursors.resize( runs.size() );
+        for( size_t i = 0; i < runs.size(); ++i )
+        {
+            auto& cursor = m_cursors[i];
+            cursor.in.open( GpuAnalysisIoPath( runs[i] ), std::ios::binary );
+            if( !cursor.in ) { error = "store_enrichment_run_open_failed"; return false; }
+            if( cursor.in.read( reinterpret_cast<char*>( &cursor.value ), sizeof( T ) ) )
+                m_heap.push( { cursor.value, i } );
+            else if( !cursor.in.eof() )
+            { error = "store_enrichment_run_read_failed"; return false; }
+        }
+        return true;
+    }
+
+    bool Empty() const { return m_heap.empty(); }
+    const T& Front() const { return m_heap.top().value; }
+    bool Pop( T& value, std::string& error )
+    {
+        if( m_heap.empty() ) return false;
+        const auto node = m_heap.top(); m_heap.pop(); value = node.value;
+        auto& cursor = m_cursors[node.run];
+        if( cursor.in.read( reinterpret_cast<char*>( &cursor.value ), sizeof( T ) ) )
+            m_heap.push( { cursor.value, node.run } );
+        else if( !cursor.in.eof() )
+        { error = "store_enrichment_run_read_failed"; return false; }
+        return true;
+    }
+private:
+    Compare m_compare;
+    std::vector<Cursor> m_cursors;
+    std::priority_queue<Node, std::vector<Node>, Later> m_heap;
+};
+
+GpuAnalysisResourceSummary ResourceSummaryOf( const GpuResourceAnalysisRecord& value,
+    uint64_t allocationResourceCount )
+{
+    GpuAnalysisResourceSummary result;
+    result.generation = value.generation;
+    result.resourceId = value.resourceId;
+    result.allocationId = value.allocationId;
+    result.capacityBytes = value.capacityBytes;
+    result.allocationOffsetBytes = value.allocationOffsetBytes;
+    result.createTime = value.createTime;
+    result.destroyTime = value.destroyTime;
+    result.nameHash = value.nameHash;
+    result.createCallsiteId = value.createCallsiteId;
+    result.definitionRevision = value.definitionRevision;
+    result.nameOriginalLength = value.nameOriginalLength;
+    result.viewCount = value.views.size();
+    result.logicalBindingCount = value.logicals.size();
+    result.partCount = value.parts.size();
+    result.rangeCount = value.ranges.size();
+    result.relationCount = value.relations.size();
+    result.vgRecordCount = value.virtualGeometry.size();
+    result.primaryKind = value.primaryKind;
+    result.resourceClass = value.resourceClass;
+    result.memoryDomain = value.memoryDomain;
+    result.allocationKind = value.allocationKind;
+    result.nameProvenance = value.nameProvenance;
+    result.stackProvenance = value.stackProvenance;
+    result.exactness = value.exactness;
+    result.openBoundary = value.openBoundary;
+    result.aliveAtEnd = value.aliveAtEnd;
+    result.name = value.name;
+    result.hasAliasGroup = std::any_of( value.logicals.begin(), value.logicals.end(),
+        []( const auto& item ) { return item.value.aliasGroupId != 0; } );
+    result.allocationResourceCount = allocationResourceCount;
+    return result;
+}
+
+bool WriteResourceSummaryPage( const std::filesystem::path& root,
+    const std::vector<GpuAnalysisResourceSummary>& values, uint64_t firstIndex,
+    uint32_t pageIndex, std::vector<GpuAnalysisStorePage>& pages,
+    uint64_t& totalBytes, const GpuAnalysisSidecarControl& control,
+    const std::function<bool()>& checkpoint, std::string& error )
+{
+    if( values.empty() ) return true;
+    if( values.size() > std::numeric_limits<uint32_t>::max() )
+    { error = "store_resource_summary_record_count_overflow"; return false; }
+    std::vector<uint8_t> payload;
+    payload.reserve( values.size() * sizeof( ResourceSummaryPageRecord ) );
+    for( const auto& value : values )
+    {
+        if( value.name.size() > std::numeric_limits<uint32_t>::max() )
+        { error = "store_resource_summary_name_too_large"; return false; }
+        ResourceSummaryPageRecord record;
+        record.generation = value.generation;
+        record.resourceId = value.resourceId;
+        record.allocationId = value.allocationId;
+        record.capacityBytes = value.capacityBytes;
+        record.allocationOffsetBytes = value.allocationOffsetBytes;
+        record.createTime = value.createTime;
+        record.destroyTime = value.destroyTime;
+        record.nameHash = value.nameHash;
+        record.viewCount = value.viewCount;
+        record.logicalBindingCount = value.logicalBindingCount;
+        record.partCount = value.partCount;
+        record.rangeCount = value.rangeCount;
+        record.relationCount = value.relationCount;
+        record.vgRecordCount = value.vgRecordCount;
+        record.allocationResourceCount = value.allocationResourceCount;
+        record.createCallsiteId = value.createCallsiteId;
+        record.definitionRevision = value.definitionRevision;
+        record.nameOriginalLength = value.nameOriginalLength;
+        record.nameBytes = uint32_t( value.name.size() );
+        record.primaryKind = value.primaryKind;
+        record.resourceClass = value.resourceClass;
+        record.memoryDomain = value.memoryDomain;
+        record.allocationKind = value.allocationKind;
+        record.nameProvenance = value.nameProvenance;
+        record.stackProvenance = value.stackProvenance;
+        record.exactness = value.exactness;
+        record.openBoundary = value.openBoundary;
+        record.aliveAtEnd = value.aliveAtEnd;
+        record.hasAliasGroup = value.hasAliasGroup;
+        AppendPod( payload, record );
+        AppendBytes( payload, value.name.data(), value.name.size() );
+    }
+    ResourceSummaryPageHeader header;
+    header.recordCount = uint32_t( values.size() );
+    header.payloadBytes = payload.size();
+    header.checksum = HashUpdate( FnvOffset, payload.data(), payload.size() );
+    std::error_code ec;
+    const auto pageRoot = root / "resource-summary";
+    std::filesystem::create_directories( GpuAnalysisIoPath( pageRoot ), ec );
+    if( ec ) { error = "store_resource_summary_directory_failed:" + ec.message(); return false; }
+    std::ostringstream fileName;
+    fileName << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
+    const auto path = pageRoot / fileName.str(); auto temporary = path; temporary += ".tmp";
+    {
+        std::ofstream out( GpuAnalysisIoPath( temporary ), std::ios::binary | std::ios::trunc );
+        if( !out ) { error = "store_resource_summary_open_failed"; return false; }
+        out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+        out.write( reinterpret_cast<const char*>( payload.data() ), std::streamsize( payload.size() ) );
+        out.flush();
+        if( !out ) { error = "store_resource_summary_write_failed"; return false; }
+    }
+    if( !AtomicReplace( temporary, path, error ) ) return false;
+    uint64_t fileBytes = 0;
+    const auto checksum = FileChecksum( path, fileBytes, error );
+    if( !error.empty() ) return false;
+    if( totalBytes > control.maximumSidecarBytes - fileBytes )
+    { error = "sidecar_size_limit"; return false; }
+    pages.push_back( { GpuAnalysisStorePageKind::ResourceSummary, firstIndex,
+        uint64_t( values.size() ), values.front().resourceId, values.back().resourceId,
+        fileBytes, checksum, std::filesystem::relative( path, root ) } );
+    totalBytes += fileBytes;
+    return checkpoint();
+}
+
+bool WriteEnrichedResourcePages( const std::filesystem::path& root,
+    const GpuAnalysisSnapshot& catalogSnapshot, const GpuAnalysisPassSpool& passSpool,
+    const std::vector<JnGpuCatalogStringData>& catalogStrings,
+    const GpuAnalysisCacheIdentity& identity, std::vector<GpuAnalysisStorePage>& pages,
+    uint64_t& totalBytes, const GpuAnalysisSidecarControl& control,
+    const std::function<bool()>& checkpoint, std::string& error )
+{
+    const auto logicalCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+        if( lhs.record.logicalResourceId != rhs.record.logicalResourceId )
+            return lhs.record.logicalResourceId < rhs.record.logicalResourceId;
+        return lhs.generation < rhs.generation;
+    };
+    const auto relationCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        if( lhs.record.time != rhs.record.time ) return lhs.record.time < rhs.record.time;
+        if( lhs.record.sourceId != rhs.record.sourceId ) return lhs.record.sourceId < rhs.record.sourceId;
+        if( lhs.record.targetId != rhs.record.targetId ) return lhs.record.targetId < rhs.record.targetId;
+        return lhs.generation < rhs.generation;
+    };
+    MergedRunCursor<GpuAnalysisLogicalStoreEntry, decltype( logicalCompare )> logicals( logicalCompare );
+    MergedRunCursor<GpuAnalysisCatalogRelationStoreEntry, decltype( relationCompare )> relations( relationCompare );
+    if( !logicals.Open( passSpool.logicalRuns, error ) ||
+        !relations.Open( passSpool.catalogRelationRuns, error ) ) return false;
+
+    struct StringKey
+    {
+        uint64_t generation = 0; uint32_t id = 0;
+        bool operator==( const StringKey& rhs ) const
+        { return generation == rhs.generation && id == rhs.id; }
+    };
+    struct StringHash
+    {
+        size_t operator()( const StringKey& value ) const
+        { return size_t( value.generation ^ ( uint64_t( value.id ) * 0x9e3779b97f4a7c15ull ) ); }
+    };
+    std::unordered_map<StringKey, const std::string*, StringHash> strings;
+    strings.reserve( catalogStrings.size() );
+    for( const auto& value : catalogStrings )
+        strings.emplace( StringKey { value.generation, value.header.stringId }, &value.value );
+    const auto stringFor = [&]( uint64_t generation, uint32_t id ) -> std::string {
+        if( id == 0 ) return {};
+        const auto found = strings.find( { generation, id } );
+        return found == strings.end() ? std::string() : *found->second;
+    };
+
+    std::vector<size_t> order( catalogSnapshot.resources.size() );
+    std::iota( order.begin(), order.end(), size_t( 0 ) );
+    std::stable_sort( order.begin(), order.end(), [&]( size_t lhs, size_t rhs ) {
+        return catalogSnapshot.resources[lhs].resourceId < catalogSnapshot.resources[rhs].resourceId;
+    } );
+    std::error_code ec; const auto pageRoot = root / "resources";
+    std::filesystem::create_directories( GpuAnalysisIoPath( pageRoot ), ec );
+    if( ec ) { error = "store_resource_directory_failed:" + ec.message(); return false; }
+    uint64_t logicalCount = 0, relationCount = 0;
+    size_t first = 0; uint32_t pageIndex = 0;
+    while( first < order.size() )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        GpuAnalysisSnapshot page = OverviewOf( catalogSnapshot );
+        const auto begin = first; uint64_t estimated = 0;
+        while( first < order.size() && ( first == begin || estimated < control.targetDerivedPageBytes ) )
+        {
+            const auto& resource = catalogSnapshot.resources[order[first++]];
+            estimated += ResourceBytes( resource ); page.resources.push_back( resource );
+        }
+        const auto firstKey = page.resources.front().resourceId;
+        const auto lastKey = page.resources.back().resourceId;
+        const auto findResource = [&]( uint64_t id ) -> GpuResourceAnalysisRecord* {
+            const auto found = std::lower_bound( page.resources.begin(), page.resources.end(), id,
+                []( const auto& value, uint64_t key ) { return value.resourceId < key; } );
+            return found == page.resources.end() || found->resourceId != id ? nullptr : &*found;
+        };
+        while( !logicals.Empty() && logicals.Front().resourceId <= lastKey )
+        {
+            GpuAnalysisLogicalStoreEntry value;
+            if( !logicals.Pop( value, error ) ) return false;
+            auto* resource = findResource( value.resourceId );
+            if( !resource || value.resourceId < firstKey )
+            { error = "store_logical_resource_missing"; return false; }
+            resource->logicals.push_back( { value.generation, value.record,
+                stringFor( value.nameGeneration, value.record.nameId ) } );
+            ++logicalCount;
+        }
+        while( !relations.Empty() && relations.Front().resourceId <= lastKey )
+        {
+            GpuAnalysisCatalogRelationStoreEntry value;
+            if( !relations.Pop( value, error ) ) return false;
+            auto* resource = findResource( value.resourceId );
+            if( !resource || value.resourceId < firstKey )
+            { error = "store_catalog_relation_resource_missing"; return false; }
+            resource->relations.push_back( { value.generation, value.record } );
+            ++relationCount;
+        }
+        const auto committedPageIndex = pageIndex++;
+        std::ostringstream fileName; fileName << std::setw( 6 ) << std::setfill( '0' )
+            << committedPageIndex << ".bin";
+        const auto path = pageRoot / fileName.str();
+        if( !SaveGpuAnalysisCache( path, identity, page, error ) ) return false;
+        uint64_t fileBytes = 0; const auto checksum = FileChecksum( path, fileBytes, error );
+        if( !error.empty() ) return false;
+        if( totalBytes > control.maximumSidecarBytes - fileBytes )
+        { error = "sidecar_size_limit"; return false; }
+        pages.push_back( { GpuAnalysisStorePageKind::Resource, begin, page.resources.size(),
+            firstKey, lastKey, fileBytes, checksum, std::filesystem::relative( path, root ) } );
+        totalBytes += fileBytes; if( !checkpoint() ) return false;
+        std::vector<GpuAnalysisResourceSummary> summaries;
+        summaries.reserve( page.resources.size() );
+        for( const auto& resource : page.resources )
+        {
+            const auto* allocation = catalogSnapshot.FindAllocation( resource.allocationId );
+            summaries.push_back( ResourceSummaryOf( resource,
+                allocation ? allocation->resources.size() : 0 ) );
+        }
+        if( !WriteResourceSummaryPage( root, summaries, begin, committedPageIndex,
+            pages, totalBytes, control, checkpoint, error ) ) return false;
+        if( control.progress ) control.progress( 0.f, "store-resource-enrichment-page" );
+    }
+    if( !logicals.Empty() || logicalCount != passSpool.logicalCount )
+    { error = "store_logical_count_mismatch"; return false; }
+    if( !relations.Empty() || relationCount != passSpool.catalogRelationCount )
+    { error = "store_catalog_relation_count_mismatch"; return false; }
+    return true;
+}
+
+bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
+    const std::filesystem::path& algorithmRoot,
+    const GpuAnalysisTraceIdentity& identity,
+    const GpuAnalysisSnapshot& catalogSnapshot,
+    const GpuAnalysisPassSpool& passSpool,
+    const std::vector<JnGpuCatalogStringData>& catalogStrings,
+    const GpuAnalysisSidecarControl& control,
+    std::string& generation, uint64_t& writtenBytes, std::string& error )
+{
+    error.clear(); writtenBytes = 0;
+    if( !catalogSnapshot.passes.empty() )
+    { error = "store_catalog_snapshot_contains_passes"; return false; }
+    std::error_code ec; std::filesystem::create_directories( GpuAnalysisIoPath( algorithmRoot ), ec );
+    if( ec ) { error = "store_algorithm_directory_failed:" + ec.message(); return false; }
+    std::filesystem::path staging;
+    for( unsigned attempt = 0; attempt < 256; ++attempt )
+    {
+        generation = GenerationName(); staging = algorithmRoot / ( generation + ".building" );
+        if( std::filesystem::create_directory( GpuAnalysisIoPath( staging ), ec ) ) break;
+        if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
+        staging.clear();
+    }
+    if( staging.empty() ) { error = "store_generation_name_exhausted"; return false; }
+
+    GpuAnalysisStoreManifest manifest;
+    manifest.generation = generation; manifest.traceSha256 = identity.sha256;
+    manifest.traceSize = identity.fileSize;
+    manifest.resourceCount = catalogSnapshot.resources.size();
+    manifest.allocationCount = catalogSnapshot.allocations.size();
+    manifest.passCount = passSpool.passCount;
+    manifest.residencyCount = catalogSnapshot.residency.size();
+    manifest.churnCount = catalogSnapshot.churnCandidates.size();
+    manifest.logicalCount = passSpool.logicalCount;
+    manifest.catalogRelationCount = passSpool.catalogRelationCount;
+    manifest.sourceGapResourceCount = passSpool.sourceGapResourceCount;
+    manifest.sourceGapReferenceCount = passSpool.sourceGapReferenceCount;
+    std::map<uint16_t, GpuAnalysisTypeSummary> typeSummaries;
+    for( const auto& resource : catalogSnapshot.resources ) if( resource.aliveAtEnd )
+    { auto& value = typeSummaries[resource.primaryKind]; value.primaryKind = resource.primaryKind;
+      ++value.liveResourceCount; value.resourceCapacityBytes += resource.capacityBytes; }
+    for( const auto& [_, value] : typeSummaries ) manifest.typeSummaries.push_back( value );
+    const auto committed = algorithmRoot / generation;
+    const GpuAnalysisCacheIdentity cacheIdentity { identity.sha256, identity.fileSize,
+        std::string( GpuAnalysisAlgorithmId ) + "-store1" };
+    const GpuAnalysisCacheIdentity spoolIdentity { identity.sha256, identity.fileSize,
+        std::string( GpuAnalysisAlgorithmId ) + "-session-pass-spool1" };
+    const auto checkpoint = [&]() {
+        manifest.totalBytes = writtenBytes; manifest.complete = false;
+        return SaveStoreManifest( staging, manifest, error );
+    };
+
+    auto overview = OverviewOf( catalogSnapshot );
+    const auto metadataPath = staging / "metadata.bin";
+    if( !SaveGpuAnalysisCache( metadataPath, cacheIdentity, overview, error ) ) return false;
+    uint64_t metadataBytes = 0;
+    const auto metadataChecksum = FileChecksum( metadataPath, metadataBytes, error );
+    if( !error.empty() ) return false;
+    manifest.pages.push_back( { GpuAnalysisStorePageKind::Metadata, 0, 1, 0, 0,
+        metadataBytes, metadataChecksum, std::filesystem::relative( metadataPath, staging ) } );
+    writtenBytes += metadataBytes; if( !checkpoint() ) return false;
+
+    if( !WriteEnrichedResourcePages( staging, catalogSnapshot, passSpool,
+        catalogStrings, cacheIdentity, manifest.pages, writtenBytes, control,
+        checkpoint, error ) ) return false;
+    if( !WriteCachePages( staging, GpuAnalysisStorePageKind::Allocation, "allocations",
+        catalogSnapshot.allocations, catalogSnapshot, cacheIdentity, AllocationBytes,
+        []( const auto& value ) { return value.allocationId; }, manifest.pages,
+        writtenBytes, control, checkpoint, error ) ) return false;
+    if( !WriteCachePages( staging, GpuAnalysisStorePageKind::Residency, "residency",
+        catalogSnapshot.residency, catalogSnapshot, cacheIdentity,
+        []( const auto& ) { return uint64_t( sizeof( GpuResidencyInterval ) ); },
+        []( const auto& value ) { return value.allocationId; }, manifest.pages,
+        writtenBytes, control, checkpoint, error ) ) return false;
+    if( !WriteCachePages( staging, GpuAnalysisStorePageKind::Churn, "churn",
+        catalogSnapshot.churnCandidates, catalogSnapshot, cacheIdentity, ChurnBytes,
+        []( const auto& value ) { return value.resourceId ? value.resourceId : value.allocationId; },
+        manifest.pages, writtenBytes, control, checkpoint, error ) ) return false;
+
+    const auto runRoot = staging / "relation-runs";
+    std::filesystem::create_directories( GpuAnalysisIoPath( runRoot ), ec );
+    if( ec ) { error = "store_relation_run_directory_failed:" + ec.message(); return false; }
+    std::vector<std::filesystem::path> resourceRuns, frameRuns;
+    uint64_t passCount = 0; uint64_t previousPassId = 0;
+    for( uint64_t pageIndex = 0; pageIndex < passSpool.pageCount; ++pageIndex )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        std::ostringstream name; name << std::setw( 6 ) << std::setfill( '0' ) << pageIndex << ".bin";
+        const auto pagePath = passSpool.root / name.str();
+        auto pageSnapshot = LoadGpuAnalysisCache( pagePath, spoolIdentity, error );
+        if( !pageSnapshot ) { error = "store_spool_page_invalid:" + error; return false; }
+        auto& passes = pageSnapshot->passes;
+        if( !std::is_sorted( passes.begin(), passes.end(), []( const auto& lhs, const auto& rhs ) {
+                return lhs.passId < rhs.passId;
+            } ) || ( !passes.empty() && previousPassId != 0 && passes.front().passId <= previousPassId ) )
+        { error = "store_spool_global_pass_order_invalid"; return false; }
+        if( !passes.empty() ) previousPassId = passes.back().passId;
+        if( !WriteSortedPassBatch( staging, passes, passCount, uint32_t( pageIndex ),
+            manifest.pages, writtenBytes, control, checkpoint, error ) ) return false;
+        passCount += passes.size();
+
+        std::vector<GpuAnalysisResourcePassEntry> resourceRelations;
+        std::vector<GpuAnalysisFramePassEntry> frameRelations;
+        uint64_t relationCount = 0;
+        for( const auto& pass : passes )
+            relationCount += pass.directResources.size() + pass.inclusiveResources.size();
+        if( relationCount > std::numeric_limits<size_t>::max() )
+        { error = "store_spool_relation_count_limit"; return false; }
+        resourceRelations.reserve( size_t( relationCount ) ); frameRelations.reserve( passes.size() );
+        for( const auto& pass : passes )
+        {
+            for( const auto resourceId : pass.directResources )
+                resourceRelations.push_back( { resourceId, pass.passId, 0, {} } );
+            for( const auto resourceId : pass.inclusiveResources )
+                if( !std::binary_search( pass.directResources.begin(),
+                    pass.directResources.end(), resourceId ) )
+                    resourceRelations.push_back( { resourceId, pass.passId, 1, {} } );
+            frameRelations.push_back( { pass.frameId, pass.passId } );
+        }
+        const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
+            if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+            if( lhs.passId != rhs.passId ) return lhs.passId < rhs.passId;
+            return lhs.inclusive < rhs.inclusive;
+        };
+        const auto frameCompare = []( const auto& lhs, const auto& rhs ) {
+            if( lhs.frameId != rhs.frameId ) return lhs.frameId < rhs.frameId;
+            return lhs.passId < rhs.passId;
+        };
+        auto resourceRun = runRoot / ( "resource-" + name.str() );
+        auto frameRun = runRoot / ( "frame-" + name.str() );
+        if( !WriteSortedRun( resourceRun, resourceRelations, resourceCompare, error ) ||
+            !WriteSortedRun( frameRun, frameRelations, frameCompare, error ) ) return false;
+        resourceRuns.push_back( std::move( resourceRun ) );
+        frameRuns.push_back( std::move( frameRun ) );
+        if( control.progress ) control.progress( float( pageIndex + 1 ) /
+            float( std::max<uint64_t>( 1, passSpool.pageCount ) ), "store-pass-spool" );
+    }
+    if( passCount != passSpool.passCount )
+    { error = "store_spool_pass_count_mismatch"; return false; }
+
+    const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        if( lhs.passId != rhs.passId ) return lhs.passId < rhs.passId;
+        return lhs.inclusive < rhs.inclusive;
+    };
+    const auto frameCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.frameId != rhs.frameId ) return lhs.frameId < rhs.frameId;
+        return lhs.passId < rhs.passId;
+    };
+    if( !MergeRelationRuns<GpuAnalysisResourcePassEntry>( staging,
+        GpuAnalysisStorePageKind::ResourcePassIndex, "resource-pass", resourceRuns,
+        resourceCompare, []( const auto& value ) { return value.resourceId; },
+        manifest.pages, writtenBytes, control, checkpoint,
+        manifest.resourcePassRelationCount, error ) ) return false;
+    if( !MergeRelationRuns<GpuAnalysisFramePassEntry>( staging,
+        GpuAnalysisStorePageKind::FramePassIndex, "frame-pass", frameRuns,
+        frameCompare, []( const auto& value ) { return value.frameId; },
+        manifest.pages, writtenBytes, control, checkpoint,
+        manifest.framePassRelationCount, error ) ) return false;
+    const auto rangeCompare = []( const auto& lhs, const auto& rhs ) {
+        if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
+        if( lhs.record.passInstanceId != rhs.record.passInstanceId )
+            return lhs.record.passInstanceId < rhs.record.passInstanceId;
+        if( lhs.record.offsetBytes != rhs.record.offsetBytes )
+            return lhs.record.offsetBytes < rhs.record.offsetBytes;
+        if( lhs.record.firstSubresource != rhs.record.firstSubresource )
+            return lhs.record.firstSubresource < rhs.record.firstSubresource;
+        return lhs.record.usageMask < rhs.record.usageMask;
+    };
+    if( !MergeRelationRuns<GpuAnalysisRangeStoreEntry>( staging,
+        GpuAnalysisStorePageKind::Range, "ranges", passSpool.rangeRuns,
+        rangeCompare, []( const auto& value ) { return value.resourceId; },
+        manifest.pages, writtenBytes, control, checkpoint,
+        manifest.rangeCount, error, false ) ) return false;
+    if( manifest.rangeCount != passSpool.rangeCount )
+    { error = "store_spool_range_count_mismatch"; return false; }
+    for( const auto& path : resourceRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : frameRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : passSpool.rangeRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    std::filesystem::remove( GpuAnalysisIoPath( runRoot ), ec );
+
+    manifest.totalBytes = writtenBytes; manifest.complete = true;
+    manifest.reason = catalogSnapshot.manifest.reason;
+    if( !SaveStoreManifest( staging, manifest, error ) ) return false;
+    if( !PublishGenerationDirectory( staging, committed, error ) ) return false;
+    auto currentTmp = algorithmRoot / "current.tmp"; const auto current = algorithmRoot / "current";
+    { std::ofstream out( GpuAnalysisIoPath( currentTmp ), std::ios::binary | std::ios::trunc );
+      out << generation << '\n'; if( !out ) { error = "store_current_write_failed"; return false; } }
+    if( !AtomicReplace( currentTmp, current, error ) ) return false;
+    if( control.progress ) control.progress( 1.f, "store-complete" );
+    return true;
+}
+
+bool BuildGpuAnalysisResourceSummariesAt( const std::filesystem::path& algorithmRoot,
+    std::string_view expectedTraceSha256, uint64_t expectedTraceSize,
+    const GpuAnalysisSidecarControl& control, std::string& generation,
+    uint64_t& logicalBytes, std::string& error )
+{
+    error.clear(); generation.clear(); logicalBytes = 0;
+    auto source = GpuAnalysisStoreReader::OpenAt( algorithmRoot,
+        expectedTraceSha256, expectedTraceSize, error );
+    if( !source ) return false;
+    uint64_t existingSummaries = 0;
+    for( const auto& page : source->Manifest().pages )
+        if( page.kind == GpuAnalysisStorePageKind::ResourceSummary )
+            existingSummaries += page.recordCount;
+    if( existingSummaries != 0 )
+    {
+        if( existingSummaries != source->Manifest().resourceCount )
+        { error = "store_resource_summary_count_mismatch"; return false; }
+        generation = source->Manifest().generation;
+        logicalBytes = source->Manifest().totalBytes;
+        if( control.progress ) control.progress( 1.f, "resource-summaries-reused" );
+        return true;
+    }
+
+    std::error_code ec;
+    std::filesystem::path staging;
+    for( unsigned attempt = 0; attempt < 256; ++attempt )
+    {
+        generation = GenerationName(); staging = algorithmRoot / ( generation + ".building" );
+        if( std::filesystem::create_directory( GpuAnalysisIoPath( staging ), ec ) ) break;
+        if( ec ) { error = "store_generation_directory_failed:" + ec.message(); return false; }
+        staging.clear();
+    }
+    if( staging.empty() ) { error = "store_generation_name_exhausted"; return false; }
+
+    auto manifest = source->Manifest();
+    const auto sourceRoot = algorithmRoot / manifest.generation;
+    manifest.generation = generation;
+    manifest.complete = false;
+    manifest.pages.clear();
+    logicalBytes = 0;
+    for( const auto& page : source->Manifest().pages )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        if( page.kind == GpuAnalysisStorePageKind::ResourceSummary ) continue;
+        const auto from = sourceRoot / page.relativePath;
+        const auto to = staging / page.relativePath;
+        std::filesystem::create_directories( GpuAnalysisIoPath( to.parent_path() ), ec );
+        if( ec ) { error = "store_summary_link_directory_failed:" + ec.message(); return false; }
+        std::filesystem::create_hard_link( GpuAnalysisIoPath( from ), GpuAnalysisIoPath( to ), ec );
+        if( ec ) { error = "store_summary_hardlink_failed:" + ec.message(); return false; }
+        manifest.pages.push_back( page );
+        if( logicalBytes > control.maximumSidecarBytes - page.fileBytes )
+        { error = "sidecar_size_limit"; return false; }
+        logicalBytes += page.fileBytes;
+    }
+    const auto checkpoint = [&]() {
+        manifest.totalBytes = logicalBytes;
+        manifest.complete = false;
+        return SaveStoreManifest( staging, manifest, error );
+    };
+    if( !checkpoint() ) return false;
+
+    std::vector<std::pair<uint64_t, uint64_t>> allocationResourceCounts;
+    allocationResourceCounts.reserve( size_t( std::min<uint64_t>(
+        source->Manifest().allocationCount, std::numeric_limits<size_t>::max() ) ) );
+    for( size_t pageIndex = 0; pageIndex < source->AllocationPageCount(); ++pageIndex )
+    {
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        std::vector<GpuAllocationAnalysisRecord> allocations;
+        if( !source->LoadAllocationPage( pageIndex, allocations, error ) ) return false;
+        for( const auto& allocation : allocations )
+            allocationResourceCounts.emplace_back( allocation.allocationId,
+                uint64_t( allocation.resources.size() ) );
+        if( control.progress ) control.progress( .15f * float( pageIndex + 1 ) /
+            float( std::max<size_t>( 1, source->AllocationPageCount() ) ),
+            "resource-summary-allocation-counts" );
+    }
+    std::sort( allocationResourceCounts.begin(), allocationResourceCounts.end() );
+    const auto allocationCountFor = [&]( uint64_t allocationId ) -> uint64_t {
+        const auto found = std::lower_bound( allocationResourceCounts.begin(),
+            allocationResourceCounts.end(), allocationId,
+            []( const auto& value, uint64_t id ) { return value.first < id; } );
+        return found != allocationResourceCounts.end() && found->first == allocationId ?
+            found->second : 0;
+    };
+
+    uint64_t summaryRecords = 0;
+    size_t resourcePageIndex = 0;
+    for( const auto& page : source->Manifest().pages )
+    {
+        if( page.kind != GpuAnalysisStorePageKind::Resource ) continue;
+        if( control.stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        std::vector<GpuResourceAnalysisRecord> resources;
+        if( !source->LoadResourcePage( resourcePageIndex, resources, error ) ) return false;
+        if( resources.size() != page.recordCount )
+        { error = "store_resource_summary_source_count_mismatch"; return false; }
+        std::vector<GpuAnalysisResourceSummary> summaries;
+        summaries.reserve( resources.size() );
+        for( const auto& resource : resources )
+            summaries.push_back( ResourceSummaryOf( resource,
+                allocationCountFor( resource.allocationId ) ) );
+        if( !WriteResourceSummaryPage( staging, summaries, page.firstIndex,
+            uint32_t( resourcePageIndex ), manifest.pages, logicalBytes,
+            control, checkpoint, error ) ) return false;
+        summaryRecords += summaries.size();
+        ++resourcePageIndex;
+        if( control.progress ) control.progress( .15f + .8f * float( resourcePageIndex ) /
+            float( std::max<size_t>( 1, source->ResourcePageCount() ) ),
+            "resource-summary-pages" );
+    }
+    if( summaryRecords != manifest.resourceCount )
+    { error = "store_resource_summary_count_mismatch"; return false; }
+    manifest.totalBytes = logicalBytes;
+    manifest.complete = true;
+    if( !SaveStoreManifest( staging, manifest, error ) ) return false;
+    const auto committed = algorithmRoot / generation;
+    if( !PublishGenerationDirectory( staging, committed, error ) ) return false;
+    auto currentTmp = algorithmRoot / "current.tmp";
+    const auto current = algorithmRoot / "current";
+    {
+        std::ofstream out( GpuAnalysisIoPath( currentTmp ), std::ios::binary | std::ios::trunc );
+        out << generation << '\n';
+        if( !out ) { error = "store_current_write_failed"; return false; }
+    }
+    if( !AtomicReplace( currentTmp, current, error ) ) return false;
+    if( control.progress ) control.progress( 1.f, "resource-summaries-complete" );
+    return true;
+}
+
 std::optional<GpuAnalysisStoreManifest> LoadStoreManifestImpl(
     const std::filesystem::path& root, bool requireComplete, std::string& error )
 {
@@ -631,7 +1468,9 @@ std::optional<GpuAnalysisStoreManifest> LoadStoreManifestImpl(
         else if( key == "trace_sha256" ) in >> std::quoted( result.traceSha256 ); else if( key == "trace_size" ) in >> result.traceSize;
 #define R( field ) else if( key == #field ) in >> result.field
         R( resourceCount ); R( allocationCount ); R( passCount ); R( residencyCount ); R( churnCount );
-        R( resourcePassRelationCount ); R( framePassRelationCount ); R( totalBytes );
+        R( resourcePassRelationCount ); R( framePassRelationCount ); R( rangeCount );
+        R( logicalCount ); R( catalogRelationCount ); R( sourceGapResourceCount );
+        R( sourceGapReferenceCount ); R( totalBytes );
 #undef R
         else if( key == "complete" ) in >> result.complete; else if( key == "reason" ) in >> std::quoted( result.reason );
         else if( key == "type_count" ) in >> expectedTypes;
@@ -713,6 +1552,7 @@ std::shared_ptr<GpuAnalysisStoreReader> GpuAnalysisStoreReader::OpenAt(
 }
 
 size_t GpuAnalysisStoreReader::ResourcePageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Resource ); }
+size_t GpuAnalysisStoreReader::ResourceSummaryPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::ResourceSummary ); }
 size_t GpuAnalysisStoreReader::AllocationPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Allocation ); }
 size_t GpuAnalysisStoreReader::PassPageCount() const { return CountPages( m_manifest, GpuAnalysisStorePageKind::Pass ); }
 
@@ -722,6 +1562,73 @@ bool GpuAnalysisStoreReader::LoadResourcePage( size_t index, std::vector<GpuReso
     if( !VerifyPageFile( m_root / page->relativePath, *page, error ) ) return false;
     auto snapshot = LoadGpuAnalysisCache( m_root / page->relativePath, m_identity, error ); if( !snapshot ) return false;
     out = std::move( snapshot->resources ); return true;
+}
+
+bool GpuAnalysisStoreReader::LoadResourceSummaryPage( size_t index,
+    std::vector<GpuAnalysisResourceSummary>& out, std::string& error ) const
+{
+    error.clear();
+    const auto* page = NthPage( m_manifest, GpuAnalysisStorePageKind::ResourceSummary, index );
+    if( !page ) { error = "resource_summary_page_out_of_range"; return false; }
+    if( !VerifyPageFile( m_root / page->relativePath, *page, error ) ) return false;
+    std::ifstream in( GpuAnalysisIoPath( m_root / page->relativePath ), std::ios::binary );
+    ResourceSummaryPageHeader header;
+    if( !in.read( reinterpret_cast<char*>( &header ), sizeof( header ) ) ||
+        header.magic != ResourceSummaryPageMagic ||
+        header.schema != GpuAnalysisStoreSchemaVersion ||
+        header.recordCount != page->recordCount ||
+        header.payloadBytes > GpuAnalysisMaximumTemporaryBytes ||
+        header.payloadBytes > page->fileBytes - std::min<uint64_t>( page->fileBytes, sizeof( header ) ) )
+    { error = "resource_summary_page_header_mismatch"; return false; }
+    std::vector<uint8_t> payload( size_t( header.payloadBytes ) );
+    if( !in.read( reinterpret_cast<char*>( payload.data() ), std::streamsize( payload.size() ) ) ||
+        HashUpdate( FnvOffset, payload.data(), payload.size() ) != header.checksum )
+    { error = "resource_summary_page_payload_corrupt"; return false; }
+    const uint8_t* cursor = payload.data(); const uint8_t* end = cursor + payload.size();
+    out.clear(); out.reserve( header.recordCount );
+    for( uint32_t index = 0; index < header.recordCount; ++index )
+    {
+        if( size_t( end - cursor ) < sizeof( ResourceSummaryPageRecord ) )
+        { error = "resource_summary_page_record_truncated"; return false; }
+        ResourceSummaryPageRecord record;
+        std::memcpy( &record, cursor, sizeof( record ) ); cursor += sizeof( record );
+        if( record.nameBytes > uint64_t( end - cursor ) )
+        { error = "resource_summary_page_name_truncated"; return false; }
+        GpuAnalysisResourceSummary value;
+        value.generation = record.generation;
+        value.resourceId = record.resourceId;
+        value.allocationId = record.allocationId;
+        value.capacityBytes = record.capacityBytes;
+        value.allocationOffsetBytes = record.allocationOffsetBytes;
+        value.createTime = record.createTime;
+        value.destroyTime = record.destroyTime;
+        value.nameHash = record.nameHash;
+        value.viewCount = record.viewCount;
+        value.logicalBindingCount = record.logicalBindingCount;
+        value.partCount = record.partCount;
+        value.rangeCount = record.rangeCount;
+        value.relationCount = record.relationCount;
+        value.vgRecordCount = record.vgRecordCount;
+        value.allocationResourceCount = record.allocationResourceCount;
+        value.createCallsiteId = record.createCallsiteId;
+        value.definitionRevision = record.definitionRevision;
+        value.nameOriginalLength = record.nameOriginalLength;
+        value.primaryKind = record.primaryKind;
+        value.resourceClass = record.resourceClass;
+        value.memoryDomain = record.memoryDomain;
+        value.allocationKind = record.allocationKind;
+        value.nameProvenance = record.nameProvenance;
+        value.stackProvenance = record.stackProvenance;
+        value.exactness = record.exactness;
+        value.openBoundary = record.openBoundary != 0;
+        value.aliveAtEnd = record.aliveAtEnd != 0;
+        value.hasAliasGroup = record.hasAliasGroup != 0;
+        value.name.assign( reinterpret_cast<const char*>( cursor ), record.nameBytes );
+        cursor += record.nameBytes;
+        out.push_back( std::move( value ) );
+    }
+    if( cursor != end ) { error = "resource_summary_page_trailing_data"; return false; }
+    return true;
 }
 
 bool GpuAnalysisStoreReader::LoadAllocationPage( size_t index, std::vector<GpuAllocationAnalysisRecord>& out, std::string& error ) const
@@ -792,6 +1699,29 @@ bool GpuAnalysisStoreReader::LoadPassPage( size_t index, std::vector<GpuPassWork
         value.directResources = decodedSets[record.directSetId]; value.inclusiveResources = decodedSets[record.inclusiveSetId]; out.push_back( std::move( value ) );
     }
     if( cursor != end ) { error = "pass_page_trailing_data"; return false; }
+    return true;
+}
+
+bool GpuAnalysisStoreReader::RangesForResource( uint64_t resourceId, size_t offset,
+    size_t limit, std::vector<GpuRangeAnalysisRecord>& out, bool& hasMore,
+    std::string& error ) const
+{
+    out.clear(); hasMore = false; size_t skipped = 0;
+    for( const auto& page : m_manifest.pages )
+    {
+        if( page.kind != GpuAnalysisStorePageKind::Range ||
+            resourceId < page.firstKey || resourceId > page.lastKey ) continue;
+        std::vector<GpuAnalysisRangeStoreEntry> values;
+        if( !LoadRelationPage( m_root / page.relativePath, page, values, error ) ) return false;
+        const auto first = std::lower_bound( values.begin(), values.end(), resourceId,
+            []( const auto& value, uint64_t id ) { return value.resourceId < id; } );
+        for( auto it = first; it != values.end() && it->resourceId == resourceId; ++it )
+        {
+            if( skipped++ < offset ) continue;
+            if( out.size() == limit ) { hasMore = true; return true; }
+            out.push_back( { it->generation, it->record } );
+        }
+    }
     return true;
 }
 
@@ -905,6 +1835,8 @@ const char* GpuAnalysisStorePageKindName( GpuAnalysisStorePageKind kind )
     case GpuAnalysisStorePageKind::Allocation: return "allocation"; case GpuAnalysisStorePageKind::Pass: return "pass";
     case GpuAnalysisStorePageKind::Residency: return "residency"; case GpuAnalysisStorePageKind::Churn: return "churn";
     case GpuAnalysisStorePageKind::ResourcePassIndex: return "resource_pass_index"; case GpuAnalysisStorePageKind::FramePassIndex: return "frame_pass_index";
+    case GpuAnalysisStorePageKind::Range: return "range";
+    case GpuAnalysisStorePageKind::ResourceSummary: return "resource_summary";
     }
     return "unknown";
 }

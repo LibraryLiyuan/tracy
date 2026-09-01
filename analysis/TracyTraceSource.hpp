@@ -1018,6 +1018,13 @@ public:
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }
     virtual std::vector<CpuUsagePointDto> GetCpuUsage() const { return {}; }
+    virtual std::vector<CpuUsagePointDto> ScanCpuUsage( size_t offset, size_t limit ) const
+    {
+        const auto values = GetCpuUsage();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = std::min( values.size(), offset + std::min( limit, values.size() - offset ) );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }

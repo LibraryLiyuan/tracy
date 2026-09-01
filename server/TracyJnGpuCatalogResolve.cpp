@@ -3,6 +3,7 @@
 #include "TracyJnData.hpp"
 #include "../public/common/TracyQueue.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <unordered_map>
 #include <vector>
@@ -19,8 +20,16 @@ JnGpuCatalogResolvedCounts ResolveJnGpuCatalogGenerationData( JnTraceData& data,
         int64_t begin;
         int64_t end;
     };
+    struct ResourceFact
+    {
+        uint64_t resourceId;
+        int64_t time;
+        uint64_t ordinal;
+        JnGpuCatalogRecordOperation operation;
+    };
     std::unordered_map<uint64_t, std::vector<ResourceInterval>> intervals;
-    std::unordered_map<uint64_t, size_t> openIntervals;
+    std::unordered_map<uint64_t, std::vector<ResourceFact>> facts;
+    uint64_t factOrdinal = 0;
 
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
@@ -38,35 +47,55 @@ JnGpuCatalogResolvedCounts ResolveJnGpuCatalogGenerationData( JnTraceData& data,
         {
             const auto& record = data.gpuCatalogResources[i];
             if( record.pointerToken == 0 || record.resourceId == 0 ) continue;
-            const auto operation = JnGpuCatalogRecordOperation( record.operation );
-            const auto key = record.pointerToken;
-            if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
-                operation == JnGpuCatalogRecordOperation::Snapshot )
-            {
-                auto& values = intervals[key];
-                const auto begin = operation == JnGpuCatalogRecordOperation::Create ? record.time : std::numeric_limits<int64_t>::min();
-                values.push_back( ResourceInterval { record.resourceId, begin, std::numeric_limits<int64_t>::max() } );
-                openIntervals[key] = values.size() - 1;
-            }
-            else if( operation == JnGpuCatalogRecordOperation::Destroy )
-            {
-                const auto open = openIntervals.find( key );
-                if( open != openIntervals.end() )
-                {
-                    auto& value = intervals[key][open->second];
-                    if( value.resourceId == record.resourceId ) value.end = record.time;
-                    openIntervals.erase( open );
-                }
-            }
-            else if( intervals.find( key ) == intervals.end() )
-            {
-                auto& values = intervals[key];
-                values.push_back( ResourceInterval { record.resourceId, std::numeric_limits<int64_t>::min(),
-                    std::numeric_limits<int64_t>::max() } );
-                openIntervals[key] = values.size() - 1;
-            }
+            facts[record.pointerToken].push_back( { record.resourceId, record.time,
+                factOrdinal++, JnGpuCatalogRecordOperation( record.operation ) } );
         }
     } );
+
+    for( auto& [pointerToken, values] : facts )
+    {
+        std::stable_sort( values.begin(), values.end(), []( const auto& lhs, const auto& rhs ) {
+            if( lhs.time != rhs.time ) return lhs.time < rhs.time;
+            return lhs.ordinal < rhs.ordinal;
+        } );
+        auto& resolved = intervals[pointerToken];
+        uint64_t active = 0;
+        int64_t activeBegin = std::numeric_limits<int64_t>::max();
+        for( auto it = values.begin(); it != values.end(); ++it )
+        {
+            const auto operation = it->operation;
+            const bool ownershipClose = operation == JnGpuCatalogRecordOperation::Destroy ||
+                operation == JnGpuCatalogRecordOperation::Close ||
+                operation == JnGpuCatalogRecordOperation::Unbind;
+            if( ownershipClose )
+            {
+                // Destroy closes Unity/D3D12 ownership, but resource-reference
+                // packets already accumulated on a command list may be emitted
+                // afterwards. The pointer generation therefore remains the
+                // same identity until a later definition proves replacement.
+                if( active == 0 )
+                {
+                    active = it->resourceId;
+                    activeBegin = std::numeric_limits<int64_t>::min();
+                }
+                continue;
+            }
+            const bool definition = operation == JnGpuCatalogRecordOperation::Create ||
+                operation == JnGpuCatalogRecordOperation::Update ||
+                operation == JnGpuCatalogRecordOperation::Bind ||
+                operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot;
+            if( !definition || it->resourceId == 0 ) continue;
+            if( active == it->resourceId ) continue;
+            if( active != 0 ) resolved.push_back( { active, activeBegin, it->time } );
+            active = it->resourceId;
+            const bool openLeft = it == values.begin() &&
+                operation != JnGpuCatalogRecordOperation::Create;
+            activeBegin = openLeft ? std::numeric_limits<int64_t>::min() : it->time;
+        }
+        if( active != 0 ) resolved.push_back( { active, activeBegin,
+            std::numeric_limits<int64_t>::max() } );
+    }
 
     const auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
     {
@@ -76,7 +105,8 @@ JnGpuCatalogResolvedCounts ResolveJnGpuCatalogGenerationData( JnTraceData& data,
         uint64_t result = 0;
         for( const auto& value : found->second )
         {
-            if( time != std::numeric_limits<int64_t>::min() && ( time < value.begin || time > value.end ) ) continue;
+            if( time != std::numeric_limits<int64_t>::min() &&
+                ( time < value.begin || time >= value.end ) ) continue;
             if( result != 0 && result != value.resourceId ) return 0;
             result = value.resourceId;
         }

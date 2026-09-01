@@ -419,10 +419,13 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshotImpl( JnTraceData& data, bool consum
         std::vector<JnGpuCatalogRelationRecordV1>().swap( data.gpuCatalogRelations );
         std::vector<JnGpuCatalogVgRecordV1>().swap( data.gpuCatalogVg );
         std::vector<JnGpuRangeSetRecordV1>().swap( data.gpuRangeSets );
-        std::vector<JnGpuCatalogStringData>().swap( data.gpuCatalogStrings );
-        std::vector<JnGpuCatalogBatchData>().swap( data.gpuCatalogBatches );
-        std::vector<JnGpuCatalogControlData>().swap( data.gpuCatalogControls );
-        std::vector<JnGpuCatalogGenerationData>().swap( data.gpuCatalogGenerations );
+        if( !control.retainCatalogDictionaries )
+        {
+            std::vector<JnGpuCatalogStringData>().swap( data.gpuCatalogStrings );
+            std::vector<JnGpuCatalogBatchData>().swap( data.gpuCatalogBatches );
+            std::vector<JnGpuCatalogControlData>().swap( data.gpuCatalogControls );
+            std::vector<JnGpuCatalogGenerationData>().swap( data.gpuCatalogGenerations );
+        }
         std::vector<uint64_t>().swap( viewGenerations ); std::vector<uint64_t>().swap( partGenerations );
         std::vector<uint64_t>().swap( relationGenerations ); std::vector<uint64_t>().swap( rangeGenerations );
         std::vector<uint64_t>().swap( vgGenerations );
@@ -585,14 +588,14 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshotImpl( JnTraceData& data, bool consum
             appendResolvedUse( out.passes[pass->second], use );
         }
     }
-    for( size_t index = 0; index < data.gpuDetailedEvidence.size(); ++index )
+    for( size_t index = 0; !control.catalogOnly && index < data.gpuDetailedEvidence.size(); ++index )
     {
         const auto& value = data.gpuDetailedEvidence[index];
         auto pass = out.passById.find( value.sourceId );
         if( pass == out.passById.end() ) pass = out.passById.find( value.targetId );
         if( pass != out.passById.end() ) out.passes[pass->second].detailedEvidence.push_back( { evidenceGenerations[index], value } );
     }
-    for( size_t index = 0; index < pendingPassRanges.size(); ++index )
+    for( size_t index = 0; !control.catalogOnly && index < pendingPassRanges.size(); ++index )
     {
         if( ( index & 4095 ) == 0 && cancelled() ) return out;
         const auto& value = pendingPassRanges[index];

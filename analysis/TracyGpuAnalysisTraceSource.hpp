@@ -11,6 +11,9 @@
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
+#include "TracyTraceSessionPlots.hpp"
+#include "TracyTraceSessionMessages.hpp"
+#include "TracyTraceSessionLocks.hpp"
 #include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionRuntime.hpp"
 #include "TracyTraceSessionIoGfx.hpp"
@@ -81,6 +84,7 @@ public:
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
+    std::vector<CpuUsagePointDto> ScanCpuUsage( size_t offset, size_t limit ) const override;
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
@@ -133,12 +137,19 @@ private:
         std::shared_ptr<TraceSessionMemoryReader> memoryReader = {},
         std::shared_ptr<TraceSessionSamplingReader> samplingReader = {},
         std::shared_ptr<TraceSessionSchedulingReader> schedulingReader = {},
+        std::shared_ptr<TraceSessionPlotReader> plotReader = {},
+        std::shared_ptr<TraceSessionMessageReader> messageReader = {},
+        std::shared_ptr<TraceSessionLockReader> lockReader = {},
         std::shared_ptr<TraceSessionRelationReader> relationReader = {},
         std::shared_ptr<TraceSessionRuntimeReader> runtimeReader = {},
         std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader = {},
         std::shared_ptr<TraceSessionSymbolReader> symbolReader = {} );
     WorkerTraceSource& Worker() const;
     bool IsSidecarMethod( std::string_view method ) const;
+    std::shared_ptr<TraceSessionJobReader> SessionJobReader() const;
+    std::shared_ptr<TraceSessionRelationReader> SessionRelationReader() const;
+    std::shared_ptr<TraceSessionRuntimeReader> SessionRuntimeReader() const;
+    std::shared_ptr<TraceSessionIoGfxReader> SessionIoGfxReader() const;
 
     std::filesystem::path m_path;
     GpuAnalysisSidecarManifest m_manifest;
@@ -148,16 +159,21 @@ private:
     TraceSessionDerivedStats m_sessionStats;
     std::shared_ptr<TraceSessionFrameReader> m_frameReader;
     std::shared_ptr<TraceSessionFrameImageReader> m_frameImageReader;
-    std::shared_ptr<TraceSessionJobReader> m_jobReader;
+    mutable std::shared_ptr<TraceSessionJobReader> m_jobReader;
     std::shared_ptr<TraceSessionCpuZoneReader> m_cpuZoneReader;
     std::shared_ptr<TraceSessionGpuZoneReader> m_gpuZoneReader;
     std::shared_ptr<TraceSessionMemoryReader> m_memoryReader;
     std::shared_ptr<TraceSessionSamplingReader> m_samplingReader;
     std::shared_ptr<TraceSessionSchedulingReader> m_schedulingReader;
-    std::shared_ptr<TraceSessionRelationReader> m_relationReader;
-    std::shared_ptr<TraceSessionRuntimeReader> m_runtimeReader;
-    std::shared_ptr<TraceSessionIoGfxReader> m_ioGfxReader;
+    std::shared_ptr<TraceSessionPlotReader> m_plotReader;
+    std::shared_ptr<TraceSessionMessageReader> m_messageReader;
+    std::shared_ptr<TraceSessionLockReader> m_lockReader;
+    mutable std::shared_ptr<TraceSessionRelationReader> m_relationReader;
+    mutable std::shared_ptr<TraceSessionRuntimeReader> m_runtimeReader;
+    mutable std::shared_ptr<TraceSessionIoGfxReader> m_ioGfxReader;
     std::shared_ptr<TraceSessionSymbolReader> m_symbolReader;
+    std::optional<TraceSessionManifest> m_sessionManifest;
+    mutable std::mutex m_sessionReaderMutex;
     mutable std::mutex m_workerMutex;
     mutable std::unique_ptr<WorkerTraceSource> m_worker;
 };

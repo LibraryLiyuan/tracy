@@ -5,6 +5,8 @@
 #include "TracyGpuAnalysisSidecar.hpp"
 #include "../server/TracyJnData.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
@@ -12,10 +14,13 @@
 namespace tracy::analysis
 {
 
+inline constexpr size_t TraceSessionGpuCatalogBatchKindCount = 10;
+
 struct TraceSessionTimeTransform
 {
     double timerMultiplier = 0;
     int64_t baseTime = 0;
+    uint64_t processId = 0;
     bool present = false;
 
     int64_t ToNanoseconds( int64_t value ) const;
@@ -42,6 +47,8 @@ struct TraceSessionGpuCanonicalStats
     uint64_t referenceSetUses = 0;
     uint64_t expandedReferenceUses = 0;
     uint64_t unresolvedPayloads = 0;
+    std::array<uint64_t, TraceSessionGpuCatalogBatchKindCount> catalogRecordCounts {};
+    std::array<uint64_t, TraceSessionGpuCatalogBatchKindCount> catalogPayloadBytes {};
 };
 
 struct TraceSessionGpuDerivedStats
@@ -49,11 +56,20 @@ struct TraceSessionGpuDerivedStats
     uint64_t resourceCount = 0;
     uint64_t allocationCount = 0;
     uint64_t passCount = 0;
+    uint64_t sourceGapResourceCount = 0;
+    uint64_t sourceGapReferenceCount = 0;
     uint64_t writtenBytes = 0;
     std::string generation;
 };
 
 bool LoadTraceSessionGpuCanonicalData( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, JnTraceData& data,
+    TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
+    std::string& error );
+// Loads Catalog/Allocation/View facts only. The unbounded Pass, ResourceSet,
+// RangeSet and DetailedEvidence streams deliberately stay on disk for the N30
+// bounded builders.
+bool LoadTraceSessionGpuCatalogData( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, JnTraceData& data,
     TraceSessionTimeTransform& timeTransform, TraceSessionGpuCanonicalStats& stats,
     std::string& error );

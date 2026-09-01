@@ -34,8 +34,9 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !frameReader ) return {};
     auto frameImageReader = TraceSessionFrameImageReader::Open( path, *session, error );
     if( !frameImageReader ) return {};
-    auto jobReader = TraceSessionJobReader::Open( path, *session, error );
-    if( !jobReader ) return {};
+    // Delay the largest immutable semantic stores until their domain is first
+    // queried. Their normal Open path still performs full SHA-256 validation.
+    std::shared_ptr<TraceSessionJobReader> jobReader;
     auto cpuZoneReader = TraceSessionCpuZoneReader::Open( path, *session, error );
     if( !cpuZoneReader ) return {};
     auto gpuZoneReader = TraceSessionGpuZoneReader::Open( path, *session, error );
@@ -46,12 +47,18 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     if( !samplingReader ) return {};
     auto schedulingReader = TraceSessionSchedulingReader::Open( path, *session, error );
     if( !schedulingReader ) return {};
-    auto relationReader = TraceSessionRelationReader::Open( path, *session, error );
-    if( !relationReader ) return {};
-    auto runtimeReader = TraceSessionRuntimeReader::Open( path, *session, error );
-    if( !runtimeReader ) return {};
-    auto ioGfxReader = TraceSessionIoGfxReader::Open( path, *session, error );
-    if( !ioGfxReader ) return {};
+    // Plot was added after the first N30 Session generation was published.
+    // Treat its index as optional when opening an older completed generation;
+    // newly converted Sessions always build and audit it before publication.
+    std::string plotError;
+    auto plotReader = TraceSessionPlotReader::Open( path, *session, plotError );
+    std::string messageError;
+    auto messageReader = TraceSessionMessageReader::Open( path, *session, messageError );
+    std::string lockError;
+    auto lockReader = TraceSessionLockReader::Open( path, *session, lockError );
+    std::shared_ptr<TraceSessionRelationReader> relationReader;
+    std::shared_ptr<TraceSessionRuntimeReader> runtimeReader;
+    std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader;
     auto symbolReader = TraceSessionSymbolReader::Open( path, *session, error );
     if( !symbolReader ) return {};
     auto reader = GpuAnalysisStoreReader::OpenAt( TraceSessionGpuAnalysisRoot( path, *session ),
@@ -72,18 +79,27 @@ std::unique_ptr<GpuAnalysisTraceSource> GpuAnalysisTraceSource::OpenSessionIfRea
     facade.summary.resourceRecordCount = reader->Manifest().resourceCount;
     facade.summary.allocationRecordCount = reader->Manifest().allocationCount;
     facade.summary.passCount = reader->Manifest().passCount;
+    facade.summary.rangeCount = reader->Manifest().rangeCount;
+    facade.summary.logicalRecordCount = reader->Manifest().logicalCount;
+    facade.summary.relationCount = reader->Manifest().catalogRelationCount;
+    facade.summary.generationCount = 1;
+    facade.summary.payloadBytes = reader->Manifest().totalBytes;
     facade.summary.engineKnownPhysicalBytes = reader->Overview().engineKnownPhysicalBytes;
     facade.summary.engineKnownPhysicalPeakBytes = reader->Overview().engineKnownPhysicalPeakBytes;
     facade.summary.engineKnownPhysicalPeakTimeNs = reader->Overview().engineKnownPhysicalPeakTimeNs;
     if( stateCallback ) stateCallback( TraceSourceState::Ready );
-    return std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
+    auto result = std::unique_ptr<GpuAnalysisTraceSource>( new GpuAnalysisTraceSource(
         path, std::move( facade ), std::move( reader ), true, sessionStats,
         std::move( frameReader ), std::move( frameImageReader ),
         std::move( jobReader ), std::move( cpuZoneReader ),
         std::move( gpuZoneReader ),
         std::move( memoryReader ), std::move( samplingReader ),
-        std::move( schedulingReader ), std::move( relationReader ),
+        std::move( schedulingReader ), std::move( plotReader ), std::move( messageReader ),
+        std::move( lockReader ),
+        std::move( relationReader ),
         std::move( runtimeReader ), std::move( ioGfxReader ), std::move( symbolReader ) ) );
+    result->m_sessionManifest = *session;
+    return result;
 }
 
 GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuAnalysisSidecarManifest manifest,
@@ -96,6 +112,9 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
     std::shared_ptr<TraceSessionMemoryReader> memoryReader,
     std::shared_ptr<TraceSessionSamplingReader> samplingReader,
     std::shared_ptr<TraceSessionSchedulingReader> schedulingReader,
+    std::shared_ptr<TraceSessionPlotReader> plotReader,
+    std::shared_ptr<TraceSessionMessageReader> messageReader,
+    std::shared_ptr<TraceSessionLockReader> lockReader,
     std::shared_ptr<TraceSessionRelationReader> relationReader,
     std::shared_ptr<TraceSessionRuntimeReader> runtimeReader,
     std::shared_ptr<TraceSessionIoGfxReader> ioGfxReader,
@@ -107,6 +126,9 @@ GpuAnalysisTraceSource::GpuAnalysisTraceSource( std::filesystem::path path, GpuA
       m_gpuZoneReader( std::move( gpuZoneReader ) ),
       m_memoryReader( std::move( memoryReader ) ), m_samplingReader( std::move( samplingReader ) ),
       m_schedulingReader( std::move( schedulingReader ) ),
+      m_plotReader( std::move( plotReader ) ),
+      m_messageReader( std::move( messageReader ) ),
+      m_lockReader( std::move( lockReader ) ),
       m_relationReader( std::move( relationReader ) ), m_runtimeReader( std::move( runtimeReader ) ),
       m_ioGfxReader( std::move( ioGfxReader ) ),
       m_symbolReader( std::move( symbolReader ) )
@@ -138,6 +160,58 @@ void GpuAnalysisTraceSource::PrepareForQuery( std::string_view method ) const
 bool GpuAnalysisTraceSource::WorkerLoaded() const
 {
     std::lock_guard lock( m_workerMutex ); return bool( m_worker );
+}
+
+std::shared_ptr<TraceSessionJobReader> GpuAnalysisTraceSource::SessionJobReader() const
+{
+    if( !m_sessionMode || m_jobReader ) return m_jobReader;
+    std::lock_guard lock( m_sessionReaderMutex );
+    if( !m_jobReader && m_sessionManifest )
+    {
+        std::string error;
+        m_jobReader = TraceSessionJobReader::Open( m_path, *m_sessionManifest, error );
+        if( !m_jobReader ) throw std::runtime_error( "Session Job index validation failed: " + error );
+    }
+    return m_jobReader;
+}
+
+std::shared_ptr<TraceSessionRelationReader> GpuAnalysisTraceSource::SessionRelationReader() const
+{
+    if( !m_sessionMode || m_relationReader ) return m_relationReader;
+    std::lock_guard lock( m_sessionReaderMutex );
+    if( !m_relationReader && m_sessionManifest )
+    {
+        std::string error;
+        m_relationReader = TraceSessionRelationReader::Open( m_path, *m_sessionManifest, error );
+        if( !m_relationReader ) throw std::runtime_error( "Session Relation index validation failed: " + error );
+    }
+    return m_relationReader;
+}
+
+std::shared_ptr<TraceSessionRuntimeReader> GpuAnalysisTraceSource::SessionRuntimeReader() const
+{
+    if( !m_sessionMode || m_runtimeReader ) return m_runtimeReader;
+    std::lock_guard lock( m_sessionReaderMutex );
+    if( !m_runtimeReader && m_sessionManifest )
+    {
+        std::string error;
+        m_runtimeReader = TraceSessionRuntimeReader::Open( m_path, *m_sessionManifest, error );
+        if( !m_runtimeReader ) throw std::runtime_error( "Session Runtime index validation failed: " + error );
+    }
+    return m_runtimeReader;
+}
+
+std::shared_ptr<TraceSessionIoGfxReader> GpuAnalysisTraceSource::SessionIoGfxReader() const
+{
+    if( !m_sessionMode || m_ioGfxReader ) return m_ioGfxReader;
+    std::lock_guard lock( m_sessionReaderMutex );
+    if( !m_ioGfxReader && m_sessionManifest )
+    {
+        std::string error;
+        m_ioGfxReader = TraceSessionIoGfxReader::Open( m_path, *m_sessionManifest, error );
+        if( !m_ioGfxReader ) throw std::runtime_error( "Session I/O/Gfx index validation failed: " + error );
+    }
+    return m_ioGfxReader;
 }
 
 WorkerTraceSource& GpuAnalysisTraceSource::Worker() const
@@ -215,13 +289,13 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     static const std::vector<std::string> JobMethods = {
         "job.search", "job.get", "job.dependencies", "job.critical_path", "job.statistics"
     };
-    const auto jobPresent = m_jobReader && m_jobReader->Stats().jobs != 0;
+    const auto jobPresent = m_sessionStats.jobs != 0;
     result.push_back( Capability { "job", jobPresent, jobPresent, true,
         jobPresent ? "available from the N30 Session mandatory Job index" :
             "The source Session contains no Job facts", JobMethods } );
     static const std::vector<std::string> GfxMethods = { "job.gfx.statistics", "job.gfx_chain" };
-    const auto gfxPresent = m_ioGfxReader && ( m_ioGfxReader->Stats().gfxDispatches != 0 ||
-        m_ioGfxReader->Stats().gfxEntities != 0 || m_ioGfxReader->Stats().gfxLinks != 0 );
+    const auto gfxPresent = m_sessionStats.gfxDispatches != 0 ||
+        m_sessionStats.gfxEntities != 0 || m_sessionStats.gfxLinks != 0;
     result.push_back( Capability { "job.gfx", gfxPresent, gfxPresent, true,
         gfxPresent ? "available from the N30 Session mandatory I/O/Gfx index" :
             "The source Session contains no Gfx evidence facts", GfxMethods } );
@@ -242,8 +316,8 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     static const std::vector<std::string> IoMethods = {
         "io.search", "io.get", "io.statistics", "io.chain"
     };
-    const auto ioPresent = m_ioGfxReader && ( m_ioGfxReader->Stats().ioRequests != 0 ||
-        m_ioGfxReader->Stats().ioConfigs != 0 || m_ioGfxReader->Stats().ioStages != 0 );
+    const auto ioPresent = m_sessionStats.ioRequests != 0 ||
+        m_sessionStats.ioConfigs != 0 || m_sessionStats.ioStages != 0;
     result.push_back( Capability { "io", ioPresent, ioPresent, true,
         ioPresent ? "available from the N30 Session mandatory I/O/Gfx index" :
             "The source Session contains no structured I/O facts", IoMethods } );
@@ -252,9 +326,30 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
     result.push_back( Capability { "sample", samplesPresent, samplesPresent, true,
         samplesPresent ? "available from the N30 Session mandatory Sampling index" :
             "The source Session contains no Sampling facts", SampleMethods } );
-    addPending( "hardware_sample", TraceSessionProtocolDomain::Sampling );
-    addPending( "thread", TraceSessionProtocolDomain::Scheduling );
-    static const std::vector<std::string> CpuSchedulingMethods = { "cpu.timeline" };
+    static const std::vector<std::string> HardwareSampleMethods = {
+        "hardware_sample.address", "hardware_sample.counts",
+        "hardware_sample.events", "hardware_sample.capabilities"
+    };
+    const auto hardwareSamplesPresent = m_samplingReader &&
+        m_samplingReader->Stats().hardwareEvents != 0;
+    result.push_back( Capability { "hardware_sample", hardwareSamplesPresent,
+        hardwareSamplesPresent, true,
+        hardwareSamplesPresent ?
+            "available from the N30 Session mandatory Sampling index" :
+            "The source Session contains no Hardware Sample facts",
+        HardwareSampleMethods } );
+    static const std::vector<std::string> ThreadMethods = {
+        "thread.list", "thread.get", "thread.statistics",
+        "thread.timeline", "thread.migration"
+    };
+    const auto threadsPresent = m_schedulingReader &&
+        !m_schedulingReader->Threads().empty();
+    result.push_back( Capability { "thread", threadsPresent, threadsPresent, true,
+        threadsPresent ? "available from the N30 Session mandatory Scheduling index" :
+            "The source Session contains no Thread facts", ThreadMethods } );
+    static const std::vector<std::string> CpuSchedulingMethods = {
+        "cpu.timeline", "cpu.topology", "cpu.usage"
+    };
     const auto cpuSchedulingPresent = m_schedulingReader && m_schedulingReader->Stats().cpuEvents != 0;
     const auto schedulingSourceGaps = m_schedulingReader ? m_schedulingReader->Stats().sourceGapEvents : 0;
     result.push_back( Capability { "cpu", cpuSchedulingPresent, cpuSchedulingPresent, true,
@@ -272,9 +367,28 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
             "available from the N30 Session mandatory Scheduling index" :
             "available with source scheduling gaps; incomplete intervals are excluded from exact duration statistics" ) :
             "The source Session contains no Context Switch intervals", ContextSwitchMethods } );
-    addPending( "message", TraceSessionProtocolDomain::MessagePlotLock );
-    addPending( "plot", TraceSessionProtocolDomain::MessagePlotLock );
-    addPending( "lock", TraceSessionProtocolDomain::MessagePlotLock );
+    static const std::vector<std::string> MessageMethods = { "message.search", "message.get" };
+    const auto messagePresent = m_messageReader && m_messageReader->Stats().messages != 0;
+    result.push_back( Capability { "message", messagePresent, messagePresent, bool( m_messageReader ),
+        messagePresent ? "available from the N30 Session mandatory Message index" :
+            ( m_messageReader ? "The source Session contains no Message facts" :
+                "This completed Session predates the N30 Message semantic index" ), MessageMethods } );
+    static const std::vector<std::string> PlotMethods = {
+        "plot.list", "plot.points", "plot.range", "plot.downsample", "plot.statistics"
+    };
+    const auto plotPresent = m_plotReader && m_plotReader->Stats().points != 0;
+    result.push_back( Capability { "plot", plotPresent, plotPresent, bool( m_plotReader ),
+        plotPresent ? "available from the N30 Session mandatory Plot index" :
+            ( m_plotReader ? "The source Session contains no Plot points" :
+                "This completed Session predates the N30 Plot semantic index" ), PlotMethods } );
+    static const std::vector<std::string> LockMethods = {
+        "lock.list", "lock.get", "lock.timeline", "lock.contention_statistics"
+    };
+    const auto lockPresent = m_lockReader && m_lockReader->Stats().locks != 0;
+    result.push_back( Capability { "lock", lockPresent, lockPresent, bool( m_lockReader ),
+        lockPresent ? "available from the N30 Session mandatory Lock index" :
+            ( m_lockReader ? "The source Session contains no Lock facts" :
+                "This completed Session predates the N30 Lock semantic index" ), LockMethods } );
     static const std::vector<std::string> SourceMethods = {
         "source.locations", "source.statistics", "source.callsite", "source.callsite.search"
     };
@@ -297,22 +411,22 @@ std::vector<Capability> GpuAnalysisTraceSource::GetCapabilities() const
         callstackPresent ? "available from the N30 Session mandatory Callstack index" :
             "The source Session contains no Callstack facts", CallstackMethods } );
     static const std::vector<std::string> RuntimeDomainMethods = { "runtime.domain.states" };
-    const auto runtimeDomainPresent = m_runtimeReader && m_runtimeReader->Stats().domainStates != 0;
+    const auto runtimeDomainPresent = m_sessionStats.runtimeDomainStates != 0;
     result.push_back( Capability { "runtime.domain", runtimeDomainPresent, runtimeDomainPresent, true,
         runtimeDomainPresent ? "available from the N30 Session mandatory Runtime index" :
             "The source Session contains no Runtime Domain state facts", RuntimeDomainMethods } );
     static const std::vector<std::string> RuntimeScriptMethods = {
         "runtime.script.summary", "runtime.script.frames", "runtime.script.stacks", "runtime.script.zones"
     };
-    const auto runtimeScriptPresent = m_runtimeReader &&
-        ( m_runtimeReader->Stats().scriptFrames != 0 || m_runtimeReader->Stats().scriptStackEvents != 0 );
+    const auto runtimeScriptPresent = m_sessionStats.scriptFrames != 0 ||
+        m_sessionStats.scriptStackEvents != 0;
     result.push_back( Capability { "runtime.script", runtimeScriptPresent, runtimeScriptPresent, true,
         runtimeScriptPresent ? "available from the N30 Session mandatory Runtime index" :
             "The source Session contains no Script Runtime facts", RuntimeScriptMethods } );
     static const std::vector<std::string> RelationMethods = {
         "relation.search", "relation.get"
     };
-    const auto relationPresent = m_relationReader && m_relationReader->Stats().relations != 0;
+    const auto relationPresent = m_sessionStats.relations != 0;
     result.push_back( Capability { "relation", relationPresent, relationPresent, true,
         relationPresent ? "available from the N30 Session mandatory Relation index" :
             "The source Session contains no Relation facts", RelationMethods } );
@@ -356,7 +470,7 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
             }
         }
     }
-    if( m_jobReader ) out.counts.jobs = m_jobReader->Stats().jobs;
+    out.counts.jobs = m_sessionStats.jobs;
     if( m_frameImageReader ) out.counts.frameImages = m_frameImageReader->Stats().images;
     if( m_cpuZoneReader ) out.counts.cpuZones = m_cpuZoneReader->Stats().zones;
     if( m_gpuZoneReader ) out.counts.gpuZones = m_gpuZoneReader->Stats().zones;
@@ -370,22 +484,25 @@ TraceInfoDto GpuAnalysisTraceSource::GetTraceInfo() const
         out.counts.samples = m_samplingReader->Stats().samples;
         out.counts.contextSwitchSamples = m_samplingReader->Stats().contextSwitchSamples;
         out.counts.callstackPayloads = m_samplingReader->Stats().callstackPayloads;
+        out.counts.hardwareSamples = m_samplingReader->Stats().hardwareEvents;
     }
-    if( m_schedulingReader ) out.counts.contextSwitches =
-        m_schedulingReader->Stats().threadEvents;
-    if( m_relationReader ) out.counts.relations = m_relationReader->Stats().relations;
-    if( m_runtimeReader )
-        out.counts.runtimeDomainStates = m_runtimeReader->Stats().domainStates;
-    if( m_ioGfxReader )
+    if( m_schedulingReader )
     {
-        out.counts.ioRequests = m_ioGfxReader->Stats().ioRequests;
-        out.counts.ioConfigs = m_ioGfxReader->Stats().ioConfigs;
-        out.counts.ioStages = m_ioGfxReader->Stats().ioStages;
-        out.counts.gfxDispatches = m_ioGfxReader->Stats().gfxDispatches;
-        out.counts.gfxEntities = m_ioGfxReader->Stats().gfxEntities;
-        out.counts.gfxLinks = m_ioGfxReader->Stats().gfxLinks;
-        out.counts.correlatedFrameEvents = m_ioGfxReader->Stats().correlatedFrames;
+        out.counts.contextSwitches = m_schedulingReader->Stats().threadEvents;
+        out.counts.threads = m_schedulingReader->Stats().threadSummaries;
     }
+    if( m_messageReader ) out.counts.messages = m_messageReader->Stats().messages;
+    if( m_plotReader ) out.counts.plots = m_plotReader->Stats().plots;
+    if( m_lockReader ) out.counts.locks = m_lockReader->Stats().locks;
+    out.counts.relations = m_sessionStats.relations;
+    out.counts.runtimeDomainStates = m_sessionStats.runtimeDomainStates;
+    out.counts.ioRequests = m_sessionStats.ioRequests;
+    out.counts.ioConfigs = m_sessionStats.ioConfigs;
+    out.counts.ioStages = m_sessionStats.ioStages;
+    out.counts.gfxDispatches = m_sessionStats.gfxDispatches;
+    out.counts.gfxEntities = m_sessionStats.gfxEntities;
+    out.counts.gfxLinks = m_sessionStats.gfxLinks;
+    out.counts.correlatedFrameEvents = m_sessionStats.correlatedFrames;
     if( m_cpuZoneReader )
     {
         out.counts.sourceLocations = m_cpuZoneReader->Stats().sourceLocations;
@@ -512,7 +629,12 @@ std::optional<uint64_t> GpuAnalysisTraceSource::ParseEntityRef( std::string_view
 #define D3(Return, Name, T1, A1, T2, A2, T3, A3) Return GpuAnalysisTraceSource::Name( T1 A1, T2 A2, T3 A3 ) const { return Worker().Name( A1, A2, A3 ); }
 #define D4(Return, Name, T1, A1, T2, A2, T3, A3, T4, A4) Return GpuAnalysisTraceSource::Name( T1 A1, T2 A2, T3 A3, T4 A4 ) const { return Worker().Name( A1, A2, A3, A4 ); }
 
-D0(std::vector<ThreadDto>, GetThreads)
+std::vector<ThreadDto> GpuAnalysisTraceSource::GetThreads() const
+{
+    if( WorkerLoaded() ) return Worker().GetThreads();
+    return m_schedulingReader ? m_schedulingReader->Threads() :
+        std::vector<ThreadDto> {};
+}
 std::vector<GpuContextDto> GpuAnalysisTraceSource::GetGpuContexts() const
 {
     if( WorkerLoaded() ) return Worker().GetGpuContexts();
@@ -523,8 +645,30 @@ std::vector<MemoryPoolDto> GpuAnalysisTraceSource::GetMemoryPools() const
     if( WorkerLoaded() ) return Worker().GetMemoryPools();
     return m_memoryReader ? m_memoryReader->Pools() : std::vector<MemoryPoolDto> {};
 }
-D0(std::vector<PlotDto>, GetPlotList)
-D0(std::vector<LockDto>, GetLocks)
+std::vector<PlotDto> GpuAnalysisTraceSource::GetPlotList() const
+{
+    if( WorkerLoaded() ) return Worker().GetPlotList();
+    return m_plotReader ? m_plotReader->Plots() : std::vector<PlotDto> {};
+}
+std::vector<LockDto> GpuAnalysisTraceSource::GetLocks() const
+{
+    if( WorkerLoaded() ) return Worker().GetLocks();
+    if( !m_lockReader ) return {};
+    auto locks = m_lockReader->Locks();
+    if( m_cpuZoneReader )
+    {
+        const auto sources = m_cpuZoneReader->Sources();
+        for( auto& lock : locks )
+        {
+            if( lock.customName ) continue;
+            const auto found = std::find_if( sources.begin(), sources.end(),
+                [&]( const auto& source ) { return source.ref == lock.sourceLocationRef; } );
+            if( found != sources.end() ) lock.name =
+                found->name.empty() ? found->function : found->name;
+        }
+    }
+    return locks;
+}
 std::vector<CpuZoneDto> GpuAnalysisTraceSource::ScanCpuZones( const ScanRange& range ) const
 {
     if( WorkerLoaded() ) return Worker().ScanCpuZones( range );
@@ -540,92 +684,114 @@ std::vector<MemoryEventDto> GpuAnalysisTraceSource::ScanMemoryEvents( const Scan
     if( WorkerLoaded() ) return Worker().ScanMemoryEvents( range );
     return m_memoryReader ? m_memoryReader->Scan( range ) : std::vector<MemoryEventDto> {};
 }
-D1(std::vector<MessageDto>, ScanMessages, const ScanRange&, range)
-D1(std::vector<PlotPointDto>, ScanPlots, const ScanRange&, range)
+std::vector<MessageDto> GpuAnalysisTraceSource::ScanMessages( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanMessages( range );
+    return m_messageReader ? m_messageReader->Scan( range ) : std::vector<MessageDto> {};
+}
+std::vector<PlotPointDto> GpuAnalysisTraceSource::ScanPlots( const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanPlots( range );
+    return m_plotReader ? m_plotReader->Scan( range ) : std::vector<PlotPointDto> {};
+}
 D1(std::vector<std::string>, ScanLocks, const ScanRange&, range)
 D1(std::vector<std::string>, ScanContextSwitches, const ScanRange&, range)
 D1(std::vector<std::string>, ScanSamples, const ScanRange&, range)
 std::vector<JobDto> GpuAnalysisTraceSource::GetJobs() const
 {
     if( WorkerLoaded() ) return Worker().GetJobs();
-    return m_jobReader ? m_jobReader->Jobs() : std::vector<JobDto> {};
+    const auto reader = SessionJobReader();
+    return reader ? reader->Jobs() : std::vector<JobDto> {};
 }
 uint64_t GpuAnalysisTraceSource::GetJobCount() const
 {
     if( WorkerLoaded() ) return Worker().GetJobCount();
-    return m_jobReader ? m_jobReader->Count() : 0;
+    return m_sessionMode ? m_sessionStats.jobs : ( m_jobReader ? m_jobReader->Count() : 0 );
 }
 std::vector<JobDto> GpuAnalysisTraceSource::ScanJobs( size_t offset, size_t limit ) const
 {
     if( WorkerLoaded() ) return Worker().ScanJobs( offset, limit );
-    return m_jobReader ? m_jobReader->Scan( offset, limit ) : std::vector<JobDto> {};
+    const auto reader = SessionJobReader();
+    return reader ? reader->Scan( offset, limit ) : std::vector<JobDto> {};
 }
 std::optional<JobDto> GpuAnalysisTraceSource::GetJob( uint64_t jobId ) const
 {
     if( WorkerLoaded() ) return Worker().GetJob( jobId );
-    return m_jobReader ? m_jobReader->Get( jobId ) : std::nullopt;
+    const auto reader = SessionJobReader();
+    return reader ? reader->Get( jobId ) : std::nullopt;
 }
 std::vector<IoRequestDto> GpuAnalysisTraceSource::GetIoRequests() const
 {
     if( WorkerLoaded() ) return Worker().GetIoRequests();
-    return m_ioGfxReader ? m_ioGfxReader->IoRequests() : std::vector<IoRequestDto> {};
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->IoRequests() : std::vector<IoRequestDto> {};
 }
 std::vector<GfxDispatchDto> GpuAnalysisTraceSource::GetGfxDispatches() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxDispatches();
-    return m_ioGfxReader ? m_ioGfxReader->GfxDispatches() : std::vector<GfxDispatchDto> {};
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxDispatches() : std::vector<GfxDispatchDto> {};
 }
 std::vector<GfxEntityDto> GpuAnalysisTraceSource::GetGfxEntities() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxEntities();
-    return m_ioGfxReader ? m_ioGfxReader->GfxEntities() : std::vector<GfxEntityDto> {};
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxEntities() : std::vector<GfxEntityDto> {};
 }
 std::vector<GfxLinkDto> GpuAnalysisTraceSource::GetGfxLinks() const
 {
     if( WorkerLoaded() ) return Worker().GetGfxLinks();
-    return m_ioGfxReader ? m_ioGfxReader->GfxLinks() : std::vector<GfxLinkDto> {};
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->GfxLinks() : std::vector<GfxLinkDto> {};
 }
 std::vector<CorrelatedFrameEventDto> GpuAnalysisTraceSource::GetCorrelatedFrameEvents() const
 {
     if( WorkerLoaded() ) return Worker().GetCorrelatedFrameEvents();
-    return m_ioGfxReader ? m_ioGfxReader->CorrelatedFrames() :
+    const auto reader = SessionIoGfxReader();
+    return reader ? reader->CorrelatedFrames() :
         std::vector<CorrelatedFrameEventDto> {};
 }
 std::vector<RelationDto> GpuAnalysisTraceSource::GetRelations() const
 {
     if( WorkerLoaded() ) return Worker().GetRelations();
-    return m_relationReader ? m_relationReader->Scan( 0,
-        size_t( std::min<uint64_t>( m_relationReader->Stats().relations,
+    const auto reader = SessionRelationReader();
+    return reader ? reader->Scan( 0,
+        size_t( std::min<uint64_t>( reader->Stats().relations,
             std::numeric_limits<size_t>::max() ) ) ) : std::vector<RelationDto> {};
 }
 uint64_t GpuAnalysisTraceSource::GetRelationCount() const
 {
     if( WorkerLoaded() ) return Worker().GetRelationCount();
-    return m_relationReader ? m_relationReader->Stats().relations : 0;
+    return m_sessionMode ? m_sessionStats.relations :
+        ( m_relationReader ? m_relationReader->Stats().relations : 0 );
 }
 std::vector<RelationDto> GpuAnalysisTraceSource::ScanRelations(
     size_t offset, size_t limit ) const
 {
     if( WorkerLoaded() ) return Worker().ScanRelations( offset, limit );
-    return m_relationReader ? m_relationReader->Scan( offset, limit ) :
+    const auto reader = SessionRelationReader();
+    return reader ? reader->Scan( offset, limit ) :
         std::vector<RelationDto> {};
 }
 std::vector<RuntimeDomainStateDto> GpuAnalysisTraceSource::GetRuntimeDomainStates() const
 {
     if( WorkerLoaded() ) return Worker().GetRuntimeDomainStates();
-    return m_runtimeReader ? m_runtimeReader->DomainStates() :
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->DomainStates() :
         std::vector<RuntimeDomainStateDto> {};
 }
 std::vector<ScriptFrameDto> GpuAnalysisTraceSource::GetScriptFrames() const
 {
     if( WorkerLoaded() ) return Worker().GetScriptFrames();
-    return m_runtimeReader ? m_runtimeReader->ScriptFrames() :
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->ScriptFrames() :
         std::vector<ScriptFrameDto> {};
 }
 std::vector<ScriptStackEventDto> GpuAnalysisTraceSource::GetScriptStackEvents() const
 {
     if( WorkerLoaded() ) return Worker().GetScriptStackEvents();
-    return m_runtimeReader ? m_runtimeReader->ScriptStackEvents() :
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->ScriptStackEvents() :
         std::vector<ScriptStackEventDto> {};
 }
 std::vector<CallsiteDto> GpuAnalysisTraceSource::GetCallsites() const
@@ -634,8 +800,25 @@ std::vector<CallsiteDto> GpuAnalysisTraceSource::GetCallsites() const
     return m_cpuZoneReader ? m_cpuZoneReader->Callsites() : std::vector<CallsiteDto> {};
 }
 D0(CrashDto, GetCrash)
-D0(std::vector<CpuTopologyDto>, GetCpuTopology)
-D0(std::vector<CpuUsagePointDto>, GetCpuUsage)
+std::vector<CpuTopologyDto> GpuAnalysisTraceSource::GetCpuTopology() const
+{
+    if( WorkerLoaded() ) return Worker().GetCpuTopology();
+    return m_schedulingReader ? m_schedulingReader->CpuTopology() :
+        std::vector<CpuTopologyDto> {};
+}
+std::vector<CpuUsagePointDto> GpuAnalysisTraceSource::GetCpuUsage() const
+{
+    if( WorkerLoaded() ) return Worker().GetCpuUsage();
+    return m_schedulingReader ? m_schedulingReader->ScanCpuUsage(
+        0, std::numeric_limits<size_t>::max() ) : std::vector<CpuUsagePointDto> {};
+}
+std::vector<CpuUsagePointDto> GpuAnalysisTraceSource::ScanCpuUsage(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanCpuUsage( offset, limit );
+    return m_schedulingReader ? m_schedulingReader->ScanCpuUsage( offset, limit ) :
+        std::vector<CpuUsagePointDto> {};
+}
 std::vector<ContextSwitchDto> GpuAnalysisTraceSource::ScanContextSwitchEvents(
     const ScanRange& range ) const
 {
@@ -656,9 +839,27 @@ std::vector<SampleDto> GpuAnalysisTraceSource::ScanSampleEvents( const ScanRange
     return m_samplingReader ? m_samplingReader->Scan( range ) : std::vector<SampleDto> {};
 }
 D1(std::vector<GhostZoneDto>, ScanGhostZones, const ScanRange&, range)
-D0(std::vector<HardwareSampleDto>, GetHardwareSamples)
-D4(std::vector<HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit)
-D1(std::vector<LockEventDto>, ScanLockEvents, const ScanRange&, range)
+std::vector<HardwareSampleDto> GpuAnalysisTraceSource::GetHardwareSamples() const
+{
+    if( WorkerLoaded() ) return Worker().GetHardwareSamples();
+    return m_samplingReader ? m_samplingReader->HardwareSamples() :
+        std::vector<HardwareSampleDto> {};
+}
+std::vector<HardwareSampleEventDto> GpuAnalysisTraceSource::GetHardwareSampleEvents(
+    uint64_t address, std::string_view kind, size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return Worker().GetHardwareSampleEvents(
+        address, kind, offset, limit );
+    return m_samplingReader ? m_samplingReader->HardwareSampleEvents(
+        address, kind, offset, limit ) : std::vector<HardwareSampleEventDto> {};
+}
+std::vector<LockEventDto> GpuAnalysisTraceSource::ScanLockEvents(
+    const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return Worker().ScanLockEvents( range );
+    return m_lockReader ? m_lockReader->Scan( range ) :
+        std::vector<LockEventDto> {};
+}
 std::vector<SymbolDto> GpuAnalysisTraceSource::GetSymbols() const
 {
     if( WorkerLoaded() ) return Worker().GetSymbols();

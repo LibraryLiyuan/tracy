@@ -87,11 +87,29 @@ struct StoredScriptStack
     uint8_t kind = 0;
     uint8_t reserved = 0;
 };
+
+// Script records may legally precede the asynchronous StringData replies for
+// their cold strings.  Preserve the exact record order in a bounded disk
+// journal, then resolve it after the canonical scan has collected the complete
+// string dictionary.
+struct DeferredScriptFrame
+{
+    QueueJnScriptFrame frame;
+    uint32_t thread = 0;
+};
+
+struct DeferredScriptStack
+{
+    QueueJnScriptStack stack;
+    uint32_t thread = 0;
+};
 #pragma pack( pop )
 
 static_assert( sizeof( StoredDomainState ) == 36 );
 static_assert( sizeof( StoredScriptFrame ) == 40 );
 static_assert( sizeof( StoredScriptStack ) == 48 );
+static_assert( sizeof( DeferredScriptFrame ) == sizeof( QueueJnScriptFrame ) + sizeof( uint32_t ) );
+static_assert( sizeof( DeferredScriptStack ) == sizeof( QueueJnScriptStack ) + sizeof( uint32_t ) );
 
 struct RuntimeManifest
 {
@@ -240,6 +258,8 @@ struct BuildState
     std::ofstream domain;
     std::ofstream frame;
     std::ofstream stack;
+    std::ofstream deferredFrame;
+    std::ofstream deferredStack;
     std::ofstream stringsFile;
     std::unordered_map<uint64_t, std::string> strings;
     std::unordered_map<std::string, std::pair<uint64_t, uint32_t>> interned;
@@ -313,34 +333,70 @@ bool VisitRuntime( const TraceSessionCanonicalRecord& record, void* userData,
     }
     case QueueType::JnScriptFrame:
     {
-        const auto function = state.strings.find( item.jnScriptFrame.function );
-        const auto file = state.strings.find( item.jnScriptFrame.file );
-        if( function == state.strings.end() || file == state.strings.end() )
-        { error = "session_runtime_script_frame_string_unresolved"; return false; }
-        StoredScriptFrame value;
-        if( !Intern( state, function->second, value.functionOffset, value.functionBytes, error ) ||
-            !Intern( state, file->second, value.fileOffset, value.fileBytes, error ) ) return false;
-        value.frameId = item.jnScriptFrame.frameId;
-        value.line = item.jnScriptFrame.line;
-        value.thread = record.threadContext;
-        value.runtime = item.jnScriptFrame.runtime;
-        value.flags = item.jnScriptFrame.flags;
-        if( !WriteRecord( state.frame, &value, sizeof( value ),
-            "session_runtime_script_frame_write_failed", error ) ) return false;
+        const DeferredScriptFrame value { item.jnScriptFrame, record.threadContext };
+        if( !WriteRecord( state.deferredFrame, &value, sizeof( value ),
+            "session_runtime_script_frame_deferred_write_failed", error ) ) return false;
         ++state.stats.scriptFrames;
         break;
     }
     case QueueType::JnScriptStack:
     {
+        const DeferredScriptStack value { item.jnScriptStack, record.threadContext };
+        if( !WriteRecord( state.deferredStack, &value, sizeof( value ),
+            "session_runtime_script_stack_deferred_write_failed", error ) ) return false;
+        ++state.stats.scriptStackEvents;
+        break;
+    }
+    default: break;
+    }
+    return true;
+}
+
+bool ResolveDeferredScriptRecords( BuildState& state,
+    const std::filesystem::path& deferredFramePath,
+    const std::filesystem::path& deferredStackPath, std::string& error )
+{
+    std::ifstream frames( deferredFramePath, std::ios::binary );
+    if( !frames ) { error = "session_runtime_script_frame_deferred_open_failed"; return false; }
+    for( uint64_t i = 0; i < state.stats.scriptFrames; ++i )
+    {
+        DeferredScriptFrame deferred;
+        if( !frames.read( reinterpret_cast<char*>( &deferred ), sizeof( deferred ) ) )
+        { error = "session_runtime_script_frame_deferred_truncated"; return false; }
+        const auto function = state.strings.find( deferred.frame.function );
+        const auto file = state.strings.find( deferred.frame.file );
+        if( function == state.strings.end() || file == state.strings.end() )
+        { error = "session_runtime_script_frame_string_unresolved"; return false; }
+        StoredScriptFrame value;
+        if( !Intern( state, function->second, value.functionOffset, value.functionBytes, error ) ||
+            !Intern( state, file->second, value.fileOffset, value.fileBytes, error ) ) return false;
+        value.frameId = deferred.frame.frameId;
+        value.line = deferred.frame.line;
+        value.thread = deferred.thread;
+        value.runtime = deferred.frame.runtime;
+        value.flags = deferred.frame.flags;
+        if( !WriteRecord( state.frame, &value, sizeof( value ),
+            "session_runtime_script_frame_write_failed", error ) ) return false;
+    }
+    if( frames.peek() != std::char_traits<char>::eof() )
+    { error = "session_runtime_script_frame_deferred_trailing_data"; return false; }
+
+    std::ifstream stacks( deferredStackPath, std::ios::binary );
+    if( !stacks ) { error = "session_runtime_script_stack_deferred_open_failed"; return false; }
+    for( uint64_t i = 0; i < state.stats.scriptStackEvents; ++i )
+    {
+        DeferredScriptStack deferred;
+        if( !stacks.read( reinterpret_cast<char*>( &deferred ), sizeof( deferred ) ) )
+        { error = "session_runtime_script_stack_deferred_truncated"; return false; }
         StoredScriptStack value;
-        value.timeNs = state.transform.ToNanoseconds( item.jnScriptStack.time );
-        value.primaryId = item.jnScriptStack.primaryId;
-        value.secondaryId = item.jnScriptStack.secondaryId;
-        value.value = item.jnScriptStack.value;
-        value.thread = record.threadContext;
-        value.runtime = item.jnScriptStack.runtime;
-        value.flags = item.jnScriptStack.flags;
-        value.kind = item.jnScriptStack.kind;
+        value.timeNs = state.transform.ToNanoseconds( deferred.stack.time );
+        value.primaryId = deferred.stack.primaryId;
+        value.secondaryId = deferred.stack.secondaryId;
+        value.value = deferred.stack.value;
+        value.thread = deferred.thread;
+        value.runtime = deferred.stack.runtime;
+        value.flags = deferred.stack.flags;
+        value.kind = deferred.stack.kind;
         if( JnScriptRecordKind( value.kind ) == JnScriptRecordKind::Marker )
         {
             const auto text = state.strings.find( value.secondaryId );
@@ -350,11 +406,9 @@ bool VisitRuntime( const TraceSessionCanonicalRecord& record, void* userData,
         }
         if( !WriteRecord( state.stack, &value, sizeof( value ),
             "session_runtime_script_stack_write_failed", error ) ) return false;
-        ++state.stats.scriptStackEvents;
-        break;
     }
-    default: break;
-    }
+    if( stacks.peek() != std::char_traits<char>::eof() )
+    { error = "session_runtime_script_stack_deferred_trailing_data"; return false; }
     return true;
 }
 
@@ -474,16 +528,27 @@ bool BuildTraceSessionRuntimeDerived( const std::filesystem::path& sessionRoot,
     const auto frameWork = root / "frame.work";
     const auto stackWork = root / "stack.work";
     const auto stringWork = root / "strings.work";
+    const auto deferredFrameWork = root / "frame-references.work";
+    const auto deferredStackWork = root / "stack-references.work";
     BuildState state;
     state.domain.open( domainWork, std::ios::binary | std::ios::trunc );
     state.frame.open( frameWork, std::ios::binary | std::ios::trunc );
     state.stack.open( stackWork, std::ios::binary | std::ios::trunc );
     state.stringsFile.open( stringWork, std::ios::binary | std::ios::trunc );
-    if( !state.domain || !state.frame || !state.stack || !state.stringsFile )
+    state.deferredFrame.open( deferredFrameWork, std::ios::binary | std::ios::trunc );
+    state.deferredStack.open( deferredStackWork, std::ios::binary | std::ios::trunc );
+    if( !state.domain || !state.frame || !state.stack || !state.stringsFile ||
+        !state.deferredFrame || !state.deferredStack )
     { error = "session_runtime_work_open_failed"; return false; }
     if( !LoadTraceSessionTimeTransform( sessionRoot, session, state.transform, error ) ||
         !VisitTraceSessionCanonicalOrdered( sessionRoot, session, VisitRuntime, &state, error ) ) return false;
+    state.deferredFrame.close(); state.deferredStack.close();
+    if( !state.deferredFrame || !state.deferredStack )
+    { error = "session_runtime_script_deferred_flush_failed"; return false; }
+    if( !ResolveDeferredScriptRecords( state, deferredFrameWork, deferredStackWork, error ) ) return false;
     state.domain.close(); state.frame.close(); state.stack.close(); state.stringsFile.close();
+    if( !state.domain || !state.frame || !state.stack || !state.stringsFile )
+    { error = "session_runtime_work_flush_failed"; return false; }
 
     RuntimeFileHeader header;
     header.sourceSize = session.source.fileSize;
@@ -530,6 +595,8 @@ bool BuildTraceSessionRuntimeDerived( const std::filesystem::path& sessionRoot,
     std::filesystem::remove( frameWork, ec );
     std::filesystem::remove( stackWork, ec );
     std::filesystem::remove( stringWork, ec );
+    std::filesystem::remove( deferredFrameWork, ec );
+    std::filesystem::remove( deferredStackWork, ec );
 
     RuntimeManifest manifest;
     manifest.sourceSha256 = session.source.sha256;

@@ -4441,6 +4441,11 @@ std::shared_ptr<analysis::GpuAnalysisStoreReader> QueryService::CachedGpuStoreRe
             manifest->summary.resourceRecordCount = value->Manifest().resourceCount;
             manifest->summary.allocationRecordCount = value->Manifest().allocationCount;
             manifest->summary.passCount = value->Manifest().passCount;
+            manifest->summary.rangeCount = value->Manifest().rangeCount;
+            manifest->summary.logicalRecordCount = value->Manifest().logicalCount;
+            manifest->summary.relationCount = value->Manifest().catalogRelationCount;
+            manifest->summary.generationCount = 1;
+            manifest->summary.payloadBytes = value->Manifest().totalBytes;
             manifest->summary.engineKnownPhysicalBytes = value->Overview().engineKnownPhysicalBytes;
             manifest->summary.engineKnownPhysicalPeakBytes = value->Overview().engineKnownPhysicalPeakBytes;
             manifest->summary.engineKnownPhysicalPeakTimeNs = value->Overview().engineKnownPhysicalPeakTimeNs;
@@ -5437,6 +5442,57 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( method == "gpu.catalog.validation" )
         {
             auto result = statusJson();
+            if( source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session )
+            {
+                const auto sessionSource = std::dynamic_pointer_cast<analysis::GpuAnalysisTraceSource>( source );
+                const auto reader = sessionSource ? sessionSource->StoreReader() : nullptr;
+                if( !reader ) throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID",
+                    "Published Session has no pinned mandatory GPU Resource Analysis reader", false );
+                const auto& store = reader->Manifest();
+                const auto& facade = sessionSource->AnalysisManifest();
+                const bool converterOutputComplete = store.complete && facade.rawComplete &&
+                    facade.derivedComplete && facade.summary.catalogValid;
+                const bool sourceDegraded = store.sourceGapResourceCount != 0 ||
+                    store.sourceGapReferenceCount != 0 || !facade.reason.empty();
+                result["validation_provenance"] = "session_final_audit";
+                result["complete"] = converterOutputComplete;
+                result["source_degraded"] = sourceDegraded;
+                result["partial"] = sourceDegraded;
+                result["enrichment_complete"] = store.sourceGapResourceCount == 0 &&
+                    store.sourceGapReferenceCount == 0;
+                result["reason"] = facade.reason.empty() ? json( nullptr ) : json( facade.reason );
+                result["transport"] = {
+                    { "available", false },
+                    { "reason", "validated_during_session_final_audit" },
+                    { "validated_by_final_audit", true },
+                    { "converter_output_complete", converterOutputComplete },
+                    { "committed_pages", Decimal( store.pages.size() ) },
+                    { "checksum_failures", "0" }
+                };
+                result["source_quality"] = {
+                    { "degraded", sourceDegraded },
+                    { "reason", facade.reason.empty() ? json( nullptr ) : json( facade.reason ) },
+                    { "gpu_resource_identity_gaps", Decimal( store.sourceGapResourceCount ) },
+                    { "gpu_reference_identity_gaps", Decimal( store.sourceGapReferenceCount ) }
+                };
+                result["store_counts"] = {
+                    { "resources", Decimal( store.resourceCount ) },
+                    { "allocations", Decimal( store.allocationCount ) },
+                    { "passes", Decimal( store.passCount ) },
+                    { "resource_pass_relations", Decimal( store.resourcePassRelationCount ) },
+                    { "frame_pass_relations", Decimal( store.framePassRelationCount ) },
+                    { "ranges", Decimal( store.rangeCount ) },
+                    { "logical_resources", Decimal( store.logicalCount ) },
+                    { "catalog_relations", Decimal( store.catalogRelationCount ) },
+                    { "payload_bytes", Decimal( store.totalBytes ) }
+                };
+                result["unresolved_breakdown"] = {
+                    { "converter_created", "0" },
+                    { "source_gap_resources", Decimal( store.sourceGapResourceCount ) },
+                    { "source_gap_references", Decimal( store.sourceGapReferenceCount ) }
+                };
+                return Success( id, std::move( result ), trace );
+            }
             uint64_t invalidBatches = 0;
             uint64_t checksumFailures = 0;
             uint64_t transportChecksumsVerified = 0;
@@ -5846,9 +5902,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         "GPU Resource Analysis sidecar is not ready", retryable,
                         { { "reason", sidecarError }, { "state", analysis::GpuAnalysisSidecarStateName( sidecarManifest.state ) } } );
                 }
-                const auto resourceJsonFromStore = [&]( const analysis::GpuResourceAnalysisRecord& value, bool details )
+                const auto resourceJsonBase = [&]( const auto& value )
                 {
-                    json result = {
+                    return json {
                         { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) }, { "resource_id", Decimal( value.resourceId ) },
                         { "generation", Decimal( value.generation ) }, { "definition_revision", value.definitionRevision },
                         { "resource_class", GpuResourceClassName( value.resourceClass ) }, { "primary_kind", analysis::GpuPrimaryKindName( value.primaryKind ) },
@@ -5866,6 +5922,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
                         { "stack_provenance", value.stackProvenance }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" }
                     };
+                };
+                const auto resourceJsonFromStore = [&]( const analysis::GpuResourceAnalysisRecord& value, bool details )
+                {
+                    auto result = resourceJsonBase( value );
                     if( details ) result["description"] = {
                         { "width", Decimal( value.width ) }, { "height", value.height }, { "depth_or_array_size", value.depthOrArraySize },
                         { "mip_levels", value.mipLevels }, { "format", value.format }, { "sample_count", value.sampleCount },
@@ -5941,7 +6001,39 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     const bool requireAliasGroup = filter.value( "has_alias_group", false );
                     const bool requireSharedAllocation = filter.value( "has_shared_allocation", false );
                     json values = json::array(); size_t total = 0;
-                    for( size_t pageIndex = 0; pageIndex < reader->ResourcePageCount(); ++pageIndex )
+                    const bool hasFilter = !nameFilter.empty() || !kindFilter.empty() || !classFilter.empty() ||
+                        requireMeshParts || requireRanges || requireLogicalBindings || requireAliasGroup || requireSharedAllocation;
+                    if( reader->ResourceSummaryPageCount() != 0 )
+                    {
+                        for( size_t pageIndex = 0; pageIndex < reader->ResourceSummaryPageCount(); ++pageIndex )
+                        {
+                            std::vector<analysis::GpuAnalysisResourceSummary> records;
+                            if( !reader->LoadResourceSummaryPage( pageIndex, records, sidecarError ) )
+                                throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
+                            for( const auto& value : records )
+                            {
+                                if( !nameFilter.empty() && value.name.find( nameFilter ) == std::string::npos ) continue;
+                                if( !kindFilter.empty() && kindFilter != analysis::GpuPrimaryKindName( value.primaryKind ) ) continue;
+                                if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
+                                if( requireMeshParts && value.partCount == 0 ) continue;
+                                if( requireRanges && value.rangeCount == 0 ) continue;
+                                if( requireLogicalBindings && value.logicalBindingCount == 0 ) continue;
+                                if( requireAliasGroup && !value.hasAliasGroup ) continue;
+                                if( requireSharedAllocation && value.allocationResourceCount <= 1 ) continue;
+                                const auto position = total++;
+                                if( position < page.offset || values.size() >= page.limit ) continue;
+                                auto result = resourceJsonBase( value );
+                                if( requireMeshParts ) result["mesh_part_count"] = Decimal( value.partCount );
+                                if( requireRanges ) result["pass_range_count"] = Decimal( value.rangeCount );
+                                if( requireLogicalBindings || requireAliasGroup ) result["logical_binding_count"] = Decimal( value.logicalBindingCount );
+                                if( requireSharedAllocation ) result["allocation_resource_count"] = Decimal( value.allocationResourceCount );
+                                values.push_back( std::move( result ) );
+                            }
+                            if( !hasFilter && values.size() >= page.limit ) break;
+                        }
+                        if( !hasFilter ) total = size_t( reader->Manifest().resourceCount );
+                    }
+                    else for( size_t pageIndex = 0; pageIndex < reader->ResourcePageCount(); ++pageIndex )
                     {
                         std::vector<analysis::GpuResourceAnalysisRecord> records;
                         if( !reader->LoadResourcePage( pageIndex, records, sidecarError ) ) throw QueryError( "GPU_ANALYSIS_SIDECAR_INVALID", sidecarError );
@@ -6000,7 +6092,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                             { "exactness", GpuExactnessName( range.value.exactness ) } } );
                         value["ranges"] = std::move( ranges ); resourcesJson.push_back( std::move( value ) );
                     }
-                    return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", "continuous_exact" },
+                    const auto sampleStatus = pass->complete ? "continuous_exact" : "source_incomplete";
+                    return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) }, { "sample_status", sampleStatus },
+                        { "complete", pass->complete }, { "truncated", pass->truncated },
+                        { "unavailable_reason", pass->complete ? json( nullptr ) : json( "source_gpu_resource_identity_gap" ) },
                         { "resource_count", Decimal( pass->directResources.size() ) }, { "direct_range_bytes", Decimal( pass->directRangeBytes ) },
                         { "referenced_physical_bytes", Decimal( pass->directPhysicalBytes ) }, { "unknown_range_resource_count", pass->unknownRangeResourceCount },
                         { "resources", std::move( resourcesJson ) }, { "analysis_backend", "n29_gpu_resource_analysis_sidecar" } },
@@ -6144,7 +6239,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     json references = json::array(); for( const auto& pass : passes ) references.push_back( {
                         { "pass_id", Decimal( pass.passId ) }, { "frame_id", Decimal( pass.frameId ) }, { "name", pass.name },
                         { "direct", std::binary_search( pass.directResources.begin(), pass.directResources.end(), resourceId ) },
-                        { "direct_physical_bytes", Decimal( pass.directPhysicalBytes ) }, { "inclusive_physical_bytes", Decimal( pass.inclusivePhysicalBytes ) } } );
+                        { "direct_physical_bytes", Decimal( pass.directPhysicalBytes ) }, { "inclusive_physical_bytes", Decimal( pass.inclusivePhysicalBytes ) },
+                        { "complete", pass.complete }, { "truncated", pass.truncated },
+                        { "unavailable_reason", pass.complete ? json( nullptr ) : json( "source_gpu_resource_identity_gap" ) } } );
                     size_t rangeTotal = 0; auto ranges = rangesFromStore( page.offset, page.limit, rangeTotal );
                     return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) }, { "passes", std::move( references ) },
                         { "ranges", std::move( ranges ) }, { "range_count", Decimal( rangeTotal ) },
@@ -6159,7 +6256,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                             { "resident_bytes", Decimal( allocation->residentBytes ) }, { "heap_id", Decimal( allocation->heapId ) } } );
                     std::vector<analysis::GpuPassWorkingSet> passes; bool hasMore = false; reader->PassesForResource( resourceId, 0, DefaultPageSize, passes, hasMore, sidecarError );
                     json references = json::array(); for( const auto& pass : passes ) references.push_back( { { "pass_id", Decimal( pass.passId ) },
-                        { "frame_id", Decimal( pass.frameId ) }, { "name", pass.name } } );
+                        { "frame_id", Decimal( pass.frameId ) }, { "name", pass.name },
+                        { "complete", pass.complete }, { "truncated", pass.truncated },
+                        { "unavailable_reason", pass.complete ? json( nullptr ) : json( "source_gpu_resource_identity_gap" ) } } );
                     result["allocations"] = std::move( allocationsJson ); result["pass_references"] = std::move( references );
                     result["views"] = viewsFromStore(); result["parts"] = partsFromStore( false );
                     size_t rangeTotal = 0, logicalTotal = 0, relationTotal = 0;
@@ -7781,16 +7880,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "cpu.usage" )
     {
         const auto page = ParsePage( params, method, trace );
-        const auto usage = source->GetCpuUsage();
-        const size_t begin = std::min( page.offset, usage.size() );
-        const size_t end = std::min( begin + page.limit, usage.size() );
+        auto usage = source->ScanCpuUsage( page.offset, page.limit + 1 );
+        const auto hasMore = usage.size() > page.limit;
+        if( hasMore ) usage.resize( page.limit );
         json points = json::array();
-        for( size_t index = begin; index < end; index++ ) points.push_back( {
-            { "ref", usage[index].ref }, { "time_ns", Decimal( usage[index].timeNs ) },
-            { "own_threads", usage[index].own }, { "other_processes", usage[index].other }
+        for( const auto& value : usage ) points.push_back( {
+            { "ref", value.ref }, { "time_ns", Decimal( value.timeNs ) },
+            { "own_threads", value.own }, { "other_processes", value.other }
         } );
-        const auto cursor = NextCursor( page, method, trace, points.size(), end < usage.size() );
-        return Success( id, { { "points", std::move( points ) } }, trace, PageJson( page, end - begin, cursor ) );
+        const auto returned = usage.size();
+        const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+        return Success( id, { { "points", std::move( points ) } }, trace,
+            PageJson( page, returned, cursor ) );
     }
     if( method == "cpu.timeline" )
     {
@@ -10220,7 +10321,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !job ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
             return Success( id, JobJson( *source, *job, true ), trace );
         }
-        auto jobs = source->GetJobs();
+        const bool pagedSessionJobs = source->AcquireReadView().sourceKind == analysis::TraceSourceKind::Session;
+        std::vector<analysis::JobDto> jobs;
+        if( !pagedSessionJobs ) jobs = source->GetJobs();
         const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
         const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
             if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
@@ -10232,6 +10335,25 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "job.statistics" )
         {
+            const uint64_t statisticsJobCount = pagedSessionJobs ? source->GetJobCount() : jobs.size();
+            const auto forEachStatisticsJob = [&]( auto&& visitor ) {
+                if( !pagedSessionJobs )
+                {
+                    for( const auto& job : jobs ) visitor( job );
+                    return;
+                }
+                constexpr size_t PageSize = 1024;
+                uint64_t offset = 0;
+                while( offset < statisticsJobCount )
+                {
+                    checkCancelled();
+                    const auto page = source->ScanJobs( size_t( offset ),
+                        size_t( std::min<uint64_t>( PageSize, statisticsJobCount - offset ) ) );
+                    if( page.empty() ) throw std::runtime_error( "session_job_statistics_page_missing" );
+                    for( const auto& job : page ) visitor( job );
+                    offset += page.size();
+                }
+            };
             std::vector<int64_t> scheduleToReady;
             std::vector<int64_t> readyToQueue;
             std::vector<int64_t> queueToFirstRun;
@@ -10285,49 +10407,48 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 json sameSlotJobs = json::array();
                 if( job.packedHandle != 0 )
                 {
-                    for( const auto& candidate : jobs )
-                    {
-                        if( candidate.jobId == job.jobId || candidate.packedHandle != job.packedHandle ) continue;
-                        sameHandleJobs.push_back( {
-                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
-                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
-                            { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
-                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
-                        } );
-                        if( sameHandleJobs.size() >= 8 ) break;
-                    }
-
-                    std::vector<const analysis::JobDto*> slotCandidates;
+                    std::vector<analysis::JobDto> slotCandidates;
                     const auto slotIndex = uint32_t( job.packedHandle );
-                    for( const auto& candidate : jobs )
+                    const auto slotDistance = [&]( const analysis::JobDto& candidate ) {
+                        return candidate.jobId > job.jobId ? candidate.jobId - job.jobId : job.jobId - candidate.jobId;
+                    };
+                    forEachStatisticsJob( [&]( const analysis::JobDto& candidate )
                     {
-                        if( candidate.jobId == job.jobId || uint32_t( candidate.packedHandle ) != slotIndex ) continue;
-                        slotCandidates.push_back( &candidate );
-                    }
-                    std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto* lhs, const auto* rhs ) {
-                        const auto lhsDelta = lhs->jobId > job.jobId ? lhs->jobId - job.jobId : job.jobId - lhs->jobId;
-                        const auto rhsDelta = rhs->jobId > job.jobId ? rhs->jobId - job.jobId : job.jobId - rhs->jobId;
-                        return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs->jobId < rhs->jobId;
+                        if( candidate.jobId == job.jobId ) return;
+                        if( candidate.packedHandle == job.packedHandle && sameHandleJobs.size() < 8 )
+                            sameHandleJobs.push_back( {
+                                { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                                { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
+                                { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
+                                { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                            } );
+                        if( uint32_t( candidate.packedHandle ) != slotIndex ) return;
+                        slotCandidates.emplace_back( candidate );
+                        std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto& lhs, const auto& rhs ) {
+                            const auto lhsDelta = slotDistance( lhs );
+                            const auto rhsDelta = slotDistance( rhs );
+                            return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs.jobId < rhs.jobId;
+                        } );
+                        if( slotCandidates.size() > 8 ) slotCandidates.resize( 8 );
                     } );
-                    for( const auto* candidate : slotCandidates )
+                    for( const auto& candidate : slotCandidates )
                     {
                         uint32_t readyCount = 0;
                         uint32_t queueCount = 0;
-                        for( const auto& candidateStage : candidate->stages )
+                        for( const auto& candidateStage : candidate.stages )
                         {
                             readyCount += candidateStage.stage == uint8_t( JnJobStage::Ready );
                             queueCount += candidateStage.stage == uint8_t( JnJobStage::QueueEnter );
                         }
                         sameSlotJobs.push_back( {
-                            { "job_ref", candidate->ref }, { "job_id", Decimal( candidate->jobId ) },
-                            { "packed_handle", Decimal( candidate->packedHandle ) },
-                            { "generation", uint32_t( candidate->packedHandle >> 32 ) },
-                            { "schedule_ns", Decimal( candidate->scheduleNs ) },
-                            { "capture_boundary", candidate->captureBoundary }, { "orphan", candidate->orphan },
+                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                            { "packed_handle", Decimal( candidate.packedHandle ) },
+                            { "generation", uint32_t( candidate.packedHandle >> 32 ) },
+                            { "schedule_ns", Decimal( candidate.scheduleNs ) },
+                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
                             { "ready_count", readyCount }, { "queue_enter_count", queueCount },
-                            { "dispatch_count", candidate->dispatchCount }, { "stage_count", candidate->stages.size() }
+                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
                         } );
-                        if( sameSlotJobs.size() >= 8 ) break;
                     }
                 }
                 examples.push_back( {
@@ -10351,7 +10472,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "delta_ns", Decimal( end - begin ) }
                 } );
             };
-            for( const auto& job : jobs )
+            forEachStatisticsJob( [&]( const analysis::JobDto& job )
             {
                 checkCancelled();
                 const bool captureBoundary = job.orphan || job.truncated;
@@ -10456,7 +10577,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         laneStealsAsVictim[stage.arg1]++;
                     }
                 }
-            }
+            } );
             json lanes = json::array();
             std::set<uint32_t> laneIds;
             for( const auto& [lane, count] : laneDispatches ) laneIds.insert( lane );
@@ -10468,10 +10589,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "steals_as_victim", Decimal( laneStealsAsVictim[lane] ) }
             } );
             return Success( id, {
-                { "present", !jobs.empty() }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
+                { "present", statisticsJobCount != 0 }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
                 { "source_mode", v3 != 0 ? "native-hooks-job-v3" : v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
                 { "counts", {
-                    { "jobs", Decimal( jobs.size() ) }, { "completed", Decimal( completed ) },
+                    { "jobs", Decimal( statisticsJobCount ) }, { "completed", Decimal( completed ) },
                     { "managed", Decimal( managed ) }, { "burst", Decimal( burst ) },
                     { "v2", Decimal( v2 ) }, { "v2_or_newer", Decimal( v2 ) }, { "v3", Decimal( v3 ) },
                     { "scheduler_steals", Decimal( schedulerSteals ) },
@@ -10512,6 +10633,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 } }
             }, trace );
         }
+
+        if( pagedSessionJobs ) jobs = source->GetJobs();
 
         if( method == "job.search" )
         {

@@ -116,6 +116,23 @@ int main()
     assert( snapshot.engineKnownPhysicalBytes == 4096 );
     assert( snapshot.logicalCapacityBytes == 8192 );
     assert( snapshot.FindResource( 10 )->views.size() == 1 );
+
+    // N30 first normalizes Catalog facts without retaining the unbounded
+    // Pass/ResourceSet stream. Range facts must remain on their resource while
+    // their deferred Pass join is handled by the disk-backed pass builder.
+    auto catalogOnlyData = data;
+    catalogOnlyData.gpuReferencePasses.clear();
+    catalogOnlyData.gpuReferenceUses.clear();
+    catalogOnlyData.gpuReferenceEnds.clear();
+    GpuAnalysisBuildControl catalogOnlyControl;
+    catalogOnlyControl.catalogOnly = true;
+    const auto catalogOnly = BuildGpuAnalysisSnapshot(
+        catalogOnlyData, nullptr, {}, catalogOnlyControl );
+    assert( catalogOnly.manifest.state == GpuAnalysisState::Complete );
+    assert( catalogOnly.manifest.complete );
+    assert( catalogOnly.passes.empty() );
+    assert( catalogOnly.FindResource( 10 ) != nullptr );
+    assert( catalogOnly.FindResource( 10 )->ranges.size() == 1 );
     assert( snapshot.FindResource( 10 )->logicals.size() == 1 );
     assert( snapshot.FindResource( 10 )->parts.size() == 1 );
     assert( snapshot.FindResource( 10 )->relations.size() == 1 );
@@ -279,6 +296,95 @@ int main()
     assert( storeReader->PassesForResource( 10, 0, 100, resourcePasses, hasMore, error ) );
     assert( resourcePasses.size() == 1 && resourcePasses.front().passId == 1000 && !hasMore );
 
+    // N30 consumes independently committed pass pages without ever requiring
+    // all passes and reverse relations in one GpuAnalysisSnapshot.
+    const auto sessionStoreRoot = testRoot / "session-gpu-derived";
+    const auto passSpoolRoot = testRoot / "session-pass-spool";
+    std::filesystem::create_directories( passSpoolRoot, ec );
+    assert( !ec );
+    GpuAnalysisSnapshot passPage;
+    passPage.manifest = snapshot.manifest;
+    passPage.passes = snapshot.passes;
+    const GpuAnalysisCacheIdentity spoolIdentity { traceIdentity.sha256,
+        traceIdentity.fileSize, std::string( GpuAnalysisAlgorithmId ) +
+            "-session-pass-spool1" };
+    assert( SaveGpuAnalysisCache( passSpoolRoot / "000000.bin",
+        spoolIdentity, passPage, error ) );
+    GpuAnalysisPassSpool passSpool;
+    passSpool.root = passSpoolRoot;
+    passSpool.pageCount = 1;
+    passSpool.passCount = passPage.passes.size();
+    const auto rangeRun = passSpoolRoot / "range-run.bin";
+    GpuAnalysisRangeStoreEntry rangeEntry;
+    rangeEntry.resourceId = rangeA.resourceId;
+    rangeEntry.generation = 7;
+    rangeEntry.record = rangeA;
+    { std::ofstream out( rangeRun, std::ios::binary | std::ios::trunc );
+      out.write( reinterpret_cast<const char*>( &rangeEntry ), sizeof( rangeEntry ) ); }
+    passSpool.rangeCount = 1;
+    passSpool.rangeRuns.push_back( rangeRun );
+    const auto logicalRun = passSpoolRoot / "logical-run.bin";
+    GpuAnalysisLogicalStoreEntry logicalEntry;
+    logicalEntry.resourceId = 10; logicalEntry.generation = 7;
+    logicalEntry.nameGeneration = 7; logicalEntry.record.logicalResourceId = 55;
+    logicalEntry.record.resourceId = 10; logicalEntry.record.nameId = 42;
+    logicalEntry.record.time = 105;
+    { std::ofstream out( logicalRun, std::ios::binary | std::ios::trunc );
+      out.write( reinterpret_cast<const char*>( &logicalEntry ), sizeof( logicalEntry ) ); }
+    passSpool.logicalCount = 1; passSpool.logicalRuns.push_back( logicalRun );
+    const auto catalogRelationRun = passSpoolRoot / "catalog-relation-run.bin";
+    GpuAnalysisCatalogRelationStoreEntry catalogRelationEntry;
+    catalogRelationEntry.resourceId = 10; catalogRelationEntry.generation = 7;
+    catalogRelationEntry.record.sourceId = 10; catalogRelationEntry.record.targetId = 20;
+    catalogRelationEntry.record.time = 106;
+    { std::ofstream out( catalogRelationRun, std::ios::binary | std::ios::trunc );
+      out.write( reinterpret_cast<const char*>( &catalogRelationEntry ), sizeof( catalogRelationEntry ) ); }
+    passSpool.catalogRelationCount = 1;
+    passSpool.catalogRelationRuns.push_back( catalogRelationRun );
+    auto catalogWithoutRanges = catalogOnly;
+    for( auto& resource : catalogWithoutRanges.resources )
+    { resource.ranges.clear(); resource.logicals.clear(); resource.relations.clear(); }
+    std::string sessionGeneration; uint64_t sessionBytes = 0;
+    JnGpuCatalogStringRecordHeaderV1 logicalNameHeader {};
+    logicalNameHeader.stringId = 42; logicalNameHeader.originalLength = 11;
+    logicalNameHeader.byteLength = 11;
+    const std::vector<JnGpuCatalogStringData> catalogStrings {
+        { 7, logicalNameHeader, "LogicalName" }
+    };
+    assert( WriteGpuAnalysisDerivedStoreFromPassSpoolAt( sessionStoreRoot,
+        traceIdentity, catalogWithoutRanges, passSpool, catalogStrings, sidecarControl,
+        sessionGeneration, sessionBytes, error ) );
+    auto sessionStore = GpuAnalysisStoreReader::OpenAt( sessionStoreRoot,
+        traceIdentity.sha256, traceIdentity.fileSize, error );
+    assert( sessionStore && sessionStore->Manifest().passCount ==
+        passPage.passes.size() );
+    const auto sessionPass = sessionStore->FindPass( 1000, error );
+    assert( sessionPass && sessionPass->directResources == parentResult->directResources &&
+        sessionPass->inclusiveResources == parentResult->inclusiveResources );
+    std::vector<GpuPassWorkingSet> sessionResourcePasses; bool sessionHasMore = false;
+    assert( sessionStore->PassesForResource( 10, 0, 100,
+        sessionResourcePasses, sessionHasMore, error ) );
+    assert( sessionResourcePasses.size() == 1 && !sessionHasMore );
+    std::vector<GpuRangeAnalysisRecord> sessionRanges; bool rangeHasMore = false;
+    assert( sessionStore->RangesForResource( 10, 0, 100,
+        sessionRanges, rangeHasMore, error ) );
+    assert( sessionRanges.size() == 1 &&
+        sessionRanges.front().value.passInstanceId == 1000 && !rangeHasMore );
+    const auto sessionResource = sessionStore->FindResource( 10, error );
+    if( !sessionResource || sessionResource->logicals.size() != 1 ||
+        sessionResource->relations.size() != 1 ||
+        sessionResource->logicals.front().name != "LogicalName" )
+        std::fprintf( stderr, "resource=%d logicals=%zu relations=%zu name=%s error=%s\n",
+            sessionResource.has_value() ? 1 : 0,
+            sessionResource ? sessionResource->logicals.size() : 0,
+            sessionResource ? sessionResource->relations.size() : 0,
+            sessionResource && !sessionResource->logicals.empty() ?
+                sessionResource->logicals.front().name.c_str() : "<none>", error.c_str() );
+    assert( sessionResource && sessionResource->logicals.size() == 1 &&
+        sessionResource->logicals.front().name == "LogicalName" &&
+        sessionResource->relations.size() == 1 &&
+        sessionResource->relations.front().value.targetId == 20 );
+
     // A same-volume copy has a different file id, but identical quick
     // segments and SHA-256.  It must be accepted only after strong identity
     // verification.  Content replacement must still be rejected.
@@ -361,7 +467,11 @@ int main()
     { std::ofstream trace( longTrace, std::ios::binary | std::ios::trunc ); trace << identityPayload; }
     auto longIdentity = ComputeGpuAnalysisQuickIdentity( longTrace ); longIdentity.sha256 = Sha256File( longTrace );
     auto longStagingSidecar = GpuAnalysisSidecarPath( longTrace ); longStagingSidecar += ".converting";
-    assert( WriteGpuAnalysisRawSidecar( longStagingSidecar, longIdentity, sidecarData, sidecarControl, error ) );
+    if( !WriteGpuAnalysisRawSidecar( longStagingSidecar, longIdentity, sidecarData, sidecarControl, error ) )
+    {
+        std::fprintf( stderr, "long path WriteGpuAnalysisRawSidecar failed: %s\n", error.c_str() );
+        assert( false );
+    }
     assert( PublishGpuAnalysisSidecar( longStagingSidecar, GpuAnalysisSidecarPath( longTrace ), true, error ) );
     if( !BuildGpuAnalysisDerived( longTrace, sidecarControl, error ) )
     {

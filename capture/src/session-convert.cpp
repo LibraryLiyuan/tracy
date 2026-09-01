@@ -418,7 +418,7 @@ int main( int argc, char** argv )
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
     const auto derivedSourceDegraded = audited.invalidCpuZoneTimings != 0 ||
-        audited.schedulingSourceGaps != 0;
+        audited.schedulingSourceGaps != 0 || audited.gpuSourceGapResources != 0;
     manifest.state = inventory.sourceDegraded || derivedSourceDegraded ?
         tracy::analysis::TraceSessionState::CompleteSourceDegraded :
         tracy::analysis::TraceSessionState::Complete;
@@ -434,6 +434,12 @@ int main( int argc, char** argv )
         {
             if( !reason.empty() ) reason += ';';
             reason += "source_scheduling_gap:" + std::to_string( audited.schedulingSourceGaps );
+        }
+        if( audited.gpuSourceGapResources != 0 )
+        {
+            if( !reason.empty() ) reason += ';';
+            reason += "source_gpu_resource_identity_gap:" +
+                std::to_string( audited.gpuSourceGapResources );
         }
         manifest.reason = std::move( reason );
     }

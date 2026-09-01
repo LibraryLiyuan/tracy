@@ -12,7 +12,9 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <queue>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -41,6 +43,10 @@ struct SamplingFileHeader
     uint64_t dictionaryEntries = 0;
     uint64_t callstackPayloads = 0;
     uint64_t recordsOffset = 0;
+    uint64_t hardwareSummaryCount = 0;
+    uint64_t hardwareEventCount = 0;
+    uint64_t hardwareSummariesOffset = 0;
+    uint64_t hardwareEventsOffset = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
 };
@@ -52,6 +58,22 @@ struct StoredSample
     uint32_t callstack = 0;
     uint8_t kind = 0;
     uint8_t reserved[3] {};
+};
+
+struct StoredHardwareSample
+{
+    uint64_t address = 0;
+    int64_t timeNs = 0;
+    uint64_t sourceOrdinal = 0;
+    uint8_t kind = 0;
+    uint8_t reserved[7] {};
+};
+
+struct StoredHardwareSummary
+{
+    uint64_t address = 0;
+    uint64_t counts[6] {};
+    uint64_t eventOffsets[6] {};
 };
 #pragma pack( pop )
 
@@ -197,6 +219,9 @@ struct BuildState
     std::unordered_map<std::string, uint32_t> callstackIds;
     std::unordered_map<uint32_t, uint32_t> sampleDictionary;
     std::map<uint64_t, std::unique_ptr<ThreadWork>> threads;
+    std::filesystem::path hardwareWorkPath;
+    std::ofstream hardwareWork;
+    uint64_t hardwareOrdinal = 0;
     uint32_t pendingCallstack = 0;
     uint32_t serialNextCallstack = 0;
     int64_t contextTime = 0;
@@ -264,6 +289,52 @@ bool AppendSample( BuildState& state, const QueueCallstackSample& sample,
     return true;
 }
 
+int HardwareKind( QueueType type )
+{
+    switch( type )
+    {
+    case QueueType::HwSampleCpuCycle: return 0;
+    case QueueType::HwSampleInstructionRetired: return 1;
+    case QueueType::HwSampleCacheReference: return 2;
+    case QueueType::HwSampleCacheMiss: return 3;
+    case QueueType::HwSampleBranchRetired: return 4;
+    case QueueType::HwSampleBranchMiss: return 5;
+    default: return -1;
+    }
+}
+
+const char* HardwareKindName( uint8_t kind )
+{
+    static constexpr const char* Names[] = {
+        "cycles", "retired", "cache_references", "cache_misses",
+        "branch_retired", "branch_misses"
+    };
+    return kind < std::size( Names ) ? Names[kind] : "unknown";
+}
+
+bool AppendHardwareSample( BuildState& state, const QueueHwSample& sample,
+    uint8_t kind, std::string& error )
+{
+    if( !state.hardwareWork.is_open() )
+    {
+        state.hardwareWorkPath = state.root / "hardware-samples.work";
+        state.hardwareWork.open( state.hardwareWorkPath,
+            std::ios::binary | std::ios::trunc );
+        if( !state.hardwareWork )
+        { error = "session_sampling_hardware_work_open_failed"; return false; }
+    }
+    StoredHardwareSample value;
+    value.address = sample.ip;
+    value.timeNs = sample.time == 0 ? 0 : state.transform.ToNanoseconds( sample.time );
+    value.sourceOrdinal = state.hardwareOrdinal++;
+    value.kind = kind;
+    state.hardwareWork.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+    if( !state.hardwareWork )
+    { error = "session_sampling_hardware_work_write_failed"; return false; }
+    ++state.stats.hardwareEvents;
+    return true;
+}
+
 bool VisitSamplingRecord( const TraceSessionCanonicalRecord& record,
     void* userData, std::string& error )
 {
@@ -272,6 +343,9 @@ bool VisitSamplingRecord( const TraceSessionCanonicalRecord& record,
     QueueItem item {};
     if( !DecodeItem( record, item, error ) ) return false;
     const auto type = QueueType( record.type );
+    const auto hardwareKind = HardwareKind( type );
+    if( hardwareKind >= 0 ) return AppendHardwareSample(
+        state, item.hwSample, uint8_t( hardwareKind ), error );
     switch( type )
     {
     case QueueType::CallstackPayload:
@@ -384,6 +458,8 @@ bool SaveSamplingManifest( const std::filesystem::path& root,
     out << "context_switch_samples " << value.stats.contextSwitchSamples << '\n';
     out << "dictionary_entries " << value.stats.dictionaryEntries << '\n';
     out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
+    out << "hardware_events " << value.stats.hardwareEvents << '\n';
+    out << "hardware_addresses " << value.stats.hardwareAddresses << '\n';
     out.flush();
     if( !out ) { error = "session_sampling_manifest_write_failed"; return false; }
     out.close();
@@ -411,6 +487,8 @@ bool LoadSamplingManifest( const std::filesystem::path& root,
         else if( key == "context_switch_samples" ) in >> value.stats.contextSwitchSamples;
         else if( key == "dictionary_entries" ) in >> value.stats.dictionaryEntries;
         else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
+        else if( key == "hardware_events" ) in >> value.stats.hardwareEvents;
+        else if( key == "hardware_addresses" ) in >> value.stats.hardwareAddresses;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_sampling_manifest_parse_failed"; return false; }
     }
@@ -422,10 +500,154 @@ bool LoadSamplingManifest( const std::filesystem::path& root,
     return true;
 }
 
+bool HardwareSampleLess( const StoredHardwareSample& lhs,
+    const StoredHardwareSample& rhs )
+{
+    return std::tie( lhs.address, lhs.kind, lhs.sourceOrdinal ) <
+        std::tie( rhs.address, rhs.kind, rhs.sourceOrdinal );
+}
+
+bool BuildHardwareFiles( BuildState& state,
+    std::filesystem::path& summaryPath, std::filesystem::path& eventPath,
+    uint64_t& summaryCount, std::string& error )
+{
+    summaryCount = 0;
+    summaryPath = state.root / "hardware-summaries.work";
+    eventPath = state.root / "hardware-events.work";
+    if( state.hardwareWork.is_open() )
+    {
+        state.hardwareWork.flush();
+        if( !state.hardwareWork )
+        { error = "session_sampling_hardware_work_flush_failed"; return false; }
+        state.hardwareWork.close();
+    }
+
+    std::ofstream emptySummary( summaryPath, std::ios::binary | std::ios::trunc );
+    std::ofstream emptyEvents( eventPath, std::ios::binary | std::ios::trunc );
+    if( !emptySummary || !emptyEvents )
+    { error = "session_sampling_hardware_output_open_failed"; return false; }
+    emptySummary.close(); emptyEvents.close();
+    if( state.stats.hardwareEvents == 0 ) return true;
+
+    constexpr size_t SortChunkRecords = 1024 * 1024;
+    std::ifstream input( state.hardwareWorkPath, std::ios::binary );
+    if( !input ) { error = "session_sampling_hardware_work_read_failed"; return false; }
+    std::vector<std::filesystem::path> runs;
+    std::vector<StoredHardwareSample> chunk( SortChunkRecords );
+    uint64_t readRecords = 0;
+    while( readRecords < state.stats.hardwareEvents )
+    {
+        const auto wanted = size_t( std::min<uint64_t>(
+            SortChunkRecords, state.stats.hardwareEvents - readRecords ) );
+        input.read( reinterpret_cast<char*>( chunk.data() ),
+            std::streamsize( wanted * sizeof( StoredHardwareSample ) ) );
+        if( size_t( input.gcount() ) != wanted * sizeof( StoredHardwareSample ) )
+        { error = "session_sampling_hardware_work_truncated"; return false; }
+        std::sort( chunk.begin(), chunk.begin() + wanted, HardwareSampleLess );
+        const auto runPath = state.root /
+            ( "hardware-run-" + std::to_string( runs.size() ) + ".work" );
+        std::ofstream run( runPath, std::ios::binary | std::ios::trunc );
+        if( !run ) { error = "session_sampling_hardware_run_open_failed"; return false; }
+        run.write( reinterpret_cast<const char*>( chunk.data() ),
+            std::streamsize( wanted * sizeof( StoredHardwareSample ) ) );
+        run.flush();
+        if( !run ) { error = "session_sampling_hardware_run_write_failed"; return false; }
+        runs.emplace_back( runPath );
+        readRecords += wanted;
+    }
+    input.close();
+
+    struct RunState
+    {
+        std::ifstream stream;
+        StoredHardwareSample value;
+        bool valid = false;
+    };
+    struct HeapEntry
+    {
+        StoredHardwareSample value;
+        size_t run = 0;
+    };
+    const auto later = []( const HeapEntry& lhs, const HeapEntry& rhs ) {
+        return HardwareSampleLess( rhs.value, lhs.value );
+    };
+    std::vector<RunState> readers( runs.size() );
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )> heap( later );
+    for( size_t i = 0; i < runs.size(); ++i )
+    {
+        readers[i].stream.open( runs[i], std::ios::binary );
+        if( !readers[i].stream || !readers[i].stream.read(
+            reinterpret_cast<char*>( &readers[i].value ), sizeof( StoredHardwareSample ) ) )
+        { error = "session_sampling_hardware_run_read_failed"; return false; }
+        readers[i].valid = true;
+        heap.push( { readers[i].value, i } );
+    }
+
+    std::ofstream summaries( summaryPath, std::ios::binary | std::ios::trunc );
+    std::ofstream events( eventPath, std::ios::binary | std::ios::trunc );
+    if( !summaries || !events )
+    { error = "session_sampling_hardware_output_open_failed"; return false; }
+    StoredHardwareSummary summary;
+    bool haveSummary = false;
+    uint64_t eventOrdinal = 0;
+    while( !heap.empty() )
+    {
+        const auto entry = heap.top(); heap.pop();
+        const auto& value = entry.value;
+        if( !haveSummary || summary.address != value.address )
+        {
+            if( haveSummary )
+            {
+                summaries.write( reinterpret_cast<const char*>( &summary ), sizeof( summary ) );
+                if( !summaries )
+                { error = "session_sampling_hardware_summary_write_failed"; return false; }
+                ++summaryCount;
+            }
+            summary = {}; summary.address = value.address; haveSummary = true;
+        }
+        if( value.kind >= 6 )
+        { error = "session_sampling_hardware_kind_invalid"; return false; }
+        if( summary.counts[value.kind] == 0 ) summary.eventOffsets[value.kind] = eventOrdinal;
+        ++summary.counts[value.kind];
+        events.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !events )
+        { error = "session_sampling_hardware_event_write_failed"; return false; }
+        ++eventOrdinal;
+
+        auto& reader = readers[entry.run];
+        if( reader.stream.read( reinterpret_cast<char*>( &reader.value ),
+            sizeof( StoredHardwareSample ) ) )
+        {
+            heap.push( { reader.value, entry.run } );
+        }
+        else if( !reader.stream.eof() )
+        { error = "session_sampling_hardware_run_read_failed"; return false; }
+    }
+    if( haveSummary )
+    {
+        summaries.write( reinterpret_cast<const char*>( &summary ), sizeof( summary ) );
+        ++summaryCount;
+    }
+    summaries.flush(); events.flush();
+    if( !summaries || !events || eventOrdinal != state.stats.hardwareEvents )
+    { error = "session_sampling_hardware_merge_failed"; return false; }
+    summaries.close(); events.close();
+
+    std::error_code ec;
+    std::filesystem::remove( state.hardwareWorkPath, ec ); ec.clear();
+    for( const auto& run : runs ) { std::filesystem::remove( run, ec ); ec.clear(); }
+    return true;
+}
+
 bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& session,
     SamplingManifest& manifest, std::string& error )
 {
     for( auto& [_, thread] : state.threads ) if( !thread->Close( error ) ) return false;
+    std::filesystem::path hardwareSummaryPath, hardwareEventPath;
+    uint64_t hardwareSummaryCount = 0;
+    if( !BuildHardwareFiles( state, hardwareSummaryPath, hardwareEventPath,
+        hardwareSummaryCount, error ) ) return false;
+    state.stats.hardwareAddresses = hardwareSummaryCount;
     SamplingFileHeader header;
     header.sourceSize = session.source.fileSize;
     header.eventCount = state.stats.events;
@@ -433,8 +655,14 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
     header.contextSwitchSampleCount = state.stats.contextSwitchSamples;
     header.dictionaryEntries = state.stats.dictionaryEntries;
     header.callstackPayloads = state.stats.callstackPayloads;
+    header.hardwareSummaryCount = state.stats.hardwareAddresses;
+    header.hardwareEventCount = state.stats.hardwareEvents;
     header.generationBytes = uint32_t( session.generation.size() );
     header.recordsOffset = sizeof( header ) + session.source.sha256.size() + session.generation.size();
+    header.hardwareSummariesOffset = header.recordsOffset +
+        header.eventCount * sizeof( StoredSample );
+    header.hardwareEventsOffset = header.hardwareSummariesOffset +
+        header.hardwareSummaryCount * sizeof( StoredHardwareSummary );
 
     const auto temporary = state.root / "samples.bin.tmp";
     const auto target = state.root / SamplingFileName;
@@ -450,6 +678,8 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
         if( !CopyFileBytes( thread->SamplePath(), out, error ) ) return false;
         if( !CopyFileBytes( thread->ContextPath(), out, error ) ) return false;
     }
+    if( !CopyFileBytes( hardwareSummaryPath, out, error ) ||
+        !CopyFileBytes( hardwareEventPath, out, error ) ) return false;
     out.flush();
     if( !out ) { error = "session_sampling_file_write_failed"; return false; }
     out.close();
@@ -460,6 +690,8 @@ bool FinalizeSamplingFile( BuildState& state, const TraceSessionManifest& sessio
         std::filesystem::remove( thread->SamplePath(), ec ); ec.clear();
         std::filesystem::remove( thread->ContextPath(), ec ); ec.clear();
     }
+    std::filesystem::remove( hardwareSummaryPath, ec ); ec.clear();
+    std::filesystem::remove( hardwareEventPath, ec ); ec.clear();
 
     manifest.sourceSha256 = session.source.sha256;
     manifest.sourceSize = session.source.fileSize;
@@ -480,6 +712,8 @@ struct TraceSessionSamplingReader::Impl
     std::string fingerprint;
     uint64_t recordsOffset = 0;
     uint64_t eventCount = 0;
+    uint64_t hardwareEventsOffset = 0;
+    std::vector<StoredHardwareSummary> hardwareSummaries;
 };
 
 TraceSessionSamplingReader::TraceSessionSamplingReader( std::shared_ptr<Impl> impl )
@@ -557,6 +791,8 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
         header.contextSwitchSampleCount != manifest.stats.contextSwitchSamples ||
         header.dictionaryEntries != manifest.stats.dictionaryEntries ||
         header.callstackPayloads != manifest.stats.callstackPayloads ||
+        header.hardwareEventCount != manifest.stats.hardwareEvents ||
+        header.hardwareSummaryCount != manifest.stats.hardwareAddresses ||
         header.generationBytes != session.generation.size() )
     { error = "session_sampling_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
@@ -565,11 +801,41 @@ std::shared_ptr<TraceSessionSamplingReader> TraceSessionSamplingReader::Open(
         sha != session.source.sha256 || generation != session.generation ||
         header.recordsOffset != uint64_t( in.tellg() ) ||
         header.eventCount > ( manifest.fileBytes - header.recordsOffset ) / sizeof( StoredSample ) ||
-        header.recordsOffset + header.eventCount * sizeof( StoredSample ) != manifest.fileBytes )
+        header.hardwareSummariesOffset != header.recordsOffset +
+            header.eventCount * sizeof( StoredSample ) ||
+        header.hardwareEventsOffset != header.hardwareSummariesOffset +
+            header.hardwareSummaryCount * sizeof( StoredHardwareSummary ) ||
+        header.hardwareEventsOffset + header.hardwareEventCount *
+            sizeof( StoredHardwareSample ) != manifest.fileBytes )
     { error = "session_sampling_file_identity_or_bounds_invalid"; return {}; }
     auto impl = std::make_shared<Impl>();
     impl->path = path; impl->fingerprint = session.source.sha256;
     impl->recordsOffset = header.recordsOffset; impl->eventCount = header.eventCount;
+    impl->hardwareEventsOffset = header.hardwareEventsOffset;
+    impl->hardwareSummaries.resize( size_t( header.hardwareSummaryCount ) );
+    if( header.hardwareSummaryCount != 0 )
+    {
+        in.seekg( std::streamoff( header.hardwareSummariesOffset ) );
+        if( !in.read( reinterpret_cast<char*>( impl->hardwareSummaries.data() ),
+            std::streamsize( header.hardwareSummaryCount * sizeof( StoredHardwareSummary ) ) ) )
+        { error = "session_sampling_hardware_summaries_truncated"; return {}; }
+        for( size_t i = 0; i < impl->hardwareSummaries.size(); ++i )
+        {
+            const auto& summary = impl->hardwareSummaries[i];
+            if( i != 0 && impl->hardwareSummaries[i-1].address >= summary.address )
+            { error = "session_sampling_hardware_summary_order_invalid"; return {}; }
+            uint64_t count = 0;
+            for( size_t kind = 0; kind < 6; ++kind )
+            {
+                if( summary.counts[kind] != 0 &&
+                    summary.eventOffsets[kind] + summary.counts[kind] > header.hardwareEventCount )
+                { error = "session_sampling_hardware_summary_bounds_invalid"; return {}; }
+                count += summary.counts[kind];
+            }
+            if( count == 0 )
+            { error = "session_sampling_hardware_summary_empty"; return {}; }
+        }
+    }
     auto reader = std::shared_ptr<TraceSessionSamplingReader>(
         new TraceSessionSamplingReader( std::move( impl ) ) );
     reader->m_stats = manifest.stats;
@@ -599,6 +865,80 @@ std::vector<SampleDto> TraceSessionSamplingReader::Scan( const ScanRange& range 
         dto.kind = value.kind == 0 ? "sample" : "context_switch";
         result.emplace_back( std::move( dto ) );
         if( result.size() >= range.limit ) break;
+    }
+    return result;
+}
+
+std::vector<HardwareSampleDto> TraceSessionSamplingReader::HardwareSamples() const
+{
+    std::vector<HardwareSampleDto> result;
+    result.reserve( m_impl->hardwareSummaries.size() );
+    for( const auto& value : m_impl->hardwareSummaries )
+    {
+        std::ostringstream address;
+        address << "0x" << std::hex << value.address;
+        HardwareSampleDto dto;
+        dto.ref = MakeRef( m_impl->fingerprint, "hardware-sample", value.address );
+        dto.address = address.str();
+        dto.cycles = value.counts[0];
+        dto.retired = value.counts[1];
+        dto.cacheReferences = value.counts[2];
+        dto.cacheMisses = value.counts[3];
+        dto.branchRetired = value.counts[4];
+        dto.branchMisses = value.counts[5];
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+std::vector<HardwareSampleEventDto> TraceSessionSamplingReader::HardwareSampleEvents(
+    uint64_t addressValue, std::string_view requestedKind,
+    size_t offset, size_t limit ) const
+{
+    std::vector<HardwareSampleEventDto> result;
+    if( limit == 0 ) return result;
+    const auto summary = std::lower_bound( m_impl->hardwareSummaries.begin(),
+        m_impl->hardwareSummaries.end(), addressValue,
+        []( const auto& value, uint64_t address ) { return value.address < address; } );
+    if( summary == m_impl->hardwareSummaries.end() || summary->address != addressValue )
+        return result;
+
+    int onlyKind = -1;
+    if( requestedKind != "all" )
+    {
+        for( int kind = 0; kind < 6; ++kind )
+            if( requestedKind == HardwareKindName( uint8_t( kind ) ) ) onlyKind = kind;
+        if( onlyKind < 0 ) return result;
+    }
+    std::ostringstream address;
+    address << "0x" << std::hex << addressValue;
+    const auto addressText = address.str();
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) return result;
+    size_t skipped = 0;
+    for( uint8_t kind = 0; kind < 6; ++kind )
+    {
+        if( onlyKind >= 0 && kind != onlyKind ) continue;
+        const auto count = summary->counts[kind];
+        for( uint64_t index = 0; index < count; ++index )
+        {
+            if( skipped++ < offset ) continue;
+            if( result.size() >= limit ) return result;
+            const auto eventOrdinal = summary->eventOffsets[kind] + index;
+            in.seekg( std::streamoff( m_impl->hardwareEventsOffset +
+                eventOrdinal * sizeof( StoredHardwareSample ) ) );
+            StoredHardwareSample value;
+            if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ||
+                value.address != addressValue || value.kind != kind ) return result;
+            HardwareSampleEventDto dto;
+            dto.ref = MakeRef( m_impl->fingerprint, "hardware-sample", addressValue ) +
+                ':' + HardwareKindName( kind ) + ':' + std::to_string( index );
+            dto.address = addressText;
+            dto.kind = HardwareKindName( kind );
+            dto.eventIndex = index;
+            dto.timeNs = value.timeNs;
+            result.emplace_back( std::move( dto ) );
+        }
     }
     return result;
 }

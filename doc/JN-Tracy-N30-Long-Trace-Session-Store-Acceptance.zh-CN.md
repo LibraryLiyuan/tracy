@@ -81,7 +81,7 @@ Projected full replay: approximately 90–100 GiB
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
 | N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol、Relation、Runtime Domain及C#/Lua Script语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling/Hardware Sample、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol、Relation、Runtime Domain、C#/Lua Script、Plot、Message和Lock语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
@@ -201,6 +201,36 @@ tracy-trace-session-store      Passed
 tracy-trace-session-inventory  Passed
 100% tests passed, 0 failed
 ```
+
+### 2026-08-31 真实30分钟Runtime前向字符串与GPU内存门禁
+
+Runtime真实数据修复：
+
+- 真实Protocol 90允许`JnScriptFrame/JnScriptStack`先引用字符串句柄，`StringData`响应随后到达；旧Session Reader错误要求定义先于引用，导致`session_runtime_script_frame_string_unresolved`。
+- Reader现将Script引用写入固定宽度work流，单次Canonical扫描完成字符串字典后再按原source order解析；未解析引用在扫描结束后仍明确失败。
+- 真实30分钟结果：`domain_states=1`、`script_frames=6`、`script_stack_events=563224`、`string_bytes=338`；`runtime-script.bin=27,035,552 bytes`，SHA-256为`a439046a8d5b2a8841ae1bb17da0a6e08b1e7c4907370655a03c5177acc50027`。
+
+GPU阻断证据：
+
+- 旧N30 Session GPU路径仍执行`LoadTraceSessionGpuCanonicalData → BuildGpuAnalysisSnapshotConsuming`，使约27,375,840个Pass、125,513,195条资源引用及Catalog历史同时驻留。
+- 真实进程达到`Private=16.27 GiB / Working Set=13.47 GiB`，违反16 GiB硬门禁；已安全取消，未发布GPU generation或最终Session。
+- 第一轮修复将Catalog与Pass拆分、ResourceSet写入磁盘字典、Pass按帧归并为≤64 MiB spool page，并以外部排序run生成Resource↔Pass和Frame↔Pass索引。架构静态门禁明确禁止Session路径重新调用全量`JnTraceData + GpuAnalysisSnapshot`链。
+- 第一轮真实复测未再展开Pass引用，但Catalog Range payload本身仍使Private达到10.9 GiB，并在N29 6 GiB分析预算处返回`analysis_hard_memory_limit`；未越过16 GiB，也未发布不完整结果。
+- 第二轮修复将Range/Subresource从Catalog snapshot外部化：Range在活动Pass内保持精确关联，同时按ResourceId写独立磁盘页。Store新增分页`RangesForResource`；Range事件不去重，避免把重复事实误删。
+
+TDD与回归：
+
+```text
+RED:   Session GPU derived仍调用全量JnTraceData/GpuAnalysisSnapshot
+GREEN: N29 GPU static architecture gate passed
+RED:   Catalog-only snapshot把尚未装载的Pass Range误判为unresolved
+GREEN: Catalog-only Resource/Allocation/Range Oracle passed
+GREEN: 分页Pass spool与N29 Store Reader的Pass/Inclusive/反向索引等价
+GREEN: Trace Session Inventory tests passed
+GREEN: 8/8 CTest passed（第二轮真实Range复测前）
+```
+
+当前状态：第二轮真实30分钟复测正在执行；在Session完整发布、GPU count/bytes/peak/checksum审计通过前，N30.5仍标记为`InProgress`，不得宣称LTS-1通过。
 
 ### 2026-08-31 Job 分页索引与 Scheduling 句柄上限修复
 
@@ -760,15 +790,16 @@ GREEN：
 - `JnMemAllocCallsiteNamed`使用已注册SiteReuse Callsite的全局Callstack ID；传统`MemAlloc/FreeCallstack*`保留逐事件栈。命名池StringData允许延迟到达，最终按稳定名称、再按native pool id排序。
 - `memory.pools/events/get/active_at_time/frame_snapshot/diff/callstack_tree/leak_candidates`现由Session Memory Reader提供，不实例化Worker；`memory.gpu`只在至少一个`GPU D3D12 `命名池存在时声明可查询。
 - `memory.bin`保存source SHA-256、source size、固定manifest generation、Pool/Event/Active计数与独立SHA-256；Final Audit核对五类alloc、四类free、两类discard的Inventory源事件守恒，并拒绝同尺寸payload篡改。
-- Sampling域新增`sampling-index/1/exact/samples.bin`：构建时按native thread使用独立顺序work file，普通Sample与ContextSwitch Sample立即落盘；内存仅保留线程文件状态、Callstack内容字典和Sample Dictionary，不保存与总样本数成比例的事件容器。
+- Sampling域使用`sampling-index/2/exact/samples.bin`：构建时按native thread使用独立顺序work file，普通Sample与ContextSwitch Sample立即落盘；Hardware Sample使用有界chunk外部排序并按address/kind/source ordinal归并；内存不保存与总样本数成比例的事件容器。
 - Sampling Reader严格保持Worker的输出顺序：native thread升序，每线程先普通Sample、再ContextSwitch Sample；时间复用`m_refTimeCtx`语义，Sample、ContextSwitch Sample、ContextSwitch和ThreadWakeup共同推进同一delta时钟。
 - `CallstackPayload`与`CallstackSampleDictionary`进入统一内容寻址Callstack ID空间；普通Sample消费pending callstack，Ref Sample只接受已经声明的dictionary id，未知、重复或协议状态冲突均阻止构建。
 - `sample.list`现由Session Sampling Reader直接分页扫描固定宽度记录，不实例化Worker；能力只声明已经实现的`sample.list`，Ghost Zone、Flamegraph和Symbol Statistics仍保持不可用，禁止过度宣称。
+- 六类PMU Hardware Sample（cycles、retired、cache reference/miss、branch retired/miss）已写入同一Sampling索引；Session打开只物化按地址聚合的有界摘要，事件通过磁盘offset按address/kind分页读取。
 - `samples.bin`保存source强身份、generation、普通/ContextSwitch Sample、dictionary与Callstack payload计数；Final Audit执行完整SHA-256并与Inventory四类Sample QueueType逐项守恒。
 - Scheduling域新增`scheduling-index/1/exact/scheduling.bin`：每个native thread和CPU使用独立顺序work file，切入立即追加，切出只原位补齐End/Reason/State；构建期内存仅保留每线程/每CPU最后一个开放区间和pending wakeup。
 - `ThreadWakeup`、`ContextSwitch`以及两类Sample共享Worker的`m_refTimeCtx` delta时钟；wakeup时间/CPU和实际run时间/CPU分别保存，跨CPU唤醒不会被误写成实际运行CPU。
 - 线程区间严格恢复Wakeup→Start→End、wait reason/state和开放边界；CPU区间独立恢复实际占用线程，外部线程压缩索引按Worker首次切入顺序生成。
-- `context_switch.range/thread/statistics`和`cpu.timeline`直接读取Scheduling Reader，不实例化Worker；`thread`、CPU topology和CPU usage尚未具备磁盘语义Reader，仍保持不可查询。
+- `context_switch.range/thread/statistics`、`cpu.timeline`、`cpu.topology`、`cpu.usage`和`thread.*`直接读取Scheduling Reader，不实例化Worker；CPU usage按页读取固定宽度磁盘记录。
 - Final Audit对`scheduling.bin`执行完整SHA-256，逐项核对源`ContextSwitch`与`ThreadWakeup` QueueType计数；派生线程/CPU区间计数不能替代源记录守恒。
 - GPU Zone域新增`gpu-zone-index/1/exact/gpu-zones.bin`：按真实GPU Context保存固定宽度Zone记录；构建期只保留每个Context/Thread的活动Zone栈、尚未收到`GpuTime`的Query ID和少量Context状态，不物化全部GPU Zone。
 - CPU侧Begin/End时间分别复用Worker的`m_refTimeThread`与`m_refTimeSerial`语义；GPU时间由异步`GpuTime`按`Context + QueryId`原位补齐，并保留Context的period、calibration、overflow和time-diff状态。
@@ -845,13 +876,13 @@ GREEN：
 
 - FrameImage与基础`Frames` FrameSet的raw index关联已接入；仍需在短Trace传统Worker差分中覆盖On-demand首次连接、pre-capture图片丢弃和初始Frame offset变体。
 - GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
-- Scheduling当前以线程/CPU固定宽度区域线性扫描；在N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。Thread identity/name、CPU topology和CPU usage磁盘Reader尚未完成。
-- Sampling当前以单个固定宽度文件线性扫描时间范围；在N30.6完成前仍需增加immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
+- Scheduling当前以线程/CPU固定宽度区域线性扫描；Thread identity/name紧凑摘要、CPU topology和CPU usage派生已经完成。N30.6完成前仍需增加immutable时间/线程/CPU索引并验证长Trace查询延迟。
+- Sampling当前以单个固定宽度文件线性扫描普通Sample时间范围；Hardware Sample已按address/kind建立精确offset。在N30.6完成前仍需增加普通Sample的immutable时间/线程索引并对长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
 - 当前CPU Zone Reader已经避免在打开时物化全部Zone，但时间范围和children查询仍线性扫描单个`cpu-zones.bin`，SourceLocation元数据仍驻内存；在N30.6完成前必须增加immutable时间/父索引并验证长Trace查询延迟，不能据此提前通过查询性能门禁。
 - 当前Memory Reader打开时只驻留Pool描述符和名称，但`memory.events`仍按Pool顺序扫描固定记录，Frame Snapshot仍物化与该帧相交的事件；在N30.6完成前必须增加immutable时间/Pool索引并验证长Trace查询延迟。
 - Memory allocation/free到CPU Zone的交叉关联尚未接到磁盘CPU Zone Reader；当前Callstack可导航，但`allocation_zone_ref/free_zone_ref`在Session路径仍为空，不得提前宣称跨域Memory证据链完整。
-- Runtime/Script Reader打开时只保留文件偏移和计数，但当前脚本查询仍会物化所请求域的全部Frame/Stack事件；N30.6完成前必须增加分页/范围读取。Legacy GC依赖的Message语义Reader尚未完成，`memory.gc.*`不得提前宣称Session可查。
+- Runtime/Script Reader打开时只保留文件偏移和计数，但当前脚本查询仍会物化所请求域的全部Frame/Stack事件；N30.6完成前必须增加分页/范围读取。Message Reader已完成，但Legacy GC消息编码与GC聚合语义仍需单独差分，`memory.gc.*`暂不得提前宣称Session可查。
 - 局部`.tracy`导出器及开放边界语义。
 - Query/MCP全域结果与传统Worker的短Trace逐项差分。
 
@@ -1139,3 +1170,172 @@ tracy-query-doctor                Passed
 tracy-gpu-analysis-n29-static     Passed
 100% tests passed, 0 failed
 ```
+
+### 2026-09-01 Plot 磁盘语义索引（N30.6A 子阶段）
+
+实现和正确性：
+
+- 新增`derived/plot-index/1/exact/plots.bin`，保存Plot定义、名称、配置、聚合值和分页点数据；Session查询不再构建完整Worker。
+- Builder单次顺序扫描Canonical，按Plot使用最多64个可复用临时流，最终原子发布不可变文件和SHA-256 manifest。
+- Final Audit将`PlotDataInt/Float/Double`、`PlotConfig`和`PlotName`源事件计数与索引独立计数对账；任何文件大小、身份或SHA不一致均拒绝使用。
+- `plot.list`、`plot.points`、`plot.range`、`plot.downsample`和`plot.statistics`已通过现有Query协议读取Session Plot Reader。
+- 老的已发布N30 Session可能早于Plot索引，因此打开时保持兼容：Plot能力明确返回“该Session早于Plot语义索引”，不会加载完整Worker或伪造空数据；新Session发布前必须构建并审计Plot索引。
+
+TDD证据：
+
+```text
+RED:   Session advertises Plot only after its disk-backed semantic reader is ready
+RED:   孤立PlotName被错误物化为第二个Plot，2条Session/Query断言失败
+GREEN: Trace Session Inventory tests passed
+```
+
+测试基础设施说明：
+
+- 新增Plot断言后，MSVC Release `/LTCG`使历史单体Inventory测试超过Windows默认1 MiB栈，进程以`0xC00000FD`退出。
+- 同一测试EXE仅把栈保留改为8 MiB后，全部断言在1.49秒内通过，证明不是递归或产品路径故障。
+- 最终只对`tracy-trace-session-inventory-tests`测试目标设置`/STACK:8388608`；converter、query、profiler等产品二进制不受影响。
+- 默认构建的最终测试在1.30秒内通过；本子阶段未启动真实30分钟转换，也未重建真实Session。
+- 快速非LTCG开发缓存首次构建时，`TracyQueryService.cpp`超过普通COFF节数上限并稳定报`C1128`；根因是该单元原先只依靠正式构建的`/GL`规避限制。现仅对该源文件增加MSVC`/bigobj`，不改变产品优化或运行语义。
+- Plot名称现在先进入待解析名称表；只有`PlotData*`或`PlotConfig`引用对应native name时才创建Plot，孤立`PlotName`不再产生虚假实体。
+- 对照`Worker::InsertPlot`确认标准Worker按协议到达顺序追加点数据，并不按时间重新排序；Session保持相同顺序，因此不引入与Worker语义不一致的外部排序。
+- 快速开发缓存的增量构建为4.31秒，修复后的完整Inventory测试为1.13秒。
+
+尚未在本子阶段宣称通过：
+
+- 全部八项回归与Query/Capture成套产品二进制重建。
+- 真实30分钟Session的Plot回填与性能门禁。
+
+### 2026-09-01 Message 磁盘语义索引（N30.6A 子阶段）
+
+实现和正确性：
+
+- 新增`derived/message-index/1/exact/messages.bin`，以固定宽度消息记录、直接字符串区和literal指针字典保存Message语义；Session打开只保留文件偏移与有界literal字典，不创建完整Worker。
+- 覆盖普通、颜色、callstack、颜色+callstack、literal及literal+callstack协议变体；`MessageAppInfo`单独计数，不伪装成时间线消息。
+- Native Callstack与Managed `CallstackAllocPayload`使用内容去重的稳定Session callstack ID；每线程下一条callstack消费语义与协议一致。
+- 彩色literal使用`QueueMessageColorLiteral::text`的真实字段偏移；测试证明literal可以先被消息引用、后收到`StringData`定义，构建器仍从完整不可变字典精确解析。
+- Final Audit将九类Message QueueType源计数与索引计数逐项对账；身份、大小或SHA-256不一致均拒绝能力开放。
+- `message.search`已通过Session Reader查询精确文本、颜色、线程和callstack引用，不依赖完整Worker。
+
+TDD证据：
+
+```text
+RED:   Session Message能力在没有磁盘语义Reader时不可查询
+RED:   Native/Managed MessageCallstack缺失，直接断言失败
+RED:   MessageLiteralColor错误读取普通literal字段，强制索引拒绝发布
+GREEN: Trace Session Inventory tests passed
+```
+
+诊断与构建说明：
+
+- 快速开发构建曾遗留5个没有`cl.exe/link.exe`子进程的MSBuild外壳；仅结束明确PID后恢复，未中止有效编译。
+- 测试最初复用`0x7000`作为literal和GPU Memory Pool名称，触发全局字符串冲突；改用唯一synthetic指针，保留生产端冲突阻断语义。
+- 测试失败消息改为在派生函数返回后拼接，消除C++实参求值顺序导致的空错误文本。
+- 本子阶段增量编译8～13秒，完整Inventory synthetic约5秒；未启动真实30分钟转换。
+
+尚未在本子阶段宣称通过：
+
+- Legacy GC专用消息编码及`memory.gc.*`聚合的传统Worker差分。
+- 全部八项回归、Query/Capture成套产品二进制重建和真实30分钟Session回填。
+
+### 2026-09-01 Lock 磁盘语义索引（N30.6A 子阶段）
+
+实现和正确性：
+
+- 新增`derived/lock-index/1/exact/locks.bin`，保存Lock定义、线程表、固定宽度时间线记录和自定义名称；Session打开只物化锁定义及每锁最多64线程的有界元数据，事件按范围从磁盘读取。
+- 恢复`LockAnnounce/Terminate/Name/Mark`及exclusive/shared Wait、Obtain、Release状态；保留lock count、owner、waiter集合、contended、source location和自定义名称。
+- 共享serial clock会同步消费Memory与serial GPU Zone事件，Lock事件的时间换算与标准Worker保持相同基准。
+- Core状态错误（未announce事件、重复announce/terminate、无wait obtain、无owner release、shared类型不符、超过64线程）阻止generation发布，不猜测修复。
+- Final Audit逐项对账十类Lock QueueType；`locks.bin`身份、大小或SHA-256不一致时拒绝能力开放。
+- `lock.list`与`lock.timeline`已通过Query 1.34直接读取Session磁盘索引；synthetic恢复Lock 700的`wait→obtain→release`、owner及lock count。
+
+TDD证据：
+
+```text
+RED:   Session Lock capability为pending，GetLocks/ScanLockEvents不可用
+GREEN: Session Lock direct reader、Query list/timeline和既有Frame/Memory Oracle同时通过
+GREEN: Plot/Message/Lock committed文件同尺寸篡改均被SHA-256审计拒绝
+```
+
+构建稳定性：
+
+- 当前终端下`/m:8`在编译完成后两次遗留5个无`cl/link`子进程的MSBuild node；改用`/m:1`后同一增量构建稳定在7～16秒完成，不再把孤儿node误判为有效编译。
+- Inventory synthetic约5秒；本子阶段未启动真实30分钟转换。
+
+尚未在本子阶段宣称通过：
+
+- SharedLockable、LockMark和多锁交错的传统Worker逐项差分。
+- 长Trace时间/Lock索引性能、全部八项回归、产品工具重建和真实30分钟Session回填。
+
+### 2026-09-01 Hardware Sample 磁盘语义索引（N30.6A 子阶段）
+
+实现结果：
+
+- Sampling索引schema升级到2；六类PMU事件与普通Sampling共享一个强身份、SHA-256和Final Audit边界。
+- Producer事件先顺序写入固定宽度work file，再以最多1,048,576条记录的有界chunk执行外部排序；最终按`address → kind → source ordinal`合并，不把总事件集合装入内存。
+- `samples.bin`保存按地址摘要、六类事件count和精确磁盘offset；Session打开只物化地址摘要，`hardware_sample.events`按地址、kind、offset和limit读取所需区间。
+- 时间语义与Worker一致：非零时间使用`(tsc-baseTime)*timerMul`，协议中的零时间保持0。
+- Final Audit将六类QueueType源计数之和与索引事件数对账；文件身份、大小、header边界或SHA-256不一致均阻止能力开放。
+- `hardware_sample.address/counts/events/capabilities`已由Session直接查询；trace counts返回事件总数，不以地址数冒充事件数。
+
+TDD证据：
+
+```text
+RED:   Session advertises Hardware Sample only after its disk-backed semantic reader is ready
+GREEN: Trace Session Inventory tests passed
+```
+
+Synthetic覆盖同一地址的cycles、retired、cache reference/miss、branch retired/miss各一条；直接Reader和Query 1.34均恢复六类count、事件顺序及16/18/0/20/22/24ns时间。现有Sampling SHA损坏测试同时覆盖新增区域。
+
+仍待N30.6集中门禁：
+
+- 使用大规模Hardware Sample corpus验证外部排序的峰值内存、run数量、查询延迟和取消恢复。
+- 与传统Worker对相同短Trace逐address、kind、eventIndex和timeNs执行100%差分。
+
+### 2026-09-01 Thread 与 CPU Topology 紧凑索引（N30.6A 子阶段）
+
+实现结果：
+
+- Scheduling索引schema升级到4，在ContextSwitch/CPU timeline之后追加按native ID排序的Thread摘要、字符串区和按logical CPU排序的Topology表。
+- Thread摘要只随线程数量增长，保存PID、local/external名称、Fiber标记、Zone/Message/Sample/ContextSwitch计数、running time、running regions、migration和group hint；Session打开不扫描完整事件时间线。
+- 名称回退保持Worker优先级：local name优先；local name仅为数字TID时，可使用非`???`且非`ntdll.dll`的external thread name；没有任何名称时明确返回`???`。
+- ThreadName、TidToPid、ThreadGroupHint、ExternalName metadata/payload、FiberName/Enter/Leave均逐QueueType计数并进入Final Audit；漏读任何一类都会以`session_thread_source_count_mismatch`阻止发布。
+- `cpu.topology`保存package/die/core/logical CPU，重复logical CPU定义阻止发布；die字段在Protocol 90中标记available。
+- `thread.list/get/statistics/timeline/migration`和`cpu.topology`已开放给Session Query；`cpu.usage`尚未开放，不会误入Worker回退。
+- 无法仅由当前紧凑摘要证明的kernel sample count保持`null`，不伪造为0。
+
+TDD证据：
+
+```text
+RED:   Session CPU topology调用仍回退到不可用Worker路径（进程返回1）
+GREEN: Trace Session Inventory tests passed
+```
+
+Synthetic恢复`Main Thread`、PID 1001、group hint 7、普通Sample、ContextSwitch运行时间和两个logical CPU；直接Reader与Query 1.34结果一致。
+
+仍待N30.6集中门禁：
+
+- External Name数字TID回退、Fiber进入/离开、空名称、重复/缺失元数据和传统Worker字段级差分。
+- 长Trace线程/CPU分页索引性能以及kernel sample count的精确来源链。
+
+### 2026-09-01 CPU Usage 磁盘派生（N30.6A 子阶段）
+
+状态：**Passed（synthetic correctness）**。
+
+实现：
+
+- Scheduling schema 4保存捕获进程PID，并从已持久化的CPU运行区间构造Worker等价的`own/other`并发曲线。
+- `own`只在该线程存在本地Zone/Sample证据，或其`TidToPid`明确等于非零捕获PID时成立；未知PID不会因`0==0`被误分类。
+- CPU区间只生成固定宽度Begin/End transition；transition以1,048,576条为有界chunk执行外部排序，再按相同时间聚合，构建内存不随总ContextSwitch数线性增长。
+- 输出包含Worker兼容的`time=0, own=0, other=0`基线点；仅当计数变化时追加记录。
+- `cpu.usage`通过`ScanCpuUsage(offset, limit)`直接分页读取，不再由Query先物化全量曲线。
+- Windows清理前显式关闭全部外部排序run句柄，避免成功发布后残留`cpu-usage-run-*.work`。
+
+TDD证据：
+
+```text
+RED:   residual=cpu-usage-run-0.work
+FIX:   close all run readers before deleting committed build temporaries
+GREEN: Trace Session Inventory tests passed
+```
+
+Synthetic同时包含本进程thread 42与未知外部thread 43/100/101，验证基线点、own/other非零状态、统计计数、Query分页游标及发布前无`.work`残留。

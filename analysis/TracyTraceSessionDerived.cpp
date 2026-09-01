@@ -12,6 +12,9 @@
 #include "TracyTraceSessionMemory.hpp"
 #include "TracyTraceSessionSampling.hpp"
 #include "TracyTraceSessionScheduling.hpp"
+#include "TracyTraceSessionPlots.hpp"
+#include "TracyTraceSessionMessages.hpp"
+#include "TracyTraceSessionLocks.hpp"
 #include "TracyTraceSessionRelations.hpp"
 #include "TracyTraceSessionRuntime.hpp"
 #include "TracyTraceSessionIoGfx.hpp"
@@ -162,6 +165,8 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "gpu_resources " << value.stats.gpuResources << '\n';
     out << "gpu_allocations " << value.stats.gpuAllocations << '\n';
     out << "gpu_passes " << value.stats.gpuPasses << '\n';
+    out << "gpu_source_gap_resources " << value.stats.gpuSourceGapResources << '\n';
+    out << "gpu_source_gap_references " << value.stats.gpuSourceGapReferences << '\n';
     out << "frame_sets " << value.stats.frameSets << '\n';
     out << "frames " << value.stats.frames << '\n';
     out << "complete_frames " << value.stats.completeFrames << '\n';
@@ -208,6 +213,8 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "context_switch_sample_events " << value.stats.contextSwitchSampleEvents << '\n';
     out << "sample_dictionary_entries " << value.stats.sampleDictionaryEntries << '\n';
     out << "callstack_payloads " << value.stats.callstackPayloads << '\n';
+    out << "hardware_sample_events " << value.stats.hardwareSampleEvents << '\n';
+    out << "hardware_sample_addresses " << value.stats.hardwareSampleAddresses << '\n';
     out << "context_switch_records " << value.stats.contextSwitchRecords << '\n';
     out << "thread_wakeup_records " << value.stats.threadWakeupRecords << '\n';
     out << "context_switch_events " << value.stats.contextSwitchEvents << '\n';
@@ -215,6 +222,10 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "cpu_context_switch_events " << value.stats.cpuContextSwitchEvents << '\n';
     out << "complete_cpu_context_switch_events " << value.stats.completeCpuContextSwitchEvents << '\n';
     out << "scheduling_source_gaps " << value.stats.schedulingSourceGaps << '\n';
+    out << "cpu_topology_records " << value.stats.cpuTopologyRecords << '\n';
+    out << "cpu_topology_cpus " << value.stats.cpuTopologyCpus << '\n';
+    out << "thread_summaries " << value.stats.threadSummaries << '\n';
+    out << "cpu_usage_points " << value.stats.cpuUsagePoints << '\n';
     out << "relations " << value.stats.relations << '\n';
     out << "runtime_domain_states " << value.stats.runtimeDomainStates << '\n';
     out << "script_frames " << value.stats.scriptFrames << '\n';
@@ -272,6 +283,8 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "gpu_resources" ) in >> value.stats.gpuResources;
         else if( key == "gpu_allocations" ) in >> value.stats.gpuAllocations;
         else if( key == "gpu_passes" ) in >> value.stats.gpuPasses;
+        else if( key == "gpu_source_gap_resources" ) in >> value.stats.gpuSourceGapResources;
+        else if( key == "gpu_source_gap_references" ) in >> value.stats.gpuSourceGapReferences;
         else if( key == "frame_sets" ) in >> value.stats.frameSets;
         else if( key == "frames" ) in >> value.stats.frames;
         else if( key == "complete_frames" ) in >> value.stats.completeFrames;
@@ -318,6 +331,8 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "context_switch_sample_events" ) in >> value.stats.contextSwitchSampleEvents;
         else if( key == "sample_dictionary_entries" ) in >> value.stats.sampleDictionaryEntries;
         else if( key == "callstack_payloads" ) in >> value.stats.callstackPayloads;
+        else if( key == "hardware_sample_events" ) in >> value.stats.hardwareSampleEvents;
+        else if( key == "hardware_sample_addresses" ) in >> value.stats.hardwareSampleAddresses;
         else if( key == "context_switch_records" ) in >> value.stats.contextSwitchRecords;
         else if( key == "thread_wakeup_records" ) in >> value.stats.threadWakeupRecords;
         else if( key == "context_switch_events" ) in >> value.stats.contextSwitchEvents;
@@ -325,6 +340,10 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "cpu_context_switch_events" ) in >> value.stats.cpuContextSwitchEvents;
         else if( key == "complete_cpu_context_switch_events" ) in >> value.stats.completeCpuContextSwitchEvents;
         else if( key == "scheduling_source_gaps" ) in >> value.stats.schedulingSourceGaps;
+        else if( key == "cpu_topology_records" ) in >> value.stats.cpuTopologyRecords;
+        else if( key == "cpu_topology_cpus" ) in >> value.stats.cpuTopologyCpus;
+        else if( key == "thread_summaries" ) in >> value.stats.threadSummaries;
+        else if( key == "cpu_usage_points" ) in >> value.stats.cpuUsagePoints;
         else if( key == "relations" ) in >> value.stats.relations;
         else if( key == "runtime_domain_states" ) in >> value.stats.runtimeDomainStates;
         else if( key == "script_frames" ) in >> value.stats.scriptFrames;
@@ -655,6 +674,8 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.contextSwitchSampleEvents = samplingStats.contextSwitchSamples;
     index.stats.sampleDictionaryEntries = samplingStats.dictionaryEntries;
     index.stats.callstackPayloads = samplingStats.callstackPayloads;
+    index.stats.hardwareSampleEvents = samplingStats.hardwareEvents;
+    index.stats.hardwareSampleAddresses = samplingStats.hardwareAddresses;
 
     TraceSessionSchedulingStats schedulingStats;
     if( control.progress ) control.progress( 0.f, "scheduling" );
@@ -671,6 +692,37 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     index.stats.cpuContextSwitchEvents = schedulingStats.cpuEvents;
     index.stats.completeCpuContextSwitchEvents = schedulingStats.completeCpuEvents;
     index.stats.schedulingSourceGaps = schedulingStats.sourceGapEvents;
+    index.stats.cpuTopologyRecords = schedulingStats.topologyRecords;
+    index.stats.cpuTopologyCpus = schedulingStats.topologyCpus;
+    index.stats.threadSummaries = schedulingStats.threadSummaries;
+    index.stats.cpuUsagePoints = schedulingStats.cpuUsagePoints;
+
+    TraceSessionPlotStats plotStats;
+    if( control.progress ) control.progress( 0.f, "plots" );
+    reuseError.clear();
+    if( AuditTraceSessionPlotDerived( sessionRoot, manifest, plotStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "plots-reused" );
+    }
+    else if( !BuildTraceSessionPlotDerived( sessionRoot, manifest, plotStats, error ) ) return false;
+
+    TraceSessionMessageStats messageStats;
+    if( control.progress ) control.progress( 0.f, "messages" );
+    reuseError.clear();
+    if( AuditTraceSessionMessageDerived( sessionRoot, manifest, messageStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "messages-reused" );
+    }
+    else if( !BuildTraceSessionMessageDerived( sessionRoot, manifest, messageStats, error ) ) return false;
+
+    TraceSessionLockStats lockStats;
+    if( control.progress ) control.progress( 0.f, "locks" );
+    reuseError.clear();
+    if( AuditTraceSessionLockDerived( sessionRoot, manifest, lockStats, reuseError ) )
+    {
+        if( control.progress ) control.progress( 1.f, "locks-reused" );
+    }
+    else if( !BuildTraceSessionLockDerived( sessionRoot, manifest, lockStats, error ) ) return false;
 
     TraceSessionRelationStats relationStats;
     if( control.progress ) control.progress( 0.f, "relations" );
@@ -724,6 +776,8 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
         index.stats.gpuResources = gpuStats.resourceCount;
         index.stats.gpuAllocations = gpuStats.allocationCount;
         index.stats.gpuPasses = gpuStats.passCount;
+        index.stats.gpuSourceGapResources = gpuStats.sourceGapResourceCount;
+        index.stats.gpuSourceGapReferences = gpuStats.sourceGapReferenceCount;
     }
     if( !SaveIndexManifest( root, index, error ) ) return false;
     stats = index.stats;
@@ -763,7 +817,9 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
             gpu->traceSize != manifest.source.fileSize ||
             gpu->resourceCount != index.stats.gpuResources ||
             gpu->allocationCount != index.stats.gpuAllocations ||
-            gpu->passCount != index.stats.gpuPasses )
+            gpu->passCount != index.stats.gpuPasses ||
+            gpu->sourceGapResourceCount != index.stats.gpuSourceGapResources ||
+            gpu->sourceGapReferenceCount != index.stats.gpuSourceGapReferences )
         { if( error.empty() ) error = "session_gpu_derived_audit_mismatch"; return false; }
     }
     TraceSessionTimeTransform timeTransform;
@@ -836,7 +892,9 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         samplingStats.samples != index.stats.sampleEvents ||
         samplingStats.contextSwitchSamples != index.stats.contextSwitchSampleEvents ||
         samplingStats.dictionaryEntries != index.stats.sampleDictionaryEntries ||
-        samplingStats.callstackPayloads != index.stats.callstackPayloads )
+        samplingStats.callstackPayloads != index.stats.callstackPayloads ||
+        samplingStats.hardwareEvents != index.stats.hardwareSampleEvents ||
+        samplingStats.hardwareAddresses != index.stats.hardwareSampleAddresses )
     { if( error.empty() ) error = "session_sampling_derived_audit_mismatch"; return false; }
     TraceSessionSchedulingStats schedulingStats;
     if( !AuditTraceSessionSchedulingDerived( sessionRoot, manifest, schedulingStats, error ) ||
@@ -846,8 +904,21 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         schedulingStats.completeThreadEvents != index.stats.completeContextSwitchEvents ||
         schedulingStats.cpuEvents != index.stats.cpuContextSwitchEvents ||
         schedulingStats.completeCpuEvents != index.stats.completeCpuContextSwitchEvents ||
-        schedulingStats.sourceGapEvents != index.stats.schedulingSourceGaps )
+        schedulingStats.sourceGapEvents != index.stats.schedulingSourceGaps ||
+        schedulingStats.topologyRecords != index.stats.cpuTopologyRecords ||
+        schedulingStats.topologyCpus != index.stats.cpuTopologyCpus ||
+        schedulingStats.threadSummaries != index.stats.threadSummaries ||
+        schedulingStats.cpuUsagePoints != index.stats.cpuUsagePoints )
     { if( error.empty() ) error = "session_scheduling_derived_audit_mismatch"; return false; }
+    TraceSessionPlotStats plotStats;
+    if( !AuditTraceSessionPlotDerived( sessionRoot, manifest, plotStats, error ) )
+    { if( error.empty() ) error = "session_plot_derived_audit_mismatch"; return false; }
+    TraceSessionMessageStats messageStats;
+    if( !AuditTraceSessionMessageDerived( sessionRoot, manifest, messageStats, error ) )
+    { if( error.empty() ) error = "session_message_derived_audit_mismatch"; return false; }
+    TraceSessionLockStats lockStats;
+    if( !AuditTraceSessionLockDerived( sessionRoot, manifest, lockStats, error ) )
+    { if( error.empty() ) error = "session_lock_derived_audit_mismatch"; return false; }
     TraceSessionRelationStats relationStats;
     if( !AuditTraceSessionRelationDerived( sessionRoot, manifest, relationStats, error ) ||
         relationStats.relations != index.stats.relations )
@@ -867,6 +938,30 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
         ioGfxStats.correlatedFrames != index.stats.correlatedFrames )
     { if( error.empty() ) error = "session_io_gfx_derived_audit_mismatch"; return false; }
     const auto& queueCounts = inventory.protocolInventory.events;
+    static constexpr std::array MessageTypes {
+        QueueType::Message, QueueType::MessageColor,
+        QueueType::MessageCallstack, QueueType::MessageColorCallstack,
+        QueueType::MessageAppInfo, QueueType::MessageLiteral,
+        QueueType::MessageLiteralColor, QueueType::MessageLiteralCallstack,
+        QueueType::MessageLiteralColorCallstack
+    };
+    for( size_t index = 0; index < MessageTypes.size(); ++index )
+    {
+        if( queueCounts[size_t( MessageTypes[index] )].count !=
+            messageStats.eventCounts[index] )
+        { error = "session_message_source_count_mismatch"; return false; }
+    }
+    if( queueCounts[size_t( QueueType::LockAnnounce )].count != lockStats.announceEvents ||
+        queueCounts[size_t( QueueType::LockTerminate )].count != lockStats.terminateEvents ||
+        queueCounts[size_t( QueueType::LockWait )].count != lockStats.waitEvents ||
+        queueCounts[size_t( QueueType::LockObtain )].count != lockStats.obtainEvents ||
+        queueCounts[size_t( QueueType::LockRelease )].count != lockStats.releaseEvents ||
+        queueCounts[size_t( QueueType::LockSharedWait )].count != lockStats.sharedWaitEvents ||
+        queueCounts[size_t( QueueType::LockSharedObtain )].count != lockStats.sharedObtainEvents ||
+        queueCounts[size_t( QueueType::LockSharedRelease )].count != lockStats.sharedReleaseEvents ||
+        queueCounts[size_t( QueueType::LockName )].count != lockStats.nameEvents ||
+        queueCounts[size_t( QueueType::LockMark )].count != lockStats.markEvents )
+    { error = "session_lock_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::JnJobType )].count != index.stats.jobTypes ||
         queueCounts[size_t( QueueType::JnJobSchedule )].count != index.stats.jobSchedules ||
         queueCounts[size_t( QueueType::JnJobConfig )].count != index.stats.jobConfigs ||
@@ -922,14 +1017,40 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     const auto contextSwitchSamples =
         queueCounts[size_t( QueueType::CallstackSampleContextSwitch )].count +
         queueCounts[size_t( QueueType::CallstackSampleContextSwitchRef )].count;
+    const auto hardwareSamples =
+        queueCounts[size_t( QueueType::HwSampleCpuCycle )].count +
+        queueCounts[size_t( QueueType::HwSampleInstructionRetired )].count +
+        queueCounts[size_t( QueueType::HwSampleCacheReference )].count +
+        queueCounts[size_t( QueueType::HwSampleCacheMiss )].count +
+        queueCounts[size_t( QueueType::HwSampleBranchRetired )].count +
+        queueCounts[size_t( QueueType::HwSampleBranchMiss )].count;
     if( samples != index.stats.sampleEvents ||
         contextSwitchSamples != index.stats.contextSwitchSampleEvents ||
         queueCounts[size_t( QueueType::CallstackSampleDictionary )].count != index.stats.sampleDictionaryEntries ||
-        queueCounts[size_t( QueueType::CallstackPayload )].count != index.stats.callstackPayloads )
+        queueCounts[size_t( QueueType::CallstackPayload )].count != index.stats.callstackPayloads ||
+        hardwareSamples != index.stats.hardwareSampleEvents )
     { error = "session_sampling_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::ContextSwitch )].count != index.stats.contextSwitchRecords ||
-        queueCounts[size_t( QueueType::ThreadWakeup )].count != index.stats.threadWakeupRecords )
+        queueCounts[size_t( QueueType::ThreadWakeup )].count != index.stats.threadWakeupRecords ||
+        queueCounts[size_t( QueueType::CpuTopology )].count != index.stats.cpuTopologyRecords )
     { error = "session_scheduling_source_count_mismatch"; return false; }
+    if( queueCounts[size_t( QueueType::ThreadName )].count != schedulingStats.threadNameRecords ||
+        queueCounts[size_t( QueueType::TidToPid )].count != schedulingStats.tidToPidRecords ||
+        queueCounts[size_t( QueueType::ThreadGroupHint )].count != schedulingStats.groupHintRecords ||
+        queueCounts[size_t( QueueType::ExternalNameMetadata )].count != schedulingStats.externalNameMetadataRecords ||
+        queueCounts[size_t( QueueType::ExternalName )].count != schedulingStats.externalNameRecords ||
+        queueCounts[size_t( QueueType::ExternalThreadName )].count != schedulingStats.externalThreadNameRecords ||
+        queueCounts[size_t( QueueType::FiberName )].count != schedulingStats.fiberNameRecords ||
+        queueCounts[size_t( QueueType::FiberEnter )].count != schedulingStats.fiberEnterRecords ||
+        queueCounts[size_t( QueueType::FiberLeave )].count != schedulingStats.fiberLeaveRecords )
+    { error = "session_thread_source_count_mismatch"; return false; }
+    const auto plotDataEvents = queueCounts[size_t( QueueType::PlotDataInt )].count +
+        queueCounts[size_t( QueueType::PlotDataFloat )].count +
+        queueCounts[size_t( QueueType::PlotDataDouble )].count;
+    if( plotDataEvents != plotStats.dataEvents || plotStats.points > plotStats.dataEvents ||
+        queueCounts[size_t( QueueType::PlotConfig )].count != plotStats.configEvents ||
+        queueCounts[size_t( QueueType::PlotName )].count != plotStats.nameEvents )
+    { error = "session_plot_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::JnRelation )].count != index.stats.relations )
     { error = "session_relation_source_count_mismatch"; return false; }
     if( queueCounts[size_t( QueueType::JnRuntimeDomainState )].count != index.stats.runtimeDomainStates ||

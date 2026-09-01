@@ -16,9 +16,11 @@
 #include "TracyTraceSessionCpuZones.hpp"
 #include "TracyQueryService.hpp"
 #include "TracyTraceSessionProtocolInventory.hpp"
+#include "TracyJnGpuCatalogResolve.hpp"
 
 #include "TracyStreamJournal.hpp"
 #include "TracyProtocolObserver.hpp"
+#include "TracyForceInline.hpp"
 #include "TracyQueue.hpp"
 #include "TracyProtocol.hpp"
 #include "tracy_lz4.hpp"
@@ -48,6 +50,69 @@ struct TestContext
 
     int failed = 0;
 };
+
+void TestSharedGpuPointerIdentityOutlivesOwnership( TestContext& test )
+{
+    constexpr uint64_t Generation = 7;
+    constexpr uint64_t Pointer = 0xCAFE;
+    tracy::JnTraceData data;
+
+    tracy::JnGpuCatalogResourceRecordV1 first {};
+    first.time = 10;
+    first.resourceId = 100;
+    first.pointerToken = Pointer;
+    first.operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    first.exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    data.gpuCatalogResources.push_back( first );
+
+    auto destroyed = first;
+    destroyed.time = 20;
+    destroyed.operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Destroy );
+    data.gpuCatalogResources.push_back( destroyed );
+
+    auto replacement = first;
+    replacement.time = 30;
+    replacement.resourceId = 101;
+    replacement.operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Snapshot );
+    replacement.exactness = uint8_t( tracy::JnGpuCatalogExactness::OpenBoundary );
+    data.gpuCatalogResources.push_back( replacement );
+
+    data.gpuCatalogBatches.push_back( { Generation, 0, 0, 0, 1, 3,
+        uint32_t( 3 * sizeof( tracy::JnGpuCatalogResourceRecordV1 ) ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::Resource ), 1, 0, 1 } );
+
+    tracy::JnGpuReferencePassData beforeReplacement {};
+    beforeReplacement.time = 25;
+    beforeReplacement.passId = 1000;
+    data.gpuReferencePasses.push_back( beforeReplacement );
+    auto afterReplacement = beforeReplacement;
+    afterReplacement.time = 35;
+    afterReplacement.passId = 1001;
+    data.gpuReferencePasses.push_back( afterReplacement );
+
+    tracy::JnGpuRangeSetRecordV1 oldUse {};
+    oldUse.passInstanceId = 1000;
+    oldUse.pointerToken = Pointer;
+    oldUse.lengthBytes = 64;
+    oldUse.rangeKind = uint8_t( tracy::JnGpuRangeKind::Buffer );
+    oldUse.exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    data.gpuRangeSets.push_back( oldUse );
+    auto newUse = oldUse;
+    newUse.passInstanceId = 1001;
+    data.gpuRangeSets.push_back( newUse );
+    data.gpuCatalogBatches.push_back( { Generation, 0, 0, 0, 2, 2,
+        uint32_t( 2 * sizeof( tracy::JnGpuRangeSetRecordV1 ) ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::RangeSet ), 1, 0, 1 } );
+
+    const auto result = tracy::ResolveJnGpuCatalogGenerationData(
+        data, Generation, []( uint64_t token ) { return token; } );
+    test.Check( result.totalUnresolved == 0 && result.coreUnresolved == 0,
+        "shared GPU resolver keeps exact pointer identity across ownership destroy" );
+    test.Check( data.gpuRangeSets[0].resourceId == 100,
+        "post-Destroy command-list use resolves to the preceding pointer generation" );
+    test.Check( data.gpuRangeSets[1].resourceId == 101,
+        "a later pointer definition switches subsequent uses to the replacement generation" );
+}
 
 struct ProgressState
 {
@@ -1062,25 +1127,207 @@ void TestProtocolJournalInventory( TestContext& test, const std::filesystem::pat
     }
 }
 
+tracy_no_inline void TestSessionPlotTraceSource( TestContext& test,
+    tracy::analysis::GpuAnalysisTraceSource& source )
+{
+    const auto capabilities = source.GetCapabilities();
+    const auto plotCapability = std::find_if( capabilities.begin(), capabilities.end(),
+        []( const auto& value ) { return value.domain == "plot"; } );
+    test.Check( plotCapability != capabilities.end() && plotCapability->present &&
+        plotCapability->indexed && plotCapability->queryable,
+        "Session advertises Plot only after its disk-backed semantic reader is ready" );
+    const auto plots = source.GetPlotList();
+    const auto points = source.ScanPlots( {} );
+    test.Check( plots.size() == 1 && plots[0].name == "Synthetic Plot" &&
+        plots[0].pointCount == 1 && plots[0].min == 1 && plots[0].max == 1 &&
+        plots[0].sum == 1 && points.size() == 1 && points[0].plotRef == plots[0].ref &&
+        points[0].value == 1,
+        "Session Plot reader preserves exact names, aggregates, and points without a Worker" );
+}
+
+tracy_no_inline void TestSessionPlotQuery( TestContext& test, tracy::query::QueryService& query,
+    const std::string& traceId, tracy::analysis::GpuAnalysisTraceSource& source )
+{
+    const auto plots = source.GetPlotList();
+    const auto plotRef = plots.empty() ? std::string {} : plots[0].ref;
+    const auto plotList = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-plot-list" }, { "method", "plot.list" },
+        { "params", { { "trace_id", traceId } } }
+    } );
+    const auto plotPoints = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-plot-points" }, { "method", "plot.points" },
+        { "params", { { "trace_id", traceId }, { "plot_ref", plotRef } } }
+    } );
+    test.Check( plotList.value( "ok", false ) && plotList["data"]["plots"].size() == 1 &&
+        plotList["data"]["plots"][0]["name"] == "Synthetic Plot" &&
+        plotList["data"]["plots"][0]["point_count"] == "1" &&
+        plotPoints.value( "ok", false ) && plotPoints["data"]["points"].size() == 1 &&
+        plotPoints["data"]["points"][0]["value"] == 1,
+        "Query 1.34 reads exact Session Plot evidence without a Worker" );
+}
+
+tracy_no_inline void TestSessionMessageTraceSource( TestContext& test,
+    tracy::analysis::GpuAnalysisTraceSource& source )
+{
+    const auto capabilities = source.GetCapabilities();
+    const auto capability = std::find_if( capabilities.begin(), capabilities.end(),
+        []( const auto& value ) { return value.domain == "message"; } );
+    std::vector<tracy::analysis::MessageDto> messages;
+    try { messages = source.ScanMessages( {} ); } catch( ... ) {}
+    const auto plain = std::find_if( messages.begin(), messages.end(),
+        []( const auto& value ) { return value.text == "Synthetic message"; } );
+    const auto stacked = std::find_if( messages.begin(), messages.end(),
+        []( const auto& value ) { return value.text == "Stacked evidence"; } );
+    const auto managed = std::find_if( messages.begin(), messages.end(),
+        []( const auto& value ) { return value.text == "Managed stacked evidence"; } );
+    const auto literal = std::find_if( messages.begin(), messages.end(),
+        []( const auto& value ) { return value.text == "Late literal evidence"; } );
+    test.Check( capability != capabilities.end() && capability->present &&
+        capability->indexed && capability->queryable && messages.size() == 4 &&
+        plain != messages.end() && plain->color == 0xFFFFFFFF && plain->callstack == 0 &&
+        stacked != messages.end() && stacked->callstack == 3 && stacked->callstackRef &&
+        managed != messages.end() && managed->callstack == 4 && managed->callstackRef &&
+        literal != messages.end() && literal->color == 0xFF332211 && literal->callstack == 0 &&
+        !stacked->threadRef.empty(),
+        "Session Message reader preserves direct/late-literal text, thread, color, and callstack semantics without a Worker" );
+}
+
+tracy_no_inline void TestSessionMessageQuery( TestContext& test,
+    tracy::query::QueryService& query, const std::string& traceId )
+{
+    const auto response = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-message-search" },
+        { "method", "message.search" }, { "params", {
+            { "trace_id", traceId }, { "filter", {
+                { "text", "Synthetic message" }, { "mode", "exact" } } } } }
+    } );
+    test.Check( response.value( "ok", false ) &&
+        response["data"]["messages"].size() == 1 &&
+        response["data"]["messages"][0]["text"] == "Synthetic message" &&
+        response["data"]["messages"][0]["color"] == 0xFFFFFFFF,
+        "Query 1.34 reads exact Session Message evidence without a Worker" );
+}
+
+tracy_no_inline void TestSessionLockTraceSource( TestContext& test,
+    tracy::analysis::GpuAnalysisTraceSource& source )
+{
+    const auto capabilities = source.GetCapabilities();
+    const auto capability = std::find_if( capabilities.begin(), capabilities.end(),
+        []( const auto& value ) { return value.domain == "lock"; } );
+    std::vector<tracy::analysis::LockDto> locks;
+    std::vector<tracy::analysis::LockEventDto> events;
+    try { locks = source.GetLocks(); events = source.ScanLockEvents( {} ); } catch( ... ) {}
+    test.Check( capability != capabilities.end() && capability->present &&
+        capability->indexed && capability->queryable && locks.size() == 1 &&
+        locks[0].nativeId == 700 && locks[0].name == "Synthetic Lock" &&
+        locks[0].customName && *locks[0].customName == "Synthetic Lock" &&
+        locks[0].eventCount == 3 && locks[0].threadCount == 1 &&
+        locks[0].valid && !locks[0].contended && locks[0].terminateNs &&
+        !locks[0].sourceLocationRef.empty() && events.size() == 3 &&
+        events[0].type == "wait" && events[1].type == "obtain" &&
+        events[1].lockCount == 1 && events[1].ownerThreadRef &&
+        events[2].type == "release" && events[2].lockCount == 0,
+        "Session Lock reader preserves announce/name/lifecycle and lock-state semantics without a Worker" );
+}
+
+tracy_no_inline void TestSessionLockQuery( TestContext& test,
+    tracy::query::QueryService& query, const std::string& traceId )
+{
+    const auto locks = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-lock-list" },
+        { "method", "lock.list" }, { "params", {
+            { "trace_id", traceId }, { "text", "Synthetic Lock" },
+            { "mode", "exact" } } }
+    } );
+    const auto timeline = query.Execute( {
+        { "protocol", "tracy-query/1" }, { "id", "session-lock-timeline" },
+        { "method", "lock.timeline" }, { "params", {
+            { "trace_id", traceId } } }
+    } );
+    test.Check( locks.value( "ok", false ) && locks["data"]["locks"].size() == 1 &&
+        locks["data"]["locks"][0]["native_id"] == 700 &&
+        timeline.value( "ok", false ) && timeline["data"]["events"].size() == 3 &&
+        timeline["data"]["events"][0]["type"] == "wait" &&
+        timeline["data"]["events"][1]["type"] == "obtain" &&
+        timeline["data"]["events"][2]["type"] == "release",
+        "Query 1.34 reads exact Session Lock definitions and timeline without a Worker" );
+}
+
 void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& directory )
 {
     constexpr uint64_t Generation = 7;
     constexpr uint64_t PayloadId = 99;
-    std::array<tracy::JnGpuCatalogResourceRecordV1, 3> resources {};
-    resources[0].time = 110;
+    std::array<tracy::JnGpuCatalogResourceRecordV1, 11> resources {};
+    // A bootstrap Snapshot has an open-left lifetime even when its transport
+    // timestamp follows a pass/use that was recorded while bootstrap was in
+    // flight.  The Session resolver must preserve that boundary semantics.
+    resources[0].time = 112;
     resources[0].resourceId = 10;
     resources[0].pointerToken = 0x1234;
     resources[0].allocationId = 20;
     resources[0].capacityBytes = 4096;
-    resources[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
-    resources[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    resources[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Snapshot );
+    resources[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::OpenBoundary );
     resources[1] = resources[0];
     resources[1].time = 114;
     resources[1].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Destroy );
     resources[2] = resources[0];
-    resources[2].time = 116;
+    resources[2].time = 115;
     resources[2].resourceId = 11;
     resources[2].allocationId = 21;
+    resources[2].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    resources[2].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    // A normal Create can also occur after Begin and before End.  N29 resolves
+    // the pass set at End; Begin-time resolution would hit a false lifetime gap.
+    resources[3] = resources[0];
+    resources[3].time = 112;
+    resources[3].resourceId = 12;
+    resources[3].pointerToken = 0x5678;
+    resources[3].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    resources[3].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    // This resource is valid at its Use timestamp but is destroyed exactly at
+    // PassEnd. Resolving every use at End loses valid source evidence; the
+    // Session must prefer Use time and only use a unique pass-interval fallback
+    // for definitions published after the Use timestamp.
+    resources[4] = resources[3];
+    resources[4].time = 113;
+    resources[4].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Destroy );
+    // An Update observed after a completed pointer generation enriches the
+    // Catalog but does not open a new pointer lifetime. Treating it as Create
+    // would make the following real Create falsely ambiguous.
+    resources[5] = resources[0];
+    resources[5].time = 114;
+    resources[5].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Update );
+    // A later Snapshot/Open is only open-left to the previous proven pointer
+    // boundary. It must not reach through an already complete earlier
+    // generation and make this pass-to-resource relation ambiguous.
+    resources[6] = resources[0];
+    resources[6].time = 112;
+    resources[6].resourceId = 13;
+    resources[6].pointerToken = 0x9999;
+    resources[6].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    resources[6].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    resources[7] = resources[6];
+    resources[7].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Update );
+    resources[7].definitionRevision = 2;
+    resources[8] = resources[6];
+    resources[8].time = 116;
+    resources[8].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Destroy );
+    resources[9] = resources[6];
+    resources[9].time = 120;
+    resources[9].resourceId = 14;
+    resources[9].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Snapshot );
+    resources[9].exactness = uint8_t( tracy::JnGpuCatalogExactness::OpenBoundary );
+    // The source can contain a reference to a resource that was alive before
+    // capture but absent from the connection bootstrap. A later Create on the
+    // same address proves the end of that anonymous pointer generation; it
+    // must not be back-filled with the future resource identity.
+    resources[10] = resources[6];
+    resources[10].time = 120;
+    resources[10].resourceId = 15;
+    resources[10].pointerToken = 0xBEEF;
+    resources[10].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    resources[10].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
 
     std::array<tracy::JnGpuCatalogViewRecordV1, 2> views {};
     views[0].time = 112;
@@ -1091,6 +1338,40 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     views[1] = views[0];
     views[1].time = 117;
     views[1].viewId = 101;
+
+    // Keep one logical id hot for enough records to force the Session GPU
+    // normalizer through its bounded spill path.  This guards against a single
+    // pathological logical lifetime making memory proportional to trace size.
+    constexpr size_t LogicalStressCount = 4096;
+    std::vector<tracy::JnGpuCatalogLogicalRecordV1> logicals( LogicalStressCount );
+    logicals[0].time = 112;
+    logicals[0].logicalResourceId = 300;
+    logicals[0].resourceId = 10;
+    logicals[0].lengthBytes = 4096;
+    logicals[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    logicals[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    for( size_t i = 1; i < logicals.size(); ++i )
+    {
+        logicals[i] = logicals[0];
+        logicals[i].time += int64_t( i );
+        logicals[i].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Update );
+    }
+    std::array<tracy::JnGpuCatalogRelationRecordV1, 1> catalogRelations {};
+    catalogRelations[0].time = 112;
+    catalogRelations[0].sourceId = 10;
+    catalogRelations[0].targetId = 20;
+    catalogRelations[0].operation = uint8_t( tracy::JnGpuCatalogRecordOperation::Create );
+    catalogRelations[0].relation = uint8_t( tracy::JnGpuCatalogRelationKind::BackedBy );
+    catalogRelations[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
+    constexpr uint64_t ExplicitGpuPassId = ( uint64_t( 1 ) << 63 ) + 123;
+    std::array<tracy::JnGpuRangeSetRecordV1, 1> ranges {};
+    ranges[0].passInstanceId = ExplicitGpuPassId;
+    ranges[0].resourceId = 10;
+    ranges[0].offsetBytes = 64;
+    ranges[0].lengthBytes = 256;
+    ranges[0].usageMask = 1;
+    ranges[0].rangeKind = uint8_t( tracy::JnGpuRangeKind::Buffer );
+    ranges[0].exactness = uint8_t( tracy::JnGpuCatalogExactness::Exact );
 
     const auto makeCatalogPayload = []( const void* records, uint32_t recordCount, uint16_t recordBytes )
     {
@@ -1109,10 +1390,23 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     };
     const auto resourcePayload = makeCatalogPayload( resources.data(), uint32_t( resources.size() ), sizeof( resources[0] ) );
     const auto viewPayload = makeCatalogPayload( views.data(), uint32_t( views.size() ), sizeof( views[0] ) );
+    const auto logicalPayload = makeCatalogPayload( logicals.data(), uint32_t( logicals.size() ), sizeof( logicals[0] ) );
+    const auto relationPayload = makeCatalogPayload( catalogRelations.data(), uint32_t( catalogRelations.size() ), sizeof( catalogRelations[0] ) );
+    const auto rangePayload = makeCatalogPayload( ranges.data(), uint32_t( ranges.size() ), sizeof( ranges[0] ) );
 
     std::vector<uint8_t> frame;
     AppendThreadContextEvent( frame, 42 );
+    AppendStringEvent( frame, tracy::QueueType::ThreadName, 42, "Main Thread" );
     tracy::QueueItem item {};
+    item.hdr.type = tracy::QueueType::TidToPid;
+    item.tidToPid.tid = 42;
+    item.tidToPid.pid = 1001;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::ThreadGroupHint;
+    item.threadGroupHint.thread = 42;
+    item.threadGroupHint.groupHint = 7;
+    AppendQueueItem( frame, item );
     const std::array<uint64_t, 1> sampleDictionaryStack { 0x10101010 };
     AppendStringEvent( frame, tracy::QueueType::CallstackSampleDictionary, 1,
         std::string( reinterpret_cast<const char*>( sampleDictionaryStack.data() ),
@@ -1125,6 +1419,33 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::CallstackSampleContextSwitchRef;
     item.callstackSampleRef = { { 1, 42 }, 1 };
     AppendQueueItem( frame, item );
+    constexpr uint64_t HardwareSampleAddress = 0xABC;
+    const std::array<std::pair<tracy::QueueType, int64_t>, 6> hardwareSamples = { {
+        { tracy::QueueType::HwSampleCpuCycle, 108 },
+        { tracy::QueueType::HwSampleInstructionRetired, 109 },
+        { tracy::QueueType::HwSampleCacheReference, 0 },
+        { tracy::QueueType::HwSampleCacheMiss, 110 },
+        { tracy::QueueType::HwSampleBranchRetired, 111 },
+        { tracy::QueueType::HwSampleBranchMiss, 112 }
+    } };
+    for( const auto& [type, time] : hardwareSamples )
+    {
+        item = {};
+        item.hdr.type = type;
+        item.hwSample.ip = HardwareSampleAddress;
+        item.hwSample.time = time;
+        AppendQueueItem( frame, item );
+    }
+    for( uint32_t cpu = 0; cpu < 2; ++cpu )
+    {
+        item = {};
+        item.hdr.type = tracy::QueueType::CpuTopology;
+        item.cpuTopology.package = 0;
+        item.cpuTopology.die = 0;
+        item.cpuTopology.core = 0;
+        item.cpuTopology.thread = cpu;
+        AppendQueueItem( frame, item );
+    }
     item = {};
     item.hdr.type = tracy::QueueType::ContextSwitch;
     item.contextSwitch.time = 1;
@@ -1250,9 +1571,6 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     constexpr uint64_t ScriptFunctionPointer = 0x7001;
     constexpr uint64_t ScriptFilePointer = 0x7002;
     constexpr uint64_t ScriptMarkerPointer = 0x7003;
-    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFunctionPointer, "Managed.Update" );
-    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFilePointer, "Managed.cs" );
-    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptMarkerPointer, "ManagedTick" );
     item = {};
     item.hdr.type = tracy::QueueType::JnRuntimeDomainState;
     item.jnRuntimeDomainState = { 117, 3, 20,
@@ -1278,6 +1596,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.jnScriptStack = { 119, 2001, 0, 0, 0, 0,
         uint8_t( tracy::JnScriptRecordKind::ZoneEnd ) };
     AppendQueueItem( frame, item );
+    // String queries are asynchronous in the Tracy protocol.  A script
+    // record may legally reference a cold string before its StringData reply
+    // appears later in the same or a subsequent protocol frame.
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFunctionPointer, "Managed.Update" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptFilePointer, "Managed.cs" );
+    AppendStringEvent( frame, tracy::QueueType::StringData, ScriptMarkerPointer, "ManagedTick" );
     item = {};
     item.hdr.type = tracy::QueueType::JnGfxDispatch;
     item.jnGfxDispatch = { 117, 300, 9, 2, 1, 0 };
@@ -1290,6 +1614,16 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item = {};
     item.hdr.type = tracy::QueueType::JnGfxLink;
     item.jnGfxLink = { 117, 300, 301, uint8_t( tracy::JnGfxRelation::Dispatches ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnGfxEntity;
+    item.jnGfxEntity = { 117, ExplicitGpuPassId, 0, 78, 0,
+        uint8_t( tracy::JnGfxEntityKind::ExplicitGpuPass ), 0 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::JnGfxLink;
+    item.jnGfxLink = { 117, ExplicitGpuPassId, 1000,
+        uint8_t( tracy::JnGfxRelation::ReferencesResources ), 0 };
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::JnFrame;
@@ -1330,9 +1664,61 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     item.hdr.type = tracy::QueueType::JnZoneBeginCallsite;
     item.jnZoneBeginCallsite = { { 104, 0x1000 }, 78 };
     AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::PlotName, 0x6000, "Synthetic Plot" );
+    AppendStringEvent( frame, tracy::QueueType::PlotName, 0x6001, "Orphan Plot Name" );
     item = {};
     item.hdr.type = tracy::QueueType::PlotDataInt;
     item.plotDataInt = { { 0x6000, 2 }, 1 };
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Synthetic message" );
+    item = {};
+    item.hdr.type = tracy::QueueType::Message;
+    item.message.time = 2;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::MessageLiteralColor;
+    item.messageColorLiteral.time = 2;
+    item.messageColorLiteral.b = 0x33;
+    item.messageColorLiteral.g = 0x22;
+    item.messageColorLiteral.r = 0x11;
+    item.messageColorLiteral.text = 0x7F000001;
+    AppendQueueItem( frame, item );
+    // Literal definitions may arrive after their consumers.  The Session
+    // builder must resolve them from the complete immutable dictionary rather
+    // than dropping the earlier message.
+    AppendStringEvent( frame, tracy::QueueType::StringData, 0x7F000001, "Late literal evidence" );
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5557,
+        std::string( reinterpret_cast<const char*>( zoneCallstack.data() ), sizeof( zoneCallstack ) ) );
+    std::string managedCallstack;
+    managedCallstack.push_back( char( 1 ) );
+    const uint32_t managedLine = 77;
+    const uint16_t managedNameBytes = 15;
+    const uint16_t managedFileBytes = 10;
+    managedCallstack.append( reinterpret_cast<const char*>( &managedLine ), sizeof( managedLine ) );
+    managedCallstack.append( reinterpret_cast<const char*>( &managedNameBytes ), sizeof( managedNameBytes ) );
+    managedCallstack.append( "Managed.Message", managedNameBytes );
+    managedCallstack.append( reinterpret_cast<const char*>( &managedFileBytes ), sizeof( managedFileBytes ) );
+    managedCallstack.append( "Managed.cs", managedFileBytes );
+    AppendStringEvent( frame, tracy::QueueType::CallstackAllocPayload, 0x5558, managedCallstack );
+    item = {};
+    item.hdr.type = tracy::QueueType::CallstackAlloc;
+    item.callstackFat.ptr = 0x5558;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Managed stacked evidence" );
+    item = {};
+    item.hdr.type = tracy::QueueType::MessageCallstack;
+    item.message.time = 2;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::CallstackPayload, 0x5556,
+        std::string( reinterpret_cast<const char*>( zoneCallstack.data() ), sizeof( zoneCallstack ) ) );
+    item = {};
+    item.hdr.type = tracy::QueueType::Callstack;
+    item.callstackFat.ptr = 0x5556;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Stacked evidence" );
+    item = {};
+    item.hdr.type = tracy::QueueType::MessageCallstack;
+    item.message.time = 2;
     AppendQueueItem( frame, item );
     item = {};
     item.hdr.type = tracy::QueueType::ZoneValidation;
@@ -1603,22 +1989,132 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         uint8_t( tracy::JnGpuCatalogBatchKind::View ),
         uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
     AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 2, logicalPayload );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 2, 4, uint32_t( logicals.size() ), uint32_t( logicalPayload.size() ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::Logical ),
+        uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
+    AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData, PayloadId + 3, relationPayload );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 3, 5, uint32_t( catalogRelations.size() ), uint32_t( relationPayload.size() ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::Relation ),
+        uint8_t( tracy::JnGpuCatalogBatchEncoding::FixedV1 ), 0 };
+    AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
     item.jnGpuReferencePass = { 111, 1000, 5, 77, 1, 0 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
-    item.jnGpuReferenceUse = { 112, 1000, 0x1234, 3, 0 };
+    item.jnGpuReferenceUse = { 111, 1000, 0x1234, 3, 0 };
+    AppendQueueItem( frame, item );
+    item.jnGpuReferenceUse = { 111, 1000, 0x5678, 1, 0 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
-    item.jnGpuReferenceEnd = { 113, 1000, 2000, 1, 0, 0 };
+    // totalReferenceCount is the producer's raw observation count.  The
+    // ResourceSet/direct uses are the unique set after per-pass deduplication,
+    // so repeated observations must not make an otherwise exact pass invalid.
+    item.jnGpuReferenceEnd = { 113, 1000, 2000, 5, 0, 0 };
+    AppendQueueItem( frame, item );
+    // Force frame 5 to be committed before its asynchronously batched RangeSet
+    // arrives.  A bounded Session converter must join this exact late evidence
+    // from disk by pass id instead of retaining every historical pass.
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 114, 1001, 8, 78, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnRelation;
+    item.jnRelation = { 114, 1001, 1000,
+        uint8_t( tracy::JnEntityKind::GpuPass ), uint8_t( tracy::JnEntityKind::GpuPass ),
+        uint8_t( tracy::JnRelationNamespace::GpuReference ),
+        uint8_t( tracy::JnRelationKind::LogicalParent ), 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 114, 1001, 0x1234, 1, 0 };
+    AppendQueueItem( frame, item );
+    item.jnGpuReferenceUse = { 114, 1001, 0x9999, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 115, 1001, 2001, 2, 0, 0 };
+    AppendQueueItem( frame, item );
+    // Resource ownership ended at 116, but a command-list reference captured
+    // for the same pointer generation may be flushed before the address is
+    // reused by the Snapshot at 120. Identity resolution must retain resource
+    // 13 without extending its allocation/ownership lifetime.
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 118, 1002, 9, 79, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 118, 1002, 0x9999, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 119, 1002, 2002, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 117, 1003, 10, 80, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 117, 1003, 0xBEEF, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 118, 1003, 2003, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    // A second source gap has no Catalog definition anywhere in the capture.
+    // The derived store must preserve the Pass relation through an anonymous
+    // open-both-boundaries resource instead of rejecting the whole Session.
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferencePass;
+    item.jnGpuReferencePass = { 119, 1004, 11, 81, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceUse;
+    item.jnGpuReferenceUse = { 119, 1004, 0xCAFE, 1, 0 };
+    AppendQueueItem( frame, item );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuReferenceEnd;
+    item.jnGpuReferenceEnd = { 120, 1004, 2004, 1, 0, 0 };
+    AppendQueueItem( frame, item );
+    AppendLargePayloadEvent( frame, tracy::QueueType::JnGpuCatalogBatchData,
+        PayloadId + 4, rangePayload );
+    item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogBatch;
+    item.jnGpuCatalogBatch = { Generation, PayloadId + 4, 6,
+        uint32_t( ranges.size() ), uint32_t( rangePayload.size() ),
+        uint8_t( tracy::JnGpuCatalogBatchKind::RangeSet ),
+        uint8_t( tracy::JnGpuCatalogBatchEncoding::RangeSetV1 ), 0 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::FrameVsync;
     item.frameVsync = { 118, 9 };
     AppendQueueItem( frame, item );
     item = {}; item.hdr.type = tracy::QueueType::JnGpuCatalogControl;
-    item.jnGpuCatalogControl = { 120, Generation, 1, 4,
+    item.jnGpuCatalogControl = { 120, Generation, 1, 7,
         uint8_t( tracy::JnGpuCatalogControlKind::GenerationEnd ),
         uint8_t( tracy::JnGpuCatalogGenerationState::Complete ), 0 };
+    AppendQueueItem( frame, item );
+
+    // Keep the Lock serial deltas after the Memory fixture so this independent
+    // domain does not change the Memory oracle's exact timestamps.
+    item = {};
+    item.hdr.type = tracy::QueueType::LockAnnounce;
+    item.lockAnnounce.id = 700;
+    item.lockAnnounce.time = 116;
+    item.lockAnnounce.lckloc = 0x1000;
+    item.lockAnnounce.type = tracy::LockType::Lockable;
+    AppendQueueItem( frame, item );
+    AppendStringEvent( frame, tracy::QueueType::SingleStringData, "Synthetic Lock" );
+    item = {};
+    item.hdr.type = tracy::QueueType::LockName;
+    item.lockName.id = 700;
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::LockWait;
+    item.lockWait = { 42, 700, 1 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::LockObtain;
+    item.lockObtain = { 42, 700, 1 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::LockRelease;
+    item.lockRelease = { 700, 1 };
+    AppendQueueItem( frame, item );
+    item = {};
+    item.hdr.type = tracy::QueueType::LockTerminate;
+    item.lockTerminate = { 700, 119 };
     AppendQueueItem( frame, item );
 
     auto* compressor = tracy::LZ4_createStream();
@@ -1640,6 +2136,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     tracy::WelcomeMessage welcome {};
     welcome.timerMul = 2.0;
     welcome.initBegin = 100;
+    welcome.pid = 1001;
     test.Check( writer->Append( tracy::stream::RecordType::ClientToServer,
         tracy::stream::RecordFlagHandshake,
         std::span<const uint8_t>( reinterpret_cast<const uint8_t*>( &welcome ), sizeof( welcome ) ),
@@ -1672,44 +2169,123 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "load GPU facts from canonical shards: " + error );
     test.Check( transform.present && transform.timerMultiplier == 2.0 && transform.baseTime == 100,
         "GPU reader restores the exact Welcome time transform" );
-    test.Check( gpuData.gpuCatalogValid && gpuData.gpuCatalogResources.size() == 3 &&
+    test.Check( gpuData.gpuCatalogValid && gpuData.gpuCatalogResources.size() == 11 &&
         gpuData.gpuCatalogResources.front().resourceId == 10 &&
-        gpuData.gpuCatalogResources.front().time == 20,
+        gpuData.gpuCatalogResources.front().time == 24,
         "GPU reader validates and restores Catalog records with Worker-equivalent time" );
     test.Check( gpuData.gpuCatalogViews.size() == 2 &&
         gpuData.gpuCatalogViews[0].resourceId == 10 && gpuData.gpuCatalogViews[0].pointerToken == 0 &&
         gpuData.gpuCatalogViews[1].resourceId == 11 && gpuData.gpuCatalogViews[1].pointerToken == 0,
         "GPU reader resolves pointer reuse against the exact resource lifetime" );
-    test.Check( gpuData.gpuReferencePasses.size() == 1 &&
-        gpuData.gpuReferenceUses.size() == 1 && gpuData.gpuReferenceEnds.size() == 1 &&
+    test.Check( gpuData.gpuReferencePasses.size() == 5 &&
+        gpuData.gpuReferenceUses.size() == 7 && gpuData.gpuReferenceEnds.size() == 5 &&
+        gpuData.gpuReferenceEnds.front().totalReferenceCount == 5 &&
         gpuData.gpuReferencePasses.front().time == 22 &&
-        gpuData.gpuReferenceUses.front().time == 24 &&
+        gpuData.gpuReferenceUses.front().time == 22 &&
         gpuData.gpuReferenceEnds.front().time == 26,
         "GPU reader restores exact pass/resource/end relations" );
-    test.Check( stats.catalogPayloads == 2 && stats.catalogBatches == 2 &&
+    test.Check( stats.catalogPayloads == 5 && stats.catalogBatches == 5 &&
         stats.unresolvedPayloads == 0,
         "GPU reader consumes each Catalog payload exactly once" );
 
+    tracy::JnTraceData catalogOnlyData;
+    tracy::analysis::TraceSessionTimeTransform catalogOnlyTransform;
+    tracy::analysis::TraceSessionGpuCanonicalStats catalogOnlyStats;
+    test.Check( tracy::analysis::LoadTraceSessionGpuCatalogData(
+        sessionRoot, manifest, catalogOnlyData, catalogOnlyTransform,
+        catalogOnlyStats, error ),
+        "load bounded Catalog facts without materializing Pass/ResourceSet evidence: " + error );
+    test.Check( catalogOnlyData.gpuCatalogResources.size() ==
+            gpuData.gpuCatalogResources.size() &&
+        catalogOnlyData.gpuCatalogAllocations.size() ==
+            gpuData.gpuCatalogAllocations.size(),
+        "Catalog-only reader preserves exact Resource and Allocation facts" );
+    test.Check( catalogOnlyData.gpuReferencePasses.empty() &&
+        catalogOnlyData.gpuReferenceUses.empty() &&
+        catalogOnlyData.gpuReferenceEnds.empty(),
+        "Catalog-only reader retains no high-volume Pass/ResourceSet facts" );
+
     tracy::analysis::GpuAnalysisSidecarControl gpuControl;
     gpuControl.minimumFreeBytes = 0;
+    // Force every completed frame into a separate temporary pass page.  The
+    // exact LogicalParent rollup must therefore work across both frame and
+    // storage-page boundaries rather than depending on retained memory.
+    gpuControl.targetDerivedPageBytes = 1;
     tracy::analysis::TraceSessionGpuDerivedStats derivedStats;
     const auto builtGpuDerived = tracy::analysis::BuildTraceSessionGpuAnalysisDerived(
         sessionRoot, manifest, gpuControl, derivedStats, error );
     test.Check( builtGpuDerived,
         "build mandatory GPU analysis from Session Canonical: " + error );
+    test.Check( derivedStats.sourceGapResourceCount == 2 &&
+        derivedStats.sourceGapReferenceCount == 2,
+        "GPU derived reports the exact source-missing identity and reference counts" );
     const auto gpuRoot = tracy::analysis::TraceSessionGpuAnalysisRoot( sessionRoot, manifest );
     const auto gpuStore = tracy::analysis::LoadGpuAnalysisStoreManifest(
         gpuRoot / derivedStats.generation, error );
     test.Check( gpuStore.has_value() && gpuStore->complete &&
-        gpuStore->resourceCount == 2 && gpuStore->passCount == 1,
+        gpuStore->resourceCount == 8 && gpuStore->passCount == 5 &&
+        gpuStore->rangeCount == 1 &&
+        gpuStore->sourceGapResourceCount == 2 &&
+        gpuStore->sourceGapReferenceCount == 2 &&
+        gpuStore->logicalCount == logicals.size() && gpuStore->catalogRelationCount == 1,
         "Session generation publishes N29 GPU analysis without a duplicate raw sidecar: " + error );
+    auto gpuReader = tracy::analysis::GpuAnalysisStoreReader::OpenAt( gpuRoot,
+        manifest.source.sha256, manifest.source.fileSize, error );
+    const auto gpuResource = gpuReader ? gpuReader->FindResource( 10, error ) : std::nullopt;
+    const auto parentGpuPass = gpuReader ? gpuReader->FindPass( 1000, error ) : std::nullopt;
+    const auto delayedGpuPass = gpuReader ? gpuReader->FindPass( 1002, error ) : std::nullopt;
+    const auto sourceGapGpuPass = gpuReader ? gpuReader->FindPass( 1003, error ) : std::nullopt;
+    const auto sourceGapGpuResource = sourceGapGpuPass && sourceGapGpuPass->directResources.size() == 1 ?
+        gpuReader->FindResource( sourceGapGpuPass->directResources.front(), error ) : std::nullopt;
+    const auto absentCatalogGpuPass = gpuReader ? gpuReader->FindPass( 1004, error ) : std::nullopt;
+    const auto absentCatalogGpuResource = absentCatalogGpuPass &&
+        absentCatalogGpuPass->directResources.size() == 1 ?
+        gpuReader->FindResource( absentCatalogGpuPass->directResources.front(), error ) : std::nullopt;
+    std::vector<tracy::analysis::GpuRangeAnalysisRecord> gpuRanges;
+    bool gpuRangesMore = false;
+    const auto loadedGpuRanges = gpuReader && gpuReader->RangesForResource(
+        10, 0, 16, gpuRanges, gpuRangesMore, error );
+    test.Check( gpuResource.has_value(), "Session GPU resource lookup succeeds: " + error );
+    test.Check( parentGpuPass.has_value(), "Session GPU parent pass lookup succeeds: " + error );
+    test.Check( parentGpuPass && parentGpuPass->inclusiveResources ==
+        std::vector<uint64_t> { 10, 12, 13 },
+        "later Snapshot does not contaminate the exact earlier inclusive set; actual_count=" +
+        std::to_string( parentGpuPass ? parentGpuPass->inclusiveResources.size() : 0 ) );
+    test.Check( delayedGpuPass && delayedGpuPass->directResources ==
+        std::vector<uint64_t> { 13 },
+        "post-Destroy command-list use retains the previous pointer generation identity" );
+    test.Check( sourceGapGpuPass && !sourceGapGpuPass->complete &&
+        sourceGapGpuPass->truncated && sourceGapGpuPass->directResources.size() == 1,
+        "a source-missing pre-Create pointer generation remains explicitly incomplete" );
+    test.Check( sourceGapGpuResource && sourceGapGpuResource->openBoundary &&
+        sourceGapGpuResource->allocationId == 0 && sourceGapGpuResource->capacityBytes == 0 &&
+        sourceGapGpuResource->exactness == uint8_t( tracy::JnGpuCatalogExactness::OpenBoundary ),
+        "source gap is represented by an anonymous open-boundary resource without guessed memory" );
+    test.Check( absentCatalogGpuPass && !absentCatalogGpuPass->complete &&
+        absentCatalogGpuPass->truncated && absentCatalogGpuResource &&
+        absentCatalogGpuResource->openBoundary && absentCatalogGpuResource->aliveAtEnd &&
+        absentCatalogGpuResource->allocationId == 0 && absentCatalogGpuResource->capacityBytes == 0,
+        "a pointer absent from the entire Catalog remains an anonymous open-ended source gap" );
+    test.Check( gpuResource && gpuResource->logicals.size() == logicals.size(),
+        "Session GPU resource retains externally merged Logical facts" );
+    test.Check( gpuResource && gpuResource->relations.size() == 1,
+        "Session GPU resource retains externally merged Relation facts" );
+    test.Check( loadedGpuRanges && gpuRanges.size() == 1 && !gpuRangesMore &&
+        gpuRanges.front().value.passInstanceId == ExplicitGpuPassId &&
+        parentGpuPass && parentGpuPass->directRangeBytes == 256,
+        "Session GPU resource preserves the explicit pass Range identity and joins it to reference evidence: " + error );
 
     tracy::analysis::TraceSessionDerivedControl derivedControl;
     derivedControl.minimumFreeBytes = 0;
+    std::string lastDerivedStage;
+    derivedControl.progress = [&]( float, std::string_view stage ) {
+        lastDerivedStage.assign( stage );
+    };
     tracy::analysis::TraceSessionDerivedStats mandatoryStats;
-    test.Check( tracy::analysis::BuildTraceSessionMandatoryDerived( sessionRoot, manifest,
-        inventory, derivedControl, mandatoryStats, error ),
-        "build all mandatory Session indexes: " + error );
+    const auto mandatoryBuilt = tracy::analysis::BuildTraceSessionMandatoryDerived(
+        sessionRoot, manifest, inventory, derivedControl, mandatoryStats, error );
+    test.Check( mandatoryBuilt,
+        "build all mandatory Session indexes at " + lastDerivedStage + ": " + error );
     const auto cpuZoneRoot = tracy::analysis::TraceSessionCpuZoneIndexRoot( sessionRoot, manifest );
     test.Check( !std::filesystem::exists( cpuZoneRoot / "zones.work" ) &&
         !std::filesystem::exists( cpuZoneRoot / "extras.work" ),
@@ -1719,10 +2295,30 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "Session GPU Zone builder removes its temporary stream before publishing the index" );
     const auto schedulingRoot = tracy::analysis::TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
     bool schedulingWorkFound = false;
+    std::string schedulingWorkNames;
     for( const auto& entry : std::filesystem::directory_iterator( schedulingRoot ) )
-        schedulingWorkFound = schedulingWorkFound || entry.path().extension() == ".work";
+    {
+        if( entry.path().extension() != ".work" ) continue;
+        schedulingWorkFound = true;
+        if( !schedulingWorkNames.empty() ) schedulingWorkNames += ',';
+        schedulingWorkNames += entry.path().filename().string();
+    }
     test.Check( !schedulingWorkFound,
-        "Session Scheduling builder removes all temporary streams before publishing the index" );
+        "Session Scheduling builder removes all temporary streams before publishing the index; residual=" +
+            schedulingWorkNames );
+    auto schedulingReader = tracy::analysis::TraceSessionSchedulingReader::Open(
+        sessionRoot, manifest, error );
+    const auto cpuUsage = schedulingReader ? schedulingReader->ScanCpuUsage( 0, 64 ) :
+        std::vector<tracy::analysis::CpuUsagePointDto> {};
+    const auto hasOwnCpuUsage = std::any_of( cpuUsage.begin(), cpuUsage.end(),
+        []( const auto& value ) { return value.own != 0; } );
+    const auto hasOtherCpuUsage = std::any_of( cpuUsage.begin(), cpuUsage.end(),
+        []( const auto& value ) { return value.other != 0; } );
+    test.Check( schedulingReader && !cpuUsage.empty() &&
+        cpuUsage.front().timeNs == 0 && cpuUsage.front().own == 0 &&
+        cpuUsage.front().other == 0 && hasOwnCpuUsage && hasOtherCpuUsage &&
+        schedulingReader->Stats().cpuUsagePoints == cpuUsage.size(),
+        "Session Scheduling persists exact paged own/other CPU usage transitions: " + error );
     std::vector<std::string> resumedDerivedStages;
     tracy::analysis::TraceSessionDerivedControl resumeDerivedControl;
     resumeDerivedControl.minimumFreeBytes = 0;
@@ -1745,6 +2341,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "memory-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "sampling-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "scheduling-reused" ) != resumedDerivedStages.end() &&
+        std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "plots-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "relations-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "runtime-script-reused" ) != resumedDerivedStages.end() &&
         std::find( resumedDerivedStages.begin(), resumedDerivedStages.end(), "io-gfx-reused" ) != resumedDerivedStages.end(),
@@ -1755,7 +2352,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         "final audit covers Canonical, mandatory indexes, and GPU derived: " + error );
     test.Check( mandatoryStats.indexedRecords == auditedStats.indexedRecords &&
         auditedStats.indexedProtocolEvents == inventory.protocolInventory.eventCount &&
-        auditedStats.gpuResources == 2 && auditedStats.gpuPasses == 1 &&
+        auditedStats.gpuResources == 8 && auditedStats.gpuPasses == 5 &&
+        auditedStats.gpuSourceGapResources == 2 &&
+        auditedStats.gpuSourceGapReferences == 2 &&
         auditedStats.jobTypes == 1 && auditedStats.jobs == 1 &&
         auditedStats.jobSchedules == 1 && auditedStats.jobConfigs == 1 &&
         auditedStats.jobDependencies == 0 && auditedStats.jobStages == 5 &&
@@ -1766,7 +2365,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     manifest.auditComplete = true;
     manifest.mandatoryDerivedComplete = true;
     manifest.state = tracy::analysis::TraceSessionState::CompleteSourceDegraded;
-    manifest.reason = "source_cpu_zone_clock_inversion:1;source_scheduling_gap:1";
+    manifest.reason = "source_cpu_zone_clock_inversion:1;source_scheduling_gap:1;source_gpu_resource_identity_gap:2";
     const auto publishedSession = directory / "gpu-canonical-published.jn-trace-session";
     test.Check( tracy::analysis::PublishTraceSession(
         sessionRoot, publishedSession, manifest, error ),
@@ -1777,8 +2376,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         tracy::analysis::TraceSessionGpuAnalysisRoot( publishedSession, manifest ),
         manifest.source.sha256, manifest.source.fileSize, error );
     test.Check( sessionGpuReader &&
-        sessionGpuReader->Manifest().resourceCount == 2 &&
-        sessionGpuReader->Manifest().passCount == 1,
+        sessionGpuReader->Manifest().resourceCount == 8 &&
+        sessionGpuReader->Manifest().passCount == 5 &&
+        sessionGpuReader->Manifest().sourceGapResourceCount == 2 &&
+        sessionGpuReader->Manifest().sourceGapReferenceCount == 2 &&
+        sessionGpuReader->Manifest().reason == "source_gpu_resource_identity_gap:2",
         "open mandatory GPU analysis directly from a published Session: " + error );
     auto sessionSource = tracy::analysis::GpuAnalysisTraceSource::OpenSessionIfReady( publishedSession );
     test.Check( sessionSource &&
@@ -1786,12 +2388,22 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sessionSource->GetTraceInfo().fingerprint == manifest.source.sha256 &&
         !sessionSource->WorkerLoaded(),
         "open a published Session without materializing a full Worker" );
+    test.Check( sessionSource &&
+        sessionSource->AnalysisManifest().summary.rangeCount == 1 &&
+        sessionSource->AnalysisManifest().summary.logicalRecordCount == logicals.size() &&
+        sessionSource->AnalysisManifest().summary.relationCount == 1 &&
+        sessionSource->AnalysisManifest().summary.generationCount == 1 &&
+        sessionSource->AnalysisManifest().summary.payloadBytes == sessionGpuReader->Manifest().totalBytes,
+        "Session GPU analysis facade preserves exact Range, Logical, Relation, generation, and byte counts" );
     const auto sessionCapabilities = sessionSource->GetCapabilities();
     const auto frameCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
         []( const auto& value ) { return value.domain == "frame"; } );
     test.Check( frameCapability != sessionCapabilities.end() && frameCapability->present &&
         frameCapability->indexed && frameCapability->queryable,
         "Session advertises Frame only after its disk-backed semantic reader is ready" );
+    TestSessionPlotTraceSource( test, *sessionSource );
+    TestSessionMessageTraceSource( test, *sessionSource );
+    TestSessionLockTraceSource( test, *sessionSource );
     const auto jobCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
         []( const auto& value ) { return value.domain == "job"; } );
     test.Check( jobCapability != sessionCapabilities.end() && jobCapability->present &&
@@ -1809,12 +2421,25 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         sampleCapability->present && sampleCapability->indexed && sampleCapability->queryable;
     test.Check( sessionSamplesReady,
         "Session advertises Sampling only after its disk-backed semantic reader is ready" );
+    const auto hardwareSampleCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "hardware_sample"; } );
+    const bool sessionHardwareSamplesReady = hardwareSampleCapability != sessionCapabilities.end() &&
+        hardwareSampleCapability->present && hardwareSampleCapability->indexed &&
+        hardwareSampleCapability->queryable;
+    test.Check( sessionHardwareSamplesReady,
+        "Session advertises Hardware Sample only after its disk-backed semantic reader is ready" );
     const auto schedulingCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
         []( const auto& value ) { return value.domain == "context_switch"; } );
     const bool sessionSchedulingReady = schedulingCapability != sessionCapabilities.end() &&
         schedulingCapability->present && schedulingCapability->indexed && schedulingCapability->queryable;
     test.Check( sessionSchedulingReady,
         "Session advertises Context Switch only after its disk-backed semantic reader is ready" );
+    const auto threadCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
+        []( const auto& value ) { return value.domain == "thread"; } );
+    const bool sessionThreadsReady = threadCapability != sessionCapabilities.end() &&
+        threadCapability->present && threadCapability->indexed && threadCapability->queryable;
+    test.Check( sessionThreadsReady,
+        "Session advertises Thread only after its compact disk-backed summary is ready" );
     const auto relationCapability = std::find_if( sessionCapabilities.begin(), sessionCapabilities.end(),
         []( const auto& value ) { return value.domain == "relation"; } );
     const bool sessionRelationReady = relationCapability != sessionCapabilities.end() &&
@@ -1822,7 +2447,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( sessionRelationReady,
         "Session advertises Relation only after its disk-backed semantic reader is ready" );
     const auto sessionRelations = sessionSource->ScanRelations( 0, 4 );
-    test.Check( sessionSource->GetRelationCount() == 1 && sessionRelations.size() == 1 &&
+    test.Check( sessionSource->GetRelationCount() == 2 && sessionRelations.size() == 2 &&
         sessionRelations[0].timeNs == 34 && sessionRelations[0].sourceId == 500 &&
         sessionRelations[0].targetId == 900 &&
         sessionRelations[0].relationNamespace == uint8_t( tracy::JnRelationNamespace::Job ) &&
@@ -1865,8 +2490,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             !ioRequests[0].orphan && !ioRequests[0].truncated,
             "Session I/O reader reconstructs one complete request without a Worker" );
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
-            gfxEntities.size() == 1 && gfxEntities[0].entityId == 301 &&
-            gfxLinks.size() == 1 && gfxLinks[0].sourceId == 300 && gfxLinks[0].targetId == 301 &&
+            gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
+            gfxEntities[1].entityId == ExplicitGpuPassId &&
+            gfxLinks.size() == 2 && gfxLinks[0].sourceId == 300 && gfxLinks[0].targetId == 301 &&
+            gfxLinks[1].sourceId == ExplicitGpuPassId && gfxLinks[1].targetId == 1000 &&
+            gfxLinks[1].relation == uint8_t( tracy::JnGfxRelation::ReferencesResources ) &&
             correlatedFrames.size() == 1 && correlatedFrames[0].frameId == 9,
             "Session Gfx/Frame evidence reader preserves fixed binary facts without a Worker" );
     }
@@ -1994,6 +2622,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             samples[1].kind == "context_switch",
             "Session Sampling reader restores dictionary callstacks and shared context time" );
     }
+    if( sessionHardwareSamplesReady )
+    {
+        const auto samples = sessionSource->GetHardwareSamples();
+        const auto events = sessionSource->GetHardwareSampleEvents(
+            HardwareSampleAddress, "all", 0, 16 );
+        test.Check( samples.size() == 1 && samples[0].address == "0xabc" &&
+            samples[0].cycles == 1 && samples[0].retired == 1 &&
+            samples[0].cacheReferences == 1 && samples[0].cacheMisses == 1 &&
+            samples[0].branchRetired == 1 && samples[0].branchMisses == 1 &&
+            events.size() == 6 && events[0].kind == "cycles" && events[0].timeNs == 16 &&
+            events[2].kind == "cache_references" && events[2].timeNs == 0 &&
+            events[5].kind == "branch_misses" && events[5].timeNs == 24,
+            "Session Hardware Sample reader preserves all six PMU kinds and Worker time semantics" );
+    }
     if( sessionSchedulingReady )
     {
         const auto contexts = sessionSource->ScanContextSwitchEvents( {} );
@@ -2016,6 +2658,25 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             cpuContexts[2].startNs == 38 && !cpuContexts[2].endNs && !cpuContexts[2].complete &&
             cpuContexts[3].startNs == 40 && cpuContexts[3].endNs == 42 && cpuContexts[3].complete,
             "Session CPU scheduling reader preserves source gaps without inventing close times" );
+        const auto topology = sessionSource->GetCpuTopology();
+        test.Check( topology.size() == 2 && topology[0].cpu == 0 &&
+            topology[0].package == 0 && topology[0].die == 0 && topology[0].core == 0 &&
+            topology[0].dieAvailability.available && topology[1].cpu == 1,
+            "Session Scheduling reader restores exact CPU topology without a Worker" );
+    }
+    if( sessionThreadsReady )
+    {
+        const auto threads = sessionSource->GetThreads();
+        const auto mainThread = std::find_if( threads.begin(), threads.end(),
+            []( const auto& value ) { return value.nativeId == 42; } );
+        test.Check( mainThread != threads.end() && mainThread->name == "Main Thread" &&
+            mainThread->localName == std::optional<std::string>( "Main Thread" ) &&
+            mainThread->processId == 1001 && mainThread->sampleCount == 1 &&
+            mainThread->contextSwitchCount != 0 && mainThread->runningTimeNs != 0 &&
+            mainThread->runningRegions && *mainThread->runningRegions != 0 &&
+            mainThread->groupHint == std::optional<int32_t>( 7 ) &&
+            mainThread->groupHintAvailability.available,
+            "Session Thread summary preserves name, PID, Sample, scheduling and group metadata" );
     }
     const auto corruptShard = std::find_if( manifest.shards.begin(), manifest.shards.end(),
         []( const auto& shard ) { return shard.domain != "checkpoint"; } );
@@ -2068,6 +2729,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             frames["data"]["frames"][0]["end_ns"] == "36" &&
             frames["data"]["frames"][1]["duration_ns"] == "4",
             "Query 1.34 preserves Session Frame timing and pagination semantics" );
+        TestSessionPlotQuery( test, query, traceId, *sessionSource );
+        TestSessionMessageQuery( test, query, traceId );
+        TestSessionLockQuery( test, query, traceId );
         const auto imageRef = sessionFrameImages.empty() ? std::string {} : sessionFrameImages[0].ref;
         const auto frameImageList = query.Execute( {
             { "protocol", "tracy-query/1" }, { "id", "session-frame-image-list" },
@@ -2097,6 +2761,20 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             jobs["data"]["jobs"][0]["job_id"] == "500" &&
             jobs["data"]["jobs"][0]["name"] == "SyntheticJob",
             "Query 1.34 searches the Session Job semantic index without a Worker" );
+        const auto sessionJobRoot = tracy::analysis::TraceSessionJobIndexRoot( publishedSession, manifest );
+        const auto sessionJobRaw = sessionJobRoot / "jobs.bin";
+        const auto sessionJobRawHidden = sessionJobRoot / "jobs.bin.statistics-test-hidden";
+        std::filesystem::rename( sessionJobRaw, sessionJobRawHidden );
+        const auto jobStatistics = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-job-statistics" },
+            { "method", "job.statistics" }, { "params", { { "trace_id", traceId } } }
+        } );
+        std::filesystem::rename( sessionJobRawHidden, sessionJobRaw );
+        test.Check( jobStatistics.value( "ok", false ) &&
+            jobStatistics["data"]["counts"]["jobs"] == "1" &&
+            jobStatistics["data"]["counts"]["completed"] == "1" &&
+            jobStatistics["data"]["latency"]["schedule_to_ready"]["count"] == "1",
+            "Query 1.34 computes exact Session Job statistics from disk pages without raw full materialization" );
         if( sessionRelationReady )
         {
             const auto relations = query.Execute( {
@@ -2105,7 +2783,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                     { "namespace", "job" }, { "relation", "executes_pass" } } }
             } );
             test.Check( relations.value( "ok", false ) && relations["data"]["present"] == true &&
-                relations["data"]["relation_count"] == "1" &&
+                relations["data"]["relation_count"] == "2" &&
                 relations["data"]["relations"].size() == 1 &&
                 relations["data"]["relations"][0]["time_ns"] == "34" &&
                 relations["data"]["relations"][0]["source_id"] == "500" &&
@@ -2164,8 +2842,8 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             } );
             test.Check( gfxStats.value( "ok", false ) &&
                 gfxStats["data"]["counts"]["dispatches"] == "1" &&
-                gfxStats["data"]["counts"]["entities"] == "1" &&
-                gfxStats["data"]["counts"]["links"] == "1",
+                gfxStats["data"]["counts"]["entities"] == "2" &&
+                gfxStats["data"]["counts"]["links"] == "2",
                 "Query 1.34 reads exact Session Gfx evidence without a Worker" );
         }
         const auto sourceLocations = query.Execute( {
@@ -2222,6 +2900,38 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             peak["data"]["present"] == true &&
             peak["data"]["analysis_backend"] == "n29_gpu_resource_analysis_sidecar",
             "Query reads exact GPU analysis from its pinned Session generation after CURRENT changes" );
+        const auto catalogStatus = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-catalog-status" },
+            { "method", "gpu.catalog.status" }, { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( catalogStatus.value( "ok", false ) &&
+            catalogStatus["data"]["counts"]["range_records"] == "1" &&
+            catalogStatus["data"]["counts"]["logical_resources"] == std::to_string( logicals.size() ) &&
+            catalogStatus["data"]["counts"]["relations"] == "1",
+            "Query Catalog status exposes exact Session derived counts" );
+        const auto catalogValidation = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-catalog-validation" },
+            { "method", "gpu.catalog.validation" }, { "params", { { "trace_id", traceId } } }
+        } );
+        test.Check( catalogValidation.value( "ok", false ) &&
+            catalogValidation["data"]["complete"] == true &&
+            catalogValidation["data"]["validation_provenance"] == "session_final_audit" &&
+            catalogValidation["data"]["source_degraded"] == true,
+            "Query validates a published Session from Final Audit without materializing legacy Worker vectors" );
+        std::vector<tracy::analysis::GpuAnalysisResourceSummary> resourceSummaries;
+        test.Check( sessionGpuReader && sessionGpuReader->ResourceSummaryPageCount() != 0 &&
+            sessionGpuReader->LoadResourceSummaryPage( 0, resourceSummaries, error ) &&
+            !resourceSummaries.empty(),
+            "Session GPU derived store publishes an independently readable compact Resource Summary page: " + error );
+        const auto resourceSearch = query.Execute( {
+            { "protocol", "tracy-query/1" }, { "id", "session-gpu-resource-search" },
+            { "method", "gpu.resource.search" }, { "params", { { "trace_id", traceId },
+                { "offset", 0 }, { "limit", 1 } } }
+        } );
+        test.Check( resourceSearch.value( "ok", false ) &&
+            resourceSearch["data"]["resources"].size() == 1 &&
+            resourceSearch["data"]["total"] == "8",
+            "GPU resource search uses compact summaries without reading enriched resource pages" );
         const auto capabilities = sessionSource->GetCapabilities();
         const auto cpuZones = std::find_if( capabilities.begin(), capabilities.end(), []( const auto& value ) {
             return value.domain == "zone.cpu";
@@ -2337,6 +3047,28 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         {
             test.Check( false, std::string( "Query 1.34 Session Sampling Reader is unavailable: " ) + exception.what() );
         }
+        if( sessionHardwareSamplesReady ) try
+        {
+            const auto counts = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-hardware-samples" },
+                { "method", "hardware_sample.counts" }, { "params", { { "trace_id", traceId } } }
+            } );
+            const auto events = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-hardware-sample-events" },
+                { "method", "hardware_sample.events" }, { "params", { { "trace_id", traceId },
+                    { "address", "0xabc" }, { "kind", "branch_misses" }, { "limit", 8 } } }
+            } );
+            test.Check( counts.value( "ok", false ) && counts["data"]["addresses"].size() == 1 &&
+                counts["data"]["addresses"][0]["cycles"] == "1" &&
+                counts["data"]["addresses"][0]["branch_misses"] == "1" &&
+                events.value( "ok", false ) && events["data"]["events"].size() == 1 &&
+                events["data"]["events"][0]["time_ns"] == "24",
+                "Query 1.34 reads exact Session Hardware Sample counts and paged events without a Worker" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session Hardware Sample Reader is unavailable: " ) + exception.what() );
+        }
         if( sessionSchedulingReady ) try
         {
             const auto contexts = query.Execute( {
@@ -2351,10 +3083,46 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 contexts["data"]["context_switches"][2]["complete"] == false &&
                 contexts["data"]["context_switches"][2]["end_ns"].is_null(),
                 "Query 1.34 reads Session Context Switch intervals without a Worker" );
+            const auto topology = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-cpu-topology" },
+                { "method", "cpu.topology" }, { "params", { { "trace_id", traceId } } }
+            } );
+            test.Check( topology.value( "ok", false ) &&
+                topology["data"]["logical_cpus"].size() == 2 &&
+                topology["data"]["logical_cpus"][1]["cpu"] == 1,
+                "Query 1.34 reads exact Session CPU topology without a Worker" );
+            const auto cpuUsage = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-cpu-usage" },
+                { "method", "cpu.usage" }, { "params", { { "trace_id", traceId },
+                    { "limit", 2 } } }
+            } );
+            test.Check( cpuUsage.value( "ok", false ) &&
+                cpuUsage["data"]["points"].size() == 2 &&
+                cpuUsage["data"]["points"][0]["time_ns"] == "0" &&
+                cpuUsage["page"]["next_cursor"].is_string(),
+                "Query 1.34 pages Session CPU usage directly from disk without a Worker" );
         }
         catch( const std::exception& exception )
         {
             test.Check( false, std::string( "Query 1.34 Session Context Switch Reader is unavailable: " ) + exception.what() );
+        }
+        if( sessionThreadsReady ) try
+        {
+            const auto threads = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-thread-list" },
+                { "method", "thread.list" }, { "params", { { "trace_id", traceId },
+                    { "filter", { { "text", "Main Thread" } } } } }
+            } );
+            test.Check( threads.value( "ok", false ) &&
+                threads["data"]["threads"].size() == 1 &&
+                threads["data"]["threads"][0]["process_id"] == "1001" &&
+                threads["data"]["threads"][0]["sample_count"] == "1" &&
+                threads["data"]["threads"][0]["group_hint"] == 7,
+                "Query 1.34 reads exact compact Session Thread summary without a Worker" );
+        }
+        catch( const std::exception& exception )
+        {
+            test.Check( false, std::string( "Query 1.34 Session Thread Reader is unavailable: " ) + exception.what() );
         }
     }
     const auto frameFile = tracy::analysis::TraceSessionFrameIndexRoot(
@@ -2469,6 +3237,42 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         publishedSession, manifest, rejectedSchedulingStats, error ) &&
         error == "session_scheduling_file_sha256_mismatch",
         "Session Final Audit rejects a corrupted committed Scheduling semantic index" );
+    const auto plotFile = tracy::analysis::TraceSessionPlotIndexRoot(
+        publishedSession, manifest ) / "plots.bin";
+    {
+        std::fstream damaged( plotFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end ); char byte = 0; damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end ); damaged.put( byte ^ '\x31' );
+    }
+    tracy::analysis::TraceSessionPlotStats rejectedPlotStats;
+    test.Check( !tracy::analysis::AuditTraceSessionPlotDerived(
+        publishedSession, manifest, rejectedPlotStats, error ) &&
+        error == "session_plot_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Plot semantic index" );
+    const auto messageFile = tracy::analysis::TraceSessionMessageIndexRoot(
+        publishedSession, manifest ) / "messages.bin";
+    {
+        std::fstream damaged( messageFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end ); char byte = 0; damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end ); damaged.put( byte ^ '\x32' );
+    }
+    tracy::analysis::TraceSessionMessageStats rejectedMessageStats;
+    test.Check( !tracy::analysis::AuditTraceSessionMessageDerived(
+        publishedSession, manifest, rejectedMessageStats, error ) &&
+        error == "session_message_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Message semantic index" );
+    const auto lockFile = tracy::analysis::TraceSessionLockIndexRoot(
+        publishedSession, manifest ) / "locks.bin";
+    {
+        std::fstream damaged( lockFile, std::ios::binary | std::ios::in | std::ios::out );
+        damaged.seekg( -1, std::ios::end ); char byte = 0; damaged.read( &byte, 1 );
+        damaged.seekp( -1, std::ios::end ); damaged.put( byte ^ '\x33' );
+    }
+    tracy::analysis::TraceSessionLockStats rejectedLockStats;
+    test.Check( !tracy::analysis::AuditTraceSessionLockDerived(
+        publishedSession, manifest, rejectedLockStats, error ) &&
+        error == "session_lock_file_sha256_mismatch",
+        "Session Final Audit rejects a corrupted committed Lock semantic index" );
     const auto relationFile = tracy::analysis::TraceSessionRelationIndexRoot(
         publishedSession, manifest ) / "relations.bin";
     {
@@ -2557,6 +3361,7 @@ int main()
         TestProtocolDecoderCheckpoint( test );
         TestCanonicalPackedFrameStorage( test, directory );
         TestProtocolJournalInventory( test, directory );
+        TestSharedGpuPointerIdentityOutlivesOwnership( test );
         TestGpuCanonicalReader( test, directory );
     }
     std::filesystem::remove_all( directory, filesystemError );

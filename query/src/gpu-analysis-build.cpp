@@ -1,5 +1,8 @@
 #include "TracyGpuAnalysisSidecar.hpp"
+#include "TracyGpuAnalysisStore.hpp"
 #include "TracyHash.hpp"
+#include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionStore.hpp"
 #include "TracyWorkerTraceSource.hpp"
 
 #include <atomic>
@@ -78,7 +81,10 @@ void WaitForSystemPressure( const std::filesystem::path& trace, const std::files
 
 void Usage()
 {
-    std::fprintf( stderr, "Usage: tracy-gpu-analysis-build --trace file.tracy [--progress-json path] [--cancel-file path] [--pause-file path] [--strong-identity]\n" );
+    std::fprintf( stderr,
+        "Usage:\n"
+        "  tracy-gpu-analysis-build --trace file.tracy [--progress-json path] [--cancel-file path] [--pause-file path] [--strong-identity]\n"
+        "  tracy-gpu-analysis-build --session capture.jn-trace-session --resource-summaries [--progress-json path] [--cancel-file path] [--pause-file path]\n" );
 }
 
 }
@@ -86,21 +92,26 @@ void Usage()
 int main( int argc, char** argv )
 {
     std::filesystem::path trace;
+    std::filesystem::path session;
     std::filesystem::path progressPath;
     std::filesystem::path cancelPath;
     std::filesystem::path pausePath;
     bool strongIdentity = false;
+    bool resourceSummaries = false;
     for( int i = 1; i < argc; ++i )
     {
         const std::string_view arg = argv[i];
         if( arg == "--trace" && i + 1 < argc ) trace = std::filesystem::u8path( argv[++i] );
+        else if( arg == "--session" && i + 1 < argc ) session = std::filesystem::u8path( argv[++i] );
         else if( arg == "--progress-json" && i + 1 < argc ) progressPath = std::filesystem::u8path( argv[++i] );
         else if( arg == "--cancel-file" && i + 1 < argc ) cancelPath = std::filesystem::u8path( argv[++i] );
         else if( arg == "--pause-file" && i + 1 < argc ) pausePath = std::filesystem::u8path( argv[++i] );
         else if( arg == "--strong-identity" ) strongIdentity = true;
+        else if( arg == "--resource-summaries" ) resourceSummaries = true;
         else { Usage(); return 1; }
     }
-    if( trace.empty() ) { Usage(); return 1; }
+    if( ( trace.empty() == session.empty() ) || ( !session.empty() && !resourceSummaries ) )
+    { Usage(); return 1; }
 #ifdef _WIN32
     SetConsoleCtrlHandler( ControlHandler, TRUE );
     SetPriorityClass( GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS );
@@ -115,6 +126,45 @@ int main( int argc, char** argv )
 
     try
     {
+        if( !session.empty() )
+        {
+            std::string error;
+            auto manifest = tracy::analysis::LoadTraceSessionManifest( session, error );
+            if( !manifest || !tracy::analysis::IsTraceSessionQueryable( session, error ) )
+            { std::fprintf( stderr, "Trace Session is not queryable: %s\n", error.c_str() ); return 7; }
+            tracy::analysis::GpuAnalysisSidecarControl control;
+            control.stopToken = stop.get_token();
+            control.maximumSidecarBytes = 256ull * 1024 * 1024 * 1024;
+            std::error_code spaceError;
+            const auto space = std::filesystem::space( session.parent_path(), spaceError );
+            if( spaceError || space.available < control.minimumFreeBytes )
+            {
+                std::fprintf( stderr, "GPU summary generation requires at least %llu free bytes; available=%llu.\n",
+                    static_cast<unsigned long long>( control.minimumFreeBytes ),
+                    static_cast<unsigned long long>( spaceError ? 0 : space.available ) );
+                return 8;
+            }
+            control.progress = [&]( float value, const char* stage ) {
+                WaitForSystemPressure( session, pausePath, progressPath,
+                    control.minimumFreeBytes, stop );
+                AtomicProgress( progressPath, value, stage, "building" );
+            };
+            std::string generation; uint64_t logicalBytes = 0;
+            if( !tracy::analysis::BuildGpuAnalysisResourceSummariesAt(
+                tracy::analysis::TraceSessionGpuAnalysisRoot( session, *manifest ),
+                manifest->source.sha256, manifest->source.fileSize, control,
+                generation, logicalBytes, error ) )
+            {
+                AtomicProgress( progressPath, 0, error.c_str(),
+                    error == "cancelled" ? "cancelled" : "failed" );
+                std::fprintf( stderr, "GPU Resource Summary build failed: %s\n", error.c_str() );
+                return error == "cancelled" ? 130 : 9;
+            }
+            AtomicProgress( progressPath, 1, "complete", "ready" );
+            std::printf( "GPU Resource Summary generation is ready: %s (%llu logical bytes)\n",
+                generation.c_str(), static_cast<unsigned long long>( logicalBytes ) );
+            return 0;
+        }
         auto sidecar = tracy::analysis::GpuAnalysisSidecarPath( trace );
         std::string error;
         auto manifest = tracy::analysis::LoadGpuAnalysisSidecarManifest( sidecar, error );

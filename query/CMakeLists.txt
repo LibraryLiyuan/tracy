@@ -55,6 +55,13 @@ add_library(TracyQueryProtocol STATIC
     src/TracyEmbeddedData.hpp
     ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp
 )
+if(MSVC)
+    # TracyQueryService.cpp intentionally contains the complete query dispatch
+    # surface.  Non-LTCG developer builds can exceed the regular COFF section
+    # limit even though production /GL builds do not, so scope /bigobj to this
+    # one translation unit.
+    set_source_files_properties(src/TracyQueryService.cpp PROPERTIES COMPILE_OPTIONS /bigobj)
+endif()
 target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
 target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
 target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore nlohmann_json::nlohmann_json)
@@ -113,6 +120,12 @@ if(BUILD_TESTING)
     add_executable(tracy-trace-session-inventory-tests tests/TraceSessionInventoryTests.cpp)
     target_link_libraries(tracy-trace-session-inventory-tests PRIVATE TracyQueryProtocol TracyStreamCore TracyServer)
     tracy_query_enable_assertions(tracy-trace-session-inventory-tests)
+    # This integration test intentionally keeps every Session domain and its
+    # Query JSON assertions in one process. MSVC /LTCG can coalesce enough of
+    # those test-only frames to exceed the Windows 1 MiB default stack.
+    if(MSVC)
+        target_link_options(tracy-trace-session-inventory-tests PRIVATE /STACK:8388608)
+    endif()
     add_test(NAME tracy-trace-session-inventory COMMAND tracy-trace-session-inventory-tests)
 
     add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)

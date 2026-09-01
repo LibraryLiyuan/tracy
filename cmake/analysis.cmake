@@ -19,6 +19,9 @@ set(TRACY_ANALYSIS_SOURCES
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionPlots.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMessages.cpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionLocks.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionRelations.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionRuntime.cpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionIoGfx.cpp
@@ -50,6 +53,9 @@ set(TRACY_ANALYSIS_HEADERS
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMemory.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionSampling.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionScheduling.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionPlots.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionMessages.hpp
+    ${TRACY_ANALYSIS_DIR}/TracyTraceSessionLocks.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionRelations.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionRuntime.hpp
     ${TRACY_ANALYSIS_DIR}/TracyTraceSessionIoGfx.hpp

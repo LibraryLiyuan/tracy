@@ -222,6 +222,14 @@ struct GpuAnalysisBuildControl
 {
     std::stop_token stopToken;
     std::function<void( float, const char* )> progress;
+    // Session conversion normalizes the bounded Resource/Allocation/View core
+    // first and builds Pass, Range, Logical and Relation evidence through
+    // external-sort spools. The absence of those records in this intermediate
+    // snapshot is not an unresolved relationship.
+    bool catalogOnly = false;
+    // The Session enrichment spool still needs the generation-scoped Catalog
+    // string dictionary after the bounded core snapshot has been normalized.
+    bool retainCatalogDictionaries = false;
 };
 
 struct GpuAnalysisSnapshot

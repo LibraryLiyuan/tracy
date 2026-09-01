@@ -12,7 +12,9 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <queue>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -44,8 +46,26 @@ struct SchedulingFileHeader
     uint64_t cpuEventCount = 0;
     uint64_t completeCpuEventCount = 0;
     uint64_t sourceGapEventCount = 0;
+    uint64_t topologyRecordCount = 0;
+    uint64_t topologyCpuCount = 0;
+    uint64_t threadSummaryCount = 0;
+    uint64_t threadStringBytes = 0;
+    uint64_t threadNameRecordCount = 0;
+    uint64_t tidToPidRecordCount = 0;
+    uint64_t groupHintRecordCount = 0;
+    uint64_t externalNameMetadataRecordCount = 0;
+    uint64_t externalNameRecordCount = 0;
+    uint64_t externalThreadNameRecordCount = 0;
+    uint64_t fiberNameRecordCount = 0;
+    uint64_t fiberEnterRecordCount = 0;
+    uint64_t fiberLeaveRecordCount = 0;
+    uint64_t cpuUsagePointCount = 0;
     uint64_t threadRecordsOffset = 0;
     uint64_t cpuRecordsOffset = 0;
+    uint64_t topologyRecordsOffset = 0;
+    uint64_t threadSummariesOffset = 0;
+    uint64_t cpuUsageRecordsOffset = 0;
+    uint64_t threadStringsOffset = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
 };
@@ -72,6 +92,63 @@ struct StoredCpuEvent
     uint32_t cpu = 0;
     uint16_t rawThreadIndex = 0;
     uint16_t reserved = 0;
+};
+
+struct StoredCpuTopology
+{
+    uint32_t cpu = 0;
+    uint32_t package = 0;
+    uint32_t die = 0;
+    uint32_t core = 0;
+};
+
+enum StoredThreadFlags : uint32_t
+{
+    StoredThreadFiber = 1u << 0,
+    StoredThreadLocalRecord = 1u << 1,
+    StoredThreadLocalName = 1u << 2,
+    StoredThreadExternalProcessName = 1u << 3,
+    StoredThreadExternalThreadName = 1u << 4,
+    StoredThreadGroupHint = 1u << 5
+};
+
+struct StoredThreadSummary
+{
+    uint64_t nativeId = 0;
+    uint64_t processId = 0;
+    uint64_t zoneCount = 0;
+    uint64_t messageCount = 0;
+    uint64_t sampleCount = 0;
+    uint64_t contextSwitchCount = 0;
+    int64_t runningTimeNs = 0;
+    uint32_t migrations = 0;
+    uint32_t runningRegions = 0;
+    int32_t groupHint = 0;
+    uint32_t flags = 0;
+    uint64_t localNameOffset = 0;
+    uint64_t externalProcessNameOffset = 0;
+    uint64_t externalThreadNameOffset = 0;
+    uint32_t localNameBytes = 0;
+    uint32_t externalProcessNameBytes = 0;
+    uint32_t externalThreadNameBytes = 0;
+    uint32_t reserved = 0;
+};
+
+struct StoredCpuUsage
+{
+    int64_t timeNs = 0;
+    uint8_t own = 0;
+    uint8_t other = 0;
+    uint8_t reserved[6] {};
+};
+
+struct StoredCpuUsageTransition
+{
+    int64_t timeNs = 0;
+    uint64_t sourceOrdinal = 0;
+    int8_t ownDelta = 0;
+    int8_t otherDelta = 0;
+    uint8_t reserved[6] {};
 };
 #pragma pack( pop )
 
@@ -114,6 +191,22 @@ bool DecodeItem( const TraceSessionCanonicalRecord& record, QueueItem& item,
         std::min<size_t>( record.payload.size(), sizeof( item ) ) );
     if( item.hdr.idx != record.type )
     { error = "session_scheduling_protocol_type_mismatch"; return false; }
+    return true;
+}
+
+bool GetShortPayload( const TraceSessionCanonicalRecord& record,
+    const uint8_t*& data, size_t& size, std::string& error )
+{
+    const auto fixed = size_t( QueueDataSize[record.type] );
+    if( record.payload.size() < fixed + sizeof( uint16_t ) )
+    { error = "session_scheduling_payload_truncated"; return false; }
+    uint16_t bytes = 0;
+    std::memcpy( &bytes, record.payload.data() + fixed, sizeof( bytes ) );
+    if( bytes != record.variablePayloadBytes ||
+        record.payload.size() != fixed + sizeof( bytes ) + bytes )
+    { error = "session_scheduling_payload_mismatch"; return false; }
+    data = record.payload.data() + fixed + sizeof( bytes );
+    size = bytes;
     return true;
 }
 
@@ -199,6 +292,26 @@ struct ThreadRuntime
     uint8_t pendingWakeupCpu = 0;
 };
 
+struct ThreadSummaryState
+{
+    StoredThreadSummary stored;
+    std::string localName;
+    std::string externalProcessName;
+    std::string externalThreadName;
+    bool localNameDefined = false;
+    bool externalProcessNameDefined = false;
+    bool externalThreadNameDefined = false;
+    bool haveLastCpu = false;
+    uint8_t lastCpu = 0;
+};
+
+struct ExternalNameState
+{
+    uint64_t thread = 0;
+    uint64_t processNamePointer = 0;
+    uint64_t threadNamePointer = 0;
+};
+
 struct CpuRuntime
 {
     StoredCpuEvent last;
@@ -215,12 +328,36 @@ struct BuildState
     std::map<uint64_t, std::unique_ptr<ThreadRuntime>> threads;
     std::map<uint32_t, std::unique_ptr<CpuRuntime>> cpus;
     std::unordered_map<uint64_t, uint16_t> compressedThreads;
+    std::map<uint32_t, StoredCpuTopology> topology;
+    std::map<uint64_t, ThreadSummaryState> threadSummaries;
+    std::unordered_map<uint64_t, std::string> externalProcessNames;
+    std::unordered_map<uint64_t, std::string> externalThreadNames;
+    std::vector<ExternalNameState> externalNameMappings;
+    std::unordered_map<uint64_t, uint64_t> fiberToThread;
+    std::unordered_map<uint32_t, uint64_t> activeFiber;
+    std::unordered_map<uint64_t, std::string> fiberNames;
     int64_t contextTime = 0;
     TraceSessionSchedulingStats stats;
 };
 
+ThreadSummaryState& EnsureThreadSummary( BuildState& state, uint64_t thread,
+    bool localRecord = false )
+{
+    auto [found, inserted] = state.threadSummaries.try_emplace( thread );
+    if( inserted ) found->second.stored.nativeId = thread;
+    if( localRecord ) found->second.stored.flags |= StoredThreadLocalRecord;
+    return found->second;
+}
+
+uint64_t LogicalThread( const BuildState& state, uint32_t nativeThread )
+{
+    const auto fiber = state.activeFiber.find( nativeThread );
+    return fiber == state.activeFiber.end() ? nativeThread : fiber->second;
+}
+
 ThreadRuntime* EnsureThread( BuildState& state, uint64_t thread, std::string& error )
 {
+    EnsureThreadSummary( state, thread );
     const auto found = state.threads.find( thread );
     if( found != state.threads.end() ) return found->second.get();
     auto runtime = std::make_unique<ThreadRuntime>();
@@ -240,6 +377,7 @@ bool AppendThreadEvent( BuildState& state, ThreadRuntime& runtime,
 {
     if( !state.threadWork.Append( value, runtime.lastIndex, error ) ) return false;
     runtime.last = value; runtime.hasLast = true; ++state.stats.threadEvents;
+    ++EnsureThreadSummary( state, value.thread ).stored.contextSwitchCount;
     return true;
 }
 
@@ -247,6 +385,12 @@ bool PatchThreadEvent( BuildState& state, ThreadRuntime& runtime,
     const StoredThreadEvent& value, std::string& error )
 {
     if( !runtime.hasLast || !state.threadWork.Patch( runtime.lastIndex, value, error ) ) return false;
+    if( runtime.last.endNs < 0 && value.endNs >= value.startNs )
+    {
+        auto& summary = EnsureThreadSummary( state, value.thread ).stored;
+        summary.runningTimeNs += value.endNs - value.startNs;
+        ++summary.runningRegions;
+    }
     runtime.last = value;
     return true;
 }
@@ -357,6 +501,11 @@ bool ProcessSwitchIn( BuildState& state, const QueueContextSwitch& event,
     value.startNs = timeNs; value.endNs = -1; value.cpu = event.cpu;
     value.reason = -1; value.state = -1; value.relatedThreadIndex = 0;
     if( !PatchThreadEvent( state, *runtime, value, error ) ) return false;
+    auto& threadSummary = EnsureThreadSummary( state, event.newThread );
+    if( threadSummary.haveLastCpu && threadSummary.lastCpu != event.cpu )
+        ++threadSummary.stored.migrations;
+    threadSummary.lastCpu = event.cpu;
+    threadSummary.haveLastCpu = true;
 
     auto* cpu = EnsureCpu( state, event.cpu, error );
     if( !cpu ) return false;
@@ -371,6 +520,143 @@ bool ProcessSwitchIn( BuildState& state, const QueueContextSwitch& event,
     return true;
 }
 
+bool IsCpuZoneBegin( QueueType type )
+{
+    switch( type )
+    {
+    case QueueType::ZoneBegin:
+    case QueueType::ZoneBeginCallstack:
+    case QueueType::ZoneBeginAllocSrcLoc:
+    case QueueType::ZoneBeginAllocSrcLocCallstack:
+    case QueueType::JnZoneBeginCallsite:
+        return true;
+    default: return false;
+    }
+}
+
+bool IsThreadMessage( QueueType type )
+{
+    switch( type )
+    {
+    case QueueType::Message:
+    case QueueType::MessageColor:
+    case QueueType::MessageCallstack:
+    case QueueType::MessageColorCallstack:
+    case QueueType::MessageLiteral:
+    case QueueType::MessageLiteralColor:
+    case QueueType::MessageLiteralCallstack:
+    case QueueType::MessageLiteralColorCallstack:
+        return true;
+    default: return false;
+    }
+}
+
+bool CollectThreadFact( BuildState& state,
+    const TraceSessionCanonicalRecord& record, const QueueItem& item,
+    QueueType type, std::string& error )
+{
+    if( record.threadContext != 0 )
+        EnsureThreadSummary( state, record.threadContext, true );
+    if( IsCpuZoneBegin( type ) )
+        ++EnsureThreadSummary( state,
+            LogicalThread( state, record.threadContext ), true ).stored.zoneCount;
+    if( IsThreadMessage( type ) )
+        ++EnsureThreadSummary( state,
+            LogicalThread( state, record.threadContext ), true ).stored.messageCount;
+    if( type == QueueType::CallstackSample || type == QueueType::CallstackSampleRef )
+    {
+        const auto thread = type == QueueType::CallstackSample ?
+            item.callstackSample.thread : item.callstackSampleRef.thread;
+        ++EnsureThreadSummary( state, thread, true ).stored.sampleCount;
+    }
+
+    switch( type )
+    {
+    case QueueType::ThreadName:
+    case QueueType::FiberName:
+    case QueueType::ExternalName:
+    case QueueType::ExternalThreadName:
+    {
+        const uint8_t* data = nullptr; size_t size = 0;
+        if( !GetShortPayload( record, data, size, error ) ) return false;
+        std::string text( reinterpret_cast<const char*>( data ), size );
+        if( type == QueueType::ThreadName )
+        {
+            ++state.stats.threadNameRecords;
+            auto& summary = EnsureThreadSummary( state, item.stringTransfer.ptr, true );
+            summary.localName = std::move( text ); summary.localNameDefined = true;
+        }
+        else if( type == QueueType::FiberName )
+        {
+            ++state.stats.fiberNameRecords;
+            state.fiberNames[item.stringTransfer.ptr] = text;
+            const auto fiber = state.fiberToThread.find( item.stringTransfer.ptr );
+            if( fiber != state.fiberToThread.end() )
+            {
+                auto& summary = EnsureThreadSummary( state, fiber->second, true );
+                summary.localName = std::move( text ); summary.localNameDefined = true;
+            }
+        }
+        else if( type == QueueType::ExternalName )
+        {
+            ++state.stats.externalNameRecords;
+            state.externalProcessNames[item.stringTransfer.ptr] = std::move( text );
+        }
+        else
+        {
+            ++state.stats.externalThreadNameRecords;
+            state.externalThreadNames[item.stringTransfer.ptr] = std::move( text );
+        }
+        break;
+    }
+    case QueueType::ExternalNameMetadata:
+        ++state.stats.externalNameMetadataRecords;
+        state.externalNameMappings.push_back( { item.externalNameMetadata.thread,
+            item.externalNameMetadata.name, item.externalNameMetadata.threadName } );
+        EnsureThreadSummary( state, item.externalNameMetadata.thread );
+        break;
+    case QueueType::TidToPid:
+        ++state.stats.tidToPidRecords;
+        EnsureThreadSummary( state, item.tidToPid.tid ).stored.processId = item.tidToPid.pid;
+        break;
+    case QueueType::ThreadGroupHint:
+    {
+        ++state.stats.groupHintRecords;
+        auto& summary = EnsureThreadSummary( state, item.threadGroupHint.thread, true );
+        summary.stored.groupHint = item.threadGroupHint.groupHint;
+        summary.stored.flags |= StoredThreadGroupHint;
+        break;
+    }
+    case QueueType::FiberEnter:
+    {
+        ++state.stats.fiberEnterRecords;
+        auto fiber = state.fiberToThread.find( item.fiberEnter.fiber );
+        if( fiber == state.fiberToThread.end() )
+        {
+            const auto id = ( uint64_t( 1 ) << 32 ) | state.fiberToThread.size();
+            fiber = state.fiberToThread.emplace( item.fiberEnter.fiber, id ).first;
+            auto& summary = EnsureThreadSummary( state, id, true );
+            summary.stored.flags |= StoredThreadFiber;
+            summary.stored.groupHint = item.fiberEnter.groupHint;
+            summary.stored.flags |= StoredThreadGroupHint;
+            const auto name = state.fiberNames.find( item.fiberEnter.fiber );
+            if( name != state.fiberNames.end() )
+            { summary.localName = name->second; summary.localNameDefined = true; }
+        }
+        EnsureThreadSummary( state, item.fiberEnter.thread, true );
+        state.activeFiber[item.fiberEnter.thread] = fiber->second;
+        break;
+    }
+    case QueueType::FiberLeave:
+        ++state.stats.fiberLeaveRecords;
+        EnsureThreadSummary( state, item.fiberLeave.thread, true );
+        state.activeFiber.erase( item.fiberLeave.thread );
+        break;
+    default: break;
+    }
+    return true;
+}
+
 bool VisitSchedulingRecord( const TraceSessionCanonicalRecord& record,
     void* userData, std::string& error )
 {
@@ -378,7 +664,9 @@ bool VisitSchedulingRecord( const TraceSessionCanonicalRecord& record,
     auto& state = *static_cast<BuildState*>( userData );
     QueueItem item {};
     if( !DecodeItem( record, item, error ) ) return false;
-    switch( QueueType( record.type ) )
+    const auto type = QueueType( record.type );
+    if( !CollectThreadFact( state, record, item, type, error ) ) return false;
+    switch( type )
     {
     case QueueType::CallstackSample:
     case QueueType::CallstackSampleContextSwitch:
@@ -401,6 +689,15 @@ bool VisitSchedulingRecord( const TraceSessionCanonicalRecord& record,
         ++state.stats.contextSwitchRecords;
         if( !ProcessSwitchOut( state, item.contextSwitch, timeNs, error ) ||
             !ProcessSwitchIn( state, item.contextSwitch, timeNs, error ) ) return false;
+        break;
+    }
+    case QueueType::CpuTopology:
+    {
+        ++state.stats.topologyRecords;
+        const StoredCpuTopology value { item.cpuTopology.thread,
+            item.cpuTopology.package, item.cpuTopology.die, item.cpuTopology.core };
+        if( !state.topology.emplace( value.cpu, value ).second )
+        { error = "session_scheduling_cpu_topology_duplicate"; return false; }
         break;
     }
     default: break;
@@ -467,6 +764,19 @@ bool SaveSchedulingManifest( const std::filesystem::path& root,
     out << "cpu_events " << value.stats.cpuEvents << '\n';
     out << "complete_cpu_events " << value.stats.completeCpuEvents << '\n';
     out << "source_gap_events " << value.stats.sourceGapEvents << '\n';
+    out << "topology_records " << value.stats.topologyRecords << '\n';
+    out << "topology_cpus " << value.stats.topologyCpus << '\n';
+    out << "thread_summaries " << value.stats.threadSummaries << '\n';
+    out << "thread_name_records " << value.stats.threadNameRecords << '\n';
+    out << "tid_to_pid_records " << value.stats.tidToPidRecords << '\n';
+    out << "group_hint_records " << value.stats.groupHintRecords << '\n';
+    out << "external_name_metadata_records " << value.stats.externalNameMetadataRecords << '\n';
+    out << "external_name_records " << value.stats.externalNameRecords << '\n';
+    out << "external_thread_name_records " << value.stats.externalThreadNameRecords << '\n';
+    out << "fiber_name_records " << value.stats.fiberNameRecords << '\n';
+    out << "fiber_enter_records " << value.stats.fiberEnterRecords << '\n';
+    out << "fiber_leave_records " << value.stats.fiberLeaveRecords << '\n';
+    out << "cpu_usage_points " << value.stats.cpuUsagePoints << '\n';
     out.flush();
     if( !out ) { error = "session_scheduling_manifest_write_failed"; return false; }
     out.close();
@@ -496,6 +806,19 @@ bool LoadSchedulingManifest( const std::filesystem::path& root,
         else if( key == "cpu_events" ) in >> value.stats.cpuEvents;
         else if( key == "complete_cpu_events" ) in >> value.stats.completeCpuEvents;
         else if( key == "source_gap_events" ) in >> value.stats.sourceGapEvents;
+        else if( key == "topology_records" ) in >> value.stats.topologyRecords;
+        else if( key == "topology_cpus" ) in >> value.stats.topologyCpus;
+        else if( key == "thread_summaries" ) in >> value.stats.threadSummaries;
+        else if( key == "thread_name_records" ) in >> value.stats.threadNameRecords;
+        else if( key == "tid_to_pid_records" ) in >> value.stats.tidToPidRecords;
+        else if( key == "group_hint_records" ) in >> value.stats.groupHintRecords;
+        else if( key == "external_name_metadata_records" ) in >> value.stats.externalNameMetadataRecords;
+        else if( key == "external_name_records" ) in >> value.stats.externalNameRecords;
+        else if( key == "external_thread_name_records" ) in >> value.stats.externalThreadNameRecords;
+        else if( key == "fiber_name_records" ) in >> value.stats.fiberNameRecords;
+        else if( key == "fiber_enter_records" ) in >> value.stats.fiberEnterRecords;
+        else if( key == "fiber_leave_records" ) in >> value.stats.fiberLeaveRecords;
+        else if( key == "cpu_usage_points" ) in >> value.stats.cpuUsagePoints;
         else { std::string ignored; std::getline( in, ignored ); }
         if( !in ) { error = "session_scheduling_manifest_parse_failed"; return false; }
     }
@@ -503,8 +826,142 @@ bool LoadSchedulingManifest( const std::filesystem::path& root,
     if( magic != SchedulingManifestMagic || schema != TraceSessionSchedulingIndexSchemaVersion ||
         value.sourceSha256.size() != 64 || value.fileSha256.size() != 64 ||
         value.stats.completeThreadEvents > value.stats.threadEvents ||
-        value.stats.completeCpuEvents > value.stats.cpuEvents )
+        value.stats.completeCpuEvents > value.stats.cpuEvents ||
+        value.stats.topologyRecords != value.stats.topologyCpus )
     { error = "session_scheduling_manifest_invalid"; return false; }
+    return true;
+}
+
+bool CpuUsageTransitionLess( const StoredCpuUsageTransition& lhs,
+    const StoredCpuUsageTransition& rhs )
+{
+    return std::tie( lhs.timeNs, lhs.sourceOrdinal ) <
+        std::tie( rhs.timeNs, rhs.sourceOrdinal );
+}
+
+bool BuildCpuUsageFile( BuildState& state, std::filesystem::path& outputPath,
+    uint64_t& pointCount, std::string& error )
+{
+    outputPath = state.root / "cpu-usage.work";
+    pointCount = 0;
+    std::ofstream empty( outputPath, std::ios::binary | std::ios::trunc );
+    if( !empty ) { error = "session_scheduling_cpu_usage_open_failed"; return false; }
+    empty.close();
+    if( state.stats.cpuEvents == 0 ) return true;
+
+    const auto transitionPath = state.root / "cpu-usage-transitions.work";
+    std::ofstream transitions( transitionPath, std::ios::binary | std::ios::trunc );
+    std::ifstream cpuEvents( state.cpuWork.Path(), std::ios::binary );
+    if( !transitions || !cpuEvents )
+    { error = "session_scheduling_cpu_usage_source_open_failed"; return false; }
+    uint64_t transitionOrdinal = 0;
+    uint64_t transitionCount = 0;
+    for( uint64_t index = 0; index < state.stats.cpuEvents; ++index )
+    {
+        StoredCpuEvent event;
+        if( !cpuEvents.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) )
+        { error = "session_scheduling_cpu_usage_source_truncated"; return false; }
+        const auto thread = state.threadSummaries.find( event.thread );
+        const auto isLocal = thread != state.threadSummaries.end() &&
+            ( thread->second.stored.zoneCount != 0 || thread->second.stored.sampleCount != 0 );
+        const auto sameProcess = thread != state.threadSummaries.end() &&
+            state.transform.processId != 0 &&
+            thread->second.stored.processId == state.transform.processId;
+        const auto own = isLocal || sameProcess;
+        StoredCpuUsageTransition begin;
+        begin.timeNs = event.startNs; begin.sourceOrdinal = transitionOrdinal++;
+        begin.ownDelta = own ? 1 : 0; begin.otherDelta = own ? 0 : 1;
+        transitions.write( reinterpret_cast<const char*>( &begin ), sizeof( begin ) );
+        ++transitionCount;
+        if( event.endNs >= event.startNs )
+        {
+            auto end = begin; end.timeNs = event.endNs; end.sourceOrdinal = transitionOrdinal++;
+            end.ownDelta = -begin.ownDelta; end.otherDelta = -begin.otherDelta;
+            transitions.write( reinterpret_cast<const char*>( &end ), sizeof( end ) );
+            ++transitionCount;
+        }
+    }
+    transitions.flush();
+    if( !transitions )
+    { error = "session_scheduling_cpu_usage_transition_write_failed"; return false; }
+    transitions.close(); cpuEvents.close();
+
+    constexpr size_t SortChunkRecords = 1024 * 1024;
+    std::ifstream transitionInput( transitionPath, std::ios::binary );
+    std::vector<StoredCpuUsageTransition> chunk( SortChunkRecords );
+    std::vector<std::filesystem::path> runs;
+    uint64_t read = 0;
+    while( read < transitionCount )
+    {
+        const auto wanted = size_t( std::min<uint64_t>(
+            SortChunkRecords, transitionCount - read ) );
+        transitionInput.read( reinterpret_cast<char*>( chunk.data() ),
+            std::streamsize( wanted * sizeof( StoredCpuUsageTransition ) ) );
+        if( size_t( transitionInput.gcount() ) !=
+            wanted * sizeof( StoredCpuUsageTransition ) )
+        { error = "session_scheduling_cpu_usage_transition_truncated"; return false; }
+        std::sort( chunk.begin(), chunk.begin() + wanted, CpuUsageTransitionLess );
+        const auto path = state.root /
+            ( "cpu-usage-run-" + std::to_string( runs.size() ) + ".work" );
+        std::ofstream run( path, std::ios::binary | std::ios::trunc );
+        run.write( reinterpret_cast<const char*>( chunk.data() ),
+            std::streamsize( wanted * sizeof( StoredCpuUsageTransition ) ) );
+        run.flush();
+        if( !run ) { error = "session_scheduling_cpu_usage_run_write_failed"; return false; }
+        runs.emplace_back( path ); read += wanted;
+    }
+    transitionInput.close();
+
+    struct RunState { std::ifstream stream; StoredCpuUsageTransition value; };
+    struct HeapEntry { StoredCpuUsageTransition value; size_t run = 0; };
+    const auto later = []( const HeapEntry& lhs, const HeapEntry& rhs ) {
+        return CpuUsageTransitionLess( rhs.value, lhs.value );
+    };
+    std::vector<RunState> readers( runs.size() );
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, decltype( later )> heap( later );
+    for( size_t index = 0; index < runs.size(); ++index )
+    {
+        readers[index].stream.open( runs[index], std::ios::binary );
+        if( !readers[index].stream || !readers[index].stream.read(
+            reinterpret_cast<char*>( &readers[index].value ), sizeof( StoredCpuUsageTransition ) ) )
+        { error = "session_scheduling_cpu_usage_run_read_failed"; return false; }
+        heap.push( { readers[index].value, index } );
+    }
+    std::ofstream output( outputPath, std::ios::binary | std::ios::trunc );
+    StoredCpuUsage current;
+    output.write( reinterpret_cast<const char*>( &current ), sizeof( current ) );
+    pointCount = 1;
+    int32_t own = 0, other = 0;
+    while( !heap.empty() )
+    {
+        const auto time = heap.top().value.timeNs;
+        int32_t ownDelta = 0, otherDelta = 0;
+        while( !heap.empty() && heap.top().value.timeNs == time )
+        {
+            const auto entry = heap.top(); heap.pop();
+            ownDelta += entry.value.ownDelta; otherDelta += entry.value.otherDelta;
+            auto& reader = readers[entry.run];
+            if( reader.stream.read( reinterpret_cast<char*>( &reader.value ),
+                sizeof( StoredCpuUsageTransition ) ) )
+                heap.push( { reader.value, entry.run } );
+            else if( !reader.stream.eof() )
+            { error = "session_scheduling_cpu_usage_run_read_failed"; return false; }
+        }
+        own += ownDelta; other += otherDelta;
+        if( own < 0 || other < 0 || own > 255 || other > 255 )
+        { error = "session_scheduling_cpu_usage_count_invalid"; return false; }
+        if( current.own == own && current.other == other ) continue;
+        current.timeNs = time; current.own = uint8_t( own ); current.other = uint8_t( other );
+        output.write( reinterpret_cast<const char*>( &current ), sizeof( current ) );
+        ++pointCount;
+    }
+    output.flush();
+    if( !output ) { error = "session_scheduling_cpu_usage_write_failed"; return false; }
+    output.close();
+    for( auto& reader : readers ) reader.stream.close();
+    std::error_code ec;
+    std::filesystem::remove( transitionPath, ec ); ec.clear();
+    for( const auto& run : runs ) { std::filesystem::remove( run, ec ); ec.clear(); }
     return true;
 }
 
@@ -512,6 +969,59 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     SchedulingManifest& manifest, std::string& error )
 {
     if( !state.threadWork.Close( error ) || !state.cpuWork.Close( error ) ) return false;
+    for( const auto& mapping : state.externalNameMappings )
+    {
+        auto& summary = EnsureThreadSummary( state, mapping.thread );
+        const auto processName = state.externalProcessNames.find( mapping.processNamePointer );
+        const auto threadName = state.externalThreadNames.find( mapping.threadNamePointer );
+        if( processName == state.externalProcessNames.end() ||
+            threadName == state.externalThreadNames.end() )
+        { error = "session_scheduling_external_name_unresolved"; return false; }
+        if( ( !summary.externalProcessName.empty() &&
+                summary.externalProcessName != processName->second ) ||
+            ( !summary.externalThreadName.empty() &&
+                summary.externalThreadName != threadName->second ) )
+        { error = "session_scheduling_external_name_conflict"; return false; }
+        summary.externalProcessName = processName->second;
+        summary.externalThreadName = threadName->second;
+        summary.externalProcessNameDefined = true;
+        summary.externalThreadNameDefined = true;
+    }
+    std::string threadStrings;
+    std::vector<StoredThreadSummary> threadSummaries;
+    threadSummaries.reserve( state.threadSummaries.size() );
+    const auto appendString = [&]( const std::string& text, bool defined,
+        uint64_t& offset, uint32_t& bytes, uint32_t flag,
+        StoredThreadSummary& stored ) -> bool {
+        if( !defined ) return true;
+        stored.flags |= flag;
+        if( text.empty() ) return true;
+        if( text.size() > std::numeric_limits<uint32_t>::max() ) return false;
+        offset = threadStrings.size(); bytes = uint32_t( text.size() );
+        threadStrings.append( text ); return true;
+    };
+    for( auto& [_, value] : state.threadSummaries )
+    {
+        if( value.stored.flags & StoredThreadLocalRecord )
+            value.stored.flags |= StoredThreadGroupHint;
+        if( !appendString( value.localName, value.localNameDefined,
+                value.stored.localNameOffset,
+                value.stored.localNameBytes, StoredThreadLocalName, value.stored ) ||
+            !appendString( value.externalProcessName, value.externalProcessNameDefined,
+                value.stored.externalProcessNameOffset,
+                value.stored.externalProcessNameBytes,
+                StoredThreadExternalProcessName, value.stored ) ||
+            !appendString( value.externalThreadName, value.externalThreadNameDefined,
+                value.stored.externalThreadNameOffset,
+                value.stored.externalThreadNameBytes,
+                StoredThreadExternalThreadName, value.stored ) )
+        { error = "session_scheduling_thread_name_too_large"; return false; }
+        threadSummaries.emplace_back( value.stored );
+    }
+    std::filesystem::path cpuUsagePath;
+    uint64_t cpuUsagePointCount = 0;
+    if( !BuildCpuUsageFile( state, cpuUsagePath, cpuUsagePointCount, error ) ) return false;
+    state.stats.cpuUsagePoints = cpuUsagePointCount;
     SchedulingFileHeader header;
     header.sourceSize = session.source.fileSize;
     header.contextSwitchRecords = state.stats.contextSwitchRecords;
@@ -521,9 +1031,33 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     header.cpuEventCount = state.stats.cpuEvents;
     header.completeCpuEventCount = state.stats.completeCpuEvents;
     header.sourceGapEventCount = state.stats.sourceGapEvents;
+    state.stats.topologyCpus = state.topology.size();
+    header.topologyRecordCount = state.stats.topologyRecords;
+    header.topologyCpuCount = state.stats.topologyCpus;
+    state.stats.threadSummaries = threadSummaries.size();
+    header.threadSummaryCount = state.stats.threadSummaries;
+    header.threadStringBytes = threadStrings.size();
+    header.threadNameRecordCount = state.stats.threadNameRecords;
+    header.tidToPidRecordCount = state.stats.tidToPidRecords;
+    header.groupHintRecordCount = state.stats.groupHintRecords;
+    header.externalNameMetadataRecordCount = state.stats.externalNameMetadataRecords;
+    header.externalNameRecordCount = state.stats.externalNameRecords;
+    header.externalThreadNameRecordCount = state.stats.externalThreadNameRecords;
+    header.fiberNameRecordCount = state.stats.fiberNameRecords;
+    header.fiberEnterRecordCount = state.stats.fiberEnterRecords;
+    header.fiberLeaveRecordCount = state.stats.fiberLeaveRecords;
+    header.cpuUsagePointCount = state.stats.cpuUsagePoints;
     header.generationBytes = uint32_t( session.generation.size() );
     header.threadRecordsOffset = sizeof( header ) + session.source.sha256.size() + session.generation.size();
     header.cpuRecordsOffset = header.threadRecordsOffset + header.threadEventCount * sizeof( StoredThreadEvent );
+    header.topologyRecordsOffset = header.cpuRecordsOffset +
+        header.cpuEventCount * sizeof( StoredCpuEvent );
+    header.threadSummariesOffset = header.topologyRecordsOffset +
+        header.topologyCpuCount * sizeof( StoredCpuTopology );
+    header.cpuUsageRecordsOffset = header.threadSummariesOffset +
+        header.threadSummaryCount * sizeof( StoredThreadSummary );
+    header.threadStringsOffset = header.cpuUsageRecordsOffset +
+        header.cpuUsagePointCount * sizeof( StoredCpuUsage );
     const auto temporary = state.root / "scheduling.bin.tmp";
     const auto target = state.root / SchedulingFileName;
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -533,13 +1067,21 @@ bool FinalizeSchedulingFile( BuildState& state, const TraceSessionManifest& sess
     out.write( session.generation.data(), std::streamsize( session.generation.size() ) );
     if( !CopyFileBytes( state.threadWork.Path(), out, error ) ||
         !CopyFileBytes( state.cpuWork.Path(), out, error ) ) return false;
+    for( const auto& [_, topology] : state.topology )
+        out.write( reinterpret_cast<const char*>( &topology ), sizeof( topology ) );
+    if( !threadSummaries.empty() ) out.write(
+        reinterpret_cast<const char*>( threadSummaries.data() ),
+        std::streamsize( threadSummaries.size() * sizeof( StoredThreadSummary ) ) );
+    if( !CopyFileBytes( cpuUsagePath, out, error ) ) return false;
+    if( !threadStrings.empty() ) out.write(
+        threadStrings.data(), std::streamsize( threadStrings.size() ) );
     out.flush();
     if( !out ) { error = "session_scheduling_file_write_failed"; return false; }
     out.close();
     if( !AtomicReplace( temporary, target, error ) ) return false;
     std::error_code ec;
-    const std::array<std::filesystem::path, 2> workFiles = {
-        state.threadWork.Path(), state.cpuWork.Path() };
+    const std::array<std::filesystem::path, 3> workFiles = {
+        state.threadWork.Path(), state.cpuWork.Path(), cpuUsagePath };
     for( const auto& path : workFiles )
     {
         if( !std::filesystem::remove( path, ec ) || ec )
@@ -566,6 +1108,10 @@ struct TraceSessionSchedulingReader::Impl
     uint64_t threadEventCount = 0;
     uint64_t cpuRecordsOffset = 0;
     uint64_t cpuEventCount = 0;
+    uint64_t cpuUsageRecordsOffset = 0;
+    uint64_t cpuUsagePointCount = 0;
+    std::vector<CpuTopologyDto> topology;
+    std::vector<ThreadDto> threads;
 };
 
 TraceSessionSchedulingReader::TraceSessionSchedulingReader( std::shared_ptr<Impl> impl )
@@ -657,6 +1203,19 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
         header.cpuEventCount != manifest.stats.cpuEvents ||
         header.completeCpuEventCount != manifest.stats.completeCpuEvents ||
         header.sourceGapEventCount != manifest.stats.sourceGapEvents ||
+        header.topologyRecordCount != manifest.stats.topologyRecords ||
+        header.topologyCpuCount != manifest.stats.topologyCpus ||
+        header.threadSummaryCount != manifest.stats.threadSummaries ||
+        header.threadNameRecordCount != manifest.stats.threadNameRecords ||
+        header.tidToPidRecordCount != manifest.stats.tidToPidRecords ||
+        header.groupHintRecordCount != manifest.stats.groupHintRecords ||
+        header.externalNameMetadataRecordCount != manifest.stats.externalNameMetadataRecords ||
+        header.externalNameRecordCount != manifest.stats.externalNameRecords ||
+        header.externalThreadNameRecordCount != manifest.stats.externalThreadNameRecords ||
+        header.fiberNameRecordCount != manifest.stats.fiberNameRecords ||
+        header.fiberEnterRecordCount != manifest.stats.fiberEnterRecords ||
+        header.fiberLeaveRecordCount != manifest.stats.fiberLeaveRecords ||
+        header.cpuUsagePointCount != manifest.stats.cpuUsagePoints ||
         header.generationBytes != session.generation.size() )
     { error = "session_scheduling_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
@@ -666,7 +1225,15 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
         header.threadRecordsOffset != uint64_t( in.tellg() ) ||
         header.cpuRecordsOffset != header.threadRecordsOffset +
             header.threadEventCount * sizeof( StoredThreadEvent ) ||
-        header.cpuRecordsOffset + header.cpuEventCount * sizeof( StoredCpuEvent ) != manifest.fileBytes )
+        header.topologyRecordsOffset != header.cpuRecordsOffset +
+            header.cpuEventCount * sizeof( StoredCpuEvent ) ||
+        header.threadSummariesOffset != header.topologyRecordsOffset +
+            header.topologyCpuCount * sizeof( StoredCpuTopology ) ||
+        header.cpuUsageRecordsOffset != header.threadSummariesOffset +
+            header.threadSummaryCount * sizeof( StoredThreadSummary ) ||
+        header.threadStringsOffset != header.cpuUsageRecordsOffset +
+            header.cpuUsagePointCount * sizeof( StoredCpuUsage ) ||
+        header.threadStringsOffset + header.threadStringBytes != manifest.fileBytes )
     { error = "session_scheduling_file_identity_or_bounds_invalid"; return {}; }
     auto impl = std::make_shared<Impl>();
     impl->path = path; impl->fingerprint = session.source.sha256;
@@ -674,6 +1241,80 @@ std::shared_ptr<TraceSessionSchedulingReader> TraceSessionSchedulingReader::Open
     impl->threadEventCount = header.threadEventCount;
     impl->cpuRecordsOffset = header.cpuRecordsOffset;
     impl->cpuEventCount = header.cpuEventCount;
+    impl->cpuUsageRecordsOffset = header.cpuUsageRecordsOffset;
+    impl->cpuUsagePointCount = header.cpuUsagePointCount;
+    impl->topology.reserve( size_t( header.topologyCpuCount ) );
+    in.seekg( std::streamoff( header.topologyRecordsOffset ) );
+    for( uint64_t index = 0; index < header.topologyCpuCount; ++index )
+    {
+        StoredCpuTopology value;
+        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ||
+            ( index != 0 && impl->topology.back().cpu >= value.cpu ) )
+        { error = "session_scheduling_topology_invalid"; return {}; }
+        CpuTopologyDto dto { value.cpu, value.package, value.die, value.core };
+        dto.dieAvailability.available = true;
+        impl->topology.emplace_back( std::move( dto ) );
+    }
+    std::vector<StoredThreadSummary> storedThreads(
+        size_t( header.threadSummaryCount ) );
+    in.seekg( std::streamoff( header.threadSummariesOffset ) );
+    if( header.threadSummaryCount != 0 && !in.read(
+        reinterpret_cast<char*>( storedThreads.data() ),
+        std::streamsize( header.threadSummaryCount * sizeof( StoredThreadSummary ) ) ) )
+    { error = "session_scheduling_thread_summaries_truncated"; return {}; }
+    const auto readThreadString = [&]( uint64_t offset, uint32_t bytes,
+        std::string& value ) -> bool {
+        if( bytes == 0 ) { value.clear(); return true; }
+        if( offset > header.threadStringBytes ||
+            bytes > header.threadStringBytes - offset ) return false;
+        value.resize( bytes );
+        in.clear();
+        in.seekg( std::streamoff( header.threadStringsOffset + offset ) );
+        return bool( in.read( value.data(), std::streamsize( bytes ) ) );
+    };
+    impl->threads.reserve( storedThreads.size() );
+    for( size_t index = 0; index < storedThreads.size(); ++index )
+    {
+        const auto& stored = storedThreads[index];
+        if( stored.nativeId == 0 ||
+            ( index != 0 && storedThreads[index-1].nativeId >= stored.nativeId ) )
+        { error = "session_scheduling_thread_summary_order_invalid"; return {}; }
+        std::string localName, externalProcessName, externalThreadName;
+        if( !readThreadString( stored.localNameOffset, stored.localNameBytes, localName ) ||
+            !readThreadString( stored.externalProcessNameOffset,
+                stored.externalProcessNameBytes, externalProcessName ) ||
+            !readThreadString( stored.externalThreadNameOffset,
+                stored.externalThreadNameBytes, externalThreadName ) )
+        { error = "session_scheduling_thread_string_bounds_invalid"; return {}; }
+        ThreadDto dto;
+        dto.ref = MakeRef( session.source.sha256, "thread", stored.nativeId );
+        dto.nativeId = stored.nativeId;
+        dto.processId = stored.processId;
+        dto.fiber = ( stored.flags & StoredThreadFiber ) != 0;
+        dto.zoneCount = stored.zoneCount;
+        dto.messageCount = stored.messageCount;
+        dto.sampleCount = stored.sampleCount;
+        dto.contextSwitchCount = stored.contextSwitchCount;
+        dto.runningTimeNs = stored.runningTimeNs;
+        dto.migrations = stored.migrations;
+        dto.runningRegions = stored.runningRegions;
+        if( stored.flags & StoredThreadLocalName ) dto.localName = localName;
+        if( stored.flags & StoredThreadExternalProcessName )
+            dto.externalProcessName = externalProcessName;
+        if( stored.flags & StoredThreadExternalThreadName )
+            dto.externalThreadName = externalThreadName;
+        dto.name = localName.empty() ?
+            ( externalThreadName.empty() ? "???" : externalThreadName ) : localName;
+        if( localName == std::to_string( stored.nativeId ) &&
+            !externalThreadName.empty() && externalThreadName != "???" &&
+            externalThreadName != "ntdll.dll" ) dto.name = externalThreadName;
+        dto.groupHintAvailability.available =
+            ( stored.flags & StoredThreadLocalRecord ) != 0;
+        if( dto.groupHintAvailability.available ) dto.groupHint = stored.groupHint;
+        else dto.groupHintAvailability.reason =
+            "this native thread has no persisted Tracy thread record";
+        impl->threads.emplace_back( std::move( dto ) );
+    }
     auto reader = std::shared_ptr<TraceSessionSchedulingReader>(
         new TraceSessionSchedulingReader( std::move( impl ) ) );
     reader->m_stats = manifest.stats;
@@ -740,6 +1381,42 @@ std::vector<CpuContextSwitchDto> TraceSessionSchedulingReader::ScanCpus(
         dto.complete = complete;
         result.emplace_back( std::move( dto ) );
         if( result.size() >= range.limit ) break;
+    }
+    return result;
+}
+
+const std::vector<CpuTopologyDto>& TraceSessionSchedulingReader::CpuTopology() const
+{
+    return m_impl->topology;
+}
+
+const std::vector<ThreadDto>& TraceSessionSchedulingReader::Threads() const
+{
+    return m_impl->threads;
+}
+
+std::vector<CpuUsagePointDto> TraceSessionSchedulingReader::ScanCpuUsage(
+    size_t offset, size_t limit ) const
+{
+    std::vector<CpuUsagePointDto> result;
+    if( limit == 0 || offset >= m_impl->cpuUsagePointCount ) return result;
+    const auto count = std::min<uint64_t>( limit,
+        m_impl->cpuUsagePointCount - uint64_t( offset ) );
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) return result;
+    in.seekg( std::streamoff( m_impl->cpuUsageRecordsOffset +
+        uint64_t( offset ) * sizeof( StoredCpuUsage ) ) );
+    result.reserve( size_t( count ) );
+    for( uint64_t index = 0; index < count; ++index )
+    {
+        StoredCpuUsage value;
+        if( !in.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) ) break;
+        CpuUsagePointDto dto;
+        dto.ref = MakeRef( m_impl->fingerprint, "cpu-usage", uint64_t( offset ) + index );
+        dto.timeNs = value.timeNs;
+        dto.own = value.own;
+        dto.other = value.other;
+        result.emplace_back( std::move( dto ) );
     }
     return result;
 }

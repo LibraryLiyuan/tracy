@@ -10,6 +10,7 @@ $traceSource = Get-Content -Raw (Join-Path $root 'analysis\TracyTraceSource.hpp'
 $sidecarSource = Get-Content -Raw (Join-Path $root 'analysis\TracyGpuAnalysisSidecar.cpp')
 $storeSource = Get-Content -Raw (Join-Path $root 'analysis\TracyGpuAnalysisStore.cpp')
 $lazySource = Get-Content -Raw (Join-Path $root 'analysis\TracyGpuAnalysisTraceSource.cpp')
+$sessionGpuSource = Get-Content -Raw (Join-Path $root 'analysis\TracyTraceSessionGpuCanonical.cpp')
 $sessionManager = Get-Content -Raw (Join-Path $root 'query\src\TracySessionManager.cpp')
 $service = Get-Content -Raw (Join-Path $root 'query\src\TracyQueryService.cpp')
 $converter = Get-Content -Raw (Join-Path $root 'capture\src\stream-convert.cpp')
@@ -48,6 +49,18 @@ Require ($controller.Contains('RunExternalBuilder')) 'Profiler does not attach t
 Require ($controller.Contains('builder-continues-external')) 'Profiler exit cannot detach from an active builder.'
 Require ($controller.Contains('StopPageLoad')) 'Profiler page-load cancellation is missing.'
 Require (-not $view.Contains('BuildGpuAnalysisSnapshot(')) 'GPU Memory & Resources still builds the full in-memory snapshot on the GUI path.'
+Require (-not ($sessionGpuSource -match 'BuildTraceSessionGpuAnalysisDerived[\s\S]*?LoadTraceSessionGpuCanonicalData\([\s\S]*?BuildGpuAnalysisSnapshotConsuming\(')) `
+    'N30 Session GPU derived construction still materializes full JnTraceData and GpuAnalysisSnapshot.'
+Require ($sessionGpuSource.Contains('sessionRoot / "checkpoints" / "gpu-pass-spool"')) `
+    'N30 Session GPU spool is still nested below the long public derived path.'
+Require (($sessionGpuSource | Select-String -Pattern 'GpuAnalysisIoPath\(' -AllMatches).Matches.Count -ge 10) `
+    'N30 Session GPU spool I/O does not consistently use the Windows long-path helper.'
+Require (-not $sessionGpuSource.Contains('std::vector<ResourceLifetimeEntry> logicalLifetimes')) `
+    'N30 Session GPU logical lifetime resolution still grows with total Logical record count.'
+Require ($sessionGpuSource.Contains('AddLogicalFile')) `
+    'N30 Session GPU pass resolution does not use the disk-backed Logical lifetime index.'
+Require ($sessionGpuSource.Contains('state.control->stopToken.stop_requested()')) `
+    'N30 Session GPU enrichment scan does not provide bounded graceful cancellation.'
 
 $coverage = Get-Content -Raw (Join-Path $root 'query\schema\coverage-v1.json') | ConvertFrom-Json
 $fields = Get-Content -Raw (Join-Path $root 'query\schema\coverage-fields-v1.json') | ConvertFrom-Json
