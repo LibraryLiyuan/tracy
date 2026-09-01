@@ -13,7 +13,7 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 7;
+inline constexpr uint32_t TraceSessionIoGfxIndexSchemaVersion = 8;
 
 struct TraceSessionIoGfxStats
 {
@@ -42,6 +42,7 @@ public:
     std::optional<IoRequestDto> IoRequest( uint64_t requestId ) const;
     std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const;
     std::vector<IoRequestDto> ScanIoRequestsByQueue( size_t offset, size_t limit ) const;
+    IoLatencyStatisticsDto IoLatencyStatistics() const;
     std::vector<IoRequestDto> IoChildren(
         uint64_t parentId, size_t offset, size_t limit ) const;
     std::vector<GfxDispatchDto> GfxDispatches() const;
@@ -66,6 +67,12 @@ private:
     uint64_t m_ioParentPostingOffset = 0;
     uint64_t m_ioRequestIdsOffset = 0;
     uint64_t m_ioRequestQueuePostingOffset = 0;
+    uint64_t m_ioQueueLatencyOffset = 0;
+    uint64_t m_ioQueueLatencyCount = 0;
+    uint64_t m_ioExecutionLatencyOffset = 0;
+    uint64_t m_ioExecutionLatencyCount = 0;
+    uint64_t m_ioTotalLatencyOffset = 0;
+    uint64_t m_ioTotalLatencyCount = 0;
     uint64_t m_gfxDispatchOffset = 0;
     uint64_t m_gfxEntityOffset = 0;
     uint64_t m_gfxLinkOffset = 0;

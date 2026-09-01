@@ -688,6 +688,29 @@ struct IoRequestDto
     std::vector<IoStageDto> stages;
 };
 
+struct ExactStatisticsDto
+{
+    uint64_t count = 0;
+    int64_t total = 0;
+    int64_t min = 0;
+    int64_t max = 0;
+    double mean = 0;
+    double median = 0;
+    double stddev = 0;
+    double p50 = 0;
+    double p90 = 0;
+    double p95 = 0;
+    double p99 = 0;
+    double truncatedMean = 0;
+};
+
+struct IoLatencyStatisticsDto
+{
+    ExactStatisticsDto queue;
+    ExactStatisticsDto execution;
+    ExactStatisticsDto total;
+};
+
 inline constexpr uint8_t IoRequestParentKindValue = 1;
 
 struct GfxDispatchDto
@@ -1093,6 +1116,10 @@ public:
         const auto begin = std::min( offset, values.size() );
         const auto end = begin + std::min( limit, values.size() - begin );
         return std::vector<IoRequestDto>( values.begin() + begin, values.begin() + end );
+    }
+    virtual std::optional<IoLatencyStatisticsDto> GetIoLatencyStatistics() const
+    {
+        return std::nullopt;
     }
     virtual std::optional<IoRequestDto> GetIoRequest( uint64_t requestId ) const
     {

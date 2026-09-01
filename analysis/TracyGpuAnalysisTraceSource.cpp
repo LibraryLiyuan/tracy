@@ -836,6 +836,13 @@ std::vector<IoRequestDto> GpuAnalysisTraceSource::ScanIoRequestsByQueue(
     return reader ? reader->ScanIoRequestsByQueue( offset, limit ) :
         std::vector<IoRequestDto> {};
 }
+std::optional<IoLatencyStatisticsDto> GpuAnalysisTraceSource::GetIoLatencyStatistics() const
+{
+    if( WorkerLoaded() ) return std::nullopt;
+    const auto reader = SessionIoGfxReader();
+    return reader ? std::optional<IoLatencyStatisticsDto>( reader->IoLatencyStatistics() ) :
+        std::nullopt;
+}
 std::optional<IoRequestDto> GpuAnalysisTraceSource::GetIoRequest( uint64_t requestId ) const
 {
     if( WorkerLoaded() ) return TraceSource::GetIoRequest( requestId );

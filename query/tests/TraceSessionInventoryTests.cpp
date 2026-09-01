@@ -2631,6 +2631,7 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto ioChildren = sessionSource->GetIoChildren( 400, 0, 8 );
         const auto ioRequestPage = sessionSource->ScanIoRequests( 1, 1 );
         const auto ioQueuePage = sessionSource->ScanIoRequestsByQueue( 1, 1 );
+        const auto ioLatency = sessionSource->GetIoLatencyStatistics();
         const auto gfxDispatches = sessionSource->GetGfxDispatches();
         const auto gfxEntities = sessionSource->GetGfxEntities();
         const auto gfxLinks = sessionSource->GetGfxLinks();
@@ -2652,7 +2653,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             ioRequests[1].requestedBytes == 1024 && ioRequests[1].transferredBytes == 1024 &&
             ioChildren.size() == 1 && ioChildren[0].requestId == 401 &&
             ioRequestPage.size() == 1 && ioRequestPage[0].requestId == 401 &&
-            ioQueuePage.size() == 1 && ioQueuePage[0].requestId == 401,
+            ioQueuePage.size() == 1 && ioQueuePage[0].requestId == 401 &&
+            ioLatency && ioLatency->queue.count == 2 && ioLatency->queue.total == 4 &&
+            ioLatency->execution.count == 2 && ioLatency->execution.total == 4 &&
+            ioLatency->total.count == 2 && ioLatency->total.total == 8,
             "Session I/O reader preserves an exact parent-child request lifecycle" );
         test.Check( gfxDispatches.size() == 1 && gfxDispatches[0].dispatchId == 300 &&
             gfxEntities.size() == 2 && gfxEntities[0].entityId == 301 &&
@@ -3092,8 +3096,11 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             test.Check( ioStatistics.value( "ok", false ) &&
                 ioStatistics["data"]["counts"]["requests"] == "2" &&
                 ioStatistics["data"]["counts"]["completed"] == "2" &&
-                ioStatistics["data"]["quality"]["unresolved_parent"] == "0",
-                "Query 1.34 computes Session I/O statistics from bounded Request ID pages" );
+                ioStatistics["data"]["quality"]["unresolved_parent"] == "0" &&
+                ioStatistics["data"]["latency"]["queue"]["count"] == "2" &&
+                ioStatistics["data"]["latency"]["queue"]["total_ns"] == "4" &&
+                ioStatistics["data"]["latency"]["total"]["total_ns"] == "8",
+                "Query 1.34 computes Session I/O statistics from bounded Request ID pages and exact disk latency runs" );
         }
         if( sessionGfxReady )
         {

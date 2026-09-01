@@ -7,6 +7,7 @@
 #include "TracyQueue.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -65,6 +66,12 @@ struct FileHeader
     uint64_t ioRequestIdsOffset = 0;
     uint64_t ioRequestQueuePostingOffset = 0;
     uint64_t ioRequestQueueIdPostingOffset = 0;
+    uint64_t ioQueueLatencyOffset = 0;
+    uint64_t ioQueueLatencyCount = 0;
+    uint64_t ioExecutionLatencyOffset = 0;
+    uint64_t ioExecutionLatencyCount = 0;
+    uint64_t ioTotalLatencyOffset = 0;
+    uint64_t ioTotalLatencyCount = 0;
     uint64_t gfxParentLinks = 0;
     uint32_t generationBytes = 0;
     uint32_t reserved = 0;
@@ -461,20 +468,45 @@ bool BuildDistinctPairKeys( const std::filesystem::path& path,
 
 bool BuildIoRequestQueuePostings( const std::filesystem::path& idPosting,
     const std::filesystem::path& requestRecords,
+    const std::filesystem::path& stageRecords,
     const std::filesystem::path& queueOutput,
     const std::filesystem::path& idOutput,
-    uint64_t postingCount, uint64_t expectedRequestIds, std::string& error )
+    const std::filesystem::path& queueLatencyOutput,
+    const std::filesystem::path& executionLatencyOutput,
+    const std::filesystem::path& totalLatencyOutput,
+    uint64_t postingCount, uint64_t expectedRequestIds,
+    uint64_t& queueLatencyCount, uint64_t& executionLatencyCount,
+    uint64_t& totalLatencyCount, std::string& error )
 {
     std::ifstream pairs( idPosting, std::ios::binary );
     std::ifstream requests( requestRecords, std::ios::binary );
+    std::ifstream stages( stageRecords, std::ios::binary );
     std::ofstream byQueue( queueOutput, std::ios::binary | std::ios::trunc );
     std::ofstream byId( idOutput, std::ios::binary | std::ios::trunc );
-    if( !pairs || !requests || !byQueue || !byId )
+    std::ofstream queueLatency( queueLatencyOutput, std::ios::binary | std::ios::trunc );
+    std::ofstream executionLatency( executionLatencyOutput, std::ios::binary | std::ios::trunc );
+    std::ofstream totalLatency( totalLatencyOutput, std::ios::binary | std::ios::trunc );
+    if( !pairs || !requests || !stages || !byQueue || !byId || !queueLatency ||
+        !executionLatency || !totalLatency )
     { error = "session_io_request_queue_posting_open_failed"; return false; }
+    queueLatencyCount = executionLatencyCount = totalLatencyCount = 0;
     uint64_t requestId = 0;
     int64_t queueNs = 0;
+    std::optional<int64_t> startNs;
+    std::optional<int64_t> endNs;
+    bool orphan = true;
     bool haveRequest = false;
     uint64_t emitted = 0;
+    const auto writeLatency = [&]( std::ofstream& output, int64_t value,
+        uint64_t& count ) -> bool {
+        const TraceSessionUInt64Pair pair {
+            uint64_t( value ) ^ ( uint64_t( 1 ) << 63 ), requestId };
+        output.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+        if( !output )
+        { error = "session_io_request_latency_write_failed"; return false; }
+        ++count;
+        return true;
+    };
     const auto emit = [&]() -> bool {
         if( !haveRequest ) return true;
         const auto encodedTime = uint64_t( queueNs ) ^ ( uint64_t( 1 ) << 63 );
@@ -484,6 +516,13 @@ bool BuildIoRequestQueuePostings( const std::filesystem::path& idPosting,
         byId.write( reinterpret_cast<const char*>( &idPair ), sizeof( idPair ) );
         if( !byQueue || !byId )
         { error = "session_io_request_queue_posting_write_failed"; return false; }
+        if( startNs && !orphan && *startNs >= queueNs &&
+            !writeLatency( queueLatency, *startNs - queueNs, queueLatencyCount ) ) return false;
+        if( startNs && endNs && *endNs >= *startNs &&
+            !writeLatency( executionLatency, *endNs - *startNs,
+                executionLatencyCount ) ) return false;
+        if( endNs && !orphan && *endNs >= queueNs &&
+            !writeLatency( totalLatency, *endNs - queueNs, totalLatencyCount ) ) return false;
         ++emitted;
         return true;
     };
@@ -499,22 +538,51 @@ bool BuildIoRequestQueuePostings( const std::filesystem::path& idPosting,
             if( !emit() ) return false;
             requestId = pair.key;
             queueNs = 0;
+            startNs.reset();
+            endNs.reset();
+            orphan = true;
             haveRequest = true;
         }
         const auto type = pair.value >> TypeShift;
-        if( type != 0 ) continue;
         const auto ordinal = pair.value & OrdinalMask;
-        StoredIoRequest request;
-        requests.clear();
-        requests.seekg( std::streamoff( ordinal * sizeof( request ) ) );
-        if( !requests.read( reinterpret_cast<char*>( &request ), sizeof( request ) ) ||
-            request.requestId != requestId )
-        { error = "session_io_request_queue_posting_target_invalid"; return false; }
-        queueNs = request.timeNs;
+        if( type == 0 )
+        {
+            StoredIoRequest request;
+            requests.clear();
+            requests.seekg( std::streamoff( ordinal * sizeof( request ) ) );
+            if( !requests.read( reinterpret_cast<char*>( &request ), sizeof( request ) ) ||
+                request.requestId != requestId )
+            { error = "session_io_request_queue_posting_target_invalid"; return false; }
+            queueNs = request.timeNs;
+            orphan = false;
+        }
+        else if( type == 2 )
+        {
+            StoredIoStage stage;
+            stages.clear();
+            stages.seekg( std::streamoff( ordinal * sizeof( stage ) ) );
+            if( !stages.read( reinterpret_cast<char*>( &stage ), sizeof( stage ) ) ||
+                stage.requestId != requestId )
+            { error = "session_io_request_latency_stage_invalid"; return false; }
+            switch( JnIoStage( stage.stage ) )
+            {
+            case JnIoStage::Start:
+                if( !startNs || stage.timeNs < *startNs ) startNs = stage.timeNs;
+                break;
+            case JnIoStage::Complete:
+            case JnIoStage::Error:
+            case JnIoStage::Cancel:
+                if( !endNs || stage.timeNs > *endNs ) endNs = stage.timeNs;
+                break;
+            default: break;
+            }
+        }
     }
     if( !emit() ) return false;
-    byQueue.flush(); byId.flush();
-    if( !byQueue || !byId || emitted != expectedRequestIds )
+    byQueue.flush(); byId.flush(); queueLatency.flush(); executionLatency.flush();
+    totalLatency.flush();
+    if( !byQueue || !byId || !queueLatency || !executionLatency || !totalLatency ||
+        emitted != expectedRequestIds )
     { error = "session_io_request_queue_posting_count_mismatch"; return false; }
     return true;
 }
@@ -673,6 +741,15 @@ bool ValidateFile( std::ifstream& in, const TraceSessionManifest& session,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         header.ioRequestQueueIdPostingOffset == expected;
     valid = valid && CheckedAppend( expected, header.ioRequestIds,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioQueueLatencyOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioQueueLatencyCount,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioExecutionLatencyOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioExecutionLatencyCount,
+        sizeof( TraceSessionUInt64Pair ), error ) &&
+        header.ioTotalLatencyOffset == expected;
+    valid = valid && CheckedAppend( expected, header.ioTotalLatencyCount,
         sizeof( TraceSessionUInt64Pair ), error ) &&
         expected == manifest.fileBytes;
     if( !in || source != session.source.sha256 || generation != session.generation || !valid )
@@ -963,39 +1040,53 @@ bool ValidateIoRequestQueuePostings( const std::filesystem::path& path,
         const TraceSessionUInt64Pair& rhs ) {
         return lhs.key < rhs.key || ( lhs.key == rhs.key && lhs.value < rhs.value );
     };
-    queue.seekg( std::streamoff( header.ioRequestQueuePostingOffset ) );
-    TraceSessionUInt64Pair previousQueue {};
-    bool havePreviousQueue = false;
-    for( uint64_t index = 0; index < header.ioRequestIds; ++index )
-    {
-        TraceSessionUInt64Pair pair;
-        if( !queue.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
-        { error = "session_io_request_queue_posting_truncated"; return false; }
-        if( havePreviousQueue && !less( previousQueue, pair ) )
-        { error = "session_io_request_queue_posting_not_strictly_sorted"; return false; }
-        previousQueue = pair;
-        havePreviousQueue = true;
-    }
+    const auto validateStrict = [&]( uint64_t offset, uint64_t count,
+        const char* failure ) -> bool {
+        queue.clear();
+        queue.seekg( std::streamoff( offset ) );
+        TraceSessionUInt64Pair previous {};
+        bool havePrevious = false;
+        for( uint64_t index = 0; index < count; ++index )
+        {
+            TraceSessionUInt64Pair pair;
+            if( !queue.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+            { error = std::string( failure ) + "_truncated"; return false; }
+            if( havePrevious && !less( previous, pair ) )
+            { error = std::string( failure ) + "_not_strictly_sorted"; return false; }
+            previous = pair;
+            havePrevious = true;
+        }
+        return true;
+    };
+    if( !validateStrict( header.ioRequestQueuePostingOffset, header.ioRequestIds,
+            "session_io_request_queue_posting" ) ||
+        !validateStrict( header.ioQueueLatencyOffset, header.ioQueueLatencyCount,
+            "session_io_queue_latency" ) ||
+        !validateStrict( header.ioExecutionLatencyOffset,
+            header.ioExecutionLatencyCount, "session_io_execution_latency" ) ||
+        !validateStrict( header.ioTotalLatencyOffset, header.ioTotalLatencyCount,
+            "session_io_total_latency" ) ) return false;
 
-    const auto containsQueuePair = [&]( const TraceSessionUInt64Pair& target ) -> bool {
+    const auto containsPair = [&]( uint64_t postingOffset, uint64_t postingCount,
+        const TraceSessionUInt64Pair& target ) -> bool {
         uint64_t begin = 0;
-        uint64_t end = header.ioRequestIds;
+        uint64_t end = postingCount;
         while( begin < end )
         {
             const auto middle = begin + ( end - begin ) / 2;
             TraceSessionUInt64Pair candidate;
             queue.clear();
-            queue.seekg( std::streamoff( header.ioRequestQueuePostingOffset +
+            queue.seekg( std::streamoff( postingOffset +
                 middle * sizeof( candidate ) ) );
             if( !queue.read( reinterpret_cast<char*>( &candidate ), sizeof( candidate ) ) )
                 return false;
             if( less( candidate, target ) ) begin = middle + 1;
             else end = middle;
         }
-        if( begin >= header.ioRequestIds ) return false;
+        if( begin >= postingCount ) return false;
         TraceSessionUInt64Pair candidate;
         queue.clear();
-        queue.seekg( std::streamoff( header.ioRequestQueuePostingOffset +
+        queue.seekg( std::streamoff( postingOffset +
             begin * sizeof( candidate ) ) );
         return queue.read( reinterpret_cast<char*>( &candidate ), sizeof( candidate ) ) &&
             candidate.key == target.key && candidate.value == target.value;
@@ -1013,6 +1104,9 @@ bool ValidateIoRequestQueuePostings( const std::filesystem::path& path,
     constexpr uint64_t OrdinalMask = ( uint64_t( 1 ) << TypeShift ) - 1;
     uint64_t previousId = 0;
     bool havePreviousId = false;
+    uint64_t queueLatencies = 0;
+    uint64_t executionLatencies = 0;
+    uint64_t totalLatencies = 0;
     for( uint64_t index = 0; index < header.ioRequestIds; ++index )
     {
         uint64_t requestId = 0;
@@ -1026,9 +1120,13 @@ bool ValidateIoRequestQueuePostings( const std::filesystem::path& path,
         { error = "session_io_request_queue_source_key_mismatch"; return false; }
 
         int64_t queueNs = 0;
+        std::optional<int64_t> startNs;
+        std::optional<int64_t> endNs;
+        bool orphan = true;
         while( havePosting && posting.key == requestId )
         {
-            if( posting.value >> TypeShift == 0 )
+            const auto type = posting.value >> TypeShift;
+            if( type == 0 )
             {
                 const auto ordinal = posting.value & OrdinalMask;
                 if( ordinal >= header.ioRequests )
@@ -1041,6 +1139,32 @@ bool ValidateIoRequestQueuePostings( const std::filesystem::path& path,
                     request.requestId != requestId )
                 { error = "session_io_request_queue_source_record_invalid"; return false; }
                 queueNs = request.timeNs;
+                orphan = false;
+            }
+            else if( type == 2 )
+            {
+                const auto ordinal = posting.value & OrdinalMask;
+                if( ordinal >= header.ioStages )
+                { error = "session_io_request_latency_stage_out_of_range"; return false; }
+                StoredIoStage stage;
+                records.clear();
+                records.seekg( std::streamoff( header.ioStageOffset +
+                    ordinal * sizeof( stage ) ) );
+                if( !records.read( reinterpret_cast<char*>( &stage ), sizeof( stage ) ) ||
+                    stage.requestId != requestId )
+                { error = "session_io_request_latency_stage_invalid"; return false; }
+                switch( JnIoStage( stage.stage ) )
+                {
+                case JnIoStage::Start:
+                    if( !startNs || stage.timeNs < *startNs ) startNs = stage.timeNs;
+                    break;
+                case JnIoStage::Complete:
+                case JnIoStage::Error:
+                case JnIoStage::Cancel:
+                    if( !endNs || stage.timeNs > *endNs ) endNs = stage.timeNs;
+                    break;
+                default: break;
+                }
             }
             ++postingIndex;
             havePosting = postingIndex < header.ioRequestIdPostingCount;
@@ -1052,14 +1176,111 @@ bool ValidateIoRequestQueuePostings( const std::filesystem::path& path,
         const TraceSessionUInt64Pair expected { encodedTime, requestId };
         if( idPair.value != encodedTime )
         { error = "session_io_request_queue_id_posting_time_mismatch"; return false; }
-        if( !containsQueuePair( expected ) )
+        if( !containsPair( header.ioRequestQueuePostingOffset,
+                header.ioRequestIds, expected ) )
         { error = "session_io_request_queue_inverse_posting_mismatch"; return false; }
+        const auto validateLatency = [&]( bool eligible, int64_t value,
+            uint64_t postingOffset, uint64_t postingCount, uint64_t& observed,
+            const char* failure ) -> bool {
+            if( !eligible ) return true;
+            const TraceSessionUInt64Pair pair {
+                uint64_t( value ) ^ ( uint64_t( 1 ) << 63 ), requestId };
+            if( !containsPair( postingOffset, postingCount, pair ) )
+            { error = failure; return false; }
+            ++observed;
+            return true;
+        };
+        if( !validateLatency( startNs && !orphan && *startNs >= queueNs,
+                startNs ? *startNs - queueNs : 0,
+                header.ioQueueLatencyOffset, header.ioQueueLatencyCount,
+                queueLatencies, "session_io_queue_latency_inverse_mismatch" ) ||
+            !validateLatency( startNs && endNs && *endNs >= *startNs,
+                startNs && endNs ? *endNs - *startNs : 0,
+                header.ioExecutionLatencyOffset, header.ioExecutionLatencyCount,
+                executionLatencies, "session_io_execution_latency_inverse_mismatch" ) ||
+            !validateLatency( endNs && !orphan && *endNs >= queueNs,
+                endNs ? *endNs - queueNs : 0,
+                header.ioTotalLatencyOffset, header.ioTotalLatencyCount,
+                totalLatencies, "session_io_total_latency_inverse_mismatch" ) ) return false;
         previousId = requestId;
         havePreviousId = true;
     }
     if( havePosting || postingIndex != header.ioRequestIdPostingCount )
     { error = "session_io_request_queue_source_count_mismatch"; return false; }
+    if( queueLatencies != header.ioQueueLatencyCount ||
+        executionLatencies != header.ioExecutionLatencyCount ||
+        totalLatencies != header.ioTotalLatencyCount )
+    { error = "session_io_request_latency_count_mismatch"; return false; }
     return true;
+}
+
+ExactStatisticsDto ReadExactStatistics( const std::filesystem::path& path,
+    uint64_t offset, uint64_t count )
+{
+    ExactStatisticsDto result;
+    result.count = count;
+    if( count == 0 ) return result;
+    std::ifstream in( path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session exact statistics are unavailable" );
+    const auto valueAt = [&]( uint64_t index ) -> int64_t {
+        TraceSessionUInt64Pair pair;
+        in.clear();
+        in.seekg( std::streamoff( offset + index * sizeof( pair ) ) );
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+            throw std::runtime_error( "Session exact statistics are truncated" );
+        return int64_t( pair.key ^ ( uint64_t( 1 ) << 63 ) );
+    };
+    const auto percentile = [&]( double value ) {
+        const double position = value * double( count - 1 );
+        const auto low = uint64_t( std::floor( position ) );
+        const auto high = std::min<uint64_t>( low + 1, count - 1 );
+        const auto fraction = position - double( low );
+        const auto lowValue = valueAt( low );
+        const auto highValue = valueAt( high );
+        return double( lowValue ) +
+            ( double( highValue ) - double( lowValue ) ) * fraction;
+    };
+    result.min = valueAt( 0 );
+    result.max = valueAt( count - 1 );
+    in.clear();
+    in.seekg( std::streamoff( offset ) );
+    for( uint64_t index = 0; index < count; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+            throw std::runtime_error( "Session exact statistics are truncated" );
+        result.total += int64_t( pair.key ^ ( uint64_t( 1 ) << 63 ) );
+    }
+    result.mean = double( result.total ) / double( count );
+    result.median = percentile( 0.50 );
+    result.p50 = result.median;
+    result.p90 = percentile( 0.90 );
+    result.p95 = percentile( 0.95 );
+    result.p99 = percentile( 0.99 );
+    const auto cutoff = result.p90;
+    long double squaredDeviation = 0;
+    long double truncatedTotal = 0;
+    uint64_t truncatedCount = 0;
+    in.clear();
+    in.seekg( std::streamoff( offset ) );
+    for( uint64_t index = 0; index < count; ++index )
+    {
+        TraceSessionUInt64Pair pair;
+        if( !in.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+            throw std::runtime_error( "Session exact statistics are truncated" );
+        const auto value = int64_t( pair.key ^ ( uint64_t( 1 ) << 63 ) );
+        const long double delta = static_cast<long double>( value ) - result.mean;
+        squaredDeviation += delta * delta;
+        if( double( value ) <= cutoff )
+        {
+            truncatedTotal += value;
+            ++truncatedCount;
+        }
+    }
+    result.stddev = std::sqrt( double( squaredDeviation / count ) );
+    result.truncatedMean = truncatedCount == 0 ? 0 :
+        double( truncatedTotal / truncatedCount );
+    return result;
 }
 
 std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
@@ -1188,6 +1409,14 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     const auto ioRequestQueueSorted = root / "io-request-queue-sorted.work";
     const auto ioRequestQueueIdSource = root / "io-request-queue-id-source.work";
     const auto ioRequestQueueIdSorted = root / "io-request-queue-id-sorted.work";
+    const std::array<std::filesystem::path, 3> ioLatencySource = {
+        root / "io-queue-latency-source.work",
+        root / "io-execution-latency-source.work",
+        root / "io-total-latency-source.work" };
+    const std::array<std::filesystem::path, 3> ioLatencySorted = {
+        root / "io-queue-latency-sorted.work",
+        root / "io-execution-latency-sorted.work",
+        root / "io-total-latency-sorted.work" };
     BuildState state;
     state.ioRequest.open( work[0], std::ios::binary | std::ios::trunc );
     state.ioConfig.open( work[1], std::ios::binary | std::ios::trunc );
@@ -1226,6 +1455,9 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     { error = "session_io_request_id_posting_count_overflow"; return false; }
     const auto ioRequestIdPostingCount = state.stats.ioRequests +
         state.stats.ioConfigs + state.stats.ioStages;
+    uint64_t queueLatencyCount = 0;
+    uint64_t executionLatencyCount = 0;
+    uint64_t totalLatencyCount = 0;
     constexpr uint64_t MaximumBufferedPostingPairs = 4ull * 1024 * 1024;
     if( !SortTraceSessionUInt64Pairs( postingSource[0], postingSorted[0], root,
             "io-gfx-dispatch-frame-posting", state.stats.gfxDispatches,
@@ -1253,14 +1485,25 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         !SortTraceSessionUInt64Pairs( postingSource[7], postingSorted[7], root,
             "io-parent-posting", state.stats.ioParentLinks,
             MaximumBufferedPostingPairs, error ) ||
-        !BuildIoRequestQueuePostings( postingSorted[6], work[0],
+        !BuildIoRequestQueuePostings( postingSorted[6], work[0], work[2],
             ioRequestQueueSource, ioRequestQueueIdSource,
-            ioRequestIdPostingCount, state.stats.ioRequestIds, error ) ||
+            ioLatencySource[0], ioLatencySource[1], ioLatencySource[2],
+            ioRequestIdPostingCount, state.stats.ioRequestIds,
+            queueLatencyCount, executionLatencyCount, totalLatencyCount, error ) ||
         !SortTraceSessionUInt64Pairs( ioRequestQueueSource, ioRequestQueueSorted, root,
             "io-request-queue-posting", state.stats.ioRequestIds,
             MaximumBufferedPostingPairs, error ) ||
         !SortTraceSessionUInt64Pairs( ioRequestQueueIdSource, ioRequestQueueIdSorted, root,
             "io-request-queue-id-posting", state.stats.ioRequestIds,
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( ioLatencySource[0], ioLatencySorted[0], root,
+            "io-queue-latency", queueLatencyCount,
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( ioLatencySource[1], ioLatencySorted[1], root,
+            "io-execution-latency", executionLatencyCount,
+            MaximumBufferedPostingPairs, error ) ||
+        !SortTraceSessionUInt64Pairs( ioLatencySource[2], ioLatencySorted[2], root,
+            "io-total-latency", totalLatencyCount,
             MaximumBufferedPostingPairs, error ) ) return false;
 
     FileHeader header;
@@ -1326,6 +1569,18 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     header.ioRequestQueueIdPostingOffset = next;
     if( !CheckedAppend( next, state.stats.ioRequestIds,
         sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioQueueLatencyOffset = next;
+    header.ioQueueLatencyCount = queueLatencyCount;
+    if( !CheckedAppend( next, queueLatencyCount,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioExecutionLatencyOffset = next;
+    header.ioExecutionLatencyCount = executionLatencyCount;
+    if( !CheckedAppend( next, executionLatencyCount,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
+    header.ioTotalLatencyOffset = next;
+    header.ioTotalLatencyCount = totalLatencyCount;
+    if( !CheckedAppend( next, totalLatencyCount,
+        sizeof( TraceSessionUInt64Pair ), error ) ) return false;
 
     const auto temporary = root / ( std::string( FileName ) + ".tmp" );
     std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
@@ -1366,6 +1621,12 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
         !CopyFile( ioRequestQueueIdSorted, out, copied, error ) ||
         copied != state.stats.ioRequestIds * sizeof( TraceSessionUInt64Pair ) )
     { if( error.empty() ) error = "session_io_request_queue_posting_size_mismatch"; return false; }
+    const std::array<uint64_t, 3> latencyCounts = {
+        queueLatencyCount, executionLatencyCount, totalLatencyCount };
+    for( size_t index = 0; index < ioLatencySorted.size(); ++index )
+        if( !CopyFile( ioLatencySorted[index], out, copied, error ) ||
+            copied != latencyCounts[index] * sizeof( TraceSessionUInt64Pair ) )
+        { if( error.empty() ) error = "session_io_request_latency_size_mismatch"; return false; }
     out.flush();
     if( !out ) { error = "session_io_gfx_file_finalize_failed"; return false; }
     out.close();
@@ -1378,6 +1639,8 @@ bool BuildTraceSessionIoGfxDerived( const std::filesystem::path& sessionRoot,
     for( const auto& path : { ioRequestQueueSource, ioRequestQueueSorted,
         ioRequestQueueIdSource, ioRequestQueueIdSorted } )
     { ec.clear(); std::filesystem::remove( path, ec ); }
+    for( const auto& path : ioLatencySource ) { ec.clear(); std::filesystem::remove( path, ec ); }
+    for( const auto& path : ioLatencySorted ) { ec.clear(); std::filesystem::remove( path, ec ); }
 
     LocalManifest manifest;
     manifest.sourceSha256 = session.source.sha256;
@@ -1422,6 +1685,12 @@ std::shared_ptr<TraceSessionIoGfxReader> TraceSessionIoGfxReader::Open(
     reader->m_ioParentPostingOffset = header.ioParentPostingOffset;
     reader->m_ioRequestIdsOffset = header.ioRequestIdsOffset;
     reader->m_ioRequestQueuePostingOffset = header.ioRequestQueuePostingOffset;
+    reader->m_ioQueueLatencyOffset = header.ioQueueLatencyOffset;
+    reader->m_ioQueueLatencyCount = header.ioQueueLatencyCount;
+    reader->m_ioExecutionLatencyOffset = header.ioExecutionLatencyOffset;
+    reader->m_ioExecutionLatencyCount = header.ioExecutionLatencyCount;
+    reader->m_ioTotalLatencyOffset = header.ioTotalLatencyOffset;
+    reader->m_ioTotalLatencyCount = header.ioTotalLatencyCount;
     reader->m_stats = manifest.stats;
     return reader;
 }
@@ -1599,6 +1868,16 @@ std::vector<IoRequestDto> TraceSessionIoGfxReader::ScanIoRequestsByQueue(
         result.emplace_back( *request );
     }
     return result;
+}
+
+IoLatencyStatisticsDto TraceSessionIoGfxReader::IoLatencyStatistics() const
+{
+    return {
+        ReadExactStatistics( m_path, m_ioQueueLatencyOffset, m_ioQueueLatencyCount ),
+        ReadExactStatistics( m_path, m_ioExecutionLatencyOffset,
+            m_ioExecutionLatencyCount ),
+        ReadExactStatistics( m_path, m_ioTotalLatencyOffset, m_ioTotalLatencyCount )
+    };
 }
 
 std::vector<GfxDispatchDto> TraceSessionIoGfxReader::GfxDispatches() const

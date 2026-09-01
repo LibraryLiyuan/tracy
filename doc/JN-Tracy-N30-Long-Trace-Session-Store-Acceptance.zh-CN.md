@@ -1608,3 +1608,25 @@ GREEN:     Trace Session Inventory tests passed；固定组合回归6/6
 ```
 
 本子阶段未启动真实30分钟转换；`io.statistics`的精确分位数外排仍是独立后续任务。
+
+### 2026-09-01 I/O 精确延迟外排统计（N30.6B 子阶段）
+
+状态：**Passed（synthetic correctness，长Trace延迟待集中门禁）**。
+
+- I/O/Gfx index schema从7升级到8；构建期按Request ID流式归并Request/Stage事实，只保留当前Request状态。
+- Queue、Execution和Total三类有效延迟分别写入固定16字节Pair，经64 MiB有界外部排序形成immutable精确序列；不会在Query内保留随Request数量增长的三条`int64_t`数组。
+- Session Reader直接从排序序列计算count、total、min/max、mean、P50/P90/P95/P99、stddev及P90截断均值；公式与既有`ComputeStatistics`保持一致。
+- Session `io.statistics`仍以1024 Request分页计算生命周期与质量计数，但延迟统计改读磁盘精确摘要；Legacy Worker继续使用原有内存统计路径。
+- Final Audit由Canonical Request/Stage事实重算每个有效延迟，验证三类posting严格排序、成员存在和总数；错误延迟即使文件checksum正确也不能发布。
+
+Synthetic证据：
+
+```text
+Request 400: queue=2 ns，execution=2 ns，total=4 ns
+Request 401: queue=2 ns，execution=2 ns，total=4 ns
+Reader totals: 4 / 4 / 8 ns，三类count均为2
+Query io.statistics与Reader一致
+Trace Session Inventory tests passed；固定组合回归6/6
+```
+
+本子阶段未启动真实30分钟转换；Job statistics的六组精确延迟数组与诊断中的嵌套全表扫描仍待后续独立收敛。

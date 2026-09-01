@@ -739,7 +739,8 @@ json CapabilityJson( const analysis::Capability& value )
     };
 }
 
-json StatisticsJson( const analysis::Statistics& value )
+template<typename StatisticsType>
+json StatisticsJson( const StatisticsType& value )
 {
     return {
         { "count", Decimal( value.count ) }, { "total_ns", Decimal( value.total ) }, { "min_ns", Decimal( value.min ) }, { "max_ns", Decimal( value.max ) },
@@ -5261,6 +5262,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "io.statistics" )
         {
+            const auto exactLatency = pagedSessionIo ?
+                source->GetIoLatencyStatistics() :
+                std::optional<analysis::IoLatencyStatisticsDto> {};
+            if( pagedSessionIo && !exactLatency )
+                throw std::runtime_error( "session_io_latency_statistics_unavailable" );
             const auto forEachIoRequest = [&]( auto&& visitor ) {
                 if( !pagedSessionIo )
                 {
@@ -5327,9 +5333,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const bool badOrder = ( value.startNs && !value.orphan && *value.startNs < value.queueNs ) ||
                     ( value.endNs && value.startNs && *value.endNs < *value.startNs ) || ( value.endNs && !value.orphan && *value.endNs < value.queueNs );
                 invalidOrder += badOrder;
-                if( value.startNs && !value.orphan && *value.startNs >= value.queueNs ) queueLatency.push_back( *value.startNs - value.queueNs );
-                if( value.startNs && value.endNs && *value.endNs >= *value.startNs ) execution.push_back( *value.endNs - *value.startNs );
-                if( value.endNs && !value.orphan && *value.endNs >= value.queueNs ) total.push_back( *value.endNs - value.queueNs );
+                if( !exactLatency )
+                {
+                    if( value.startNs && !value.orphan && *value.startNs >= value.queueNs ) queueLatency.push_back( *value.startNs - value.queueNs );
+                    if( value.startNs && value.endNs && *value.endNs >= *value.startNs ) execution.push_back( *value.endNs - *value.startNs );
+                    if( value.endNs && !value.orphan && *value.endNs >= value.queueNs ) total.push_back( *value.endNs - value.queueNs );
+                }
             } );
             auto result = base();
             result["counts"] = {
@@ -5339,9 +5348,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "operations", std::move( operationCounts ) }
             };
             result["latency"] = {
-                { "queue", StatisticsJson( analysis::ComputeStatistics( std::move( queueLatency ) ) ) },
-                { "execution", StatisticsJson( analysis::ComputeStatistics( std::move( execution ) ) ) },
-                { "total", StatisticsJson( analysis::ComputeStatistics( std::move( total ) ) ) }
+                { "queue", exactLatency ? StatisticsJson( exactLatency->queue ) :
+                    StatisticsJson( analysis::ComputeStatistics( std::move( queueLatency ) ) ) },
+                { "execution", exactLatency ? StatisticsJson( exactLatency->execution ) :
+                    StatisticsJson( analysis::ComputeStatistics( std::move( execution ) ) ) },
+                { "total", exactLatency ? StatisticsJson( exactLatency->total ) :
+                    StatisticsJson( analysis::ComputeStatistics( std::move( total ) ) ) }
             };
             result["quality"] = {
                 { "missing_start", Decimal( missingStart ) }, { "missing_terminal", Decimal( missingTerminal ) },
