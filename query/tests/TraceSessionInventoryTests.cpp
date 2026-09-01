@@ -2316,6 +2316,19 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     const auto gpuZoneRoot = tracy::analysis::TraceSessionGpuZoneIndexRoot( sessionRoot, manifest );
     test.Check( !std::filesystem::exists( gpuZoneRoot / "zones.work" ),
         "Session GPU Zone builder removes its temporary stream before publishing the index" );
+    auto gpuZoneReader = tracy::analysis::TraceSessionGpuZoneReader::Open(
+        sessionRoot, manifest, error );
+    const auto gpuContextZeroRef = std::string( "tracy:v1:" ) +
+        manifest.source.sha256.substr( 0, 16 ) + ":gpu-context:0";
+    tracy::analysis::ScanRange narrowGpuZoneRange;
+    narrowGpuZoneRange.startNs = 37;
+    narrowGpuZoneRange.endNs = 39;
+    narrowGpuZoneRange.limit = 16;
+    const auto contextGpuZones = gpuZoneReader ? gpuZoneReader->ScanContext(
+        gpuContextZeroRef, narrowGpuZoneRange ) : std::vector<tracy::analysis::GpuZoneDto> {};
+    test.Check( gpuZoneReader && gpuZoneReader->Stats().zoneBlocks != 0 &&
+        contextGpuZones.size() == 1 && contextGpuZones.front().contextRef == gpuContextZeroRef,
+        "Session GPU Zone publishes exact time/Context block indexes: " + error );
     const auto schedulingRoot = tracy::analysis::TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
     bool schedulingWorkFound = false;
     std::string schedulingWorkNames;
@@ -3088,6 +3101,12 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 { "protocol", "tracy-query/1" }, { "id", "session-gpu-zone" }, { "method", "zone.gpu.search" },
                 { "params", { { "trace_id", traceId } } }
             } );
+            const auto gpuContextSearch = query.Execute( {
+                { "protocol", "tracy-query/1" }, { "id", "session-gpu-zone-context" },
+                { "method", "zone.gpu.search" }, { "params", { { "trace_id", traceId },
+                    { "context_ref", gpuContextZeroRef }, { "start_ns", 37 },
+                    { "end_ns", 39 }, { "limit", 16 } } }
+            } );
             test.Check( gpuContexts.value( "ok", false ) && gpuContexts["data"]["contexts"].size() == 1 &&
                 gpuContexts["data"]["contexts"][0]["type_name"] == "direct3d12" &&
                 gpuContexts["data"]["contexts"][0]["zone_count"] == "1" &&
@@ -3099,7 +3118,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
                 gpuSearch["data"]["zones"][0]["cpu_end_ns"] == "-162" &&
                 gpuSearch["data"]["zones"][0]["self_time_ns"] == "4" &&
                 gpuSearch["data"]["zones"][0]["query_id"] == 7 &&
-                gpuSearch["data"]["zones"][0]["complete"] == true,
+                gpuSearch["data"]["zones"][0]["complete"] == true &&
+                gpuContextSearch.value( "ok", false ) &&
+                gpuContextSearch["data"]["zones"].size() == 1 &&
+                gpuContextSearch["data"]["zones"][0]["context_ref"] == gpuContextZeroRef,
                 "Query 1.34 restores Session GPU timestamp, CPU submission, Context and Query ID semantics" );
         }
         catch( const std::exception& exception )

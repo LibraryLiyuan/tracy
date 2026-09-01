@@ -7,6 +7,8 @@
 #include "TracyQueue.hpp"
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -51,7 +53,9 @@ struct GpuZoneFileHeader
     uint64_t completeZoneCount = 0;
     uint64_t contextCount = 0;
     uint64_t sourceCount = 0;
+    uint64_t zoneBlockCount = 0;
     uint64_t zonesOffset = 0;
+    uint64_t zoneBlocksOffset = 0;
     uint64_t contextsOffset = 0;
     uint64_t sourcesOffset = 0;
     uint32_t generationBytes = 0;
@@ -103,7 +107,20 @@ struct StoredSource
     uint32_t fileBytes = 0;
     uint32_t flags = 0;
 };
+
+struct StoredZoneBlock
+{
+    uint64_t firstZone = 0;
+    uint32_t zoneCount = 0;
+    uint32_t reserved = 0;
+    int64_t minStartNs = 0;
+    int64_t maxEndNs = 0;
+    uint64_t contextBloom[4] {};
+};
 #pragma pack( pop )
+
+void AddContext( StoredZoneBlock& block, uint32_t context );
+bool MayContainContext( const StoredZoneBlock& block, uint32_t context );
 
 struct GpuZoneManifest
 {
@@ -237,26 +254,59 @@ public:
         uint64_t zones, uint64_t complete, GpuZoneManifest& manifest, std::string& error )
     {
         m_file.flush(); if( !m_file ) { error = "session_gpu_zone_work_flush_failed"; return false; } m_file.close();
+        constexpr uint32_t ZonesPerBlock = 4096;
+        std::vector<StoredZoneBlock> blocks;
+        blocks.reserve( size_t( ( zones + ZonesPerBlock - 1 ) / ZonesPerBlock ) );
+        std::ifstream zonesIn( m_workPath, std::ios::binary );
+        if( !zonesIn ) { error = "session_gpu_zone_work_read_failed"; return false; }
+        for( uint64_t first = 0; first < zones; first += ZonesPerBlock )
+        {
+            StoredZoneBlock block;
+            block.firstZone = first;
+            block.zoneCount = uint32_t( std::min<uint64_t>( ZonesPerBlock, zones - first ) );
+            block.minStartNs = std::numeric_limits<int64_t>::max();
+            block.maxEndNs = std::numeric_limits<int64_t>::min();
+            for( uint32_t index = 0; index < block.zoneCount; ++index )
+            {
+                StoredZone zone;
+                if( !zonesIn.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) ||
+                    zone.id != first + index )
+                { error = "session_gpu_zone_block_source_invalid"; return false; }
+                const auto start = ( zone.flags & ZoneGpuStartValid ) != 0 ? zone.gpuStartNs : zone.cpuStartNs;
+                const auto end = ( zone.flags & ZoneGpuEndValid ) != 0 ? zone.gpuEndNs : start;
+                block.minStartNs = std::min( block.minStartNs, std::min( start, end ) );
+                block.maxEndNs = std::max( block.maxEndNs, std::max( start, end ) );
+                AddContext( block, zone.context );
+            }
+            blocks.emplace_back( block );
+        }
+        if( zonesIn.peek() != std::char_traits<char>::eof() )
+        { error = "session_gpu_zone_block_source_trailing_bytes"; return false; }
+        zonesIn.clear(); zonesIn.seekg( 0 );
         const auto target = m_root / GpuZoneFileName; auto temporary = target; temporary += ".tmp";
         std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "session_gpu_zone_file_open_failed"; return false; }
         GpuZoneFileHeader header;
         header.sourceSize = m_session->source.fileSize; header.zoneCount = zones;
         header.completeZoneCount = complete; header.contextCount = contexts.size(); header.sourceCount = sources.size();
+        header.zoneBlockCount = blocks.size();
         header.generationBytes = uint32_t( m_session->generation.size() );
         header.zonesOffset = sizeof( header ) + m_session->source.sha256.size() + m_session->generation.size();
-        header.contextsOffset = header.zonesOffset + zones * sizeof( StoredZone );
+        header.zoneBlocksOffset = header.zonesOffset + zones * sizeof( StoredZone );
+        header.contextsOffset = header.zoneBlocksOffset + blocks.size() * sizeof( StoredZoneBlock );
         uint64_t contextBytes = 0;
         for( const auto& context : contexts ) contextBytes += sizeof( StoredContext ) + context.name.size();
         header.sourcesOffset = header.contextsOffset + contextBytes;
         out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
         out.write( m_session->source.sha256.data(), std::streamsize( m_session->source.sha256.size() ) );
         out.write( m_session->generation.data(), std::streamsize( m_session->generation.size() ) );
-        std::ifstream zonesIn( m_workPath, std::ios::binary );
         std::vector<char> buffer( 1024 * 1024 );
         while( zonesIn ) { zonesIn.read( buffer.data(), std::streamsize( buffer.size() ) ); const auto n = zonesIn.gcount(); if( n > 0 ) out.write( buffer.data(), n ); }
         if( !zonesIn.eof() ) { error = "session_gpu_zone_copy_failed"; return false; }
         zonesIn.close();
+        if( !blocks.empty() ) out.write( reinterpret_cast<const char*>( blocks.data() ),
+            std::streamsize( blocks.size() * sizeof( StoredZoneBlock ) ) );
+        if( !out ) { error = "session_gpu_zone_block_write_failed"; return false; }
         for( const auto& context : contexts )
         {
             StoredContext stored;
@@ -287,7 +337,7 @@ public:
         manifest.generation = m_session->generation; manifest.fileBytes = std::filesystem::file_size( target, ec );
         if( ec ) { error = "session_gpu_zone_file_size_failed:" + ec.message(); return false; }
         manifest.fileSha256 = Sha256File( target ); manifest.stats.contexts = contexts.size();
-        manifest.stats.zones = zones; manifest.stats.completeZones = complete;
+        manifest.stats.zones = zones; manifest.stats.zoneBlocks = blocks.size(); manifest.stats.completeZones = complete;
         manifest.stats.sourceLocations = sources.size(); manifest.stats.fileBytes = manifest.fileBytes;
         return true;
     }
@@ -720,7 +770,8 @@ bool SaveManifest( const std::filesystem::path& root, const GpuZoneManifest& val
         << "source_sha256 " << std::quoted( value.sourceSha256 ) << '\n' << "source_size " << value.sourceSize << '\n'
         << "generation " << std::quoted( value.generation ) << '\n' << "file_bytes " << value.fileBytes << '\n'
         << "file_sha256 " << std::quoted( value.fileSha256 ) << '\n' << "contexts " << value.stats.contexts << '\n'
-        << "zones " << value.stats.zones << '\n' << "complete_zones " << value.stats.completeZones << '\n'
+        << "zones " << value.stats.zones << '\n' << "zone_blocks " << value.stats.zoneBlocks << '\n'
+        << "complete_zones " << value.stats.completeZones << '\n'
         << "source_locations " << value.stats.sourceLocations << '\n' << "begin_events " << value.stats.beginEvents << '\n'
         << "end_events " << value.stats.endEvents << '\n' << "gpu_time_events " << value.stats.gpuTimeEvents << '\n'
         << "calibration_events " << value.stats.calibrationEvents << '\n' << "sync_events " << value.stats.syncEvents << '\n';
@@ -739,7 +790,8 @@ bool LoadManifest( const std::filesystem::path& root, GpuZoneManifest& value, st
         else if( key == "source_sha256" ) in >> std::quoted( value.sourceSha256 ); else if( key == "source_size" ) in >> value.sourceSize;
         else if( key == "generation" ) in >> std::quoted( value.generation ); else if( key == "file_bytes" ) in >> value.fileBytes;
         else if( key == "file_sha256" ) in >> std::quoted( value.fileSha256 ); else if( key == "contexts" ) in >> value.stats.contexts;
-        else if( key == "zones" ) in >> value.stats.zones; else if( key == "complete_zones" ) in >> value.stats.completeZones;
+        else if( key == "zones" ) in >> value.stats.zones; else if( key == "zone_blocks" ) in >> value.stats.zoneBlocks;
+        else if( key == "complete_zones" ) in >> value.stats.completeZones;
         else if( key == "source_locations" ) in >> value.stats.sourceLocations; else if( key == "begin_events" ) in >> value.stats.beginEvents;
         else if( key == "end_events" ) in >> value.stats.endEvents; else if( key == "gpu_time_events" ) in >> value.stats.gpuTimeEvents;
         else if( key == "calibration_events" ) in >> value.stats.calibrationEvents; else if( key == "sync_events" ) in >> value.stats.syncEvents;
@@ -756,6 +808,48 @@ bool LoadManifest( const std::filesystem::path& root, GpuZoneManifest& value, st
 std::string MakeRef( const std::string& fingerprint, const char* kind, uint64_t id )
 {
     std::ostringstream out; out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id; return out.str();
+}
+
+std::optional<uint32_t> ParseContextRef( const std::string& fingerprint,
+    std::string_view ref )
+{
+    const auto prefix = std::string( "tracy:v1:" ) + fingerprint.substr( 0, 16 ) + ":gpu-context:";
+    if( !ref.starts_with( prefix ) ) return std::nullopt;
+    uint32_t value = 0;
+    const auto first = ref.data() + prefix.size();
+    const auto last = ref.data() + ref.size();
+    const auto parsed = std::from_chars( first, last, value, 16 );
+    if( parsed.ec != std::errc {} || parsed.ptr != last ) return std::nullopt;
+    return value;
+}
+
+uint64_t MixContext( uint64_t value )
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
+void AddContext( StoredZoneBlock& block, uint32_t context )
+{
+    const auto mixed = MixContext( context );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits ) block.contextBloom[bit >> 6] |= uint64_t( 1 ) << ( bit & 63 );
+}
+
+bool MayContainContext( const StoredZoneBlock& block, uint32_t context )
+{
+    const auto mixed = MixContext( context );
+    const std::array<uint8_t, 3> bits = {
+        uint8_t( mixed ), uint8_t( mixed >> 21 ), uint8_t( mixed >> 42 ) };
+    for( const auto bit : bits )
+    {
+        if( ( block.contextBloom[bit >> 6] & ( uint64_t( 1 ) << ( bit & 63 ) ) ) == 0 ) return false;
+    }
+    return true;
 }
 
 const char* ContextTypeName( uint8_t value )
@@ -792,6 +886,7 @@ const char* UnavailableReasonName( uint8_t value )
 struct TraceSessionGpuZoneReader::Impl
 {
     std::filesystem::path path; std::string fingerprint; uint64_t zonesOffset = 0, zoneCount = 0;
+    std::vector<StoredZoneBlock> zoneBlocks;
     std::unordered_map<int32_t, SourceState> sources;
     bool ReadZone( uint64_t id, StoredZone& zone ) const
     {
@@ -824,7 +919,8 @@ TraceSessionGpuZoneReader::TraceSessionGpuZoneReader( std::shared_ptr<Impl> impl
 
 std::filesystem::path TraceSessionGpuZoneIndexRoot( const std::filesystem::path& sessionRoot, const TraceSessionManifest& manifest )
 {
-    return sessionRoot / "generations" / manifest.generation / "derived" / "gpu-zone-index" / "1" / "exact";
+    return sessionRoot / "generations" / manifest.generation / "derived" / "gpu-zone-index" /
+        std::to_string( TraceSessionGpuZoneIndexSchemaVersion ) / "exact";
 }
 
 bool CleanupTraceSessionGpuZoneTemporaryFiles( const std::filesystem::path& sessionRoot,
@@ -901,14 +997,36 @@ std::shared_ptr<TraceSessionGpuZoneReader> TraceSessionGpuZoneReader::Open(
         header.sourceSize != session.source.fileSize || header.zoneCount != manifest.stats.zones ||
         header.completeZoneCount != manifest.stats.completeZones ||
         header.contextCount != manifest.stats.contexts || header.sourceCount != manifest.stats.sourceLocations ||
+        header.zoneBlockCount != manifest.stats.zoneBlocks ||
         header.generationBytes != session.generation.size() )
     { error = "session_gpu_zone_file_header_invalid"; return {}; }
     std::string sha( 64, '\0' ), generation( header.generationBytes, '\0' );
     if( !in.read( sha.data(), std::streamsize( sha.size() ) ) || !in.read( generation.data(), std::streamsize( generation.size() ) ) ||
         sha != session.source.sha256 || generation != session.generation )
     { error = "session_gpu_zone_file_identity_invalid"; return {}; }
+    const auto expectedZonesOffset = sizeof( header ) + sha.size() + generation.size();
+    const auto expectedBlocksOffset = expectedZonesOffset + header.zoneCount * sizeof( StoredZone );
+    const auto expectedContextsOffset = expectedBlocksOffset + header.zoneBlockCount * sizeof( StoredZoneBlock );
+    if( header.zonesOffset != expectedZonesOffset || header.zoneBlocksOffset != expectedBlocksOffset ||
+        header.contextsOffset != expectedContextsOffset || header.sourcesOffset < header.contextsOffset )
+    { error = "session_gpu_zone_file_layout_invalid"; return {}; }
     auto impl = std::make_shared<Impl>(); impl->path = path; impl->fingerprint = session.source.sha256;
     impl->zonesOffset = header.zonesOffset; impl->zoneCount = header.zoneCount;
+    impl->zoneBlocks.resize( size_t( header.zoneBlockCount ) );
+    in.seekg( std::streamoff( header.zoneBlocksOffset ) );
+    if( !impl->zoneBlocks.empty() && !in.read( reinterpret_cast<char*>( impl->zoneBlocks.data() ),
+        std::streamsize( impl->zoneBlocks.size() * sizeof( StoredZoneBlock ) ) ) )
+    { error = "session_gpu_zone_block_records_truncated"; return {}; }
+    uint64_t expectedFirstZone = 0;
+    for( const auto& block : impl->zoneBlocks )
+    {
+        if( block.firstZone != expectedFirstZone || block.zoneCount == 0 || block.zoneCount > 4096 ||
+            block.firstZone + block.zoneCount > header.zoneCount || block.minStartNs > block.maxEndNs )
+        { error = "session_gpu_zone_block_record_invalid"; return {}; }
+        expectedFirstZone += block.zoneCount;
+    }
+    if( expectedFirstZone != header.zoneCount )
+    { error = "session_gpu_zone_block_coverage_invalid"; return {}; }
     auto reader = std::shared_ptr<TraceSessionGpuZoneReader>( new TraceSessionGpuZoneReader( impl ) ); reader->m_stats = manifest.stats;
     in.seekg( std::streamoff( header.contextsOffset ) );
     for( uint64_t i = 0; i < header.contextCount; ++i )
@@ -951,15 +1069,40 @@ std::optional<GpuZoneDto> TraceSessionGpuZoneReader::Get( uint64_t id ) const
 
 std::vector<GpuZoneDto> TraceSessionGpuZoneReader::Scan( const ScanRange& range ) const
 {
-    std::vector<GpuZoneDto> result; size_t skipped = 0; std::ifstream in( m_impl->path, std::ios::binary ); if( !in ) return result;
-    in.seekg( std::streamoff( m_impl->zonesOffset ) );
-    for( uint64_t id = 0; id < m_impl->zoneCount; ++id )
+    return ScanImpl( range, std::nullopt );
+}
+
+std::vector<GpuZoneDto> TraceSessionGpuZoneReader::ScanContext(
+    std::string_view contextRef, const ScanRange& range ) const
+{
+    const auto context = ParseContextRef( m_impl->fingerprint, contextRef );
+    return context ? ScanImpl( range, context ) : std::vector<GpuZoneDto> {};
+}
+
+std::vector<GpuZoneDto> TraceSessionGpuZoneReader::ScanImpl(
+    const ScanRange& range, std::optional<uint32_t> context ) const
+{
+    std::vector<GpuZoneDto> result;
+    if( range.limit == 0 ) return result;
+    size_t skipped = 0; std::ifstream in( m_impl->path, std::ios::binary ); if( !in ) return result;
+    for( const auto& block : m_impl->zoneBlocks )
     {
-        StoredZone zone; if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) || zone.id != id ) break;
-        const auto start = ( zone.flags & ZoneGpuStartValid ) ? zone.gpuStartNs : zone.cpuStartNs;
-        const auto end = ( zone.flags & ZoneGpuEndValid ) ? zone.gpuEndNs : start;
-        if( end < range.startNs || start > range.endNs ) continue; if( skipped++ < range.offset ) continue;
-        result.emplace_back( m_impl->ToDto( zone ) ); if( result.size() >= range.limit ) break;
+        if( block.maxEndNs < range.startNs || block.minStartNs > range.endNs ||
+            ( context && !MayContainContext( block, *context ) ) ) continue;
+        in.clear();
+        in.seekg( std::streamoff( m_impl->zonesOffset + block.firstZone * sizeof( StoredZone ) ) );
+        for( uint32_t index = 0; index < block.zoneCount; ++index )
+        {
+            StoredZone zone; const auto id = block.firstZone + index;
+            if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) || zone.id != id ) return result;
+            if( context && zone.context != *context ) continue;
+            const auto start = ( zone.flags & ZoneGpuStartValid ) ? zone.gpuStartNs : zone.cpuStartNs;
+            const auto end = ( zone.flags & ZoneGpuEndValid ) ? zone.gpuEndNs : start;
+            if( end < range.startNs || start > range.endNs ) continue;
+            if( skipped++ < range.offset ) continue;
+            result.emplace_back( m_impl->ToDto( zone ) );
+            if( result.size() >= range.limit ) return result;
+        }
     }
     return result;
 }

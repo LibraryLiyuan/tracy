@@ -8139,8 +8139,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     if( method == "zone.gpu.search" )
     {
         const auto page = ParsePage( params, method, trace );
+        const std::string contextRef = params.value( "context_ref", "" );
         auto scanPage = ScanFiltered<analysis::GpuZoneDto>( *source, params, page,
-            []( const auto& source, const auto& range ) { return source.ScanGpuZones( range ); },
+            [&]( const auto& source, const auto& range ) {
+                return contextRef.empty() ? source.ScanGpuZones( range ) :
+                    source.ScanGpuZonesForContext( contextRef, range );
+            },
             [&]( const auto& value ) { return TextMatches( value.name, params ); }, GpuZoneJson );
         scanPage.values = ProjectFields( std::move( scanPage.values ), params );
         const auto returned = scanPage.values.size();

@@ -59,6 +59,8 @@ public:
     std::vector<CpuZoneDto> ScanCpuZonesForThread(
         std::string_view threadRef, const ScanRange& range ) const override;
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override;
+    std::vector<GpuZoneDto> ScanGpuZonesForContext(
+        std::string_view contextRef, const ScanRange& range ) const override;
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override;
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override;
     std::vector<MessageDto> ScanMessages( const ScanRange& range ) const override;

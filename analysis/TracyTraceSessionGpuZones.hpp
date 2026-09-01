@@ -15,12 +15,13 @@
 namespace tracy::analysis
 {
 
-inline constexpr uint32_t TraceSessionGpuZoneIndexSchemaVersion = 1;
+inline constexpr uint32_t TraceSessionGpuZoneIndexSchemaVersion = 2;
 
 struct TraceSessionGpuZoneStats
 {
     uint64_t contexts = 0;
     uint64_t zones = 0;
+    uint64_t zoneBlocks = 0;
     uint64_t completeZones = 0;
     uint64_t sourceLocations = 0;
     uint64_t beginEvents = 0;
@@ -41,12 +42,16 @@ public:
     const TraceSessionGpuZoneStats& Stats() const { return m_stats; }
     const std::vector<GpuContextDto>& Contexts() const { return m_contexts; }
     std::vector<GpuZoneDto> Scan( const ScanRange& range ) const;
+    std::vector<GpuZoneDto> ScanContext( std::string_view contextRef,
+        const ScanRange& range ) const;
     std::optional<GpuZoneDto> Get( uint64_t id ) const;
     std::vector<GpuZoneDto> Children( uint64_t id, size_t offset, size_t limit ) const;
 
 private:
     struct Impl;
     explicit TraceSessionGpuZoneReader( std::shared_ptr<Impl> impl );
+    std::vector<GpuZoneDto> ScanImpl( const ScanRange& range,
+        std::optional<uint32_t> context ) const;
     std::shared_ptr<Impl> m_impl;
     TraceSessionGpuZoneStats m_stats;
     std::vector<GpuContextDto> m_contexts;

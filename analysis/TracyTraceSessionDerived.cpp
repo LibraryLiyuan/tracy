@@ -196,6 +196,7 @@ bool SaveIndexManifest( const std::filesystem::path& root,
     out << "symbol_code_bytes " << value.stats.symbolCodeBytes << '\n';
     out << "gpu_contexts " << value.stats.gpuContexts << '\n';
     out << "gpu_zones " << value.stats.gpuZones << '\n';
+    out << "gpu_zone_blocks " << value.stats.gpuZoneBlocks << '\n';
     out << "complete_gpu_zones " << value.stats.completeGpuZones << '\n';
     out << "gpu_zone_sources " << value.stats.gpuZoneSources << '\n';
     out << "gpu_zone_begins " << value.stats.gpuZoneBegins << '\n';
@@ -318,6 +319,7 @@ bool LoadIndexManifest( const std::filesystem::path& root,
         else if( key == "symbol_code_bytes" ) in >> value.stats.symbolCodeBytes;
         else if( key == "gpu_contexts" ) in >> value.stats.gpuContexts;
         else if( key == "gpu_zones" ) in >> value.stats.gpuZones;
+        else if( key == "gpu_zone_blocks" ) in >> value.stats.gpuZoneBlocks;
         else if( key == "complete_gpu_zones" ) in >> value.stats.completeGpuZones;
         else if( key == "gpu_zone_sources" ) in >> value.stats.gpuZoneSources;
         else if( key == "gpu_zone_begins" ) in >> value.stats.gpuZoneBegins;
@@ -647,6 +649,7 @@ bool BuildTraceSessionMandatoryDerived( const std::filesystem::path& sessionRoot
     else if( !BuildTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ) return false;
     index.stats.gpuContexts = gpuZoneStats.contexts;
     index.stats.gpuZones = gpuZoneStats.zones;
+    index.stats.gpuZoneBlocks = gpuZoneStats.zoneBlocks;
     index.stats.completeGpuZones = gpuZoneStats.completeZones;
     index.stats.gpuZoneSources = gpuZoneStats.sourceLocations;
     index.stats.gpuZoneBegins = gpuZoneStats.beginEvents;
@@ -882,6 +885,7 @@ bool AuditTraceSessionFinal( const std::filesystem::path& sessionRoot,
     if( !AuditTraceSessionGpuZoneDerived( sessionRoot, manifest, gpuZoneStats, error ) ||
         gpuZoneStats.contexts != index.stats.gpuContexts ||
         gpuZoneStats.zones != index.stats.gpuZones ||
+        gpuZoneStats.zoneBlocks != index.stats.gpuZoneBlocks ||
         gpuZoneStats.completeZones != index.stats.completeGpuZones ||
         gpuZoneStats.sourceLocations != index.stats.gpuZoneSources ||
         gpuZoneStats.beginEvents != index.stats.gpuZoneBegins ||

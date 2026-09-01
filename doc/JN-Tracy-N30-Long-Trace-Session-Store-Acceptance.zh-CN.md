@@ -875,7 +875,7 @@ GREEN：
 ### 尚未完成，不能提前通过N30.6
 
 - FrameImage与基础`Frames` FrameSet的raw index关联已接入；仍需在短Trace传统Worker差分中覆盖On-demand首次连接、pre-capture图片丢弃和初始Frame offset变体。
-- GPU Zone Reader当前使用固定宽度文件线性扫描；在N30.6完成前仍需增加immutable时间/Context/父节点索引，并补齐Annotation以及serial/fiber边界的传统Worker差分，不能据此提前通过长Trace查询性能门禁。
+- GPU Zone schema 2已经增加4096条一块的immutable时间包络与256-bit Context Bloom，时间窗口和指定Context可跳过不可能命中的块；父节点查询仍需posting index，并且Annotation及serial/fiber边界仍需传统Worker差分，不能据此提前通过长Trace查询性能门禁。
 - Scheduling schema 5已经为线程/CPU固定宽度记录增加4096条一块的immutable时间包络与256-bit identity Bloom；时间窗口、指定thread和指定CPU可跳过不可能命中的块。仍需在真实长Trace验证查询延迟，若Bloom误命中导致门禁不通过，再升级为压缩posting list。
 - Sampling schema 3已为普通Sample增加4096条一块的immutable时间包络和Thread Bloom；Hardware Sample已按address/kind建立精确offset。仍需对真实长Trace查询延迟做门禁。Callstack frame、符号和SourceLocation已可导航，但Parent Callstack、embedded Source、Symbol反汇编和Sample Symbol Statistics尚未完成，相关能力不得提前宣称。
 - 当前Job Reader已经具备正确语义和强校验，但打开时仍会物化该Session的全部Job DTO；在N30.6完成前必须改为immutable Job shards + 分页/范围读取，不能把当前实现用于宣称长录制内存门禁通过。
@@ -1375,6 +1375,17 @@ Trace Session Inventory tests passed
 - 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
 
 仍待N30.6集中门禁：parent→children posting index、真实长Trace时间/thread查询延迟和SourceLocation驻留内存评估。
+
+### 2026-09-01 GPU Zone 时间与 Context 块索引（N30.6B 子阶段）
+
+- GPU Zone schema升级到2，在固定宽度Zone记录后追加4096条一块的immutable block目录。
+- 每个block保存记录范围、GPU/CPU fallback时间包络和256-bit Context Bloom；Reader仍逐条核对Context及原有GPU Zone时间交集，Bloom误命中不会改变结果。
+- `zone.gpu.search`新增可选`context_ref`下推，Session路径直接调用`ScanContext`；Legacy Worker路径保持正确的兼容过滤。
+- Context 0是合法身份，解析与Bloom不能把它误判为缺失；synthetic已验证`gpu-context:0`和`[37,39]ns`精确返回唯一Zone。
+- header、manifest与Final Audit同时核对block数量、连续覆盖、布局、文件大小和SHA-256；索引根目录跟随schema版本。
+- 单节点inventory测试与六项N29/N30组合回归通过（6/6）。
+
+仍待N30.6集中门禁：GPU parent→children posting index、Annotation、serial/fiber传统Worker差分与真实长Trace延迟。
 
 Synthetic验证thread 42的普通/ContextSwitch Sample、Query thread filter、Hardware六类PMU事件、block计数和临时文件清理：
 

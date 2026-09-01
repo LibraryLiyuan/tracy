@@ -686,6 +686,13 @@ std::vector<GpuZoneDto> GpuAnalysisTraceSource::ScanGpuZones( const ScanRange& r
     if( WorkerLoaded() ) return Worker().ScanGpuZones( range );
     return m_gpuZoneReader ? m_gpuZoneReader->Scan( range ) : std::vector<GpuZoneDto> {};
 }
+std::vector<GpuZoneDto> GpuAnalysisTraceSource::ScanGpuZonesForContext(
+    std::string_view contextRef, const ScanRange& range ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanGpuZonesForContext( contextRef, range );
+    return m_gpuZoneReader ? m_gpuZoneReader->ScanContext( contextRef, range ) :
+        std::vector<GpuZoneDto> {};
+}
 std::vector<MemoryEventDto> GpuAnalysisTraceSource::ScanMemoryEvents( const ScanRange& range ) const
 {
     if( WorkerLoaded() ) return Worker().ScanMemoryEvents( range );

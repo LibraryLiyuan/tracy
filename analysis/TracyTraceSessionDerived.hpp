@@ -62,6 +62,7 @@ struct TraceSessionDerivedStats
     uint64_t symbolCodeBytes = 0;
     uint64_t gpuContexts = 0;
     uint64_t gpuZones = 0;
+    uint64_t gpuZoneBlocks = 0;
     uint64_t completeGpuZones = 0;
     uint64_t gpuZoneSources = 0;
     uint64_t gpuZoneBegins = 0;
