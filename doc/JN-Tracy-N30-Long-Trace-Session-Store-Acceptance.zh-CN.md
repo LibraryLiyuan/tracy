@@ -80,13 +80,21 @@ Projected full replay: approximately 90–100 GiB
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
-| N30.5 Derived/N29整合 | Passed | 全域不可变索引、Canonical GPU→N29 derived、pointer生命周期、强制索引门禁和Final Audit已通过synthetic；失败不会发布Session。 |
-| N30.6 Query/MCP/导出 | InProgress | Query 1.34已直接打开Session GPU derived；generation固定、能力门禁、构建状态、有序Canonical Reader、Frame、Job、CPU/GPU Zone、Memory、Sampling/Hardware Sample、Scheduling、FrameImage、Source/Callsite/Callstack/Symbol、Relation、Runtime Domain、C#/Lua Script、Plot、Message和Lock语义索引已完成，其余域的分页Reader及局部导出仍在实施。 |
+| N30.5 Derived/N29整合 | InProgress（N30A重开） | Synthetic路径已通过，但真实30分钟GPU Derived未完成最终发布、count/bytes/peak/checksum和16 GiB门禁；不得继续标记Passed。 |
+| N30.6 Query/MCP/导出 | Paused（Query部分完成） | Query 1.34已完成大量Session Reader；Protocol重放式局部导出因握手、delta时间和开放边界问题退出正式主线。N30A先完成全域可信Session，局部`.tracy`导出转入后续方案C。 |
 | N30.7 LTS-1 | NotStarted | — |
 | N30.8 Profiler Session | NotStarted | — |
 | N30.9 LTS-2 | NotStarted | — |
 
 后续每阶段记录：源码HEAD、测试RED/GREEN证据、工具SHA-256、输入身份、事件/关系计数、内存/磁盘/耗时、失败项和回滚提交。
+
+### 2026-09-01 N30A策略重置
+
+- 当前正式基线：`b121e58c N30.6 Plan exact export boundaries`。
+- 未提交Protocol replay导出实验已保存到授权诊断目录；Patch SHA-256为`49C3610D0AA06D9FBF93E12D9FA1B0E761B6FB1A15F4EDF309F160491750EB10`。
+- 三个实验文件已恢复到HEAD内容；`build-n30-stream-tests/`作为既有未跟踪构建目录保留。
+- 新优先级：全域Canonical正确性 → GPU Derived纵向闭环 → GPU真实规模门禁 → 其他数据域收口 → 全域Final Audit。
+- N30A期间不实现局部`.tracy`导出或Profiler Session后端；二者分别进入后续方案C和P。
 
 ## 3. N30.1 Schema 与原子存储
 
@@ -1943,3 +1951,42 @@ Regression: 固定组合回归6/6通过
 ```
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
+## 9. N30A全域可信Session收口
+
+### 2026-09-01 A0恢复可信基线
+
+状态：**Passed**。
+
+- 正式基线为`b121e58c22d964eef05ca3fbbd834dc2d6a53e19`。
+- Protocol replay导出WIP已保存为独立patch；SHA-256为`49C3610D0AA06D9FBF93E12D9FA1B0E761B6FB1A15F4EDF309F160491750EB10`。
+- 三个实验文件内容哈希与HEAD逐项相等，Git暂存区无差异；既有`build-n30-stream-tests/`未跟踪目录未修改。
+- N30.5从历史表中的`Passed`纠正为`InProgress（N30A重开）`；N30.6导出路径暂停，Query已完成部分保留。
+- 新计划记录于`JN-Tracy-N30A-Trusted-Session-Completion-Plan.zh-CN.md`。
+
+短回归：
+
+```text
+tracy-query-contract              Passed
+tracy-gpu-analysis                Passed
+tracy-trace-session-store         Passed
+tracy-trace-session-inventory     Passed
+tracy-query-mcp-transcript        Passed
+tracy-query-version               Passed
+tracy-query-doctor                Passed
+tracy-gpu-analysis-n29-static     Passed
+
+8/8 Passed；Total Test Time 2.67 sec
+```
+
+工具身份：
+
+```text
+tracy-query.exe
+AEBC5B533C0B2F866BC41EADC204654ADB1409C034D56655C5609279A51DA252
+
+tracy-trace-session-inventory-tests.exe
+BA2D43985611CE0DF08B92B277D82F3F5B322EE6331EDE646E79AD11BC32EBB5
+```
+
+本阶段没有启动G05或真实30分钟转换。
