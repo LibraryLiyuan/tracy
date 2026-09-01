@@ -2838,8 +2838,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     test.Check( schedulingReader && !cpuUsage.empty() &&
         cpuUsage.front().timeNs == 0 && cpuUsage.front().own == 0 &&
         cpuUsage.front().other == 0 && hasOwnCpuUsage && hasOtherCpuUsage &&
+        cpuUsage.back().own == 0 && cpuUsage.back().other == 0 &&
         schedulingReader->Stats().cpuUsagePoints == cpuUsage.size(),
-        "Session Scheduling persists exact paged own/other CPU usage transitions: " + error );
+        "Session Scheduling closes process-scoped external gaps at the next observed CPU boundary "
+        "without leaving cumulative phantom CPU usage: " + error );
     test.Check( schedulingReader && schedulingReader->Stats().threadBlocks != 0 &&
         schedulingReader->Stats().cpuBlocks != 0,
         "Session Scheduling publishes bounded immutable time-block indexes" );

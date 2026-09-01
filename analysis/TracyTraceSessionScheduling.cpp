@@ -890,11 +890,33 @@ bool BuildCpuUsageFile( BuildState& state, std::filesystem::path& outputPath,
     { error = "session_scheduling_cpu_usage_source_open_failed"; return false; }
     uint64_t transitionOrdinal = 0;
     uint64_t transitionCount = 0;
+    // Process-scoped Windows context-switch capture intentionally omits
+    // external-to-external switches.  The raw CPU interval for the first
+    // external thread must remain incomplete (its thread attribution cannot
+    // be proven), but CPU occupancy stays in the same "other" category until
+    // the next observed boundary on that CPU.  Close only the usage
+    // transition at that boundary so stale incomplete intervals cannot
+    // accumulate into phantom CPU counts.
+    std::unordered_map<uint32_t, StoredCpuUsageTransition> pendingUsage;
     for( uint64_t index = 0; index < state.stats.cpuEvents; ++index )
     {
         StoredCpuEvent event;
         if( !cpuEvents.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) )
         { error = "session_scheduling_cpu_usage_source_truncated"; return false; }
+        const auto pending = pendingUsage.find( event.cpu );
+        if( pending != pendingUsage.end() )
+        {
+            if( event.startNs < pending->second.timeNs )
+            { error = "session_scheduling_cpu_usage_time_regression"; return false; }
+            auto end = pending->second;
+            end.timeNs = event.startNs;
+            end.sourceOrdinal = transitionOrdinal++;
+            end.ownDelta = -end.ownDelta;
+            end.otherDelta = -end.otherDelta;
+            transitions.write( reinterpret_cast<const char*>( &end ), sizeof( end ) );
+            ++transitionCount;
+            pendingUsage.erase( pending );
+        }
         const auto thread = state.threadSummaries.find( event.thread );
         const auto isLocal = thread != state.threadSummaries.end() &&
             ( thread->second.stored.zoneCount != 0 || thread->second.stored.sampleCount != 0 );
@@ -913,6 +935,10 @@ bool BuildCpuUsageFile( BuildState& state, std::filesystem::path& outputPath,
             end.ownDelta = -begin.ownDelta; end.otherDelta = -begin.otherDelta;
             transitions.write( reinterpret_cast<const char*>( &end ), sizeof( end ) );
             ++transitionCount;
+        }
+        else
+        {
+            pendingUsage.emplace( event.cpu, begin );
         }
     }
     transitions.flush();

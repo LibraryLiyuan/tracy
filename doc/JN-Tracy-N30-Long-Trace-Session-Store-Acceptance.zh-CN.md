@@ -2168,3 +2168,22 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 8.97 sec
 ```
 
 同时观察到一项尚未收口的A5性能/恢复问题：`job-pages`恢复时未复用已完成工作，需单核重新扫描约`252,997,676`条Canonical记录，运行超过10分钟且只有30秒heartbeat、没有shard百分比。该问题不是死锁或内存膨胀，但会显著放大真实验收迭代时间；在G05正确性收口后必须补充可恢复checkpoint和可观察进度。
+
+#### Process-scoped Context Switch CPU usage累计失真
+
+- G05在GPU Zone、Memory和Sampling派生完成后停止于`session_scheduling_cpu_usage_count_invalid`。
+- 对失败现场`cpu-events.work`做只读扫描：共`4,227,026`个CPU区间，其中`3,518,823`个完整、`708,203`个不完整；最大CPU编号仅为`27`，因此不是CPU数量超过`uint8_t`范围。
+- `JN_TRACY_CONTEXT_SWITCH_SCOPE=process`按设计过滤所有“外部线程→外部线程”的切换，只保留至少一端属于Unity进程的记录。Session Scheduling此前仍把第一个外部线程的未闭合区间永久加入全局CPU usage；下一次Unity线程边界到来时，原始区间因线程身份不可证明而正确保持`incomplete`，但usage没有在该CPU的新观测边界结束，最终累计出数十万个虚假并发CPU。
+- 修复保持原始Context Switch事实不变：不补写线程End、不猜测外部线程身份，`source_gap_events`和`complete=false`继续暴露；只在派生CPU usage中将pending占用延续到同一CPU的下一个已观测边界。process过滤隐藏的区间仍属于`other`类别，因此能够恢复CPU占用连续性而不伪造线程归属。
+- G05完整区间单独验证为：同一CPU重叠数`0`，全局最大完整并发`19`，证明虚高仅来自未闭合区间的累计。
+
+TDD与回归证据：
+
+```text
+RED: Synthetic process-scoped gap结束后CPU usage尾部仍为other=1
+GREEN: 原始gap interval保持incomplete；派生usage在下一观测边界回到own=0,other=0
+GREEN: tracy-trace-session-inventory-tests Passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 9.78 sec
+```
+
+G05仍需使用修复后的Release Converter从Scheduling阶段恢复，成功发布前不宣称A5通过。
