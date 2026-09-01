@@ -33,7 +33,10 @@ enum class GpuAnalysisStorePageKind : uint8_t
     ResourcePassIndex,
     FramePassIndex,
     Range,
-    ResourceSummary
+    ResourceSummary,
+    PassSummary,
+    StablePassSummary,
+    PassChildIndex
 };
 
 struct GpuAnalysisStorePage
@@ -65,6 +68,9 @@ struct GpuAnalysisStoreManifest
     uint64_t resourceCount = 0;
     uint64_t allocationCount = 0;
     uint64_t passCount = 0;
+    uint64_t passSummaryCount = 0;
+    uint64_t stablePassSummaryCount = 0;
+    uint64_t passChildRelationCount = 0;
     uint64_t residencyCount = 0;
     uint64_t churnCount = 0;
     uint64_t resourcePassRelationCount = 0;
@@ -94,6 +100,66 @@ struct GpuAnalysisFramePassEntry
     uint64_t frameId = 0;
     uint64_t passId = 0;
 };
+
+struct GpuAnalysisPassChildEntry
+{
+    uint64_t parentPassId = 0;
+    uint64_t childPassId = 0;
+};
+
+// Fixed-width, independently paged exact summary. It lets Query/MCP inspect
+// counts, hashes and physical rollups without decoding variable-size Pass
+// member dictionaries. Exact members remain available through PassResources.
+struct GpuAnalysisPassSummary
+{
+    uint64_t passId = 0;
+    uint64_t parentPassId = 0;
+    uint64_t frameId = 0;
+    uint64_t directResourceCount = 0;
+    uint64_t inclusiveResourceCount = 0;
+    uint64_t directPhysicalBytes = 0;
+    uint64_t inclusivePhysicalBytes = 0;
+    uint64_t directResourceHash = 0;
+    uint64_t inclusiveResourceHash = 0;
+    uint64_t directRangeBytes = 0;
+    uint32_t taxonomyId = 0;
+    uint32_t unknownRangeResourceCount = 0;
+    uint8_t taxonomyLevel = 0;
+    uint8_t taxonomyFlags = 0;
+    uint8_t complete = 0;
+    uint8_t truncated = 0;
+};
+
+struct GpuAnalysisPassTaxonomyEntry
+{
+    uint64_t passId = 0;
+    uint64_t frameId = 0;
+    uint32_t taxonomyId = 0;
+    uint8_t taxonomyLevel = 0;
+    uint8_t flags = 0;
+    uint8_t reserved[2] {};
+};
+
+// Exact rollup for a stable Frame/Taxonomy node. Multiple runtime pass
+// instances with the same key are deterministically deduplicated.
+struct GpuAnalysisStablePassSummary
+{
+    uint64_t frameId = 0;
+    uint32_t taxonomyId = 0;
+    uint32_t parentTaxonomyId = 0;
+    uint64_t directResourceCount = 0;
+    uint64_t inclusiveResourceCount = 0;
+    uint64_t directPhysicalBytes = 0;
+    uint64_t inclusivePhysicalBytes = 0;
+    uint64_t directResourceHash = 0;
+    uint64_t inclusiveResourceHash = 0;
+    uint8_t taxonomyLevel = 0;
+    uint8_t complete = 0;
+    uint8_t truncated = 0;
+    uint8_t reserved[5] {};
+};
+
+uint64_t GpuAnalysisResourceSetHash( const std::vector<uint64_t>& resources );
 
 // Compact, independently paged projection used by resource listings.  Full
 // Resource pages retain history and all enrichment vectors for get/explain,
@@ -185,6 +251,10 @@ struct GpuAnalysisPassSpool
     std::vector<std::filesystem::path> viewRuns;
     std::vector<std::filesystem::path> partRuns;
     std::vector<std::filesystem::path> virtualGeometryRuns;
+    std::vector<std::filesystem::path> taxonomyRuns;
+    std::vector<std::filesystem::path> stableSummaryRuns;
+    uint64_t taxonomyCount = 0;
+    uint64_t stableSummaryCount = 0;
 };
 
 // Bounded Session Catalog product. Resource and Allocation pages are immutable
@@ -305,17 +375,26 @@ public:
     bool FindResources( std::vector<uint64_t> resourceIds, std::vector<GpuResourceAnalysisRecord>& out, std::string& error ) const;
     std::optional<GpuAllocationAnalysisRecord> FindAllocation( uint64_t allocationId, std::string& error ) const;
     std::optional<GpuPassWorkingSet> FindPass( uint64_t passId, std::string& error ) const;
+    std::optional<GpuAnalysisPassSummary> FindPassSummary( uint64_t passId, std::string& error ) const;
+    std::optional<GpuAnalysisStablePassSummary> FindStablePassSummary(
+        uint64_t frameId, uint32_t taxonomyId, std::string& error ) const;
+    bool PassResources( uint64_t passId, bool inclusive, size_t offset, size_t limit,
+        std::vector<uint64_t>& out, bool& hasMore, std::string& error ) const;
+    bool PassRelationsForResource( uint64_t resourceId, size_t offset, size_t limit,
+        std::vector<GpuAnalysisResourcePassEntry>& out, bool& hasMore, std::string& error ) const;
     bool PassesForFrame( uint64_t frameId, size_t offset, size_t limit,
         std::vector<GpuPassWorkingSet>& out, bool& hasMore, std::string& error ) const;
     bool PassesForResource( uint64_t resourceId, size_t offset, size_t limit,
         std::vector<GpuPassWorkingSet>& out, bool& hasMore, std::string& error ) const;
 
 private:
+    struct InclusiveCache;
     bool LoadPassesByIds( std::vector<uint64_t> ids, std::vector<GpuPassWorkingSet>& out, std::string& error ) const;
     std::filesystem::path m_root;
     GpuAnalysisCacheIdentity m_identity;
     GpuAnalysisStoreManifest m_manifest;
     GpuAnalysisSnapshot m_overview;
+    std::shared_ptr<InclusiveCache> m_inclusiveCache;
 };
 
 std::optional<GpuAnalysisStoreManifest> LoadGpuAnalysisStoreManifest(

@@ -9,11 +9,13 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <sstream>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #  include <Windows.h>
@@ -26,6 +28,20 @@ namespace tracy::analysis
 {
 std::optional<GpuAnalysisStoreManifest> LoadStoreManifestImpl(
     const std::filesystem::path& root, bool requireComplete, std::string& error );
+
+struct GpuAnalysisStoreReader::InclusiveCache
+{
+    struct Entry
+    {
+        std::shared_ptr<const std::vector<uint64_t>> resources;
+        uint64_t lastUse = 0;
+    };
+    static constexpr uint64_t MaximumBytes = 512ull * 1024 * 1024;
+    std::mutex mutex;
+    std::unordered_map<uint64_t, Entry> entries;
+    uint64_t bytes = 0;
+    uint64_t clock = 0;
+};
 
 namespace
 {
@@ -296,8 +312,8 @@ bool SaveStoreManifest( const std::filesystem::path& root, const GpuAnalysisStor
     out << "trace_sha256 " << std::quoted( value.traceSha256 ) << '\n';
     out << "trace_size " << value.traceSize << '\n';
 #define W( field ) out << #field " " << value.field << '\n'
-    W( resourceCount ); W( allocationCount ); W( passCount ); W( residencyCount ); W( churnCount );
-    W( resourcePassRelationCount ); W( framePassRelationCount ); W( rangeCount );
+    W( resourceCount ); W( allocationCount ); W( passCount ); W( passSummaryCount ); W( stablePassSummaryCount ); W( residencyCount ); W( churnCount );
+    W( resourcePassRelationCount ); W( framePassRelationCount ); W( passChildRelationCount ); W( rangeCount );
     W( logicalCount ); W( catalogRelationCount ); W( sourceGapResourceCount );
     W( sourceGapReferenceCount ); W( totalBytes );
 #undef W
@@ -528,6 +544,42 @@ bool RelationIds( const std::filesystem::path& root, const GpuAnalysisStoreManif
     return true;
 }
 
+GpuAnalysisPassSummary PassSummaryOf( const GpuPassWorkingSet& pass,
+    const GpuAnalysisPassTaxonomyEntry* taxonomy = nullptr )
+{
+    GpuAnalysisPassSummary value;
+    value.passId = pass.passId;
+    value.parentPassId = pass.parentPassId;
+    value.frameId = pass.frameId;
+    value.directResourceCount = pass.directResources.size();
+    value.inclusiveResourceCount = pass.inclusiveResources.size();
+    value.directPhysicalBytes = pass.directPhysicalBytes;
+    value.inclusivePhysicalBytes = pass.inclusivePhysicalBytes;
+    value.directResourceHash = GpuAnalysisResourceSetHash( pass.directResources );
+    value.inclusiveResourceHash = GpuAnalysisResourceSetHash( pass.inclusiveResources );
+    value.directRangeBytes = pass.directRangeBytes;
+    value.unknownRangeResourceCount = pass.unknownRangeResourceCount;
+    if( taxonomy )
+    {
+        value.taxonomyId = taxonomy->taxonomyId;
+        value.taxonomyLevel = taxonomy->taxonomyLevel;
+        value.taxonomyFlags = taxonomy->flags;
+    }
+    value.complete = pass.complete;
+    value.truncated = pass.truncated;
+    return value;
+}
+
+}
+
+uint64_t GpuAnalysisResourceSetHash( const std::vector<uint64_t>& resources )
+{
+    uint64_t hash = FnvOffset;
+    const uint64_t count = resources.size();
+    hash = HashUpdate( hash, &count, sizeof( count ) );
+    if( !resources.empty() )
+        hash = HashUpdate( hash, resources.data(), resources.size() * sizeof( uint64_t ) );
+    return hash;
 }
 
 bool WriteGpuAnalysisDerivedStore( const std::filesystem::path& sidecarPath,
@@ -576,7 +628,11 @@ bool WriteSortedPassBatch( const std::filesystem::path& root,
         record.unknownRangeResourceCount = value.unknownRangeResourceCount;
         record.nameBytes = uint32_t( value.name.size() );
         record.directSetId = intern( value.directResources );
-        record.inclusiveSetId = intern( value.inclusiveResources );
+        // Session Pass pages persist only authoritative Direct members. Exact
+        // Inclusive members are reconstructed from Parent->Child + Direct and
+        // verified against PassSummary count/hash.
+        static const std::vector<uint64_t> EmptySet;
+        record.inclusiveSetId = intern( EmptySet );
         record.evidenceCount = uint32_t( value.detailedEvidence.size() );
         record.complete = value.complete; record.truncated = value.truncated;
         records.push_back( record );
@@ -1215,7 +1271,14 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
     const auto runRoot = staging / "relation-runs";
     std::filesystem::create_directories( GpuAnalysisIoPath( runRoot ), ec );
     if( ec ) { error = "store_relation_run_directory_failed:" + ec.message(); return false; }
-    std::vector<std::filesystem::path> resourceRuns, frameRuns;
+    const auto taxonomyCompare = []( const auto& lhs, const auto& rhs ) {
+        return lhs.passId < rhs.passId;
+    };
+    MergedRunCursor<GpuAnalysisPassTaxonomyEntry, decltype( taxonomyCompare )>
+        taxonomy( taxonomyCompare );
+    if( !taxonomy.Open( passSpool.taxonomyRuns, error ) ) return false;
+    uint64_t consumedTaxonomy = 0;
+    std::vector<std::filesystem::path> resourceRuns, frameRuns, summaryRuns, childRuns;
     uint64_t passCount = 0; uint64_t previousPassId = 0;
     for( uint64_t pageIndex = 0; pageIndex < passSpool.pageCount; ++pageIndex )
     {
@@ -1236,14 +1299,26 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
 
         std::vector<GpuAnalysisResourcePassEntry> resourceRelations;
         std::vector<GpuAnalysisFramePassEntry> frameRelations;
+        std::vector<GpuAnalysisPassChildEntry> childRelations;
+        std::vector<GpuAnalysisPassSummary> summaries;
         uint64_t relationCount = 0;
         for( const auto& pass : passes )
             relationCount += pass.directResources.size() + pass.inclusiveResources.size();
         if( relationCount > std::numeric_limits<size_t>::max() )
         { error = "store_spool_relation_count_limit"; return false; }
         resourceRelations.reserve( size_t( relationCount ) ); frameRelations.reserve( passes.size() );
+        summaries.reserve( passes.size() );
         for( const auto& pass : passes )
         {
+            GpuAnalysisPassTaxonomyEntry taxonomyValue;
+            const GpuAnalysisPassTaxonomyEntry* taxonomyPtr = nullptr;
+            if( passSpool.taxonomyCount != 0 )
+            {
+                if( taxonomy.Empty() || taxonomy.Front().passId != pass.passId ||
+                    !taxonomy.Pop( taxonomyValue, error ) || taxonomyValue.frameId != pass.frameId )
+                { error = "store_pass_taxonomy_order_mismatch"; return false; }
+                taxonomyPtr = &taxonomyValue; ++consumedTaxonomy;
+            }
             for( const auto resourceId : pass.directResources )
                 resourceRelations.push_back( { resourceId, pass.passId, 0, {} } );
             for( const auto resourceId : pass.inclusiveResources )
@@ -1251,6 +1326,9 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
                     pass.directResources.end(), resourceId ) )
                     resourceRelations.push_back( { resourceId, pass.passId, 1, {} } );
             frameRelations.push_back( { pass.frameId, pass.passId } );
+            if( pass.parentPassId != 0 )
+                childRelations.push_back( { pass.parentPassId, pass.passId } );
+            summaries.push_back( PassSummaryOf( pass, taxonomyPtr ) );
         }
         const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
             if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
@@ -1263,15 +1341,27 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
         };
         auto resourceRun = runRoot / ( "resource-" + name.str() );
         auto frameRun = runRoot / ( "frame-" + name.str() );
+        auto summaryRun = runRoot / ( "summary-" + name.str() );
+        auto childRun = runRoot / ( "child-" + name.str() );
         if( !WriteSortedRun( resourceRun, resourceRelations, resourceCompare, error ) ||
-            !WriteSortedRun( frameRun, frameRelations, frameCompare, error ) ) return false;
+            !WriteSortedRun( frameRun, frameRelations, frameCompare, error ) ||
+            !WriteSortedRun( summaryRun, summaries,
+                []( const auto& lhs, const auto& rhs ) { return lhs.passId < rhs.passId; }, error ) ||
+            !WriteSortedRun( childRun, childRelations, []( const auto& lhs, const auto& rhs ) {
+                if( lhs.parentPassId != rhs.parentPassId ) return lhs.parentPassId < rhs.parentPassId;
+                return lhs.childPassId < rhs.childPassId;
+            }, error ) ) return false;
         resourceRuns.push_back( std::move( resourceRun ) );
         frameRuns.push_back( std::move( frameRun ) );
+        summaryRuns.push_back( std::move( summaryRun ) );
+        childRuns.push_back( std::move( childRun ) );
         if( control.progress ) control.progress( float( pageIndex + 1 ) /
             float( std::max<uint64_t>( 1, passSpool.pageCount ) ), "store-pass-spool" );
     }
     if( passCount != passSpool.passCount )
     { error = "store_spool_pass_count_mismatch"; return false; }
+    if( consumedTaxonomy != passSpool.taxonomyCount || !taxonomy.Empty() )
+    { error = "store_pass_taxonomy_count_mismatch"; return false; }
 
     const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
         if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
@@ -1292,6 +1382,30 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
         frameCompare, []( const auto& value ) { return value.frameId; },
         manifest.pages, writtenBytes, control, checkpoint,
         manifest.framePassRelationCount, error ) ) return false;
+    if( !MergeRelationRuns<GpuAnalysisPassSummary>( staging,
+        GpuAnalysisStorePageKind::PassSummary, "pass-summary", summaryRuns,
+        []( const auto& lhs, const auto& rhs ) { return lhs.passId < rhs.passId; },
+        []( const auto& value ) { return value.passId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.passSummaryCount, error ) ) return false;
+    if( manifest.passSummaryCount != manifest.passCount )
+    { error = "store_pass_summary_count_mismatch"; return false; }
+    if( !MergeRelationRuns<GpuAnalysisPassChildEntry>( staging,
+        GpuAnalysisStorePageKind::PassChildIndex, "pass-child", childRuns,
+        []( const auto& lhs, const auto& rhs ) {
+            if( lhs.parentPassId != rhs.parentPassId ) return lhs.parentPassId < rhs.parentPassId;
+            return lhs.childPassId < rhs.childPassId;
+        }, []( const auto& value ) { return value.parentPassId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.passChildRelationCount, error ) ) return false;
+    if( !MergeRelationRuns<GpuAnalysisStablePassSummary>( staging,
+        GpuAnalysisStorePageKind::StablePassSummary, "stable-pass-summary",
+        passSpool.stableSummaryRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.frameId != rhs.frameId ) return lhs.frameId < rhs.frameId;
+            return lhs.taxonomyId < rhs.taxonomyId;
+        }, []( const auto& value ) { return value.frameId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.stablePassSummaryCount,
+        error, false ) ) return false;
+    if( manifest.stablePassSummaryCount != passSpool.stableSummaryCount )
+    { error = "store_stable_pass_summary_count_mismatch"; return false; }
     const auto rangeCompare = []( const auto& lhs, const auto& rhs ) {
         if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
         if( lhs.record.passInstanceId != rhs.record.passInstanceId )
@@ -1311,6 +1425,8 @@ bool WriteGpuAnalysisDerivedStoreFromPassSpoolAt(
     { error = "store_spool_range_count_mismatch"; return false; }
     for( const auto& path : resourceRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : frameRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : summaryRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : childRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : passSpool.rangeRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     std::filesystem::remove( GpuAnalysisIoPath( runRoot ), ec );
 
@@ -1560,7 +1676,14 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     const auto runRoot = staging / "relation-runs";
     std::filesystem::create_directories( GpuAnalysisIoPath( runRoot ), ec );
     if( ec ) { error = "store_relation_run_directory_failed:" + ec.message(); return false; }
-    std::vector<std::filesystem::path> resourceRuns, frameRuns;
+    const auto taxonomyCompare = []( const auto& lhs, const auto& rhs ) {
+        return lhs.passId < rhs.passId;
+    };
+    MergedRunCursor<GpuAnalysisPassTaxonomyEntry, decltype( taxonomyCompare )>
+        taxonomy( taxonomyCompare );
+    if( !taxonomy.Open( passSpool.taxonomyRuns, error ) ) return false;
+    uint64_t consumedTaxonomy = 0;
+    std::vector<std::filesystem::path> resourceRuns, frameRuns, summaryRuns, childRuns;
     uint64_t passCount = 0; uint64_t previousPassId = 0;
     for( uint64_t pageIndex = 0; pageIndex < passSpool.pageCount; ++pageIndex )
     {
@@ -1578,13 +1701,27 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
         passCount += passes.size();
         std::vector<GpuAnalysisResourcePassEntry> resourceRelations;
         std::vector<GpuAnalysisFramePassEntry> frameRelations;
+        std::vector<GpuAnalysisPassChildEntry> childRelations;
+        std::vector<GpuAnalysisPassSummary> summaries;
+        summaries.reserve( passes.size() );
         for( const auto& pass : passes )
         {
+            GpuAnalysisPassTaxonomyEntry taxonomyValue;
+            const GpuAnalysisPassTaxonomyEntry* taxonomyPtr = nullptr;
+            if( passSpool.taxonomyCount != 0 )
+            {
+                if( taxonomy.Empty() || taxonomy.Front().passId != pass.passId ||
+                    !taxonomy.Pop( taxonomyValue, error ) || taxonomyValue.frameId != pass.frameId )
+                { error = "store_pass_taxonomy_order_mismatch"; return false; }
+                taxonomyPtr = &taxonomyValue; ++consumedTaxonomy;
+            }
             for( const auto id : pass.directResources ) resourceRelations.push_back( { id, pass.passId, 0, {} } );
             for( const auto id : pass.inclusiveResources )
                 if( !std::binary_search( pass.directResources.begin(), pass.directResources.end(), id ) )
                     resourceRelations.push_back( { id, pass.passId, 1, {} } );
             frameRelations.push_back( { pass.frameId, pass.passId } );
+            if( pass.parentPassId != 0 ) childRelations.push_back( { pass.parentPassId, pass.passId } );
+            summaries.push_back( PassSummaryOf( pass, taxonomyPtr ) );
         }
         const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
             if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
@@ -1595,11 +1732,23 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
         };
         auto resourceRun = runRoot / ( "resource-" + name.str() );
         auto frameRun = runRoot / ( "frame-" + name.str() );
+        auto summaryRun = runRoot / ( "summary-" + name.str() );
+        auto childRun = runRoot / ( "child-" + name.str() );
         if( !WriteSortedRun( resourceRun, resourceRelations, resourceCompare, error ) ||
-            !WriteSortedRun( frameRun, frameRelations, frameCompare, error ) ) return false;
+            !WriteSortedRun( frameRun, frameRelations, frameCompare, error ) ||
+            !WriteSortedRun( summaryRun, summaries,
+                []( const auto& lhs, const auto& rhs ) { return lhs.passId < rhs.passId; }, error ) ||
+            !WriteSortedRun( childRun, childRelations, []( const auto& lhs, const auto& rhs ) {
+                if( lhs.parentPassId != rhs.parentPassId ) return lhs.parentPassId < rhs.parentPassId;
+                return lhs.childPassId < rhs.childPassId;
+            }, error ) ) return false;
         resourceRuns.push_back( resourceRun ); frameRuns.push_back( frameRun );
+        summaryRuns.push_back( summaryRun );
+        childRuns.push_back( childRun );
     }
     if( passCount != passSpool.passCount ) { error = "store_spool_pass_count_mismatch"; return false; }
+    if( consumedTaxonomy != passSpool.taxonomyCount || !taxonomy.Empty() )
+    { error = "store_pass_taxonomy_count_mismatch"; return false; }
     const auto resourceCompare = []( const auto& lhs, const auto& rhs ) {
         if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
         if( lhs.passId != rhs.passId ) return lhs.passId < rhs.passId; return lhs.inclusive < rhs.inclusive;
@@ -1617,6 +1766,30 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
         frameCompare, []( const auto& value ) { return value.frameId; },
         manifest.pages, writtenBytes, control, checkpoint,
         manifest.framePassRelationCount, error ) ) return false;
+    if( !MergeRelationRuns<GpuAnalysisPassSummary>( staging,
+        GpuAnalysisStorePageKind::PassSummary, "pass-summary", summaryRuns,
+        []( const auto& lhs, const auto& rhs ) { return lhs.passId < rhs.passId; },
+        []( const auto& value ) { return value.passId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.passSummaryCount, error ) ) return false;
+    if( manifest.passSummaryCount != manifest.passCount )
+    { error = "store_pass_summary_count_mismatch"; return false; }
+    if( !MergeRelationRuns<GpuAnalysisPassChildEntry>( staging,
+        GpuAnalysisStorePageKind::PassChildIndex, "pass-child", childRuns,
+        []( const auto& lhs, const auto& rhs ) {
+            if( lhs.parentPassId != rhs.parentPassId ) return lhs.parentPassId < rhs.parentPassId;
+            return lhs.childPassId < rhs.childPassId;
+        }, []( const auto& value ) { return value.parentPassId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.passChildRelationCount, error ) ) return false;
+    if( !MergeRelationRuns<GpuAnalysisStablePassSummary>( staging,
+        GpuAnalysisStorePageKind::StablePassSummary, "stable-pass-summary",
+        passSpool.stableSummaryRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.frameId != rhs.frameId ) return lhs.frameId < rhs.frameId;
+            return lhs.taxonomyId < rhs.taxonomyId;
+        }, []( const auto& value ) { return value.frameId; }, manifest.pages,
+        writtenBytes, control, checkpoint, manifest.stablePassSummaryCount,
+        error, false ) ) return false;
+    if( manifest.stablePassSummaryCount != passSpool.stableSummaryCount )
+    { error = "store_stable_pass_summary_count_mismatch"; return false; }
     const auto rangeCompare = []( const auto& lhs, const auto& rhs ) {
         if( lhs.resourceId != rhs.resourceId ) return lhs.resourceId < rhs.resourceId;
         if( lhs.record.passInstanceId != rhs.record.passInstanceId ) return lhs.record.passInstanceId < rhs.record.passInstanceId;
@@ -1631,6 +1804,8 @@ bool WriteGpuAnalysisDerivedStoreFromCatalogAndPassSpoolsAt(
     if( manifest.rangeCount != passSpool.rangeCount ) { error = "store_spool_range_count_mismatch"; return false; }
     for( const auto& path : resourceRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : frameRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : summaryRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
+    for( const auto& path : childRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     for( const auto& path : passSpool.rangeRuns ) std::filesystem::remove( GpuAnalysisIoPath( path ), ec );
     std::filesystem::remove( GpuAnalysisIoPath( runRoot ), ec );
     manifest.totalBytes = writtenBytes; manifest.complete = true;
@@ -1786,8 +1961,8 @@ std::optional<GpuAnalysisStoreManifest> LoadStoreManifestImpl(
         else if( key == "algorithm" ) in >> std::quoted( result.algorithmId ); else if( key == "generation" ) in >> std::quoted( result.generation );
         else if( key == "trace_sha256" ) in >> std::quoted( result.traceSha256 ); else if( key == "trace_size" ) in >> result.traceSize;
 #define R( field ) else if( key == #field ) in >> result.field
-        R( resourceCount ); R( allocationCount ); R( passCount ); R( residencyCount ); R( churnCount );
-        R( resourcePassRelationCount ); R( framePassRelationCount ); R( rangeCount );
+        R( resourceCount ); R( allocationCount ); R( passCount ); R( passSummaryCount ); R( stablePassSummaryCount ); R( residencyCount ); R( churnCount );
+        R( resourcePassRelationCount ); R( framePassRelationCount ); R( passChildRelationCount ); R( rangeCount );
         R( logicalCount ); R( catalogRelationCount ); R( sourceGapResourceCount );
         R( sourceGapReferenceCount ); R( totalBytes );
 #undef R
@@ -1835,6 +2010,7 @@ std::shared_ptr<GpuAnalysisStoreReader> GpuAnalysisStoreReader::Open( const std:
     auto overview = LoadGpuAnalysisCache( root / metadata->relativePath, cacheIdentity, error ); if( !overview ) return {};
     auto reader = std::shared_ptr<GpuAnalysisStoreReader>( new GpuAnalysisStoreReader );
     reader->m_root = root; reader->m_identity = std::move( cacheIdentity ); reader->m_manifest = std::move( *store ); reader->m_overview = std::move( *overview );
+    reader->m_inclusiveCache = std::make_shared<GpuAnalysisStoreReader::InclusiveCache>();
     return reader;
 }
 
@@ -1867,6 +2043,7 @@ std::shared_ptr<GpuAnalysisStoreReader> GpuAnalysisStoreReader::OpenAt(
     reader->m_identity = std::move( cacheIdentity );
     reader->m_manifest = std::move( *store );
     reader->m_overview = std::move( *overview );
+    reader->m_inclusiveCache = std::make_shared<GpuAnalysisStoreReader::InclusiveCache>();
     return reader;
 }
 
@@ -2105,6 +2282,171 @@ std::optional<GpuPassWorkingSet> GpuAnalysisStoreReader::FindPass( uint64_t id, 
     error = "gpu_pass_not_found"; return std::nullopt;
 }
 
+std::optional<GpuAnalysisPassSummary> GpuAnalysisStoreReader::FindPassSummary(
+    uint64_t id, std::string& error ) const
+{
+    for( const auto& page : m_manifest.pages )
+    {
+        if( page.kind != GpuAnalysisStorePageKind::PassSummary ||
+            id < page.firstKey || id > page.lastKey ) continue;
+        std::vector<GpuAnalysisPassSummary> values;
+        if( !LoadRelationPage( m_root / page.relativePath, page, values, error ) )
+            return std::nullopt;
+        const auto found = std::lower_bound( values.begin(), values.end(), id,
+            []( const auto& value, uint64_t key ) { return value.passId < key; } );
+        if( found != values.end() && found->passId == id ) return *found;
+    }
+    error = "gpu_pass_summary_not_found";
+    return std::nullopt;
+}
+
+std::optional<GpuAnalysisStablePassSummary>
+GpuAnalysisStoreReader::FindStablePassSummary( uint64_t frameId,
+    uint32_t taxonomyId, std::string& error ) const
+{
+    for( const auto& page : m_manifest.pages )
+    {
+        if( page.kind != GpuAnalysisStorePageKind::StablePassSummary ||
+            frameId < page.firstKey || frameId > page.lastKey ) continue;
+        std::vector<GpuAnalysisStablePassSummary> values;
+        if( !LoadRelationPage( m_root / page.relativePath, page, values, error ) )
+            return std::nullopt;
+        const auto key = std::pair<uint64_t, uint32_t> { frameId, taxonomyId };
+        const auto found = std::lower_bound( values.begin(), values.end(), key,
+            []( const auto& value, const auto& candidate ) {
+                return value.frameId != candidate.first ?
+                    value.frameId < candidate.first : value.taxonomyId < candidate.second;
+            } );
+        if( found != values.end() && found->frameId == frameId &&
+            found->taxonomyId == taxonomyId ) return *found;
+    }
+    error = "gpu_stable_pass_summary_not_found";
+    return std::nullopt;
+}
+
+bool GpuAnalysisStoreReader::PassResources( uint64_t passId, bool inclusive,
+    size_t offset, size_t limit, std::vector<uint64_t>& out, bool& hasMore,
+    std::string& error ) const
+{
+    out.clear(); hasMore = false;
+    const auto rootPass = FindPass( passId, error );
+    if( !rootPass ) return false;
+    std::vector<uint64_t> reconstructed;
+    std::shared_ptr<const std::vector<uint64_t>> cached;
+    const std::vector<uint64_t>* resourcesPtr = &rootPass->directResources;
+    if( inclusive )
+    {
+        if( m_inclusiveCache )
+        {
+            std::lock_guard lock( m_inclusiveCache->mutex );
+            const auto found = m_inclusiveCache->entries.find( passId );
+            if( found != m_inclusiveCache->entries.end() )
+            {
+                found->second.lastUse = ++m_inclusiveCache->clock;
+                cached = found->second.resources;
+            }
+        }
+        if( cached ) resourcesPtr = cached.get();
+        else
+        {
+        std::vector<uint64_t> passIds { passId };
+        std::unordered_set<uint64_t> seen { passId };
+        for( size_t cursor = 0; cursor < passIds.size(); ++cursor )
+        {
+            const auto parentId = passIds[cursor];
+            for( const auto& page : m_manifest.pages )
+            {
+                if( page.kind != GpuAnalysisStorePageKind::PassChildIndex ||
+                    parentId < page.firstKey || parentId > page.lastKey ) continue;
+                std::vector<GpuAnalysisPassChildEntry> children;
+                if( !LoadRelationPage( m_root / page.relativePath, page, children, error ) ) return false;
+                const auto first = std::lower_bound( children.begin(), children.end(), parentId,
+                    []( const auto& value, uint64_t key ) { return value.parentPassId < key; } );
+                for( auto it = first; it != children.end() && it->parentPassId == parentId; ++it )
+                {
+                    if( it->childPassId == 0 || !seen.emplace( it->childPassId ).second )
+                    { error = "gpu_pass_child_cycle_or_duplicate"; return false; }
+                    passIds.push_back( it->childPassId );
+                }
+            }
+        }
+        std::sort( passIds.begin(), passIds.end() );
+        std::vector<GpuPassWorkingSet> passes;
+        if( !LoadPassesByIds( std::move( passIds ), passes, error ) ) return false;
+        size_t memberCount = 0;
+        for( const auto& pass : passes )
+        {
+            if( memberCount > std::numeric_limits<size_t>::max() - pass.directResources.size() )
+            { error = "gpu_pass_inclusive_member_count_overflow"; return false; }
+            memberCount += pass.directResources.size();
+        }
+        reconstructed.reserve( memberCount );
+        for( const auto& pass : passes ) reconstructed.insert( reconstructed.end(),
+            pass.directResources.begin(), pass.directResources.end() );
+        std::sort( reconstructed.begin(), reconstructed.end() );
+        reconstructed.erase( std::unique( reconstructed.begin(), reconstructed.end() ),
+            reconstructed.end() );
+        const auto summary = FindPassSummary( passId, error );
+        if( !summary || summary->inclusiveResourceCount != reconstructed.size() ||
+            summary->inclusiveResourceHash != GpuAnalysisResourceSetHash( reconstructed ) )
+        { error = "gpu_pass_inclusive_summary_mismatch"; return false; }
+            const auto bytes = uint64_t( reconstructed.size() ) * sizeof( uint64_t );
+            if( m_inclusiveCache && bytes <= InclusiveCache::MaximumBytes )
+            {
+                auto value = std::make_shared<const std::vector<uint64_t>>(
+                    std::move( reconstructed ) );
+                std::lock_guard lock( m_inclusiveCache->mutex );
+                while( m_inclusiveCache->bytes > InclusiveCache::MaximumBytes - bytes &&
+                    !m_inclusiveCache->entries.empty() )
+                {
+                    const auto victim = std::min_element( m_inclusiveCache->entries.begin(),
+                        m_inclusiveCache->entries.end(), []( const auto& lhs, const auto& rhs ) {
+                            return lhs.second.lastUse < rhs.second.lastUse;
+                        } );
+                    m_inclusiveCache->bytes -= uint64_t( victim->second.resources->size() ) *
+                        sizeof( uint64_t );
+                    m_inclusiveCache->entries.erase( victim );
+                }
+                const auto [stored, inserted] = m_inclusiveCache->entries.emplace(
+                    passId, InclusiveCache::Entry { value, ++m_inclusiveCache->clock } );
+                if( inserted ) m_inclusiveCache->bytes += bytes;
+                cached = inserted ? value : stored->second.resources;
+                resourcesPtr = cached.get();
+            }
+            else resourcesPtr = &reconstructed;
+        }
+    }
+    const auto& resources = *resourcesPtr;
+    if( offset >= resources.size() ) return true;
+    const auto count = std::min( limit, resources.size() - offset );
+    out.assign( resources.begin() + offset, resources.begin() + offset + count );
+    hasMore = offset + count < resources.size();
+    return true;
+}
+
+bool GpuAnalysisStoreReader::PassRelationsForResource( uint64_t resourceId,
+    size_t offset, size_t limit, std::vector<GpuAnalysisResourcePassEntry>& out,
+    bool& hasMore, std::string& error ) const
+{
+    out.clear(); hasMore = false; size_t skipped = 0;
+    for( const auto& page : m_manifest.pages )
+    {
+        if( page.kind != GpuAnalysisStorePageKind::ResourcePassIndex ||
+            resourceId < page.firstKey || resourceId > page.lastKey ) continue;
+        std::vector<GpuAnalysisResourcePassEntry> values;
+        if( !LoadRelationPage( m_root / page.relativePath, page, values, error ) ) return false;
+        const auto first = std::lower_bound( values.begin(), values.end(), resourceId,
+            []( const auto& value, uint64_t key ) { return value.resourceId < key; } );
+        for( auto it = first; it != values.end() && it->resourceId == resourceId; ++it )
+        {
+            if( skipped++ < offset ) continue;
+            if( out.size() == limit ) { hasMore = true; return true; }
+            out.push_back( *it );
+        }
+    }
+    return true;
+}
+
 bool GpuAnalysisStoreReader::PassesForFrame( uint64_t frameId, size_t offset, size_t limit,
     std::vector<GpuPassWorkingSet>& out, bool& hasMore, std::string& error ) const
 {
@@ -2156,6 +2498,9 @@ const char* GpuAnalysisStorePageKindName( GpuAnalysisStorePageKind kind )
     case GpuAnalysisStorePageKind::ResourcePassIndex: return "resource_pass_index"; case GpuAnalysisStorePageKind::FramePassIndex: return "frame_pass_index";
     case GpuAnalysisStorePageKind::Range: return "range";
     case GpuAnalysisStorePageKind::ResourceSummary: return "resource_summary";
+    case GpuAnalysisStorePageKind::PassSummary: return "pass_summary";
+    case GpuAnalysisStorePageKind::StablePassSummary: return "stable_pass_summary";
+    case GpuAnalysisStorePageKind::PassChildIndex: return "pass_child_index";
     }
     return "unknown";
 }

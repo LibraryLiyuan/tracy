@@ -360,7 +360,26 @@ int main()
         passPage.passes.size() );
     const auto sessionPass = sessionStore->FindPass( 1000, error );
     assert( sessionPass && sessionPass->directResources == parentResult->directResources &&
-        sessionPass->inclusiveResources == parentResult->inclusiveResources );
+        sessionPass->inclusiveResources.empty() );
+    const auto sessionPassSummary = sessionStore->FindPassSummary( 1000, error );
+    assert( sessionPassSummary && sessionPassSummary->directResourceCount == 1 &&
+        sessionPassSummary->inclusiveResourceCount == 2 &&
+        sessionPassSummary->directResourceHash ==
+            GpuAnalysisResourceSetHash( parentResult->directResources ) &&
+        sessionPassSummary->inclusiveResourceHash ==
+            GpuAnalysisResourceSetHash( parentResult->inclusiveResources ) &&
+        sessionPassSummary->directPhysicalBytes == 4096 &&
+        sessionPassSummary->inclusivePhysicalBytes == 4096 );
+    std::vector<uint64_t> pagedInclusiveResources; bool inclusiveHasMore = false;
+    assert( sessionStore->PassResources( 1000, true, 1, 1,
+        pagedInclusiveResources, inclusiveHasMore, error ) );
+    assert( pagedInclusiveResources == std::vector<uint64_t> { 11 } && !inclusiveHasMore );
+    std::vector<GpuAnalysisResourcePassEntry> resourceRelations; bool relationHasMore = false;
+    assert( sessionStore->PassRelationsForResource( 11, 0, 100,
+        resourceRelations, relationHasMore, error ) );
+    assert( resourceRelations.size() == 2 && !relationHasMore &&
+        resourceRelations[0].passId == 1000 && resourceRelations[0].inclusive == 1 &&
+        resourceRelations[1].passId == 1001 && resourceRelations[1].inclusive == 0 );
     std::vector<GpuPassWorkingSet> sessionResourcePasses; bool sessionHasMore = false;
     assert( sessionStore->PassesForResource( 10, 0, 100,
         sessionResourcePasses, sessionHasMore, error ) );

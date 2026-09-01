@@ -2737,6 +2737,7 @@ struct PassFrameState
     // so retain the compact tokens until End rather than resolving too early.
     std::vector<std::vector<PassReferenceToken>> referenceTokens;
     std::unordered_map<uint64_t, size_t> byId;
+    std::unordered_map<uint64_t, GpuAnalysisPassTaxonomyEntry> taxonomyByPass;
 };
 
 struct PassSpoolBuildState
@@ -2758,11 +2759,39 @@ struct PassSpoolBuildState
     std::unordered_map<uint64_t, std::vector<uint8_t>> catalogPayloads;
     std::vector<GpuPassWorkingSet> page;
     std::vector<GpuAnalysisRangeStoreEntry> rangeRun;
+    std::vector<GpuAnalysisPassTaxonomyEntry> taxonomyRun;
+    std::vector<GpuAnalysisStablePassSummary> stableSummaryRun;
     uint64_t pageBytes = 0;
     uint64_t maxFrame = 0;
     uint64_t emittedMaxPassId = 0;
     uint64_t useCount = 0;
 };
+
+bool FlushPassTaxonomyRun( PassSpoolBuildState& state, std::string& error )
+{
+    if( state.taxonomyRun.empty() ) return true;
+    const auto before = state.taxonomyRun.size();
+    if( !SaveGpuSpoolRun( state.taxonomyRun, state.spool->root / "taxonomy-runs",
+        "taxonomy", state.spool->taxonomyRuns, []( const auto& lhs, const auto& rhs ) {
+            return lhs.passId < rhs.passId;
+        }, error ) ) return false;
+    state.spool->taxonomyCount += before;
+    return true;
+}
+
+bool FlushStableSummaryRun( PassSpoolBuildState& state, std::string& error )
+{
+    if( state.stableSummaryRun.empty() ) return true;
+    const auto before = state.stableSummaryRun.size();
+    if( !SaveGpuSpoolRun( state.stableSummaryRun,
+        state.spool->root / "stable-summary-runs", "stable-summary",
+        state.spool->stableSummaryRuns, []( const auto& lhs, const auto& rhs ) {
+            if( lhs.frameId != rhs.frameId ) return lhs.frameId < rhs.frameId;
+            return lhs.taxonomyId < rhs.taxonomyId;
+        }, error ) ) return false;
+    state.spool->stableSummaryCount += before;
+    return true;
+}
 
 uint64_t ResolvePassResource( PassSpoolBuildState& state, uint64_t token,
     int64_t time, int64_t passBegin, int64_t passEnd,
@@ -2853,6 +2882,109 @@ bool SavePassSpoolPage( PassSpoolBuildState& state, std::string& error )
     return SaveRangeRun( state, error );
 }
 
+bool BuildStableFrameSummaries( PassSpoolBuildState& state,
+    const PassFrameState& frame, std::string& error )
+{
+    struct Node
+    {
+        GpuAnalysisStablePassSummary summary;
+        std::vector<uint64_t> direct;
+        std::vector<uint64_t> inclusive;
+        std::vector<uint32_t> children;
+        bool seen = false;
+    };
+    std::map<uint32_t, Node> nodes;
+    for( const auto& pass : frame.passes )
+    {
+        const auto metadata = frame.taxonomyByPass.find( pass.passId );
+        if( metadata == frame.taxonomyByPass.end() )
+        { error = "session_gpu_pass_taxonomy_missing:pass=" + std::to_string( pass.passId ); return false; }
+        const auto taxonomyId = metadata->second.taxonomyId;
+        if( taxonomyId == 0 ) continue;
+        auto& node = nodes[taxonomyId];
+        if( !node.seen )
+        {
+            node.seen = true;
+            node.summary.frameId = frame.frameId;
+            node.summary.taxonomyId = taxonomyId;
+            node.summary.taxonomyLevel = metadata->second.taxonomyLevel;
+            node.summary.complete = 1;
+        }
+        else if( node.summary.taxonomyLevel != metadata->second.taxonomyLevel )
+        { error = "session_gpu_stable_taxonomy_level_conflict"; return false; }
+        node.summary.complete = uint8_t( node.summary.complete && pass.complete );
+        node.summary.truncated = uint8_t( node.summary.truncated || pass.truncated );
+        node.direct.insert( node.direct.end(), pass.directResources.begin(),
+            pass.directResources.end() );
+        if( pass.parentPassId != 0 )
+        {
+            const auto parentMetadata = frame.taxonomyByPass.find( pass.parentPassId );
+            // Stable Frame summaries deliberately do not absorb a relation
+            // whose parent belongs to another frame.
+            if( parentMetadata != frame.taxonomyByPass.end() &&
+                parentMetadata->second.taxonomyId != taxonomyId )
+            {
+                const auto parentTaxonomyId = parentMetadata->second.taxonomyId;
+                if( node.summary.parentTaxonomyId != 0 &&
+                    node.summary.parentTaxonomyId != parentTaxonomyId )
+                { error = "session_gpu_stable_taxonomy_parent_conflict"; return false; }
+                node.summary.parentTaxonomyId = parentTaxonomyId;
+            }
+        }
+    }
+    for( auto& [taxonomyId, node] : nodes )
+    {
+        std::sort( node.direct.begin(), node.direct.end() );
+        node.direct.erase( std::unique( node.direct.begin(), node.direct.end() ),
+            node.direct.end() );
+        if( node.summary.parentTaxonomyId != 0 )
+        {
+            const auto parent = nodes.find( node.summary.parentTaxonomyId );
+            if( parent == nodes.end() )
+            { error = "session_gpu_stable_taxonomy_parent_missing"; return false; }
+            parent->second.children.push_back( taxonomyId );
+        }
+    }
+    std::map<uint32_t, uint8_t> visit;
+    const auto buildInclusive = [&]( auto&& self, uint32_t taxonomyId ) -> bool {
+        auto& mark = visit[taxonomyId];
+        if( mark == 2 ) return true;
+        if( mark == 1 ) { error = "session_gpu_stable_taxonomy_cycle"; return false; }
+        mark = 1;
+        auto& node = nodes[taxonomyId];
+        node.inclusive = node.direct;
+        for( const auto childId : node.children )
+        {
+            if( !self( self, childId ) ) return false;
+            std::vector<uint64_t> merged;
+            const auto& child = nodes[childId];
+            merged.reserve( node.inclusive.size() + child.inclusive.size() );
+            std::set_union( node.inclusive.begin(), node.inclusive.end(),
+                child.inclusive.begin(), child.inclusive.end(),
+                std::back_inserter( merged ) );
+            node.inclusive = std::move( merged );
+            node.summary.complete = uint8_t( node.summary.complete && child.summary.complete );
+            node.summary.truncated = uint8_t( node.summary.truncated || child.summary.truncated );
+        }
+        mark = 2;
+        return true;
+    };
+    for( const auto& [taxonomyId, _] : nodes )
+        if( !buildInclusive( buildInclusive, taxonomyId ) ) return false;
+    for( auto& [_, node] : nodes )
+    {
+        node.summary.directResourceCount = node.direct.size();
+        node.summary.inclusiveResourceCount = node.inclusive.size();
+        node.summary.directResourceHash = GpuAnalysisResourceSetHash( node.direct );
+        node.summary.inclusiveResourceHash = GpuAnalysisResourceSetHash( node.inclusive );
+        node.summary.directPhysicalBytes = state.catalog->PhysicalBytes( node.direct );
+        node.summary.inclusivePhysicalBytes = state.catalog->PhysicalBytes( node.inclusive );
+        state.stableSummaryRun.push_back( node.summary );
+    }
+    return state.stableSummaryRun.size() * sizeof( GpuAnalysisStablePassSummary ) <
+        64ull * 1024 * 1024 || FlushStableSummaryRun( state, error );
+}
+
 bool FinalizePassFrame( PassSpoolBuildState& state,
     std::map<uint64_t, PassFrameState>::iterator frameIt, bool captureEnd,
     std::string& error )
@@ -2899,15 +3031,22 @@ bool FinalizePassFrame( PassSpoolBuildState& state,
             pass.detailedEvidence.push_back( it->evidence );
         pass.directPhysicalBytes = state.catalog->PhysicalBytes( pass.directResources );
     }
+    if( !BuildStableFrameSummaries( state, frame, error ) ) return false;
     std::sort( frame.passes.begin(), frame.passes.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.passId < rhs.passId;
     } );
     for( auto& pass : frame.passes )
     {
+        const auto taxonomy = frame.taxonomyByPass.find( pass.passId );
+        if( taxonomy == frame.taxonomyByPass.end() )
+        { error = "session_gpu_pass_taxonomy_missing:pass=" + std::to_string( pass.passId ); return false; }
+        state.taxonomyRun.push_back( taxonomy->second );
         state.spool->passCount++;
         state.spool->directRelationCount += pass.directResources.size();
         state.pageBytes += PassBytes( pass ); state.page.push_back( std::move( pass ) );
     }
+    if( state.taxonomyRun.size() * sizeof( GpuAnalysisPassTaxonomyEntry ) >=
+        64ull * 1024 * 1024 && !FlushPassTaxonomyRun( state, error ) ) return false;
     for( const auto& [passId, _] : frame.byId )
     { state.passFrame.erase( passId ); state.pendingParents.erase( passId ); }
     state.frames.erase( frameIt );
@@ -3182,6 +3321,9 @@ bool VisitGpuPassSpool( const TraceSessionCanonicalRecord& record,
             parent != state.pendingParents.end() ) pass.parentPassId = parent->second;
         frame.byId.emplace( event.passId, frame.passes.size() );
         frame.passes.push_back( std::move( pass ) );
+        frame.taxonomyByPass.emplace( event.passId, GpuAnalysisPassTaxonomyEntry {
+            event.passId, event.frameIndex, event.taxonomyId,
+            event.taxonomyLevel, event.flags, {} } );
         frame.encodedReferenceCounts.push_back( 0 );
         frame.referenceTokens.emplace_back();
         ++frame.active;
@@ -3352,6 +3494,8 @@ bool BuildGpuPassSpool( const std::filesystem::path& sessionRoot,
     if( !state.catalogPayloads.empty() )
     { error = "session_gpu_pass_catalog_payload_unresolved"; return false; }
     if( !FlushPassFrames( state, true, error ) ) return false;
+    if( !FlushPassTaxonomyRun( state, error ) ||
+        !FlushStableSummaryRun( state, error ) ) return false;
     if( !state.pendingParents.empty() )
     { error = "session_gpu_pass_parent_without_pass"; return false; }
     if( !BuildGlobalPassInclusiveRollup( state, error ) ) return false;

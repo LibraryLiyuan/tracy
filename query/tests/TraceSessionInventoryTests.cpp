@@ -2371,6 +2371,10 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         manifest.source.sha256, manifest.source.fileSize, error );
     const auto gpuResource = gpuReader ? gpuReader->FindResource( 10, error ) : std::nullopt;
     const auto parentGpuPass = gpuReader ? gpuReader->FindPass( 1000, error ) : std::nullopt;
+    const auto parentGpuPassSummary = gpuReader ?
+        gpuReader->FindPassSummary( 1000, error ) : std::nullopt;
+    const auto parentStableSummary = gpuReader ?
+        gpuReader->FindStablePassSummary( 5, 77, error ) : std::nullopt;
     const auto delayedGpuPass = gpuReader ? gpuReader->FindPass( 1002, error ) : std::nullopt;
     const auto sourceGapGpuPass = gpuReader ? gpuReader->FindPass( 1003, error ) : std::nullopt;
     const auto sourceGapGpuResource = sourceGapGpuPass && sourceGapGpuPass->directResources.size() == 1 ?
@@ -2385,10 +2389,27 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         10, 0, 16, gpuRanges, gpuRangesMore, error );
     test.Check( gpuResource.has_value(), "Session GPU resource lookup succeeds: " + error );
     test.Check( parentGpuPass.has_value(), "Session GPU parent pass lookup succeeds: " + error );
-    test.Check( parentGpuPass && parentGpuPass->inclusiveResources ==
-        std::vector<uint64_t> { 10, 12, 13 },
-        "later Snapshot does not contaminate the exact earlier inclusive set; actual_count=" +
-        std::to_string( parentGpuPass ? parentGpuPass->inclusiveResources.size() : 0 ) );
+    test.Check( parentGpuPassSummary && parentGpuPassSummary->taxonomyId == 77 &&
+        parentGpuPassSummary->taxonomyLevel == 1 &&
+        parentGpuPassSummary->directResourceCount == 2 &&
+        parentGpuPassSummary->inclusiveResourceCount == 3,
+        "Pass Summary retains exact taxonomy, Direct and Inclusive facts" );
+    test.Check( parentStableSummary && parentStableSummary->frameId == 5 &&
+        parentStableSummary->taxonomyId == 77 &&
+        parentStableSummary->directResourceCount == 2 &&
+        parentStableSummary->inclusiveResourceCount == 2 &&
+        parentStableSummary->directResourceHash ==
+            tracy::analysis::GpuAnalysisResourceSetHash( std::vector<uint64_t> { 10, 12 } ) &&
+        parentStableSummary->inclusiveResourceHash ==
+            tracy::analysis::GpuAnalysisResourceSetHash( std::vector<uint64_t> { 10, 12 } ),
+        "stable Frame/Taxonomy summary is exact and cannot absorb a child from another frame" );
+    std::vector<uint64_t> parentInclusiveMembers; bool parentInclusiveMore = false;
+    const auto loadedParentInclusive = gpuReader && gpuReader->PassResources(
+        1000, true, 0, 16, parentInclusiveMembers, parentInclusiveMore, error );
+    test.Check( parentGpuPass && parentGpuPass->inclusiveResources.empty() &&
+        loadedParentInclusive && !parentInclusiveMore && parentInclusiveMembers ==
+            std::vector<uint64_t> { 10, 12, 13 },
+        "Session persists Direct facts only and reconstructs the exact cross-page Inclusive set on demand" );
     test.Check( delayedGpuPass && delayedGpuPass->directResources ==
         std::vector<uint64_t> { 13 },
         "post-Destroy command-list use retains the previous pointer generation identity" );

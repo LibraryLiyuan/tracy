@@ -2017,3 +2017,30 @@ Regression: Debug CTest 8/8通过；Total Test Time 6.02 sec
 ```
 
 本阶段没有启动G05或真实30分钟转换，也没有修改Protocol 90、Unity、PackageRepo或Player。
+
+### 2026-09-02 A2 GPU Derived 精确索引与按需Inclusive重建
+
+状态：**Passed（Synthetic/短Trace正确性；真实G05、30分钟容量与墙钟门禁留在A5）**。
+
+- 最终Session Store只持久化每个Pass的Direct ResourceSet；不再为父Pass重复保存完整Inclusive成员集合。
+- 新增固定宽度`PassSummary`，保存Direct/Inclusive的精确资源数、物理字节、稳定哈希、Direct Range字节、taxonomy、unknown-range数量和完整性状态。
+- 新增`PassChildIndex`。按需查询Inclusive成员时，从目标Pass沿父子索引读取所需子树的Direct集合，执行精确排序、去重和哈希复核；复核不通过时拒绝返回，不把不完整集合伪装为Exact。
+- 新增Resource→Pass反向索引，保留Direct与Inclusive provenance；同一资源在子Pass直接使用、父Pass派生包含时可双向导航。
+- 新增`StablePassSummary`：按`Frame + taxonomy`聚合实际Pass实例，保存Direct/Inclusive count、physical bytes与hash；父taxonomy采用确定性并集汇总，跨Frame父子关系不会污染单帧摘要。
+- shared allocation物理字节按allocation去重；Synthetic中父Pass引用三个Resource但两个Resource共享同一allocation，Inclusive physical bytes仍为4096而不是重复累加。
+- Reader提供512 MiB有界LRU缓存，缓存按需重建的Inclusive成员；单个结果大于缓存上限时不进入LRU，但仍可作为一次性结果返回。A3/A5继续验证极端单查询结果的总进程内存门禁。
+- taxonomy缺失、层级冲突、父级冲突、父级不存在和环均显式拒绝或标记质量问题，不根据名称或时间猜测层级。
+- Legacy独立`.tracy` sidecar路径保持可读；本阶段新增摘要页由Session生产路径生成。
+
+TDD与回归证据：
+
+```text
+RED-1: 缺少FindPassSummary/hash/PassResources/PassRelations API，测试编译失败
+RED-2: 缺少Stable taxonomy summary API与字段，测试编译失败
+RED-3: persisted inclusive集合非空，Direct-only门禁运行失败
+GREEN: tracy-gpu-analysis-tests Passed
+GREEN: tracy-trace-session-inventory-tests Passed
+Regression: Debug CTest 8/8 Passed；Total Test Time 6.70 sec
+```
+
+本阶段没有启动G05或真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。
