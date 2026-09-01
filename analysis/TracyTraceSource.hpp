@@ -1357,8 +1357,32 @@ public:
     virtual std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& ) const { return std::nullopt; }
     virtual std::optional<bool> HasGpuMemoryProtocol2() const { return std::nullopt; }
     virtual std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const { return {}; }
+    virtual uint64_t GetRuntimeDomainStateCount() const { return GetRuntimeDomainStates().size(); }
+    virtual std::vector<RuntimeDomainStateDto> ScanRuntimeDomainStates( size_t offset, size_t limit ) const
+    {
+        const auto values = GetRuntimeDomainStates();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = std::min( values.size(), offset + std::min( limit, values.size() - offset ) );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
+    virtual uint64_t GetScriptFrameCount() const { return GetScriptFrames().size(); }
+    virtual std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const
+    {
+        const auto values = GetScriptFrames();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = std::min( values.size(), offset + std::min( limit, values.size() - offset ) );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
+    virtual uint64_t GetScriptStackEventCount() const { return GetScriptStackEvents().size(); }
+    virtual std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const
+    {
+        const auto values = GetScriptStackEvents();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = std::min( values.size(), offset + std::min( limit, values.size() - offset ) );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<CallsiteDto> GetCallsites() const { return {}; }
     // Immutable N27 Catalog snapshot. Pointer tokens are retained only for
     // validation and lifetime resolution and must never reach Query output.

@@ -633,14 +633,26 @@ std::shared_ptr<TraceSessionRuntimeReader> TraceSessionRuntimeReader::Open(
 
 std::vector<RuntimeDomainStateDto> TraceSessionRuntimeReader::DomainStates() const
 {
-    const auto stored = ReadFixed<StoredDomainState>( m_path, m_domainOffset,
-        m_stats.domainStates, "runtime-domain index read failed" );
+    return ScanDomainStates( 0, size_t( std::min<uint64_t>(
+        m_stats.domainStates, std::numeric_limits<size_t>::max() ) ) );
+}
+
+std::vector<RuntimeDomainStateDto> TraceSessionRuntimeReader::ScanDomainStates(
+    size_t offset, size_t limit ) const
+{
+    if( limit == 0 || uint64_t( offset ) >= m_stats.domainStates ) return {};
+    const auto count = std::min<uint64_t>( limit, m_stats.domainStates - uint64_t( offset ) );
+    if( uint64_t( offset ) > ( std::numeric_limits<uint64_t>::max() - m_domainOffset ) /
+        sizeof( StoredDomainState ) ) throw std::runtime_error( "runtime-domain index offset overflow" );
+    const auto stored = ReadFixed<StoredDomainState>( m_path,
+        m_domainOffset + uint64_t( offset ) * sizeof( StoredDomainState ), count,
+        "runtime-domain index read failed" );
     std::vector<RuntimeDomainStateDto> result;
     result.reserve( stored.size() );
     for( size_t i = 0; i < stored.size(); ++i )
     {
         const auto& value = stored[i];
-        result.push_back( { MakeRef( m_fingerprint, "runtime-domain-state", i ),
+        result.push_back( { MakeRef( m_fingerprint, "runtime-domain-state", uint64_t( offset ) + i ),
             value.generation, value.requestedFrame, value.timeNs,
             MakeRef( m_fingerprint, "thread", value.thread ), value.domain,
             value.requestedMode, value.effectiveMode, value.reason, value.flags } );
@@ -650,8 +662,20 @@ std::vector<RuntimeDomainStateDto> TraceSessionRuntimeReader::DomainStates() con
 
 std::vector<ScriptFrameDto> TraceSessionRuntimeReader::ScriptFrames() const
 {
-    const auto stored = ReadFixed<StoredScriptFrame>( m_path, m_frameOffset,
-        m_stats.scriptFrames, "script-frame index read failed" );
+    return ScanScriptFrames( 0, size_t( std::min<uint64_t>(
+        m_stats.scriptFrames, std::numeric_limits<size_t>::max() ) ) );
+}
+
+std::vector<ScriptFrameDto> TraceSessionRuntimeReader::ScanScriptFrames(
+    size_t offset, size_t limit ) const
+{
+    if( limit == 0 || uint64_t( offset ) >= m_stats.scriptFrames ) return {};
+    const auto count = std::min<uint64_t>( limit, m_stats.scriptFrames - uint64_t( offset ) );
+    if( uint64_t( offset ) > ( std::numeric_limits<uint64_t>::max() - m_frameOffset ) /
+        sizeof( StoredScriptFrame ) ) throw std::runtime_error( "script-frame index offset overflow" );
+    const auto stored = ReadFixed<StoredScriptFrame>( m_path,
+        m_frameOffset + uint64_t( offset ) * sizeof( StoredScriptFrame ), count,
+        "script-frame index read failed" );
     std::ifstream strings( m_path, std::ios::binary );
     if( !strings ) throw std::runtime_error( "runtime string index is unavailable" );
     std::vector<ScriptFrameDto> result;
@@ -659,7 +683,7 @@ std::vector<ScriptFrameDto> TraceSessionRuntimeReader::ScriptFrames() const
     for( size_t i = 0; i < stored.size(); ++i )
     {
         const auto& value = stored[i];
-        result.push_back( { MakeRef( m_fingerprint, "script-frame", i ), value.frameId,
+        result.push_back( { MakeRef( m_fingerprint, "script-frame", uint64_t( offset ) + i ), value.frameId,
             ReadString( strings, m_stringOffset, value.functionOffset, value.functionBytes ),
             ReadString( strings, m_stringOffset, value.fileOffset, value.fileBytes ), value.line, 0,
             MakeRef( m_fingerprint, "thread", value.thread ), value.runtime, value.flags } );
@@ -669,8 +693,20 @@ std::vector<ScriptFrameDto> TraceSessionRuntimeReader::ScriptFrames() const
 
 std::vector<ScriptStackEventDto> TraceSessionRuntimeReader::ScriptStackEvents() const
 {
-    const auto stored = ReadFixed<StoredScriptStack>( m_path, m_stackOffset,
-        m_stats.scriptStackEvents, "script-stack index read failed" );
+    return ScanScriptStackEvents( 0, size_t( std::min<uint64_t>(
+        m_stats.scriptStackEvents, std::numeric_limits<size_t>::max() ) ) );
+}
+
+std::vector<ScriptStackEventDto> TraceSessionRuntimeReader::ScanScriptStackEvents(
+    size_t offset, size_t limit ) const
+{
+    if( limit == 0 || uint64_t( offset ) >= m_stats.scriptStackEvents ) return {};
+    const auto count = std::min<uint64_t>( limit, m_stats.scriptStackEvents - uint64_t( offset ) );
+    if( uint64_t( offset ) > ( std::numeric_limits<uint64_t>::max() - m_stackOffset ) /
+        sizeof( StoredScriptStack ) ) throw std::runtime_error( "script-stack index offset overflow" );
+    const auto stored = ReadFixed<StoredScriptStack>( m_path,
+        m_stackOffset + uint64_t( offset ) * sizeof( StoredScriptStack ), count,
+        "script-stack index read failed" );
     std::ifstream strings( m_path, std::ios::binary );
     if( !strings ) throw std::runtime_error( "runtime string index is unavailable" );
     std::vector<ScriptStackEventDto> result;
@@ -678,7 +714,7 @@ std::vector<ScriptStackEventDto> TraceSessionRuntimeReader::ScriptStackEvents() 
     for( size_t i = 0; i < stored.size(); ++i )
     {
         const auto& value = stored[i];
-        result.push_back( { MakeRef( m_fingerprint, "script-stack-event", i ),
+        result.push_back( { MakeRef( m_fingerprint, "script-stack-event", uint64_t( offset ) + i ),
             value.primaryId, value.secondaryId, value.value, value.timeNs,
             MakeRef( m_fingerprint, "thread", value.thread ), value.runtime, value.flags,
             value.kind, value.textBytes == 0 ? std::string() :

@@ -116,8 +116,14 @@ public:
     uint64_t GetRelationCount() const override;
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
     std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
+    uint64_t GetRuntimeDomainStateCount() const override;
+    std::vector<RuntimeDomainStateDto> ScanRuntimeDomainStates( size_t offset, size_t limit ) const override;
     std::vector<ScriptFrameDto> GetScriptFrames() const override;
+    uint64_t GetScriptFrameCount() const override;
+    std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const override;
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
+    uint64_t GetScriptStackEventCount() const override;
+    std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const override;
     std::vector<CallsiteDto> GetCallsites() const override;
     std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override;
     CrashDto GetCrash() const override;

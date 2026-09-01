@@ -33,8 +33,11 @@ public:
 
     const TraceSessionRuntimeStats& Stats() const { return m_stats; }
     std::vector<RuntimeDomainStateDto> DomainStates() const;
+    std::vector<RuntimeDomainStateDto> ScanDomainStates( size_t offset, size_t limit ) const;
     std::vector<ScriptFrameDto> ScriptFrames() const;
+    std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const;
     std::vector<ScriptStackEventDto> ScriptStackEvents() const;
+    std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const;
 
 private:
     std::filesystem::path m_path;

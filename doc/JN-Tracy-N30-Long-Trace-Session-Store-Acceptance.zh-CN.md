@@ -1677,6 +1677,27 @@ Trace Session Inventory tests passed；固定组合回归6/6
 
 本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
 
+### 2026-09-01 Runtime/Script 原始记录分页（N30.6B 子阶段）
+
+状态：**Passed（raw-record bounded read；Script语义结果磁盘化仍待后续）**。
+
+- `TraceSource`新增Runtime Domain State、Script Frame和Script Stack Event的精确count/page接口；Legacy Worker默认实现保持兼容。
+- Session Runtime Reader直接按固定记录大小定位目标页，Frame和Stack文本仍从已校验的字符串区读取；分页不会先构造整个原始记录vector。
+- `ParseN11Trace`使用4096条一页扫描Script Frame/Stack原始事实，并接入Query scan/CPU预算；不再调用Session的全量`GetScriptFrames()/GetScriptStackEvents()`。
+- 事件顺序、Stack Header/Frame配对、Marker、Zone Begin/End、invalid/unresolved/orphan质量语义保持原实现。
+- 本子阶段只消除了原始二进制事件的第一层全量物化。当前`N11TraceData`仍会为一次查询累积全部解析后的Frame、Stack、Marker和Zone JSON；长Trace下要满足最终内存门禁，仍需把这些语义对象建立为磁盘Derived并按查询页读取，不能把本子阶段标记为Runtime Script完全完成。
+
+TDD与回归证据：
+
+```text
+RED:       测试先调用不存在的Runtime/Script count/page API，编译按预期失败
+Reader:    Domain State=1；Script Frame=1；Script Stack Event=5
+Page:      Frame(0,1)和Stack Event(1,2)返回精确原始记录
+GREEN:     Trace Session Inventory tests passed
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。
+
 ### 2026-09-01 Gfx Statistics 分页与点查（N30.6B 子阶段）
 
 状态：**Passed（synthetic correctness，真实长Trace随机读取墙钟待N30.7集中门禁）**。

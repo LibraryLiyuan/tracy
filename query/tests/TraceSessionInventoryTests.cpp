@@ -2640,6 +2640,9 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         const auto gfxLinkPage = sessionSource->ScanGfxLinks( 1, 1 );
         const auto gfxDispatch300 = sessionSource->GetGfxDispatch( 300 );
         const auto gfxEntity301 = sessionSource->GetGfxEntity( 301 );
+        const auto runtimeDomainPage = sessionSource->ScanRuntimeDomainStates( 0, 1 );
+        const auto scriptFramePage = sessionSource->ScanScriptFrames( 0, 1 );
+        const auto scriptStackPage = sessionSource->ScanScriptStackEvents( 1, 2 );
         const auto correlatedFrames = sessionSource->GetCorrelatedFrameEvents();
         const auto frameNineDispatches = sessionSource->GetGfxDispatchesForFrame( 9, 0, 8 );
         const auto frameNineEvents = sessionSource->GetCorrelatedFrameEventsForFrame( 9, 0, 8 );
@@ -2680,6 +2683,14 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             gfxDispatch300 && gfxDispatch300->dispatchId == 300 &&
             gfxEntity301 && gfxEntity301->parentId == 300,
             "Session Gfx count/page/point APIs read bounded exact records from disk" );
+        test.Check( sessionSource->GetRuntimeDomainStateCount() == 1 &&
+            runtimeDomainPage.size() == 1 && runtimeDomainPage[0].timeNs == 34,
+            "Session Runtime Domain reader pages exact state records" );
+        test.Check( sessionSource->GetScriptFrameCount() == 1 &&
+            scriptFramePage.size() == 1 && scriptFramePage[0].frameId == 71 &&
+            sessionSource->GetScriptStackEventCount() == 5 &&
+            scriptStackPage.size() == 2 && scriptStackPage[0].primaryId == 1001,
+            "Session Script reader pages exact frame and stack records" );
         test.Check( frameNineDispatches.size() == 1 && frameNineDispatches[0].dispatchId == 300 &&
             frameNineEvents.size() == 1 && frameNineEvents[0].frameId == 9 &&
             missingFrameDispatches.empty() && missingFrameEvents.empty(),

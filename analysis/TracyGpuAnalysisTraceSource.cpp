@@ -1022,6 +1022,20 @@ std::vector<RuntimeDomainStateDto> GpuAnalysisTraceSource::GetRuntimeDomainState
     return reader ? reader->DomainStates() :
         std::vector<RuntimeDomainStateDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetRuntimeDomainStateCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetRuntimeDomainStateCount();
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->Stats().domainStates : 0;
+}
+std::vector<RuntimeDomainStateDto> GpuAnalysisTraceSource::ScanRuntimeDomainStates(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanRuntimeDomainStates( offset, limit );
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->ScanDomainStates( offset, limit ) :
+        std::vector<RuntimeDomainStateDto> {};
+}
 std::vector<ScriptFrameDto> GpuAnalysisTraceSource::GetScriptFrames() const
 {
     if( WorkerLoaded() ) return Worker().GetScriptFrames();
@@ -1029,11 +1043,39 @@ std::vector<ScriptFrameDto> GpuAnalysisTraceSource::GetScriptFrames() const
     return reader ? reader->ScriptFrames() :
         std::vector<ScriptFrameDto> {};
 }
+uint64_t GpuAnalysisTraceSource::GetScriptFrameCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetScriptFrameCount();
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->Stats().scriptFrames : 0;
+}
+std::vector<ScriptFrameDto> GpuAnalysisTraceSource::ScanScriptFrames(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanScriptFrames( offset, limit );
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->ScanScriptFrames( offset, limit ) :
+        std::vector<ScriptFrameDto> {};
+}
 std::vector<ScriptStackEventDto> GpuAnalysisTraceSource::GetScriptStackEvents() const
 {
     if( WorkerLoaded() ) return Worker().GetScriptStackEvents();
     const auto reader = SessionRuntimeReader();
     return reader ? reader->ScriptStackEvents() :
+        std::vector<ScriptStackEventDto> {};
+}
+uint64_t GpuAnalysisTraceSource::GetScriptStackEventCount() const
+{
+    if( WorkerLoaded() ) return TraceSource::GetScriptStackEventCount();
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->Stats().scriptStackEvents : 0;
+}
+std::vector<ScriptStackEventDto> GpuAnalysisTraceSource::ScanScriptStackEvents(
+    size_t offset, size_t limit ) const
+{
+    if( WorkerLoaded() ) return TraceSource::ScanScriptStackEvents( offset, limit );
+    const auto reader = SessionRuntimeReader();
+    return reader ? reader->ScanScriptStackEvents( offset, limit ) :
         std::vector<ScriptStackEventDto> {};
 }
 std::vector<CallsiteDto> GpuAnalysisTraceSource::GetCallsites() const

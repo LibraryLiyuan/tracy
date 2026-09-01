@@ -3842,9 +3842,9 @@ const char* GcKindName( uint64_t kind )
 N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis::TraceInfoDto& info, bool includeGc )
 {
     N11TraceData result;
-    const auto binaryFrames = source.GetScriptFrames();
-    const auto binaryEvents = source.GetScriptStackEvents();
-    const bool binaryScript = !binaryFrames.empty() || !binaryEvents.empty();
+    const auto binaryFrameCount = source.GetScriptFrameCount();
+    const auto binaryEventCount = source.GetScriptStackEventCount();
+    const bool binaryScript = binaryFrameCount != 0 || binaryEventCount != 0;
     std::map<uint64_t, size_t> openZones;
     if( binaryScript )
     {
@@ -3864,8 +3864,17 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
                     frameByScriptZone[relation.targetId] = relation.sourceId;
             offset += page.size();
         }
-        for( const auto& frame : binaryFrames )
+        constexpr size_t ScriptPageSize = 4096;
+        for( uint64_t offset = 0; offset < binaryFrameCount; )
         {
+            const auto requested = size_t( std::min<uint64_t>( ScriptPageSize,
+                binaryFrameCount - offset ) );
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed == 0 ) break;
+            const auto page = source.ScanScriptFrames( size_t( offset ), allowed );
+            BudgetScanned( page.size(), requested, allowed );
+            for( const auto& frame : page )
+            {
             if( frame.frameId == 0 || !ScriptRuntimeValid( frame.runtime ) || frame.function.empty() ||
                 result.frames.contains( frame.frameId ) )
             {
@@ -3878,6 +3887,9 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
                 { "file", frame.file }, { "line", frame.line }, { "flags", frame.flags },
                 { "source_mode", "binary-script-schema-2" }, { "trust", "untrusted_trace_data" }
             } );
+            }
+            offset += page.size();
+            if( page.size() < allowed ) break;
         }
 
         struct PendingStack
@@ -3888,8 +3900,16 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
             bool header = false;
         };
         std::map<uint64_t, PendingStack> pendingStacks;
-        for( const auto& event : binaryEvents )
+        for( uint64_t offset = 0; offset < binaryEventCount; )
         {
+            const auto requested = size_t( std::min<uint64_t>( ScriptPageSize,
+                binaryEventCount - offset ) );
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed == 0 ) break;
+            const auto page = source.ScanScriptStackEvents( size_t( offset ), allowed );
+            BudgetScanned( page.size(), requested, allowed );
+            for( const auto& event : page )
+            {
             if( event.primaryId == 0 || ( event.kind != 5 && !ScriptRuntimeValid( event.runtime ) ) )
             {
                 result.scriptInvalid++;
@@ -3998,6 +4018,9 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
                 result.scriptInvalid++;
                 break;
             }
+            }
+            offset += page.size();
+            if( page.size() < allowed ) break;
         }
         for( auto& [stackId, stack] : pendingStacks )
         {
