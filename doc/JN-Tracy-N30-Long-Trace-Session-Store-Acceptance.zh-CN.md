@@ -1918,3 +1918,28 @@ Regression: 固定组合回归6/6通过
 ```
 
 本子阶段没有生成正式`.tracy`或`tracy-session-export.exe`，也未启动真实30分钟转换。
+
+### 2026-09-01 开放生命周期边界计划（N30.6C 子阶段）
+
+状态：**Passed（边界清单正确性；事件注入与公开导出仍待实现）**。
+
+- 新增`TraceSessionExportBoundaryPlan`，分别统计CPU Zone、GPU Zone、CPU/GPU Allocation、Job和I/O Request在导出窗口的`openBefore`、`openAfter`和`spanning`。
+- 半开窗口语义固定为：起点前开始且在起点后结束为`openBefore`；终点前开始且在终点或更晚结束为`openAfter`；无End的源事实按开放生命周期处理，不伪造结束时间。
+- GPU Zone边界按其CPU Begin/End时刻判断，因为窗口由全局CPU时间定义；GPU timestamp仍由原有GpuTime/Calibration事实恢复，不能用GPU轴替代协议事件边界。
+- CPU/GPU Zone新增按ID连续页读取，单页最多4096条；不再为每个Zone反复打开文件。
+- Memory新增`ScanByStorageOrder`，跨Pool按物理存储顺序分页。它直接seek到目标Pool/offset，避免范围分页从头跳过导致长Trace二次复杂度。
+- Job使用Schedule posting分页，I/O使用Queue-time posting分页；统计过程只保留单页DTO和标量计数。
+- Synthetic Oracle独立逐实体枚举五个域，与生产边界计划逐字段100%相等：CPU起点开放1，Allocation终点开放2，Job终点开放1；fixture中不存在贯穿整个窗口的实体。
+- 当前计划只证明“需要补哪些边界状态”，尚未将这些状态编码进输出协议。未完成事件注入前，`.tracy`发布仍保持关闭。
+
+TDD与回归证据：
+
+```text
+RED:        缺少TraceSessionExportBoundaryPlan/Build API，编译按预期失败
+Diagnosis:  首次GREEN候选与Oracle完全一致；修正了测试对fixture跨窗实体的错误假设
+Memory:     2条/页的Storage-order分页与完整Memory扫描ref顺序100%一致
+GREEN:      Trace Session Inventory tests passed
+Regression: 固定组合回归6/6通过
+```
+
+本子阶段未启动真实30分钟转换，也未修改录制协议、Unity或Player。

@@ -45,6 +45,7 @@ public:
     std::vector<GpuZoneDto> Scan( const ScanRange& range ) const;
     std::vector<GpuZoneDto> ScanContext( std::string_view contextRef,
         const ScanRange& range ) const;
+    std::vector<GpuZoneDto> ScanById( size_t offset, size_t limit ) const;
     std::optional<GpuZoneDto> Get( uint64_t id ) const;
     std::vector<GpuZoneDto> Children( uint64_t id, size_t offset, size_t limit ) const;
 

@@ -2440,11 +2440,26 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
     allMemoryEvents.limit = 16;
     const auto indexedPoolEvents = memoryReader ? memoryReader->ScanPool(
         indexedMemoryPoolRef, allMemoryEvents ) : std::vector<tracy::analysis::MemoryEventDto> {};
+    const auto indexedAllMemoryEvents = memoryReader ? memoryReader->Scan( allMemoryEvents ) :
+        std::vector<tracy::analysis::MemoryEventDto> {};
+    std::vector<tracy::analysis::MemoryEventDto> pagedMemoryEvents;
+    if( memoryReader )
+    {
+        for( size_t offset = 0; offset < memoryReader->Stats().events; offset += 2 )
+        {
+            auto page = memoryReader->ScanByStorageOrder( offset, 2 );
+            pagedMemoryEvents.insert( pagedMemoryEvents.end(), page.begin(), page.end() );
+        }
+    }
     test.Check( memoryReader && memoryReader->Stats().eventBlocks != 0 &&
         !indexedPoolEvents.empty() && std::all_of( indexedPoolEvents.begin(),
             indexedPoolEvents.end(), [&]( const auto& value ) {
                 return value.poolRef == indexedMemoryPoolRef;
-            } ), "Session Memory publishes exact time/Pool block indexes: " + error );
+            } ) && pagedMemoryEvents.size() == indexedAllMemoryEvents.size() &&
+        std::equal( pagedMemoryEvents.begin(), pagedMemoryEvents.end(),
+            indexedAllMemoryEvents.begin(), []( const auto& left, const auto& right ) {
+                return left.ref == right.ref;
+            } ), "Session Memory publishes exact time/Pool and physical-order page indexes: " + error );
     const auto schedulingRoot = tracy::analysis::TraceSessionSchedulingIndexRoot( sessionRoot, manifest );
     bool schedulingWorkFound = false;
     std::string schedulingWorkNames;
@@ -2630,6 +2645,89 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
         manifest, timeRange, limitedExportControl, limitedExportPlan, error ) &&
         error == "session_export_worker_memory_limit" && !limitedExportPlan.memoryAllowed,
         "Session export refuses a range whose conservative Worker estimate exceeds the configured hard limit" );
+    tracy::analysis::TraceSessionExportBoundaryPlan boundaryPlan;
+    test.Check( tracy::analysis::BuildTraceSessionExportBoundaryPlan( publishedSession,
+        manifest, timeRange, boundaryPlan, error ),
+        "Session export enumerates exact cross-range lifecycle state: " + error );
+    tracy::analysis::TraceSessionExportBoundaryPlan boundaryOracle;
+    const auto classifyBoundary = [&]( auto& domain, int64_t begin,
+        const std::optional<int64_t>& end ) {
+        const bool openBefore = begin < timeRange.beginNs &&
+            ( !end || *end > timeRange.beginNs );
+        const bool openAfter = begin < timeRange.endNs &&
+            ( !end || *end >= timeRange.endNs );
+        domain.openBefore += openBefore ? 1 : 0;
+        domain.openAfter += openAfter ? 1 : 0;
+        domain.spanning += openBefore && openAfter ? 1 : 0;
+    };
+    auto exportCpuReader = tracy::analysis::TraceSessionCpuZoneReader::Open(
+        publishedSession, manifest, error );
+    if( exportCpuReader )
+    {
+        boundaryOracle.scannedCpuZones = exportCpuReader->Stats().zones;
+        for( uint64_t id = 0; id < exportCpuReader->Stats().zones; ++id )
+            if( const auto zone = exportCpuReader->Get( id ) )
+                classifyBoundary( boundaryOracle.cpuZones, zone->startNs, zone->endNs );
+    }
+    auto exportGpuZoneReader = tracy::analysis::TraceSessionGpuZoneReader::Open(
+        publishedSession, manifest, error );
+    if( exportGpuZoneReader )
+    {
+        boundaryOracle.scannedGpuZones = exportGpuZoneReader->Stats().zones;
+        for( uint64_t id = 0; id < exportGpuZoneReader->Stats().zones; ++id )
+            if( const auto zone = exportGpuZoneReader->Get( id ) )
+                classifyBoundary( boundaryOracle.gpuZones, zone->cpuStartNs, zone->cpuEndNs );
+    }
+    auto exportMemoryReader = tracy::analysis::TraceSessionMemoryReader::Open(
+        publishedSession, manifest, error );
+    tracy::analysis::ScanRange exportAllMemory;
+    exportAllMemory.limit = 1024;
+    const auto exportMemory = exportMemoryReader ? exportMemoryReader->Scan( exportAllMemory ) :
+        std::vector<tracy::analysis::MemoryEventDto> {};
+    boundaryOracle.scannedAllocations = exportMemory.size();
+    for( const auto& allocation : exportMemory )
+        classifyBoundary( boundaryOracle.allocations,
+            allocation.allocationNs, allocation.freeNs );
+    auto exportJobReader = tracy::analysis::TraceSessionJobReader::Open(
+        publishedSession, manifest, error );
+    const auto exportJobs = exportJobReader ? exportJobReader->ScanBySchedule( 0, 1024 ) :
+        std::vector<tracy::analysis::JobDto> {};
+    boundaryOracle.scannedJobs = exportJobs.size();
+    for( const auto& job : exportJobs )
+        classifyBoundary( boundaryOracle.jobs, job.scheduleNs, job.completedNs );
+    auto exportIoReader = tracy::analysis::TraceSessionIoGfxReader::Open(
+        publishedSession, manifest, error );
+    const auto exportIo = exportIoReader ? exportIoReader->ScanIoRequestsByQueue( 0, 1024 ) :
+        std::vector<tracy::analysis::IoRequestDto> {};
+    boundaryOracle.scannedIoRequests = exportIo.size();
+    for( const auto& request : exportIo )
+        classifyBoundary( boundaryOracle.ioRequests, request.queueNs, request.endNs );
+    const auto boundarySummary = []( const auto& value ) {
+        return std::to_string( value.openBefore ) + "/" +
+            std::to_string( value.openAfter ) + "/" +
+            std::to_string( value.spanning );
+    };
+    test.Check( boundaryPlan == boundaryOracle &&
+        boundaryPlan.cpuZones.openBefore != 0 &&
+        boundaryPlan.allocations.openAfter != 0 &&
+        boundaryPlan.jobs.openAfter != 0,
+        "Session export boundary plan matches the independently enumerated Derived lifecycle oracle; actual cpu/gpu/mem/job/io=" +
+            boundarySummary( boundaryPlan.cpuZones ) + "," + boundarySummary( boundaryPlan.gpuZones ) + "," +
+            boundarySummary( boundaryPlan.allocations ) + "," + boundarySummary( boundaryPlan.jobs ) + "," +
+            boundarySummary( boundaryPlan.ioRequests ) + " scanned=" +
+            std::to_string( boundaryPlan.scannedCpuZones ) + "/" +
+            std::to_string( boundaryPlan.scannedGpuZones ) + "/" +
+            std::to_string( boundaryPlan.scannedAllocations ) + "/" +
+            std::to_string( boundaryPlan.scannedJobs ) + "/" +
+            std::to_string( boundaryPlan.scannedIoRequests ) + " oracle=" +
+            boundarySummary( boundaryOracle.cpuZones ) + "," + boundarySummary( boundaryOracle.gpuZones ) + "," +
+            boundarySummary( boundaryOracle.allocations ) + "," + boundarySummary( boundaryOracle.jobs ) + "," +
+            boundarySummary( boundaryOracle.ioRequests ) + " scanned=" +
+            std::to_string( boundaryOracle.scannedCpuZones ) + "/" +
+            std::to_string( boundaryOracle.scannedGpuZones ) + "/" +
+            std::to_string( boundaryOracle.scannedAllocations ) + "/" +
+            std::to_string( boundaryOracle.scannedJobs ) + "/" +
+            std::to_string( boundaryOracle.scannedIoRequests ) );
     ExportProtocolCapture exportProtocol;
     tracy::analysis::TraceSessionWindowProtocolStats exportProtocolStats;
     test.Check( tracy::analysis::BuildTraceSessionWindowProtocol( publishedSession,

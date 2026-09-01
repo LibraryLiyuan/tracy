@@ -1,8 +1,13 @@
 #include "TracyTraceSessionExport.hpp"
 
 #include "TracyTraceSessionCanonical.hpp"
+#include "TracyTraceSessionCpuZones.hpp"
 #include "TracyTraceSessionFrames.hpp"
 #include "TracyTraceSessionGpuCanonical.hpp"
+#include "TracyTraceSessionGpuZones.hpp"
+#include "TracyTraceSessionIoGfx.hpp"
+#include "TracyTraceSessionJobs.hpp"
+#include "TracyTraceSessionMemory.hpp"
 #include "TracyProtocol.hpp"
 #include "TracyStreamJournal.hpp"
 #include "tracy_lz4.hpp"
@@ -11,6 +16,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace tracy::analysis
 {
@@ -201,6 +207,19 @@ bool VisitWindowProtocolRecord( const TraceSessionCanonicalRecord& record,
     }
     state.frame.insert( state.frame.end(), record.payload.begin(), record.payload.end() );
     return true;
+}
+
+void ClassifyBoundary( TraceSessionExportBoundaryDomain& domain,
+    int64_t beginNs, const std::optional<int64_t>& endNs,
+    const TraceSessionExportRange& range )
+{
+    const bool openBefore = beginNs < range.beginNs &&
+        ( !endNs || *endNs > range.beginNs );
+    const bool openAfter = beginNs < range.endNs &&
+        ( !endNs || *endNs >= range.endNs );
+    domain.openBefore += openBefore ? 1 : 0;
+    domain.openAfter += openAfter ? 1 : 0;
+    domain.spanning += openBefore && openAfter ? 1 : 0;
 }
 
 }
@@ -411,6 +430,90 @@ bool BuildTraceSessionWindowProtocol( const std::filesystem::path& sessionRoot,
     if( stats.outputFrames == 0 || stats.selectedSemanticEvents == 0 )
     {
         error = "session_export_range_has_no_protocol_events";
+        return false;
+    }
+    return true;
+}
+
+bool BuildTraceSessionExportBoundaryPlan( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
+    TraceSessionExportBoundaryPlan& plan, std::string& error )
+{
+    error.clear();
+    plan = {};
+    if( range.beginNs >= range.endNs )
+    {
+        error = "session_export_time_range_invalid";
+        return false;
+    }
+    if( !VerifyCurrentGeneration( sessionRoot, manifest, error ) ) return false;
+    constexpr size_t PageSize = 4096;
+    try
+    {
+        auto cpu = TraceSessionCpuZoneReader::Open( sessionRoot, manifest, error );
+        if( !cpu ) return false;
+        for( uint64_t offset = 0; offset < cpu->Stats().zones; offset += PageSize )
+        {
+            const auto page = cpu->ScanById( size_t( offset ), PageSize );
+            if( page.empty() ) { error = "session_export_cpu_zone_page_missing"; return false; }
+            for( const auto& value : page )
+                ClassifyBoundary( plan.cpuZones, value.startNs, value.endNs, range );
+            plan.scannedCpuZones += page.size();
+        }
+
+        auto gpu = TraceSessionGpuZoneReader::Open( sessionRoot, manifest, error );
+        if( !gpu ) return false;
+        for( uint64_t offset = 0; offset < gpu->Stats().zones; offset += PageSize )
+        {
+            const auto page = gpu->ScanById( size_t( offset ), PageSize );
+            if( page.empty() ) { error = "session_export_gpu_zone_page_missing"; return false; }
+            for( const auto& value : page )
+                ClassifyBoundary( plan.gpuZones, value.cpuStartNs, value.cpuEndNs, range );
+            plan.scannedGpuZones += page.size();
+        }
+
+        auto memory = TraceSessionMemoryReader::Open( sessionRoot, manifest, error );
+        if( !memory ) return false;
+        for( uint64_t offset = 0; offset < memory->Stats().events; offset += PageSize )
+        {
+            if( offset > std::numeric_limits<size_t>::max() )
+            { error = "session_export_memory_offset_platform_overflow"; return false; }
+            const auto page = memory->ScanByStorageOrder( size_t( offset ), PageSize );
+            if( page.empty() ) { error = "session_export_memory_page_missing"; return false; }
+            for( const auto& value : page )
+                ClassifyBoundary( plan.allocations, value.allocationNs, value.freeNs, range );
+            plan.scannedAllocations += page.size();
+        }
+
+        auto jobs = TraceSessionJobReader::Open( sessionRoot, manifest, error );
+        if( !jobs ) return false;
+        for( uint64_t offset = 0; offset < jobs->Count(); offset += PageSize )
+        {
+            if( offset > std::numeric_limits<size_t>::max() )
+            { error = "session_export_job_offset_platform_overflow"; return false; }
+            const auto page = jobs->ScanBySchedule( size_t( offset ), PageSize );
+            if( page.empty() ) { error = "session_export_job_page_missing"; return false; }
+            for( const auto& value : page )
+                ClassifyBoundary( plan.jobs, value.scheduleNs, value.completedNs, range );
+            plan.scannedJobs += page.size();
+        }
+
+        auto io = TraceSessionIoGfxReader::Open( sessionRoot, manifest, error );
+        if( !io ) return false;
+        for( uint64_t offset = 0; offset < io->Stats().ioRequestIds; offset += PageSize )
+        {
+            if( offset > std::numeric_limits<size_t>::max() )
+            { error = "session_export_io_offset_platform_overflow"; return false; }
+            const auto page = io->ScanIoRequestsByQueue( size_t( offset ), PageSize );
+            if( page.empty() ) { error = "session_export_io_page_missing"; return false; }
+            for( const auto& value : page )
+                ClassifyBoundary( plan.ioRequests, value.queueNs, value.endNs, range );
+            plan.scannedIoRequests += page.size();
+        }
+    }
+    catch( const std::exception& exception )
+    {
+        error = "session_export_boundary_read_failed:" + std::string( exception.what() );
         return false;
     }
     return true;

@@ -86,6 +86,31 @@ struct TraceSessionWindowProtocolStats
     uint64_t outputBytes = 0;
 };
 
+struct TraceSessionExportBoundaryDomain
+{
+    uint64_t openBefore = 0;
+    uint64_t openAfter = 0;
+    uint64_t spanning = 0;
+
+    bool operator==( const TraceSessionExportBoundaryDomain& ) const = default;
+};
+
+struct TraceSessionExportBoundaryPlan
+{
+    TraceSessionExportBoundaryDomain cpuZones;
+    TraceSessionExportBoundaryDomain gpuZones;
+    TraceSessionExportBoundaryDomain allocations;
+    TraceSessionExportBoundaryDomain jobs;
+    TraceSessionExportBoundaryDomain ioRequests;
+    uint64_t scannedCpuZones = 0;
+    uint64_t scannedGpuZones = 0;
+    uint64_t scannedAllocations = 0;
+    uint64_t scannedJobs = 0;
+    uint64_t scannedIoRequests = 0;
+
+    bool operator==( const TraceSessionExportBoundaryPlan& ) const = default;
+};
+
 bool ResolveTraceSessionExportRange( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionExportSelection& selection,
     TraceSessionExportRange& range, std::string& error );
@@ -104,6 +129,10 @@ bool BuildTraceSessionWindowProtocol( const std::filesystem::path& sessionRoot,
     const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
     TraceSessionWindowProtocolSink sink, void* sinkUserData,
     TraceSessionWindowProtocolStats& stats, std::string& error );
+
+bool BuildTraceSessionExportBoundaryPlan( const std::filesystem::path& sessionRoot,
+    const TraceSessionManifest& manifest, const TraceSessionExportRange& range,
+    TraceSessionExportBoundaryPlan& plan, std::string& error );
 
 }
 

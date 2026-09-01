@@ -1139,6 +1139,28 @@ std::vector<GpuZoneDto> TraceSessionGpuZoneReader::ScanContext(
     return context ? ScanImpl( range, context ) : std::vector<GpuZoneDto> {};
 }
 
+std::vector<GpuZoneDto> TraceSessionGpuZoneReader::ScanById(
+    size_t offset, size_t limit ) const
+{
+    std::vector<GpuZoneDto> result;
+    const auto begin = std::min<uint64_t>( offset, m_impl->zoneCount );
+    const auto count = std::min<uint64_t>( limit, m_impl->zoneCount - begin );
+    if( count == 0 ) return result;
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session GPU Zone pages are unavailable" );
+    in.seekg( std::streamoff( m_impl->zonesOffset + begin * sizeof( StoredZone ) ) );
+    result.reserve( size_t( count ) );
+    for( uint64_t index = 0; index < count; ++index )
+    {
+        StoredZone zone;
+        if( !in.read( reinterpret_cast<char*>( &zone ), sizeof( zone ) ) ||
+            zone.id != begin + index )
+            throw std::runtime_error( "Session GPU Zone page is truncated" );
+        result.emplace_back( m_impl->ToDto( zone ) );
+    }
+    return result;
+}
+
 std::vector<GpuZoneDto> TraceSessionGpuZoneReader::ScanImpl(
     const ScanRange& range, std::optional<uint32_t> context ) const
 {

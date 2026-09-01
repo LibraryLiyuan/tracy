@@ -43,6 +43,7 @@ public:
     std::vector<CpuZoneDto> Scan( const ScanRange& range ) const;
     std::vector<CpuZoneDto> ScanThread( std::string_view threadRef,
         const ScanRange& range ) const;
+    std::vector<CpuZoneDto> ScanById( size_t offset, size_t limit ) const;
     std::optional<CpuZoneDto> Get( uint64_t id ) const;
     std::vector<CpuZoneDto> Children( uint64_t id, size_t offset, size_t limit ) const;
 

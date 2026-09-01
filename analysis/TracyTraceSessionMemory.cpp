@@ -935,6 +935,40 @@ std::vector<MemoryEventDto> TraceSessionMemoryReader::Scan( const ScanRange& ran
     return ScanImpl( range, std::nullopt );
 }
 
+std::vector<MemoryEventDto> TraceSessionMemoryReader::ScanByStorageOrder(
+    size_t offset, size_t limit ) const
+{
+    std::vector<MemoryEventDto> result;
+    if( limit == 0 || uint64_t( offset ) >= m_stats.events ) return result;
+    result.reserve( size_t( std::min<uint64_t>( limit, m_stats.events - uint64_t( offset ) ) ) );
+    uint64_t skip = offset;
+    std::ifstream in( m_impl->path, std::ios::binary );
+    if( !in ) throw std::runtime_error( "Session Memory pages are unavailable" );
+    for( const auto& pool : m_impl->pools )
+    {
+        if( skip >= pool.stored.eventCount )
+        {
+            skip -= pool.stored.eventCount;
+            continue;
+        }
+        const auto available = pool.stored.eventCount - skip;
+        const auto count = std::min<uint64_t>( available, limit - result.size() );
+        in.clear();
+        in.seekg( std::streamoff( pool.stored.eventsOffset +
+            skip * sizeof( StoredMemoryEvent ) ) );
+        for( uint64_t index = 0; index < count; ++index )
+        {
+            StoredMemoryEvent event;
+            if( !in.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) )
+                throw std::runtime_error( "Session Memory page is truncated" );
+            result.emplace_back( m_impl->ToDto( pool, skip + index, event ) );
+        }
+        skip = 0;
+        if( result.size() >= limit ) break;
+    }
+    return result;
+}
+
 std::vector<MemoryEventDto> TraceSessionMemoryReader::ScanPool(
     std::string_view poolRef, const ScanRange& range ) const
 {

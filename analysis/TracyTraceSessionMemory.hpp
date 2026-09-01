@@ -39,6 +39,7 @@ public:
 
     const TraceSessionMemoryStats& Stats() const { return m_stats; }
     const std::vector<MemoryPoolDto>& Pools() const { return m_pools; }
+    std::vector<MemoryEventDto> ScanByStorageOrder( size_t offset, size_t limit ) const;
     std::vector<MemoryEventDto> Scan( const ScanRange& range ) const;
     std::vector<MemoryEventDto> ScanPool( std::string_view poolRef,
         const ScanRange& range ) const;
