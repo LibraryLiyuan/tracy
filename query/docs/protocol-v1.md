@@ -59,6 +59,14 @@ Modes are `exact`, `contains`, and `prefix`. `fields` performs bounded response 
 
 `system.capabilities` reports `present`, `queryable`, `indexed`, `reason`, methods, and limits for every domain. The complete method-to-Worker-data map is in `schema/coverage-v1.json`. The main groups are trace/session, threads and scheduling, frames/images, CPU/GPU zones, callstacks/samples/symbols/source, memory/GTMEM1, locks, plots/messages, statistics, compare, and validation.
 
+Long captures may contain thousands of AppInfo quality and configuration
+envelopes. `trace.info` and `trace.overview` therefore return a bounded AppInfo
+preview (at most 100 records and 256 KiB) plus `app_info_count` and
+`app_info_complete`. `trace.app_info` is the lossless route and uses the common
+`limit`/`cursor` pagination contract; `matched_count` reports the exact total.
+This keeps overview responses below the protocol response budget without
+discarding persisted AppInfo evidence.
+
 ## Capture context and producer quality
 
 Schema 1.2 reads versioned `JNCTX1` Capture Context and `JNQ1` Producer Quality

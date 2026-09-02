@@ -24,13 +24,26 @@ Baseline: b121e58c
 
 N30A不修改Protocol 90、JN section 12、Unity、PackageRepo、Player或录制配置；不自动合并或推送其他分支。
 
-截至2026-09-02的执行状态：
+截至2026-09-02的最终执行状态：
 
 | 阶段 | 状态 |
 |---|---|
 | A0～A5 | 已完成并提交；G05真实规模GPU正确性通过 |
-| A6 | 已完成实现、短Trace全域回归、Release/G05查询验收；等待阶段提交 |
-| A7 | 待执行；A6提交后只启动一次真实30分钟最终验收 |
+| A6 | 已完成并提交；短Trace全域回归、Release/G05查询与跨域Evidence验收通过 |
+| A7 | 已完成实现与真实30分钟最终验收；等待本阶段文档提交，不合并、不推送 |
+
+A7固定输入已发布为可查询Session：
+
+```text
+Source SHA-256: 2AC46C53257CE9027EC67E098FC15070FB911243F6CD311A166EB97547848068
+Session generation: n30-1788306859373994-47656
+Canonical shards: 402
+Indexed records: 2,285,222,848
+GPU independent verifier mismatch_count: 0
+Release Query acceptance: 24/24
+```
+
+Session状态为`CompleteSourceDegraded`：Converter自身造成的gap/unresolved/checksum failure为0；CPU Zone时钟逆序、process-scoped Scheduling gap以及GPU Catalog producer drop/identity gap均来自源录制，已按域显式保留，不被伪装修复。完整证据见验收文档A7章节。
 
 后续独立里程碑：
 

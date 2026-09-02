@@ -161,7 +161,10 @@ class RunReader
 public:
     bool Open( const std::filesystem::path& path, std::string& error )
     {
-        m_in.open( path, std::ios::binary ); RunHeader header;
+        m_in.open( path, std::ios::binary );
+        if( !m_in )
+        { error = "gpu_verifier_run_open_failed"; return false; }
+        RunHeader header;
         if( !m_in.read( reinterpret_cast<char*>( &header ), sizeof( header ) ) ||
             header.magic != VerifierRunMagic || header.schema != 1 ||
             header.recordBytes != sizeof( T ) )
@@ -224,6 +227,94 @@ bool MergeRuns( const std::vector<std::filesystem::path>& paths,
         if( !readers[node.run].Empty() ) queue.push( { node.run, readers[node.run].Front() } );
     }
     return true;
+}
+
+template<typename T, typename Compare>
+bool MergeRunGroup( const std::vector<std::filesystem::path>& paths,
+    const std::filesystem::path& target, Compare compare,
+    const std::stop_token& stopToken, std::string& error )
+{
+    std::error_code ec;
+    std::filesystem::create_directories( target.parent_path(), ec );
+    if( ec )
+    { error = "gpu_verifier_run_directory_failed:" + ec.message(); return false; }
+    const auto temporary = target.string() + ".tmp";
+    std::ofstream out( temporary, std::ios::binary | std::ios::trunc );
+    if( !out ) { error = "gpu_verifier_run_open_failed"; return false; }
+    RunHeader header;
+    header.recordBytes = sizeof( T );
+    out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+    uint64_t count = 0;
+    uint64_t checksum = FnvOffset;
+    const auto write = [&]( const T& value, std::string& consumeError ) {
+        out.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !out )
+        { consumeError = "gpu_verifier_run_write_failed"; return false; }
+        checksum = FnvUpdate( checksum, &value, sizeof( value ) );
+        ++count;
+        return true;
+    };
+    if( !MergeRuns<T>( paths, compare, write, stopToken, error ) )
+    {
+        out.close();
+        std::filesystem::remove( temporary, ec );
+        return false;
+    }
+    header.recordCount = count;
+    header.checksum = checksum;
+    out.seekp( 0, std::ios::beg );
+    out.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+    out.flush();
+    out.close();
+    if( !out )
+    {
+        error = "gpu_verifier_run_write_failed";
+        std::filesystem::remove( temporary, ec );
+        return false;
+    }
+    return AtomicReplace( temporary, target, error );
+}
+
+template<typename T, typename Compare, typename Consumer>
+bool MergeRunsBounded( const std::vector<std::filesystem::path>& paths,
+    const std::filesystem::path& mergeRoot, const char* prefix,
+    uint32_t maximumOpenRunReaders, Compare compare, Consumer consumer,
+    const std::stop_token& stopToken, TraceSessionGpuVerifierReport& report,
+    std::string& error )
+{
+    if( maximumOpenRunReaders < 2 )
+    { error = "gpu_verifier_run_fan_in_invalid"; return false; }
+    auto current = paths;
+    uint32_t round = 0;
+    while( current.size() > maximumOpenRunReaders )
+    {
+        std::vector<std::filesystem::path> next;
+        next.reserve( ( current.size() + maximumOpenRunReaders - 1 ) /
+            maximumOpenRunReaders );
+        const auto roundRoot = mergeRoot / ( "round-" + std::to_string( round ) );
+        for( size_t begin = 0; begin < current.size(); begin += maximumOpenRunReaders )
+        {
+            const auto end = std::min( current.size(),
+                begin + size_t( maximumOpenRunReaders ) );
+            std::vector<std::filesystem::path> group(
+                current.begin() + begin, current.begin() + end );
+            report.peakOpenRunReaders = std::max<uint64_t>(
+                report.peakOpenRunReaders, group.size() );
+            std::ostringstream name;
+            name << prefix << '-' << std::setw( 6 ) << std::setfill( '0' )
+                << next.size() << ".bin";
+            const auto target = roundRoot / name.str();
+            if( !MergeRunGroup<T>( group, target, compare, stopToken, error ) )
+                return false;
+            next.push_back( target );
+        }
+        current = std::move( next );
+        ++round;
+        ++report.runMergePassCount;
+    }
+    report.peakOpenRunReaders = std::max<uint64_t>(
+        report.peakOpenRunReaders, current.size() );
+    return MergeRuns<T>( current, compare, consumer, stopToken, error );
 }
 
 bool IsDefinition( JnGpuCatalogRecordOperation operation )
@@ -412,8 +503,11 @@ bool ComputePhysicalPeak( SourceState& source, TraceSessionGpuVerifierReport& re
         if( lhs.value.time != rhs.value.time ) return lhs.value.time < rhs.value.time;
         return lhs.ordinal < rhs.ordinal;
     };
-    if( !MergeRuns<AllocationRaw>( source.allocationRuns, allocationCompare,
-        consumeAllocation, source.control->stopToken, error ) || !flushDeltas() ) return false;
+    if( !MergeRunsBounded<AllocationRaw>( source.allocationRuns,
+        source.runRoot / "allocation-merge", "allocation",
+        source.control->maximumOpenRunReaders, allocationCompare,
+        consumeAllocation, source.control->stopToken, report, error ) ||
+        !flushDeltas() ) return false;
 
     int64_t current = 0;
     const auto consumeDelta = [&]( const PhysicalDelta& value, std::string& consumeError ) {
@@ -430,8 +524,10 @@ bool ComputePhysicalPeak( SourceState& source, TraceSessionGpuVerifierReport& re
         if( lhs.time != rhs.time ) return lhs.time < rhs.time;
         return lhs.ordinal < rhs.ordinal;
     };
-    return MergeRuns<PhysicalDelta>( deltaRuns, deltaCompare, consumeDelta,
-        source.control->stopToken, error );
+    return MergeRunsBounded<PhysicalDelta>( deltaRuns,
+        source.runRoot / "delta-merge", "delta",
+        source.control->maximumOpenRunReaders, deltaCompare, consumeDelta,
+        source.control->stopToken, report, error );
 }
 
 struct PassAuditFact
@@ -553,8 +649,10 @@ bool AuditStoreRelationsLinear( const GpuAnalysisStoreReader& reader,
         else pending.direct = uint8_t( pending.direct || value.direct );
         return true;
     };
-    if( !MergeRuns<PassRelationRaw>( passRuns, passCompare,
-        consumePassRelation, control.stopToken, error ) || !commitPending() ) return false;
+    if( !MergeRunsBounded<PassRelationRaw>( passRuns,
+        runRoot / "pass-relation-merge", "pass-relation",
+        control.maximumOpenRunReaders, passCompare, consumePassRelation,
+        control.stopToken, report, error ) || !commitPending() ) return false;
     inclusiveOut.flush(); inclusiveOut.close();
     if( !inclusiveOut )
     { error = "gpu_verifier_relation_output_flush_failed"; return false; }
@@ -620,8 +718,10 @@ bool AuditStoreRelationsLinear( const GpuAnalysisStoreReader& reader,
             stored.resourceId, stored.passId, stored.inclusive );
         return true;
     };
-    if( !MergeRuns<GpuAnalysisResourcePassEntry>( resourceRuns, resourceCompare,
-        compareStore, control.stopToken, error ) ) return false;
+    if( !MergeRunsBounded<GpuAnalysisResourcePassEntry>( resourceRuns,
+        runRoot / "resource-relation-merge", "resource-relation",
+        control.maximumOpenRunReaders, resourceCompare, compareStore,
+        control.stopToken, report, error ) ) return false;
     GpuAnalysisResourcePassEntry trailing; bool hasTrailing = false;
     if( !nextStore( trailing, hasTrailing ) ) return false;
     if( hasTrailing )
@@ -728,7 +828,8 @@ bool VerifyTraceSessionGpuDerived( const std::filesystem::path& sessionRoot,
     error.clear(); report = {};
     if( control.maximumBufferedAllocationRecords == 0 ||
         control.maximumBufferedDeltas == 0 ||
-        control.maximumBufferedPassRelations == 0 )
+        control.maximumBufferedPassRelations == 0 ||
+        control.maximumOpenRunReaders < 2 )
     { error = "gpu_verifier_buffer_limit_invalid"; return false; }
     report.sourceSha256 = manifest.source.sha256; report.sourceSize = manifest.source.fileSize;
     report.sessionGeneration = manifest.generation; report.sourceRecordHash = FnvOffset;

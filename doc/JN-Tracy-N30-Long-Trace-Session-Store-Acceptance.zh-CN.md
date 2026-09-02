@@ -80,11 +80,11 @@ Projected full replay: approximately 90–100 GiB
 | N30.2 Inventory与容量预检 | Passed | Journal、强身份、容量、Protocol QueueType、数据域、CaptureEnd质量及immutable依赖run通过真实30分钟输入。 |
 | N30.3 Canonical/Checkpoint | Passed | 按17域对齐分片、共享Reader、ThreadContext/raw TSC、record-boundary安全取消、LZ4 checkpoint、单writer lease、强身份/损坏拒绝及内存/磁盘门禁已通过synthetic。生命周期索引从Canonical重建，不进入转换恢复checkpoint，避免重复维护第二套权威状态机。 |
 | N30.4 全Canonical域 | Passed | Protocol 90全部QueueType均按17域保存原始事实；显式ProtocolFrame fact与独立全域Audit已通过synthetic。跨Shard生命周期和开放边界由N30.5 Mandatory Derived从同一Canonical generation确定性重建。 |
-| N30.5 Derived/N29整合 | InProgress（N30A重开） | Synthetic路径已通过，但真实30分钟GPU Derived未完成最终发布、count/bytes/peak/checksum和16 GiB门禁；不得继续标记Passed。 |
-| N30.6 Query/MCP/导出 | Paused（Query部分完成） | Query 1.34已完成大量Session Reader；Protocol重放式局部导出因握手、delta时间和开放边界问题退出正式主线。N30A先完成全域可信Session，局部`.tracy`导出转入后续方案C。 |
-| N30.7 LTS-1 | NotStarted | — |
-| N30.8 Profiler Session | NotStarted | — |
-| N30.9 LTS-2 | NotStarted | — |
+| N30.5 Derived/N29整合 | Passed（N30A A1～A7收口） | 真实30分钟GPU Derived成功发布；独立Verifier的count/bytes/peak/checksum和双向关系均为0 mismatch。 |
+| N30.6 Query/MCP/导出 | Query/MCP Passed；导出Deferred | Query 1.34全域Session Reader及真实30分钟24项矩阵通过；Protocol重放式局部导出退出正式主线，语义导出转入后续方案C。 |
+| N30.7 LTS-1 | Superseded by N30A | 全域可信Session目标由N30A A0～A7完成；原LTS-1中的局部`.tracy`导出明确延期。 |
+| N30.8 Profiler Session | Deferred | 进入后续方案P。 |
+| N30.9 LTS-2 | Deferred | 等待方案C与方案P完成后重新定义最终验收。 |
 
 后续每阶段记录：源码HEAD、测试RED/GREEN证据、工具SHA-256、输入身份、事件/关系计数、内存/磁盘/耗时、失败项和回滚提交。
 
@@ -2340,3 +2340,175 @@ Regression: Debug CTest 8/8 Passed；Total Test Time 8.94 sec
 ```
 
 本阶段没有启动真实30分钟转换，没有修改Protocol 90、Unity、PackageRepo或Player，也没有触碰既有未跟踪`build-n30-stream-tests/`目录。A6通过后提交阶段改动；A7只对固定真实30分钟stream执行一次最终全域转换与审计，避免重复消耗。
+
+### 2026-09-02 A7 真实30分钟Session全域最终审计
+
+状态：**Passed（可信Session成功发布；源录制已有退化被忠实保留）。**
+
+#### 输入、工具和输出身份
+
+固定输入：
+
+```text
+Path:
+C:\Users\Admin\Documents\JN-Unity-T3\N29-Autonomous-30m\Run-20260830-220012\Admin-HighEvidence-30m.tracy-stream
+
+Size:
+19,122,822,908 bytes
+
+SHA-256（A7结束后重新计算）:
+2AC46C53257CE9027EC67E098FC15070FB911243F6CD311A166EB97547848068
+```
+
+工具：
+
+| 工具 | 大小 | SHA-256 |
+|---|---:|---|
+| `build-n30-capture\Release\tracy-stream-convert.exe` | 1,964,032 | `F3FD70B0901F06373B4CA9DDC4CC0CD8F9A1458D7C0DF9F586F7F03E8A16B44A` |
+| `build-n30-query\Release\tracy-query.exe` | 16,013,312 | `6C11214415716B1E6CE7F970E9AE8987D43EC0C6B3AD7582B8483F00C7C8F249` |
+
+发布结果：
+
+```text
+Session:
+C:\Users\Admin\Documents\JN-Unity-T3\N29-Autonomous-30m\Run-20260830-220012\Admin-HighEvidence-30m.jn-trace-session
+
+CURRENT / generation:
+n30-1788306859373994-47656
+
+Canonical shards: 402
+Indexed records: 2,285,222,848
+Generation files: 1,286
+Generation bytes: 202,134,780,631 bytes（188.253 GiB）
+```
+
+原始stream在发布后重新计算的大小和SHA-256与A7前完全一致，未被修改或删除。旧成功generation继续保留作为回滚点；一次因操作命令把`-o`误传为building目录而产生的嵌套generation没有删除，而是可逆重命名为：
+
+```text
+Admin-HighEvidence-30m.jn-trace-session.abandoned.n30-1788316934993530-63044
+```
+
+正确恢复命令以最终Session根作为`-o`，随后成功复用402个已校验Canonical shard。
+
+#### GPU Mandatory Derived与独立Verifier
+
+独立Verifier在真实规模下生成并有界归并：
+
+```text
+Pass relation runs:      1,143 → 9
+Resource relation runs:    637 → 5
+Maximum open run readers:  128
+```
+
+修复前，Verifier尝试同时打开全部run，超过Windows进程句柄/文件打开能力；修复后使用多轮有界external merge，且把“打开失败”和“header损坏”拆分为不同错误。测试用`maximumOpenRunReaders=2`先稳定RED，再验证多轮归并GREEN。
+
+真实GPU审计：
+
+| 项目 | 数值 |
+|---|---:|
+| Resource | 1,769,168 |
+| Allocation | 1,769,007 |
+| Pass | 27,375,840 |
+| Range | 43,884,638 |
+| Direct members | 357,965,580 |
+| Inclusive / Resource-Pass relations | 667,721,122 |
+| Forward relation hash | 5,854,663,396,778,239,566 |
+| Reverse relation hash | 5,854,663,396,778,239,566 |
+| Verifier report hash | 9,444,475,405,900,354,442 |
+| `mismatch_count` | 0 |
+| EngineKnownPhysical peak | 3,848,863,744 bytes |
+| Peak time | 1,859,905,005,679 ns |
+
+Transport最终审计：`converter_output_complete=true`、320个GPU committed page、checksum failure为0、Converter创建的unresolved为0。
+
+#### 全域Canonical与Query/MCP验收
+
+Release Query 1.34 `--doctor`通过，Session source kind为`session`、state为`ready`、fingerprint与源stream SHA-256一致。24项同源请求全部通过：
+
+```text
+requests=24
+passed=24
+failed=0
+```
+
+证据文件：
+
+```text
+C:\Users\Admin\Documents\JN-Unity-T3\N30A-A7-30m-doctor.json
+C:\Users\Admin\Documents\JN-Unity-T3\N30A-A7-30m-acceptance.ndjson
+```
+
+主要全域计数：
+
+| 数据域 | 数量 |
+|---|---:|
+| Frame / FrameSet | 580,182 / 5 |
+| CPU Zone | 234,691,471 |
+| GPU Zone | 36,837,665 |
+| Job | 18,578,994 |
+| Gfx Entity / Link | 63,579,905 / 106,965,570 |
+| Sampling | 206,122,329 |
+| Context Switch | 104,697,072 |
+| Memory Event / Pool | 1,864,438 / 9 |
+| Relation | 125,513,195 |
+| Message / Plot | 141,012 / 48 |
+| FrameImage | 1,173 |
+| I/O Request / Stage | 26 / 52 |
+| Callstack payload / frame | 751,825 / 431,956 |
+
+FrameImage前5项为960×540，并保持60帧采样语义。Hardware Sample与Lock在源录制中不存在，因此返回`present=false`，不是Converter缺失。
+
+#### 长录制AppInfo响应上限修复
+
+首次真实Query矩阵为21/24：`trace.info`、`trace.overview`和`trace.app_info`因51,254条AppInfo超过8 MiB响应上限而返回`RESOURCE_LIMIT`。这是Query长录制合约缺口，不是Session损坏。
+
+修复后：
+
+- `trace.info`和`trace.overview`只嵌入最多100项、最多256 KiB的有界AppInfo预览；同时返回`app_info_count`、`app_info_complete=false`和`app_info_query=trace.app_info`。
+- `trace.app_info`使用标准cursor分页，单页上限1,000；真实Session第一页返回1,000项、`matched_count=51,254`和有效`next_cursor`。
+- 完整AppInfo仍可无损分页访问，没有静默截断。
+
+TDD：12,000条、每条约1 KiB的synthetic AppInfo先使`trace.info`稳定RED；修复后摘要预览和`trace.app_info`多页游标全部GREEN。
+
+#### 源端质量与发布语义
+
+Session为`CompleteSourceDegraded`，而不是`Complete`。明确区分如下：
+
+| 来源 | 数量 | 处理 |
+|---|---:|---|
+| CPU Zone source clock inversion | 7,144 | 保留事实；从精确时长统计排除无效项 |
+| process-scoped Scheduling source gap | 12,931,785 | 保留观测区间；受影响区间标记不完整 |
+| GPU Resource identity gap | 140 | 显式`source_gap_resources` |
+| GPU Reference identity gap | 1,334 | 显式`source_gap_references` |
+| GPU Catalog producer dropped/overflow | 159 / 159 | Producer quality标记degraded，coverage=0.9999936778622713 |
+| Converter-created unresolved | 0 | 通过 |
+| Verifier mismatch | 0 | 通过 |
+| committed checksum failure | 0 | 通过 |
+
+因此，Session完整忠实地保存了源端已有质量状态；没有用旧状态、空集合或推断值掩盖缺口。
+
+#### 取消、内存、耗时与残余优化项
+
+- 在同一19.1 GB源上执行独立Inventory取消探针：处理到8.0%时发送第一次Ctrl+C，Converter在`0.061 s`内返回`Inventory cancelled safely at a committed input boundary`，退出码1，未发布不完整Session。
+- A7正确恢复从约10:52到11:52完成，约60分钟；这是复用Canonical及多数通用Derived后的恢复路径，不是从零端到端基准。
+- A7运行期间周期性进程采样观察到Converter Private Bytes低于约0.83 GiB，远低于16 GiB硬上限；本次未使用ETW做高频RSS峰值审计，因此该数字记为观测上界，不冒充精确峰值。
+- 独立Verifier临时external run约41.70 GiB，归并后成功释放当前阶段临时输入；最终generation为188.253 GiB，低于256 GiB Session上限。
+- 已知性能改进项：恢复路径虽然复用了Canonical和常规Derived，仍重建GPU spool/store后再运行Verifier。它不影响正确性或最终审计，但会放大恢复墙钟和临时磁盘，留作后续恢复性能优化。
+
+#### 最终回归
+
+```text
+Debug CTest: 8/8 Passed
+tracy-query-contract: Passed
+tracy-gpu-analysis: Passed
+tracy-trace-session-store: Passed
+tracy-trace-session-inventory: Passed
+tracy-query-mcp-transcript: Passed
+tracy-query-version: Passed
+tracy-query-doctor: Passed
+tracy-gpu-analysis-n29-static: Passed
+Release real Session Query: 24/24 Passed
+Source SHA-256 unchanged: Passed
+```
+
+A7没有修改Protocol 90、Unity、PackageRepo、Player或录制配置；没有合并或推送N30分支。既有未跟踪`build-n30-stream-tests/`继续保留。局部`.tracy`语义导出和Profiler Session后端仍分别延期到方案C和方案P，不属于N30A完成门禁。

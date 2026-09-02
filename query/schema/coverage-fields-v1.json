@@ -392,9 +392,9 @@
       "entity": "trace.app_info",
       "classification": "persisted_semantic",
       "persisted_fields": ["ordered_text_entries"],
-      "query_fields": ["app_info"],
+      "query_fields": ["app_info", "app_info_count", "app_info_complete", "matched_count", "page.next_cursor"],
       "unmapped_fields": [],
-      "methods": ["trace.app_info", "trace.overview"],
+      "methods": ["trace.info", "trace.app_info", "trace.overview"],
       "status": "complete"
     },
     {

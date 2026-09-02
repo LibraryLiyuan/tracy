@@ -100,6 +100,7 @@ struct TemporaryTraceFiles
         conflictingIdentity = root / "conflicting-identity.tracy";
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
+        largeAppInfo = root / "large-app-info.tracy";
         session = root / "complete.jn-trace-session";
         sessionBuilding = root / "active.jn-trace-session.building.g-active";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
@@ -115,6 +116,7 @@ struct TemporaryTraceFiles
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
+        std::ofstream( largeAppInfo, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
         tracy::analysis::TraceSessionManifest sessionManifest;
         sessionManifest.sessionId = "query-contract-session";
@@ -171,6 +173,7 @@ struct TemporaryTraceFiles
     std::filesystem::path conflictingIdentity;
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
+    std::filesystem::path largeAppInfo;
     std::filesystem::path session;
     std::filesystem::path sessionBuilding;
     std::filesystem::path outsideRoot;
@@ -594,6 +597,15 @@ int main()
                 }
                 return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
             }
+            if( filename == "large-app-info.tracy" )
+            {
+                std::vector<std::string> records;
+                records.reserve( 12000 );
+                for( size_t index = 0; index < 12000; ++index )
+                    records.emplace_back( "APPINFO|" + std::to_string( index ) + '|' +
+                        std::string( 1024, char( 'a' + index % 26 ) ) );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
             if( filename == "duplicate-identity.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
@@ -706,6 +718,43 @@ int main()
     assert( openCandidate.at( "ok" ) );
     const auto candidateId = openCandidate.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( candidateId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+
+    const auto openLargeAppInfo = service.Execute( Request( 101, "trace.open", {
+        { "path", files.largeAppInfo.string() }
+    } ) );
+    assert( openLargeAppInfo.at( "ok" ) );
+    const auto largeAppInfoId = openLargeAppInfo.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( largeAppInfoId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto largeTraceInfo = service.Execute( Request( 102, "trace.info", {
+        { "trace_id", largeAppInfoId }
+    } ) );
+    assert( largeTraceInfo.at( "ok" ) );
+    assert( largeTraceInfo.at( "data" ).at( "app_info_count" ) == "12000" );
+    assert( largeTraceInfo.at( "data" ).at( "app_info_complete" ) == false );
+    assert( largeTraceInfo.at( "data" ).at( "app_info" ).size() <= 100 );
+    const auto largeOverview = service.Execute( Request( 103, "trace.overview", {
+        { "trace_id", largeAppInfoId }
+    } ) );
+    assert( largeOverview.at( "ok" ) );
+    assert( largeOverview.at( "data" ).at( "trace" ).at( "app_info_count" ) == "12000" );
+    const auto largeAppInfoPage = service.Execute( Request( 104, "trace.app_info", {
+        { "trace_id", largeAppInfoId }, { "limit", 1000 }
+    } ) );
+    assert( largeAppInfoPage.at( "ok" ) );
+    assert( largeAppInfoPage.at( "data" ).at( "matched_count" ) == "12000" );
+    assert( largeAppInfoPage.at( "data" ).at( "app_info" ).size() == 1000 );
+    assert( largeAppInfoPage.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto largeAppInfoSecondPage = service.Execute( Request( 105, "trace.app_info", {
+        { "trace_id", largeAppInfoId }, { "limit", 1000 },
+        { "cursor", largeAppInfoPage.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( largeAppInfoSecondPage.at( "ok" ) );
+    assert( largeAppInfoSecondPage.at( "data" ).at( "app_info" ).size() == 1000 );
+    assert( largeAppInfoSecondPage.at( "data" ).at( "app_info" ).front() !=
+        largeAppInfoPage.at( "data" ).at( "app_info" ).front() );
+    assert( service.Execute( Request( 106, "trace.close", {
+        { "trace_id", largeAppInfoId }
+    } ) ).at( "ok" ) );
 
     const auto oldScript = service.Execute( Request( 1000, "runtime.script.summary", { { "trace_id", candidateId } } ) );
     assert( oldScript.at( "ok" ) && oldScript.at( "data" ).at( "present" ) == false && oldScript.at( "data" ).at( "complete" ) == false );
@@ -1063,7 +1112,7 @@ int main()
         jobOnlyEvidence.at( "domain_coverage" ).end(), []( const auto& value ) { return value.at( "domain" ) == "cpu"; } );
     assert( cpuFilteredCoverage != jobOnlyEvidence.at( "domain_coverage" ).end() );
     assert( cpuFilteredCoverage->at( "present" ) == false );
-    assert( cpuFilteredCoverage->at( "status" ) == "not_observed_in_selected_frame" );
+    assert( cpuFilteredCoverage->at( "status" ) == "not_requested" );
     assert( cpuFilteredCoverage->at( "capability_domain" ) == "zone.cpu" );
     assert( cpuFilteredCoverage->at( "capability_available" ) == true );
 

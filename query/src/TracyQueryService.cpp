@@ -721,6 +721,17 @@ json FieldAvailabilityJson( const analysis::FieldAvailabilityDto& value )
 
 json TraceInfoJson( const analysis::TraceInfoDto& value )
 {
+    constexpr size_t MaximumAppInfoPreviewBytes = 256 * 1024;
+    json appInfo = json::array();
+    size_t appInfoPreviewBytes = 0;
+    for( const auto& record : value.appInfo )
+    {
+        if( appInfo.size() >= DefaultPageSize ||
+            record.size() > MaximumAppInfoPreviewBytes - appInfoPreviewBytes ) break;
+        appInfo.emplace_back( record );
+        appInfoPreviewBytes += record.size();
+    }
+    const auto appInfoComplete = value.appInfo.size() == appInfo.size();
     return {
         { "fingerprint", value.fingerprint }, { "capture_name", value.captureName }, { "capture_program", value.captureProgram },
         { "host_info", value.hostInfo }, { "capture_time", Decimal( value.captureTime ) }, { "executable_time", Decimal( value.executableTime ) },
@@ -733,7 +744,10 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
         { "legacy_queue_delay_ns", value.legacyQueueDelayNs ? json( Decimal( *value.legacyQueueDelayNs ) ) : json( nullptr ) },
         { "field_availability", { { "legacy_queue_delay_ns", FieldAvailabilityJson( value.legacyQueueDelayAvailability ) } } },
         { "has_crash", value.hasCrash }, { "samples_inconsistent", value.samplesInconsistent },
-        { "counts", CountsJson( value.counts ) }, { "app_info", value.appInfo }, { "trust", "untrusted_trace_data" }
+        { "counts", CountsJson( value.counts ) }, { "app_info", std::move( appInfo ) },
+        { "app_info_count", Decimal( value.appInfo.size() ) },
+        { "app_info_complete", appInfoComplete },
+        { "app_info_query", "trace.app_info" }, { "trust", "untrusted_trace_data" }
     };
 }
 
@@ -4722,7 +4736,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     const auto info = [&] { return source->GetTraceInfo(); };
     if( method == "trace.info" ) return Success( id, TraceInfoJson( info() ), trace );
     if( method == "trace.counts" ) return Success( id, CountsJson( info().counts ), trace );
-    if( method == "trace.app_info" ) return Success( id, { { "app_info", info().appInfo }, { "trust", "untrusted_trace_data" } }, trace );
+    if( method == "trace.app_info" )
+    {
+        const auto metadata = info();
+        const auto page = ParsePage( params, method, trace );
+        const auto begin = std::min( page.offset, metadata.appInfo.size() );
+        const auto end = std::min( begin + page.limit, metadata.appInfo.size() );
+        json appInfo = json::array();
+        for( size_t index = begin; index < end; ++index )
+            appInfo.emplace_back( metadata.appInfo[index] );
+        const auto returned = end - begin;
+        const auto cursor = NextCursor( page, method, trace, returned,
+            end < metadata.appInfo.size() );
+        return Success( id, {
+            { "app_info", std::move( appInfo ) },
+            { "matched_count", Decimal( metadata.appInfo.size() ) },
+            { "trust", "untrusted_trace_data" }
+        }, trace, PageJson( page, returned, cursor ) );
+    }
     if( method == "trace.identity" ) return Success( id, CaptureIdentityJson( info() ), trace );
     if( method == "capture.context" ) return Success( id, CaptureContextJson( info() ), trace );
     if( method == "capture.coverage" || method == "producer.list" )

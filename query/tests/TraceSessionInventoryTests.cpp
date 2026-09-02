@@ -2610,6 +2610,21 @@ void TestGpuCanonicalReader( TestContext& test, const std::filesystem::path& dir
             std::to_string( gpuReader ? gpuReader->Overview().engineKnownPhysicalBytes : 0 ) +
         ":peak=" + std::to_string( gpuVerifier.engineKnownPhysicalPeakBytes ) + "/" +
             std::to_string( gpuReader ? gpuReader->Overview().engineKnownPhysicalPeakBytes : 0 ) );
+    tracy::analysis::TraceSessionGpuVerifierControl boundedMergeControl;
+    boundedMergeControl.maximumBufferedPassRelations = 1;
+    boundedMergeControl.maximumOpenRunReaders = 2;
+    tracy::analysis::TraceSessionGpuVerifierReport boundedMergeVerifier;
+    const auto boundedMergeVerified = tracy::analysis::VerifyTraceSessionGpuDerived(
+        sessionRoot, manifest, inventory, boundedMergeControl,
+        boundedMergeVerifier, error );
+    test.Check( boundedMergeVerified && boundedMergeVerifier.complete &&
+        boundedMergeVerifier.peakOpenRunReaders > 0 &&
+        boundedMergeVerifier.peakOpenRunReaders <=
+            boundedMergeControl.maximumOpenRunReaders &&
+        boundedMergeVerifier.runMergePassCount > 0,
+        "independent GPU verifier bounds external merge fan-in across many runs: " + error +
+        ":peak=" + std::to_string( boundedMergeVerifier.peakOpenRunReaders ) +
+        ":passes=" + std::to_string( boundedMergeVerifier.runMergePassCount ) );
     std::filesystem::remove_all( tracy::analysis::TraceSessionGpuVerifierRoot(
         sessionRoot, manifest ) );
 

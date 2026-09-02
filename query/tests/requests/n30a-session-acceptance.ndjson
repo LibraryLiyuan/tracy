@@ -3,7 +3,7 @@
 {"protocol":"tracy-query/1","id":"overview","method":"trace.overview","params":{}}
 {"protocol":"tracy-query/1","id":"counts","method":"trace.counts","params":{}}
 {"protocol":"tracy-query/1","id":"trace-info","method":"trace.info","params":{}}
-{"protocol":"tracy-query/1","id":"trace-app-info","method":"trace.app_info","params":{}}
+{"protocol":"tracy-query/1","id":"trace-app-info","method":"trace.app_info","params":{"limit":1000}}
 {"protocol":"tracy-query/1","id":"trace-identity","method":"trace.identity","params":{}}
 {"protocol":"tracy-query/1","id":"capture-context","method":"capture.context","params":{}}
 {"protocol":"tracy-query/1","id":"capture-coverage","method":"capture.coverage","params":{}}

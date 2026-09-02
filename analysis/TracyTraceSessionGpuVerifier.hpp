@@ -21,6 +21,7 @@ struct TraceSessionGpuVerifierControl
     uint64_t maximumBufferedAllocationRecords = 65536;
     uint64_t maximumBufferedDeltas = 65536;
     uint64_t maximumBufferedPassRelations = 1048576;
+    uint32_t maximumOpenRunReaders = 128;
 };
 
 // This is an independently recomputed audit product.  It deliberately stores
@@ -58,6 +59,8 @@ struct TraceSessionGpuVerifierReport
     uint64_t forwardRelationHash = 0;
     uint64_t reverseRelationHash = 0;
     uint64_t verifiedPassCount = 0;
+    uint64_t peakOpenRunReaders = 0;
+    uint64_t runMergePassCount = 0;
     uint64_t mismatchCount = 0;
     uint64_t reportHash = 0;
     bool complete = false;
