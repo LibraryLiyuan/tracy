@@ -2,6 +2,10 @@
 _build
 _compiler
 tools/*
+!tools/n30_acceptance/
+!tools/n30_acceptance/**
+tools/n30_acceptance/**/__pycache__/
+tools/n30_acceptance/**/*.pyc
 *.d
 *.o
 *.so

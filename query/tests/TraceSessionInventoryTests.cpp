@@ -46,12 +46,14 @@ struct TestContext
 {
     void Check( bool condition, const std::string& message )
     {
+        checks++;
         if( condition ) return;
         std::cerr << "FAIL: " << message << '\n';
         failed++;
     }
 
     int failed = 0;
+    uint64_t checks = 0;
 };
 
 void TestSharedGpuPointerIdentityOutlivesOwnership( TestContext& test )
@@ -4749,6 +4751,9 @@ int main()
     }
     std::filesystem::remove_all( tracy::analysis::GpuAnalysisIoPath( directory ), filesystemError );
     test.Check( !filesystemError, "remove test directory" );
+    std::cout << "N30A_CHECK_SUMMARY checks=" << test.checks
+        << " passed=" << ( test.checks - uint64_t( test.failed ) )
+        << " failed=" << test.failed << '\n';
     if( test.failed != 0 )
     {
         std::cerr << test.failed << " inventory tests failed\n";

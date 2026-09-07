@@ -128,6 +128,10 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME tracy-trace-session-inventory COMMAND tracy-trace-session-inventory-tests)
 
+    add_executable(tracy-trace-session-scale-corpus tests/TraceSessionScaleCorpus.cpp)
+    target_link_libraries(tracy-trace-session-scale-corpus PRIVATE TracyAnalysis TracyStreamCore TracyServer)
+    tracy_query_enable_assertions(tracy-trace-session-scale-corpus)
+
     add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)
     target_link_libraries(tracy-gpu-analysis-corpus PRIVATE TracyAnalysis)
 

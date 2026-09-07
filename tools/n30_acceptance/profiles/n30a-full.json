@@ -1,0 +1,58 @@
+{
+  "profile_schema": 1,
+  "name": "N30A-Deterministic-Full-Acceptance",
+  "query_schema": "1.34.0",
+  "session_schema": 1,
+  "canonical_schema": 1,
+  "derived_schema": 1,
+  "protocol": 90,
+  "git": {
+    "branch": "feature/JNTracy-N30-LongTraceSessionStore",
+    "required_ancestor": "7eb9e55de1fdc01b61646e7d40dbf1a731003f00"
+  },
+  "expected_session_state_code": 11,
+  "golden": "expected-n30a-a7.json",
+  "phases": ["P0", "P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"],
+  "harness": {
+    "minimum_unit_tests": 50
+  },
+  "toolchain": {
+    "parallel": 8,
+    "minimum_ctest_count": 7
+  },
+  "query": {
+    "attempts": 3,
+    "max_response_bytes": 16777216,
+    "session_open_limit_ns": 2000000000,
+    "single_frame_resource_limit_ns": 2000000000,
+    "cross_domain_limit_ns": 5000000000,
+    "cancel_worst_limit_ns": 2000000000,
+    "hard_private_bytes": 17179869184
+  },
+  "converter": {
+    "sample_interval_seconds": 1.0,
+    "no_progress_timeout_seconds": 120,
+    "target_private_bytes": 8589934592,
+    "soft_private_bytes": 12884901888,
+    "hard_private_bytes": 17179869184,
+    "outer_job_bytes": 19327352832
+  },
+  "disk": {
+    "scratch_hard_bytes": 343597383680,
+    "minimum_free_reserve_bytes": 68719476736,
+    "minimum_free_reserve_percent": 10
+  },
+  "synthetic": {
+    "logical_duration_hours": 2,
+    "minimum_shards": 240,
+    "density_base_records": 1000000,
+    "minimum_density_shards": 2,
+    "density_factors": [1, 2, 4],
+    "maximum_growth_ratio_numerator": 5,
+    "maximum_growth_ratio_denominator": 2
+  },
+  "deferred": [
+    "local-tracy-export",
+    "profiler-direct-session-timeline"
+  ]
+}
