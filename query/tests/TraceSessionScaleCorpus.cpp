@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "TraceSessionAcceptanceAnchors.hpp"
 
 namespace
 {
@@ -107,7 +108,7 @@ bool ParseArguments( int argc, char** argv, Arguments& args, std::string& error 
         return false;
     }
     if( args.mode != "duration" && args.mode != "density" &&
-        !( args.command == "inspect" && args.mode == "audit" ) )
+        !( args.command == "inspect" && ( args.mode == "audit" || args.mode == "anchors" ) ) )
     {
         error = "mode must be duration or density";
         return false;
@@ -596,6 +597,7 @@ uint64_t DirectoryBytes( const std::filesystem::path& path )
 
 bool Inspect( const Arguments& args, std::string& error )
 {
+    if( args.mode == "anchors" ) return EmitSessionAcceptanceAnchors( args.session, error );
     const auto manifestValue = tracy::analysis::LoadTraceSessionManifest( args.session, error );
     if( !manifestValue ) return false;
     const auto& manifest = *manifestValue;

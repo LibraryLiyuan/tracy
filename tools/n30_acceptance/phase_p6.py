@@ -244,11 +244,15 @@ def evaluate_query_matrix(
 
 
 def evaluate_pagination(
-    observation: PaginationObservation, *, recorder: ComparisonRecorder
+    observation: PaginationObservation, *, recorder: ComparisonRecorder,
+    name: str = "P6.pagination",
 ) -> PhaseOutcome:
     results: list[ComparisonResult] = []
 
     def record(result: ComparisonResult) -> None:
+        if name != "P6.pagination":
+            from dataclasses import replace
+            result = replace(result, name=result.name.replace("P6.pagination", name, 1))
         results.append(recorder.record(result))
 
     record(compare_exact("P6.pagination.small_page_count", 3, len(observation.small_page_refs)))
@@ -495,6 +499,8 @@ def _run_pagination(
     allow_root: Path,
     session: Path,
     directory: Path,
+    method: str = "frame_image.list",
+    collection: str = "images",
 ) -> tuple[PaginationObservation, int, int]:
     client = _new_mcp_client(query_executable, allow_root, directory)
     response_bytes = 0
@@ -505,13 +511,13 @@ def _run_pagination(
         _initialize_mcp(client)
         trace_id, _ = open_mcp_session(client, session, timeout_seconds=120)
         large = _inspect(
-            client, trace_id, "frame_image.list", {"limit": 9}, timeout_seconds=30
+            client, trace_id, method, {"limit": 9}, timeout_seconds=30
         )
         response_bytes = max(
             response_bytes,
             len(json.dumps(large, separators=(",", ":")).encode("utf-8")),
         )
-        large_refs, _ = extract_page(large, "images")
+        large_refs, _ = extract_page(large, collection)
         cursor: str | None = None
         for ordinal in range(3):
             params: dict[str, Any] = {"limit": 3}
@@ -520,13 +526,13 @@ def _run_pagination(
             elif ordinal > 0:
                 break
             page = _inspect(
-                client, trace_id, "frame_image.list", params, timeout_seconds=30
+                client, trace_id, method, params, timeout_seconds=30
             )
             response_bytes = max(
                 response_bytes,
                 len(json.dumps(page, separators=(",", ":")).encode("utf-8")),
             )
-            refs, cursor = extract_page(page, "images")
+            refs, cursor = extract_page(page, collection)
             small_pages.append(refs)
             cursors.append(cursor)
         _close_trace(client, trace_id)
@@ -599,21 +605,22 @@ def _run_cancellation(
 def _failed_contract(
     recorder: ComparisonRecorder, name: str, error: BaseException
 ) -> PhaseOutcome:
+    timed_out = isinstance(error, TimeoutError)
     result = recorder.record(
         ComparisonResult(
             name=name,
             status=ComparisonStatus.FAIL,
-            expected="valid complete Query/MCP result",
+            expected="response before configured timeout" if timed_out else "valid complete Query/MCP result",
             actual=type(error).__name__,
-            delta="contract failed",
-            rule="query_contract",
+            delta="deadline exceeded; no data verdict" if timed_out else "contract failed",
+            rule="query_timeout" if timed_out else "query_contract",
             detail=str(error),
         )
     )
     return PhaseOutcome(
         "P6",
-        AcceptanceStatus.FAIL_CORRECTNESS,
-        f"Query/MCP contract failed at {name}",
+        AcceptanceStatus.FAIL_PERFORMANCE if timed_out else AcceptanceStatus.FAIL_CORRECTNESS,
+        f"Query/MCP {'timeout' if timed_out else 'contract failure'} at {name}",
         repair_direction="inspect the preserved MCP/Query logs; do not treat missing output as empty data",
         evidence={"failed_comparisons": [result.name]},
     )
@@ -767,29 +774,31 @@ def run_p6(context) -> PhaseOutcome:
         except (McpContractError, ValueError, TimeoutError) as error:
             outcomes.append(_failed_contract(context.recorder, f"P6.probe.{name}.contract", error))
 
-    try:
-        pagination_directory = _allocate_attempt_directory(work / "pagination", "attempt")
-        pagination, pagination_memory, pagination_response = _run_pagination(
-            query_executable=query_executable,
-            allow_root=allow_root,
-            session=session,
-            directory=pagination_directory,
-        )
-        outcomes.append(evaluate_pagination(pagination, recorder=context.recorder))
-        memory_result = context.recorder.record(
-            compare_at_most("P6.pagination.peak_private_bytes", hard_private, pagination_memory)
-        )
-        response_result = context.recorder.record(
-            compare_at_most("P6.pagination.response_bytes", response_limit, pagination_response)
-        )
-        outcomes.append(
-            _outcome(
-                [memory_result, response_result],
-                success="pagination response and process memory stayed within limits",
+    for method, collection in (("frame_image.list", "images"), ("gpu.resource.search", "resources"),
+                               ("frame.list", "frames"), ("job.search", "jobs"),
+                               ("zone.cpu.search", "zones"), ("sample.list", "samples")):
+        try:
+            pagination_directory = _allocate_attempt_directory(work / "pagination" / method, "attempt")
+            pagination, pagination_memory, pagination_response = _run_pagination(
+                query_executable=query_executable, allow_root=allow_root, session=session,
+                directory=pagination_directory, method=method, collection=collection,
             )
-        )
+            prefix = f"P6.pagination.{method}"
+            outcomes.append(evaluate_pagination(pagination, recorder=context.recorder, name=prefix))
+            memory_result = context.recorder.record(
+                compare_at_most(f"{prefix}.peak_private_bytes", hard_private, pagination_memory))
+            response_result = context.recorder.record(
+                compare_at_most(f"{prefix}.response_bytes", response_limit, pagination_response))
+            outcomes.append(_outcome([memory_result, response_result],
+                success="pagination response and process memory stayed within limits"))
+        except (McpContractError, ValueError, TimeoutError) as error:
+            outcomes.append(_failed_contract(context.recorder, f"P6.pagination.{method}.contract", error))
+
+    try:
+        from .query_anchors import run_anchor_matrix
+        outcomes.append(run_anchor_matrix(context, work / "anchors"))
     except (McpContractError, ValueError, TimeoutError) as error:
-        outcomes.append(_failed_contract(context.recorder, "P6.pagination.contract", error))
+        outcomes.append(_failed_contract(context.recorder, "P6.anchors.contract", error))
 
     cancellations: list[CancellationObservation] = []
     cancel_limit = int(query_profile.get("cancel_worst_limit_ns", 2_000_000_000))

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from typing import Sequence
+from .tool_output import ToolOutputDecoder
 
 from .win32_metrics import (
     ProcessIdentity,
@@ -130,6 +131,7 @@ class ProcessRunner:
         last_activity_ns = start
         observed_sizes = {stdout_path: 0, stderr_path: 0}
         echo_offsets = {stdout_path: 0, stderr_path: 0}
+        echo_decoders = {stdout_path: ToolOutputDecoder(), stderr_path: ToolOutputDecoder()}
         control_text = ""
         console_break_count = 0
         first_console_break_ns = 0
@@ -150,7 +152,7 @@ class ProcessRunner:
                     source.seek(echo_offsets[path])
                     payload = source.read(size - echo_offsets[path])
                 echo_offsets[path] = size
-                text = payload.decode("utf-8", errors="replace")
+                text = echo_decoders[path].feed(payload)
                 if console_break_plan is not None:
                     control_text = (control_text + text)[-16384:]
                 if echo_output:
@@ -276,6 +278,10 @@ class ProcessRunner:
             stdout.flush()
             stderr.flush()
         observe_output()
+        if echo_output:
+            for path, label in ((stdout_path, "stdout"), (stderr_path, "stderr")):
+                for line in echo_decoders[path].finish().splitlines():
+                    print(f"[TOOL][{label}] {line}", flush=True)
         if job_limit is not None:
             job_limit.close()
         elapsed = time.monotonic_ns() - start

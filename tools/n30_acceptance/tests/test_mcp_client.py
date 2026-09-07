@@ -69,8 +69,9 @@ class McpClientTests(unittest.TestCase):
                 metrics_path=root / "metrics.ndjson",
                 sample_interval_seconds=0.02,
             ) as client:
-                with self.assertRaisesRegex(McpContractError, "timed out"):
+                with self.assertRaisesRegex(McpContractError, "timed out") as failure:
                     client.request("slow", {}, timeout_seconds=0.05)
+                self.assertIsInstance(failure.exception, TimeoutError)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,10 @@ class McpContractError(RuntimeError):
     pass
 
 
+class McpTimeoutError(McpContractError, TimeoutError):
+    """A response deadline, not evidence of semantic data corruption."""
+
+
 class McpClient:
     """One audited MCP process with bounded waits and process-tree metrics."""
 
@@ -206,13 +210,13 @@ class McpClient:
                 return pending
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise McpContractError(
+                raise McpTimeoutError(
                     f"MCP request {method!r} id={identifier} timed out after {timeout_seconds}s"
                 )
             try:
                 value = self._messages.get(timeout=remaining)
             except queue.Empty as error:
-                raise McpContractError(
+                raise McpTimeoutError(
                     f"MCP request {method!r} id={identifier} timed out after {timeout_seconds}s"
                 ) from error
             if isinstance(value, BaseException):

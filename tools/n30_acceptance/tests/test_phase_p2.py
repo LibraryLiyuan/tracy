@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,11 +10,22 @@ from tools.n30_acceptance.phase_p2 import (
     build_toolchain_commands,
     evaluate_toolchain,
     parse_ctest_summary,
+    parse_query_capability_schema,
 )
 from tools.n30_acceptance.status import AcceptanceStatus
 
 
 class ToolchainPlanTests(unittest.TestCase):
+    def test_schema_comes_from_successful_official_response_not_empty_version_banner(self):
+        payload = {"protocol": "tracy-query/1", "id": "n30a-tool-schema", "ok": True,
+                   "schema_version": "1.34.0", "data": {"schema_version": "1.34.0"}}
+        self.assertEqual(parse_query_capability_schema(json.dumps(payload)), "1.34.0")
+        payload["data"]["schema_version"] = "1.33.0"
+        with self.assertRaises(ValueError):
+            parse_query_capability_schema(json.dumps(payload))
+        with self.assertRaises(ValueError):
+            parse_query_capability_schema("")
+
     def test_plan_builds_fresh_capture_and_query_with_required_dev_oracles(self):
         commands = build_toolchain_commands(
             cmake=Path("C:/cmake.exe"),

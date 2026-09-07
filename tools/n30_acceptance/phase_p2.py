@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import re
 from typing import Any, Mapping
@@ -61,6 +62,16 @@ def parse_query_schema(output: str) -> str:
     if len(matches) != 1:
         raise ValueError(f"expected exactly one Query schema, found {len(matches)}")
     return matches[0].group("schema")
+
+
+def parse_query_capability_schema(output: str) -> str:
+    value = json.loads(output)
+    if not isinstance(value, dict) or value.get("ok") is not True or value.get("protocol") != "tracy-query/1":
+        raise ValueError("Query capability response is not a successful protocol response")
+    schema = value.get("schema_version")
+    if not isinstance(schema, str) or value.get("data", {}).get("schema_version") != schema:
+        raise ValueError("Query envelope and capability schema disagree")
+    return schema
 
 
 def build_toolchain_commands(
@@ -245,12 +256,13 @@ def run_p2(context) -> PhaseOutcome:
     query_path = tools["query"]
     if query_path.is_file():
         result, stdout, stderr = context.commands.run_text(
-            "P2-query-version", (str(query_path), "--version"), cwd=query_release
+            "P2-query-version", (str(query_path), "--request",
+                str(context.inputs.worktree / "query/tests/requests/n30a-system-schema.json")), cwd=query_release
         )
         exit_codes["P2-query-version"] = result.exit_code
         if result.exit_code == 0:
             try:
-                query_schema = parse_query_schema(stdout + "\n" + stderr)
+                query_schema = parse_query_capability_schema(stdout)
             except ValueError:
                 pass
     observation = ToolchainObservation(

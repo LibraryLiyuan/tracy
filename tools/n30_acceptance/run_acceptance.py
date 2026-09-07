@@ -231,6 +231,11 @@ def _status(output_root: Path) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Codex/PowerShell log readers use UTF-8; Windows Python otherwise chooses
+    # GBK for redirected stdout on this host. Child bytes remain untouched.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = _parser().parse_args(argv)
     if args.status:
         return _status(args.output)

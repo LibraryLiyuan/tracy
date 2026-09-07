@@ -50,3 +50,13 @@ python -m unittest discover -s tools/n30_acceptance/tests -v
 ```
 
 仅依赖 Python 标准库。Windows Job Object 的低预算测试只限制本测试启动的子进程，不修改系统配置。
+
+## 比较日志的阅读方式
+
+每项实际判断立即输出并落盘 `expected / actual / delta / PASS|FAIL`。整数和字节不转换为浮点数；比例保留分子、分母。每批结束打印总数、通过数、失败数；失败不得仅藏在文件中。
+
+控制台输出为 UTF-8。Windows MSBuild 中文使用系统代码页回退解码，仅影响屏幕显示；`raw/` 下的 stdout/stderr 保留原始字节。
+
+P6 的 `anchors.json` 保存锁定 generation 的确定性查询锚点。两个独立只读选择进程必须生成相同 SHA-256。完整性审计和定点 Query 检查分别报告，不能互相替代。
+
+Query 超时显示 `FAIL_PERFORMANCE`，附明确期限和异常消息；没有结果不能当作空集合，也不能据此宣称数据损坏。响应本身缺项或语义不一致仍为 `FAIL_CORRECTNESS`。图中的局部 frame index 和 packed FrameIdentity 必须通过源记录的显式 alias 关联，禁止按数值相等或时间接近猜测。

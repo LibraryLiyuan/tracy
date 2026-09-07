@@ -209,5 +209,25 @@ class CancellationEvaluationTests(unittest.TestCase):
             self.assertEqual(outcome.status, AcceptanceStatus.FAIL_CORRECTNESS)
 
 
+class QueryFailureClassificationTests(unittest.TestCase):
+    def test_timeout_is_performance_failure_without_claiming_data_mismatch(self):
+        from tools.n30_acceptance.phase_p6 import _failed_contract
+        with tempfile.TemporaryDirectory() as directory:
+            console = io.StringIO()
+            recorder = ComparisonRecorder(Path(directory) / "comparisons.ndjson", console=console)
+            outcome = _failed_contract(recorder, "P6.job.search", TimeoutError("no response after 60 seconds"))
+            self.assertEqual(outcome.status, AcceptanceStatus.FAIL_PERFORMANCE)
+            self.assertEqual(recorder.failed, 1)
+            self.assertIn("no response after 60 seconds", console.getvalue())
+
+    def test_invalid_response_remains_correctness_failure(self):
+        from tools.n30_acceptance.phase_p6 import _failed_contract
+        with tempfile.TemporaryDirectory() as directory:
+            recorder = ComparisonRecorder(Path(directory) / "comparisons.ndjson", console=io.StringIO())
+            outcome = _failed_contract(recorder, "P6.job.search", ValueError("missing required identity"))
+            self.assertEqual(outcome.status, AcceptanceStatus.FAIL_CORRECTNESS)
+            self.assertEqual(recorder.failed, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

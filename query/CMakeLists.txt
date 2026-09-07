@@ -129,7 +129,7 @@ if(BUILD_TESTING)
     add_test(NAME tracy-trace-session-inventory COMMAND tracy-trace-session-inventory-tests)
 
     add_executable(tracy-trace-session-scale-corpus tests/TraceSessionScaleCorpus.cpp)
-    target_link_libraries(tracy-trace-session-scale-corpus PRIVATE TracyAnalysis TracyStreamCore TracyServer)
+    target_link_libraries(tracy-trace-session-scale-corpus PRIVATE TracyAnalysis TracyStreamCore TracyServer nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-trace-session-scale-corpus)
 
     add_executable(tracy-gpu-analysis-corpus tests/GpuAnalysisCorpus.cpp)
