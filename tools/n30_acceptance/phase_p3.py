@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import shutil
 from typing import Any, Iterable, Mapping, Sequence
 
 from .acceptance_runner import PhaseOutcome
@@ -18,6 +20,7 @@ from .comparators import (
     compare_true,
 )
 from .evidence import extract_acceptance_metrics
+from .io_utils import sha256_file
 from .query_driver import (
     QueryContractError,
     load_ndjson_requests,
@@ -311,13 +314,32 @@ def run_p3(context) -> PhaseOutcome:
         context.profile.get("query", {}).get("hard_private_bytes", 16 * 1024**3)
     )
 
+    # The traditional converter publishes a map next to its input and requires
+    # the snapshot in that same directory. Never expose the original capture
+    # folder to these writes. Both paths read this byte-identical private copy.
+    short_input = full_directory / "input.tracy-stream"
+    expected_size = context.inputs.short_stream.stat().st_size
+    expected_sha = sha256_file(context.inputs.short_stream)
+    with context.inputs.short_stream.open("rb") as source, short_input.open("xb") as destination:
+        shutil.copyfileobj(source, destination, length=8 * 1024 * 1024)
+        destination.flush()
+        os.fsync(destination.fileno())
+    copy_checks = [
+        context.recorder.record(compare_exact("P3.input.copy.size_bytes", expected_size, short_input.stat().st_size)),
+        context.recorder.record(compare_equal("P3.input.copy.sha256", expected_sha, sha256_file(short_input))),
+    ]
+    if any(check.status == ComparisonStatus.FAIL for check in copy_checks):
+        return PhaseOutcome("P3", AcceptanceStatus.HARNESS_ERROR,
+            "isolated short input is not identical to the original; no converter was started",
+            repair_direction="inspect source stability and copy integrity; preserve both files")
+
     command_results: list[ComparisonResult] = []
     legacy = context.commands.run(
         "P3-short-full-worker-convert",
         (
             str(legacy_converter),
             "-i",
-            str(context.inputs.short_stream),
+            str(short_input),
             "-o",
             str(full_trace),
             "-f",
@@ -349,12 +371,21 @@ def run_p3(context) -> PhaseOutcome:
         context.recorder.record(compare_true("P3.output.full_worker_trace.exists", full_trace.is_file()))
     )
 
+    if any(result.status == ComparisonStatus.FAIL for result in command_results):
+        return PhaseOutcome(
+            "P3", AcceptanceStatus.FAIL_CORRECTNESS,
+            "Full Worker conversion gate failed; Session and Query were not started",
+            repair_direction="inspect converter invocation and raw logs before attributing the failure to trace data",
+            evidence={"attempt_directory": str(attempt),
+                "failed_comparisons": [result.name for result in command_results if result.status == ComparisonStatus.FAIL]},
+        )
+
     session = context.commands.run(
         "P3-short-session-convert",
         (
             str(session_converter),
             "-i",
-            str(context.inputs.short_stream),
+            str(short_input),
             "-o",
             str(session_trace),
             "--restart-generation",

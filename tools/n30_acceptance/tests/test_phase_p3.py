@@ -39,6 +39,7 @@ class ShortDifferentialTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "input.tracy-stream").write_bytes(b"short stream fixture")
             commands = CaptureCommand()
             context = SimpleNamespace(
                 run_directory=root / "run",
@@ -50,6 +51,7 @@ class ShortDifferentialTests(unittest.TestCase):
                 ),
                 profile={},
                 commands=commands,
+                recorder=ComparisonRecorder(root / "comparisons.ndjson", console=io.StringIO()),
             )
             with self.assertRaises(CommandCaptured):
                 run_p3(context)
@@ -58,6 +60,67 @@ class ShortDifferentialTests(unittest.TestCase):
             self.assertEqual(command[command.index("--mode") + 1], "offline")
             self.assertEqual(Path(command[command.index("-o") + 1]).suffix, ".tracy")
             self.assertIn("--no-cache", command)
+
+    def test_p3_copies_source_beside_snapshot_without_touching_original_mapping(self):
+        class CommandCaptured(Exception):
+            pass
+
+        class CaptureCommand:
+            command = None
+
+            def run(self, label, command, **kwargs):
+                self.command = command
+                raise CommandCaptured()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "input.tracy-stream"
+            original.write_bytes(b"independent source fixture")
+            mapping = root / "input.tracy-stream.snapshot-map"
+            mapping.write_text("preserve old mapping", encoding="utf-8")
+            commands = CaptureCommand()
+            console = io.StringIO()
+            context = SimpleNamespace(
+                run_directory=root / "run",
+                inputs=SimpleNamespace(build_capture=root / "capture-build",
+                    build_query=root / "query-build", worktree=root, short_stream=original),
+                profile={}, commands=commands,
+                recorder=ComparisonRecorder(root / "comparisons.ndjson", console=console),
+            )
+            with self.assertRaises(CommandCaptured):
+                run_p3(context)
+            command = commands.command
+            source = Path(command[command.index("-i") + 1])
+            output = Path(command[command.index("-o") + 1])
+            self.assertEqual(source.parent, output.parent)
+            self.assertNotEqual(source, original)
+            self.assertEqual(source.read_bytes(), b"independent source fixture")
+            self.assertEqual(mapping.read_text(encoding="utf-8"), "preserve old mapping")
+            self.assertIn("P3.input.copy.sha256", console.getvalue())
+
+    def test_failed_full_worker_does_not_start_session_or_query(self):
+        class FailConversion:
+            calls = 0
+
+            def run(self, label, command, **kwargs):
+                self.calls += 1
+                return SimpleNamespace(exit_code=7, peak_private_bytes=1024)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / "input.tracy-stream"
+            original.write_bytes(b"short stream fixture")
+            commands = FailConversion()
+            context = SimpleNamespace(
+                run_directory=root / "run",
+                inputs=SimpleNamespace(build_capture=root / "capture-build",
+                    build_query=root / "query-build", worktree=root, short_stream=original),
+                profile={}, commands=commands,
+                recorder=ComparisonRecorder(root / "comparisons.ndjson", console=io.StringIO()),
+            )
+            outcome = run_p3(context)
+            self.assertNotEqual(outcome.status, AcceptanceStatus.PASS)
+            self.assertEqual(commands.calls, 1)
 
     def _responses(self, count="7"):
         return [

@@ -91,3 +91,13 @@ Catalog 的 `frame_id=617` 实际是 GPU domain 的局部 frame index；验收�
 - 已按 PID、创建时间和 executable 核对后停止本轮 Python 28196 和 converter 12192；保留所有原始日志及 HARNESS-ABORT.zh-CN.md。没有启动 fresh30m，也未终止其他对话的进程。
 - 先新增行为回归，确认实际 P3 命令错误选择 legacy 时失败；再将验收器改为既有 `--mode offline`。继续使用完整 Worker 生成 `.tracy`，不修改 N30 产品、不放宽 Oracle。
 - RED：3 项测试中 1 项因 `legacy != offline` 失败。GREEN：135 项 Python 测试全部通过，耗时 1.996 秒。真实差分必须在新 Run 执行，不复用已中止 Run。
+
+## P3 隔离目录与前置失败停止修正
+
+Run `n30a-20260907-083936-03b6e54f` 的离线完整 Worker 26.093 秒完成生成 `.tracy`，但退出码 7。原因已在 `WriteConvertedSnapshotMap` 定位：snapshot 必须与输入 stream 同目录。验收器将输入留在原目录而 output 隔离，触发了现有工具约束，不是已证明的 Session 数据丢失。该 Run 原始机器状态保留为 FAILED，旁附 HARNESS-FINDING.zh-CN.md 解释归因，禁止悄悄覆盖。
+
+此 Run 随后已启动的短 Session 成功发布，耗时 668.594 秒，峰值 Private Bytes 884,891,648，28 个 Canonical shard、142,901,883 个 indexed records。独立 GPU verifier 完成，但没有执行 Query 双路径差分，不能标记 P3 通过。P9 原 source SHA 和既有 A7 Session 元数据均不变；总比较 7 PASS / 1 FAIL。
+
+验收器改为将短 stream 复制到独立 attempt/full-worker 目录，并逐项打印大小与 SHA-256；Full Worker 与 Session 使用同一副本。转换器写 map 不会触碰原始捕获文件夹。Full Worker 门禁失败立即返回，不再启动 Session 和 Query。
+
+RED：新回归分别观察到输入/output 不同目录、失败后命令数 2 而非 1；两项按预期失败。GREEN：137 项 Python 自测全部通过，2.003 秒。没有修改产品代码、门槛或 Golden。
