@@ -81,3 +81,13 @@ Catalog 的 `frame_id=617` 实际是 GPU domain 的局部 frame index；验收�
 - 最大 Resource ID 为 `Untracked GPU Resource`；保留源退化，不隐藏为完整分类资源。
 - Native Reader 与公开 Query 的定点比较不能代替 P3 独立短 Trace 差分和 P5 全量审计。
 - 正式 fresh 30m、P0–P9 全量验收仍未执行；发现产品问题后按设计停止依赖路径，不自动修复产品。
+
+## P0/P2 正式准备通过与 P3 回放模式纠正（2026-09-07）
+
+- 当前 preflight Run `n30a-20260907-082636-e79e928b`：P0 21/21 PASS，P9 源文件和既有 Session 完整性 2/2 PASS。
+- 当前 toolchain Run `n30a-20260907-082725-e79e928b`：P2 18/18 PASS，CTest 8/8 PASS，Query 正式 capability 为 1.34.0，P9 2/2 PASS。局部 Run 总状态仍为 INCOMPLETE。
+- P3 `n30a-20260907-082821-e79e928b` 误选旧 TCP `--mode legacy`，约 412 秒仅处理 488/9860 records。源码证据：`Worker::ProcessJnGpuReferenceSet` 非 OfflineConvert 路径逐集合按精确长度 reserve；Catalog generation end 后还有逐 batch resolve。没有产品死锁或数据错误证据。
+- 同一短输入历史离线完整 Worker 报告总耗时 22.4763 秒，只用于定位模式差异，不充当本轮通过结果。
+- 已按 PID、创建时间和 executable 核对后停止本轮 Python 28196 和 converter 12192；保留所有原始日志及 HARNESS-ABORT.zh-CN.md。没有启动 fresh30m，也未终止其他对话的进程。
+- 先新增行为回归，确认实际 P3 命令错误选择 legacy 时失败；再将验收器改为既有 `--mode offline`。继续使用完整 Worker 生成 `.tracy`，不修改 N30 产品、不放宽 Oracle。
+- RED：3 项测试中 1 项因 `legacy != offline` 失败。GREEN：135 项 Python 测试全部通过，耗时 1.996 秒。真实差分必须在新 Run 执行，不复用已中止 Run。

@@ -322,7 +322,10 @@ def run_p3(context) -> PhaseOutcome:
             str(full_trace),
             "-f",
             "--mode",
-            "legacy",
+            # This executable is the legacy *file format* converter. Its
+            # offline mode still materializes the complete Worker, but avoids
+            # live socket replay and its intentionally unoptimized growth.
+            "offline",
             "--no-cache",
             "--progress-json",
             str(full_directory / "progress.json"),

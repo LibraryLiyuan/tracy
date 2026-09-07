@@ -278,6 +278,8 @@ Golden 不是“当前结果自动更新”。修改 `expected-n30a-a7.json` 必
 
 ### 6.2 零误差数据
 
+P3 的 Traditional Full Worker 指完整内存 Worker 生成传统 `.tracy`，使用独立构建的 `tracy-stream-convert-legacy.exe --mode offline --no-cache`。这里 executable 的 legacy 指输出介质，不表示应强制旧 TCP `--mode legacy`。OfflineConvert 仍执行完整 Worker 事件存储和最终校验，独立于 Session Canonical Sink；不使用 ProtocolOnly，不复用 Session 数据作为自身 Oracle。
+
 以下全部零误差：
 
 - source SHA-256、大小和 committed revision。
