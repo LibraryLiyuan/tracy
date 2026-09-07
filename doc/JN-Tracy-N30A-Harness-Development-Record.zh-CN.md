@@ -101,3 +101,13 @@ Run `n30a-20260907-083936-03b6e54f` 的离线完整 Worker 26.093 秒完成生�
 验收器改为将短 stream 复制到独立 attempt/full-worker 目录，并逐项打印大小与 SHA-256；Full Worker 与 Session 使用同一副本。转换器写 map 不会触碰原始捕获文件夹。Full Worker 门禁失败立即返回，不再启动 Session 和 Query。
 
 RED：新回归分别观察到输入/output 不同目录、失败后命令数 2 而非 1；两项按预期失败。GREEN：137 项 Python 自测全部通过，2.003 秒。没有修改产品代码、门槛或 Golden。
+
+## P3 正式隔离运行：产品差分门禁未通过
+
+Run `n30a-20260907-085424-34fb83c5`（执行 HEAD `e3bfec71`）两条转换均成功：完整 Worker 29.843 秒、峰值 Private Bytes 6,484,979,712；Session 569.516 秒、峰值 884,629,504。Session 发布 28 shards、142,901,883 indexed records，独立 GPU verifier 完成。
+
+完整 Worker Query 返回 20/24 响应后，下一请求 `gpu.catalog.validation` 连续 459.860 秒无新输出；核实 PID 74536 创建时间和命令后受控停止，总时间 513.562 秒、峰值 14,538,416,128。Session 相同批次 3.594 秒返回 24/24，峰值 100,356,096。这是单次诊断，不是三次性能门禁。
+
+原报告保留 P3 FAIL_CORRECTNESS（非零退出码和响应不完整）。补充 Python 比较 **45 项 / 29 PASS / 16 FAIL**；只读 manifest 回查 **9 项 / 3 PASS / 6 FAIL**。确认 Query Job 字段未填充及 Plot/Callstack 单位不同，但底层 schedules +64、dependencies +35、stages +1,922 待逐事件解释。不能将所有差异都称为丢数据，也不能全按展示问题豁免。
+
+最后工具及短输入原件/副本 SHA **10/10 PASS**；P9 原 30 分钟 source SHA 与 A7 元数据 **2/2 PASS**。未启动 fresh30m，未自动修复或重试产品。表格、归因边界及后续方向见 [P3 失败解读](JN-Tracy-N30A-P3-Short-Differential-Failure-Review.zh-CN.md)。
