@@ -14,9 +14,9 @@ from typing import Any, Iterable
 ANALYSIS_SCHEMA_VERSION = 2
 EVIDENCE_SCHEMA_VERSION = 1
 REPORT_MANIFEST_SCHEMA_VERSION = 1
-REPORT_BUILDER_VERSION = "1.1.1"
-TEMPLATE_VERSION = "1.1.1"
-ANALYSIS_WORKFLOW_VERSION = "1.1.1"
+REPORT_BUILDER_VERSION = "2.0.0"
+TEMPLATE_VERSION = "2.0.0"
+ANALYSIS_WORKFLOW_VERSION = "2.0.0"
 
 PRIMARY_LIMITERS = {
     "IntentionalPacing",
@@ -239,7 +239,14 @@ def validate_analysis_and_evidence(
     _required(identity, ["report_id", "title", "generated_at", "trace_id", "trace_sha256", "configuration"], "analysis.report_identity", errors)
     _validate_sha(identity.get("trace_sha256"), "analysis.report_identity.trace_sha256", errors)
     configuration = _require_mapping(identity.get("configuration"), "analysis.report_identity.configuration", errors)
-    for key in ("local_profile", "project_profile", "performance_budgets", "marker_attribution"):
+    versions = analysis_obj.get("report_versions")
+    query_native = isinstance(analysis_obj.get("query_scan"), dict) or (
+        isinstance(versions, dict) and versions.get("analysis_workflow") == "2.0.0"
+    )
+    configuration_keys = ("analysis_profile",) if query_native else (
+        "local_profile", "project_profile", "performance_budgets", "marker_attribution"
+    )
+    for key in configuration_keys:
         config = _require_mapping(configuration.get(key), f"analysis.report_identity.configuration.{key}", errors)
         _required(config, ["path", "sha256"], f"analysis.report_identity.configuration.{key}", errors)
         _validate_sha(config.get("sha256"), f"analysis.report_identity.configuration.{key}.sha256", errors)

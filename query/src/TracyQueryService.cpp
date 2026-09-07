@@ -1,4 +1,7 @@
 #include "TracyQueryService.hpp"
+#include "TracyDeterministicScanTypes.hpp"
+#include "TracyAnalysisProfile.hpp"
+#include "TracyHash.hpp"
 
 #include "TracyAnalysis.hpp"
 #include "TracyEmbeddedData.hpp"
@@ -19,6 +22,11 @@
 #include <sstream>
 #include <unordered_map>
 
+#ifdef _WIN32
+#  include <windows.h>
+#  undef FindResource
+#endif
+
 namespace tracy::query
 {
 
@@ -30,6 +38,9 @@ const std::vector<std::string>& RawQueryMethodRegistry()
     static const std::vector<std::string> methods = {
         "system.capabilities", "system.describe", "system.schema",
         "trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.crash",
+        "analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume",
+        "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get",
+        "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close",
         "capture.context", "capture.coverage", "trace.telemetry_cost", "producer.list", "producer.get",
         "catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality",
         "relation.search", "relation.get", "runtime.domain.states",
@@ -63,6 +74,21 @@ const std::vector<std::string>& RawQueryMethodRegistry()
 nlohmann::json RequiredParametersFor( const std::string& method )
 {
     nlohmann::json required = nlohmann::json::array();
+    if( method.rfind( "analysis.scan.", 0 ) == 0 )
+    {
+        if( method == "analysis.scan.profile.validate" ) required.emplace_back( "profile" );
+        else if( method == "analysis.scan.start" )
+        {
+            required.emplace_back( "trace_id" );
+            required.emplace_back( "profile" );
+        }
+        else
+        {
+            required.emplace_back( "scan_id" );
+            if( method == "analysis.scan.candidate.get" || method == "analysis.scan.representative_frames" ) required.emplace_back( "candidate_id" );
+        }
+        return required;
+    }
     if( method == "trace.open" ) required.emplace_back( "path" );
     else if( method.rfind( "compare.", 0 ) == 0 ) { required.emplace_back( "baseline_trace_id" ); required.emplace_back( "trace_id" ); }
     else if( method != "system.describe" && method != "system.schema" && method != "trace.list" ) required.emplace_back( "trace_id" );
@@ -102,12 +128,16 @@ nlohmann::json ParameterSchemaFor( const std::string& name )
     if( name == "max_edges" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxEdges } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "max_groups" ) return { { "oneOf", json::array( { json { { "type", "integer" }, { "minimum", 1 }, { "maximum", MaximumMaxGroups } }, json { { "type", "string" }, { "pattern", "^[0-9]+$" } } } ) } };
     if( name == "filter" ) return { { "type", "object" } };
-    if( name == "callstacks" || name == "values_ns" || name == "fields" ) return { { "type", "array" }, { "items", { { "type", { "string", "integer" } } } } };
+    if( name == "profile" ) return { { "type", "object" } };
+    if( name == "scan_id" || name == "candidate_id" ) return { { "type", "string" }, { "minLength", 1 }, { "maxLength", 256 } };
+    if( name == "callstacks" || name == "values_ns" ) return { { "type", "array" }, { "items", { { "type", { "string", "integer" } } } } };
+    if( name == "fields" ) return { { "type", "array" }, { "items", { { "type", "string" } } }, { "maxItems", 128 } };
     return { { "type", "string" } };
 }
 
 std::string MethodDomain( const std::string& method )
 {
+    if( method.rfind( "analysis.scan.", 0 ) == 0 ) return "analysis.scan";
     if( method.rfind( "source.callsite", 0 ) == 0 ) return "source.callsite";
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" ) return "evidence";
     if( method.rfind( "runtime.domain.", 0 ) == 0 ) return "runtime.domain";
@@ -160,13 +190,21 @@ const nlohmann::json& QueryOperationSchemaRegistry()
         };
         for( const auto& method : RawQueryMethodRegistry() )
         {
+            const bool deterministicScan = method.rfind( "analysis.scan.", 0 ) == 0;
             const auto required = RequiredParametersFor( method );
             json properties = json::object();
-            for( const auto& name : common ) properties[name] = ParameterSchemaFor( name );
+            if( !deterministicScan ) for( const auto& name : common ) properties[name] = ParameterSchemaFor( name );
             for( const auto& value : required )
             {
                 const auto name = value.get<std::string>();
                 properties[name] = ParameterSchemaFor( name );
+            }
+            if( deterministicScan && ( method == "analysis.scan.signatures" || method == "analysis.scan.candidates" ) )
+            {
+                properties["limit"] = ParameterSchemaFor( "limit" );
+                properties["cursor"] = ParameterSchemaFor( "cursor" );
+                properties["fields"] = ParameterSchemaFor( "fields" );
+                properties["filter"] = ParameterSchemaFor( "filter" );
             }
             json alternatives = json::array();
             if( method == "frame.get" )
@@ -211,7 +249,7 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 properties["provenance"] = ParameterSchemaFor( "provenance" );
                 properties["domain"] = ParameterSchemaFor( "domain" );
             }
-            json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", true } };
+            json inputSchema = { { "type", "object" }, { "properties", std::move( properties ) }, { "required", required }, { "additionalProperties", !deterministicScan } };
             if( !alternatives.empty() ) inputSchema["oneOf"] = json::array( {
                 json { { "required", alternatives[0] } }, json { { "required", alternatives[1] } }
             } );
@@ -238,6 +276,10 @@ const nlohmann::json& QueryOperationSchemaRegistry()
                 { "required", required }, { "one_of_required", alternatives }, { "pagination", true },
                 { "budget_parameters", { "max_scan_events", "max_cpu_ms", "max_nodes", "max_groups", "max_edges" } },
                 { "input_schema", std::move( inputSchema ) }, { "output_schema", QueryEnvelopeOutputSchema() },
+                { "annotations", {
+                    { "readOnlyHint", true }, { "destructiveHint", false },
+                    { "idempotentHint", true }, { "openWorldHint", false }
+                } },
                 { "request_example", { { "protocol", QueryProtocol }, { "id", "request-1" }, { "method", method }, { "params", std::move( exampleParams ) } } }
             } );
         }
@@ -266,7 +308,90 @@ bool IsPublicQueryMethod( std::string_view method )
 namespace
 {
 
+std::string QueryExecutableSha256()
+{
+#ifdef _WIN32
+    std::wstring path( 32768, L'\0' );
+    const auto length = GetModuleFileNameW( nullptr, path.data(), DWORD( path.size() ) );
+    if( length == 0 || length >= path.size() ) throw std::runtime_error( "query_executable_path_unavailable" );
+    path.resize( length );
+    return analysis::Sha256File( std::filesystem::path( path ) );
+#else
+    analysis::Sha256Builder hash;
+    hash.Update( QuerySchemaVersion, std::char_traits<char>::length( QuerySchemaVersion ) );
+    return hash.FinalHex();
+#endif
+}
+
+nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
+{
+    return {
+        { "scan_id", value.scanId }, { "state", analysis::ScanStateName( value.state ) },
+        { "resumable", value.resumable }, { "completed", value.completed },
+        { "closed", value.closed },
+        { "progress", { { "completed", std::to_string( value.progressCompleted ) },
+            { "total", std::to_string( value.progressTotal ) }, { "stage", value.stage } } },
+        { "error", value.error.empty() ? nlohmann::json( nullptr ) : nlohmann::json( value.error ) }
+    };
+}
+
 using nlohmann::json;
+
+bool IsDeterministicScanMethod( std::string_view method )
+{
+    return method.starts_with( "analysis.scan." );
+}
+
+void ValidateDeterministicScanParameters( const std::string& method, const json& params )
+{
+    const auto& operations = QueryOperationSchemaRegistry();
+    const auto operation = std::find_if( operations.begin(), operations.end(), [&]( const json& value ) {
+        return value.at( "method" ).get_ref<const std::string&>() == method;
+    } );
+    if( operation == operations.end() ) throw QueryError( "METHOD_NOT_FOUND", "unknown method: " + method );
+    const auto& properties = operation->at( "input_schema" ).at( "properties" );
+    for( const auto& [name, value] : params.items() )
+        if( !properties.contains( name ) ) throw QueryError( "INVALID_PARAMS", "unknown analysis scan parameter: " + name );
+    for( const auto& required : operation->at( "required" ) )
+    {
+        const auto& name = required.get_ref<const std::string&>();
+        if( !params.contains( name ) ) throw QueryError( "INVALID_PARAMS", "missing required analysis scan parameter: " + name );
+    }
+
+    const auto nonEmptyString = [&]( const char* name ) {
+        if( !params.contains( name ) ) return;
+        if( !params[name].is_string() || params[name].get_ref<const std::string&>().empty() || params[name].get_ref<const std::string&>().size() > 256 )
+            throw QueryError( "INVALID_PARAMS", std::string( name ) + " must be a non-empty string of at most 256 bytes" );
+    };
+    nonEmptyString( "trace_id" );
+    nonEmptyString( "scan_id" );
+    nonEmptyString( "candidate_id" );
+    nonEmptyString( "cursor" );
+    if( params.contains( "profile" ) && !params["profile"].is_object() ) throw QueryError( "INVALID_PARAMS", "profile must be an object" );
+    if( params.contains( "filter" ) && !params["filter"].is_object() ) throw QueryError( "INVALID_PARAMS", "filter must be an object" );
+    if( params.contains( "fields" ) )
+    {
+        if( !params["fields"].is_array() || params["fields"].size() > 128 ) throw QueryError( "INVALID_PARAMS", "fields must be an array with at most 128 entries" );
+        for( const auto& field : params["fields"] ) if( !field.is_string() ) throw QueryError( "INVALID_PARAMS", "fields entries must be strings" );
+    }
+    if( params.contains( "limit" ) )
+    {
+        if( !params["limit"].is_number_integer() && !params["limit"].is_number_unsigned() ) throw QueryError( "INVALID_PARAMS", "limit must be an integer" );
+        const auto limit = params["limit"].get<int64_t>();
+        if( limit < 1 || limit > int64_t( MaximumPageSize ) ) throw QueryError( "INVALID_PARAMS", "limit must be between 1 and 1000" );
+    }
+}
+
+json ScanContractIdentity()
+{
+    return {
+        { "native_scan", analysis::NativeScanApiSchemaVersion },
+        { "neutral_aggregate", analysis::NeutralAggregateSchemaVersion },
+        { "policy_evaluation", analysis::PolicyEvaluationSchemaVersion },
+        { "candidate_manifest", analysis::CandidateManifestSchemaVersion },
+        { "analysis_profile", analysis::AnalysisProfileSchemaVersion }
+    };
+}
 
 bool JsonDepthAllowed( const json& value, size_t depth = 0 )
 {
@@ -4245,10 +4370,51 @@ N11TraceData ParseN11Trace( const analysis::TraceSource& source, const analysis:
 
 }
 
-QueryService::QueryService( SessionManager& sessions, size_t analysisCacheBytes )
+QueryService::QueryService( SessionManager& sessions, size_t analysisCacheBytes,
+    std::filesystem::path analysisRoot, std::filesystem::path analysisCacheRoot,
+    AnalysisScanExecutor scanExecutor, std::string queryExecutableSha256 )
     : m_sessions( sessions )
+    , m_analysisRoot( std::move( analysisRoot ) )
+    , m_analysisCacheRoot( std::move( analysisCacheRoot ) )
     , m_cacheBudget( analysisCacheBytes )
-{}
+{
+    if( m_analysisRoot.empty() != m_analysisCacheRoot.empty() )
+    {
+        throw std::invalid_argument( "analysis root and analysis cache root must be configured together" );
+    }
+    if( !m_analysisRoot.empty() )
+    {
+        if( !m_analysisRoot.is_absolute() || !m_analysisCacheRoot.is_absolute() )
+        {
+            throw std::invalid_argument( "analysis root and analysis cache root must be absolute paths" );
+        }
+        m_analysisRoot = m_analysisRoot.lexically_normal();
+        m_analysisCacheRoot = m_analysisCacheRoot.lexically_normal();
+        std::error_code error;
+        if( !std::filesystem::is_directory( m_analysisRoot, error ) || error )
+        {
+            throw std::invalid_argument( "analysis root must be an existing directory" );
+        }
+        if( !analysis::ResolveAnalysisPathWithinRoot( m_analysisRoot, m_analysisCacheRoot ) )
+        {
+            throw std::invalid_argument( "analysis cache root must be contained by analysis root" );
+        }
+        if( !scanExecutor ) scanExecutor = ExecuteDefaultAnalysisScan;
+        if( queryExecutableSha256.empty() ) queryExecutableSha256 = QueryExecutableSha256();
+        m_scanManager = std::make_unique<AnalysisScanManager>( m_analysisRoot, m_analysisCacheRoot,
+            std::move( queryExecutableSha256 ),
+            [this]( const std::filesystem::path& path, std::stop_token stopToken ) -> std::shared_ptr<analysis::TraceSource> {
+                const auto opened = m_sessions.Open( path );
+                while( !stopToken.stop_requested() )
+                {
+                    const auto status = m_sessions.WaitReady( opened.id, std::chrono::milliseconds( 100 ) );
+                    if( status.state == analysis::TraceSourceState::Ready ) return m_sessions.GetReadySource( opened.id );
+                    if( status.state == analysis::TraceSourceState::Failed || status.state == analysis::TraceSourceState::Closed ) return {};
+                }
+                return {};
+            }, std::move( scanExecutor ) );
+    }
+}
 
 void QueryService::EvictCache( size_t incomingBytes )
 {
@@ -4391,17 +4557,27 @@ json QueryService::Execute( const json& request, const std::optional<std::string
         if( request.value( "protocol", "" ) != QueryProtocol ) throw QueryError( "INVALID_REQUEST", "protocol must be tracy-query/1" );
         if( !request.contains( "id" ) || !( id.is_string() || id.is_number() ) ) throw QueryError( "INVALID_REQUEST", "id must be a string or number" );
         if( !request.contains( "method" ) || !request["method"].is_string() ) throw QueryError( "INVALID_REQUEST", "method must be a string" );
+        const auto method = request["method"].get<std::string>();
+        if( !IsPublicQueryMethod( method ) ) throw QueryError( "METHOD_NOT_FOUND", "unknown method: " + method );
         const auto params = request.value( "params", json::object() );
         if( !params.is_object() ) throw QueryError( "INVALID_PARAMS", "params must be an object" );
+        if( IsDeterministicScanMethod( method ) ) ValidateDeterministicScanParameters( method, params );
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+        const auto execute = [&] {
+            if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
+            QueryBudgetState budget( params, stopToken );
+            QueryBudgetScope budgetScope( budget );
+            auto response = Dispatch( id, method, params, defaultTraceId, stopToken );
+            budget.Attach( response );
+            if( DumpProtocolJson( response ).size() > MaximumResponseBytes )
+                throw QueryError( "RESOURCE_LIMIT", "response exceeds the 8 MiB budget; use pagination or field projection" );
+            return response;
+        };
+        // Deterministic scans own an immutable TraceSource pin and persistent
+        // state. They must never hold the legacy global query/cache mutex.
+        if( IsDeterministicScanMethod( method ) ) return execute();
         std::lock_guard lock( m_queryMutex );
-        if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
-        QueryBudgetState budget( params, stopToken );
-        QueryBudgetScope budgetScope( budget );
-        auto response = Dispatch( id, request["method"].get<std::string>(), params, defaultTraceId, stopToken );
-        budget.Attach( response );
-        if( DumpProtocolJson( response ).size() > MaximumResponseBytes ) throw QueryError( "RESOURCE_LIMIT", "response exceeds the 8 MiB budget; use pagination or field projection" );
-        return response;
+        return execute();
     }
     catch( const SessionError& error )
     {
@@ -4427,8 +4603,106 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
     };
     checkCancelled();
+    if( method == "analysis.scan.profile.validate" )
+    {
+        const auto validation = analysis::ValidateAndNormalizeAnalysisProfile( params.at( "profile" ) );
+        if( !validation.valid )
+        {
+            json errors = json::array();
+            for( const auto& error : validation.errors ) errors.emplace_back( json { { "path", error.path }, { "message", error.message } } );
+            throw QueryError( "INVALID_ANALYSIS_PROFILE", "analysis profile validation failed", false, {
+                { "schema_identity", ScanContractIdentity() }, { "errors", std::move( errors ) }
+            } );
+        }
+        return Success( id, {
+            { "valid", true }, { "profile_schema_version", analysis::AnalysisProfileSchemaVersion },
+            { "profile_identity", validation.profileSha256 }, { "normalized_profile", validation.normalized },
+            { "schema_identity", ScanContractIdentity() },
+            { "identity", {
+                { "trace_identity", nullptr }, { "aggregate_identity", nullptr },
+                { "policy_identity", validation.profileSha256 }
+            } }
+        } );
+    }
+    if( IsDeterministicScanMethod( method ) )
+    {
+        if( !m_scanManager ) throw QueryError( "ANALYSIS_PATHS_NOT_CONFIGURED",
+            "deterministic analysis scans require --analysis-root and --analysis-cache-root" );
+        const auto scanId = params.value( "scan_id", std::string() );
+        const auto snapshot = [&]( const AnalysisScanSnapshot& value ) {
+            return Success( id, AnalysisScanSnapshotJson( value ) );
+        };
+        const auto requireComplete = [&] {
+            const auto value = m_scanManager->Status( scanId );
+            if( !value.completed ) throw QueryError( "SCAN_NOT_READY",
+                "analysis scan has not completed", true, AnalysisScanSnapshotJson( value ) );
+        };
+        try
+        {
+            if( method == "analysis.scan.start" )
+            {
+                const auto validation = analysis::ValidateAndNormalizeAnalysisProfile( params.at( "profile" ) );
+                if( !validation.valid )
+                {
+                    json errors = json::array();
+                    for( const auto& error : validation.errors ) errors.push_back( {
+                        { "path", error.path }, { "message", error.message } } );
+                    throw QueryError( "INVALID_ANALYSIS_PROFILE", "analysis profile validation failed",
+                        false, { { "errors", std::move( errors ) } } );
+                }
+                const auto traceId = params.at( "trace_id" ).get<std::string>();
+                const auto trace = m_sessions.Status( traceId );
+                auto source = m_sessions.GetReadySource( traceId );
+                AnalysisScanStartRequest request;
+                request.traceSessionId = traceId;
+                request.tracePath = trace.path;
+                request.source = std::move( source );
+                request.normalizedProfile = validation.normalized;
+                request.profileIdentity = validation.profileSha256;
+                return snapshot( m_scanManager->Start( request ) );
+            }
+            if( method == "analysis.scan.status" ) return snapshot( m_scanManager->Status( scanId ) );
+            if( method == "analysis.scan.cancel" ) return snapshot( m_scanManager->Cancel( scanId ) );
+            if( method == "analysis.scan.resume" ) return snapshot( m_scanManager->Resume( scanId ) );
+            if( method == "analysis.scan.close" ) return snapshot( m_scanManager->Close( scanId ) );
+            requireComplete();
+            if( method == "analysis.scan.summary" ) return Success( id, m_scanManager->Summary( scanId ) );
+            if( method == "analysis.scan.quality" ) return Success( id, m_scanManager->Quality( scanId ) );
+            if( method == "analysis.scan.candidate.get" ) return Success( id,
+                m_scanManager->Candidate( scanId, params.at( "candidate_id" ).get<std::string>() ) );
+            if( method == "analysis.scan.representative_frames" ) return Success( id,
+                m_scanManager->RepresentativeFrames( scanId, params.at( "candidate_id" ).get<std::string>() ) );
+            const auto limit = size_t( params.value( "limit", uint64_t( DefaultPageSize ) ) );
+            const auto cursor = params.value( "cursor", std::string() );
+            const auto fields = params.value( "fields", std::vector<std::string>() );
+            const auto filter = params.value( "filter", json::object() );
+            if( method == "analysis.scan.signatures" ) return Success( id,
+                m_scanManager->Signatures( scanId, limit, cursor, fields, filter ) );
+            if( method == "analysis.scan.candidates" ) return Success( id,
+                m_scanManager->Candidates( scanId, limit, cursor, fields, filter ) );
+        }
+        catch( const QueryError& ) { throw; }
+        catch( const std::invalid_argument& error )
+        {
+            throw QueryError( "INVALID_PARAMS", error.what() );
+        }
+        catch( const std::runtime_error& error )
+        {
+            const std::string message = error.what();
+            if( message == "analysis_scan_not_found" ) throw QueryError( "SCAN_NOT_FOUND", message );
+            if( message == "analysis_scan_candidate_not_found" ) throw QueryError( "CANDIDATE_NOT_FOUND", message );
+            throw QueryError( "SCAN_STORAGE_ERROR", message, true );
+        }
+        throw QueryError( "METHOD_NOT_FOUND", "unsupported deterministic analysis scan method" );
+    }
     if( method == "system.schema" ) return Success( id, {
         { "schema", json::parse( QuerySchemaJson ) },
+        { "analysis_scan_schemas", {
+            { "analysis_profile", json::parse( AnalysisProfileSchemaJson ) },
+            { "neutral_aggregate", json::parse( NeutralAggregateSchemaJson ) },
+            { "candidate_manifest", json::parse( CandidateManifestSchemaJson ) },
+            { "api", json::parse( AnalysisScanApiSchemaJson ) }
+        } },
         { "operations", QueryOperationSchemaRegistry() },
         { "coverage", {
             { "domain", json::parse( QueryCoverageJson ) },
@@ -4441,6 +4715,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         auto data = DescribeData( params );
         data["limits"]["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         data["analysis_cache"] = { { "bytes", Decimal( uint64_t( m_cacheBytes ) ) }, { "entries", m_gpuCache.size() + m_memoryCache.size() }, { "policy", "LRU; entries in use are not evicted" } };
+        data["analysis_scan"] = {
+            { "schema_version", 1 }, { "paths_configured", !m_analysisRoot.empty() },
+            { "analysis_root", m_analysisRoot.empty() ? json( nullptr ) : json( m_analysisRoot.string() ) },
+            { "cache_root", m_analysisCacheRoot.empty() ? json( nullptr ) : json( m_analysisCacheRoot.string() ) }
+        };
         return Success( id, std::move( data ) );
     }
     if( method == "trace.open" )

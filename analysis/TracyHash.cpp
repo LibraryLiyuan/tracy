@@ -1,4 +1,5 @@
 #include "TracyHash.hpp"
+#include "TracyAnalysisIoPath.hpp"
 
 #include <algorithm>
 #include <array>
@@ -7,6 +8,12 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
+
+#ifdef _WIN32
+#  include <Windows.h>
+#  include <bcrypt.h>
+#endif
 
 namespace tracy::analysis
 {
@@ -127,9 +134,98 @@ private:
 
 }
 
+struct Sha256Builder::Impl
+{
+    Sha256 value;
+    std::string finalHex;
+};
+
+Sha256Builder::Sha256Builder()
+    : m_impl( std::make_unique<Impl>() )
+{}
+
+Sha256Builder::~Sha256Builder() = default;
+Sha256Builder::Sha256Builder( Sha256Builder&& ) noexcept = default;
+Sha256Builder& Sha256Builder::operator=( Sha256Builder&& ) noexcept = default;
+
+void Sha256Builder::Update( const void* data, size_t size )
+{
+    if( !m_impl || !m_impl->finalHex.empty() ) throw std::runtime_error( "sha256_builder_already_finalized" );
+    if( size != 0 ) m_impl->value.Update( static_cast<const uint8_t*>( data ), size );
+}
+
+std::string Sha256Builder::FinalHex()
+{
+    if( !m_impl ) throw std::runtime_error( "sha256_builder_moved" );
+    if( !m_impl->finalHex.empty() ) return m_impl->finalHex;
+    const auto digest = m_impl->value.Final();
+    std::ostringstream output;
+    output << std::hex << std::setfill( '0' );
+    for( const auto byte : digest ) output << std::setw( 2 ) << unsigned( byte );
+    m_impl->finalHex = output.str();
+    return m_impl->finalHex;
+}
+
 std::string Sha256File( const std::filesystem::path& path )
 {
-    std::ifstream stream( path, std::ios::binary );
+#ifdef _WIN32
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::vector<uint8_t> object;
+    std::array<uint8_t, 32> digest {};
+    const auto cleanup = [&] {
+        if( hash ) BCryptDestroyHash( hash );
+        if( algorithm ) BCryptCloseAlgorithmProvider( algorithm, 0 );
+    };
+    if( BCryptOpenAlgorithmProvider( &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0 ) != 0 )
+        throw std::runtime_error( "unable to open SHA-256 provider" );
+    DWORD objectBytes = 0, resultBytes = 0;
+    if( BCryptGetProperty( algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>( &objectBytes ), sizeof( objectBytes ),
+            &resultBytes, 0 ) != 0 || objectBytes == 0 )
+    {
+        cleanup();
+        throw std::runtime_error( "unable to query SHA-256 provider" );
+    }
+    object.resize( objectBytes );
+    if( BCryptCreateHash( algorithm, &hash, object.data(), DWORD( object.size() ),
+            nullptr, 0, 0 ) != 0 )
+    {
+        cleanup();
+        throw std::runtime_error( "unable to create SHA-256 hash" );
+    }
+
+    std::ifstream stream( AnalysisIoPath( path ), std::ios::binary );
+    if( !stream )
+    {
+        cleanup();
+        throw std::runtime_error( "unable to open trace for fingerprint" );
+    }
+    std::vector<uint8_t> buffer( 4 * 1024 * 1024 );
+    while( stream )
+    {
+        stream.read( reinterpret_cast<char*>( buffer.data() ),
+            std::streamsize( buffer.size() ) );
+        const auto read = stream.gcount();
+        if( read > 0 && BCryptHashData( hash, buffer.data(), ULONG( read ), 0 ) != 0 )
+        {
+            cleanup();
+            throw std::runtime_error( "unable to hash trace fingerprint" );
+        }
+    }
+    if( !stream.eof() )
+    {
+        cleanup();
+        throw std::runtime_error( "unable to read trace for fingerprint" );
+    }
+    if( BCryptFinishHash( hash, digest.data(), ULONG( digest.size() ), 0 ) != 0 )
+    {
+        cleanup();
+        throw std::runtime_error( "unable to finish trace fingerprint" );
+    }
+    cleanup();
+#else
+    std::ifstream stream( AnalysisIoPath( path ), std::ios::binary );
     if( !stream ) throw std::runtime_error( "unable to open trace for fingerprint" );
 
     Sha256 hash;
@@ -145,6 +241,7 @@ std::string Sha256File( const std::filesystem::path& path )
     if( !stream.eof() ) throw std::runtime_error( "unable to read trace for fingerprint" );
 
     const auto digest = hash.Final();
+#endif
     std::ostringstream output;
     output << std::hex << std::setfill( '0' );
     for( const auto byte : digest ) output << std::setw( 2 ) << unsigned( byte );

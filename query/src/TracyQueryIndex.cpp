@@ -792,7 +792,9 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
     return result;
 }
 
-class IndexedTraceSource final : public analysis::TraceSource
+class IndexedTraceSource final : public analysis::TraceSource,
+    public analysis::NativeBoundedTraceSource,
+    public analysis::GpuCatalogBoundedScanSource
 {
 public:
     IndexedTraceSource( QueryIndexManifest manifest, std::unique_ptr<analysis::WorkerTraceSource> source )
@@ -834,6 +836,11 @@ public:
         return result;
     }
 
+    uint32_t NativeBoundedScanVersion() const override
+    {
+        return analysis::NativeBoundedScanSchemaVersion;
+    }
+
     analysis::TraceInfoDto GetTraceInfo() const override
     {
         auto result = m_source->GetTraceInfo();
@@ -855,6 +862,31 @@ public:
         // domains while forwarding Catalog evidence verbatim, so an indexed
         // open cannot silently report N27 as absent.
         return m_source->GetGpuCatalogData();
+    }
+
+    uint64_t GetGpuCatalogResourceCountBounded() const override { return m_source->GetGpuCatalogResourceCountBounded(); }
+    uint64_t GetGpuCatalogAllocationCountBounded() const override { return m_source->GetGpuCatalogAllocationCountBounded(); }
+    uint64_t GetGpuCatalogPassCountBounded() const override { return m_source->GetGpuCatalogPassCountBounded(); }
+    uint64_t GetGpuCatalogRangeCountBounded() const override { return m_source->GetGpuCatalogRangeCountBounded(); }
+    std::vector<analysis::GpuAnalysisResourceSummary> ScanGpuCatalogResourcesBounded(
+        size_t offset, size_t limit ) const override
+    {
+        return m_source->ScanGpuCatalogResourcesBounded( offset, limit );
+    }
+    std::vector<analysis::GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded(
+        size_t offset, size_t limit ) const override
+    {
+        return m_source->ScanGpuCatalogAllocationsBounded( offset, limit );
+    }
+    std::vector<analysis::GpuPassWorkingSet> ScanGpuCatalogPassesBounded(
+        size_t offset, size_t limit ) const override
+    {
+        return m_source->ScanGpuCatalogPassesBounded( offset, limit );
+    }
+    std::vector<analysis::GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded(
+        size_t offset, size_t limit ) const override
+    {
+        return m_source->ScanGpuCatalogRangesBounded( offset, limit );
     }
 
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
@@ -1110,9 +1142,15 @@ public:
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanContextSwitches, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
+    TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::vector<analysis::JobDto>, GetEvidenceJobs, uint64_t, frameId )
     TRACY_INDEX_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
+    TRACY_INDEX_FORWARD0( uint64_t, GetIoRequestCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::IoRequestDto>, ScanIoRequests, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
+    TRACY_INDEX_FORWARD0( uint64_t, GetGfxDispatchCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::GfxDispatchDto>, ScanGfxDispatches, size_t, offset, size_t, limit )
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override
     {
         std::vector<analysis::GfxEntityDto> result;
@@ -1122,6 +1160,22 @@ public:
             const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
             result.push_back( { MakeEntityRef( "gfx-entity", value.entityId ), value.entityId, value.parentId, value.time,
                 MakeEntityRef( "thread", value.thread ), value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
+        }
+        return result;
+    }
+    uint64_t GetGfxEntityCount() const override { return m_gfxEntities.Count(); }
+    std::vector<analysis::GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override
+    {
+        const auto begin = std::min<uint64_t>( offset, m_gfxEntities.Count() );
+        const auto end = begin + std::min<uint64_t>( limit, m_gfxEntities.Count() - begin );
+        std::vector<analysis::GfxEntityDto> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t index = begin; index < end; ++index )
+        {
+            const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
+            result.push_back( { MakeEntityRef( "gfx-entity", value.entityId ), value.entityId,
+                value.parentId, value.time, MakeEntityRef( "thread", value.thread ),
+                value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
         }
         return result;
     }
@@ -1137,7 +1191,23 @@ public:
         }
         return result;
     }
-    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override
+    uint64_t GetGfxLinkCount() const override { return m_gfxLinks.Count(); }
+    std::vector<analysis::GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override
+    {
+        const auto begin = std::min<uint64_t>( offset, m_gfxLinks.Count() );
+        const auto end = begin + std::min<uint64_t>( limit, m_gfxLinks.Count() - begin );
+        std::vector<analysis::GfxLinkDto> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t index = begin; index < end; ++index )
+        {
+            const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
+            result.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId,
+                value.time, MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
+        }
+        return result;
+    }
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds ) const override
     {
         analysis::GfxEvidenceSlice result;
         std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
@@ -1201,8 +1271,14 @@ public:
         return result;
     }
     TRACY_INDEX_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
+    TRACY_INDEX_FORWARD0( uint64_t, GetRuntimeDomainStateCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::RuntimeDomainStateDto>, ScanRuntimeDomainStates, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
+    TRACY_INDEX_FORWARD0( uint64_t, GetScriptFrameCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::ScriptFrameDto>, ScanScriptFrames, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
+    TRACY_INDEX_FORWARD0( uint64_t, GetScriptStackEventCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::ScriptStackEventDto>, ScanScriptStackEvents, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD0( analysis::CrashDto, GetCrash )
     TRACY_INDEX_FORWARD0( std::vector<analysis::CpuTopologyDto>, GetCpuTopology )
     TRACY_INDEX_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )
@@ -1218,6 +1294,8 @@ public:
     TRACY_INDEX_FORWARD1( std::optional<analysis::SymbolAddressMappingDto>, ResolveSymbolAddress, uint64_t, address )
     TRACY_INDEX_FORWARD0( std::vector<analysis::SourceLocationDto>, GetSourceLocations )
     TRACY_INDEX_FORWARD0( std::vector<analysis::CallsiteDto>, GetCallsites )
+    TRACY_INDEX_FORWARD0( uint64_t, GetCallsiteCount )
+    TRACY_INDEX_FORWARD2( std::vector<analysis::CallsiteDto>, ScanCallsites, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveParentCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes )

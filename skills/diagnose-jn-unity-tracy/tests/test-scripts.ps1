@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([string]$PythonExe = 'python')
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -64,7 +64,21 @@ try {
     }
 
     $resolvedPath = Join-Path $testRoot 'resolved-profile.json'
-    & (Join-Path $skillRoot 'scripts\resolve-profile.ps1') -OutputPath $resolvedPath | Out-Null
+    # Legacy script regression uses synthetic local paths, never the developer's
+    # personal config or installed capture tools. Only Python is executed.
+    $testToolRoot = Join-Path $testRoot 'tools'
+    [void](New-Item -ItemType Directory -Path $testToolRoot)
+    foreach ($name in @('tracy-capture.exe', 'tracy-stream-convert.exe', 'tracy-query.exe', 'tracy-profiler.exe')) {
+        [System.IO.File]::WriteAllText((Join-Path $testToolRoot $name), 'identity-only test fixture')
+    }
+    $testLocal = Read-JNJson -LiteralPath (Join-Path $skillRoot 'config\local-profile.example.json')
+    $testLocal.paths.toolchain_root = $testToolRoot
+    $testLocal.paths.python_exe = (Get-Command $PythonExe -CommandType Application -ErrorAction Stop).Source
+    $testLocal.source_roots = @('tracy_repo')
+    $testLocal.paths.tracy_repo = $skillRoot
+    $testLocalPath = Join-Path $testRoot 'local-profile.json'
+    Write-JNJsonAtomic -LiteralPath $testLocalPath -Value $testLocal
+    & (Join-Path $skillRoot 'scripts\resolve-profile.ps1') -LocalProfile $testLocalPath -OutputPath $resolvedPath | Out-Null
     $resolved = Read-JNJson -LiteralPath $resolvedPath
     Assert-Test ($resolved.project.schema_version -eq 2) 'Resolved project profile schema is not 2.'
     Assert-Test ($resolved.project.trace_contract.protocol -eq 90) 'Resolved Protocol is not 90.'
@@ -138,6 +152,32 @@ try {
     Assert-Test ($stopResult.reason -eq 'capture_already_exited_requires_mcp_validation') 'Manual Ctrl+C recovery was not accepted.'
     Assert-Test ($stopResult.completeness -eq 'requires_mcp_validation') 'Manual Ctrl+C recovery bypassed MCP validation.'
 
+    $conversionTask = Join-Path $testRoot 'conversion-finalize-query-135'
+    [void](New-Item -ItemType Directory -Path $conversionTask)
+    $conversionStream = Join-Path $conversionTask 'input.tracy-stream'
+    $conversionTrace = Join-Path $conversionTask 'output.tracy'
+    $conversionCandidate = $conversionTrace + '.converting'
+    [System.IO.File]::WriteAllBytes($conversionStream, [byte[]](1, 2, 3, 4))
+    [System.IO.File]::WriteAllBytes($conversionCandidate, [byte[]](5, 6, 7, 8))
+    $conversionCandidateSha = (Get-FileHash -LiteralPath $conversionCandidate -Algorithm SHA256).Hash
+    $conversionValidation = Join-Path $conversionTask 'validation.json'
+    Write-JNJsonAtomic -LiteralPath $conversionValidation -Value ([ordered]@{
+        publishable = $true
+        trace_sha256 = $conversionCandidateSha
+        protocol = 90
+        query_schema = '1.35.0'
+        completeness = 'Complete'
+    })
+    & (Join-Path $skillRoot 'scripts\convert-stream.ps1') `
+        -Mode Finalize `
+        -ResolvedProfile $resolvedPath `
+        -TaskDirectory $conversionTask `
+        -StreamPath $conversionStream `
+        -OutputTrace $conversionTrace `
+        -ValidationEvidence $conversionValidation | Out-Null
+    Assert-Test (Test-Path -LiteralPath $conversionTrace -PathType Leaf) 'Query 1.35 validation did not publish the converted Trace.'
+    Assert-Test (-not (Test-Path -LiteralPath $conversionCandidate)) 'Finalized conversion candidate was not atomically renamed.'
+
     $monitorProfile = Read-JNJson -LiteralPath $resolvedPath
     $monitorProfile.local.protection.warn_free_disk_gib = 1000000
     $monitorProfile.local.protection.stop_free_disk_gib = 1000000
@@ -150,14 +190,14 @@ try {
     Assert-Test ($monitorResult.protection_applied -eq $false) 'A pre-existing stop marker was incorrectly attributed to this monitor run.'
 
     $state = Read-JNJson -LiteralPath (Join-Path $skillRoot 'assets\analysis-state-template.json')
-    Assert-Test ($state.schema_version -eq 3) 'Analysis State schema is not 3.'
-    foreach ($field in @('analysis_windows', 'frame_classes', 'bottleneck_signatures', 'evidence_cards', 'hypothesis_ledger', 'query_ledger', 'evidence_manifest', 'report_build')) {
+    Assert-Test ($state.schema_version -eq 4) 'Analysis State schema is not 4.'
+    foreach ($field in @('profile', 'query', 'trace', 'scan', 'candidate_manifest', 'investigations', 'ledgers', 'report_build')) {
         Assert-Test ($null -ne $state.PSObject.Properties[$field]) ("Analysis State is missing field: $field")
     }
-    Assert-Test ($null -eq $state.PSObject.Properties['episodes']) 'Schema 3 must not retain an Episode state field.'
+    Assert-Test ($null -eq $state.PSObject.Properties['episodes']) 'Schema 4 must not retain an Episode state field.'
 
     $python = [string]$resolved.local.paths.python_exe
-    & $python -m unittest discover -s (Join-Path $skillRoot 'tests') -p 'test_*.py' -v
+    & $python -X utf8 -m unittest discover -s (Join-Path $skillRoot 'tests') -t $skillRoot -p 'test_*.py' -v
     Assert-Test ($LASTEXITCODE -eq 0) 'Python report builder tests failed.'
 
     [ordered]@{
@@ -166,7 +206,7 @@ try {
         powershell_version = $PSVersionTable.PSVersion.ToString()
         tests = @(
             'skill_structure', 'openai_yaml_contract', 'powershell_ast', 'json_parse', 'profile_resolution', 'frame_selection',
-            'marker_attribution_audit', 'manual_ctrl_c_recovery', 'capture_protection_attribution', 'analysis_state_schema3',
+            'marker_attribution_audit', 'manual_ctrl_c_recovery', 'conversion_finalize_query_135', 'capture_protection_attribution', 'analysis_state_schema4',
             'python_report_builder'
         )
     } | ConvertTo-Json -Depth 10

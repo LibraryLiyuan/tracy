@@ -1,6 +1,9 @@
 {
   "kind": "jntracy_performance_budgets",
   "schema_version": 1,
+  "execution_status": "legacy_compatibility_only",
+  "authoritative_profile": "JNTracy.AnalysisProfile.yaml",
+  "formal_route_removal_stage": "QSCAN-11",
   "budget_id": "JN-60FPS-Budget-v3",
   "units": {
     "time": "ms",

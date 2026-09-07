@@ -34,7 +34,7 @@ int main()
     assert( initialized["result"]["instructions"].get<std::string>().find( "untrusted" ) != std::string::npos );
 
     const auto tools = server.HandleRequest( Request( 2, "tools/list" ) );
-    assert( tools["result"]["tools"].size() == 12 );
+    assert( tools["result"]["tools"].size() == 13 );
     for( const auto& tool : tools["result"]["tools"] )
     {
         assert( tool.contains( "inputSchema" ) );
@@ -63,6 +63,16 @@ int main()
     assert( std::find( compareKinds.begin(), compareKinds.end(), "normalized" ) != compareKinds.end() );
     assert( ( *compare )["inputSchema"]["properties"].contains( "comparison_mode" ) );
     assert( ( *compare )["inputSchema"]["properties"].contains( "allow_warnings" ) );
+    const auto scan = std::find_if( tools["result"]["tools"].begin(), tools["result"]["tools"].end(), []( const auto& tool ) {
+        return tool["name"] == "tracy_scan";
+    } );
+    assert( scan != tools["result"]["tools"].end() );
+    assert( ( *scan )["inputSchema"]["properties"]["operation"]["enum"].size() == 12 );
+    const auto scanWithoutPaths = server.HandleRequest( Request( 21, "tools/call", {
+        { "name", "tracy_scan" }, { "arguments", { { "operation", "status" }, { "scan_id", "missing" } } }
+    } ) );
+    assert( scanWithoutPaths["result"]["isError"] == true );
+    assert( scanWithoutPaths["result"]["structuredContent"]["error"]["code"] == "ANALYSIS_PATHS_NOT_CONFIGURED" );
 
     const auto described = query.Execute( {
         { "protocol", tracy::query::QueryProtocol }, { "id", "mcp-registry" },

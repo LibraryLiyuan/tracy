@@ -833,6 +833,12 @@ analysis::TraceReadView SegmentTraceSource::AcquireReadView() const
     return { analysis::TraceSourceKind::Segment, analysis::TraceSourceState::Ready, m_view->revision, int64_t( m_view->watermarkNs ), m_view->complete };
 }
 
+uint32_t SegmentTraceSource::NativeBoundedScanVersion() const
+{
+    const auto* bounded = dynamic_cast<const analysis::NativeBoundedTraceSource*>( m_source.get() );
+    return bounded ? bounded->NativeBoundedScanVersion() : 0;
+}
+
 std::vector<analysis::Capability> SegmentTraceSource::GetCapabilities() const
 {
     auto result = m_source->GetCapabilities();
@@ -871,19 +877,89 @@ TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanContextSwitches, const ana
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CorrelatedFrameEventDto>, GetCorrelatedFrameEvents )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetJobCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD1( std::vector<analysis::JobDto>, GetEvidenceJobs, uint64_t, frameId )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetIoRequestCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::IoRequestDto>, ScanIoRequests, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetGfxDispatchCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::GfxDispatchDto>, ScanGfxDispatches, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxEntityDto>, GetGfxEntities )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetGfxEntityCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::GfxEntityDto>, ScanGfxEntities, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GfxLinkDto>, GetGfxLinks )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetGfxLinkCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::GfxLinkDto>, ScanGfxLinks, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD2( analysis::GfxEvidenceSlice, GetEvidenceGfx, uint64_t, frameId, const std::vector<uint64_t>&, seedIds )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RelationDto>, GetRelations )
 TRACY_SEGMENT_FORWARD0( uint64_t, GetRelationCount )
 TRACY_SEGMENT_FORWARD2( std::vector<analysis::RelationDto>, ScanRelations, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::RuntimeDomainStateDto>, GetRuntimeDomainStates )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetRuntimeDomainStateCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::RuntimeDomainStateDto>, ScanRuntimeDomainStates, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptFrameDto>, GetScriptFrames )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetScriptFrameCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::ScriptFrameDto>, ScanScriptFrames, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ScriptStackEventDto>, GetScriptStackEvents )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetScriptStackEventCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::ScriptStackEventDto>, ScanScriptStackEvents, size_t, offset, size_t, limit )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetCallsiteCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::CallsiteDto>, ScanCallsites, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::shared_ptr<const tracy::JnTraceData>, GetGpuCatalogData )
+uint64_t SegmentTraceSource::GetGpuCatalogResourceCountBounded() const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->GetGpuCatalogResourceCountBounded();
+}
+uint64_t SegmentTraceSource::GetGpuCatalogAllocationCountBounded() const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->GetGpuCatalogAllocationCountBounded();
+}
+uint64_t SegmentTraceSource::GetGpuCatalogPassCountBounded() const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->GetGpuCatalogPassCountBounded();
+}
+uint64_t SegmentTraceSource::GetGpuCatalogRangeCountBounded() const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->GetGpuCatalogRangeCountBounded();
+}
+std::vector<analysis::GpuAnalysisResourceSummary> SegmentTraceSource::ScanGpuCatalogResourcesBounded(
+    size_t offset, size_t limit ) const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->ScanGpuCatalogResourcesBounded( offset, limit );
+}
+std::vector<analysis::GpuAllocationAnalysisRecord> SegmentTraceSource::ScanGpuCatalogAllocationsBounded(
+    size_t offset, size_t limit ) const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->ScanGpuCatalogAllocationsBounded( offset, limit );
+}
+std::vector<analysis::GpuPassWorkingSet> SegmentTraceSource::ScanGpuCatalogPassesBounded(
+    size_t offset, size_t limit ) const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->ScanGpuCatalogPassesBounded( offset, limit );
+}
+std::vector<analysis::GpuAnalysisRangeStoreEntry> SegmentTraceSource::ScanGpuCatalogRangesBounded(
+    size_t offset, size_t limit ) const
+{
+    const auto* gpu = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( m_source.get() );
+    if( !gpu ) throw analysis::BoundedScanError( "gpu_catalog_bounded_scan_unavailable" );
+    return gpu->ScanGpuCatalogRangesBounded( offset, limit );
+}
 TRACY_SEGMENT_FORWARD0( analysis::CrashDto, GetCrash )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuTopologyDto>, GetCpuTopology )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )

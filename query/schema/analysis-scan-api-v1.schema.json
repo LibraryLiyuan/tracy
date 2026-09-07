@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jn.game/tracy/query/analysis-scan-api-v1.schema.json",
+  "title": "JN Tracy Analysis Scan API",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "query_schema_version", "methods", "identity_fields", "states"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "query_schema_version": { "const": "1.35.0" },
+    "methods": {
+      "type": "array",
+      "minItems": 12,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^analysis\\.scan\\." }
+    },
+    "identity_fields": {
+      "const": ["trace_identity", "aggregate_identity", "policy_identity", "schema_identity"]
+    },
+    "states": {
+      "const": ["contract_only", "queued", "validating", "scanning", "aggregating", "evaluating_policy", "auditing", "complete", "cancelled_resumable", "failed"]
+    }
+  }
+}

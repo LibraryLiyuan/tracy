@@ -11,7 +11,7 @@
 判断：
 
 - 先扣除 Wait、Pacing 和已归属 Render 的墙钟，只比较 Active Work。
-- 用 `marker-attribution.json` 把主线程 Zone 归入项目预算分类；ambiguous/unmapped 单列。
+- 用规范化 `JNTracy.AnalysisProfile.yaml` 的 `module_budgets[].marker_rules` 把主线程 Zone 归入项目预算分类；ambiguous/unmapped 单列。
 - C# direct/Lua source stack 优先 Exact Source；ProfilerMarker 只有 MarkerOnly 时不宣称代码行。
 - GC 只在 allocation/collection 时间关系和调用栈同时支持时归因。
 

@@ -81,6 +81,20 @@ int main()
     assert( parentResult->inclusiveResources.size() == 2 );
     assert( parentResult->inclusivePhysicalBytes == 4096 );
     assert( snapshot.FindPass( 0 ) == nullptr );
+    GpuAnalysisBuildControl catalogControl;
+    catalogControl.catalogOnly = true;
+    bool builtPasses = false;
+    catalogControl.progress = [&]( float, const char* stage ) {
+        if( std::string( stage ) == "passes" ) builtPasses = true;
+    };
+    const auto catalogOnly = BuildGpuAnalysisSnapshot( data, &attribution, {}, catalogControl );
+    assert( catalogOnly.resources.size() == snapshot.resources.size() );
+    assert( catalogOnly.allocations.size() == snapshot.allocations.size() );
+    assert( catalogOnly.engineKnownPhysicalPeakBytes == snapshot.engineKnownPhysicalPeakBytes );
+    assert( catalogOnly.passes.empty() );
+    assert( !builtPasses );
+    assert( data.gpuRangeSets.size() == 2 );
+    assert( attribution.passes.size() == 2 );
     const auto comparison = CompareGpuFrames( snapshot, 5, 6 );
     assert( !comparison.valid );
 

@@ -4,11 +4,11 @@
 
 支持新录制、接管活动录制、分析既有 `.tracy`、转换既有 `.tracy-stream` 和恢复中断任务。AI 负责配置核对、Capture 生命周期、转换与文件事实；用户负责确认目标场景已经准备好，或提供可验证的 ready marker。
 
-默认目标启动模式为 `manual`。只有 `local-profile.json` 明确提供已验证的自动启动命令、日志、ready/failure pattern 时，才使用自动模式。不得用固定等待时间替代 ready 证据。
+默认目标启动模式为 `manual`。只有用户明确提供并授权了已验证的自动启动命令、日志和 ready/failure pattern，才使用自动模式。机器路径和权限不属于 Analysis Profile，不得写入共享预算配置。不得用固定等待时间替代 ready 证据。
 
 ## 2. 新录制前检查
 
-1. 运行 `resolve-profile.ps1` 并保存 resolved profile。
+1. 记录用户指定的 Capture EXE、目标地址、输出目录和本次参数；不从旧 JSON 配置猜测机器路径。
 2. 记录任务 ID、目标、Editor/Player、场景、操作、分辨率、画质、D3D12 和 Graphics Jobs。
 3. 确认请求档位为 HighEvidence；Periodic60/Manual 只能作为专项补证。
 4. 确认只存在一个目标 Unity 进程和一个 JNTracy Client。

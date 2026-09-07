@@ -160,12 +160,12 @@ int main()
     assert( schema.at( "$defs" ).at( "page" ).at( "required" ).size() == 7 );
     assert( schema.at( "$defs" ).contains( "budget" ) );
     assert( schema.at( "$defs" ).contains( "captureIdentity" ) );
-    assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 19 );
+    assert( schema.at( "$defs" ).at( "errorCode" ).at( "enum" ).size() == 21 );
 
     const auto coverage = LoadJson( TRACY_QUERY_COVERAGE_PATH );
-    assert( coverage.at( "domains" ).size() == 42 );
+    assert( coverage.at( "domains" ).size() == 43 );
     assert( coverage.at( "coverage_level" ) == "domain" );
-    assert( coverage.at( "domain_status" ) == "complete" );
+    assert( coverage.at( "domain_status" ) == "partial" );
     assert( coverage.at( "field_status" ) == "complete" );
     assert( coverage.at( "mcp_status" ) == "complete" );
     for( const auto& domain : coverage.at( "domains" ) )
@@ -174,6 +174,7 @@ int main()
         assert( !domain.at( "methods" ).empty() );
         assert( !domain.at( "worker_data" ).empty() );
         if( domain.at( "domain" ) == "network" ) assert( domain.at( "status" ) == "deferred_by_user" );
+        else if( domain.at( "domain" ) == "analysis.scan" ) assert( domain.at( "status" ) == "contract_only" );
         else assert( domain.at( "status" ) == "complete" );
         assert( !domain.at( "tests" ).empty() );
     }
@@ -819,7 +820,7 @@ int main()
 
     const auto schemaResponse = service.Execute( Request( 103, "system.schema" ) );
     assert( schemaResponse.at( "ok" ) );
-    assert( schemaResponse.at( "data" ).at( "coverage" ).at( "domain" ).at( "domain_status" ) == "complete" );
+    assert( schemaResponse.at( "data" ).at( "coverage" ).at( "domain" ).at( "domain_status" ) == "partial" );
     assert( schemaResponse.at( "data" ).at( "coverage" ).at( "field" ).at( "status" ) == "complete" );
     assert( schemaResponse.at( "data" ).at( "coverage" ).at( "mcp" ).at( "status" ) == "complete" );
     assert( schemaResponse.at( "data" ).at( "operations" ) == operations );
@@ -827,7 +828,7 @@ int main()
     int requestId = 200;
     for( const auto& method : describedMethods )
     {
-        if( method == "trace.open" || method == "trace.close" ) continue;
+        if( method == "trace.open" || method == "trace.close" || method.rfind( "analysis.scan.", 0 ) == 0 ) continue;
         const auto response = service.Execute( Request( requestId++, method, ValidParams( method, candidateId, baselineId ) ) );
         if( !response.value( "ok", false ) )
         {

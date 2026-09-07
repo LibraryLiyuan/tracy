@@ -13,7 +13,7 @@
 namespace tracy::query::test
 {
 
-class FakeTraceSource final : public analysis::TraceSource
+class FakeTraceSource : public analysis::TraceSource
 {
     bool m_legacyFormat = false;
     bool m_truncatedSource = false;

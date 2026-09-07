@@ -109,8 +109,8 @@ if ($validation.publishable -ne $true) {
 if ([string]$validation.trace_sha256 -ne [string]$candidateIdentity.sha256) {
     throw 'MCP validation trace SHA-256 does not match the candidate.'
 }
-if ([string]$validation.protocol -ne '90' -or [string]$validation.query_schema -ne '1.32.0') {
-    throw 'MCP validation does not prove Protocol 90 and Query 1.32.0.'
+if ([string]$validation.protocol -ne '90' -or [string]$validation.query_schema -ne '1.35.0') {
+    throw 'MCP validation does not prove Protocol 90 and Query 1.35.0.'
 }
 if ([string]$validation.completeness -notin @('Complete', 'RecoverablePrefix')) {
     throw 'MCP validation completeness is not publishable.'

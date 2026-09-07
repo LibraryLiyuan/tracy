@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jn.game/tracy/query/analysis-profile-v1.schema.json",
+  "title": "JN Tracy Analysis Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "profile_name", "frame_budget", "resource_budgets", "candidate_policy", "limits"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_name": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "frame_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target_fps", "frame_ms"],
+      "properties": {
+        "target_fps": { "type": "number", "exclusiveMinimum": 0 },
+        "frame_ms": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "module_budgets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "scope", "budget_ms", "status"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "scope": { "enum": ["per_complete_frame", "when_present"] },
+          "budget_ms": { "type": "number", "minimum": 0 },
+          "status": { "enum": ["fixed", "provisional", "planning_reference"] },
+          "marker_rules": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "default": []
+    },
+    "resource_budgets": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu_memory", "gpu_memory"],
+      "properties": {
+        "cpu_memory": { "$ref": "#/$defs/budgetQuantity" },
+        "gpu_memory": { "$ref": "#/$defs/budgetQuantity" }
+      }
+    },
+    "candidate_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top_n", "cumulative_contribution", "per_domain_limit", "priorities"],
+      "properties": {
+        "top_n": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "absolute_frame_cost_ms": { "type": "number", "exclusiveMinimum": 0, "default": 1.0 },
+        "local_top_n": { "type": "integer", "minimum": 1, "maximum": 100, "default": 5 },
+        "local_min_cost_ms": { "type": "number", "exclusiveMinimum": 0, "default": 0.2 },
+        "growth_absolute_ms": { "type": "number", "exclusiveMinimum": 0, "default": 0.5 },
+        "growth_ratio": { "type": "number", "exclusiveMinimum": 0, "default": 0.5 },
+        "window_sizes": { "type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": { "type": "integer", "minimum": 2, "maximum": 10000 }, "default": [30,60,120] },
+        "window_valid_ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.8 },
+        "window_over_budget_ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.8 },
+        "window_stable_mad_ratio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.1 },
+        "cumulative_contribution": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "per_domain_limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
+        "priorities": { "type": "array", "items": { "enum": ["P0", "P1", "P2", "P3", "P4"] }, "uniqueItems": true }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["query_memory_target_bytes", "query_memory_hard_bytes", "cache_max_bytes", "minimum_free_disk_bytes"],
+      "properties": {
+        "query_memory_target_bytes": { "type": "integer", "minimum": 1 },
+        "query_memory_hard_bytes": { "type": "integer", "minimum": 1 },
+        "cache_max_bytes": { "type": "integer", "minimum": 1 },
+        "minimum_free_disk_bytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "user_focus": { "type": "array", "items": { "type": "string", "minLength": 1 }, "default": [] }
+  },
+  "$defs": {
+    "budgetQuantity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["value", "unit", "status"],
+      "properties": {
+        "value": { "type": "number", "minimum": 0 },
+        "unit": { "enum": ["B", "KB", "MB", "GB", "KiB", "MiB", "GiB"] },
+        "status": { "enum": ["fixed", "provisional"] }
+      }
+    }
+  }
+}

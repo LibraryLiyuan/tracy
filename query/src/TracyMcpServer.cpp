@@ -384,6 +384,17 @@ json McpServer::ToolsList( const json& id ) const
     tools.emplace_back( Tool( "tracy_compare", "Check capture compatibility or compare normalized aligned frame windows, zones, frames, or bounded embedded source.",
         std::move( compareProperties ), required( { "baseline_trace_id", "candidate_trace_id", "kind" } ), true ) );
     tools.emplace_back( Tool( "tracy_validate", "Validate persisted timing, references, memory lifetimes, samples, and GPU attribution evidence. Findings contain severity and reviewable refs when available.", json { { "trace_id", traceId }, { "async", { { "type", "boolean" } } } }, required( { "trace_id" } ) ) );
+    json scanProperties = {
+        { "operation", enumeration( { "profile_validate", "start", "status", "cancel", "resume",
+            "summary", "signatures", "candidates", "candidate_get", "representative_frames", "quality", "close" } ) },
+        { "trace_id", traceId }, { "scan_id", { { "type", "string" } } },
+        { "candidate_id", { { "type", "string" } } }, { "profile", { { "type", "object" } } },
+        { "limit", integer( 1, 1000 ) }, { "cursor", { { "type", "string" } } },
+        { "fields", { { "type", "array" }, { "items", { { "type", "string" } } } } },
+        { "filter", { { "type", "object" } } }
+    };
+    tools.emplace_back( Tool( "tracy_scan", "Start, resume, cancel, poll, and page a persistent deterministic whole-trace scan. Scan state survives MCP and Query process restarts.",
+        std::move( scanProperties ), required( { "operation" } ), true ) );
     tools.emplace_back( Tool( "tracy_job", "Poll, retrieve, or cooperatively cancel a long-running trace-open or analysis job.",
         json { { "job_id", { { "type", "string" } } }, { "operation", enumeration( { "status", "result", "cancel" } ) } }, required( { "job_id", "operation" } ) ) );
     return { { "jsonrpc", "2.0" }, { "id", id }, { "result", { { "tools", std::move( tools ) } } } };
@@ -402,6 +413,23 @@ json McpServer::CallTool( const std::string& name, json arguments )
     else if( name == "tracy_overview" ) method = "trace.overview";
     else if( name == "tracy_timeline" ) method = "timeline.slice";
     else if( name == "tracy_validate" ) method = "validation.run";
+    else if( name == "tracy_scan" )
+    {
+        const auto operation = arguments.value( "operation", std::string() );
+        static const std::map<std::string, std::string> methods = {
+            { "profile_validate", "analysis.scan.profile.validate" },
+            { "start", "analysis.scan.start" }, { "status", "analysis.scan.status" },
+            { "cancel", "analysis.scan.cancel" }, { "resume", "analysis.scan.resume" },
+            { "summary", "analysis.scan.summary" }, { "signatures", "analysis.scan.signatures" },
+            { "candidates", "analysis.scan.candidates" }, { "candidate_get", "analysis.scan.candidate.get" },
+            { "representative_frames", "analysis.scan.representative_frames" },
+            { "quality", "analysis.scan.quality" }, { "close", "analysis.scan.close" }
+        };
+        const auto found = methods.find( operation );
+        if( found == methods.end() ) throw QueryError( "INVALID_PARAMS", "unsupported tracy_scan operation" );
+        method = found->second;
+        arguments.erase( "operation" );
+    }
     else if( name == "tracy_search" )
     {
         const std::string domain = arguments.value( "domain", "" );

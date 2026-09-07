@@ -308,6 +308,8 @@ struct CpuZoneDto
     std::optional<int64_t> runningTimeNs;
     uint64_t runningRegions = 0;
     bool complete = true;
+    bool timingValid = true;
+    std::optional<std::string> timingInvalidReason;
     bool nameResolved = true;
     uint32_t extraIndex = 0;
     bool extraValid = true;
@@ -911,6 +913,77 @@ public:
     virtual std::vector<std::string> ScanSamples( const ScanRange& range ) const = 0;
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
+    virtual uint64_t GetJobCount() const { return GetJobs().size(); }
+    virtual std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const
+    {
+        const auto values = GetJobs();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
+    virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
+    {
+        const auto values = GetIoRequests();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetGfxDispatchCount() const { return GetGfxDispatches().size(); }
+    virtual std::vector<GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxDispatches();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetGfxEntityCount() const { return GetGfxEntities().size(); }
+    virtual std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxEntities();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetGfxLinkCount() const { return GetGfxLinks().size(); }
+    virtual std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const
+    {
+        const auto values = GetGfxLinks();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetRuntimeDomainStateCount() const { return GetRuntimeDomainStates().size(); }
+    virtual std::vector<RuntimeDomainStateDto> ScanRuntimeDomainStates( size_t offset, size_t limit ) const
+    {
+        const auto values = GetRuntimeDomainStates();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetScriptFrameCount() const { return GetScriptFrames().size(); }
+    virtual std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const
+    {
+        const auto values = GetScriptFrames();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual uint64_t GetScriptStackEventCount() const { return GetScriptStackEvents().size(); }
+    virtual std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const
+    {
+        const auto values = GetScriptStackEvents();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
+    virtual std::vector<CpuUsagePointDto> ScanCpuUsage( size_t offset, size_t limit ) const
+    {
+        const auto values = GetCpuUsage();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const
     {
         const auto jobs = GetJobs();
@@ -985,6 +1058,14 @@ public:
     virtual std::vector<ScriptFrameDto> GetScriptFrames() const { return {}; }
     virtual std::vector<ScriptStackEventDto> GetScriptStackEvents() const { return {}; }
     virtual std::vector<CallsiteDto> GetCallsites() const { return {}; }
+    virtual uint64_t GetCallsiteCount() const { return GetCallsites().size(); }
+    virtual std::vector<CallsiteDto> ScanCallsites( size_t offset, size_t limit ) const
+    {
+        const auto values = GetCallsites();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = std::min( values.size(), offset + std::min( limit, values.size() - offset ) );
+        return { values.begin() + offset, values.begin() + end };
+    }
     // Immutable N27 Catalog snapshot. Pointer tokens are retained only for
     // validation and lifetime resolution and must never reach Query output.
     virtual std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const { return {}; }

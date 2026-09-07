@@ -1,8 +1,8 @@
 {
-  "schema_version": "1.32.0",
+  "schema_version": "1.35.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "domain",
-  "domain_status": "complete",
+  "domain_status": "partial",
   "field_status": "complete",
   "mcp_status": "complete",
   "field_manifest": "coverage-fields-v1.json",
@@ -12,6 +12,7 @@
   "domains": [
     { "domain": "system", "worker_data": ["trace version", "build flags"], "methods": ["system.capabilities", "system.describe", "system.schema"], "status": "complete", "tests": ["schema snapshot", "MCP transcript", "doctor"] },
     { "domain": "trace", "worker_data": ["capture metadata", "appInfo", "JNCI1 capture identity", "JNQ1 producer cost snapshots", "crashEvent", "global counts"], "methods": ["trace.open", "trace.status", "trace.list", "trace.close", "trace.info", "trace.overview", "trace.counts", "trace.app_info", "trace.identity", "trace.telemetry_cost", "trace.crash"], "status": "complete", "tests": ["FakeTraceSource", "Capture Identity contract", "producer telemetry cost contract", "Worker smoke", "MCP Worker integration"] },
+    { "domain": "analysis.scan", "worker_data": ["Native Scan API schema 1", "Neutral Aggregate schema 1", "Policy Evaluation schema 1", "Candidate Manifest schema 1"], "methods": ["analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume", "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get", "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close"], "status": "contract_only", "tests": ["DeterministicScanTests strict Query 1.35 contract and explicit NOT_IMPLEMENTED_SCAN_SCHEMA_1"] },
     { "domain": "capture", "worker_data": ["JNCTX1 context generations", "JNQ1 producer snapshots"], "methods": ["capture.context", "capture.coverage"], "status": "complete", "tests": ["FakeTraceSource generation/quality contract", "snapshot/stream/replay MCP acceptance"] },
     { "domain": "producer", "worker_data": ["JNQ1 producer configuration and TLS counter snapshots"], "methods": ["producer.list", "producer.get"], "status": "complete", "tests": ["disabled/unsupported/filtered/dropped/real-zero contract", "MCP generic inspect route"] },
     { "domain": "catalog", "worker_data": ["JNCAT1 stable definitions", "JNENT1 capture-local entities"], "methods": ["catalog.kinds", "catalog.list", "catalog.get", "catalog.entities", "catalog.quality"], "status": "complete", "tests": ["stable DefinitionKey contract", "generation-bearing EntityId contract", "privacy and unresolved validation", "old trace present=false"] },

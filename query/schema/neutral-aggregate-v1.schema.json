@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jn.game/tracy/query/neutral-aggregate-v1.schema.json",
+  "title": "JN Tracy Neutral Aggregate Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "native_scan_schema", "trace_identity", "aggregate_identity", "algorithm_identity", "state", "domains", "quality", "storage"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "native_scan_schema": { "const": 1 },
+    "trace_identity": { "$ref": "#/$defs/sha256" },
+    "aggregate_identity": { "$ref": "#/$defs/sha256" },
+    "algorithm_identity": { "type": "string", "minLength": 1 },
+    "state": { "enum": ["building", "cancelled_resumable", "complete", "invalid"] },
+    "domains": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["domain", "present", "status", "input_count", "output_count", "checksum"],
+        "properties": {
+          "domain": { "type": "string", "minLength": 1 },
+          "present": { "type": "boolean" },
+          "status": { "enum": ["complete", "absent", "invalid", "unsupported"] },
+          "input_count": { "type": "string", "pattern": "^[0-9]+$" },
+          "output_count": { "type": "string", "pattern": "^[0-9]+$" },
+          "checksum": { "$ref": "#/$defs/sha256" },
+          "unavailable_reason": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "unreported_gap_count"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "unreported_gap_count": { "type": "integer", "minimum": 0 },
+        "findings": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["magic", "query_executable_sha256", "query_schema", "aggregate_schema", "generation", "last_access_unix_ns", "pinned", "report_reference_count", "completed", "reason", "runs"],
+      "properties": {
+        "magic": { "type": "string", "pattern": "^[0-9]+$" },
+        "query_executable_sha256": { "$ref": "#/$defs/sha256" },
+        "query_schema": { "type": "string", "minLength": 1 },
+        "aggregate_schema": { "const": 1 },
+        "generation": { "type": "string", "minLength": 1 },
+        "last_access_unix_ns": { "$ref": "#/$defs/uint64" },
+        "pinned": { "type": "boolean" },
+        "report_reference_count": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "boolean" },
+        "reason": { "type": "string" },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["run_id", "domain", "kind", "path", "record_count", "file_bytes", "sha256"],
+            "properties": {
+              "run_id": { "$ref": "#/$defs/uint64" },
+              "domain": { "type": "string", "minLength": 1 },
+              "kind": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 },
+              "record_count": { "$ref": "#/$defs/uint64" },
+              "file_bytes": { "$ref": "#/$defs/uint64" },
+              "sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "uint64": { "type": "string", "pattern": "^[0-9]+$" }
+  }
+}

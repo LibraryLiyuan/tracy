@@ -32,16 +32,26 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json
     ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json
     ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-mcp-v1.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-profile-v1.schema.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/neutral-aggregate-v1.schema.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/candidate-manifest-v1.schema.json
+    ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-scan-api-v1.schema.json
 )
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json TRACY_QUERY_SCHEMA_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json TRACY_QUERY_COVERAGE_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-fields-v1.json TRACY_QUERY_FIELD_COVERAGE_JSON)
 file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-mcp-v1.json TRACY_QUERY_MCP_COVERAGE_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-profile-v1.schema.json TRACY_ANALYSIS_PROFILE_SCHEMA_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/neutral-aggregate-v1.schema.json TRACY_NEUTRAL_AGGREGATE_SCHEMA_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/candidate-manifest-v1.schema.json TRACY_CANDIDATE_MANIFEST_SCHEMA_JSON)
+file(READ ${CMAKE_CURRENT_LIST_DIR}/schema/analysis-scan-api-v1.schema.json TRACY_ANALYSIS_SCAN_API_SCHEMA_JSON)
 configure_file(src/TracyEmbeddedData.cpp.in ${CMAKE_CURRENT_BINARY_DIR}/generated/TracyEmbeddedData.cpp @ONLY)
 
 add_library(TracyQueryProtocol STATIC
     src/TracyMcpServer.cpp
     src/TracyMcpServer.hpp
+    src/TracyAnalysisScanManager.cpp
+    src/TracyAnalysisScanManager.hpp
     src/TracyPng.cpp
     src/TracyPng.hpp
     src/TracyQueryIndex.cpp
@@ -96,6 +106,66 @@ if(BUILD_TESTING)
     )
     tracy_query_enable_assertions(tracy-query-contract-tests)
     add_test(NAME tracy-query-contract COMMAND tracy-query-contract-tests)
+
+    add_executable(tracy-query-deterministic-scan-contract-tests tests/DeterministicScanTests.cpp)
+    target_link_libraries(tracy-query-deterministic-scan-contract-tests PRIVATE TracyQueryProtocol)
+    target_compile_definitions(tracy-query-deterministic-scan-contract-tests PRIVATE
+        TRACY_ANALYSIS_PROFILE_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/analysis-profile-v1.schema.json"
+        TRACY_NEUTRAL_AGGREGATE_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/neutral-aggregate-v1.schema.json"
+        TRACY_CANDIDATE_MANIFEST_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/candidate-manifest-v1.schema.json"
+        TRACY_ANALYSIS_SCAN_API_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/analysis-scan-api-v1.schema.json"
+    )
+    tracy_query_enable_assertions(tracy-query-deterministic-scan-contract-tests)
+    add_test(NAME tracy-query-deterministic-scan-contract COMMAND tracy-query-deterministic-scan-contract-tests)
+
+    add_executable(tracy-analysis-profile-tests tests/AnalysisProfileTests.cpp)
+    target_link_libraries(tracy-analysis-profile-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-analysis-profile-tests)
+    add_test(NAME tracy-analysis-profile COMMAND tracy-analysis-profile-tests)
+
+    add_executable(tracy-neutral-aggregate-store-tests tests/NeutralAggregateStoreTests.cpp)
+    target_link_libraries(tracy-neutral-aggregate-store-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-neutral-aggregate-store-tests)
+    add_test(NAME tracy-neutral-aggregate-store COMMAND tracy-neutral-aggregate-store-tests)
+
+    add_executable(tracy-bounded-scan-cursor-tests tests/BoundedScanCursorTests.cpp)
+    target_link_libraries(tracy-bounded-scan-cursor-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-bounded-scan-cursor-tests)
+    add_test(NAME tracy-bounded-scan-cursor COMMAND tracy-bounded-scan-cursor-tests)
+
+    add_executable(tracy-frame-cpu-scanner-tests tests/FrameCpuScannerTests.cpp)
+    target_link_libraries(tracy-frame-cpu-scanner-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-frame-cpu-scanner-tests)
+    add_test(NAME tracy-frame-cpu-scanner COMMAND tracy-frame-cpu-scanner-tests)
+
+    add_executable(tracy-gpu-job-managed-scanner-tests tests/GpuJobManagedScannerTests.cpp)
+    target_link_libraries(tracy-gpu-job-managed-scanner-tests PRIVATE TracyAnalysis)
+    target_include_directories(tracy-gpu-job-managed-scanner-tests PRIVATE ${TRACY_COMMON_DIR})
+    tracy_query_enable_assertions(tracy-gpu-job-managed-scanner-tests)
+    add_test(NAME tracy-gpu-job-managed-scanner COMMAND tracy-gpu-job-managed-scanner-tests)
+
+    add_executable(tracy-memory-io-sampling-telemetry-scanner-tests tests/MemoryIoSamplingTelemetryScannerTests.cpp)
+    target_link_libraries(tracy-memory-io-sampling-telemetry-scanner-tests PRIVATE TracyAnalysis)
+    target_include_directories(tracy-memory-io-sampling-telemetry-scanner-tests PRIVATE ${TRACY_COMMON_DIR})
+    tracy_query_enable_assertions(tracy-memory-io-sampling-telemetry-scanner-tests)
+    add_test(NAME tracy-memory-io-sampling-telemetry-scanner COMMAND tracy-memory-io-sampling-telemetry-scanner-tests)
+
+    add_executable(tracy-exact-statistics-tests tests/ExactStatisticsTests.cpp)
+    target_link_libraries(tracy-exact-statistics-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-exact-statistics-tests)
+    add_test(NAME tracy-exact-statistics COMMAND tracy-exact-statistics-tests)
+
+    add_executable(tracy-candidate-policy-tests tests/CandidatePolicyTests.cpp)
+target_link_libraries(tracy-candidate-policy-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+target_compile_definitions(tracy-candidate-policy-tests PRIVATE
+    TRACY_CANDIDATE_MANIFEST_SCHEMA_PATH="${CMAKE_CURRENT_LIST_DIR}/schema/candidate-manifest-v1.schema.json")
+    tracy_query_enable_assertions(tracy-candidate-policy-tests)
+    add_test(NAME tracy-candidate-policy COMMAND tracy-candidate-policy-tests)
+
+    add_executable(tracy-analysis-scan-manager-tests tests/AnalysisScanManagerTests.cpp)
+    target_link_libraries(tracy-analysis-scan-manager-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-analysis-scan-manager-tests)
+    add_test(NAME tracy-analysis-scan-manager COMMAND tracy-analysis-scan-manager-tests)
 
     add_executable(tracy-gpu-analysis-tests tests/GpuAnalysisTests.cpp)
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)

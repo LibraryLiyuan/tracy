@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -11,6 +12,25 @@ from pathlib import Path
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 BUILD_REPORT = SKILL_ROOT / "scripts" / "build_report.py"
 VALIDATE_RESULT = SKILL_ROOT / "scripts" / "validate_analysis_result.py"
+
+
+class ReceiptBundleTests(unittest.TestCase):
+    def test_packaged_report_retains_raw_receipts(self):
+        sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+        spec = importlib.util.spec_from_file_location("receipt_report_builder", BUILD_REPORT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_json(root / "evidence-data/value.json", {"value": 1})
+            write_json(root / "mcp-transcript/q.json", {"jsonrpc": "2.0", "id": 1})
+            write_json(root / "mcp-transcript/r.json", {"jsonrpc": "2.0", "id": 1})
+            item = {"data_path": "evidence-data/value.json", "mcp_receipt": {
+                kind: {"path": "mcp-transcript/" + name, "sha256": sha256(root / "mcp-transcript" / name)}
+                for kind, name in (("request", "q.json"), ("response", "r.json"))}}
+            module.copy_evidence_data(root / "report", root / "evidence.json", {"E1": item})
+            self.assertTrue((root / "report/mcp-transcript/q.json").is_file())
+            self.assertEqual(sha256(root / "report/mcp-transcript/r.json"), item["mcp_receipt"]["response"]["sha256"])
 
 
 def write_json(path: Path, value: object) -> None:

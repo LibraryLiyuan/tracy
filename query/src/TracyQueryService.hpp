@@ -3,9 +3,11 @@
 
 #include "TracySessionManager.hpp"
 #include "TracyGpuAnalysis.hpp"
+#include "TracyAnalysisScanManager.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <filesystem>
 #include <mutex>
 #include <memory>
 #include <optional>
@@ -20,7 +22,7 @@ namespace tracy::query
 {
 
 inline constexpr const char* QueryProtocol = "tracy-query/1";
-inline constexpr const char* QuerySchemaVersion = "1.32.0";
+inline constexpr const char* QuerySchemaVersion = "1.35.0";
 inline constexpr size_t DefaultPageSize = 100;
 inline constexpr size_t MaximumPageSize = 1000;
 inline constexpr size_t DefaultTopN = 20;
@@ -57,7 +59,9 @@ public:
 class QueryService
 {
 public:
-    explicit QueryService( SessionManager& sessions, size_t analysisCacheBytes = DefaultAnalysisCacheBytes );
+    explicit QueryService( SessionManager& sessions, size_t analysisCacheBytes = DefaultAnalysisCacheBytes,
+        std::filesystem::path analysisRoot = {}, std::filesystem::path analysisCacheRoot = {},
+        AnalysisScanExecutor scanExecutor = {}, std::string queryExecutableSha256 = {} );
 
     nlohmann::json Execute( const nlohmann::json& request, const std::optional<std::string>& defaultTraceId = std::nullopt, std::stop_token stopToken = {} );
     nlohmann::json Failure( const nlohmann::json& id, const QueryError& error ) const;
@@ -93,6 +97,8 @@ private:
     void EraseTraceCache( const std::string& traceId );
 
     SessionManager& m_sessions;
+    std::filesystem::path m_analysisRoot;
+    std::filesystem::path m_analysisCacheRoot;
     std::mutex m_queryMutex;
     size_t m_cacheBudget = DefaultAnalysisCacheBytes;
     size_t m_cacheBytes = 0;
@@ -100,6 +106,7 @@ private:
     std::unordered_map<std::string, GpuCacheEntry> m_gpuCache;
     std::unordered_map<std::string, GpuSnapshotCacheEntry> m_gpuSnapshotCache;
     std::unordered_map<std::string, MemoryCacheEntry> m_memoryCache;
+    std::unique_ptr<AnalysisScanManager> m_scanManager;
 };
 
 const std::vector<std::string>& QueryMethodRegistry();

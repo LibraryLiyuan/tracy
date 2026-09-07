@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.32.0",
+  "schema_version": "1.35.0",
   "trace_format": "Tracy 0.9.0-0.13.2-JN",
   "coverage_level": "field",
   "status": "complete",
@@ -729,6 +729,15 @@
       "query_fields": ["ref", "time_ns", "thread_ref", "generation", "requested_frame", "domain", "requested_mode", "effective_mode", "reason", "capability_status", "flags", "provenance"],
       "unmapped_fields": [],
       "methods": ["runtime.domain.states"],
+      "status": "complete"
+    },
+    {
+      "entity": "analysis.scan.contract",
+      "classification": "query_runtime_contract",
+      "persisted_fields": ["Native Scan API schema", "Neutral Aggregate schema", "Policy Evaluation schema", "Candidate Manifest schema", "Analysis Profile schema"],
+      "query_fields": ["trace_identity", "aggregate_identity", "policy_identity", "schema_identity", "state", "progress", "unavailable_reason"],
+      "unmapped_fields": [],
+      "methods": ["analysis.scan.profile.validate", "analysis.scan.start", "analysis.scan.status", "analysis.scan.cancel", "analysis.scan.resume", "analysis.scan.summary", "analysis.scan.signatures", "analysis.scan.candidates", "analysis.scan.candidate.get", "analysis.scan.representative_frames", "analysis.scan.quality", "analysis.scan.close"],
       "status": "complete"
     }
   ],

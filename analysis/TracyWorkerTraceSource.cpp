@@ -295,6 +295,39 @@ void DecodeBc1( const uint8_t* input, uint32_t width, uint32_t height, std::vect
     }
 }
 
+GpuAnalysisResourceSummary ResourceSummary( const GpuResourceAnalysisRecord& value )
+{
+    GpuAnalysisResourceSummary result;
+    result.generation = value.generation;
+    result.resourceId = value.resourceId;
+    result.allocationId = value.allocationId;
+    result.capacityBytes = value.capacityBytes;
+    result.allocationOffsetBytes = value.allocationOffsetBytes;
+    result.createTime = value.createTime;
+    result.destroyTime = value.destroyTime;
+    result.nameHash = value.nameHash;
+    result.createCallsiteId = value.createCallsiteId;
+    result.definitionRevision = value.definitionRevision;
+    result.nameOriginalLength = value.nameOriginalLength;
+    result.viewCount = value.views.size();
+    result.logicalBindingCount = value.logicals.size();
+    result.partCount = value.parts.size();
+    result.rangeCount = value.ranges.size();
+    result.relationCount = value.relations.size();
+    result.vgRecordCount = value.virtualGeometry.size();
+    result.primaryKind = value.primaryKind;
+    result.resourceClass = value.resourceClass;
+    result.memoryDomain = value.memoryDomain;
+    result.allocationKind = value.allocationKind;
+    result.nameProvenance = value.nameProvenance;
+    result.stackProvenance = value.stackProvenance;
+    result.exactness = value.exactness;
+    result.openBoundary = value.openBoundary;
+    result.aliveAtEnd = value.aliveAtEnd;
+    result.name = value.name;
+    return result;
+}
+
 }
 
 class WorkerTraceSource::Impl
@@ -323,6 +356,31 @@ public:
     {}
 
     mutable std::shared_ptr<const tracy::JnTraceData> gpuCatalogSnapshot;
+    mutable std::shared_ptr<const GpuAnalysisSnapshot> gpuBoundedSnapshot;
+    mutable std::optional<std::vector<GpuAllocationAnalysisRecord>> gpuBoundedAllocationFacts;
+    mutable std::vector<GpuAnalysisRangeStoreEntry> gpuBoundedRanges;
+    mutable std::vector<uint64_t> jobScanIds;
+    mutable std::vector<uint64_t> ioScanIds;
+    mutable bool jobScanIdsReady = false;
+    mutable bool ioScanIdsReady = false;
+
+    // Called under readMutex. Allocation pagination must not resolve the
+    // unrelated Pass/ResourceSet graph or keep its working sets resident.
+    const std::vector<GpuAllocationAnalysisRecord>& GpuAllocationFacts() const
+    {
+        if( gpuBoundedSnapshot ) return gpuBoundedSnapshot->allocations;
+        if( !gpuBoundedAllocationFacts )
+        {
+            GpuAnalysisBuildControl control;
+            control.catalogOnly = true;
+            auto facts = BuildGpuAnalysisSnapshot( worker->GetJnTraceData(), nullptr, {}, control );
+            if( facts.manifest.state == GpuAnalysisState::ResourceLimit ||
+                facts.manifest.state == GpuAnalysisState::Cancelled )
+                throw std::runtime_error( facts.manifest.reason );
+            gpuBoundedAllocationFacts.emplace( std::move( facts.allocations ) );
+        }
+        return *gpuBoundedAllocationFacts;
+    }
 
     std::string MakeRef( const char* kind, uint64_t id ) const
     {
@@ -1992,12 +2050,14 @@ std::vector<std::string> WorkerTraceSource::ScanSamples( const ScanRange& range 
     return result;
 }
 
-std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> evidenceFrameId ) const
+std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> evidenceFrameId,
+    const std::unordered_set<uint64_t>* explicitJobIds ) const
 {
     std::lock_guard lock( m_impl->readMutex );
     const auto& data = m_impl->worker->GetJnTraceData();
     std::unordered_set<uint64_t> selectedJobIds;
-    if( evidenceFrameId )
+    if( explicitJobIds ) selectedJobIds = *explicitJobIds;
+    else if( evidenceFrameId )
     {
         const auto frameSequence = uint32_t( *evidenceFrameId );
         for( const auto& config : data.jobConfigs )
@@ -2018,7 +2078,9 @@ std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> eviden
         }
         if( selectedJobIds.empty() ) return {};
     }
-    const auto includeJob = [&]( uint64_t jobId ) { return !evidenceFrameId || selectedJobIds.contains( jobId ); };
+    const auto includeJob = [&]( uint64_t jobId ) {
+        return ( !evidenceFrameId && !explicitJobIds ) || selectedJobIds.contains( jobId );
+    };
     std::map<uint64_t, JobDto> jobs;
     std::unordered_map<uint32_t, std::string> typeNames;
     std::unordered_map<uint32_t, uint64_t> frameIdsBySequence;
@@ -2087,6 +2149,13 @@ std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> eviden
     std::unordered_map<uint64_t, SpanStarts> spinStarts;
     std::unordered_map<uint64_t, SpanStarts> sleepStarts;
     std::unordered_map<uint64_t, SpanStarts> waitStarts;
+    std::unordered_map<uint64_t, int64_t> completedByJob;
+    if( explicitJobIds )
+    {
+        for( const auto& stage : data.jobStages )
+            if( JnJobStage( stage.stage ) == JnJobStage::Completed )
+                completedByJob[stage.jobId] = stage.time;
+    }
     const auto closeSpan = []( auto& starts, uint64_t jobId, uint32_t spanId, int64_t time, int64_t& total ) {
         const auto jobsIt = starts.find( jobId );
         if( jobsIt == starts.end() ) return;
@@ -2221,13 +2290,17 @@ std::vector<JobDto> WorkerTraceSource::BuildJobs( std::optional<uint64_t> eviden
         for( const auto& dependency : job.dependencies )
         {
             const auto prerequisite = jobs.find( dependency.prerequisiteJobId );
-            if( prerequisite == jobs.end() || !prerequisite->second.completedNs )
+            const auto externalCompletion = completedByJob.find( dependency.prerequisiteJobId );
+            const auto completed = prerequisite != jobs.end() && prerequisite->second.completedNs ?
+                prerequisite->second.completedNs :
+                externalCompletion != completedByJob.end() ? std::optional<int64_t>( externalCompletion->second ) : std::nullopt;
+            if( !completed )
             {
                 complete = false;
                 break;
             }
-            if( !maximumPrerequisiteCompleted || *prerequisite->second.completedNs > *maximumPrerequisiteCompleted )
-                maximumPrerequisiteCompleted = *prerequisite->second.completedNs;
+            if( !maximumPrerequisiteCompleted || *completed > *maximumPrerequisiteCompleted )
+                maximumPrerequisiteCompleted = *completed;
         }
         if( complete && maximumPrerequisiteCompleted && *job.readyNs >= *maximumPrerequisiteCompleted )
             job.dependencyReadyLatencyNs = *job.readyNs - *maximumPrerequisiteCompleted;
@@ -2252,12 +2325,45 @@ std::vector<JobDto> WorkerTraceSource::GetJobs() const
     return BuildJobs( std::nullopt );
 }
 
+uint64_t WorkerTraceSource::GetJobCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->jobScanIdsReady )
+    {
+        std::set<uint64_t> ids;
+        const auto& data = m_impl->worker->GetJnTraceData();
+        for( const auto& value : data.jobSchedules ) ids.emplace( value.jobId );
+        for( const auto& value : data.jobConfigs ) ids.emplace( value.jobId );
+        for( const auto& value : data.jobDependencies ) ids.emplace( value.jobId );
+        for( const auto& value : data.jobStages ) ids.emplace( value.jobId );
+        m_impl->jobScanIds.assign( ids.begin(), ids.end() );
+        m_impl->jobScanIdsReady = true;
+    }
+    return m_impl->jobScanIds.size();
+}
+
+std::vector<JobDto> WorkerTraceSource::ScanJobs( size_t offset, size_t limit ) const
+{
+    if( limit == 0 ) return {};
+    (void)GetJobCount();
+    std::unordered_set<uint64_t> selected;
+    {
+        std::lock_guard lock( m_impl->readMutex );
+        const auto begin = std::min( offset, m_impl->jobScanIds.size() );
+        const auto end = begin + std::min( limit, m_impl->jobScanIds.size() - begin );
+        selected.reserve( end - begin );
+        for( size_t i = begin; i < end; ++i ) selected.emplace( m_impl->jobScanIds[i] );
+    }
+    return selected.empty() ? std::vector<JobDto> {} : BuildJobs( std::nullopt, &selected );
+}
+
 std::vector<JobDto> WorkerTraceSource::GetEvidenceJobs( uint64_t frameId ) const
 {
     return BuildJobs( frameId );
 }
 
-std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
+std::vector<IoRequestDto> WorkerTraceSource::BuildIoRequests(
+    const std::unordered_set<uint64_t>* explicitRequestIds ) const
 {
     std::lock_guard lock( m_impl->readMutex );
     const auto& data = m_impl->worker->GetJnTraceData();
@@ -2275,6 +2381,7 @@ std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
 
     for( const auto& value : data.ioRequests )
     {
+        if( explicitRequestIds && !explicitRequestIds->contains( value.requestId ) ) continue;
         auto& request = ensureRequest( value.requestId );
         request.resourceId = value.resourceId;
         request.queueThreadRef = m_impl->MakeRef( "thread", value.thread );
@@ -2289,6 +2396,7 @@ std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
     }
     for( const auto& value : data.ioConfigs )
     {
+        if( explicitRequestIds && !explicitRequestIds->contains( value.requestId ) ) continue;
         auto& request = ensureRequest( value.requestId );
         request.parentId = value.parentId;
         request.requestedBytes = value.requestedBytes;
@@ -2299,6 +2407,7 @@ std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
     }
     for( const auto& value : data.ioStages )
     {
+        if( explicitRequestIds && !explicitRequestIds->contains( value.requestId ) ) continue;
         auto& request = ensureRequest( value.requestId );
         request.stages.push_back( { value.time, m_impl->MakeRef( "thread", value.thread ), value.bytes, value.detail, value.stage, value.status, value.flags } );
         request.captureBoundary = request.captureBoundary || ( value.flags & uint8_t( JnIoFlags::CaptureBoundary ) ) != 0;
@@ -2335,6 +2444,42 @@ std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
     return result;
 }
 
+std::vector<IoRequestDto> WorkerTraceSource::GetIoRequests() const
+{
+    return BuildIoRequests();
+}
+
+uint64_t WorkerTraceSource::GetIoRequestCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->ioScanIdsReady )
+    {
+        std::set<uint64_t> ids;
+        const auto& data = m_impl->worker->GetJnTraceData();
+        for( const auto& value : data.ioRequests ) ids.emplace( value.requestId );
+        for( const auto& value : data.ioConfigs ) ids.emplace( value.requestId );
+        for( const auto& value : data.ioStages ) ids.emplace( value.requestId );
+        m_impl->ioScanIds.assign( ids.begin(), ids.end() );
+        m_impl->ioScanIdsReady = true;
+    }
+    return m_impl->ioScanIds.size();
+}
+
+std::vector<IoRequestDto> WorkerTraceSource::ScanIoRequests( size_t offset, size_t limit ) const
+{
+    if( limit == 0 ) return {};
+    (void)GetIoRequestCount();
+    std::unordered_set<uint64_t> selected;
+    {
+        std::lock_guard lock( m_impl->readMutex );
+        const auto begin = std::min( offset, m_impl->ioScanIds.size() );
+        const auto end = begin + std::min( limit, m_impl->ioScanIds.size() - begin );
+        selected.reserve( end - begin );
+        for( size_t i = begin; i < end; ++i ) selected.emplace( m_impl->ioScanIds[i] );
+    }
+    return selected.empty() ? std::vector<IoRequestDto> {} : BuildIoRequests( &selected );
+}
+
 std::vector<GfxDispatchDto> WorkerTraceSource::GetGfxDispatches() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -2344,6 +2489,30 @@ std::vector<GfxDispatchDto> WorkerTraceSource::GetGfxDispatches() const
     for( const auto& value : values ) result.push_back( {
         m_impl->MakeRef( "gfx-dispatch", value.dispatchId ), value.dispatchId, value.frameIndex, value.time,
         m_impl->MakeRef( "thread", value.thread ), value.expectedJobs, value.threadingMode, value.flags } );
+    return result;
+}
+
+uint64_t WorkerTraceSource::GetGfxDispatchCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().gfxDispatches.size();
+}
+
+std::vector<GfxDispatchDto> WorkerTraceSource::ScanGfxDispatches( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxDispatches;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<GfxDispatchDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "gfx-dispatch", value.dispatchId ), value.dispatchId,
+            value.frameIndex, value.time, m_impl->MakeRef( "thread", value.thread ),
+            value.expectedJobs, value.threadingMode, value.flags } );
+    }
     return result;
 }
 
@@ -2359,6 +2528,30 @@ std::vector<GfxEntityDto> WorkerTraceSource::GetGfxEntities() const
     return result;
 }
 
+uint64_t WorkerTraceSource::GetGfxEntityCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().gfxEntities.size();
+}
+
+std::vector<GfxEntityDto> WorkerTraceSource::ScanGfxEntities( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxEntities;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<GfxEntityDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "gfx-entity", value.entityId ), value.entityId,
+            value.parentId, value.time, m_impl->MakeRef( "thread", value.thread ),
+            value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
+    }
+    return result;
+}
+
 std::vector<GfxLinkDto> WorkerTraceSource::GetGfxLinks() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -2370,6 +2563,29 @@ std::vector<GfxLinkDto> WorkerTraceSource::GetGfxLinks() const
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
             m_impl->MakeRef( "thread", value.thread ), value.relation, value.flags } );
+    }
+    return result;
+}
+
+uint64_t WorkerTraceSource::GetGfxLinkCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().gfxLinks.size();
+}
+
+std::vector<GfxLinkDto> WorkerTraceSource::ScanGfxLinks( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().gfxLinks;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<GfxLinkDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "gfx-link", index ), value.sourceId, value.targetId,
+            value.time, m_impl->MakeRef( "thread", value.thread ), value.relation, value.flags } );
     }
     return result;
 }
@@ -2445,6 +2661,30 @@ std::vector<RuntimeDomainStateDto> WorkerTraceSource::GetRuntimeDomainStates() c
     return result;
 }
 
+uint64_t WorkerTraceSource::GetRuntimeDomainStateCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().runtimeDomainStates.size();
+}
+
+std::vector<RuntimeDomainStateDto> WorkerTraceSource::ScanRuntimeDomainStates( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().runtimeDomainStates;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<RuntimeDomainStateDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "runtime-domain-state", index ), value.generation,
+            value.requestedFrame, value.time, m_impl->MakeRef( "thread", value.thread ), value.domain,
+            value.requestedMode, value.effectiveMode, value.reason, value.flags } );
+    }
+    return result;
+}
+
 std::vector<ScriptFrameDto> WorkerTraceSource::GetScriptFrames() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -2452,6 +2692,30 @@ std::vector<ScriptFrameDto> WorkerTraceSource::GetScriptFrames() const
     std::vector<ScriptFrameDto> result;
     result.reserve( values.size() );
     for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "script-frame", index ), value.frameId,
+            Safe( m_impl->worker->GetString( value.function ) ), Safe( m_impl->worker->GetString( value.file ) ),
+            value.line, 0, m_impl->MakeRef( "thread", value.thread ), value.runtime, value.flags } );
+    }
+    return result;
+}
+
+uint64_t WorkerTraceSource::GetScriptFrameCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().scriptFrames.size();
+}
+
+std::vector<ScriptFrameDto> WorkerTraceSource::ScanScriptFrames( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().scriptFrames;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<ScriptFrameDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
     {
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "script-frame", index ), value.frameId,
@@ -2477,6 +2741,32 @@ std::vector<ScriptStackEventDto> WorkerTraceSource::GetScriptStackEvents() const
     return result;
 }
 
+uint64_t WorkerTraceSource::GetScriptStackEventCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().scriptStacks.size();
+}
+
+std::vector<ScriptStackEventDto> WorkerTraceSource::ScanScriptStackEvents( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().scriptStacks;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<ScriptStackEventDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
+    {
+        const auto& value = values[index];
+        result.push_back( { m_impl->MakeRef( "script-stack-event", index ), value.primaryId,
+            value.secondaryId, value.value, value.time, m_impl->MakeRef( "thread", value.thread ),
+            value.runtime, value.flags, value.kind,
+            value.kind == uint8_t( JnScriptRecordKind::Marker ) ?
+                Safe( m_impl->worker->GetString( value.secondaryId ) ) : std::string() } );
+    }
+    return result;
+}
+
 std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
 {
     std::lock_guard lock( m_impl->readMutex );
@@ -2484,6 +2774,40 @@ std::vector<CallsiteDto> WorkerTraceSource::GetCallsites() const
     std::vector<CallsiteDto> result;
     result.reserve( values.size() );
     for( size_t index = 0; index < values.size(); index++ )
+    {
+        const auto& value = values[index];
+        CallsiteDto dto;
+        dto.ref = m_impl->MakeRef( "callsite", value.callsiteId );
+        dto.callsiteId = value.callsiteId;
+        dto.threadRef = m_impl->MakeRef( "thread", value.thread );
+        dto.sourceLocationRef = m_impl->SourceLocation( value.sourceLocation ).ref;
+        dto.callstack = value.callstack;
+        if( value.callstack != 0 ) dto.stackRef = m_impl->MakeRef( "callstack", value.callstack );
+        dto.domain = value.domain;
+        dto.provenance = StackProvenanceName( value.provenance );
+        dto.flags = value.flags;
+        const auto reason = StackUnavailableReasonName( value.unavailableReason );
+        if( *reason != '\0' ) dto.unavailableReason = reason;
+        result.emplace_back( std::move( dto ) );
+    }
+    return result;
+}
+
+uint64_t WorkerTraceSource::GetCallsiteCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().callsites.size();
+}
+
+std::vector<CallsiteDto> WorkerTraceSource::ScanCallsites( size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->worker->GetJnTraceData().callsites;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<CallsiteDto> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index )
     {
         const auto& value = values[index];
         CallsiteDto dto;
@@ -2530,6 +2854,95 @@ std::shared_ptr<const tracy::JnTraceData> WorkerTraceSource::GetGpuCatalogData()
     snapshot->gpuDetailedEvidence = source.gpuDetailedEvidence;
     m_impl->gpuCatalogSnapshot = std::move( snapshot );
     return m_impl->gpuCatalogSnapshot;
+}
+
+uint64_t WorkerTraceSource::GetGpuCatalogResourceCountBounded() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->gpuBoundedSnapshot )
+        m_impl->gpuBoundedSnapshot = std::make_shared<GpuAnalysisSnapshot>(
+            BuildGpuAnalysisSnapshot( m_impl->worker->GetJnTraceData() ) );
+    return m_impl->gpuBoundedSnapshot->resources.size();
+}
+
+uint64_t WorkerTraceSource::GetGpuCatalogAllocationCountBounded() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->GpuAllocationFacts().size();
+}
+
+uint64_t WorkerTraceSource::GetGpuCatalogPassCountBounded() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->gpuBoundedSnapshot )
+        m_impl->gpuBoundedSnapshot = std::make_shared<GpuAnalysisSnapshot>(
+            BuildGpuAnalysisSnapshot( m_impl->worker->GetJnTraceData() ) );
+    return m_impl->gpuBoundedSnapshot->passes.size();
+}
+
+uint64_t WorkerTraceSource::GetGpuCatalogRangeCountBounded() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->gpuBoundedSnapshot )
+        m_impl->gpuBoundedSnapshot = std::make_shared<GpuAnalysisSnapshot>(
+            BuildGpuAnalysisSnapshot( m_impl->worker->GetJnTraceData() ) );
+    if( m_impl->gpuBoundedRanges.empty() )
+    {
+        for( const auto& resource : m_impl->gpuBoundedSnapshot->resources )
+            for( const auto& range : resource.ranges )
+                m_impl->gpuBoundedRanges.push_back( { resource.resourceId, range.generation, range.value } );
+    }
+    return m_impl->gpuBoundedRanges.size();
+}
+
+std::vector<GpuAnalysisResourceSummary> WorkerTraceSource::ScanGpuCatalogResourcesBounded(
+    size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->gpuBoundedSnapshot )
+        m_impl->gpuBoundedSnapshot = std::make_shared<GpuAnalysisSnapshot>(
+            BuildGpuAnalysisSnapshot( m_impl->worker->GetJnTraceData() ) );
+    const auto& values = m_impl->gpuBoundedSnapshot->resources;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    std::vector<GpuAnalysisResourceSummary> result;
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; ++index ) result.emplace_back( ResourceSummary( values[index] ) );
+    return result;
+}
+
+std::vector<GpuAllocationAnalysisRecord> WorkerTraceSource::ScanGpuCatalogAllocationsBounded(
+    size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->GpuAllocationFacts();
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    return { values.begin() + begin, values.begin() + end };
+}
+
+std::vector<GpuPassWorkingSet> WorkerTraceSource::ScanGpuCatalogPassesBounded(
+    size_t offset, size_t limit ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    if( !m_impl->gpuBoundedSnapshot )
+        m_impl->gpuBoundedSnapshot = std::make_shared<GpuAnalysisSnapshot>(
+            BuildGpuAnalysisSnapshot( m_impl->worker->GetJnTraceData() ) );
+    const auto& values = m_impl->gpuBoundedSnapshot->passes;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    return { values.begin() + begin, values.begin() + end };
+}
+
+std::vector<GpuAnalysisRangeStoreEntry> WorkerTraceSource::ScanGpuCatalogRangesBounded(
+    size_t offset, size_t limit ) const
+{
+    (void)GetGpuCatalogRangeCountBounded();
+    std::lock_guard lock( m_impl->readMutex );
+    const auto& values = m_impl->gpuBoundedRanges;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
+    return { values.begin() + begin, values.begin() + end };
 }
 
 std::optional<ZoneValidationSummaryDto> WorkerTraceSource::ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const

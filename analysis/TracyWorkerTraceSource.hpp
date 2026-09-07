@@ -1,7 +1,7 @@
 #ifndef __TRACYWORKERTRACESOURCE_HPP__
 #define __TRACYWORKERTRACESOURCE_HPP__
 
-#include "TracyTraceSource.hpp"
+#include "TracyBoundedScanCursor.hpp"
 #include "TracyMemoryAnalysis.hpp"
 
 #include <filesystem>
@@ -54,7 +54,8 @@ enum class WorkerTraceLoadMode
     IndexedSidecar
 };
 
-class WorkerTraceSource final : public TraceSource
+class WorkerTraceSource final : public TraceSource, public NativeBoundedTraceSource,
+    public GpuCatalogBoundedScanSource
 {
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
@@ -90,21 +91,48 @@ public:
     std::vector<std::string> ScanLocks( const ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const ScanRange& range ) const override;
+    uint32_t NativeBoundedScanVersion() const override { return NativeBoundedScanSchemaVersion; }
     std::vector<JobDto> GetJobs() const override;
+    uint64_t GetJobCount() const override;
+    std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override;
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
+    uint64_t GetIoRequestCount() const override;
+    std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const override;
     std::vector<GfxDispatchDto> GetGfxDispatches() const override;
+    uint64_t GetGfxDispatchCount() const override;
+    std::vector<GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const override;
     std::vector<GfxEntityDto> GetGfxEntities() const override;
+    uint64_t GetGfxEntityCount() const override;
+    std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override;
     std::vector<GfxLinkDto> GetGfxLinks() const override;
+    uint64_t GetGfxLinkCount() const override;
+    std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
     std::vector<RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
+    uint64_t GetRuntimeDomainStateCount() const override;
+    std::vector<RuntimeDomainStateDto> ScanRuntimeDomainStates( size_t offset, size_t limit ) const override;
     std::vector<ScriptFrameDto> GetScriptFrames() const override;
+    uint64_t GetScriptFrameCount() const override;
+    std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const override;
     std::vector<ScriptStackEventDto> GetScriptStackEvents() const override;
+    uint64_t GetScriptStackEventCount() const override;
+    std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const override;
     std::vector<CallsiteDto> GetCallsites() const override;
+    uint64_t GetCallsiteCount() const override;
+    std::vector<CallsiteDto> ScanCallsites( size_t offset, size_t limit ) const override;
     std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override;
+    uint64_t GetGpuCatalogResourceCountBounded() const override;
+    uint64_t GetGpuCatalogAllocationCountBounded() const override;
+    uint64_t GetGpuCatalogPassCountBounded() const override;
+    uint64_t GetGpuCatalogRangeCountBounded() const override;
+    std::vector<GpuAnalysisResourceSummary> ScanGpuCatalogResourcesBounded( size_t offset, size_t limit ) const override;
+    std::vector<GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded( size_t offset, size_t limit ) const override;
+    std::vector<GpuPassWorkingSet> ScanGpuCatalogPassesBounded( size_t offset, size_t limit ) const override;
+    std::vector<GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded( size_t offset, size_t limit ) const override;
     std::optional<ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override;
     CrashDto GetCrash() const override;
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
@@ -159,7 +187,9 @@ public:
     BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
-    std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId ) const;
+    std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId,
+        const std::unordered_set<uint64_t>* explicitJobIds = nullptr ) const;
+    std::vector<IoRequestDto> BuildIoRequests( const std::unordered_set<uint64_t>* explicitRequestIds = nullptr ) const;
     class Impl;
     explicit WorkerTraceSource( std::unique_ptr<Impl> impl );
     std::unique_ptr<Impl> m_impl;

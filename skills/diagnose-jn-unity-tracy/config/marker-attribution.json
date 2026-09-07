@@ -1,6 +1,9 @@
 {
   "kind": "jntracy_marker_attribution",
   "schema_version": 1,
+  "execution_status": "legacy_compatibility_only",
+  "authoritative_profile": "JNTracy.AnalysisProfile.yaml",
+  "formal_route_removal_stage": "QSCAN-11",
   "mapping_revision": 1,
   "minimum_main_thread_coverage": 0.9,
   "rules": [

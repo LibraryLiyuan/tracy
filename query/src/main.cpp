@@ -65,6 +65,8 @@ struct Arguments
     std::optional<std::filesystem::path> output;
     std::vector<std::filesystem::path> allowRoots;
     std::vector<std::filesystem::path> allowSourceRoots;
+    std::optional<std::filesystem::path> analysisRoot;
+    std::optional<std::filesystem::path> analysisCacheRoot;
     size_t analysisCacheMiB = 512;
 };
 
@@ -79,7 +81,7 @@ void Usage()
         << "  tracy-query --build-index --trace file.tracy [--allow-root path] [--output file.json]\n"
         << "  tracy-query --trace file.tracy --request request.json|- [--indexed] [--allow-root path] [--output file.json]\n"
         << "  tracy-query --trace file.tracy --batch requests.ndjson|- [--indexed] [--allow-root path] [--output file.ndjson]\n"
-        << "  tracy-query --mcp [--indexed|--no-indexed] [--allow-root path] [--allow-source-root path] [--analysis-cache-mib 512]\n";
+        << "  tracy-query --mcp [--indexed|--no-indexed] [--allow-root path] [--allow-source-root path] [--analysis-root path --analysis-cache-root path] [--analysis-cache-mib 512]\n";
 }
 
 Arguments ParseArguments( int argc, char** argv )
@@ -106,6 +108,8 @@ Arguments ParseArguments( int argc, char** argv )
         else if( option == "--output" ) result.output = value( "--output" );
         else if( option == "--allow-root" ) result.allowRoots.emplace_back( value( "--allow-root" ) );
         else if( option == "--allow-source-root" ) result.allowSourceRoots.emplace_back( value( "--allow-source-root" ) );
+        else if( option == "--analysis-root" ) result.analysisRoot = value( "--analysis-root" );
+        else if( option == "--analysis-cache-root" ) result.analysisCacheRoot = value( "--analysis-cache-root" );
         else if( option == "--analysis-cache-mib" )
         {
             const auto parsed = std::stoull( value( "--analysis-cache-mib" ) );
@@ -123,6 +127,19 @@ Arguments ParseArguments( int argc, char** argv )
     // memory-mapped sidecar path while retaining an explicit diagnostic escape
     // hatch for investigations that require the full in-memory Worker.
     if( result.mcp && !result.indexedExplicit ) result.indexed = true;
+    if( result.analysisRoot.has_value() != result.analysisCacheRoot.has_value() )
+    {
+        throw std::runtime_error( "--analysis-root and --analysis-cache-root must be provided together" );
+    }
+    if( result.analysisRoot )
+    {
+        if( !result.analysisRoot->is_absolute() || !result.analysisCacheRoot->is_absolute() )
+        {
+            throw std::runtime_error( "--analysis-root and --analysis-cache-root must be absolute paths" );
+        }
+        *result.analysisRoot = result.analysisRoot->lexically_normal();
+        *result.analysisCacheRoot = result.analysisCacheRoot->lexically_normal();
+    }
     return result;
 }
 
@@ -181,7 +198,8 @@ std::optional<std::string> OpenDefaultTrace( SessionManager& sessions, const std
 int RunSingle( const Arguments& args )
 {
     SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
-    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
+    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
+        args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
     if( args.trace && !trace )
@@ -199,7 +217,8 @@ int RunSingle( const Arguments& args )
 int RunBatch( const Arguments& args )
 {
     SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
-    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
+    QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
+        args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
     json failure;
     const auto trace = OpenDefaultTrace( sessions, args.trace, failure, service );
     if( args.trace && !trace )
@@ -246,6 +265,10 @@ int RunDoctor( const Arguments& args )
             { "domain_coverage_manifest", json::parse( QueryCoverageJson ).is_object() ? "ok" : "failed" },
             { "field_coverage_manifest", json::parse( QueryFieldCoverageJson ).is_object() ? "ok" : "failed" },
             { "mcp_coverage_manifest", json::parse( QueryMcpCoverageJson ).is_object() ? "ok" : "failed" },
+            { "analysis_profile_schema", json::parse( AnalysisProfileSchemaJson ).is_object() ? "ok" : "failed" },
+            { "neutral_aggregate_schema", json::parse( NeutralAggregateSchemaJson ).is_object() ? "ok" : "failed" },
+            { "candidate_manifest_schema", json::parse( CandidateManifestSchemaJson ).is_object() ? "ok" : "failed" },
+            { "analysis_scan_api_schema", json::parse( AnalysisScanApiSchemaJson ).is_object() ? "ok" : "failed" },
             { "stdio_framing", "single-line UTF-8 JSON/NDJSON" }, { "statistics", "enabled" }
         } }
     };
@@ -397,7 +420,8 @@ int main( int argc, char** argv )
         if( args.mcp )
         {
             SessionManager sessions( args.allowRoots, 2, {}, args.indexed );
-            QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024 );
+            QueryService service( sessions, args.analysisCacheMiB * 1024 * 1024,
+                args.analysisRoot.value_or( std::filesystem::path {} ), args.analysisCacheRoot.value_or( std::filesystem::path {} ) );
             McpServer server( sessions, service, args.allowSourceRoots );
             return server.Run( std::cin, std::cout );
         }

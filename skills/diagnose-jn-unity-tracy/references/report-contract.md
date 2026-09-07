@@ -3,21 +3,32 @@
 ## 1. 权威数据流
 
 ```text
-MCP Evidence
-→ evidence-manifest.json
-→ AI analysis-result.json
+Query 1.35 Aggregate Store（中立事实）
+→ Candidate Manifest（确定性候选）
+→ 常驻 MCP 定向查询 + Source 检查（解释证据）
+→ evidence-manifest.json + analysis-result.json
 → validate_analysis_result.py
 → build_report.py
-→ Markdown + SVG + MCP PNG
+→ 主报告 + 9 份专项报告 + SVG/MCP PNG
 ```
 
-AI 不手写最终布局。Markdown 是权威结论，SVG 与 MCP PNG 是默认证据附件。HTML 默认关闭，只能由用户明确要求后以试验模式生成。
+AI 不重新扫描 Trace、不重算 Query 数值，也不手写最终布局。Query Aggregate/Candidate、MCP 定向证据与 Source 证据必须分开登记。Markdown 是权威结论，SVG 与 MCP PNG 是默认证据附件。HTML 默认关闭，只能由用户明确要求后以试验模式生成。
 
 ## 2. Analysis Result
 
 Schema 位于 `schemas/analysis-result.schema.json`。每个显著 Signature 必须包含稳定键、显著性原因、影响范围、频率、Budget Debt、Primary Limiter、代表实例、因果链、假设账本、深度、Evidence、provenance、支持/不支持结论、优化方向、功能风险、理论收益上限、复测指标和置信度。
 
 每个 Signature 都必须有独立 Evidence Card。`deepest_level != L6` 时必须携带最小 EvidenceGap，否则校验失败。
+
+Query-native Workflow 2.0 还必须包含：
+
+- `query_scan`：Scan、Aggregate、Candidate Manifest、Profile SHA-256 与覆盖率。
+- `candidate_findings`：每个已调查 Candidate 的结论与完整 Analysis Trail。
+- `investigation_backlog`：未完成 Candidate、原因与下一步。
+
+每个 Candidate Finding 必须逐字携带 Query 的数值事实，不允许 AI 改写、四舍五入或重新计算。代表帧必须来自 Candidate Manifest，并说明 `selection_reason`。Analysis Trail 固定包含 discovery、statistics、representative selection、attribution、hypothesis、source inspection、counterevidence 和 conclusion。
+
+`Confirmed` 结论必须具有 `ExactRelation`，或同时具有 `ExactSource`/`IndependentEvidence` 之一；Source 证据中的实际 revision 必须与期望 revision 一致。单 Trace 报告固定不得宣称总体 A/B Tracy 开销。
 
 ## 3. Evidence Manifest
 
@@ -32,7 +43,17 @@ AnalysisReport/
 ├─ Performance-Analysis-Report.md
 ├─ Analysis-Process-and-Query-Audit.md
 ├─ Evidence-Index.md
+├─ 01-Trace-Quality-and-Scan-Coverage.md
+├─ 02-Frame-and-CPU-Analysis.md
+├─ 03-GPU-and-Render-Analysis.md
+├─ 04-Job-and-Scheduling-Analysis.md
+├─ 05-Memory-and-GPU-Resource-Analysis.md
+├─ 06-IO-Sampling-and-System-Analysis.md
+├─ 07-Tracy-Telemetry-Overhead.md
+├─ 08-Profiler-Manual-Verification-Guide.md
+├─ 09-Investigation-Backlog-and-Evidence-Gaps.md
 ├─ analysis-result.json
+├─ candidate-manifest.json
 ├─ evidence-manifest.json
 ├─ manifest.json
 ├─ report-validation.json
@@ -50,17 +71,19 @@ AnalysisReport/
 ## 5. Markdown 固定结构
 
 1. Trace 身份与证据质量。
-2. 性能结论总览。
-3. Frame Class 分布。
-4. Bottleneck Signature 地图。
-5. 关键路径与等待传播。
-6. 独立 Evidence Cards。
-7. CPU 内存与 GPU 显存专项。
-8. Tracy Runtime 采集与 Tracy Analysis 离线压力。
-9. Evidence Gaps。
-10. 优化优先级和复测方案。
-11. 全域健康统计附录。
-12. 查询审计索引。
+2. Query-native 扫描身份、覆盖率和候选入口。
+3. 性能结论总览。
+4. Frame Class 分布。
+5. Bottleneck Signature 地图。
+6. 关键路径与等待传播。
+7. 独立 Evidence Cards。
+8. Candidate Analysis Trail（不得省略分析过程）。
+9. CPU 内存与 GPU 显存专项。
+10. Tracy Runtime 采集与 Tracy Analysis 离线压力。
+11. Evidence Gaps 与 Investigation Backlog。
+12. 优化优先级和复测方案。
+13. 全域健康统计附录。
+14. 查询审计索引和九份专项报告链接。
 
 无异常域只出现在健康附录，不为满足模板强造正文。
 
@@ -136,4 +159,9 @@ TotalCaptureOverhead = NotMeasuredSingleTrace
 - 静态图不存在文字/Zone/节点重叠；无坐标或无关系的卡片不产生占位 SVG。
 - 显式启用 HTML 时，Markdown/HTML 数字、结论和 Evidence ID 一致，所有锚点可解析且可离线双击打开。
 - 两次确定性构建 SHA 一致。
+- 所有 selected/P1/UserFocus Candidate 已完成实际调查，或在对应 Finding 中记录实际查询回执、最深可信层、blocked_by 和 minimum_additional_evidence；不能仅凭 Backlog 中一条原因跳过。覆盖计数与 Candidate Manifest 一致；P0 兼容保留但当前不生成，其他优先级不前移。selected P2 未调查同样阻止完整报告。阶段结果明确标注未完成，保存调查队列，不使用完整报告的 passed/completed 状态。
+- `analysis.capture_quality` 必须原样保留 Candidate Manifest/Query summary 中的 `capture_quality`，位于主报告附录和质量附件，不得作为 Candidate Finding、性能 P0/P1/P2、强制 L6 调查或性能 Backlog。附注只写问题、受影响域和限制；性能候选确实依赖缺失数据时才关联 EvidenceGap 深查。
+- 旧 quality Candidate 拒绝进入新报告，必须用 candidate-policy-v3 重新生成；扫描器自身 checksum/identity/audit 错误仍阻止发布。
+- 每个重大结论均可追溯到 Candidate ID、Query 数值路径、代表帧、Evidence ID 和 Source revision（若使用 Source）。
+- Query 数值与 Candidate Manifest 逐字段一致；AI 不得重算或改写。
 - `report-validation.json.passed=true`。

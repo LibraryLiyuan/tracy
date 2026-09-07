@@ -31,12 +31,20 @@ from report_common import (
     validate_analysis_and_evidence,
     write_json,
 )
+from query_native_report import (
+    SPECIALTY_REPORT_FILES,
+    is_query_native,
+    render_analysis_process,
+    render_specialty_reports,
+    validate_query_native_analysis,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path)
+    parser.add_argument("--candidates", type=Path, help="Query Candidate Manifest; required by workflow 2.0")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--export-static", action="store_true")
@@ -385,6 +393,8 @@ def render_main_report(
     ]
     for key, config in sorted(identity["configuration"].items()):
         lines.append(f'  - `{md_text(key)}`：`{md_text(config.get("path"))}` / `{md_text(config.get("sha256"))}`')
+    if analysis.get("report_status") == "in_progress":
+        lines[2:2] = ["**阶段报告：仍有入选候选未完成调查，不是完整性能验收结论。**", ""]
     for warning in quality.get("warnings", []):
         lines.append(f'- 质量警告：{md_text(warning)}')
 
@@ -397,7 +407,13 @@ def render_main_report(
                 f'{format_ms(signature.get("budget_debt", {}).get("total_ms"))}；结论 `{md_text(signature.get("conclusion_status"))}`。'
             )
     else:
-        lines.append('- 未发现达到显著性门禁的 Bottleneck Signature。')
+        lines.append('- 尚未形成已调查的性能结论；未调查项目见调查清单。' if
+                     analysis.get("report_status") == "in_progress" else
+                     '- 未发现达到显著性门禁的 Bottleneck Signature。')
+
+    process = render_analysis_process(analysis)
+    if process:
+        lines.extend(["", process])
 
     lines.extend(["", "## 3. Frame Class 分布", "", "| Frame Class | 帧数 | 比例 | Flags |", "|---|---:|---:|---|"])
     for item in sorted(analysis["frame_class_summary"], key=lambda value: str(value.get("class"))):
@@ -514,7 +530,21 @@ def render_main_report(
     for domain in sorted(analysis["domain_health"], key=lambda item: str(item.get("domain"))):
         lines.append(f'| {md_text(domain.get("domain"))} | {md_text(domain.get("status"))} | {md_text(", ".join(domain.get("evidence_refs", [])))} |')
 
+    if is_query_native(analysis):
+        lines.extend(["", "### 录制质量与分析限制", "",
+            "质量附注不参与性能优先级排序，不占候选/调查名额，不默认深查。仅在具体性能问题依赖缺失数据时关联补查。", "",
+            "| 受影响域 | 状态 | 原始原因 | 分析限制 |", "|---|---|---|---|"])
+        for item in analysis.get("capture_quality", []):
+            lines.append(f'| {md_text(item.get("domain"))} | {md_text(item.get("status"))} | {md_text(item.get("reason"))} | 不依赖该失效/缺失数据确认根因；独立有效域继续分析。 |')
+        if not analysis.get("capture_quality"):
+            lines.append("| — | — | Query 未返回质量附注 | 不代表所有未采集域均完整。 |")
+
     lines.extend(["", "## 12. 查询审计索引", "", "详见 [Analysis-Process-and-Query-Audit.md](Analysis-Process-and-Query-Audit.md) 与 [Evidence-Index.md](Evidence-Index.md)。", ""])
+    if is_query_native(analysis):
+        lines.extend(["## 13. 专项报告", ""])
+        for name in SPECIALTY_REPORT_FILES:
+            lines.append(f"- [{md_text(name.removesuffix('.md'))}]({name})")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -630,6 +660,21 @@ def copy_evidence_data(output: Path, evidence_path: Path, evidence_by_id: dict[s
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
+        receipt = item.get("mcp_receipt", {})
+        for kind in ("request", "response"):
+            if kind not in receipt:
+                continue
+            record = receipt[kind]
+            relative = Path(record["path"])
+            source = (evidence_path.parent / relative).resolve()
+            destination = (output / relative).resolve()
+            if relative.is_absolute() or not source.is_relative_to(evidence_path.parent.resolve()) or not destination.is_relative_to(output.resolve()):
+                raise ValidationFailure(["raw MCP receipt path escapes report/evidence root"])
+            if sha256_file(source) != record["sha256"]:
+                raise ValidationFailure(["raw MCP receipt checksum mismatch before bundling"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source != destination:
+                shutil.copyfile(source, destination)
 
 
 def validate_rendered_report(output: Path, analysis: dict[str, Any], html_enabled: bool) -> dict[str, Any]:
@@ -648,6 +693,12 @@ def validate_rendered_report(output: Path, analysis: dict[str, Any], html_enable
                 errors.append(f"HTML missing signature anchor for {signature['id']}")
     if "TotalCaptureOverhead = NotMeasuredSingleTrace" not in report:
         errors.append("Markdown missing single-trace overhead boundary")
+    if is_query_native(analysis):
+        if "Query 原生候选与分析过程" not in report:
+            errors.append("Markdown missing Query-native analysis process")
+        for name in SPECIALTY_REPORT_FILES:
+            if not (output / name).is_file():
+                errors.append(f"specialty report is missing: {name}")
     if html_enabled and ("https://" in html_index or "http://" in html_index):
         errors.append("HTML references a network resource")
     for match in re.finditer(r"\[[^\]]*\]\(([^)]+)\)", report):
@@ -682,6 +733,20 @@ def build(args: argparse.Namespace) -> int:
     analysis = load_json(args.analysis)
     evidence = load_json(args.evidence)
     errors, evidence_by_id, data_by_id = validate_analysis_and_evidence(analysis, evidence, args.evidence.parent)
+    candidate_manifest: dict[str, Any] | None = None
+    if is_query_native(analysis):
+        if not args.candidates:
+            errors.append("--candidates is required for Query-native workflow 2.0")
+        else:
+            candidate_manifest = load_json(args.candidates)
+            if not isinstance(candidate_manifest, dict):
+                errors.append("Candidate Manifest must be an object")
+            else:
+                errors.extend(validate_query_native_analysis(analysis, candidate_manifest, evidence, args.evidence.parent))
+                expected_sha = analysis.get("query_scan", {}).get("candidate_manifest_sha256")
+                actual_sha = sha256_file(args.candidates)
+                if expected_sha != actual_sha:
+                    errors.append("analysis.query_scan.candidate_manifest_sha256 does not match --candidates")
     if errors:
         raise ValidationFailure(errors)
     if args.validate_only:
@@ -711,14 +776,21 @@ def build(args: argparse.Namespace) -> int:
 
     write_json(output / "analysis-result.json", analysis)
     write_json(output / "evidence-manifest.json", evidence)
+    if candidate_manifest is not None:
+        write_json(output / "candidate-manifest.json", candidate_manifest)
     copy_evidence_data(output, args.evidence, evidence_by_id)
 
     signature_keys: dict[str, str] = {}
     primary_visuals: dict[str, dict[str, str]] = {}
     extra_visuals: dict[str, list[str]] = {}
     generated_paths: set[Path] = {output / "analysis-result.json", output / "evidence-manifest.json"}
+    if candidate_manifest is not None:
+        generated_paths.add(output / "candidate-manifest.json")
     for item in evidence_by_id.values():
         generated_paths.add(output / item["data_path"])
+        for record in item.get("mcp_receipt", {}).values():
+            if isinstance(record, dict) and "path" in record:
+                generated_paths.add(output / record["path"])
     for signature in analysis["bottleneck_signatures"]:
         evidence_id, timeline = timeline_evidence(signature, evidence_by_id, data_by_id)
         sid = stable_id(signature["id"])
@@ -776,6 +848,10 @@ def build(args: argparse.Namespace) -> int:
     audit_path.write_text(render_query_audit(analysis, evidence_by_id), encoding="utf-8")
     index_path.write_text(render_evidence_index(analysis, evidence_by_id), encoding="utf-8")
     generated_paths.update({report_path, audit_path, index_path})
+    for name, content in render_specialty_reports(analysis, evidence_by_id).items():
+        specialty_path = output / name
+        specialty_path.write_text(content, encoding="utf-8")
+        generated_paths.add(specialty_path)
 
     html_path = visuals / "index.html"
     standalone_path = visuals / "standalone.html"

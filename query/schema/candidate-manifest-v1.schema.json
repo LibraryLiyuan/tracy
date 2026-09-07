@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://jn.game/tracy/query/candidate-manifest-v1.schema.json",
+  "title": "JN Tracy Candidate Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "aggregate_identity", "aggregate_content_sha256", "policy_identity", "profile_identity", "policy_algorithm", "content_sha256", "ranked_signatures", "candidates", "backlog"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "aggregate_identity": { "$ref": "#/$defs/sha256" },
+    "aggregate_content_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_identity": { "$ref": "#/$defs/sha256" },
+    "profile_identity": { "$ref": "#/$defs/sha256" },
+    "policy_algorithm": { "const": "candidate-policy-v3" },
+    "capture_quality": {
+      "type": "array",
+      "description": "Source limitations only; no performance priority or investigation quota.",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["domain", "status", "reason", "input_count", "consumed_input_count", "audit_complete"],
+        "properties": {
+          "domain": { "type": "string" }, "status": { "type": "string" },
+          "reason": { "type": "string" },
+          "input_count": { "type": "string", "pattern": "^[0-9]+$" },
+          "consumed_input_count": { "type": "string", "pattern": "^[0-9]+$" },
+          "audit_complete": { "type": "boolean" }
+        }
+      }
+    },
+    "content_sha256": { "$ref": "#/$defs/sha256" },
+    "ranked_signatures": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ranked_signature" }
+    },
+    "candidates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/candidate" }
+    },
+    "backlog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "selected", "not_selected"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "selected": { "type": "integer", "minimum": 0 },
+        "not_selected": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "decimal": {
+      "type": "string",
+      "pattern": "^-?(0|[1-9][0-9]*)(\\.[0-9]+)?([eE][+-]?[0-9]+)?$"
+    },
+    "ranked_signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["domain", "ranking", "rank", "signature_id", "frame_scope", "total_ns", "contribution", "cumulative_contribution", "top_policy_eligible", "not_selected_reason"],
+      "properties": {
+        "domain": { "type": "string", "minLength": 1 },
+        "ranking": { "enum": ["inclusive", "exclusive", "wait_critical"] },
+        "rank": { "type": "integer", "minimum": 1 },
+        "signature_id": { "type": "string", "minLength": 1 },
+        "frame_scope": { "type": "string" },
+        "total_ns": { "type": "string", "pattern": "^-?[0-9]+$" },
+        "contribution": { "type": "number" },
+        "cumulative_contribution": { "type": "number" },
+        "top_policy_eligible": { "type": "boolean" },
+        "not_selected_reason": { "type": ["string", "null"] }
+      }
+    },
+    "trigger_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trigger", "metric", "scope", "reason", "observed_value", "threshold_value", "unit", "authority", "eligible"],
+      "properties": {
+        "trigger": { "enum": ["budget", "top", "anomaly", "capacity", "quality", "user_focus", "frame_local", "window_local"] },
+        "metric": { "type": "string", "minLength": 1 },
+        "scope": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "observed_value": { "$ref": "#/$defs/decimal" },
+        "threshold_value": { "oneOf": [{ "$ref": "#/$defs/decimal" }, { "type": "null" }] },
+        "unit": { "type": "string", "minLength": 1 },
+        "authority": { "type": "string", "minLength": 1 },
+        "eligible": { "type": "boolean" }
+      }
+    },
+    "representative_frame_detail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["frame", "reasons", "event_refs"],
+      "properties": {
+        "frame": { "type": "string", "pattern": "^[0-9]+$" },
+        "reasons": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "event_refs": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "family_id", "priority", "domain", "signature_id", "structural_signature", "member_signatures", "triggers", "trigger_evidence", "representative_frames", "representative_frame_details", "selected", "not_selected_reason", "quality_status"],
+      "properties": {
+        "candidate_id": { "type": "string", "minLength": 1 },
+        "family_id": { "type": "string", "minLength": 1 },
+        "priority": { "enum": ["P0", "P1", "P2", "P3", "P4"] },
+        "domain": { "type": "string", "minLength": 1 },
+        "signature_id": { "type": "string", "minLength": 1 },
+        "structural_signature": { "type": "string", "minLength": 1 },
+        "member_signatures": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "triggers": { "type": "array", "items": { "enum": ["budget", "top", "anomaly", "capacity", "quality", "user_focus", "frame_local", "window_local"] }, "uniqueItems": true },
+        "trigger_evidence": { "type": "array", "items": { "$ref": "#/$defs/trigger_evidence" } },
+        "representative_frames": { "type": "array", "items": { "type": "string", "pattern": "^[0-9]+$" } },
+        "representative_frame_details": { "type": "array", "items": { "$ref": "#/$defs/representative_frame_detail" } },
+        "selected": { "type": "boolean" },
+        "not_selected_reason": { "type": ["string", "null"] },
+        "quality_status": { "type": "string", "minLength": 1 },
+        "frame_scope": { "type": "string" },
+        "thread_or_queue": { "type": "string" },
+        "metric": { "type": "string" },
+        "manifestation": { "type": "string" },
+        "local_evidence": { "type": "object" }
+        , "observation_unit": { "enum": ["frame", "l0_segment"] },
+        "representative_intervals": { "type": "array", "items": { "type": "object" } },
+        "frame_root": { "type": "boolean" }
+      }
+    }
+  }
+}

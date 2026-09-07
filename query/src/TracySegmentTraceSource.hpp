@@ -1,6 +1,6 @@
 #pragma once
 
-#include "TracyTraceSource.hpp"
+#include "TracyBoundedScanCursor.hpp"
 #include "TracyWorkerTraceSource.hpp"
 #include "TracyStreamStore.hpp"
 
@@ -10,7 +10,9 @@
 namespace tracy::query
 {
 
-class SegmentTraceSource final : public analysis::TraceSource
+class SegmentTraceSource final : public analysis::TraceSource,
+    public analysis::NativeBoundedTraceSource,
+    public analysis::GpuCatalogBoundedScanSource
 {
 public:
     using StateCallback = analysis::WorkerTraceSource::StateCallback;
@@ -46,21 +48,49 @@ public:
     std::vector<std::string> ScanLocks( const analysis::ScanRange& range ) const override;
     std::vector<std::string> ScanContextSwitches( const analysis::ScanRange& range ) const override;
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
+    uint32_t NativeBoundedScanVersion() const override;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
     std::vector<analysis::JobDto> GetJobs() const override;
+    uint64_t GetJobCount() const override;
+    std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const override;
     std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
     std::vector<analysis::IoRequestDto> GetIoRequests() const override;
+    uint64_t GetIoRequestCount() const override;
+    std::vector<analysis::IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const override;
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override;
+    uint64_t GetGfxDispatchCount() const override;
+    std::vector<analysis::GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const override;
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override;
+    uint64_t GetGfxEntityCount() const override;
+    std::vector<analysis::GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override;
     std::vector<analysis::GfxLinkDto> GetGfxLinks() const override;
-    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId, const std::vector<uint64_t>& seedIds ) const override;
+    uint64_t GetGfxLinkCount() const override;
+    std::vector<analysis::GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
+    analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds ) const override;
     std::vector<analysis::RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override;
     std::vector<analysis::RuntimeDomainStateDto> GetRuntimeDomainStates() const override;
+    uint64_t GetRuntimeDomainStateCount() const override;
+    std::vector<analysis::RuntimeDomainStateDto> ScanRuntimeDomainStates( size_t offset, size_t limit ) const override;
     std::vector<analysis::ScriptFrameDto> GetScriptFrames() const override;
+    uint64_t GetScriptFrameCount() const override;
+    std::vector<analysis::ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const override;
     std::vector<analysis::ScriptStackEventDto> GetScriptStackEvents() const override;
+    uint64_t GetScriptStackEventCount() const override;
+    std::vector<analysis::ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const override;
+    uint64_t GetCallsiteCount() const override;
+    std::vector<analysis::CallsiteDto> ScanCallsites( size_t offset, size_t limit ) const override;
     std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override;
+    uint64_t GetGpuCatalogResourceCountBounded() const override;
+    uint64_t GetGpuCatalogAllocationCountBounded() const override;
+    uint64_t GetGpuCatalogPassCountBounded() const override;
+    uint64_t GetGpuCatalogRangeCountBounded() const override;
+    std::vector<analysis::GpuAnalysisResourceSummary> ScanGpuCatalogResourcesBounded( size_t offset, size_t limit ) const override;
+    std::vector<analysis::GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded( size_t offset, size_t limit ) const override;
+    std::vector<analysis::GpuPassWorkingSet> ScanGpuCatalogPassesBounded( size_t offset, size_t limit ) const override;
+    std::vector<analysis::GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded( size_t offset, size_t limit ) const override;
     analysis::CrashDto GetCrash() const override;
     std::vector<analysis::CpuTopologyDto> GetCpuTopology() const override;
     std::vector<analysis::CpuUsagePointDto> GetCpuUsage() const override;
