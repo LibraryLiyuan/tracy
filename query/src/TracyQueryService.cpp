@@ -329,6 +329,7 @@ nlohmann::json AnalysisScanSnapshotJson( const AnalysisScanSnapshot& value )
         { "scan_id", value.scanId }, { "state", analysis::ScanStateName( value.state ) },
         { "resumable", value.resumable }, { "completed", value.completed },
         { "closed", value.closed },
+        { "process_memory", AnalysisProcessMemorySnapshotJson(value.processMemory) },
         { "progress", { { "completed", std::to_string( value.progressCompleted ) },
             { "total", std::to_string( value.progressTotal ) }, { "stage", value.stage } } },
         { "error", value.error.empty() ? nlohmann::json( nullptr ) : nlohmann::json( value.error ) }

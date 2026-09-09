@@ -15,7 +15,7 @@ namespace tracy::analysis
 
 inline constexpr uint32_t NeutralAggregateStoreSchemaVersion = 1;
 inline constexpr uint32_t NeutralScanAlgorithmVersion = 2;
-inline constexpr const char* NeutralScanAlgorithmId = "native-scan-v2";
+inline constexpr const char* NeutralScanAlgorithmId = "native-scan-v3";
 
 enum class NeutralAggregateState : uint8_t
 {

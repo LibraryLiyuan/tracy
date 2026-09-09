@@ -71,6 +71,9 @@ struct PolicySignatureContext
     uint64_t seriesCount = 0;
     std::string seriesSha256;
     std::string observationUnit = "frame";
+    // Original context traversal order for order-sensitive legacy family fields.
+    // Unset outside cached policy input; it is not a Player.Frame index.
+    std::optional<uint64_t> sourceOrdinal;
 };
 
 struct PolicyFrameTimeline
@@ -193,6 +196,11 @@ struct CandidatePolicyResult
 };
 
 CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input );
+// Query cache record encoding, separate from the legacy context-v2 document.
+// Unknown/exact and interval boundaries must survive the storage boundary.
+std::string SerializePolicySignatureContextRecord( const PolicySignatureContext& context );
+bool DeserializePolicySignatureContextRecord( const std::string& payload,
+    PolicySignatureContext& context, std::string& error );
 std::string SerializeCandidatePolicyResult( const CandidatePolicyResult& result );
 bool WriteCandidatePolicyManifest( const std::filesystem::path& path,
     const CandidatePolicyResult& result, std::string& error );

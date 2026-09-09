@@ -1,8 +1,11 @@
 #include "TracyGpuJobManagedScanner.hpp"
 #include "FakeTraceSource.hpp"
 #include "TracyQueue.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cassert>
+#include <iostream>
+#include <map>
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -127,37 +130,55 @@ public:
     }
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override
     {
+        ReadBoundary( "frame" );
         return SliceValues( frames, range.offset, range.limit );
     }
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override
     {
+        ReadBoundary( "gpu" );
         return SliceValues( gpuZones, range.offset, range.limit );
     }
     std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "job" );
         return SliceValues( jobs, offset, limit );
     }
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "relation" );
         return SliceValues( relations, offset, limit );
     }
     std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "gfx_entity" );
         return SliceValues( gfxEntities, offset, limit );
     }
     std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "gfx_link" );
         return SliceValues( gfxLinks, offset, limit );
     }
     std::vector<ScriptFrameDto> ScanScriptFrames( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "script_frame" );
         return SliceValues( scriptFrames, offset, limit );
     }
     std::vector<ScriptStackEventDto> ScanScriptStackEvents( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "script_stack" );
         return SliceValues( scriptEvents, offset, limit );
     }
 
+    std::string cancelAt;
+    std::function<void( std::string_view )> readHook;
+    mutable bool cancellationRequested = false;
+    mutable size_t readsAfterCancel = 0;
+    void ReadBoundary( std::string_view domain ) const
+    {
+        if( readHook ) readHook( domain );
+        if( cancellationRequested ) ++readsAfterCancel;
+        if( domain == cancelAt ) cancellationRequested = true;
+    }
     std::vector<FrameDto> frames;
     std::vector<GpuZoneDto> gpuZones;
     std::vector<JobDto> jobs;
@@ -226,11 +247,284 @@ const JobLifecycleFact& JobFact( const GpuJobManagedScanResult& result, uint64_t
 
 }
 
+template<typename Options>
+void SetCancellation( Options& options, std::function<bool()> cancelled )
+{
+    options.cancelled = std::move( cancelled );
+}
+
+template<typename Options>
+void SetGpuDefinitionSink( Options& options, std::function<bool( const GpuSignatureDefinition& )> sink )
+{
+    options.definitionSink = std::move( sink );
+}
+
+template<typename Options>
+void SetGpuWorkspace( Options& options, std::shared_ptr<AnalysisWorkspaceBudget> workspace )
+{
+    options.workspace = std::move( workspace );
+}
+
 int main()
 {
+    // Missing checks at any domain boundary must neither read another batch nor
+    // emit a fact after the source has requested cancellation.
+    bool cancellationTestsPassed = true;
+    for( const auto* domain : { "pre_cancelled", "frame", "gfx_entity", "gfx_link",
+        "relation", "gpu", "job", "script_frame", "script_stack" } )
+    {
+        GpuJobManagedSource cancelledSource;
+        cancelledSource.cancelAt = domain;
+        cancelledSource.cancellationRequested = std::string_view( domain ) == "pre_cancelled";
+        GpuJobManagedScanOptions options;
+        SetCancellation( options, [&] { return cancelledSource.cancellationRequested; } );
+        size_t emittedAfterCancel = 0;
+        const auto sink = [&]( const auto& ) {
+            if( cancelledSource.cancellationRequested ) ++emittedAfterCancel;
+            return true;
+        };
+        options.gpuZoneSink = sink; options.jobSink = sink;
+        options.managedZoneSink = sink; options.relationSink = sink;
+        bool rejected = false;
+        try { (void)GpuJobManagedScanner( cancelledSource, 2 ).Scan( options ); }
+        catch( const BoundedScanError& e ) { rejected = std::string( e.what() ).find( "cancelled" ) != std::string::npos; }
+        if( !rejected || cancelledSource.readsAfterCancel != 0 || emittedAfterCancel != 0 )
+        {
+            std::cerr << "GPU/job cancellation bypass: " << domain << " rejected=" << rejected
+                << " later_reads=" << cancelledSource.readsAfterCancel << " emitted=" << emittedAfterCancel << '\n';
+            cancellationTestsPassed = false;
+        }
+    }
+    if( !cancellationTestsPassed ) return 1;
+    for( const bool managed : { false, true } )
+    {
+        GpuJobManagedSource drainSource;
+        drainSource.gpuZones.resize( 2 ); // A root and child, both emitted during final stack drain.
+        bool cancelled = false;
+        size_t emitted = 0;
+        GpuJobManagedScanOptions options;
+        options.cancelled = [&] { return cancelled; };
+        const auto sink = [&]( const auto& ) { ++emitted; cancelled = true; return true; };
+        if( managed ) options.managedZoneSink = sink;
+        else options.gpuZoneSink = sink;
+        bool rejected = false;
+        try { (void)GpuJobManagedScanner( drainSource, 100 ).Scan( options ); }
+        catch( const BoundedScanError& e ) { rejected = std::string( e.what() ).find( "cancelled" ) != std::string::npos; }
+        if( !rejected || emitted != 1 )
+        {
+            std::cerr << "Post-read cancellation bypass: managed=" << managed << " emitted=" << emitted << '\n';
+            cancellationTestsPassed = false;
+        }
+    }
+    if( !cancellationTestsPassed ) return 1;
     GpuJobManagedSource source;
     GpuJobManagedScanner scanner( source, 2 );
     const auto result = scanner.Scan();
+
+    // A missing outer timestamp is a local quality gap, not permission to
+    // erase the known parent identity or turn a valid child into an orphan.
+    {
+        GpuJobManagedSource missingRoot;
+        missingRoot.gpuZones.resize(2);
+        missingRoot.gpuZones[0].gpuEndNs.reset();
+        missingRoot.gpuZones[0].complete=false;
+        const auto partial=GpuJobManagedScanner(missingRoot,1).Scan();
+        const auto& child=GpuFact(partial,10);
+        if(partial.gpuZones.size()!=2 || partial.physicalL0SegmentCount!=1 ||
+            child.depth!=1 || child.signatureId!=GpuFact(result,10).signatureId ||
+            !child.physicalTimingExact || child.inclusiveNs!=20)
+        {
+            std::cerr<<"An incomplete GPU root lost a valid child or changed its stable path/L0 identity\n";
+            return 1;
+        }
+    }
+
+    // A streaming consumer receives each complete definition before any fact
+    // refers to it, without a second retained definition collection.
+    std::map<std::string, GpuSignatureDefinition> definitions;
+    GpuJobManagedScanOptions streamedDefinitions;
+    streamedDefinitions.retainDetails = false;
+    SetGpuDefinitionSink( streamedDefinitions, [&]( const auto& definition ) {
+        assert( definitions.emplace( definition.signatureId, definition ).second );
+        return true;
+    } );
+    // Do not rely on assert inside the fact callback for the missing-API RED.
+    streamedDefinitions.gpuZoneSink = [&]( const auto& fact ) {
+        if( !definitions.contains( fact.signatureId ) || !definitions.contains( fact.logicalSignatureId ) )
+            return false;
+        return true;
+    };
+    bool streamedDefinitionsPassed = true;
+    try
+    {
+        const auto output = scanner.Scan( streamedDefinitions );
+        streamedDefinitionsPassed = output.gpuSignatures.empty() &&
+            definitions.size() == result.gpuSignatures.size() && output.gpuZoneCount == 8;
+    }
+    catch( const BoundedScanError& ) { streamedDefinitionsPassed = false; }
+    if( !streamedDefinitionsPassed ) std::cerr << "GPU definitions are not streamed before facts without retained copies\n";
+    for( const auto& expected : result.gpuSignatures )
+    {
+        if( !streamedDefinitionsPassed ) break;
+        const auto& actual = definitions.at( expected.signatureId );
+        assert( std::tie( actual.signatureId, actual.parentSignatureId, actual.name, actual.sourceLocationRef,
+            actual.function, actual.file, actual.line, actual.contextRef, actual.queueClass, actual.path,
+            actual.depth, actual.logical ) == std::tie( expected.signatureId, expected.parentSignatureId,
+            expected.name, expected.sourceLocationRef, expected.function, expected.file, expected.line,
+            expected.contextRef, expected.queueClass, expected.path, expected.depth, expected.logical ) );
+    }
+    if( streamedDefinitionsPassed )
+    {
+        assert( definitions.at( GpuFact( result, 10 ).signatureId ).path == "GPU.L0.DirectA > Pass" );
+        assert( definitions.at( GpuFact( result, 12 ).signatureId ).path == "GPU.L0.DirectB > Pass" );
+    }
+    auto workspace = std::make_shared<AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+    AnalysisWorkspaceReservation pressure( workspace, 1024 * 1024 - 256 );
+    GpuJobManagedScanOptions deniedOptions;
+    deniedOptions.retainDetails = false;
+    SetGpuWorkspace( deniedOptions, workspace );
+    size_t definitionsAfterPressure = 0;
+    SetGpuDefinitionSink( deniedOptions, [&]( const auto& ) { ++definitionsAfterPressure; return true; } );
+    bool budgetRejected = false;
+    try { (void)scanner.Scan( deniedOptions ); }
+    catch( const std::exception& e ) { budgetRejected = std::string( e.what() ).find( "analysis_workspace_budget" ) != std::string::npos; }
+    if( !budgetRejected || definitionsAfterPressure != 0 )
+        std::cerr << "GPU definition registry bypassed shared workspace budget\n";
+    if( !streamedDefinitionsPassed || !budgetRejected || definitionsAfterPressure != 0 ) return 1;
+    pressure.Resize( 0 );
+    assert( workspace->Snapshot().currentBytes == 0 );
+    bool residentBudgetTestsPassed = true;
+    for( const auto* domain : { "frame", "gfx_entity", "gfx_link", "relation", "job", "script_frame", "script_stack" } )
+    {
+        GpuJobManagedSource pressured;
+        pressured.gpuZones.clear(); // No signature allocations may mask another domain's missing budget.
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+        AnalysisWorkspaceReservation occupied( shared );
+        bool pressureActive = false;
+        size_t laterReads = 0;
+        pressured.readHook = [&]( std::string_view current ) {
+            if( pressureActive ) ++laterReads;
+            else if( current == domain )
+            {
+                pressureActive = true;
+                occupied.Resize( 1024 * 1024 - shared->Snapshot().currentBytes - 128 );
+            }
+        };
+        GpuJobManagedScanOptions options;
+        options.workspace = shared; options.retainDetails = false;
+        bool rejected = false;
+        try { (void)GpuJobManagedScanner( pressured, 2 ).Scan( options ); }
+        catch( const std::exception& e ) { rejected = std::string( e.what() ).find( "analysis_workspace_budget" ) != std::string::npos; }
+        if( !rejected || laterReads != 0 )
+        {
+            std::cerr << "GPU/job resident budget bypass: " << domain << " rejected=" << rejected << " later_reads=" << laterReads << '\n';
+            residentBudgetTestsPassed = false;
+        }
+        occupied.Resize( 0 );
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    {
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        GpuJobManagedScanOptions options; options.workspace = shared;
+        {
+            auto retained = scanner.Scan( options );
+            if( shared->Snapshot().currentBytes == 0 )
+            {
+                std::cerr << "GPU/job returned detail vectors have no surviving workspace ownership\n";
+                residentBudgetTestsPassed = false;
+            }
+            const auto bytes = shared->Snapshot().currentBytes;
+            auto moved = std::move( retained );
+            assert( shared->Snapshot().currentBytes == bytes && moved.gpuZones.size() == 8 );
+        }
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    if( !residentBudgetTestsPassed ) return 1;
+    {
+        GpuJobManagedSource activeSource;
+        activeSource.gpuZones.resize( 1 );
+        activeSource.gpuZones.front().ref = "gpu-instance:" + std::string( 64 * 1024, 'r' );
+        activeSource.jobs.clear(); activeSource.scriptFrames.clear(); activeSource.scriptEvents.clear();
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+        AnalysisWorkspaceReservation occupied( shared );
+        GpuJobManagedScanOptions options;
+        options.workspace = shared; options.retainDetails = false; options.includeLogicalGpuSignatures = false;
+        options.definitionSink = [&]( const auto& ) {
+            occupied.Resize( 1024 * 1024 - shared->Snapshot().currentBytes - 128 );
+            return true;
+        };
+        size_t emitted = 0;
+        options.gpuZoneSink = [&]( const auto& ) { ++emitted; return true; };
+        bool rejected = false;
+        try { (void)GpuJobManagedScanner( activeSource, 2 ).Scan( options ); }
+        catch( const std::exception& e ) { rejected = std::string( e.what() ).find( "analysis_workspace_budget" ) != std::string::npos; }
+        if( !rejected || emitted != 0 )
+        {
+            std::cerr << "Active GPU zone payload bypassed workspace: rejected=" << rejected << " emitted=" << emitted << '\n';
+            return 1;
+        }
+        occupied.Resize( 0 );
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    {
+        GpuJobManagedSource repeated;
+        repeated.gpuZones.clear(); repeated.jobs.clear(); repeated.scriptFrames.clear(); repeated.scriptEvents.clear();
+        for( size_t index = 0; index < 10000; ++index )
+        {
+            auto zone = source.gpuZones.front();
+            zone.ref = repeated.MakeEntityRef( "gpu-zone", index );
+            repeated.gpuZones.push_back( std::move( zone ) );
+        }
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+        GpuJobManagedScanOptions options;
+        options.workspace = shared; options.retainDetails = false; options.includeLogicalGpuSignatures = false;
+        size_t emittedDefinitions = 0;
+        options.definitionSink = [&]( const auto& ) { ++emittedDefinitions; return true; };
+        {
+            const auto output = GpuJobManagedScanner( repeated, 2 ).Scan( options );
+            assert( emittedDefinitions == 1 && output.gpuZoneCount == 10000 );
+            assert( output.physicalL0SegmentCount == 10000 && output.gpuSignatures.empty() );
+        }
+        assert( shared->Snapshot().currentBytes == 0 && shared->Snapshot().peakBytes <= 1024 * 1024 );
+    }
+    {
+        GpuJobManagedScanOptions cancelledDefinition;
+        size_t emitted = 0, facts = 0;
+        cancelledDefinition.definitionSink = [&]( const auto& ) { ++emitted; return false; };
+        cancelledDefinition.gpuZoneSink = [&]( const auto& ) { ++facts; return true; };
+        bool rejected = false;
+        try { (void)scanner.Scan( cancelledDefinition ); }
+        catch( const BoundedScanError& e ) { rejected = std::string( e.what() ).find( "cancelled" ) != std::string::npos; }
+        assert( rejected && emitted == 1 && facts == 0 );
+    }
+    {
+        GpuJobManagedSource wide;
+        wide.gpuZones.clear();
+        for( size_t index = 0; index < 128; ++index )
+        {
+            auto zone = source.gpuZones.front();
+            zone.ref = wide.MakeEntityRef( "gpu-zone", index );
+            zone.sourceLocationRef = "wide-source:" + std::to_string( index );
+            zone.name = "Wide" + std::string( 64 * 1024, 'x' );
+            zone.function = "WideFunction";
+            wide.gpuZones.push_back( std::move( zone ) );
+        }
+        auto compact = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        GpuJobManagedScanOptions options;
+        options.workspace = compact; options.retainDetails = false; options.includeLogicalGpuSignatures = false;
+        std::set<std::string> seen;
+        options.definitionSink = [&]( const auto& definition ) {
+            assert( definition.name == "Wide" + std::string( 64 * 1024, 'x' ) );
+            assert( definition.path == definition.name && definition.parentSignatureId.empty() );
+            assert( seen.emplace( definition.signatureId ).second );
+            return true;
+        };
+        {
+            const auto output = GpuJobManagedScanner( wide, 2 ).Scan( options );
+            assert( seen.size() == 128 && output.gpuSignatures.empty() && output.gpuZoneCount == 128 );
+        }
+        assert( compact->Snapshot().peakBytes <= 2 * 1024 * 1024 && compact->Snapshot().currentBytes == 0 );
+    }
 
     assert( result.maximumBatchObserved <= 2 );
     assert( result.gpuZones.size() == source.gpuZones.size() );

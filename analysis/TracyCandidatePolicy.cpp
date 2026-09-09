@@ -1,4 +1,5 @@
 #include "TracyCandidatePolicy.hpp"
+#include "TracyCandidatePolicyInternal.hpp"
 #include "TracyFrameWindowPolicy.hpp"
 
 #include "TracyAnalysisIoPath.hpp"
@@ -24,7 +25,7 @@
 
 namespace tracy::analysis
 {
-namespace
+namespace candidate_policy
 {
 
 using nlohmann::json;
@@ -42,14 +43,7 @@ struct SignatureKey
     }
 };
 
-struct FamilyWork
-{
-    CandidateFamily candidate;
-    bool policyEligible = false;
-    bool mandatory = false;
-    uint64_t bestTopRank = std::numeric_limits<uint64_t>::max();
-    std::map<uint64_t, CandidateRepresentativeFrame> representatives;
-};
+
 
 bool IsHexDigest( const std::string& value )
 {
@@ -262,6 +256,7 @@ void AddSignal( std::map<std::string, FamilyWork>& families,
     work.bestTopRank = std::min( work.bestTopRank, topRank );
     if( context != nullptr )
     {
+        work.contextWritten = true;
         candidate.frameScope = context->frameScope;
         candidate.threadOrQueue = context->threadOrQueue;
         candidate.observationUnit = context->observationUnit;
@@ -376,6 +371,52 @@ json TriggerEvidenceJson( const CandidateTriggerEvidence& value )
     };
 }
 
+json RankedJson(const PolicyRankedSignature& ranking)
+{
+    return {
+            { "domain", ranking.domain }, { "ranking", ranking.ranking }, { "rank", ranking.rank },
+            { "signature_id", ranking.signatureId }, { "frame_scope", ranking.frameScope },
+            { "total_ns", std::to_string( ranking.totalNs ) },
+            { "contribution", ranking.contribution },
+            { "cumulative_contribution", ranking.cumulativeContribution },
+            { "top_policy_eligible", ranking.topPolicyEligible },
+            { "not_selected_reason", ranking.notSelectedReason.empty() ? json( nullptr ) : json( ranking.notSelectedReason ) }
+    };
+}
+
+json CandidateJson(const CandidateFamily& candidate)
+{
+    json triggers = json::array();
+    for( const auto trigger : candidate.triggers ) triggers.emplace_back( CandidateTriggerName( trigger ) );
+    json frames = json::array();
+    json frameDetails = json::array();
+    for( const auto& frame : candidate.representativeFrames )
+    {
+        if( candidate.observationUnit != "frame" ) continue;
+        frames.emplace_back( std::to_string( frame.frameIndex ) );
+        frameDetails.push_back( { { "frame", std::to_string( frame.frameIndex ) },
+            { "reasons", frame.reasons }, { "event_refs", frame.eventRefs } } );
+    }
+    json evidence = json::array();
+    for( const auto& item : candidate.triggerEvidence ) evidence.push_back( TriggerEvidenceJson( item ) );
+    return {
+        { "candidate_id", candidate.candidateId }, { "family_id", candidate.familyId },
+        { "priority", CandidatePriorityName( candidate.priority ) }, { "domain", candidate.domain },
+        { "signature_id", candidate.signatureId }, { "structural_signature", candidate.structuralSignature },
+        { "member_signatures", candidate.memberSignatures }, { "triggers", std::move( triggers ) },
+        { "trigger_evidence", std::move( evidence ) }, { "representative_frames", std::move( frames ) },
+        { "representative_frame_details", std::move( frameDetails ) },
+        { "selected", candidate.selected },
+        { "not_selected_reason", candidate.notSelectedReason.empty() ? json( nullptr ) : json( candidate.notSelectedReason ) },
+        { "quality_status", candidate.qualityStatus }
+        , { "frame_scope", candidate.frameScope }, { "thread_or_queue", candidate.threadOrQueue },
+        { "metric", candidate.metric }, { "manifestation", candidate.manifestation },
+        { "local_evidence", candidate.localEvidence }
+        , { "observation_unit", candidate.observationUnit }, { "representative_intervals", candidate.representativeIntervals }
+        , { "frame_root", candidate.frameRoot }
+    };
+}
+
 std::string SerializeInternal( const CandidatePolicyResult& result, bool includeHash )
 {
     json document = {
@@ -392,47 +433,11 @@ std::string SerializeInternal( const CandidatePolicyResult& result, bool include
     if( includeHash ) document["content_sha256"] = result.contentSha256;
     for( const auto& ranking : result.rankedSignatures )
     {
-        document["ranked_signatures"].push_back( {
-            { "domain", ranking.domain }, { "ranking", ranking.ranking }, { "rank", ranking.rank },
-            { "signature_id", ranking.signatureId }, { "frame_scope", ranking.frameScope },
-            { "total_ns", std::to_string( ranking.totalNs ) },
-            { "contribution", ranking.contribution },
-            { "cumulative_contribution", ranking.cumulativeContribution },
-            { "top_policy_eligible", ranking.topPolicyEligible },
-            { "not_selected_reason", ranking.notSelectedReason.empty() ? json( nullptr ) : json( ranking.notSelectedReason ) }
-        } );
+        document["ranked_signatures"].push_back(RankedJson(ranking));
     }
     for( const auto& candidate : result.candidates )
     {
-        json triggers = json::array();
-        for( const auto trigger : candidate.triggers ) triggers.emplace_back( CandidateTriggerName( trigger ) );
-        json frames = json::array();
-        json frameDetails = json::array();
-        for( const auto& frame : candidate.representativeFrames )
-        {
-            if( candidate.observationUnit != "frame" ) continue;
-            frames.emplace_back( std::to_string( frame.frameIndex ) );
-            frameDetails.push_back( { { "frame", std::to_string( frame.frameIndex ) },
-                { "reasons", frame.reasons }, { "event_refs", frame.eventRefs } } );
-        }
-        json evidence = json::array();
-        for( const auto& item : candidate.triggerEvidence ) evidence.push_back( TriggerEvidenceJson( item ) );
-        document["candidates"].push_back( {
-            { "candidate_id", candidate.candidateId }, { "family_id", candidate.familyId },
-            { "priority", CandidatePriorityName( candidate.priority ) }, { "domain", candidate.domain },
-            { "signature_id", candidate.signatureId }, { "structural_signature", candidate.structuralSignature },
-            { "member_signatures", candidate.memberSignatures }, { "triggers", std::move( triggers ) },
-            { "trigger_evidence", std::move( evidence ) }, { "representative_frames", std::move( frames ) },
-            { "representative_frame_details", std::move( frameDetails ) },
-            { "selected", candidate.selected },
-            { "not_selected_reason", candidate.notSelectedReason.empty() ? json( nullptr ) : json( candidate.notSelectedReason ) },
-            { "quality_status", candidate.qualityStatus }
-            , { "frame_scope", candidate.frameScope }, { "thread_or_queue", candidate.threadOrQueue },
-            { "metric", candidate.metric }, { "manifestation", candidate.manifestation },
-            { "local_evidence", candidate.localEvidence }
-            , { "observation_unit", candidate.observationUnit }, { "representative_intervals", candidate.representativeIntervals }
-            , { "frame_root", candidate.frameRoot }
-        } );
+        document["candidates"].push_back(CandidateJson(candidate));
     }
     return document.dump();
 }
@@ -453,7 +458,238 @@ bool AtomicReplace( const std::filesystem::path& temporary,
     return false;
 }
 
+void Local(Families& families, const PolicySignatureContext& context, const frame_window::Signal& signal)
+{
+    const auto identity = context.domain + ":" + context.signatureId + ":" + context.frameScope +
+        ":" + context.threadOrQueue + ":" + context.metricPreference + ":" + signal.manifestation;
+    CandidateTriggerEvidence evidence { signal.manifestation == "frame_cost" ?
+        CandidateTrigger::FrameLocal : CandidateTrigger::WindowLocal, context.metricPreference,
+        context.frameScope, signal.reason, double( signal.valueNs ),
+        std::nullopt, "ns", CandidatePolicyAlgorithmId, true };
+    SetExactValues( evidence, std::to_string( signal.valueNs ) );
+    AddSignal( families, identity, context.domain, context.signatureId, context.frameRoot ? CandidatePriority::P1 : CandidatePriority::P2,
+        std::move( evidence ), true, std::numeric_limits<uint64_t>::max(), nullptr, nullptr );
+    auto& work = families.at( identity );
+    work.mandatory = true;
+    work.localWritten = true;
+    work.candidate.structuralSignature = context.path.empty() ? context.signatureId : context.path;
+    work.candidate.frameScope = context.frameScope;
+    work.candidate.threadOrQueue = context.threadOrQueue;
+    work.candidate.metric = context.metricPreference;
+    work.candidate.manifestation = signal.manifestation;
+    work.candidate.observationUnit = context.observationUnit;
+    work.candidate.localEvidence = signal.evidence;
+    for( const auto& frame : signal.representatives )
+        AddRepresentative( work, frame.frameIndex, signal.reason, frame.eventRefs );
 }
+
+void Budget(Families& families, const CandidatePolicyInput& input, const NeutralSignatureAggregate* aggregate, const PolicySignatureContext& context,
+    const std::function<void(uint64_t)>& beforeSignal)
+{
+    const auto frameBudgetMs = input.normalizedProfile.at( "frame_budget" ).at( "frame_ms" ).get<double>();
+    if( aggregate == nullptr ) return;
+    if( context.frameRoot && aggregate->inclusive.perCompleteFrame.exact &&
+        aggregate->inclusive.perCompleteFrame.p95 / 1000000.0 > frameBudgetMs )
+    {
+        if( beforeSignal ) beforeSignal( 0 );
+        CandidateTriggerEvidence evidence { CandidateTrigger::Budget, "frame_wall", "per_complete_frame",
+            "p95_exceeds_confirmed_frame_budget", aggregate->inclusive.perCompleteFrame.p95,
+            frameBudgetMs * 1000000.0, "ns", "confirmed", true };
+        SetExactValues( evidence, NumberString( aggregate->inclusive.perCompleteFrame.p95 ),
+            NumberString( frameBudgetMs * 1000000.0 ) );
+        AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
+            context.domain, context.signatureId, CandidatePriority::P1, std::move( evidence ), true,
+            std::numeric_limits<uint64_t>::max(), &context, &aggregate->inclusive );
+    }
+    for( const auto& module : input.normalizedProfile.at( "module_budgets" ) )
+    {
+        if( module.at( "status" ) == "planning_reference" ) continue;
+        const auto moduleId = module.at( "id" ).get<std::string>();
+        bool matched = !context.moduleBudgetId.empty() && context.moduleBudgetId == moduleId;
+        if( !matched ) for( const auto& rule : module.at( "marker_rules" ) )
+            if( MarkerRuleMatches( rule.get<std::string>(), context ) ) { matched = true; break; }
+        if( !matched ) continue;
+        const auto scopeName = module.at( "scope" ).get<std::string>();
+        if( !context.budgetScope.empty() && context.budgetScope != scopeName ) continue;
+        const auto metricName = context.metricPreference.empty() ? "exclusive" : context.metricPreference;
+        const auto metric = Metric( aggregate, metricName );
+        if( metric == nullptr ) continue;
+        const auto& distribution = Scope( *metric, scopeName );
+        const auto thresholdMs = module.at( "budget_ms" ).get<double>();
+        if( !distribution.exact || distribution.p95 / 1000000.0 <= thresholdMs ) continue;
+        if( beforeSignal ) beforeSignal( moduleId.size() + scopeName.size() + metricName.size() +
+            module.at( "status" ).get_ref<const std::string&>().size() );
+        const auto authority = module.at( "status" ).get<std::string>();
+        const auto priority = authority == "fixed" ? CandidatePriority::P1 : CandidatePriority::P2;
+        CandidateTriggerEvidence evidence { CandidateTrigger::Budget, metricName, scopeName,
+            "p95_exceeds_module_budget:" + moduleId, distribution.p95,
+            thresholdMs * 1000000.0, "ns", authority, true };
+        SetExactValues( evidence, NumberString( distribution.p95 ),
+            NumberString( thresholdMs * 1000000.0 ) );
+        AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
+            context.domain, context.signatureId, priority, std::move( evidence ), true,
+            std::numeric_limits<uint64_t>::max(), &context, metric );
+    }
+}
+
+PolicyRankedSignature Top(Families& families, const CandidatePolicyInput& input, const std::string& domain, const char* rankingName,
+    const NeutralRankingEntry& entry, uint64_t index, double previousCumulative,
+    const PolicySignatureContext* context, const NeutralSignatureAggregate* aggregate)
+{
+    const auto& policy = input.normalizedProfile.at("candidate_policy");
+    const auto topN = policy.at("top_n").get<uint64_t>();
+    const auto perDomainLimit = policy.at("per_domain_limit").get<uint64_t>();
+    const auto cumulativeTarget = policy.at("cumulative_contribution").get<double>();
+    bool qualified = index < perDomainLimit && ( index < topN ||
+        ( index != 0 && previousCumulative < cumulativeTarget ) );
+    PolicyRankedSignature ranked { domain, rankingName, uint64_t( index + 1 ),
+        entry.signatureId, entry.frameScope, entry.totalNs, entry.contribution,
+        entry.cumulativeContribution, qualified, {} };
+    if( entry.totalNs <= 0 ) { qualified = false; ranked.topPolicyEligible = false; ranked.notSelectedReason = "zero_total"; }
+    else if( !qualified ) ranked.notSelectedReason = "outside_top_policy";
+    if( entry.totalNs <= 0 ) return ranked;
+    const auto metric = Metric( aggregate, rankingName );
+    auto priority = index < topN ? CandidatePriority::P2 : CandidatePriority::P4;
+    if( context != nullptr && context->provenCriticalPath ) priority = CandidatePriority::P1;
+    CandidateTriggerEvidence evidence { CandidateTrigger::Top, rankingName, "all_complete_frames",
+        qualified ? ( index < topN ? "top_n" : "cumulative_contribution_extension" ) :
+            "outside_top_policy", double( entry.totalNs ), std::nullopt, "ns",
+        "deterministic_ranking", qualified };
+    SetExactValues( evidence, std::to_string( entry.totalNs ) );
+    AddSignal( families, ResolveFamily( domain, entry.signatureId,
+        context == nullptr ? std::string() : context->familyId ), domain,
+        entry.signatureId, priority, std::move( evidence ), qualified, uint64_t( index + 1 ),
+        context, metric );
+    return ranked;
+}
+
+void Anomalies(Families& families, const NeutralSignatureAggregate& signature, const PolicySignatureContext* context)
+{
+    const std::pair<const char*, const NeutralMetricAggregate*> metrics[] = {
+        { "inclusive", &signature.inclusive }, { "exclusive", &signature.exclusive },
+        { "wait", &signature.wait }, { "critical_path", &signature.criticalPath }
+    };
+    for( const auto& [metricName, metric] : metrics )
+    {
+        if( metric->pattern == AnomalyPattern::None ) continue;
+        const auto anomalyCount = metric->anomalyCount != 0 || metric->anomalies.empty() ?
+            metric->anomalyCount : uint64_t( metric->anomalies.size() );
+        auto priority = metric->pattern == AnomalyPattern::IsolatedSpike ?
+            CandidatePriority::P3 : CandidatePriority::P2;
+        if( context != nullptr && context->provenCriticalPath ) priority = CandidatePriority::P1;
+        CandidateTriggerEvidence evidence { CandidateTrigger::Anomaly, metricName, "per_complete_frame",
+            AnomalyPatternName( metric->pattern ), double( anomalyCount ), std::nullopt,
+            "frames", "robust_median_mad", true };
+        SetExactValues( evidence, std::to_string( anomalyCount ) );
+        AddSignal( families, ResolveFamily( signature.domain, signature.signatureId,
+            context == nullptr ? std::string() : context->familyId ), signature.domain,
+            signature.signatureId, priority, std::move( evidence ), true,
+            std::numeric_limits<uint64_t>::max(), context, metric );
+    }
+}
+
+void Capacity(Families& families, const CandidatePolicyInput& input, const PolicyCapacityFact& fact)
+{
+    const auto& resourceBudgets = input.normalizedProfile.at("resource_budgets");
+    const auto bytesKey = fact.metric + "_bytes";
+    const auto statusKey = fact.metric + "_status";
+    if( !resourceBudgets.contains( bytesKey ) || !resourceBudgets.contains( statusKey ) ) return;
+    const auto threshold = resourceBudgets.at( bytesKey ).get<uint64_t>();
+    if( !fact.exact || fact.valueBytes <= threshold ) return;
+    const auto authority = resourceBudgets.at( statusKey ).get<std::string>();
+    const auto priority = authority == "fixed" ? CandidatePriority::P1 : CandidatePriority::P2;
+    CandidateTriggerEvidence evidence { CandidateTrigger::Capacity, fact.metric, "capture_peak",
+        fact.description, double( fact.valueBytes ), double( threshold ), "bytes", authority, true };
+    SetExactValues( evidence, std::to_string( fact.valueBytes ), std::to_string( threshold ) );
+    AddSignal( families, ResolveFamily( fact.domain, fact.signatureId, fact.familyId ), fact.domain,
+        fact.signatureId, priority, std::move( evidence ), true,
+        std::numeric_limits<uint64_t>::max(), nullptr, nullptr );
+    if( fact.frameIndex ) AddRepresentative( families[ResolveFamily( fact.domain,
+        fact.signatureId, fact.familyId )], *fact.frameIndex, "capacity_peak", {} );
+}
+
+void Focus(Families& families, const json& focusJson, const PolicySignatureContext& context, const NeutralSignatureAggregate* aggregate)
+{
+    const auto focus = Lower(focusJson.get<std::string>());
+    const auto haystack = Lower( context.domain + "\n" + context.signatureId + "\n" +
+        context.familyId + "\n" + context.name + "\n" + context.path );
+    if( haystack.find( focus ) == std::string::npos ) return;
+    const auto metric = Metric( aggregate, context.metricPreference );
+    CandidateTriggerEvidence evidence { CandidateTrigger::UserFocus, context.metricPreference,
+        context.frameScope, "user_focus:" + focusJson.get<std::string>(), 1.0,
+        std::nullopt, "match", "user", true };
+    SetExactValues( evidence, "1" );
+    AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
+        context.domain, context.signatureId, CandidatePriority::P2, std::move( evidence ), true,
+        std::numeric_limits<uint64_t>::max(), &context, metric );
+}
+
+void Finalize(FamilyWork& work, const std::string& familyId, const std::string& policyIdentity)
+{
+    auto& candidate = work.candidate;
+    std::sort( candidate.memberSignatures.begin(), candidate.memberSignatures.end() );
+    candidate.memberSignatures.erase( std::unique( candidate.memberSignatures.begin(),
+        candidate.memberSignatures.end() ), candidate.memberSignatures.end() );
+    std::sort( candidate.triggers.begin(), candidate.triggers.end() );
+    candidate.triggers.erase( std::unique( candidate.triggers.begin(), candidate.triggers.end() ),
+        candidate.triggers.end() );
+    std::sort( candidate.triggerEvidence.begin(), candidate.triggerEvidence.end(),
+        []( const auto& left, const auto& right ) { return TriggerSortKey( left ) < TriggerSortKey( right ); } );
+    for( auto& [frame, representative] : work.representatives )
+    {
+        std::sort( representative.reasons.begin(), representative.reasons.end() );
+        representative.reasons.erase( std::unique( representative.reasons.begin(), representative.reasons.end() ),
+            representative.reasons.end() );
+        std::sort( representative.eventRefs.begin(), representative.eventRefs.end() );
+        representative.eventRefs.erase( std::unique( representative.eventRefs.begin(), representative.eventRefs.end() ),
+            representative.eventRefs.end() );
+        candidate.representativeFrames.push_back( std::move( representative ) );
+    }
+    candidate.candidateId = "candidate:" + Sha256Text( policyIdentity + "\n" + familyId );
+}
+
+void Select(FamilyWork& work, const CandidatePolicyInput& input, std::map<std::string, uint64_t>& selectedDiscretionaryByDomain)
+{
+    const auto& policy = input.normalizedProfile.at("candidate_policy");
+    const auto perDomainLimit = policy.at("per_domain_limit").get<uint64_t>();
+    std::set<std::string> allowedPriorities;
+    for(const auto& p:policy.at("priorities")) allowedPriorities.emplace(p.get<std::string>());
+    auto& candidate = work.candidate;
+    if( candidate.observationUnit == "l0_segment" )
+    {
+        for( const auto& timeline : input.frameTimelines ) if( timeline.frameScope == candidate.frameScope )
+            for( const auto& frame : candidate.representativeFrames )
+            {
+                const auto segment = std::find_if( timeline.frames.begin(), timeline.frames.end(),
+                    [&]( const auto& s ) { return s.frameIndex == frame.frameIndex; } );
+                if( segment == timeline.frames.end() ) continue;
+                candidate.representativeIntervals.push_back( {
+                    { "l0_segment_ordinal", std::to_string( frame.frameIndex ) },
+                    { "begin_ns", segment->beginNs?json(std::to_string(*segment->beginNs)):json(nullptr) },
+                    { "end_ns", segment->endNs?json(std::to_string(*segment->endNs)):json(nullptr) },
+                    { "event_refs", segment->eventRefs }, { "reasons", frame.reasons },
+                    { "player_frame_relation", "unavailable_not_inferred" } } );
+                if(!segment->exact) candidate.representativeIntervals.back()["l0_complete"]=false;
+                if(!segment->beginNs || !segment->endNs)
+                    candidate.representativeIntervals.back()["timing_unavailable_reason"]="source_l0_timestamps_missing";
+            }
+    }
+    const auto priorityAllowed = allowedPriorities.contains( CandidatePriorityName( candidate.priority ) );
+    if( work.mandatory ) candidate.selected = true;
+    else if( !priorityAllowed ) candidate.notSelectedReason = "priority_not_enabled";
+    else if( !work.policyEligible && !work.mandatory ) candidate.notSelectedReason = "outside_top_policy";
+    else if( selectedDiscretionaryByDomain[candidate.domain] < perDomainLimit )
+    {
+        candidate.selected = true;
+        ++selectedDiscretionaryByDomain[candidate.domain];
+    }
+    else candidate.notSelectedReason = "per_domain_limit";
+}
+
+
+}
+
+using namespace candidate_policy;
 
 const char* CandidateTriggerName( CandidateTrigger trigger )
 {
@@ -494,13 +730,6 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     result.policyIdentity = Sha256Text( std::string( CandidatePolicyAlgorithmId ) + "\n" +
         input.aggregateIdentity + "\n" + input.profileIdentity );
 
-    const auto& policy = input.normalizedProfile.at( "candidate_policy" );
-    const auto topN = policy.at( "top_n" ).get<uint64_t>();
-    const auto cumulativeTarget = policy.at( "cumulative_contribution" ).get<double>();
-    const auto perDomainLimit = policy.at( "per_domain_limit" ).get<uint64_t>();
-    std::set<std::string> allowedPriorities;
-    for( const auto& priority : policy.at( "priorities" ) ) allowedPriorities.emplace( priority.get<std::string>() );
-
     std::map<SignatureKey, const PolicySignatureContext*> contexts;
     for( const auto& context : input.signatures )
         contexts.emplace( SignatureKey { context.domain, context.signatureId, context.frameScope }, &context );
@@ -520,74 +749,12 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     for( const auto& signal : localSignals )
     {
         const auto& context = input.signatures.at( signal.context );
-        const auto identity = context.domain + ":" + context.signatureId + ":" + context.frameScope +
-            ":" + context.threadOrQueue + ":" + context.metricPreference + ":" + signal.manifestation;
-        CandidateTriggerEvidence evidence { signal.manifestation == "frame_cost" ?
-            CandidateTrigger::FrameLocal : CandidateTrigger::WindowLocal, context.metricPreference,
-            context.frameScope, signal.reason, double( signal.valueNs ),
-            std::nullopt, "ns", CandidatePolicyAlgorithmId, true };
-        SetExactValues( evidence, std::to_string( signal.valueNs ) );
-        AddSignal( families, identity, context.domain, context.signatureId, context.frameRoot ? CandidatePriority::P1 : CandidatePriority::P2,
-            std::move( evidence ), true, std::numeric_limits<uint64_t>::max(), nullptr, nullptr );
-        auto& work = families.at( identity );
-        work.mandatory = true;
-        work.candidate.structuralSignature = context.path.empty() ? context.signatureId : context.path;
-        work.candidate.frameScope = context.frameScope;
-        work.candidate.threadOrQueue = context.threadOrQueue;
-        work.candidate.metric = context.metricPreference;
-        work.candidate.manifestation = signal.manifestation;
-        work.candidate.observationUnit = context.observationUnit;
-        work.candidate.localEvidence = signal.evidence;
-        for( const auto& frame : signal.representatives )
-            AddRepresentative( work, frame.frameIndex, signal.reason, frame.eventRefs );
+        Local(families, context, signal);
     }
 
     // Budget pool: frame wall budget and explicitly attributable module budgets only.
-    const auto frameBudgetMs = input.normalizedProfile.at( "frame_budget" ).at( "frame_ms" ).get<double>();
-    for( const auto& context : input.signatures )
-    {
-        const auto aggregate = FindAggregate( input, context.domain, context.signatureId, context.frameScope );
-        if( aggregate == nullptr ) continue;
-        if( context.frameRoot && aggregate->inclusive.perCompleteFrame.exact &&
-            aggregate->inclusive.perCompleteFrame.p95 / 1000000.0 > frameBudgetMs )
-        {
-            CandidateTriggerEvidence evidence { CandidateTrigger::Budget, "frame_wall", "per_complete_frame",
-                "p95_exceeds_confirmed_frame_budget", aggregate->inclusive.perCompleteFrame.p95,
-                frameBudgetMs * 1000000.0, "ns", "confirmed", true };
-            SetExactValues( evidence, NumberString( aggregate->inclusive.perCompleteFrame.p95 ),
-                NumberString( frameBudgetMs * 1000000.0 ) );
-            AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
-                context.domain, context.signatureId, CandidatePriority::P1, std::move( evidence ), true,
-                std::numeric_limits<uint64_t>::max(), &context, &aggregate->inclusive );
-        }
-        for( const auto& module : input.normalizedProfile.at( "module_budgets" ) )
-        {
-            if( module.at( "status" ) == "planning_reference" ) continue;
-            const auto moduleId = module.at( "id" ).get<std::string>();
-            bool matched = !context.moduleBudgetId.empty() && context.moduleBudgetId == moduleId;
-            if( !matched ) for( const auto& rule : module.at( "marker_rules" ) )
-                if( MarkerRuleMatches( rule.get<std::string>(), context ) ) { matched = true; break; }
-            if( !matched ) continue;
-            const auto scopeName = module.at( "scope" ).get<std::string>();
-            if( !context.budgetScope.empty() && context.budgetScope != scopeName ) continue;
-            const auto metricName = context.metricPreference.empty() ? "exclusive" : context.metricPreference;
-            const auto metric = Metric( aggregate, metricName );
-            if( metric == nullptr ) continue;
-            const auto& distribution = Scope( *metric, scopeName );
-            const auto thresholdMs = module.at( "budget_ms" ).get<double>();
-            if( !distribution.exact || distribution.p95 / 1000000.0 <= thresholdMs ) continue;
-            const auto authority = module.at( "status" ).get<std::string>();
-            const auto priority = authority == "fixed" ? CandidatePriority::P1 : CandidatePriority::P2;
-            CandidateTriggerEvidence evidence { CandidateTrigger::Budget, metricName, scopeName,
-                "p95_exceeds_module_budget:" + moduleId, distribution.p95,
-                thresholdMs * 1000000.0, "ns", authority, true };
-            SetExactValues( evidence, NumberString( distribution.p95 ),
-                NumberString( thresholdMs * 1000000.0 ) );
-            AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
-                context.domain, context.signatureId, priority, std::move( evidence ), true,
-                std::numeric_limits<uint64_t>::max(), &context, metric );
-        }
-    }
+    for(const auto& context:input.signatures)
+        Budget(families, input, FindAggregate(input, context.domain, context.signatureId, context.frameScope), context);
 
     // Top pool: preserve every ranked signature; qualification is Top N, then the
     // cumulative extension, capped per domain. Unqualified rows remain auditable backlog.
@@ -602,29 +769,10 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
             for( size_t index = 0; index < entries->size(); ++index )
             {
                 const auto& entry = ( *entries )[index];
-                bool qualified = index < perDomainLimit && ( index < topN ||
-                    ( index != 0 && ( *entries )[index - 1].cumulativeContribution < cumulativeTarget ) );
-                PolicyRankedSignature ranked { ranking.domain, rankingName, uint64_t( index + 1 ),
-                    entry.signatureId, entry.frameScope, entry.totalNs, entry.contribution,
-                    entry.cumulativeContribution, qualified, {} };
-                if( entry.totalNs <= 0 ) { qualified = false; ranked.topPolicyEligible = false; ranked.notSelectedReason = "zero_total"; }
-                else if( !qualified ) ranked.notSelectedReason = "outside_top_policy";
-                result.rankedSignatures.push_back( ranked );
-                if( entry.totalNs <= 0 ) continue;
-                const auto context = findContext( ranking.domain, entry.signatureId, entry.frameScope );
-                const auto aggregate = FindAggregate( input, ranking.domain, entry.signatureId, entry.frameScope );
-                const auto metric = Metric( aggregate, rankingName );
-                auto priority = index < topN ? CandidatePriority::P2 : CandidatePriority::P4;
-                if( context != nullptr && context->provenCriticalPath ) priority = CandidatePriority::P1;
-                CandidateTriggerEvidence evidence { CandidateTrigger::Top, rankingName, "all_complete_frames",
-                    qualified ? ( index < topN ? "top_n" : "cumulative_contribution_extension" ) :
-                        "outside_top_policy", double( entry.totalNs ), std::nullopt, "ns",
-                    "deterministic_ranking", qualified };
-                SetExactValues( evidence, std::to_string( entry.totalNs ) );
-                AddSignal( families, ResolveFamily( ranking.domain, entry.signatureId,
-                    context == nullptr ? std::string() : context->familyId ), ranking.domain,
-                    entry.signatureId, priority, std::move( evidence ), qualified, uint64_t( index + 1 ),
-                    context, metric );
+                result.rankedSignatures.push_back(Top(families, input, ranking.domain, rankingName, entry, index,
+                    index == 0 ? 0 : (*entries)[index-1].cumulativeContribution,
+                    findContext(ranking.domain, entry.signatureId, entry.frameScope),
+                    FindAggregate(input, ranking.domain, entry.signatureId, entry.frameScope)));
             }
         }
     }
@@ -632,50 +780,11 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     // Anomaly pool.
     for( const auto& signature : input.aggregate.signatures )
     {
-        const std::pair<const char*, const NeutralMetricAggregate*> metrics[] = {
-            { "inclusive", &signature.inclusive }, { "exclusive", &signature.exclusive },
-            { "wait", &signature.wait }, { "critical_path", &signature.criticalPath }
-        };
-        const auto context = findContext( signature.domain, signature.signatureId, signature.frameScope );
-        for( const auto& [metricName, metric] : metrics )
-        {
-            if( metric->pattern == AnomalyPattern::None ) continue;
-            const auto anomalyCount = metric->anomalyCount != 0 || metric->anomalies.empty() ?
-                metric->anomalyCount : uint64_t( metric->anomalies.size() );
-            auto priority = metric->pattern == AnomalyPattern::IsolatedSpike ?
-                CandidatePriority::P3 : CandidatePriority::P2;
-            if( context != nullptr && context->provenCriticalPath ) priority = CandidatePriority::P1;
-            CandidateTriggerEvidence evidence { CandidateTrigger::Anomaly, metricName, "per_complete_frame",
-                AnomalyPatternName( metric->pattern ), double( anomalyCount ), std::nullopt,
-                "frames", "robust_median_mad", true };
-            SetExactValues( evidence, std::to_string( anomalyCount ) );
-            AddSignal( families, ResolveFamily( signature.domain, signature.signatureId,
-                context == nullptr ? std::string() : context->familyId ), signature.domain,
-                signature.signatureId, priority, std::move( evidence ), true,
-                std::numeric_limits<uint64_t>::max(), context, metric );
-        }
+        Anomalies(families, signature, findContext(signature.domain, signature.signatureId, signature.frameScope));
     }
 
     // Capacity pool.
-    const auto& resourceBudgets = input.normalizedProfile.at( "resource_budgets" );
-    for( const auto& fact : input.capacityFacts )
-    {
-        const auto bytesKey = fact.metric + "_bytes";
-        const auto statusKey = fact.metric + "_status";
-        if( !resourceBudgets.contains( bytesKey ) || !resourceBudgets.contains( statusKey ) ) continue;
-        const auto threshold = resourceBudgets.at( bytesKey ).get<uint64_t>();
-        if( !fact.exact || fact.valueBytes <= threshold ) continue;
-        const auto authority = resourceBudgets.at( statusKey ).get<std::string>();
-        const auto priority = authority == "fixed" ? CandidatePriority::P1 : CandidatePriority::P2;
-        CandidateTriggerEvidence evidence { CandidateTrigger::Capacity, fact.metric, "capture_peak",
-            fact.description, double( fact.valueBytes ), double( threshold ), "bytes", authority, true };
-        SetExactValues( evidence, std::to_string( fact.valueBytes ), std::to_string( threshold ) );
-        AddSignal( families, ResolveFamily( fact.domain, fact.signatureId, fact.familyId ), fact.domain,
-            fact.signatureId, priority, std::move( evidence ), true,
-            std::numeric_limits<uint64_t>::max(), nullptr, nullptr );
-        if( fact.frameIndex ) AddRepresentative( families[ResolveFamily( fact.domain,
-            fact.signatureId, fact.familyId )], *fact.frameIndex, "capacity_peak", {} );
-    }
+    for(const auto& fact:input.capacityFacts) Capacity(families, input, fact);
 
     // Keep capture limitations independently of candidate quotas and priorities.
     for( const auto& domain : input.aggregate.domains )
@@ -696,47 +805,14 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     // Top/cumulative limits.
     for( const auto& focusJson : input.normalizedProfile.at( "user_focus" ) )
     {
-        const auto focus = Lower( focusJson.get<std::string>() );
-        for( const auto& context : input.signatures )
-        {
-            const auto haystack = Lower( context.domain + "\n" + context.signatureId + "\n" +
-                context.familyId + "\n" + context.name + "\n" + context.path );
-            if( haystack.find( focus ) == std::string::npos ) continue;
-            const auto aggregate = FindAggregate( input, context.domain, context.signatureId, context.frameScope );
-            const auto metric = Metric( aggregate, context.metricPreference );
-            CandidateTriggerEvidence evidence { CandidateTrigger::UserFocus, context.metricPreference,
-                context.frameScope, "user_focus:" + focusJson.get<std::string>(), 1.0,
-                std::nullopt, "match", "user", true };
-            SetExactValues( evidence, "1" );
-            AddSignal( families, ResolveFamily( context.domain, context.signatureId, context.familyId ),
-                context.domain, context.signatureId, CandidatePriority::P2, std::move( evidence ), true,
-                std::numeric_limits<uint64_t>::max(), &context, metric );
-        }
+        for(const auto& context:input.signatures)
+            Focus(families, focusJson, context, FindAggregate(input, context.domain, context.signatureId, context.frameScope));
     }
 
     std::vector<std::pair<std::string, FamilyWork*>> ordered;
     for( auto& [familyId, work] : families )
     {
-        auto& candidate = work.candidate;
-        std::sort( candidate.memberSignatures.begin(), candidate.memberSignatures.end() );
-        candidate.memberSignatures.erase( std::unique( candidate.memberSignatures.begin(),
-            candidate.memberSignatures.end() ), candidate.memberSignatures.end() );
-        std::sort( candidate.triggers.begin(), candidate.triggers.end() );
-        candidate.triggers.erase( std::unique( candidate.triggers.begin(), candidate.triggers.end() ),
-            candidate.triggers.end() );
-        std::sort( candidate.triggerEvidence.begin(), candidate.triggerEvidence.end(),
-            []( const auto& left, const auto& right ) { return TriggerSortKey( left ) < TriggerSortKey( right ); } );
-        for( auto& [frame, representative] : work.representatives )
-        {
-            std::sort( representative.reasons.begin(), representative.reasons.end() );
-            representative.reasons.erase( std::unique( representative.reasons.begin(), representative.reasons.end() ),
-                representative.reasons.end() );
-            std::sort( representative.eventRefs.begin(), representative.eventRefs.end() );
-            representative.eventRefs.erase( std::unique( representative.eventRefs.begin(), representative.eventRefs.end() ),
-                representative.eventRefs.end() );
-            candidate.representativeFrames.push_back( std::move( representative ) );
-        }
-        candidate.candidateId = "candidate:" + Sha256Text( result.policyIdentity + "\n" + familyId );
+        Finalize(work, familyId, result.policyIdentity);
         ordered.emplace_back( familyId, &work );
     }
     std::sort( ordered.begin(), ordered.end(), []( const auto& left, const auto& right ) {
@@ -752,33 +828,8 @@ CandidatePolicyResult EvaluateCandidatePolicy( const CandidatePolicyInput& input
     for( const auto& [familyId, workPointer] : ordered )
     {
         auto& work = *workPointer;
-        auto& candidate = work.candidate;
-        if( candidate.observationUnit == "l0_segment" )
-        {
-            for( const auto& timeline : input.frameTimelines ) if( timeline.frameScope == candidate.frameScope )
-                for( const auto& frame : candidate.representativeFrames )
-                {
-                    const auto segment = std::find_if( timeline.frames.begin(), timeline.frames.end(),
-                        [&]( const auto& s ) { return s.frameIndex == frame.frameIndex; } );
-                    if( segment == timeline.frames.end() || !segment->beginNs || !segment->endNs ) continue;
-                    candidate.representativeIntervals.push_back( {
-                        { "l0_segment_ordinal", std::to_string( frame.frameIndex ) },
-                        { "begin_ns", std::to_string( *segment->beginNs ) }, { "end_ns", std::to_string( *segment->endNs ) },
-                        { "event_refs", segment->eventRefs }, { "reasons", frame.reasons },
-                        { "player_frame_relation", "unavailable_not_inferred" } } );
-                }
-        }
-        const auto priorityAllowed = allowedPriorities.contains( CandidatePriorityName( candidate.priority ) );
-        if( work.mandatory ) candidate.selected = true;
-        else if( !priorityAllowed ) candidate.notSelectedReason = "priority_not_enabled";
-        else if( !work.policyEligible && !work.mandatory ) candidate.notSelectedReason = "outside_top_policy";
-        else if( selectedDiscretionaryByDomain[candidate.domain] < perDomainLimit )
-        {
-            candidate.selected = true;
-            ++selectedDiscretionaryByDomain[candidate.domain];
-        }
-        else candidate.notSelectedReason = "per_domain_limit";
-        result.candidates.push_back( std::move( candidate ) );
+        Select(work, input, selectedDiscretionaryByDomain);
+        result.candidates.push_back( std::move( work.candidate ) );
     }
     std::sort( result.rankedSignatures.begin(), result.rankedSignatures.end(), []( const auto& left, const auto& right ) {
         return std::tie( left.domain, left.frameScope, left.ranking, left.rank, left.signatureId ) <
@@ -797,6 +848,75 @@ std::string SerializeCandidatePolicyResult( const CandidatePolicyResult& result 
 {
     if( !result.valid ) return {};
     return SerializeInternal( result, true );
+}
+
+std::string SerializePolicySignatureContextRecord( const PolicySignatureContext& value )
+{
+    json frames = json::array();
+    for( const auto& frame : value.frames ) frames.push_back( {
+        { "frame_index", std::to_string( frame.frameIndex ) }, { "value_ns", std::to_string( frame.valueNs ) },
+        { "event_refs", frame.eventRefs }, { "structure_key", frame.structureKey }, { "exact", frame.exact },
+        { "begin_ns", frame.beginNs ? json( std::to_string( *frame.beginNs ) ) : json( nullptr ) },
+        { "end_ns", frame.endNs ? json( std::to_string( *frame.endNs ) ) : json( nullptr ) } } );
+    return json {
+        { "context_schema", 1 }, { "domain", value.domain }, { "signature_id", value.signatureId },
+        { "family_id", value.familyId }, { "parent_signature_id", value.parentSignatureId },
+        { "name", value.name }, { "path", value.path }, { "frame_scope", value.frameScope },
+        { "metric_preference", value.metricPreference }, { "module_budget_id", value.moduleBudgetId },
+        { "budget_scope", value.budgetScope }, { "frame_root", value.frameRoot },
+        { "proven_critical_path", value.provenCriticalPath }, { "frames", std::move( frames ) },
+        { "frame_series_complete", value.frameSeriesComplete }, { "thread_or_queue", value.threadOrQueue },
+        { "series_offset", std::to_string( value.seriesOffset ) }, { "series_count", std::to_string( value.seriesCount ) },
+        { "series_sha256", value.seriesSha256 }, { "observation_unit", value.observationUnit },
+        { "source_ordinal", value.sourceOrdinal ? json( std::to_string( *value.sourceOrdinal ) ) : json( nullptr ) }
+    }.dump();
+}
+bool DeserializePolicySignatureContextRecord( const std::string& payload,
+    PolicySignatureContext& context, std::string& error )
+{
+    context = {}; error.clear();
+    try
+    {
+        const auto item = json::parse( payload );
+        if( item.at( "context_schema" ).get<uint32_t>() != 1 ) throw std::runtime_error( "schema_mismatch" );
+        const auto u64 = []( const json& value ) { return std::stoull( value.get<std::string>() ); };
+        PolicySignatureContext value;
+        value.domain = item.at( "domain" ).get<std::string>();
+        value.signatureId = item.at( "signature_id" ).get<std::string>();
+        value.familyId = item.at( "family_id" ).get<std::string>();
+        value.parentSignatureId = item.at( "parent_signature_id" ).get<std::string>();
+        value.name = item.at( "name" ).get<std::string>();
+        value.path = item.at( "path" ).get<std::string>();
+        value.frameScope = item.at( "frame_scope" ).get<std::string>();
+        value.metricPreference = item.at( "metric_preference" ).get<std::string>();
+        value.moduleBudgetId = item.at( "module_budget_id" ).get<std::string>();
+        value.budgetScope = item.at( "budget_scope" ).get<std::string>();
+        value.frameRoot = item.at( "frame_root" ).get<bool>();
+        value.provenCriticalPath = item.at( "proven_critical_path" ).get<bool>();
+        value.frameSeriesComplete = item.at( "frame_series_complete" ).get<bool>();
+        value.threadOrQueue = item.at( "thread_or_queue" ).get<std::string>();
+        value.seriesOffset = u64( item.at( "series_offset" ) );
+        value.seriesCount = u64( item.at( "series_count" ) );
+        value.seriesSha256 = item.at( "series_sha256" ).get<std::string>();
+        value.observationUnit = item.at( "observation_unit" ).get<std::string>();
+        if( item.contains( "source_ordinal" ) && !item.at( "source_ordinal" ).is_null() )
+            value.sourceOrdinal = u64( item.at( "source_ordinal" ) );
+        for( const auto& row : item.at( "frames" ) )
+        {
+            PolicyFrameEvidence frame;
+            frame.frameIndex = u64( row.at( "frame_index" ) );
+            frame.valueNs = std::stoll( row.at( "value_ns" ).get<std::string>() );
+            frame.eventRefs = row.at( "event_refs" ).get<std::vector<std::string>>();
+            frame.structureKey = row.at( "structure_key" ).get<std::string>();
+            frame.exact = row.at( "exact" ).get<bool>();
+            if( !row.at( "begin_ns" ).is_null() ) frame.beginNs = std::stoll( row.at( "begin_ns" ).get<std::string>() );
+            if( !row.at( "end_ns" ).is_null() ) frame.endNs = std::stoll( row.at( "end_ns" ).get<std::string>() );
+            value.frames.push_back( std::move( frame ) );
+        }
+        context = std::move( value ); return true;
+    }
+    catch( const std::exception& exception )
+    { error = "policy_context_record_parse_failed:" + std::string( exception.what() ); return false; }
 }
 
 bool WriteCandidatePolicyManifest( const std::filesystem::path& path,

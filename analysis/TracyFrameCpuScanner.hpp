@@ -2,6 +2,7 @@
 #define __TRACYFRAMECPUSCANNER_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -82,6 +83,11 @@ struct CpuFrameSetDenominator
 
 struct CpuFrameScanResult
 {
+    AnalysisWorkspaceReservation outputWorkspace;
+    explicit CpuFrameScanResult( std::shared_ptr<AnalysisWorkspaceBudget> workspace = {} )
+        : outputWorkspace( std::move( workspace ), 2048 ) {}
+    CpuFrameScanResult( CpuFrameScanResult&& ) = default;
+    CpuFrameScanResult& operator=( CpuFrameScanResult&& ) = delete;
     uint64_t inputZoneCount = 0;
     uint64_t validZoneCount = 0;
     uint64_t invalidZoneCount = 0;
@@ -131,10 +137,19 @@ enum class CpuLogicalSignatureMode : uint8_t
 
 struct CpuFrameScanOptions
 {
+    std::function<bool()> cancelled;
     bool includeExactSignatures = true;
     bool includeLogicalSignatures = true;
     CpuLogicalSignatureMode logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
     std::function<void( const std::string&, uint64_t, int64_t, int64_t )> completeFrameSink;
+    // When supplied, emit each exact/logical definition once before its first
+    // frame run, and do not retain full definitions in the result. The view is
+    // valid only during the callback; false cancels the scan explicitly.
+    std::function<bool( const CpuSignatureDefinition& )> definitionSink;
+    // Shared analysis-owned metadata, signatures, active stacks and returned
+    // result storage. Source pages are charged once returned; constructing a
+    // native source DTO is not protected by an absolute allocator limit.
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
 };
 
 class ExactFrameCpuScanner

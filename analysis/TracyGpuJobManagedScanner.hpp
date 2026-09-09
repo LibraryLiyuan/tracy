@@ -2,6 +2,7 @@
 #define __TRACYGPUJOBMANAGEDSCANNER_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -76,6 +77,10 @@ struct GpuZoneScanFact
     bool exact = true;
     bool physicalTimingExact = true;
     uint64_t l0SegmentOrdinal = 0;
+    // On a depth-zero fact, every recorded node in this L0 has valid timing
+    // and a consistent physical containment relationship. Individual children
+    // can still have useful exact timings when their enclosing L0 is incomplete.
+    bool l0Complete = true;
 };
 
 struct GpuTrackFact
@@ -175,6 +180,13 @@ struct CrossDomainQualityFinding
 
 struct GpuJobManagedScanResult
 {
+    // Declared first so returned allocations are destroyed before their lease.
+    AnalysisWorkspaceReservation outputWorkspace;
+    GpuJobManagedScanResult() = default;
+    GpuJobManagedScanResult( GpuJobManagedScanResult&& ) = default;
+    GpuJobManagedScanResult& operator=( GpuJobManagedScanResult&& ) = delete;
+    GpuJobManagedScanResult( const GpuJobManagedScanResult& ) = delete;
+    GpuJobManagedScanResult& operator=( const GpuJobManagedScanResult& ) = delete;
     size_t maximumBatchObserved = 0;
     size_t maximumGpuDepth = 0;
     uint64_t physicalL0SegmentCount = 0;
@@ -206,6 +218,13 @@ enum class GpuLogicalSignatureMode : uint8_t
 
 struct GpuJobManagedScanOptions
 {
+    std::function<bool()> cancelled;
+    // Shared analysis allocation budget. Native source calls still construct
+    // their current DTO batch before the scanner can inspect its payload size.
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    // Called once per definition, before its first zone fact. When set, full
+    // definitions are not also retained in result.gpuSignatures.
+    std::function<bool( const GpuSignatureDefinition& )> definitionSink;
     bool retainDetails = true;
     bool includeExactGpuSignatures = true;
     bool includeLogicalGpuSignatures = true;

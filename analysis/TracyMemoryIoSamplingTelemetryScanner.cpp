@@ -1,6 +1,7 @@
 #include "TracyMemoryIoSamplingTelemetryScanner.hpp"
 
 #include "TracyQueue.hpp"
+#include "TracyAnalysisDictionary.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -20,6 +21,11 @@ namespace
 
 using json = nlohmann::json;
 constexpr size_t RepresentativeLimit = 8;
+
+void CheckCancelled( const std::function<bool()>& cancelled )
+{
+    if( cancelled && cancelled() ) throw BoundedScanError( "memory_io_sampling_scan_cancelled" );
+}
 
 std::string Lower( std::string value )
 {
@@ -53,6 +59,43 @@ const Capability* FindCapability( const std::vector<Capability>& capabilities, s
     return found == capabilities.end() ? nullptr : &*found;
 }
 
+uint64_t TextBytes( const std::optional<std::string>& text ) { return text ? text->size() : 0; }
+uint64_t RecordBytes( const MemoryEventDto& value )
+{
+    return 2048 + 4 * ( value.ref.size() + value.poolRef.size() + value.address.size() +
+        value.allocationThreadRef.size() + TextBytes( value.freeThreadRef ) +
+        TextBytes( value.allocationCallstackRef ) + TextBytes( value.freeCallstackRef ) +
+        TextBytes( value.allocationZoneRef ) + TextBytes( value.freeZoneRef ) );
+}
+uint64_t RecordBytes( const GpuAllocationAnalysisRecord& value )
+{ return 1024 + 32 * ( value.history.size() + value.resources.size() ); }
+uint64_t RecordBytes( const GpuAnalysisResourceSummary& value )
+{ return 1024 + 4 * value.name.size(); }
+uint64_t RecordBytes( const GpuPassWorkingSet& value )
+{
+    return 1024 + 4 * value.name.size() + 32 * ( value.directResources.size() + value.inclusiveResources.size() ) +
+        4 * sizeof( GpuDetailedEvidenceAnalysisRecord ) * value.detailedEvidence.size();
+}
+uint64_t RecordBytes( const GpuAnalysisRangeStoreEntry& ) { return 1024; }
+uint64_t RecordBytes( const IoRequestDto& value )
+{
+    uint64_t bytes = 1024 + 4 * ( value.ref.size() + value.queueThreadRef.size() );
+    for( const auto& stage : value.stages ) bytes += 256 + 4 * stage.threadRef.size();
+    return bytes;
+}
+uint64_t RecordBytes( const SampleDto& value )
+{ return 1024 + 4 * ( value.ref.size() + value.threadRef.size() + value.kind.size() + TextBytes( value.callstackRef ) ); }
+uint64_t RecordBytes( const ContextSwitchDto& value )
+{
+    return 2048 + 4 * ( value.ref.size() + value.threadRef.size() + value.reasonName.size() +
+        value.stateName.size() + TextBytes( value.relatedThreadRef ) + value.wakeupCpuAvailability.reason.size() );
+}
+uint64_t RecordBytes( const CallstackFrameDto& value )
+{
+    return 1024 + 4 * ( value.ref.size() + value.name.size() + value.file.size() + value.address.size() +
+        value.symbolAddress.size() + TextBytes( value.imageName ) );
+}
+
 GpuCatalogState CatalogState( const Capability* capability )
 {
     if( capability == nullptr ) return GpuCatalogState::Absent;
@@ -64,45 +107,39 @@ GpuCatalogState CatalogState( const Capability* capability )
     return GpuCatalogState::Absent;
 }
 
-template<typename T>
-std::vector<T> ReadAll( const BoundedTraceScanner& scanner, BoundedScanDomain domain,
-    size_t batchSize, size_t& maximumBatch )
-{
-    std::vector<T> result;
-    BoundedScanRequest request;
-    request.domain = domain;
-    request.limit = batchSize;
-    for( ;; )
-    {
-        const auto batch = scanner.Read( request );
-        maximumBatch = std::max( maximumBatch, batch.Count() );
-        const auto& values = std::get<std::vector<T>>( batch.records );
-        result.insert( result.end(), values.begin(), values.end() );
-        if( batch.cursor.complete ) break;
-        request.cursor = batch.cursor;
-    }
-    return result;
-}
-
 template<typename T, typename Visitor>
 void VisitAll( const BoundedTraceScanner& scanner, BoundedScanDomain domain,
-    size_t batchSize, size_t& maximumBatch, Visitor&& visitor )
+    size_t batchSize, size_t& maximumBatch, const std::function<bool()>& cancelled,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace, Visitor&& visitor )
 {
     BoundedScanRequest request;
     request.domain = domain;
     request.limit = batchSize;
     for( ;; )
     {
+        CheckCancelled( cancelled );
+        // Source DTO sizes are only known after NativeBoundedScan returns.
+        // Account for the complete live page before analysis copies/retention;
+        // source-side allocation is separately covered by the process sampler,
+        // not an absolute allocator cap.
+        AnalysisWorkspaceReservation pageWorkspace( workspace );
         const auto batch = scanner.Read( request );
+        CheckCancelled( cancelled );
         maximumBatch = std::max( maximumBatch, batch.Count() );
         const auto& values = std::get<std::vector<T>>( batch.records );
-        for( const auto& value : values ) visitor( value );
+        for( const auto& value : values ) { CheckCancelled( cancelled ); pageWorkspace.Add( RecordBytes( value ) ); }
+        for( const auto& value : values )
+        {
+            CheckCancelled( cancelled );
+            visitor( value );
+        }
+        CheckCancelled( cancelled );
         if( batch.cursor.complete ) break;
         request.cursor = batch.cursor;
     }
 }
 
-void AddRepresentative( MemoryIoSamplingQualityFinding& finding, const std::string& ref )
+void AddRepresentative( MemoryIoSamplingQualityFinding& finding, std::string_view ref )
 {
     if( finding.representativeRefs.size() < RepresentativeLimit )
         finding.representativeRefs.emplace_back( ref );
@@ -150,10 +187,11 @@ void AddEvidenceClass( std::vector<TelemetryEvidenceClass>& values, TelemetryEvi
     if( std::find( values.begin(), values.end(), value ) == values.end() ) values.emplace_back( value );
 }
 
-IoLifecycleState IoState( const IoRequestDto& request )
+IoLifecycleState IoState( const IoRequestDto& request, const std::function<bool()>& cancelled )
 {
     const auto hasStage = [&]( JnIoStage stage ) {
         return std::any_of( request.stages.begin(), request.stages.end(), [&]( const auto& value ) {
+            CheckCancelled( cancelled );
             return value.stage == uint8_t( stage );
         } );
     };
@@ -183,17 +221,53 @@ MemoryIoSamplingTelemetryScanner::MemoryIoSamplingTelemetryScanner( const TraceS
         throw BoundedScanError( "memory_io_sampling_scan_threshold_invalid" );
 }
 
-MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() const
+MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan( const std::function<bool()>& cancelled ) const
 {
+    return ScanImpl( cancelled, true, {} );
+}
+
+MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanSummary(
+    const std::function<bool()>& cancelled, std::shared_ptr<AnalysisWorkspaceBudget> workspace ) const
+{
+    return ScanImpl( cancelled, false, std::move( workspace ) );
+}
+
+MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
+    const std::function<bool()>& cancelled, bool retainDetails, std::shared_ptr<AnalysisWorkspaceBudget> workspace ) const
+{
+    const auto checkCancelled = [&] { CheckCancelled( cancelled ); };
+    checkCancelled();
     MemoryIoSamplingTelemetryScanResult result;
+    result.outputWorkspace = AnalysisWorkspaceReservation( workspace, 8192 );
+    AnalysisWorkspaceReservation metadataWorkspace( workspace );
     BoundedTraceScanner scanner( m_source );
     const auto info = m_source.GetTraceInfo();
+    checkCancelled();
+    metadataWorkspace.Add( 2048 + 4 * ( info.fingerprint.size() + info.captureName.size() +
+        info.captureProgram.size() + info.hostInfo.size() + info.cpuManufacturer.size() +
+        info.cpuArchitecture.size() + info.legacyQueueDelayAvailability.reason.size() ) );
+    for( const auto& text : info.appInfo ) metadataWorkspace.Add( 256 + 4 * text.size() );
     const auto capabilities = m_source.GetCapabilities();
+    checkCancelled();
+    for( const auto& capability : capabilities )
+    {
+        metadataWorkspace.Add( 1024 + 8 * ( capability.domain.size() + capability.reason.size() ) );
+        for( const auto& method : capability.methods ) metadataWorkspace.Add( 128 + 4 * method.size() );
+    }
     const auto pools = m_source.GetMemoryPools();
+    checkCancelled();
+    for( const auto& pool : pools ) metadataWorkspace.Add( 2048 + 8 * ( pool.ref.size() + pool.name.size() + pool.storedName.size() ) );
     const auto threads = m_source.GetThreads();
+    checkCancelled();
 
     std::unordered_map<std::string, std::string> roleByThread;
-    for( const auto& thread : threads ) roleByThread.emplace( thread.ref, ThreadRole( thread.name ) );
+    for( const auto& thread : threads )
+    {
+        checkCancelled();
+        metadataWorkspace.Add( 2048 + 8 * ( thread.ref.size() + thread.name.size() + TextBytes( thread.externalProcessName ) +
+            TextBytes( thread.externalThreadName ) + TextBytes( thread.localName ) + thread.groupHintAvailability.reason.size() ) );
+        roleByThread.emplace( thread.ref, ThreadRole( thread.name ) );
+    }
     const auto role = [&]( const std::string& ref ) {
         const auto found = roleByThread.find( ref );
         return found == roleByThread.end() ? std::string( "Unknown" ) : found->second;
@@ -204,37 +278,63 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     std::unordered_map<std::string, size_t> cpuPoolIndex;
     for( const auto& pool : pools )
     {
+        checkCancelled();
         if( pool.gpuD3D12 ) continue;
+        result.outputWorkspace.Add( 2048 + 4 * ( pool.ref.size() + pool.name.size() ) );
         cpuPoolIndex.emplace( pool.ref, result.cpuMemoryPools.size() );
         CpuMemoryPoolFact fact;
         fact.poolRef = pool.ref; fact.name = pool.name; fact.hasCapacity = true;
         fact.classifications.emplace_back( CpuMemoryClassification::Capacity );
         result.cpuMemoryPools.emplace_back( std::move( fact ) );
     }
-    const auto memoryEvents = ReadAll<MemoryEventDto>( scanner, BoundedScanDomain::Memory,
-        m_batchSize, result.maximumBatchObserved );
-    result.inputMemoryEventCount = memoryEvents.size();
-    std::vector<std::vector<const MemoryEventDto*>> memoryByPool( result.cpuMemoryPools.size() );
-    for( const auto& event : memoryEvents )
     {
+    AnalysisWorkspaceReservation memoryWorkspace( workspace );
+    AnalysisDictionary memoryDictionary( workspace );
+    struct MemoryLife
+    {
+        AnalysisDictionary::StringId ref, address;
+        uint64_t size;
+        int64_t allocationNs;
+        std::optional<int64_t> freeNs;
+    };
+    std::vector<std::vector<MemoryLife>> memoryByPool( result.cpuMemoryPools.size() );
+    VisitAll<MemoryEventDto>( scanner, BoundedScanDomain::Memory,
+        m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const MemoryEventDto& event ) {
+        checkCancelled();
+        result.inputMemoryEventCount++;
         const auto found = cpuPoolIndex.find( event.poolRef );
-        if( found != cpuPoolIndex.end() ) memoryByPool[found->second].emplace_back( &event );
-    }
+        if( found != cpuPoolIndex.end() )
+        {
+            // Keep only exact lifetime state; callstacks, zone refs and thread
+            // payloads have no role in the capacity/quality formulas below.
+            memoryWorkspace.Add( 256 ); // vector capacity and old/new growth overlap
+            const auto ref = memoryDictionary.Intern( event.ref );
+            const auto address = memoryDictionary.Intern( event.address );
+            memoryByPool[found->second].push_back( { ref, address, event.size, event.allocationNs, event.freeNs } );
+        }
+    } );
     for( size_t poolIndex = 0; poolIndex < result.cpuMemoryPools.size(); ++poolIndex )
     {
+        checkCancelled();
         auto& fact = result.cpuMemoryPools[poolIndex];
         auto& events = memoryByPool[poolIndex];
-        std::sort( events.begin(), events.end(), []( const auto* lhs, const auto* rhs ) {
-            return lhs->allocationNs != rhs->allocationNs ? lhs->allocationNs < rhs->allocationNs : lhs->ref < rhs->ref;
+        std::sort( events.begin(), events.end(), [&]( const auto& lhs, const auto& rhs ) {
+            checkCancelled();
+            return lhs.allocationNs != rhs.allocationNs ? lhs.allocationNs < rhs.allocationNs :
+                memoryDictionary.Text( lhs.ref ) < memoryDictionary.Text( rhs.ref );
         } );
         struct AddressLife { std::optional<int64_t> freeNs; };
-        std::unordered_map<std::string, AddressLife> addressLife;
-        std::unordered_set<std::string> ambiguousAddresses;
-        struct SweepPoint { int64_t time; uint64_t size; bool allocation; std::string ref; };
+        AnalysisWorkspaceReservation poolWorkspace( workspace );
+        std::unordered_map<AnalysisDictionary::StringId, AddressLife> addressLife;
+        std::unordered_set<AnalysisDictionary::StringId> ambiguousAddresses;
+        struct SweepPoint { int64_t time; uint64_t size; bool allocation; AnalysisDictionary::StringId ref; };
         std::vector<SweepPoint> sweep;
+        poolWorkspace.Add( 1024 * events.size() );
         sweep.reserve( events.size() * 2 );
-        for( const auto* event : events )
+        for( const auto& value : events )
         {
+            checkCancelled();
+            const auto* event = &value;
             fact.eventCount++;
             fact.totalAllocatedBytes = SaturatingAdd( fact.totalAllocatedBytes, event->size );
             if( event->allocationNs <= info.firstTimeNs ) fact.openBoundaryCount++;
@@ -273,8 +373,10 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
         // Address ambiguity may only become visible at a later allocation.
         // Classify leak candidates after the complete pool lifetime pass so the
         // answer is independent from input/event order.
-        for( const auto* event : events )
+        for( const auto& value : events )
         {
+            checkCancelled();
+            const auto* event = &value;
             if( event->freeNs ) continue;
             const bool observedCreate = event->allocationNs > info.firstTimeNs;
             const bool oldEnough = info.lastTimeNs >= event->allocationNs &&
@@ -282,14 +384,16 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
             if( observedCreate && oldEnough && ambiguousAddresses.find( event->address ) == ambiguousAddresses.end() )
                 fact.leakCandidateCount++;
         }
-        std::sort( sweep.begin(), sweep.end(), []( const auto& lhs, const auto& rhs ) {
+        std::sort( sweep.begin(), sweep.end(), [&]( const auto& lhs, const auto& rhs ) {
+            checkCancelled();
             if( lhs.time != rhs.time ) return lhs.time < rhs.time;
             if( lhs.allocation != rhs.allocation ) return !lhs.allocation;
-            return lhs.ref < rhs.ref;
+            return memoryDictionary.Text( lhs.ref ) < memoryDictionary.Text( rhs.ref );
         } );
         uint64_t live = 0;
         for( const auto& point : sweep )
         {
+            checkCancelled();
             if( point.allocation ) live = SaturatingAdd( live, point.size );
             else if( live >= point.size ) live -= point.size;
             else
@@ -313,44 +417,59 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
         {
             fact.classifications.emplace_back( CpuMemoryClassification::AccountingGap );
             result.qualityComplete = false;
+            result.outputWorkspace.Add( 2048 );
             MemoryIoSamplingQualityFinding finding { "cpu_memory_accounting_gap",
                 "Overlapping address lifetimes or invalid allocation/free ordering prevent exact accounting.",
                 fact.accountingGapCount, {} };
-            for( const auto* event : events ) if( ambiguousAddresses.find( event->address ) != ambiguousAddresses.end() )
-                AddRepresentative( finding, event->ref );
+            for( const auto& value : events )
+            {
+                checkCancelled();
+                const auto* event = &value;
+                if( ambiguousAddresses.find( event->address ) != ambiguousAddresses.end() && finding.representativeRefs.size() < RepresentativeLimit )
+                {
+                    const auto ref = memoryDictionary.Text( event->ref );
+                    result.outputWorkspace.Add( 128 + 4 * ref.size() );
+                    AddRepresentative( finding, ref );
+                }
+            }
             result.qualityFindings.emplace_back( std::move( finding ) );
         }
+    }
     }
 
     // GPU totals use unique allocation identities. Logical capacity, Pass
     // working sets and Range evidence stay in separate fields by construction.
     const auto* catalogCapability = FindCapability( capabilities, "gpu.catalog" );
     result.gpuMemory.catalogState = CatalogState( catalogCapability );
+    result.outputWorkspace.Add( 1024 + ( catalogCapability ? 4 * catalogCapability->reason.size() : 0 ) );
     result.gpuMemory.catalogReason = catalogCapability ? catalogCapability->reason : "gpu_catalog_capability_absent";
     for( const auto& pool : pools )
     {
+        checkCancelled();
         const auto lower = Lower( pool.name );
         if( pool.gpuD3D12 && Contains( lower, "dxgi" ) && Contains( lower, "local" ) )
             result.gpuMemory.dxgiUsageBytes = std::max( result.gpuMemory.dxgiUsageBytes.value_or( 0 ), pool.persistedUsageBytes );
     }
     if( dynamic_cast<const GpuCatalogBoundedScanSource*>( &m_source ) )
     {
-        const auto allocations = ReadAll<GpuAllocationAnalysisRecord>( scanner, BoundedScanDomain::GpuAllocation,
-            m_batchSize, result.maximumBatchObserved );
-        result.inputGpuAllocationCount = allocations.size();
+        AnalysisWorkspaceReservation allocationWorkspace( workspace );
         std::unordered_set<uint64_t> allocationIds;
         struct PhysicalPoint { uint64_t time; uint64_t bytes; bool create; };
         std::vector<PhysicalPoint> physicalPoints;
-        for( const auto& allocation : allocations )
-        {
+        VisitAll<GpuAllocationAnalysisRecord>( scanner, BoundedScanDomain::GpuAllocation,
+            m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const auto& allocation ) {
+            checkCancelled();
+            result.inputGpuAllocationCount++;
             if( allocation.invalid || allocation.allocationId == 0 ||
                 ( allocation.destroyTime != 0 && allocation.destroyTime < allocation.createTime ) )
             {
                 result.gpuMemory.invalidAllocationCount++;
                 result.gpuMemory.physicalPeakExact = false;
-                continue;
+                return;
             }
-            if( !allocationIds.emplace( allocation.allocationId ).second ) continue;
+            if( allocationIds.contains( allocation.allocationId ) ) return;
+            allocationWorkspace.Add( 512 ); // identity, buckets and two sweep points including growth peak
+            allocationIds.emplace( allocation.allocationId );
             result.gpuMemory.allocationCount++;
             // Child placed ranges are already accounted for by their heap.
             if( allocation.parentAllocationId == 0 )
@@ -369,14 +488,16 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
                     result.gpuMemory.residentBytes = SaturatingAdd( result.gpuMemory.residentBytes, allocation.residentBytes );
             }
             if( allocation.resources.size() > 1 ) result.gpuMemory.sharedAllocationCount++;
-        }
-        std::sort( physicalPoints.begin(), physicalPoints.end(), []( const auto& a, const auto& b ) {
+        } );
+        std::sort( physicalPoints.begin(), physicalPoints.end(), [&]( const auto& a, const auto& b ) {
+            checkCancelled();
             if( a.time != b.time ) return a.time < b.time;
             return a.create < b.create; // Half-open lifetimes: free before create at equal time.
         } );
         uint64_t livePhysicalBytes = 0;
         for( const auto& point : physicalPoints )
         {
+            checkCancelled();
             if( point.create )
             {
                 if( UINT64_MAX - livePhysicalBytes < point.bytes ) result.gpuMemory.physicalPeakExact = false;
@@ -395,42 +516,42 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
 
         if( result.gpuMemory.catalogState == GpuCatalogState::Complete )
         {
-            const auto resources = ReadAll<GpuAnalysisResourceSummary>( scanner, BoundedScanDomain::GpuResource,
-                m_batchSize, result.maximumBatchObserved );
-            result.inputGpuResourceCount = resources.size();
+            AnalysisWorkspaceReservation resourceWorkspace( workspace );
             std::unordered_set<uint64_t> resourceIds;
-            for( const auto& resource : resources )
-            {
+            VisitAll<GpuAnalysisResourceSummary>( scanner, BoundedScanDomain::GpuResource,
+                m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const auto& resource ) {
+                checkCancelled();
+                result.inputGpuResourceCount++;
                 if( resource.resourceId == 0 )
                 {
                     result.gpuMemory.invalidResourceCount++;
-                    continue;
+                    return;
                 }
-                if( !resourceIds.emplace( resource.resourceId ).second ) continue;
+                if( resourceIds.contains( resource.resourceId ) ) return;
+                resourceWorkspace.Add( 128 );
+                resourceIds.emplace( resource.resourceId );
                 result.gpuMemory.resourceCount++;
                 result.gpuMemory.logicalCapacityBytes = SaturatingAdd( result.gpuMemory.logicalCapacityBytes, resource.capacityBytes );
                 if( resource.hasAliasGroup ) result.gpuMemory.aliasResourceCount++;
-            }
-            const auto passes = ReadAll<GpuPassWorkingSet>( scanner, BoundedScanDomain::GpuPass,
-                m_batchSize, result.maximumBatchObserved );
-            result.inputGpuPassCount = passes.size();
-            for( const auto& pass : passes )
-            {
+            } );
+            VisitAll<GpuPassWorkingSet>( scanner, BoundedScanDomain::GpuPass,
+                m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const auto& pass ) {
+                checkCancelled();
+                result.inputGpuPassCount++;
                 result.gpuMemory.passCount++;
                 result.gpuMemory.maximumDirectWorkingSetBytes = std::max(
                     result.gpuMemory.maximumDirectWorkingSetBytes, pass.directPhysicalBytes );
                 result.gpuMemory.maximumInclusiveWorkingSetBytes = std::max(
                     result.gpuMemory.maximumInclusiveWorkingSetBytes, pass.inclusivePhysicalBytes );
-            }
-            const auto ranges = ReadAll<GpuAnalysisRangeStoreEntry>( scanner, BoundedScanDomain::GpuRange,
-                m_batchSize, result.maximumBatchObserved );
-            result.inputGpuRangeCount = ranges.size();
-            for( const auto& range : ranges )
-            {
+            } );
+            VisitAll<GpuAnalysisRangeStoreEntry>( scanner, BoundedScanDomain::GpuRange,
+                m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const auto& range ) {
+                checkCancelled();
+                result.inputGpuRangeCount++;
                 result.gpuMemory.rangeCount++;
                 result.gpuMemory.rangeEvidenceBytes = SaturatingAdd(
                     result.gpuMemory.rangeEvidenceBytes, range.record.lengthBytes );
-            }
+            } );
             result.gpuMemory.resourceFactsAvailable = true;
         }
     }
@@ -438,14 +559,17 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     // Without a common timestamp their difference is not untracked memory.
     // Keep the optional unavailable instead of manufacturing an exact value.
 
-    const auto io = ReadAll<IoRequestDto>( scanner, BoundedScanDomain::IoRequest,
-        m_batchSize, result.maximumBatchObserved );
-    result.inputIoRequestCount = io.size();
-    result.ioRequests.reserve( io.size() );
-    for( const auto& request : io )
-    {
+    VisitAll<IoRequestDto>( scanner, BoundedScanDomain::IoRequest,
+        m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const auto& request ) {
+        checkCancelled();
+        result.inputIoRequestCount++;
         IoRequestFact fact;
-        fact.ref = request.ref; fact.requestId = request.requestId; fact.state = IoState( request );
+        if( retainDetails )
+        {
+            result.outputWorkspace.Add( 1024 + 4 * request.ref.size() );
+            fact.ref = request.ref;
+        }
+        fact.requestId = request.requestId; fact.state = IoState( request, cancelled );
         fact.requestedBytes = request.requestedBytes; fact.transferredBytes = request.transferredBytes;
         fact.stageCount = uint32_t( request.stages.size() );
         if( request.startNs && *request.startNs >= request.queueNs ) fact.queueLatencyNs = *request.startNs - request.queueNs;
@@ -465,15 +589,17 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
         }
         result.ioSummary.requestedBytes = SaturatingAdd( result.ioSummary.requestedBytes, request.requestedBytes );
         result.ioSummary.transferredBytes = SaturatingAdd( result.ioSummary.transferredBytes, request.transferredBytes );
-        result.ioRequests.emplace_back( std::move( fact ) );
-    }
+        if( retainDetails ) result.ioRequests.emplace_back( std::move( fact ) );
+    } );
 
     const auto* sampleCapability = FindCapability( capabilities, "sample" );
     result.sampling.available = sampleCapability && sampleCapability->present && sampleCapability->queryable;
+    result.outputWorkspace.Add( 1024 + ( sampleCapability ? 4 * sampleCapability->reason.size() : 0 ) );
     if( !result.sampling.available ) result.sampling.unavailableReason = sampleCapability ?
         sampleCapability->reason : "sampling_capability_absent";
     if( result.sampling.available )
     {
+        AnalysisWorkspaceReservation samplingWorkspace( workspace );
         struct Key
         {
             std::string role;
@@ -482,18 +608,26 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
             bool operator<( const Key& other ) const
             { return std::tie( role, kind, callstack ) < std::tie( other.role, other.kind, other.callstack ); }
         };
-        std::set<uint32_t> callstacks;
+        std::map<uint32_t, uint64_t> callstacks;
         std::map<Key, SamplingLeafFact> aggregate;
         // Sample captures can contain tens or hundreds of millions of events.
         // Aggregate each bounded page immediately; retaining every SampleDto
         // made Query memory grow linearly with capture duration even though the
         // final result only needs one row per role/kind/callstack key.
         VisitAll<SampleDto>( scanner, BoundedScanDomain::Sample, m_batchSize,
-            result.maximumBatchObserved, [&]( const SampleDto& sample ) {
+            result.maximumBatchObserved, cancelled, workspace, [&]( const SampleDto& sample ) {
                 result.inputSampleCount++;
                 result.sampling.totalSamples++;
-                if( sample.callstack != 0 ) callstacks.emplace( sample.callstack );
+                if( sample.callstack == 0 ) result.sampling.unresolvedSamples++;
+                else
+                {
+                    if( !callstacks.contains( sample.callstack ) ) samplingWorkspace.Add( 160 );
+                    callstacks[sample.callstack]++;
+                }
+                if( !retainDetails ) return;
+                AnalysisWorkspaceReservation currentKey( workspace, 1024 + 8 * ( sample.threadRef.size() + sample.kind.size() ) );
                 const Key key { role( sample.threadRef ), sample.kind, sample.callstack };
+                if( !aggregate.contains( key ) ) samplingWorkspace.Add( 2048 + 8 * ( key.role.size() + key.kind.size() ) );
                 auto& fact = aggregate[key];
                 fact.threadRole = key.role;
                 fact.sampleKind = key.kind;
@@ -501,24 +635,42 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
                 fact.sampleCount++;
             } );
         std::unordered_map<uint32_t, CallstackFrameDto> leaves;
-        std::vector<uint32_t> ids( callstacks.begin(), callstacks.end() );
-        for( size_t offset = 0; offset < ids.size(); offset += m_batchSize )
+        for( auto next = callstacks.begin(); next != callstacks.end(); )
         {
-            const auto end = std::min( ids.size(), offset + m_batchSize );
-            std::vector<uint32_t> page( ids.begin() + ptrdiff_t( offset ), ids.begin() + ptrdiff_t( end ) );
+            checkCancelled();
+            AnalysisWorkspaceReservation pageWorkspace( workspace, 1024 + 32 * std::min( m_batchSize, callstacks.size() ) );
+            std::vector<uint32_t> page;
+            page.reserve( std::min( m_batchSize, callstacks.size() ) );
+            for( ; next != callstacks.end() && page.size() < m_batchSize; ++next ) page.push_back( next->first );
             const auto frames = m_source.ResolveCallstacks( page, 1 );
+            checkCancelled();
+            for( const auto& frame : frames ) pageWorkspace.Add( RecordBytes( frame ) );
+            // Resolution may legitimately return no rows. Its working step
+            // still needs a fresh post-read check under concurrent pressure.
+            pageWorkspace.Add( 1024 );
+            std::unordered_set<uint32_t> resolved;
             for( const auto& frame : frames )
             {
+                checkCancelled();
+                resolved.emplace( frame.callstack );
+                if( !retainDetails ) continue;
                 const auto found = leaves.find( frame.callstack );
-                if( found == leaves.end() || frame.depth < found->second.depth ) leaves[frame.callstack] = frame;
+                if( found == leaves.end() || frame.depth < found->second.depth )
+                {
+                    samplingWorkspace.Add( RecordBytes( frame ) );
+                    leaves[frame.callstack] = frame;
+                }
             }
+            for( auto id : page ) if( !resolved.contains( id ) ) result.sampling.unresolvedSamples =
+                SaturatingAdd( result.sampling.unresolvedSamples, callstacks.at( id ) );
         }
         for( auto& [key, fact] : aggregate )
         {
+            checkCancelled();
             const auto leaf = leaves.find( key.callstack );
             fact.resolved = key.callstack != 0 && leaf != leaves.end();
-            if( !fact.resolved ) result.sampling.unresolvedSamples = SaturatingAdd(
-                result.sampling.unresolvedSamples, fact.sampleCount );
+            result.outputWorkspace.Add( 2048 + 8 * ( fact.threadRole.size() + fact.sampleKind.size() ) +
+                ( fact.resolved ? 8 * ( leaf->second.name.size() + leaf->second.file.size() ) : 0 ) );
             if( fact.resolved )
             {
                 fact.leafFunction = leaf->second.name; fact.leafFile = leaf->second.file;
@@ -531,15 +683,20 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
 
     const auto* contextCapability = FindCapability( capabilities, "context_switch" );
     result.scheduling.available = contextCapability && contextCapability->present && contextCapability->queryable;
+    result.outputWorkspace.Add( 1024 + ( contextCapability ? 4 * contextCapability->reason.size() : 0 ) );
     if( !result.scheduling.available ) result.scheduling.unavailableReason = contextCapability ?
         contextCapability->reason : "context_switch_capability_absent";
     if( result.scheduling.available )
     {
+        AnalysisWorkspaceReservation schedulingWorkspace( workspace );
         std::map<std::string, SchedulingRoleFact> aggregate;
         VisitAll<ContextSwitchDto>( scanner, BoundedScanDomain::ContextSwitch,
-            m_batchSize, result.maximumBatchObserved, [&]( const ContextSwitchDto& value ) {
+            m_batchSize, result.maximumBatchObserved, cancelled, workspace, [&]( const ContextSwitchDto& value ) {
                 result.inputContextSwitchCount++;
+                if( !retainDetails ) return;
+                AnalysisWorkspaceReservation currentRole( workspace, 1024 + 8 * value.threadRef.size() );
                 const auto threadRole = role( value.threadRef );
+                if( !aggregate.contains( threadRole ) ) schedulingWorkspace.Add( 1024 + 8 * threadRole.size() );
                 auto& fact = aggregate[threadRole];
                 fact.threadRole = threadRole; fact.intervalCount++;
                 if( value.complete && value.endNs && *value.endNs >= value.startNs )
@@ -554,17 +711,27 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
                 if( Contains( state, "ready" ) || Contains( reasonName, "preempt" ) ||
                     Contains( reasonName, "quantum" ) ) fact.preemptCount++;
             } );
-        for( auto& [key, fact] : aggregate ) result.scheduling.roles.emplace_back( std::move( fact ) );
+        for( auto& [key, fact] : aggregate )
+        {
+            checkCancelled();
+            result.outputWorkspace.Add( 1024 + 4 * key.size() );
+            result.scheduling.roles.emplace_back( std::move( fact ) );
+        }
     }
 
     // Producer self-cost is the only cost measurable from one trace. Overall
     // capture overhead is a counterfactual and therefore always requires A/B.
+    AnalysisWorkspaceReservation telemetryWorkspace( workspace );
     std::map<std::pair<uint64_t, std::string>, std::vector<ProducerSnapshot>> producerSnapshots;
     bool invalidProducerRecord = false;
     for( const auto& record : info.appInfo )
     {
+        checkCancelled();
         if( !record.starts_with( "JNQ1|" ) ) continue;
         result.inputTelemetryRecordCount++;
+        // Outside the parse catch: budget rejection must abort, never become
+        // a quality warning that permits publication of an incomplete scan.
+        telemetryWorkspace.Add( 8192 + 64 * record.size() );
         try
         {
             const auto document = json::parse( record.begin() + 5, record.end() );
@@ -592,9 +759,14 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     };
     for( auto& [identity, snapshots] : producerSnapshots )
     {
-        std::sort( snapshots.begin(), snapshots.end(), []( const auto& lhs, const auto& rhs ) {
+        checkCancelled();
+        std::sort( snapshots.begin(), snapshots.end(), [&]( const auto& lhs, const auto& rhs ) {
+            checkCancelled();
             return lhs.sequence < rhs.sequence;
         } );
+        result.outputWorkspace.Add( 4096 + 8 * identity.second.size() +
+            ( snapshots.back().producer.contains( "source_mode" ) && snapshots.back().producer["source_mode"].is_string() ?
+                8 * snapshots.back().producer["source_mode"].get_ref<const std::string&>().size() : 0 ) );
         TelemetryProducerFact fact;
         fact.producerId = identity.first; fact.key = identity.second;
         fact.sourceMode = snapshots.back().producer.value( "source_mode", std::string() );
@@ -639,12 +811,16 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     if( !result.telemetry.producerQualityComplete && result.telemetry.producerQualityPresent )
     {
         result.qualityComplete = false;
+        result.outputWorkspace.Add( 2048 );
         MemoryIoSamplingQualityFinding finding;
         finding.code = "telemetry_producer_quality_incomplete";
         finding.message = "Producer counter windows contain loss, overflow, degradation, truncation, or invalid records.";
-        for( const auto& producer : result.telemetry.producers ) if( !producer.complete )
+        for( const auto& producer : result.telemetry.producers )
         {
+            checkCancelled();
+            if( producer.complete ) continue;
             finding.count++;
+            if( finding.representativeRefs.size() < RepresentativeLimit ) result.outputWorkspace.Add( 128 + 4 * producer.key.size() );
             AddRepresentative( finding, producer.key );
         }
         if( invalidProducerRecord ) finding.count++;
@@ -653,7 +829,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     if( result.gpuMemory.catalogState == GpuCatalogState::Absent )
     {
         const auto producer = std::find_if( result.telemetry.producers.begin(), result.telemetry.producers.end(),
-            []( const auto& value ) { return value.key == "gpu.catalog"; } );
+            [&]( const auto& value ) { checkCancelled(); return value.key == "gpu.catalog"; } );
         if( producer != result.telemetry.producers.end() && producer->state != "effective" )
         {
             result.gpuMemory.catalogState = GpuCatalogState::Disabled;
@@ -664,6 +840,7 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::Scan() con
     if( result.telemetry.frameImageCount != 0 )
         AddEvidenceClass( result.telemetry.evidenceClasses, TelemetryEvidenceClass::EstimatedAttribution );
     AddEvidenceClass( result.telemetry.evidenceClasses, TelemetryEvidenceClass::RequiresABValidation );
+    checkCancelled();
     return result;
 }
 

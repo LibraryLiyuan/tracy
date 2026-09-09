@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include "TracyAnalysisDiskBudget.hpp"
 
 namespace tracy::analysis
 {
@@ -23,12 +24,12 @@ bool SortAnalysisUInt64Pairs(
     const std::string& prefix,
     uint64_t expectedCount,
     uint64_t maximumBufferedPairs,
-    std::string& error );
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
 
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,
     const std::string& prefix,
-    std::string& error );
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
 
 }
 

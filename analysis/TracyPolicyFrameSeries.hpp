@@ -3,6 +3,7 @@
 
 #include "TracyCandidatePolicy.hpp"
 #include "TracyHash.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 #include <array>
 #include <bit>
 #include <fstream>
@@ -19,8 +20,11 @@ static_assert( sizeof( PolicySeriesRecord ) == 56 );
 static_assert( std::endian::native == std::endian::little );
 
 inline void WritePolicyFrameSeries( std::ostream& output, PolicySignatureContext& context,
-    const std::vector<NeutralMergedFrameValues>& frames )
+    const std::vector<NeutralMergedFrameValues>& frames,
+    const std::shared_ptr<AnalysisDiskBudget>& disk={} )
 {
+    if(frames.size()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("analysis_scan_cache_disk_budget");
+    AnalysisDiskGrow(disk,uint64_t(frames.size())*sizeof(PolicySeriesRecord));
     const auto offset = output.tellp();
     if( offset < 0 ) throw std::runtime_error( "frame_series_position_failed" );
     context.seriesOffset = uint64_t( offset );

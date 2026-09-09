@@ -4,6 +4,9 @@
 #include "TracyCandidatePolicy.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyTraceSource.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
+#include "TracyAnalysisProcessMemory.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 
 #include <filesystem>
 #include <functional>
@@ -22,6 +25,35 @@ namespace tracy::query
 
 struct AnalysisScanProducts
 {
+    AnalysisScanProducts() = default;
+    AnalysisScanProducts(const AnalysisScanProducts&) = delete;
+    AnalysisScanProducts& operator=(const AnalysisScanProducts&) = delete;
+    AnalysisScanProducts(AnalysisScanProducts&&) noexcept = default;
+    AnalysisScanProducts& operator=(AnalysisScanProducts&& other) noexcept
+    {
+        if(this!=&other)
+        {
+            AnalysisScanProducts replacement(std::move(other));
+            using std::swap;
+            swap(metadataWorkspace,replacement.metadataWorkspace);
+            swap(contextWorkspace,replacement.contextWorkspace);
+            swap(neutralCachePath,replacement.neutralCachePath);
+            swap(neutralCacheIdentity,replacement.neutralCacheIdentity);
+            swap(aggregate,replacement.aggregate);
+            swap(signatureContexts,replacement.signatureContexts);
+            swap(capacityFacts,replacement.capacityFacts);
+            swap(frameTimelines,replacement.frameTimelines);
+            swap(frameSeriesPath,replacement.frameSeriesPath);
+        }
+        return *this;
+    }
+    // Declared before the owned vectors: released only after their destruction.
+    analysis::AnalysisWorkspaceReservation metadataWorkspace;
+    analysis::AnalysisWorkspaceReservation contextWorkspace;
+    // The default executor returns a completed, immutable cache and small
+    // audit/metadata only. Vectors remain for explicitly injected executors.
+    std::filesystem::path neutralCachePath;
+    std::string neutralCacheIdentity;
     analysis::NeutralStatisticsResult aggregate;
     std::vector<analysis::PolicySignatureContext> signatureContexts;
     std::vector<analysis::PolicyCapacityFact> capacityFacts;
@@ -40,6 +72,9 @@ struct AnalysisScanExecutionRequest
     analysis::NeutralAggregateIdentity aggregateIdentity;
     std::filesystem::path aggregateRoot;
     std::filesystem::path temporaryRoot;
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace;
+    std::function<void()> checkDiskSpace;
+    std::shared_ptr<analysis::AnalysisDiskBudget> disk;
 };
 
 using AnalysisScanProgressCallback = std::function<void(
@@ -79,14 +114,20 @@ struct AnalysisScanSnapshot
     uint64_t progressTotal = 0;
     std::string stage;
     std::string error;
+    analysis::AnalysisProcessMemorySnapshot processMemory;
 };
+
+nlohmann::json AnalysisProcessMemorySnapshotJson(const analysis::AnalysisProcessMemorySnapshot& value);
 
 class AnalysisScanManager
 {
 public:
     AnalysisScanManager( std::filesystem::path root, std::filesystem::path cacheRoot,
         std::string queryExecutableSha256, AnalysisScanSourceResolver resolver,
-        AnalysisScanExecutor executor );
+        AnalysisScanExecutor executor,
+        std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace = {},
+        analysis::AnalysisProcessMemoryOptions processMemory = {},
+        std::function<uint64_t(const std::filesystem::path&)> diskAvailable = {} );
     ~AnalysisScanManager();
 
     AnalysisScanManager( const AnalysisScanManager& ) = delete;
@@ -115,19 +156,24 @@ private:
 
     std::shared_ptr<Entry> FindOrLoad( const std::string& scanId ) const;
     void StartWorker( const std::shared_ptr<Entry>& entry );
-    void Run( const std::shared_ptr<Entry>& entry, std::stop_token stopToken );
+    void Run( const std::shared_ptr<Entry>& entry, std::stop_token stopToken,
+        analysis::AnalysisProcessMemoryGuard& memory );
     void Update( const std::shared_ptr<Entry>& entry, analysis::ScanState state,
         uint64_t completed, uint64_t total, std::string_view stage,
         std::string_view error = {} ) const;
     bool SaveStateLocked( const Entry& entry, std::string& error ) const;
     std::shared_ptr<Entry> LoadEntry( const std::string& scanId ) const;
-    nlohmann::json ReadAggregateDocument( const Entry& entry ) const;
-    nlohmann::json ReadCandidateDocument( const Entry& entry ) const;
+    // Caller holds Entry::readMutex; readers are pinned to completed generations.
+    void EnsureReaders( const std::shared_ptr<Entry>& entry ) const;
     std::filesystem::path m_root;
     std::filesystem::path m_cacheRoot;
     std::string m_queryExecutableSha256;
     AnalysisScanSourceResolver m_resolver;
     AnalysisScanExecutor m_executor;
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> m_workspace;
+    analysis::AnalysisProcessMemoryOptions m_processMemory;
+    std::function<uint64_t(const std::filesystem::path&)> m_diskAvailable;
+    std::shared_ptr<analysis::AnalysisDiskUsage> m_diskUsage;
     mutable std::mutex m_mutex;
     mutable std::unordered_map<std::string, std::shared_ptr<Entry>> m_entries;
 };

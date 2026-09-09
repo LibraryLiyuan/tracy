@@ -1,10 +1,12 @@
 #include "TracyFrameCpuScanner.hpp"
 #include "FakeTraceSource.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cassert>
 #include <chrono>
 #include <limits>
 #include <map>
+#include <iostream>
 
 using namespace tracy::analysis;
 
@@ -84,10 +86,12 @@ public:
     }
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override
     {
+        ReadBoundary( "frame" );
         return Page( frames, range );
     }
     std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const override
     {
+        ReadBoundary( "cpu" );
         std::vector<CpuZoneDto> matching;
         for( const auto& zone : zones )
         {
@@ -98,6 +102,16 @@ public:
         return Page( matching, range );
     }
 
+    std::string cancelAt;
+    std::function<void( std::string_view )> readHook;
+    mutable bool cancellationRequested = false;
+    mutable size_t readsAfterCancel = 0;
+    void ReadBoundary( std::string_view domain ) const
+    {
+        if( readHook ) readHook( domain );
+        if( cancellationRequested ) ++readsAfterCancel;
+        if( domain == cancelAt ) cancellationRequested = true;
+    }
     std::vector<FrameDto> frames;
     std::vector<CpuZoneDto> zones;
 
@@ -252,8 +266,122 @@ std::pair<int64_t, int64_t> BruteForceParentAndDirectChildUnion(
 
 }
 
+template<typename Options>
+void SetCpuCancellation( Options& options, std::function<bool()> cancelled )
+{
+    options.cancelled = std::move( cancelled );
+}
+
 int main()
 {
+    bool workspaceTestsPassed = true;
+    for( const auto* domain : { "frame", "cpu" } )
+    {
+        CpuTreeSource source;
+        // No definitions: their already-protected registry must not mask the
+        // independent frame, invalid-zone and quality-finding allocations.
+        source.zones.resize(1); source.zones.front().endNs.reset();
+        auto budget=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        AnalysisWorkspaceReservation pressure(budget);
+        bool active=false; size_t laterReads=0;
+        source.readHook=[&](std::string_view current) {
+            if(active) ++laterReads;
+            else if(current==domain) {active=true;pressure.Resize(2*1024*1024-budget->Snapshot().currentBytes-128);}
+        };
+        CpuFrameScanOptions options; options.workspace=budget;
+        bool rejected=false;
+        try { (void)ExactFrameCpuScanner(source,2).Scan({},options); }
+        catch(const std::exception& e) { rejected=std::string(e.what()).find("workspace_budget")!=std::string::npos; }
+        if(!rejected || laterReads!=0) {
+            std::cerr<<"CPU resident state bypasses budget: "<<domain<<" rejected="<<rejected<<" later_reads="<<laterReads<<'\n';
+            workspaceTestsPassed=false;
+        }
+        pressure.Resize(0); assert(budget->Snapshot().currentBytes==0);
+    }
+    {
+        CpuTreeSource source; source.zones.resize(1);
+        source.zones.front().ref=std::string(64*1024,'x');
+        auto budget=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        AnalysisWorkspaceReservation pressure(budget);
+        CpuFrameScanOptions options; options.workspace=budget; options.includeLogicalSignatures=false;
+        options.definitionSink=[&](const auto&) {
+            pressure.Resize(2*1024*1024-budget->Snapshot().currentBytes-128); return true;
+        };
+        bool rejected=false; size_t emitted=0;
+        try { (void)ExactFrameCpuScanner(source,2).ScanView([&](const auto&){++emitted;return true;},options); }
+        catch(const std::exception& e) { rejected=std::string(e.what()).find("workspace_budget")!=std::string::npos; }
+        if(!rejected || emitted!=0) {
+            std::cerr<<"CPU active payload bypasses post-definition pressure: rejected="<<rejected<<" emitted="<<emitted<<'\n';
+            workspaceTestsPassed=false;
+        }
+        pressure.Resize(0); assert(budget->Snapshot().currentBytes==0);
+    }
+    {
+        CpuTreeSource source;
+        auto budget=std::make_shared<AnalysisWorkspaceBudget>(4*1024*1024,2*1024*1024);
+        CpuFrameScanOptions options; options.workspace=budget;
+        {
+            auto result=ExactFrameCpuScanner(source,2).Scan({},options);
+            if(budget->Snapshot().currentBytes==0) {
+                std::cerr<<"CPU returned definitions/runs/denominators release workspace too early\n";
+                workspaceTestsPassed=false;
+            }
+            const auto bytes=budget->Snapshot().currentBytes;
+            auto moved=std::move(result);
+            assert(budget->Snapshot().currentBytes==bytes && !moved.denominators.empty());
+        }
+        assert(budget->Snapshot().currentBytes==0);
+    }
+    {
+        CpuTreeSource source;
+        const auto first=source.zones.front();
+        source.zones.assign(10000,first);
+        for(size_t i=0;i<source.zones.size();++i) source.zones[i].ref="repeated:"+std::to_string(i);
+        auto budget=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        CpuFrameScanOptions options; options.workspace=budget; options.includeLogicalSignatures=false;
+        size_t definitions=0,runs=0; int64_t inclusive=0;
+        options.definitionSink=[&](const auto& definition) {++definitions;assert(definition.path=="Root");return true;};
+        {
+            const auto result=ExactFrameCpuScanner(source,128).ScanView([&](const auto& run) {
+                ++runs; inclusive+=run.inclusiveNs; assert(run.exact && run.directChildUnionNs==0); return true;
+            },options);
+            assert(definitions==1 && runs==10000 && inclusive==700000);
+            assert(result.signatures.empty() && result.runs.empty() && result.denominators.size()==1);
+            assert(result.denominators.front().completeFrameDenominator==2);
+        }
+        assert(budget->Snapshot().currentBytes==0 && budget->Snapshot().peakBytes<=2*1024*1024);
+    }
+    if(!workspaceTestsPassed) return 1;
+    for( const auto* domain : { "pre_cancelled", "frame", "cpu" } )
+    {
+        CpuTreeSource source;
+        source.cancelAt=domain;
+        source.cancellationRequested=std::string_view(domain)=="pre_cancelled";
+        CpuFrameScanOptions options;
+        SetCpuCancellation(options,[&]{return source.cancellationRequested;});
+        size_t emittedAfterCancel=0;
+        const auto emission=[&]{if(source.cancellationRequested) ++emittedAfterCancel;};
+        options.completeFrameSink=[&](const auto&,auto,auto,auto){emission();};
+        options.definitionSink=[&](const auto&){emission();return true;};
+        bool rejected=false;
+        try { (void)ExactFrameCpuScanner(source,2).Scan([&](const auto&){emission();return true;},options); }
+        catch(const std::exception& e){rejected=std::string(e.what()).find("cancelled")!=std::string::npos;}
+        if(!rejected || source.readsAfterCancel!=0 || emittedAfterCancel!=0)
+        {
+            std::cerr<<"CPU cancellation bypass: "<<domain<<" later_reads="<<source.readsAfterCancel<<" emitted="<<emittedAfterCancel<<'\n';
+            return 1;
+        }
+    }
+    {
+        CpuTreeSource source; source.zones.resize(2);
+        bool cancelled=false; size_t emitted=0;
+        CpuFrameScanOptions options;
+        SetCpuCancellation(options,[&]{return cancelled;});
+        bool rejected=false;
+        try { (void)ExactFrameCpuScanner(source,100).Scan([&](const auto&){++emitted;cancelled=true;return true;},options); }
+        catch(const std::exception& e){rejected=std::string(e.what()).find("cancelled")!=std::string::npos;}
+        if(!rejected || emitted!=1) {std::cerr<<"CPU final drain cancellation bypass: emitted="<<emitted<<'\n';return 1;}
+    }
     CpuTreeSource source;
     ExactFrameCpuScanner scanner( source, 2 );
     const auto result = scanner.Scan();
@@ -346,6 +474,10 @@ int main()
                 finding.count == 1;
         } ) );
     assert( largeResult.runs.empty() );
+    // AC0: event IDs and timestamps change for all 4096 occurrences, but
+    // the single physical path and single logical site remain two definitions.
+    // Cache partitioning must never "fix" cardinality by merging other paths.
+    assert( largeResult.signatures.size() == 2 );
     assert( largeResult.frameBoundaryProbeCount < 4096 * 16 );
 
     // The policy scan consumes the stable logical rollup only.  Physical
@@ -377,5 +509,52 @@ int main()
         }, logicalOnly );
     assert( viewRuns == 4095 );
     assert( viewResult.runs.empty() && viewResult.signatures.size() == 1 );
+
+    // Removing the definition callback, retaining every full path, changing
+    // ancestry, or emitting a definition twice must fail this real scan.
+    CpuFrameScanOptions streamedOptions;
+    std::map<std::string,CpuSignatureDefinition> definitions;
+    streamedOptions.definitionSink=[&](const CpuSignatureDefinition& definition) {
+        assert(definitions.emplace(definition.signatureId,definition).second);
+        return true;
+    };
+    uint64_t definitionStreamRuns=0;
+    const auto definitionStream=scanner.ScanView([&](const CpuSignatureFrameRunView& run) {
+        assert(definitions.contains(std::string(run.signatureId)));
+        ++definitionStreamRuns; return true;
+    },streamedOptions);
+    assert(definitionStreamRuns>0 && definitionStream.signatures.empty() && definitionStream.runs.empty());
+    assert(definitions.size()==result.signatures.size());
+    for(const auto& expected:result.signatures)
+    {
+        const auto& actual=definitions.at(expected.signatureId);
+        assert(std::tie(actual.parentSignatureId,actual.name,actual.sourceLocationRef,actual.function,actual.file,
+            actual.line,actual.threadRef,actual.threadRole,actual.path,actual.depth,actual.workClass,actual.logical)==
+            std::tie(expected.parentSignatureId,expected.name,expected.sourceLocationRef,expected.function,expected.file,
+            expected.line,expected.threadRef,expected.threadRole,expected.path,expected.depth,expected.workClass,expected.logical));
+    }
+    assert(definitions.at(workA.signatureId).path=="Root > ParentA > Work");
+    assert(definitions.at(workB.signatureId).path=="Root > ParentB > Work");
+    bool stopped=false;
+    streamedOptions.definitionSink=[](const CpuSignatureDefinition&) { return false; };
+    try { scanner.ScanView([](const CpuSignatureFrameRunView&) { return true; },streamedOptions); }
+    catch(const std::exception& e) { stopped=std::string(e.what())=="frame_cpu_scan_definition_sink_cancelled"; }
+    assert(stopped);
+    {
+        auto budget=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+        AnalysisWorkspaceReservation pressure(budget,1024*1024-256);
+        CpuFrameScanOptions options;
+        options.workspace=budget;
+        uint64_t emitted=0;
+        options.definitionSink=[&](const auto&) { ++emitted; return true; };
+        bool rejected=false;
+        try { scanner.ScanView([](const CpuSignatureFrameRunView&) { return true; },options); }
+        catch(const std::exception& e) { rejected=std::string(e.what()).find("workspace_budget")!=std::string::npos; }
+        if(!rejected || emitted!=0) {
+            std::cerr<<"CPU dictionary and registry bypass shared budget before definition emission: rejected="<<rejected<<" emitted="<<emitted<<'\n';
+            return 1;
+        }
+        assert(budget->Snapshot().currentBytes==1024*1024-256);
+    }
     return 0;
 }

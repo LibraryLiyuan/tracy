@@ -52,6 +52,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyMcpServer.hpp
     src/TracyAnalysisScanManager.cpp
     src/TracyAnalysisScanManager.hpp
+    src/TracyAnalysisScanCache.cpp
+    src/TracyAnalysisScanCache.hpp
     src/TracyPng.cpp
     src/TracyPng.hpp
     src/TracyQueryIndex.cpp
@@ -128,6 +130,37 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-neutral-aggregate-store-tests)
     add_test(NAME tracy-neutral-aggregate-store COMMAND tracy-neutral-aggregate-store-tests)
 
+    add_executable(tracy-analysis-cache-table-tests tests/AnalysisCacheTableTests.cpp)
+    target_link_libraries(tracy-analysis-cache-table-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-analysis-cache-table-tests)
+    add_test(NAME tracy-analysis-cache-table COMMAND tracy-analysis-cache-table-tests)
+    add_executable(tracy-analysis-cache-query-tests tests/AnalysisCacheQueryTests.cpp)
+    target_link_libraries(tracy-analysis-cache-query-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-analysis-cache-query-tests)
+    add_test(NAME tracy-analysis-cache-query COMMAND tracy-analysis-cache-query-tests)
+    add_executable(tracy-analysis-workspace-budget-tests tests/AnalysisWorkspaceBudgetTests.cpp)
+    target_link_libraries(tracy-analysis-workspace-budget-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-analysis-workspace-budget-tests)
+    add_test(NAME tracy-analysis-workspace-budget COMMAND tracy-analysis-workspace-budget-tests)
+    add_executable(tracy-analysis-dictionary-tests tests/AnalysisDictionaryTests.cpp)
+    target_include_directories(tracy-analysis-dictionary-tests PRIVATE ../analysis)
+    tracy_query_enable_assertions(tracy-analysis-dictionary-tests)
+    add_test(NAME tracy-analysis-dictionary COMMAND tracy-analysis-dictionary-tests)
+
+    add_executable(tracy-neutral-statistics-cache-tests tests/NeutralStatisticsCacheTests.cpp)
+    target_link_libraries(tracy-neutral-statistics-cache-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-neutral-statistics-cache-tests)
+    add_test(NAME tracy-neutral-statistics-cache COMMAND tracy-neutral-statistics-cache-tests)
+
+    add_executable(tracy-policy-cache-input-tests tests/PolicyCacheInputTests.cpp)
+    target_link_libraries(tracy-policy-cache-input-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-policy-cache-input-tests)
+    add_test(NAME tracy-policy-cache-input COMMAND tracy-policy-cache-input-tests)
+    add_executable(tracy-candidate-policy-cache-tests tests/CandidatePolicyCacheTests.cpp)
+    target_link_libraries(tracy-candidate-policy-cache-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-candidate-policy-cache-tests)
+    add_test(NAME tracy-candidate-policy-cache COMMAND tracy-candidate-policy-cache-tests)
+
     add_executable(tracy-bounded-scan-cursor-tests tests/BoundedScanCursorTests.cpp)
     target_link_libraries(tracy-bounded-scan-cursor-tests PRIVATE TracyAnalysis)
     tracy_query_enable_assertions(tracy-bounded-scan-cursor-tests)
@@ -166,6 +199,20 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     target_link_libraries(tracy-analysis-scan-manager-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-analysis-scan-manager-tests)
     add_test(NAME tracy-analysis-scan-manager COMMAND tracy-analysis-scan-manager-tests)
+    # Same native-source assertions without linking the full QueryService
+    # dispatcher; keeps default-producer red/green cycles independent of MCP.
+    add_executable(tracy-default-analysis-cache-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp)
+    target_link_libraries(tracy-default-analysis-cache-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    target_include_directories(tracy-default-analysis-cache-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+    target_compile_definitions(tracy-default-analysis-cache-tests PRIVATE TRACY_DEFAULT_SCAN_TEST_ONLY)
+    tracy_query_enable_assertions(tracy-default-analysis-cache-tests)
+    add_test(NAME tracy-default-analysis-cache COMMAND tracy-default-analysis-cache-tests)
+    add_executable(tracy-analysis-cache-manager-tests tests/AnalysisScanManagerTests.cpp src/TracyAnalysisScanManager.cpp src/TracyAnalysisScanCache.cpp)
+    target_link_libraries(tracy-analysis-cache-manager-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    target_include_directories(tracy-analysis-cache-manager-tests PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src)
+    target_compile_definitions(tracy-analysis-cache-manager-tests PRIVATE TRACY_SCAN_MANAGER_TEST_ONLY)
+    tracy_query_enable_assertions(tracy-analysis-cache-manager-tests)
+    add_test(NAME tracy-analysis-cache-manager COMMAND tracy-analysis-cache-manager-tests)
 
     add_executable(tracy-gpu-analysis-tests tests/GpuAnalysisTests.cpp)
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)
@@ -176,6 +223,11 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     target_link_libraries(tracy-query-mcp-transcript-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-mcp-transcript-tests)
     add_test(NAME tracy-query-mcp-transcript COMMAND tracy-query-mcp-transcript-tests)
+
+    # Explicit diagnostic CLI only; never opens a real Trace during CTest.
+    add_executable(tracy-gpu-frame-scope-probe tests/GpuFrameScopeTraceProbe.cpp)
+    target_link_libraries(tracy-gpu-frame-scope-probe PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-gpu-frame-scope-probe)
 
     add_test(NAME tracy-query-version COMMAND tracy-query --version)
     add_test(NAME tracy-query-doctor COMMAND tracy-query --doctor)

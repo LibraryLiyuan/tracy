@@ -19,7 +19,8 @@ bool PairLess( const AnalysisUInt64Pair& lhs, const AnalysisUInt64Pair& rhs )
 }
 
 bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
-    const std::filesystem::path& output, uint64_t& written, std::string& error )
+    const std::filesystem::path& output, uint64_t& written, std::string& error,
+    const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
     struct Cursor
     {
@@ -62,6 +63,7 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     {
         const auto head = heap.top();
         heap.pop();
+        AnalysisDiskGrow(disk,sizeof(head.value));
         out.write( reinterpret_cast<const char*>( &head.value ), sizeof( head.value ) );
         if( !out ) { error = "analysis_pair_sort_merge_write_failed"; return false; }
         ++written;
@@ -78,13 +80,16 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     return true;
 }
 
-bool RemoveFiles( const std::vector<std::filesystem::path>& paths, std::string& error )
+bool RemoveFiles( const std::vector<std::filesystem::path>& paths, std::string& error,
+    const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
     std::error_code ec;
     for( const auto& path : paths )
     {
         ec.clear();
-        if( !std::filesystem::remove( path, ec ) || ec )
+        const bool existed=std::filesystem::exists(path,ec);
+        if(!ec) AnalysisDiskRemove(path,disk,ec);
+        if( !existed || ec )
         {
             error = "analysis_pair_sort_cleanup_failed:" +
                 ( ec ? ec.message() : path.filename().string() );
@@ -97,7 +102,7 @@ bool RemoveFiles( const std::vector<std::filesystem::path>& paths, std::string& 
 }
 
 bool CleanupAnalysisExternalSortFiles( const std::filesystem::path& temporaryRoot,
-    const std::string& prefix, std::string& error )
+    const std::string& prefix, std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
     error.clear();
     std::error_code ec;
@@ -109,7 +114,8 @@ bool CleanupAnalysisExternalSortFiles( const std::filesystem::path& temporaryRoo
         const auto name = entry.path().filename().string();
         if( !name.starts_with( prefix ) || !name.ends_with( ".work" ) ) continue;
         ec.clear();
-        if( !std::filesystem::remove( entry.path(), ec ) || ec )
+        AnalysisDiskRemove(entry.path(),disk,ec);
+        if( ec )
         {
             error = "analysis_pair_sort_cleanup_failed:" +
                 ( ec ? ec.message() : entry.path().filename().string() );
@@ -123,7 +129,7 @@ bool CleanupAnalysisExternalSortFiles( const std::filesystem::path& temporaryRoo
 bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedPairs,
-    std::string& error )
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
     error.clear();
     if( maximumBufferedPairs == 0 ) maximumBufferedPairs = 1;
@@ -135,7 +141,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     if( expectedCount > std::numeric_limits<uint64_t>::max() / sizeof( AnalysisUInt64Pair ) ||
         bytes != expectedCount * sizeof( AnalysisUInt64Pair ) )
     { error = "analysis_pair_sort_source_size_mismatch"; return false; }
-    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error ) ) return false;
+    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error,disk ) ) return false;
 
     std::ifstream in( source, std::ios::binary );
     if( !in ) { error = "analysis_pair_sort_source_open_failed"; return false; }
@@ -152,6 +158,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
         std::sort( values.begin(), values.end(), PairLess );
         const auto run = temporaryRoot / ( prefix + "-run-0-" +
             std::to_string( runIndex++ ) + ".work" );
+        AnalysisDiskGrow(disk,uint64_t(values.size())*sizeof(AnalysisUInt64Pair));
         std::ofstream out( run, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "analysis_pair_sort_run_write_open_failed"; return false; }
         out.write( reinterpret_cast<const char*>( values.data() ),
@@ -166,8 +173,10 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
 
     if( runs.empty() )
     {
+        const auto previous=disk && disk->usage?AnalysisDiskUsage::Bytes(output):0;
         std::ofstream out( output, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "analysis_pair_sort_output_open_failed"; return false; }
+        if(disk && disk->usage) disk->usage->Release(previous);
         return true;
     }
 
@@ -182,7 +191,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
             const auto merged = temporaryRoot / ( prefix + "-run-" +
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
-            if( !MergeRuns( group, merged, written, error ) ) return false;
+            if( !MergeRuns( group, merged, written, error,disk ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {
@@ -193,14 +202,14 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
             }
             if( written != expected )
             { error = "analysis_pair_sort_merge_count_mismatch"; return false; }
-            if( !RemoveFiles( group, error ) ) return false;
+            if( !RemoveFiles( group, error,disk ) ) return false;
             next.emplace_back( merged );
         }
         runs = std::move( next );
         ++pass;
     }
 
-    std::filesystem::remove( output, ec );
+    AnalysisDiskRemove(output,disk,ec);
     ec.clear();
     std::filesystem::rename( runs.front(), output, ec );
     if( ec ) { error = "analysis_pair_sort_publish_failed:" + ec.message(); return false; }

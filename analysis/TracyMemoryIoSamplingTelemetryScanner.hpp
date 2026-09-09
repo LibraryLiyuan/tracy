@@ -2,8 +2,10 @@
 #define __TRACYMEMORYIOSAMPLINGTELEMETRYSCANNER_HPP__
 
 #include "TracyBoundedScanCursor.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -218,6 +220,11 @@ struct MemoryIoSamplingQualityFinding
 
 struct MemoryIoSamplingTelemetryScanResult
 {
+    // Declared first so the lease outlives all returned allocations.
+    AnalysisWorkspaceReservation outputWorkspace;
+    MemoryIoSamplingTelemetryScanResult() = default;
+    MemoryIoSamplingTelemetryScanResult( MemoryIoSamplingTelemetryScanResult&& ) = default;
+    MemoryIoSamplingTelemetryScanResult& operator=( MemoryIoSamplingTelemetryScanResult&& ) = delete;
     size_t maximumBatchObserved = 0;
     bool qualityComplete = true;
     // Exact source records consumed by each bounded scan.  Keep these counts
@@ -248,9 +255,15 @@ public:
     explicit MemoryIoSamplingTelemetryScanner( const TraceSource& source,
         size_t batchSize = 4096, int64_t transientLifetimeNs = 1'000'000,
         int64_t leakCandidateAgeNs = 10'000'000'000 );
-    MemoryIoSamplingTelemetryScanResult Scan() const;
+    MemoryIoSamplingTelemetryScanResult Scan( const std::function<bool()>& cancelled = {} ) const;
+    // Same source audit and capacity/quality facts; omit IO, sample-leaf and
+    // scheduling detail vectors unused by the default Query analysis path.
+    MemoryIoSamplingTelemetryScanResult ScanSummary( const std::function<bool()>& cancelled,
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace ) const;
 
 private:
+    MemoryIoSamplingTelemetryScanResult ScanImpl( const std::function<bool()>& cancelled,
+        bool retainDetails, std::shared_ptr<AnalysisWorkspaceBudget> workspace ) const;
     const TraceSource& m_source;
     size_t m_batchSize;
     int64_t m_transientLifetimeNs;

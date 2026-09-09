@@ -1,6 +1,7 @@
 #include "TracyMemoryIoSamplingTelemetryScanner.hpp"
 #include "FakeTraceSource.hpp"
 #include "TracyQueue.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -135,6 +136,7 @@ public:
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":0,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"0\",\"emitted\":\"0\",\"dropped\":\"0\",\"filtered\":\"0\",\"sampled_out\":\"0\",\"overflow\":\"0\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"0\",\"event_bytes\":\"0\"}}}",
             "JNQ1|{\"schema_version\":1,\"snapshot_sequence\":1,\"producer\":{\"id\":1,\"key\":\"gpu.reference\",\"source_mode\":\"test\",\"requested\":true,\"compiled\":true,\"supported\":true,\"enabled\":true,\"effective\":true,\"permission_denied\":false,\"deferred\":false,\"reason\":\"\",\"counters\":{\"observed\":\"10\",\"emitted\":\"8\",\"dropped\":\"1\",\"filtered\":\"1\",\"sampled_out\":\"0\",\"overflow\":\"1\",\"mismatch\":\"0\",\"unresolved\":\"0\",\"tail_truncated\":\"0\",\"cpu_time_ns\":\"1000\",\"event_bytes\":\"256\"}}}"
         };
+        if( wideMetadataAt == "info" ) info.captureName = std::string( 3 * 1024 * 1024, 'x' );
         return info;
     }
     std::vector<Capability> GetCapabilities() const override
@@ -145,7 +147,7 @@ public:
         if( m_mode == CatalogFixtureMode::Invalid ) catalogReason = "GPU Catalog Core generation is invalid";
         else if( m_mode == CatalogFixtureMode::Disabled ) catalogReason = "GPU Catalog disabled by capture profile";
         else if( m_mode == CatalogFixtureMode::Absent ) catalogReason = "trace predates N27 or contains no GPU Catalog section";
-        return {
+        std::vector<Capability> values = {
             { "memory", true, true, true, "available", {} },
             { "memory.gpu", true, true, true, "physical allocation facts available", {} },
             { "gpu.catalog", catalogPresent, catalogQueryable, catalogQueryable, catalogReason, {} },
@@ -155,6 +157,8 @@ public:
                 m_contextSwitchAvailable ? "available" : "context switch permission unavailable", {} },
             { "io", true, true, true, "available", {} }
         };
+        if( wideMetadataAt == "capability" ) values.front().methods.push_back( std::string( 3 * 1024 * 1024, 'x' ) );
+        return values;
     }
     std::vector<ThreadDto> GetThreads() const override
     {
@@ -162,27 +166,69 @@ public:
         values[0].ref = MakeEntityRef( "thread", 1 ); values[0].name = "Main";
         values[1].ref = MakeEntityRef( "thread", 2 ); values[1].name = "Render Thread";
         values[2].ref = MakeEntityRef( "thread", 3 ); values[2].name = "Loading";
+        if( wideMetadataAt == "thread" ) values.front().externalThreadName = std::string( 3 * 1024 * 1024, 'x' );
         return values;
     }
-    std::vector<MemoryPoolDto> GetMemoryPools() const override { return pools; }
+    std::vector<MemoryPoolDto> GetMemoryPools() const override
+    {
+        auto values = pools;
+        if( wideMetadataAt == "pool" ) values.front().storedName = std::string( 3 * 1024 * 1024, 'x' );
+        return values;
+    }
     std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const override
     {
+        ReadBoundary( "memory" );
+        if( wideMemoryCount )
+        {
+            std::vector<MemoryEventDto> values;
+            const auto first = std::min( range.offset, wideMemoryCount );
+            const auto last = first + std::min( range.limit, wideMemoryCount - first );
+            for( auto index = first; index < last; ++index )
+            {
+                auto value = memory.front();
+                value.ref = "memory:" + std::to_string( index );
+                value.address = "address:" + std::to_string( index );
+                value.size = 1; value.allocationNs = 10 + int64_t( index ) * 2;
+                value.freeNs = value.allocationNs + 1;
+                value.allocationZoneRef = std::string( 64 * 1024, 'x' );
+                values.push_back( std::move( value ) );
+            }
+            return values;
+        }
         return SliceValues( memory, range.offset, range.limit );
     }
     std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const override
     {
+        ReadBoundary( "io" );
+        if( wideIoCount )
+        {
+            std::vector<IoRequestDto> values;
+            const auto first = std::min( offset, wideIoCount );
+            const auto last = first + std::min( limit, wideIoCount - first );
+            for( auto index = first; index < last; ++index )
+            {
+                auto value = io.front();
+                value.requestId = index;
+                value.ref = "io:" + std::to_string( index ) + std::string( 64 * 1024, 'x' );
+                values.push_back( std::move( value ) );
+            }
+            return values;
+        }
         return SliceValues( io, offset, limit );
     }
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override
     {
+        ReadBoundary( "sample" );
         return m_samplingAvailable ? SliceValues( samples, range.offset, range.limit ) : std::vector<SampleDto> {};
     }
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override
     {
+        ReadBoundary( "context_switch" );
         return m_contextSwitchAvailable ? SliceValues( contextSwitches, range.offset, range.limit ) : std::vector<ContextSwitchDto> {};
     }
     std::vector<CallstackFrameDto> ResolveCallstacks( const std::vector<uint32_t>& ids, size_t maxDepth ) const override
     {
+        ReadBoundary( "callstack" );
         std::vector<CallstackFrameDto> result;
         for( const auto id : ids )
         {
@@ -198,13 +244,27 @@ public:
     uint64_t GetGpuCatalogPassCountBounded() const override { return passes.size(); }
     uint64_t GetGpuCatalogRangeCountBounded() const override { return ranges.size(); }
     std::vector<GpuAnalysisResourceSummary> ScanGpuCatalogResourcesBounded( size_t offset, size_t limit ) const override
-    { return SliceValues( resources, offset, limit ); }
+    { ReadBoundary( "gpu_resource" ); return SliceValues( resources, offset, limit ); }
     std::vector<GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded( size_t offset, size_t limit ) const override
-    { return SliceValues( allocations, offset, limit ); }
+    { ReadBoundary( "gpu_allocation" ); return SliceValues( allocations, offset, limit ); }
     std::vector<GpuPassWorkingSet> ScanGpuCatalogPassesBounded( size_t offset, size_t limit ) const override
-    { return SliceValues( passes, offset, limit ); }
+    { ReadBoundary( "gpu_pass" ); return SliceValues( passes, offset, limit ); }
     std::vector<GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded( size_t offset, size_t limit ) const override
-    { return SliceValues( ranges, offset, limit ); }
+    { ReadBoundary( "gpu_range" ); return SliceValues( ranges, offset, limit ); }
+
+    std::string cancelAt;
+    size_t wideIoCount = 0;
+    size_t wideMemoryCount = 0;
+    std::string wideMetadataAt;
+    std::function<void( std::string_view )> readHook;
+    mutable bool cancellationRequested = false;
+    mutable size_t readsAfterCancel = 0;
+    void ReadBoundary( std::string_view domain ) const
+    {
+        if( readHook ) readHook( domain );
+        if( cancellationRequested ) ++readsAfterCancel;
+        if( domain == cancelAt ) cancellationRequested = true;
+    }
 
 private:
     void AddMemory( uint64_t id, std::string address, uint64_t size, int64_t begin,
@@ -265,8 +325,39 @@ const CpuMemoryPoolFact& CpuPool( const MemoryIoSamplingTelemetryScanResult& res
 
 }
 
+template<typename Scanner>
+auto ScanWithCancellation( Scanner& scanner, const std::function<bool()>& cancelled )
+{
+    return scanner.Scan( cancelled );
+}
+
+template<typename Scanner>
+auto ScanCompact( Scanner& scanner, std::shared_ptr<AnalysisWorkspaceBudget> workspace )
+{
+    return scanner.ScanSummary( {}, std::move( workspace ) );
+}
+
 int main()
 {
+    bool cancellationTestsPassed = true;
+    for( const auto* domain : { "pre_cancelled", "memory", "gpu_allocation", "gpu_resource",
+        "gpu_pass", "gpu_range", "io", "sample", "callstack", "context_switch" } )
+    {
+        MemoryIoSamplingSource cancelledSource;
+        cancelledSource.cancelAt = domain;
+        cancelledSource.cancellationRequested = std::string_view( domain ) == "pre_cancelled";
+        MemoryIoSamplingTelemetryScanner cancelledScanner( cancelledSource, 2, 2, 20 );
+        bool rejected = false;
+        try { (void)ScanWithCancellation( cancelledScanner, [&] { return cancelledSource.cancellationRequested; } ); }
+        catch( const BoundedScanError& e ) { rejected = std::string( e.what() ).find( "cancelled" ) != std::string::npos; }
+        if( !rejected || cancelledSource.readsAfterCancel != 0 )
+        {
+            std::cerr << "Memory/IO cancellation bypass: " << domain << " rejected=" << rejected
+                << " later_reads=" << cancelledSource.readsAfterCancel << '\n';
+            cancellationTestsPassed = false;
+        }
+    }
+    if( !cancellationTestsPassed ) return 1;
     {
         MemoryIoSamplingSource lifetimes;
         lifetimes.allocations[0].createTime = 10;
@@ -283,6 +374,125 @@ int main()
     MemoryIoSamplingSource source;
     MemoryIoSamplingTelemetryScanner scanner( source, 2, 2, 20 );
     const auto result = scanner.Scan();
+
+    bool compactTestsPassed = true;
+    for( const auto* domain : { "info", "capability", "pool", "thread" } )
+    {
+        MemoryIoSamplingSource wide;
+        wide.wideMetadataAt = domain;
+        size_t traversalReads = 0;
+        wide.readHook = [&]( std::string_view ) { ++traversalReads; };
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        MemoryIoSamplingTelemetryScanner wideScanner( wide, 2, 2, 20 );
+        bool rejected = false;
+        try { (void)ScanCompact( wideScanner, shared ); }
+        catch( const std::exception& e ) { rejected = std::string( e.what() ).find( "analysis_workspace_budget" ) != std::string::npos; }
+        if( !rejected || traversalReads != 0 )
+        {
+            std::cerr << "System metadata payload bypasses budget: " << domain << " rejected=" << rejected << " reads=" << traversalReads << '\n';
+            compactTestsPassed = false;
+        }
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    {
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        {
+            auto compact = ScanCompact( scanner, shared );
+            if( !compact.ioRequests.empty() || !compact.sampling.leaves.empty() || !compact.scheduling.roles.empty() )
+            {
+                std::cerr << "Summary scan retains unused IO/sample/scheduling detail vectors\n";
+                compactTestsPassed = false;
+            }
+            if( shared->Snapshot().currentBytes == 0 )
+            {
+                std::cerr << "Summary scan returned facts have no shared workspace ownership\n";
+                compactTestsPassed = false;
+            }
+            assert( compact.inputMemoryEventCount == 6 && compact.inputGpuAllocationCount == 2 );
+            assert( compact.inputGpuResourceCount == 3 && compact.inputGpuPassCount == 1 && compact.inputGpuRangeCount == 1 );
+            assert( compact.inputIoRequestCount == 4 && compact.inputSampleCount == 4 && compact.inputContextSwitchCount == 2 );
+            assert( compact.inputTelemetryRecordCount == 2 && !compact.qualityComplete );
+            assert( CpuPool( compact ).peakLiveBytes == 630 && CpuPool( compact ).endLiveBytes == 420 );
+            assert( compact.gpuMemory.physicalBytes == 300 && compact.gpuMemory.logicalCapacityBytes == 220 );
+            assert( compact.ioSummary.completeCount == 1 && compact.ioSummary.cancelledCount == 1 &&
+                compact.ioSummary.errorCount == 1 && compact.ioSummary.orphanCount == 1 );
+            assert( compact.ioSummary.requestedBytes == 400 && compact.ioSummary.transferredBytes == 210 );
+            assert( compact.sampling.available && compact.sampling.totalSamples == 4 && compact.sampling.unresolvedSamples == 1 );
+            assert( compact.scheduling.available && compact.telemetry.totalCpuTimeNs == 1000 );
+            assert( compact.qualityFindings.size() == result.qualityFindings.size() );
+            for( size_t i = 0; i < result.qualityFindings.size(); ++i )
+            {
+                const auto& a = compact.qualityFindings[i]; const auto& b = result.qualityFindings[i];
+                assert( a.code == b.code && a.message == b.message && a.count == b.count && a.representativeRefs == b.representativeRefs );
+            }
+            const auto bytes = shared->Snapshot().currentBytes;
+            auto moved = std::move( compact );
+            assert( shared->Snapshot().currentBytes == bytes && moved.cpuMemoryPools.size() == 1 );
+        }
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    for( const auto* domain : { "memory", "gpu_allocation", "gpu_resource", "gpu_pass", "gpu_range",
+        "io", "sample", "callstack", "context_switch" } )
+    {
+        MemoryIoSamplingSource pressured;
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        AnalysisWorkspaceReservation occupied( shared );
+        bool pressureActive = false;
+        size_t laterReads = 0;
+        pressured.readHook = [&]( std::string_view current ) {
+            if( pressureActive ) ++laterReads;
+            else if( current == domain )
+            {
+                pressureActive = true;
+                occupied.Resize( 2 * 1024 * 1024 - shared->Snapshot().currentBytes - 128 );
+            }
+        };
+        MemoryIoSamplingTelemetryScanner pressuredScanner( pressured, 2, 2, 20 );
+        bool rejected = false;
+        try { (void)ScanCompact( pressuredScanner, shared ); }
+        catch( const std::exception& e ) { rejected = std::string( e.what() ).find( "analysis_workspace_budget" ) != std::string::npos; }
+        if( !rejected || laterReads != 0 )
+        {
+            std::cerr << "System summary workspace bypass: " << domain << " rejected=" << rejected << " later_reads=" << laterReads << '\n';
+            compactTestsPassed = false;
+        }
+        occupied.Resize( 0 );
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    {
+        MemoryIoSamplingSource wide;
+        wide.wideIoCount = 512; // 32 MiB of raw strings, generated in bounded pages.
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        MemoryIoSamplingTelemetryScanner wideScanner( wide, 2, 2, 20 );
+        {
+            const auto compact = ScanCompact( wideScanner, shared );
+            if( !compact.ioRequests.empty() ) compactTestsPassed = false;
+            assert( compact.inputIoRequestCount == 512 && compact.ioSummary.completeCount == 512 );
+            assert( compact.ioSummary.requestedBytes == 51200 && compact.ioSummary.transferredBytes == 51200 );
+        }
+        assert( shared->Snapshot().currentBytes == 0 && shared->Snapshot().peakBytes <= 2 * 1024 * 1024 );
+    }
+    {
+        MemoryIoSamplingSource wide;
+        wide.wideMemoryCount = 512; // Irrelevant 32 MiB zone-ref payload must not be retained.
+        auto shared = std::make_shared<AnalysisWorkspaceBudget>( 2 * 1024 * 1024, 1024 * 1024 );
+        MemoryIoSamplingTelemetryScanner wideScanner( wide, 2, 2, 20 );
+        try
+        {
+            const auto compact = ScanCompact( wideScanner, shared );
+            const auto& pool = CpuPool( compact );
+            assert( compact.inputMemoryEventCount == 512 && pool.eventCount == 512 );
+            assert( pool.totalAllocatedBytes == 512 && pool.totalFreedBytes == 512 );
+            assert( pool.peakLiveBytes == 1 && pool.endLiveBytes == 0 && pool.accountingGapCount == 0 );
+        }
+        catch( const std::exception& e )
+        {
+            std::cerr << "Memory summary retains irrelevant per-event DTO strings: " << e.what() << '\n';
+            compactTestsPassed = false;
+        }
+        assert( shared->Snapshot().currentBytes == 0 );
+    }
+    if( !compactTestsPassed ) return 1;
 
     assert( result.maximumBatchObserved <= 2 );
     assert( result.inputMemoryEventCount == 6 );

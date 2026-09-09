@@ -2,6 +2,8 @@
 #define __TRACYEXACTSTATISTICS_HPP__
 
 #include "TracyNeutralAggregateStore.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -123,6 +125,7 @@ struct NeutralSignatureAggregate
     uint64_t presentFrameCount = 0;
     uint64_t occurrenceCount = 0;
     uint64_t unknownFrameCount = 0;
+    uint64_t outsideCompleteFrameCount = 0;
     NeutralMetricAggregate inclusive;
     NeutralMetricAggregate exclusive;
     NeutralMetricAggregate wait;
@@ -191,6 +194,18 @@ struct NeutralMergedFrameValues
 using NeutralSignatureFramesSink = std::function<void(
     const NeutralSignatureAggregate&, const std::vector<NeutralMergedFrameValues>& )>;
 
+// Small audit for a streamed output. This must not be mistaken for a fully
+// materialized NeutralStatisticsResult or passed to the legacy JSON reader.
+struct NeutralStatisticsStreamSummary
+{
+    bool qualityComplete = false;
+    uint64_t signatureCount = 0;
+    uint64_t unreportedGapCount = 0;
+    uint64_t materializedResultPeak = 0;
+    std::vector<std::string> qualityFindings;
+    std::vector<NeutralDomainAuditResult> domains;
+};
+
 // Exact, disk-backed SignatureFrameRun aggregation. Only a bounded raw-run
 // buffer and one signature's merged frame values are resident at a time.
 class NeutralStatisticsStreamBuilder
@@ -200,7 +215,9 @@ public:
     static constexpr SignatureToken InvalidSignatureToken = UINT32_MAX;
 
     NeutralStatisticsStreamBuilder( std::filesystem::path temporaryRoot,
-        uint64_t maximumBufferedValues = 65536, size_t maximumBufferedRuns = 65536 );
+        uint64_t maximumBufferedValues = 65536, size_t maximumBufferedRuns = 65536,
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace = {},
+        std::shared_ptr<AnalysisDiskBudget> disk = {} );
     ~NeutralStatisticsStreamBuilder();
     NeutralStatisticsStreamBuilder( NeutralStatisticsStreamBuilder&& ) noexcept;
     NeutralStatisticsStreamBuilder& operator=( NeutralStatisticsStreamBuilder&& ) noexcept;
@@ -210,20 +227,35 @@ public:
     bool AddRun( const NeutralSignatureFrameInput& value );
     SignatureToken RegisterSignature( std::string_view domain,
         std::string_view signatureId, std::string_view frameScope );
+    // Read-only lookup remains valid during/after Finish. It never registers a
+    // new signature, so streamed consumers can share the numeric merge order.
+    SignatureToken FindSignatureToken( std::string_view domain,
+        std::string_view signatureId, std::string_view frameScope ) const;
     bool AddRegisteredRun( SignatureToken signature, uint64_t frameIndex,
         int64_t inclusiveNs, int64_t exclusiveNs, int64_t waitNs,
         int64_t criticalPathNs, uint64_t occurrenceCount,
         bool exact, bool logical );
     void AddDenominator( const NeutralSignatureDenominatorInput& value );
+    // Membership, not just a denominator count: known observations outside
+    // complete source frames remain in when_present and in the evidence sink.
+    using CompleteFrameFilter = std::function<bool(std::string_view domain,
+        std::string_view frameScope, uint64_t frameIndex)>;
+    void SetCompleteFrameFilter( CompleteFrameFilter filter );
     void AddDomainAudit( const NeutralDomainAuditInput& value );
     bool Finish( NeutralStatisticsResult& result, std::string& error,
         const NeutralSignatureFramesSink& signatureSink = {},
+        const std::function<bool()>& cancelled = {} );
+    bool FinishToSink( NeutralStatisticsStreamSummary& summary, std::string& error,
+        const NeutralSignatureFramesSink& signatureSink,
         const std::function<bool()>& cancelled = {} );
 
     size_t MaximumBufferedRunsObserved() const;
     uint64_t InputRunCount() const;
 
 private:
+    bool FinishImpl( NeutralStatisticsResult& result, std::string& error,
+        const NeutralSignatureFramesSink& signatureSink,
+        const std::function<bool()>& cancelled, bool retainResults );
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };
@@ -233,11 +265,16 @@ ExactDistribution ComputeExactDistributionExternal(
     uint64_t implicitZeros,
     const std::filesystem::path& temporaryRoot,
     const std::string& prefix,
-    uint64_t maximumBufferedValues );
+    uint64_t maximumBufferedValues,
+    const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
 
 NeutralStatisticsResult BuildNeutralStatistics( const NeutralStatisticsInput& input );
 
 std::string SerializeNeutralStatisticsResult( const NeutralStatisticsResult& result );
+// Shared exact encoding for one output row; does not allocate an all-result DOM.
+std::string SerializeNeutralSignatureRecord( const NeutralSignatureAggregate& signature );
+bool DeserializeNeutralSignatureRecord( const std::string& payload,
+    NeutralSignatureAggregate& signature, std::string& error );
 bool DeserializeNeutralStatisticsResult( const std::string& payload,
     NeutralStatisticsResult& result, std::string& error );
 

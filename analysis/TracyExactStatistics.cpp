@@ -2,6 +2,7 @@
 
 #include "TracyHash.hpp"
 #include "TracyAnalysisExternalSort.hpp"
+#include "TracyAnalysisDictionary.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -38,6 +39,20 @@ struct SignatureKey
     {
         return std::tie( domain, signature, frameScope ) <
             std::tie( other.domain, other.signature, other.frameScope );
+    }
+};
+
+struct SignatureKeyView
+{
+    std::string_view domain, signature, frameScope;
+};
+struct SignatureKeyLess
+{
+    using is_transparent = void;
+    template<class Left, class Right> bool operator()(const Left& left, const Right& right) const
+    {
+        return std::tuple(std::string_view(left.domain),std::string_view(left.signature),std::string_view(left.frameScope)) <
+            std::tuple(std::string_view(right.domain),std::string_view(right.signature),std::string_view(right.frameScope));
     }
 };
 
@@ -110,15 +125,16 @@ std::string SafePrefix( const std::string& value )
     return result.empty() ? "statistics" : result;
 }
 
-void RemoveQuietly( const std::filesystem::path& path )
+void RemoveQuietly( const std::filesystem::path& path,const std::shared_ptr<AnalysisDiskBudget>& disk={} )
 {
     std::error_code ignored;
-    std::filesystem::remove( path, ignored );
+    AnalysisDiskRemove(path,disk,ignored);
 }
 
 bool WritePairs( const std::filesystem::path& path, const std::vector<int64_t>& values,
-    std::string& error )
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
+    AnalysisDiskGrow(disk,uint64_t(values.size())*sizeof(AnalysisUInt64Pair));
     std::ofstream output( path, std::ios::binary | std::ios::trunc );
     if( !output ) { error = "exact_statistics_source_open_failed"; return false; }
     uint64_t ordinal = 0;
@@ -279,6 +295,26 @@ json RankingJson( const std::vector<NeutralRankingEntry>& values )
     return result;
 }
 
+json SignatureJson( const NeutralSignatureAggregate& signature )
+{
+    json result = {
+        { "domain", signature.domain }, { "signature_id", signature.signatureId },
+        { "frame_scope", signature.frameScope }, { "logical", signature.logical },
+        { "exact", signature.exact },
+        { "complete_frame_count", std::to_string( signature.completeFrameCount ) },
+        { "present_frame_count", std::to_string( signature.presentFrameCount ) },
+        { "occurrence_count", std::to_string( signature.occurrenceCount ) },
+        { "unknown_frame_count", std::to_string( signature.unknownFrameCount ) },
+        { "inclusive", MetricJson( signature.inclusive ) },
+        { "exclusive", MetricJson( signature.exclusive ) },
+        { "wait", MetricJson( signature.wait ) },
+        { "critical_path", MetricJson( signature.criticalPath ) }
+    };
+    if( signature.outsideCompleteFrameCount != 0 )
+        result["outside_complete_frame_count"] = std::to_string(signature.outsideCompleteFrameCount);
+    return result;
+}
+
 std::string SerializeResult( const NeutralStatisticsResult& value, bool includeHash )
 {
     json document = {
@@ -309,19 +345,7 @@ std::string SerializeResult( const NeutralStatisticsResult& value, bool includeH
     }
     for( const auto& signature : value.signatures )
     {
-        document["signatures"].push_back( {
-            { "domain", signature.domain }, { "signature_id", signature.signatureId },
-            { "frame_scope", signature.frameScope }, { "logical", signature.logical },
-            { "exact", signature.exact },
-            { "complete_frame_count", std::to_string( signature.completeFrameCount ) },
-            { "present_frame_count", std::to_string( signature.presentFrameCount ) },
-            { "occurrence_count", std::to_string( signature.occurrenceCount ) },
-            { "unknown_frame_count", std::to_string( signature.unknownFrameCount ) },
-            { "inclusive", MetricJson( signature.inclusive ) },
-            { "exclusive", MetricJson( signature.exclusive ) },
-            { "wait", MetricJson( signature.wait ) },
-            { "critical_path", MetricJson( signature.criticalPath ) }
-        } );
+        document["signatures"].push_back( SignatureJson(signature) );
     }
     for( const auto& ranking : value.rankings )
     {
@@ -343,14 +367,14 @@ std::string Sha256Text( const std::string& value )
 
 NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
     uint64_t completeFrames, const std::filesystem::path& root, const std::string& prefix,
-    uint64_t maximumBufferedValues )
+    uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk={} )
 {
     NeutralMetricAggregate result;
     std::vector<int64_t> values;
     values.reserve( points.size() );
     for( const auto& point : points ) values.push_back( point.value );
     result.whenPresent = ComputeExactDistributionExternal( values, 0, root,
-        prefix + "-present", maximumBufferedValues );
+        prefix + "-present", maximumBufferedValues,disk );
     if( completeFrames < points.size() )
     {
         result.perCompleteFrame.exact = false;
@@ -358,7 +382,7 @@ NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
         return result;
     }
     result.perCompleteFrame = ComputeExactDistributionExternal( values,
-        completeFrames - points.size(), root, prefix + "-complete", maximumBufferedValues );
+        completeFrames - points.size(), root, prefix + "-complete", maximumBufferedValues,disk );
     if( !result.perCompleteFrame.exact || !result.whenPresent.exact ) return result;
 
     const auto median = result.perCompleteFrame.median;
@@ -653,7 +677,7 @@ const char* AnomalyPatternName( AnomalyPattern pattern )
 
 ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& explicitValues,
     uint64_t implicitZeros, const std::filesystem::path& temporaryRoot,
-    const std::string& rawPrefix, uint64_t maximumBufferedValues )
+    const std::string& rawPrefix, uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk )
 {
     if( maximumBufferedValues == 0 ) maximumBufferedValues = 1;
     if( explicitValues.size() <= maximumBufferedValues )
@@ -681,10 +705,10 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     const auto deviationSource = temporaryRoot / ( prefix + "-deviation-source.work" );
     const auto deviationSorted = temporaryRoot / ( prefix + "-deviation-sorted.work" );
     const auto cleanup = [&]() {
-        RemoveQuietly( source ); RemoveQuietly( sorted );
-        RemoveQuietly( deviationSource ); RemoveQuietly( deviationSorted );
+        RemoveQuietly( source,disk ); RemoveQuietly( sorted,disk );
+        RemoveQuietly( deviationSource,disk ); RemoveQuietly( deviationSorted,disk );
         std::string ignored;
-        CleanupAnalysisExternalSortFiles( temporaryRoot, prefix, ignored );
+        CleanupAnalysisExternalSortFiles( temporaryRoot, prefix, ignored,disk );
     };
     cleanup();
 
@@ -707,9 +731,9 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     result.mean = double( total ) / double( result.count );
 
     std::string error;
-    if( !WritePairs( source, explicitValues, error ) ||
+    if( !WritePairs( source, explicitValues, error,disk ) ||
         !SortAnalysisUInt64Pairs( source, sorted, temporaryRoot, prefix + "-values",
-            explicitValues.size(), maximumBufferedValues, error ) )
+            explicitValues.size(), maximumBufferedValues, error,disk ) )
     {
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
     }
@@ -744,6 +768,7 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
         result.exact = false; result.unavailableReason = "statistics_median_read_failed"; cleanup(); return result;
     }
     const uint64_t median2 = medianLow + medianHigh;
+    AnalysisDiskGrow(disk,uint64_t(explicitValues.size())*sizeof(AnalysisUInt64Pair));
     std::ofstream deviations( deviationSource, std::ios::binary | std::ios::trunc );
     if( !deviations )
     {
@@ -766,7 +791,7 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     deviations.flush();
     deviations.close();
     if( !SortAnalysisUInt64Pairs( deviationSource, deviationSorted, temporaryRoot,
-        prefix + "-deviation", explicitValues.size(), maximumBufferedValues, error ) )
+        prefix + "-deviation", explicitValues.size(), maximumBufferedValues, error,disk ) )
     {
         accessor.Close();
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
@@ -814,7 +839,8 @@ struct PackedNeutralRun
 static_assert( std::is_trivially_copyable_v<PackedNeutralRun> );
 
 void FinalizeRankingsAndAudit( NeutralStatisticsResult& result,
-    const std::vector<NeutralDomainAuditInput>& audits )
+    const std::vector<NeutralDomainAuditInput>& audits,
+    const std::map<std::string,uint64_t>* streamedOutputs = nullptr )
 {
     using RankingScope = std::pair<std::string, std::string>;
     std::set<RankingScope> domainsWithPhysicalSignatures;
@@ -846,7 +872,8 @@ void FinalizeRankingsAndAudit( NeutralStatisticsResult& result,
     }
 
     std::map<std::string, uint64_t> actualOutputs;
-    for( const auto& signature : result.signatures ) ++actualOutputs[signature.domain];
+    if(streamedOutputs) actualOutputs = *streamedOutputs;
+    else for( const auto& signature : result.signatures ) ++actualOutputs[signature.domain];
     std::set<std::string> auditedDomains;
     for( const auto& audit : audits )
     {
@@ -913,34 +940,56 @@ struct NeutralStatisticsStreamBuilder::Impl
         }
     };
 
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    std::shared_ptr<AnalysisDiskBudget> disk;
+    AnalysisWorkspaceReservation registryBudget;
+    AnalysisWorkspaceReservation rawBudget, runBudget, denominatorBudget, auditBudget;
+    AnalysisDictionary dictionary;
     std::filesystem::path root;
     uint64_t maximumBufferedValues = 1;
     size_t maximumBufferedRuns = 1;
     size_t maximumBufferedRunsObserved = 0;
     uint64_t inputRunCount = 0;
+    uint64_t outputSignatureCount = 0;
+    uint64_t materializedResultPeak = 0;
     uint64_t mergeFailures = 0;
     uint64_t fileOrdinal = 0;
     std::vector<PackedNeutralRun> buffer;
     std::unordered_map<BufferedKey, size_t, BufferedKeyHash> bufferIndexes;
     std::vector<std::filesystem::path> runs;
-    std::map<SignatureKey, uint32_t> signatureIndexes;
-    std::vector<SignatureKey> signatures;
-    std::vector<NeutralSignatureDenominatorInput> denominators;
+    std::map<SignatureKeyView, uint32_t, SignatureKeyLess> signatureIndexes;
+    std::vector<SignatureKeyView> signatures;
+    struct Denominator { SignatureKeyView key; uint64_t completeFrameCount; };
+    std::vector<Denominator> denominators;
     std::vector<NeutralDomainAuditInput> audits;
+    CompleteFrameFilter completeFrameFilter;
     std::string error;
     bool finished = false;
 
-    Impl( std::filesystem::path temporaryRoot, uint64_t values, size_t rawRuns )
-        : root( std::move( temporaryRoot ) )
+    Impl( std::filesystem::path temporaryRoot, uint64_t values, size_t rawRuns,
+        std::shared_ptr<AnalysisWorkspaceBudget> budget,std::shared_ptr<AnalysisDiskBudget> diskBudget )
+        : workspace(std::move(budget)), disk(std::move(diskBudget)), registryBudget(workspace)
+        , rawBudget(workspace), runBudget(workspace), denominatorBudget(workspace), auditBudget(workspace)
+        , dictionary(workspace)
+        , root( std::move( temporaryRoot ) )
         , maximumBufferedValues( std::max<uint64_t>( values, 1 ) )
         , maximumBufferedRuns( std::max<size_t>( rawRuns, 1 ) )
     {
+        if(maximumBufferedRuns > (UINT64_MAX-65536)/256)
+            throw std::runtime_error("analysis_workspace_budget");
+        // Packed values, hash entries/buckets, stream buffers and allocator slack.
+        rawBudget.Resize(65536 + uint64_t(maximumBufferedRuns)*256);
         std::filesystem::create_directories( root );
         buffer.reserve( maximumBufferedRuns );
         bufferIndexes.reserve( maximumBufferedRuns );
     }
 
-    const SignatureKey& Key( uint32_t index ) const { return signatures[index]; }
+    const SignatureKeyView& Key( uint32_t index ) const { return signatures[index]; }
+    SignatureKeyView InternKey(std::string_view domain,std::string_view signature,std::string_view scope)
+    {
+        return {dictionary.Text(dictionary.Intern(domain)),dictionary.Text(dictionary.Intern(signature)),
+            dictionary.Text(dictionary.Intern(scope))};
+    }
     bool Less( const PackedNeutralRun& left, const PackedNeutralRun& right ) const
     {
         // The registry index is unique for the complete (domain, signature,
@@ -986,12 +1035,12 @@ struct NeutralStatisticsStreamBuilder::Impl
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) );
+                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
                 pending = value;
             }
             if( !output ) { error = "neutral_run_write_failed"; return false; }
         }
-        if( pending ) output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) );
+        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
         output.flush();
         if( !output ) { error = "neutral_run_flush_failed"; return false; }
         return true;
@@ -999,6 +1048,8 @@ struct NeutralStatisticsStreamBuilder::Impl
     bool Flush()
     {
         if( buffer.empty() ) return true;
+        // Current and next merge-pass path vectors, including reallocation.
+        runBudget.Resize((runs.size()+1)*(1024+8ull*root.native().size()));
         maximumBufferedRunsObserved = std::max( maximumBufferedRunsObserved, buffer.size() );
         const auto path = NextPath( "neutral-run" );
         if( !WriteCompacted( buffer, path ) ) return false;
@@ -1025,6 +1076,7 @@ struct NeutralStatisticsStreamBuilder::Impl
     bool MergeGroup( const std::vector<std::filesystem::path>& source,
         const std::filesystem::path& outputPath, const std::function<bool()>& cancelled )
     {
+        AnalysisWorkspaceReservation mergeBudget(workspace,65536+source.size()*16384ull);
         std::vector<Reader> readers;
         readers.reserve( source.size() );
         for( const auto& path : source )
@@ -1054,12 +1106,12 @@ struct NeutralStatisticsStreamBuilder::Impl
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) );
+                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
                 pending = value;
             }
             if( !output ) { error = "neutral_merge_write_failed"; return false; }
         }
-        if( pending ) output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) );
+        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
         output.flush();
         if( !output ) { error = "neutral_merge_flush_failed"; return false; }
         return true;
@@ -1078,18 +1130,20 @@ struct NeutralStatisticsStreamBuilder::Impl
                 const auto output = NextPath( "neutral-merge" );
                 if( !MergeGroup( group, output, cancelled ) ) return false;
                 next.push_back( output );
-                for( const auto& path : group ) RemoveQuietly( path );
+                for( const auto& path : group ) RemoveQuietly( path,disk );
             }
             runs = std::move( next );
+            runBudget.Resize(runs.size()*(1024+8ull*root.native().size()));
         }
         return true;
     }
 };
 
 NeutralStatisticsStreamBuilder::NeutralStatisticsStreamBuilder( std::filesystem::path temporaryRoot,
-    uint64_t maximumBufferedValues, size_t maximumBufferedRuns )
+    uint64_t maximumBufferedValues, size_t maximumBufferedRuns,
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace,std::shared_ptr<AnalysisDiskBudget> disk )
     : m_impl( std::make_unique<Impl>( std::move( temporaryRoot ),
-        maximumBufferedValues, maximumBufferedRuns ) )
+        maximumBufferedValues, maximumBufferedRuns, std::move(workspace),std::move(disk) ) )
 {}
 
 NeutralStatisticsStreamBuilder::~NeutralStatisticsStreamBuilder() = default;
@@ -1109,15 +1163,28 @@ NeutralStatisticsStreamBuilder::SignatureToken NeutralStatisticsStreamBuilder::R
     std::string_view domain, std::string_view signatureId, std::string_view frameScope )
 {
     if( !m_impl || m_impl->finished || !m_impl->error.empty() ) return InvalidSignatureToken;
-    const SignatureKey key { std::string( domain ), std::string( signatureId ), std::string( frameScope ) };
-    auto found = m_impl->signatureIndexes.find( key );
+    const SignatureKeyView lookup { domain, signatureId, frameScope };
+    auto found = m_impl->signatureIndexes.find( lookup );
     if( found != m_impl->signatureIndexes.end() ) return found->second;
     if( m_impl->signatures.size() >= std::numeric_limits<uint32_t>::max() )
     { m_impl->error = "neutral_signature_limit_exceeded"; return InvalidSignatureToken; }
+    // Map nodes and vector growth hold views only; the exact dictionary owns
+    // each text once (including long scopes shared by many signatures).
+    // Existing-key lookup still performs no allocation or reservation.
+    m_impl->registryBudget.Add(320);
+    const auto key = m_impl->InternKey(domain,signatureId,frameScope);
     const auto signature = uint32_t( m_impl->signatures.size() );
     m_impl->signatures.push_back( key );
     m_impl->signatureIndexes.emplace( key, signature );
     return signature;
+}
+
+NeutralStatisticsStreamBuilder::SignatureToken NeutralStatisticsStreamBuilder::FindSignatureToken(
+    std::string_view domain, std::string_view signatureId, std::string_view frameScope ) const
+{
+    if(!m_impl) return InvalidSignatureToken;
+    const auto found=m_impl->signatureIndexes.find(SignatureKeyView{domain,signatureId,frameScope});
+    return found==m_impl->signatureIndexes.end()?InvalidSignatureToken:found->second;
 }
 
 bool NeutralStatisticsStreamBuilder::AddRegisteredRun( SignatureToken signature,
@@ -1146,12 +1213,24 @@ bool NeutralStatisticsStreamBuilder::AddRegisteredRun( SignatureToken signature,
 
 void NeutralStatisticsStreamBuilder::AddDenominator( const NeutralSignatureDenominatorInput& value )
 {
-    if( m_impl && !m_impl->finished ) m_impl->denominators.push_back( value );
+    if( m_impl && !m_impl->finished )
+    {
+        // Input vector and Finish lookup nodes hold views into the same exact
+        // dictionary as the signature registry, not three further string copies.
+        m_impl->denominatorBudget.Add(384);
+        m_impl->denominators.push_back( {m_impl->InternKey(value.domain,value.signatureId,value.frameScope),
+            value.completeFrameCount} );
+    }
 }
 
 void NeutralStatisticsStreamBuilder::AddDomainAudit( const NeutralDomainAuditInput& value )
 {
-    if( m_impl && !m_impl->finished ) m_impl->audits.push_back( value );
+    if( m_impl && !m_impl->finished )
+    {
+        m_impl->auditBudget.Add(4096+32ull*(value.domain.size()+value.status.size()+value.inputChecksum.size()+
+            value.consumedChecksum.size()+value.unavailableReason.size()));
+        m_impl->audits.push_back( value );
+    }
 }
 
 size_t NeutralStatisticsStreamBuilder::MaximumBufferedRunsObserved() const
@@ -1164,29 +1243,58 @@ uint64_t NeutralStatisticsStreamBuilder::InputRunCount() const
     return m_impl ? m_impl->inputRunCount : 0;
 }
 
+void NeutralStatisticsStreamBuilder::SetCompleteFrameFilter(CompleteFrameFilter filter)
+{
+    if(!m_impl || m_impl->finished) throw std::runtime_error("neutral_frame_filter_after_finish");
+    m_impl->completeFrameFilter=std::move(filter);
+}
+
+bool NeutralStatisticsStreamBuilder::FinishToSink( NeutralStatisticsStreamSummary& summary,
+    std::string& error, const NeutralSignatureFramesSink& signatureSink,
+    const std::function<bool()>& cancelled )
+{
+    summary = {};
+    if(!signatureSink) { error = "neutral_stream_sink_missing"; return false; }
+    NeutralStatisticsResult result;
+    const auto ok = FinishImpl(result, error, signatureSink, cancelled, false);
+    summary.qualityComplete = ok && result.qualityComplete;
+    summary.signatureCount = m_impl ? m_impl->outputSignatureCount : 0;
+    summary.materializedResultPeak = m_impl ? m_impl->materializedResultPeak : 0;
+    summary.unreportedGapCount = result.unreportedGapCount;
+    summary.qualityFindings = std::move(result.qualityFindings);
+    summary.domains = std::move(result.domains);
+    return ok;
+}
+
 bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, std::string& error,
     const NeutralSignatureFramesSink& signatureSink, const std::function<bool()>& cancelled )
+{
+    return FinishImpl(result, error, signatureSink, cancelled, true);
+}
+
+bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result, std::string& error,
+    const NeutralSignatureFramesSink& signatureSink, const std::function<bool()>& cancelled, bool retainResults )
 {
     result = {};
     result.qualityComplete = true;
     error.clear();
+    if(cancelled && cancelled()) { error = "cancelled"; result.qualityComplete = false; return false; }
     if( !m_impl || m_impl->finished ) { error = "neutral_stream_builder_already_finished"; return false; }
     m_impl->finished = true;
     if( !m_impl->error.empty() ) { error = m_impl->error; return false; }
     if( !m_impl->Flush() || !m_impl->Consolidate( cancelled ) )
     { error = m_impl->error; return false; }
 
-    std::map<SignatureKey, uint64_t> denominators;
+    std::map<SignatureKeyView, uint64_t, SignatureKeyLess> denominators;
     for( const auto& value : m_impl->denominators )
     {
-        const SignatureKey key { value.domain, value.signatureId, value.frameScope };
-        const auto [found, inserted] = denominators.emplace( key, value.completeFrameCount );
+        const auto [found, inserted] = denominators.emplace( value.key, value.completeFrameCount );
         if( !inserted && found->second != value.completeFrameCount )
         {
             result.qualityComplete = false;
             ++result.unreportedGapCount;
             result.qualityFindings.push_back( "conflicting_complete_frame_denominator:" +
-                value.domain + ":" + value.signatureId );
+                std::string(value.key.domain) + ":" + std::string(value.key.signature) );
         }
     }
     if( m_impl->mergeFailures != 0 )
@@ -1196,11 +1304,20 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
         result.qualityFindings.push_back( "duration_or_occurrence_overflow_during_frame_merge" );
     }
 
+    std::map<std::string,uint64_t> streamedOutputs;
     size_t ordinal = 0;
     auto finishSignature = [&]( uint32_t signatureIndex,
         std::vector<NeutralMergedFrameValues>& frames ) {
         if( frames.empty() ) return;
+        // Four MetricPoint arrays, BuildMetric's values and distribution/MAD
+        // scratch. The external path also retains run-name vectors and up to
+        // 64 merge streams. Reserve before creating any of those allocations.
+        AnalysisWorkspaceReservation metricBudget(m_impl->workspace,65536+frames.size()*128ull);
+        if(frames.size()>m_impl->maximumBufferedValues)
+            metricBudget.Add(1024*1024 + (1+(frames.size()-1)/m_impl->maximumBufferedValues)*
+                (2048+8ull*m_impl->root.native().size()));
         const auto& signature = m_impl->Key( signatureIndex );
+        metricBudget.Add(8ull*(signature.domain.size()+signature.signature.size()+signature.frameScope.size()));
         NeutralSignatureAggregate aggregate;
         aggregate.domain = signature.domain;
         aggregate.signatureId = signature.signature;
@@ -1211,17 +1328,23 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
             result.qualityComplete = false;
             ++result.unreportedGapCount;
             result.qualityFindings.push_back( "missing_complete_frame_denominator:" +
-                signature.domain + ":" + signature.signature );
+                std::string(signature.domain) + ":" + std::string(signature.signature) );
             aggregate.exact = false;
         }
         else aggregate.completeFrameCount = denominator->second;
         std::vector<MetricPoint> inclusive, exclusive, wait, critical;
         inclusive.reserve( frames.size() ); exclusive.reserve( frames.size() );
         wait.reserve( frames.size() ); critical.reserve( frames.size() );
+        const auto completeFrame = [&](uint64_t index) {
+            return !m_impl->completeFrameFilter || m_impl->completeFrameFilter(signature.domain,signature.frameScope,index);
+        };
+        uint64_t unknownCompleteFrames=0;
         for( const auto& frame : frames )
         {
             aggregate.logical = aggregate.logical || frame.logical;
-            if( !frame.exact ) { ++aggregate.unknownFrameCount; continue; }
+            const auto complete=completeFrame(frame.frameIndex);
+            if(!complete) ++aggregate.outsideCompleteFrameCount;
+            if( !frame.exact ) { ++aggregate.unknownFrameCount; if(complete) ++unknownCompleteFrames; continue; }
             if( !AddChecked( aggregate.occurrenceCount, frame.occurrenceCount ) ) aggregate.exact = false;
             inclusive.push_back( { frame.frameIndex, frame.inclusiveNs } );
             exclusive.push_back( { frame.frameIndex, frame.exclusiveNs } );
@@ -1229,45 +1352,63 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
             critical.push_back( { frame.frameIndex, frame.criticalPathNs } );
         }
         aggregate.presentFrameCount = inclusive.size();
-        const auto knownFrameCount = aggregate.completeFrameCount >= aggregate.unknownFrameCount ?
-            aggregate.completeFrameCount - aggregate.unknownFrameCount : 0;
-        if( aggregate.unknownFrameCount > aggregate.completeFrameCount ) aggregate.exact = false;
+        const auto knownFrameCount = aggregate.completeFrameCount >= unknownCompleteFrames ?
+            aggregate.completeFrameCount - unknownCompleteFrames : 0;
+        if( unknownCompleteFrames > aggregate.completeFrameCount ) aggregate.exact = false;
         const auto itemPrefix = "signature-" + std::to_string( ordinal++ );
-        aggregate.inclusive = BuildMetric( inclusive, knownFrameCount,
-            m_impl->root, itemPrefix + "-inclusive", m_impl->maximumBufferedValues );
-        aggregate.exclusive = BuildMetric( exclusive, knownFrameCount,
-            m_impl->root, itemPrefix + "-exclusive", m_impl->maximumBufferedValues );
-        aggregate.wait = BuildMetric( wait, knownFrameCount,
-            m_impl->root, itemPrefix + "-wait", m_impl->maximumBufferedValues );
-        aggregate.criticalPath = BuildMetric( critical, knownFrameCount,
-            m_impl->root, itemPrefix + "-critical", m_impl->maximumBufferedValues );
+        const auto buildMetric=[&](const std::vector<MetricPoint>& points,const char* suffix) {
+            const auto prefix=itemPrefix+suffix;
+            if(aggregate.outsideCompleteFrameCount==0)
+                return BuildMetric(points,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+            AnalysisWorkspaceReservation subsetBudget(m_impl->workspace,65536+64ull*points.size());
+            std::vector<MetricPoint> eligible; eligible.reserve(points.size());
+            for(const auto& point:points) if(completeFrame(point.frame)) eligible.push_back(point);
+            auto metric=BuildMetric(eligible,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+            std::vector<int64_t> present; present.reserve(points.size());
+            for(const auto& point:points) present.push_back(point.value);
+            metric.whenPresent=ComputeExactDistributionExternal(present,0,m_impl->root,
+                prefix+"-all-present",m_impl->maximumBufferedValues,m_impl->disk);
+            return metric;
+        };
+        aggregate.inclusive=buildMetric(inclusive,"-inclusive");
+        aggregate.exclusive=buildMetric(exclusive,"-exclusive");
+        aggregate.wait=buildMetric(wait,"-wait");
+        aggregate.criticalPath=buildMetric(critical,"-critical");
         aggregate.exact = aggregate.exact && aggregate.inclusive.perCompleteFrame.exact &&
             aggregate.exclusive.perCompleteFrame.exact && aggregate.wait.perCompleteFrame.exact &&
-            aggregate.criticalPath.perCompleteFrame.exact;
+            aggregate.criticalPath.perCompleteFrame.exact && aggregate.inclusive.whenPresent.exact &&
+            aggregate.exclusive.whenPresent.exact && aggregate.wait.whenPresent.exact && aggregate.criticalPath.whenPresent.exact;
         if( !aggregate.exact )
         {
             result.qualityComplete = false;
             ++result.unreportedGapCount;
             result.qualityFindings.push_back( "non_exact_signature_statistics:" +
-                signature.domain + ":" + signature.signature );
+                std::string(signature.domain) + ":" + std::string(signature.signature) );
         }
         // Known observations remain useful, but a partial source cannot claim
         // an exact all-frame distribution. This is not a decoder/count gap.
-        if( aggregate.unknownFrameCount != 0 )
+        if( unknownCompleteFrames != 0 || (aggregate.completeFrameCount==0 && aggregate.outsideCompleteFrameCount!=0) )
         {
             aggregate.exact = false;
             for( auto* metric : { &aggregate.inclusive, &aggregate.exclusive,
                 &aggregate.wait, &aggregate.criticalPath } )
             {
                 metric->perCompleteFrame.exact = false;
-                metric->perCompleteFrame.unavailableReason = "source_frames_unknown";
+                metric->perCompleteFrame.unavailableReason = unknownCompleteFrames!=0 ?
+                    "source_frames_unknown" : "no_complete_source_frames";
                 metric->pattern = AnomalyPattern::None;
             }
         }
         result.maximumBufferedValuesObserved = std::max( result.maximumBufferedValuesObserved,
             std::min<uint64_t>( m_impl->maximumBufferedValues, aggregate.presentFrameCount ) );
         if( signatureSink ) signatureSink( aggregate, frames );
-        result.signatures.push_back( std::move( aggregate ) );
+        ++streamedOutputs[aggregate.domain];
+        ++m_impl->outputSignatureCount;
+        if(retainResults)
+        {
+            result.signatures.push_back( std::move( aggregate ) );
+            m_impl->materializedResultPeak = std::max<uint64_t>(m_impl->materializedResultPeak, result.signatures.size());
+        }
     };
 
     if( !m_impl->runs.empty() )
@@ -1276,6 +1417,7 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
         if( !reader.input ) { error = "neutral_final_run_open_failed"; return false; }
         uint32_t currentSignature = 0;
         bool haveSignature = false;
+        AnalysisWorkspaceReservation frameBudget(m_impl->workspace);
         std::vector<NeutralMergedFrameValues> frames;
         uint64_t processed = 0;
         while( reader.valid )
@@ -1287,18 +1429,28 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
             if( !reader.valid && !reader.input.eof() ) { error = "neutral_final_run_read_failed"; return false; }
             if( haveSignature && value.signature != currentSignature )
             {
+                if(cancelled && cancelled()) { error = "cancelled"; return false; }
                 finishSignature( currentSignature, frames );
+                if(cancelled && cancelled()) { error = "cancelled"; return false; }
                 frames.clear();
             }
             currentSignature = value.signature;
             haveSignature = true;
+            if(frames.size()==frames.capacity())
+            {
+                const auto capacity=std::max<size_t>(64,frames.capacity()*2);
+                frameBudget.Resize(capacity*2ull*sizeof(NeutralMergedFrameValues));
+                frames.reserve(capacity);
+            }
             frames.push_back( { value.frame, value.inclusive, value.exclusive,
                 value.wait, value.critical, value.occurrences,
                 ( value.flags & 1u ) != 0, ( value.flags & 2u ) != 0 } );
         }
+        if(cancelled && cancelled()) { error = "cancelled"; return false; }
         if( haveSignature ) finishSignature( currentSignature, frames );
+        if(cancelled && cancelled()) { error = "cancelled"; return false; }
         reader.input.close();
-        RemoveQuietly( m_impl->runs.front() );
+        RemoveQuietly( m_impl->runs.front(),m_impl->disk );
         m_impl->runs.clear();
     }
 
@@ -1310,7 +1462,9 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
         if( left.signatureId != right.signatureId ) return left.signatureId < right.signatureId;
         return left.frameScope < right.frameScope;
     } );
-    FinalizeRankingsAndAudit( result, m_impl->audits );
+    // The streamed consumer owns persisted statistics/rankings. Only the small
+    // per-domain count audit is returned here; it is a distinct public type.
+    FinalizeRankingsAndAudit( result, m_impl->audits, retainResults ? nullptr : &streamedOutputs );
     return true;
 }
 
@@ -1347,6 +1501,96 @@ std::string SerializeNeutralStatisticsResult( const NeutralStatisticsResult& res
     return SerializeResult( result, true );
 }
 
+std::string SerializeNeutralSignatureRecord( const NeutralSignatureAggregate& signature )
+{
+    return SignatureJson(signature).dump();
+}
+
+namespace
+{
+NeutralSignatureAggregate ParseSignatureRecord( const json& item )
+{
+    const auto u64 = []( const json& value ) -> uint64_t {
+        if( value.is_string() ) return std::stoull( value.get<std::string>() );
+        return value.get<uint64_t>();
+    };
+    const auto i64 = []( const json& value ) -> int64_t {
+        if( value.is_string() ) return std::stoll( value.get<std::string>() );
+        return value.get<int64_t>();
+    };
+    const auto real = []( const json& value ) -> double {
+        if( value.is_string() ) return std::stod( value.get<std::string>() );
+        return value.get<double>();
+    };
+    const auto distribution = [&]( const json& value, ExactDistribution& output ) {
+        output.exact = value.at( "exact" ).get<bool>();
+        output.count = u64( value.at( "count" ) );
+        output.zeroCount = u64( value.at( "zero_count" ) );
+        output.total = i64( value.at( "total_ns" ) );
+        output.min = i64( value.at( "min_ns" ) );
+        output.max = i64( value.at( "max_ns" ) );
+        output.mean = real( value.at( "mean_ns" ) );
+        output.median = real( value.at( "median_ns" ) );
+        output.mad = real( value.at( "mad_ns" ) );
+        output.p50 = real( value.at( "p50_ns" ) );
+        output.p90 = real( value.at( "p90_ns" ) );
+        output.p95 = real( value.at( "p95_ns" ) );
+        output.p99 = real( value.at( "p99_ns" ) );
+        if( value.contains( "unavailable_reason" ) && !value.at( "unavailable_reason" ).is_null() )
+            output.unavailableReason = value.at( "unavailable_reason" ).get<std::string>();
+    };
+    const auto metric = [&]( const json& value, NeutralMetricAggregate& output ) {
+        distribution( value.at( "per_complete_frame" ), output.perCompleteFrame );
+        distribution( value.at( "when_present" ), output.whenPresent );
+        const auto pattern = value.at( "pattern" ).get<std::string>();
+        if( pattern == "isolated_spike" ) output.pattern = AnomalyPattern::IsolatedSpike;
+        else if( pattern == "recurrent_spike" ) output.pattern = AnomalyPattern::RecurrentSpike;
+        else if( pattern == "burst_window" ) output.pattern = AnomalyPattern::BurstWindow;
+        else if( pattern == "persistent_pressure" ) output.pattern = AnomalyPattern::PersistentPressure;
+        else output.pattern = AnomalyPattern::None;
+        for( const auto& anomaly : value.at( "anomalies" ) )
+            output.anomalies.push_back( { u64( anomaly.at( "frame_index" ) ),
+                i64( anomaly.at( "value_ns" ) ), real( anomaly.at( "delta_from_median_ns" ) ) } );
+        output.anomalyCount = value.contains( "anomaly_count" ) ?
+            u64( value.at( "anomaly_count" ) ) : output.anomalies.size();
+        output.anomaliesComplete = value.value( "anomalies_complete", true );
+        output.longestBurstFrames = u64( value.at( "longest_burst_frames" ) );
+        if( value.contains( "longest_burst_start_frame" ) && !value.at( "longest_burst_start_frame" ).is_null() )
+            output.longestBurstStartFrame = u64( value.at( "longest_burst_start_frame" ) );
+        if( value.contains( "longest_burst_end_frame" ) && !value.at( "longest_burst_end_frame" ).is_null() )
+            output.longestBurstEndFrame = u64( value.at( "longest_burst_end_frame" ) );
+        if( value.contains( "longest_burst_peak_frame" ) && !value.at( "longest_burst_peak_frame" ).is_null() )
+            output.longestBurstPeakFrame = u64( value.at( "longest_burst_peak_frame" ) );
+        if( !value.at( "period_frames" ).is_null() ) output.periodFrames = u64( value.at( "period_frames" ) );
+    };
+    NeutralSignatureAggregate signature;
+    signature.domain = item.at( "domain" ).get<std::string>();
+    signature.signatureId = item.at( "signature_id" ).get<std::string>();
+    signature.frameScope = item.at( "frame_scope" ).get<std::string>();
+    signature.logical = item.at( "logical" ).get<bool>();
+    signature.exact = item.at( "exact" ).get<bool>();
+    signature.completeFrameCount = u64( item.at( "complete_frame_count" ) );
+    signature.presentFrameCount = u64( item.at( "present_frame_count" ) );
+    signature.occurrenceCount = u64( item.at( "occurrence_count" ) );
+    signature.unknownFrameCount = item.contains( "unknown_frame_count" ) ? u64( item.at( "unknown_frame_count" ) ) : 0;
+    signature.outsideCompleteFrameCount = item.contains("outside_complete_frame_count") ? u64(item.at("outside_complete_frame_count")) : 0;
+    metric( item.at( "inclusive" ), signature.inclusive );
+    metric( item.at( "exclusive" ), signature.exclusive );
+    metric( item.at( "wait" ), signature.wait );
+    metric( item.at( "critical_path" ), signature.criticalPath );
+    return signature;
+}
+}
+
+bool DeserializeNeutralSignatureRecord( const std::string& payload,
+    NeutralSignatureAggregate& signature, std::string& error )
+{
+    signature = {}; error.clear();
+    try { signature = ParseSignatureRecord( json::parse( payload ) ); return true; }
+    catch( const std::exception& exception )
+    { error = "neutral_signature_record_parse_failed:" + std::string( exception.what() ); return false; }
+}
+
 bool DeserializeNeutralStatisticsResult( const std::string& payload,
     NeutralStatisticsResult& result, std::string& error )
 {
@@ -1373,51 +1617,6 @@ bool DeserializeNeutralStatisticsResult( const std::string& payload,
             if( value.is_string() ) return std::stod( value.get<std::string>() );
             return value.get<double>();
         };
-        auto distribution = [&]( const json& value, ExactDistribution& output ) {
-            output.exact = value.at( "exact" ).get<bool>();
-            output.count = u64( value.at( "count" ) );
-            output.zeroCount = u64( value.at( "zero_count" ) );
-            output.total = i64( value.at( "total_ns" ) );
-            output.min = i64( value.at( "min_ns" ) );
-            output.max = i64( value.at( "max_ns" ) );
-            output.mean = real( value.at( "mean_ns" ) );
-            output.median = real( value.at( "median_ns" ) );
-            output.mad = real( value.at( "mad_ns" ) );
-            output.p50 = real( value.at( "p50_ns" ) );
-            output.p90 = real( value.at( "p90_ns" ) );
-            output.p95 = real( value.at( "p95_ns" ) );
-            output.p99 = real( value.at( "p99_ns" ) );
-            if( value.contains( "unavailable_reason" ) && !value.at( "unavailable_reason" ).is_null() )
-                output.unavailableReason = value.at( "unavailable_reason" ).get<std::string>();
-        };
-        auto metric = [&]( const json& value, NeutralMetricAggregate& output ) {
-            distribution( value.at( "per_complete_frame" ), output.perCompleteFrame );
-            distribution( value.at( "when_present" ), output.whenPresent );
-            const auto pattern = value.at( "pattern" ).get<std::string>();
-            if( pattern == "isolated_spike" ) output.pattern = AnomalyPattern::IsolatedSpike;
-            else if( pattern == "recurrent_spike" ) output.pattern = AnomalyPattern::RecurrentSpike;
-            else if( pattern == "burst_window" ) output.pattern = AnomalyPattern::BurstWindow;
-            else if( pattern == "persistent_pressure" ) output.pattern = AnomalyPattern::PersistentPressure;
-            else output.pattern = AnomalyPattern::None;
-            for( const auto& item : value.at( "anomalies" ) )
-                output.anomalies.push_back( { u64( item.at( "frame_index" ) ),
-                    i64( item.at( "value_ns" ) ), real( item.at( "delta_from_median_ns" ) ) } );
-            output.anomalyCount = value.contains( "anomaly_count" ) ?
-                u64( value.at( "anomaly_count" ) ) : output.anomalies.size();
-            output.anomaliesComplete = value.value( "anomalies_complete", true );
-            output.longestBurstFrames = u64( value.at( "longest_burst_frames" ) );
-            if( value.contains( "longest_burst_start_frame" ) &&
-                !value.at( "longest_burst_start_frame" ).is_null() )
-                output.longestBurstStartFrame = u64( value.at( "longest_burst_start_frame" ) );
-            if( value.contains( "longest_burst_end_frame" ) &&
-                !value.at( "longest_burst_end_frame" ).is_null() )
-                output.longestBurstEndFrame = u64( value.at( "longest_burst_end_frame" ) );
-            if( value.contains( "longest_burst_peak_frame" ) &&
-                !value.at( "longest_burst_peak_frame" ).is_null() )
-                output.longestBurstPeakFrame = u64( value.at( "longest_burst_peak_frame" ) );
-            if( !value.at( "period_frames" ).is_null() ) output.periodFrames = u64( value.at( "period_frames" ) );
-        };
-
         const auto& quality = document.at( "quality" );
         result.qualityComplete = quality.at( "complete" ).get<bool>();
         result.unreportedGapCount = u64( quality.at( "unreported_gap_count" ) );
@@ -1443,22 +1642,7 @@ bool DeserializeNeutralStatisticsResult( const std::string& payload,
         }
         for( const auto& item : document.at( "signatures" ) )
         {
-            NeutralSignatureAggregate signature;
-            signature.domain = item.at( "domain" ).get<std::string>();
-            signature.signatureId = item.at( "signature_id" ).get<std::string>();
-            signature.frameScope = item.at( "frame_scope" ).get<std::string>();
-            signature.logical = item.at( "logical" ).get<bool>();
-            signature.exact = item.at( "exact" ).get<bool>();
-            signature.completeFrameCount = u64( item.at( "complete_frame_count" ) );
-            signature.presentFrameCount = u64( item.at( "present_frame_count" ) );
-            signature.occurrenceCount = u64( item.at( "occurrence_count" ) );
-            signature.unknownFrameCount = item.contains( "unknown_frame_count" ) ?
-                u64( item.at( "unknown_frame_count" ) ) : 0;
-            metric( item.at( "inclusive" ), signature.inclusive );
-            metric( item.at( "exclusive" ), signature.exclusive );
-            metric( item.at( "wait" ), signature.wait );
-            metric( item.at( "critical_path" ), signature.criticalPath );
-            result.signatures.push_back( std::move( signature ) );
+            result.signatures.push_back( ParseSignatureRecord( item ) );
         }
         auto rankingList = [&]( const json& values, std::vector<NeutralRankingEntry>& output ) {
             for( const auto& item : values )
