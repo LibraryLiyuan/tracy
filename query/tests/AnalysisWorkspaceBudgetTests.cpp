@@ -57,13 +57,13 @@ void DiskFiles(const std::filesystem::path& root)
         out.flush(); Require(std::filesystem::file_size(root/"frames")==0,"frame series reject before writing any oversized extent");
     }
     AnalysisCacheTableOptions options; options.blockBytes=1024; options.disk=disk;
-    disk->maximumBytes=98; // 24-byte index header + 24-byte row + 50-byte block.
+    disk->maximumBytes=114; // 24-byte index header + 24-byte row + 66-byte v2 raw block.
     {
         AnalysisCacheTableWriter writer(root/"manifest-denied",std::string(64,'a'),"disk",options);
         writer.Append("k","v");
         Reject([&]{writer.Commit();},"cache_disk_budget");
     }
-    Require(AnalysisDiskUsage::Bytes(root)==98 && usage->Current()==98,
+    Require(AnalysisDiskUsage::Bytes(root)==114 && usage->Current()==114,
         "manifest publication is charged before writing, retaining only actual partial data");
     Require(!std::filesystem::exists(root/"manifest-denied"/"manifest.json"),"disk-denied manifest cannot publish");
     disk->maximumBytes=1024*1024;

@@ -3,6 +3,7 @@
 #include "TracyAnalysisCacheQuery.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include "TracyAnalysisCacheKey.hpp"
+#include "TracyAnalysisWriterLease.hpp"
 #include "TracyCandidatePolicyCache.hpp"
 
 #include "TracyExactStatistics.hpp"
@@ -101,6 +102,10 @@ bool ReplaceFile( const std::filesystem::path& from, const std::filesystem::path
     std::string& error )
 {
 #ifdef _WIN32
+    HANDLE file=CreateFileW(from.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) { error="analysis_scan_flush_open_failed"; return false; }
+    const bool flushed=FlushFileBuffers(file)!=0; CloseHandle(file);
+    if(!flushed) { error="analysis_scan_flush_failed"; return false; }
     if( MoveFileExW( from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING |
         MOVEFILE_WRITE_THROUGH ) != FALSE ) return true;
     error = "analysis_scan_atomic_replace_failed:" + std::to_string( GetLastError() );
@@ -166,6 +171,92 @@ json ReadJson( const std::filesystem::path& path,AnalysisWorkspaceReservation& w
     if(input.gcount()!=std::streamsize(payload.size()) || input.peek()!=std::char_traits<char>::eof())
         throw std::runtime_error("analysis_scan_small_document_changed");
     return json::parse(payload);
+}
+
+// Final tables only. Build scratch is neither recursively discovered nor
+// inferred from filenames. A missing/corrupt final block prevents publication.
+void ValidateFinalTables(const std::filesystem::path& root,const std::string& identity,
+    bool policy,AnalysisCacheTableOptions options)
+{
+    const std::vector<std::string> names=policy ?
+        std::vector<std::string>{"header","candidates","candidate-index","ranked-signatures"} :
+        std::vector<std::string>{"header","statistics","contexts","rankings","ranking-groups"};
+    const std::string prefix=policy ? "candidate-policy-cache-v1-" : "neutral-cache-v1-";
+    for(const auto& name:names) {
+        AnalysisCacheTableReader reader(root/name,identity,prefix+name,options);
+        reader.ValidateAll();
+    }
+}
+
+void CheckCleanupPath(const std::filesystem::path& root,const std::filesystem::path& path)
+{
+    const auto absolute=std::filesystem::absolute(path).lexically_normal();
+    const auto base=std::filesystem::absolute(root).lexically_normal();
+    const auto relative=absolute.lexically_relative(base);
+    if(relative.empty() || relative.is_absolute()) throw std::runtime_error("analysis_cleanup_path");
+    for(const auto& part:relative) if(part=="..") throw std::runtime_error("analysis_cleanup_path");
+    const auto check=[](const std::filesystem::path& value) {
+        const auto status=std::filesystem::symlink_status(value);
+        if(std::filesystem::is_symlink(status)) throw std::runtime_error("analysis_cleanup_link");
+#ifdef _WIN32
+        const auto attributes=GetFileAttributesW(value.c_str());
+        if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("analysis_cleanup_reparse");
+#endif
+    };
+    for(auto value=absolute;!value.empty();) {
+#ifdef _WIN32
+        // Extended drive roots have a lexical parent such as \\?\C:,
+        // which is not a queryable filesystem path without its separator.
+        const auto name=value.filename().native();
+        if(!name.empty() && name.back()==L':') { check(value/L""); break; }
+#endif
+        check(value); const auto parent=value.parent_path(); if(parent==value) break; value=parent;
+    }
+    if(std::filesystem::exists(absolute) && std::filesystem::is_directory(absolute))
+        for(const auto& entry:std::filesystem::recursive_directory_iterator(absolute)) check(entry.path());
+}
+
+// Best-effort after durable publication. Failure leaves pending work; final
+// analysis state and original/frozen namespaces are never modified here.
+void CleanupPublishedTables(const std::filesystem::path& root,const std::string& identity,
+    bool policy,bool create,AnalysisCacheTableOptions options) noexcept
+{
+    try {
+        if(!AnalysisCacheCleanupDefault()) return;
+        const auto marker=root/"cleanup.json";
+        if(!create && !std::filesystem::exists(marker)) return;
+        CheckCleanupPath(root,marker);
+        AnalysisWriterLease lease; std::string error;
+        CheckCleanupPath(root,root/"build-state");
+        if(!AcquireAnalysisWriterLease(root,lease,error)) return;
+        const json paths=policy ? json::array({"facts","priority","ranking-input"}) : json::array({"ranking-input"});
+        json record;
+        AnalysisWorkspaceReservation control(options.workspace);
+        if(std::filesystem::exists(marker)) {
+            record=ReadJson(marker,control);
+            if(record.at("schema")!=1 || record.at("identity")!=identity || record.at("policy")!=policy || record.at("paths")!=paths) return;
+            if(record.at("state")=="done") return;
+            if(record.at("state")!="pending") return;
+            ValidateFinalTables(root,identity,policy,options);
+        } else {
+            if(!create) return;
+            record={{"schema",1},{"identity",identity},{"policy",policy},{"paths",paths},{"state","pending"}};
+            if(!WriteJson(marker,record,error,options.disk?options.disk->usage:nullptr)) return;
+        }
+        bool done=true;
+        for(const auto& name:paths) {
+            const auto target=root/name.get<std::string>();
+            CheckCleanupPath(root,target);
+            std::error_code ec;
+            AnalysisDiskRemove(target,options.disk,ec,true);
+            if(ec || std::filesystem::exists(target)) done=false;
+        }
+        if(done) {
+            record["state"]="done";
+            WriteJson(marker,record,error,options.disk?options.disk->usage:nullptr);
+        }
+    } catch(const std::exception& error) { fprintf(stderr,"cache cleanup deferred: %s\n",error.what()); }
 }
 
 ScanState ParseState( const std::string& value )
@@ -951,8 +1042,20 @@ void AnalysisScanManager::Update( const std::shared_ptr<Entry>& entry, ScanState
     entry->snapshot.processMemory=memory;
     entry->snapshot.completed = state == ScanState::Complete;
     entry->snapshot.resumable = state == ScanState::CancelledResumable;
-    std::string ignored;
-    SaveStateLocked( *entry, ignored );
+    std::string persistError;
+    bool saved=false;
+    try { saved=SaveStateLocked(*entry,persistError); }
+    catch(const std::exception& failure) { persistError=failure.what(); }
+    catch(...) { persistError="analysis_scan_state_persist_exception"; }
+    if(!saved) {
+        entry->snapshot.completed=false; entry->snapshot.state=ScanState::Failed;
+        entry->snapshot.resumable=false; entry->snapshot.stage="state_persist_failed";
+        entry->snapshot.error=persistError;
+        // Stop normal execution: no generation may be published or reclaimed
+        // after a failed journal transition. The worker's terminal reporter
+        // separately contains failures while persisting this failure itself.
+        throw std::runtime_error(persistError);
+    }
 }
 
 AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest& request )
@@ -1019,6 +1122,10 @@ void AnalysisScanManager::StartWorker( const std::shared_ptr<Entry>& entry )
     entry->worker = std::jthread( [this, entry,memory]( std::stop_token userStop ) {
         std::stop_source executionStop;
         std::stop_callback forward(userStop,[&]{executionStop.request_stop();});
+        const auto terminal=[&](ScanState state,std::string_view stage,std::string_view error) noexcept {
+            try { Update(entry,state,0,4,stage,error); }
+            catch(...) { /* Update already leaves a non-complete failure snapshot. */ }
+        };
         try {
             memory->Check();
             auto monitor=memory->Monitor(executionStop);
@@ -1028,13 +1135,13 @@ void AnalysisScanManager::StartWorker( const std::shared_ptr<Entry>& entry )
         {
             const std::string error=exception.what();
             if(error.find("analysis_workspace_budget")!=std::string::npos)
-                Update(entry,ScanState::CancelledResumable,0,4,"workspace_budget",error);
+                terminal(ScanState::CancelledResumable,"workspace_budget",error);
             else if(const auto reason=DiskBudgetReason(error); !reason.empty())
-                Update(entry,ScanState::CancelledResumable,0,4,"disk_budget",reason);
-            else Update( entry, ScanState::Failed, 0, 4, "unhandled_exception", error );
+                terminal(ScanState::CancelledResumable,"disk_budget",reason);
+            else terminal(ScanState::Failed,"unhandled_exception",error);
         }
         catch( ... )
-        { Update( entry, ScanState::Failed, 0, 4, "unhandled_exception", "unknown_exception" ); }
+        { terminal(ScanState::Failed,"unhandled_exception","unknown_exception"); }
     } );
 }
 
@@ -1140,6 +1247,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         CheckGenerationDiskBudget(request.temporaryRoot,limit,stopToken);
         disk->Check(true);
         const auto sha=PublishAnalysisNeutralBundle(request.temporaryRoot,identity,products,options);
+        ValidateFinalTables(products.neutralCachePath,identity,false,options);
         products={}; // Reopen the persisted metadata; never trust only the writer's copy.
         products=OpenAnalysisNeutralBundle(request.temporaryRoot,identity,sha,options);
         memory.Check();
@@ -1147,6 +1255,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         if(!WriteJson(entry->aggregateRoot/"current.json",{{"schema",1},{"identity",identity},
             {"generation",generation},{"header_sha256",sha}},error,m_diskUsage,limit)) throw std::runtime_error(error);
         recordNeutral(generation,sha);
+        CleanupPublishedTables(products.neutralCachePath,identity,false,true,options);
         }
     }
 
@@ -1180,6 +1289,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;
     const auto candidateRoot=entry->scanRoot/"policy-generations"/generation/"policy-cache";
     const auto policyIdentity=BuildCandidatePolicyCache(candidateRoot,neutral,policy,policyOptions);
+    ValidateFinalTables(candidateRoot,policyIdentity,true,options);
     CandidatePolicyCacheReader verified(candidateRoot,policyIdentity,policyOptions);
     {
         AnalysisWorkspaceReservation summaryWorkspace(m_workspace,65536+32ull*verified.SummaryBytes());
@@ -1198,6 +1308,8 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     { Update( entry, ScanState::CancelledResumable, 3, 4, "cancelled", "cancelled" ); return; }
     memory.Check();
     Update( entry, ScanState::Complete, 4, 4, "complete" );
+    { std::lock_guard lock(entry->mutex); if(!entry->snapshot.completed) return; }
+    CleanupPublishedTables(candidateRoot,policyIdentity,true,true,options);
 }
 
 std::shared_ptr<AnalysisScanManager::Entry> AnalysisScanManager::LoadEntry( const std::string& scanId ) const
@@ -1355,7 +1467,12 @@ AnalysisScanSnapshot AnalysisScanManager::Resume( const std::string& scanId )
 AnalysisScanSnapshot AnalysisScanManager::Close( const std::string& scanId )
 {
     const auto entry = FindOrLoad( scanId );
+    std::lock_guard readLock( entry->readMutex );
     std::lock_guard lock( entry->mutex );
+    entry->signatureQuery.reset();
+    entry->candidateQuery.reset();
+    entry->neutralReader.reset();
+    entry->policyReader.reset();
     entry->snapshot.closed = true;
     if( entry->snapshot.completed ) entry->request.source.reset();
     std::string error;
@@ -1402,6 +1519,8 @@ void AnalysisScanManager::EnsureReaders( const std::shared_ptr<Entry>& entry ) c
     if(summary.at("neutral_cache_content_sha256")!=neutral->ContentSha256() ||
         summary.at("profile_identity")!=entry->request.profileIdentity)
         throw std::runtime_error("analysis_scan_policy_content_identity");
+    CleanupPublishedTables(neutralRoot/"neutral-statistics-v1",identity,false,false,options);
+    CleanupPublishedTables(policyRoot/"policy-cache",policyIdentity,true,false,options);
     entry->signatureQuery.reset(); entry->candidateQuery.reset();
     entry->neutralReader=std::move(neutral); entry->policyReader=std::move(policy);
     const auto n=entry->neutralReader.get(); const auto p=entry->policyReader.get();

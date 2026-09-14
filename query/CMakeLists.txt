@@ -27,6 +27,15 @@ include(${CMAKE_CURRENT_LIST_DIR}/../cmake/server.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/stream.cmake)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/analysis.cmake)
 
+# Internal acceptance builds only; production binaries ignore experiment env.
+option(TRACY_CACHE_STORAGE_EXPERIMENTS "Enable internal cache storage comparisons" OFF)
+mark_as_advanced(TRACY_CACHE_STORAGE_EXPERIMENTS)
+if(TRACY_CACHE_STORAGE_EXPERIMENTS)
+    set_property(SOURCE ${TRACY_ANALYSIS_DIR}/TracyAnalysisCacheTable.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS TRACY_CACHE_STORAGE_EXPERIMENTS)
+endif()
+
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_LIST_DIR}/schema/tracy-query-v1.schema.json
     ${CMAKE_CURRENT_LIST_DIR}/schema/coverage-v1.json
@@ -135,7 +144,7 @@ if(BUILD_TESTING)
     add_test(NAME tracy-neutral-aggregate-store COMMAND tracy-neutral-aggregate-store-tests)
 
     add_executable(tracy-analysis-cache-table-tests tests/AnalysisCacheTableTests.cpp)
-    target_link_libraries(tracy-analysis-cache-table-tests PRIVATE TracyAnalysis)
+    target_link_libraries(tracy-analysis-cache-table-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-analysis-cache-table-tests)
     add_test(NAME tracy-analysis-cache-table COMMAND tracy-analysis-cache-table-tests)
     add_executable(tracy-analysis-cache-query-tests tests/AnalysisCacheQueryTests.cpp)

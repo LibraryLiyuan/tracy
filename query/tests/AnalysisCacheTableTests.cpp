@@ -1,4 +1,6 @@
 #include <iostream>
+#include "TracyHash.hpp"
+#include <nlohmann/json.hpp>
 #include "TracyAnalysisCacheTable.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include <chrono>
@@ -245,6 +247,135 @@ int main(int argc, char** argv)
         AnalysisCacheTableWriter second(temporary / "larger-blocks", Identity, "statistics", larger);
         for(uint64_t i = 0; i < 40; ++i) second.Append(Key(i), Payload(i));
         Require(second.Commit().contentSha256 == descriptor.contentSha256, "content identity depends on block size");
+
+        // Regression: repetitive records must consume less disk without losing bytes.
+        {
+            auto compressedOptions = options;
+            compressedOptions.blockBytes = 64 * 1024;
+            const auto path = temporary / "compressible";
+            AnalysisCacheTableWriter packed(path, Identity, "statistics", compressedOptions);
+            for(uint64_t i=0;i<100;++i) packed.Append(Key(i),std::string(4096,'x'));
+            packed.Commit();
+            uint64_t stored=0;
+            for(const auto& file:std::filesystem::directory_iterator(path/"blocks")) stored+=file.file_size();
+            Require(stored<100*4096/2,"compressible blocks were stored uncompressed");
+            AnalysisCacheTableReader decoded(path,Identity,"statistics",compressedOptions);
+            for(uint64_t i=0;i<100;++i) Require(decoded.GetAt(i).payload==std::string(4096,'x'),"compressed roundtrip changed payload");
+        }
+        {
+            const auto legacy=std::filesystem::path(__FILE__).parent_path()/"analysis-cache"/"v1-table";
+            AnalysisCacheTableReader old(legacy,Identity,"statistics",options);
+            Require(old.RecordCount()==40,"v1 fixture record count");
+            for(uint64_t i=0;i<40;++i) Require(old.GetAt(i).payload==Payload(i),"v1 payload changed");
+            Require(old.Descriptor().contentSha256==descriptor.contentSha256,"v1/v2 logical identities differ");
+            auto raw=options; raw.compressBlocks=false;
+            AnalysisCacheTableWriter plain(temporary/"raw-v2",Identity,"statistics",raw);
+            for(uint64_t i=0;i<40;++i) plain.Append(Key(i),Payload(i));
+            Require(plain.Commit().contentSha256==descriptor.contentSha256,"codec changed logical identity");
+            AnalysisCacheTableReader readRaw(temporary/"raw-v2",Identity,"statistics",raw);
+            Require(readRaw.GetAt(39).payload==Payload(39),"raw v2 fallback cannot be read");
+        }
+
+        {
+            const auto copy=temporary/"logical-corrupt";
+            std::filesystem::copy(temporary/"raw-v2",copy,std::filesystem::copy_options::recursive);
+            nlohmann::json manifest;
+            { std::ifstream input(copy/"manifest.json"); input>>manifest; }
+            manifest["body"]["content_sha256"]=std::string(64,'b');
+            const auto body=manifest["body"].dump(); Sha256Builder hash; hash.Update(body.data(),body.size());
+            manifest["sha256"]=hash.FinalHex();
+            { std::ofstream output(copy/"manifest.json"); output<<manifest.dump(); }
+            AnalysisCacheTableReader logical(copy,Identity,"statistics",options);
+            Reject([&]{logical.ValidateAll();},"content_checksum");
+        }
+        {
+            const auto copy=temporary/"unknown-codec";
+            std::filesystem::copy(temporary/"raw-v2",copy,std::filesystem::copy_options::recursive);
+            nlohmann::json manifest;
+            { std::ifstream input(copy/"manifest.json"); input>>manifest; }
+            manifest["body"]["blocks"][0]["codec"]=99;
+            const auto body=manifest["body"].dump(); Sha256Builder hash; hash.Update(body.data(),body.size());
+            manifest["sha256"]=hash.FinalHex();
+            { std::ofstream output(copy/"manifest.json"); output<<manifest.dump(); }
+            Reject([&]{AnalysisCacheTableReader unknown(copy,Identity,"statistics",options);},"block_encoding");
+        }
+        {
+            const auto copy=temporary/"decode-size-mismatch";
+            std::filesystem::copy(temporary/"compressible",copy,std::filesystem::copy_options::recursive);
+            nlohmann::json manifest;
+            { std::ifstream input(copy/"manifest.json"); input>>manifest; }
+            const auto block=copy/"blocks"/"0000000000000000.bin";
+            const uint64_t wrong=manifest["body"]["blocks"][0]["bytes"].get<uint64_t>()+1;
+            { std::fstream file(block,std::ios::in|std::ios::out|std::ios::binary);
+              file.seekp(32); file.write(reinterpret_cast<const char*>(&wrong),sizeof(wrong)); }
+            manifest["body"]["blocks"][0]["bytes"]=wrong;
+            manifest["body"]["blocks"][0]["sha256"]=Sha256File(block);
+            const auto body=manifest["body"].dump(); Sha256Builder hash; hash.Update(body.data(),body.size());
+            manifest["sha256"]=hash.FinalHex();
+            { std::ofstream output(copy/"manifest.json"); output<<manifest.dump(); }
+            auto sizes=options; sizes.blockBytes=64*1024;
+            AnalysisCacheTableReader mismatch(copy,Identity,"statistics",sizes);
+            Reject([&]{mismatch.GetAt(0);},"codec_frame_size");
+        }
+        {
+            const auto copy=temporary/"unknown-version";
+            std::filesystem::copy(temporary/"raw-v2",copy,std::filesystem::copy_options::recursive);
+            nlohmann::json manifest;
+            { std::ifstream input(copy/"manifest.json"); input>>manifest; }
+            manifest["body"]["schema"]=uint64_t(0x100000002ULL); // Must not narrow to the supported version 2.
+            const auto body=manifest["body"].dump(); Sha256Builder hash; hash.Update(body.data(),body.size());
+            manifest["sha256"]=hash.FinalHex();
+            { std::ofstream output(copy/"manifest.json"); output<<manifest.dump(); }
+            Reject([&]{AnalysisCacheTableReader unknown(copy,Identity,"statistics",options);},"schema_mismatch");
+        }
+        {
+            auto bounded=options; bounded.blockBytes=64*1024;
+            auto budget=std::make_shared<AnalysisWorkspaceBudget>(256*1024,128*1024);
+            bounded.workspace=budget;
+            const auto path=temporary/"codec-budget";
+            {
+                AnalysisCacheTableWriter denied(path,Identity,"statistics",bounded);
+                denied.Append("a",std::string(4096,'x'));
+                Reject([&]{denied.Commit();},"workspace_budget");
+                Require(std::filesystem::is_empty(path/"blocks"),"codec reservation must precede any compressed block write");
+            }
+            Require(budget->Snapshot().currentBytes==0,"codec failure leaked workspace");
+        }
+        {
+            auto bounded=options; bounded.blockBytes=64*1024;
+            auto budget=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+            bounded.workspace=budget;
+            {
+                AnalysisCacheTableReader first(temporary/"compressible",Identity,"statistics",bounded);
+                AnalysisCacheTableReader second(temporary/"compressible",Identity,"statistics",bounded);
+                first.GetAt(0); second.GetAt(0);
+                AnalysisWorkspaceReservation pressure(budget,2*1024*1024-budget->Snapshot().currentBytes-32768);
+                Reject([&]{first.GetAt(99);},"workspace_budget");
+                Require(second.GetAt(1).payload==std::string(4096,'x'),"one reader's codec denial invalidated another reader");
+            }
+            Require(budget->Snapshot().currentBytes==0,"multiple readers leaked codec/block reservations");
+        }
+        {
+            auto entropyOptions=options; entropyOptions.blockBytes=1024;
+            const auto path=temporary/"entropy"; uint32_t random=0x12345678;
+            std::vector<std::string> expected;
+            {
+                AnalysisCacheTableWriter writer(path,Identity,"statistics",entropyOptions);
+                for(uint64_t i=0;i<40;++i) {
+                    std::string payload;
+                    for(size_t j=0;j<512;++j) { random^=random<<13; random^=random>>17; random^=random<<5; payload.push_back(char(random)); }
+                    expected.push_back(payload); writer.Append(Key(i),payload);
+                }
+                writer.Commit();
+            }
+            uint64_t physical=0;
+            for(const auto& file:std::filesystem::directory_iterator(path/"blocks")) physical+=file.file_size();
+            Require(physical<=40*(8+12+512+56),"incompressible payload expanded beyond raw v2 framing");
+            AnalysisCacheTableReader reader(path,Identity,"statistics",entropyOptions);
+            for(size_t i=0;i<40;++i) Require(reader.GetAt(i).payload==expected[i],"incompressible binary payload did not roundtrip");
+            reader.ValidateAll();
+        }
+        reader.ValidateAll();
 
         AnalysisCacheTableWriter empty(temporary / "empty", Identity, "statistics", options);
         empty.Commit();

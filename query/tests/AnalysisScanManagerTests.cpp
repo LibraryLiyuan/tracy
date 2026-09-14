@@ -438,6 +438,51 @@ public:
 // Removing control-document ownership must fail cold Status and new Start
 // under pressure; neither may silently report a missing scan or lose profile
 // ownership once its parsing stack frame has returned.
+void PublicationIntegrityFailures(const std::filesystem::path& root,const std::filesystem::path& tracePath)
+{
+    for(const int fault:{0,1,2}) {
+        const bool corrupt=fault==0;
+        const auto name=corrupt ? "corrupt-publication" : fault==1 ? "state-write-denial" : "state-ledger-overflow";
+        const auto stateRoot=root/name,cacheRoot=root/(std::string(name)+"-cache");
+        auto native=std::make_shared<SourceDegradedTrace>();
+        const auto validated=ValidateAndNormalizeAnalysisProfile(Profile()); assert(validated.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId=name; request.tracePath=tracePath; request.source=native;
+        request.normalizedProfile=validated.normalized; request.profileIdentity=validated.profileSha256;
+        AnalysisScanExecutor executor=[&](const auto& input,std::stop_token token,const auto& progress,auto& products,auto& error) {
+            if(!ExecuteDefaultAnalysisScan(input,token,progress,products,error)) return false;
+            if(corrupt) {
+                const auto blocks=products.neutralCachePath/"statistics"/"blocks";
+                const auto block=std::filesystem::directory_iterator(blocks)->path();
+                std::fstream file(block,std::ios::in|std::ios::out|std::ios::binary);
+                assert(file); file.seekg(-1,std::ios::end); char last; file.get(last);
+                file.seekp(-1,std::ios::end); file.put(char(last^1));
+            } else if(fault==1) {
+                assert(std::filesystem::create_directory(stateRoot/"scans"/input.scanId/"scan-state.json.tmp"));
+            } else {
+                // Exercise an exception (not only a false return) in state
+                // persistence, using the existing shared-budget seam.
+                input.disk->usage->Grow(UINT64_MAX-input.disk->usage->Current(),UINT64_MAX,false);
+            }
+            return true;
+        };
+        std::string scanId;
+        {
+            AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),AnalysisScanSourceResolver{},executor);
+            scanId=manager.Start(request).scanId;
+            const auto failed=WaitFor(manager,scanId,ScanState::Failed,8s);
+            assert(!failed.completed);
+            if(corrupt) assert(failed.error.find("block_checksum")!=std::string::npos);
+            else assert(failed.stage=="state_persist_failed");
+        }
+        if(corrupt) for(const auto& file:std::filesystem::recursive_directory_iterator(cacheRoot))
+            assert(file.path().filename()!="current.json");
+        const auto statePath=stateRoot/"scans"/scanId/"scan-state.json";
+        json persisted; { std::ifstream input(statePath); input>>persisted; }
+        assert(!persisted.at("completed").get<bool>());
+    }
+}
+
 void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesystem::path& tracePath)
 {
     constexpr uint64_t maximum=1024ull*1024*1024;
@@ -470,7 +515,10 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
         scanId=warm.Start(request).scanId; WaitFor(warm,scanId,ScanState::Complete,6s);
         // Resume of an already complete entry only joins its finished worker;
         // no transient scan locals can influence this retained-owner check.
-        assert(warm.Resume(scanId).completed);
+        assert(warm.Resume(scanId).completed);        for(const auto& ownedRoot:{root/"control-state",root/"control-cache"})
+            for(const auto& file:std::filesystem::recursive_directory_iterator(ownedRoot))
+                if(file.is_directory() && file.path().filename()=="ranking-input")
+                    throw std::runtime_error("published scan retained disposable ranking input");
         const auto held=workspace->Snapshot().currentBytes;
         if(held<65536+32768) std::cerr<<"completed entry retained an uncharged profile\n";
         protectedControl&=held>=65536+32768;
@@ -496,6 +544,50 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
     }
     if(workspace->Snapshot().currentBytes!=0) throw std::runtime_error("Cold Manager destruction leaked control workspace");
     if(!protectedControl) throw std::runtime_error("Manager control JSON must be admitted before copying/parsing and charged for its retained lifetime");
+    // Simulate a process ending after durable completion but before cleanup.
+    const auto scanRoot=root/"control-state"/"scans"/scanId;
+    json state; { std::ifstream input(scanRoot/"scan-state.json"); input>>state; }
+    const auto policyRoot=scanRoot/"policy-generations"/state.at("policy_generation").get<std::string>()/"policy-cache";
+    const auto marker=policyRoot/"cleanup.json";
+    json cleanup; { std::ifstream input(marker); input>>cleanup; }
+    assert(cleanup.at("state")=="done");
+    std::filesystem::create_directory(policyRoot/"facts");
+    const auto retained=policyRoot/"facts"/"held.bin";
+    { std::ofstream output(retained); output<<"disposable"; }
+    cleanup["state"]="pending";
+    { std::ofstream output(marker); output<<cleanup.dump(); }
+#ifdef _WIN32
+    const auto held=CreateFileW(retained.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    assert(held!=INVALID_HANDLE_VALUE);
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && std::filesystem::exists(retained));
+        json pending; { std::ifstream input(marker); input>>pending; }
+        assert(pending.at("state")=="pending");        CloseHandle(held);
+        cold.Close(scanId);
+        cold.Summary(scanId);
+        assert(!std::filesystem::exists(retained));
+    }
+#endif
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && !std::filesystem::exists(policyRoot/"facts"));
+        json done; { std::ifstream input(marker); input>>done; }
+        assert(done.at("state")=="done" && executions==beforeCold);
+    }
+    // An altered cleanup record cannot widen the fixed deletion whitelist.
+    const auto protectedFile=scanRoot/"keep-evidence.txt";
+    { std::ofstream output(protectedFile); output<<"must remain"; }
+    cleanup["paths"]=json::array({"../../../keep-evidence.txt"});
+    { std::ofstream output(marker); output<<cleanup.dump(); }
+    {
+        AnalysisScanManager cold(root/"control-state",root/"control-cache",std::string(64,'e'),AnalysisScanSourceResolver{},executor,workspace);
+        cold.Summary(scanId);
+        assert(cold.Status(scanId).completed && std::filesystem::exists(protectedFile));
+    }
+
 }
 
 void ManagerColdBundleWorkspace(const std::filesystem::path& root,const std::filesystem::path& tracePath)
@@ -934,6 +1026,7 @@ int main(int argc,char** argv)
     if(argc==2 && std::string(argv[1])=="--cold-bundle-only") {
         RemoveTestRoot(root); return 0;
     }
+    testStage="publication integrity failures"; PublicationIntegrityFailures(root,tracePath);
     testStage="manager control workspace"; ManagerControlWorkspace(root,tracePath);
     if(argc==2 && std::string(argv[1])=="--control-json-only") {
         RemoveTestRoot(root); return 0;
