@@ -494,7 +494,7 @@ class ReportBuilderTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn('"passed":true', result.stdout)
+            self.assertTrue(json.loads(result.stdout)["passed"])
 
     def test_default_report_does_not_generate_html(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

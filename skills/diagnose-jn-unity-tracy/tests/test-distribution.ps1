@@ -12,6 +12,7 @@ function Assert-Test {
 $skillRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $installer = Join-Path $skillRoot 'scripts\install-skill.ps1'
 $exampleProfile = Join-Path $skillRoot 'config\local-profile.example.json'
+$exampleAnalysisProfile = Join-Path $skillRoot 'config\JNTracy.AnalysisProfile.example.yaml'
 $localIgnore = Join-Path $skillRoot 'config\.gitignore'
 
 Assert-Test (Test-Path -LiteralPath $installer -PathType Leaf) 'Portable install script is missing.'
@@ -33,6 +34,9 @@ try {
     Assert-Test (Test-Path -LiteralPath (Join-Path $installed 'SKILL.md') -PathType Leaf) 'Installed SKILL.md is missing.'
     Assert-Test (Test-Path -LiteralPath (Join-Path $installed 'config\local-profile.json') -PathType Leaf) 'Installer did not create a local profile.'
     Assert-Test ((Get-FileHash -LiteralPath (Join-Path $installed 'config\local-profile.json') -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $exampleProfile -Algorithm SHA256).Hash) 'First install did not initialize from the example profile.'
+    $installedAnalysisProfile = Join-Path $installed 'config\JNTracy.AnalysisProfile.yaml'
+    Assert-Test (Test-Path -LiteralPath $installedAnalysisProfile -PathType Leaf) 'Installer did not create the authoritative YAML analysis profile.'
+    Assert-Test ((Get-FileHash -LiteralPath $installedAnalysisProfile -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $exampleAnalysisProfile -Algorithm SHA256).Hash) 'First install did not initialize the analysis profile from its example.'
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $installed 'debug.log'))) 'Installer copied a generated debug.log.'
     Assert-Test (@(Get-ChildItem -LiteralPath $installed -Recurse -File -Filter *.pyc).Count -eq 0) 'Installer copied Python bytecode cache files.'
     Assert-Test (@(Get-ChildItem -LiteralPath $installed -Recurse -Directory -Filter __pycache__).Count -eq 0) 'Installer copied Python __pycache__ directories.'
@@ -40,14 +44,21 @@ try {
     $personalProfile = Get-Content -LiteralPath (Join-Path $installed 'config\local-profile.json') -Raw | ConvertFrom-Json
     $personalProfile.machine_profile = 'preserve-on-upgrade'
     $personalProfile | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath (Join-Path $installed 'config\local-profile.json') -Encoding utf8
+    # Non-default bytes, CRLF and a UTF-8 BOM must survive; do not reserialize a user's policy.
+    $personalAnalysisBytes = [System.Text.Encoding]::UTF8.GetPreamble() + [System.Text.Encoding]::UTF8.GetBytes("# preserve local policy`r`nschema_version: 1`r`nprofile_name: Personal policy`r`n")
+    [System.IO.File]::WriteAllBytes($installedAnalysisProfile, $personalAnalysisBytes)
+    $profileHashBefore = (Get-FileHash -LiteralPath (Join-Path $installed 'config\local-profile.json') -Algorithm SHA256).Hash
+    $analysisHashBefore = (Get-FileHash -LiteralPath $installedAnalysisProfile -Algorithm SHA256).Hash
     & $installer -DestinationRoot $destinationRoot -Force | Out-Null
     $upgradedProfile = Get-Content -LiteralPath (Join-Path $installed 'config\local-profile.json') -Raw | ConvertFrom-Json
     Assert-Test ($upgradedProfile.machine_profile -eq 'preserve-on-upgrade') 'Force upgrade overwrote the machine-local profile.'
+    Assert-Test ((Get-FileHash -LiteralPath (Join-Path $installed 'config\local-profile.json') -Algorithm SHA256).Hash -eq $profileHashBefore) 'Force upgrade changed the original JSON profile bytes.'
+    Assert-Test ((Get-FileHash -LiteralPath $installedAnalysisProfile -Algorithm SHA256).Hash -eq $analysisHashBefore) 'Force upgrade changed the authoritative YAML policy bytes.'
 
     Assert-Test (-not (Test-Path -LiteralPath (Join-Path $installed 'config\local-profile.source.json'))) 'Installer leaked the source machine profile.'
     [ordered]@{
         passed = $true
-        tests = @('portable_example', 'local_profile_ignore', 'first_install', 'generated_artifacts_excluded', 'upgrade_preserves_local_profile')
+        tests = @('portable_example', 'local_profile_ignore', 'first_install', 'generated_artifacts_excluded', 'upgrade_preserves_local_profile', 'first_install_analysis_yaml', 'upgrade_preserves_profile_bytes', 'upgrade_preserves_analysis_yaml_bytes')
     } | ConvertTo-Json -Depth 5
 }
 finally {

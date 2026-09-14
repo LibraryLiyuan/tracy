@@ -17,6 +17,8 @@ CONTRACT_PATH = SKILL_ROOT / "scripts" / "query_native_report.py"
 
 
 def load_contract():
+    if str(CONTRACT_PATH.parent) not in sys.path:
+        sys.path.insert(0, str(CONTRACT_PATH.parent))
     spec = importlib.util.spec_from_file_location("jntracy_query_native_report", CONTRACT_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load query-native report contract")
@@ -34,7 +36,7 @@ def candidate_manifest() -> dict:
         "observed_value": "13000000",
         "threshold_value": "10000000",
         "unit": "ns",
-        "authority": "candidate-policy-v1",
+        "authority": "candidate-policy-v3",
         "eligible": True,
     }
     return {
@@ -43,7 +45,7 @@ def candidate_manifest() -> dict:
         "aggregate_content_sha256": "2" * 64,
         "policy_identity": "3" * 64,
         "profile_identity": "4" * 64,
-        "policy_algorithm": "candidate-policy-v1",
+        "policy_algorithm": "candidate-policy-v3",
         "content_sha256": "5" * 64,
         "ranked_signatures": [],
         "candidates": [
@@ -72,7 +74,7 @@ def candidate_manifest() -> dict:
     }
 
 
-def query_native_analysis(root: Path) -> tuple[Path, Path, Path, dict, dict]:
+def _legacy_query_native_analysis(root: Path) -> tuple[Path, Path, Path, dict, dict]:
     analysis_path, evidence_path = valid_inputs(root)
     analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
     manifest = candidate_manifest()
@@ -128,9 +130,67 @@ def query_native_analysis(root: Path) -> tuple[Path, Path, Path, dict, dict]:
     return analysis_path, evidence_path, manifest_path, analysis, manifest
 
 
+def query_native_analysis(root):
+    from tests.review_fixtures import current_policy_fixture
+    return current_policy_fixture(root)
+
+
 class QueryNativeReportContractTests(unittest.TestCase):
-    def validate(self, analysis: dict, manifest: dict) -> list[str]:
-        return load_contract().validate_query_native_analysis(analysis, manifest)
+    def test_validation_machine_output_distinguishes_stage_from_complete(self):
+        # A passing format/receipt check is not completion of all investigations.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ap, ep, cp, analysis, _ = query_native_analysis(root)
+            analysis["report_status"] = "in_progress"
+            analysis["candidate_findings"] = []
+            analysis["bottleneck_signatures"] = []
+            analysis["evidence_cards"] = []
+            analysis["investigation_backlog"] = [{"candidate_id": "candidate-tsr", "reason": "not_investigated"}]
+            analysis["query_scan"]["coverage"].update(required_completed=0, investigated_total=0, uninvestigated_total=1)
+            write_json(ap, analysis)
+            for script, extra in [(BUILD_REPORT, ["--validate-only"]),
+                    (SKILL_ROOT / "scripts" / "validate_analysis_result.py", [])]:
+                result = subprocess.run([sys.executable, "-B", str(script), "--legacy-regression", "--analysis", str(ap),
+                    "--evidence", str(ep), "--candidates", str(cp), *extra], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                status = json.loads(result.stdout)
+                self.assertTrue(status["passed"])
+                self.assertEqual(status.get("report_status"), "in_progress")
+                self.assertIs(status.get("analysis_complete"), False)
+                self.assertEqual(status.get("required_pending"), 1)
+            output = root / "stage-report"
+            rendered = subprocess.run([sys.executable, "-B", str(BUILD_REPORT), "--legacy-regression", "--analysis", str(ap),
+                "--evidence", str(ep), "--candidates", str(cp), "--output", str(output), "--deterministic"],
+                capture_output=True, text=True)
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            status = json.loads((output / "report-validation.json").read_text(encoding="utf-8"))
+            self.assertTrue(status["passed"])
+            self.assertEqual(status["report_status"], "in_progress")
+            self.assertFalse(status["analysis_complete"])
+            self.assertEqual(status["required_pending"], 1)
+
+    def test_complete_validation_and_failed_validation_report_completion_honestly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ap, ep, cp, analysis, _ = query_native_analysis(root)
+            command = [sys.executable, "-B", str(SKILL_ROOT / "scripts" / "validate_analysis_result.py"), "--legacy-regression",
+                "--analysis", str(ap), "--evidence", str(ep), "--candidates", str(cp), "--output", str(root / "validation.json")]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            status = json.loads((root / "validation.json").read_text(encoding="utf-8"))
+            self.assertFalse(status["analysis_complete"])
+            self.assertEqual(status["required_pending"], 0)
+            # Claimed complete coverage cannot override an actual numeric audit error.
+            analysis["candidate_findings"][0]["query_numeric_facts"][0]["observed_value"] = "999"
+            write_json(ap, analysis)
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            status = json.loads((root / "validation.json").read_text(encoding="utf-8"))
+            self.assertFalse(status["passed"])
+            self.assertFalse(status["analysis_complete"])
+
+    def validate(self, analysis: dict, manifest: dict, root: Path) -> list[str]:
+        return load_contract().validate_query_native_analysis(analysis, manifest, json.loads((root / "evidence-manifest.json").read_text()), root)
 
     def test_stage_report_retains_pending_without_claiming_completion(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -140,15 +200,16 @@ class QueryNativeReportContractTests(unittest.TestCase):
             analysis["bottleneck_signatures"] = []
             analysis["investigation_backlog"] = [{"candidate_id": "candidate-tsr", "reason": "not_investigated"}]
             analysis["query_scan"]["coverage"].update(required_completed=0, investigated_total=0, uninvestigated_total=1)
-            self.assertEqual([], self.validate(analysis, manifest))
+            self.assertEqual([], self.validate(analysis, manifest, Path(directory)))
             analysis["report_status"] = "complete"
-            self.assertTrue(self.validate(analysis, manifest))
+            self.assertTrue(self.validate(analysis, manifest, Path(directory)))
 
     def test_v3_prose_only_finding_does_not_count_as_investigated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, _, _, analysis, manifest = query_native_analysis(Path(directory))
             manifest["policy_algorithm"] = "candidate-policy-v3"
-            self.assertTrue(any("receipt" in e for e in self.validate(analysis, manifest)))
+            analysis["candidate_findings"][0].pop("investigation_receipts")
+            self.assertTrue(any("receipt" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_selected_p2_in_backlog_cannot_complete_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -162,26 +223,26 @@ class QueryNativeReportContractTests(unittest.TestCase):
                 "candidate_total": 1, "required_total": 0, "required_completed": 0,
                 "investigated_total": 0, "uninvestigated_total": 1,
             }
-            self.assertTrue(any("no completed investigation" in e for e in self.validate(analysis, manifest)),
+            self.assertTrue(any("no completed investigation" in e for e in self.validate(analysis, manifest, Path(directory))),
                             "Selected P2 must not be satisfied by a backlog reason")
 
     def test_missing_candidate_trigger_path_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, _, _, analysis, manifest = query_native_analysis(Path(directory))
             analysis["candidate_findings"][0]["query_numeric_facts"] = []
-            self.assertTrue(any("query_numeric_facts" in e for e in self.validate(analysis, manifest)))
+            self.assertTrue(any("query_numeric_facts" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_missing_representative_selection_reason_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, _, _, analysis, manifest = query_native_analysis(Path(directory))
             analysis["candidate_findings"][0]["representative_selection_reason"] = ""
-            self.assertTrue(any("representative_selection_reason" in e for e in self.validate(analysis, manifest)))
+            self.assertTrue(any("representative_selection_reason" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_ai_numeric_rewrite_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _, _, _, analysis, manifest = query_native_analysis(Path(directory))
             analysis["candidate_findings"][0]["query_numeric_facts"][0]["observed_value"] = "13000001"
-            self.assertTrue(any("query_numeric_facts" in e for e in self.validate(analysis, manifest)))
+            self.assertTrue(any("query_numeric_facts" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_confirmed_requires_auditable_confirmation_basis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -189,7 +250,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
             finding = analysis["candidate_findings"][0]
             finding["conclusion_status"] = "Confirmed"
             finding["confirmation_basis"] = []
-            self.assertTrue(any("confirmation_basis" in e for e in self.validate(analysis, manifest)))
+            self.assertTrue(any("confirmation_basis" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_source_revision_mismatch_cannot_confirm_source_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -200,7 +261,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
             finding["source_evidence"] = [
                 {"source_id": "SRC-1", "revision_match": False, "used_for_confirmation": True}
             ]
-            self.assertTrue(any("revision" in e for e in self.validate(analysis, manifest)))
+            self.assertTrue(any("revision" in e for e in self.validate(analysis, manifest, Path(directory))))
 
     def test_capture_quality_cannot_be_a_performance_finding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -226,7 +287,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(BUILD_REPORT),
+                    str(BUILD_REPORT), "--legacy-regression",
                     "--analysis", str(analysis_path),
                     "--evidence", str(evidence_path),
                     "--candidates", str(manifest_path),
@@ -244,9 +305,9 @@ class QueryNativeReportContractTests(unittest.TestCase):
             _, _, _, analysis, manifest = query_native_analysis(root)
             quality = [{"domain": "gpu.catalog", "status": "invalid", "reason": "catalog core gap"}]
             manifest["capture_quality"] = quality
-            self.assertTrue(any("capture_quality" in error for error in self.validate(analysis, manifest)))
+            self.assertTrue(any("capture_quality" in error for error in self.validate(analysis, manifest, Path(directory))))
             analysis["capture_quality"] = quality
-            self.assertEqual(self.validate(analysis, manifest), [])
+            self.assertEqual(self.validate(analysis, manifest, Path(directory)), [])
             self.assertEqual(analysis["candidate_findings"][0]["priority"], "P1")
 
     def test_quality_appendix_is_rendered_in_main_and_quality_attachment(self) -> None:
@@ -260,7 +321,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
             analysis["query_scan"]["candidate_manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
             write_json(analysis_path, analysis)
             output = root / "report"
-            result = subprocess.run([sys.executable, str(BUILD_REPORT), "--analysis", str(analysis_path),
+            result = subprocess.run([sys.executable, str(BUILD_REPORT), "--legacy-regression", "--analysis", str(analysis_path),
                 "--evidence", str(evidence_path), "--candidates", str(manifest_path),
                 "--output", str(output), "--deterministic"], text=True, capture_output=True, check=False)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -274,11 +335,8 @@ class QueryNativeReportContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             analysis_path, evidence_path, manifest_path, analysis, manifest = query_native_analysis(root)
-            job_signature = "job:type:33:ChunkLayoutV2:BuildIndexSetCutJob (Burst)"
-            manifest["candidates"][0]["domain"] = "job"
-            manifest["candidates"][0]["signature_id"] = job_signature
-            manifest["candidates"][0]["structural_signature"] = job_signature
-            analysis["candidate_findings"][0]["signature_id"] = job_signature
+            from tests.job_report_fixture import attach_job
+            job_signature = attach_job(root, analysis, manifest, evidence_path)
             analysis["bottleneck_signatures"] = []
             analysis["evidence_cards"] = []
             write_json(manifest_path, manifest)
@@ -291,7 +349,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(BUILD_REPORT),
+                    str(BUILD_REPORT), "--legacy-regression",
                     "--analysis", str(analysis_path),
                     "--evidence", str(evidence_path),
                     "--candidates", str(manifest_path),
@@ -318,7 +376,7 @@ class QueryNativeReportContractTests(unittest.TestCase):
                 result = subprocess.run(
                     [
                         sys.executable,
-                        str(BUILD_REPORT),
+                        str(BUILD_REPORT), "--legacy-regression",
                         "--analysis", str(analysis),
                         "--evidence", str(evidence),
                         "--candidates", str(candidates),

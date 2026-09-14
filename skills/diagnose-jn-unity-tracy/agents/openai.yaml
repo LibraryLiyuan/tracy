@@ -1,7 +1,7 @@
 interface:
   display_name: "JN Unity × Tracy 性能诊断"
-  short_description: "用 Query 原生全量扫描完成单 Trace 深度诊断"
-  default_prompt: "使用 $diagnose-jn-unity-tracy 对一个现有 JN Unity Tracy 捕获执行 Query 1.35 确定性全量扫描，逐项调查 P0/P1/UserFocus 候选，并生成包含完整分析过程的可审计报告。"
+  short_description: "按候选细分、源码深查与原因归并生成可读单 Trace 性能报告"
+  default_prompt: "使用 $diagnose-jn-unity-tracy 对一个现有 JN Unity Tracy 捕获执行 Query 1.35 确定性全量扫描，细分全部必查候选，逐项阅读实际源码，以具体帧、真实Event链、耗时及分母解释如何发现，复核反例并按原因去重，生成全文使用可读术语的可审计报告；源码未读不得完成深查。"
 
 policy:
   allow_implicit_invocation: true

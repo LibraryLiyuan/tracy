@@ -1,5 +1,11 @@
 # 固定报告合同
 
+> 2.2 适用范围：先执行 [优先级与测试人员决策](priority-and-tester-review.md)。本文的原 P 级为 Query 旧编号；所有“源码必读/深查完成”要求仅适用于新 P0、原有低级别必查项及测试人员明确批准的新 P1。新 P1 入队项先完成 Query 证据核查和候选报告；未选择不算源码受阻。分流排除项保留精确 Query 事实及理由。旧流程章节仅用于其适用范围内的证据和源码合同，不能覆盖新分流规则。
+
+
+> 2.1流程补充：必须同时执行 deep-analysis-and-report.md。下文保留的Candidate Finding与收据完成条件仅证明查询覆盖；所有深查完成条目都必须读实际源码。所有报告正文改用可读名称；本文出现的candidate_id、ref、SHA及Evidence字段名属于机器合同，不能直接作为报告展示内容。源码不可读时保留阶段结果，不以Unresolved自动完成整项深查。
+
+
 ## 1. 权威数据流
 
 ```text
@@ -14,13 +20,17 @@ Query 1.35 Aggregate Store（中立事实）
 
 AI 不重新扫描 Trace、不重算 Query 数值，也不手写最终布局。Query Aggregate/Candidate、MCP 定向证据与 Source 证据必须分开登记。Markdown 是权威结论，SVG 与 MCP PNG 是默认证据附件。HTML 默认关闭，只能由用户明确要求后以试验模式生成。
 
+大型 Candidate Manifest 使用小型 JSON 描述文件及同目录 `candidates.ndjson`（或 `candidate-records.ndjson`）。以 `candidate_records={encoding:"ndjson-v1",path,sha256,count}` 替代内嵌 `candidates`，二者不能同时存在；这是保存已导出 Query 候选的包装，不改变 Query policy/schema 或候选内容。报告、数值和状态审计通过 `candidate_manifest.py` 逐条读取，读到 EOF 才完成计数/SHA 校验；错误阻止发布。描述文件和 NDJSON 原字节复制进报告，保留身份及可移植性。
+
+单描述文件/单行最大 16 MiB；不安全路径、保留输出名冲突、重复 ID、缺失行、尾部 hash/count 错误均拒绝。此改动避免保留全量候选 payload，但所有 ID、调查状态和 Backlog 仍占内存；不得声称整个报告流程已经常数内存化。完整报告须覆盖全部 selected 的分流；新 P1 入队项须有实际证据报告，源码完成范围由新 P0/原有低级别必查项和测试人员批准项确定。禁止只取前 N 项规避门禁。
+
 ## 2. Analysis Result
 
 Schema 位于 `schemas/analysis-result.schema.json`。每个显著 Signature 必须包含稳定键、显著性原因、影响范围、频率、Budget Debt、Primary Limiter、代表实例、因果链、假设账本、深度、Evidence、provenance、支持/不支持结论、优化方向、功能风险、理论收益上限、复测指标和置信度。
 
 每个 Signature 都必须有独立 Evidence Card。`deepest_level != L6` 时必须携带最小 EvidenceGap，否则校验失败。
 
-Query-native Workflow 2.0 还必须包含：
+Query-native Workflow 2.1 还必须包含 `performance_review`（schema见performance-review.schema.json）以及：
 
 - `query_scan`：Scan、Aggregate、Candidate Manifest、Profile SHA-256 与覆盖率。
 - `candidate_findings`：每个已调查 Candidate 的结论与完整 Analysis Trail。
@@ -28,7 +38,15 @@ Query-native Workflow 2.0 还必须包含：
 
 每个 Candidate Finding 必须逐字携带 Query 的数值事实，不允许 AI 改写、四舍五入或重新计算。代表帧必须来自 Candidate Manifest，并说明 `selection_reason`。Analysis Trail 固定包含 discovery、statistics、representative selection、attribution、hypothesis、source inspection、counterevidence 和 conclusion。
 
-`Confirmed` 结论必须具有 `ExactRelation`，或同时具有 `ExactSource`/`IndependentEvidence` 之一；Source 证据中的实际 revision 必须与期望 revision 一致。单 Trace 报告固定不得宣称总体 A/B Tracy 开销。
+`Confirmed` 的 `confirmation_basis` 必须声明至少一种已核实依据：`typed_relation`、`source_revision_match` 或 `independent_evidence`。源码确认按 evidence-and-source 的机器证据合同办理。单 Trace 报告固定不得宣称总体 A/B Tracy 开销。
+
+因果链须引用该 Signature 自身引用的 Evidence。每条 `relation_ref` 的 `from_ref`、`to_ref`、`relation` 必须与原始关系的真实端点和 `kind` 一致；反向连接、替换关系类型或同一引用出现互相矛盾的关系，都必须失败。端点分别存在不等于它们之间存在关系。
+
+`independent_evidence` 依据还须填写同名数组，每项为 `{evidence_id,channel,supports}`：引用真实成功回执，`channel` 为原始查询 method 的首段（如 `zone`、`sample`、`job`），`supports` 用具体文字说明它支持同一结论的哪一步。至少两项来自不同测量通道。相同 Evidence 引用、同一请求/结果的别名、同一查询的分页、同一通道换参数，均不能满足这项确认依据。不要人为改写 channel。
+
+不同通道只是可机验的必要条件。AI 仍须解释它们为什么共同支持所述原因，并审查共同来源、派生关系和反证；“两条查询成功”不自动证明独立性或根因。机器验证通过表示保存的材料满足证据合同，不表示每句性能解释都已被程序证明。
+
+报告必须打包原始 MCP 请求、响应以及已引用的源码快照。生成后应能直接用报告目录内的三个 JSON 文件再次运行 `validate_analysis_result.py`。源码版本复核仍需要对应的授权本地 Git 仓库。
 
 ## 3. Evidence Manifest
 
@@ -159,9 +177,13 @@ TotalCaptureOverhead = NotMeasuredSingleTrace
 - 静态图不存在文字/Zone/节点重叠；无坐标或无关系的卡片不产生占位 SVG。
 - 显式启用 HTML 时，Markdown/HTML 数字、结论和 Evidence ID 一致，所有锚点可解析且可离线双击打开。
 - 两次确定性构建 SHA 一致。
-- 所有 selected/P1/UserFocus Candidate 已完成实际调查，或在对应 Finding 中记录实际查询回执、最深可信层、blocked_by 和 minimum_additional_evidence；不能仅凭 Backlog 中一条原因跳过。覆盖计数与 Candidate Manifest 一致；P0 兼容保留但当前不生成，其他优先级不前移。selected P2 未调查同样阻止完整报告。阶段结果明确标注未完成，保存调查队列，不使用完整报告的 passed/completed 状态。
+- 所有需要证据调查的分流项须记录实际回执、最深可信层与缺口；新 P1 筛选排除须有原始事实与理由，不能仅凭 Backlog 一句话跳过。覆盖计数与 Candidate Manifest 一致；P0 兼容保留但当前不生成，Query 原级别不改写，分析级别按 2.2 映射。原 P2（新 P1）入队但未完成证据报告会阻止完成；已经完成证据报告但未被选择源码深查，不阻止本轮规定范围完成。阶段结果明确标注未完成，保存调查队列，不使用完整报告的 passed/completed 状态。
 - `analysis.capture_quality` 必须原样保留 Candidate Manifest/Query summary 中的 `capture_quality`，位于主报告附录和质量附件，不得作为 Candidate Finding、性能 P0/P1/P2、强制 L6 调查或性能 Backlog。附注只写问题、受影响域和限制；性能候选确实依赖缺失数据时才关联 EvidenceGap 深查。
 - 旧 quality Candidate 拒绝进入新报告，必须用 candidate-policy-v3 重新生成；扫描器自身 checksum/identity/audit 错误仍阻止发布。
 - 每个重大结论均可追溯到 Candidate ID、Query 数值路径、代表帧、Evidence ID 和 Source revision（若使用 Source）。
 - Query 数值与 Candidate Manifest 逐字段一致；AI 不得重算或改写。
-- `report-validation.json.passed=true`。
+- `report-validation.json.passed=true` 表示产物合同校验成功，不独立表示分析完成。完整 Query-native 报告同时要求 `report_status=complete`、`analysis_complete=true`、`required_pending=0`；阶段报告使用 `in_progress/false` 并保留实际待查数。`build_report.py --validate-only` 和 `validate_analysis_result.py` 返回同一组状态字段。
+- 经完整无过滤查询证实没有 CPU Zone 的 FrameSet 代表区间，只能按 candidate-investigation 中的 `verified_absent` 合同写 Unresolved，且在 `evidence_gaps` 显式保留候选关联和最小补证要求；不能写成健康、0 CPU 耗时或跳过其他代表帧。
+- 具体 CPU 事件的 `verified_not_recorded` 和 Native Wait 的 `completion_not_recorded` 仅按 candidate-investigation 的完整原始收据合同结束为 Unresolved。主报告和专项报告必须可见 candidate_id、结束 outcome、Frame/原始 Evidence 引用、blocked_by 和最小补证；不能把“调查完成”呈现成“根因闭环”。原 partial、历史失败或开放时间边界保留，已补齐者通过独立新回执说明解决过程。
+
+2.1正文以原因条目为单位，每条只完整解释一次。九份专项报告按域引用正文；未入选原始候选仍完整保存于机器清单。普通build_report.py自动执行新合同；历史回归必须显式使用--legacy-regression，且analysis_complete永远为false。新报告写入空目录以保留历史版本。

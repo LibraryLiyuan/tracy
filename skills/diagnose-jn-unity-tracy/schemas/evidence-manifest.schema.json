@@ -32,6 +32,14 @@
           "mcp": { "type": "object", "required": ["method", "params"] },
           "request": { "type": "object", "required": ["path", "sha256"] },
           "response": { "type": "object", "required": ["path", "sha256"] },
+          "mcp_receipt": {
+            "type": "object", "additionalProperties": false,
+            "required": ["request", "response"],
+            "properties": {
+              "request": { "type": "object", "required": ["path", "sha256"] },
+              "response": { "type": "object", "required": ["path", "sha256"] }
+            }
+          },
           "refs": { "type": "object", "required": ["frames", "time_ranges_ns", "threads", "queues", "entities"] },
           "partial": { "type": "boolean" },
           "truncated": { "type": "boolean" },

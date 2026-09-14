@@ -25,6 +25,10 @@ from typing import Any, Iterable
 
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+if str(SKILL_ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(SKILL_ROOT / "scripts"))
+from report_common import ValidationFailure
+
 VENDOR_ROOT = SKILL_ROOT / "vendor"
 if str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
@@ -37,6 +41,7 @@ PROFILE_SCHEMA_VERSION = 1
 REQUIRED_QUERY_SCHEMA = "1.35.0"
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 REQUIRED_PRIORITIES = {"P0", "P1"}
+from review_routing import priority as analysis_priority, in_scope as routing_scope
 
 
 class AnalysisStateError(RuntimeError):
@@ -61,9 +66,11 @@ def _read_json(path: Path) -> Any:
 def _atomic_write(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
-    payload = _stable_json(value)
-    with temporary.open("wb") as output:
-        output.write(payload)
+    # Preserve canonical bytes/atomic replacement without holding another
+    # whole JSON string and UTF-8 byte copy beside a large investigation queue.
+    with temporary.open("w", encoding="utf-8", newline="\n") as output:
+        json.dump(value, output, ensure_ascii=False, indent=2, sort_keys=True)
+        output.write("\n")
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
@@ -157,8 +164,8 @@ def apply_scan_status(state: dict[str, Any], response: dict[str, Any], evidence:
         {
             "scan_id": scan_id,
             "state": scan_state,
-            "resumable": bool(response.get("resumable", False)),
-            "completed": bool(response.get("completed", False)),
+            "resumable": response.get("resumable") is True,
+            "completed": response.get("completed") is True,
             "closed": bool(response.get("closed", False)),
             "progress_completed": str(progress.get("completed", "0")),
             "progress_total": str(progress.get("total", "0")),
@@ -167,6 +174,10 @@ def apply_scan_status(state: dict[str, Any], response: dict[str, Any], evidence:
         }
     )
     target = {
+        # Query 1.35 wire values; retain legacy Schema 4 spellings below.
+        "complete": "scan_complete",
+        "cancelled_resumable": "scan_cancelled_resumable",
+        "failed": "scan_failed",
         "Complete": "scan_complete",
         "CancelledResumable": "scan_cancelled_resumable",
         "Failed": "scan_failed",
@@ -176,11 +187,11 @@ def apply_scan_status(state: dict[str, Any], response: dict[str, Any], evidence:
 
 def next_scan_action(state: dict[str, Any]) -> str:
     scan = state.get("scan", {})
-    if scan.get("state") == "CancelledResumable" and scan.get("resumable") is True:
+    if scan.get("state") in ("cancelled_resumable", "CancelledResumable") and scan.get("resumable") is True:
         return "resume"
-    if scan.get("state") == "Complete" and scan.get("completed") is True:
+    if scan.get("state") in ("complete", "Complete") and scan.get("completed") is True:
         return "read_summary_and_candidates"
-    if scan.get("state") == "Failed":
+    if scan.get("state") in ("failed", "Failed"):
         return "stop"
     if scan.get("scan_id"):
         return "status"
@@ -188,6 +199,8 @@ def next_scan_action(state: dict[str, Any]) -> str:
 
 
 def apply_scan_summary(state: dict[str, Any], response: dict[str, Any], evidence: str = "") -> None:
+    if response.get("policy_algorithm") != "candidate-policy-v3":
+        raise AnalysisStateError("scan.policy_algorithm must be candidate-policy-v3")
     scan_id = response.get("scan_id")
     if scan_id != state["scan"].get("scan_id"):
         raise AnalysisStateError("scan summary belongs to a different scan")
@@ -211,6 +224,7 @@ def _queue_item(candidate: dict[str, Any], required: bool) -> dict[str, Any]:
     return {
         "candidate_id": candidate["candidate_id"],
         "priority": candidate.get("priority", "P4"),
+        "analysis_priority": analysis_priority(candidate),
         "domain": candidate.get("domain", "unknown"),
         "signature_id": candidate.get("signature_id", ""),
         "triggers": list(candidate.get("triggers", [])),
@@ -225,8 +239,8 @@ def _queue_item(candidate: dict[str, Any], required: bool) -> dict[str, Any]:
 
 
 def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, str]:
-    required = candidate.get("priority") in REQUIRED_PRIORITIES or "user_focus" in candidate.get("triggers", [])
-    priority = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(candidate.get("priority"), 5)
+    required = analysis_priority(candidate) == 'P0'
+    priority = {"P0": 0, "P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(analysis_priority(candidate), 5)
     focus = 0 if "user_focus" in candidate.get("triggers", []) else 1
     return (0 if required else 1), priority, focus, str(candidate.get("candidate_id", ""))
 
@@ -234,21 +248,34 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, str]:
 def ingest_candidate_pages(
     state: dict[str, Any], pages: Iterable[dict[str, Any]], evidence_paths: Iterable[str] | None = None
 ) -> None:
-    all_candidates: list[dict[str, Any]] = []
-    page_list = list(pages)
-    if not page_list:
-        raise AnalysisStateError("candidate pagination returned no pages")
+    # Keep compact queue metadata, not all pages/trigger facts/representatives.
+    # Full Query records remain in the immutable page evidence. This removes
+    # raw-payload amplification; queue metadata still grows with candidate IDs.
+    compact_candidates: list[dict[str, Any]] = []
     expected_total: int | None = None
     seen_ids: set[str] = set()
-    for index, page in enumerate(page_list):
+    page_count = 0
+    done = False
+    for index, page in enumerate(pages):
+        if done:
+            raise AnalysisStateError("candidate pages continue after done")
         items = page.get("items")
         metadata = page.get("page")
         if not isinstance(items, list) or not isinstance(metadata, dict):
             raise AnalysisStateError(f"candidate page {index} is malformed")
+        if any(container.get(flag) for container in (page, metadata) for flag in ("partial", "truncated")):
+            raise AnalysisStateError("candidate pagination is partial/truncated")
         try:
             total = int(metadata.get("total"))
+            cursor = metadata.get("cursor")
+            # Old saved single-page fixtures omit the ordinal. Actual Query
+            # pages use decimal cursors, whose continuity must be verified.
+            if cursor not in (None, "") and int(cursor) != len(seen_ids):
+                raise AnalysisStateError("candidate cursor ordinal mismatch")
         except (TypeError, ValueError) as exc:
             raise AnalysisStateError(f"candidate page {index} has invalid total") from exc
+        if total < 0:
+            raise AnalysisStateError("candidate total must not be negative")
         if expected_total is None:
             expected_total = total
         elif expected_total != total:
@@ -262,46 +289,78 @@ def ingest_candidate_pages(
             if candidate_id in seen_ids:
                 raise AnalysisStateError(f"duplicate candidate_id: {candidate_id}")
             seen_ids.add(candidate_id)
-            all_candidates.append(candidate)
-    if page_list[-1]["page"].get("done") is not True or page_list[-1]["page"].get("next_cursor") is not None:
+            triggers = candidate.get("triggers", [])
+            required = routing_scope(candidate)
+            compact_candidates.append(_queue_item(candidate, required))
+        page_count += 1
+        done = metadata.get("done") is True
+        next_cursor = metadata.get("next_cursor")
+        if done:
+            if next_cursor is not None:
+                raise AnalysisStateError("completed candidate page still has a cursor")
+        else:
+            try:
+                if not items or int(next_cursor) != len(seen_ids):
+                    raise AnalysisStateError("candidate pagination did not advance exactly")
+            except (TypeError, ValueError) as exc:
+                raise AnalysisStateError("candidate next cursor is invalid") from exc
+    if not page_count:
+        raise AnalysisStateError("candidate pagination returned no pages")
+    if not done:
         raise AnalysisStateError("candidate pagination is incomplete")
-    if expected_total != len(all_candidates):
+    if expected_total != len(compact_candidates):
         raise AnalysisStateError(
-            f"candidate pagination count mismatch: expected {expected_total}, got {len(all_candidates)}"
+            f"candidate pagination count mismatch: expected {expected_total}, got {len(compact_candidates)}"
         )
+    candidate_count = len(compact_candidates)
+    del seen_ids
 
     completed = {
         item.get("candidate_id")
         for item in state["investigations"].get("completed", [])
         if isinstance(item, dict)
     }
-    if completed and state.get("scan", {}).get("policy_algorithm") == "candidate-policy-v3":
+    if state.get("scan", {}).get("policy_algorithm") != "candidate-policy-v3":
+        raise AnalysisStateError("scan.policy_algorithm must be candidate-policy-v3")
+    if completed or state["investigations"].get("routing_workflow") == "2.2.0":
         audit_errors = validate_investigation_audit(state)
         if audit_errors:
             raise AnalysisStateError("cannot resume unverified completed IDs: " + "; ".join(audit_errors))
+    if state["investigations"].get("routing_workflow") == "2.2.0":
+        from candidate_manifest import load_candidate_manifest
+        audit_path=Path(state["investigations"]["artifact_audit"]["candidates"]["path"])
+        expected=load_candidate_manifest(audit_path)
+        actual={item["candidate_id"]:item for item in compact_candidates}
+        count=0
+        for candidate in expected["candidates"]:
+            count+=1
+            if actual.get(candidate["candidate_id"]) != _queue_item(candidate,routing_scope(candidate)):
+                raise AnalysisStateError("resumed pages differ from audited routing candidates")
+        if count!=candidate_count:
+            raise AnalysisStateError("resumed candidate count differs from routing audit")
+        # Preserve separately audited query completion, tester decisions and source queue.
+        return
     queue: list[dict[str, Any]] = []
     backlog: list[dict[str, Any]] = []
     required_total = 0
     required_completed = 0
-    for candidate in sorted(all_candidates, key=_candidate_sort_key):
-        triggers = candidate.get("triggers", [])
-        required = (candidate.get("selected") is True
-                    or candidate.get("priority") in REQUIRED_PRIORITIES or "user_focus" in triggers)
+    compact_candidates.sort(key=_candidate_sort_key)
+    for item in compact_candidates:
+        required = item["required"]
         if required:
             required_total += 1
-        if candidate["candidate_id"] in completed:
+        if item["candidate_id"] in completed:
             if required:
                 required_completed += 1
             continue
-        item = _queue_item(candidate, required)
-        backlog.append(copy.deepcopy(item))
-        if required or candidate.get("selected") is True:
+        backlog.append(item)
+        if required:
             queue.append(copy.deepcopy(item))
 
     state["investigations"]["queue"] = queue
     state["investigations"]["backlog"] = backlog
     state["investigations"]["coverage"] = {
-        "candidate_total": len(all_candidates),
+        "candidate_total": candidate_count,
         "required_total": required_total,
         "required_completed": required_completed,
         "investigated_total": len(completed),
@@ -311,8 +370,8 @@ def ingest_candidate_pages(
     state["candidate_manifest"].update(
         {
             "page_evidence": evidence,
-            "page_count": len(page_list),
-            "candidate_count": len(all_candidates),
+            "page_count": page_count,
+            "candidate_count": candidate_count,
             "pagination_complete": True,
             "content_sha256": state["scan"].get("candidate_content_sha256", ""),
         }
@@ -326,14 +385,17 @@ def validate_candidate_numeric_facts(
     errors: list[str] = []
     candidates = candidate_manifest.get("candidates")
     findings = analysis.get("candidate_findings")
-    if not isinstance(candidates, list):
+    from candidate_manifest import is_candidate_collection
+    if not is_candidate_collection(candidates):
         return ["candidate_manifest.candidates must be an array"]
     if not isinstance(findings, list):
         return ["analysis.candidate_findings must be an array"]
+    finding_ids = {item.get("candidate_id") for item in findings
+                   if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)}
     by_id = {
         item.get("candidate_id"): item
         for item in candidates
-        if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)
+        if isinstance(item, dict) and item.get("candidate_id") in finding_ids
     }
     seen: set[str] = set()
     for index, finding in enumerate(findings):
@@ -382,20 +444,50 @@ def validate_investigation_audit(state: dict[str, Any]) -> list[str]:
             path = Path(audit[key]["path"])
             if not path.is_absolute() or _sha256_file(path) != audit[key]["sha256"]:
                 return [f"investigation audit {key} artifact identity mismatch"]
-            docs[key] = _read_json(path)
+            if key == "candidates":
+                from candidate_manifest import load_candidate_manifest
+                docs[key] = load_candidate_manifest(path)
+            else:
+                docs[key] = _read_json(path)
         if docs["candidates"].get("content_sha256") != state.get("scan", {}).get("candidate_content_sha256"):
             return ["investigation audit belongs to another candidate manifest"]
         script_root = str(Path(__file__).resolve().parent)
         if script_root not in sys.path:
             sys.path.insert(0, script_root)
         from query_native_report import validate_query_native_analysis
-        errors = validate_query_native_analysis(docs["analysis"], docs["candidates"], docs["evidence"], Path(audit["evidence"]["path"]).parent)
+        from report_common import validate_analysis_and_evidence
+        errors = validate_analysis_and_evidence(docs["analysis"], docs["evidence"], Path(audit["evidence"]["path"]).parent)[0]
+        errors += validate_query_native_analysis(docs["analysis"], docs["candidates"], docs["evidence"], Path(audit["evidence"]["path"]).parent)
+        from performance_review import validate_review
+        deep_errors, deep_model = validate_review(docs["analysis"], docs["candidates"], docs["evidence"], Path(audit["evidence"]["path"]).parent)
+        errors.extend(deep_errors)
         completed = {item.get("candidate_id") for item in state["investigations"].get("completed", [])}
-        verified = {item.get("candidate_id") for item in docs["analysis"].get("candidate_findings", [])}
+        pending_deep = set(deep_model.get("pending", []))
+        if docs["analysis"].get("report_versions", {}).get("analysis_workflow") == "2.2.0":
+            from review_routing import validate_routing
+            routes, _ = validate_routing(docs["analysis"], docs["candidates"], docs["evidence"], Path(audit["evidence"]["path"]).parent)
+            query_done = {f["candidate_id"] for f in docs["analysis"].get("candidate_findings", [])}
+            filtered = {cid for cid,row in routes.items() if row["route"] == "filtered"}
+            waiting = {cid for cid,row in routes.items() if row["decision"] == "pending"}
+            for key, expected in (("query_reviewed_ids",query_done),("filtered_ids",filtered),("tester_pending_ids",waiting)):
+                if set(state["investigations"].get(key,[])) != expected:
+                    errors.append("routing state differs from audited " + key)
+            if state.get("task",{}).get("state") in {"completed","completed_with_degradation"} and pending_deep:
+                errors.append("completed state has pending mandatory or approved source analysis")
+        if completed & pending_deep:
+            errors.append("completed IDs include candidates without completed source analysis")
+        verified = set(deep_model.get("deep_completed_ids", []))
         if completed != verified:
             errors.append("completed IDs differ from artifact audit findings")
+        if state.get("task", {}).get("state") in {"completed", "completed_with_degradation"}:
+            coverage = docs["analysis"].get("query_scan", {}).get("coverage", {})
+            if coverage != state.get("investigations", {}).get("coverage", {}):
+                errors.append("completed coverage differs from artifact audit")
+            if (docs["analysis"].get("report_status", "complete") != "complete"
+                    or coverage.get("required_completed") != coverage.get("required_total")):
+                errors.append("completed state requires a complete audited report")
         return errors
-    except (KeyError, TypeError, ValueError, OSError) as exc:
+    except (KeyError, TypeError, ValueError, OSError, ValidationFailure) as exc:
         return [f"investigation artifact audit failed: {exc}"]
 
 
@@ -417,12 +509,15 @@ def validate_state(state: dict[str, Any]) -> list[str]:
     if completed.intersection(queued):
         errors.append("completed candidates remain in the investigation queue")
     if state.get("task", {}).get("state") in {"completed", "completed_with_degradation"}:
-        if state.get("scan", {}).get("policy_algorithm") == "candidate-policy-v3":
-            errors.extend(validate_investigation_audit(state))
+        if state.get("scan", {}).get("policy_algorithm") != "candidate-policy-v3":
+            errors.append("scan.policy_algorithm must be candidate-policy-v3")
+        errors.extend(validate_investigation_audit(state))
         coverage = investigations.get("coverage", {})
         pending = [item for item in investigations.get("backlog", [])
                    if isinstance(item, dict) and (item.get("required") or item.get("query_selected"))
-                   and item.get("candidate_id") not in completed]
+                   and item.get("candidate_id") not in completed
+                   and item.get("candidate_id") not in set(investigations.get("query_reviewed_ids", []))
+                   and item.get("candidate_id") not in set(investigations.get("filtered_ids", []))]
         if queued or pending or coverage.get("required_completed") != coverage.get("required_total"):
             errors.append("completed state has pending required/selected investigations; save an in-progress report")
     return errors
@@ -492,7 +587,7 @@ def main() -> int:
             _atomic_write(args.state, state)
         elif args.command == "ingest-candidates":
             state = _load_state(args.state)
-            pages = [_read_json(path) for path in args.page]
+            pages = (_read_json(path) for path in args.page)
             ingest_candidate_pages(state, pages, [str(path) for path in args.page])
             _atomic_write(args.state, state)
         elif args.command == "record-ledger":
@@ -507,9 +602,30 @@ def main() -> int:
                 for key in ("analysis", "candidates", "evidence")
             }
             analysis = _read_json(args.analysis)
+            deep_completed = {cid for issue in analysis.get("performance_review", {}).get("issues", [])
+                              if issue.get("analysis_state") == "complete" for cid in issue.get("candidate_ids", [])}
+            deep_completed -= {cid for issue in analysis.get("performance_review", {}).get("issues", [])
+                               if issue.get("analysis_state") != "complete" for cid in issue.get("candidate_ids", [])}
             state["investigations"]["completed"] = [
                 {"candidate_id": item["candidate_id"], "status": item["conclusion_status"]}
-                for item in analysis.get("candidate_findings", [])]
+                for item in analysis.get("candidate_findings", []) if item["candidate_id"] in deep_completed]
+            if analysis.get("report_versions", {}).get("analysis_workflow") == "2.2.0":
+                from candidate_manifest import load_candidate_manifest
+                from review_routing import validate_routing, deep_required, query_required
+                manifest = load_candidate_manifest(args.candidates)
+                routes, _ = validate_routing(analysis, manifest, _read_json(args.evidence), args.evidence.parent)
+                done = {f["candidate_id"] for f in analysis.get("candidate_findings", [])}
+                state["investigations"]["routing_workflow"] = "2.2.0"
+                state["investigations"]["query_reviewed_ids"] = sorted(done)
+                state["investigations"]["filtered_ids"] = sorted(cid for cid,row in routes.items() if row["route"] == "filtered")
+                state["investigations"]["tester_pending_ids"] = sorted(cid for cid,row in routes.items() if row["decision"] == "pending")
+                queue = []
+                for c in manifest["candidates"]:
+                    cid = c["candidate_id"]
+                    if (deep_required(c,routes) and cid not in deep_completed) or (query_required(c,routes) and cid not in done):
+                        queue.append(_queue_item(c, True))
+                state["investigations"]["queue"] = sorted(queue, key=_candidate_sort_key)
+                state["investigations"]["coverage"] = analysis["query_scan"]["coverage"]
             errors = validate_investigation_audit(state)
             if errors:
                 raise AnalysisStateError("; ".join(errors))
@@ -519,13 +635,14 @@ def main() -> int:
             print(json.dumps({"passed": not errors, "errors": errors}, ensure_ascii=False))
             return 0 if not errors else 1
         elif args.command == "validate-numerics":
+            from candidate_manifest import load_candidate_manifest
             errors = validate_candidate_numeric_facts(
-                _read_json(args.analysis), _read_json(args.candidate_manifest)
+                _read_json(args.analysis), load_candidate_manifest(args.candidate_manifest)
             )
             print(json.dumps({"passed": not errors, "errors": errors}, ensure_ascii=False))
             return 0 if not errors else 1
         return 0
-    except AnalysisStateError as exc:
+    except (AnalysisStateError, ValidationFailure) as exc:
         print(json.dumps({"passed": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2
 

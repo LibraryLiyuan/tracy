@@ -22,8 +22,8 @@ try {
     $frontmatterMatch = [regex]::Match($skillText, '\A---\r?\n(?<body>.*?)\r?\n---', [System.Text.RegularExpressions.RegexOptions]::Singleline)
     Assert-Test ($frontmatterMatch.Success) 'SKILL.md YAML frontmatter is missing or malformed.'
     $frontmatter = [string]$frontmatterMatch.Groups['body'].Value
-    $nameMatch = [regex]::Match($frontmatter, '(?m)^name:\s*(?<value>[^\r\n]+)$')
-    $descriptionMatch = [regex]::Match($frontmatter, '(?m)^description:\s*(?<value>[^\r\n]+)$')
+    $nameMatch = [regex]::Match($frontmatter, '(?m)^name:\s*(?<value>[^\r\n]+)\r?$')
+    $descriptionMatch = [regex]::Match($frontmatter, '(?m)^description:\s*(?<value>[^\r\n]+)\r?$')
     Assert-Test ($nameMatch.Success) 'SKILL.md name is missing.'
     Assert-Test ($descriptionMatch.Success) 'SKILL.md description is missing.'
     $skillName = $nameMatch.Groups['value'].Value.Trim()

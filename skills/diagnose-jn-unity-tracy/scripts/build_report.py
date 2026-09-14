@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 import sys
@@ -26,15 +27,18 @@ from report_common import (
     js_literal,
     load_json,
     md_text,
+    render_minimum_evidence,
     sha256_file,
     stable_id,
     validate_analysis_and_evidence,
+    validation_result,
     write_json,
 )
 from query_native_report import (
     SPECIALTY_REPORT_FILES,
     is_query_native,
     render_analysis_process,
+    render_evidence_gaps,
     render_specialty_reports,
     validate_query_native_analysis,
 )
@@ -42,6 +46,7 @@ from query_native_report import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy-regression", action="store_true", help="Historical regression output, not current workflow completion")
     parser.add_argument("--analysis", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--candidates", type=Path, help="Query Candidate Manifest; required by workflow 2.0")
@@ -490,7 +495,7 @@ def render_main_report(
         )
         if signature.get("evidence_gap"):
             gap = signature["evidence_gap"]
-            lines.append(f'- EvidenceGap：`{md_text(gap.get("reason"))}` / `{md_text(gap.get("blocked_by"))}`；最小补充证据：{md_text(", ".join(gap.get("minimum_additional_evidence", [])))}。')
+            lines.append(f'- EvidenceGap：`{md_text(gap.get("reason"))}` / `{md_text(gap.get("blocked_by"))}`；最小补充证据：{render_minimum_evidence(gap.get("minimum_additional_evidence", []), separator=", ")}。')
         lines.append("")
 
     lines.extend(["## 7. CPU 内存与 GPU 显存专项", "", "### 7.1 CPU 内存", ""])
@@ -514,11 +519,7 @@ def render_main_report(
     lines.extend(bullet_lines(tracy.get("analysis_findings", []), "未发现 Query、转换或 Profiler 的独立离线分析压力。"))
 
     lines.extend(["", "## 9. Evidence Gaps", ""])
-    if analysis["evidence_gaps"]:
-        for gap in analysis["evidence_gaps"]:
-            lines.append(f'- `{md_text(gap.get("reason"))}`：{md_text(", ".join(gap.get("minimum_additional_evidence", [])))}')
-    else:
-        lines.append('- 无。')
+    lines.extend(render_evidence_gaps(analysis))
 
     lines.extend(["", "## 10. 优化优先级和复测方案", ""])
     for index, signature in enumerate(signatures, start=1):
@@ -660,7 +661,7 @@ def copy_evidence_data(output: Path, evidence_path: Path, evidence_by_id: dict[s
         destination.parent.mkdir(parents=True, exist_ok=True)
         if source.resolve() != destination.resolve():
             shutil.copyfile(source, destination)
-        receipt = item.get("mcp_receipt", {})
+        receipt = item.get("mcp_receipt", item if item.get("type") == "mcp_query" else {})
         for kind in ("request", "response"):
             if kind not in receipt:
                 continue
@@ -726,7 +727,7 @@ def validate_rendered_report(output: Path, analysis: dict[str, Any], html_enable
             errors.append(f"HTML {attribute} escapes visuals output: {target}")
         elif not linked.is_file():
             errors.append(f"HTML {attribute} target is missing: {target}")
-    return {"schema_version": 1, "passed": not errors, "error_count": len(errors), "errors": errors}
+    return validation_result(analysis, errors)
 
 
 def build(args: argparse.Namespace) -> int:
@@ -734,11 +735,12 @@ def build(args: argparse.Namespace) -> int:
     evidence = load_json(args.evidence)
     errors, evidence_by_id, data_by_id = validate_analysis_and_evidence(analysis, evidence, args.evidence.parent)
     candidate_manifest: dict[str, Any] | None = None
-    if is_query_native(analysis):
+    if is_query_native(analysis) or args.candidates:
         if not args.candidates:
             errors.append("--candidates is required for Query-native workflow 2.0")
         else:
-            candidate_manifest = load_json(args.candidates)
+            from candidate_manifest import load_candidate_manifest
+            candidate_manifest = load_candidate_manifest(args.candidates)
             if not isinstance(candidate_manifest, dict):
                 errors.append("Candidate Manifest must be an object")
             else:
@@ -747,10 +749,33 @@ def build(args: argparse.Namespace) -> int:
                 actual_sha = sha256_file(args.candidates)
                 if expected_sha != actual_sha:
                     errors.append("analysis.query_scan.candidate_manifest_sha256 does not match --candidates")
+                records = candidate_manifest.get("candidate_records", {})
+                record_path = records.get("path")
+                if record_path:
+                    for item in evidence_by_id.values():
+                        evidence_paths = [item.get("data_path")]
+                        evidence_paths += [r.get("path") for r in item.get("mcp_receipt", {}).values() if isinstance(r, dict)]
+                        if record_path in evidence_paths:
+                            errors.append("candidate_records path collides with evidence artifact")
+    model = {}
+    if candidate_manifest is not None and not args.legacy_regression:
+        from performance_review import validate_review
+        new_errors, model = validate_review(analysis, candidate_manifest, evidence, args.evidence.parent)
+        errors.extend(new_errors)
     if errors:
         raise ValidationFailure(errors)
+    if candidate_manifest is not None and not args.legacy_regression:
+        from performance_report import status, build_review_report
+        if args.validate_only:
+            print(json.dumps(status(analysis,model),ensure_ascii=False,sort_keys=True))
+            return 0
+        if not args.output:
+            raise ValidationFailure(["--output is required unless --validate-only is used"])
+        return build_review_report(args,analysis,candidate_manifest,evidence,model)
+    if args.legacy_regression:
+        analysis = dict(analysis, legacy_regression=True)
     if args.validate_only:
-        print('{"passed":true}')
+        print(json.dumps(validation_result(analysis, []), ensure_ascii=False, sort_keys=True))
         return 0
     if not args.output:
         raise ValidationFailure(["--output is required unless --validate-only is used"])
@@ -776,19 +801,39 @@ def build(args: argparse.Namespace) -> int:
 
     write_json(output / "analysis-result.json", analysis)
     write_json(output / "evidence-manifest.json", evidence)
+    candidate_artifacts = []
     if candidate_manifest is not None:
-        write_json(output / "candidate-manifest.json", candidate_manifest)
+        from candidate_manifest import copy_candidate_manifest
+        candidate_artifacts = copy_candidate_manifest(args.candidates, output)
     copy_evidence_data(output, args.evidence, evidence_by_id)
+
+    source_artifacts = set()
+    for finding in analysis.get("candidate_findings", []):
+        for source in finding.get("source_evidence", []):
+            snapshot = source.get("snapshot")
+            if not snapshot:
+                continue
+            relative = Path(snapshot["path"])
+            original = (args.evidence.parent / relative).resolve()
+            destination = (output / relative).resolve()
+            if relative.is_absolute() or not original.is_relative_to(args.evidence.parent.resolve()) or not destination.is_relative_to(output.resolve()):
+                raise ValidationFailure(["source snapshot path escapes evidence/report root"])
+            if sha256_file(original) != snapshot["sha256"]:
+                raise ValidationFailure(["source snapshot checksum mismatch before bundling"])
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if original != destination:
+                shutil.copyfile(original, destination)
+            source_artifacts.add(destination)
 
     signature_keys: dict[str, str] = {}
     primary_visuals: dict[str, dict[str, str]] = {}
     extra_visuals: dict[str, list[str]] = {}
     generated_paths: set[Path] = {output / "analysis-result.json", output / "evidence-manifest.json"}
-    if candidate_manifest is not None:
-        generated_paths.add(output / "candidate-manifest.json")
+    generated_paths.update(candidate_artifacts)
+    generated_paths.update(source_artifacts)
     for item in evidence_by_id.values():
         generated_paths.add(output / item["data_path"])
-        for record in item.get("mcp_receipt", {}).values():
+        for record in item.get("mcp_receipt", {k: item[k] for k in ("request", "response") if k in item} if item.get("type") == "mcp_query" else {}).values():
             if isinstance(record, dict) and "path" in record:
                 generated_paths.add(output / record["path"])
     for signature in analysis["bottleneck_signatures"]:

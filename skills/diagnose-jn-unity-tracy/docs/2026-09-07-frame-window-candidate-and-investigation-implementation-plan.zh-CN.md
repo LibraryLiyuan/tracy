@@ -2,6 +2,21 @@
 
 日期：2026-09-07。状态：已获用户批准，实施中。本文承接 2026-09-06 Query-native deterministic scan 计划；下列新规则覆盖旧版的全局 Top 截断和仅 P1 必查规则。
 
+## 当前接续基线（2026-09-09）
+
+下文第 2/6 节的旧 Session 衍生工作树仅为历史记录，不再用于本轮开发。
+
+- 当前工作树：`C:\CodeProjects\GodotProjects\tracy-0.13.1-ai-query-scan-dev`。
+- 当前分支：`feature/JNTracy-AI-QueryScan-DevBase`。
+- 已按用户授权 fast-forward 合入 `feature/JNTracy-QueryAnalysisCache`，HEAD `80bceb339014fc02f22a18945fd510bfc14ccf65`；不带 Session Store。
+- 当前 Skill 源码：此工作树的 `skills/diagnose-jn-unity-tracy`；Query 构建：`build-query-devbase`。
+- 缓存分支已完成同一短 Trace 的完整统计、候选、全部分页和自然热点检出。FW5 不再卡在旧 run2 的 16 GiB 精确统计失败点。
+- 本轮证据：`C:\Users\Admin\Documents\JN-Unity-T3\QSCAN15-Cache-Merge-and-FW-Acceptance-20260909`；继续 FW4/FW6，不复跑 30 分钟 Session。
+- 生成旧缓存的冻结 EXE 与重建 EXE 分别记录身份；不跨 EXE SHA 改写缓存身份。
+- 所有 selected 的读取契约通过不等于根因调查完成；2,596 个必查项仍须真实调查。安装版 Skill 尚未更新。
+
+合并核验与接续边界见仓库 `doc/JN-Tracy-Skill-Cache-Integration-20260909.zh-CN.md`。
+
 ## 1. 目标与范围
 
 解决两类已复现问题：局部高峰、稳定偏慢的具体事件被全局统计或名额挤掉；入选 P2 仅进入待办而报告仍宣布完成。保留全局统计的价值，不以代表帧代替全量扫描。
@@ -139,3 +154,45 @@ run2 在三个域扫描后进入精确统计，触发 16 GiB 保护并安全取�
 在第三次真实全量扫描前，先完成高基数合成回归：长期 Aggregate/Context/排名/代表项、hash、publish、缓存读取不得因整体 JSON 对象和字符串复制放大而失控。需要分页/分块时保留全部精确事实与候选语义；不提高门槛、不减少数据域、不改用 N30 Session。取消与正式中间结果复用必须有身份、字典和 checksum，不凭未完成 `.work` 文件伪装恢复。
 
 此为 FW2/FW5 已批准内存/取消边界的落实，不改变十二项业务规则。当前真实验收失败仍阻止 FW6 安装发布；详见 `QSCAN14-Frame-Window-Investigation-20260907/FW5-Run2-Exact-Statistics-Memory.zh-CN.md`。
+
+## 9. 2026-09-09 缓存合并后的实际位置
+
+上节是历史失败记录。缓存分支已在独立 dev-base Skill 工作树合入 `80bceb33`，短 Trace 的完整精确统计/候选已完成并可复用，不再重做失败全量扫描。没有引入 N30 Session。当前续接的是 FW4/FW6，而不是重新执行 30 分钟验收。
+
+新增流式候选 reader 接通报告、数值校验和状态审计；真实 1,508,732 候选在 43.875 秒内完成身份/Backlog 校验，100 ms private 峰值采样 811,458,560 B，全部 2,596 个未调查 selected 仍拒绝 complete。此测试不替代完整报告渲染/全链内存门禁。
+
+真实 MCP 树缺少祖先时改为验证独立父链回执；已用 6 个自然候选所需代表范围验证，并展开 Sampling/CS/源码假设与反证。Python 73/73、PowerShell/distribution/quick_validate 通过。额外 linter 缺依赖单列为未完成。全部 selected 调查、最终报告和安装仍未通过；不能把 6 项回执验证写成已完成全量诊断。
+
+完整进度和证据见仓库 `doc/JN-Tracy-Skill-Cache-Integration-20260909.zh-CN.md` 与本地 `QSCAN15-Cache-Merge-and-FW-Acceptance-20260909/Plan-and-Progress.zh-CN.md`。仍按原完成门禁执行，不增加性能阈值、不削减候选、不自动提交或覆盖安装版。
+
+## 10. 续接进展：阶段报告与实际 GPU 回执
+
+实际阶段报告已生成两次，3,390个文件字节一致；约45秒/次，private观测峰值约3.40GB。1,508,732候选完整保留，只有六项CPU已进入Findings（1 Supported、5 Unresolved），不是完整性能报告。独立恢复状态已经实际审计并落盘，2590个selected仍待查。
+
+FW4补齐真实GPU DTO的CPU线程/GPU Context区分及ref-based L0区间锚点；两项自然GPU候选的四个代表片段、八个实际匹配实例父链校验通过，没有虚构PlayerFrame。最终Python78/78，PowerShell/distribution通过。
+
+Job定向深查暴露独立Query问题：全局GetJobs展开导致内存保护，domains=[frame,job]替代路径仍超时。该候选未完成，不伪造source unavailable。后端范围读取修复尚未实施，定位及下一步范围见本地 `FW4-Job-Directed-Query-Blocker.zh-CN.md`。FW6完整调查与安装仍不放行。
+
+## 11. 2026-09-09 Job 修复后的真实 SKILL 续验
+
+上节Job阻断为历史状态。范围读取修复已完成并通过25/25原生回归；继续实际MCP调查9个OriginFrameId、27个Job。修正收据中OriginFrameId与Player.Frame数组下标混淆，独立核验canonical帧身份，并在正式Schema增加 `job_frame_identity_evidence_id`。
+
+真实Job收据通过；Python81/81、PowerShell总测试和隔离distribution通过。七项阶段报告两次生成，3738文件完全相同，约49秒/次、private峰值约3.51GB。附加quick_validate因当前Python缺yaml单列未完成，不改变已完成的测试结果。
+
+本轮报告新增Shader创建相关Worker长尾与真实依赖组等待的证据，也保留Native符号不足和单帧critical-path-cycle限制。Quality不成为性能P0；SiteReuse不冒充执行栈；CPU搜索的返回线程逐ref核对。当前7/2596 selected已实际调查，2589仍待查，报告in_progress，FW6及安装未放行。没有新scan、Session或Unity/Player变更。
+
+证据：`QSCAN15-Cache-Merge-and-FW-Acceptance-20260909/FW4-Job-Skill-Investigation-Acceptance.zh-CN.md`、`job-actual-receipt-bindings.json`、`job-stage-report-verified/determinism.json`。
+
+## 12. 2026-09-10：已确认的 FrameSet 缺失边界与状态修复
+
+用户已确认：FrameSet duration 候选在代表区间确实没有 CPU Zone 时，可以完成该区间的证据调查，但只能给出 Unresolved 和最小缺口。已实现 `verified_absent`：严格 frame-wall 身份、真实 frame.get、原始无过滤 CPU search 首页、精确边界、完整空结果、零遗漏、无预算耗尽。请求可使用候选的 FrameSet 名称，但响应稳定 ID 必须精确匹配；不能把名称当成 opaque ID。
+
+普通 CPU/GPU Zone 不适用该分支；有记录的代表区间仍需真实树。错误、部分结果、未读页、筛选后空集、children=[] 以及 Supported/Confirmed 均不能通过。顶层 EvidenceGap 必须绑定具体候选与搜索/Frame 回执，不能只写泛化“数据不足”。
+
+报告校验输出统一增加 report_status、analysis_complete、required_pending。passed 只表示产物合法；完整分析要求 complete/true/0。没有放宽 selected、数值一致性、质量附录或状态恢复门禁。
+
+91 项 Python 测试通过；PowerShell、分发、quick_validate 通过，linter 0 error（7 项既有 warning 保留，不擅改许可证/CI）。独立真实回执行为复测 21/21 通过。没有重新扫描，没有启动 Session，没有改 Query EXE、Unity、Player 或采集配置。
+
+真实调查累计 32/2596；本批队列剩余21项P1已全部处理，加上此前2项，累计23项P1均已调查。2564 项 selected 仍待查。Unresolved 不等于已证明根因。FW4 此次修复已验，FW6 完整分析与安装仍未完成，禁止覆盖安装版。最新证据见本地 `FW4-Verified-Absence-and-Report-Status-Acceptance.zh-CN.md`。
+
+最终32项阶段报告两次生成，9176文件字节一致；76.718/75.719秒，private采样峰值3839000576/3839623168 bytes，均低于4GiB保护线。恢复审计76.063秒，完整保留1508732候选及2564待查项；未重算Trace统计。最终机器状态为passed=true、report_status=in_progress、analysis_complete=false、required_pending=2564。

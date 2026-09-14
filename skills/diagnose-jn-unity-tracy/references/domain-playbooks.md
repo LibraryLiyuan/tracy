@@ -133,6 +133,8 @@
 - 将 `CapturePerturbed` 帧与稳定业务分布分开，但保留在完整分布。
 - producer 直接位于 Unity 关键路径时形成 `TracyRuntimeOverhead` Signature；离线 Query/转换/Profiler 的 CPU 或内存压力形成 `TracyAnalysisPressure`，不得混入游戏帧耗时。
 - Sampling 栈是证据来源，不把样本数直接换算为确定执行时间。
+- 当前 Query 1.35 的 `sample.symbol_statistics` 是整份 Trace 的符号汇总，不使用请求中的线程/时间过滤；不得用它回答某一帧或某个 Zone 的热点。局部查询使用 `sample.list` / `sample.flamegraph` 的明确 `thread_ref,start_ns,end_ns`，原请求/响应落盘。flamegraph 的 TopN 当前上限 500（不同于通用分页上限 1000）；如 paths 少于 unique_callstacks，不得宣称全量展示。
+- `context_switch.thread` 可返回与窗口相交的完整区间，不保证已按窗口裁剪；不能把返回区间总长度直接当作该 Zone 的等待时间。原生符号仅有模块名/导出近邻时，具体锁、驱动函数或 Lua 函数名称必须标为未解析。
 - 单 Trace 只能报告观测到的自耗时和风险。
 
 反证：没有对照运行不能计算总体录制开销；Query 机器内存/CPU 不属于被测 Unity 帧内开销。

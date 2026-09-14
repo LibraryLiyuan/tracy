@@ -6,7 +6,9 @@ import hashlib
 import html
 import json
 import math
+import os
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,10 +60,38 @@ SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
+def _valid_signature_id(value: Any, query_native: bool) -> bool:
+    if not isinstance(value, str):
+        return False
+    if query_native and value.startswith("job:type:"):
+        # Query's identity contains the exact Job name, including (Burst),
+        # generic names and Unicode. It is not a filename or an editable slug.
+        # The Query-native contract separately binds it to the frozen manifest.
+        return (len(value) <= 4096 and value.isprintable()
+                and re.fullmatch(r"job:type:[0-9]+:.+", value) is not None)
+    return SAFE_ID_RE.fullmatch(value) is not None
+
+
 class ValidationFailure(Exception):
     def __init__(self, errors: Iterable[str]):
         self.errors = list(errors)
         super().__init__("; ".join(self.errors))
+
+
+def validation_result(analysis: dict, errors: list[str]) -> dict:
+    """Separate artifact validity from the completion of mandatory analysis."""
+    status = analysis.get("report_status", "complete")
+    scan = analysis.get("query_scan")
+    pending = None
+    if isinstance(scan, dict):
+        coverage = scan.get("coverage", {})
+        total, completed = coverage.get("required_total"), coverage.get("required_completed")
+        if type(total) is int and type(completed) is int and 0 <= completed <= total:
+            pending = total - completed
+    return {"schema_version": 1, "passed": not errors, "error_count": len(errors), "errors": errors,
+            "report_status": status,
+            "analysis_complete": not analysis.get("legacy_regression") and not errors and status == "complete" and (scan is None or pending == 0),
+            "required_pending": pending}
 
 
 def load_json(path: Path) -> Any:
@@ -77,7 +107,23 @@ def stable_json_bytes(value: Any) -> bytes:
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(stable_json_bytes(value))
+    temporary: Path | None = None
+    try:
+        # Same canonical JSON bytes, without an additional whole-output
+        # Unicode string and UTF-8 copy beside large validated evidence.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=".jntracy-json-", suffix=".tmp", delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            json.dump(value, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -241,7 +287,7 @@ def validate_analysis_and_evidence(
     configuration = _require_mapping(identity.get("configuration"), "analysis.report_identity.configuration", errors)
     versions = analysis_obj.get("report_versions")
     query_native = isinstance(analysis_obj.get("query_scan"), dict) or (
-        isinstance(versions, dict) and versions.get("analysis_workflow") == "2.0.0"
+        isinstance(versions, dict) and versions.get("analysis_workflow") in {"2.0.0", "2.1.0", "2.2.0"}
     )
     configuration_keys = ("analysis_profile",) if query_native else (
         "local_profile", "project_profile", "performance_budgets", "marker_attribution"
@@ -271,6 +317,15 @@ def validate_analysis_and_evidence(
     data_by_id: dict[str, Any] = {}
     available_entity_refs: set[str] = set()
     available_relation_refs: set[str] = set()
+    relations_by_ref: dict[str, list[tuple[str, dict]]] = {}
+    def remember_relation(eid, relation):
+        ref = relation["relation_ref"]
+        available_relation_refs.add(ref)
+        entries = relations_by_ref.setdefault(ref, [])
+        identity = lambda edge: (edge.get("from_ref"), edge.get("to_ref"), edge.get("kind", edge.get("relation")))
+        if entries and any(identity(previous) != identity(relation) for _, previous in entries):
+            errors.append("conflicting Evidence relation identity: " + ref)
+        entries.append((eid, relation))
     evidence_items = _require_list(evidence_obj.get("evidence"), "evidence_manifest.evidence", errors)
     for index, item in enumerate(evidence_items):
         item_path = f"evidence_manifest.evidence[{index}]"
@@ -325,7 +380,7 @@ def validate_analysis_and_evidence(
                             available_entity_refs.add(zone["zone_ref"])
                     for relation in data.get("relations", []):
                         if isinstance(relation, dict) and isinstance(relation.get("relation_ref"), str):
-                            available_relation_refs.add(relation["relation_ref"])
+                            remember_relation(evidence_id, relation)
             elif obj.get("type") == "memory_timeline":
                 data_obj = _require_mapping(data, f"evidence[{evidence_id}].data", errors)
                 if data_obj.get("trace_id") != manifest_trace.get("trace_id") or data_obj.get("trace_sha256") != manifest_trace.get("sha256"):
@@ -359,7 +414,7 @@ def validate_analysis_and_evidence(
                     if edge_obj.get("from_ref") not in graph_nodes or edge_obj.get("to_ref") not in graph_nodes:
                         errors.append(f"evidence[{evidence_id}].data.edges[{edge_index}] endpoint is missing")
                     if isinstance(edge_obj.get("relation_ref"), str):
-                        available_relation_refs.add(edge_obj["relation_ref"])
+                        remember_relation(evidence_id, edge_obj)
             elif obj.get("type") == "frame_image":
                 data_obj = _require_mapping(data, f"evidence[{evidence_id}].data", errors)
                 if data_obj.get("trace_id") != manifest_trace.get("trace_id") or data_obj.get("trace_sha256") != manifest_trace.get("sha256"):
@@ -420,7 +475,7 @@ def validate_analysis_and_evidence(
             errors,
         )
         signature_id = obj.get("id")
-        if not isinstance(signature_id, str) or not SAFE_ID_RE.fullmatch(signature_id):
+        if not _valid_signature_id(signature_id, query_native):
             errors.append(f"{path}.id is invalid")
         elif signature_id in signature_ids:
             errors.append(f"{path}.id is duplicated")
@@ -451,11 +506,30 @@ def validate_analysis_and_evidence(
             if evidence_id not in evidence_by_id:
                 errors.append(f"{path} references missing evidence {evidence_id}")
         limiter = obj.get("primary_limiter")
+        def relation_in_scope(eid):
+            data = data_by_id.get(eid, {})
+            affected = {str(frame) for frame in obj.get("affected_frames", [])}
+            if affected and data.get("frame_id") is not None and str(data["frame_id"]) not in affected:
+                return False
+            scope = analysis_obj.get("analysis_scope", {})
+            if data.get("start_ns") is not None and data.get("end_ns") is not None:
+                try:
+                    if int(data["end_ns"]) <= int(scope["start_ns"]) or int(data["start_ns"]) >= int(scope["end_ns"]):
+                        return False
+                except (KeyError, TypeError, ValueError):
+                    return False
+            return True
         for edge_index, edge in enumerate(_require_list(obj.get("causal_chain"), f"{path}.causal_chain", errors)):
             edge_obj = _require_mapping(edge, f"{path}.causal_chain[{edge_index}]", errors)
             _required(edge_obj, ["relation_ref", "from_ref", "to_ref", "relation"], f"{path}.causal_chain[{edge_index}]", errors)
             if edge_obj.get("relation_ref") not in available_relation_refs:
                 errors.append(f"{path}.causal_chain[{edge_index}].relation_ref is not present in Evidence")
+            originals = relations_by_ref.get(edge_obj.get("relation_ref"), [])
+            if originals and not any(eid in obj.get("evidence_refs", []) and relation_in_scope(eid) and
+                    (edge_obj.get("from_ref"), edge_obj.get("to_ref"), edge_obj.get("relation")) ==
+                    (original.get("from_ref"), original.get("to_ref"), original.get("kind", original.get("relation")))
+                    for eid, original in originals):
+                errors.append(f"{path}.causal_chain[{edge_index}] does not match a relation in its cited Evidence")
             if edge_obj.get("from_ref") not in available_entity_refs or edge_obj.get("to_ref") not in available_entity_refs:
                 errors.append(f"{path}.causal_chain[{edge_index}] endpoint is not present in Evidence")
         if limiter in {"MainWaitsJob", "MainWaitsRender", "RenderWaitsGpuFencePresent"}:
@@ -509,6 +583,19 @@ def md_text(value: Any) -> str:
     )
 
 
+def render_minimum_evidence(values: list[Any], separator: str = "；") -> str:
+    """Render mixed gap descriptions without dropping structured evidence fields."""
+    rendered = []
+    for value in values:
+        if isinstance(value, str):
+            rendered.append(md_text(value))
+        else:
+            payload = json.dumps(value, ensure_ascii=False, sort_keys=True)
+            fence = "`" * (1 + max((len(run) for run in re.findall(r"`+", payload)), default=0))
+            rendered.append(f"{fence} {payload} {fence}")
+    return separator.join(rendered)
+
+
 def html_text(value: Any) -> str:
     return html.escape(safe_text(value), quote=True)
 
@@ -524,6 +611,10 @@ def format_ms(value: Any) -> str:
 
 
 def stable_id(value: str) -> str:
+    if value.startswith("job:type:"):
+        # Sanitizing names alone aliases A/B, A B and A-B; lowercased anchors
+        # also alias Foo and foo. Hash the complete opaque Job signature.
+        return "job-" + sha256_bytes(value.encode("utf-8"))
     clean = re.sub(r"[^A-Za-z0-9_.:-]+", "-", value).strip("-")
     return clean or sha256_bytes(value.encode("utf-8"))[:12]
 

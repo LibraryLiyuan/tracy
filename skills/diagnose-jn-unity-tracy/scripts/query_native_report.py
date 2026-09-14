@@ -10,6 +10,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from candidate_manifest import is_candidate_collection
+from review_routing import active as routing_active, validate_routing, query_required
+from report_common import render_minimum_evidence
+
 
 SPECIALTY_REPORT_FILES = [
     "01-Trace-Quality-and-Scan-Coverage.md",
@@ -40,7 +44,7 @@ CONFIRMATION_BASES = {"typed_relation", "source_revision_match", "independent_ev
 def is_query_native(analysis: dict[str, Any]) -> bool:
     versions = analysis.get("report_versions")
     return isinstance(analysis.get("query_scan"), dict) or (
-        isinstance(versions, dict) and versions.get("analysis_workflow") == "2.0.0"
+        isinstance(versions, dict) and versions.get("analysis_workflow") in {"2.0.0", "2.1.0", "2.2.0"}
     )
 
 
@@ -54,23 +58,42 @@ def validate_query_native_analysis(
 ) -> list[str]:
     errors: list[str] = []
     if not is_query_native(analysis):
-        return errors
+        return ["Query-native validation requires analysis.query_scan and workflow 2.0 identity"]
     if candidate_manifest.get("schema_version") != 1:
         errors.append("candidate_manifest.schema_version must be 1")
+    if candidate_manifest.get("policy_algorithm") != "candidate-policy-v3":
+        return [*errors, "candidate_manifest.policy_algorithm must be candidate-policy-v3"]
     candidates = candidate_manifest.get("candidates")
-    if not isinstance(candidates, list):
+    if not is_candidate_collection(candidates):
         return [*errors, "candidate_manifest.candidates must be an array"]
+    # Keep detailed numeric facts only for actual findings. All IDs and all
+    # mandatory entries are still audited, including late/unselected records.
+    raw_findings = analysis.get("candidate_findings")
+    finding_ids = {item.get("candidate_id") for item in (raw_findings if isinstance(raw_findings, list) else [])
+                   if isinstance(item, dict) and isinstance(item.get("candidate_id"), str)}
     by_id: dict[str, dict[str, Any]] = {}
+    all_ids: set[str] = set()
+    required: set[str] = set()
+    routing = None
+    if routing_active(analysis):
+        try:
+            routing, _ = validate_routing(analysis, candidate_manifest, evidence_manifest, evidence_root)
+        except (KeyError, TypeError, ValueError, OSError) as exc:
+            return [*errors, "review routing: " + str(exc)]
     for index, candidate in enumerate(candidates):
         if not isinstance(candidate, dict) or not isinstance(candidate.get("candidate_id"), str):
             errors.append(f"candidate_manifest.candidates[{index}] is invalid")
             continue
         candidate_id = candidate["candidate_id"]
         if candidate.get("domain") == "quality" or "quality" in candidate.get("triggers", []):
-            errors.append("legacy quality candidate requires candidate-policy-v2; capture quality belongs in appendix")
-        if candidate_id in by_id:
+            errors.append("legacy quality candidate requires candidate-policy-v3; capture quality belongs in appendix")
+        if candidate_id in all_ids:
             errors.append(f"candidate_manifest contains duplicate candidate {candidate_id}")
-        by_id[candidate_id] = candidate
+        all_ids.add(candidate_id)
+        if (query_required(candidate, routing) if routing is not None else _candidate_required(candidate)):
+            required.add(candidate_id)
+        if candidate_id in finding_ids:
+            by_id[candidate_id] = candidate
 
     scan = analysis.get("query_scan")
     capture_quality = candidate_manifest.get("capture_quality", [])
@@ -129,6 +152,39 @@ def validate_query_native_analysis(
             else:
                 from investigation_receipts import validate_receipts
                 errors.extend(validate_receipts(candidate, finding, evidence_manifest, evidence_root))
+            for receipt in finding.get("investigation_receipts", []):
+                outcome = receipt.get("outcome")
+                reasons = {
+                    "verified_absent": "NoRecordedCpuZonesInRepresentativeFrame",
+                    "verified_not_recorded": "CandidateNotRecordedInRepresentativeFrame",
+                    "completion_not_recorded": "UnresolvedWaitChain",
+                }
+                if outcome not in reasons:
+                    continue
+                # An absence receipt closes only the evidence investigation;
+                # neither absent events nor unrecorded completion links imply
+                # zero cost or a confirmed cause. Every dependency stays visible.
+                required_refs = {receipt.get("evidence_id")}
+                required_refs.update(receipt.get("page_evidence_ids", []))
+                if outcome == "completion_not_recorded":
+                    required_refs.update(receipt.get("relation_evidence_ids", []))
+                else:
+                    required_refs.add(receipt.get("frame_anchor_evidence_id"))
+                    if receipt.get("frame_set_evidence_id"):
+                        required_refs.add(receipt["frame_set_evidence_id"])
+                    for exclusion in receipt.get("exclusion_evidence", []):
+                        required_refs.update(item.get("evidence_id") for item in exclusion.get("parent_chain_evidence", []))
+                if not any(isinstance(gap, dict) and gap.get("candidate_id") == candidate_id
+                        and gap.get("reason") == reasons[outcome]
+                        and isinstance(gap.get("evidence_refs"), list)
+                        and required_refs <= set(gap["evidence_refs"])
+                        and isinstance(gap.get("blocked_by"), str) and gap["blocked_by"].strip()
+                        and isinstance(gap.get("minimum_additional_evidence"), list)
+                        and gap["minimum_additional_evidence"]
+                        and all(isinstance(value, str) and value.strip() for value in gap["minimum_additional_evidence"])
+                        for gap in analysis.get("evidence_gaps", [])):
+                    category = "completion_gap" if outcome == "completion_not_recorded" else "absence_gap"
+                    errors.append(f"{path}.{category} missing candidate-linked evidence and minimum follow-up")
         if not isinstance(finding.get("representative_selection_reason"), str) or not finding["representative_selection_reason"].strip():
             errors.append(f"{path}.representative_selection_reason is required")
 
@@ -169,6 +225,9 @@ def validate_query_native_analysis(
             ):
                 errors.append(f"{path}.confirmation_basis source_revision_match lacks matching source evidence")
 
+        from confirmation_evidence import validate_confirmation_evidence
+        errors.extend(validate_confirmation_evidence(finding, evidence_manifest, evidence_root, path))
+
         evidence_refs = finding.get("evidence_refs")
         if not isinstance(evidence_refs, list) or not evidence_refs:
             errors.append(f"{path}.evidence_refs must not be empty")
@@ -182,7 +241,6 @@ def validate_query_native_analysis(
             if not isinstance(signature, dict) or not signature.get("causal_chain"):
                 errors.append(f"{path}.confirmation_basis typed_relation lacks a validated causal chain")
 
-    required = {candidate_id for candidate_id, candidate in by_id.items() if _candidate_required(candidate)}
     missing_required = sorted(required - set(finding_by_id))
     status = analysis.get("report_status", "complete")
     if status not in {"complete", "in_progress"}:
@@ -204,7 +262,7 @@ def validate_query_native_analysis(
     backlog_ids = {
         item.get("candidate_id") for item in backlog if isinstance(item, dict)
     }
-    expected_backlog = set(by_id) - set(finding_by_id)
+    expected_backlog = all_ids - set(finding_by_id)
     if backlog_ids != expected_backlog:
         errors.append("analysis.investigation_backlog does not enumerate every uninvestigated candidate")
 
@@ -213,7 +271,7 @@ def validate_query_native_analysis(
         errors.append("analysis.query_scan.coverage is required")
     else:
         expected = {
-            "candidate_total": len(by_id),
+            "candidate_total": len(all_ids),
             "required_total": len(required),
             "required_completed": len(required & set(finding_by_id)),
             "investigated_total": len(finding_by_id),
@@ -291,10 +349,36 @@ def _finding_sections(analysis: dict[str, Any], predicate: Any = None) -> list[s
         }
         for step in TRAIL_STEPS:
             lines.append(f"- **{labels[step]}**：{_md(trail.get(step))}")
+        limited = [receipt for receipt in finding.get("investigation_receipts", [])
+                   if receipt.get("outcome") in {"verified_absent", "verified_not_recorded", "completion_not_recorded", "unavailable"}]
+        if limited:
+            lines.extend(["", "### 调查结束的证据边界", "", "已调查至可证明边界，不代表根因已确认；缺失不等于零开销。", ""])
+            for receipt in limited:
+                refs = [receipt.get("evidence_id", "")]
+                refs.extend(receipt.get("page_evidence_ids", []))
+                refs.extend(receipt.get("relation_evidence_ids", []))
+                if receipt.get("frame_anchor_evidence_id"):
+                    refs.append(receipt["frame_anchor_evidence_id"])
+                lines.append(f"- `{_md(receipt.get('outcome'))}`；原始 Evidence / Frame 锚点：{_md(', '.join(dict.fromkeys(refs)))}。")
         lines.append("")
     if not lines:
         lines.extend(["本专项没有已完成的 Candidate 调查。", ""])
     return lines
+
+
+def render_evidence_gaps(analysis: dict[str, Any]) -> list[str]:
+    """Keep the candidate, blocker and actual receipt IDs beside each limit."""
+    lines = []
+    for gap in analysis.get("evidence_gaps", []):
+        lines.extend([
+            f"- `{_md(gap.get('reason'))}`；Candidate：`{_md(gap.get('candidate_id', '域级限制'))}`。",
+            "",
+            f"  - 当前限制：{_md(gap.get('blocked_by', '详见对应调查记录'))}",
+            f"  - Evidence：{_md(', '.join(gap.get('evidence_refs', []))) or '详见对应调查记录'}",
+            f"  - 最小补证：{render_minimum_evidence(gap.get('minimum_additional_evidence', []))}",
+            "",
+        ])
+    return lines or ["- 无。"]
 
 
 def render_analysis_process(analysis: dict[str, Any]) -> str:
@@ -407,12 +491,6 @@ def render_specialty_reports(
     else:
         lines.append("- 无。")
     lines.extend(["", "## Evidence Gaps", ""])
-    if analysis.get("evidence_gaps"):
-        for gap in analysis["evidence_gaps"]:
-            lines.append(
-                f"- `{_md(gap.get('reason'))}`：{_md(', '.join(gap.get('minimum_additional_evidence', [])))}"
-            )
-    else:
-        lines.append("- 无。")
+    lines.extend(render_evidence_gaps(analysis))
     reports[SPECIALTY_REPORT_FILES[8]] = "\n".join(lines) + "\n"
     return reports

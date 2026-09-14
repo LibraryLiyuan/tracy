@@ -41,7 +41,7 @@ def candidate(candidate_id, priority, triggers, *, selected=True):
                 "observed_value": "2500000",
                 "threshold_value": "1000000",
                 "unit": "ns",
-                "authority": "candidate-policy-v1",
+                "authority": "candidate-policy-v3",
                 "eligible": True,
             }
         ],
@@ -60,6 +60,7 @@ class SkillV2ContractTests(unittest.TestCase):
         tool = load_state_tool()
         state = tool.new_state(STATE_TEMPLATE)
         state["scan"]["policy_algorithm"] = "candidate-policy-v3"
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
         state["task"]["state"] = "completed"
         state["investigations"]["coverage"] = {"required_total": 1, "required_completed": 1}
         state["investigations"]["completed"] = [{"candidate_id": "forged-only-id"}]
@@ -68,6 +69,7 @@ class SkillV2ContractTests(unittest.TestCase):
     def test_selected_p2_is_required_and_terminal_state_rejects_pending(self) -> None:
         tool = load_state_tool()
         state = tool.new_state(STATE_TEMPLATE)
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
         tool.ingest_candidate_pages(state, [{"items": [candidate("local-p2", "P2", ["top"])],
             "page": {"done": True, "next_cursor": None, "total": "1"}}])
         self.assertTrue(state["investigations"]["queue"][0]["required"])
@@ -88,7 +90,8 @@ class SkillV2ContractTests(unittest.TestCase):
         self.assertRegex(description.lower(), r"(single|单个|单次).*(trace|capture|捕获)")
         self.assertNotIn("A/B", description)
         self.assertNotIn("不用于", description)
-        self.assertIn("version: 2.0.1", frontmatter)
+        # Patch releases do not change this routing contract. Package identity
+        # and frontmatter validity are checked by distribution/release tests.
 
     def test_schema4_and_yaml_are_the_only_runtime_authorities(self) -> None:
         text = SKILL_PATH.read_text(encoding="utf-8")
@@ -96,13 +99,14 @@ class SkillV2ContractTests(unittest.TestCase):
         self.assertEqual(template["schema_version"], 4)
         self.assertIn("JNTracy.AnalysisProfile.yaml", text)
         for legacy in (
-            "config/local-profile.json",
             "config/project-profile.json",
             "config/performance-budgets.json",
             "config/marker-attribution.json",
             "resolve-profile.ps1",
         ):
             self.assertNotIn(legacy, text)
+        self.assertIn("config/local-profile.json", text)
+        self.assertIn("不覆盖 YAML", text)
 
     def test_missing_profile_and_wrong_query_schema_stop_preflight(self) -> None:
         tool = load_state_tool()
@@ -118,6 +122,7 @@ class SkillV2ContractTests(unittest.TestCase):
     def test_scan_resume_and_aggregate_reuse_are_idempotent(self) -> None:
         tool = load_state_tool()
         state = tool.new_state(STATE_TEMPLATE)
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
         tool.apply_scan_status(
             state,
             {"scan_id": "scan-1", "state": "CancelledResumable", "resumable": True,
@@ -128,7 +133,7 @@ class SkillV2ContractTests(unittest.TestCase):
         summary = {
             "scan_id": "scan-1",
             "aggregate_content_sha256": "a" * 64,
-            "candidate_content_sha256": "b" * 64,
+            "candidate_content_sha256": "b" * 64, "policy_algorithm": "candidate-policy-v3",
             "quality": {"complete": True},
             "domains": [],
             "backlog": {"total": 1, "selected": 1, "not_selected": 0},
@@ -139,7 +144,7 @@ class SkillV2ContractTests(unittest.TestCase):
         self.assertEqual(len(state["task"]["state_history"]), history_count)
         self.assertEqual(state["scan"]["aggregate_content_sha256"], "a" * 64)
 
-    def test_all_p0_p1_and_user_focus_candidates_enter_queue_once(self) -> None:
+    def test_legacy_p0_excluded_and_new_p0_focus_enter_queue_once(self) -> None:
         tool = load_state_tool()
         candidates = [
             candidate("p0", "P0", ["user_focus"]),
@@ -149,9 +154,8 @@ class SkillV2ContractTests(unittest.TestCase):
             candidate("backlog-p4", "P4", ["top"], selected=False),
         ]
         state = tool.new_state(STATE_TEMPLATE)
-        state["investigations"]["completed"] = [
-            {"candidate_id": "p0", "status": "Confirmed", "completed_at": "2026-09-06T00:00:00Z"}
-        ]
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
+        state["investigations"]["completed"] = []
         tool.ingest_candidate_pages(
             state,
             [{"items": candidates, "page": {"cursor": "", "next_cursor": None, "done": True, "total": "5"}}],
@@ -159,8 +163,8 @@ class SkillV2ContractTests(unittest.TestCase):
         queue_ids = [item["candidate_id"] for item in state["investigations"]["queue"]]
         backlog_ids = [item["candidate_id"] for item in state["investigations"]["backlog"]]
         self.assertNotIn("p0", queue_ids)
-        self.assertEqual(queue_ids, ["p1", "focus", "selected-p2"])
-        self.assertEqual(backlog_ids, ["p1", "focus", "selected-p2", "backlog-p4"])
+        self.assertEqual(queue_ids, ["focus", "p1", "selected-p2"])
+        self.assertEqual(set(backlog_ids), {"p0", "p1", "focus", "selected-p2", "backlog-p4"})
         self.assertTrue(all(cid in {"p0", *queue_ids} for cid in {"p0", "p1", "focus"}))
 
         tool.ingest_candidate_pages(
@@ -192,6 +196,7 @@ class SkillV2ContractTests(unittest.TestCase):
     def test_legacy_quality_candidates_require_new_policy_not_an_investigation(self) -> None:
         tool = load_state_tool()
         state = tool.new_state(STATE_TEMPLATE)
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
         items = [candidate("quality", "P0", ["quality"]), candidate("cpu", "P1", ["budget"])]
         with self.assertRaisesRegex(tool.AnalysisStateError, "quality.*candidate-policy-v2"):
             tool.ingest_candidate_pages(state, [{"items": items, "page": {
@@ -201,10 +206,11 @@ class SkillV2ContractTests(unittest.TestCase):
     def test_quality_summary_does_not_change_priorities_or_coverage(self) -> None:
         tool = load_state_tool()
         state = tool.new_state(STATE_TEMPLATE)
+        state["scan"]["policy_algorithm"] = "candidate-policy-v3"
         state["scan"]["scan_id"] = "scan-1"
         quality = [{"domain": "gpu.catalog", "status": "invalid", "reason": "core gap"}]
         tool.apply_scan_summary(state, {"scan_id": "scan-1", "aggregate_content_sha256": "a" * 64,
-            "candidate_content_sha256": "b" * 64, "capture_quality": quality})
+            "candidate_content_sha256": "b" * 64, "policy_algorithm": "candidate-policy-v3", "capture_quality": quality})
         items = [candidate("cpu", "P1", ["budget"]), candidate("render", "P2", ["top"])]
         tool.ingest_candidate_pages(state, [{"items": items, "page": {
             "total": "2", "done": True, "next_cursor": None}}])

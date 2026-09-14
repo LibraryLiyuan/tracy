@@ -158,7 +158,21 @@ class ReceiptTests(unittest.TestCase):
             e["evidence"][0]["request"] = store(root, "request.json", req)
             self.assertTrue(load().validate_receipts(c, f, e, root))
 
-    def test_three_actual_scoped_capability_failures_can_be_evidence_gap_not_success(self):
+    def test_nested_has_more_without_cursor_is_not_complete_evidence(self):
+        # gpu.pass.search currently exposes data.page.has_more without an
+        # envelope cursor. Accepting this as exhausted could falsely prove
+        # target absence or uniqueness from the first 1,000 of 1,077 rows.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            c, f, e, _, reply = self.fixture(root)
+            content = reply["result"]["structuredContent"]
+            content.update(partial=False, page={"next_cursor": None, "partial": False})
+            content["data"]["page"] = {"has_more": True, "returned": 1000, "total": 1077}
+            e["evidence"][0]["response"] = store(root, "response.json", reply)
+            errors = load().validate_receipts(c, f, e, root)
+            self.assertTrue(any("receipt_query_incomplete" in error for error in errors), errors)
+
+    def test_ignored_signature_fields_without_entity_anchor_cannot_close_gap(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             c, f, e, req, reply = self.fixture(root)
@@ -171,7 +185,7 @@ class ReceiptTests(unittest.TestCase):
                 reply["result"]["structuredContent"] = {"ok": False, "trace": {"fingerprint": "a" * 64}, "error": {"code": "capability_unavailable", "message": "not captured"}}
                 e["evidence"].append({"evidence_id": str(i), "request": store(root, f"q{i}.json", req), "response": store(root, f"r{i}.json", reply)})
                 f["investigation_receipts"].append({"evidence_id": str(i), "purpose": "zone_tree", "manifestation": "frame_cost", "outcome": "unavailable"})
-            self.assertEqual([], load().validate_receipts(c, f, e, root))
+            self.assertTrue(load().validate_receipts(c, f, e, root))
             f["conclusion_status"] = "Supported"
             self.assertTrue(load().validate_receipts(c, f, e, root))
             f["conclusion_status"] = "Unresolved"
@@ -189,6 +203,101 @@ class ReceiptTests(unittest.TestCase):
             f["investigation_receipts"][0]["parent_chain_json_pointers"] = ["/data/nodes/1"]
             e["evidence"][0]["response"] = store(root, "response.json", reply)
             self.assertTrue(load().validate_receipts(c, f, e, root))
+
+    def test_parent_chain_can_use_actual_separate_get_receipts(self):
+        # Production zone.tree returns root + children, never its ancestors.
+        # Ancestor get calls must be hash/identity/ref verified independently.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            c, f, e, req, reply = self.fixture(root)
+            node = reply["result"]["structuredContent"]["data"]["nodes"][0]
+            node.pop("path")
+            node["parent_ref"] = "zone:parent"
+            e["evidence"][0]["response"] = store(root, "response.json", reply)
+            parent_req = json.loads(json.dumps(req))
+            parent_req["id"] = 2
+            parent_req["params"]["arguments"].update(method="zone.cpu.get", params={"ref": "zone:parent"})
+            parent_reply = {"jsonrpc": "2.0", "id": 2, "result": {"structuredContent": {
+                "ok": True, "trace": {"fingerprint": "a" * 64}, "data": {
+                    "ref": "zone:parent", "name": "Parent", "parent_ref": None, "thread_ref": "thread:main"}}}}
+            e["evidence"].append({"evidence_id": "P1", "request": store(root, "parent-q.json", parent_req),
+                "response": store(root, "parent-r.json", parent_reply)})
+            f["investigation_receipts"][0]["parent_chain_evidence"] = [{"evidence_id": "P1", "entity_json_pointer": "/data"}]
+            self.assertEqual([], load().validate_receipts(c, f, e, root))
+            parent_reply["result"]["structuredContent"]["data"]["ref"] = "zone:unrelated"
+            e["evidence"][-1]["response"] = store(root, "parent-r.json", parent_reply)
+            self.assertTrue(load().validate_receipts(c, f, e, root))
+
+    def test_frame_wall_signature_uses_real_root_even_when_legacy_flag_is_false(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            c, f, e, _, reply = self.fixture(root)
+            c.update(frame_root=False, signature_id="frame-wall:Player.Frame", structural_signature="Player.Frame")
+            reply["result"]["structuredContent"]["data"]["nodes"][0].update(
+                name="Main.PlayerLoop", path="Main.PlayerLoop", parent_ref=None, complete=True)
+            e["evidence"][0]["response"] = store(root, "response.json", reply)
+            self.assertEqual([], load().validate_receipts(c, f, e, root))
+            c["signature_id"] = "frame-wall:Other.Frame"
+            self.assertTrue(load().validate_receipts(c, f, e, root))
+
+    def gpu_fixture(self, root):
+        c, f, e, req, reply = self.fixture(root)
+        c.update(domain="gpu", structural_signature="GPU.Frame.Direct > Work",
+            thread_or_queue="gpu-context:0", observation_unit="l0_segment", representative_frames=[],
+            representative_intervals=[{"begin_ns": "100", "end_ns": "200", "event_refs": ["gpu-zone:l0"]}])
+        req["params"]["arguments"].update(method="zone.gpu.tree", params={"ref": "gpu-zone:work"})
+        reply["result"]["structuredContent"]["data"] = {"root": {
+            "ref": "gpu-zone:work", "name": "Work", "thread_ref": "thread:render",
+            "context_ref": "gpu-context:0", "parent_ref": "gpu-zone:l0", "complete": True,
+            "gpu_start_ns": "110", "gpu_end_ns": "190"}, "children": []}
+        parent_req = json.loads(json.dumps(req)); parent_req["id"] = 2
+        parent_req["params"]["arguments"].update(method="zone.gpu.get", params={"ref": "gpu-zone:l0"})
+        parent_reply = {"jsonrpc": "2.0", "id": 2, "result": {"structuredContent": {
+            "ok": True, "trace": {"fingerprint": "a" * 64}, "data": {
+                "ref": "gpu-zone:l0", "name": "GPU.Frame.Direct", "parent_ref": None,
+                "thread_ref": "thread:render", "context_ref": "gpu-context:0", "complete": True,
+                "gpu_start_ns": "100", "gpu_end_ns": "200"}}}}
+        e["evidence"].append({"evidence_id": "GPU0"})
+        f["investigation_receipts"][0].update(entity_json_pointers=["/data/root"],
+            parent_chain_evidence=[{"evidence_id": "GPU0", "entity_json_pointer": "/data"}],
+            interval_anchor_evidence_id="GPU0", interval_anchor_json_pointer="/data")
+        return c, f, e, req, reply, parent_req, parent_reply
+
+    def save_gpu_fixture(self, root, e, req, reply, parent_req, parent_reply):
+        e["evidence"][0].update(request=store(root, "gpu-q.json", req), response=store(root, "gpu-r.json", reply))
+        e["evidence"][1].update(request=store(root, "anchor-q.json", parent_req), response=store(root, "anchor-r.json", parent_reply))
+
+    def test_gpu_ref_tree_uses_context_and_proven_l0_anchor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            c, f, e, req, reply, pq, pr = self.gpu_fixture(root)
+            self.save_gpu_fixture(root, e, req, reply, pq, pr)
+            self.assertEqual([], load().validate_receipts(c, f, e, root))
+            # CPU producer thread identity must not be mistaken for a GPU queue.
+            reply["result"]["structuredContent"]["data"]["root"]["thread_ref"] = "thread:other-producer"
+            self.save_gpu_fixture(root, e, req, reply, pq, pr)
+            self.assertEqual([], load().validate_receipts(c, f, e, root))
+
+    def test_gpu_l0_anchor_rejects_wrong_queue_scope_or_unrelated_event(self):
+        for mutation in ["wrong_queue", "parent_queue", "wrong_ref", "other_interval", "unrelated_parent",
+                         "missing_anchor", "missing_time", "outside_interval", "partial_anchor", "wrong_tree_ref"]:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                c, f, e, req, reply, pq, pr = self.gpu_fixture(root)
+                node = reply["result"]["structuredContent"]["data"]["root"]
+                parent = pr["result"]["structuredContent"]["data"]
+                if mutation == "wrong_queue": node["context_ref"] = "gpu-context:1"
+                elif mutation == "parent_queue": parent["context_ref"] = "gpu-context:1"
+                elif mutation == "wrong_ref": c["representative_intervals"][0]["event_refs"] = ["gpu-zone:other"]
+                elif mutation == "other_interval": parent["gpu_start_ns"] = "99"
+                elif mutation == "unrelated_parent": node["parent_ref"] = "gpu-zone:other"
+                elif mutation == "missing_anchor": f["investigation_receipts"][0].pop("interval_anchor_evidence_id")
+                elif mutation == "missing_time": node.pop("gpu_end_ns")
+                elif mutation == "outside_interval": node["gpu_end_ns"] = "201"
+                elif mutation == "partial_anchor": pr["result"]["structuredContent"]["partial"] = True
+                elif mutation == "wrong_tree_ref": req["params"]["arguments"]["params"]["ref"] = "gpu-zone:other"
+                self.save_gpu_fixture(root, e, req, reply, pq, pr)
+                self.assertTrue(load().validate_receipts(c, f, e, root))
 
 
 if __name__ == "__main__":
