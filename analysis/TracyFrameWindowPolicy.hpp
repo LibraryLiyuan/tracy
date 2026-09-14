@@ -2,6 +2,7 @@
 #define __TRACYFRAMEWINDOWPOLICY_HPP__
 
 #include "TracyCandidatePolicy.hpp"
+#include "TracyWindowStatistics.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -44,7 +45,8 @@ struct Window
 };
 
 inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
-    const nlohmann::json& config, double budgetNs )
+    const nlohmann::json& config, double budgetNs,
+    const std::function<bool()>& cancelled = {}, WindowWork* work = nullptr )
 {
     std::vector<Window> result;
     const auto& frames = timeline.frames;
@@ -53,40 +55,46 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
     const auto overRatio = config.value( "window_over_budget_ratio", 0.8 );
     const auto stableRatio = config.value( "window_stable_mad_ratio", 0.1 );
     const auto scales = config.value( "window_sizes", std::vector<uint64_t> { 30, 60, 120 } );
+    const auto check = [&] { if(cancelled && cancelled()) throw std::runtime_error("cancelled"); };
+    check();
+    WindowStatistics statistics(frames,budgetNs,cancelled,work);
+    const auto frameOffset = [&](uint64_t index) { return size_t(std::lower_bound(frames.begin(),frames.end(),index,
+        [](const auto& f,uint64_t i){return f.frameIndex<i;})-frames.begin()); };
     for( const auto length : scales ) for( size_t start = 0; start < frames.size(); ++start )
     {
+        check();
         const auto begin = frames[start].frameIndex;
         if( length == 0 || frames.back().frameIndex - begin < length - 1 ) break;
         const auto end = begin + length - 1;
-        std::vector<int64_t> values;
-        size_t over = 0;
-        for( size_t i = start; i < frames.size() && frames[i].frameIndex <= end; ++i )
-            if( frames[i].exact )
-            { values.push_back( frames[i].valueNs ); over += double( frames[i].valueNs ) > budgetNs; }
-        if( values.empty() || double( values.size() ) / length < coverage ||
-            double( over ) / values.size() < overRatio ) continue;
-        const auto median = Median( values );
+        const auto finish = size_t(std::upper_bound(frames.begin()+start,frames.end(),end,
+            [](uint64_t i,const auto& f){return i<f.frameIndex;})-frames.begin());
+        statistics.Range(start,finish);
+        if( !statistics.Count() || double(statistics.Count()) / length < coverage ||
+            double(statistics.Over()) / statistics.Count() < overRatio ) continue;
+        const auto median = statistics.Median();
         if( median <= budgetNs ) continue;
-        result.push_back( { begin, end, Mad( values, median ) / median <= stableRatio, { length } } );
+        result.push_back( { begin, end, statistics.Mad(median) / median <= stableRatio, { length } } );
     }
-    std::sort( result.begin(), result.end(), []( const auto& a, const auto& b ) {
+    std::sort( result.begin(), result.end(), [&]( const auto& a, const auto& b ) {
+        check();
         return std::tie( a.stable, a.begin, a.end ) < std::tie( b.stable, b.begin, b.end );
     } );
     std::vector<Window> merged;
     const auto mergedStillMatches = [&](const Window& left, const Window& right) {
-        const auto end = std::max(left.end, right.end);
-        std::vector<int64_t> values;
-        size_t over = 0;
-        for(const auto& frame : frames) if(frame.frameIndex >= left.begin && frame.frameIndex <= end && frame.exact)
-        { values.push_back(frame.valueNs); over += double(frame.valueNs) > budgetNs; }
-        if(values.empty() || double(values.size()) / double(end-left.begin+1) < coverage ||
-            double(over) / values.size() < overRatio) return false;
-        const auto median = Median(values);
+        if(right.end<=left.end) return true; // The union is the already-verified left window.
+        const auto end = right.end;
+        const auto finish=size_t(std::upper_bound(frames.begin(),frames.end(),end,
+            [](uint64_t i,const auto& f){return i<f.frameIndex;})-frames.begin());
+        statistics.Range(frameOffset(left.begin),finish);
+        if(!statistics.Count() || double(statistics.Count()) / double(end-left.begin+1) < coverage ||
+            double(statistics.Over()) / statistics.Count() < overRatio) return false;
+        const auto median = statistics.Median();
         if(median <= budgetNs) return false;
-        return (Mad(values,median) / median <= stableRatio) == left.stable;
+        return (statistics.Mad(median) / median <= stableRatio) == left.stable;
     };
     for( const auto& window : result )
     {
+        check();
         if( !merged.empty() && merged.back().stable == window.stable &&
             window.begin <= merged.back().end && mergedStillMatches(merged.back(), window) )
         {
@@ -126,17 +134,22 @@ TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
     const auto& config=input.normalizedProfile.at("candidate_policy");
     const auto budgetNs=input.normalizedProfile.at("frame_budget").at("frame_ms").get<double>()*1e6;
     TimelineState state; auto& timelines=state.timelines; auto& windows=state.windows;
-    for(const auto& t:input.frameTimelines) timelines.emplace(t.frameScope,t);
+    const auto check = [&] { if(input.cancelled && input.cancelled()) throw std::runtime_error("cancelled"); };
+    check();
+    for(const auto& t:input.frameTimelines) { check(); timelines.emplace(t.frameScope,t); }
     visit([&](const PolicySignatureContext& c) {
         if(c.frameRoot && c.frameSeriesComplete && !timelines.contains(c.frameScope))
             timelines.emplace(c.frameScope,PolicyFrameTimeline{c.frameScope,c.name,c.frames});
     });
     for( auto& [scope, t] : timelines )
     {
-        std::sort( t.frames.begin(), t.frames.end(), []( const auto& a, const auto& b ) { return a.frameIndex < b.frameIndex; } );
+        check();
+        size_t comparisons=0;
+        std::sort( t.frames.begin(), t.frames.end(), [&]( const auto& a, const auto& b ) {
+            if((++comparisons & 255)==0)check(); return a.frameIndex < b.frameIndex; } );
         for( size_t i = 1; i < t.frames.size(); ++i )
             if( t.frames[i].frameIndex == t.frames[i-1].frameIndex ) throw std::runtime_error( "duplicate_frame_timeline" );
-        windows.emplace( scope, Windows( t, config, budgetNs ) );
+        windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled ) );
     }
     return state;
 }
@@ -241,24 +254,33 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
         acceptTop(TopKey{c.frameScope, c.threadOrQueue, c.metricPreference, target},
             TopItem{frame.valueNs, ci, frame.frameIndex, manifestation, evidence, c.signatureId});
     };
-    const auto reference = [&]( uint64_t begin, uint64_t end ) -> std::optional<PolicyFrameEvidence> {
-        if( t == timelines.end() || c.observationUnit != "frame" ) return {};
-        uint64_t distance = UINT64_MAX;
-        std::optional<PolicyFrameEvidence> nearest;
-        for( const auto& frame : t->second.frames )
+    // Compute eligible reference points once per signature. lower_bound keeps
+    // nearest-distance selection (and the earlier-frame tie break) deterministic.
+    std::vector<PolicyFrameEvidence> normalFrames;
+    if(t != timelines.end() && c.observationUnit == "frame") for(const auto& frame:t->second.frames)
+    {
+        if(input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
+        if(!frame.exact || frame.valueNs>budgetNs)continue;
+        const auto value=at(frame.frameIndex); if(value.exact)normalFrames.push_back(value);
+    }
+    const auto reference = [&](uint64_t begin,uint64_t end)->std::optional<PolicyFrameEvidence> {
+        auto after=std::upper_bound(normalFrames.begin(),normalFrames.end(),end,
+            [](uint64_t index,const auto& frame){return index<frame.frameIndex;});
+        auto before=std::lower_bound(normalFrames.begin(),normalFrames.end(),begin,
+            [](const auto& frame,uint64_t index){return frame.frameIndex<index;});
+        if(before!=normalFrames.begin())
         {
-            if( !frame.exact || frame.valueNs > budgetNs || ( frame.frameIndex >= begin && frame.frameIndex <= end ) ) continue;
-            const auto value = at( frame.frameIndex );
-            if( !value.exact ) continue;
-            const auto d = frame.frameIndex < begin ? begin - frame.frameIndex : frame.frameIndex - end;
-            if( d < distance ) { distance = d; nearest = value; }
+            --before;
+            if(after==normalFrames.end() || begin-before->frameIndex<=after->frameIndex-end)return *before;
         }
-        return nearest;
+        if(after!=normalFrames.end())return *after;
+        return {};
     };
     std::vector<PolicyFrameEvidence> qualified;
     std::set<std::string> reasons;
     for( const auto& frame : series )
     {
+        if(input.cancelled && input.cancelled())throw std::runtime_error("cancelled");
         if( !frame.exact ) continue;
         bool problem = c.observationUnit == "l0_segment";
         if( t != timelines.end() )

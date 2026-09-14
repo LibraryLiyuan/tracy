@@ -160,7 +160,7 @@ AnalysisProfileValidationResult ValidateAndNormalizeAnalysisProfile( const json&
                 const auto id = item["id"].get<std::string>();
                 if( !ids.emplace( id ).second ) AddError( result, path + ".id", "must be unique" );
                 if( !item["scope"].is_string() || ( item["scope"] != "per_complete_frame" && item["scope"] != "when_present" ) ) AddError( result, path + ".scope", "must be per_complete_frame or when_present" );
-                if( !IsFiniteNumber( item["budget_ms"] ) || item["budget_ms"].get<double>() < 0 ) AddError( result, path + ".budget_ms", "must be a finite non-negative number" );
+                if( !IsFiniteNumber( item["budget_ms"] ) || item["budget_ms"].get<double>() <= 0 ) AddError( result, path + ".budget_ms", "must be a finite positive number" );
                 if( !item["status"].is_string() || ( item["status"] != "fixed" && item["status"] != "provisional" && item["status"] != "planning_reference" ) ) AddError( result, path + ".status", "must be fixed, provisional, or planning_reference" );
                 json markerRules = json::array();
                 if( item.contains( "marker_rules" ) )
@@ -168,7 +168,7 @@ AnalysisProfileValidationResult ValidateAndNormalizeAnalysisProfile( const json&
                     if( !item["marker_rules"].is_array() ) AddError( result, path + ".marker_rules", "must be an array" );
                     else for( const auto& marker : item["marker_rules"] )
                     {
-                        if( !marker.is_string() ) AddError( result, path + ".marker_rules", "entries must be strings" );
+                        if( !marker.is_string() || marker.get_ref<const std::string&>().empty() ) AddError( result, path + ".marker_rules", "entries must be non-empty strings" );
                         else markerRules.emplace_back( marker );
                     }
                     std::sort( markerRules.begin(), markerRules.end() );

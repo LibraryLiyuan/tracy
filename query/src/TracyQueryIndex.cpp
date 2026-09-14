@@ -1,3 +1,4 @@
+#include <type_traits>
 #include "TracyQueryIndex.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyWorker.hpp"
@@ -35,7 +36,7 @@ namespace
 using nlohmann::json;
 constexpr const char* IndexMagic = "JNTRACY-QUERY-INDEX";
 constexpr uint64_t MaximumManifestBytes = 1024 * 1024;
-constexpr uint64_t MaximumGpuMemorySummaryBytes = 64 * 1024 * 1024;
+constexpr uint64_t MaximumGpuMemorySummaryBytes = 256 * 1024 * 1024;
 
 uint64_t UnsignedProtocolField( std::string_view line, std::string_view key )
 {
@@ -1145,6 +1146,15 @@ public:
     TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::vector<analysis::JobDto>, GetEvidenceJobs, uint64_t, frameId )
+    std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId, const std::function<void()>& check ) const override
+    {
+        return m_source->GetEvidenceJobs( frameId, check );
+    }
+    std::vector<analysis::JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,
+        const std::function<void()>& check ) const override
+    {
+        return m_source->GetDirectedJobs( jobId, includeNeighbors, check );
+    }
     TRACY_INDEX_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
     TRACY_INDEX_FORWARD0( uint64_t, GetIoRequestCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::IoRequestDto>, ScanIoRequests, size_t, offset, size_t, limit )
@@ -2016,6 +2026,18 @@ private:
     mutable std::unordered_map<uint64_t, ResourcePassRefs> m_gpuResourcePassRefs;
     bool m_gpuQueryIdAvailable = false;
 };
+
+// An inherited default silently materializes all Jobs and drops in-read controls.
+// Keep the production index wrapper on the directed Worker path.
+static_assert( std::is_same_v<decltype(&IndexedTraceSource::GetDirectedJobs),
+    std::vector<analysis::JobDto> (IndexedTraceSource::*)(uint64_t, bool, const std::function<void()>&) const>,
+    "IndexedTraceSource must override controlled directed Job reads" );
+template<class Owner>
+constexpr bool IndexedOwnsControlledFrameJobs(std::vector<analysis::JobDto> (Owner::*)(uint64_t, const std::function<void()>&) const)
+{ return std::is_same_v<Owner, IndexedTraceSource>; }
+static_assert( IndexedOwnsControlledFrameJobs(&IndexedTraceSource::GetEvidenceJobs),
+    "IndexedTraceSource must override controlled frame Job reads" );
+
 
 int64_t WriteTime( const std::filesystem::path& path )
 {

@@ -4603,6 +4603,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     const auto checkCancelled = [&] {
         if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
     };
+    const auto checkDirectedJobRead = [&] {
+        checkCancelled();
+        if( ActiveBudget && ActiveBudget->ElapsedMs() >= ActiveBudget->maxCpuMs )
+        {
+            ActiveBudget->Exhaust( "max_cpu_ms" );
+            throw QueryError( "RESOURCE_LIMIT", "Job source read exceeded max_cpu_ms; no complete result was published", true,
+                { { "stage", "job_source_read" }, { "complete", false } } );
+        }
+    };
     checkCancelled();
     if( method == "analysis.scan.profile.validate" )
     {
@@ -8976,7 +8985,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             true, { { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
                 { "sequence", uint32_t( frameId ) }, { "event_refs", std::move( frameEventRefs ) } }, true );
 
-        const auto jobs = source->GetEvidenceJobs( frameId );
+        // Domain selection is a read boundary, not just an output filter.
+        // Gfx reachability needs Job seeds; resources need Gfx/pass and I/O
+        // identities. Job/Wait alone must not evaluate those other domains.
+        const bool readGpu = graph.DomainAllowed( "gpu" ) || graph.DomainAllowed( "resource" );
+        const bool readGfx = readGpu || graph.DomainAllowed( "gfx" ) || graph.DomainAllowed( "submission" );
+        const bool readJobs = readGfx || graph.DomainAllowed( "job" ) || graph.DomainAllowed( "wait" );
+        const auto jobReadStarted = std::chrono::steady_clock::now();
+        const auto jobs = readJobs ? source->GetEvidenceJobs( frameId, checkDirectedJobRead ) : std::vector<analysis::JobDto>{};
+        const auto jobReadMs = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - jobReadStarted ).count();
         std::unordered_map<uint64_t, const analysis::JobDto*> jobsById;
         for( const auto& job : jobs ) jobsById[job.jobId] = &job;
         std::set<uint64_t> selectedJobIds;
@@ -8986,6 +9003,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::set<uint64_t> expandedDependencies;
         while( !dependencyFrontier.empty() )
         {
+            checkDirectedJobRead();
             const auto jobId = dependencyFrontier.front();
             dependencyFrontier.pop();
             if( !expandedDependencies.emplace( jobId ).second ) continue;
@@ -9063,6 +9081,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             };
             for( const auto& stage : stages )
             {
+                checkDirectedJobRead();
                 const auto begin = beginFamily( stage.stage );
                 if( begin.first )
                 {
@@ -9099,6 +9118,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         for( const auto jobId : selectedJobIds )
         {
+            checkDirectedJobRead();
             const auto found = jobsById.find( jobId );
             if( found == jobsById.end() || !jobNodes.contains( jobId ) ) continue;
             for( const auto& dependency : found->second->dependencies )
@@ -9254,7 +9274,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
 
-        const auto ioRequests = source->GetIoRequests();
+        const auto ioRequests = graph.DomainAllowed( "io" ) || graph.DomainAllowed( "resource" ) ?
+            source->GetIoRequests() : std::vector<analysis::IoRequestDto>{};
         std::unordered_map<uint64_t, size_t> ioNodes;
         const auto frameSequence = uint32_t( frameId );
         for( const auto& request : ioRequests )
@@ -9300,7 +9321,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::vector<uint64_t> gfxSeeds;
         gfxSeeds.reserve( selectedJobIds.size() );
         for( const auto jobId : selectedJobIds ) gfxSeeds.emplace_back( jobId );
-        const auto gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds );
+        const auto gfxEvidence = readGfx ? source->GetEvidenceGfx( frameId, gfxSeeds ) : analysis::GfxEvidenceSlice{};
         const auto& dispatches = gfxEvidence.dispatches;
         const auto& entities = gfxEvidence.entities;
         const auto& gfxLinks = gfxEvidence.links;
@@ -9324,9 +9345,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "GfxDispatchDto.frameIndex" } );
         }
 
-        auto taxonomy = GpuTaxonomyCatalogJson( info() );
-        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy, &entities, &gfxLinks );
+        auto explicitPasses = readGpu ? BuildExplicitGpuPassSet( *source, GpuTaxonomyCatalogJson( info() ),
+            &entities, &gfxLinks ) : ExplicitGpuPassSet{};
         std::vector<analysis::GpuZoneDto> frameGpuZones;
+        if( readGpu )
         {
             checkCancelled();
             const auto requested = std::max<size_t>( 1, maxNodes );
@@ -9408,7 +9430,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( match.frameId == frameId && match.referenceToken != 0 ) frameReferenceTokens.emplace_back( match.referenceToken );
         std::sort( frameReferenceTokens.begin(), frameReferenceTokens.end() );
         frameReferenceTokens.erase( std::unique( frameReferenceTokens.begin(), frameReferenceTokens.end() ), frameReferenceTokens.end() );
-        const auto gpuEvidence = source->GetGpuMemoryEvidence( frameReferenceTokens, maxNodes );
+        const auto gpuEvidence = graph.DomainAllowed( "resource" ) ?
+            source->GetGpuMemoryEvidence( frameReferenceTokens, maxNodes ) : analysis::GpuMemoryEvidenceSlice{};
         std::unordered_map<uint64_t, const analysis::GpuMemoryPass*> evidencePasses;
         for( const auto& pass : gpuEvidence.passes ) evidencePasses.emplace( pass.passId, &pass );
         std::unordered_map<uint64_t, const analysis::GpuMemoryEvidenceResource*> evidenceResources;
@@ -9458,6 +9481,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         std::vector<std::pair<size_t, std::optional<std::string>>> cpuParents;
+        if( graph.DomainAllowed( "cpu" ) )
         {
             checkCancelled();
             const auto requested = std::max<size_t>( 1, maxNodes );
@@ -9499,6 +9523,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         std::map<std::string, analysis::LockEventDto> lockWaits;
+        if( graph.DomainAllowed( "lock" ) )
         {
             checkCancelled();
             const auto requested = std::max<size_t>( 1, maxNodes * 2 );
@@ -9528,6 +9553,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
 
+        if( graph.DomainAllowed( "context_switch" ) )
         {
             checkCancelled();
             const auto requested = std::max<size_t>( 1, maxNodes );
@@ -9636,6 +9662,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "begin_ns", Decimal( frameBegin ) }, { "end_ns", Decimal( frameEnd ) },
                     { "duration_ns", Decimal( std::max<int64_t>( 0, frameEnd - frameBegin ) ) }, { "complete", frameComplete } } },
                 { "evidence_counts", evidenceCounts }, { "domain_coverage", domainCoverage },
+                { "source_read_cost", { { "job_read_ms", jobReadMs }, { "job_dto_count", Decimal( jobs.size() ) },
+                    { "job_read", readJobs }, { "gfx_read", readGfx }, { "gpu_read", readGpu } } },
                 { "heuristic_enabled", includeHeuristic }, { "heuristic_used_by_default_path", false },
                 { "truncated", graph.truncated || BudgetPartial() },
                 { "omitted_nodes", Decimal( graph.omittedNodes ) }, { "omitted_edges", Decimal( graph.omittedEdges ) },
@@ -9754,10 +9782,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             return Success( id, { { "present", true }, { "identities", std::move( values ) } }, trace, PageJson( page, count, cursor ) );
         }
 
-        const auto jobs = source->GetJobs();
-        const auto dispatches = source->GetGfxDispatches();
-        const auto entities = source->GetGfxEntities();
-        const auto gfxLinks = source->GetGfxLinks();
+        const bool frameSlice = method == "timeline.correlated_slice";
+        const auto jobs = frameSlice ? source->GetEvidenceJobs( parseFrame(), checkDirectedJobRead ) : source->GetJobs();
+        std::vector<uint64_t> sliceSeeds;
+        if( frameSlice ) for( const auto& job : jobs ) sliceSeeds.emplace_back( job.jobId );
+        const auto gfxSlice = frameSlice ? source->GetEvidenceGfx( parseFrame(), sliceSeeds ) : analysis::GfxEvidenceSlice{};
+        const auto dispatches = frameSlice ? gfxSlice.dispatches : source->GetGfxDispatches();
+        const auto entities = frameSlice ? gfxSlice.entities : source->GetGfxEntities();
+        const auto gfxLinks = frameSlice ? gfxSlice.links : source->GetGfxLinks();
         std::unordered_map<uint64_t, std::string> jobRefs;
         std::unordered_map<uint64_t, std::string> dispatchRefs;
         std::unordered_map<uint64_t, std::string> entityRefs;
@@ -9772,6 +9804,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         };
         json relations = json::array();
         const auto addRelation = [&]( std::string sourceRef, std::string targetRef, const char* relation, uint64_t originFrameId ) {
+            if( frameSlice ) checkDirectedJobRead();
             relations.push_back( {
                 { "ref", source->MakeEntityRef( "correlation", relations.size() + 1 ) },
                 { "source_ref", sourceRef }, { "target_ref", targetRef }, { "relation", relation },
@@ -9892,13 +9925,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         return Success( id, {
             { "present", true }, { "identity", frameJson( frameId ) }, { "jobs", std::move( relatedJobs ) },
             { "gfx_dispatches", std::move( relatedDispatches ) }, { "relations", std::move( selectedRelations ) },
+            { "relation_scope", "frame_jobs_prerequisites_and_reachable_gfx" },
             { "evidence_kind", "exact" }, { "window_inference_used", false }, { "truncated", truncated }
         }, trace );
     }
     if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.statistics" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {
-        auto jobs = source->GetJobs();
-        const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
         const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
             if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
             const auto value = params[parameter].get<std::string>();
@@ -9906,6 +9938,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
             return *parsed;
         };
+        const bool directed = method == "job.get" || method == "job.dependencies";
+        auto jobs = directed ? source->GetDirectedJobs( parseJobRef(), method == "job.dependencies", checkDirectedJobRead ) : source->GetJobs();
+        const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
 
         if( method == "job.statistics" )
         {

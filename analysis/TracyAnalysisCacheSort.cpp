@@ -1,4 +1,6 @@
 #include "TracyAnalysisCacheSort.hpp"
+#include <chrono>
+#include <thread>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -152,7 +154,26 @@ AnalysisCacheTableDescriptor AnalysisCacheSortedWriter::Commit()
         if(description.records != state.records) throw std::runtime_error("analysis_cache_sort_count_mismatch");
         state.Check();
         if(std::filesystem::exists(state.output)) throw std::runtime_error("analysis_cache_already_exists");
-        std::filesystem::rename(state.runs.front(),state.output);
+        // Windows can briefly deny a directory rename even after our table
+        // readers/writers have closed (e.g. another process is inspecting it).
+        // Keep the immutable directory unpublished until the rename succeeds.
+#ifdef _WIN32
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+#endif
+        for(;;)
+        {
+            state.Check();
+            std::error_code error;
+            std::filesystem::rename(state.runs.front(),state.output,error);
+            if(!error) break;
+#ifdef _WIN32
+            const bool occupied = error.category() == std::system_category() &&
+                (error.value() == 5 || error.value() == 32 || error.value() == 33);
+            if(occupied && !std::filesystem::exists(state.output) && std::chrono::steady_clock::now() < deadline)
+            { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+#endif
+            throw std::filesystem::filesystem_error("analysis cache directory publication",state.runs.front(),state.output,error);
+        }
         state.committed = true;
         // Own unpublished merge intermediates only; a cleanup failure cannot
         // invalidate or delete the now-published complete output.

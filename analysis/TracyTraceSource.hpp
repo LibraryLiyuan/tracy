@@ -1008,6 +1008,33 @@ public:
         for( const auto jobId : selected ) if( const auto found = byId.find( jobId ); found != byId.end() ) result.emplace_back( *found->second );
         return result;
     }
+    // Controlled directed reads. Legacy/small sources may use the fallback;
+    // Worker overrides select raw IDs before materializing any Job DTOs.
+    virtual std::vector<JobDto> GetEvidenceJobs( uint64_t frameId, const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        auto result = GetEvidenceJobs( frameId );
+        if( check ) check();
+        return result;
+    }
+    virtual std::vector<JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,
+        const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        auto jobs = GetJobs();
+        std::unordered_set<uint64_t> selected { jobId };
+        if( includeNeighbors ) for( const auto& job : jobs )
+        {
+            if( check ) check();
+            for( const auto& dependency : job.dependencies )
+            {
+                if( job.jobId == jobId ) selected.emplace( dependency.prerequisiteJobId );
+                if( dependency.prerequisiteJobId == jobId ) selected.emplace( job.jobId );
+            }
+        }
+        std::erase_if( jobs, [&]( const auto& job ) { if( check ) check(); return !selected.contains( job.jobId ); } );
+        return jobs;
+    }
     virtual std::vector<IoRequestDto> GetIoRequests() const { return {}; }
     virtual std::vector<GfxDispatchDto> GetGfxDispatches() const { return {}; }
     virtual std::vector<GfxEntityDto> GetGfxEntities() const { return {}; }

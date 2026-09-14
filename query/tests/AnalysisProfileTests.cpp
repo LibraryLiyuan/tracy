@@ -1,4 +1,5 @@
 #include "TracyAnalysisProfile.hpp"
+#include "TracyCandidatePolicy.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -41,6 +42,15 @@ json ValidProfile()
 
 int main()
 {
+    auto boundaryProfile = ValidProfile();
+    boundaryProfile["module_budgets"][0]["budget_ms"] = 0.0;
+    if( ValidateAndNormalizeAnalysisProfile(boundaryProfile).valid )
+    { std::cerr << "zero module budget must fail profile validation\n"; return 1; }
+    boundaryProfile = ValidProfile();
+    boundaryProfile["module_budgets"][0]["marker_rules"] = { "" };
+    if( ValidateAndNormalizeAnalysisProfile(boundaryProfile).valid )
+    { std::cerr << "empty module marker must fail profile validation\n"; return 1; }
+
     auto localProfile = ValidProfile();
     localProfile["candidate_policy"]["absolute_frame_cost_ms"] = 2.0;
     const auto localPolicy = ValidateAndNormalizeAnalysisProfile( localProfile );
@@ -57,6 +67,18 @@ int main()
     assert( valid.normalized.at( "resource_budgets" ).at( "cpu_memory_status" ) == "provisional" );
     assert( !valid.normalized.contains( "gpu_pass_budgets" ) );
     assert( valid.profileSha256.size() == 64 );
+
+    for(double value:{0.000001,1.0,10000.0}) for(const auto status:{"fixed","provisional","planning_reference"})
+    {
+        auto raw=ValidProfile();raw["module_budgets"][0]["budget_ms"]=value;
+        raw["module_budgets"][0]["status"]=status;raw["module_budgets"][0]["marker_rules"]=json::array();
+        const auto normalized=ValidateAndNormalizeAnalysisProfile(raw);
+        CandidatePolicyInput input;input.aggregateIdentity=std::string(64,'a');
+        input.aggregate.contentSha256=std::string(64,'b');input.aggregate.qualityComplete=true;
+        input.normalizedProfile=normalized.normalized;input.profileIdentity=normalized.profileSha256;
+        if(!normalized.valid || !EvaluateCandidatePolicy(input).valid)
+        {std::cerr<<"normalized positive budgets and supported statuses must be consumable by policy\n";return 1;}
+    }
 
     auto reordered = json::parse( ValidProfile().dump() );
     assert( ValidateAndNormalizeAnalysisProfile( reordered ).profileSha256 == valid.profileSha256 );

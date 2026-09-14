@@ -96,6 +96,9 @@ public:
     uint64_t GetJobCount() const override;
     std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const override;
     std::vector<JobDto> GetEvidenceJobs( uint64_t frameId ) const override;
+    std::vector<JobDto> GetEvidenceJobs( uint64_t frameId, const std::function<void()>& check ) const override;
+    std::vector<JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,
+        const std::function<void()>& check ) const override;
     std::vector<IoRequestDto> GetIoRequests() const override;
     uint64_t GetIoRequestCount() const override;
     std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const override;
@@ -188,7 +191,8 @@ public:
 
 private:
     std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId,
-        const std::unordered_set<uint64_t>* explicitJobIds = nullptr ) const;
+        const std::unordered_set<uint64_t>* explicitJobIds = nullptr,
+        const std::function<void()>& check = {} ) const;
     std::vector<IoRequestDto> BuildIoRequests( const std::unordered_set<uint64_t>* explicitRequestIds = nullptr ) const;
     class Impl;
     explicit WorkerTraceSource( std::unique_ptr<Impl> impl );

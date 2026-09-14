@@ -98,6 +98,10 @@ if(BUILD_TESTING)
         endif()
     endfunction()
 
+    add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
+    target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
+    add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)
+
     add_executable(tracy-query-contract-tests tests/ProtocolTests.cpp)
     target_link_libraries(tracy-query-contract-tests PRIVATE TracyQueryProtocol)
     target_compile_definitions(tracy-query-contract-tests PRIVATE
@@ -187,6 +191,16 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-exact-statistics-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-exact-statistics-tests)
     add_test(NAME tracy-exact-statistics COMMAND tracy-exact-statistics-tests)
+
+    add_executable(tracy-cache-publish-retry-tests tests/CachePublishRetryTests.cpp)
+    target_link_libraries(tracy-cache-publish-retry-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-cache-publish-retry-tests)
+    add_test(NAME tracy-cache-publish-retry COMMAND tracy-cache-publish-retry-tests)
+
+    add_executable(tracy-frame-window-review-tests tests/FrameWindowReviewTests.cpp)
+    target_link_libraries(tracy-frame-window-review-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-frame-window-review-tests)
+    add_test(NAME tracy-frame-window-review COMMAND tracy-frame-window-review-tests)
 
     add_executable(tracy-candidate-policy-tests tests/CandidatePolicyTests.cpp)
 target_link_libraries(tracy-candidate-policy-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
