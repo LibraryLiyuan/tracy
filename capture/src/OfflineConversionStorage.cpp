@@ -22,7 +22,7 @@ OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,st
 void OfflineConversionStorage::Check()
 {
     m_resources.CheckFast();
-    if(m_resources.SoftTargetExceeded() && !m_reclaimed && m_definitions) {m_definitions->ReduceCaches();m_reclaimed=true;}
+    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();m_reclaimed=true;}
     if(!m_resources.SoftTargetExceeded())m_reclaimed=false;
 }
 bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,size_t bytes)
@@ -61,6 +61,10 @@ void OfflineConversionStorage::Seal()
     if(m_jobs){m_jobs->Commit();m_jobHash=m_jobs->ContentHash();}
     if(m_uses){m_uses->Commit();m_useHash=m_uses->ContentHash();}
     if(m_definitions)m_definitions->Seal();
+    analysis::Sha256Builder zoneHash;
+    if(m_zoneExtras){m_zoneExtras->Seal();m_zoneExtras->Visit([&](const auto* rows,uint64_t n){zoneHash.Update(rows,size_t(n)*12);});}
+    else {storage::MutableRecordStore::Record zero{};zoneHash.Update(&zero,12);}
+    m_zoneHash=zoneHash.FinalHex();
     m_jobs.reset();m_uses.reset();m_definitions.reset();m_members.clear();m_members.shrink_to_fit();m_expanded.clear();m_expanded.shrink_to_fit();m_expandLease.Resize(0);
     m_sealed=true;
 }
@@ -78,4 +82,12 @@ void OfflineConversionStorage::VisitReferenceUses(const std::function<void(const
 void OfflineConversionStorage::VisitJobStages(const std::function<void(const JnJobStageData*,uint64_t)>& f){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_jobCount)Visit("jobs",f);}
 std::string OfflineConversionStorage::JobStageHash() const {if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");return m_jobHash;}
 std::string OfflineConversionStorage::ReferenceUseHash() const {if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");return m_useHash;}
+uint32_t OfflineConversionStorage::AppendZoneExtra(const void* value){
+    Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
+    if(!m_zoneExtras){m_zoneExtras=std::make_unique<storage::MutableRecordStore>(m_root/"zone-extras.bin",m_resources);m_zoneExtras->Append({});}
+    storage::MutableRecordStore::Record row;std::memcpy(&row,value,12);return m_zoneExtras->Append(row);
+}
+void OfflineConversionStorage::ReadZoneExtra(uint32_t id,void* value){Check();if(!m_zoneExtras){if(id)throw std::runtime_error("zone_extra_index");std::memset(value,0,12);return;}auto row=m_zoneExtras->Read(id);std::memcpy(value,&row,12);}
+void OfflineConversionStorage::PutZoneExtra(uint32_t id,const void* value){Check();if(m_sealed||!m_zoneExtras)throw std::runtime_error("zone_extra_update_state");storage::MutableRecordStore::Record row;std::memcpy(&row,value,12);m_zoneExtras->Put(id,row);}
+void OfflineConversionStorage::VisitZoneExtras(const std::function<void(const void*,uint64_t)>& f){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_zoneExtras)m_zoneExtras->Visit([&](const auto* p,uint64_t n){f(p,n);});else{storage::MutableRecordStore::Record zero{};f(&zero,1);}}
 }

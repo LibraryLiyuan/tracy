@@ -1590,7 +1590,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(workerStorage&&diskStorage)workerStorage->JoinOfflineReplay();
         std::ostringstream out;out<<"{\"source_bytes\":"<<inputFileSize<<",\"source_sha256\":\""<<inputIdentity.hex
             <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
-        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount();
+        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount();
         if(workerStorage){
             if(options.allocationDiagnostics){const auto witness=workerStorage->GetOfflineMemoryWitness();
                 out<<",\"slab_allocated_bytes\":"<<witness[0]<<",\"zone_extra_size\":"<<witness[1]

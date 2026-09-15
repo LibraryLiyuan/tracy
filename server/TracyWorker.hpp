@@ -90,6 +90,9 @@ public:
     };
 
     virtual ~SerializedZoneSink() = default;
+    virtual bool WantsZoneExtras() const { return false; }
+    virtual void ZoneExtrasRawBlock(uint64_t,const void*,uint64_t) {}
+    virtual void ValidateZoneExtraIndex(uint32_t) {}
     virtual void ZoneExtrasBegin( uint64_t count ) = 0;
     virtual void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) = 0;
     virtual void ZoneExtrasEnd() = 0;
@@ -614,7 +617,7 @@ public:
     int64_t GetFirstTime() const;
     int64_t GetLastTime() const { return m_data.lastTime; }
     uint64_t GetZoneCount() const { return m_data.zonesCnt; }
-    uint64_t GetZoneExtraCount() const { return m_data.zoneExtra.size() - 1; }
+    uint64_t GetZoneExtraCount() const { return (m_offlineStorage?m_offlineStorage->ZoneExtraCount():m_data.zoneExtra.size()) - 1; }
     // Diagnostic caller must first join offline replay (or hold the data lock).
     std::array<uint64_t,4> GetOfflineMemoryWitness() const {
         return {m_slab.AllocatedBytes(),m_data.zoneExtra.size(),m_data.zoneExtra.OwnedCapacityBytes(),reinterpret_cast<uintptr_t>(&m_data.zoneExtra)};
@@ -766,8 +769,8 @@ public:
 #endif
 
     tracy_force_inline const bool HasZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0; }
-    tracy_force_inline const bool HasValidZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0 && ev.extra < m_data.zoneExtra.size(); }
-    tracy_force_inline const ZoneExtra& GetZoneExtra( const ZoneEvent& ev ) const { return m_data.zoneExtra[ev.extra]; }
+    tracy_force_inline const bool HasValidZoneExtra( const ZoneEvent& ev ) const { return ev.extra != 0 && ev.extra <= GetZoneExtraCount(); }
+    tracy_force_inline const ZoneExtra& GetZoneExtra( const ZoneEvent& ev ) const { if(m_offlineStorage)throw std::runtime_error("offline_zone_extra_requires_value_access");return m_data.zoneExtra[ev.extra]; }
 
     std::vector<int16_t> GetMatchingSourceLocation( const char* query, bool ignoreCase ) const;
 
@@ -1214,6 +1217,18 @@ private:
     tracy_force_inline ZoneExtra& GetZoneExtraMutable( const ZoneEvent& ev ) { return m_data.zoneExtra[ev.extra]; }
     tracy_force_inline ZoneExtra& AllocZoneExtra( ZoneEvent& ev );
     tracy_force_inline ZoneExtra& RequestZoneExtra( ZoneEvent& ev );
+    ZoneExtra ReadZoneExtraValue(const ZoneEvent& ev) const {
+        ZoneExtra value;if(m_offlineStorage)m_offlineStorage->ReadZoneExtra(ev.extra,&value);else value=m_data.zoneExtra[ev.extra];return value;
+    }
+    template<class F> void UpdateZoneExtra(ZoneEvent& ev,F update) {
+        if(!m_offlineStorage){update(RequestZoneExtra(ev));return;}
+        ZoneExtra value{};
+        if(ev.extra)m_offlineStorage->ReadZoneExtra(ev.extra,&value);
+        update(value);
+        if(ev.extra)m_offlineStorage->PutZoneExtra(ev.extra,&value);
+        else ev.extra=m_offlineStorage->AppendZoneExtra(&value);
+    }
+
 
     int64_t GetZoneEndImpl( const ZoneEvent& ev );
     int64_t GetZoneEndImpl( const GpuEvent& ev );

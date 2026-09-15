@@ -39,3 +39,26 @@ capture 的 CTest 使用 `-R '^tracy-'`，排除第三方依赖自行登记、�
 `tracy-offline-worker-semantic-tests <1001-resource fixture.tracy> <independent-output-directory>` 对实际 Worker 处理函数执行旧内存/新磁盘逐字段对照，覆盖 65,535 成员、直接与集合 Use 交错、重复使用、PassEnd、重复定义、Job 调用栈 Stage，并验证普通与分块重开。
 
 真实长录制只做一轮初评；结果不能替代 Query 长数据验收，也不能证明剩余 Worker 数据已变为有界存储。
+# ZoneExtra mutable offline pages
+
+Offline conversion additionally stores ZoneExtra records in fixed 53,248-byte
+pages (4 KiB header plus 4,096 twelve-byte records). Logical IDs locate slots
+directly; no per-record in-memory index is needed. The cache holds at most 600
+pages, with reservations for page and cache metadata in the existing shared
+256 MiB workspace. Under soft memory pressure it shrinks to 64 pages.
+
+Updates use a local value and explicit writeback; a new Zone index is published
+only after append succeeds. This covers delayed callsite resolution as well as
+text/name/color/value and callstack events. The original Full/live reference
+accessors remain in-memory; offline internal reads use value access.
+
+Dirty pages are checked on write, checksummed on reload, flushed and closed at
+seal. Only sealed records are visited for hashing and ordinary-format output.
+The conversion validation sink explicitly streams the ZoneExtra domain even
+when CPU zones are loaded, checks the final byte hash/count/order and verifies
+CPU Zone extra indices. Normal readers and Query retain their default policy.
+The fixed 32-bit Zone index limit is checked instead of silently truncating.
+
+The page file is conversion-local, charged to the existing 3J budget and removed
+by the same cleanup owner. It is not a recovery format. Other Worker domains
+remain in memory, so this change does not promise full conversion within 20 GiB.

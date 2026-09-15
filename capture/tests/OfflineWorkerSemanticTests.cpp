@@ -8,9 +8,22 @@
 #include <cstring>
 namespace tracy {
 static void Check(bool v){if(!v)throw std::runtime_error("offline Worker semantic mismatch");}
+template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void CompareExtras(Worker& oldWorker,WorkerOfflineStorage& store){
+    uint64_t seen=0;store.VisitZoneExtras([&](const void* p,uint64_t n){Check(std::memcmp(p,oldWorker.m_data.zoneExtra.data()+seen,size_t(n)*sizeof(ZoneExtra))==0);seen+=n;});
+    Check(seen==oldWorker.m_data.zoneExtra.size());
+ }
  static void Populate(Worker& w,WorkerOfflineStorage* storage) {
+    // File-loaded vectors borrow an exact slab allocation and cannot be grown.
+    // Replay's normal backend owns a growable vector; reproduce that here.
+    if(!storage){Vector<ZoneExtra> growing;for(const auto& row:w.m_data.zoneExtra)growing.push_back(row);w.m_data.zoneExtra=std::move(growing);}
+    if(storage)for(uint64_t i=1;i<w.m_data.zoneExtra.size();++i)Check(storage->AppendZoneExtra(&w.m_data.zoneExtra[i])==i);
     w.m_offlineStorage=storage;w.m_threadCtx=901;w.m_timerMul=0.5;w.m_data.baseTime=100;
+    std::vector<ZoneEvent> zones(20000);
+    for(uint32_t i=0;i<zones.size();++i){zones[i].extra=0;w.UpdateZoneExtra(zones[i],[&](ZoneExtra& e){e.callstack.SetVal(i+1);e.color.SetVal(i*3);});}
+    for(uint32_t i=0;i<zones.size();i+=137)w.UpdateZoneExtra(zones[i],[](ZoneExtra& e){e.color.SetVal(42);});
+    for(uint32_t i=0;i<zones.size();++i){auto e=w.ReadZoneExtraValue(zones[i]);Check(e.callstack.Val()==i+1&&e.color.Val()==(i%137?i*3:42));}
     std::vector<JnGpuReferenceSetEntry> entries(65535);
     for(uint32_t i=0;i<entries.size();++i)entries[i]={uint64_t(i)+1,(i%17)+1};
     w.AddJnGpuResourceSetDefinition(0xFFFF1234,reinterpret_cast<const char*>(entries.data()),entries.size()*sizeof(entries[0]));
@@ -35,6 +48,7 @@ struct OfflineStorageSemanticTest {
 };
 }
 int main(int argc,char** argv) {
+ try {
  if(argc!=3)return 2;
  using namespace tracy;
  storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;
@@ -46,12 +60,16 @@ int main(int argc,char** argv) {
  Worker oldWorker(*oldFile,EventType::All,false),newWorker(*newFile,EventType::All,false);
  OfflineStorageSemanticTest::Populate(oldWorker,nullptr);OfflineStorageSemanticTest::Populate(newWorker,&store);
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());store.Seal();
+ OfflineStorageSemanticTest::CompareExtras(oldWorker,store);
  uint64_t seen=0;
  store.VisitReferenceUses([&](const JnGpuReferenceUseData* p,uint64_t n){Check(std::memcmp(p,oldWorker.GetJnTraceData().gpuReferenceUses.data()+seen,size_t(n)*sizeof(*p))==0);seen+=n;});
  Check(seen==131072);seen=0;
  store.VisitJobStages([&](const JnJobStageData* p,uint64_t n){Check(std::memcmp(p,oldWorker.GetJnTraceData().jobStages.data()+seen,size_t(n)*sizeof(*p))==0);seen+=n;});Check(seen==3);
  const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> file(FileWrite::Open(output,FileCompression::Zstd,1,1));newWorker.Write(*file,false);file->Finish();}
- {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false,false,&sink);sink.Finish();Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());}
+ {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false,false,&sink);sink.Finish();Check(reopened.GetZoneExtraCount()==0);Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());}
  {std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false);Check(reopened.GetJnTraceData().jobStages.size()==3&&reopened.GetJnTraceData().gpuReferenceUses.size()==131072);}
+ {conversion::OfflineValidationSink sink(store,resources);Refuses([&]{sink.ZoneExtrasBegin(store.ZoneExtraCount()+1);});}
+ {conversion::OfflineValidationSink sink(store,resources);sink.ZoneExtrasBegin(store.ZoneExtraCount());Refuses([&]{sink.ZoneExtrasEnd();});Refuses([&]{sink.ValidateZoneExtraIndex(uint32_t(store.ZoneExtraCount()));});}
  std::puts("Worker Full/disk fields, order, maximum set, callstack and reopen passed");
+ } catch(const std::exception& e){std::fprintf(stderr,"Worker semantic failure: %s\n",e.what());return 1;}
 }

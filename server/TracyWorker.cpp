@@ -564,8 +564,9 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
 
             if( !v.text.empty() )
             {
-                auto& extra = RequestZoneExtra( *zone );
+                UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
                 extra.text = StringIdx( StoreString( v.text.c_str(), v.text.size() ).idx );
+    });
             }
 
             if( m_threadCtx != v.tid )
@@ -1171,9 +1172,25 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
 
     f.Read( sz );
-    assert( sz != 0 );
-    if( eventMask & EventType::CpuZones )
+    if(sz==0 || sz>uint64_t(UINT32_MAX)+1)throw LoadFailure("zone_extra_count");
+    if(m_serializedZoneSink && m_serializedZoneSink->WantsZoneExtras()) {
+        m_data.zoneExtra.reserve_exact(1,m_slab);
+        m_serializedZoneSink->ZoneExtrasBegin(sz);
+        m_serializedZoneSink->JnBufferBytes(4096*sizeof(ZoneExtra));
+        std::array<ZoneExtra,4096> rows;
+        for(uint64_t offset=0;offset<sz;) {
+            m_serializedZoneSink->CheckRead();
+            const auto n=std::min<uint64_t>(rows.size(),sz-offset);
+            f.Read(rows.data(),size_t(n)*sizeof(ZoneExtra));
+            if(offset==0)m_data.zoneExtra[0]=rows[0];
+            m_serializedZoneSink->ZoneExtrasRawBlock(offset,rows.data(),n);offset+=n;
+        }
+        m_serializedZoneSink->ZoneExtrasEnd();
+        m_serializedZoneSink->JnBufferBytes(0);
+    }
+    else if( eventMask & EventType::CpuZones )
     {
+        if(sz>UINT32_MAX)throw LoadFailure("zone_extra_memory_count");
         m_data.zoneExtra.reserve_exact( sz, m_slab );
         f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
     }
@@ -2961,9 +2978,9 @@ const char* Worker::GetZoneName( const ZoneEvent& ev ) const
 
 const char* Worker::GetZoneName( const ZoneEvent& ev, const SourceLocation& srcloc ) const
 {
-    if( HasZoneExtra( ev ) && GetZoneExtra( ev ).name.Active() )
+    if( HasZoneExtra( ev ) && ReadZoneExtraValue( ev ).name.Active() )
     {
-        return GetString( GetZoneExtra( ev ).name );
+        return GetString( ReadZoneExtraValue( ev ).name );
     }
     else if( srcloc.name.active )
     {
@@ -6903,8 +6920,9 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
         {
             for( auto* zone : cpuPending->second )
             {
-                auto& extra = RequestZoneExtra( *zone );
+                UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
                 extra.callstack.SetVal( callstack );
+    });
             }
         }
         m_jnPendingCpuCallsites.erase( cpuPending );
@@ -7673,8 +7691,9 @@ void Worker::ProcessZoneBeginCallstack( const QueueZoneBegin& ev )
     auto td = GetCurrentThreadData();
     auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.callstack.SetVal( it->second );
+    });
     it->second = 0;
 }
 
@@ -7687,8 +7706,9 @@ void Worker::ProcessJnZoneBeginCallsite( const QueueJnZoneBeginCallsite& ev )
     {
         if( found->second != 0 )
         {
-            auto& extra = RequestZoneExtra( *zone );
+            UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
             extra.callstack.SetVal( found->second );
+    });
         }
     }
     else
@@ -7710,8 +7730,9 @@ void Worker::ProcessZoneBeginAllocSrcLocCallstack( const QueueZoneBeginLean& ev 
     auto td = GetCurrentThreadData();
     auto it = m_nextCallstack.find( td->id );
     assert( it != m_nextCallstack.end() );
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.callstack.SetVal( it->second );
+    });
     it->second = 0;
 }
 
@@ -8112,7 +8133,7 @@ void Worker::ProcessZoneText()
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     if( !extra.text.Active() )
     {
         extra.text = StringIdx( idx );
@@ -8136,6 +8157,7 @@ void Worker::ProcessZoneText()
         memcpy( buf+len0+1, str1, len1 );
         extra.text = StringIdx( StoreString( buf, bsz ).idx );
     }
+    });
 }
 
 void Worker::ProcessZoneName()
@@ -8156,8 +8178,9 @@ void Worker::ProcessZoneName()
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     extra.name = StringIdx( GetSingleStringIdx() );
+    });
 }
 
 void Worker::ProcessZoneColor( const QueueZoneColor& ev )
@@ -8178,9 +8201,10 @@ void Worker::ProcessZoneColor( const QueueZoneColor& ev )
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     const uint32_t color = ( ev.b << 16 ) | ( ev.g << 8 ) | ev.r;
     extra.color = color;
+    });
 }
 
 void Worker::ProcessZoneValue( const QueueZoneValue& ev )
@@ -8204,7 +8228,7 @@ void Worker::ProcessZoneValue( const QueueZoneValue& ev )
     td->nextZoneId = 0;
     auto& stack = td->stack;
     auto zone = stack.back();
-    auto& extra = RequestZoneExtra( *zone );
+    UpdateZoneExtra( *zone, [&](ZoneExtra& extra) {
     if( !extra.text.Active() )
     {
         extra.text = StringIdx( StoreString( tmp, tsz ).idx );
@@ -8226,6 +8250,7 @@ void Worker::ProcessZoneValue( const QueueZoneValue& ev )
         memcpy( buf+len0+1, tmp, tsz );
         extra.text = StringIdx( StoreString( buf, bsz ).idx );
     }
+    });
 }
 
 void Worker::ProcessLockAnnounce( const QueueLockAnnounce& ev )
@@ -10707,6 +10732,7 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
     {
         refTime += tstart;
         zone->SetStartSrcLoc( refTime, srcloc );
+        if(m_serializedZoneSink)m_serializedZoneSink->ValidateZoneExtraIndex(extra);
         zone->extra = extra;
         refTime = ReadTimelineHaveSize( f, zone, refTime, childIdx, childSz );
         f.Read5( tend, srcloc, tstart, extra, childSz );
@@ -10720,6 +10746,7 @@ int64_t Worker::ReadTimeline( FileRead& f, Vector<short_ptr<ZoneEvent>>& _vec, u
 
     refTime += tstart;
     zone->SetStartSrcLoc( refTime, srcloc );
+    if(m_serializedZoneSink)m_serializedZoneSink->ValidateZoneExtraIndex(extra);
     zone->extra = extra;
     refTime = ReadTimelineHaveSize( f, zone, refTime, childIdx, childSz );
     f.Read( tend );
@@ -11133,9 +11160,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = m_data.zoneExtra.size();
+    sz = m_offlineStorage ? m_offlineStorage->ZoneExtraCount() : m_data.zoneExtra.size();
     f.Write( &sz, sizeof( sz ) );
-    f.Write( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+    if(m_offlineStorage)m_offlineStorage->VisitZoneExtras([&](const void* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(ZoneExtra));});
+    else f.Write( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
 
     sz = 0;
     for( auto& v : m_data.threads ) sz += v->count;
@@ -11715,9 +11743,10 @@ const Worker::CpuThreadTopology* Worker::GetThreadTopology( uint32_t cpuThread )
 ZoneExtra& Worker::AllocZoneExtra( ZoneEvent& ev )
 {
     assert( ev.extra == 0 );
-    ev.extra = uint32_t( m_data.zoneExtra.size() );
+    const auto index = m_data.zoneExtra.size();
     auto& extra = m_data.zoneExtra.push_next();
     memset( (char*)&extra, 0, sizeof( extra ) );
+    ev.extra = uint32_t(index);
     return extra;
 }
 

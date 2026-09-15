@@ -8,6 +8,11 @@ class WorkerOfflineStorage
 {
 public:
     virtual ~WorkerOfflineStorage()=default;
+    virtual uint64_t ZoneExtraCount() const=0;
+    virtual uint32_t AppendZoneExtra(const void*)=0;
+    virtual void ReadZoneExtra(uint32_t,void*)=0;
+    virtual void PutZoneExtra(uint32_t,const void*)=0;
+    virtual void VisitZoneExtras(const std::function<void(const void*,uint64_t)>&)=0;
     virtual void Check()=0;
     virtual void Fail(const char*) noexcept=0;
     virtual bool DefineResourceSet(uint32_t,const char*,size_t)=0;
