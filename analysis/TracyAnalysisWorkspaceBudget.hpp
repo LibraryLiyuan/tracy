@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <stdexcept>
 #include <utility>
 namespace tracy::analysis
@@ -18,8 +19,8 @@ class AnalysisWorkspaceBudget
 {
 public:
     explicit AnalysisWorkspaceBudget(uint64_t maximumBytes=4ull*1024*1024*1024,
-        uint64_t targetBytes=2ull*1024*1024*1024)
-        :m_maximum(maximumBytes),m_target(targetBytes)
+        uint64_t targetBytes=2ull*1024*1024*1024,std::function<void(uint64_t)> beforeAcquire={})
+        :m_maximum(maximumBytes),m_target(targetBytes),m_beforeAcquire(std::move(beforeAcquire))
     {
         if(!maximumBytes || maximumBytes>4ull*1024*1024*1024 || targetBytes>maximumBytes)
             throw std::runtime_error("analysis_workspace_configuration");
@@ -32,6 +33,7 @@ private:
     { ++m_rejected; throw std::runtime_error("analysis_workspace_budget"); }
     void Acquire(uint64_t bytes)
     {
+        if(m_beforeAcquire) m_beforeAcquire(bytes);
         auto current=m_current.load(std::memory_order_relaxed);
         do { if(bytes>m_maximum-current) Reject(); }
         while(!m_current.compare_exchange_weak(current,current+bytes,std::memory_order_relaxed));
@@ -41,6 +43,7 @@ private:
     }
     void Release(uint64_t bytes) noexcept { m_current.fetch_sub(bytes,std::memory_order_relaxed); }
     const uint64_t m_maximum,m_target;
+    std::function<void(uint64_t)> m_beforeAcquire;
     std::atomic<uint64_t> m_current=0,m_peak=0,m_rejected=0;
 };
 class AnalysisWorkspaceReservation

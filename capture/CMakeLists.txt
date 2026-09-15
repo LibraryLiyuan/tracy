@@ -44,3 +44,10 @@ add_executable(tracy-stream-inspect src/stream-inspect.cpp)
 target_link_libraries(tracy-stream-inspect PRIVATE TracyServer TracyStreamCore)
 
 install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(tracy-conversion-resources-tests tests/ConversionResourcesTests.cpp)
+    target_link_libraries(tracy-conversion-resources-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-conversion-resources COMMAND tracy-conversion-resources-tests ${CMAKE_CURRENT_BINARY_DIR}/resources-test)
+endif()
