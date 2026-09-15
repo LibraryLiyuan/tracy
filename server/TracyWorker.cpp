@@ -455,6 +455,7 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
 
 void Worker::RunWorkerThread(bool network)
 {
+    if(AllocationDiagnosticsEnabled())g_allocationRole=network?"network":"worker";
     try { if(network)Network();else Exec(); }
     catch(const std::exception& e) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,e.what()); }
     catch(...) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,"conversion_worker_unknown_failure"); }
@@ -4031,6 +4032,10 @@ void Worker::QueryCallstackFrame( uint64_t addr )
 
 bool Worker::DispatchProcess( const QueueItem& ev, const char*& ptr )
 {
+    if(AllocationDiagnosticsEnabled()){
+        g_allocationQueueType=int32_t(ev.hdr.type);g_allocationEventOrdinal=m_offlineEventCount;
+        g_allocationCompletedFrames=m_protocolFramesProcessed.load(std::memory_order_relaxed);
+    }
     OfflineEventStat* offlineStat = nullptr;
     bool sampleOfflineCost = false;
     std::chrono::steady_clock::time_point offlineSampleStart;

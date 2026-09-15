@@ -11,6 +11,7 @@
 
 #include "../public/common/TracyForceInline.hpp"
 #include "TracyMemory.hpp"
+#include "TracyAllocationDiagnostics.hpp"
 #include "TracyPopcnt.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -300,6 +301,11 @@ private:
 
     void Realloc(uint8_t capacity)
     {
+#ifdef _MSC_VER
+        ScopedAllocationContext diagnostic(__FUNCSIG__,this,m_size,Capacity(),sizeof(T));
+#else
+        ScopedAllocationContext diagnostic(__PRETTY_FUNCTION__,this,m_size,Capacity(),sizeof(T));
+#endif
         const uint64_t count=uint64_t(1)<<capacity;
         if(count>SIZE_MAX/sizeof(T))throw std::bad_alloc();
         T* ptr = (T*)malloc( sizeof( T ) * size_t(count) );

@@ -615,6 +615,10 @@ public:
     int64_t GetLastTime() const { return m_data.lastTime; }
     uint64_t GetZoneCount() const { return m_data.zonesCnt; }
     uint64_t GetZoneExtraCount() const { return m_data.zoneExtra.size() - 1; }
+    // Diagnostic caller must first join offline replay (or hold the data lock).
+    std::array<uint64_t,4> GetOfflineMemoryWitness() const {
+        return {m_slab.AllocatedBytes(),m_data.zoneExtra.size(),m_data.zoneExtra.OwnedCapacityBytes(),reinterpret_cast<uintptr_t>(&m_data.zoneExtra)};
+    }
     uint64_t GetGpuZoneCount() const { return m_data.gpuCnt; }
     uint64_t GetLockCount() const;
     uint64_t GetPlotCount() const;

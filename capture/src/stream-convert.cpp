@@ -75,8 +75,10 @@ struct Options
     bool purgeCache = false;
     bool keepFailedOutput = false;
     bool diagnostics = false;
+    bool allocationDiagnostics = false;
     uint64_t testCancelAfterRecords = 0;
     bool testFailBeforeValidate = false;
+    bool testAllocationFailure = false;
     Mode mode = Mode::Offline;
     Compression compression = Compression::Fast;
 };
@@ -92,6 +94,8 @@ void Usage()
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
         "  Development only: [--mode offline|legacy] [-p legacy-port]\n"
         "                    [--diagnostics] [--test-cancel-after-records N] [--test-fail-before-validate]\n"
+        "                    [--allocation-diagnostics]\n"
+        "                    [--test-allocation-failure]\n"
         "                    [--memory-attribution path.jsonl] [--diagnostic-private-limit bytes]\n"
 #endif
     );
@@ -153,6 +157,14 @@ bool ParseArguments( int argc, char** argv, Options& options )
             return false;
 #endif
         }
+        else if( argument == "--allocation-diagnostics" )
+        {
+#ifdef JN_STREAM_CONVERT_DEV_TOOLS
+            options.allocationDiagnostics=true;
+#else
+            return false;
+#endif
+        }
         else if( argument == "--memory-attribution" && i + 1 < argc )
         {
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
@@ -173,6 +185,14 @@ bool ParseArguments( int argc, char** argv, Options& options )
         {
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
             if( !ParseUnsigned( argv[++i], options.testCancelAfterRecords ) || options.testCancelAfterRecords == 0 ) return false;
+#else
+            return false;
+#endif
+        }
+        else if( argument == "--test-allocation-failure" )
+        {
+#ifdef JN_STREAM_CONVERT_DEV_TOOLS
+            options.testAllocationFailure=true;
 #else
             return false;
 #endif
@@ -244,7 +264,8 @@ bool ParseArguments( int argc, char** argv, Options& options )
     }
     return !options.input.empty() && !options.output.empty() &&
         (options.memoryAttribution.empty() || options.mode==Options::Mode::Offline) &&
-        (!options.diagnosticPrivateLimit || !options.memoryAttribution.empty());
+        (!options.diagnosticPrivateLimit || !options.memoryAttribution.empty()) &&
+        (!options.allocationDiagnostics || options.mode==Options::Mode::Offline);
 }
 
 std::atomic<uint32_t> s_cancelRequests { 0 };
@@ -1571,6 +1592,9 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
         if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount();
         if(workerStorage){
+            if(options.allocationDiagnostics){const auto witness=workerStorage->GetOfflineMemoryWitness();
+                out<<",\"slab_allocated_bytes\":"<<witness[0]<<",\"zone_extra_size\":"<<witness[1]
+                    <<",\"zone_extra_capacity_bytes\":"<<witness[2]<<",\"zone_extra_owner\":"<<witness[3];}
             out<<",\"processed_events\":"<<workerStorage->GetProtocolEventCount()<<",\"processed_frames\":"<<workerStorage->GetProtocolFramesProcessed();
             const auto& data=workerStorage->GetJnTraceData();
             out<<",\"remaining_JN_vector_capacity_bytes\":{";
@@ -2298,6 +2322,7 @@ int main(int argc,char** argv)
     Options options;if(!ParseArguments(argc,argv,options)){Usage();return 1;}
     options.threads=ResolveThreadCount(options.threads);
     std::unique_ptr<tracy::analysis::ProcessCommitLimit> hardLimit;
+    std::unique_ptr<tracy::AllocationDiagnostics> allocationDiagnostics;
     std::unique_ptr<tracy::storage::ConversionResources> resources;
     std::unique_ptr<tracy::conversion::ConversionFiles> files;
     std::filesystem::path resourceReport,completion,workRoot;
@@ -2352,7 +2377,13 @@ int main(int argc,char** argv)
         resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[]{return CancelRequested();});
         files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();
         hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(options.processMemoryLimit);
+        if(options.allocationDiagnostics)allocationDiagnostics=std::make_unique<tracy::AllocationDiagnostics>();
         resources->Check();resources->StartMonitoring();
+        if(options.testAllocationFailure){
+            void* allocation=std::malloc(size_t(options.processMemoryLimit+1));
+            if(!allocation)throw std::bad_alloc();
+            std::free(allocation);throw std::runtime_error("allocation_failure_injection_unexpected_success");
+        }
         code=RunConversion(options,*resources,workRoot);
         outputValid=conversionPublished;
         if(code!=0&&! *resources->Failure())resources->Fail(("conversion_stage_exit_"+std::to_string(code)).c_str());
@@ -2376,6 +2407,7 @@ int main(int argc,char** argv)
             <<"\",\"cleanup_complete\":"<<(cleaned?"true":"false")
             <<",\"private_peak_bytes\":"<<resources->PeakPrivate()<<",\"working_set_peak_bytes\":"<<resources->PeakWorkingSet()
             <<",\"process_hard_limit_bytes\":"<<options.processMemoryLimit
+            <<",\"allocation_diagnostics_enabled\":"<<(options.allocationDiagnostics?"true":"false")
             <<",\"system_commit_peak_bytes\":"<<resources->PeakSystemCommit()<<",\"minimum_commit_headroom_bytes\":"<<resources->MinimumCommitHeadroom()
             <<",\"soft_target_met\":"<<(resources->PeakPrivate()<=(16ull<<30)?"true":"false")
             <<",\"workspace_peak_bytes\":"<<workspace.peakBytes<<",\"disk_limit_bytes\":"<<resources->DiskLimit()
@@ -2395,6 +2427,24 @@ int main(int argc,char** argv)
                 text.replace(begin,end-begin,std::to_string(number));
             };
             replaceNumber("disk_peak_bytes",resources->DiskPeak());replaceNumber("disk_retained_bytes",resources->DiskCurrent());
+            if(options.allocationDiagnostics){
+                const auto failure=tracy::GetAllocationFailure();std::ostringstream extra;
+                extra<<",\"allocation_failure\":{\"captured\":"<<(failure.ready?"true":"false");
+                if(failure.ready){
+                    extra<<",\"site\":\""<<JsonEscape(failure.site)<<"\",\"thread_role\":\""<<failure.role<<"\",\"thread_id\":"<<failure.threadId
+                        <<",\"requested_bytes\":"<<failure.requestedBytes<<",\"old_size\":"<<failure.oldSize<<",\"old_capacity\":"<<failure.oldCapacity
+                        <<",\"element_bytes\":"<<failure.elementBytes<<",\"owner\":"<<failure.owner<<",\"private_bytes_at_failure\":"<<failure.privateBytes
+                        <<",\"system_commit_bytes_at_failure\":"<<failure.systemCommitBytes<<",\"system_commit_limit_bytes_at_failure\":"<<failure.systemCommitLimitBytes
+                        <<",\"tick_ms\":"<<failure.tickMilliseconds<<",\"queue_type\":"<<failure.queueType
+                        <<",\"queue_type_name\":\""<<(failure.queueType>=0?QueueTypeName(tracy::QueueType(failure.queueType)):"none")<<"\",\"event_ordinal\":"<<failure.eventOrdinal
+                        <<",\"completed_frames\":"<<failure.completedFrames<<",\"stack\":[";
+                    for(uint32_t i=0;i<failure.frameCount;++i){const auto& frame=failure.frames[i];if(i)extra<<',';
+                        extra<<"{\"address\":"<<frame.address<<",\"module_base\":"<<frame.moduleBase<<",\"rva\":"<<(frame.moduleBase?frame.address-frame.moduleBase:0)
+                            <<",\"module\":\""<<JsonEscape(frame.module)<<"\"}";}extra<<']';
+                }extra<<'}';text.insert(text.size()-1,extra.str());
+                resources->BeforeControlGrowth(pending,text.size()+128);
+                replaceNumber("disk_peak_bytes",resources->DiskPeak());replaceNumber("disk_retained_bytes",resources->DiskCurrent());
+            }
             files->WriteText(resourceReport,text);
             if(outputValid&&cleaned)files->WriteText(completion,"{\"schema\":1,\"output_valid\":true,\"cleanup_complete\":true}");
         }catch(const std::exception& e){std::fprintf(stderr,"Resource report/marker failed: %s\n",e.what());if(code==0)code=7;}

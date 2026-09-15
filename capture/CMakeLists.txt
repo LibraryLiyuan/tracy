@@ -49,6 +49,12 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-allocation-diagnostics-tests tests/AllocationDiagnosticsTests.cpp)
+    if(WIN32)
+        target_link_libraries(tracy-allocation-diagnostics-tests PRIVATE Psapi)
+        add_test(NAME tracy-allocation-diagnostics COMMAND tracy-allocation-diagnostics-tests)
+        add_test(NAME tracy-allocation-growth-peak COMMAND tracy-allocation-diagnostics-tests scaled)
+    endif()
     add_executable(tracy-vector-allocation-failure-tests tests/VectorAllocationFailureTests.cpp)
     add_test(NAME tracy-vector-allocation-failure COMMAND tracy-vector-allocation-failure-tests)
     add_executable(tracy-resource-set-seal-tests tests/ResourceSetSealTests.cpp)
