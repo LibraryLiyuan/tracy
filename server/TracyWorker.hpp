@@ -22,6 +22,7 @@
 #include "TracyEvent.hpp"
 #include "TracyJnData.hpp"
 #include "TracyMemoryAttribution.hpp"
+#include "TracyOfflineStorage.hpp"
 #include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -553,7 +554,8 @@ public:
         size_t recorderQueryQueueLimit = DefaultRecorderQueryQueueLimit, bool deferSymbolExpansion = false,
         uint32_t serverQuerySpaceOverride = 0, bool useRecorderDrainState = false,
         bool allowEarlyProtocolDefinitions = false, bool deferLiveSampleAnalysis = false,
-        WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false );
+        WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false,
+        WorkerOfflineStorage* offlineStorage = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
     ~Worker();
@@ -799,6 +801,7 @@ public:
     bool IsBackgroundDone() const { return m_backgroundDone.load( std::memory_order_acquire ); }
     bool IsOnDemand() const { return m_onDemand; }
     void Shutdown() { m_shutdown.store( true, std::memory_order_relaxed ); }
+    void JoinOfflineReplay();
     void Disconnect();
     void MarkProtocolDisconnect() { m_disconnect.store( true, std::memory_order_release ); }
     void RequestProtocolDrain( bool disconnectClient = true );
@@ -875,6 +878,8 @@ private:
     bool RecordProtocolDrainControl();
     void NotifyProtocolClose( ProtocolCloseReason reason );
     void FinishProtocol( ProtocolCloseReason reason );
+    void RunWorkerThread(bool network);
+    void OfflineThreadFailure(bool network,const char* reason) noexcept;
 
     tracy_force_inline bool DispatchProcess( const QueueItem& ev, const char*& ptr );
     tracy_force_inline bool Process( const QueueItem& ev );
@@ -1225,6 +1230,7 @@ private:
 
     Socket m_sock;
     WorkerOfflineTransport* m_offlineTransport = nullptr;
+    WorkerOfflineStorage* m_offlineStorage = nullptr;
     std::string m_addr;
     uint16_t m_port;
     ProtocolObserver* m_protocolObserver = nullptr;

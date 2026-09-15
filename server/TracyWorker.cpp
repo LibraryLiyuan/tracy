@@ -420,8 +420,10 @@ LoadProgress Worker::s_loadProgress;
 Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolObserver* protocolObserver,
     Mode mode, size_t recorderDefinitionLimit, size_t recorderQueryQueueLimit, bool deferSymbolExpansion,
     uint32_t serverQuerySpaceOverride, bool useRecorderDrainState, bool allowEarlyProtocolDefinitions,
-    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport, bool collectOfflineEventStats )
+    bool deferLiveSampleAnalysis, WorkerOfflineTransport* offlineTransport, bool collectOfflineEventStats,
+    WorkerOfflineStorage* offlineStorage )
     : m_offlineTransport( offlineTransport )
+    , m_offlineStorage( mode == Mode::OfflineConvert ? offlineStorage : nullptr )
     , m_addr( addr )
     , m_port( port )
     , m_protocolObserver( protocolObserver )
@@ -467,8 +469,38 @@ Worker::Worker( const char* addr, uint16_t port, int64_t memoryLimit, ProtocolOb
     m_data.symbolSamplesReady = true;
 #endif
 
-    m_thread = std::thread( [this] { SetThreadName( "Tracy Worker" ); Exec(); } );
-    m_threadNet = std::thread( [this] { SetThreadName( "Tracy Network" ); Network(); } );
+    m_thread = std::thread( [this] { SetThreadName( "Tracy Worker" ); RunWorkerThread(false); } );
+    try { m_threadNet = std::thread( [this] { SetThreadName( "Tracy Network" ); RunWorkerThread(true); } ); }
+    catch(...) {
+        Shutdown();TransportClose();m_netWriteCv.notify_all();m_netReadCv.notify_all();
+        { std::lock_guard lock(m_networkStopLock);m_networkStopped=true; }m_networkStopCv.notify_all();
+        if(m_thread.joinable())m_thread.join();throw;
+    }
+}
+
+void Worker::RunWorkerThread(bool network)
+{
+    try { if(network)Network();else Exec(); }
+    catch(const std::exception& e) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,e.what()); }
+    catch(...) { if(!m_offlineStorage)throw;OfflineThreadFailure(network,"conversion_worker_unknown_failure"); }
+}
+void Worker::OfflineThreadFailure(bool network,const char* reason) noexcept
+{
+    m_offlineStorage->Fail(reason);Shutdown();
+    try { TransportClose(); }catch(...){}
+    m_netWriteCv.notify_all();m_netReadCv.notify_all();
+    if(network) {
+        m_protocolTransportError=true;m_networkReading=false;
+        {std::lock_guard lock(m_networkStopLock);m_networkStopped=true;}m_networkStopCv.notify_all();
+    }else {
+        try { FinishProtocol(ProtocolCloseReason::TransportError); }catch(...){m_connected=false;}
+    }
+}
+void Worker::JoinOfflineReplay()
+{
+    if(m_mode!=Mode::OfflineConvert)throw std::runtime_error("join_requires_offline_worker");
+    Shutdown();TransportClose();m_netWriteCv.notify_all();m_netReadCv.notify_all();
+    if(m_threadNet.joinable())m_threadNet.join();if(m_thread.joinable())m_thread.join();
 }
 
 Worker::Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames )
@@ -3450,6 +3482,7 @@ void Worker::Exec()
                 closeReason = m_protocolObserverFailed.load( std::memory_order_relaxed ) ? ProtocolCloseReason::RecorderFailure : ProtocolCloseReason::TransportError;
             goto close;
         }
+        if(m_offlineStorage)m_offlineStorage->Check();
         if( m_memoryLimit > 0 && memUsage.load( std::memory_order_relaxed ) > m_memoryLimit )
         {
             if( m_mode == Mode::ProtocolOnly )
@@ -3487,6 +3520,7 @@ void Worker::Exec()
         {
             std::unique_lock<std::mutex> lock( m_netReadLock );
             m_netReadCv.wait( lock, [this] {
+                if(m_offlineStorage && m_shutdown.load())return true;
                 if( !m_netRead.empty() ) return true;
                 if( m_protocolReplayTerminate.load( std::memory_order_acquire ) ) return true;
                 const bool beginDrain = m_disconnect.load( std::memory_order_acquire ) &&
@@ -3500,6 +3534,7 @@ void Worker::Exec()
                 std::lock_guard writeLock( m_netWriteLock );
                 return m_netWriteCnt == 0 && !m_networkReading.load( std::memory_order_acquire );
             } );
+            if(m_offlineStorage && m_shutdown.load()) {lock.unlock();goto close;}
             bool beginDrain = false;
             bool finishDrain = false;
             if( m_netRead.empty() && m_protocolReplayTerminate.exchange( false, std::memory_order_acq_rel ) )
@@ -3599,7 +3634,10 @@ void Worker::Exec()
                 {
                     m_offlineEventCount++;
                     if( ( m_offlineEventCount & 4095 ) == 0 )
+                    {
                         m_protocolEventCount.store( m_offlineEventCount, std::memory_order_relaxed );
+                        if(m_offlineStorage)m_offlineStorage->Check();
+                    }
                 }
                 const bool processed = m_protocolDrainOnly.load( std::memory_order_acquire ) ?
                     DispatchProtocolDrain( *ev, ptr ) :
@@ -3818,7 +3856,8 @@ void Worker::HandleFailure( const char* ptr, const char* end )
         NetBuffer netbuf;
         {
             std::unique_lock<std::mutex> lock( m_netReadLock );
-            m_netReadCv.wait( lock, [this] { return !m_netRead.empty(); } );
+            m_netReadCv.wait( lock, [this] { return !m_netRead.empty() || (m_offlineStorage && m_shutdown.load()); } );
+            if(m_netRead.empty())return;
             netbuf = m_netRead.front();
             m_netRead.erase( m_netRead.begin() );
         }
@@ -5700,6 +5739,10 @@ void Worker::AddCallstackSampleDictionary( uint32_t stackId, const char* data, s
 
 void Worker::AddJnGpuResourceSetDefinition( uint32_t resourceSetId, const char* data, size_t sz )
 {
+    if(m_offlineStorage) {
+        if(!m_offlineStorage->DefineResourceSet(resourceSetId,data,sz))MarkProtocolDisconnect();
+        return;
+    }
     if( resourceSetId == 0 || data == nullptr || sz == 0 ||
         sz % sizeof( JnGpuReferenceSetEntry ) != 0 ||
         sz / sizeof( JnGpuReferenceSetEntry ) > 0xFFFF ||
@@ -6642,7 +6685,8 @@ void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
         thread = ev.arg0;
         m_serialNextCallstack = 0;
     }
-    data.jobStages.push_back( JnJobStageData { time, ev.jobId, thread, spanId, ev.arg0, ev.arg1, ev.stage, ev.flags } );
+    const JnJobStageData row { time, ev.jobId, thread, spanId, ev.arg0, ev.arg1, ev.stage, ev.flags };
+    if(m_offlineStorage)m_offlineStorage->AppendJobStage(row);else data.jobStages.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6763,13 +6807,21 @@ void Worker::ProcessJnGpuReferenceUse( const QueueJnGpuReferenceUse& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gpuReferenceUses.push_back( JnGpuReferenceUseData { time, ev.passId, ev.resourceId,
-        m_threadCtx, ev.usageMask, 0, ev.flags, 1 } );
+    const JnGpuReferenceUseData row { time, ev.passId, ev.resourceId,m_threadCtx, ev.usageMask, 0, ev.flags, 1 };
+    if(m_offlineStorage)m_offlineStorage->AppendReferenceUse(row);else data.gpuReferenceUses.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
 void Worker::ProcessJnGpuReferenceSetUse( const QueueJnGpuReferenceSetUse& ev )
 {
+    if(m_offlineStorage) {
+        const auto pass=m_jnGpuReferencePassTimes.find(ev.passId);
+        if(ev.encoding!=2 || pass==m_jnGpuReferencePassTimes.end() ||
+            !m_offlineStorage->AppendReferenceSet(ev.resourceSetId,ev.entryCount,pass->second,ev.passId,m_threadCtx,ev.flags,ev.encoding)) {
+            MarkProtocolDisconnect();return;
+        }
+        m_data.jnTrace.present=true;m_data.jnTrace.schemaVersion=JnTraceSchemaVersion;return;
+    }
     const auto found = m_jnGpuResourceSets.find( ev.resourceSetId );
     const auto passTime = m_jnGpuReferencePassTimes.find( ev.passId );
     if( ev.encoding != 2 || found == m_jnGpuResourceSets.end() || passTime == m_jnGpuReferencePassTimes.end() ||
@@ -7263,6 +7315,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     {
         for( const auto& batch : data.gpuCatalogBatches )
         {
+            if(m_offlineStorage)m_offlineStorage->Check();
             if( batch.generation != generation || batch.kind != uint8_t( kind ) || batch.valid == 0 ) continue;
             fn( size_t( batch.firstRecordIndex ), size_t( batch.recordCount ) );
         }
@@ -7509,6 +7562,7 @@ void Worker::FinalizeJnGpuCatalogForSave()
     if( !data.gpuCatalogPresent ) return;
     for( auto& generation : data.gpuCatalogGenerations )
     {
+        if(m_offlineStorage)m_offlineStorage->Check();
         const auto resolved = ResolveJnGpuCatalogGeneration( generation.generation,
             JnGpuCatalogResolveReason::FinalizeSave );
         generation.unresolvedCount = resolved.totalUnresolved;
@@ -7528,6 +7582,7 @@ void Worker::FinalizeJnGpuCatalogForSave()
     };
     for( auto& batch : data.gpuCatalogBatches )
     {
+        if(m_offlineStorage)m_offlineStorage->Check();
         switch( JnGpuCatalogBatchKind( batch.kind ) )
         {
         case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords( data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
@@ -10858,6 +10913,7 @@ static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec 
 
 void Worker::Write( FileWrite& f, bool fiDict )
 {
+    if(m_offlineStorage)m_offlineStorage->Check();
     DoPostponedWorkAll();
 
     f.Write( FileHeader, sizeof( FileHeader ) );
@@ -11509,7 +11565,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.jobSchedules );
     WriteJnVector( f, m_data.jnTrace.jobConfigs );
     WriteJnVector( f, m_data.jnTrace.jobDependencies );
-    WriteJnVector( f, m_data.jnTrace.jobStages );
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->JobStageCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitJobStages([&](const JnJobStageData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.jobStages );
     WriteJnVector( f, m_data.jnTrace.gfxDispatches );
     WriteJnVector( f, m_data.jnTrace.gfxEntities );
     WriteJnVector( f, m_data.jnTrace.gfxLinks );
@@ -11520,7 +11579,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.relations );
     WriteJnVector( f, m_data.jnTrace.runtimeDomainStates );
     WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
-    WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->ReferenceUseCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitReferenceUses([&](const JnGpuReferenceUseData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
     WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
     WriteJnVector( f, m_data.jnTrace.scriptFrames );
     WriteJnVector( f, m_data.jnTrace.scriptStacks );
