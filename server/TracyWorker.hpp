@@ -163,6 +163,7 @@ struct LoadProgress
 
 class Worker
 {
+    friend struct OfflineStorageSemanticTest;
 public:
     struct OfflineEventStat
     {

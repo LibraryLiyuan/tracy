@@ -31,6 +31,7 @@ public:
     uint64_t Count() const;
     void Read(uint64_t ordinal,void* output,uint64_t count);
     void ClearReadCache();
+    void LimitReadCache(uint64_t bytes);
     std::string ContentHash() const;
 private:
     struct Impl; std::unique_ptr<Impl> m_impl;

@@ -181,6 +181,8 @@ void PagedRecordWriter::ClearReadCache()
     auto& w=*m_impl;w.cache.clear();w.cacheBytes=0;
     if(w.data.is_open()) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush"); }
 }
+void PagedRecordWriter::LimitReadCache(uint64_t bytes)
+{ClearReadCache();m_impl->options.activeReadCacheBytes=bytes;}
 std::string PagedRecordWriter::ContentHash() const
 { const auto& w=*m_impl;if(!w.committed)Fail("not_committed");return std::string(w.header.contentHash,64); }
 void PagedRecordWriter::Read(uint64_t ordinal,void* output,uint64_t count)

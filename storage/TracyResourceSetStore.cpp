@@ -181,6 +181,29 @@ void ResourceSetStore::Read(ResourceSetDefinition d,uint32_t offset,std::span<Re
     s.members->Read(d.first+offset,output.data(),output.size());
 }
 void ResourceSetStore::ClearCaches(){auto& s=*m_impl;s.Flush();s.cache.clear();s.members->ClearReadCache();}
-void ResourceSetStore::Seal(){auto& s=*m_impl;if(s.sealed)Fail("resource_set_closed");s.Flush();s.members->Commit();s.sealed=true;}
+void ResourceSetStore::ReduceCaches(){ClearCaches();m_impl->cacheLimit=std::min<uint64_t>(m_impl->cacheLimit,1ull<<20);m_impl->members->LimitReadCache(4ull<<20);}
+void ResourceSetStore::Seal()
+{
+    auto& s=*m_impl;if(s.sealed)Fail("resource_set_closed");s.Flush();s.cache.clear();s.members->Commit();
+    // Verify every persisted page, including definitions never looked up during replay.
+    uint64_t definitions=0;
+    for(uint64_t id=1;id<s.nextPage;++id) {
+        s.resources.CheckFast();const auto page=s.Get(id);
+        if(!page.level) {
+            if(page.count>UINT64_MAX-definitions)Fail("resource_set_definition_overflow");definitions+=page.count;
+            for(uint16_t i=0;i<page.count;++i) {
+                const auto& item=page.items[i];
+                if(!item.key||!item.count||item.count>65535||item.value>s.members->Count()||item.count>s.members->Count()-item.value)
+                    Fail("resource_set_definition_bounds");
+            }
+        }else for(uint16_t i=0;i<page.count;++i) {
+            const auto child=s.Get(page.items[i].value);
+            if(child.level+1!=page.level||!child.count||child.items[0].key!=page.items[i].key)Fail("resource_set_child_bounds");
+        }
+    }
+    if(definitions!=s.definitions)Fail("resource_set_definition_count");
+    analysis::PagedRecordReader reader(s.root/"members",s.identity,uint32_t(sizeof(ResourceSetMember)),Options(s.resources,0));
+    reader.ValidateAll();s.sealed=true;
+}
 uint64_t ResourceSetStore::Count() const{return m_impl->definitions;}
 }

@@ -26,6 +26,11 @@ int main(int argc,char** argv)
     try{std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"short.tracy").string().c_str(),tracy::FileCompression::Zstd,1,1,hooks));}
     catch(const std::exception&){rejected=true;}
     Check(rejected&&notified);
+    hooks=std::make_shared<tracy::FileWriteHooks>();notified=false;const auto mainThread=std::this_thread::get_id();
+    hooks->check=[&]{if(std::this_thread::get_id()!=mainThread)throw std::runtime_error("injected_compressor_thread_failure");};
+    hooks->failed=[&](const char*){notified=true;};rejected=false;
+    try{std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open((root/"thread.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));writer->Write(bytes.data(),bytes.size());writer->Finish();}
+    catch(const std::exception&){rejected=true;}Check(rejected&&notified);
     // Default output and repeated explicit finish remain supported.
     std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"normal.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2));
     Check(bool(out));out->Write("abcd",4);out->Finish();out->Finish();Check(std::filesystem::file_size(root/"normal.tracy")>8);

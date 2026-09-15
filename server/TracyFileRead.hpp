@@ -24,6 +24,7 @@
 #endif
 #if defined __APPLE__ || defined __FreeBSD__ || (defined __linux__ && !defined __GLIBC__)
 #  define stat64 stat
+#  define fstat64 fstat
 #endif
 
 #include "TracyFileHeader.hpp"
@@ -52,6 +53,7 @@ public:
         {
         case 0:
             m_stream = LZ4_createStreamDecode();
+            if(!m_stream)throw std::bad_alloc();
             break;
         case 1:
             m_streamZstd = ZSTD_createDStream();

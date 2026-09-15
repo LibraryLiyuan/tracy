@@ -15,6 +15,10 @@ int main(int argc,char** argv)
     {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(path,tracy::FileCompression::Zstd,1,1));uint64_t n=123;out->Write(&n,8);out->Finish();}
     {std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(path,hooks));uint64_t n;in->Read(n);Check(n==123&&reserved>0);}
     Check(reserved==0&&peak<16ull*1024*1024);
+    auto deep=root;for(int i=0;i<8;++i)deep/=std::string(40,'x');std::filesystem::create_directories(tracy::analysis::AnalysisIoPath(deep));
+    const auto longFile=deep/std::filesystem::path(L"trace-\u957f\u8def\u5f84.tracy");
+    {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(longFile,tracy::FileCompression::Zstd,1,1));uint64_t n=321;out->Write(&n,8);out->Finish();}
+    {std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(longFile,hooks));uint64_t n;in->Read(n);Check(n==321);}
     bool rejected=false;hooks->check=[](){throw std::runtime_error("cancelled");};
     try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(path,hooks));}catch(...){rejected=true;}Check(rejected&&failed&&reserved==0);hooks->check={};
     for(int kind=0;kind<3;++kind){

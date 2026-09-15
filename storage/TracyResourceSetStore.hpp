@@ -22,6 +22,7 @@ public:
     std::optional<ResourceSetDefinition> Lookup(uint32_t id);
     void Read(ResourceSetDefinition definition,uint32_t offset,std::span<ResourceSetMember> output);
     void ClearCaches();
+    void ReduceCaches();
     void Seal();
     uint64_t Count() const;
 private:

@@ -18,9 +18,10 @@ public:
     Slab()
         : m_ptr( new char[BlockSize] )
         , m_offset( 0 )
-        , m_buffer( { m_ptr } )
+        , m_buffer()
         , m_usage( BlockSize )
     {
+        try{m_buffer.emplace_back(m_ptr);}catch(...){delete[] m_ptr;throw;}
         memUsage.fetch_add( BlockSize, std::memory_order_relaxed );
     }
 
@@ -107,10 +108,10 @@ public:
         }
         else
         {
+            auto ret = new char[size];
+            try{m_buffer.emplace_back(ret);}catch(...){delete[] ret;throw;}
             memUsage.fetch_add( size, std::memory_order_relaxed );
             m_usage += size;
-            auto ret = new char[size];
-            m_buffer.emplace_back( ret );
             return ret;
         }
     }
@@ -142,9 +143,9 @@ private:
     void* DoAlloc( uint32_t willUseBytes )
     {
         auto ptr = new char[BlockSize];
+        try{m_buffer.emplace_back(ptr);}catch(...){delete[] ptr;throw;}
         m_ptr = ptr;
         m_offset = willUseBytes;
-        m_buffer.emplace_back( m_ptr );
         memUsage.fetch_add( BlockSize, std::memory_order_relaxed );
         m_usage += BlockSize;
         return ptr;

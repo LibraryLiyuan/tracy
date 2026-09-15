@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <string>
+#include <functional>
 
 namespace tracy::stream
 {
@@ -23,7 +24,8 @@ bool WriteConvertedSnapshotMap(
     const std::filesystem::path& streamPath,
     const ScanResult& scan,
     const std::filesystem::path& snapshotPath,
-    std::string& error );
+    std::string& error,
+    std::function<void(const std::filesystem::path&,const std::string&)> publish = {} );
 
 bool ReadConvertedSnapshotMap(
     const std::filesystem::path& streamPath,

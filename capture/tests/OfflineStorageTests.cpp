@@ -31,6 +31,14 @@ int main(int argc,char** argv)
     });Check(seen==3);
     store.VisitJobStages([&](const tracy::JnJobStageData* rows,uint64_t count){Check(count==1 && rows[0].spanId==123 && rows[0].thread==77);});
     Check(store.JobStageHash().size()==64 && store.ReferenceUseHash().size()==64);
+    {
+        tracy::storage::ResourceLimits small=limits;small.streamBytes=8192;
+        tracy::storage::ConversionResources r(small,[&]{return sample;},[]{return 1ull<<40;});
+        tracy::conversion::OfflineConversionStorage empty(std::filesystem::path(argv[1])/"empty",std::string(64,'c'),r);
+        Check(r.DiskCurrent()<=4096);empty.Seal();uint64_t rows=0;
+        empty.VisitJobStages([&](const auto*,uint64_t n){rows+=n;});
+        empty.VisitReferenceUses([&](const auto*,uint64_t n){rows+=n;});Check(rows==0);
+    }
     std::puts("offline storage passed");
 }
 #else

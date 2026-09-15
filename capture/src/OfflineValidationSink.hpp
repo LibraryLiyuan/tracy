@@ -28,7 +28,10 @@ public:
     }
     void JnRecordsEnd(JnDomain domain) override
     {CheckRead();const auto i=Slot(domain);if(!m_started[i]||m_done[i]||m_seen[i]!=m_expected[i]||m_actual[i].FinalHex()!=m_hashes[i])throw std::runtime_error("conversion_validation_hash");m_done[i]=true;}
-    void Finish() const{if(!m_done[0]||!m_done[1])throw std::runtime_error("conversion_validation_missing_domain");}
+    void Finish() const{
+        if(!m_started[0]&&!m_started[1]&&!m_expected[0]&&!m_expected[1])return;
+        if(!m_done[0]||!m_done[1])throw std::runtime_error("conversion_validation_missing_domain");
+    }
     void ZoneExtrasBegin(uint64_t)override{} void ZoneExtraRecord(uint64_t,uint32_t,bool,uint32_t,bool,uint32_t,uint32_t)override{} void ZoneExtrasEnd()override{}
     void CpuZonesBegin(uint64_t)override{} void CpuZoneBegin(uint64_t,uint64_t,uint64_t,int64_t,int16_t,uint32_t,uint32_t)override{} void CpuZoneEnd(uint64_t,int64_t)override{} void CpuZonesEnd()override{}
     void GpuZonesBegin(uint64_t)override{} void GpuZoneBegin(uint64_t,uint64_t,uint32_t,int64_t,int64_t,int16_t,uint32_t,uint64_t,uint64_t)override{}

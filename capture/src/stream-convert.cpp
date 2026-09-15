@@ -8,6 +8,10 @@
 #include "../../stream/src/TracyStreamReplay.hpp"
 #include "../../stream/src/TracyStreamSnapshotMap.hpp"
 #include "MemoryPressure.hpp"
+#include "OfflineConversionStorage.hpp"
+#include "OfflineValidationSink.hpp"
+#include "ConversionFiles.hpp"
+#include "../../analysis/TracyProcessCommitLimit.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -306,9 +310,33 @@ std::string JsonEscape( std::string_view text )
     return output;
 }
 
+tracy::storage::ConversionResources* conversionResources=nullptr;
+tracy::conversion::ConversionFiles* conversionFiles=nullptr;
+std::atomic<const char*> conversionStage{"startup"};
+std::map<std::string,double> conversionStageSeconds;
+auto conversionStageStarted=std::chrono::steady_clock::now();
+void SetConversionStage(const char* stage){
+    const auto now=std::chrono::steady_clock::now();
+    conversionStageSeconds[conversionStage.load()]+=std::chrono::duration<double>(now-conversionStageStarted).count();
+    conversionStageStarted=now;conversionStage=stage;
+}
+bool conversionPublished=false;
+std::string conversionEvidence="{}";
+struct ScopeExit { std::function<void()> action;~ScopeExit() noexcept{try{action();}catch(...){}} };
+void CheckConversion()
+{
+    if(!conversionResources)return;
+    if(CancelRequested())conversionResources->Cancel();
+    conversionResources->CheckFast();
+}
 bool AtomicWriteText( const std::filesystem::path& path, const std::string& text )
 {
     if( path.empty() ) return true;
+    if(conversionFiles) {
+        try{conversionFiles->WriteText(path,text);return true;}
+        catch(const std::exception& e){conversionResources->Fail(e.what());return false;}
+        catch(...){conversionResources->Fail("conversion_metadata_failure");return false;}
+    }
     auto temporary = path;
     temporary += ".tmp";
     {
@@ -420,6 +448,7 @@ public:
     {
         std::lock_guard<std::mutex> lock( m_lock );
         m_stage = stage;
+        if(stage!=ProgressStage::Failed&&stage!=ProgressStage::Cancelled)SetConversionStage(ProgressStageName(stage));
         m_completed = 0;
         m_total = total;
         m_unit = unit;
@@ -453,7 +482,7 @@ public:
             m_signal.notify_all();
         }
         if( m_thread.joinable() ) m_thread.join();
-        Emit();
+        try{Emit();}catch(...){if(conversionResources)conversionResources->Fail("conversion_progress_failure");}
     }
 
 private:
@@ -465,7 +494,7 @@ private:
             m_signal.wait_for( lock, std::chrono::seconds( 2 ) );
             if( m_stop ) break;
             lock.unlock();
-            Emit();
+            try{Emit();}catch(...){if(conversionResources)conversionResources->Fail("conversion_progress_failure");}
             lock.lock();
         }
     }
@@ -625,6 +654,7 @@ bool ComputeInputIdentity( const std::filesystem::path& path, uint64_t fileSize,
         uint64_t readBytes = 0;
         while( input )
         {
+            if(conversionResources&&*conversionResources->Failure()){error=conversionResources->Failure();break;}
             input.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( buffer.size() ) );
             const auto count = size_t( input.gcount() );
             if( count == 0 ) break;
@@ -835,6 +865,7 @@ public:
 
     bool Read( const tracy::stream::RecordInfo& record, std::vector<uint8_t>& payload, std::string& error )
     {
+        if(conversionResources&&*conversionResources->Failure()){error=conversionResources->Failure();return false;}
         if( record.payloadSize > uint64_t( std::numeric_limits<size_t>::max() ) )
         {
             error = "record payload does not fit in memory";
@@ -1257,16 +1288,10 @@ void EnableLocalReplayOnly()
 
 }
 
-int main( int argc, char** argv )
+int RunConversion( Options& options,tracy::storage::ConversionResources& resources,
+    const std::filesystem::path& workRoot )
 {
     const auto totalStart = std::chrono::steady_clock::now();
-    Options options;
-    if( !ParseArguments( argc, argv, options ) )
-    {
-        Usage();
-        return 1;
-    }
-    options.threads = ResolveThreadCount( options.threads );
 #ifdef _WIN32
     SetConsoleCtrlHandler( ConversionControlHandler, TRUE );
 #endif
@@ -1275,23 +1300,6 @@ int main( int argc, char** argv )
     {
         std::fprintf( stderr, "Input journal and output snapshot must use different paths.\n" );
         return 1;
-    }
-
-    if( options.purgeCache )
-    {
-        const auto cachePath = options.input.parent_path() / ".jnconvert-cache";
-        if( cachePath.filename() != ".jnconvert-cache" )
-        {
-            std::fprintf( stderr, "Refusing to purge an unexpected cache path.\n" );
-            return 1;
-        }
-        std::error_code purgeError;
-        std::filesystem::remove_all( cachePath, purgeError );
-        if( purgeError )
-        {
-            std::fprintf( stderr, "Cannot purge conversion cache: %s.\n", purgeError.message().c_str() );
-            return 1;
-        }
     }
 
     std::error_code inputSizeError;
@@ -1305,6 +1313,7 @@ int main( int argc, char** argv )
 
     tracy::stream::ScanOptions scanOptions;
     scanOptions.maxCollectedRecords = 2'000'000;
+    scanOptions.check=[]{CheckConversion();};
     const auto scanStart = std::chrono::steady_clock::now();
     tracy::stream::ScanResult scan;
     InputIdentity inputIdentity;
@@ -1334,7 +1343,7 @@ int main( int argc, char** argv )
             {
                 std::fprintf( stderr, "Warning: ignoring invalid scan cache: %s.\n", cacheError.c_str() );
                 std::error_code ignored;
-                std::filesystem::remove( scanCacheFile, ignored );
+                // Invalid historical cache is left untouched.
             }
         }
     }
@@ -1342,12 +1351,7 @@ int main( int argc, char** argv )
     {
         progress.SetStage( ProgressStage::Scan, 0, "journal_bytes" );
         scan = tracy::stream::ScanJournal( options.input, scanOptions );
-        if( inputIdentityAvailable && scan.HasRecoverablePrefix() )
-        {
-            std::string cacheError;
-            if( !SaveScanCache( scanCacheDirectory / "scan.cache", inputFileSize, inputIdentity, scan, cacheError ) )
-                std::fprintf( stderr, "Warning: scan cache could not be saved: %s.\n", cacheError.c_str() );
-        }
+
     }
     const auto scanSeconds = ElapsedSeconds( scanStart );
     progress.Update( scan.validSize, inputFileSize );
@@ -1389,24 +1393,7 @@ int main( int argc, char** argv )
         return 3;
     }
 
-    const auto outputDirectory = options.output.has_parent_path() ? options.output.parent_path() : std::filesystem::current_path();
-    const uint64_t safetyMargin = 2ull * 1024 * 1024 * 1024;
-    const uint64_t estimatedOutput = std::max<uint64_t>( scan.validSize, 512ull * 1024 * 1024 );
-    const uint64_t requiredDisk = estimatedOutput > std::numeric_limits<uint64_t>::max() - safetyMargin ?
-        std::numeric_limits<uint64_t>::max() : estimatedOutput + safetyMargin;
-    if( options.diskBudget != 0 && requiredDisk > options.diskBudget )
-    {
-        std::fprintf( stderr, "Estimated conversion space %llu exceeds --disk-budget %llu.\n",
-            static_cast<unsigned long long>( requiredDisk ), static_cast<unsigned long long>( options.diskBudget ) );
-        return 3;
-    }
-    const auto diskSpace = std::filesystem::space( outputDirectory, filesystemError );
-    if( filesystemError || diskSpace.available < requiredDisk )
-    {
-        std::fprintf( stderr, "Insufficient output disk space: need %llu bytes including safety margin, available %llu.\n",
-            static_cast<unsigned long long>( requiredDisk ), static_cast<unsigned long long>( diskSpace.available ) );
-        return 3;
-    }
+    resources.Check();
 
     progress.SetStage( ProgressStage::DecodeBuild, scan.recordCount, "records" );
     const auto analysisStart = std::chrono::steady_clock::now();
@@ -1563,8 +1550,30 @@ int main( int argc, char** argv )
     std::atomic<uint64_t> replayedServerSequence { 0 };
     std::unique_ptr<OfflineReplayTransport> offlineTransport;
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
+    std::unique_ptr<tracy::conversion::OfflineConversionStorage> diskStorage;
+    if(options.mode==Options::Mode::Offline) {
+        const auto identity=std::to_string(scan.fileSize)+":"+std::to_string(scan.prefixCrc32c)+":"+std::to_string(scan.lastSequence);
+        tracy::analysis::Sha256Builder hash;hash.Update(identity.data(),identity.size());
+        diskStorage=std::make_unique<tracy::conversion::OfflineConversionStorage>(workRoot,hash.FinalHex(),resources);
+    }
     std::unique_ptr<tracy::Worker> workerStorage;
     tracy::ListenSocket listener;
+    ScopeExit evidence{[&]{
+        if(workerStorage&&diskStorage)workerStorage->JoinOfflineReplay();
+        std::ostringstream out;out<<"{\"source_bytes\":"<<inputFileSize<<",\"source_sha256\":\""<<inputIdentity.hex
+            <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
+        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount();
+        if(workerStorage){
+            out<<",\"processed_events\":"<<workerStorage->GetProtocolEventCount()<<",\"processed_frames\":"<<workerStorage->GetProtocolFramesProcessed();
+            const auto& data=workerStorage->GetJnTraceData();
+            out<<",\"remaining_JN_vector_capacity_bytes\":{";
+            bool first=true;auto field=[&](const char* name,const auto& v){if(!first)out<<',';first=false;out<<'"'<<name<<"\":"<<v.capacity()*sizeof(typename std::decay_t<decltype(v)>::value_type);};
+            field("gfxEntities",data.gfxEntities);field("gfxLinks",data.gfxLinks);field("jobSchedules",data.jobSchedules);
+            field("gpuReferencePasses",data.gpuReferencePasses);field("gpuReferenceEnds",data.gpuReferenceEnds);
+            field("gpuCatalogResources",data.gpuCatalogResources);field("gpuCatalogBatches",data.gpuCatalogBatches);field("gpuCatalogGenerations",data.gpuCatalogGenerations);
+            out<<'}';
+        }out<<'}';conversionEvidence=out.str();
+    }};
 
     if( options.mode == Options::Mode::Offline )
     {
@@ -1575,7 +1584,7 @@ int main( int argc, char** argv )
         workerStorage = std::make_unique<tracy::Worker>( "offline", 0, -1, nullptr, tracy::Worker::Mode::OfflineConvert,
             tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
             replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true, true, offlineTransport.get(),
-            options.diagnostics );
+            options.diagnostics,diskStorage.get() );
     }
     else
     {
@@ -1616,6 +1625,7 @@ int main( int argc, char** argv )
     const auto analysisSeconds = ElapsedSeconds( analysisStart );
     const auto replayStart = std::chrono::steady_clock::now();
     progress.SetStage( ProgressStage::DecodeBuild, clientRecords.size(), "client_records" );
+    SetConversionStage("Replay");
 
     auto& worker = *workerStorage;
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
@@ -1624,7 +1634,7 @@ int main( int argc, char** argv )
         auto lastEventProgress = worker.GetProtocolEventCount();
         auto lastFrameProgress = worker.GetProtocolFramesProcessed();
         auto progressDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
-        while( !complete() && !replayError.Failed() )
+        while( !complete() && !replayError.Failed() && !*resources.Failure() )
         {
             if( CancelRequested() )
             {
@@ -1645,7 +1655,7 @@ int main( int argc, char** argv )
             }
             std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
         }
-        return complete() && !replayError.Failed();
+        return complete() && !replayError.Failed() && !*resources.Failure();
     };
 
     std::thread verifier;
@@ -1781,6 +1791,8 @@ int main( int argc, char** argv )
         size_t serverDependencyCursor = 0;
         uint64_t replayedClientRecordCount = 0;
         auto replayClientRecord = [&]( const tracy::stream::RecordInfo& record ) {
+            if(CancelRequested())resources.Cancel();
+            if(*resources.Failure()){replayError.Set(resources.Failure());return false;}
             if(memoryAttribution.is_open() && (publishedClientRecordCount%4096)==0) emitMemoryAttribution("periodic");
             if(options.diagnosticPrivateLimit && (publishedClientRecordCount%128)==0 &&
                 GetProcessMemoryState().commit>=options.diagnosticPrivateLimit)
@@ -1821,7 +1833,7 @@ int main( int argc, char** argv )
                 auto lastFrameProgress = worker.GetProtocolFramesProcessed();
                 auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
                 while( replayedServerSequence.load( std::memory_order_acquire ) < requiredServerSequence &&
-                    !replayError.Failed() && std::chrono::steady_clock::now() < dependencyDeadline )
+                    !replayError.Failed() && !*resources.Failure() && std::chrono::steady_clock::now() < dependencyDeadline )
                 {
                     if( CancelRequested() )
                     {
@@ -1881,7 +1893,7 @@ int main( int argc, char** argv )
                 if( !replayClientRecord( record ) ) break;
                 if( ( record.flags & tracy::stream::RecordFlagCompressedFrame ) != 0 ) replayedFrames++;
             }
-            if( !replayError.Failed() && scan.complete && recordedEndsWithTerminate )
+            if( !replayError.Failed() && !*resources.Failure() && scan.complete && recordedEndsWithTerminate )
             {
                 if( !waitForWorkerProgress( [&] { return worker.GetProtocolFramesProcessed() >= replayedFrames; } ) )
                 {
@@ -1913,7 +1925,7 @@ int main( int argc, char** argv )
             const auto prefixFrameTarget = uint64_t( preDrainFrameCount >= 2 ? preDrainFrameCount - 2 : 0 );
             uint64_t sentFrames = 0;
             size_t splitIndex = 0;
-            for( ; splitIndex < clientRecords.size() && !replayError.Failed(); splitIndex++ )
+            for( ; splitIndex < clientRecords.size() && !replayError.Failed() && !*resources.Failure(); splitIndex++ )
             {
                 const auto& record = clientRecords[splitIndex];
                 if( record.sequence > drainControlSequence ) break;
@@ -1929,7 +1941,7 @@ int main( int argc, char** argv )
                     std::to_string( worker.GetProtocolEventCount() ) + ", frames=" +
                     std::to_string( worker.GetProtocolFramesProcessed() ) + "/" + std::to_string( prefixFrameTarget ) );
             }
-            else if( !replayError.Failed() )
+            else if( !replayError.Failed() && !*resources.Failure() )
             {
                 worker.RequestProtocolDrain( drainControlVersion >= 2 );
                 for( ; splitIndex < clientRecords.size(); splitIndex++ )
@@ -1962,7 +1974,7 @@ int main( int argc, char** argv )
         auto lastFrameProgress = worker.GetProtocolFramesProcessed();
         auto transcriptDeadline = std::chrono::steady_clock::now() + ReplayProgressTimeout;
         while( replayedServerSequence.load( std::memory_order_acquire ) < finalServerSequence &&
-            !replayError.Failed() && std::chrono::steady_clock::now() < transcriptDeadline )
+            !replayError.Failed() && !*resources.Failure() && std::chrono::steady_clock::now() < transcriptDeadline )
         {
             const auto eventProgress = worker.GetProtocolEventCount();
             const auto frameProgress = worker.GetProtocolFramesProcessed();
@@ -1974,12 +1986,12 @@ int main( int argc, char** argv )
             }
             std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
         }
-        if( replayedServerSequence.load( std::memory_order_acquire ) < finalServerSequence && !replayError.Failed() )
+        if( replayedServerSequence.load( std::memory_order_acquire ) < finalServerSequence && !replayError.Failed() && !*resources.Failure() )
         {
             replayError.Set( "Worker made no protocol progress for 120 seconds before consuming the complete in-process server transcript" );
         }
         std::string offlineError;
-        if( !replayError.Failed() && !offlineTransport->Finish( offlineError ) ) replayError.Set( offlineError );
+        if( !replayError.Failed() && !*resources.Failure() && !offlineTransport->Finish( offlineError ) ) replayError.Set( offlineError );
         offlineTransport->CloseClient();
     }
     else
@@ -1988,7 +2000,7 @@ int main( int argc, char** argv )
         verifier.join();
     }
 
-    if( !replayError.Failed() && options.mode == Options::Mode::Legacy )
+    if( !replayError.Failed() && !*resources.Failure() && options.mode == Options::Mode::Legacy )
     {
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
         uint8_t extraByte = 0;
@@ -2007,6 +2019,7 @@ int main( int argc, char** argv )
     }
     if( options.mode == Options::Mode::Legacy && peer->IsValid() ) peer->Close();
 
+    if(*resources.Failure())replayError.Set(resources.Failure());
     const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 10 );
     while( !worker.HasData() && worker.GetHandshakeStatus() == tracy::HandshakePending && std::chrono::steady_clock::now() < workerDeadline )
     {
@@ -2025,7 +2038,7 @@ int main( int argc, char** argv )
     {
         replayError.Set( "Worker rejected the replay before receiving capture metadata" );
     }
-    if( !replayError.Failed() &&
+    if( !replayError.Failed() && !*resources.Failure() &&
         ( publishedClientRecordCount != clientRecords.size() || publishedCompressedFrameCount != inputCompressedFrameCount ) )
     {
         replayError.Set( "client journal replay coverage mismatch: records=" +
@@ -2033,8 +2046,11 @@ int main( int argc, char** argv )
             ", compressed_frames=" + std::to_string( publishedCompressedFrameCount ) + "/" +
             std::to_string( inputCompressedFrameCount ) );
     }
+    if(diskStorage)worker.JoinOfflineReplay();
+    if(*resources.Failure())replayError.Set(resources.Failure());
     if( replayError.Failed() )
     {
+        resources.Fail(replayError.Message().c_str());
         emitMemoryAttribution("replay_failed");
         std::fprintf( stderr, "Replay failed: %s\n", replayError.Message().c_str() );
         const auto failure = worker.GetFailureType();
@@ -2059,9 +2075,9 @@ int main( int argc, char** argv )
     const auto offlineDecodedEventCount = options.mode == Options::Mode::Offline ?
         worker.GetOfflineDecodedEventCount() : 0;
     const auto workerCompressedFrameCount = worker.GetProtocolFramesProcessed();
-    const auto gpuReferenceUseCount = worker.GetJnTraceData().gpuReferenceUses.size();
+    const auto gpuReferenceUseCount = diskStorage?diskStorage->ReferenceUseCount():worker.GetJnTraceData().gpuReferenceUses.size();
     const auto gpuReferencePassCount = worker.GetJnTraceData().gpuReferencePasses.size();
-    const auto jobStageCount = worker.GetJnTraceData().jobStages.size();
+    const auto jobStageCount = diskStorage?diskStorage->JobStageCount():worker.GetJnTraceData().jobStages.size();
 
     if( options.mode == Options::Mode::Offline && options.diagnostics )
     {
@@ -2094,20 +2110,26 @@ int main( int argc, char** argv )
     }
 
     const auto replaySeconds = ElapsedSeconds( replayStart );
+    CheckConversion();
+    SetConversionStage("Finalize");
+    if(diskStorage)diskStorage->Seal();
     const auto writeStart = std::chrono::steady_clock::now();
     auto temporaryOutput = options.output;
     temporaryOutput += ".converting";
-    TemporaryOutputGuard temporaryGuard( temporaryOutput, options.keepFailedOutput );
+    // Task-owned candidate is cleaned by the resource ledger after handles close.
     progress.SetStage( ProgressStage::Write, 0, "bytes" );
     progress.SetTemporaryPath( temporaryOutput );
     tracy::Worker::JnGpuCatalogResolveStats gpuCatalogResolveStats {};
-    {
-        std::error_code ignored;
-        std::filesystem::remove( temporaryOutput, ignored );
-    }
+    if(std::filesystem::exists(temporaryOutput))throw std::runtime_error("conversion_candidate_already_exists");
+    tracy::analysis::AnalysisWorkspaceReservation writerMemory(resources.Workspace());
+    auto writeHooks=std::make_shared<tracy::FileWriteHooks>();
+    writeHooks->check=[]{CheckConversion();};
+    writeHooks->reserveMemory=[&](uint64_t bytes){writerMemory.Resize(bytes);};
+    writeHooks->beforeWrite=[&](uint64_t bytes){resources.BeforeFileGrowth(temporaryOutput,bytes);};
+    writeHooks->failed=[&](const char* reason){resources.Fail(reason);};
     const auto compression = GetCompressionSettings( options.compression, options.threads );
     auto output = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open(
-        temporaryOutput.string().c_str(), tracy::FileCompression::Zstd, compression.level, int( compression.streams ) ) );
+        temporaryOutput, tracy::FileCompression::Zstd, compression.level, int( resources.SoftTargetExceeded()?1:compression.streams ),writeHooks ) );
     if( !output )
     {
         std::fprintf( stderr, "Cannot create output snapshot.\n" );
@@ -2145,16 +2167,31 @@ int main( int argc, char** argv )
 
     const auto validationStart = std::chrono::steady_clock::now();
     progress.SetStage( ProgressStage::Validate, 1, "checks" );
+    const auto expectedCatalogValid=worker.GetJnTraceData().gpuCatalogValid;
+    tracy::analysis::Sha256Builder qualityHash;
+    const auto& generations=worker.GetJnTraceData().gpuCatalogGenerations;
+    qualityHash.Update(generations.data(),generations.size()*sizeof(tracy::JnGpuCatalogGenerationData));
+    const auto expectedQualityHash=qualityHash.FinalHex();
     workerStorage.reset();
     try
     {
-        auto validationFile = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( temporaryOutput.string().c_str() ) );
+        tracy::analysis::AnalysisWorkspaceReservation readerMemory(resources.Workspace());
+        auto readHooks=std::make_shared<tracy::FileReadHooks>();readHooks->check=[]{CheckConversion();};
+        readHooks->reserveMemory=[&](uint64_t bytes){readerMemory.Resize(bytes);};
+        readHooks->failed=[&](const char* reason){resources.Fail(reason);};
+        auto validationFile = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( temporaryOutput,readHooks ) );
         if( !validationFile )
         {
             std::fprintf( stderr, "Cannot reopen temporary snapshot for validation.\n" );
             return 6;
         }
-        tracy::Worker validationWorker( *validationFile, tracy::EventType::All, true );
+        std::unique_ptr<tracy::conversion::OfflineValidationSink> sink;
+        if(diskStorage)sink=std::make_unique<tracy::conversion::OfflineValidationSink>(*diskStorage,resources);
+        tracy::Worker validationWorker( *validationFile, tracy::EventType::All, false,false,sink.get() );
+        if(sink)sink->Finish();
+        const auto& actual=validationWorker.GetJnTraceData();
+        tracy::analysis::Sha256Builder actualHash;actualHash.Update(actual.gpuCatalogGenerations.data(),actual.gpuCatalogGenerations.size()*sizeof(tracy::JnGpuCatalogGenerationData));
+        if(actual.gpuCatalogValid!=expectedCatalogValid||actualHash.FinalHex()!=expectedQualityHash)throw std::runtime_error("conversion_validation_catalog_quality");
         if( !validationWorker.HasData() )
         {
             std::fprintf( stderr, "Temporary snapshot validation produced no data.\n" );
@@ -2164,6 +2201,7 @@ int main( int argc, char** argv )
     }
     catch( const std::exception& exception )
     {
+        resources.Fail(exception.what());
         std::fprintf( stderr, "Temporary snapshot validation failed: %s\n", exception.what() );
         return 6;
     }
@@ -2176,34 +2214,20 @@ int main( int argc, char** argv )
 
     progress.SetStage( ProgressStage::Publish, 1, "artifacts" );
     std::string publishError;
-    if( !PublishSnapshotAtomically( temporaryOutput, options.output, options.overwrite, publishError ) )
-    {
-        std::fprintf( stderr, "Snapshot validation passed but atomic publication failed: %s\n", publishError.c_str() );
-        return 6;
-    }
-    temporaryGuard.Published();
+    CheckConversion();
+    resources.RenameOwned(temporaryOutput,options.output);
 
     const auto mapStart = std::chrono::steady_clock::now();
     std::string snapshotMapError;
-    if( !tracy::stream::WriteConvertedSnapshotMap( options.input, scan, options.output, snapshotMapError ) )
+    if( !tracy::stream::WriteConvertedSnapshotMap( options.input, scan, options.output, snapshotMapError,[](const auto& path,const auto& text){CheckConversion();conversionFiles->WriteText(path,text,true);} ) )
     {
+        resources.Fail(snapshotMapError.c_str());
         std::fprintf( stderr, "Snapshot was converted but its stream mapping could not be published: %s\n", snapshotMapError.c_str() );
         return 7;
     }
+    resources.KeepOwned(options.output);
+    conversionPublished=true;
     const auto mapSeconds = ElapsedSeconds( mapStart );
-    if( !scanCacheDirectory.empty() )
-    {
-        std::error_code cacheCleanupError;
-        std::filesystem::remove_all( scanCacheDirectory, cacheCleanupError );
-        if( cacheCleanupError )
-            std::fprintf( stderr, "Warning: successful conversion could not remove its scan cache: %s.\n",
-                cacheCleanupError.message().c_str() );
-        else
-        {
-            std::error_code emptyRootError;
-            std::filesystem::remove( scanCacheDirectory.parent_path(), emptyRootError );
-        }
-    }
     progress.Update( 1, 1 );
     progress.SetTemporaryPath( {} );
     progress.SetStage( ProgressStage::Complete, 1, "conversion" );
@@ -2260,4 +2284,113 @@ int main( int argc, char** argv )
         }
     }
     return 0;
+}
+
+int main(int argc,char** argv)
+{
+    Options options;if(!ParseArguments(argc,argv,options)){Usage();return 1;}
+    options.threads=ResolveThreadCount(options.threads);
+    std::unique_ptr<tracy::analysis::ProcessCommitLimit> hardLimit;
+    std::unique_ptr<tracy::storage::ConversionResources> resources;
+    std::unique_ptr<tracy::conversion::ConversionFiles> files;
+    std::filesystem::path resourceReport,completion,workRoot;
+    int code=1;std::string reason;bool outputValid=false;
+#ifdef _WIN32
+    HANDLE runMutex=nullptr,inputLock=INVALID_HANDLE_VALUE;bool ownsMutex=false;
+    ScopeExit releaseMutex{[&]{if(inputLock!=INVALID_HANDLE_VALUE)CloseHandle(inputLock);if(ownsMutex)ReleaseMutex(runMutex);if(runMutex)CloseHandle(runMutex);}};
+#endif
+    try {
+        options.input=tracy::analysis::AnalysisIoPath(std::filesystem::weakly_canonical(options.input));
+        options.output=tracy::analysis::AnalysisIoPath(std::filesystem::weakly_canonical(options.output));
+        if(!options.reportJson.empty())options.reportJson=tracy::analysis::AnalysisIoPath(options.reportJson);
+        if(!options.progressJson.empty())options.progressJson=tracy::analysis::AnalysisIoPath(options.progressJson);
+#ifdef _WIN32
+        auto key=options.input.native();std::transform(key.begin(),key.end(),key.begin(),[](wchar_t c){return std::towlower(c);});
+        tracy::analysis::Sha256Builder lockHash;lockHash.Update(key.data(),key.size()*sizeof(wchar_t));
+        const auto hex=lockHash.FinalHex();const auto lockName=L"Local\\JNTracyConversion-"+std::wstring(hex.begin(),hex.end());
+        runMutex=CreateMutexW(nullptr,FALSE,lockName.c_str());if(!runMutex)throw std::runtime_error("conversion_lock_create");
+        const auto waited=WaitForSingleObject(runMutex,0);ownsMutex=waited==WAIT_OBJECT_0||waited==WAIT_ABANDONED;
+        if(!ownsMutex)throw std::runtime_error("conversion_input_already_running");
+        inputLock=CreateFileW(tracy::analysis::AnalysisIoPath(options.input).c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(inputLock==INVALID_HANDLE_VALUE)throw std::runtime_error("conversion_input_not_stable_or_readable");
+#endif
+        if(options.input.parent_path()!=options.output.parent_path())throw std::runtime_error("conversion_snapshot_map_requires_same_directory");
+        if(options.input==options.output||std::filesystem::exists(options.output))throw std::runtime_error("conversion_output_already_exists");
+        if(options.keepFailedOutput)throw std::runtime_error("conversion_keep_failed_output_conflicts_with_cleanup_contract");
+        if(options.purgeCache)throw std::runtime_error("conversion_purge_cache_is_not_part_of_this_run");
+        if(!options.memoryAttribution.empty())throw std::runtime_error("conversion_heavy_attribution_disabled_for_bounded_run");
+        if(options.reportJson.empty()){options.reportJson=options.output;options.reportJson+=".conversion.json";}
+        if(options.progressJson.empty()){options.progressJson=options.output;options.progressJson+=".progress.json";}
+        resourceReport=options.output;resourceReport+=".resources.json";
+        completion=options.output;completion+=".complete.json";
+        workRoot=options.output;workRoot+=".work";
+        auto candidate=options.output;candidate+=".converting";
+        if(std::filesystem::exists(workRoot)||std::filesystem::exists(candidate))throw std::runtime_error("conversion_previous_run_files_require_cleanup");
+        std::set<std::filesystem::path> destinations{options.input,options.output,candidate,workRoot,tracy::stream::ConvertedSnapshotMapPath(options.input)};
+        for(const auto& path:{options.reportJson,options.progressJson,resourceReport,completion}) {
+            if(path.empty())continue;
+            const auto target=std::filesystem::absolute(path).lexically_normal();
+            if(!destinations.insert(target).second)throw std::runtime_error("conversion_artifact_path_collision");
+            if(tracy::storage::ConversionResources::VolumeRoot(target)!=tracy::storage::ConversionResources::VolumeRoot(options.output))throw std::runtime_error("conversion_metadata_requires_same_volume");
+            if(std::filesystem::exists(target))throw std::runtime_error("conversion_report_already_exists");
+            auto temporary=target;temporary+=".tmp";
+            if(std::filesystem::exists(temporary))throw std::runtime_error("conversion_report_temporary_already_exists");
+        }
+        tracy::storage::ResourceLimits limits;limits.streamBytes=std::filesystem::file_size(options.input);limits.absoluteDiskLimit=options.diskBudget;
+        if(!limits.streamBytes||limits.streamBytes>UINT64_MAX/3)throw std::runtime_error("conversion_input_size_overflow");
+        limits.clusterBytes=tracy::storage::ConversionResources::VolumeCluster(options.output);
+        const auto disk=options.diskBudget?std::min(options.diskBudget,limits.streamBytes*3):limits.streamBytes*3;
+        limits.controlReserveBytes=std::min<uint64_t>(65536,disk/4);
+        resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[]{return CancelRequested();});
+        files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();
+        hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(32ull<<30);
+        resources->Check();resources->StartMonitoring();
+        code=RunConversion(options,*resources,workRoot);
+        outputValid=conversionPublished;
+        if(code!=0&&! *resources->Failure())resources->Fail(("conversion_stage_exit_"+std::to_string(code)).c_str());
+    }catch(const std::exception& e){reason=e.what();if(resources)resources->Fail(e.what());std::fprintf(stderr,"Conversion failed: %s\n",e.what());}
+    catch(...){reason="conversion_unknown_exception";if(resources)resources->Fail(reason.c_str());}
+    if(resources) {
+        resources->StopMonitoring();
+        outputValid=conversionPublished;
+        const auto beforeCleanup=resources->Files();
+        const auto finishedStage=conversionStage.load();SetConversionStage("Cleanup");
+        const bool cleaned=resources->CleanupOwned();
+        if(!outputValid)reason=resources->Failure();
+        const auto workspace=resources->Workspace()->Snapshot();
+        try{
+            auto pending=resourceReport;pending+=".tmp";resources->BeforeControlGrowth(pending,resources->DiskLimit()>(1ull<<20)?16384:4096);
+            if(outputValid&&cleaned){auto marker=completion;marker+=".tmp";resources->BeforeControlGrowth(marker,256);}
+        }catch(const std::exception& e){std::fprintf(stderr,"Cannot reserve final evidence: %s\n",e.what());}
+        std::ostringstream report;
+        report<<"{\"schema\":1,\"success\":"<<(outputValid?"true":"false")
+            <<",\"stage\":\""<<finishedStage<<"\",\"failure\":\""<<JsonEscape(reason)
+            <<"\",\"cleanup_complete\":"<<(cleaned?"true":"false")
+            <<",\"private_peak_bytes\":"<<resources->PeakPrivate()<<",\"working_set_peak_bytes\":"<<resources->PeakWorkingSet()
+            <<",\"system_commit_peak_bytes\":"<<resources->PeakSystemCommit()<<",\"minimum_commit_headroom_bytes\":"<<resources->MinimumCommitHeadroom()
+            <<",\"soft_target_met\":"<<(resources->PeakPrivate()<=(16ull<<30)?"true":"false")
+            <<",\"workspace_peak_bytes\":"<<workspace.peakBytes<<",\"disk_limit_bytes\":"<<resources->DiskLimit()
+            <<",\"disk_peak_bytes\":"<<resources->DiskPeak()<<",\"disk_retained_bytes\":"<<resources->DiskCurrent()<<",\"evidence\":"<<conversionEvidence
+            <<",\"owned_files_before_cleanup\":[";
+        bool firstFile=true;for(const auto& file:beforeCleanup){if(!firstFile)report<<',';firstFile=false;report<<"{\"path\":\""<<JsonEscape(file.path.string())<<"\",\"reserved_bytes\":"<<file.bytes<<",\"kept\":"<<(file.kept?"true":"false")<<'}';}
+        report<<"],\"cleanup_residuals\":[";firstFile=true;
+        for(const auto& file:resources->Files())if(!file.kept&&std::filesystem::exists(file.path)){if(!firstFile)report<<',';firstFile=false;report<<"{\"path\":\""<<JsonEscape(file.path.string())<<"\",\"reserved_bytes\":"<<file.bytes<<'}';}
+        SetConversionStage("Report");report<<"],\"stages_seconds\":{";firstFile=true;
+        for(const auto& [stage,seconds]:conversionStageSeconds){if(!firstFile)report<<',';firstFile=false;report<<'"'<<stage<<"\":"<<seconds;}report<<"}}";
+        try {
+            auto text=report.str();auto pending=resourceReport;pending+=".tmp";
+            resources->BeforeControlGrowth(pending,text.size()+128);
+            const auto replaceNumber=[&](const char* key,uint64_t number){
+                const std::string prefix=std::string("\"")+key+"\":";
+                const auto begin=text.find(prefix)+prefix.size();const auto end=text.find_first_of(",}",begin);
+                text.replace(begin,end-begin,std::to_string(number));
+            };
+            replaceNumber("disk_peak_bytes",resources->DiskPeak());replaceNumber("disk_retained_bytes",resources->DiskCurrent());
+            files->WriteText(resourceReport,text);
+            if(outputValid&&cleaned)files->WriteText(completion,"{\"schema\":1,\"output_valid\":true,\"cleanup_complete\":true}");
+        }catch(const std::exception& e){std::fprintf(stderr,"Resource report/marker failed: %s\n",e.what());if(code==0)code=7;}
+        if(!cleaned){std::fprintf(stderr,"Temporary cleanup incomplete; task files remain at %s\n",workRoot.string().c_str());if(code==0)code=7;}
+    }
+    conversionFiles=nullptr;conversionResources=nullptr;
+    return CancelRequested()?130:code;
 }

@@ -39,6 +39,10 @@ int main(int argc,char** argv)
     rejected=false;Sink truncated;
     try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open((root/"truncated.tracy").string().c_str()));tracy::ReadJnRecordsToSink(*in,retained,"test",&truncated,Sink::JnDomain::JobStage);}
     catch(const std::exception&){rejected=true;}Check(rejected&&!truncated.ended);
+    {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"overflow.tracy").string().c_str()));uint64_t n=UINT64_MAX;out->Write(&n,8);out->Finish();}
+    struct Wide{char bytes[42];};std::vector<Wide> wide;rejected=false;
+    try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open((root/"overflow.tracy").string().c_str()));tracy::ReadJnRecordsToSink(*in,wide,"overflow",&sink,Sink::JnDomain::GpuReferenceUse);}
+    catch(const tracy::LoadFailure&){rejected=true;}Check(rejected&&wide.empty());
     std::puts("JN bounded reader passed");
 }
 #else

@@ -49,6 +49,13 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-vector-allocation-failure-tests tests/VectorAllocationFailureTests.cpp)
+    add_test(NAME tracy-vector-allocation-failure COMMAND tracy-vector-allocation-failure-tests)
+    add_executable(tracy-resource-set-seal-tests tests/ResourceSetSealTests.cpp)
+    target_link_libraries(tracy-resource-set-seal-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-resource-set-seal COMMAND tracy-resource-set-seal-tests ${CMAKE_CURRENT_BINARY_DIR}/resource-set-seal-test)
+    add_executable(tracy-offline-worker-semantic-tests tests/OfflineWorkerSemanticTests.cpp)
+    target_link_libraries(tracy-offline-worker-semantic-tests PRIVATE TracyServer TracyOfflineConversion)
     add_executable(tracy-conversion-files-tests tests/ConversionFilesTests.cpp)
     target_link_libraries(tracy-conversion-files-tests PRIVATE TracyStorageCore)
     add_test(NAME tracy-conversion-files COMMAND tracy-conversion-files-tests ${CMAKE_CURRENT_BINARY_DIR}/conversion-files-test)

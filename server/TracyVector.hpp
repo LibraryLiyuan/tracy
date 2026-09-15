@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <type_traits>
+#include <new>
 
 #include "../public/common/TracyForceInline.hpp"
 #include "TracyMemory.hpp"
@@ -47,6 +48,7 @@ public:
         , m_capacity( 0 )
         , m_magic( 0 )
     {
+        if(!m_ptr)throw std::bad_alloc();
         memUsage.fetch_add( sizeof( T ), std::memory_order_relaxed );
         new(m_ptr) T( value );
     }
@@ -250,6 +252,7 @@ public:
     void reserve_non_zero( size_t cap )
     {
         assert( m_capacity != MaxCapacity() );
+        if(cap>(uint64_t(1)<<31))throw std::bad_alloc();
         cap--;
         cap |= cap >> 1;
         cap |= cap >> 2;
@@ -257,9 +260,7 @@ public:
         cap |= cap >> 8;
         cap |= cap >> 16;
         cap = TracyCountBits( cap );
-        memUsage.fetch_add( ( ( 1 << cap ) - Capacity() ) * sizeof( T ), std::memory_order_relaxed );
-        m_capacity = cap;
-        Realloc();
+        Realloc(uint8_t(cap));
     }
 
     tracy_force_inline void reserve_and_use( size_t sz )
@@ -273,9 +274,10 @@ public:
     tracy_force_inline void reserve_exact( uint32_t sz, Slab<U>& slab )
     {
         assert( !m_ptr );
+        auto* ptr=(T*)slab.AllocBig(sizeof(T)*sz);
         m_capacity = MaxCapacity();
         m_size = sz;
-        m_ptr = (T*)slab.AllocBig( sizeof( T ) * sz );
+        m_ptr=ptr;
     }
 
     tracy_force_inline void clear()
@@ -292,23 +294,16 @@ private:
     {
         assert( m_capacity != MaxCapacity() );
 
-        if( m_ptr == nullptr )
-        {
-            memUsage.fetch_add( sizeof( T ), std::memory_order_relaxed );
-            m_ptr = (T*)malloc( sizeof( T ) );
-            m_capacity = 0;
-        }
-        else
-        {
-            memUsage.fetch_add( Capacity() * sizeof( T ), std::memory_order_relaxed );
-            m_capacity++;
-            Realloc();
-        }
+        if(m_ptr&&m_capacity>=31)throw std::bad_alloc();
+        Realloc(m_ptr?uint8_t(m_capacity+1):uint8_t(0));
     }
 
-    void Realloc()
+    void Realloc(uint8_t capacity)
     {
-        T* ptr = (T*)malloc( sizeof( T ) * CapacityNoNullptrCheck() );
+        const uint64_t count=uint64_t(1)<<capacity;
+        if(count>SIZE_MAX/sizeof(T))throw std::bad_alloc();
+        T* ptr = (T*)malloc( sizeof( T ) * size_t(count) );
+        if(!ptr)throw std::bad_alloc();
         if( m_size != 0 )
         {
             if( std::is_trivially_copyable<T>() )
@@ -322,19 +317,22 @@ private:
                     new(ptr+i) T( std::move( m_ptr[i] ) );
                 }
             }
-            free( m_ptr );
         }
+        const auto previous=Capacity();
+        free(m_ptr);
         m_ptr = ptr;
+        m_capacity=capacity;
+        memUsage.fetch_add((count-previous)*sizeof(T),std::memory_order_relaxed);
     }
 
     tracy_force_inline uint32_t Capacity() const
     {
-        return m_ptr == nullptr ? 0 : 1 << m_capacity;
+        return m_ptr == nullptr ? 0 : uint32_t(1) << m_capacity;
     }
 
     tracy_force_inline uint32_t CapacityNoNullptrCheck() const
     {
-        return 1 << m_capacity;
+        return uint32_t(1) << m_capacity;
     }
 
 #ifdef TRACY_VECTOR_DEBUG

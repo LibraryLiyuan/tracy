@@ -24,6 +24,7 @@ public:
         if(!out)throw std::runtime_error("conversion_metadata_open");
         out.write(text.data(),std::streamsize(text.size()));out.flush();out.close();
         if(!out)throw std::runtime_error("conversion_metadata_write");
+        if(replaceHistoricalMap)m_resources.Check();
         m_resources.ReplaceOwned(temporary,target,replaceHistoricalMap);
         m_resources.KeepOwned(target);m_written.insert(target);
     }catch(...){m_resources.RemoveOwned(temporary);throw;}

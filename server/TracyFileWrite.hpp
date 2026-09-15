@@ -103,7 +103,7 @@ public:
                 hooks->reserveMemory(uint64_t(streams)*(2*FileBufSize+FileBoundSize+codec+sizeof(StreamHandle)+(1ull<<20)));
             }
             if(hooks&&hooks->beforeWrite)hooks->beforeWrite(sizeof(TracyHeader)+2);
-            file=open();if(!file){if(hooks&&hooks->reserveMemory)hooks->reserveMemory(0);return nullptr;}
+            file=open();if(!file){Notify(hooks,"file_write_open_failed");if(hooks&&hooks->reserveMemory)hooks->reserveMemory(0);return nullptr;}
             return new FileWrite(file,comp,level,streams,hooks);
         }catch(const std::exception& e){if(file)fclose(file);Notify(hooks,e.what());Release(hooks);throw;}
         catch(...){if(file)fclose(file);Notify(hooks,"file_write_open_failure");Release(hooks);throw;}
