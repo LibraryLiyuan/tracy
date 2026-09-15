@@ -84,6 +84,9 @@ public:
     tracy_force_inline bool empty() const { return m_size == 0; }
     tracy_force_inline size_t size() const { return m_size; }
 
+    // Slab-backed vectors borrow storage already charged to the slab.
+    size_t OwnedCapacityBytes() const { return m_capacity == 0x7F ? 0 : size_t(Capacity()) * sizeof(T); }
+
     tracy_force_inline void set_size( size_t sz ) { assert( m_capacity != MaxCapacity() ); m_size = sz; }
 
     tracy_force_inline T* data() { return m_ptr; }

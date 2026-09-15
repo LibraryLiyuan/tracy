@@ -7,6 +7,7 @@
 #include "../../stream/src/TracyStreamJournal.hpp"
 #include "../../stream/src/TracyStreamReplay.hpp"
 #include "../../stream/src/TracyStreamSnapshotMap.hpp"
+#include "MemoryPressure.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -58,6 +59,8 @@ struct Options
     std::filesystem::path output;
     std::filesystem::path progressJson;
     std::filesystem::path reportJson;
+    std::filesystem::path memoryAttribution;
+    uint64_t diagnosticPrivateLimit = 0;
     uint16_t port = 18086;
     uint32_t threads = 0;
     uint64_t diskBudget = 0;
@@ -83,6 +86,7 @@ void Usage()
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
         "  Development only: [--mode offline|legacy] [-p legacy-port]\n"
         "                    [--diagnostics] [--test-cancel-after-records N] [--test-fail-before-validate]\n"
+        "                    [--memory-attribution path.jsonl] [--diagnostic-private-limit bytes]\n"
 #endif
     );
 }
@@ -139,6 +143,22 @@ bool ParseArguments( int argc, char** argv, Options& options )
         {
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
             options.diagnostics = true;
+#else
+            return false;
+#endif
+        }
+        else if( argument == "--memory-attribution" && i + 1 < argc )
+        {
+#ifdef JN_STREAM_CONVERT_DEV_TOOLS
+            options.memoryAttribution = std::filesystem::u8path(argv[++i]);
+#else
+            return false;
+#endif
+        }
+        else if( argument == "--diagnostic-private-limit" && i + 1 < argc )
+        {
+#ifdef JN_STREAM_CONVERT_DEV_TOOLS
+            if(!ParseUnsigned(argv[++i],options.diagnosticPrivateLimit) || !options.diagnosticPrivateLimit) return false;
 #else
             return false;
 #endif
@@ -211,7 +231,9 @@ bool ParseArguments( int argc, char** argv, Options& options )
             return false;
         }
     }
-    return !options.input.empty() && !options.output.empty();
+    return !options.input.empty() && !options.output.empty() &&
+        (options.memoryAttribution.empty() || options.mode==Options::Mode::Offline) &&
+        (!options.diagnosticPrivateLimit || !options.memoryAttribution.empty());
 }
 
 std::atomic<uint32_t> s_cancelRequests { 0 };
@@ -314,7 +336,9 @@ struct ProcessMemoryState
     uint64_t commit = 0;
     uint64_t physicalAvailable = 0;
     uint64_t physicalTotal = 0;
-    uint32_t commitLoadPercent = 0;
+    uint32_t physicalLoadPercent = 0;
+    uint64_t systemCommitBytes = 0;
+    uint64_t systemCommitLimitBytes = 0;
 };
 
 ProcessMemoryState GetProcessMemoryState()
@@ -334,7 +358,14 @@ ProcessMemoryState GetProcessMemoryState()
     {
         state.physicalAvailable = memory.ullAvailPhys;
         state.physicalTotal = memory.ullTotalPhys;
-        state.commitLoadPercent = memory.dwMemoryLoad;
+        state.physicalLoadPercent = memory.dwMemoryLoad;
+    }
+    PERFORMANCE_INFORMATION performance {};
+    performance.cb = sizeof(performance);
+    if(GetPerformanceInfo(&performance,sizeof(performance)))
+    {
+        state.systemCommitBytes=uint64_t(performance.CommitTotal)*performance.PageSize;
+        state.systemCommitLimitBytes=uint64_t(performance.CommitLimit)*performance.PageSize;
     }
 #endif
     return state;
@@ -476,12 +507,15 @@ private:
         auto peakWorkingSet = m_peakWorkingSet.load( std::memory_order_relaxed );
         while( memory.workingSet > peakWorkingSet &&
             !m_peakWorkingSet.compare_exchange_weak( peakWorkingSet, memory.workingSet, std::memory_order_relaxed ) ) {}
-        if( memory.physicalTotal != 0 )
+        const auto pressureFlags = tracy::conversion::MemoryPressureFlags(memory.commit,
+            memory.physicalTotal,memory.physicalAvailable,memory.physicalLoadPercent);
+        if( pressureFlags != 0 )
         {
-            const auto minimumAvailable = std::max<uint64_t>( 8ull * 1024 * 1024 * 1024, memory.physicalTotal * 15 / 100 );
-            if( memory.commit > memory.physicalTotal * 60 / 100 || memory.physicalAvailable < minimumAvailable ||
-                memory.commitLoadPercent >= 85 )
-                m_pressureExceeded.store( true, std::memory_order_relaxed );
+            if(!m_pressureExceeded.exchange(true,std::memory_order_relaxed))
+                std::fprintf(stderr,"[MemoryPressure] flags=%u private_bytes=%llu physical_total=%llu available_physical=%llu physical_load_percent=%u system_commit_bytes=%llu system_commit_limit_bytes=%llu\n",
+                    pressureFlags,(unsigned long long)memory.commit,(unsigned long long)memory.physicalTotal,
+                    (unsigned long long)memory.physicalAvailable,memory.physicalLoadPercent,
+                    (unsigned long long)memory.systemCommitBytes,(unsigned long long)memory.systemCommitLimitBytes);
         }
 
         if( percent >= 0 )
@@ -1688,6 +1722,53 @@ int main( int argc, char** argv )
     uint64_t publishedClientRecordCount = 0;
     uint64_t publishedCompressedFrameCount = 0;
     uint64_t lastPublishedClientSequence = 0;
+    std::ofstream memoryAttribution;
+    if(!options.memoryAttribution.empty())
+    {
+        std::error_code ec;
+        if(std::filesystem::exists(options.memoryAttribution,ec))
+            replayError.Set("memory attribution output already exists");
+        else
+        {
+            memoryAttribution.open(options.memoryAttribution,std::ios::out|std::ios::binary);
+            if(!memoryAttribution) replayError.Set("cannot open memory attribution output");
+        }
+    }
+    auto emitMemoryAttribution = [&](const char* reason) {
+        if(!memoryAttribution.is_open()) return;
+        const auto started=std::chrono::steady_clock::now();
+        auto lock=worker.ObtainLockForMainThread();
+        auto snapshot=worker.CollectMemoryAttributionLocked();
+        const auto memory=GetProcessMemoryState();
+        std::sort(snapshot.rows.begin(),snapshot.rows.end(),[](const auto& a,const auto& b) {
+            return a.ownedCapacityBytes>b.ownedCapacityBytes;
+        });
+        memoryAttribution << "{\"schema\":1,\"reason\":\"" << reason << "\",\"published_client_records\":" << publishedClientRecordCount
+            << ",\"published_sequence\":" << lastPublishedClientSequence
+            << ",\"worker_frames\":" << snapshot.compressedFrames << ",\"worker_events\":" << snapshot.protocolEvents
+            << ",\"private_bytes\":" << memory.commit << ",\"working_set_bytes\":" << memory.workingSet
+            << ",\"known_owned_capacity_bytes\":" << snapshot.knownOwnedBytes
+            << ",\"tracy_memusage_counter\":" << tracy::memUsage.load(std::memory_order_relaxed)
+            << ",\"physical_total_bytes\":" << memory.physicalTotal << ",\"physical_available_bytes\":" << memory.physicalAvailable
+            << ",\"physical_load_percent\":" << memory.physicalLoadPercent
+            << ",\"system_commit_bytes\":" << memory.systemCommitBytes << ",\"system_commit_limit_bytes\":" << memory.systemCommitLimitBytes
+            << ",\"pressure_flags\":" << tracy::conversion::MemoryPressureFlags(memory.commit,memory.physicalTotal,memory.physicalAvailable,memory.physicalLoadPercent)
+            << ",\"diagnostic_private_limit_bytes\":" << options.diagnosticPrivateLimit
+            << ",\"journal_directory_capacity_bytes\":" << uint64_t(scan.records.capacity()+clientRecords.capacity()+serverRecords.capacity())*sizeof(tracy::stream::RecordInfo)
+            << ",\"rows\":[";
+        bool first=true;
+        for(const auto& row:snapshot.rows)
+        {
+            if(!first) memoryAttribution << ',';
+            first=false;
+            memoryAttribution << "{\"name\":\"" << row.name << "\",\"count\":" << row.count
+                << ",\"logical_bytes\":" << row.logicalBytes << ",\"owned_capacity_bytes\":" << row.ownedCapacityBytes
+                << ",\"hash_payload_estimate_bytes\":" << row.hashPayloadEstimateBytes << '}';
+        }
+        memoryAttribution << "],\"snapshot_ms\":" << std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count() << "}\n";
+        memoryAttribution.flush();
+        if(!memoryAttribution) replayError.Set("memory attribution output write failed");
+    };
     PayloadReader clientReader( options.input );
     if( !clientReader.IsOpen() )
     {
@@ -1700,6 +1781,14 @@ int main( int argc, char** argv )
         size_t serverDependencyCursor = 0;
         uint64_t replayedClientRecordCount = 0;
         auto replayClientRecord = [&]( const tracy::stream::RecordInfo& record ) {
+            if(memoryAttribution.is_open() && (publishedClientRecordCount%4096)==0) emitMemoryAttribution("periodic");
+            if(options.diagnosticPrivateLimit && (publishedClientRecordCount%128)==0 &&
+                GetProcessMemoryState().commit>=options.diagnosticPrivateLimit)
+            {
+                emitMemoryAttribution("diagnostic_private_limit");
+                replayError.Set("diagnostic private-memory prefix stop; no snapshot will be published");
+                return false;
+            }
             if( CancelRequested() )
             {
                 replayError.Set( "conversion cancelled" );
@@ -1707,6 +1796,7 @@ int main( int argc, char** argv )
             }
             if( progress.PressureExceeded() )
             {
+                emitMemoryAttribution("system_pressure");
                 replayError.Set( "system memory pressure exceeded the offline conversion safety limit" );
                 return false;
             }
@@ -1945,6 +2035,7 @@ int main( int argc, char** argv )
     }
     if( replayError.Failed() )
     {
+        emitMemoryAttribution("replay_failed");
         std::fprintf( stderr, "Replay failed: %s\n", replayError.Message().c_str() );
         const auto failure = worker.GetFailureType();
         if( failure != tracy::Worker::Failure::None )
@@ -1964,6 +2055,7 @@ int main( int argc, char** argv )
     }
 
     const auto protocolEventCount = worker.GetProtocolEventCount();
+    emitMemoryAttribution("replay_complete");
     const auto offlineDecodedEventCount = options.mode == Options::Mode::Offline ?
         worker.GetOfflineDecodedEventCount() : 0;
     const auto workerCompressedFrameCount = worker.GetProtocolFramesProcessed();

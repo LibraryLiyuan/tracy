@@ -21,6 +21,7 @@
 #include "tracy_robin_hood.h"
 #include "TracyEvent.hpp"
 #include "TracyJnData.hpp"
+#include "TracyMemoryAttribution.hpp"
 #include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -572,6 +573,10 @@ public:
     const char* GetCpuManufacturer() const { return m_data.cpuManufacturer; }
 
     std::mutex& GetDataLock() { return m_data.lock; }
+
+    // Diagnostic only. Caller holds ObtainLockForMainThread; OfflineConvert
+    // with deferred sample analysis has one owner for these model containers.
+    MemoryAttribution CollectMemoryAttributionLocked() const;
 
     // This guard helps prevent main thread starvation by coordinating lock acquisition between
     // the main thread and worker threads. It uses an atomic flag (mainThreadWantsLock) to signal

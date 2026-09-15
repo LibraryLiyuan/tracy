@@ -33,6 +33,8 @@ public:
         }
     }
 
+    size_t AllocatedBytes() const { return m_usage; }
+
     tracy_force_inline void* AllocRaw( size_t size )
     {
         assert( size <= BlockSize );

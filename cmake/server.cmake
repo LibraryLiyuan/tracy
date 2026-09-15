@@ -22,6 +22,7 @@ set(TRACY_SERVER_SOURCES
     TracyTextureCompression.cpp
     TracyThreadCompress.cpp
     TracyWorker.cpp
+    TracyWorkerMemory.cpp
 )
 
 list(TRANSFORM TRACY_SERVER_SOURCES PREPEND "${TRACY_SERVER_DIR}/")
