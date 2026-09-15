@@ -14,7 +14,7 @@ def check(root):
     if not skill.startswith('---\n'):errors.append('SKILL frontmatter missing')
     if not re.search(r'^name: diagnose-jn-unity-tracy$',skill,re.M):errors.append('skill name differs')
     if not re.search(r'^description: Use when ',skill,re.M):errors.append('routing description missing')
-    if 'version: 2.2.0' not in skill:errors.append('package version missing')
+    if 'version: 2.3.0' not in skill:errors.append('package version missing')
     for link in re.findall(r'\]\(([^)]+)\)',skill):
         if '://' not in link and not (root/link.split('#')[0]).is_file():errors.append('missing skill reference: '+link)
     for path in (root/'scripts').glob('*.py'):

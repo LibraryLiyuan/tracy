@@ -1,5 +1,7 @@
 # 固定报告合同
 
+> 2.3 原生配图与交互回查按 [native-profiler-views.md](native-profiler-views.md) 执行。展示结果独立验收；本文旧脚本不会自动校验新展示合同，不能仅凭 report-validation.passed 宣称全部配图与交互已完成。
+
 > 2.2 适用范围：先执行 [优先级与测试人员决策](priority-and-tester-review.md)。本文的原 P 级为 Query 旧编号；所有“源码必读/深查完成”要求仅适用于新 P0、原有低级别必查项及测试人员明确批准的新 P1。新 P1 入队项先完成 Query 证据核查和候选报告；未选择不算源码受阻。分流排除项保留精确 Query 事实及理由。旧流程章节仅用于其适用范围内的证据和源码合同，不能覆盖新分流规则。
 
 
@@ -15,10 +17,10 @@ Query 1.35 Aggregate Store（中立事实）
 → evidence-manifest.json + analysis-result.json
 → validate_analysis_result.py
 → build_report.py
-→ 主报告 + 9 份专项报告 + SVG/MCP PNG
+→ 主报告 + 9 份专项报告 + 经验证的原生 PNG/交互入口或展示缺口（辅助 SVG/MCP PNG 分别标明来源）
 ```
 
-AI 不重新扫描 Trace、不重算 Query 数值，也不手写最终布局。Query Aggregate/Candidate、MCP 定向证据与 Source 证据必须分开登记。Markdown 是权威结论，SVG 与 MCP PNG 是默认证据附件。HTML 默认关闭，只能由用户明确要求后以试验模式生成。
+AI 不重新扫描 Trace、不重算 Query 数值，也不手写最终布局。Query Aggregate/Candidate、MCP 定向证据与 Source 证据必须分开登记。Markdown 是权威结论；原生 Profiler PNG 按 2.3 合同生成，辅助 SVG 与 MCP PNG 不替代原生视图。静态 HTML 报告默认关闭，由用户明确要求后生成；独立 Profiler 运行时入口不受静态报告 --html 开关控制，其能力与可达性必须实测。
 
 大型 Candidate Manifest 使用小型 JSON 描述文件及同目录 `candidates.ndjson`（或 `candidate-records.ndjson`）。以 `candidate_records={encoding:"ndjson-v1",path,sha256,count}` 替代内嵌 `candidates`，二者不能同时存在；这是保存已导出 Query 候选的包装，不改变 Query policy/schema 或候选内容。报告、数值和状态审计通过 `candidate_manifest.py` 逐条读取，读到 EOF 才完成计数/SHA 校验；错误阻止发布。描述文件和 NDJSON 原字节复制进报告，保留身份及可移植性。
 
@@ -95,7 +97,7 @@ AnalysisReport/
 5. Bottleneck Signature 地图。
 6. 关键路径与等待传播。
 7. 独立 Evidence Cards。
-8. Candidate Analysis Trail（不得省略分析过程）。
+8. 候选结论与证据索引；详细 Candidate Analysis Trail 留在机器 JSON，正文不重复逐项“如何发现”。
 9. CPU 内存与 GPU 显存专项。
 10. Tracy Runtime 采集与 Tracy Analysis 离线压力。
 11. Evidence Gaps 与 Investigation Backlog。
@@ -125,7 +127,7 @@ AnalysisReport/
 4. Pass→Resource→Allocation/Heap。
 5. 对应 FrameImage（若存在）。
 
-静态 SVG 与 MCP PNG 直接嵌入 Markdown。Timeline 没有包含可验证 Zone 坐标的 Evidence 时不生成 Timeline SVG；没有已证明 typed relation 时不生成因果 SVG；资源关系 Evidence 没有可验证节点时不生成资源图。Markdown 必须用文字披露缺失原因，禁止生成只有 `EvidenceUnavailable`/`EvidenceGap` 字样的空图。只有显式启用 HTML 时，才附加 `visuals/index.html#signature-<id>` 或 `#frame-<id>` 链接。
+原生 Profiler PNG 使用独立资源路径嵌入 Markdown，并关联同一定位记录的已验证交互入口；缺少能力或验收失败时明确展示缺口。静态 SVG 与 MCP PNG 仅作为来源明确的辅助图嵌入 Markdown。Timeline 没有包含可验证 Zone 坐标的 Evidence 时不生成 Timeline SVG；没有已证明 typed relation 时不生成因果 SVG；资源关系 Evidence 没有可验证节点时不生成资源图。Markdown 必须用文字披露缺失原因，禁止生成只有 `EvidenceUnavailable`/`EvidenceGap` 字样的空图。只有显式启用 HTML 时，才附加 `visuals/index.html#signature-<id>` 或 `#frame-<id>` 链接。
 
 静态布局必须满足：
 
@@ -135,7 +137,7 @@ AnalysisReport/
 - 单时间点内存证据渲染为带名称和值的快照比较图，不伪装成趋势折线。
 - 无数据不生成 SVG 文件；旧输出目录中的同名陈旧 SVG 必须在重建时清理。
 
-FrameImage 必须来自 MCP `resources/read` 返回的 `image/png`，保存 resource URI、MIME 和 PNG SHA-256。报告生成器拒绝 Skill 内本地解码或重建的图片。
+Profiler Canvas 原生截图单独按 2.3 合同登记，不是采集 FrameImage，不套用下面的 MCP 来源规则。采集 FrameImage 必须来自 MCP `resources/read` 返回的 `image/png`，保存 resource URI、MIME 和 PNG SHA-256。报告生成器拒绝 Skill 内本地解码或重建的图片。
 
 ## 7. Timeline LOD
 
@@ -162,10 +164,10 @@ TotalCaptureOverhead = NotMeasuredSingleTrace
 ## 9. 确定性与安全
 
 - `--deterministic` 使用 Analysis Result 内固定生成时间和稳定排序。
-- 同一输入、配置、生成器和模板版本的权威产物 SHA-256 一致。
+- 同一输入、配置、生成器和模板版本的确定性分析核心产物 SHA-256 一致。原生 PNG 与运行时验证记录单独保存实测身份，不承诺未经验证的跨环境像素确定性。
 - 所有 Trace 字符串做 Markdown 转义；启用 HTML 时同时做 HTML/JavaScript 转义。
 - 文件名只使用生成的稳定 ID，不使用 Marker/Resource 名称。
-- 可选 HTML 不读取 `.tracy`，不要求 Query 常驻。
+- 可选静态报告 HTML 不读取 `.tracy`，不要求 Query 常驻；独立 Profiler 运行时需要实际加载 Trace 和可用服务。
 - `manifest.json` 记录版本、配置 SHA 和所有产物身份。
 
 ## 10. 完成门禁
@@ -175,8 +177,8 @@ TotalCaptureOverhead = NotMeasuredSingleTrace
 - GPU 推断与内存口径符合证据边界。
 - 默认产物不包含 HTML，所有 Markdown 链接可解析。
 - 静态图不存在文字/Zone/节点重叠；无坐标或无关系的卡片不产生占位 SVG。
-- 显式启用 HTML 时，Markdown/HTML 数字、结论和 Evidence ID 一致，所有锚点可解析且可离线双击打开。
-- 两次确定性构建 SHA 一致。
+- 显式启用 HTML 时，Markdown/HTML 数字、结论和 Evidence ID 一致，静态报告锚点可解析且可离线双击打开；可交互 Profiler 不作双击 HTML 即可运行的承诺。
+- 两次确定性构建的分析核心产物 SHA 一致；原生视图按独立展示合同验证。
 - 所有需要证据调查的分流项须记录实际回执、最深可信层与缺口；新 P1 筛选排除须有原始事实与理由，不能仅凭 Backlog 一句话跳过。覆盖计数与 Candidate Manifest 一致；P0 兼容保留但当前不生成，Query 原级别不改写，分析级别按 2.2 映射。原 P2（新 P1）入队但未完成证据报告会阻止完成；已经完成证据报告但未被选择源码深查，不阻止本轮规定范围完成。阶段结果明确标注未完成，保存调查队列，不使用完整报告的 passed/completed 状态。
 - `analysis.capture_quality` 必须原样保留 Candidate Manifest/Query summary 中的 `capture_quality`，位于主报告附录和质量附件，不得作为 Candidate Finding、性能 P0/P1/P2、强制 L6 调查或性能 Backlog。附注只写问题、受影响域和限制；性能候选确实依赖缺失数据时才关联 EvidenceGap 深查。
 - 旧 quality Candidate 拒绝进入新报告，必须用 candidate-policy-v3 重新生成；扫描器自身 checksum/identity/audit 错误仍阻止发布。

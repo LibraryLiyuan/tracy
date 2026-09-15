@@ -84,8 +84,41 @@ def _html(markdown):
     return '\n'.join(lines+['</body></html>'])
 
 
+def _frame_scope_name(sample, audited):
+    name=audited['frame'].get('frame_set_name') or sample.get('frame_name','')
+    return re.sub(r'\s*第\s*\d+\s*帧.*$', '', name).strip()
+
+
+def _scope_order(name):
+    return ({'Frames':0,'Player.Frame':1,'Render.Frame':2}.get(name,3),name)
+
+
+def _issue_frame_order(issue, model):
+    # Pick the first primary (peak) frame, not an earlier normal counterexample.
+    samples=issue.get('samples',[])
+    frames=[(s,model['samples'][(issue['issue_id'],s['sample_id'])]) for s in samples
+            if model['samples'][(issue['issue_id'],s['sample_id'])]['kind']=='frame']
+    if frames:
+        sample,sm=next(((s,m) for s,m in frames if s.get('role')=='peak'),frames[0])
+        return (0,_scope_order(_frame_scope_name(sample,sm)),int(sm['frame']['index']),sm['begin'],issue['issue_id'])
+    return (1,(0,''),0,min((model['samples'][(issue['issue_id'],s['sample_id'])]['begin']
+                           for s in samples if model['samples'][(issue['issue_id'],s['sample_id'])]['begin'] is not None),default=0),issue['issue_id'])
+
+
+def _routing_frame_order(row, model, scope_names):
+    c=model.get('candidate_facts',{}).get(row['candidate_id'],{})
+    if c.get('domain') in {'gpu','job'}:
+        return (1,c.get('domain',''),0,row['candidate_id'])
+    frames=c.get('representative_frames',[])
+    numbers=[int(f.get('frame',f) if isinstance(f,dict) else f) for f in frames]
+    start=(c.get('local_evidence') or {}).get('frame_begin')
+    number=int(start) if start is not None else min(numbers,default=2**63)
+    scope=c.get('frame_scope','')
+    return (0,_scope_order(scope_names.get(scope,scope)),number,row['candidate_id'])
+
+
 def render_documents(analysis,model):
-    review=model['review'];issues=review['issues'];counts=model['counts']
+    review=model['review'];issues=sorted(review['issues'],key=lambda i:_issue_frame_order(i,model));counts=model['counts']
     labels=review['evidence_labels'];views=model['classifications'];source_models=model['sources']
     ev_order={eid:i+1 for i,eid in enumerate(sorted(labels))}
     def references(ids):
@@ -153,14 +186,7 @@ def render_documents(analysis,model):
                 relation=model['relations'][rid]
                 left=model['events'][relation['from_event_id']]['record']['name'];right=model['events'][relation['to_event_id']]['record']['name']
                 lines.append(f'- {md(left)} → {md(right)}：{md(relation["name"])}。{md(relation["meaning"])}；{references([relation["evidence_id"]])}')
-        lines += ['### 如何发现','']
-        for j,step in enumerate(issue['discovery_steps'],1):
-            lines += [f'**步骤{j}：为什么查这里** — {md(step["question"])}',
-                f'- 实际检查：{md(step["action"])}',f'- 查到什么：{md(step["observation"])}',
-                f'- 对判断的影响：{md(step["judgment"])}',f'- 依据：{references(step["evidence_refs"])}','']
-            if step.get('source_refs'):
-                lines.append('对应源码：'+'、'.join(md(source_models[s]['record']['name']) for s in step['source_refs']))
-        audit += [f'- {link}：发现步骤、样本、源码和反证均在正文该条目下。']
+        audit += [f'- {link}：样本、源码和反证见正文；详细发现过程保留在结构化分析记录中。']
         lines += ['### 源码分析','',md(issue['source_applicability']),'']
         for sid in issue.get('source_refs',[]):
             source=source_models[sid]['record'];snippet=source_models[sid]['excerpt'];n=source_index[sid]
@@ -204,7 +230,10 @@ def render_documents(analysis,model):
         docs[name]='\n'.join(content)+'\n'
     if analysis.get('report_versions',{}).get('analysis_workflow')=='2.2.0':
         from review_routing import render_routing
-        docs['P1-Source-Review-Candidates.md']=render_routing(analysis)
+        scope_names={sm['frame'].get('frame_set_ref'):_frame_scope_name(sm['record'],sm)
+                     for sm in model['samples'].values() if sm['kind']=='frame'}
+        rows=sorted(analysis['review_routing']['records'],key=lambda r:_routing_frame_order(r,model,scope_names))
+        docs['P1-Source-Review-Candidates.md']=render_routing(analysis, rows=rows)
         problems=['# Tracy 数据收集与 AI 性能分析问题汇总','','以下为证据质量与分析过程问题，不计入性能候选数量，也不使用性能 P 级。','','## 采集质量','']
         for note in review.get('quality_notes',[]):
             problems.append('- '+md(note['description']))

@@ -3,7 +3,7 @@
 > 2.2 适用范围：先执行 [优先级与测试人员决策](priority-and-tester-review.md)。本文的原 P 级为 Query 旧编号；所有“源码必读/深查完成”要求仅适用于新 P0、原有低级别必查项及测试人员明确批准的新 P1。新 P1 入队项先完成 Query 证据核查和候选报告；未选择不算源码受阻。分流排除项保留精确 Query 事实及理由。旧流程章节仅用于其适用范围内的证据和源码合同，不能覆盖新分流规则。
 
 
-本合同落实用户确认的四项要求及人工分析式“如何发现”。必须与原始收据验证同时执行。Query 1.35和候选策略不变；这里组织其结果，不重新计算排名或静默改变预算。
+本合同落实深查、源码与机器调查过程要求；正文不逐项展开“如何发现”。必须与原始收据验证同时执行。Query 1.35和候选策略不变；这里组织其结果，不重新计算排名或静默改变预算。
 
 ## 一、候选细分与分析进度
 
@@ -51,7 +51,9 @@ issues是原因条目或明确待查线索。每个强制或已批准且已调�
 
 同一源码记录可复用；每个原因用source_applicability解释其版本和条件是否适用。不得把别的问题的源码背景当成本事件实际执行分支的证明。
 
-## 四、具体帧、调用链和“如何发现”
+## 四、具体帧、调用链与机器发现记录
+
+2.2.1 展示规则：主报告按主要帧样本的真实索引数值升序，同一 FrameSet 内排序，不混用编号。`discovery_steps` 只保存在机器分析记录中供校验，不在每个观察条目下输出“如何发现”或逐步推理；下述选样与发现记录要求仍必须实际执行。
 
 samples逐项列sample_id、role、选择reason、可读frame_name、frame_evidence_id、frame_pointer及event_ids。role取normal、peak、repeated、sustained、recovery或user_focus。缺正常对照写comparison_gap，不虚构正常数据。
 
@@ -83,6 +85,8 @@ counterevidence必须写具体observation、对解释的effect、evidence_refs�
 ## 六、输出和恢复
 
 正常validate_analysis_result.py、build_report.py和状态审计都执行新合同。没有performance_review的旧材料必须补查或作为明确历史回归；--legacy-regression永远不能产生当前analysis_complete=true，禁止用于正式流程。
+
+生成新报告时另执行 [原生配图与交互回查](native-profiler-views.md)，原生视图不替代 Query 证据和源码因果核查。
 
 主报告每个原因只解释一次；专项、发现过程索引和人工回查指南链接到该条。Markdown及可选HTML均使用可读名称，原始JSON与源码快照独立打包。每份quality_notes以可读description保留对应capture_quality项，不能隐藏数据质量限制。
 

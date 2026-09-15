@@ -3,10 +3,27 @@ name: diagnose-jn-unity-tracy
 description: Use when diagnosing a single existing JN Unity Tracy capture with Query-native deterministic scanning and an auditable performance report.
 metadata:
   author: JN Game
-  version: 2.2.0
+  version: 2.3.0
 ---
 
 # JN Unity × Tracy 单 Trace 深度诊断
+
+## 原生视图与交互回查（2.3.0）
+
+生成新报告前读取 [native-profiler-views.md](references/native-profiler-views.md)。每个完成的深度观察及新 P1 决策样本登记原生视图/回查入口或明确展示缺口；截图与链接共享经核验的定位身份，分别验收数据定位、原生图片及真实交互。正常分析仅调用已发布、验证过的工具，不临时编译或修补 Profiler。
+
+本次新增执行规范，现有生成器和校验器尚未实现通用 Profiler 接口或展示门禁；必须另存 view-manifest.json 与 presentation-validation.json，不得把旧 passed 标志当作原生视图验收。工具能力缺失时保存合法分析结果并单独披露展示 pending/degraded，不能把静态图或冻结网页标为可交互。
+
+SKILL 发布版本为 2.3.0；Query 1.35.0、candidate-policy-v3、Schema 4、performance_review/review_routing schema 1 与 report_versions=2.2.0 均保持兼容，新增展示记录独立保存，不向旧严格 schema 注入未支持字段。
+
+## 继续沿用的报告展示规则（2.2.1）
+
+以下排序与正文精简规则继续适用；展示升级不改变优先级、Query 统计或源码深查范围。
+
+- 主报告按主要样本的真实帧号数值升序排列，先 `Frames`，再 `Player.Frame`、`Render.Frame`，其他 FrameSet 独立分组。主要样本取首个 `peak` 帧样本，没有时取首个帧样本；不能用较早的正常对照帧替代主要帧。条目作者应把目标样本放在前面。同号条目按实际区间及稳定身份排序；无普通帧号的原生/GPU区间放后面，不伪造帧号。
+- 新 P1 候选报告按同一 FrameSet 的窗口起始帧或最早代表帧升序；原生 Job 与 GPU 单列，不把原生身份当普通帧号。排序后统一生成目录、条目编号、专项和人工回查链接，不按字符串排序，也不修改原候选优先级与数值。
+- 每项深度观察的阅读正文不再输出“如何发现”和逐步骤叙述。仍展示结论、具体样本/调用链、数值、源码、反例与下一步。`discovery_steps` 和 Analysis Trail 继续保存在机器 JSON 并校验，不因精简正文而省略调查。
+- 本规则适用于新生成的 Markdown 及可选 HTML；分册从同一排序结果生成。不要原地改写已冻结报告。
 
 使用 Query 1.35 对一个已存在的 `.tracy` 做确定性全量扫描，再由 AI 核查证据、按分析优先级分流：新 P0 强制源码深查，新 P1 先生成测试人员决策报告。本 dev 基线发行版仅支持普通 `.tracy`，不包含 N30 Session Store。Query 拥有全部统计数值；AI 只负责证据驱动的解释、假设验证、源码核查和优化建议。
 
@@ -94,7 +111,8 @@ created
 10. 对需要证据分析的候选调用 `candidate_get`、`representative_frames` 并定位真实事件和等待关系。新 P0 强制源码深查；新 P1 筛选入队后先解释 Query 情况、影响程度和不确定性，生成源码深查候选报告，测试人员明确选择后才深查。新 P2/P3 保留原 Query 入选语义，已 selected 的源码深查要求不在本次豁免。
 11. 填写 `review_routing` 与独立问题汇总；对强制或已批准源码深查项填写 `performance_review`：候选视图、共享事件表、源码阅读、具体样本、逐步发现过程、反例及原因条目。按实际同事件或已核实机制归并；不同原因保留明确区分依据。
 12. 完成当前要求的源码深查和新 P1 决策报告后，复核原因归并，运行数值校验、报告验证和生成器。正文按原因组织，专项仅引用同一正文条目；未入选候选不展开为用户待办。
-13. 报告通过后调用 `tracy_scan(close)` 与 `tracy_trace_close`，保存最终状态。
+13. 按 native-profiler-views.md 完成视图定位、原生导图、交互检查及独立展示状态；失败时保留合法分析并交付明确展示缺口。
+14. 分析报告校验及展示状态记录完成后调用 `tracy_scan(close)` 与 `tracy_trace_close`，保存最终状态。
 
 每一步的退出条件和失败语义见 [query-native-scan-workflow.md](references/query-native-scan-workflow.md)。
 
@@ -152,7 +170,7 @@ Candidate trigger
 
 - **候选分类**：观察层次、性能表现、成本类型、原始触发理由和范围分别记录。CPU自身时间不自动等于CPU执行时间。
 - **源码必读**：每个深查完成条目必须引用已核验的实际源码快照和具体阅读解释。可复用同一源码记录，但逐原因核对适用条件。源码不可得只交阶段结果并保留实际搜索与下一步，不能将深查标为完成。
-- **如何发现**：列实际FrameSet/帧号或原生GPU/OriginFrame范围，展示为什么选样本、真实父子链、耗时/自身/运行时间、正常异常差异、源码解释、反例及每步判断变化。缺数据明确留作缺口，不编造查询顺序。
+- **如何发现（机器记录）**：在 discovery_steps / Analysis Trail 保存真实选样、父子链、数值、正常异常差异、源码、反例及判断变化；正文不输出逐步“如何发现”，只呈现核查所需样本、证据与结论。缺数据明确留作缺口，不编造查询顺序。
 - **占比**：只从已经保存并核验的Query计时做展示换算；明确分母，跨帧只用交集计算该帧贡献，完整事件另列。父子和并发时间不相加，不把采样比例写成耗时，不把占比写成优化收益。
 - **原因去重**：同事件复用一个实体；同因实例归成一个条目。一整帧/窗口包含多个不同原因时登记candidate_splits，保留多对多关系，候选覆盖只计一次。跨实例机制归并须有匹配源码和运行核验。相同事件、源码位置或同名事件分成多个原因时必须记录区别和证据；不得仅按文字相似自动合并。
 - **全文可读**：所有Markdown、HTML和图表使用实际事件、业务术语和可读证据名称。无名称时不退回哈希/内部ID；程序会拒绝不可读展示。原始身份仅在机器JSON、原始请求和源码快照中保留。
@@ -192,7 +210,7 @@ python scripts/build_report.py `
   --export-static
 ```
 
-维护或发布 SKILL 时运行相关 Python/PowerShell 回归及 `python scripts/lint-skill.py`；每次分析只运行本轮产物校验，不重复整个 SKILL 测试套件。报告包含：强制/已批准深查结果、新 P1 源码深查候选报告、筛选排除记录、未选择/暂缓/不深查状态、Backlog、证据缺口，以及独立的 Tracy 数据收集与 AI 性能分析问题汇总。
+维护或发布 SKILL 时运行相关 Python/PowerShell 回归及 `python scripts/lint-skill.py`；每次分析只运行本轮产物校验，不重复整个 SKILL 测试套件。展示验收另按 native-profiler-views.md 保存状态，现有脚本 passed 不覆盖它。报告包含：强制/已批准深查结果、新 P1 源码深查候选报告、筛选排除记录、未选择/暂缓/不深查状态、Backlog、证据缺口，以及独立的 Tracy 数据收集与 AI 性能分析问题汇总。
 
 发布同时检查 passed、report_status、analysis_complete、required_pending；required_pending 只计算本轮应深查项。新 P1 已完成证据报告但尚待选择，可以交付完整的本轮规定范围报告，并明确尚有多少项未源码深查。已批准项或强制项尚未完成时只能交付 in_progress。状态恢复和批准记录必须绑定当前候选身份及原始证据，不能复用旧清单的批准。完成后用 record-investigation-audit 重建源码队列、证据已核查集合和待选择集合。
 

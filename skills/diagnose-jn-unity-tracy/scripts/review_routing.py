@@ -205,10 +205,10 @@ def validate_routing(analysis, manifest, evidence=None, root=None):
     return by_id, dict(counts)
 
 
-def render_routing(analysis):
+def render_routing(analysis, rows=None):
     """Small decision report; source excerpts belong only in approved deep reports."""
     from performance_report import md
-    rows = analysis['review_routing']['records']
+    rows = analysis['review_routing']['records'] if rows is None else rows
     labels = analysis['performance_review']['evidence_labels']
     order = {eid: n for n, eid in enumerate(sorted(labels), 1)}
     impact = {'high': '影响较大', 'moderate': '局部成本较高', 'low': '当前影响较小', 'unknown': '证据不足'}

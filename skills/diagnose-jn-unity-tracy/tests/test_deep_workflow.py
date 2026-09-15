@@ -118,8 +118,9 @@ class DeepWorkflowTests(unittest.TestCase):
             result=self.command(root,'build_report.py',('--output',str(out),'--deterministic','--html','--standalone'))
             self.assertEqual(0,result.returncode,result.stderr)
             main=(out/'Performance-Analysis-Report.md').read_text(encoding='utf-8')
-            for expected in ('Player.Frame','42','17.000','100.00%','7.000','Work.cpp','RebuildIfDirty','为什么','源码'):
+            for expected in ('Player.Frame','42','17.000','100.00%','7.000','Work.cpp','RebuildIfDirty','源码'):
                 self.assertIn(expected,main)
+            self.assertNotIn('### 如何发现',main)
             for p in out.rglob('*'):
                 if p.suffix in {'.md','.html','.svg'}:
                     content=p.read_text(encoding='utf-8')
