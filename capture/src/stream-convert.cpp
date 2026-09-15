@@ -68,6 +68,7 @@ struct Options
     uint16_t port = 18086;
     uint32_t threads = 0;
     uint64_t diskBudget = 0;
+    uint64_t processMemoryLimit = 32ull << 30;
     bool overwrite = false;
     bool requireCleanEnd = false;
     bool noCache = false;
@@ -87,6 +88,7 @@ void Usage()
         "  [--compression fast|balanced|legacy] [--threads auto|N]\n"
         "  [--require-clean-end] [--progress-json path] [--report-json path]\n"
         "  [--no-cache] [--purge-cache] [--keep-failed-output] [--disk-budget bytes]\n"
+        "  [--process-memory-limit bytes] (16-32 GiB; default 32 GiB)\n"
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
         "  Development only: [--mode offline|legacy] [-p legacy-port]\n"
         "                    [--diagnostics] [--test-cancel-after-records N] [--test-fail-before-validate]\n"
@@ -225,6 +227,11 @@ bool ParseArguments( int argc, char** argv, Options& options )
         else if( argument == "--keep-failed-output" )
         {
             options.keepFailedOutput = true;
+        }
+        else if( argument == "--process-memory-limit" && i + 1 < argc )
+        {
+            if(!ParseUnsigned(argv[++i],options.processMemoryLimit) ||
+                options.processMemoryLimit<(16ull<<30) || options.processMemoryLimit>(32ull<<30))return false;
         }
         else if( argument == "--disk-budget" && i + 1 < argc )
         {
@@ -2337,13 +2344,14 @@ int main(int argc,char** argv)
             if(std::filesystem::exists(temporary))throw std::runtime_error("conversion_report_temporary_already_exists");
         }
         tracy::storage::ResourceLimits limits;limits.streamBytes=std::filesystem::file_size(options.input);limits.absoluteDiskLimit=options.diskBudget;
+        limits.maximumPrivateBytes=options.processMemoryLimit;
         if(!limits.streamBytes||limits.streamBytes>UINT64_MAX/3)throw std::runtime_error("conversion_input_size_overflow");
         limits.clusterBytes=tracy::storage::ConversionResources::VolumeCluster(options.output);
         const auto disk=options.diskBudget?std::min(options.diskBudget,limits.streamBytes*3):limits.streamBytes*3;
         limits.controlReserveBytes=std::min<uint64_t>(65536,disk/4);
         resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[]{return CancelRequested();});
         files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();
-        hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(32ull<<30);
+        hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(options.processMemoryLimit);
         resources->Check();resources->StartMonitoring();
         code=RunConversion(options,*resources,workRoot);
         outputValid=conversionPublished;
@@ -2367,6 +2375,7 @@ int main(int argc,char** argv)
             <<",\"stage\":\""<<finishedStage<<"\",\"failure\":\""<<JsonEscape(reason)
             <<"\",\"cleanup_complete\":"<<(cleaned?"true":"false")
             <<",\"private_peak_bytes\":"<<resources->PeakPrivate()<<",\"working_set_peak_bytes\":"<<resources->PeakWorkingSet()
+            <<",\"process_hard_limit_bytes\":"<<options.processMemoryLimit
             <<",\"system_commit_peak_bytes\":"<<resources->PeakSystemCommit()<<",\"minimum_commit_headroom_bytes\":"<<resources->MinimumCommitHeadroom()
             <<",\"soft_target_met\":"<<(resources->PeakPrivate()<=(16ull<<30)?"true":"false")
             <<",\"workspace_peak_bytes\":"<<workspace.peakBytes<<",\"disk_limit_bytes\":"<<resources->DiskLimit()
