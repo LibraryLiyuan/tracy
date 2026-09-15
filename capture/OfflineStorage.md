@@ -62,3 +62,24 @@ The fixed 32-bit Zone index limit is checked instead of silently truncating.
 The page file is conversion-local, charged to the existing 3J budget and removed
 by the same cleanup owner. It is not a recovery format. Other Worker domains
 remain in memory, so this change does not promise full conversion within 20 GiB.
+# Relation append-only offline storage
+
+Offline conversion routes normalized 37-byte JnRelationData records to the
+existing compressed paged record store. The original vector remains empty;
+record ordering, duplicate events, thread attribution and all field bits are
+preserved. Full/live and ordinary Query loading retain their existing policy.
+
+The table is created lazily, sealed before ordinary-format output, and read in
+bounded batches. Conversion validation explicitly consumes Relation alongside
+JobStage and ReferenceUse, checking count, order and final SHA256. Missing
+nonempty domains and incomplete empty domains fail validation; older absent
+domains are allowed only when their expected count is zero. A large count is
+allowed only for an explicitly requested sink and a matching expected count.
+
+Buffers and codec scratch use the existing shared workspace. The paged store
+has an optional pre-allocation callback for fresh conversion OS memory checks;
+normal callers leave it unset. Files use the existing conversion ownership,
+disk budget and cleanup lifecycle. Reports include the relation record count,
+backend state, sealed hash, and original vector size/capacity.
+
+This does not externalize gpuCatalogRelations or other remaining Worker tables.

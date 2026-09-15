@@ -49,6 +49,9 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-relation-storage-tests tests/RelationStorageTests.cpp)
+    target_link_libraries(tracy-relation-storage-tests PRIVATE TracyServer TracyOfflineConversion)
+    add_test(NAME tracy-relation-storage COMMAND tracy-relation-storage-tests ${CMAKE_CURRENT_BINARY_DIR}/relation-storage-test)
     add_executable(tracy-mutable-record-tests tests/MutableRecordStoreTests.cpp)
     target_link_libraries(tracy-mutable-record-tests PRIVATE TracyStorageCore)
     add_test(NAME tracy-mutable-record COMMAND tracy-mutable-record-tests ${CMAKE_CURRENT_BINARY_DIR}/mutable-record-test)

@@ -19,6 +19,9 @@ public:
     virtual bool AppendReferenceSet(uint32_t,uint16_t,int64_t,uint64_t,uint64_t,uint8_t,uint8_t)=0;
     virtual void AppendReferenceUse(const JnGpuReferenceUseData&)=0;
     virtual void AppendJobStage(const JnJobStageData&)=0;
+    virtual void AppendRelation(const JnRelationData&)=0;
+    virtual uint64_t RelationCount() const=0;
+    virtual void VisitRelations(const std::function<void(const JnRelationData*,uint64_t)>&)=0;
     virtual uint64_t ReferenceUseCount() const=0;
     virtual uint64_t JobStageCount() const=0;
     virtual void VisitReferenceUses(const std::function<void(const JnGpuReferenceUseData*,uint64_t)>&)=0;

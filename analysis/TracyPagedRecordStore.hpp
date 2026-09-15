@@ -18,6 +18,7 @@ struct PagedRecordOptions
     std::function<void(const std::filesystem::path&,uint64_t)> beforeFileGrowth;
     std::function<void(const std::filesystem::path&,const std::filesystem::path&)> renameFile;
     uint64_t activeReadCacheBytes=0;
+    std::function<void(uint64_t)> beforeMemoryAllocation;
 };
 // Fixed-width records (including byte records for string/blob storage). The
 // ordinal directory is on disk; neither open nor lookup materializes it.

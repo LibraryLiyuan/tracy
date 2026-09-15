@@ -91,7 +91,7 @@ struct PagedRecordWriter::Impl
     {
         Validate(identity,width,options);
         if(std::filesystem::exists(AnalysisIoPath(root))) Fail("already_exists");
-        memory.Resize(options.blockBytes+4096);
+        if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(options.blockBytes+4096); memory.Resize(options.blockBytes+4096);
         header.recordBytes=width; header.blockRecords=options.blockBytes/width;
         std::memcpy(header.identity,identity.data(),64);
         buffer.reserve(size_t(header.blockRecords)*width);
@@ -110,6 +110,7 @@ struct PagedRecordWriter::Impl
         entry.records=uint32_t(buffer.size()/header.recordBytes); entry.decoded=uint32_t(buffer.size());
         const auto bound=ZSTD_compressBound(buffer.size()),arenaBytes=ZSTD_estimateCCtxSize(1);
         if(ZSTD_isError(bound)||ZSTD_isError(arenaBytes)) Fail("codec");
+        if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(bound+arenaBytes+4096);
         AnalysisWorkspaceReservation compression(options.workspace,bound+arenaBytes+4096);
         std::vector<char> encoded(bound);
         std::vector<uint64_t> arena((arenaBytes+7)/8);
@@ -247,7 +248,7 @@ struct PagedRecordReader::Impl
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
         :root(std::move(path)),options(std::move(config)),memory(options.workspace)
     {
-        Validate(identity,width,options); memory.Resize(options.blockBytes+4096);
+        Validate(identity,width,options); if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(options.blockBytes+4096); memory.Resize(options.blockBytes+4096);
         std::ifstream in(AnalysisIoPath(root/"header.bin"),std::ios::binary); header=ReadObject<Header>(in);
         std::string digest(64,0); in.read(digest.data(),64);
         if(!in || std::filesystem::file_size(AnalysisIoPath(root/"header.bin"))!=sizeof(Header)+64 || digest!=Hash(&header,sizeof(header))) Fail("header_checksum");
@@ -276,6 +277,7 @@ struct PagedRecordReader::Impl
             entry.codec>1 || (!entry.codec && entry.stored!=entry.decoded) ||
             entry.offset>dataBytes || entry.stored>dataBytes-entry.offset ||
             (block+1==header.blocks && entry.offset+entry.stored!=dataBytes)) Fail("block_bounds");
+        if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(entry.stored+ZSTD_estimateDCtxSize()+4096);
         AnalysisWorkspaceReservation decoding(options.workspace,entry.stored+ZSTD_estimateDCtxSize()+4096);
         std::vector<char> stored(entry.stored); Seek(data,entry.offset); data.read(stored.data(),entry.stored);
         if(!data || Hash(stored.data(),stored.size())!=std::string(entry.hash,64)) Fail("block_checksum");

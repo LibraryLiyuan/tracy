@@ -1590,20 +1590,24 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(workerStorage&&diskStorage)workerStorage->JoinOfflineReplay();
         std::ostringstream out;out<<"{\"source_bytes\":"<<inputFileSize<<",\"source_sha256\":\""<<inputIdentity.hex
             <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
-        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount();
+        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount()<<",\"relation_records\":"<<diskStorage->RelationCount()<<",\"relation_store_state\":\""<<diskStorage->RelationState()<<"\"";
         if(workerStorage){
             if(options.allocationDiagnostics){const auto witness=workerStorage->GetOfflineMemoryWitness();
                 out<<",\"slab_allocated_bytes\":"<<witness[0]<<",\"zone_extra_size\":"<<witness[1]
                     <<",\"zone_extra_capacity_bytes\":"<<witness[2]<<",\"zone_extra_owner\":"<<witness[3];}
             out<<",\"processed_events\":"<<workerStorage->GetProtocolEventCount()<<",\"processed_frames\":"<<workerStorage->GetProtocolFramesProcessed();
             const auto& data=workerStorage->GetJnTraceData();
+            out<<",\"relation_vector_size\":"<<data.relations.size()<<",\"relation_vector_capacity_bytes\":"<<uint64_t(data.relations.capacity())*sizeof(tracy::JnRelationData);
             out<<",\"remaining_JN_vector_capacity_bytes\":{";
             bool first=true;auto field=[&](const char* name,const auto& v){if(!first)out<<',';first=false;out<<'"'<<name<<"\":"<<v.capacity()*sizeof(typename std::decay_t<decltype(v)>::value_type);};
             field("gfxEntities",data.gfxEntities);field("gfxLinks",data.gfxLinks);field("jobSchedules",data.jobSchedules);
+            field("jobConfigs",data.jobConfigs);field("ioRequests",data.ioRequests);field("runtimeDomainStates",data.runtimeDomainStates);
             field("gpuReferencePasses",data.gpuReferencePasses);field("gpuReferenceEnds",data.gpuReferenceEnds);
             field("gpuCatalogResources",data.gpuCatalogResources);field("gpuCatalogBatches",data.gpuCatalogBatches);field("gpuCatalogGenerations",data.gpuCatalogGenerations);
             out<<'}';
-        }out<<'}';conversionEvidence=out.str();
+        }
+        if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
+        out<<'}';conversionEvidence=out.str();
     }};
 
     if( options.mode == Options::Mode::Offline )

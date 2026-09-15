@@ -6770,8 +6770,9 @@ void Worker::ProcessJnRelation( const QueueJnRelation& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.relations.push_back( JnRelationData { time, ev.sourceId, ev.targetId, m_threadCtx,
-        ev.sourceKind, ev.targetKind, ev.relationNamespace, ev.relation, ev.flags } );
+    const JnRelationData row { time, ev.sourceId, ev.targetId, m_threadCtx,
+        ev.sourceKind, ev.targetKind, ev.relationNamespace, ev.relation, ev.flags };
+    if(m_offlineStorage)m_offlineStorage->AppendRelation(row);else data.relations.push_back(row);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -11584,7 +11585,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteJnVector( f, m_data.jnTrace.ioRequests );
     WriteJnVector( f, m_data.jnTrace.ioConfigs );
     WriteJnVector( f, m_data.jnTrace.ioStages );
-    WriteJnVector( f, m_data.jnTrace.relations );
+    if(m_offlineStorage) {
+        const uint64_t count=m_offlineStorage->RelationCount();f.Write(&count,sizeof(count));
+        m_offlineStorage->VisitRelations([&](const JnRelationData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
+    }else WriteJnVector( f, m_data.jnTrace.relations );
     WriteJnVector( f, m_data.jnTrace.runtimeDomainStates );
     WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
     if(m_offlineStorage) {

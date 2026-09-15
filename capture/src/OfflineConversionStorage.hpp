@@ -23,6 +23,11 @@ public:
     bool AppendReferenceSet(uint32_t,uint16_t,int64_t,uint64_t,uint64_t,uint8_t,uint8_t) override;
     void AppendReferenceUse(const JnGpuReferenceUseData&) override;
     void AppendJobStage(const JnJobStageData&) override;
+    void AppendRelation(const JnRelationData&) override;
+    uint64_t RelationCount() const override { return m_relationCount; }
+    void VisitRelations(const std::function<void(const JnRelationData*,uint64_t)>&) override;
+    std::string RelationHash() const;
+    const char* RelationState() const {return m_relationFailed?"failed":m_sealed?"sealed":m_relationCount?"appending":"empty";}
     uint64_t ReferenceUseCount() const override { return m_useCount; }
     uint64_t JobStageCount() const override { return m_jobCount; }
     uint64_t DefinitionCount() const { return m_definitionCount; }
@@ -41,6 +46,10 @@ private:
     std::vector<storage::ResourceSetMember> m_members;
     std::vector<JnGpuReferenceUseData> m_expanded;
     std::unique_ptr<analysis::PagedRecordWriter> m_jobs,m_uses;
+    std::unique_ptr<analysis::PagedRecordWriter> m_relations;
+    uint64_t m_relationCount=0;
+    std::string m_relationHash;
+    bool m_relationFailed=false;
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::string m_zoneHash;

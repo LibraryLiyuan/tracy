@@ -8,6 +8,7 @@ namespace tracy::conversion
 analysis::PagedRecordOptions OfflineConversionStorage::Options()
 {
     analysis::PagedRecordOptions o;o.workspace=m_resources.Workspace();
+    o.beforeMemoryAllocation=[this](uint64_t bytes){m_resources.Check(bytes);};
     o.cancelled=[this]{m_resources.CheckFast();return false;};
     o.beforeFileGrowth=[this](const auto& p,uint64_t n){m_resources.BeforeFileGrowth(p,n);};
     o.renameFile=[this](const auto& a,const auto& b){m_resources.RenameOwned(a,b);};return o;
@@ -58,6 +59,14 @@ void OfflineConversionStorage::Seal()
 {
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
     m_jobHash=analysis::Sha256Builder().FinalHex();m_useHash=m_jobHash;
+    m_relationHash=m_jobHash;
+    if(m_relationFailed)throw std::runtime_error("relation_store_failed");
+    if(m_relations){
+        try {
+            if(m_relations->Count()!=m_relationCount)throw std::runtime_error("relation_store_count");
+            m_relations->Commit();m_relationHash=m_relations->ContentHash();
+        }catch(...){m_relationFailed=true;throw;}
+    }
     if(m_jobs){m_jobs->Commit();m_jobHash=m_jobs->ContentHash();}
     if(m_uses){m_uses->Commit();m_useHash=m_uses->ContentHash();}
     if(m_definitions)m_definitions->Seal();
@@ -67,12 +76,28 @@ void OfflineConversionStorage::Seal()
     m_zoneHash=zoneHash.FinalHex();
     m_jobs.reset();m_uses.reset();m_definitions.reset();m_members.clear();m_members.shrink_to_fit();m_expanded.clear();m_expanded.shrink_to_fit();m_expandLease.Resize(0);
     m_sealed=true;
+    m_relations.reset();
 }
+
+void OfflineConversionStorage::AppendRelation(const JnRelationData& row)
+{
+    static_assert(sizeof(JnRelationData)==37);
+    Check();if(m_sealed||m_relationFailed)throw std::runtime_error("relation_store_closed");
+    try {
+        if(!m_relations)m_relations=std::make_unique<analysis::PagedRecordWriter>(m_root/"relations",m_identity,uint32_t(sizeof(row)),Options());
+        m_relations->Append(&row,1);m_relationCount=m_relations->Count();
+    }catch(...){m_relationFailed=true;throw;}
+}
+void OfflineConversionStorage::VisitRelations(const std::function<void(const JnRelationData*,uint64_t)>& visitor)
+{Check();if(!m_sealed||m_relationFailed)throw std::runtime_error("relation_store_not_sealed");if(m_relationCount)Visit("relations",visitor);}
+std::string OfflineConversionStorage::RelationHash() const
+{if(!m_sealed||m_relationFailed)throw std::runtime_error("relation_store_not_sealed");return m_relationHash;}
 template<class T> void OfflineConversionStorage::Visit(const char* domain,const std::function<void(const T*,uint64_t)>& visitor)
 {
     Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");
     analysis::PagedRecordReader reader(m_root/domain,m_identity,uint32_t(sizeof(T)),Options());reader.ValidateAll();
     const auto capacity=std::min<uint64_t>(65536,reader.Count());
+    m_resources.Check(capacity*sizeof(T)+256);
     analysis::AnalysisWorkspaceReservation memory(m_resources.Workspace(),capacity*sizeof(T)+256);std::vector<T> rows(size_t(capacity),T{});
     for(uint64_t offset=0;offset<reader.Count();) {
         Check();const auto take=std::min<uint64_t>(capacity,reader.Count()-offset);reader.Read(offset,rows.data(),take);visitor(rows.data(),take);offset+=take;

@@ -43,6 +43,22 @@ int main(int argc,char** argv)
     struct Wide{char bytes[42];};std::vector<Wide> wide;rejected=false;
     try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open((root/"overflow.tracy").string().c_str()));tracy::ReadJnRecordsToSink(*in,wide,"overflow",&sink,Sink::JnDomain::GpuReferenceUse);}
     catch(const tracy::LoadFailure&){rejected=true;}Check(rejected&&wide.empty());
+    // Relation uses the same explicit sink policy, with its real 37-byte width.
+    struct RelationPolicy:Sink {
+        bool began=false;
+        bool WantsJnRecords(JnDomain d,uint32_t w)const override{return d==JnDomain::Relation&&w==37;}
+        bool AllowsLargeJnRecords(JnDomain d,uint64_t n,uint32_t w)const override{return WantsJnRecords(d,w)&&n==expected;}
+        void JnRecordsBegin(JnDomain,uint64_t n,uint32_t)override{Check(n==expected);began=true;throw std::runtime_error("stop at policy boundary");}
+    };
+    std::vector<tracy::JnRelationData> relations;
+    for(const uint64_t count:{100000000ull,100000001ull,UINT64_MAX}) {
+        const auto p=root/"relation-count.tracy";
+        {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(p));out->Write(&count,8);out->Finish();}
+        RelationPolicy policy;policy.expected=count;rejected=false;
+        try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(p));tracy::ReadJnRecordsToSink(*in,relations,"relation",&policy,Sink::JnDomain::Relation);}
+        catch(const std::exception&){rejected=true;}Check(rejected&&relations.empty()&&policy.began==(count!=UINT64_MAX));
+        if(count>100000000){rejected=false;try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(p));tracy::ReadJnRecordsToSink(*in,relations,"relation",nullptr,Sink::JnDomain::Relation);}catch(const std::exception&){rejected=true;}Check(rejected&&relations.empty());}
+    }
     std::puts("JN bounded reader passed");
 }
 #else
