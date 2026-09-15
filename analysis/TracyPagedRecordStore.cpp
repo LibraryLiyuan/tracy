@@ -1,5 +1,6 @@
 #include "TracyPagedRecordStore.hpp"
 #include "TracyHash.hpp"
+#include "TracyAnalysisIoPath.hpp"
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <vector>
+#include <map>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -52,7 +54,7 @@ template<class T> T ReadObject(std::istream& in)
 void FlushFile(const std::filesystem::path& path)
 {
 #ifdef _WIN32
-    const auto file=CreateFileW(path.c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    const auto file=CreateFileW(AnalysisIoPath(path).c_str(),GENERIC_WRITE,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(file==INVALID_HANDLE_VALUE) Fail("flush_open");
     const bool ok=FlushFileBuffers(file)!=0; CloseHandle(file); if(!ok) Fail("flush");
 #else
@@ -75,18 +77,29 @@ struct PagedRecordWriter::Impl
     std::vector<char> buffer;
     Sha256Builder content;
     uint64_t offset=0;
+    struct CachedBlock {
+        AnalysisWorkspaceReservation memory;
+        std::vector<char> bytes;
+        uint64_t touched=0;
+        CachedBlock(const PagedRecordOptions& o,size_t size):memory(o.workspace,size+256),bytes(size){}
+    };
+    std::map<uint64_t,std::unique_ptr<CachedBlock>> cache;
+    uint64_t cacheBytes=0,clock=0;
     bool committed=false,failed=false;
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
         :root(std::move(path)),options(std::move(config)),memory(options.workspace)
     {
         Validate(identity,width,options);
-        if(std::filesystem::exists(root)) Fail("already_exists");
+        if(std::filesystem::exists(AnalysisIoPath(root))) Fail("already_exists");
         memory.Resize(options.blockBytes+4096);
         header.recordBytes=width; header.blockRecords=options.blockBytes/width;
         std::memcpy(header.identity,identity.data(),64);
         buffer.reserve(size_t(header.blockRecords)*width);
-        std::filesystem::create_directories(root);
-        data.open(root/"data.bin",std::ios::binary); directory.open(root/"directory.bin",std::ios::binary);
+        if(options.beforeFileGrowth) {
+            options.beforeFileGrowth(root,0);options.beforeFileGrowth(root/"data.bin",0);options.beforeFileGrowth(root/"directory.bin",0);
+        }
+        std::filesystem::create_directories(AnalysisIoPath(root));
+        data.open(AnalysisIoPath(root/"data.bin"),std::ios::binary); directory.open(AnalysisIoPath(root/"directory.bin"),std::ios::binary);
         if(!data || !directory) Fail("open");
     }
     void Flush()
@@ -108,8 +121,12 @@ struct PagedRecordWriter::Impl
         const auto digest=Hash(payload,entry.stored); std::memcpy(entry.hash,digest.data(),64);
         if(entry.stored>UINT64_MAX-offset) Fail("offset");
         AnalysisDiskGrow(options.disk,entry.stored);
+        if(options.beforeFileGrowth) options.beforeFileGrowth(root/"data.bin",offset+entry.stored);
         data.write(payload,entry.stored); if(!data) Fail("write");
-        AnalysisDiskGrow(options.disk,sizeof(entry)); Write(directory,entry);
+        AnalysisDiskGrow(options.disk,sizeof(entry));
+        if(options.beforeFileGrowth) options.beforeFileGrowth(root/"directory.bin",(header.blocks+1)*sizeof(entry));
+        Write(directory,entry);
+        content.Update(buffer.data(),buffer.size());
         offset+=entry.stored; ++header.blocks; buffer.clear();
     }
 };
@@ -128,7 +145,7 @@ void PagedRecordWriter::Append(const void* records,uint64_t count)
         while(count) {
             const auto room=(uint64_t(w.header.blockRecords)*w.header.recordBytes-w.buffer.size())/w.header.recordBytes;
             const auto take=std::min(count,room),length=take*w.header.recordBytes;
-            w.buffer.insert(w.buffer.end(),bytes,bytes+length); w.content.Update(bytes,size_t(length));
+            w.buffer.insert(w.buffer.end(),bytes,bytes+length);
             w.header.records+=take; bytes+=length; count-=take;
             if(w.buffer.size()==uint64_t(w.header.blockRecords)*w.header.recordBytes) w.Flush();
         }
@@ -145,15 +162,75 @@ void PagedRecordWriter::Commit()
         const auto headerHash=Hash(&w.header,sizeof(w.header));
         AnalysisDiskGrow(w.options.disk,sizeof(w.header)+64);
         const auto temporary=w.root/"header.tmp",final=w.root/"header.bin";
-        { std::ofstream out(temporary,std::ios::binary); Write(out,w.header); out.write(headerHash.data(),64); out.flush(); if(!out) Fail("write"); }
+        if(w.options.beforeFileGrowth) w.options.beforeFileGrowth(temporary,sizeof(w.header)+64);
+        { std::ofstream out(AnalysisIoPath(temporary),std::ios::binary); Write(out,w.header); out.write(headerHash.data(),64); out.flush(); if(!out) Fail("write"); }
         FlushFile(temporary); Check(w.options);
+        if(w.options.renameFile) w.options.renameFile(temporary,final);
+        else {
 #ifdef _WIN32
-        if(!MoveFileExW(temporary.c_str(),final.c_str(),MOVEFILE_WRITE_THROUGH)) Fail("publish");
+        if(!MoveFileExW(AnalysisIoPath(temporary).c_str(),AnalysisIoPath(final).c_str(),MOVEFILE_WRITE_THROUGH)) Fail("publish");
 #else
         std::filesystem::rename(temporary,final);
 #endif
+        }
         w.committed=true;
     } catch(...) { w.failed=true; throw; }
+}
+void PagedRecordWriter::ClearReadCache()
+{
+    auto& w=*m_impl;w.cache.clear();w.cacheBytes=0;
+    if(w.data.is_open()) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush"); }
+}
+std::string PagedRecordWriter::ContentHash() const
+{ const auto& w=*m_impl;if(!w.committed)Fail("not_committed");return std::string(w.header.contentHash,64); }
+void PagedRecordWriter::Read(uint64_t ordinal,void* output,uint64_t count)
+{
+    auto& w=*m_impl;Check(w.options);
+    if(w.failed || ordinal>w.header.records || count>w.header.records-ordinal || count>SIZE_MAX/w.header.recordBytes || (count&&!output)) Fail("ordinal");
+    auto* target=static_cast<char*>(output);
+    const auto tailFirst=w.header.records-w.buffer.size()/w.header.recordBytes;
+    while(count) {
+        Check(w.options);
+        if(ordinal>=tailFirst && !w.buffer.empty()) {
+            std::memcpy(target,w.buffer.data()+(ordinal-tailFirst)*w.header.recordBytes,size_t(count*w.header.recordBytes));return;
+        }
+        const auto block=ordinal/w.header.blockRecords;
+        auto found=w.cache.find(block);
+        if(found==w.cache.end()) {
+            if(w.data.is_open()) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush"); }
+            std::ifstream index(AnalysisIoPath(w.root/"directory.bin"),std::ios::binary);
+            Seek(index,block*sizeof(Entry));const auto e=ReadObject<Entry>(index);
+            const auto expected=std::min<uint64_t>(w.header.blockRecords,w.header.records-block*w.header.blockRecords);
+            if(e.first!=block*w.header.blockRecords || e.records!=expected || uint64_t(e.decoded)!=expected*w.header.recordBytes ||
+                !e.stored || e.stored>e.decoded || e.codec>1 || (!e.codec&&e.stored!=e.decoded) || e.offset>w.offset || e.stored>w.offset-e.offset)
+                Fail("active_block_bounds");
+            const auto limit=std::max<uint64_t>(w.options.blockBytes+256,w.options.activeReadCacheBytes);
+            while(!w.cache.empty() && w.cacheBytes+e.decoded+256>limit) {
+                auto victim=std::min_element(w.cache.begin(),w.cache.end(),[](const auto& a,const auto& b){return a.second->touched<b.second->touched;});
+                w.cacheBytes-=victim->second->bytes.size()+256;w.cache.erase(victim);
+            }
+            auto page=std::make_unique<Impl::CachedBlock>(w.options,e.decoded);
+            const auto arenaBytes=ZSTD_estimateDCtxSize();
+            AnalysisWorkspaceReservation scratch(w.options.workspace,e.stored+arenaBytes+4096);
+            std::vector<char> encoded(e.stored);std::ifstream input(AnalysisIoPath(w.root/"data.bin"),std::ios::binary);
+            Seek(input,e.offset);input.read(encoded.data(),e.stored);
+            if(!input || Hash(encoded.data(),encoded.size())!=std::string(e.hash,64)) Fail("active_block_checksum");
+            if(e.codec) {
+                if(ZSTD_getFrameContentSize(encoded.data(),encoded.size())!=e.decoded || ZSTD_findFrameCompressedSize(encoded.data(),encoded.size())!=encoded.size()) Fail("active_frame_size");
+                std::vector<uint64_t> arena((arenaBytes+7)/8);
+                auto* context=ZSTD_initStaticDCtx(arena.data(),arena.size()*8);if(!context)Fail("codec");
+                const auto bytes=ZSTD_decompressDCtx(context,page->bytes.data(),page->bytes.size(),encoded.data(),encoded.size());
+                if(ZSTD_isError(bytes)||bytes!=e.decoded)Fail("active_decode");
+            }else std::memcpy(page->bytes.data(),encoded.data(),encoded.size());
+            w.cacheBytes+=page->bytes.size()+256;found=w.cache.emplace(block,std::move(page)).first;
+        }
+        auto& page=*found->second;page.touched=++w.clock;
+        const auto start=ordinal%w.header.blockRecords;
+        const auto take=std::min<uint64_t>(count,page.bytes.size()/w.header.recordBytes-start);
+        if(!take)Fail("active_block_count");
+        const auto bytes=take*w.header.recordBytes;std::memcpy(target,page.bytes.data()+start*w.header.recordBytes,size_t(bytes));
+        ordinal+=take;count-=take;target+=bytes;
+    }
 }
 struct PagedRecordReader::Impl
 {
@@ -169,9 +246,9 @@ struct PagedRecordReader::Impl
         :root(std::move(path)),options(std::move(config)),memory(options.workspace)
     {
         Validate(identity,width,options); memory.Resize(options.blockBytes+4096);
-        std::ifstream in(root/"header.bin",std::ios::binary); header=ReadObject<Header>(in);
+        std::ifstream in(AnalysisIoPath(root/"header.bin"),std::ios::binary); header=ReadObject<Header>(in);
         std::string digest(64,0); in.read(digest.data(),64);
-        if(!in || std::filesystem::file_size(root/"header.bin")!=sizeof(Header)+64 || digest!=Hash(&header,sizeof(header))) Fail("header_checksum");
+        if(!in || std::filesystem::file_size(AnalysisIoPath(root/"header.bin"))!=sizeof(Header)+64 || digest!=Hash(&header,sizeof(header))) Fail("header_checksum");
         const Header expected;
         if(std::memcmp(header.magic,expected.magic,8) || header.recordBytes!=width ||
             !header.blockRecords || uint64_t(header.blockRecords)*width>4*1024*1024 ||
@@ -179,10 +256,10 @@ struct PagedRecordReader::Impl
             std::string(header.identity,64)!=identity || !Digest(std::string(header.contentHash,64))) Fail("identity_or_format");
         if(header.blocks!=header.records/header.blockRecords+(header.records%header.blockRecords!=0) ||
             header.blocks>UINT64_MAX/sizeof(Entry) ||
-            std::filesystem::file_size(root/"directory.bin")!=header.blocks*sizeof(Entry)) Fail("directory_size");
-        dataBytes=std::filesystem::file_size(root/"data.bin");
+            std::filesystem::file_size(AnalysisIoPath(root/"directory.bin"))!=header.blocks*sizeof(Entry)) Fail("directory_size");
+        dataBytes=std::filesystem::file_size(AnalysisIoPath(root/"data.bin"));
         if(!header.blocks && dataBytes) Fail("data_size");
-        data.open(root/"data.bin",std::ios::binary); directory.open(root/"directory.bin",std::ios::binary);
+        data.open(AnalysisIoPath(root/"data.bin"),std::ios::binary); directory.open(AnalysisIoPath(root/"directory.bin"),std::ios::binary);
         if(!data||!directory) Fail("open");
         buffer.reserve(options.blockBytes);
     }

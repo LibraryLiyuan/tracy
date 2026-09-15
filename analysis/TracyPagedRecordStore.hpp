@@ -14,6 +14,10 @@ struct PagedRecordOptions
     std::shared_ptr<AnalysisWorkspaceBudget> workspace;
     std::shared_ptr<AnalysisDiskBudget> disk;
     std::function<bool()> cancelled;
+    // Optional conversion-owned file accounting. Sizes are cumulative per file.
+    std::function<void(const std::filesystem::path&,uint64_t)> beforeFileGrowth;
+    std::function<void(const std::filesystem::path&,const std::filesystem::path&)> renameFile;
+    uint64_t activeReadCacheBytes=0;
 };
 // Fixed-width records (including byte records for string/blob storage). The
 // ordinal directory is on disk; neither open nor lookup materializes it.
@@ -25,6 +29,9 @@ public:
     void Append(const void* records,uint64_t count);
     void Commit();
     uint64_t Count() const;
+    void Read(uint64_t ordinal,void* output,uint64_t count);
+    void ClearReadCache();
+    std::string ContentHash() const;
 private:
     struct Impl; std::unique_ptr<Impl> m_impl;
 };
