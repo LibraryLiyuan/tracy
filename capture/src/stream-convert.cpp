@@ -1592,6 +1592,8 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
         if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount()<<",\"relation_records\":"<<diskStorage->RelationCount()<<",\"relation_store_state\":\""<<diskStorage->RelationState()<<"\"";
         if(workerStorage){
+            const auto core=workerStorage->GetOfflineCoreCounts();
+            out<<",\"core_counts\":{\"strings\":"<<core[0]<<",\"callstacks\":"<<core[1]<<",\"cpu_zones\":"<<core[2]<<",\"gpu_zones\":"<<core[3]<<",\"cpu_children\":"<<core[4]<<",\"callstack_frames\":"<<core[5]<<",\"unique_strings\":"<<core[6]<<",\"slab_bytes\":"<<core[7]<<'}';
             if(options.allocationDiagnostics){const auto witness=workerStorage->GetOfflineMemoryWitness();
                 out<<",\"slab_allocated_bytes\":"<<witness[0]<<",\"zone_extra_size\":"<<witness[1]
                     <<",\"zone_extra_capacity_bytes\":"<<witness[2]<<",\"zone_extra_owner\":"<<witness[3];}
@@ -1607,6 +1609,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             out<<'}';
         }
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
+        if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
         out<<'}';conversionEvidence=out.str();
     }};
 

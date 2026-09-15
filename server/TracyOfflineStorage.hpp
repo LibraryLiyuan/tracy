@@ -1,6 +1,7 @@
 #ifndef TRACY_OFFLINE_STORAGE_HPP
 #define TRACY_OFFLINE_STORAGE_HPP
 #include "TracyJnData.hpp"
+#include "TracyOfflineDomains.hpp"
 #include <functional>
 namespace tracy
 {
@@ -8,6 +9,9 @@ class WorkerOfflineStorage
 {
 public:
     virtual ~WorkerOfflineStorage()=default;
+    virtual void AppendRecord(OfflineAppendDomain,const void*,uint32_t)=0;
+    virtual uint64_t RecordCount(OfflineAppendDomain) const=0;
+    virtual void VisitRecords(OfflineAppendDomain,const std::function<void(const void*,uint64_t)>&)=0;
     virtual uint64_t ZoneExtraCount() const=0;
     virtual uint32_t AppendZoneExtra(const void*)=0;
     virtual void ReadZoneExtra(uint32_t,void*)=0;

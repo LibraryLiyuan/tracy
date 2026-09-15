@@ -86,7 +86,10 @@ public:
         Relation,
         GpuReferencePass,
         GpuReferenceUse,
-        GpuReferenceEnd
+        GpuReferenceEnd,
+#define X(name,field,type) name,
+        TRACY_OFFLINE_APPEND_DOMAINS(X)
+#undef X
     };
 
     virtual ~SerializedZoneSink() = default;
@@ -621,6 +624,11 @@ public:
     // Diagnostic caller must first join offline replay (or hold the data lock).
     std::array<uint64_t,4> GetOfflineMemoryWitness() const {
         return {m_slab.AllocatedBytes(),m_data.zoneExtra.size(),m_data.zoneExtra.OwnedCapacityBytes(),reinterpret_cast<uintptr_t>(&m_data.zoneExtra)};
+    }
+    // Caller joins replay before reading; no traversal or large snapshot allocation.
+    std::array<uint64_t,8> GetOfflineCoreCounts() const {
+        return {m_data.stringData.size(),m_data.callstackPayload.size(),m_data.zonesCnt,m_data.gpuCnt,
+            m_data.zoneChildren.size(),m_data.callstackFrameMap.size(),m_data.stringMap.size(),m_slab.AllocatedBytes()};
     }
     uint64_t GetGpuZoneCount() const { return m_data.gpuCnt; }
     uint64_t GetLockCount() const;
@@ -1254,6 +1262,11 @@ private:
     Socket m_sock;
     WorkerOfflineTransport* m_offlineTransport = nullptr;
     WorkerOfflineStorage* m_offlineStorage = nullptr;
+    template<class T> void AppendOfflineRecord(OfflineAppendDomain domain,const T& row,std::vector<T>& memory){
+        if(m_offlineStorage)m_offlineStorage->AppendRecord(domain,&row,sizeof(T));else memory.push_back(row);
+    }
+
+
     std::string m_addr;
     uint16_t m_port;
     ProtocolObserver* m_protocolObserver = nullptr;

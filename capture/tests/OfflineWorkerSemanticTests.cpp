@@ -20,6 +20,9 @@ struct OfflineStorageSemanticTest {
     if(!storage){Vector<ZoneExtra> growing;for(const auto& row:w.m_data.zoneExtra)growing.push_back(row);w.m_data.zoneExtra=std::move(growing);}
     if(storage)for(uint64_t i=1;i<w.m_data.zoneExtra.size();++i)Check(storage->AppendZoneExtra(&w.m_data.zoneExtra[i])==i);
     w.m_offlineStorage=storage;w.m_threadCtx=901;w.m_timerMul=0.5;w.m_data.baseTime=100;
+#define X(name,field,type) w.m_data.jnTrace.field.clear(); {type row{};w.AppendOfflineRecord(OfflineAppendDomain::name,row,w.m_data.jnTrace.field);w.AppendOfflineRecord(OfflineAppendDomain::name,row,w.m_data.jnTrace.field);}
+    TRACY_OFFLINE_APPEND_DOMAINS(X)
+#undef X
     w.m_data.jnTrace.relations.clear();
     QueueJnRelation relation{};
     for(uint32_t i=0;i<130000;++i){
@@ -71,6 +74,9 @@ int main(int argc,char** argv) {
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());
  Check(newWorker.GetJnTraceData().relations.empty());store.Seal();
  OfflineStorageSemanticTest::CompareExtras(oldWorker,store);
+#define X(name,field,type) {uint64_t seen=0;Check(newWorker.GetJnTraceData().field.empty());store.VisitRecords(OfflineAppendDomain::name,[&](const void* rows,uint64_t n){Check(std::memcmp(rows,oldWorker.GetJnTraceData().field.data()+seen,size_t(n)*sizeof(type))==0);seen+=n;});Check(seen==oldWorker.GetJnTraceData().field.size());}
+ TRACY_OFFLINE_APPEND_DOMAINS(X)
+#undef X
  Check(store.RelationCount()==130002);
  uint64_t relationSeen=0;
  store.VisitRelations([&](const JnRelationData* rows,uint64_t n){Check(std::memcmp(rows,oldWorker.GetJnTraceData().relations.data()+relationSeen,size_t(n)*sizeof(*rows))==0);relationSeen+=n;});

@@ -6,11 +6,20 @@ static void Check(bool v){if(!v)throw std::runtime_error("relation storage invar
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 static void Zones(conversion::OfflineValidationSink& sink){ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();}
 int main(int argc,char** argv){try{
+ StringIdx largest(0xFFFFFE);Check(largest.Active()&&largest.Idx()==0xFFFFFE);
+ Refuses([]{StringIdx invalid(0xFFFFFF);});
+ Refuses([]{StringIdx invalid(UINT32_MAX);});
  if(argc!=2)return 2;auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
  storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  const std::string identity(64,'e');using Domain=SerializedZoneSink::JnDomain;
+ {
+ conversion::OfflineConversionStorage generic(root/"generic",identity,resources);
+ for(size_t i=0;i<OfflineAppendDomainCount;++i){auto domain=OfflineAppendDomain(i);auto width=OfflineAppendInfo(domain).width;std::vector<char> row(width,char(i+1));for(int j=0;j<3;++j)generic.AppendRecord(domain,row.data(),width);Check(generic.RecordCount(domain)==3);}
+ generic.Seal();
+ for(size_t i=0;i<OfflineAppendDomainCount;++i){auto domain=OfflineAppendDomain(i);uint64_t seen=0;generic.VisitRecords(domain,[&](const void* p,uint64_t n){auto bytes=static_cast<const char*>(p);for(uint64_t j=0;j<n*OfflineAppendInfo(domain).width;++j)Check(bytes[j]==char(i+1));seen+=n;});Check(seen==3);}
+ }
  {
  conversion::OfflineConversionStorage empty(root/"empty",identity,resources);empty.Seal();
  Check(empty.RelationCount()==0&&!std::filesystem::exists(root/"empty/relations"));

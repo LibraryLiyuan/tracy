@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <limits>
 #include <stdint.h>
+#include <stdexcept>
 #include <string>
 #include <string.h>
 
@@ -73,6 +74,7 @@ public:
 
     tracy_force_inline void SetIdx( uint32_t idx )
     {
+        if(idx>0xFFFFFEu)throw std::out_of_range("string_index_24bit_overflow:"+std::to_string(idx));
         idx++;
         memcpy( m_idx, &idx, 3 );
     }

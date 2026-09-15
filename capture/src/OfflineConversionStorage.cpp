@@ -60,6 +60,10 @@ void OfflineConversionStorage::Seal()
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
     m_jobHash=analysis::Sha256Builder().FinalHex();m_useHash=m_jobHash;
     m_relationHash=m_jobHash;
+    for(auto& table:m_appendTables){
+        if(table.failed)throw std::runtime_error("offline_append_failed");table.hash=m_jobHash;
+        if(table.writer){try{if(table.count!=table.writer->Count())throw std::runtime_error("offline_append_count");table.writer->Commit();table.hash=table.writer->ContentHash();table.writer.reset();}catch(...){table.failed=true;throw;}}
+    }
     if(m_relationFailed)throw std::runtime_error("relation_store_failed");
     if(m_relations){
         try {
@@ -87,6 +91,27 @@ void OfflineConversionStorage::AppendRelation(const JnRelationData& row)
         if(!m_relations)m_relations=std::make_unique<analysis::PagedRecordWriter>(m_root/"relations",m_identity,uint32_t(sizeof(row)),Options());
         m_relations->Append(&row,1);m_relationCount=m_relations->Count();
     }catch(...){m_relationFailed=true;throw;}
+}
+void OfflineConversionStorage::AppendRecord(OfflineAppendDomain domain,const void* row,uint32_t width)
+{
+    Check();const auto& info=OfflineAppendInfo(domain);auto& table=m_appendTables[size_t(domain)];
+    if(m_sealed||table.failed||width!=info.width||!row)throw std::runtime_error("offline_append_state_or_width");
+    try{if(!table.writer){auto options=Options();options.blockBytes=1024*1024;table.writer=std::make_unique<analysis::PagedRecordWriter>(m_root/info.name,m_identity,width,options);}table.writer->Append(row,1);table.count=table.writer->Count();}
+    catch(...){table.failed=true;throw;}
+}
+uint64_t OfflineConversionStorage::RecordCount(OfflineAppendDomain domain) const
+{OfflineAppendInfo(domain);return m_appendTables[size_t(domain)].count;}
+std::string OfflineConversionStorage::RecordHash(OfflineAppendDomain domain) const
+{OfflineAppendInfo(domain);const auto& table=m_appendTables[size_t(domain)];if(!m_sealed||table.failed)throw std::runtime_error("offline_append_not_sealed");return table.hash;}
+void OfflineConversionStorage::VisitRecords(OfflineAppendDomain domain,const std::function<void(const void*,uint64_t)>& visitor)
+{
+    Check();const auto& info=OfflineAppendInfo(domain);auto& table=m_appendTables[size_t(domain)];
+    if(!m_sealed||table.failed)throw std::runtime_error("offline_append_not_sealed");if(!table.count)return;
+    auto options=Options();options.blockBytes=1024*1024;analysis::PagedRecordReader reader(m_root/info.name,m_identity,info.width,options);reader.ValidateAll();
+    if(reader.Count()!=table.count)throw std::runtime_error("offline_append_count");
+    const auto capacity=std::min<uint64_t>(65536,table.count);const auto bytes=capacity*info.width;
+    m_resources.Check(bytes+256);analysis::AnalysisWorkspaceReservation lease(m_resources.Workspace(),bytes+256);std::vector<char> rows(size_t(bytes),0);
+    for(uint64_t offset=0;offset<table.count;){Check();auto take=std::min(capacity,table.count-offset);reader.Read(offset,rows.data(),take);visitor(rows.data(),take);offset+=take;}
 }
 void OfflineConversionStorage::VisitRelations(const std::function<void(const JnRelationData*,uint64_t)>& visitor)
 {Check();if(!m_sealed||m_relationFailed)throw std::runtime_error("relation_store_not_sealed");if(m_relationCount)Visit("relations",visitor);}

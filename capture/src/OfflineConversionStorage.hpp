@@ -5,6 +5,7 @@
 #include "../../analysis/TracyPagedRecordStore.hpp"
 #include "../../storage/TracyMutableRecordStore.hpp"
 #include <vector>
+#include <array>
 namespace tracy::conversion
 {
 class OfflineConversionStorage final : public WorkerOfflineStorage
@@ -12,6 +13,10 @@ class OfflineConversionStorage final : public WorkerOfflineStorage
 public:
     OfflineConversionStorage(std::filesystem::path root,std::string identity,storage::ConversionResources& resources);
     void Check() override;
+    void AppendRecord(OfflineAppendDomain,const void*,uint32_t) override;
+    uint64_t RecordCount(OfflineAppendDomain) const override;
+    void VisitRecords(OfflineAppendDomain,const std::function<void(const void*,uint64_t)>&) override;
+    std::string RecordHash(OfflineAppendDomain) const;
     uint64_t ZoneExtraCount() const override { return m_zoneExtras?m_zoneExtras->Count():1; }
     uint32_t AppendZoneExtra(const void*) override;
     void ReadZoneExtra(uint32_t,void*) override;
@@ -37,6 +42,8 @@ public:
     std::string JobStageHash() const;
     std::string ReferenceUseHash() const;
 private:
+    struct AppendTable {std::unique_ptr<analysis::PagedRecordWriter> writer;uint64_t count=0;std::string hash;bool failed=false;};
+    std::array<AppendTable,OfflineAppendDomainCount> m_appendTables;
     template<class T> void Visit(const char*,const std::function<void(const T*,uint64_t)>&);
     analysis::PagedRecordOptions Options();
     std::filesystem::path m_root;

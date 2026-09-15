@@ -92,6 +92,15 @@ static void WriteJnVector( FileWrite& f, const std::vector<T>& source )
     if( size != 0 ) f.Write( source.data(), size * sizeof( T ) );
 }
 
+template<class T> static void WriteOfflineJnVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineAppendDomain domain)
+{
+    if(!storage){WriteJnVector(file,memory);return;}
+    if(OfflineAppendInfo(domain).width!=sizeof(T))throw std::runtime_error("offline_write_width");
+    const uint64_t count=storage->RecordCount(domain);file.Write(&count,sizeof(count));uint64_t seen=0;
+    storage->VisitRecords(domain,[&](const void* rows,uint64_t n){if(n>count-seen)throw std::runtime_error("offline_write_count");file.Write(rows,size_t(n)*sizeof(T));seen+=n;});
+    if(seen!=count)throw std::runtime_error("offline_write_count");
+}
+
 template<typename T>
 static uint64_t AppendJnCatalogRecords( std::vector<T>& target, const uint8_t* data, uint32_t count )
 {
@@ -1976,7 +1985,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         jn.present = present != 0;
         jn.schemaVersion = schemaVersion;
         ReadJnVector( f, jn.jobTypes, "job type" );
-        ReadJnVector( f, jn.jobSchedules, "job schedule" );
+        ReadJnVector(f,jn.jobSchedules,"job schedule",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobSchedule);
         if( schemaVersion == 1 )
         {
 #pragma pack( push, 1 )
@@ -1999,24 +2008,24 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         else
         {
-            ReadJnVector( f, jn.jobConfigs, "job config" );
+            ReadJnVector(f,jn.jobConfigs,"job config",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobConfig);
         }
-        ReadJnVector( f, jn.jobDependencies, "job dependency" );
+        ReadJnVector(f,jn.jobDependencies,"job dependency",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobDependency);
         ReadJnVector( f, jn.jobStages, "job stage",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobStage );
-        ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
+        ReadJnVector(f,jn.gfxDispatches,"gfx dispatch",m_serializedZoneSink,SerializedZoneSink::JnDomain::GfxDispatch);
         ReadJnVector( f, jn.gfxEntities, "gfx entity", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxEntity );
         ReadJnVector( f, jn.gfxLinks, "gfx link", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxLink );
-        if( schemaVersion >= 2 ) ReadJnVector( f, jn.frames, "frame correlation" );
+        if( schemaVersion >= 2 ) ReadJnVector(f,jn.frames,"frame correlation",m_serializedZoneSink,SerializedZoneSink::JnDomain::Frame);
         if( schemaVersion >= 3 )
         {
-            ReadJnVector( f, jn.ioRequests, "I/O request" );
-            ReadJnVector( f, jn.ioConfigs, "I/O config" );
-            ReadJnVector( f, jn.ioStages, "I/O stage" );
+            ReadJnVector(f,jn.ioRequests,"I/O request",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoRequest);
+            ReadJnVector(f,jn.ioConfigs,"I/O config",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoConfig);
+            ReadJnVector(f,jn.ioStages,"I/O stage",m_serializedZoneSink,SerializedZoneSink::JnDomain::IoStage);
         }
         if( schemaVersion >= 4 )
         {
             ReadJnVector( f, jn.relations, "relation", m_serializedZoneSink, SerializedZoneSink::JnDomain::Relation );
-            ReadJnVector( f, jn.runtimeDomainStates, "runtime domain state" );
+            ReadJnVector(f,jn.runtimeDomainStates,"runtime domain state",m_serializedZoneSink,SerializedZoneSink::JnDomain::RuntimeDomainState);
         }
         if( schemaVersion >= 5 )
         {
@@ -2049,12 +2058,12 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         if( schemaVersion >= 6 )
         {
-            ReadJnVector( f, jn.scriptFrames, "script frame" );
-            ReadJnVector( f, jn.scriptStacks, "script stack" );
+            ReadJnVector(f,jn.scriptFrames,"script frame",m_serializedZoneSink,SerializedZoneSink::JnDomain::ScriptFrame);
+            ReadJnVector(f,jn.scriptStacks,"script stack",m_serializedZoneSink,SerializedZoneSink::JnDomain::ScriptStack);
         }
         if( schemaVersion >= 8 )
         {
-            ReadJnVector( f, jn.callsites, "callsite" );
+            ReadJnVector(f,jn.callsites,"callsite",m_serializedZoneSink,SerializedZoneSink::JnDomain::Callsite);
         }
         if( schemaVersion >= 12 )
         {
@@ -6646,7 +6655,7 @@ void Worker::ProcessJnJobSchedule( const QueueJnJobSchedule& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobSchedules.push_back( JnJobScheduleData { time, ev.jobId, ev.packedHandle, m_threadCtx, ev.dependencyCount, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobSchedule, JnJobScheduleData { time, ev.jobId, ev.packedHandle, m_threadCtx, ev.dependencyCount, ev.kind, ev.flags }, data.jobSchedules);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6655,7 +6664,7 @@ void Worker::ProcessJnJobConfig( const QueueJnJobConfig& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobConfigs.push_back( JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.originFrameSequence, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobConfig, JnJobConfigData { ev.jobId, ev.typeId, ev.count, ev.grainSize, ev.unityFlowId, ev.originFrameSequence, ev.kind, ev.flags }, data.jobConfigs);
 }
 
 void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
@@ -6663,7 +6672,7 @@ void Worker::ProcessJnJobDependency( const QueueJnJobDependency& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.jobDependencies.push_back( JnJobDependencyData { ev.jobId, ev.prerequisiteJobId, ev.prerequisiteHandle, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::JobDependency, JnJobDependencyData { ev.jobId, ev.prerequisiteJobId, ev.prerequisiteHandle, ev.flags }, data.jobDependencies);
 }
 
 void Worker::ProcessJnJobStage( const QueueJnJobStage& ev )
@@ -6693,7 +6702,7 @@ void Worker::ProcessJnGfxDispatch( const QueueJnGfxDispatch& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxDispatches.push_back( JnGfxDispatchData { time, ev.dispatchId, ev.frameIndex, m_threadCtx, ev.expectedJobs, ev.threadingMode, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxDispatch, JnGfxDispatchData { time, ev.dispatchId, ev.frameIndex, m_threadCtx, ev.expectedJobs, ev.threadingMode, ev.flags }, data.gfxDispatches);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6723,7 +6732,7 @@ void Worker::ProcessJnFrame( const QueueJnFrame& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.frames.push_back( JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::Frame, JnFrameData { time, ev.frameId, ev.domainIndex, m_threadCtx, ev.domain, ev.phase, ev.flags }, data.frames);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6733,7 +6742,7 @@ void Worker::ProcessJnIoRequest( const QueueJnIoRequest& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.ioRequests.push_back( JnIoRequestData { time, ev.requestId, ev.resourceId, m_threadCtx, ev.operation, ev.source, ev.priority, ev.subsystem, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoRequest, JnIoRequestData { time, ev.requestId, ev.resourceId, m_threadCtx, ev.operation, ev.source, ev.priority, ev.subsystem, ev.flags }, data.ioRequests);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6742,7 +6751,7 @@ void Worker::ProcessJnIoConfig( const QueueJnIoConfig& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.ioConfigs.push_back( JnIoConfigData { ev.requestId, ev.parentId, ev.requestedBytes, ev.originFrameSequence, ev.parentKind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoConfig, JnIoConfigData { ev.requestId, ev.parentId, ev.requestedBytes, ev.originFrameSequence, ev.parentKind, ev.flags }, data.ioConfigs);
 }
 
 void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
@@ -6760,7 +6769,7 @@ void Worker::ProcessJnIoStage( const QueueJnIoStage& ev )
         thread = ev.detail;
         m_serialNextCallstack = 0;
     }
-    data.ioStages.push_back( JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::IoStage, JnIoStageData { time, ev.requestId, ev.bytes, thread, detail, ev.stage, ev.status, ev.flags }, data.ioStages);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6782,8 +6791,8 @@ void Worker::ProcessJnRuntimeDomainState( const QueueJnRuntimeDomainState& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.runtimeDomainStates.push_back( JnRuntimeDomainStateData { time, ev.generation, ev.requestedFrame,
-        m_threadCtx, ev.domain, ev.requestedMode, ev.effectiveMode, ev.reason, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::RuntimeDomainState, JnRuntimeDomainStateData { time, ev.generation, ev.requestedFrame,
+        m_threadCtx, ev.domain, ev.requestedMode, ev.effectiveMode, ev.reason, ev.flags }, data.runtimeDomainStates);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6875,8 +6884,8 @@ void Worker::ProcessJnScriptFrame( const QueueJnScriptFrame& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.scriptFrames.push_back( JnScriptFrameData { ev.function, ev.file, m_threadCtx,
-        ev.frameId, ev.line, ev.runtime, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::ScriptFrame, JnScriptFrameData { ev.function, ev.file, m_threadCtx,
+        ev.frameId, ev.line, ev.runtime, ev.flags }, data.scriptFrames);
 }
 
 void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
@@ -6886,8 +6895,8 @@ void Worker::ProcessJnScriptStack( const QueueJnScriptStack& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.scriptStacks.push_back( JnScriptStackData { time, ev.primaryId, ev.secondaryId, m_threadCtx,
-        ev.value, ev.runtime, ev.flags, ev.kind } );
+    AppendOfflineRecord(OfflineAppendDomain::ScriptStack, JnScriptStackData { time, ev.primaryId, ev.secondaryId, m_threadCtx,
+        ev.value, ev.runtime, ev.flags, ev.kind }, data.scriptStacks);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6910,8 +6919,8 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.callsites.push_back( JnCallsiteData { uint64_t( ev.thread ), ev.callsiteId, callstack,
-        sourceLocation, ev.domain, ev.provenance, ev.flags, ev.unavailableReason } );
+    AppendOfflineRecord(OfflineAppendDomain::Callsite, JnCallsiteData { uint64_t( ev.thread ), ev.callsiteId, callstack,
+        sourceLocation, ev.domain, ev.provenance, ev.flags, ev.unavailableReason }, data.callsites);
     m_jnCallsiteCallstacks[ev.callsiteId] = callstack;
 
     const auto cpuPending = m_jnPendingCpuCallsites.find( ev.callsiteId );
@@ -11571,34 +11580,34 @@ void Worker::Write( FileWrite& f, bool fiDict )
     const uint8_t jnPresent = m_data.jnTrace.present;
     f.Write( &jnPresent, sizeof( jnPresent ) );
     WriteJnVector( f, m_data.jnTrace.jobTypes );
-    WriteJnVector( f, m_data.jnTrace.jobSchedules );
-    WriteJnVector( f, m_data.jnTrace.jobConfigs );
-    WriteJnVector( f, m_data.jnTrace.jobDependencies );
+    WriteOfflineJnVector(f,m_data.jnTrace.jobSchedules,m_offlineStorage,OfflineAppendDomain::JobSchedule);
+    WriteOfflineJnVector(f,m_data.jnTrace.jobConfigs,m_offlineStorage,OfflineAppendDomain::JobConfig);
+    WriteOfflineJnVector(f,m_data.jnTrace.jobDependencies,m_offlineStorage,OfflineAppendDomain::JobDependency);
     if(m_offlineStorage) {
         const uint64_t count=m_offlineStorage->JobStageCount();f.Write(&count,sizeof(count));
         m_offlineStorage->VisitJobStages([&](const JnJobStageData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
     }else WriteJnVector( f, m_data.jnTrace.jobStages );
-    WriteJnVector( f, m_data.jnTrace.gfxDispatches );
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxDispatches,m_offlineStorage,OfflineAppendDomain::GfxDispatch);
     WriteJnVector( f, m_data.jnTrace.gfxEntities );
     WriteJnVector( f, m_data.jnTrace.gfxLinks );
-    WriteJnVector( f, m_data.jnTrace.frames );
-    WriteJnVector( f, m_data.jnTrace.ioRequests );
-    WriteJnVector( f, m_data.jnTrace.ioConfigs );
-    WriteJnVector( f, m_data.jnTrace.ioStages );
+    WriteOfflineJnVector(f,m_data.jnTrace.frames,m_offlineStorage,OfflineAppendDomain::Frame);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioRequests,m_offlineStorage,OfflineAppendDomain::IoRequest);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioConfigs,m_offlineStorage,OfflineAppendDomain::IoConfig);
+    WriteOfflineJnVector(f,m_data.jnTrace.ioStages,m_offlineStorage,OfflineAppendDomain::IoStage);
     if(m_offlineStorage) {
         const uint64_t count=m_offlineStorage->RelationCount();f.Write(&count,sizeof(count));
         m_offlineStorage->VisitRelations([&](const JnRelationData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
     }else WriteJnVector( f, m_data.jnTrace.relations );
-    WriteJnVector( f, m_data.jnTrace.runtimeDomainStates );
+    WriteOfflineJnVector(f,m_data.jnTrace.runtimeDomainStates,m_offlineStorage,OfflineAppendDomain::RuntimeDomainState);
     WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
     if(m_offlineStorage) {
         const uint64_t count=m_offlineStorage->ReferenceUseCount();f.Write(&count,sizeof(count));
         m_offlineStorage->VisitReferenceUses([&](const JnGpuReferenceUseData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
     }else WriteJnVector( f, m_data.jnTrace.gpuReferenceUses );
     WriteJnVector( f, m_data.jnTrace.gpuReferenceEnds );
-    WriteJnVector( f, m_data.jnTrace.scriptFrames );
-    WriteJnVector( f, m_data.jnTrace.scriptStacks );
-    WriteJnVector( f, m_data.jnTrace.callsites );
+    WriteOfflineJnVector(f,m_data.jnTrace.scriptFrames,m_offlineStorage,OfflineAppendDomain::ScriptFrame);
+    WriteOfflineJnVector(f,m_data.jnTrace.scriptStacks,m_offlineStorage,OfflineAppendDomain::ScriptStack);
+    WriteOfflineJnVector(f,m_data.jnTrace.callsites,m_offlineStorage,OfflineAppendDomain::Callsite);
     const uint8_t gpuCatalogPresent = m_data.jnTrace.gpuCatalogPresent ? 1 : 0;
     const uint8_t gpuCatalogValid = m_data.jnTrace.gpuCatalogValid ? 1 : 0;
     f.Write( &gpuCatalogPresent, sizeof( gpuCatalogPresent ) );
