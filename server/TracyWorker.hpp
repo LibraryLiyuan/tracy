@@ -103,6 +103,9 @@ public:
     virtual void GpuZoneEnd( uint64_t index, int64_t cpuEnd, int64_t gpuEnd, uint16_t queryId ) = 0;
     virtual void GpuZonesEnd() = 0;
     virtual bool WantsJnRecords( JnDomain, uint32_t ) const { return false; }
+    virtual bool AllowsLargeJnRecords( JnDomain, uint64_t, uint32_t ) const { return false; }
+    virtual void JnBufferBytes(uint64_t) {}
+    virtual void CheckRead() {}
     virtual void JnRecordsBegin( JnDomain, uint64_t, uint32_t ) {}
     virtual void JnRecordsBlock( JnDomain, uint64_t, const void*, uint64_t, uint32_t ) {}
     virtual void JnRecordsEnd( JnDomain ) {}

@@ -13,6 +13,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <memory>
+#include <exception>
+#include "TracyFileReadHooks.hpp"
+#include "../analysis/TracyAnalysisIoPath.hpp"
 #include <zstd.h>
 
 #ifdef _MSC_VER
@@ -38,7 +42,7 @@ struct FileReadError : public std::exception {};
 class ReadStream
 {
 public:
-    ReadStream( uint8_t type )
+    ReadStream( uint8_t type, bool bounded=false )
         : m_stream( nullptr )
         , m_streamZstd( nullptr )
         , m_buf( new char[FileBufSize] )
@@ -51,6 +55,10 @@ public:
             break;
         case 1:
             m_streamZstd = ZSTD_createDStream();
+            if(!m_streamZstd) throw std::bad_alloc();
+            if(bounded && ZSTD_isError(ZSTD_DCtx_setParameter(m_streamZstd,ZSTD_d_windowLogMax,22))) {
+                ZSTD_freeDStream(m_streamZstd);m_streamZstd=nullptr;throw FileReadError();
+            }
             break;
         default:
             assert( false );
@@ -60,8 +68,6 @@ public:
 
     ~ReadStream()
     {
-        delete[] m_buf;
-        delete[] m_second;
 
         if( m_stream ) LZ4_freeStreamDecode( m_stream );
         if( m_streamZstd ) ZSTD_freeDStream( m_streamZstd );
@@ -72,26 +78,27 @@ public:
         std::swap( m_buf, m_second );
         if( m_stream )
         {
-            m_size = (size_t)LZ4_decompress_safe_continue( m_stream, src, m_buf, size, FileBufSize );
+            const auto decoded=LZ4_decompress_safe_continue( m_stream, src, m_buf.get(), size, FileBufSize );
+            if(decoded<=0) throw FileReadError();m_size=size_t(decoded);
         }
         else
         {
-            ZSTD_outBuffer out = { m_buf, FileBufSize, 0 };
+            ZSTD_outBuffer out = { m_buf.get(), FileBufSize, 0 };
             ZSTD_inBuffer in = { src, size, 0 };
-            ZSTD_decompressStream( m_streamZstd, &out, &in );
+            const auto result=ZSTD_decompressStream( m_streamZstd, &out, &in );
+            if(ZSTD_isError(result)||in.pos!=in.size||out.pos==0)throw FileReadError();
             m_size = out.pos;
         }
     }
 
-    const char* GetBuffer() const { return m_buf; }
+    const char* GetBuffer() const { return m_buf.get(); }
     size_t GetSize() const { return m_size; }
 
 private:
     LZ4_streamDecode_t* m_stream;
     ZSTD_DStream* m_streamZstd;
 
-    char* m_buf;
-    char* m_second;
+    std::unique_ptr<char[]> m_buf,m_second;
 
     size_t m_size;
 };
@@ -100,7 +107,8 @@ class FileRead
 {
     struct StreamHandle
     {
-        StreamHandle( uint8_t type ) : stream( type ), outputReady( false ) {}
+        StreamHandle( uint8_t type,bool bounded ) : stream( type,bounded ), outputReady( false ) {}
+        std::exception_ptr error;
 
         ReadStream stream;
         const char* src;
@@ -118,13 +126,25 @@ class FileRead
     };
 
 public:
-    static FileRead* Open( const char* fn )
+    static FileRead* Open( const char* fn,std::shared_ptr<FileReadHooks> hooks={} )
     {
         auto f = fopen( fn, "rb" );
-        return f ? new FileRead( f, fn ) : nullptr;
+        return f ? new FileRead( f, fn,std::move(hooks) ) : nullptr;
+    }
+    static FileRead* Open(const std::filesystem::path& fn,std::shared_ptr<FileReadHooks> hooks={}) {
+#ifdef _WIN32
+        auto f=_wfopen(analysis::AnalysisIoPath(fn).c_str(),L"rb");
+#else
+        auto f=fopen(fn.c_str(),"rb");
+#endif
+        const auto name=fn.u8string();
+        return f?new FileRead(f,reinterpret_cast<const char*>(name.c_str()),std::move(hooks)):nullptr;
     }
 
     ~FileRead()
+    {Cleanup();}
+private:
+    void Cleanup() noexcept
     {
         for( auto& v : m_streams )
         {
@@ -132,11 +152,12 @@ public:
             v->exit = true;
             v->signal.notify_one();
         }
-        for( auto& v : m_streams ) v->thread.join();
+        for( auto& v : m_streams ) if(v->thread.joinable()) v->thread.join();
         m_streams.clear();
-        if( m_data ) munmap( m_data, m_dataSize );
+        if( m_data ){munmap( m_data, m_dataSize );m_data=nullptr;}
+        try{if(m_hooks&&m_hooks->reserveMemory)m_hooks->reserveMemory(0);}catch(...){}
     }
-
+public:
     tracy_force_inline void Read( void* ptr, size_t size )
     {
         if( size <= m_bufSize - m_offset )
@@ -414,17 +435,19 @@ public:
     const std::string& GetFilename() const { return m_filename; }
 
 private:
-    FileRead( FILE* f, const char* fn )
+    FileRead( FILE* f, const char* fn,std::shared_ptr<FileReadHooks> hooks )
         : m_data( nullptr )
         , m_offset( 0 )
         , m_bufSize( 0 )
         , m_streamId( 0 )
         , m_filename( fn )
+        , m_hooks(std::move(hooks))
     {
+        try {
+        if(m_hooks&&m_hooks->check)m_hooks->check();
         char hdr[4];
         if( fread( hdr, 1, sizeof( hdr ), f ) != sizeof( hdr ) )
         {
-            fclose( f );
             throw NotTracyDump();
         }
 
@@ -436,12 +459,10 @@ private:
         {
             if( fread( &type, 1, 1, f ) != 1 || type > 1 )
             {
-                fclose( f );
                 throw NotTracyDump();
             }
-            if( fread( &streams, 1, 1, f ) != 1 )
+            if( fread( &streams, 1, 1, f ) != 1 || streams==0 )
             {
-                fclose( f );
                 throw NotTracyDump();
             }
             m_dataOffset += 2;
@@ -456,34 +477,40 @@ private:
         }
         else
         {
-            fclose( f );
             throw NotTracyDump();
         }
 
         struct stat64 buf;
-        if( stat64( fn, &buf ) == 0 )
+#ifdef _MSC_VER
+        if( _fstat64( _fileno(f), &buf ) == 0 )
+#else
+        if( fstat64( fileno(f), &buf ) == 0 )
+#endif
         {
             m_dataSize = buf.st_size;
         }
         else
         {
-            fclose( f );
             throw FileReadError();
         }
+
+        if(m_hooks&&m_hooks->reserveMemory)m_hooks->reserveMemory(uint64_t(streams)*(8ull<<20));
 
         m_data = (char*)mmap( nullptr, m_dataSize, PROT_READ, MAP_SHARED, fileno( f ), 0 );
-        fclose( f );
-        if( !m_data )
+        fclose( f );f=nullptr;
+        if( !m_data || m_data==reinterpret_cast<char*>(-1) )
         {
+            m_data=nullptr;
             throw FileReadError();
         }
 
+        m_streams.reserve(streams);
         for( int i=0; i<(int)streams; i++ )
         {
             if( m_dataOffset == m_dataSize ) break;
 
             const auto sz = ReadBlockSize();
-            auto uptr = std::make_unique<StreamHandle>( type );
+            auto uptr = std::make_unique<StreamHandle>( type,bool(m_hooks) );
             uptr->src = m_data + m_dataOffset;
             uptr->size = sz;
             uptr->inputReady = true;
@@ -493,6 +520,11 @@ private:
         }
 
         GetNextDataBlock();
+        }catch(...) {
+            if(f)fclose(f);Cleanup();
+            try{if(m_hooks&&m_hooks->failed)m_hooks->failed("file_read_open_or_decode_failed");}catch(...){}
+            throw;
+        }
     }
 
     tracy_force_inline uint32_t ReadBlockSize()
@@ -514,7 +546,8 @@ private:
             if( hnd->exit ) return;
             lock.unlock();
 
-            hnd->stream.Decompress( hnd->src, hnd->size );
+            try{hnd->stream.Decompress( hnd->src, hnd->size );}
+            catch(...){hnd->error=std::current_exception();}
             hnd->inputReady = false;
             hnd->outputReady.store( true, std::memory_order_release );
         }
@@ -566,9 +599,14 @@ private:
 
     void GetNextDataBlock()
     {
+        if(m_hooks&&m_hooks->check)m_hooks->check();
+        if(m_streams.empty())throw FileReadError();
         auto& hnd = *m_streams[m_streamId];
         if( hnd.exhausted ) throw FileReadError();
-        while( hnd.outputReady.load( std::memory_order_acquire ) == false ) { YieldThread(); }
+        while( hnd.outputReady.load( std::memory_order_acquire ) == false ) {
+            if(m_hooks&&m_hooks->check)m_hooks->check();YieldThread();
+        }
+        if(hnd.error)std::rethrow_exception(hnd.error);
         hnd.outputReady.store( false, std::memory_order_relaxed );
         m_buf = hnd.stream.GetBuffer();
         m_bufSize = hnd.stream.GetSize();
@@ -602,6 +640,7 @@ private:
     int m_streamId;
 
     std::string m_filename;
+    std::shared_ptr<FileReadHooks> m_hooks;
 
     std::vector<std::unique_ptr<StreamHandle>> m_streams;
 };

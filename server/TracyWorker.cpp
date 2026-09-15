@@ -40,6 +40,7 @@
 #include "TracySort.hpp"
 #include "TracyTaskDispatch.hpp"
 #include "TracyWorker.hpp"
+#include "TracyJnRecordReader.hpp"
 #include "tracy_pdqsort.h"
 
 namespace tracy
@@ -80,33 +81,7 @@ template<typename T>
 static void ReadJnVector( FileRead& f, std::vector<T>& target, const char* domain,
     SerializedZoneSink* sink, SerializedZoneSink::JnDomain sinkDomain )
 {
-    uint64_t size;
-    f.Read( size );
-    if( size > JnTraceMaxRecordsPerDomain )
-    {
-        char message[128];
-        snprintf( message, sizeof( message ), "JN trace %s record count is invalid.", domain );
-        throw LoadFailure( message );
-    }
-    if( !sink || !sink->WantsJnRecords( sinkDomain, sizeof( T ) ) )
-    {
-        target.resize( size );
-        if( size != 0 ) f.Read( target.data(), size * sizeof( T ) );
-        return;
-    }
-
-    sink->JnRecordsBegin( sinkDomain, size, sizeof( T ) );
-    constexpr uint64_t RecordsPerBlock = 64 * 1024;
-    std::vector<T> block( size_t( std::min<uint64_t>( size, RecordsPerBlock ) ) );
-    uint64_t offset = 0;
-    while( offset < size )
-    {
-        const auto count = std::min<uint64_t>( RecordsPerBlock, size - offset );
-        f.Read( block.data(), count * sizeof( T ) );
-        sink->JnRecordsBlock( sinkDomain, offset, block.data(), count, sizeof( T ) );
-        offset += count;
-    }
-    sink->JnRecordsEnd( sinkDomain );
+    ReadJnRecordsToSink(f,target,domain,sink,sinkDomain);
 }
 
 template<typename T>
@@ -2009,7 +1984,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             ReadJnVector( f, jn.jobConfigs, "job config" );
         }
         ReadJnVector( f, jn.jobDependencies, "job dependency" );
-        ReadJnVector( f, jn.jobStages, "job stage" );
+        ReadJnVector( f, jn.jobStages, "job stage",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobStage );
         ReadJnVector( f, jn.gfxDispatches, "gfx dispatch" );
         ReadJnVector( f, jn.gfxEntities, "gfx entity", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxEntity );
         ReadJnVector( f, jn.gfxLinks, "gfx link", m_serializedZoneSink, SerializedZoneSink::JnDomain::GfxLink );
