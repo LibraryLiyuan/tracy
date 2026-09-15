@@ -81,6 +81,20 @@ private:
 };
 struct AnalysisDiskBudget
 {
+    struct TraceLimits
+    {
+        uint64_t finalBytes;
+        uint64_t peakBytes;
+        void CheckFinal(uint64_t bytes) const
+        {
+            if(bytes>finalBytes) throw std::runtime_error("analysis_final_disk_ratio");
+        }
+    };
+    static TraceLimits ForTrace(uint64_t bytes)
+    {
+        if(!bytes || bytes>UINT64_MAX/16) throw std::runtime_error("analysis_disk_trace_size");
+        return {bytes*8,bytes*16};
+    }
     std::shared_ptr<AnalysisDiskUsage> usage;
     uint64_t maximumBytes=UINT64_MAX;
     std::function<void()> checkSpace;

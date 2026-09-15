@@ -1,0 +1,43 @@
+#ifndef TRACY_PAGED_RECORD_STORE_HPP
+#define TRACY_PAGED_RECORD_STORE_HPP
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
+#include <filesystem>
+#include <functional>
+#include <memory>
+#include <string>
+namespace tracy::analysis
+{
+struct PagedRecordOptions
+{
+    uint32_t blockBytes=4*1024*1024;
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    std::shared_ptr<AnalysisDiskBudget> disk;
+    std::function<bool()> cancelled;
+};
+// Fixed-width records (including byte records for string/blob storage). The
+// ordinal directory is on disk; neither open nor lookup materializes it.
+class PagedRecordWriter
+{
+public:
+    PagedRecordWriter(std::filesystem::path root,std::string identity,uint32_t recordBytes,PagedRecordOptions options={});
+    ~PagedRecordWriter();
+    void Append(const void* records,uint64_t count);
+    void Commit();
+    uint64_t Count() const;
+private:
+    struct Impl; std::unique_ptr<Impl> m_impl;
+};
+class PagedRecordReader
+{
+public:
+    PagedRecordReader(std::filesystem::path root,std::string identity,uint32_t recordBytes,PagedRecordOptions options={});
+    ~PagedRecordReader();
+    uint64_t Count() const;
+    void Read(uint64_t ordinal,void* output,uint64_t count);
+    void ValidateAll();
+private:
+    struct Impl; std::unique_ptr<Impl> m_impl;
+};
+}
+#endif

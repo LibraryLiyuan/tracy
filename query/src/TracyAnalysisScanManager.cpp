@@ -762,8 +762,10 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         }
         progress( ScanState::Aggregating, 3, 4, "exact_statistics" );
         products.frameSeriesPath = temporaryRoot / "frame-series-v1.bin";
-        std::ofstream seriesOutput( products.frameSeriesPath, std::ios::binary | std::ios::trunc );
-        if( !seriesOutput ) throw std::runtime_error( "frame_series_open_failed" );
+        PagedRecordOptions seriesOptions; seriesOptions.workspace=workspace;
+        seriesOptions.disk=request.disk; seriesOptions.cancelled=cancelled;
+        PagedRecordWriter seriesOutput(products.frameSeriesPath,ComputeNeutralAggregateIdentity(request.aggregateIdentity),
+            sizeof(PolicySeriesRecord),seriesOptions);
         const auto selectEvidence = [&]( const NeutralSignatureAggregate& aggregate,
             const std::vector<NeutralMergedFrameValues>& frames, PolicySignatureContext& context ) {
             if( frames.empty() ) return;
@@ -892,9 +894,7 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         });
         if( !statistics.FinishToSink( summary, error, persistSignature,
             cancelled ) ) return false;
-        seriesOutput.flush();
-        if( !seriesOutput ) throw std::runtime_error( "frame_series_flush_failed" );
-        seriesOutput.close();
+        seriesOutput.Commit();
         if( !summary.qualityComplete )
         {
             error = "neutral_statistics_quality_incomplete";
@@ -1063,6 +1063,10 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     if( request.tracePath.empty() || !request.source || request.profileIdentity.size() != 64 ||
         !request.normalizedProfile.is_object() )
         throw std::invalid_argument( "analysis_scan_start_invalid" );
+    const auto traceLimits=AnalysisDiskBudget::ForTrace(std::filesystem::file_size(request.tracePath));
+    // Even the resumable state journal must fit before any namespace is
+    // published. There is deliberately no fixed-size floor overriding 16*S.
+    if(traceLimits.peakBytes<65536) throw std::runtime_error("analysis_scan_cache_disk_budget");
     const auto traceStrongId = request.source->GetTraceInfo().fingerprint;
     if( traceStrongId.empty() ) throw std::invalid_argument( "analysis_scan_trace_identity_missing" );
     NeutralAggregateIdentity aggregateIdentity { traceStrongId, m_queryExecutableSha256,
@@ -1104,7 +1108,7 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     std::filesystem::create_directories( entry->scanRoot );
     std::string error;
     if( !WriteJson( entry->scanRoot / "profile.json", request.normalizedProfile, error,m_diskUsage,
-        request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>() ) ||
+        std::min(traceLimits.peakBytes,request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>()) ) ||
         !SaveStateLocked( *entry, error ) ) throw std::runtime_error( error );
     {
         std::lock_guard lock( m_mutex );
@@ -1167,7 +1171,8 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     options.cancelled=[stopToken,disk] { disk->Check(); return stopToken.stop_requested(); };
     options.workspace=m_workspace;
     options.disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{m_diskUsage,
-        entry->request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>(),
+        std::min(AnalysisDiskBudget::ForTrace(std::filesystem::file_size(entry->request.tracePath)).peakBytes,
+            entry->request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>()),
         [disk]{disk->Check();}});
     const auto recordNeutral=[&](const std::string& generation,const std::string& sha) {
         std::lock_guard lock(entry->mutex);
@@ -1281,9 +1286,9 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     policy.cancelled = options.cancelled;
     const auto frameSeriesPath = products.frameSeriesPath;
     const uint64_t seriesBudget=32*1024*1024;
-    policy.readFrameSeries = [frameSeriesPath, seriesBudget, cancelled=options.cancelled]( const PolicySignatureContext& context ) {
+    policy.readFrameSeries = [frameSeriesPath, seriesBudget, identity, cancelled=options.cancelled]( const PolicySignatureContext& context ) {
         return ReadPolicyFrameSeries( frameSeriesPath, context, seriesBudget,
-            cancelled );
+            cancelled, identity );
     };
     const auto generation=NewGeneration(entry->scanRoot/"policy-generations");
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;

@@ -4,6 +4,7 @@
 #include "TracyCandidatePolicy.hpp"
 #include "TracyHash.hpp"
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyPagedRecordStore.hpp"
 #include <array>
 #include <bit>
 #include <fstream>
@@ -43,19 +44,43 @@ inline void WritePolicyFrameSeries( std::ostream& output, PolicySignatureContext
     context.frameSeriesComplete = true;
 }
 
+inline void WritePolicyFrameSeries( PagedRecordWriter& output, PolicySignatureContext& context,
+    const std::vector<NeutralMergedFrameValues>& frames,
+    const std::shared_ptr<AnalysisDiskBudget>& = {} )
+{
+    if(output.Count()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("frame_series_position_failed");
+    context.seriesOffset=output.Count()*sizeof(PolicySeriesRecord);
+    context.seriesCount=frames.size();
+    Sha256Builder hash;
+    for(const auto& frame:frames) {
+        const PolicySeriesRecord row{frame.frameIndex,uint64_t(frame.inclusiveNs),uint64_t(frame.exclusiveNs),
+            uint64_t(frame.waitNs),uint64_t(frame.criticalPathNs),frame.occurrenceCount,frame.exact?1ULL:0ULL};
+        output.Append(row.data(),1); hash.Update(row.data(),sizeof(row));
+    }
+    context.seriesSha256=hash.FinalHex(); context.frameSeriesComplete=true;
+}
+
 inline std::vector<PolicyFrameEvidence> ReadPolicyFrameSeries( const std::filesystem::path& path,
     const PolicySignatureContext& context, uint64_t memoryBudgetBytes,
-    const std::function<bool()>& cancelled = {} )
+    const std::function<bool()>& cancelled = {}, const std::string& identity = {} )
 {
     if( context.seriesCount == 0 ) return context.frames;
     constexpr uint64_t residentPerRow = sizeof( PolicyFrameEvidence ) * 4;
     if( context.seriesCount > memoryBudgetBytes / residentPerRow )
         throw std::runtime_error( "frame_series_memory_budget" );
-    const auto size = std::filesystem::file_size( path );
+    std::unique_ptr<PagedRecordReader> paged;
+    if(std::filesystem::is_directory(path)) {
+        PagedRecordOptions options; options.cancelled=cancelled;
+        options.blockBytes=uint32_t(std::min<uint64_t>(4*1024*1024,memoryBudgetBytes/4));
+        paged=std::make_unique<PagedRecordReader>(path,identity,sizeof(PolicySeriesRecord),options);
+        if(paged->Count()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("frame_series_extent_invalid");
+    }
+    const auto size = paged ? paged->Count()*sizeof(PolicySeriesRecord) : std::filesystem::file_size( path );
+    if(context.seriesOffset%sizeof(PolicySeriesRecord)) throw std::runtime_error("frame_series_extent_invalid");
     if( context.seriesOffset > size || context.seriesCount > ( size-context.seriesOffset ) / sizeof( PolicySeriesRecord ) )
         throw std::runtime_error( "frame_series_extent_invalid" );
-    std::ifstream file( path, std::ios::binary );
-    file.seekg( std::streamoff( context.seriesOffset ) );
+    std::ifstream file;
+    if(!paged) { file.open(path,std::ios::binary); file.seekg(std::streamoff(context.seriesOffset)); }
     std::vector<PolicyFrameEvidence> result;
     result.reserve( size_t( context.seriesCount ) );
     Sha256Builder hash;
@@ -63,8 +88,11 @@ inline std::vector<PolicyFrameEvidence> ReadPolicyFrameSeries( const std::filesy
     {
         if( ( i % 4096 == 0 ) && cancelled && cancelled() ) throw std::runtime_error( "cancelled" );
         PolicySeriesRecord row;
-        file.read( reinterpret_cast<char*>( row.data() ), sizeof( row ) );
-        if( !file ) throw std::runtime_error( "frame_series_read_failed" );
+        if(paged) paged->Read(context.seriesOffset/sizeof(PolicySeriesRecord)+i,row.data(),1);
+        else {
+            file.read( reinterpret_cast<char*>( row.data() ), sizeof( row ) );
+            if( !file ) throw std::runtime_error( "frame_series_read_failed" );
+        }
         hash.Update( row.data(), sizeof( row ) );
         size_t field = context.metricPreference == "inclusive" ? 1 :
             context.metricPreference == "wait" ? 3 : context.metricPreference == "critical" ? 4 : 2;

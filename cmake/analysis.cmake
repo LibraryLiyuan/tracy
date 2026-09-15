@@ -1,6 +1,7 @@
 set(TRACY_ANALYSIS_DIR ${CMAKE_CURRENT_LIST_DIR}/../analysis)
 
 set(TRACY_ANALYSIS_SOURCES
+    ${TRACY_ANALYSIS_DIR}/TracyPagedRecordStore.cpp
     ${TRACY_ANALYSIS_DIR}/TracyAnalysisProcessMemory.cpp
     ${TRACY_ANALYSIS_DIR}/TracyAnalysisCacheTable.cpp
     ${TRACY_ANALYSIS_DIR}/TracyAnalysisCacheSort.cpp

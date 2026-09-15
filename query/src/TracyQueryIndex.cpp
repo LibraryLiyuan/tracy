@@ -2,6 +2,8 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyWorker.hpp"
+#include "TracyPagedRecordStore.hpp"
+#include "TracyHash.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -475,6 +477,26 @@ private:
     std::unordered_map<uint32_t, uint64_t> m_gpuZonesByContext;
 };
 
+std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind)
+{
+    const auto value=std::string(source)+":jnidx:"+std::to_string(QueryIndexSchemaVersion)+":"+std::to_string(uint32_t(kind));
+    analysis::Sha256Builder hash; hash.Update(value.data(),value.size()); return hash.FinalHex();
+}
+uint64_t SectionBytes(const std::filesystem::path& path)
+{
+    return analysis::AnalysisDiskUsage::Bytes(path);
+}
+std::string SectionFingerprint(const std::filesystem::path& path)
+{
+    if(!std::filesystem::is_directory(path)) return analysis::WorkerTraceSource::ComputeFingerprint(path);
+    analysis::Sha256Builder hash;
+    for(const auto name:{"header.bin","directory.bin","data.bin"}) {
+        const auto value=std::string(name)+":"+analysis::Sha256File(path/name)+"\n";
+        hash.Update(value.data(),value.size());
+    }
+    return hash.FinalHex();
+}
+
 class ReadOnlyZoneSection
 {
 public:
@@ -488,9 +510,13 @@ public:
     ReadOnlyZoneSection& operator=( const ReadOnlyZoneSection& ) = delete;
 
     template<typename T>
-    const T& At( uint64_t index ) const
+    T At( uint64_t index ) const
     {
         if( index >= m_count || sizeof( T ) != m_recordBytes ) throw std::out_of_range( "zone index record is outside the mapped section" );
+        if(m_paged) {
+            std::lock_guard lock(m_readMutex);
+            T value{}; m_paged->Read(index,&value,1); return value;
+        }
         return *reinterpret_cast<const T*>( m_data + sizeof( ZoneSectionHeader ) + index * m_recordBytes );
     }
     uint64_t Count() const { return m_count; }
@@ -500,6 +526,12 @@ private:
     {
         if( section.recordBytes != recordBytes || section.count > ( std::numeric_limits<uint64_t>::max() - sizeof( ZoneSectionHeader ) ) / recordBytes )
             throw std::runtime_error( "zone index section layout mismatch" );
+        if(std::filesystem::is_directory(section.path)) {
+            if(SectionBytes(section.path)!=section.bytes) throw std::runtime_error("paged index section size mismatch");
+            m_paged=std::make_unique<analysis::PagedRecordReader>(section.path,PagedSectionIdentity(sourceFingerprint,kind),recordBytes);
+            if(m_paged->Count()!=section.count) throw std::runtime_error("paged index section count mismatch");
+            m_count=section.count; m_recordBytes=recordBytes; return;
+        }
         const auto expectedBytes = sizeof( ZoneSectionHeader ) + section.count * recordBytes;
         if( section.bytes != expectedBytes || std::filesystem::file_size( section.path ) != expectedBytes )
             throw std::runtime_error( "zone index section size mismatch" );
@@ -532,6 +564,7 @@ private:
 
     void Close()
     {
+        m_paged.reset();
 #ifdef _WIN32
         if( m_data ) UnmapViewOfFile( m_data );
         if( m_mapping ) CloseHandle( m_mapping );
@@ -545,6 +578,8 @@ private:
         m_data = nullptr; m_bytes = 0; m_count = 0; m_recordBytes = 0;
     }
 
+    std::unique_ptr<analysis::PagedRecordReader> m_paged;
+    mutable std::mutex m_readMutex;
     const uint8_t* m_data = nullptr;
     uint64_t m_bytes = 0;
     uint64_t m_count = 0;
@@ -1972,7 +2007,8 @@ private:
         dto.threadRef = m_source->MakeEntityRef( "thread", zone.thread );
         dto.sourceLocationRef = source ? source->ref : m_source->MakeEntityRef( "source", uint16_t( zone.sourceLocation ) );
         dto.extraIndex = zone.extra;
-        const ZoneExtraIndexRecord* extra = zone.extra < m_extras.Count() ? &m_extras.At<ZoneExtraIndexRecord>( zone.extra ) : nullptr;
+        std::optional<ZoneExtraIndexRecord> extra;
+        if(zone.extra<m_extras.Count()) extra=m_extras.At<ZoneExtraIndexRecord>(zone.extra);
         if( extra )
         {
             dto.extraColor = extra->color;
@@ -2189,7 +2225,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     // fingerprint; this bounded basename is only a collision-resistant local
     // section identity within the trace directory.
     const auto baseName = std::string( "jnidx." ) + result.sourceFingerprint.substr( 0, 16 ) +
-        ".s" + std::to_string( QueryIndexSchemaVersion );
+        ".s" + std::to_string( QueryIndexSchemaVersion ) + ".g" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const auto dataName = baseName + ".jnidx.data";
     result.dataPath = tracePath.parent_path() / dataName;
     result.zoneExtras.path = tracePath.parent_path() / ( baseName + ".jnidx.zextra" );
@@ -2236,6 +2273,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     auto temporaryGpuMemoryCpuZones = result.gpuMemoryCpuZones.path; temporaryGpuMemoryCpuZones += suffix;
     auto temporaryGpuMemorySummaryCpuZones = result.gpuMemorySummaryCpuZones.path; temporaryGpuMemorySummaryCpuZones += suffix;
     auto temporaryGpuMemorySummary = result.gpuMemorySummary.path; temporaryGpuMemorySummary += suffix;
+    std::vector<std::filesystem::path> packedScratch;
 
     try
     {
@@ -2451,6 +2489,45 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             result.gpuMemorySummary.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemorySummary );
         }
 
+        // Mutable build extents are closed before compression. Publication
+        // names are generation-specific, so existing readers retain their
+        // immutable files until their own analysis is released.
+        const auto packSection=[&](std::filesystem::path& temporary,QueryIndexSection& section,ZoneSectionKind kind) {
+            const auto raw=temporary;
+            auto packed=temporary; packed+=".pages";
+            if(std::filesystem::exists(packed)) throw std::runtime_error("index packed scratch already exists");
+            packedScratch.push_back(packed);
+            std::ifstream input(raw,std::ios::binary);
+            ZoneSectionHeader header{}; input.read(reinterpret_cast<char*>(&header),sizeof(header));
+            if(!input || std::memcmp(header.magic,"JNIDXZ1",7) || header.count!=section.count ||
+                header.recordBytes!=section.recordBytes || header.kind!=uint32_t(kind))
+                throw std::runtime_error("index compression input mismatch");
+            analysis::PagedRecordOptions options;
+            const auto identity=PagedSectionIdentity(result.sourceFingerprint,kind);
+            analysis::PagedRecordWriter output(packed,identity,section.recordBytes,options);
+            const uint64_t perBlock=options.blockBytes/section.recordBytes;
+            std::vector<char> buffer(size_t(perBlock*section.recordBytes));
+            for(uint64_t ordinal=0;ordinal<section.count;) {
+                const auto count=std::min(perBlock,section.count-ordinal),bytes=count*section.recordBytes;
+                input.read(buffer.data(),std::streamsize(bytes));
+                if(!input) throw std::runtime_error("index compression input truncated");
+                output.Append(buffer.data(),count); ordinal+=count;
+            }
+            output.Commit();
+            analysis::PagedRecordReader check(packed,identity,section.recordBytes,options); check.ValidateAll();
+            input.close();
+            // Only this invocation's known raw scratch file is reclaimed.
+            std::filesystem::remove(raw);
+            temporary=packed; section.bytes=SectionBytes(packed); section.fingerprint=SectionFingerprint(packed);
+        };
+        packSection(temporaryExtras,result.zoneExtras,ZoneSectionKind::Extra);
+        packSection(temporaryCpu,result.cpuZones,ZoneSectionKind::Cpu);
+        packSection(temporaryGpu,result.gpuZones,ZoneSectionKind::Gpu);
+        for(size_t index=0;index<temporaryJn.size();++index)
+            packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
+        packSection(temporaryGpuMemoryCpuZones,result.gpuMemoryCpuZones,ZoneSectionKind::GpuMemoryCpuZone);
+        packSection(temporaryGpuMemorySummaryCpuZones,result.gpuMemorySummaryCpuZones,ZoneSectionKind::GpuMemorySummaryCpuZone);
+
         {
             std::ofstream output( temporaryManifest, std::ios::binary | std::ios::trunc );
             if( !output ) throw std::runtime_error( "cannot create index manifest" );
@@ -2476,6 +2553,19 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     catch( ... )
     {
         std::error_code ignored;
+        // Directory cleanup is limited to this build's explicitly recorded
+        // direct children; never recurse through a link or another generation.
+        for(const auto& packed:packedScratch) {
+            const auto parent=std::filesystem::absolute(tracePath).parent_path().lexically_normal();
+            const auto target=std::filesystem::absolute(packed).lexically_normal();
+            if(target.parent_path()!=parent || !target.filename().string().starts_with(baseName)) continue;
+            if(std::filesystem::is_symlink(std::filesystem::symlink_status(target,ignored))) continue;
+#ifdef _WIN32
+            const auto attributes=GetFileAttributesW(target.c_str());
+            if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+#endif
+            std::filesystem::remove_all(target,ignored);
+        }
         std::filesystem::remove( temporaryData, ignored );
         std::filesystem::remove( temporaryManifest, ignored );
         std::filesystem::remove( temporaryExtras, ignored );
@@ -2589,24 +2679,35 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
             result.reason = "data_hash_mismatch";
             return result;
         }
-        const auto validateSection = [&]( const QueryIndexSection& section, uint32_t expectedRecordBytes, const char* name ) {
+        const auto validateSection = [&]( const QueryIndexSection& section, uint32_t expectedRecordBytes, const char* name,
+            ZoneSectionKind kind=ZoneSectionKind::Extra ) {
+            if(std::filesystem::is_directory(section.path) && expectedRecordBytes) {
+                if(section.recordBytes!=expectedRecordBytes || SectionBytes(section.path)!=section.bytes)
+                    throw std::runtime_error(std::string(name)+" paged section identity mismatch");
+                if(deep && SectionFingerprint(section.path)!=section.fingerprint)
+                    throw std::runtime_error(std::string(name)+" paged section hash mismatch");
+                analysis::PagedRecordReader records(section.path,PagedSectionIdentity(manifest.sourceFingerprint,kind),expectedRecordBytes);
+                if(records.Count()!=section.count) throw std::runtime_error(std::string(name)+" paged count mismatch");
+                if(deep) records.ValidateAll();
+                return;
+            }
             if( section.recordBytes != expectedRecordBytes || !std::filesystem::is_regular_file( section.path ) || std::filesystem::file_size( section.path ) != section.bytes )
                 throw std::runtime_error( std::string( name ) + " section identity mismatch" );
             if( deep && analysis::WorkerTraceSource::ComputeFingerprint( section.path ) != section.fingerprint )
                 throw std::runtime_error( std::string( name ) + " section hash mismatch" );
         };
         validateSection( manifest.zoneExtras, sizeof( ZoneExtraIndexRecord ), "zone-extra" );
-        validateSection( manifest.cpuZones, sizeof( CpuZoneIndexRecord ), "CPU-zone" );
-        validateSection( manifest.gpuZones, sizeof( GpuZoneIndexRecord ), "GPU-zone" );
-        validateSection( manifest.jobStages, sizeof( JnJobStageData ), "job-stage" );
-        validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity" );
-        validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link" );
-        validateSection( manifest.relations, sizeof( JnRelationData ), "relation" );
-        validateSection( manifest.gpuReferencePasses, sizeof( JnGpuReferencePassData ), "GPU-reference-pass" );
-        validateSection( manifest.gpuReferenceUses, sizeof( JnGpuReferenceUseData ), "GPU-reference-use" );
-        validateSection( manifest.gpuReferenceEnds, sizeof( JnGpuReferenceEndData ), "GPU-reference-end" );
-        validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone" );
-        validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone" );
+        validateSection( manifest.cpuZones, sizeof( CpuZoneIndexRecord ), "CPU-zone",ZoneSectionKind::Cpu );
+        validateSection( manifest.gpuZones, sizeof( GpuZoneIndexRecord ), "GPU-zone",ZoneSectionKind::Gpu );
+        validateSection( manifest.jobStages, sizeof( JnJobStageData ), "job-stage",ZoneSectionKind::JobStage );
+        validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
+        validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link",ZoneSectionKind::GfxLink );
+        validateSection( manifest.relations, sizeof( JnRelationData ), "relation",ZoneSectionKind::Relation );
+        validateSection( manifest.gpuReferencePasses, sizeof( JnGpuReferencePassData ), "GPU-reference-pass",ZoneSectionKind::GpuReferencePass );
+        validateSection( manifest.gpuReferenceUses, sizeof( JnGpuReferenceUseData ), "GPU-reference-use",ZoneSectionKind::GpuReferenceUse );
+        validateSection( manifest.gpuReferenceEnds, sizeof( JnGpuReferenceEndData ), "GPU-reference-end",ZoneSectionKind::GpuReferenceEnd );
+        validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );
+        validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone",ZoneSectionKind::GpuMemorySummaryCpuZone );
         validateSection( manifest.gpuMemorySummary, 0, "GPU-memory-summary" );
         result.manifest = std::move( manifest );
         result.reason = "valid";

@@ -18,6 +18,11 @@ json Descriptor(const AnalysisCacheTableDescriptor& d)
 { return {{"records",d.records},{"blocks",d.blocks},{"content_sha256",d.contentSha256}}; }
 json FileIdentity(const std::filesystem::path& path,const AnalysisCacheTableOptions& options)
 {
+    if(std::filesystem::is_directory(path)) {
+        json files=json::object();
+        for(const auto name:{"header.bin","directory.bin","data.bin"}) files[name]=FileIdentity(path/name,options);
+        return {{"format","paged-records-v1"},{"files",std::move(files)}};
+    }
     std::ifstream input(path,std::ios::binary); if(!input) Fail("series_missing");
     std::array<char,65536> buffer; Sha256Builder hash; uint64_t bytes=0;
     while(input) {
@@ -80,8 +85,16 @@ std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation
         std::ofstream output(series,std::ios::binary); if(!output) Fail("series_create");
     }
     else if(products.frameSeriesPath!=series) {
-        AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath));
-        std::filesystem::copy_file(products.frameSeriesPath,series);
+        if(std::filesystem::is_directory(products.frameSeriesPath)) {
+            std::filesystem::create_directory(series);
+            for(const auto name:{"data.bin","directory.bin","header.bin"}) {
+                AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath/name));
+                std::filesystem::copy_file(products.frameSeriesPath/name,series/name);
+            }
+        } else {
+            AnalysisDiskGrow(options.disk,std::filesystem::file_size(products.frameSeriesPath));
+            std::filesystem::copy_file(products.frameSeriesPath,series);
+        }
     }
     products.frameSeriesPath=series;
     const auto seriesIdentity=FileIdentity(series,options);

@@ -738,7 +738,7 @@ void GpuLocalQualityRecovery(const std::filesystem::path& root)
             value->outsideCompleteFrameCount!=test.outside || value->inclusive.perCompleteFrame.zeroCount!=test.zeros ||
             value->inclusive.perCompleteFrame.exact!=(test.complete!=0))
             throw std::runtime_error("Valid Pass observations from both L0s must survive; complete-frame statistics use only the one complete L0");
-        const auto rows=ReadPolicyFrameSeries(products.frameSeriesPath,context,1024*1024);
+        const auto rows=ReadPolicyFrameSeries(products.frameSeriesPath,context,1024*1024,{},products.neutralCacheIdentity);
         if(rows.size()!=test.present || std::any_of(rows.begin(),rows.end(),[](const auto& row){return !row.exact || row.valueNs!=1000000;}))
             throw std::runtime_error("Local GPU cost evidence must retain both valid one-millisecond Pass observations");
     });
@@ -1004,6 +1004,23 @@ int main(int argc,char** argv)
 
     const auto validation = ValidateAndNormalizeAnalysisProfile( Profile() );
     assert( validation.valid );
+    if(argc==2 && std::string(argv[1])=="--trace-disk-admission") {
+        auto source=std::make_shared<SourceDegradedTrace>();
+        AnalysisScanManager manager(root/"admission",root/"admission-cache",std::string(64,'d'),
+            [source](const auto&,auto){return source;},ExecuteDefaultAnalysisScan);
+        AnalysisScanStartRequest request;
+        request.tracePath=tracePath; request.traceSessionId="tiny"; request.source=source;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        bool rejected=false;
+        try { manager.Start(request); } catch(const std::exception& error) {
+            rejected=std::string(error.what()).find("disk")!=std::string::npos;
+        }
+        if(!rejected) { std::cerr<<"tiny input admitted a cache larger than its trace-relative quota\n"; return 1; }
+        std::cout<<"trace disk admission passed\n"; return 0;
+    }
+    // Other tests use an injected source; its physical fixture must have
+    // sufficient capacity for the cache they intentionally construct.
+    std::filesystem::resize_file(tracePath,16*1024*1024);
     if(argc==2 && std::string(argv[1])=="--gpu-frame-scope-probe") {
         testStage="GPU L0 denominator diagnostic"; GpuFrameScopeProbe(root); RemoveTestRoot(root); return 0;
     }
@@ -1230,7 +1247,7 @@ int main(int argc,char** argv)
         bool observedUnknown=false;
         unknownReader.VisitSignatureContexts([&](const NeutralSignatureAggregate*,const PolicySignatureContext& context) {
             if(context.domain!="cpu" || context.seriesCount==0) return;
-            const auto full=ReadPolicyFrameSeries(unknown.frameSeriesPath,context,32*1024*1024);
+            const auto full=ReadPolicyFrameSeries(unknown.frameSeriesPath,context,32*1024*1024,{},unknown.neutralCacheIdentity);
             for(const auto& frame:full) if(!frame.exact) observedUnknown=true;
             for(const auto& representative:context.frames) {
                 const auto source=std::find_if(full.begin(),full.end(),[&](const auto& f){return f.frameIndex==representative.frameIndex;});

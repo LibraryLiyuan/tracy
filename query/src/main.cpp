@@ -5,6 +5,7 @@
 #include "TracySessionManager.hpp"
 #include "TracySegmentTraceSource.hpp"
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyProcessCommitLimit.hpp"
 
 #include "../../public/common/TracyVersion.hpp"
 
@@ -34,7 +35,7 @@ void ApplyIndexedMemoryBudget()
 {
 #ifdef _WIN32
     constexpr SIZE_T MinimumWorkingSet = SIZE_T( 64 ) * 1024 * 1024;
-    constexpr SIZE_T MaximumWorkingSet = SIZE_T( 1900 ) * 1024 * 1024;
+    constexpr SIZE_T MaximumWorkingSet = SIZE_T( 16 ) * 1024 * 1024 * 1024;
     if( !SetProcessWorkingSetSizeEx( GetCurrentProcess(), MinimumWorkingSet, MaximumWorkingSet, QUOTA_LIMITS_HARDWS_MAX_ENABLE ) )
     {
         // PROCESS_SET_QUOTA is not available to a normal desktop token on all
@@ -43,7 +44,7 @@ void ApplyIndexedMemoryBudget()
         // continue to provide the portable memory bound.  The OS hard working
         // set is therefore an additional best-effort guard, not a start-up
         // requirement.
-        std::cerr << "warning: could not apply the optional 1.9 GiB indexed working-set guard (Windows error "
+        std::cerr << "warning: could not apply the optional 16 GiB indexed working-set guard (Windows error "
             << GetLastError() << "); continuing with internal query budgets\n";
     }
 #endif
@@ -413,6 +414,11 @@ int main( int argc, char** argv )
             std::cout << QuerySchemaJson << '\n';
             return 0;
         }
+#ifdef _WIN32
+        // Installed before any input is opened, covering Worker, indexing,
+        // scans, caches and direct/MCP query allocations in this process.
+        tracy::analysis::ProcessCommitLimit commitLimit(32ull*1024*1024*1024);
+#endif
         if( args.doctor ) return RunDoctor( args );
         if( args.buildIndex ) return RunBuildIndex( args );
         if( args.request ) return RunSingle( args );

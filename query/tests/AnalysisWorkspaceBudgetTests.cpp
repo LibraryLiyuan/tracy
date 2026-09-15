@@ -236,9 +236,26 @@ void Components(const std::filesystem::path& root)
     Require(budget->Snapshot().currentBytes==0,"all component reservations released");
 }
 }
+template<class Disk> void TraceRelativeLimits()
+{
+    // A byte above the per-input final/peak quotas must not be admitted.
+    // The two fixtures represent independent analyses, not cumulative history.
+    if constexpr(requires { Disk::ForTrace(uint64_t(100)); })
+    {
+        const auto first=Disk::ForTrace(100),second=Disk::ForTrace(200);
+        Require(first.finalBytes==800 && first.peakBytes==1600,"trace quotas use one input's bytes");
+        Require(second.finalBytes==1600 && second.peakBytes==3200,"independent inputs have independent quotas");
+        first.CheckFinal(800);
+        Reject([&]{first.CheckFinal(801);},"final_disk_ratio");
+        Reject([&]{Disk::ForTrace(0);},"trace_size");
+        Reject([&]{Disk::ForTrace(UINT64_MAX/16+1);},"trace_size");
+    }
+    else throw std::runtime_error("trace-relative final/peak disk admission is missing");
+}
 int main()
 {
     try {
+        TraceRelativeLimits<AnalysisDiskBudget>();
         ProcessMemoryGuard(); ProcessMemoryCheckpoints(); Reservations(); ConcurrentReservations();
         const auto root=std::filesystem::temp_directory_path()/
             ("jn-workspace-budget-test-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));

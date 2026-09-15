@@ -107,6 +107,25 @@ if(BUILD_TESTING)
         endif()
     endfunction()
 
+    add_executable(tracy-paged-record-store-tests tests/PagedRecordStoreTests.cpp)
+    target_link_libraries(tracy-paged-record-store-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-paged-record-store-tests)
+    add_test(NAME tracy-paged-record-store COMMAND tracy-paged-record-store-tests)
+
+    add_executable(tracy-process-commit-limit-tests tests/ProcessCommitLimitTests.cpp)
+    target_include_directories(tracy-process-commit-limit-tests PRIVATE ${TRACY_ANALYSIS_DIR})
+    tracy_query_enable_assertions(tracy-process-commit-limit-tests)
+    add_test(NAME tracy-process-commit-limit COMMAND tracy-process-commit-limit-tests)
+
+    add_executable(tracy-gpu-memory-request-scope-tests tests/GpuMemoryRequestScopeTests.cpp)
+    target_link_libraries(tracy-gpu-memory-request-scope-tests PRIVATE TracyAnalysis)
+    tracy_query_enable_assertions(tracy-gpu-memory-request-scope-tests)
+    add_test(NAME tracy-gpu-memory-request-scope COMMAND tracy-gpu-memory-request-scope-tests)
+
+    add_executable(tracy-compressed-query-index-tests tests/CompressedQueryIndexTests.cpp)
+    target_link_libraries(tracy-compressed-query-index-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-compressed-query-index-tests)
+
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
     add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)

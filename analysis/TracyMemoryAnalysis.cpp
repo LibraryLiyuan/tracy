@@ -444,11 +444,44 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         } );
     }
 
-    std::sort( result.requestScopes.begin(), result.requestScopes.end(), []( const auto& lhs, const auto& rhs ) {
+    std::stable_sort( result.requestScopes.begin(), result.requestScopes.end(), []( const auto& lhs, const auto& rhs ) {
         return lhs.thread != rhs.thread ? lhs.thread < rhs.thread : lhs.start < rhs.start;
     } );
-    std::unordered_map<uint64_t, std::vector<size_t>> scopesByThread;
-    for( size_t index = 0; index < result.requestScopes.size(); index++ ) scopesByThread[result.requestScopes[index].thread].emplace_back( index );
+    struct ScopeLookup
+    {
+        std::vector<size_t> indices;
+        std::vector<int64_t> maximumEnd;
+        void Build(const std::vector<GpuMemoryRequestScope>& scopes)
+        {
+            if(indices.size()>SIZE_MAX/4) throw std::length_error("gpu_memory_scope_index_size");
+            maximumEnd.resize(indices.size()*4,INT64_MIN);
+            if(!indices.empty()) BuildNode(scopes,1,0,indices.size());
+        }
+        int64_t BuildNode(const std::vector<GpuMemoryRequestScope>& scopes,size_t node,size_t first,size_t last)
+        {
+            if(last-first==1) return maximumEnd[node]=scopes[indices[first]].end;
+            const auto middle=first+(last-first)/2;
+            return maximumEnd[node]=std::max(BuildNode(scopes,node*2,first,middle),BuildNode(scopes,node*2+1,middle,last));
+        }
+        size_t FindNode(size_t node,size_t first,size_t last,size_t upper,int64_t time) const
+        {
+            if(first>=upper || maximumEnd[node]<time) return SIZE_MAX;
+            if(last-first==1) return indices[first];
+            const auto middle=first+(last-first)/2;
+            const auto right=FindNode(node*2+1,middle,last,upper,time);
+            return right!=SIZE_MAX ? right : FindNode(node*2,first,middle,upper,time);
+        }
+        size_t Find(const std::vector<GpuMemoryRequestScope>& scopes,int64_t time) const
+        {
+            const auto upper=std::upper_bound(indices.begin(),indices.end(),time,
+                [&](int64_t point,size_t index){return point<scopes[index].start;});
+            if(upper==indices.begin()) return SIZE_MAX;
+            return FindNode(1,0,indices.size(),size_t(upper-indices.begin()),time);
+        }
+    };
+    std::unordered_map<uint64_t, ScopeLookup> scopesByThread;
+    for( size_t index = 0; index < result.requestScopes.size(); index++ ) scopesByThread[result.requestScopes[index].thread].indices.emplace_back( index );
+    for(auto& [thread,lookup]:scopesByThread) lookup.Build(result.requestScopes);
 
     result.allocations.reserve( allocations.size() );
     std::unordered_map<uint64_t, std::vector<size_t>> logicalAllocationLifetimes;
@@ -459,12 +492,10 @@ GpuMemoryAttribution BuildGpuMemoryAttribution( const std::vector<GpuMemoryCpuZo
         const auto scopes = scopesByThread.find( allocation.thread );
         if( scopes != scopesByThread.end() )
         {
-            for( auto it = scopes->second.rbegin(); it != scopes->second.rend(); ++it )
-            {
-                const auto& scope = result.requestScopes[*it];
-                if( scope.start <= allocation.allocationNs && allocation.allocationNs <= scope.end ) { attributed.requestLabelId = scope.labelId; break; }
-                if( scope.end < allocation.allocationNs ) break;
-            }
+            // Find the latest-starting containing interval, without scanning
+            // all future scopes or letting an expired child hide its parent.
+            const auto index=scopes->second.Find(result.requestScopes,allocation.allocationNs);
+            if(index!=SIZE_MAX) attributed.requestLabelId=result.requestScopes[index].labelId;
         }
         const bool logicalPool = StartsWith( allocation.poolName, "GPU D3D12 Logical " );
         const bool physicalPool = StartsWith( allocation.poolName, "GPU D3D12 Physical " );
