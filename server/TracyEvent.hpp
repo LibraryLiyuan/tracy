@@ -12,6 +12,7 @@
 #include "TracyShortPtr.hpp"
 #include "TracySortedVector.hpp"
 #include "TracyVector.hpp"
+#include "TracyStringIdx.hpp"
 #include "tracy_robin_hood.h"
 #include "../public/common/TracyForceInline.hpp"
 #include "../public/common/TracyQueue.hpp"
@@ -61,40 +62,6 @@ struct StringRefComparator
     {
         return memcmp( &lhs, &rhs, sizeof( StringRef ) ) == 0;
     }
-};
-
-class StringIdx
-{
-public:
-    tracy_force_inline StringIdx() { memset( m_idx, 0, sizeof( m_idx ) ); }
-    tracy_force_inline StringIdx( uint32_t idx )
-    {
-        SetIdx( idx );
-    }
-
-    tracy_force_inline void SetIdx( uint32_t idx )
-    {
-        if(idx>0xFFFFFEu)throw std::out_of_range("string_index_24bit_overflow:"+std::to_string(idx));
-        idx++;
-        memcpy( m_idx, &idx, 3 );
-    }
-
-    tracy_force_inline uint32_t Idx() const
-    {
-        uint32_t idx = 0;
-        memcpy( &idx, m_idx, 3 );
-        assert( idx != 0 );
-        return idx - 1;
-    }
-
-    tracy_force_inline bool Active() const
-    {
-        uint32_t zero = 0;
-        return memcmp( m_idx, &zero, 3 ) != 0;
-    }
-
-private:
-    uint8_t m_idx[3];
 };
 
 struct StringIdxHasher
@@ -237,6 +204,7 @@ struct ZoneExtra
 };
 
 enum { ZoneExtraSize = sizeof( ZoneExtra ) };
+static_assert(sizeof(ZoneExtra)==14 && sizeof(StringRef)==9);
 
 
 // This union exploits the fact that the current implementations of x64 and arm64 do not provide
@@ -476,6 +444,7 @@ struct SymbolData : public CallstackFrameBasic
 enum { CallstackFrameBasicSize = sizeof( CallstackFrameBasic ) };
 enum { CallstackFrameSize = sizeof( CallstackFrame ) };
 enum { SymbolDataSize = sizeof( SymbolData ) };
+static_assert(sizeof(CallstackFrameBasic)==12 && sizeof(CallstackFrame)==20 && sizeof(SymbolData)==28);
 
 
 struct SymbolLocation

@@ -15,15 +15,16 @@ namespace tracy::storage
 class MutableRecordStore
 {
 public:
-    using Record=std::array<uint32_t,3>;
+    using Record=std::array<uint32_t,4>;
     static constexpr uint64_t Rows=4096;
 private:
     struct Page {
-        uint64_t magic=0x315058455a,id=0,checksum=0;
-        std::array<char,4096-24> reserved{};
+        uint64_t magic=0x325058455a,id=0,checksum=0;
+        uint32_t schema=2,recordBytes=16;
+        std::array<char,4096-32> reserved{};
         std::array<Record,Rows> rows{};
     };
-    static_assert(sizeof(Page)==53248);
+    static_assert(sizeof(Page)==69632);
     struct Slot {
         analysis::AnalysisWorkspaceReservation lease;
         Page page;uint64_t touched=0;bool dirty=false;
@@ -70,15 +71,15 @@ private:
                 m_file.flush();Require(bool(m_file),"zone_extra_page_flush");
                 m_file.seekg(std::streamoff(id*sizeof(Page)));
                 m_file.read(reinterpret_cast<char*>(&slot->page),sizeof(Page));
-                Require(bool(m_file)&&slot->page.magic==0x315058455a&&slot->page.id==id&&slot->page.checksum==Digest(slot->page),"zone_extra_page_integrity");
+                Require(bool(m_file)&&slot->page.magic==0x325058455a&&slot->page.schema==2&&slot->page.recordBytes==16&&slot->page.id==id&&slot->page.checksum==Digest(slot->page),"zone_extra_page_integrity");
             }
             found=m_cache.emplace(id,std::move(slot)).first;
         }
         m_last=found->second.get();m_last->touched=++m_clock;return *m_last;
     }
 public:
-    MutableRecordStore(std::filesystem::path path,ConversionResources& r,uint64_t cachedPages=600):m_path(std::move(path)),m_resources(r),m_limit(cachedPages){
-        Require(cachedPages>=1&&cachedPages<=600,"zone_extra_cache_limit");
+    MutableRecordStore(std::filesystem::path path,ConversionResources& r,uint64_t cachedPages=0):m_path(std::move(path)),m_resources(r),m_limit(cachedPages?cachedPages:(32ull<<20)/(sizeof(Slot)+256)){
+        Require(m_limit>=1&&m_limit<=(32ull<<20)/(sizeof(Slot)+256),"zone_extra_cache_limit");
         Require(!std::filesystem::exists(analysis::AnalysisIoPath(m_path)),"zone_extra_file_exists");
         r.BeforeFileGrowth(m_path,0);
         m_file.open(analysis::AnalysisIoPath(m_path),std::ios::in|std::ios::out|std::ios::binary|std::ios::trunc);
@@ -93,7 +94,7 @@ public:
     }
     Record Read(uint32_t id){Require(id<m_count,"zone_extra_index");return Get(id/Rows).page.rows[id%Rows];}
     void Put(uint32_t id,const Record& value){Require(!m_sealed&&id<m_count,"zone_extra_update_state");auto& slot=Get(id/Rows);slot.page.rows[id%Rows]=value;slot.dirty=true;}
-    void ReduceCache(){m_limit=std::min<uint64_t>(m_limit,64);while(m_cache.size()>m_limit)Evict();}
+    void ReduceCache(){m_limit=std::min<uint64_t>(m_limit,(4ull<<20)/(sizeof(Slot)+256));while(m_cache.size()>m_limit)Evict();}
     void Seal(){
         Require(!m_sealed,"zone_extra_already_sealed");for(auto& s:m_cache)Flush(*s.second);
         m_file.flush();Require(bool(m_file),"zone_extra_seal_flush");

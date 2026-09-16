@@ -23,6 +23,7 @@
 #include "TracyJnData.hpp"
 #include "TracyMemoryAttribution.hpp"
 #include "TracyOfflineStorage.hpp"
+#include "TracyTraceFormat.hpp"
 #include "TracyProtocolObserver.hpp"
 #include "TracyShortPtr.hpp"
 #include "TracySlab.hpp"
@@ -1188,6 +1189,12 @@ private:
 
     uint32_t GetSingleStringIdx();
     uint32_t GetSecondStringIdx();
+    void ValidateStringIndex(const StringIdx& value) const {
+        if(value.Active()&&value.Idx()>=m_data.stringData.size())throw LoadFailure("string index references missing string");
+    }
+    void ValidateStringReference(const StringRef& value) const {
+        if(value.active&&value.isidx&&value.str>=m_data.stringData.size())throw LoadFailure("string reference exceeds string table");
+    }
     const ContextSwitch* const GetContextSwitchDataImpl( uint64_t thread );
 
     void CacheSource( const StringRef& str, const StringIdx& image = StringIdx() );

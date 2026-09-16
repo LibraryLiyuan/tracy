@@ -57,9 +57,8 @@ static bool SourceFileValid( const char* fn, uint64_t olderThan )
 }
 
 
-static const uint8_t FileHeader[8] { 't', 'r', 'a', 'c', 'y', Version::Major, Version::Minor, Version::Patch };
-enum { FileHeaderMagic = 5 };
-static const int CurrentVersion = FileVersion( Version::Major, Version::Minor, Version::Patch );
+static const auto FileHeader = EncodeTraceHeader();
+static const int CurrentVersion = ExtendedTraceBaseLayout;
 static const int MinSupportedVersion = FileVersion( 0, 9, 0 );
 
 template<typename T>
@@ -753,28 +752,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     int fileVer = 0;
 
-    uint8_t hdr[8];
-    f.Read( hdr, sizeof( hdr ) );
-    if( memcmp( FileHeader, hdr, FileHeaderMagic ) == 0 )
-    {
-        fileVer = FileVersion( hdr[FileHeaderMagic], hdr[FileHeaderMagic+1], hdr[FileHeaderMagic+2] );
-        if( fileVer > CurrentVersion )
-        {
-            throw UnsupportedVersion( fileVer );
-        }
-        if( fileVer < MinSupportedVersion )
-        {
-            throw LegacyVersion( fileVer );
-        }
-        if( fileVer < FileVersion( 0, 12, 3 ) )
-        {
-            f.Read( m_legacyQueueDelay );
-        }
-    }
-    else
-    {
-        throw LegacyVersion( FileVersion( 0, 2, 0 ) );
-    }
+    ReadExtendedTraceHeader(f);
+    fileVer = ExtendedTraceBaseLayout;
     m_traceVersion = fileVer;
 
     s_loadProgress.total.store( fileVer >= FileVersion( 0, 13, 2 ) ? 18 : 17, std::memory_order_relaxed );
@@ -926,6 +905,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     unordered_flat_map<uint64_t, const char*> pointerMap;
 
     f.Read( sz );
+    if(sz>UINT32_MAX || sz>SIZE_MAX/sizeof(const char*))throw LoadFailure("string table count exceeds supported index range");
     m_data.stringMap.reserve( sz );
 
     if( !m_allowStringModification )
@@ -937,7 +917,8 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     {
         uint64_t ptr, ssz;
         f.Read2( ptr, ssz );
-        auto dst = m_slab.Alloc<char>( ssz+1 );
+        if(ssz>UINT32_MAX || ssz>=SIZE_MAX)throw LoadFailure("string byte length overflow");
+        auto dst = static_cast<char*>(m_slab.AllocBig( size_t(ssz)+1 ));
         f.Read( dst, ssz );
         dst[ssz] = '\0';
         m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
@@ -1008,6 +989,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ptr );
         SourceLocation srcloc;
         f.Read( &srcloc, sizeof( SourceLocationBase ) );
+        ValidateStringReference(srcloc.name);ValidateStringReference(srcloc.function);ValidateStringReference(srcloc.file);
         srcloc.namehash = 0;
         m_data.sourceLocation.emplace( ptr, srcloc );
     }
@@ -1030,6 +1012,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     {
         auto srcloc = m_slab.Alloc<SourceLocation>();
         f.Read( srcloc, sizeof( SourceLocationBase ) );
+        ValidateStringReference(srcloc->name);ValidateStringReference(srcloc->function);ValidateStringReference(srcloc->file);
         srcloc->namehash = 0;
         m_data.sourceLocationPayload[i] = srcloc;
         m_data.sourceLocationPayloadMap.emplace( srcloc, int16_t( i ) );
@@ -1092,6 +1075,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint32_t id;
             uint64_t tsz;
             f.Read8( id, lockmap.customName, lockmap.srcloc, lockmap.type, lockmap.valid, lockmap.timeAnnounce, lockmap.timeTerminate, tsz );
+            ValidateStringIndex(lockmap.customName);
             lockmap.isContended = false;
             lockmap.threadMap.reserve( tsz );
             lockmap.threadList.reserve( tsz );
@@ -1171,6 +1155,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             auto msgdata = m_slab.Alloc<MessageData>();
             msgdata->time = ReadTimeOffset( f, refTime );
             f.Read3( msgdata->ref, msgdata->color, msgdata->callstack );
+            ValidateStringReference(msgdata->ref);
             m_data.messages[i] = msgdata;
             msgMap.emplace( ptr, msgdata );
         }
@@ -1191,6 +1176,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             m_serializedZoneSink->CheckRead();
             const auto n=std::min<uint64_t>(rows.size(),sz-offset);
             f.Read(rows.data(),size_t(n)*sizeof(ZoneExtra));
+            for(uint64_t i=0;i<n;++i){ValidateStringIndex(rows[i].text);ValidateStringIndex(rows[i].name);}
             if(offset==0)m_data.zoneExtra[0]=rows[0];
             m_serializedZoneSink->ZoneExtrasRawBlock(offset,rows.data(),n);offset+=n;
         }
@@ -1202,6 +1188,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         if(sz>UINT32_MAX)throw LoadFailure("zone_extra_memory_count");
         m_data.zoneExtra.reserve_exact( sz, m_slab );
         f.Read( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
+        for(const auto& row:m_data.zoneExtra){ValidateStringIndex(row.text);ValidateStringIndex(row.name);}
     }
     else
     {
@@ -1211,6 +1198,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         {
             ZoneExtra value;
             f.Read( value );
+            ValidateStringIndex(value.text);ValidateStringIndex(value.name);
             if( index == 0 ) m_data.zoneExtra[0] = value;
             if( m_serializedZoneSink ) m_serializedZoneSink->ZoneExtraRecord( index, value.callstack.Val(), value.text.Active(), value.text.Active() ? value.text.Idx() : 0,
                 value.name.Active(), value.name.Active() ? value.name.Idx() : 0, value.color.Val() );
@@ -1339,6 +1327,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         auto ctx = m_slab.AllocInit<GpuCtxData>();
         uint8_t calibration;
         f.Read7( ctx->thread, calibration, ctx->count, ctx->period, ctx->type, ctx->name, ctx->overflow );
+        ValidateStringIndex(ctx->name);
         uint64_t notesz;
         if( fileVer >= FileVersion( 0, 12, 4 ) )
         {
@@ -1348,6 +1337,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 decltype( ctx->noteNames )::key_type key;
                 decltype( ctx->noteNames )::mapped_type value;
                 f.Read2( key, value );
+                ValidateStringIndex(value);
                 ctx->noteNames[key] = value;
             }
         }
@@ -1537,9 +1527,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         CallstackFrameId id;
         auto frameData = m_slab.Alloc<CallstackFrameData>();
         f.Read3( id, frameData->size, frameData->imageName );
+        ValidateStringIndex(frameData->imageName);
 
         frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
         f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
+        for(uint32_t j=0;j<frameData->size;++j){ValidateStringIndex(frameData->data[j].name);ValidateStringIndex(frameData->data[j].file);}
 
         m_data.callstackFrameMap.emplace( id, frameData );
     }
@@ -1848,6 +1840,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         uint8_t isInline;
         Int24 size;
         f.Read9( symAddr, name, file, line, imageName, callFile, callLine, isInline, size );
+        ValidateStringIndex(name);ValidateStringIndex(file);ValidateStringIndex(imageName);ValidateStringIndex(callFile);
         m_data.symbolMap.emplace( symAddr, SymbolData { { name, file, line }, imageName, callFile, callLine, isInline, size } );
         if( isInline )
         {
@@ -6209,7 +6202,9 @@ StringLocation Worker::StoreString( const char* str, size_t sz )
     auto sit = m_data.stringMap.find( key );
     if( sit == m_data.stringMap.end() )
     {
-        auto ptr = m_slab.Alloc<char>( sz+1 );
+        if(m_data.stringData.size()>0xFFFFFFFEull)throw std::out_of_range("string_table_32bit_overflow");
+        if(sz==SIZE_MAX)throw std::out_of_range("string_size_overflow");
+        auto ptr = static_cast<char*>(m_slab.AllocBig(sz+1));
         memcpy( ptr, str, sz );
         ptr[sz] = '\0';
         ret.ptr = ptr;
@@ -10933,7 +10928,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     if(m_offlineStorage)m_offlineStorage->Check();
     DoPostponedWorkAll();
 
-    f.Write( FileHeader, sizeof( FileHeader ) );
+    f.Write( FileHeader.data(), FileHeader.size() );
 
     f.Write( &m_resolution, sizeof( m_resolution ) );
     f.Write( &m_timerMul, sizeof( m_timerMul ) );

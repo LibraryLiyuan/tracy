@@ -7,7 +7,7 @@ template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(cons
 static void Zones(conversion::OfflineValidationSink& sink){ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();}
 int main(int argc,char** argv){try{
  StringIdx largest(0xFFFFFE);Check(largest.Active()&&largest.Idx()==0xFFFFFE);
- Refuses([]{StringIdx invalid(0xFFFFFF);});
+ Check(StringIdx(0xFFFFFF).Idx()==0xFFFFFF);
  Refuses([]{StringIdx invalid(UINT32_MAX);});
  if(argc!=2)return 2;auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
  storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;

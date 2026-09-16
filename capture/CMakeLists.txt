@@ -49,6 +49,12 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-safe-snapshot-tests tests/SafeSnapshotTests.cpp)
+    target_link_libraries(tracy-safe-snapshot-tests PRIVATE TracyServer)
+    add_test(NAME tracy-safe-snapshot COMMAND tracy-safe-snapshot-tests ${CMAKE_CURRENT_BINARY_DIR}/safe-snapshot-test)
+    add_executable(tracy-extended-zone-extra-tests tests/ExtendedZoneExtraTests.cpp)
+    target_link_libraries(tracy-extended-zone-extra-tests PRIVATE TracyServer TracyOfflineConversion)
+    add_test(NAME tracy-extended-zone-extra COMMAND tracy-extended-zone-extra-tests ${CMAKE_CURRENT_BINARY_DIR}/extended-zone-extra-test)
     add_executable(tracy-extended-format-tests tests/ExtendedTraceFormatTests.cpp)
     add_test(NAME tracy-extended-format COMMAND tracy-extended-format-tests)
     add_executable(tracy-relation-storage-tests tests/RelationStorageTests.cpp)

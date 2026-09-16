@@ -1,6 +1,7 @@
 #include "OfflineConversionStorage.hpp"
 #include "../../analysis/TracyHash.hpp"
 #include "../../analysis/TracyAnalysisIoPath.hpp"
+#include "../../storage/TracyZoneExtraCodec.hpp"
 #include <algorithm>
 #include <cstring>
 namespace tracy::conversion
@@ -75,8 +76,13 @@ void OfflineConversionStorage::Seal()
     if(m_uses){m_uses->Commit();m_useHash=m_uses->ContentHash();}
     if(m_definitions)m_definitions->Seal();
     analysis::Sha256Builder zoneHash;
-    if(m_zoneExtras){m_zoneExtras->Seal();m_zoneExtras->Visit([&](const auto* rows,uint64_t n){zoneHash.Update(rows,size_t(n)*12);});}
-    else {storage::MutableRecordStore::Record zero{};zoneHash.Update(&zero,12);}
+    if(m_zoneExtras){
+        m_zoneExtras->Seal();
+        analysis::AnalysisWorkspaceReservation encodedMemory(m_resources.Workspace(),storage::MutableRecordStore::Rows*storage::ZoneExtraWireBytes);
+        std::array<uint8_t,storage::MutableRecordStore::Rows*storage::ZoneExtraWireBytes> encoded{};
+        m_zoneExtras->Visit([&](const auto* rows,uint64_t n){for(uint64_t i=0;i<n;++i)storage::EncodeZoneExtra32(rows[i],encoded.data()+i*storage::ZoneExtraWireBytes);zoneHash.Update(encoded.data(),size_t(n)*storage::ZoneExtraWireBytes);});
+    }
+    else {std::array<uint8_t,storage::ZoneExtraWireBytes> zero{};zoneHash.Update(zero.data(),zero.size());}
     m_zoneHash=zoneHash.FinalHex();
     m_jobs.reset();m_uses.reset();m_definitions.reset();m_members.clear();m_members.shrink_to_fit();m_expanded.clear();m_expanded.shrink_to_fit();m_expandLease.Resize(0);
     m_sealed=true;
@@ -135,9 +141,15 @@ std::string OfflineConversionStorage::ReferenceUseHash() const {if(!m_sealed)thr
 uint32_t OfflineConversionStorage::AppendZoneExtra(const void* value){
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
     if(!m_zoneExtras){m_zoneExtras=std::make_unique<storage::MutableRecordStore>(m_root/"zone-extras.bin",m_resources);m_zoneExtras->Append({});}
-    storage::MutableRecordStore::Record row;std::memcpy(&row,value,12);return m_zoneExtras->Append(row);
+    return m_zoneExtras->Append(storage::DecodeZoneExtra32(value));
 }
-void OfflineConversionStorage::ReadZoneExtra(uint32_t id,void* value){Check();if(!m_zoneExtras){if(id)throw std::runtime_error("zone_extra_index");std::memset(value,0,12);return;}auto row=m_zoneExtras->Read(id);std::memcpy(value,&row,12);}
-void OfflineConversionStorage::PutZoneExtra(uint32_t id,const void* value){Check();if(m_sealed||!m_zoneExtras)throw std::runtime_error("zone_extra_update_state");storage::MutableRecordStore::Record row;std::memcpy(&row,value,12);m_zoneExtras->Put(id,row);}
-void OfflineConversionStorage::VisitZoneExtras(const std::function<void(const void*,uint64_t)>& f){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_zoneExtras)m_zoneExtras->Visit([&](const auto* p,uint64_t n){f(p,n);});else{storage::MutableRecordStore::Record zero{};f(&zero,1);}}
+void OfflineConversionStorage::ReadZoneExtra(uint32_t id,void* value){Check();if(!m_zoneExtras){if(id)throw std::runtime_error("zone_extra_index");std::memset(value,0,storage::ZoneExtraWireBytes);return;}storage::EncodeZoneExtra32(m_zoneExtras->Read(id),value);}
+void OfflineConversionStorage::PutZoneExtra(uint32_t id,const void* value){Check();if(m_sealed||!m_zoneExtras)throw std::runtime_error("zone_extra_update_state");m_zoneExtras->Put(id,storage::DecodeZoneExtra32(value));}
+void OfflineConversionStorage::VisitZoneExtras(const std::function<void(const void*,uint64_t)>& f){
+    Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");
+    if(!m_zoneExtras){std::array<uint8_t,storage::ZoneExtraWireBytes> zero{};f(zero.data(),1);return;}
+    analysis::AnalysisWorkspaceReservation encodedMemory(m_resources.Workspace(),storage::MutableRecordStore::Rows*storage::ZoneExtraWireBytes);
+    std::array<uint8_t,storage::MutableRecordStore::Rows*storage::ZoneExtraWireBytes> encoded{};
+    m_zoneExtras->Visit([&](const auto* rows,uint64_t n){for(uint64_t i=0;i<n;++i)storage::EncodeZoneExtra32(rows[i],encoded.data()+i*storage::ZoneExtraWireBytes);f(encoded.data(),n);});
+}
 }
