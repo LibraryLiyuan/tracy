@@ -2114,7 +2114,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         worker.GetOfflineDecodedEventCount() : 0;
     const auto workerCompressedFrameCount = worker.GetProtocolFramesProcessed();
     const auto gpuReferenceUseCount = diskStorage?diskStorage->ReferenceUseCount():worker.GetJnTraceData().gpuReferenceUses.size();
-    const auto gpuReferencePassCount = worker.GetJnTraceData().gpuReferencePasses.size();
+    const auto gpuReferencePassCount = diskStorage ? diskStorage->RecordCount(tracy::OfflineAppendDomain::GpuReferencePass) : worker.GetJnTraceData().gpuReferencePasses.size();
     const auto jobStageCount = diskStorage?diskStorage->JobStageCount():worker.GetJnTraceData().jobStages.size();
 
     if( options.mode == Options::Mode::Offline && options.diagnostics )

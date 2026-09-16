@@ -6,10 +6,25 @@
 #include "../src/OfflineValidationSink.hpp"
 #include <cstdio>
 #include <cstring>
+#include <source_location>
 namespace tracy {
-static void Check(bool v){if(!v)throw std::runtime_error("offline Worker semantic mismatch");}
+static void Check(bool v,std::source_location at=std::source_location::current()){if(!v)throw std::runtime_error("offline Worker semantic mismatch at "+std::to_string(at.line()));}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void PassLifetimeResolution(Worker& w){
+    auto& data=w.m_data.jnTrace;
+    auto resources=std::exchange(data.gpuCatalogResources,{});auto ranges=std::exchange(data.gpuRangeSets,{});auto batches=std::exchange(data.gpuCatalogBatches,{});
+    for(uint64_t generation:{11ull,12ull}){
+        for(unsigned i=0;i<4;++i){JnGpuCatalogResourceRecordV1 record{};record.resourceId=i<2?1:2;record.pointerToken=777;record.time=i==0?300:i==1?400:i==2?410:500;record.operation=uint8_t(i%2?JnGpuCatalogRecordOperation::Destroy:JnGpuCatalogRecordOperation::Create);data.gpuCatalogResources.push_back(record);}
+        JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;data.gpuRangeSets.push_back(range);
+        JnGpuCatalogBatchData batch{};batch.generation=generation;batch.valid=1;batch.kind=uint8_t(JnGpuCatalogBatchKind::Resource);batch.recordCount=4;data.gpuCatalogBatches.push_back(batch);
+        batch.kind=uint8_t(JnGpuCatalogBatchKind::RangeSet);batch.recordCount=1;data.gpuCatalogBatches.push_back(batch);
+        const auto result=w.ResolveJnGpuCatalogGeneration(generation,Worker::JnGpuCatalogResolveReason::FinalizeSave);
+        Check(result.totalUnresolved==0&&data.gpuRangeSets[0].resourceId==1&&data.gpuRangeSets[0].pointerToken==0);
+        data.gpuCatalogResources.clear();data.gpuRangeSets.clear();data.gpuCatalogBatches.clear();
+    }
+    data.gpuCatalogResources=std::move(resources);data.gpuRangeSets=std::move(ranges);data.gpuCatalogBatches=std::move(batches);
+ }
  static void PersistentStrings(const char* input,const std::filesystem::path& output){
     std::unique_ptr<FileRead> in(FileRead::Open(input));Worker w(*in,EventType::All,false);
     Check(w.m_data.stringData.size()>=4);
@@ -73,6 +88,11 @@ struct OfflineStorageSemanticTest {
     w.AddJnGpuResourceSetDefinition(0xFFFF1234,reinterpret_cast<const char*>(entries.data()),entries.size()*sizeof(entries[0]));
     Check(!w.WasDisconnectIssued());
     QueueJnGpuReferencePass pass{};pass.time=1000;pass.passId=701;pass.frameIndex=4;pass.flags=3;w.ProcessJnGpuReferencePass(pass);
+    QueueJnGfxEntity entity{};entity.time=950;entity.entityId=701;entity.kind=uint8_t(JnGfxEntityKind::ExplicitGpuPass);w.ProcessJnGfxEntity(entity);
+    QueueJnGfxLink link{};link.time=900;link.sourceId=701;link.relation=uint8_t(JnGfxRelation::RangeEvidenceComplete);w.ProcessJnGfxLink(link);
+    link.time=850;w.ProcessJnGfxLink(link); // last record wins even when its timestamp is earlier
+    link.sourceId=1ull<<40;link.time=50;w.ProcessJnGfxLink(link);
+    link.sourceId=701;link.time=2000;link.relation=0;w.ProcessJnGfxLink(link); // non-completion links do not override
     QueueJnGpuReferenceUse direct{};direct.time=1100;direct.passId=701;direct.resourceId=99;direct.usageMask=12;direct.flags=5;
     w.ProcessJnGpuReferenceUse(direct);
     QueueJnGpuReferenceSetUse set{};set.passId=701;set.resourceSetId=0xFFFF1234;set.entryCount=65535;set.flags=7;set.encoding=2;
@@ -107,6 +127,10 @@ int main(int argc,char** argv) {
  OfflineStorageSemanticTest::Populate(oldWorker,nullptr);OfflineStorageSemanticTest::Populate(newWorker,&store);
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());
  Check(newWorker.GetJnTraceData().relations.empty());store.Seal();
+ Check(store.LookupPassTime(701)==375); // (850 - baseTime 100) * 0.5; last completion overrides other sources
+ Check(!store.LookupPassTime(0));
+ Check(store.LookupPassTime(1ull<<40)==-25);Check(!store.LookupPassTime(42));
+ OfflineStorageSemanticTest::PassLifetimeResolution(oldWorker);OfflineStorageSemanticTest::PassLifetimeResolution(newWorker);
  OfflineStorageSemanticTest::CompareExtras(oldWorker,store);
 #define X(name,field,type) {uint64_t seen=0;Check(newWorker.GetJnTraceData().field.empty());store.VisitRecords(OfflineAppendDomain::name,[&](const void* rows,uint64_t n){Check(std::memcmp(rows,oldWorker.GetJnTraceData().field.data()+seen,size_t(n)*sizeof(type))==0);seen+=n;});Check(seen==oldWorker.GetJnTraceData().field.size());}
  TRACY_OFFLINE_APPEND_DOMAINS(X)

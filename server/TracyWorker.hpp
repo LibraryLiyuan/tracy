@@ -89,9 +89,11 @@ public:
         GpuReferenceUse,
         GpuReferenceEnd,
 #define X(name,field,type) name,
-        TRACY_OFFLINE_APPEND_DOMAINS(X)
+        TRACY_OFFLINE_BASE_APPEND_DOMAINS(X)
 #undef X
     };
+    // Query index section ordinals are stable even as offline storage domains grow.
+    static_assert(uint8_t(JnDomain::GfxEntity)==1&&uint8_t(JnDomain::GfxLink)==2&&uint8_t(JnDomain::GpuReferencePass)==4&&uint8_t(JnDomain::GpuReferenceEnd)==6);
 
     virtual ~SerializedZoneSink() = default;
     virtual bool WantsZoneExtras() const { return false; }

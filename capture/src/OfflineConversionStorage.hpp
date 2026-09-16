@@ -4,6 +4,7 @@
 #include "../../storage/TracyResourceSetStore.hpp"
 #include "../../analysis/TracyPagedRecordStore.hpp"
 #include "../../storage/TracyMutableRecordStore.hpp"
+#include "../../storage/TracyDiskIndex64.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -13,6 +14,7 @@ class OfflineConversionStorage final : public WorkerOfflineStorage
 public:
     OfflineConversionStorage(std::filesystem::path root,std::string identity,storage::ConversionResources& resources);
     void Check() override;
+    std::optional<int64_t> LookupPassTime(uint64_t) override;
     void AppendRecord(OfflineAppendDomain,const void*,uint32_t) override;
     uint64_t RecordCount(OfflineAppendDomain) const override;
     void VisitRecords(OfflineAppendDomain,const std::function<void(const void*,uint64_t)>&) override;
@@ -59,6 +61,7 @@ private:
     bool m_relationFailed=false;
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
+    std::unique_ptr<storage::DiskIndex64> m_passTimes;
     std::string m_zoneHash;
     uint64_t m_jobCount=0,m_useCount=0,m_definitionCount=0;
     bool m_sealed=false,m_reclaimed=false;

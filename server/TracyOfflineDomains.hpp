@@ -3,7 +3,7 @@
 #include "TracyJnData.hpp"
 #include <cstddef>
 #include <stdexcept>
-#define TRACY_OFFLINE_APPEND_DOMAINS(X) \
+#define TRACY_OFFLINE_BASE_APPEND_DOMAINS(X) \
  X(JobSchedule,jobSchedules,JnJobScheduleData) \
  X(JobConfig,jobConfigs,JnJobConfigData) \
  X(JobDependency,jobDependencies,JnJobDependencyData) \
@@ -16,6 +16,11 @@
  X(ScriptFrame,scriptFrames,JnScriptFrameData) \
  X(ScriptStack,scriptStacks,JnScriptStackData) \
  X(Callsite,callsites,JnCallsiteData)
+#define TRACY_OFFLINE_APPEND_DOMAINS(X) \
+ TRACY_OFFLINE_BASE_APPEND_DOMAINS(X) \
+ X(GfxEntity,gfxEntities,JnGfxEntityData) \
+ X(GfxLink,gfxLinks,JnGfxLinkData) \
+ X(GpuReferencePass,gpuReferencePasses,JnGpuReferencePassData)
 namespace tracy {
 enum class OfflineAppendDomain {
 #define X(name,field,type) name,

@@ -49,6 +49,9 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-disk-index64-tests tests/DiskIndex64Tests.cpp)
+    target_link_libraries(tracy-disk-index64-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-disk-index64 COMMAND tracy-disk-index64-tests ${CMAKE_CURRENT_BINARY_DIR}/disk-index64-test)
     add_executable(tracy-safe-snapshot-tests tests/SafeSnapshotTests.cpp)
     target_link_libraries(tracy-safe-snapshot-tests PRIVATE TracyServer)
     add_test(NAME tracy-safe-snapshot COMMAND tracy-safe-snapshot-tests ${CMAKE_CURRENT_BINARY_DIR}/safe-snapshot-test)

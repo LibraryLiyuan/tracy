@@ -2,8 +2,10 @@
 #include "../../analysis/TracyHash.hpp"
 #include "../../analysis/TracyAnalysisIoPath.hpp"
 #include "../../storage/TracyZoneExtraCodec.hpp"
+#include "../../public/common/TracyQueue.hpp"
 #include <algorithm>
 #include <cstring>
+#include <bit>
 namespace tracy::conversion
 {
 analysis::PagedRecordOptions OfflineConversionStorage::Options()
@@ -24,7 +26,7 @@ OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,st
 void OfflineConversionStorage::Check()
 {
     m_resources.CheckFast();
-    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();m_reclaimed=true;}
+    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();m_reclaimed=true;}
     if(!m_resources.SoftTargetExceeded())m_reclaimed=false;
 }
 bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,size_t bytes)
@@ -97,6 +99,20 @@ void OfflineConversionStorage::AppendRelation(const JnRelationData& row)
         if(!m_relations)m_relations=std::make_unique<analysis::PagedRecordWriter>(m_root/"relations",m_identity,uint32_t(sizeof(row)),Options());
         m_relations->Append(&row,1);m_relationCount=m_relations->Count();
     }catch(...){m_relationFailed=true;throw;}
+}
+std::optional<int64_t> OfflineConversionStorage::LookupPassTime(uint64_t id)
+{
+    Check();if(!m_sealed)throw std::runtime_error("pass_index_before_seal");if(!id)return {};
+    if(!m_passTimes){
+        try {
+            auto index=std::make_unique<storage::DiskIndex64>(m_root/"pass-times.index",m_identity,m_resources);
+            VisitRecords(OfflineAppendDomain::GpuReferencePass,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGpuReferencePassData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].passId)index->Upsert(rows[i].passId,std::bit_cast<uint64_t>(rows[i].time));});
+            VisitRecords(OfflineAppendDomain::GfxEntity,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGfxEntityData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].entityId&&rows[i].kind==uint8_t(JnGfxEntityKind::ExplicitGpuPass))index->Upsert(rows[i].entityId,std::bit_cast<uint64_t>(rows[i].time));});
+            VisitRecords(OfflineAppendDomain::GfxLink,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGfxLinkData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].sourceId&&rows[i].relation==uint8_t(JnGfxRelation::RangeEvidenceComplete))index->Upsert(rows[i].sourceId,std::bit_cast<uint64_t>(rows[i].time));});
+            index->Seal();m_passTimes=std::move(index);
+        }catch(...){m_resources.Fail("pass_index_build_failed");throw;}
+    }
+    const auto value=m_passTimes->Find(id);return value?std::optional<int64_t>(std::bit_cast<int64_t>(*value)):std::nullopt;
 }
 void OfflineConversionStorage::AppendRecord(OfflineAppendDomain domain,const void* row,uint32_t width)
 {

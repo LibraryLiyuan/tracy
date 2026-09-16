@@ -6707,7 +6707,7 @@ void Worker::ProcessJnGfxEntity( const QueueJnGfxEntity& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxEntities.push_back( JnGfxEntityData { time, ev.entityId, ev.parentId, m_threadCtx, ev.gpuQueryId, ev.gpuContext, ev.kind, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxEntity, JnGfxEntityData { time, ev.entityId, ev.parentId, m_threadCtx, ev.gpuQueryId, ev.gpuContext, ev.kind, ev.flags }, data.gfxEntities);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6717,7 +6717,7 @@ void Worker::ProcessJnGfxLink( const QueueJnGfxLink& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gfxLinks.push_back( JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GfxLink, JnGfxLinkData { time, ev.sourceId, ev.targetId, m_threadCtx, ev.relation, ev.flags }, data.gfxLinks);
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -6797,8 +6797,8 @@ void Worker::ProcessJnGpuReferencePass( const QueueJnGpuReferencePass& ev )
     auto& data = m_data.jnTrace;
     data.present = true;
     data.schemaVersion = JnTraceSchemaVersion;
-    data.gpuReferencePasses.push_back( JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
-        m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags } );
+    AppendOfflineRecord(OfflineAppendDomain::GpuReferencePass, JnGpuReferencePassData { time, ev.passId, ev.frameIndex,
+        m_threadCtx, ev.taxonomyId, ev.taxonomyLevel, ev.flags }, data.gpuReferencePasses);
     if( ev.passId != 0 ) m_jnGpuReferencePassTimes[ev.passId] = time;
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
@@ -7311,8 +7311,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
         data.gpuCatalogResources.size() + data.gpuCatalogViews.size() +
         data.gpuCatalogLogicals.size() + data.gpuCatalogVg.size() +
         data.gpuRangeSets.size() + data.gpuCatalogRelations.size() +
-        data.gpuDetailedEvidence.size() + data.gpuReferencePasses.size() +
-        data.gfxEntities.size() + data.gfxLinks.size();
+        data.gpuDetailedEvidence.size() +
+        (m_offlineStorage ? m_offlineStorage->RecordCount(OfflineAppendDomain::GpuReferencePass)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxEntity)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxLink) : data.gpuReferencePasses.size()+data.gfxEntities.size()+data.gfxLinks.size());
 
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
@@ -7377,6 +7377,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     };
 
     unordered_flat_map<uint64_t, int64_t> passTimes;
+    if(!m_offlineStorage){
     for( const auto& pass : data.gpuReferencePasses )
         if( pass.passId != 0 ) passTimes[pass.passId] = pass.time;
     // N27 RangeSet records are keyed by the authoritative explicit GPU pass
@@ -7400,6 +7401,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
             passTimes[link.sourceId] = link.time;
     }
 
+    }
     uint64_t unresolved = 0;
     uint64_t coreUnresolved = 0;
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
@@ -7454,8 +7456,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
         {
             auto& record = data.gpuRangeSets[i];
             auto time = std::numeric_limits<int64_t>::min();
-            const auto pass = passTimes.find( record.passInstanceId );
-            if( pass != passTimes.end() ) time = pass->second;
+            if(m_offlineStorage){const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
+            else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -11583,8 +11585,8 @@ void Worker::Write( FileWrite& f, bool fiDict )
         m_offlineStorage->VisitJobStages([&](const JnJobStageData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
     }else WriteJnVector( f, m_data.jnTrace.jobStages );
     WriteOfflineJnVector(f,m_data.jnTrace.gfxDispatches,m_offlineStorage,OfflineAppendDomain::GfxDispatch);
-    WriteJnVector( f, m_data.jnTrace.gfxEntities );
-    WriteJnVector( f, m_data.jnTrace.gfxLinks );
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxEntities,m_offlineStorage,OfflineAppendDomain::GfxEntity);
+    WriteOfflineJnVector(f,m_data.jnTrace.gfxLinks,m_offlineStorage,OfflineAppendDomain::GfxLink);
     WriteOfflineJnVector(f,m_data.jnTrace.frames,m_offlineStorage,OfflineAppendDomain::Frame);
     WriteOfflineJnVector(f,m_data.jnTrace.ioRequests,m_offlineStorage,OfflineAppendDomain::IoRequest);
     WriteOfflineJnVector(f,m_data.jnTrace.ioConfigs,m_offlineStorage,OfflineAppendDomain::IoConfig);
@@ -11594,7 +11596,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         m_offlineStorage->VisitRelations([&](const JnRelationData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
     }else WriteJnVector( f, m_data.jnTrace.relations );
     WriteOfflineJnVector(f,m_data.jnTrace.runtimeDomainStates,m_offlineStorage,OfflineAppendDomain::RuntimeDomainState);
-    WriteJnVector( f, m_data.jnTrace.gpuReferencePasses );
+    WriteOfflineJnVector(f,m_data.jnTrace.gpuReferencePasses,m_offlineStorage,OfflineAppendDomain::GpuReferencePass);
     if(m_offlineStorage) {
         const uint64_t count=m_offlineStorage->ReferenceUseCount();f.Write(&count,sizeof(count));
         m_offlineStorage->VisitReferenceUses([&](const JnGpuReferenceUseData* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(*rows));});
