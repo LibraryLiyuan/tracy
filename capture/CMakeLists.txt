@@ -42,3 +42,8 @@ add_executable(tracy-stream-inspect src/stream-inspect.cpp)
 target_link_libraries(tracy-stream-inspect PRIVATE TracyServer TracyStreamCore)
 
 install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(WIN32)
+    target_sources(tracy-capture PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsUtf8.manifest)
+    target_sources(tracy-stream-convert PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsUtf8.manifest)
+endif()

@@ -5,6 +5,7 @@
 #  include <unistd.h>
 #endif
 
+#include "CaptureStatus.hpp"
 #include <atomic>
 #include <algorithm>
 #include <charconv>
@@ -110,12 +111,12 @@ void AnsiPrintf( const char* ansiEscape, const char* format, ... ) {
 std::filesystem::path NormalizeOutputPath( const char* value )
 {
     std::error_code ec;
-    auto result = std::filesystem::weakly_canonical( std::filesystem::path( value ), ec );
+    auto result = std::filesystem::weakly_canonical( std::filesystem::u8path( value ), ec );
     if( ec )
     {
         ec.clear();
-        result = std::filesystem::absolute( std::filesystem::path( value ), ec );
-        if( ec ) result = std::filesystem::path( value );
+        result = std::filesystem::absolute( std::filesystem::u8path( value ), ec );
+        if( ec ) result = std::filesystem::u8path( value );
         result = result.lexically_normal();
     }
 #ifdef _WIN32
@@ -141,10 +142,20 @@ bool ParseIntegerOption( const char* value, int& result )
     return parsed.ec == std::errc() && parsed.ptr == end;
 }
 
-int main( int argc, char** argv )
+int CaptureMain( int argc, char** argv )
 {
+    CaptureStatus status;
+    bool headless = false;
+    int kept = 1;
+    for( int i = 1; i < argc; ++i )
+    {
+        if( std::string_view(argv[i]) == "--headless" ) headless = true;
+        else if( std::string_view(argv[i]) == "--status-json" && i+1 < argc ) status.path = std::filesystem::u8path(argv[++i]);
+        else argv[kept++] = argv[i];
+    }
+    argc = kept; argv[argc] = nullptr;
 #ifdef _WIN32
-    if( !AttachConsole( ATTACH_PARENT_PROCESS ) )
+    if( !headless && !AttachConsole( ATTACH_PARENT_PROCESS ) )
     {
         AllocConsole();
         SetConsoleMode( GetStdHandle( STD_OUTPUT_HANDLE ), 0x07 );
@@ -244,6 +255,27 @@ int main( int argc, char** argv )
         return 4;
     }
     const auto normalizedStopFile = stopFile ? NormalizeOutputPath( stopFile ) : std::filesystem::path();
+    if(!status.path.empty())
+    {
+        std::error_code statusError;
+        const auto statusText=status.path.u8string();
+        const auto statusValue=reinterpret_cast<const char*>(statusText.c_str());
+        if(std::filesystem::exists(status.path,statusError) || statusError ||
+            (output && SameOutputPath(statusValue,output)) ||
+            (journalOutput && SameOutputPath(statusValue,journalOutput)) ||
+            (stopFile && SameOutputPath(statusValue,stopFile)))
+        {
+            printf("Status path must be new and differ from capture artifacts.\n");
+            return 1;
+        }
+        status.Write("starting");
+        if(!std::filesystem::is_regular_file(status.path,statusError))
+        {
+            status.terminal=true;
+            printf("Cannot create status file.\n");
+            return 1;
+        }
+    }
 
     if( output )
     {
@@ -274,7 +306,7 @@ int main( int argc, char** argv )
         if( deferSymbolExpansion )
             journalOptions.sessionFlags |= tracy::stream::SessionBeginFlagDeferredSymbolExpansion;
         std::string journalError;
-        protocolObserver = tracy::stream::StreamProtocolObserver::CreateFileJournal( journalOutput, address, uint16_t( port ), tracy::ProtocolVersion, overwrite, journalOptions, journalError );
+        protocolObserver = tracy::stream::StreamProtocolObserver::CreateFileJournal( std::filesystem::u8path(journalOutput), address, uint16_t( port ), tracy::ProtocolVersion, overwrite, journalOptions, journalError );
         if( !protocolObserver )
         {
             printf( "Cannot create stream journal %s: %s\n", journalOutput, journalError.c_str() );
@@ -283,6 +315,7 @@ int main( int argc, char** argv )
         printf( "Streaming protocol journal to %s\n", journalOutput );
     }
 
+    status.Write("connecting");
     printf( "Connecting to %s:%i...", address, port );
     fflush( stdout );
     tracy::Worker worker( address, port, memoryLimit, protocolObserver.get(),
@@ -291,6 +324,13 @@ int main( int argc, char** argv )
         deferSymbolExpansion );
     while( !worker.HasData() )
     {
+        std::error_code stopError;
+        if( stopFile && std::filesystem::exists(normalizedStopFile, stopError) )
+        {
+            worker.Disconnect();
+            status.Write("cancelled", true);
+            return 0;
+        }
         const auto handshake = worker.GetHandshakeStatus();
         if( handshake == tracy::HandshakeProtocolMismatch )
         {
@@ -309,6 +349,10 @@ int main( int argc, char** argv )
         }
         std::this_thread::sleep_for( std::chrono::milliseconds( 100 ) );
     }
+    status.firstData = true;
+    status.clientPid = worker.GetPid();
+    status.started = std::chrono::steady_clock::now();
+    status.Write("recording");
     printf( "\nTimer resolution: %s\n", tracy::TimeToString( worker.GetResolution() ) );
     if( protocolOnly )
     {
@@ -346,6 +390,7 @@ int main( int argc, char** argv )
     const auto t0 = std::chrono::high_resolution_clock::now();
     while( worker.IsConnected() )
     {
+        status.Write("recording");
         if( stopFile )
         {
             std::error_code stopError;
@@ -359,6 +404,7 @@ int main( int argc, char** argv )
         {
             if( protocolDrain )
             {
+                status.Write("draining");
                 s_protocolDrainActive.store( true, std::memory_order_relaxed );
                 printf( "\nStopping event capture and resolving pending definitions. Press Ctrl+C again to force stop.\n" );
                 fflush( stdout );
@@ -431,6 +477,7 @@ int main( int argc, char** argv )
         }
     }
     const auto t1 = std::chrono::high_resolution_clock::now();
+    status.Write("draining");
     auto lastDrainProgress = std::chrono::steady_clock::now();
     uint64_t drainCommittedSize = protocolObserver ? protocolObserver->CommittedSize() : 0;
     uint64_t drainClientBytes = protocolObserver ? protocolObserver->ClientBytes() : 0;
@@ -443,6 +490,7 @@ int main( int argc, char** argv )
         {
             printf( "\nProtocol drain force-stopped. The committed journal prefix remains recoverable.\n" );
             fflush( stdout );
+            status.Write("interrupted", true);
             std::_Exit( 130 );
         }
         if( protocolDrain && drainIdleSeconds != 0 )
@@ -468,6 +516,7 @@ int main( int argc, char** argv )
                 printf( "\nProtocol drain made no progress for %d seconds and was force-stopped. "
                     "The committed journal prefix remains recoverable.\n", drainIdleSeconds );
                 fflush( stdout );
+                status.Write("drain_timeout", true);
                 std::_Exit( 124 );
             }
         }
@@ -609,5 +658,13 @@ int main( int argc, char** argv )
 
     if( protocolObserver && protocolObserver->Failed() ) return 6;
     if( worker.DidProtocolResolverFail() ) return 7;
+    status.sessionEnd = protocolObserver && protocolObserver->Finalized();
+    status.Write("finished", true);
     return 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) { auto args = CaptureUtf8Arguments(argc, argv); std::vector<char*> pointers; for(auto& a: args) pointers.push_back(a.data()); pointers.push_back(nullptr); return CaptureMain(argc,pointers.data()); }
+#else
+int main(int argc,char** argv) { return CaptureMain(argc,argv); }
+#endif

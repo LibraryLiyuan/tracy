@@ -8,6 +8,7 @@
 #include "../../stream/src/TracyStreamReplay.hpp"
 #include "../../stream/src/TracyStreamSnapshotMap.hpp"
 
+#include "CaptureStatus.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1223,7 +1224,7 @@ void EnableLocalReplayOnly()
 
 }
 
-int main( int argc, char** argv )
+int ConvertMain( int argc, char** argv )
 {
     const auto totalStart = std::chrono::steady_clock::now();
     Options options;
@@ -2169,3 +2170,9 @@ int main( int argc, char** argv )
     }
     return 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t** argv) { auto args = CaptureUtf8Arguments(argc, argv); std::vector<char*> pointers; for(auto& a: args) pointers.push_back(a.data()); pointers.push_back(nullptr); return ConvertMain(argc,pointers.data()); }
+#else
+int main(int argc,char** argv) { return ConvertMain(argc,argv); }
+#endif

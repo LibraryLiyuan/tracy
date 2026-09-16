@@ -291,3 +291,7 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
         endif()
     endif()
 endif()
+
+if(WIN32)
+    target_sources(tracy-query PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../cmake/WindowsUtf8.manifest)
+endif()
