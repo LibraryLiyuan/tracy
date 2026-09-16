@@ -373,13 +373,13 @@ void CheckConversion()
     if(CancelRequested())conversionResources->Cancel();
     conversionResources->CheckFast();
 }
-bool AtomicWriteText( const std::filesystem::path& path, const std::string& text )
+bool AtomicWriteText( const std::filesystem::path& path, const std::string& text, bool fatal = true )
 {
     if( path.empty() ) return true;
     if(conversionFiles) {
         try{conversionFiles->WriteText(path,text);return true;}
-        catch(const std::exception& e){conversionResources->Fail(e.what());return false;}
-        catch(...){conversionResources->Fail("conversion_metadata_failure");return false;}
+        catch(const std::exception& e){if(fatal)conversionResources->Fail(e.what());return false;}
+        catch(...){if(fatal)conversionResources->Fail("conversion_metadata_failure");return false;}
     }
     auto temporary = path;
     temporary += ".tmp";
@@ -530,6 +530,7 @@ public:
     bool PressureExceeded() const { return m_pressureExceeded.load( std::memory_order_relaxed ); }
     uint64_t PeakCommitBytes() const { return m_peakCommit.load( std::memory_order_relaxed ); }
     uint64_t PeakWorkingSetBytes() const { return m_peakWorkingSet.load( std::memory_order_relaxed ); }
+    uint64_t ProgressWriteFailures() const { return m_progressWriteFailures.load( std::memory_order_relaxed ); }
 
     void Stop()
     {
@@ -549,7 +550,7 @@ private:
         std::unique_lock<std::mutex> lock( m_lock );
         while( !m_stop )
         {
-            m_signal.wait_for( lock, std::chrono::seconds( 2 ) );
+            m_signal.wait_for( lock, std::chrono::seconds( 2 ), [this]{ return m_stop; } );
             if( m_stop ) break;
             lock.unlock();
             try{Emit();}catch(...){if(conversionResources)conversionResources->Fail("conversion_progress_failure");}
@@ -631,7 +632,11 @@ private:
                 << "\",\"system_available_bytes\":\"" << memory.physicalAvailable
                 << "\",\"temporary_output_bytes\":\"" << temporarySize << "\",\"task_disk_current_bytes\":\""<<taskDiskCurrent<<"\",\"task_disk_peak_bytes\":\""<<taskDiskPeak<<"\",\"task_disk_limit_bytes\":\""<<taskDiskLimit<<"\",\"workspace_current_bytes\":\""<<workspaceCurrent<<"\",\"workspace_peak_bytes\":\""<<workspacePeak<<"\",\"workspace_limit_bytes\":\""<<workspaceLimit<<"\",\"cancel_requested\":"
                 << ( CancelRequested() ? "true" : "false" ) << "}";
-            AtomicWriteText( m_jsonPath, json.str() );
+            if(!AtomicWriteText( m_jsonPath, json.str(), false ))
+            {
+                const auto failures=m_progressWriteFailures.fetch_add(1,std::memory_order_relaxed)+1;
+                if(failures==1)std::fprintf(stderr,"Progress JSON update failed; conversion will continue and retry on the next interval.\n");
+            }
         }
     }
 
@@ -650,6 +655,7 @@ private:
     std::atomic<bool> m_pressureExceeded { false };
     std::atomic<uint64_t> m_peakCommit { 0 };
     std::atomic<uint64_t> m_peakWorkingSet { 0 };
+    std::atomic<uint64_t> m_progressWriteFailures { 0 };
     std::thread m_thread;
     std::string m_substage;
     std::chrono::steady_clock::time_point m_substageStarted=m_started;
@@ -2345,6 +2351,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             << gpuReferenceUseCount << "\",\"job_stages\":\"" << jobStageCount << "\",\"output_bytes\":\""
             << ( outputSizeError ? 0 : outputSize ) << "\",\"peak_commit_bytes\":\"" << progress.PeakCommitBytes()
             << "\",\"peak_working_set_bytes\":\"" << progress.PeakWorkingSetBytes()
+            << "\",\"progress_write_failures\":\"" << progress.ProgressWriteFailures()
             << "\",\"gpu_catalog_resolver\":{\"full_resolve_calls\":\"" << gpuCatalogResolveStats.fullResolveCalls
             << "\",\"generation_end_calls\":\"" << gpuCatalogResolveStats.generationEndCalls
             << "\",\"post_end_batch_calls\":\"" << gpuCatalogResolveStats.postEndBatchCalls

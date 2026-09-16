@@ -162,8 +162,15 @@ void ConversionResources::ReplaceOwned(const std::filesystem::path& from,const s
     const auto registryAfter=m_controlRegistryBytes-PathMemory(a)-(dest==m_files.end()?0:PathMemory(b))+PathMemory(b);
     if(registryAfter>(1ull<<20))Refuse("conversion_control_registry_limit");
 #ifdef _WIN32
-    if(!MoveFileExW(analysis::AnalysisIoPath(a).c_str(),analysis::AnalysisIoPath(b).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
-        throw std::runtime_error("conversion_control_publish:"+std::to_string(GetLastError()));
+    DWORD publishError=ERROR_SUCCESS;bool published=false;
+    for(uint32_t attempt=0;attempt<10;++attempt)
+    {
+        if(MoveFileExW(analysis::AnalysisIoPath(a).c_str(),analysis::AnalysisIoPath(b).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){published=true;break;}
+        publishError=GetLastError();
+        if(publishError!=ERROR_ACCESS_DENIED&&publishError!=ERROR_SHARING_VIOLATION&&publishError!=ERROR_LOCK_VIOLATION)break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10*(attempt+1)));
+    }
+    if(!published)throw std::runtime_error("conversion_control_publish:"+std::to_string(publishError));
 #else
     std::filesystem::rename(a,b);
 #endif
