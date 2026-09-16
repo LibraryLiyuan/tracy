@@ -889,6 +889,7 @@ public:
     void CacheSourceFiles();
 
     StringLocation StoreString(const char* str, size_t sz);
+    uint32_t StoreCallstackFrames(const CallstackFrameId*,uint16_t,bool);
     uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():m_data.stringData.size(); }
     uint64_t PersistedStringToken(const char*) const;
 

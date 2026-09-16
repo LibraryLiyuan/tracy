@@ -70,6 +70,15 @@ class MappedAppendArena
             m_used += bytes;
             return result;
         }
+        std::pair<uint64_t,char*> Allocate( uint64_t bytes, uint64_t alignment )
+        {
+            Require( alignment && ( alignment & ( alignment - 1 ) ) == 0 && alignment <= 4096, "mapped_arena_alignment" );
+            Require( m_used <= UINT64_MAX - alignment + 1, "mapped_arena_offset" );
+            const auto offset = ( m_used + alignment - 1 ) & ~( alignment - 1 );
+            Require( offset <= m_capacity && bytes <= m_capacity - offset, "mapped_arena_append" );
+            m_used = offset + bytes;
+            return { offset, m_data + offset };
+        }
         const char* At( uint64_t offset, uint64_t bytes ) const
         {
             Require( offset <= m_used && bytes <= m_used - offset, "mapped_arena_range" );
@@ -109,17 +118,24 @@ public:
     }
     Location Append( const void* data, uint64_t bytes )
     {
-        m_resources.CheckFast();
+        Require( bytes == 0 || data, "mapped_arena_append" );
         Require( bytes < UINT64_MAX, "mapped_arena_size" );
-        const auto required = bytes + 1;
+        auto location = Allocate( bytes + 1, 1 );
+        if( bytes ) std::memcpy( location.data, data, size_t( bytes ) );
+        location.data[bytes] = 0;
+        return location;
+    }
+    Location Allocate( uint64_t bytes, uint64_t alignment )
+    {
+        m_resources.CheckFast();
+        Require( bytes > 0 && alignment && bytes <= UINT64_MAX - alignment + 1, "mapped_arena_size" );
+        const auto required = bytes + alignment - 1;
         if( m_chunks.empty() || required > m_chunks.back()->Capacity() - m_chunks.back()->Used() ) AddChunk( required );
         auto& chunk = *m_chunks.back();
-        const auto offset = chunk.Used();
-        auto* result = chunk.Append( data, bytes );
-        const char zero = 0;
-        chunk.Append( &zero, 1 );
-        m_used += required;
-        return { uint32_t( m_chunks.size() - 1 ), offset, result };
+        const auto before = chunk.Used();
+        const auto allocation = chunk.Allocate( bytes, alignment );
+        m_used += chunk.Used() - before;
+        return { uint32_t( m_chunks.size() - 1 ), allocation.first, allocation.second };
     }
     const char* Get( uint32_t chunk, uint64_t offset, uint64_t bytes ) const
     {
@@ -127,6 +143,11 @@ public:
         const auto* result = m_chunks[chunk]->At( offset, bytes + 1 );
         Require( result[bytes] == 0, "mapped_arena_terminator" );
         return result;
+    }
+    const char* GetRaw( uint32_t chunk, uint64_t offset, uint64_t bytes ) const
+    {
+        Require( chunk < m_chunks.size(), "mapped_arena_chunk" );
+        return m_chunks[chunk]->At( offset, bytes );
     }
     void Flush() { for( auto& chunk : m_chunks ) chunk->Flush(); }
     uint64_t UsedBytes() const { return m_used; }

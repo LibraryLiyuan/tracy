@@ -49,6 +49,8 @@ public:
     virtual const char* StringAt(uint32_t)=0;
     virtual uint64_t StringCount() const=0;
     virtual void VisitStrings(const std::function<void(uint32_t,const char*,uint64_t)>&)=0;
+    virtual const uint64_t* InternCallstack(const uint64_t*,uint32_t,uint32_t&)=0;
+    virtual uint64_t CallstackCount() const=0;
     virtual uint64_t CreateCpuThread()=0;
     virtual uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&)=0;
     virtual void ReadCpuZone(uint64_t,OfflineCpuZone&)=0;

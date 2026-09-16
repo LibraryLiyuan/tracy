@@ -9,6 +9,7 @@
 #include "../../storage/TracyBoundedRecordTable.hpp"
 #include "../../storage/TracyOrderedForest.hpp"
 #include "../../storage/TracyOfflineStringStore.hpp"
+#include "../../storage/TracyOfflineCallstackStore.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -54,6 +55,11 @@ public:
     uint64_t StringReservedBytes()const{return m_strings?m_strings->ReservedBytes():0;}
     std::string StringHash()const;
     bool StringsSealed()const{return m_sealed;}
+    const uint64_t* InternCallstack(const uint64_t*,uint32_t,uint32_t&) override;
+    uint64_t CallstackCount()const override{return m_callstacks?m_callstacks->Count():1;}
+    uint64_t CallstackUsedBytes()const{return m_callstacks?m_callstacks->UsedBytes():0;}
+    uint64_t CallstackReservedBytes()const{return m_callstacks?m_callstacks->ReservedBytes():0;}
+    std::string CallstackHash()const;
     uint64_t CreateCpuThread() override;
     uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&) override;
     void ReadCpuZone(uint64_t,OfflineCpuZone&) override;
@@ -114,6 +120,7 @@ private:
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::unique_ptr<storage::OfflineStringStore> m_strings;
+    std::unique_ptr<storage::OfflineCallstackStore> m_callstacks;
     std::unique_ptr<storage::OrderedForest> m_cpuZones;
     bool m_cpuZonesSealed=false;
     std::unique_ptr<storage::OrderedForest> m_gpuZones;

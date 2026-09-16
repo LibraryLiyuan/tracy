@@ -11,6 +11,18 @@ namespace tracy {
 static void Check(bool v,std::source_location at=std::source_location::current()){if(!v)throw std::runtime_error("offline Worker semantic mismatch at "+std::to_string(at.line()));}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void CallstackRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
+    std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);conversion::OfflineConversionStorage store(root/"store",std::string(64,'8'),resources);MigrateStrings(worker,store);
+    for(uint64_t i=1;i<worker.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&worker.m_data.zoneExtra[i]);
+#define X(name,field,type,mut) for(const auto& row:worker.m_data.jnTrace.field)store.AppendCatalog(OfflineCatalogDomain::name,&row,sizeof(row));
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+    for(uint32_t i=1;i<worker.m_data.callstackPayload.size();++i){const auto value=worker.m_data.callstackPayload[i].get();uint32_t id=0;const auto* frames=store.InternCallstack(reinterpret_cast<const uint64_t*>(value->data()),value->size(),id);Check(id==i&&std::memcmp(frames,value->data(),value->size()*sizeof(CallstackFrameId))==0);}
+    worker.m_offlineStorage=&store;const uint64_t raw[2]={0x1000,0x2000};worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));const auto id=worker.m_pendingCallstackId;Check(id==worker.m_data.callstackPayload.size()-1);worker.m_pendingCallstackId=0;worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));Check(worker.m_pendingCallstackId==id&&store.CallstackCount()==worker.m_data.callstackPayload.size());worker.m_pendingCallstackId=0;
+    worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
+    std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto& value=reopened.GetCallstack(id);Check(value.size()==2&&reopened.GetCanonicalPointer(value[0])==raw[0]&&reopened.GetCanonicalPointer(value[1])==raw[1]);worker.m_offlineStorage=nullptr;
+ }
  static void MigrateStrings(Worker& worker,conversion::OfflineConversionStorage& store){for(uint32_t i=0;i<worker.m_data.stringData.size();++i){uint32_t id=UINT32_MAX;const auto* source=worker.m_data.stringData[i];const auto* value=store.InternString(source,std::strlen(source),id);Check(id==i&&std::strcmp(value,source)==0);}}
  static void StringRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
     std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);conversion::OfflineConversionStorage store(root/"store",std::string(64,'9'),resources);
@@ -248,6 +260,7 @@ int main(int argc,char** argv) {
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  auto root=std::filesystem::path(argv[2]);std::filesystem::create_directories(root);
+ OfflineStorageSemanticTest::CallstackRoundTrip(argv[1],root/"callstacks",resources);
  OfflineStorageSemanticTest::StringRoundTrip(argv[1],root/"strings",resources);
  OfflineStorageSemanticTest::CpuZoneRoundTrip(argv[1],root/"cpu-zones",resources);
  OfflineStorageSemanticTest::GpuZoneRoundTrip(argv[1],root/"gpu-zones",resources);

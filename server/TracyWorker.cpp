@@ -5715,25 +5715,31 @@ uint64_t Worker::GetCanonicalPointer( const CallstackFrameId& id ) const
     return ( id.idx & 0x3FFFFFFFFFFFFFFF ) | ( ( id.idx & 0x3000000000000000 ) << 2 );
 }
 
-void Worker::AddCallstackPayload( const char* _data, size_t _sz )
+uint32_t Worker::StoreCallstackFrames( const CallstackFrameId* frames, uint16_t size, bool queryFrames )
 {
-    assert( m_pendingCallstackId == 0 );
-
-    const auto sz = _sz / sizeof( uint64_t );
-    const auto memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
-    auto mem = (char*)m_slab.AllocRaw( memsize );
-
-    auto data = (CallstackFrameId*)mem;
-    auto dst = data;
-    auto src = (uint64_t*)_data;
-    for( size_t i=0; i<sz; i++ )
+    assert( frames && size );
+    if( m_offlineStorage )
     {
-        *dst++ = PackPointer( *src++ );
+        uint32_t id;
+        const auto* stored = m_offlineStorage->InternCallstack( reinterpret_cast<const uint64_t*>( frames ), size, id );
+        if( id == m_data.callstackPayload.size() )
+        {
+            auto* array = m_slab.Alloc<VarArray<CallstackFrameId>>();
+            new( array ) VarArray<CallstackFrameId>( size, reinterpret_cast<const CallstackFrameId*>( stored ) );
+            m_data.callstackPayload.push_back( array );
+            if( queryFrames ) for( const auto& frame : *array ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
+        }
+        else
+        {
+            if( id == 0 || id >= m_data.callstackPayload.size() || m_data.callstackPayload[id]->size() != size || std::memcmp( m_data.callstackPayload[id]->data(), stored, size * sizeof( CallstackFrameId ) ) != 0 ) throw std::runtime_error( "offline_callstack_id_mismatch" );
+        }
+        return id;
     }
-
-    auto arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
-    new(arr) VarArray<CallstackFrameId>( sz, data );
-
+    const auto memsize = sizeof( VarArray<CallstackFrameId> ) + size * sizeof( CallstackFrameId );
+    auto* mem = static_cast<char*>( m_slab.AllocRaw( memsize ) );
+    std::memcpy( mem, frames, size * sizeof( CallstackFrameId ) );
+    auto* arr = reinterpret_cast<VarArray<CallstackFrameId>*>( mem + size * sizeof( CallstackFrameId ) );
+    new( arr ) VarArray<CallstackFrameId>( size, reinterpret_cast<CallstackFrameId*>( mem ) );
     uint32_t idx;
     auto it = m_data.callstackMap.find( arr );
     if( it == m_data.callstackMap.end() )
@@ -5742,10 +5748,7 @@ void Worker::AddCallstackPayload( const char* _data, size_t _sz )
         m_data.callstackMap.emplace( arr, idx );
         m_data.callstackPayload.push_back( arr );
 
-        for( auto& frame : *arr )
-        {
-            QueryCallstackFrame( GetCanonicalPointer( frame ) );
-        }
+        if( queryFrames ) for( const auto& frame : *arr ) QueryCallstackFrame( GetCanonicalPointer( frame ) );
     }
     else
     {
@@ -5753,7 +5756,18 @@ void Worker::AddCallstackPayload( const char* _data, size_t _sz )
         m_slab.Unalloc( memsize );
     }
 
-    m_pendingCallstackId = idx;
+    return idx;
+}
+
+void Worker::AddCallstackPayload( const char* _data, size_t _sz )
+{
+    assert( m_pendingCallstackId == 0 );
+    if( !_data || _sz == 0 || _sz % sizeof( uint64_t ) != 0 || _sz / sizeof( uint64_t ) > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+    const auto size = uint16_t( _sz / sizeof( uint64_t ) );
+    std::vector<CallstackFrameId> frames( size );
+    const auto* source = reinterpret_cast<const uint64_t*>( _data );
+    for( uint16_t i = 0; i < size; ++i ) frames[i] = PackPointer( source[i] );
+    m_pendingCallstackId = StoreCallstackFrames( frames.data(), size, true );
 }
 
 void Worker::AddCallstackSampleDictionary( uint32_t stackId, const char* data, size_t sz )
@@ -5856,52 +5870,23 @@ void Worker::AddCallstackAllocPayload( const char* data )
         stack[i] = id;
     }
 
-    VarArray<CallstackFrameId>* arr;
-    size_t memsize;
+    std::vector<CallstackFrameId> combined;
     if( m_pendingCallstackId != 0 )
     {
         const auto nativeCs = m_data.callstackPayload[m_pendingCallstackId];
         const auto nsz = nativeCs->size();
         const auto tsz = sz + nsz;
-
-        memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-        memcpy( mem, stack, sizeof( CallstackFrameId ) * sz );
-        memcpy( mem + sizeof( CallstackFrameId ) * sz, nativeCs->data(), sizeof( CallstackFrameId ) * nsz );
-
-        arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
+        if( tsz > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+        combined.reserve( tsz );
+        combined.insert( combined.end(), stack, stack + sz );
+        combined.insert( combined.end(), nativeCs->begin(), nativeCs->end() );
     }
     else
     {
-        memsize = sizeof( VarArray<CallstackFrameId> ) + sz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-        memcpy( mem, stack, sizeof( CallstackFrameId ) * sz );
-
-        arr = (VarArray<CallstackFrameId>*)( mem + sz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( sz, (CallstackFrameId*)mem );
+        combined.assign( stack, stack + sz );
     }
-
-    uint32_t idx;
-    auto it = m_data.callstackMap.find( arr );
-    if( it == m_data.callstackMap.end() )
-    {
-        idx = m_data.callstackPayload.size();
-        m_data.callstackMap.emplace( arr, idx );
-        m_data.callstackPayload.push_back( arr );
-
-        for( auto& frame : *arr )
-        {
-            QueryCallstackFrame( GetCanonicalPointer( frame ) );
-        }
-    }
-    else
-    {
-        idx = it->second;
-        m_slab.Unalloc( memsize );
-    }
-
-    m_pendingCallstackId = idx;
+    if( combined.empty() ) throw std::runtime_error( "callstack_payload_size" );
+    m_pendingCallstackId = StoreCallstackFrames( combined.data(), uint16_t( combined.size() ), true );
 }
 
 uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
@@ -5911,30 +5896,13 @@ uint32_t Worker::MergeCallstacks( uint32_t first, uint32_t second )
 
     const auto sz1 = cs1.size();
     const auto sz2 = cs2.size();
-    const auto tsz = sz1 + sz2;
-
-    size_t memsize = sizeof( VarArray<CallstackFrameId> ) + tsz * sizeof( CallstackFrameId );
-    auto mem = (char*)m_slab.AllocRaw( memsize );
-    memcpy( mem, cs1.data(), sizeof( CallstackFrameId ) * sz1 );
-    memcpy( mem + sizeof( CallstackFrameId ) * sz1, cs2.data(), sizeof( CallstackFrameId ) * sz2 );
-
-    VarArray<CallstackFrameId>* arr = (VarArray<CallstackFrameId>*)( mem + tsz * sizeof( CallstackFrameId ) );
-    new(arr) VarArray<CallstackFrameId>( tsz, (CallstackFrameId*)mem );
-
-    uint32_t idx;
-    auto it = m_data.callstackMap.find( arr );
-    if( it == m_data.callstackMap.end() )
-    {
-        idx = m_data.callstackPayload.size();
-        m_data.callstackMap.emplace( arr, idx );
-        m_data.callstackPayload.push_back( arr );
-    }
-    else
-    {
-        idx = it->second;
-        m_slab.Unalloc( memsize );
-    }
-    return idx;
+    const auto total = uint32_t( sz1 ) + uint32_t( sz2 );
+    if( total == 0 || total > UINT16_MAX ) throw std::runtime_error( "callstack_payload_size" );
+    std::vector<CallstackFrameId> frames;
+    frames.reserve( total );
+    frames.insert( frames.end(), cs1.begin(), cs1.end() );
+    frames.insert( frames.end(), cs2.begin(), cs2.end() );
+    return StoreCallstackFrames( frames.data(), uint16_t( frames.size() ), false );
 }
 
 void Worker::InsertPlot( PlotData* plot, int64_t time, double val )
