@@ -44,6 +44,11 @@ public:
     virtual void ReadZoneExtra(uint32_t,void*)=0;
     virtual void PutZoneExtra(uint32_t,const void*)=0;
     virtual void VisitZoneExtras(const std::function<void(const void*,uint64_t)>&)=0;
+    virtual const char* InternString(const char*,size_t,uint32_t&)=0;
+    virtual bool FindString(const char*,size_t,uint32_t&)=0;
+    virtual const char* StringAt(uint32_t)=0;
+    virtual uint64_t StringCount() const=0;
+    virtual void VisitStrings(const std::function<void(uint32_t,const char*,uint64_t)>&)=0;
     virtual uint64_t CreateCpuThread()=0;
     virtual uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&)=0;
     virtual void ReadCpuZone(uint64_t,OfflineCpuZone&)=0;

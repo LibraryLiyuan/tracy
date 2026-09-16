@@ -2836,6 +2836,11 @@ int64_t Worker::GetZoneEndImpl( const GpuEvent& ev )
 uint32_t Worker::FindStringIdx( const char* str ) const
 {
     if( !str ) return 0;
+    if( m_offlineStorage )
+    {
+        uint32_t id;
+        return m_offlineStorage->FindString( str, strlen( str ), id ) ? id : 0;
+    }
     charutil::StringKey key = { str, strlen( str ) };
     auto sit = m_data.stringMap.find( key );
     if( sit == m_data.stringMap.end() )
@@ -2866,7 +2871,7 @@ const char* Worker::GetString( const StringRef& ref ) const
     if( ref.isidx )
     {
         assert( ref.active );
-        return m_data.stringData[ref.str];
+        return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( ref.str ) ) : m_data.stringData[ref.str];
     }
     else
     {
@@ -2884,7 +2889,7 @@ const char* Worker::GetString( const StringRef& ref ) const
 const char* Worker::GetString( const StringIdx& idx ) const
 {
     assert( idx.Active() );
-    return m_data.stringData[idx.Idx()];
+    return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( idx.Idx() ) ) : m_data.stringData[idx.Idx()];
 }
 
 static const char* BadExternalThreadNames[] = {
@@ -6229,6 +6234,12 @@ uint32_t Worker::GetSecondStringIdx()
 
 StringLocation Worker::StoreString( const char* str, size_t sz )
 {
+    if( m_offlineStorage )
+    {
+        uint32_t id;
+        const auto* value = m_offlineStorage->InternString( str, sz, id );
+        return { value, id };
+    }
     StringLocation ret;
     charutil::StringKey key = { str, sz };
     auto sit = m_data.stringMap.find( key );
@@ -7675,6 +7686,31 @@ void Worker::FinalizeJnGpuCatalogForSave()
         PutCatalogValue(OfflineCatalogDomain::CatalogBatch,index,batch,data.gpuCatalogBatches);
     }
     seal();
+}
+
+uint64_t Worker::PersistedStringToken( const char* value ) const
+{
+    if( !m_offlineStorage ) return uint64_t( value );
+    if( !value ) throw std::runtime_error( "offline_string_null_token" );
+    uint32_t id;
+    if( !m_offlineStorage->FindString( value, strlen( value ), id ) ) throw std::runtime_error( "offline_string_token_missing" );
+    return uint64_t( id ) + 1;
+}
+
+void Worker::FinalizeOfflineStrings()
+{
+    if( !m_offlineStorage ) return;
+    const auto intern = [&]( const char* value ) {
+        if( !value ) throw std::runtime_error( "offline_string_null_reference" );
+        return StoreString( value, strlen( value ) ).ptr;
+    };
+    for( auto& value : m_data.strings ) value.second = intern( value.second );
+    for( auto& value : m_data.threadNames ) value.second = intern( value.second );
+    for( auto& value : m_data.externalNames )
+    {
+        value.second.first = intern( value.second.first );
+        value.second.second = intern( value.second.second );
+    }
 }
 template<class T> static void WriteCatalogVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineCatalogDomain domain)
 {
@@ -11168,15 +11204,27 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = m_data.stringData.size();
+    sz = StringTableCount();
     f.Write( &sz, sizeof( sz ) );
-    for( auto& v : m_data.stringData )
+    if( m_offlineStorage )
     {
-        uint64_t ptr = (uint64_t)v;
-        f.Write( &ptr, sizeof( ptr ) );
-        sz = strlen( v );
-        f.Write( &sz, sizeof( sz ) );
-        f.Write( v, sz );
+        m_offlineStorage->VisitStrings( [&]( uint32_t id, const char* value, uint64_t bytes ) {
+            const uint64_t token = uint64_t( id ) + 1;
+            f.Write( &token, sizeof( token ) );
+            f.Write( &bytes, sizeof( bytes ) );
+            f.Write( value, size_t( bytes ) );
+        } );
+    }
+    else
+    {
+        for( auto& v : m_data.stringData )
+        {
+            uint64_t ptr = (uint64_t)v;
+            f.Write( &ptr, sizeof( ptr ) );
+            sz = strlen( v );
+            f.Write( &sz, sizeof( sz ) );
+            f.Write( v, sz );
+        }
     }
 
     sz = m_data.strings.size();
@@ -11184,7 +11232,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     for( auto& v : m_data.strings )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second;
+        uint64_t ptr = PersistedStringToken( v.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 
@@ -11193,7 +11241,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     for( auto& v : m_data.threadNames )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second;
+        uint64_t ptr = PersistedStringToken( v.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 
@@ -11202,9 +11250,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
     for( auto& v : m_data.externalNames )
     {
         f.Write( &v.first, sizeof( v.first ) );
-        uint64_t ptr = (uint64_t)v.second.first;
+        uint64_t ptr = PersistedStringToken( v.second.first );
         f.Write( &ptr, sizeof( ptr ) );
-        ptr = (uint64_t)v.second.second;
+        ptr = PersistedStringToken( v.second.second );
         f.Write( &ptr, sizeof( ptr ) );
     }
 

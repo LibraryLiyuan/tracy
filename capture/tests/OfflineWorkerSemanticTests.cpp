@@ -11,6 +11,22 @@ namespace tracy {
 static void Check(bool v,std::source_location at=std::source_location::current()){if(!v)throw std::runtime_error("offline Worker semantic mismatch at "+std::to_string(at.line()));}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void MigrateStrings(Worker& worker,conversion::OfflineConversionStorage& store){for(uint32_t i=0;i<worker.m_data.stringData.size();++i){uint32_t id=UINT32_MAX;const auto* source=worker.m_data.stringData[i];const auto* value=store.InternString(source,std::strlen(source),id);Check(id==i&&std::strcmp(value,source)==0);}}
+ static void StringRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
+    std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);conversion::OfflineConversionStorage store(root/"store",std::string(64,'9'),resources);
+    std::vector<std::string> expected;for(uint32_t i=0;i<worker.m_data.stringData.size();++i){expected.emplace_back(worker.m_data.stringData[i]);uint32_t id=UINT32_MAX;const auto* value=store.InternString(expected.back().data(),expected.back().size(),id);Check(id==i&&std::strcmp(value,expected.back().c_str())==0);}
+    for(uint64_t i=1;i<worker.m_data.zoneExtra.size();++i)Check(store.AppendZoneExtra(&worker.m_data.zoneExtra[i])==i);
+#define X(name,field,type,mut) for(const auto& row:worker.m_data.jnTrace.field)store.AppendCatalog(OfflineCatalogDomain::name,&row,sizeof(row));
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+    worker.m_data.stringData.clear();worker.m_data.stringMap.clear();worker.m_offlineStorage=&store;
+    const auto duplicate=worker.StoreString(expected[0].data(),expected[0].size());Check(duplicate.idx==0&&std::strcmp(duplicate.ptr,expected[0].c_str())==0);
+    const auto added=worker.StoreString("p5-new",6);Check(added.idx==expected.size()&&std::strcmp(worker.GetString(StringIdx(added.idx)),"p5-new")==0);expected.emplace_back("p5-new");
+    worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
+    std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);Check(reopened.m_data.stringData.size()==expected.size());for(uint32_t i=0;i<expected.size();++i)Check(std::strcmp(reopened.m_data.stringData[i],expected[i].c_str())==0);
+    worker.m_offlineStorage=nullptr;
+ }
  static void GpuZoneRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
     std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);
     conversion::OfflineConversionStorage store(root/"store",std::string(64,'e'),resources);
@@ -19,6 +35,7 @@ struct OfflineStorageSemanticTest {
     TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
     for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;Check(value.value.size()<=256);std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+    MigrateStrings(worker,store);
     Vector<GpuCtxData*> growingGpu;for(auto* context:worker.m_data.gpuData)growingGpu.push_back(context);worker.m_data.gpuData=std::move(growingGpu);
     worker.m_offlineStorage=&store;worker.m_timerMul=1;worker.m_data.baseTime=0;worker.m_refTimeThread=0;worker.m_refTimeSerial=0;worker.m_refTimeGpu=0;
     Check(!worker.m_data.sourceLocationExpand.empty());const auto sourceIndex=worker.m_data.sourceLocationExpand.size()>1?1:0;const auto source=worker.m_data.sourceLocationExpand[sourceIndex];worker.m_sourceLocationShrink[source]=int16_t(sourceIndex);worker.m_data.shrinkSrclocLast={source,int16_t(sourceIndex)};
@@ -31,7 +48,7 @@ struct OfflineStorageSemanticTest {
     end.cpuTime=30;end.queryId=4;worker.ProcessGpuZoneEnd(end,false);gpu.queryId=4;gpu.gpuTime=10;worker.ProcessGpuTime(gpu);
     QueueJnCallsiteDefinition definition{};definition.srcloc=source;definition.callsiteId=77;definition.flags=uint8_t(JnCallsiteFlags::HasCallstack);worker.m_serialNextCallstack=1;worker.ProcessJnCallsiteDefinition(definition);
     Check(store.GpuZoneCount()==2&&store.GpuThreadCount()==1);
-    store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
+    worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const GpuCtxData* loaded=nullptr;for(auto* value:reopened.m_data.gpuData)if(value->type==GpuContextType::Vulkan&&value->threadData.contains(111))loaded=value;Check(loaded);
     const auto& timeline=loaded->threadData.at(111).timeline;Check(timeline.size()==1);const auto top=timeline.is_magic()?&(*(const Vector<GpuEvent>*)(&timeline))[0]:timeline[0].get();Check(top->CpuStart()==10&&top->CpuEnd()==40&&top->GpuStart()==100&&top->GpuEnd()==130&&top->Child()>=0);
     const auto& children=reopened.GetGpuChildren(top->Child());Check(children.size()==1);const auto nested=children.is_magic()?&(*(const Vector<GpuEvent>*)(&children))[0]:children[0].get();Check(nested->CpuStart()==20&&nested->CpuEnd()==30&&nested->GpuStart()==110&&nested->GpuEnd()==120&&nested->callstack.Val()==1);
@@ -45,6 +62,7 @@ struct OfflineStorageSemanticTest {
     TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
     for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;Check(value.value.size()<=256);std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+    MigrateStrings(worker,store);
     Vector<ThreadData*> growingThreads;for(auto* thread:worker.m_data.threads)growingThreads.push_back(thread);worker.m_data.threads=std::move(growingThreads);
     worker.m_offlineStorage=&store;worker.m_timerMul=1;worker.m_data.baseTime=0;worker.m_refTimeThread=0;worker.m_threadCtx=0xC0FFEE;worker.m_threadCtxData=nullptr;
     Check(!worker.m_data.sourceLocationExpand.empty());const auto sourceIndex=worker.m_data.sourceLocationExpand.size()>1?1:0;const auto source=worker.m_data.sourceLocationExpand[sourceIndex];worker.m_sourceLocationShrink[source]=int16_t(sourceIndex);worker.m_data.shrinkSrclocLast={source,int16_t(sourceIndex)};const auto shrunk=worker.ShrinkSourceLocation(source);
@@ -53,7 +71,7 @@ struct OfflineStorageSemanticTest {
     QueueZoneEnd end{};end.time=10;worker.ProcessZoneEnd(end);end.time=10;worker.ProcessZoneEnd(end);
     QueueJnCallsiteDefinition definition{};definition.srcloc=source;definition.callsiteId=77;definition.flags=uint8_t(JnCallsiteFlags::HasCallstack);worker.m_serialNextCallstack=1;worker.ProcessJnCallsiteDefinition(definition);
     Check(store.CpuZoneCount()==2&&store.CpuThreadCount()==1);
-    store.Seal();worker.FinalizeOfflineCatalog();
+    worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();
     const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto td=reopened.GetThreadData(0xC0FFEE);Check(td&&td->timeline.size()==1);
     const auto top=td->timeline.is_magic()?&(*(const Vector<ZoneEvent>*)(&td->timeline))[0]:td->timeline[0].get();Check(top->Start()==10&&top->End()==40&&top->HasChildren());Check(top->Child()>=0&&uint64_t(top->Child())<reopened.m_data.zoneChildren.size());const auto& children=reopened.GetZoneChildren(top->Child());Check(children.size()==1);
@@ -93,8 +111,8 @@ struct OfflineStorageSemanticTest {
  static void ProtocolCatalog(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources,bool missingCore){
     std::filesystem::create_directories(root);conversion::OfflineConversionStorage store(root/"store",std::string(64,'b'),resources);
     std::unique_ptr<FileRead> first(FileRead::Open(input)),second(FileRead::Open(input));Worker memory(*first,EventType::All,false),disk(*second,EventType::All,false);
-    for(uint64_t i=1;i<disk.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&disk.m_data.zoneExtra[i]);disk.m_offlineStorage=&store;
-    FillProtocolCatalog(memory,missingCore);FillProtocolCatalog(disk,missingCore);store.Seal();disk.FinalizeOfflineCatalog();
+    for(uint64_t i=1;i<disk.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&disk.m_data.zoneExtra[i]);MigrateStrings(disk,store);disk.m_offlineStorage=&store;
+    FillProtocolCatalog(memory,missingCore);FillProtocolCatalog(disk,missingCore);disk.FinalizeOfflineStrings();store.Seal();disk.FinalizeOfflineCatalog();
     {std::unique_ptr<FileWrite> file(FileWrite::Open(root/"out.tracy",FileCompression::Zstd,1,1));disk.Write(*file,false);file->Finish();}
     std::unique_ptr<FileRead> out(FileRead::Open(root/"out.tracy"));Worker read(*out,EventType::All,false);CompareCatalog(memory,read);
     Check(read.m_data.jnTrace.gpuCatalogValid==!missingCore);Check(read.m_data.jnTrace.gpuCatalogViews[0].resourceId==1&&read.m_data.jnTrace.gpuCatalogViews[1].resourceId==0);
@@ -171,6 +189,7 @@ struct OfflineStorageSemanticTest {
     if(!storage){Vector<ZoneExtra> growing;for(const auto& row:w.m_data.zoneExtra)growing.push_back(row);w.m_data.zoneExtra=std::move(growing);}
     if(storage)for(uint64_t i=1;i<w.m_data.zoneExtra.size();++i)Check(storage->AppendZoneExtra(&w.m_data.zoneExtra[i])==i);
     if(storage){
+        MigrateStrings(w,*static_cast<conversion::OfflineConversionStorage*>(storage));
 #define X(name,field,type,mut) for(const auto& row:w.m_data.jnTrace.field)storage->AppendCatalog(OfflineCatalogDomain::name,&row,sizeof(row));w.m_data.jnTrace.field.clear();w.m_data.jnTrace.field.shrink_to_fit();
         TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
@@ -229,6 +248,7 @@ int main(int argc,char** argv) {
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  auto root=std::filesystem::path(argv[2]);std::filesystem::create_directories(root);
+ OfflineStorageSemanticTest::StringRoundTrip(argv[1],root/"strings",resources);
  OfflineStorageSemanticTest::CpuZoneRoundTrip(argv[1],root/"cpu-zones",resources);
  OfflineStorageSemanticTest::GpuZoneRoundTrip(argv[1],root/"gpu-zones",resources);
  OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-valid",resources,false);OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-core-gap",resources,true);
@@ -239,7 +259,7 @@ int main(int argc,char** argv) {
  OfflineStorageSemanticTest::CheckMissingString(oldWorker,root/"missing-string.tracy");
  OfflineStorageSemanticTest::Populate(oldWorker,nullptr);OfflineStorageSemanticTest::Populate(newWorker,&store);
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());
- Check(newWorker.GetJnTraceData().relations.empty());store.Seal();
+ Check(newWorker.GetJnTraceData().relations.empty());newWorker.FinalizeOfflineStrings();store.Seal();
  Check(store.LookupPassTime(701)==375); // (850 - baseTime 100) * 0.5; last completion overrides other sources
  Check(!store.LookupPassTime(0));
  Check(store.LookupPassTime(1ull<<40)==-25);Check(!store.LookupPassTime(42));

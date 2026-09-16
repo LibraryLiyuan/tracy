@@ -8,6 +8,7 @@
 #include "../../storage/TracyResourceIntervals.hpp"
 #include "../../storage/TracyBoundedRecordTable.hpp"
 #include "../../storage/TracyOrderedForest.hpp"
+#include "../../storage/TracyOfflineStringStore.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -44,6 +45,15 @@ public:
     void ReadZoneExtra(uint32_t,void*) override;
     void PutZoneExtra(uint32_t,const void*) override;
     void VisitZoneExtras(const std::function<void(const void*,uint64_t)>&) override;
+    const char* InternString(const char*,size_t,uint32_t&) override;
+    bool FindString(const char*,size_t,uint32_t&) override;
+    const char* StringAt(uint32_t) override;
+    uint64_t StringCount() const override { return m_strings?m_strings->Count():0; }
+    void VisitStrings(const std::function<void(uint32_t,const char*,uint64_t)>&) override;
+    uint64_t StringUsedBytes()const{return m_strings?m_strings->UsedBytes():0;}
+    uint64_t StringReservedBytes()const{return m_strings?m_strings->ReservedBytes():0;}
+    std::string StringHash()const;
+    bool StringsSealed()const{return m_sealed;}
     uint64_t CreateCpuThread() override;
     uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&) override;
     void ReadCpuZone(uint64_t,OfflineCpuZone&) override;
@@ -103,6 +113,7 @@ private:
     bool m_relationFailed=false;
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
+    std::unique_ptr<storage::OfflineStringStore> m_strings;
     std::unique_ptr<storage::OrderedForest> m_cpuZones;
     bool m_cpuZonesSealed=false;
     std::unique_ptr<storage::OrderedForest> m_gpuZones;

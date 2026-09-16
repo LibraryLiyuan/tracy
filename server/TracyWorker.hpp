@@ -641,7 +641,7 @@ public:
     }
     // Caller joins replay before reading; no traversal or large snapshot allocation.
     std::array<uint64_t,8> GetOfflineCoreCounts() const {
-        return {m_data.stringData.size(),m_data.callstackPayload.size(),m_data.zonesCnt,m_data.gpuCnt,
+        return {StringTableCount(),m_data.callstackPayload.size(),m_data.zonesCnt,m_data.gpuCnt,
             m_data.zoneChildren.size(),m_data.callstackFrameMap.size(),m_data.stringMap.size(),m_slab.AllocatedBytes()};
     }
     uint64_t GetGpuZoneCount() const { return m_data.gpuCnt; }
@@ -664,7 +664,7 @@ public:
     uint64_t GetSymbolCodeSize() const { return m_data.symbolCodeSize; }
     uint64_t GetGhostZonesCount() const { return m_data.ghostCnt; }
     uint32_t GetFrameImageCount() const { return (uint32_t)m_data.frameImage.size(); }
-    uint64_t GetStringsCount() const { return m_data.strings.size() + m_data.stringData.size(); }
+    uint64_t GetStringsCount() const { return m_data.strings.size() + StringTableCount(); }
     uint64_t GetHwSampleCountAddress() const { return m_data.hwSamples.size(); }
     uint64_t GetHwSampleCount() const;
     bool HasHwBranchRetirement() const { return m_data.hasBranchRetirement; }
@@ -759,7 +759,7 @@ public:
         if( !ref.active ) return nullptr;
         if( ref.isidx )
         {
-            return ref.str < m_data.stringData.size() ? m_data.stringData[ref.str] : nullptr;
+            return ref.str < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(ref.str)):m_data.stringData[ref.str]) : nullptr;
         }
         const auto it = m_data.strings.find( ref.str );
         return it != m_data.strings.end() ? it->second : nullptr;
@@ -768,7 +768,7 @@ public:
     {
         if( !idx.Active() ) return nullptr;
         const auto value = idx.Idx();
-        return value < m_data.stringData.size() ? m_data.stringData[value] : nullptr;
+        return value < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(value)):m_data.stringData[value]) : nullptr;
     }
     const char* GetThreadName( uint64_t id ) const;
     bool IsThreadLocal( uint64_t id );
@@ -856,6 +856,7 @@ public:
 
     void Write( FileWrite& f, bool fiDict );
     void FinalizeOfflineCatalog(){if(m_offlineStorage)FinalizeJnGpuCatalogForSave();}
+    void FinalizeOfflineStrings();
     int GetTraceVersion() const { return m_traceVersion; }
     int64_t GetLegacyQueueDelay() const { return m_legacyQueueDelay; }
     uint8_t GetHandshakeStatus() const { return m_handshake.load( std::memory_order_relaxed ); }
@@ -888,6 +889,8 @@ public:
     void CacheSourceFiles();
 
     StringLocation StoreString(const char* str, size_t sz);
+    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():m_data.stringData.size(); }
+    uint64_t PersistedStringToken(const char*) const;
 
     std::vector<uint32_t>& GetPendingThreadHints() { return m_pendingThreadHints; }
     void ClearPendingThreadHints() { m_pendingThreadHints.clear(); }
@@ -1207,10 +1210,10 @@ private:
     uint32_t GetSingleStringIdx();
     uint32_t GetSecondStringIdx();
     void ValidateStringIndex(const StringIdx& value) const {
-        if(value.Active()&&value.Idx()>=m_data.stringData.size())throw LoadFailure("string index references missing string");
+        if(value.Active()&&value.Idx()>=StringTableCount())throw LoadFailure("string index references missing string");
     }
     void ValidateStringReference(const StringRef& value) const {
-        if(value.active&&value.isidx&&value.str>=m_data.stringData.size())throw LoadFailure("string reference exceeds string table");
+        if(value.active&&value.isidx&&value.str>=StringTableCount())throw LoadFailure("string reference exceeds string table");
     }
     const ContextSwitch* const GetContextSwitchDataImpl( uint64_t thread );
 

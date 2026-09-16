@@ -49,6 +49,12 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-mapped-hash-index-tests tests/MappedHashIndexTests.cpp)
+    target_link_libraries(tracy-mapped-hash-index-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-mapped-hash-index COMMAND tracy-mapped-hash-index-tests ${CMAKE_CURRENT_BINARY_DIR}/mapped-hash-index-test)
+    add_executable(tracy-offline-string-store-tests tests/OfflineStringStoreTests.cpp)
+    target_link_libraries(tracy-offline-string-store-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-offline-string-store COMMAND tracy-offline-string-store-tests ${CMAKE_CURRENT_BINARY_DIR}/offline-string-store-test)
     add_executable(tracy-ordered-forest-tests tests/OrderedForestTests.cpp)
     target_link_libraries(tracy-ordered-forest-tests PRIVATE TracyStorageCore)
     add_test(NAME tracy-ordered-forest COMMAND tracy-ordered-forest-tests ${CMAKE_CURRENT_BINARY_DIR}/ordered-forest-test)

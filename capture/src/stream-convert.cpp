@@ -1592,7 +1592,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(workerStorage&&diskStorage)workerStorage->JoinOfflineReplay();
         std::ostringstream out;out<<"{\"source_bytes\":"<<inputFileSize<<",\"source_sha256\":\""<<inputIdentity.hex
             <<"\",\"source_prefix_crc32c\":"<<scan.prefixCrc32c<<",\"source_revision\":"<<scan.lastSequence;
-        if(diskStorage)out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount()<<",\"cpu_zone_records\":"<<diskStorage->CpuZoneCount()<<",\"cpu_zone_threads\":"<<diskStorage->CpuThreadCount()<<",\"cpu_zone_branches\":"<<diskStorage->CpuBranchCount()<<",\"cpu_zone_logical_bytes\":"<<diskStorage->CpuZoneLogicalBytes()<<",\"gpu_zone_records\":"<<diskStorage->GpuZoneCount()<<",\"gpu_zone_threads\":"<<diskStorage->GpuThreadCount()<<",\"gpu_zone_branches\":"<<diskStorage->GpuBranchCount()<<",\"gpu_zone_logical_bytes\":"<<diskStorage->GpuZoneLogicalBytes()<<",\"relation_records\":"<<diskStorage->RelationCount()<<",\"relation_store_state\":\""<<diskStorage->RelationState()<<"\"";
+        if(diskStorage){out<<",\"job_stages\":"<<diskStorage->JobStageCount()<<",\"reference_uses\":"<<diskStorage->ReferenceUseCount()<<",\"resource_set_definitions\":"<<diskStorage->DefinitionCount()<<",\"zone_extra_records\":"<<diskStorage->ZoneExtraCount()<<",\"string_records\":"<<diskStorage->StringCount()<<",\"string_used_bytes\":"<<diskStorage->StringUsedBytes()<<",\"string_reserved_bytes\":"<<diskStorage->StringReservedBytes()<<",\"strings_sealed\":"<<(diskStorage->StringsSealed()?"true":"false");if(diskStorage->StringsSealed())out<<",\"strings_sha256\":\""<<diskStorage->StringHash()<<"\"";out<<",\"cpu_zone_records\":"<<diskStorage->CpuZoneCount()<<",\"cpu_zone_threads\":"<<diskStorage->CpuThreadCount()<<",\"cpu_zone_branches\":"<<diskStorage->CpuBranchCount()<<",\"cpu_zone_logical_bytes\":"<<diskStorage->CpuZoneLogicalBytes()<<",\"gpu_zone_records\":"<<diskStorage->GpuZoneCount()<<",\"gpu_zone_threads\":"<<diskStorage->GpuThreadCount()<<",\"gpu_zone_branches\":"<<diskStorage->GpuBranchCount()<<",\"gpu_zone_logical_bytes\":"<<diskStorage->GpuZoneLogicalBytes()<<",\"relation_records\":"<<diskStorage->RelationCount()<<",\"relation_store_state\":\""<<diskStorage->RelationState()<<"\"";}
         if(workerStorage){
             const auto core=workerStorage->GetOfflineCoreCounts();
             out<<",\"core_counts\":{\"strings\":"<<core[0]<<",\"callstacks\":"<<core[1]<<",\"cpu_zones\":"<<core[2]<<",\"gpu_zones\":"<<core[3]<<",\"cpu_children\":"<<core[4]<<",\"callstack_frames\":"<<core[5]<<",\"unique_strings\":"<<core[6]<<",\"slab_bytes\":"<<core[7]<<'}';
@@ -2154,7 +2154,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     const auto replaySeconds = ElapsedSeconds( replayStart );
     CheckConversion();
     SetConversionStage("Finalize");
-    if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");diskStorage->Seal();worker.FinalizeOfflineCatalog();}
+    if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");worker.FinalizeOfflineStrings();diskStorage->Seal();worker.FinalizeOfflineCatalog();}
     const auto writeStart = std::chrono::steady_clock::now();
     auto temporaryOutput = options.output;
     temporaryOutput += ".converting";
