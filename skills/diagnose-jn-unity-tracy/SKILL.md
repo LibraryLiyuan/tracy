@@ -3,10 +3,14 @@ name: diagnose-jn-unity-tracy
 description: Use when diagnosing a single existing JN Unity Tracy capture with Query-native deterministic scanning and an auditable performance report.
 metadata:
   author: JN Game
-  version: 2.3.0
+  version: 2.3.1
 ---
 
 # JN Unity × Tracy 单 Trace 深度诊断
+
+## 最终阅读版布局（2.3.1 小补丁）
+
+最终交付使用总览导航文档 `Typora/Performance-Analysis-Report.md`，详细深查观察默认每 5 条一册，命名为 `强制深查观察-分册01.md` 等。每条在同一分册内完整呈现详细分析、源码分析、原生图片及可交互 Profiler 链接；不得以另一个分析附件的链接替代必需正文。先沿用帧序排序，再分册；分册不缩减分析覆盖。具体布局及验收见 [native-profiler-views.md](references/native-profiler-views.md) 的“最终阅读版布局”。本补丁仅更新交付合同，不宣称现有生成器已实现自动分册与配图集成。
 
 ## 原生视图与交互回查（2.3.0）
 
@@ -14,7 +18,7 @@ metadata:
 
 本次新增执行规范，现有生成器和校验器尚未实现通用 Profiler 接口或展示门禁；必须另存 view-manifest.json 与 presentation-validation.json，不得把旧 passed 标志当作原生视图验收。工具能力缺失时保存合法分析结果并单独披露展示 pending/degraded，不能把静态图或冻结网页标为可交互。
 
-SKILL 发布版本为 2.3.0；Query 1.35.0、candidate-policy-v3、Schema 4、performance_review/review_routing schema 1 与 report_versions=2.2.0 均保持兼容，新增展示记录独立保存，不向旧严格 schema 注入未支持字段。
+SKILL 发布版本为 2.3.1；Query 1.35.0、candidate-policy-v3、Schema 4、performance_review/review_routing schema 1 与 report_versions=2.2.0 均保持兼容，新增展示记录独立保存，不向旧严格 schema 注入未支持字段。
 
 ## 继续沿用的报告展示规则（2.2.1）
 
