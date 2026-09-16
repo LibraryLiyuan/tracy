@@ -1244,6 +1244,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         memset( (char*)m_data.zoneChildren.data(), 0, sizeof( Vector<short_ptr<ZoneEvent>> ) * sz );
     }
     int32_t childIdx = 0;
+    const bool externalSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsSamples();
     f.Read( sz );
     m_data.threads.reserve_exact( sz, m_slab );
     for( uint64_t i=0; i<sz; i++ )
@@ -1289,7 +1290,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         }
         uint64_t ssz;
         f.Read( ssz );
-        if( ssz != 0 )
+        if(externalSamples)
+        {
+            m_serializedZoneSink->SamplesBegin(tid,1,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,1,j,refTime,callstack.Val());}m_serializedZoneSink->SamplesEnd(tid,1);
+        }
+        else if( ssz != 0 )
         {
             if( eventMask & EventType::Samples )
             {
@@ -1309,7 +1314,11 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             }
         }
         f.Read( ssz );
-        if( ssz != 0 )
+        if(externalSamples)
+        {
+            m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());}m_serializedZoneSink->SamplesEnd(tid,0);
+        }
+        else if( ssz != 0 )
         {
             if( eventMask & EventType::Samples )
             {
@@ -9357,7 +9366,13 @@ void Worker::ProcessCallstack()
 void Worker::ProcessCallstackSampleInsertSample( const SampleData& sd, ThreadData& td )
 {
     const auto t = sd.time.Val();
-    if( td.samples.empty() )
+    if( m_offlineStorage )
+    {
+        const auto last=m_offlineStorage->LastSampleTime(td.id,0);
+        if(t!=0&&last&&*last>=t){m_inconsistentSamples=true;uint64_t id;uint32_t callstack;if(m_offlineStorage->FindSample(td.id,0,t,id,callstack)){const auto merged=MergeCallstacks(callstack,sd.callstack.Val());m_offlineStorage->PutSample(id,t,merged);return;}}
+        m_offlineStorage->AppendSample(td.id,0,t,sd.callstack.Val());
+    }
+    else if( td.samples.empty() )
     {
         td.samples.push_back( sd );
     }
@@ -9603,7 +9618,7 @@ void Worker::ProcessCallstackSampleContextSwitch( const QueueCallstackSample& ev
 
     ProcessCallstackSampleInsertSample( sd, td );
 
-    td.ctxSwitchSamples.push_back( sd );
+    if(m_offlineStorage)m_offlineStorage->AppendSample(td.id,1,t,callstack);else td.ctxSwitchSamples.push_back( sd );
 }
 
 void Worker::ProcessCallstackSampleRef( const QueueCallstackSampleRef& ev, bool contextSwitch )
@@ -11377,15 +11392,16 @@ void Worker::Write( FileWrite& f, bool fiDict )
             auto ptr = uint64_t( (MessageData*)v );
             f.Write( &ptr, sizeof( ptr ) );
         }
-        sz = thread->ctxSwitchSamples.size();
+        sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,1):thread->ctxSwitchSamples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        for( auto& v : thread->ctxSwitchSamples )
+        if(m_offlineStorage)m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));});
+        else for( auto& v : thread->ctxSwitchSamples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
             f.Write( &v.callstack, sizeof( v.callstack ) );
         }
-        if( m_inconsistentSamples )
+        if( m_inconsistentSamples && !m_offlineStorage )
         {
 #ifdef __EMSCRIPTEN__
             pdqsort_branchless( thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
@@ -11393,10 +11409,11 @@ void Worker::Write( FileWrite& f, bool fiDict )
             ppqsort::sort( ppqsort::execution::par, thread->samples.begin(), thread->samples.end(), [] ( const auto& lhs, const auto& rhs ) { return lhs.time.Val() < rhs.time.Val(); } );
 #endif
         }
-        sz = thread->samples.size();
+        sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,0):thread->samples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        for( auto& v : thread->samples )
+        if(m_offlineStorage)m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));});
+        else for( auto& v : thread->samples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
             f.Write( &v.callstack, sizeof( v.callstack ) );

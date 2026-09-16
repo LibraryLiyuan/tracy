@@ -9,11 +9,11 @@ namespace tracy::conversion
 class OfflineValidationSink final:public SerializedZoneSink
 {
 public:
-    OfflineValidationSink(const OfflineConversionStorage& storage,storage::ConversionResources& resources)
-        :m_resources(resources),m_buffer(resources.Workspace()),m_expected{storage.JobStageCount(),storage.ReferenceUseCount(),storage.RelationCount()},
+    OfflineValidationSink(OfflineConversionStorage& storage,storage::ConversionResources& resources)
+        :m_storage(storage),m_resources(resources),m_buffer(resources.Workspace()),m_expected{storage.JobStageCount(),storage.ReferenceUseCount(),storage.RelationCount()},
          m_hashes{storage.JobStageHash(),storage.ReferenceUseHash(),storage.RelationHash()},m_zoneCount(storage.ZoneExtraCount()),m_zoneHash(storage.ZoneExtraHash()){
         for(size_t i=0;i<OfflineAppendDomainCount;++i){m_expected[3+i]=storage.RecordCount(OfflineAppendDomain(i));m_hashes[3+i]=storage.RecordHash(OfflineAppendDomain(i));}
-        for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();m_stringCount=storage.StringCount();m_stringHash=storage.StringHash();m_callstackCount=storage.CallstackCount()-1;m_callstackHash=storage.CallstackHash();
+        for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();m_stringCount=storage.StringCount();m_stringHash=storage.StringHash();m_callstackCount=storage.CallstackCount()-1;m_callstackHash=storage.CallstackHash();m_sampleExpectedTotal=storage.TotalSampleCount();
     }
     bool WantsGlobalStrings()const override{return true;}
     void GlobalStringsBegin(uint64_t count)override{CheckRead();if(m_stringStarted||count!=m_stringCount)throw std::runtime_error("conversion_validation_string_count");m_stringStarted=true;}
@@ -30,6 +30,10 @@ public:
     void CallstackFrames(uint32_t id,uint32_t offset,const CallstackFrameId* frames,uint32_t count)override{CheckRead();if(!m_callstackOpen||id!=m_callstackSeen+1||offset!=m_callstackOffset||count>m_callstackFrames-m_callstackOffset||(count&&!frames))throw std::runtime_error("conversion_validation_callstack_frames");m_callstackActual.Update(frames,size_t(count)*sizeof(CallstackFrameId));m_callstackOffset+=count;}
     void CallstackEnd(uint32_t id)override{CheckRead();if(!m_callstackOpen||id!=m_callstackSeen+1||m_callstackOffset!=m_callstackFrames)throw std::runtime_error("conversion_validation_callstack_end");m_callstackOpen=false;++m_callstackSeen;}
     void CallstacksEnd()override{CheckRead();if(!m_callstackStarted||m_callstackDone||m_callstackOpen||m_callstackSeen!=m_callstackCount||m_callstackActual.FinalHex()!=m_callstackHash)throw std::runtime_error("conversion_validation_callstack_hash");m_callstackDone=true;}
+    bool WantsSamples()const override{return true;}
+    void SamplesBegin(uint64_t thread,uint8_t kind,uint64_t count)override{CheckRead();if(m_sampleOpen||kind>=2||count!=m_storage.SampleCount(thread,kind))throw std::runtime_error("conversion_validation_sample_count");m_sampleOpen=true;m_sampleThread=thread;m_sampleKind=kind;m_sampleExpected=count;m_sampleSeen=0;m_sampleExpectedHash=m_storage.SampleHash(thread,kind);m_sampleActual=std::make_unique<analysis::Sha256Builder>();m_sampleSaw=true;}
+    void SampleRecord(uint64_t thread,uint8_t kind,uint64_t index,int64_t time,uint32_t callstack)override{CheckRead();if(!m_sampleOpen||thread!=m_sampleThread||kind!=m_sampleKind||index!=m_sampleSeen||index>=m_sampleExpected)throw std::runtime_error("conversion_validation_sample_record");storage::OfflineSampleRow row{time,callstack};m_sampleActual->Update(&row,sizeof(row));++m_sampleSeen;++m_sampleSeenTotal;}
+    void SamplesEnd(uint64_t thread,uint8_t kind)override{CheckRead();if(!m_sampleOpen||thread!=m_sampleThread||kind!=m_sampleKind||m_sampleSeen!=m_sampleExpected||m_sampleActual->FinalHex()!=m_sampleExpectedHash)throw std::runtime_error("conversion_validation_sample_hash");m_sampleOpen=false;m_sampleActual.reset();}
     bool ValidatesCatalog()const override{return true;}
     void CatalogMetadata(OfflineCatalogQuality quality)override{CheckRead();if(m_catalogMetadata||quality!=m_catalogQuality)throw std::runtime_error("conversion_validation_catalog_quality");m_catalogMetadata=true;}
     bool WantsCatalogStrings()const override{return true;}
@@ -70,6 +74,7 @@ public:
         if(!m_zoneDone)throw std::runtime_error("zone_extra_validation_missing");
         if(!m_stringDone||!m_pointerDone[0]||!m_pointerDone[1]||!m_pointerDone[2])throw std::runtime_error("conversion_validation_global_strings_missing");
         if(!m_callstackDone)throw std::runtime_error("conversion_validation_callstacks_missing");
+        if(!m_sampleSaw||m_sampleOpen||m_sampleSeenTotal!=m_sampleExpectedTotal)throw std::runtime_error("conversion_validation_samples_missing");
         if(!m_catalogMetadata)throw std::runtime_error("conversion_validation_catalog_metadata_missing");
         for(size_t i=0;i<m_expected.size();++i){
             if(!m_started[i]&&!m_expected[i])continue; // older schemas may omit an empty domain
@@ -96,6 +101,7 @@ private:
         TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
         default:throw std::runtime_error("conversion_validation_domain");}}
+    OfflineConversionStorage& m_storage;
     storage::ConversionResources& m_resources;
     analysis::AnalysisWorkspaceReservation m_buffer;
     static constexpr size_t DomainCount=3+OfflineAppendDomainCount+OfflineCatalogDomainCount;
@@ -121,6 +127,11 @@ private:
     std::string m_callstackHash;
     analysis::Sha256Builder m_callstackActual;
     bool m_callstackStarted=false,m_callstackOpen=false,m_callstackDone=false;
+    uint64_t m_sampleExpectedTotal=0,m_sampleSeenTotal=0,m_sampleThread=0,m_sampleExpected=0,m_sampleSeen=0;
+    uint8_t m_sampleKind=0;
+    std::string m_sampleExpectedHash;
+    std::unique_ptr<analysis::Sha256Builder> m_sampleActual;
+    bool m_sampleSaw=false,m_sampleOpen=false;
 };
 }
 #endif

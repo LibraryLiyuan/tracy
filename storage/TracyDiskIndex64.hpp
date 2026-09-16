@@ -75,6 +75,11 @@ class DiskIndex64 {
         const auto middle=count/2;page.count=uint16_t(middle);std::copy_n(items.begin(),middle,page.items.begin());Put(page);
         Page right;right.level=page.level;right.count=uint16_t(count-middle);std::copy(items.begin()+middle,items.begin()+count,right.items.begin());Allocate(right);return {page.items[0].key,Item{right.items[0].key,right.id}};
     }
+    template<class Visitor> void VisitPage(uint64_t id,uint64_t first,uint64_t last,Visitor& visitor,unsigned depth=0){
+        Require(depth<16,"disk_index64_depth");const auto page=Get(id);
+        if(!page.level){for(uint16_t i=0;i<page.count;++i){const auto& item=page.items[i];if(item.key<first)continue;if(item.key>last)break;visitor(item.key,item.value);}return;}
+        for(uint16_t i=0;i<page.count;++i){const auto childFirst=page.items[i].key;const auto childLast=i+1<page.count?page.items[i+1].key-1:UINT64_MAX;if(childLast<first||childFirst>last)continue;VisitPage(page.items[i].value,first,last,visitor,depth+1);}
+    }
 public:
     DiskIndex64(std::filesystem::path path,std::string identity,ConversionResources& resources,uint64_t cacheBytes=8ull<<20)
         :m_path(std::move(path)),m_identity(std::move(identity)),m_resources(resources),m_traversal(resources.Workspace(),1ull<<20),m_cacheBytes(cacheBytes){
@@ -96,6 +101,7 @@ public:
             if(added)++m_count;
         }catch(...){m_failed=true;m_resources.Fail("disk_index64_upsert");throw;}
     }
+    template<class Visitor> void VisitRange(uint64_t first,uint64_t last,Visitor&& visitor){Check();Require(first<=last,"disk_index64_range");VisitPage(m_root,first,last,visitor);}
     void ClearCache(){Check();for(auto& item:m_cache)if(item.second->dirty)Write(item.second->page);m_file.flush();Require(bool(m_file),"disk_index64_flush");m_cache.clear();}
     void ReduceCache(){m_cacheBytes=std::min<uint64_t>(m_cacheBytes,4ull<<20);while(m_cache.size()*PageCharge>m_cacheBytes)Evict();}
     void Seal(){Check();Require(!m_sealed,"disk_index64_sealed");ClearCache();std::array<char,HeaderBytes> header{};std::memcpy(header.data(),"JNIDX642",8);std::memcpy(header.data()+8,m_identity.data(),64);std::memcpy(header.data()+72,&m_root,8);std::memcpy(header.data()+80,&m_next,8);std::memcpy(header.data()+88,&m_count,8);m_file.seekp(0);m_file.write(header.data(),header.size());m_file.flush();Require(bool(m_file),"disk_index64_seal");m_sealed=true;}

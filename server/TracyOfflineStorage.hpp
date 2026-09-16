@@ -51,6 +51,12 @@ public:
     virtual void VisitStrings(const std::function<void(uint32_t,const char*,uint64_t)>&)=0;
     virtual const uint64_t* InternCallstack(const uint64_t*,uint32_t,uint32_t&)=0;
     virtual uint64_t CallstackCount() const=0;
+    virtual uint64_t AppendSample(uint64_t,uint8_t,int64_t,uint32_t)=0;
+    virtual bool FindSample(uint64_t,uint8_t,int64_t,uint64_t&,uint32_t&)=0;
+    virtual void PutSample(uint64_t,int64_t,uint32_t)=0;
+    virtual std::optional<int64_t> LastSampleTime(uint64_t,uint8_t)const=0;
+    virtual uint64_t SampleCount(uint64_t,uint8_t)const=0;
+    virtual void VisitSamples(uint64_t,uint8_t,const std::function<void(int64_t,uint32_t)>&)=0;
     virtual uint64_t CreateCpuThread()=0;
     virtual uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&)=0;
     virtual void ReadCpuZone(uint64_t,OfflineCpuZone&)=0;

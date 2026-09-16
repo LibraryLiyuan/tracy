@@ -10,6 +10,7 @@
 #include "../../storage/TracyOrderedForest.hpp"
 #include "../../storage/TracyOfflineStringStore.hpp"
 #include "../../storage/TracyOfflineCallstackStore.hpp"
+#include "../../storage/TracyOfflineSampleStore.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -60,6 +61,16 @@ public:
     uint64_t CallstackUsedBytes()const{return m_callstacks?m_callstacks->UsedBytes():0;}
     uint64_t CallstackReservedBytes()const{return m_callstacks?m_callstacks->ReservedBytes():0;}
     std::string CallstackHash()const;
+    uint64_t AppendSample(uint64_t,uint8_t,int64_t,uint32_t)override;
+    bool FindSample(uint64_t,uint8_t,int64_t,uint64_t&,uint32_t&)override;
+    void PutSample(uint64_t,int64_t,uint32_t)override;
+    std::optional<int64_t> LastSampleTime(uint64_t,uint8_t)const override;
+    uint64_t SampleCount(uint64_t,uint8_t)const override;
+    void VisitSamples(uint64_t,uint8_t,const std::function<void(int64_t,uint32_t)>&)override;
+    uint64_t TotalSampleCount()const{return m_samples?m_samples->TotalCount():0;}
+    uint64_t SampleThreadCount()const{return m_samples?m_samples->ThreadCount():0;}
+    bool HasSampleTimeIndex()const{return m_samples&&m_samples->HasTimeIndex();}
+    std::string SampleHash(uint64_t,uint8_t);
     uint64_t CreateCpuThread() override;
     uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&) override;
     void ReadCpuZone(uint64_t,OfflineCpuZone&) override;
@@ -121,6 +132,7 @@ private:
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::unique_ptr<storage::OfflineStringStore> m_strings;
     std::unique_ptr<storage::OfflineCallstackStore> m_callstacks;
+    std::unique_ptr<storage::OfflineSampleStore> m_samples;
     std::unique_ptr<storage::OrderedForest> m_cpuZones;
     bool m_cpuZonesSealed=false;
     std::unique_ptr<storage::OrderedForest> m_gpuZones;

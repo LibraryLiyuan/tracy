@@ -19,6 +19,7 @@ int main(int argc,char** argv){try{
  index.Upsert(UINT64_MAX,UINT64_MAX);index.Upsert(0,42);index.Seal();
  Check(index.Count()==5002&&index.Find(0)==42&&index.Find(UINT64_MAX)==UINT64_MAX);
  for(uint64_t i=0;i<5000;++i)Check(index.Find((i<<40)+3)==4999-i);
+ std::vector<std::pair<uint64_t,uint64_t>> range;index.VisitRange((100ull<<40)+3,(109ull<<40)+3,[&](uint64_t key,uint64_t value){range.emplace_back(key,value);});Check(range.size()==10);for(uint64_t i=0;i<10;++i)Check(range[i].first==((i+100)<<40)+3&&range[i].second==4899-i);
  Check(!index.Find(4));
  bool failed=false;try{index.Upsert(1,1);}catch(const std::exception&){failed=true;}Check(failed);
  Check(resources.Workspace()->Snapshot().peakBytes<controlBytes+(2ull<<20));

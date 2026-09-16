@@ -118,6 +118,10 @@ public:
     virtual void CallstackFrames(uint32_t,uint32_t,const CallstackFrameId*,uint32_t){}
     virtual void CallstackEnd(uint32_t){}
     virtual void CallstacksEnd(){}
+    virtual bool WantsSamples()const{return false;}
+    virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
+    virtual void SampleRecord(uint64_t,uint8_t,uint64_t,int64_t,uint32_t){}
+    virtual void SamplesEnd(uint64_t,uint8_t){}
     virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
     virtual void CatalogStringsBegin(uint64_t){}
     virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
