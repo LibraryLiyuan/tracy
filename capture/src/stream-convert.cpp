@@ -2229,7 +2229,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         }
         std::unique_ptr<tracy::conversion::OfflineValidationSink> sink;
         if(diskStorage)sink=std::make_unique<tracy::conversion::OfflineValidationSink>(*diskStorage,resources);
-        tracy::Worker validationWorker( *validationFile, tracy::EventType::All, false,false,sink.get() );
+        tracy::Worker validationWorker( *validationFile, tracy::conversion::OfflineValidationEventMask, false,false,sink.get() );
         if(sink)sink->Finish();
         const auto& actual=validationWorker.GetJnTraceData();
         tracy::analysis::Sha256Builder actualHash;actualHash.Update(actual.gpuCatalogGenerations.data(),actual.gpuCatalogGenerations.size()*sizeof(tracy::JnGpuCatalogGenerationData));

@@ -29,7 +29,7 @@ struct OfflineStorageSemanticTest {
     const int64_t times[]={0,0,5,10,15,20};for(size_t i=0;i<6;++i)Check(td->samples[i].time.Val()==times[i]);
     Check(reopened.GetCallstack(td->samples[5].callstack.Val()).size()==4);
     Check(td->ctxSwitchSamples[0].time.Val()==5);worker.m_offlineStorage=nullptr;
-    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,EventType::All,false,false,&sink);sink.Finish();const auto streamedThread=streamed.GetThreadData(thread.id);Check(streamedThread&&streamedThread->samples.empty()&&streamedThread->ctxSwitchSamples.empty());}
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();const auto streamedThread=streamed.GetThreadData(thread.id);Check(streamedThread&&streamedThread->samples.empty()&&streamedThread->ctxSwitchSamples.empty());}
  }
  static void CallstackRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
     std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);conversion::OfflineConversionStorage store(root/"store",std::string(64,'8'),resources);MigrateStrings(worker,store);
@@ -42,7 +42,7 @@ struct OfflineStorageSemanticTest {
     MakeCallstacksGrowable(worker);worker.m_offlineStorage=&store;const uint64_t raw[2]={0x1000,0x2000};worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));const auto id=worker.m_pendingCallstackId;Check(id==worker.m_data.callstackPayload.size()-1);worker.m_pendingCallstackId=0;worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));Check(worker.m_pendingCallstackId==id&&store.CallstackCount()==worker.m_data.callstackPayload.size());worker.m_pendingCallstackId=0;
     worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto& value=reopened.GetCallstack(id);Check(value.size()==2&&reopened.GetCanonicalPointer(value[0])==raw[0]&&reopened.GetCanonicalPointer(value[1])==raw[1]);worker.m_offlineStorage=nullptr;
-    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.callstackPayload.size()==1);}
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();Check(streamed.m_data.callstackPayload.size()==1);}
  }
  static void MigrateStrings(Worker& worker,conversion::OfflineConversionStorage& store){for(uint32_t i=0;i<worker.m_data.stringData.size();++i){uint32_t id=UINT32_MAX;const auto* source=worker.m_data.stringData[i];const auto* value=store.InternString(source,std::strlen(source),id);Check(id==i&&std::strcmp(value,source)==0);}}
  static void MigrateCallstacks(Worker& worker,conversion::OfflineConversionStorage& store){for(uint32_t i=1;i<worker.m_data.callstackPayload.size();++i){const auto value=worker.m_data.callstackPayload[i].get();uint32_t id=0;const auto* frames=store.InternCallstack(reinterpret_cast<const uint64_t*>(value->data()),value->size(),id);Check(id==i&&std::memcmp(frames,value->data(),value->size()*sizeof(CallstackFrameId))==0);}}
@@ -60,7 +60,7 @@ struct OfflineStorageSemanticTest {
     const auto added=worker.StoreString("p5-new",6);Check(added.idx==expected.size()&&std::strcmp(worker.GetString(StringIdx(added.idx)),"p5-new")==0);expected.emplace_back("p5-new");
     worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);Check(reopened.m_data.stringData.size()==expected.size());for(uint32_t i=0;i<expected.size();++i)Check(std::strcmp(reopened.m_data.stringData[i],expected[i].c_str())==0);
-    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.stringData.empty()&&streamed.m_data.stringMap.empty()&&streamed.m_data.strings.empty()&&streamed.m_data.threadNames.empty()&&streamed.m_data.externalNames.empty());}
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();Check(streamed.m_data.stringData.empty()&&streamed.m_data.stringMap.empty()&&streamed.m_data.strings.empty()&&streamed.m_data.threadNames.empty()&&streamed.m_data.externalNames.empty());}
     worker.m_offlineStorage=nullptr;
  }
  static void GpuZoneRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
@@ -153,7 +153,7 @@ struct OfflineStorageSemanticTest {
     std::unique_ptr<FileRead> out(FileRead::Open(root/"out.tracy"));Worker read(*out,EventType::All,false);CompareCatalog(memory,read);
     Check(read.m_data.jnTrace.gpuCatalogValid==!missingCore);Check(read.m_data.jnTrace.gpuCatalogViews[0].resourceId==1&&read.m_data.jnTrace.gpuCatalogViews[1].resourceId==0);
     Check(read.m_data.jnTrace.gpuDetailedEvidence[0].sourceId==1&&read.m_data.jnTrace.gpuDetailedEvidence[0].targetId==0xD000000000000001ull);
-    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(root/"out.tracy"));Worker streamed(*file,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.jnTrace.gpuCatalogResources.empty());}
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(root/"out.tracy"));Worker streamed(*file,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();Check(streamed.m_data.jnTrace.gpuCatalogResources.empty());}
     disk.m_offlineStorage=nullptr;memory.m_mode=Worker::Mode::Full;disk.m_mode=Worker::Mode::Full;
  }
  static void CompareCatalog(Worker& expected,Worker& actual){
@@ -315,7 +315,7 @@ int main(int argc,char** argv) {
  Check(seen==131072);seen=0;
  store.VisitJobStages([&](const JnJobStageData* p,uint64_t n){Check(std::memcmp(p,oldWorker.GetJnTraceData().jobStages.data()+seen,size_t(n)*sizeof(*p))==0);seen+=n;});Check(seen==3);
  const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> file(FileWrite::Open(output,FileCompression::Zstd,1,1));newWorker.Write(*file,false);file->Finish();}
- {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false,false,&sink);sink.Finish();Check(reopened.GetZoneExtraCount()==0);Check(reopened.GetJnTraceData().relations.empty());Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());
+ {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();Check(reopened.GetZoneExtraCount()==0);Check(reopened.GetJnTraceData().relations.empty());Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());
 #define X(name,field,type,mut) Check(reopened.GetJnTraceData().field.empty());
  TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X

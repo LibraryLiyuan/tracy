@@ -6,6 +6,7 @@
 #include <array>
 namespace tracy::conversion
 {
+static constexpr EventType::Type OfflineValidationEventMask=EventType::Type(EventType::All&~(EventType::CpuZones|EventType::GpuZones|EventType::Samples));
 class OfflineValidationSink final:public SerializedZoneSink
 {
 public:
@@ -74,7 +75,7 @@ public:
         if(!m_zoneDone)throw std::runtime_error("zone_extra_validation_missing");
         if(!m_stringDone||!m_pointerDone[0]||!m_pointerDone[1]||!m_pointerDone[2])throw std::runtime_error("conversion_validation_global_strings_missing");
         if(!m_callstackDone)throw std::runtime_error("conversion_validation_callstacks_missing");
-        if(!m_sampleSaw||m_sampleOpen||m_sampleSeenTotal!=m_sampleExpectedTotal)throw std::runtime_error("conversion_validation_samples_missing");
+        if((m_sampleExpectedTotal&&!m_sampleSaw)||m_sampleOpen||m_sampleSeenTotal!=m_sampleExpectedTotal)throw std::runtime_error("conversion_validation_samples_missing");
         if(!m_catalogMetadata)throw std::runtime_error("conversion_validation_catalog_metadata_missing");
         for(size_t i=0;i<m_expected.size();++i){
             if(!m_started[i]&&!m_expected[i])continue; // older schemas may omit an empty domain

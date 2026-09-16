@@ -4,7 +4,7 @@
 using namespace tracy;
 static void Check(bool v){if(!v)throw std::runtime_error("relation storage invariant");}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
-static void Zones(conversion::OfflineValidationSink& sink){ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();sink.CatalogMetadata({});
+static void Zones(conversion::OfflineValidationSink& sink){sink.GlobalStringsBegin(0);sink.GlobalStringsEnd();for(uint8_t kind=0;kind<3;++kind){sink.GlobalPointerTableBegin(kind,0);sink.GlobalPointerTableEnd(kind);}sink.CallstacksBegin(0);sink.CallstacksEnd();ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();sink.CatalogMetadata({});
 #define X(name,field,type,mut) sink.JnRecordsBegin(SerializedZoneSink::JnDomain::name,0,sizeof(type));sink.JnRecordsEnd(SerializedZoneSink::JnDomain::name);
  TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
