@@ -49,6 +49,8 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-extended-format-tests tests/ExtendedTraceFormatTests.cpp)
+    add_test(NAME tracy-extended-format COMMAND tracy-extended-format-tests)
     add_executable(tracy-relation-storage-tests tests/RelationStorageTests.cpp)
     target_link_libraries(tracy-relation-storage-tests PRIVATE TracyServer TracyOfflineConversion)
     add_test(NAME tracy-relation-storage COMMAND tracy-relation-storage-tests ${CMAKE_CURRENT_BINARY_DIR}/relation-storage-test)
