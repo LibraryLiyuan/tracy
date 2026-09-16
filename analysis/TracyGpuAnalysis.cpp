@@ -31,7 +31,7 @@ uint64_t PhysicalBytesForResources( const GpuAnalysisSnapshot& snapshot, const s
     uint64_t bytes = 0;
     for( const auto resourceId : resources )
     {
-        const auto* resource = snapshot.FindResource( resourceId );
+        const auto* resource = snapshot.FindGpuResource( resourceId );
         if( !resource || resource->allocationId == 0 || !allocations.emplace( resource->allocationId ).second ) continue;
         const auto* allocation = snapshot.FindAllocation( resource->allocationId );
         if( allocation && allocation->aliveAtEnd ) bytes += allocation->sizeBytes;
@@ -41,7 +41,7 @@ uint64_t PhysicalBytesForResources( const GpuAnalysisSnapshot& snapshot, const s
 
 }
 
-const GpuResourceAnalysisRecord* GpuAnalysisSnapshot::FindResource( uint64_t resourceId ) const
+const GpuResourceAnalysisRecord* GpuAnalysisSnapshot::FindGpuResource( uint64_t resourceId ) const
 {
     const auto it = resourceById.find( resourceId );
     return it == resourceById.end() ? nullptr : &resources[it->second];
@@ -504,7 +504,7 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshotImpl( JnTraceData& data, bool consum
             const auto* allocation = out.FindAllocation( use.resolvedPhysicalAllocationId );
             if( allocation ) for( const auto resourceId : allocation->resources )
             {
-                const auto* resource = out.FindResource( resourceId );
+                const auto* resource = out.FindGpuResource( resourceId );
                 if( !resource ) continue;
                 if( resource->createTime != 0 && pass.endNs < int64_t( resource->createTime ) ) continue;
                 if( resource->destroyTime != 0 && pass.startNs > int64_t( resource->destroyTime ) ) continue;

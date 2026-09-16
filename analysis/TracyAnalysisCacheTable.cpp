@@ -116,7 +116,7 @@ void CheckContained(const std::filesystem::path& root, const std::filesystem::pa
 }
 void DurableRename(const std::filesystem::path& temporary, const std::filesystem::path& target)
 {
-    if(std::filesystem::exists(target)) Fail("already_exists");
+    if(std::filesystem::exists(AnalysisIoPath(target))) Fail("already_exists");
 #ifdef _WIN32
     const auto source = AnalysisIoPath(temporary);
     const auto destination = AnalysisIoPath(target);
@@ -152,7 +152,7 @@ template<class T> T Read(std::istream& input)
 }
 std::string ReadText(const std::filesystem::path& path, uint64_t limit)
 {
-    const auto size = std::filesystem::file_size(path);
+    const auto size = std::filesystem::file_size(AnalysisIoPath(path));
     if(size > limit) Fail("manifest_budget");
     std::ifstream input(AnalysisIoPath(path), std::ios::binary);
     std::string value(size_t(size), '\0');
@@ -217,9 +217,9 @@ struct AnalysisCacheTableWriter::Impl
         // Block capacity, the maximum retained previous key, and stream/hash
         // overhead share the caller's workspace, before any buffer is grown.
         memory.Resize(options.blockBytes+128*1024);
-        std::filesystem::create_directories(root.parent_path());
-        if(!std::filesystem::create_directory(root)) Fail("already_exists");
-        std::filesystem::create_directory(root / "blocks");
+        std::filesystem::create_directories(AnalysisIoPath(root.parent_path()));
+        if(!std::filesystem::create_directory(AnalysisIoPath(root))) Fail("already_exists");
+        std::filesystem::create_directory(AnalysisIoPath(root / "blocks"));
         buffer.reserve(size_t(options.blockBytes));
         AnalysisDiskGrow(options.disk,sizeof(IndexHeader));
         index.open(AnalysisIoPath(root / "index.tmp"), std::ios::binary | std::ios::trunc);
@@ -327,7 +327,7 @@ AnalysisCacheTableDescriptor AnalysisCacheTableWriter::Commit()
         if(!w.index) Fail("index_write_failed");
         w.index.close();
         const auto indexHash = Sha256File(w.root / "index.tmp");
-        const auto indexBytes = std::filesystem::file_size(w.root / "index.tmp");
+        const auto indexBytes = std::filesystem::file_size(AnalysisIoPath(w.root / "index.tmp"));
         if(w.records > (UINT64_MAX-sizeof(header))/sizeof(IndexEntry) ||
             indexBytes != sizeof(header)+w.records*sizeof(IndexEntry)) Fail("index_size");
         DurableRename(w.root / "index.tmp", w.root / "index.bin");
@@ -370,9 +370,9 @@ struct AnalysisCacheTableReader::Impl
     {
         ValidateOptions(options); CheckCancel(options);
         const auto manifestPath = root / "manifest.json";
-        if(!std::filesystem::exists(manifestPath)) Fail("not_complete");
+        if(!std::filesystem::exists(AnalysisIoPath(manifestPath))) Fail("not_complete");
         CheckContained(root, manifestPath);
-        const auto manifestBytes=std::filesystem::file_size(manifestPath);
+        const auto manifestBytes=std::filesystem::file_size(AnalysisIoPath(manifestPath));
         if(manifestBytes>options.manifestBytes) Fail("manifest_budget");
         metadataMemory.Resize(64*1024);
         AnalysisWorkspaceReservation parseMemory(options.workspace,64*1024+manifestBytes*16);
@@ -409,7 +409,7 @@ struct AnalysisCacheTableReader::Impl
         CheckContained(root, indexPath);
         if(descriptor.records > (UINT64_MAX-sizeof(IndexHeader))/sizeof(IndexEntry)) Fail("index_size");
         const auto expectedBytes = sizeof(IndexHeader)+descriptor.records*sizeof(IndexEntry);
-        if(body.at("index_bytes").get<uint64_t>() != expectedBytes || std::filesystem::file_size(indexPath) != expectedBytes) Fail("index_size");
+        if(body.at("index_bytes").get<uint64_t>() != expectedBytes || std::filesystem::file_size(AnalysisIoPath(indexPath)) != expectedBytes) Fail("index_size");
         if(Sha256File(indexPath) != body.at("index_sha256").get<std::string>()) Fail("index_checksum");
         index.open(AnalysisIoPath(indexPath), std::ios::binary);
         const auto header = Read<IndexHeader>(index);
@@ -435,9 +435,9 @@ struct AnalysisCacheTableReader::Impl
         const auto& block = blocks[size_t(blockOrdinal)];
         const auto path = root / "blocks" / BlockName(blockOrdinal);
         CheckContained(root, path);
-        if(!std::filesystem::exists(path)) Fail("block_missing");
+        if(!std::filesystem::exists(AnalysisIoPath(path))) Fail("block_missing");
         const auto extensionBytes=schema==1 ? 0 : sizeof(BlockEncoding);
-        if(std::filesystem::file_size(path) != sizeof(BlockHeader)+extensionBytes+block.storedBytes) Fail("block_size");
+        if(std::filesystem::file_size(AnalysisIoPath(path)) != sizeof(BlockHeader)+extensionBytes+block.storedBytes) Fail("block_size");
         std::ifstream input(AnalysisIoPath(path), std::ios::binary);
         const auto header = Read<BlockHeader>(input);
         BlockHeader expected; expected.magic[7]=char('0'+schema);

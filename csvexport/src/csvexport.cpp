@@ -247,6 +247,7 @@ int64_t GetZoneChildTimeFast(
 }
 
 int main(int argc, char** argv)
+try
 {
 #ifdef _WIN32
     if (!AttachConsole(ATTACH_PARENT_PROCESS))
@@ -528,4 +529,9 @@ int main(int argc, char** argv)
     }
 
     return 0;
+}
+catch(const tracy::TraceFormatError& error)
+{
+    fprintf(stderr, "%s\n", error.what());
+    return 1;
 }

@@ -209,10 +209,15 @@ int main( int argc, char** argv )
         const auto outSize = ftello64( out );
         fclose( out );
 
-        printf( "%s (%i.%i.%i) {%s} -> %s (%i.%i.%i) {%s, %.2f%%}  %s load, %s save, %.2f%% change\n",
+        printf( "JNTRACYX v1 (32-bit strings): %s (base %i.%i.%i) {%s} -> %s (tool %i.%i.%i) {%s, %.2f%%}  %s load, %s save, %.2f%% change\n",
             input, inVer >> 16, ( inVer >> 8 ) & 0xFF, inVer & 0xFF, tracy::MemSizeToString( inSize ),
             output, tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch, tracy::MemSizeToString( outSize ), ratio,
             tracy::TimeToString( tLoad ), tracy::TimeToString( tSave ), float( outSize ) / inSize * 100 );
+    }
+    catch( const tracy::TraceFormatError& e )
+    {
+        fprintf( stderr, "%s\n", e.what() );
+        return 1;
     }
     catch( const tracy::UnsupportedVersion& e )
     {

@@ -2,6 +2,7 @@
 #include "TracyHash.hpp"
 #include <nlohmann/json.hpp>
 #include "TracyAnalysisCacheTable.hpp"
+#include "TracyAnalysisIoPath.hpp"
 #include "TracyAnalysisCacheSort.hpp"
 #include <chrono>
 #include <filesystem>
@@ -182,6 +183,13 @@ int main(int argc, char** argv)
             Scale(std::stoull(argv[2]), temporary / "scale");
             std::filesystem::remove_all(temporary);
             return 0;
+        }
+        {
+            const auto owned=temporary/"long-path";
+            const auto table=owned/std::string(190,'x')/"table";
+            {AnalysisCacheTableWriter writer(table,Identity,"long-path");writer.Append("key","value");writer.Commit();}
+            {AnalysisCacheTableReader reader(table,Identity,"long-path");Require(reader.GetAt(0).payload=="value","long path roundtrip");}
+            std::filesystem::remove_all(AnalysisIoPath(owned));
         }
         ReturnedRecordWorkspace(temporary/"returned-workspace");
         LookupLocality(temporary/"lookup-locality");

@@ -134,6 +134,13 @@ target_include_directories(TracyGetOpt PUBLIC ${GETOPT_DIR})
 
 # ImGui
 
+option(TRACY_USE_PREPATCHED_VENDOR_SOURCES "Use explicitly supplied, already patched ImGui and PPQSort sources without modifying them" OFF)
+if(TRACY_USE_PREPATCHED_VENDOR_SOURCES)
+    if(NOT IS_DIRECTORY "${CPM_ImGui_SOURCE}" OR NOT IS_DIRECTORY "${CPM_PPQSort_SOURCE}")
+        message(FATAL_ERROR "Prepatched vendor mode requires CPM_ImGui_SOURCE and CPM_PPQSort_SOURCE")
+    endif()
+    set(ImGui_SOURCE_DIR "${CPM_ImGui_SOURCE}")
+else()
 CPMAddPackage(
     NAME ImGui
     GITHUB_REPOSITORY ocornut/imgui
@@ -143,6 +150,7 @@ CPMAddPackage(
         "${CMAKE_CURRENT_LIST_DIR}/imgui-emscripten.patch"
         "${CMAKE_CURRENT_LIST_DIR}/imgui-loader.patch"
 )
+endif()
 
 set(IMGUI_SOURCES
     imgui_widgets.cpp
@@ -192,6 +200,11 @@ endif()
 
 # PPQSort
 
+if(TRACY_USE_PREPATCHED_VENDOR_SOURCES)
+    add_library(PPQSort INTERFACE)
+    add_library(PPQSort::PPQSort ALIAS PPQSort)
+    target_include_directories(PPQSort INTERFACE "${CPM_PPQSort_SOURCE}/include")
+else()
 CPMAddPackage(
     NAME PPQSort
     GITHUB_REPOSITORY GabTux/PPQSort
@@ -200,6 +213,7 @@ CPMAddPackage(
         "${CMAKE_CURRENT_LIST_DIR}/ppqsort-nodebug.patch"
     EXCLUDE_FROM_ALL TRUE
 )
+endif()
 
 # json
 

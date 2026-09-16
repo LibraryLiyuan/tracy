@@ -15,6 +15,7 @@
 
 #include "TracyConfig.hpp"
 #include "TracyFileRead.hpp"
+#include "TracySafeSnapshot.hpp"
 #include "TracyFilesystem.hpp"
 #include "TracyImGui.hpp"
 #include "TracyGpuAnalysisController.hpp"
@@ -735,7 +736,8 @@ bool View::DrawImpl()
         const auto dst = m_dstFileBytes.load( std::memory_order_relaxed );
         m_notificationTime = 4;
         char buf[1024];
-        sprintf( buf, "Trace size %s (%.2f%% ratio)", MemSizeToString( dst ), 100.f * dst / src );
+        if(m_saveFailed)snprintf(buf,sizeof(buf),"Trace save failed: %s",m_saveError);
+        else sprintf( buf, "JNTRACYX v1 trace size %s (%.2f%% ratio)", MemSizeToString( dst ), src?100.f * dst / src:0.f );
         m_notificationText = buf;
         m_acb();
     }
@@ -1462,20 +1464,22 @@ void View::DrawSourceTooltip( const char* filename, uint32_t srcline, int before
 
 bool View::Save( const char* fn, FileCompression comp, int zlevel, bool buildDict, int streams )
 {
-    std::unique_ptr<FileWrite> f( FileWrite::Open( fn, comp, zlevel, streams ) );
-    if( !f ) return false;
-
+    if(m_saveThreadState.load(std::memory_order_acquire)!=SaveThreadState::Inert)return false;
+    const auto output=std::filesystem::u8path(fn);
     m_userData.StateShouldBePreserved();
+    m_saveFailed=false;m_saveError[0]=0;
     m_saveThreadState.store( SaveThreadState::Saving, std::memory_order_relaxed );
-    m_saveThread = std::thread( [this, f{std::move( f )}, buildDict] {
-        Worker::MainThreadDataLockGuard lock = m_worker.ObtainLockForMainThread();
-        m_worker.Write( *f, buildDict );
-        f->Finish();
-        const auto stats = f->GetCompressionStatistics();
-        m_srcFileBytes.store( stats.first, std::memory_order_relaxed );
-        m_dstFileBytes.store( stats.second, std::memory_order_relaxed );
+    try { m_saveThread = std::thread( [this, output, comp, zlevel, streams, buildDict] {
+        const auto result=SaveSnapshotAtomically(output,comp,zlevel,streams,[&](FileWrite& file){
+            Worker::MainThreadDataLockGuard lock = m_worker.ObtainLockForMainThread();
+            m_worker.Write(file,buildDict);
+        });
+        m_saveFailed=!result.success;snprintf(m_saveError,sizeof(m_saveError),"%s",result.error.data());
+        m_srcFileBytes.store( result.sourceBytes, std::memory_order_relaxed );
+        m_dstFileBytes.store( result.destinationBytes, std::memory_order_relaxed );
         m_saveThreadState.store( SaveThreadState::NeedsJoin, std::memory_order_release );
-    } );
+    } ); }
+    catch(const std::exception& e){m_saveThreadState.store(SaveThreadState::Inert,std::memory_order_release);m_notificationText=std::string("Cannot start snapshot save: ")+e.what();m_notificationTime=4;return false;}
 
     return true;
 }

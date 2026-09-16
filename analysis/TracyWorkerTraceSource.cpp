@@ -757,6 +757,10 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         if( stateCallback ) stateCallback( TraceSourceState::Ready );
         return std::unique_ptr<WorkerTraceSource>( new WorkerTraceSource( std::move( impl ) ) );
     }
+    catch( const TraceFormatError& error )
+    {
+        throw TraceLoadError( TraceLoadErrorCode::UnsupportedVersion, error.what(), ExtendedTraceVersion );
+    }
     catch( const UnsupportedVersion& error )
     {
         throw TraceLoadError( TraceLoadErrorCode::UnsupportedVersion, "trace was written by a newer Tracy version", error.version );
@@ -1532,6 +1536,9 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     result.executableTime = worker.GetExecutableTime();
     result.processId = worker.GetPid();
     result.traceVersion = worker.GetTraceVersion();
+    result.traceFormatName = "JNTRACYX";
+    result.traceFormatVersion = ExtendedTraceVersion;
+    result.stringIndexBits = 32;
     result.resolution = worker.GetResolution();
     result.firstTimeNs = worker.GetFirstTime();
     result.lastTimeNs = worker.GetLastTime();

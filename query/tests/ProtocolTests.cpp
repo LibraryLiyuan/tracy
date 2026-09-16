@@ -139,7 +139,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 14 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 15 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
@@ -792,6 +792,7 @@ int main()
     assert( service.Execute( Request( 1015, "trace.close", { { "trace_id", profileMismatchId } } ) ).at( "ok" ) );
 
     const auto described = service.Execute( Request( 102, "system.describe" ) );
+    assert( service.Execute(Request(1021,"system.capabilities")).at("data").at("trace_versions") == nlohmann::json::array({"JNTRACYX/1"}) );
     assert( described.at( "ok" ) );
     assert( described.at( "schema_version" ) == tracy::query::QuerySchemaVersion );
     assert( described.at( "partial" ) == false && described.at( "omitted_count" ) == "0" );

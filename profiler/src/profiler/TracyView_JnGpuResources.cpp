@@ -311,7 +311,7 @@ void DrawPassResourceTable( const analysis::GpuAnalysisSnapshot& snapshot, const
     while( clipper.Step() ) for( int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i )
     {
         const auto id = pass.directResources[size_t( i )];
-        const auto* resource = snapshot.FindResource( id );
+        const auto* resource = snapshot.FindGpuResource( id );
         const auto* allocation = resource ? snapshot.FindAllocation( resource->allocationId ) : nullptr;
         ImGui::TableNextRow(); ImGui::TableNextColumn();
         const auto label = std::to_string( id ) + "##passResource" + std::to_string( pass.passId );
@@ -351,7 +351,7 @@ analysis::GpuFrameComparison CompareGpuFrameIntervals( const analysis::GpuAnalys
         uint64_t bytes = 0;
         for( const auto resourceId : resources )
         {
-            const auto* resource = snapshot.FindResource( resourceId );
+            const auto* resource = snapshot.FindGpuResource( resourceId );
             if( resource && resource->allocationId != 0 ) allocations.emplace_back( resource->allocationId );
         }
         std::sort( allocations.begin(), allocations.end() );
@@ -406,7 +406,7 @@ nlohmann::json EvidenceJson( const analysis::GpuAnalysisSnapshot& snapshot, uint
             { "unresolved", snapshot.manifest.unresolvedCount }, { "invalid_records", snapshot.manifest.invalidRecordCount },
             { "reason", snapshot.manifest.reason } } }
     };
-    if( const auto resource = snapshot.FindResource( resourceId ) ) out["resource"] = {
+    if( const auto resource = snapshot.FindGpuResource( resourceId ) ) out["resource"] = {
         { "id", resource->resourceId }, { "name", resource->name }, { "kind", analysis::GpuPrimaryKindName( resource->primaryKind ) },
         { "capacity_bytes", resource->capacityBytes }, { "allocation_id", resource->allocationId }, { "generation", resource->generation },
         { "definition_revision", resource->definitionRevision }, { "exactness", analysis::GpuExactnessName( resource->exactness ) },
@@ -557,7 +557,7 @@ void View::DrawJnGpuResources()
         ImGui::SetNextItemWidth( -1 ); ImGui::InputTextWithHint( "##gpuSearch", "Search name, ID or type", m_jnGpuUi.search, sizeof( m_jnGpuUi.search ) );
         ImGui::BeginChild( "gpuResourceList", ImVec2( ImGui::GetContentRegionAvail().x * .60f, 0 ), ImGuiChildFlags_Borders ); DrawResourceTable( *snapshot, m_jnGpuUi ); ImGui::EndChild();
         ImGui::SameLine(); ImGui::BeginChild( "gpuResourceInspector", ImVec2( 0, 0 ), ImGuiChildFlags_Borders );
-        DrawResourceInspector( *snapshot, snapshot->FindResource( m_jnGpuUi.selectedResource ), m_jnGpuUi.decimalUnits ); ImGui::EndChild();
+        DrawResourceInspector( *snapshot, snapshot->FindGpuResource( m_jnGpuUi.selectedResource ), m_jnGpuUi.decimalUnits ); ImGui::EndChild();
     }
     else if( m_jnGpuUi.tab == 2 )
     {

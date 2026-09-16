@@ -129,6 +129,9 @@ struct TraceInfoDto
     uint64_t executableTime = 0;
     uint64_t processId = 0;
     int traceVersion = 0;
+    std::string traceFormatName;
+    uint32_t traceFormatVersion = 0;
+    uint32_t stringIndexBits = 0;
     int64_t resolution = 0;
     int64_t firstTimeNs = 0;
     int64_t lastTimeNs = 0;

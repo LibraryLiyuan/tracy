@@ -833,6 +833,7 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
 {
     return {
         { "fingerprint", value.fingerprint }, { "capture_name", value.captureName }, { "capture_program", value.captureProgram },
+        { "trace_format", { { "family", value.traceFormatName }, { "version", value.traceFormatVersion }, { "base_layout", value.traceVersion }, { "string_index_bits", value.stringIndexBits } } },
         { "host_info", value.hostInfo }, { "capture_time", Decimal( value.captureTime ) }, { "executable_time", Decimal( value.executableTime ) },
         { "process_id", Decimal( value.processId ) }, { "trace_version", value.traceVersion }, { "resolution", Decimal( value.resolution ) },
         { "first_time_ns", Decimal( value.firstTimeNs ) }, { "last_time_ns", Decimal( value.lastTimeNs ) },
@@ -4772,7 +4773,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         auto limits = DescribeData()["limits"];
         limits["analysis_cache_bytes"] = Decimal( uint64_t( m_cacheBudget ) );
         return Success( id, {
-            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "0.9.0", "0.13.2-JN" } },
+            { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion }, { "trace_versions", { "JNTRACYX/1" } },
             { "source_kinds", { "snapshot", "segment" } }, { "statistics_required", true },
             { "limits", std::move( limits ) }
         } );

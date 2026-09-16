@@ -5,7 +5,7 @@
 namespace tracy::query
 {
 struct AnalysisScanProducts;
-inline constexpr const char* AnalysisScanCacheFormatId = "query-analysis-cache-v1";
+inline constexpr const char* AnalysisScanCacheFormatId = "query-analysis-cache-v2";
 // The generation directory must be fresh. Its bundle header is published last,
 // after checked neutral tables, per-record metadata, and the frame-series file.
 std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation,

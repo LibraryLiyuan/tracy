@@ -3,6 +3,7 @@
 #include "TracyAnalysisCacheKey.hpp"
 #include "TracyNeutralStatisticsCache.hpp"
 #include "TracyHash.hpp"
+#include "../../server/TracyTraceFormat.hpp"
 #include <array>
 #include <fstream>
 #include <stdexcept>
@@ -125,7 +126,7 @@ std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation
         }
     }
     const auto md=metadata.Commit();
-    const json document={{"schema",1},{"format",AnalysisScanCacheFormatId},{"identity",identity},
+    const json document={{"schema",1},{"format",AnalysisScanCacheFormatId},{"identity",identity},{"decoder",ExtendedTraceDecoderIdentity},
         {"neutral_content_sha256",neutral.ContentSha256()},{"metadata",Descriptor(md)},{"frame_series",seriesIdentity}};
     Check(options);
     AnalysisCacheTableWriter header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
@@ -140,7 +141,7 @@ AnalysisScanProducts OpenAnalysisNeutralBundle(const std::filesystem::path& gene
     const auto record=header.GetAt(0);
     AnalysisWorkspaceReservation headerWorkspace(options.workspace,65536+32ull*record.payload.size());
     const auto j=json::parse(record.payload);
-    if(record.key!="header" || j.at("schema")!=1 || j.at("format")!=AnalysisScanCacheFormatId || j.at("identity")!=identity) Fail("header_schema");
+    if(record.key!="header" || j.at("schema")!=1 || j.at("format")!=AnalysisScanCacheFormatId || j.at("identity")!=identity || j.value("decoder",std::string())!=ExtendedTraceDecoderIdentity) Fail("header_schema");
     AnalysisScanProducts products;
     products.metadataWorkspace=AnalysisWorkspaceReservation(options.workspace);
     products.neutralCachePath=generation/"neutral-statistics-v1"; products.neutralCacheIdentity=identity;

@@ -1,5 +1,6 @@
 #include "TracyAnalysisScanManager.hpp"
 #include "TracyAnalysisScanCache.hpp"
+#include "TracyAnalysisIoPath.hpp"
 #include "TracyAnalysisProfile.hpp"
 #include "TracyBoundedScanCursor.hpp"
 #include "TracyExactStatistics.hpp"
@@ -453,7 +454,7 @@ void PublicationIntegrityFailures(const std::filesystem::path& root,const std::f
             if(!ExecuteDefaultAnalysisScan(input,token,progress,products,error)) return false;
             if(corrupt) {
                 const auto blocks=products.neutralCachePath/"statistics"/"blocks";
-                const auto block=std::filesystem::directory_iterator(blocks)->path();
+                const auto block=std::filesystem::directory_iterator(AnalysisIoPath(blocks))->path();
                 std::fstream file(block,std::ios::in|std::ios::out|std::ios::binary);
                 assert(file); file.seekg(-1,std::ios::end); char last; file.get(last);
                 file.seekp(-1,std::ios::end); file.put(char(last^1));
@@ -475,7 +476,7 @@ void PublicationIntegrityFailures(const std::filesystem::path& root,const std::f
             if(corrupt) assert(failed.error.find("block_checksum")!=std::string::npos);
             else assert(failed.stage=="state_persist_failed");
         }
-        if(corrupt) for(const auto& file:std::filesystem::recursive_directory_iterator(cacheRoot))
+        if(corrupt) for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(cacheRoot)))
             assert(file.path().filename()!="current.json");
         const auto statePath=stateRoot/"scans"/scanId/"scan-state.json";
         json persisted; { std::ifstream input(statePath); input>>persisted; }
@@ -516,7 +517,7 @@ void ManagerControlWorkspace(const std::filesystem::path& root,const std::filesy
         // Resume of an already complete entry only joins its finished worker;
         // no transient scan locals can influence this retained-owner check.
         assert(warm.Resume(scanId).completed);        for(const auto& ownedRoot:{root/"control-state",root/"control-cache"})
-            for(const auto& file:std::filesystem::recursive_directory_iterator(ownedRoot))
+            for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(ownedRoot)))
                 if(file.is_directory() && file.path().filename()=="ranking-input")
                     throw std::runtime_error("published scan retained disposable ranking input");
         const auto held=workspace->Snapshot().currentBytes;
@@ -616,7 +617,7 @@ void ManagerColdBundleWorkspace(const std::filesystem::path& root,const std::fil
         auto document=json::parse(header.GetAt(0).payload);
         document["extension"]=std::string(1024*1024,'h'); payload=document.dump();
     }
-    std::filesystem::remove_all(generation/"bundle-header");
+    std::filesystem::remove_all(AnalysisIoPath(generation/"bundle-header"));
     {
         AnalysisCacheTableWriter header(generation/"bundle-header",identity,"analysis-neutral-bundle-v1");
         header.Append("header",payload); state["neutral_header_sha256"]=header.Commit().contentSha256;
@@ -1408,7 +1409,7 @@ int main(int argc,char** argv)
         } // Join the paused worker and its writer-lease cleanup before walking files.
         uint64_t bytes=0;
         for(const auto& scope:{stateRoot/"scans",cacheRoot/AnalysisScanCacheFormatId})
-            for(const auto& file:std::filesystem::recursive_directory_iterator(scope))
+            for(const auto& file:std::filesystem::recursive_directory_iterator(AnalysisIoPath(scope)))
                 if(file.is_regular_file()) bytes+=file.file_size();
         if(bytes>quota || std::filesystem::file_size(existing)!=oldBytes)
             throw std::runtime_error("Disk quota must reject growth before writing and must preserve older generation files");

@@ -481,7 +481,7 @@ private:
 
 std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind)
 {
-    const auto value=std::string(source)+":jnidx:"+std::to_string(QueryIndexSchemaVersion)+":"+std::to_string(uint32_t(kind));
+    const auto value=std::string(source)+":"+ExtendedTraceDecoderIdentity+":jnidx:"+std::to_string(QueryIndexSchemaVersion)+":"+std::to_string(uint32_t(kind));
     analysis::Sha256Builder hash; hash.Update(value.data(),value.size()); return hash.FinalHex();
 }
 uint64_t SectionBytes(const std::filesystem::path& path)

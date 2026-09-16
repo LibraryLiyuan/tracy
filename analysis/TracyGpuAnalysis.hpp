@@ -251,7 +251,7 @@ struct GpuAnalysisSnapshot
     std::unordered_map<uint64_t, size_t> allocationById;
     std::unordered_map<uint64_t, size_t> passById;
 
-    const GpuResourceAnalysisRecord* FindResource( uint64_t resourceId ) const;
+    const GpuResourceAnalysisRecord* FindGpuResource( uint64_t resourceId ) const;
     const GpuAllocationAnalysisRecord* FindAllocation( uint64_t allocationId ) const;
     const GpuPassWorkingSet* FindPass( uint64_t passId ) const;
 };

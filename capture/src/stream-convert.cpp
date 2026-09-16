@@ -2409,7 +2409,7 @@ int main(int argc,char** argv)
             if(outputValid&&cleaned){auto marker=completion;marker+=".tmp";resources->BeforeControlGrowth(marker,256);}
         }catch(const std::exception& e){std::fprintf(stderr,"Cannot reserve final evidence: %s\n",e.what());}
         std::ostringstream report;
-        report<<"{\"schema\":1,\"success\":"<<(outputValid?"true":"false")
+        report<<"{\"schema\":1,\"trace_format\":{\"family\":\"JNTRACYX\",\"version\":1,\"base_layout\":3330,\"string_index_bits\":32},\"success\":"<<(outputValid?"true":"false")
             <<",\"stage\":\""<<finishedStage<<"\",\"failure\":\""<<JsonEscape(reason)
             <<"\",\"cleanup_complete\":"<<(cleaned?"true":"false")
             <<",\"private_peak_bytes\":"<<resources->PeakPrivate()<<",\"working_set_peak_bytes\":"<<resources->PeakWorkingSet()

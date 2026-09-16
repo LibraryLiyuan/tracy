@@ -406,7 +406,7 @@ int main( int argc, char** argv )
         }
         if( args.version )
         {
-            std::cout << "tracy-query " << tracy::Version::Major << '.' << tracy::Version::Minor << '.' << tracy::Version::Patch << " protocol " << QueryProtocol << " schema " << QuerySchemaVersion << '\n';
+            std::cout << "tracy-query " << tracy::Version::Major << '.' << tracy::Version::Minor << '.' << tracy::Version::Patch << " protocol " << QueryProtocol << " schema " << QuerySchemaVersion << " trace-format JNTRACYX/1 string-index 32\n";
             return 0;
         }
         if( args.schema )
