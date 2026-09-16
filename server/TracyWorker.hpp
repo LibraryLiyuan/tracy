@@ -103,6 +103,21 @@ public:
     virtual bool ValidatesCatalog()const{return false;}
     virtual void CatalogMetadata(OfflineCatalogQuality){}
     virtual bool WantsCatalogStrings()const{return false;}
+    virtual bool WantsGlobalStrings()const{return false;}
+    virtual void GlobalStringsBegin(uint64_t){}
+    virtual void GlobalStringBegin(uint64_t,uint64_t,uint64_t){}
+    virtual void GlobalStringBytes(uint64_t,uint64_t,const void*,uint64_t){}
+    virtual void GlobalStringEnd(uint64_t){}
+    virtual void GlobalStringsEnd(){}
+    virtual void GlobalPointerTableBegin(uint8_t,uint64_t){}
+    virtual void GlobalPointerRecord(uint8_t,uint64_t,uint64_t,uint64_t,uint64_t){}
+    virtual void GlobalPointerTableEnd(uint8_t){}
+    virtual bool WantsCallstacks()const{return false;}
+    virtual void CallstacksBegin(uint64_t){}
+    virtual void CallstackBegin(uint32_t,uint32_t){}
+    virtual void CallstackFrames(uint32_t,uint32_t,const CallstackFrameId*,uint32_t){}
+    virtual void CallstackEnd(uint32_t){}
+    virtual void CallstacksEnd(){}
     virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
     virtual void CatalogStringsBegin(uint64_t){}
     virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
@@ -652,7 +667,7 @@ public:
     uint64_t GetContextSwitchPerCpuCount() const;
     bool HasContextSwitches() const { return !m_data.ctxSwitch.empty(); }
     uint64_t GetSrcLocCount() const { return m_data.sourceLocationPayload.size() + m_data.sourceLocation.size(); }
-    uint64_t GetCallstackPayloadCount() const { return m_data.callstackPayload.size() - 1; }
+    uint64_t GetCallstackPayloadCount() const { return m_externalCallstacks?m_externalCallstackCount:m_data.callstackPayload.size() - 1; }
 #ifndef TRACY_NO_STATISTICS
     uint64_t GetCallstackParentPayloadCount() const { return m_data.parentCallstackPayload.size(); }
     uint64_t GetCallstackParentFrameCount() const { return m_callstackParentNextIdx; }
@@ -890,7 +905,7 @@ public:
 
     StringLocation StoreString(const char* str, size_t sz);
     uint32_t StoreCallstackFrames(const CallstackFrameId*,uint16_t,bool);
-    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():m_data.stringData.size(); }
+    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():(m_externalStrings?m_externalStringCount:m_data.stringData.size()); }
     uint64_t PersistedStringToken(const char*) const;
 
     std::vector<uint32_t>& GetPendingThreadHints() { return m_pendingThreadHints; }
@@ -1470,6 +1485,10 @@ private:
     int64_t m_loadTime;
     SerializedZoneSink* m_serializedZoneSink = nullptr;
     uint64_t m_serializedCpuZoneIndex = 0;
+    uint64_t m_externalStringCount = 0;
+    bool m_externalStrings = false;
+    uint64_t m_externalCallstackCount = 0;
+    bool m_externalCallstacks = false;
     uint64_t m_serializedGpuZoneIndex = 0;
 
     Failure m_failure = Failure::None;

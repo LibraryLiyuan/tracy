@@ -919,64 +919,76 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
     f.Read( sz );
     if(sz>UINT32_MAX || sz>SIZE_MAX/sizeof(const char*))throw LoadFailure("string table count exceeds supported index range");
-    m_data.stringMap.reserve( sz );
-
-    if( !m_allowStringModification )
+    const bool externalStrings = m_serializedZoneSink && m_serializedZoneSink->WantsGlobalStrings();
+    m_externalStrings = externalStrings;
+    m_externalStringCount = externalStrings ? sz : 0;
+    if( externalStrings )
     {
-        m_data.stringData.reserve_exact( sz, m_slab );
+        m_serializedZoneSink->GlobalStringsBegin( sz );
+        std::array<char,64*1024> buffer;
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            m_serializedZoneSink->CheckRead();
+            uint64_t token,bytes;f.Read2(token,bytes);
+            if(bytes>UINT32_MAX)throw LoadFailure("string byte length overflow");
+            m_serializedZoneSink->GlobalStringBegin(i,token,bytes);
+            for(uint64_t offset=0;offset<bytes;){const auto take=std::min<uint64_t>(buffer.size(),bytes-offset);f.Read(buffer.data(),size_t(take));m_serializedZoneSink->GlobalStringBytes(i,offset,buffer.data(),take);offset+=take;}
+            m_serializedZoneSink->GlobalStringEnd(i);
+        }
+        m_serializedZoneSink->GlobalStringsEnd();
     }
-
-    for( uint64_t i=0; i<sz; i++ )
+    else
     {
-        uint64_t ptr, ssz;
-        f.Read2( ptr, ssz );
-        if(ssz>UINT32_MAX || ssz>=SIZE_MAX)throw LoadFailure("string byte length overflow");
-        auto dst = static_cast<char*>(m_slab.AllocBig( size_t(ssz)+1 ));
-        f.Read( dst, ssz );
-        dst[ssz] = '\0';
-        m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
-
-        if( m_allowStringModification )
+        m_data.stringMap.reserve( sz );
+        if( !m_allowStringModification ) m_data.stringData.reserve_exact( sz, m_slab );
+        for( uint64_t i=0; i<sz; i++ )
         {
-            m_data.stringData.push_back( dst );
+            uint64_t ptr, ssz;f.Read2( ptr, ssz );
+            if(ssz>UINT32_MAX || ssz>=SIZE_MAX)throw LoadFailure("string byte length overflow");
+            auto dst = static_cast<char*>(m_slab.AllocBig( size_t(ssz)+1 ));f.Read( dst, ssz );dst[ssz] = '\0';
+            m_data.stringMap.emplace( charutil::StringKey { dst, size_t( ssz ) }, i );
+            if( m_allowStringModification )m_data.stringData.push_back( dst );else m_data.stringData[i] = dst;
+            pointerMap.emplace( ptr, dst );
         }
-        else
-        {
-            m_data.stringData[i] = ( dst );
-        }
-
-        pointerMap.emplace( ptr, dst );
     }
 
     f.Read( sz );
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(0,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
+        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(0,i,id,ptr,0);continue;}
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.strings.emplace( id, it->second );
         }
     }
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(0);
 
     f.Read( sz );
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(1,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
+        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(1,i,id,ptr,0);continue;}
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.threadNames.emplace( id, it->second );
         }
     }
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(1);
 
     f.Read( sz );
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(2,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr, ptr2;
         f.Read3( id, ptr, ptr2 );
+        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(2,i,id,ptr,ptr2);continue;}
         auto it = pointerMap.find( ptr );
         auto it2 = pointerMap.find( ptr2 );
         if( it != pointerMap.end() && it2 != pointerMap.end() )
@@ -984,6 +996,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             m_data.externalNames.emplace( id, std::make_pair( it->second, it2->second ) );
         }
     }
+    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(2);
 
     m_data.localThreadCompress.Load( f );
     m_data.externalThreadCompress.Load( f );
@@ -1514,23 +1527,22 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::CallStacks, std::memory_order_relaxed );
     f.Read( sz );
-    m_data.callstackPayload.reserve_exact( sz+1, m_slab );
-    m_data.callstackPayload[0] = nullptr;
-    for( uint64_t i=0; i<sz; i++ )
+    const bool externalCallstacks=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstacks();
+    m_externalCallstacks=externalCallstacks;m_externalCallstackCount=externalCallstacks?sz:0;
+    if(externalCallstacks)
     {
-        uint16_t csz;
-        f.Read( csz );
-
-        const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );
-        auto mem = (char*)m_slab.AllocRaw( memsize );
-
-        auto data = (CallstackFrameId*)mem;
-        f.Read( data, csz * sizeof( CallstackFrameId ) );
-
-        auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );
-        new(arr) VarArray<CallstackFrameId>( csz, data );
-
-        m_data.callstackPayload[i+1] = arr;
+        if(m_data.callstackPayload.empty())m_data.callstackPayload.push_back(nullptr);else if(m_data.callstackPayload.size()!=1)throw LoadFailure("callstack sentinel state");
+        m_serializedZoneSink->CallstacksBegin(sz);std::array<CallstackFrameId,4096> frames;
+        for(uint64_t i=0;i<sz;++i){m_serializedZoneSink->CheckRead();uint16_t count;f.Read(count);if(!count)throw LoadFailure("empty callstack payload");const auto id=uint32_t(i+1);m_serializedZoneSink->CallstackBegin(id,count);for(uint32_t offset=0;offset<count;){const auto take=std::min<uint32_t>(uint32_t(frames.size()),count-offset);f.Read(frames.data(),size_t(take)*sizeof(CallstackFrameId));m_serializedZoneSink->CallstackFrames(id,offset,frames.data(),take);offset+=take;}m_serializedZoneSink->CallstackEnd(id);}m_serializedZoneSink->CallstacksEnd();
+    }
+    else
+    {
+        m_data.callstackPayload.reserve_exact( sz+1, m_slab );m_data.callstackPayload[0] = nullptr;
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            uint16_t csz;f.Read( csz );
+            const auto memsize = sizeof( VarArray<CallstackFrameId> ) + csz * sizeof( CallstackFrameId );auto mem = (char*)m_slab.AllocRaw( memsize );auto data = (CallstackFrameId*)mem;f.Read( data, csz * sizeof( CallstackFrameId ) );auto arr = (VarArray<CallstackFrameId>*)( mem + csz * sizeof( CallstackFrameId ) );new(arr) VarArray<CallstackFrameId>( csz, data );m_data.callstackPayload[i+1] = arr;
+        }
     }
 
     f.Read( sz );

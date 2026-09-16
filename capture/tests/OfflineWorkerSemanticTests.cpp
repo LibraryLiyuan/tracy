@@ -22,6 +22,7 @@ struct OfflineStorageSemanticTest {
     worker.m_offlineStorage=&store;const uint64_t raw[2]={0x1000,0x2000};worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));const auto id=worker.m_pendingCallstackId;Check(id==worker.m_data.callstackPayload.size()-1);worker.m_pendingCallstackId=0;worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));Check(worker.m_pendingCallstackId==id&&store.CallstackCount()==worker.m_data.callstackPayload.size());worker.m_pendingCallstackId=0;
     worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto& value=reopened.GetCallstack(id);Check(value.size()==2&&reopened.GetCanonicalPointer(value[0])==raw[0]&&reopened.GetCanonicalPointer(value[1])==raw[1]);worker.m_offlineStorage=nullptr;
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.callstackPayload.size()==1);}
  }
  static void MigrateStrings(Worker& worker,conversion::OfflineConversionStorage& store){for(uint32_t i=0;i<worker.m_data.stringData.size();++i){uint32_t id=UINT32_MAX;const auto* source=worker.m_data.stringData[i];const auto* value=store.InternString(source,std::strlen(source),id);Check(id==i&&std::strcmp(value,source)==0);}}
  static void StringRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
@@ -37,6 +38,7 @@ struct OfflineStorageSemanticTest {
     const auto added=worker.StoreString("p5-new",6);Check(added.idx==expected.size()&&std::strcmp(worker.GetString(StringIdx(added.idx)),"p5-new")==0);expected.emplace_back("p5-new");
     worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);Check(reopened.m_data.stringData.size()==expected.size());for(uint32_t i=0;i<expected.size();++i)Check(std::strcmp(reopened.m_data.stringData[i],expected[i].c_str())==0);
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.stringData.empty()&&streamed.m_data.stringMap.empty()&&streamed.m_data.strings.empty()&&streamed.m_data.threadNames.empty()&&streamed.m_data.externalNames.empty());}
     worker.m_offlineStorage=nullptr;
  }
  static void GpuZoneRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){

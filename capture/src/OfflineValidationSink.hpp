@@ -13,8 +13,23 @@ public:
         :m_resources(resources),m_buffer(resources.Workspace()),m_expected{storage.JobStageCount(),storage.ReferenceUseCount(),storage.RelationCount()},
          m_hashes{storage.JobStageHash(),storage.ReferenceUseHash(),storage.RelationHash()},m_zoneCount(storage.ZoneExtraCount()),m_zoneHash(storage.ZoneExtraHash()){
         for(size_t i=0;i<OfflineAppendDomainCount;++i){m_expected[3+i]=storage.RecordCount(OfflineAppendDomain(i));m_hashes[3+i]=storage.RecordHash(OfflineAppendDomain(i));}
-        for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();
+        for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();m_stringCount=storage.StringCount();m_stringHash=storage.StringHash();m_callstackCount=storage.CallstackCount()-1;m_callstackHash=storage.CallstackHash();
     }
+    bool WantsGlobalStrings()const override{return true;}
+    void GlobalStringsBegin(uint64_t count)override{CheckRead();if(m_stringStarted||count!=m_stringCount)throw std::runtime_error("conversion_validation_string_count");m_stringStarted=true;}
+    void GlobalStringBegin(uint64_t index,uint64_t token,uint64_t bytes)override{CheckRead();if(!m_stringStarted||m_stringDone||m_stringOpen||index!=m_stringSeen||token!=index+1||bytes>UINT32_MAX)throw std::runtime_error("conversion_validation_string_begin");m_stringOpen=true;m_stringBytes=bytes;m_stringOffset=0;m_stringActual.Update(&bytes,sizeof(bytes));}
+    void GlobalStringBytes(uint64_t index,uint64_t offset,const void* bytes,uint64_t count)override{CheckRead();if(!m_stringOpen||index!=m_stringSeen||offset!=m_stringOffset||count>m_stringBytes-m_stringOffset||(count&&!bytes))throw std::runtime_error("conversion_validation_string_bytes");m_stringActual.Update(bytes,size_t(count));m_stringOffset+=count;}
+    void GlobalStringEnd(uint64_t index)override{CheckRead();if(!m_stringOpen||index!=m_stringSeen||m_stringOffset!=m_stringBytes)throw std::runtime_error("conversion_validation_string_end");m_stringOpen=false;++m_stringSeen;}
+    void GlobalStringsEnd()override{CheckRead();if(!m_stringStarted||m_stringDone||m_stringOpen||m_stringSeen!=m_stringCount||m_stringActual.FinalHex()!=m_stringHash)throw std::runtime_error("conversion_validation_string_hash");m_stringDone=true;}
+    void GlobalPointerTableBegin(uint8_t kind,uint64_t count)override{CheckRead();if(kind>=3||m_pointerStarted[kind])throw std::runtime_error("conversion_validation_pointer_begin");m_pointerStarted[kind]=true;m_pointerExpected[kind]=count;}
+    void GlobalPointerRecord(uint8_t kind,uint64_t index,uint64_t,uint64_t token,uint64_t token2)override{CheckRead();if(kind>=3||!m_pointerStarted[kind]||m_pointerDone[kind]||index!=m_pointerSeen[kind]||!token||token>m_stringCount||(kind==2&&(!token2||token2>m_stringCount))||(kind!=2&&token2))throw std::runtime_error("conversion_validation_pointer_record");++m_pointerSeen[kind];}
+    void GlobalPointerTableEnd(uint8_t kind)override{CheckRead();if(kind>=3||!m_pointerStarted[kind]||m_pointerDone[kind]||m_pointerSeen[kind]!=m_pointerExpected[kind])throw std::runtime_error("conversion_validation_pointer_end");m_pointerDone[kind]=true;}
+    bool WantsCallstacks()const override{return true;}
+    void CallstacksBegin(uint64_t count)override{CheckRead();if(m_callstackStarted||count!=m_callstackCount)throw std::runtime_error("conversion_validation_callstack_count");m_callstackStarted=true;}
+    void CallstackBegin(uint32_t id,uint32_t count)override{CheckRead();if(!m_callstackStarted||m_callstackDone||m_callstackOpen||id!=m_callstackSeen+1||id>m_callstackCount||!count||count>UINT16_MAX)throw std::runtime_error("conversion_validation_callstack_begin");m_callstackOpen=true;m_callstackFrames=count;m_callstackOffset=0;m_callstackActual.Update(&count,sizeof(count));}
+    void CallstackFrames(uint32_t id,uint32_t offset,const CallstackFrameId* frames,uint32_t count)override{CheckRead();if(!m_callstackOpen||id!=m_callstackSeen+1||offset!=m_callstackOffset||count>m_callstackFrames-m_callstackOffset||(count&&!frames))throw std::runtime_error("conversion_validation_callstack_frames");m_callstackActual.Update(frames,size_t(count)*sizeof(CallstackFrameId));m_callstackOffset+=count;}
+    void CallstackEnd(uint32_t id)override{CheckRead();if(!m_callstackOpen||id!=m_callstackSeen+1||m_callstackOffset!=m_callstackFrames)throw std::runtime_error("conversion_validation_callstack_end");m_callstackOpen=false;++m_callstackSeen;}
+    void CallstacksEnd()override{CheckRead();if(!m_callstackStarted||m_callstackDone||m_callstackOpen||m_callstackSeen!=m_callstackCount||m_callstackActual.FinalHex()!=m_callstackHash)throw std::runtime_error("conversion_validation_callstack_hash");m_callstackDone=true;}
     bool ValidatesCatalog()const override{return true;}
     void CatalogMetadata(OfflineCatalogQuality quality)override{CheckRead();if(m_catalogMetadata||quality!=m_catalogQuality)throw std::runtime_error("conversion_validation_catalog_quality");m_catalogMetadata=true;}
     bool WantsCatalogStrings()const override{return true;}
@@ -53,6 +68,8 @@ public:
     {CheckRead();const auto i=Slot(domain);if(!m_started[i]||m_done[i]||m_seen[i]!=m_expected[i]||m_actual[i].FinalHex()!=m_hashes[i])throw std::runtime_error("conversion_validation_hash");m_done[i]=true;}
     void Finish() const{
         if(!m_zoneDone)throw std::runtime_error("zone_extra_validation_missing");
+        if(!m_stringDone||!m_pointerDone[0]||!m_pointerDone[1]||!m_pointerDone[2])throw std::runtime_error("conversion_validation_global_strings_missing");
+        if(!m_callstackDone)throw std::runtime_error("conversion_validation_callstacks_missing");
         if(!m_catalogMetadata)throw std::runtime_error("conversion_validation_catalog_metadata_missing");
         for(size_t i=0;i<m_expected.size();++i){
             if(!m_started[i]&&!m_expected[i])continue; // older schemas may omit an empty domain
@@ -93,6 +110,17 @@ private:
     std::string m_zoneHash;
     analysis::Sha256Builder m_zoneActual;
     bool m_zoneStarted=false,m_zoneDone=false;
+    uint64_t m_stringCount=0,m_stringSeen=0,m_stringBytes=0,m_stringOffset=0;
+    std::string m_stringHash;
+    analysis::Sha256Builder m_stringActual;
+    bool m_stringStarted=false,m_stringOpen=false,m_stringDone=false;
+    std::array<uint64_t,3> m_pointerExpected{},m_pointerSeen{};
+    std::array<bool,3> m_pointerStarted{},m_pointerDone{};
+    uint64_t m_callstackCount=0,m_callstackSeen=0;
+    uint32_t m_callstackFrames=0,m_callstackOffset=0;
+    std::string m_callstackHash;
+    analysis::Sha256Builder m_callstackActual;
+    bool m_callstackStarted=false,m_callstackOpen=false,m_callstackDone=false;
 };
 }
 #endif
