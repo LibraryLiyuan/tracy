@@ -5,6 +5,7 @@
 #include "../../analysis/TracyPagedRecordStore.hpp"
 #include "../../storage/TracyMutableRecordStore.hpp"
 #include "../../storage/TracyDiskIndex64.hpp"
+#include "../../storage/TracyResourceIntervals.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -15,6 +16,12 @@ public:
     OfflineConversionStorage(std::filesystem::path root,std::string identity,storage::ConversionResources& resources);
     void Check() override;
     std::optional<int64_t> LookupPassTime(uint64_t) override;
+    void BeginResourceIntervals() override;
+    void AddResourceInterval(const JnGpuCatalogResourceRecordV1&) override;
+    void SealResourceIntervals() override;
+    uint64_t ResolveResource(uint64_t,int64_t) override;
+    void EndResourceIntervals() noexcept override;
+    std::array<uint64_t,3> ResourceIntervalPeaks()const{return m_intervalPeaks;}
     void AppendRecord(OfflineAppendDomain,const void*,uint32_t) override;
     uint64_t RecordCount(OfflineAppendDomain) const override;
     void VisitRecords(OfflineAppendDomain,const std::function<void(const void*,uint64_t)>&) override;
@@ -62,6 +69,8 @@ private:
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::unique_ptr<storage::DiskIndex64> m_passTimes;
+    std::unique_ptr<storage::ResourceIntervals> m_resourceIntervals;
+    std::array<uint64_t,3> m_intervalPeaks{};
     std::string m_zoneHash;
     uint64_t m_jobCount=0,m_useCount=0,m_definitionCount=0;
     bool m_sealed=false,m_reclaimed=false;

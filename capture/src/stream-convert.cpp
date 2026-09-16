@@ -1610,6 +1610,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         }
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
+        if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';}
         out<<'}';conversionEvidence=out.str();
     }};
 

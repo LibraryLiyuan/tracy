@@ -7306,6 +7306,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     };
     unordered_flat_map<uint64_t, std::vector<ResourceInterval>> intervals;
     unordered_flat_map<uint64_t, size_t> openIntervals;
+    struct IntervalScope {WorkerOfflineStorage* storage;~IntervalScope(){if(storage)storage->EndResourceIntervals();}} intervalScope{m_offlineStorage};
+    if(m_offlineStorage)m_offlineStorage->BeginResourceIntervals();
     auto& data = m_data.jnTrace;
     stats.fullResolveInputUnits += uint64_t( data.gpuCatalogBatches.size() ) * 7 +
         data.gpuCatalogResources.size() + data.gpuCatalogViews.size() +
@@ -7330,6 +7332,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
         for( size_t i = first; i < first + count; ++i )
         {
             const auto& record = data.gpuCatalogResources[i];
+            if(m_offlineStorage){m_offlineStorage->AddResourceInterval(record);continue;}
             if( record.pointerToken == 0 || record.resourceId == 0 ) continue;
             const auto operation = JnGpuCatalogRecordOperation( record.operation );
             const auto key = record.pointerToken;
@@ -7363,6 +7366,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
 
     auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
     {
+        if(m_offlineStorage)return m_offlineStorage->ResolveResource(pointerToken,time);
         if( pointerToken == 0 ) return 0;
         const auto found = intervals.find( pointerToken );
         if( found == intervals.end() ) return 0;
@@ -7377,6 +7381,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     };
 
     unordered_flat_map<uint64_t, int64_t> passTimes;
+    if(m_offlineStorage)m_offlineStorage->SealResourceIntervals();
     if(!m_offlineStorage){
     for( const auto& pass : data.gpuReferencePasses )
         if( pass.passId != 0 ) passTimes[pass.passId] = pass.time;

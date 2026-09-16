@@ -49,6 +49,12 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-resource-intervals-tests tests/ResourceIntervalsTests.cpp)
+    target_link_libraries(tracy-resource-intervals-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-resource-intervals COMMAND tracy-resource-intervals-tests ${CMAKE_CURRENT_BINARY_DIR}/resource-intervals-test)
+    add_executable(tracy-mutable-rows-tests tests/MutableRowsTests.cpp)
+    target_link_libraries(tracy-mutable-rows-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-mutable-rows COMMAND tracy-mutable-rows-tests ${CMAKE_CURRENT_BINARY_DIR}/mutable-rows-test)
     add_executable(tracy-disk-index64-tests tests/DiskIndex64Tests.cpp)
     target_link_libraries(tracy-disk-index64-tests PRIVATE TracyStorageCore)
     add_test(NAME tracy-disk-index64 COMMAND tracy-disk-index64-tests ${CMAKE_CURRENT_BINARY_DIR}/disk-index64-test)

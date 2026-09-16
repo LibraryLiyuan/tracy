@@ -114,6 +114,11 @@ std::optional<int64_t> OfflineConversionStorage::LookupPassTime(uint64_t id)
     }
     const auto value=m_passTimes->Find(id);return value?std::optional<int64_t>(std::bit_cast<int64_t>(*value)):std::nullopt;
 }
+void OfflineConversionStorage::BeginResourceIntervals(){Check();if(!m_sealed||m_resourceIntervals)throw std::runtime_error("resource_interval_begin_state");m_resourceIntervals=std::make_unique<storage::ResourceIntervals>(m_root/"resource-intervals",m_resources,m_identity);}
+void OfflineConversionStorage::AddResourceInterval(const JnGpuCatalogResourceRecordV1& row){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");m_resourceIntervals->Add(row);}
+void OfflineConversionStorage::SealResourceIntervals(){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");m_resourceIntervals->Seal();}
+uint64_t OfflineConversionStorage::ResolveResource(uint64_t pointer,int64_t time){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");return m_resourceIntervals->Resolve(pointer,time);}
+void OfflineConversionStorage::EndResourceIntervals() noexcept {if(m_resourceIntervals){m_intervalPeaks[0]=std::max(m_intervalPeaks[0],m_resourceIntervals->Count());m_intervalPeaks[1]=std::max(m_intervalPeaks[1],m_resourceIntervals->PointerCount());m_intervalPeaks[2]=std::max(m_intervalPeaks[2],m_resourceIntervals->LogicalBytes());m_resourceIntervals.reset();}}
 void OfflineConversionStorage::AppendRecord(OfflineAppendDomain domain,const void* row,uint32_t width)
 {
     Check();const auto& info=OfflineAppendInfo(domain);auto& table=m_appendTables[size_t(domain)];

@@ -13,7 +13,7 @@ namespace tracy::storage {
 // Task-local B+ tree. Pages can be evicted; references never escape the cache.
 // Interrupted trees are discarded rather than resumed.
 class DiskIndex64 {
-    static constexpr uint64_t PageBytes=16384,PageCharge=PageBytes+256;
+    static constexpr uint64_t PageBytes=16384,HeaderBytes=4096,PageCharge=PageBytes+256;
     static constexpr size_t Capacity=1018;
     struct Item {uint64_t key=0,value=0;};
     struct Page {
@@ -31,15 +31,15 @@ class DiskIndex64 {
     std::fstream m_file;std::map<uint64_t,std::unique_ptr<Slot>> m_cache;
     uint64_t m_cacheBytes,m_clock=0,m_next=1,m_root=0,m_count=0;bool m_sealed=false,m_failed=false;
     static void Require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+    static uint64_t Offset(uint64_t id){Require(id>0&&id<(uint64_t(INT64_MAX)-HeaderBytes)/PageBytes,"disk_index64_offset");return HeaderBytes+(id-1)*PageBytes;}
     static std::string Digest(Page page){std::memset(page.checksum,0,64);analysis::Sha256Builder hash;hash.Update(&page,sizeof(page));return hash.FinalHex();}
     void Check(){m_resources.CheckFast();Require(!m_failed,"disk_index64_failed");}
     void Write(Page page){
         Check();const auto hash=Digest(page);std::memcpy(page.checksum,hash.data(),64);
-        Require(page.id<uint64_t(INT64_MAX)/PageBytes,"disk_index64_offset");
-        m_file.clear();m_file.seekp(std::streamoff(page.id*PageBytes));m_file.write(reinterpret_cast<const char*>(&page),sizeof(page));Require(bool(m_file),"disk_index64_write");
+        m_file.clear();m_file.seekp(std::streamoff(Offset(page.id)));m_file.write(reinterpret_cast<const char*>(&page),sizeof(page));Require(bool(m_file),"disk_index64_write");
     }
     uint64_t Allocate(Page& page){
-        Require(m_next<uint64_t(INT64_MAX)/PageBytes,"disk_index64_offset");m_resources.BeforeFileGrowth(m_path,(m_next+1)*PageBytes);
+        Require(m_next<(uint64_t(INT64_MAX)-HeaderBytes)/PageBytes,"disk_index64_offset");m_resources.BeforeFileGrowth(m_path,HeaderBytes+m_next*PageBytes);
         page.id=m_next++;Write(page);return page.id;
     }
     void Evict(){
@@ -50,7 +50,7 @@ class DiskIndex64 {
         Check();Require(id>0&&id<m_next,"disk_index64_page_id");auto found=m_cache.find(id);
         if(found==m_cache.end()){
             while((m_cache.size()+1)*PageCharge>m_cacheBytes)Evict();auto slot=std::make_unique<Slot>(m_resources);
-            m_file.flush();Require(bool(m_file),"disk_index64_flush");m_file.clear();m_file.seekg(std::streamoff(id*PageBytes));m_file.read(reinterpret_cast<char*>(&slot->page),sizeof(Page));
+            m_file.flush();Require(bool(m_file),"disk_index64_flush");m_file.clear();m_file.seekg(std::streamoff(Offset(id)));m_file.read(reinterpret_cast<char*>(&slot->page),sizeof(Page));
             const auto& page=slot->page;Require(bool(m_file)&&page.magic==0x31583649&&page.id==id&&page.level<16&&page.count<=Capacity&&(!page.level||page.count),"disk_index64_header");
             Require(Digest(page)==std::string(page.checksum,64),"disk_index64_checksum");
             for(size_t i=1;i<page.count;++i)Require(page.items[i-1].key<page.items[i].key,"disk_index64_order");
@@ -79,8 +79,8 @@ public:
     DiskIndex64(std::filesystem::path path,std::string identity,ConversionResources& resources,uint64_t cacheBytes=8ull<<20)
         :m_path(std::move(path)),m_identity(std::move(identity)),m_resources(resources),m_traversal(resources.Workspace(),1ull<<20),m_cacheBytes(cacheBytes){
         Require(m_identity.size()==64&&cacheBytes>=2*PageCharge&&cacheBytes<=32ull<<20,"disk_index64_configuration");Require(!std::filesystem::exists(analysis::AnalysisIoPath(m_path)),"disk_index64_exists");
-        m_resources.BeforeFileGrowth(m_path,PageBytes);m_file.open(analysis::AnalysisIoPath(m_path),std::ios::in|std::ios::out|std::ios::binary|std::ios::trunc);Require(bool(m_file),"disk_index64_open");
-        std::array<char,PageBytes> header{};m_file.write(header.data(),header.size());Require(bool(m_file),"disk_index64_write");Page root;m_root=Allocate(root);
+        m_resources.BeforeFileGrowth(m_path,HeaderBytes);m_file.open(analysis::AnalysisIoPath(m_path),std::ios::in|std::ios::out|std::ios::binary|std::ios::trunc);Require(bool(m_file),"disk_index64_open");
+        std::array<char,HeaderBytes> header{};m_file.write(header.data(),header.size());Require(bool(m_file),"disk_index64_write");Page root;m_root=Allocate(root);
     }
     ~DiskIndex64()=default;
     std::optional<uint64_t> Find(uint64_t key){
@@ -98,8 +98,9 @@ public:
     }
     void ClearCache(){Check();for(auto& item:m_cache)if(item.second->dirty)Write(item.second->page);m_file.flush();Require(bool(m_file),"disk_index64_flush");m_cache.clear();}
     void ReduceCache(){m_cacheBytes=std::min<uint64_t>(m_cacheBytes,4ull<<20);while(m_cache.size()*PageCharge>m_cacheBytes)Evict();}
-    void Seal(){Check();Require(!m_sealed,"disk_index64_sealed");ClearCache();std::array<char,PageBytes> header{};std::memcpy(header.data(),"JNIDX641",8);std::memcpy(header.data()+8,m_identity.data(),64);std::memcpy(header.data()+72,&m_root,8);std::memcpy(header.data()+80,&m_next,8);std::memcpy(header.data()+88,&m_count,8);m_file.seekp(0);m_file.write(header.data(),header.size());m_file.flush();Require(bool(m_file),"disk_index64_seal");m_sealed=true;}
+    void Seal(){Check();Require(!m_sealed,"disk_index64_sealed");ClearCache();std::array<char,HeaderBytes> header{};std::memcpy(header.data(),"JNIDX642",8);std::memcpy(header.data()+8,m_identity.data(),64);std::memcpy(header.data()+72,&m_root,8);std::memcpy(header.data()+80,&m_next,8);std::memcpy(header.data()+88,&m_count,8);m_file.seekp(0);m_file.write(header.data(),header.size());m_file.flush();Require(bool(m_file),"disk_index64_seal");m_sealed=true;}
     uint64_t Count()const{return m_count;}
+    uint64_t LogicalBytes()const{return HeaderBytes+(m_next-1)*PageBytes;}
 };
 }
 #endif

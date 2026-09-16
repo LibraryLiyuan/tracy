@@ -22,7 +22,7 @@ int main(int argc,char** argv){try{
  Check(!index.Find(4));
  bool failed=false;try{index.Upsert(1,1);}catch(const std::exception&){failed=true;}Check(failed);
  Check(resources.Workspace()->Snapshot().peakBytes<controlBytes+(2ull<<20));
- index.ClearCache();{std::fstream file(tracy::analysis::AnalysisIoPath(root/"pass.index"),std::ios::in|std::ios::out|std::ios::binary);file.seekp(16384);file.put(0);file.flush();Check(bool(file));}
+ index.ClearCache();{std::fstream file(tracy::analysis::AnalysisIoPath(root/"pass.index"),std::ios::in|std::ios::out|std::ios::binary);file.seekp(4096);file.put(0);file.flush();Check(bool(file));}
  failed=false;try{index.Find(3);}catch(const std::exception&){failed=true;}Check(failed);
  auto tight=limits;tight.streamBytes=1;tracy::storage::ConversionResources denied(tight,[&]{return sample;},[]{return 1ull<<40;});
  failed=false;try{tracy::storage::DiskIndex64 noSpace(root/"denied.index",std::string(64,'e'),denied);}catch(const std::exception&){failed=true;}Check(failed);
