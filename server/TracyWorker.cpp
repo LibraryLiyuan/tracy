@@ -7358,20 +7358,18 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     struct IntervalScope {WorkerOfflineStorage* storage;~IntervalScope(){if(storage)storage->EndResourceIntervals();}} intervalScope{m_offlineStorage};
     if(m_offlineStorage)m_offlineStorage->BeginResourceIntervals();
     auto& data = m_data.jnTrace;
-    stats.fullResolveInputUnits += CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches) * 7 +
-        CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources) + CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews) +
-        CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals) + CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg) +
-        CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets) + CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations) +
-        CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence) +
-        (m_offlineStorage ? m_offlineStorage->RecordCount(OfflineAppendDomain::GpuReferencePass)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxEntity)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxLink) : data.gpuReferencePasses.size()+data.gfxEntities.size()+data.gfxLinks.size());
-
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
+        if(m_offlineStorage&&m_offlineStorage->VisitCatalogDirectoryBatches(generation,uint8_t(kind),[&](uint64_t index){
+            ++stats.batchRowsExamined;++stats.fullResolveInputUnits;const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);m_offlineStorage->Check();
+            if(batch.generation!=generation||batch.kind!=uint8_t(kind))throw std::runtime_error("catalog_batch_directory_mismatch");if(batch.valid!=0){++stats.batchRowsMatched;stats.catalogRowsProcessed+=batch.recordCount;stats.fullResolveInputUnits+=batch.recordCount;fn(size_t(batch.firstRecordIndex),size_t(batch.recordCount));}
+        }))return;
         for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);++index)
         {
-            const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
+            ++stats.batchRowsExamined;++stats.fullResolveInputUnits;const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
             if(m_offlineStorage)m_offlineStorage->Check();
             if( batch.generation != generation || batch.kind != uint8_t( kind ) || batch.valid == 0 ) continue;
+            ++stats.batchRowsMatched;stats.catalogRowsProcessed+=batch.recordCount;stats.fullResolveInputUnits+=batch.recordCount;
             fn( size_t( batch.firstRecordIndex ), size_t( batch.recordCount ) );
         }
     };
@@ -7500,10 +7498,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);if(first>size||count>size-first)return;
         ForCatalogRows(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets,first,count,[&](auto& record){
-            auto time = std::numeric_limits<int64_t>::min();
-            if(m_offlineStorage){const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
-            else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
-            if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, time );
+            if( record.resourceId == 0 && record.pointerToken != 0 ){
+                auto time = std::numeric_limits<int64_t>::min();
+                if(m_offlineStorage){if(!m_offlinePassTimesPrepared){m_offlineStorage->PreparePassTimes();m_offlinePassTimesPrepared=true;}const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
+                else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
+                record.resourceId = resolve( record.pointerToken, time );
+            }
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
                 ++unresolved;
@@ -7609,7 +7609,14 @@ void Worker::FinalizeJnGpuCatalogForSave()
     if(m_offlineStorage&&m_offlineCatalogFinalized)return;
     const auto seal=[&]{if(m_offlineStorage){m_offlineStorage->SealCatalog({uint64_t(data.gpuCatalogPresent),uint64_t(data.gpuCatalogValid),data.gpuCatalogSchemaVersion,data.gpuDetailedEvidenceSchemaVersion});m_offlineCatalogFinalized=true;}};
     if( !data.gpuCatalogPresent ){seal();return;}
-    for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);++index)
+    if(m_offlineStorage){
+        const auto generations=CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations),batches=CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches),total=generations+batches;m_offlineStorage->ReportFinalizeProgress("catalog_directory",0,total,"rows");m_offlineStorage->BeginCatalogBatchDirectory();
+        for(uint64_t index=0;index<generations;++index){m_offlineStorage->AddCatalogDirectoryGeneration(CatalogValue(OfflineCatalogDomain::CatalogGeneration,index,data.gpuCatalogGenerations).generation);if((index&0xFFF)==0||index+1==generations)m_offlineStorage->ReportFinalizeProgress("catalog_directory",index+1,total,"rows");}
+        for(uint64_t index=0;index<batches;++index){const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);m_offlineStorage->AddCatalogDirectoryBatch(index,batch.generation,batch.kind);if((index&0xFFF)==0||index+1==batches)m_offlineStorage->ReportFinalizeProgress("catalog_directory",generations+index+1,total,"rows");}
+        m_offlineStorage->SealCatalogBatchDirectory();
+    }
+    const auto generationCount=CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve",0,generationCount,"generations");
+    for(uint64_t index=0;index<generationCount;++index)
     {
         auto generation=CatalogValue(OfflineCatalogDomain::CatalogGeneration,index,data.gpuCatalogGenerations);
         if(m_offlineStorage)m_offlineStorage->Check();
@@ -7623,6 +7630,7 @@ void Worker::FinalizeJnGpuCatalogForSave()
             data.gpuCatalogValid = false;
         }
         PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,index,generation,data.gpuCatalogGenerations);
+        if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve",index+1,generationCount,"generations");
     }
 
     auto checksumRecords = [&]( OfflineCatalogDomain domain,auto& values, uint64_t first, uint32_t count ) -> uint64_t
@@ -7632,7 +7640,8 @@ void Worker::FinalizeJnGpuCatalogForSave()
         if(!m_offlineStorage)return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
         auto hash=JnGpuCatalogChecksum64(nullptr,0);ForCatalogRows(domain,values,first,count,[&](const auto& row){hash=JnGpuCatalogChecksum64Update(hash,&row,sizeof(row));});return hash;
     };
-    for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);++index)
+    const auto batchCount=CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_checksum",0,batchCount,"batches");
+    for(uint64_t index=0;index<batchCount;++index)
     {
         auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
         if(m_offlineStorage)m_offlineStorage->Check();
@@ -7673,6 +7682,7 @@ void Worker::FinalizeJnGpuCatalogForSave()
             data.gpuCatalogValid = false;
         }
         PutCatalogValue(OfflineCatalogDomain::CatalogBatch,index,batch,data.gpuCatalogBatches);
+        if(m_offlineStorage&&((index&0xFFF)==0||index+1==batchCount))m_offlineStorage->ReportFinalizeProgress("catalog_checksum",index+1,batchCount,"batches");
     }
     seal();
 }

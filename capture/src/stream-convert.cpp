@@ -64,6 +64,7 @@ struct Options
     std::filesystem::path progressJson;
     std::filesystem::path reportJson;
     std::filesystem::path memoryAttribution;
+    std::filesystem::path cancelFile;
     uint64_t diagnosticPrivateLimit = 0;
     uint16_t port = 18086;
     uint32_t threads = 0;
@@ -77,6 +78,7 @@ struct Options
     bool diagnostics = false;
     bool allocationDiagnostics = false;
     uint64_t testCancelAfterRecords = 0;
+    uint64_t testCancelFinalizeAfterRows = 0;
     bool testFailBeforeValidate = false;
     bool testAllocationFailure = false;
     Mode mode = Mode::Offline;
@@ -89,11 +91,13 @@ void Usage()
         "Usage: tracy-stream-convert -i input.tracy-stream -o output.tracy [-f]\n"
         "  [--compression fast|balanced|legacy] [--threads auto|N]\n"
         "  [--require-clean-end] [--progress-json path] [--report-json path]\n"
+        "  [--cancel-file path] (default: output.tracy.cancel)\n"
         "  [--no-cache] [--purge-cache] [--keep-failed-output] [--disk-budget bytes]\n"
         "  [--process-memory-limit bytes] (16-32 GiB; default 32 GiB)\n"
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
         "  Development only: [--mode offline|legacy] [-p legacy-port]\n"
-        "                    [--diagnostics] [--test-cancel-after-records N] [--test-fail-before-validate]\n"
+        "                    [--diagnostics] [--test-cancel-after-records N] [--test-cancel-finalize-after-rows N]\n"
+        "                    [--test-fail-before-validate]\n"
         "                    [--allocation-diagnostics]\n"
         "                    [--test-allocation-failure]\n"
         "                    [--memory-attribution path.jsonl] [--diagnostic-private-limit bytes]\n"
@@ -189,6 +193,14 @@ bool ParseArguments( int argc, char** argv, Options& options )
             return false;
 #endif
         }
+        else if( argument == "--test-cancel-finalize-after-rows" && i + 1 < argc )
+        {
+#ifdef JN_STREAM_CONVERT_DEV_TOOLS
+            if( !ParseUnsigned( argv[++i], options.testCancelFinalizeAfterRows ) || options.testCancelFinalizeAfterRows == 0 ) return false;
+#else
+            return false;
+#endif
+        }
         else if( argument == "--test-allocation-failure" )
         {
 #ifdef JN_STREAM_CONVERT_DEV_TOOLS
@@ -231,6 +243,10 @@ bool ParseArguments( int argc, char** argv, Options& options )
         else if( argument == "--progress-json" && i + 1 < argc )
         {
             options.progressJson = std::filesystem::u8path( argv[++i] );
+        }
+        else if( argument == "--cancel-file" && i + 1 < argc )
+        {
+            options.cancelFile = std::filesystem::u8path( argv[++i] );
         }
         else if( argument == "--report-json" && i + 1 < argc )
         {
@@ -477,14 +493,26 @@ public:
     void SetStage( ProgressStage stage, uint64_t total = 0, const char* unit = "items" )
     {
         std::lock_guard<std::mutex> lock( m_lock );
+        AccumulateSubstageLocked(std::chrono::steady_clock::now());
         m_stage = stage;
         if(stage!=ProgressStage::Failed&&stage!=ProgressStage::Cancelled)SetConversionStage(ProgressStageName(stage));
         m_completed = 0;
         m_total = total;
         m_unit = unit;
+        m_substage.clear();
         m_stageStarted = std::chrono::steady_clock::now();
         m_signal.notify_all();
     }
+
+    void SetSubstage(const char* name,uint64_t completed,uint64_t total,const char* unit)
+    {
+        std::lock_guard<std::mutex> lock(m_lock);const auto now=std::chrono::steady_clock::now();const std::string next=name?name:"";
+        if(next!=m_substage){AccumulateSubstageLocked(now);m_substage=next;m_substageStarted=now;}
+        m_completed=completed;m_total=total;m_unit=unit?unit:"items";m_signal.notify_all();
+    }
+
+    std::map<std::string,double> FinalizeSubstageSeconds()
+    {std::lock_guard<std::mutex> lock(m_lock);return m_finalizeSubstageSeconds;}
 
     void Update( uint64_t completed, uint64_t total = 0 )
     {
@@ -535,6 +563,7 @@ private:
         uint64_t completed;
         uint64_t total;
         std::string unit;
+        std::string substage;
         std::filesystem::path temporaryPath;
         std::chrono::steady_clock::time_point stageStarted;
         {
@@ -543,8 +572,9 @@ private:
             completed = m_completed;
             total = m_total;
             unit = m_unit;
+            substage = m_substage;
             temporaryPath = m_temporaryPath;
-            stageStarted = m_stageStarted;
+            stageStarted = substage.empty()?m_stageStarted:m_substageStarted;
         }
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration<double>( now - m_started ).count();
@@ -561,6 +591,8 @@ private:
             if( !sizeError ) temporarySize = size;
         }
         const auto memory = GetProcessMemoryState();
+        uint64_t taskDiskCurrent=0,taskDiskPeak=0,taskDiskLimit=0,workspaceCurrent=0,workspacePeak=0,workspaceLimit=0;
+        if(conversionResources){taskDiskCurrent=conversionResources->DiskCurrent();taskDiskPeak=conversionResources->DiskPeak();taskDiskLimit=conversionResources->DiskLimit();const auto workspace=conversionResources->Workspace()->Snapshot();workspaceCurrent=workspace.currentBytes;workspacePeak=workspace.peakBytes;workspaceLimit=workspace.maximumBytes;}
         auto peakCommit = m_peakCommit.load( std::memory_order_relaxed );
         while( memory.commit > peakCommit && !m_peakCommit.compare_exchange_weak( peakCommit, memory.commit, std::memory_order_relaxed ) ) {}
         auto peakWorkingSet = m_peakWorkingSet.load( std::memory_order_relaxed );
@@ -578,26 +610,26 @@ private:
         }
 
         if( percent >= 0 )
-            std::printf( "[%s] %.1f%% %llu/%llu %s, %.1f/s, elapsed %.1fs, ETA %.1fs, memory %.2f GiB, temp %.2f MiB\n",
-                ProgressStageName( stage ), percent, static_cast<unsigned long long>( completed ),
+            std::printf( "[%s%s%s] %.1f%% %llu/%llu %s, %.1f/s, elapsed %.1fs, ETA %.1fs, memory %.2f GiB, temp %.2f MiB\n",
+                ProgressStageName( stage ),substage.empty()?"":"/",substage.c_str(), percent, static_cast<unsigned long long>( completed ),
                 static_cast<unsigned long long>( total ), unit.c_str(), rate, elapsed, std::max( 0.0, eta ),
                 double( memory.commit ) / double( 1ull << 30 ), double( temporarySize ) / double( 1ull << 20 ) );
         else
-            std::printf( "[%s] estimating, elapsed %.1fs, memory %.2f GiB, temp %.2f MiB\n",
-                ProgressStageName( stage ), elapsed, double( memory.commit ) / double( 1ull << 30 ),
+            std::printf( "[%s%s%s] estimating, elapsed %.1fs, memory %.2f GiB, temp %.2f MiB\n",
+                ProgressStageName( stage ),substage.empty()?"":"/",substage.c_str(), elapsed, double( memory.commit ) / double( 1ull << 30 ),
                 double( temporarySize ) / double( 1ull << 20 ) );
         std::fflush( stdout );
 
         if( !m_jsonPath.empty() )
         {
             std::ostringstream json;
-            json << "{\"schema\":1,\"stage\":\"" << ProgressStageName( stage ) << "\",\"completed\":\""
+            json << "{\"schema\":1,\"stage\":\"" << ProgressStageName( stage ) << "\",\"substage\":\""<<JsonEscape(substage)<<"\",\"completed\":\""
                 << completed << "\",\"total\":\"" << total << "\",\"unit\":\"" << JsonEscape( unit )
                 << "\",\"percent\":" << percent << ",\"elapsed_seconds\":" << elapsed
                 << ",\"eta_seconds\":" << eta << ",\"rate\":" << rate << ",\"threads\":" << m_threads
                 << ",\"working_set_bytes\":\"" << memory.workingSet << "\",\"commit_bytes\":\"" << memory.commit
                 << "\",\"system_available_bytes\":\"" << memory.physicalAvailable
-                << "\",\"temporary_output_bytes\":\"" << temporarySize << "\",\"cancel_requested\":"
+                << "\",\"temporary_output_bytes\":\"" << temporarySize << "\",\"task_disk_current_bytes\":\""<<taskDiskCurrent<<"\",\"task_disk_peak_bytes\":\""<<taskDiskPeak<<"\",\"task_disk_limit_bytes\":\""<<taskDiskLimit<<"\",\"workspace_current_bytes\":\""<<workspaceCurrent<<"\",\"workspace_peak_bytes\":\""<<workspacePeak<<"\",\"workspace_limit_bytes\":\""<<workspaceLimit<<"\",\"cancel_requested\":"
                 << ( CancelRequested() ? "true" : "false" ) << "}";
             AtomicWriteText( m_jsonPath, json.str() );
         }
@@ -619,6 +651,10 @@ private:
     std::atomic<uint64_t> m_peakCommit { 0 };
     std::atomic<uint64_t> m_peakWorkingSet { 0 };
     std::thread m_thread;
+    std::string m_substage;
+    std::chrono::steady_clock::time_point m_substageStarted=m_started;
+    std::map<std::string,double> m_finalizeSubstageSeconds;
+    void AccumulateSubstageLocked(std::chrono::steady_clock::time_point now){if(m_stage==ProgressStage::Finalize&&!m_substage.empty())m_finalizeSubstageSeconds[m_substage]+=std::chrono::duration<double>(now-m_substageStarted).count();m_substageStarted=now;}
 };
 
 class TemporaryOutputGuard
@@ -1585,6 +1621,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         const auto identity=std::to_string(scan.fileSize)+":"+std::to_string(scan.prefixCrc32c)+":"+std::to_string(scan.lastSequence);
         tracy::analysis::Sha256Builder hash;hash.Update(identity.data(),identity.size());
         diskStorage=std::make_unique<tracy::conversion::OfflineConversionStorage>(workRoot,hash.FinalHex(),resources);
+        diskStorage->SetFinalizeProgress([&](const char* phase,uint64_t completed,uint64_t total,const char* unit){progress.SetSubstage(phase,completed,total,unit);if(options.testCancelFinalizeAfterRows&&std::strcmp(phase,"catalog_directory")==0&&completed>=options.testCancelFinalizeAfterRows)resources.Cancel();});
     }
     std::unique_ptr<tracy::Worker> workerStorage;
     tracy::ListenSocket listener;
@@ -1612,7 +1649,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         }
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
-        if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';}
+        if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';const auto interval=diskStorage->ResourceIntervalStatistics();out<<",\"catalog_interval_activity\":{\"adds\":"<<interval.adds<<",\"resolves\":"<<interval.resolves<<",\"node_visits\":"<<interval.intervalNodeVisits<<",\"max_nodes_per_resolve\":"<<interval.maxNodesPerResolve<<'}';const auto pass=diskStorage->PassTimeStatistics();out<<",\"pass_time_build\":{\"source_rows\":"<<pass.sourceRows<<",\"candidate_rows\":"<<pass.candidateRows<<",\"unique_keys\":"<<pass.uniqueKeys<<",\"upserts\":"<<pass.upserts<<",\"build_count\":"<<pass.buildCount<<",\"build_nanoseconds\":"<<pass.buildNanoseconds<<",\"seal_nanoseconds\":"<<pass.sealNanoseconds<<'}';const auto directory=diskStorage->CatalogBatchDirectoryStatistics();out<<",\"catalog_batch_directory\":{\"generations\":"<<directory.generations<<",\"batches\":"<<directory.batches<<",\"non_empty_chains\":"<<directory.nonEmptyChains<<",\"visited\":"<<directory.visited<<",\"logical_bytes\":"<<directory.logicalBytes<<'}';}
         if(diskStorage){out<<",\"catalog_records\":{";for(size_t i=0;i<tracy::OfflineCatalogDomainCount;++i){if(i)out<<',';out<<'"'<<tracy::OfflineCatalogDescriptors[i].name<<"\":"<<diskStorage->CatalogCount(tracy::OfflineCatalogDomain(i));}out<<"},\"catalog_sealed\":"<<(diskStorage->CatalogSealed()?"true":"false")<<",\"descriptor_heap_ids\":"<<diskStorage->DescriptorHeapCount();if(diskStorage->CatalogSealed()){const auto quality=diskStorage->CatalogQuality();out<<",\"catalog_quality\":{\"present\":"<<quality[0]<<",\"valid\":"<<quality[1]<<",\"schema\":"<<quality[2]<<",\"evidence_schema\":"<<quality[3]<<'}';}}
         out<<'}';conversionEvidence=out.str();
     }};
@@ -2153,13 +2190,14 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
 
     const auto replaySeconds = ElapsedSeconds( replayStart );
     CheckConversion();
-    SetConversionStage("Finalize");
-    if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");worker.FinalizeOfflineStrings();diskStorage->Seal();worker.FinalizeOfflineCatalog();}
+    SetConversionStage("Finalize");const auto finalizeStart=std::chrono::steady_clock::now();double finalizeSeconds=0;std::map<std::string,double> finalizeSubstageSeconds;
+    if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");progress.SetSubstage("strings_finalize",0,1,"steps");worker.FinalizeOfflineStrings();progress.SetSubstage("strings_finalize",1,1,"steps");progress.SetSubstage("stores_seal",0,1,"steps");diskStorage->Seal();progress.SetSubstage("stores_seal",1,1,"steps");worker.FinalizeOfflineCatalog();}
+    finalizeSeconds=ElapsedSeconds(finalizeStart);
     const auto writeStart = std::chrono::steady_clock::now();
     auto temporaryOutput = options.output;
     temporaryOutput += ".converting";
     // Task-owned candidate is cleaned by the resource ledger after handles close.
-    progress.SetStage( ProgressStage::Write, 0, "bytes" );
+    progress.SetStage( ProgressStage::Write, 0, "bytes" );finalizeSubstageSeconds=progress.FinalizeSubstageSeconds();
     progress.SetTemporaryPath( temporaryOutput );
     tracy::Worker::JnGpuCatalogResolveStats gpuCatalogResolveStats {};
     if(std::filesystem::exists(temporaryOutput))throw std::runtime_error("conversion_candidate_already_exists");
@@ -2312,12 +2350,20 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             << "\",\"post_end_batch_calls\":\"" << gpuCatalogResolveStats.postEndBatchCalls
             << "\",\"finalize_save_calls\":\"" << gpuCatalogResolveStats.finalizeSaveCalls
             << "\",\"input_units\":\"" << gpuCatalogResolveStats.fullResolveInputUnits
+            << "\",\"batch_rows_examined\":\""<<gpuCatalogResolveStats.batchRowsExamined
+            << "\",\"batch_rows_matched\":\""<<gpuCatalogResolveStats.batchRowsMatched
+            << "\",\"catalog_rows_processed\":\""<<gpuCatalogResolveStats.catalogRowsProcessed
             << "\",\"total_unresolved\":\"" << gpuCatalogResolveStats.totalUnresolved
             << "\",\"core_unresolved\":\"" << gpuCatalogResolveStats.coreUnresolved
             << "\",\"nanoseconds\":\"" << gpuCatalogResolveStats.fullResolveNanoseconds
-            << "\"},\"stages_seconds\":{"
+            << "\"},\"finalize_substages\":{";
+        {
+            bool first=true;
+            for(const auto& [name,seconds]:finalizeSubstageSeconds){if(!first)report<<',';first=false;report<<'"'<<JsonEscape(name)<<"\":"<<seconds;}
+        }
+        report<<"},\"stages_seconds\":{"
             << "\"scan\":" << scanSeconds << ",\"analysis\":" << analysisSeconds << ",\"replay\":" << replaySeconds
-            << ",\"write\":" << writeSeconds << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
+            << ",\"finalize\":"<<finalizeSeconds<<",\"write\":" << writeSeconds << ",\"validate\":" << validationSeconds << ",\"snapshot_map\":"
             << mapSeconds << ",\"total\":" << totalSeconds << "}}";
         if( !AtomicWriteText( options.reportJson, report.str() ) )
         {
@@ -2337,7 +2383,7 @@ int main(int argc,char** argv)
     std::unique_ptr<tracy::storage::ConversionResources> resources;
     std::unique_ptr<tracy::conversion::ConversionFiles> files;
     std::filesystem::path resourceReport,completion,workRoot;
-    int code=1;std::string reason;bool outputValid=false;
+    int code=1;std::string reason;bool outputValid=false,cancelled=false;
 #ifdef _WIN32
     HANDLE runMutex=nullptr,inputLock=INVALID_HANDLE_VALUE;bool ownsMutex=false;
     ScopeExit releaseMutex{[&]{if(inputLock!=INVALID_HANDLE_VALUE)CloseHandle(inputLock);if(ownsMutex)ReleaseMutex(runMutex);if(runMutex)CloseHandle(runMutex);}};
@@ -2347,6 +2393,7 @@ int main(int argc,char** argv)
         options.output=tracy::analysis::AnalysisIoPath(std::filesystem::weakly_canonical(options.output));
         if(!options.reportJson.empty())options.reportJson=tracy::analysis::AnalysisIoPath(options.reportJson);
         if(!options.progressJson.empty())options.progressJson=tracy::analysis::AnalysisIoPath(options.progressJson);
+        if(options.cancelFile.empty()){options.cancelFile=options.output;options.cancelFile+=".cancel";}else options.cancelFile=tracy::analysis::AnalysisIoPath(std::filesystem::absolute(options.cancelFile).lexically_normal());
 #ifdef _WIN32
         auto key=options.input.native();std::transform(key.begin(),key.end(),key.begin(),[](wchar_t c){return std::towlower(c);});
         tracy::analysis::Sha256Builder lockHash;lockHash.Update(key.data(),key.size()*sizeof(wchar_t));
@@ -2358,6 +2405,7 @@ int main(int argc,char** argv)
         if(inputLock==INVALID_HANDLE_VALUE)throw std::runtime_error("conversion_input_not_stable_or_readable");
 #endif
         if(options.input.parent_path()!=options.output.parent_path())throw std::runtime_error("conversion_snapshot_map_requires_same_directory");
+        if(options.cancelFile.parent_path()!=options.output.parent_path())throw std::runtime_error("conversion_cancel_file_requires_output_directory");
         if(options.input==options.output||std::filesystem::exists(options.output))throw std::runtime_error("conversion_output_already_exists");
         if(options.keepFailedOutput)throw std::runtime_error("conversion_keep_failed_output_conflicts_with_cleanup_contract");
         if(options.purgeCache)throw std::runtime_error("conversion_purge_cache_is_not_part_of_this_run");
@@ -2369,7 +2417,8 @@ int main(int argc,char** argv)
         workRoot=options.output;workRoot+=".work";
         auto candidate=options.output;candidate+=".converting";
         if(std::filesystem::exists(workRoot)||std::filesystem::exists(candidate))throw std::runtime_error("conversion_previous_run_files_require_cleanup");
-        std::set<std::filesystem::path> destinations{options.input,options.output,candidate,workRoot,tracy::stream::ConvertedSnapshotMapPath(options.input)};
+        std::set<std::filesystem::path> destinations{options.input,options.output,candidate,workRoot,options.cancelFile,tracy::stream::ConvertedSnapshotMapPath(options.input)};
+        if(std::filesystem::exists(options.cancelFile))throw std::runtime_error("conversion_cancel_file_exists");
         for(const auto& path:{options.reportJson,options.progressJson,resourceReport,completion}) {
             if(path.empty())continue;
             const auto target=std::filesystem::absolute(path).lexically_normal();
@@ -2385,7 +2434,7 @@ int main(int argc,char** argv)
         limits.clusterBytes=tracy::storage::ConversionResources::VolumeCluster(options.output);
         const auto disk=options.diskBudget?std::min(options.diskBudget,limits.streamBytes*3):limits.streamBytes*3;
         limits.controlReserveBytes=std::min<uint64_t>(65536,disk/4);
-        resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[]{return CancelRequested();});
+        resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[&]{return CancelRequested()||std::filesystem::exists(tracy::analysis::AnalysisIoPath(options.cancelFile));});
         files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();
         hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(options.processMemoryLimit);
         if(options.allocationDiagnostics)allocationDiagnostics=std::make_unique<tracy::AllocationDiagnostics>();
@@ -2406,7 +2455,7 @@ int main(int argc,char** argv)
         const auto beforeCleanup=resources->Files();
         const auto finishedStage=conversionStage.load();SetConversionStage("Cleanup");
         const bool cleaned=resources->CleanupOwned();
-        if(!outputValid)reason=resources->Failure();
+        if(!outputValid)reason=resources->Failure();cancelled=resources->Cancelled()||reason=="conversion_cancelled";
         const auto workspace=resources->Workspace()->Snapshot();
         try{
             auto pending=resourceReport;pending+=".tmp";resources->BeforeControlGrowth(pending,resources->DiskLimit()>(1ull<<20)?16384:4096);
@@ -2458,9 +2507,11 @@ int main(int argc,char** argv)
             }
             files->WriteText(resourceReport,text);
             if(outputValid&&cleaned)files->WriteText(completion,"{\"schema\":1,\"output_valid\":true,\"cleanup_complete\":true}");
+            if(cancelled){const auto currentWorkspace=resources->Workspace()->Snapshot();std::ostringstream state;state<<"{\"schema\":1,\"stage\":\"Cancelled\",\"substage\":\"\",\"completed\":\"0\",\"total\":\"0\",\"unit\":\"items\",\"percent\":-1,\"elapsed_seconds\":0,\"eta_seconds\":-1,\"rate\":0,\"threads\":"<<options.threads<<",\"working_set_bytes\":\""<<resources->PeakWorkingSet()<<"\",\"commit_bytes\":\""<<resources->PeakPrivate()<<"\",\"system_available_bytes\":\"0\",\"temporary_output_bytes\":\"0\",\"task_disk_current_bytes\":\""<<resources->DiskCurrent()<<"\",\"task_disk_peak_bytes\":\""<<resources->DiskPeak()<<"\",\"task_disk_limit_bytes\":\""<<resources->DiskLimit()<<"\",\"workspace_current_bytes\":\""<<currentWorkspace.currentBytes<<"\",\"workspace_peak_bytes\":\""<<currentWorkspace.peakBytes<<"\",\"workspace_limit_bytes\":\""<<currentWorkspace.maximumBytes<<"\",\"cancel_requested\":true}";files->WriteText(options.progressJson,state.str());}
         }catch(const std::exception& e){std::fprintf(stderr,"Resource report/marker failed: %s\n",e.what());if(code==0)code=7;}
         if(!cleaned){std::fprintf(stderr,"Temporary cleanup incomplete; task files remain at %s\n",workRoot.string().c_str());if(code==0)code=7;}
     }
     conversionFiles=nullptr;conversionResources=nullptr;
-    return CancelRequested()?130:code;
+    if(!options.cancelFile.empty()){std::error_code ignored;std::filesystem::remove(tracy::analysis::AnalysisIoPath(options.cancelFile),ignored);}
+    return (CancelRequested()||cancelled)?130:code;
 }

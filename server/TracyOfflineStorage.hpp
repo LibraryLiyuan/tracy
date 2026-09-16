@@ -7,6 +7,11 @@
 #include <optional>
 namespace tracy
 {
+struct OfflinePassTimeBuildStats
+{
+    uint64_t sourceRows=0,candidateRows=0,uniqueKeys=0,upserts=0,buildCount=0;
+    uint64_t buildNanoseconds=0,sealNanoseconds=0;
+};
 #pragma pack(push,1)
 struct OfflineCpuZone
 {
@@ -78,12 +83,19 @@ public:
     virtual uint64_t GpuBranchCount() const=0;
     virtual uint32_t GpuRootChildren(uint64_t)=0;
     virtual void Check()=0;
+    virtual void ReportFinalizeProgress(const char*,uint64_t,uint64_t,const char*)=0;
+    virtual OfflinePassTimeBuildStats PreparePassTimes()=0;
     virtual std::optional<int64_t> LookupPassTime(uint64_t)=0;
     virtual void BeginResourceIntervals()=0;
     virtual void AddResourceInterval(const JnGpuCatalogResourceRecordV1&)=0;
     virtual void SealResourceIntervals()=0;
     virtual uint64_t ResolveResource(uint64_t,int64_t)=0;
     virtual void EndResourceIntervals() noexcept=0;
+    virtual void BeginCatalogBatchDirectory()=0;
+    virtual void AddCatalogDirectoryGeneration(uint64_t)=0;
+    virtual void AddCatalogDirectoryBatch(uint64_t,uint64_t,uint8_t)=0;
+    virtual void SealCatalogBatchDirectory()=0;
+    virtual bool VisitCatalogDirectoryBatches(uint64_t,uint8_t,const std::function<void(uint64_t)>&)=0;
     virtual uint64_t AppendCatalog(OfflineCatalogDomain,const void*,uint32_t)=0;
     virtual uint64_t CatalogCount(OfflineCatalogDomain) const=0;
     virtual void ReadCatalog(OfflineCatalogDomain,uint64_t,void*,uint32_t)=0;

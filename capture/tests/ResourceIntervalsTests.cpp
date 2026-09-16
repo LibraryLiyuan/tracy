@@ -27,6 +27,7 @@ int main(int argc,char** argv){try{
  Check(intervals.Resolve(6,INT64_MIN)==61&&intervals.Resolve(6,25)==0);
  Check(intervals.Resolve(UINT64_MAX,0)==1&&intervals.Resolve(UINT64_MAX,99995)==10000&&intervals.Resolve(UINT64_MAX,99996)==0);
  Check(intervals.Resolve(0,0)==0&&intervals.Resolve(999,0)==0);
+ const auto statistics=intervals.Statistics();Check(statistics.resolves>0&&statistics.maxNodesPerResolve==10000&&statistics.intervalNodeVisits>=30000);
  intervals.CloseAndRemove();Check(budget.DiskCurrent()==0);
  puts("disk lifetimes preserve boundaries, gaps, ambiguity, mismatched destroy and long history");return 0;
  }catch(const std::exception& e){fprintf(stderr,"%s\n",e.what());return 1;}}

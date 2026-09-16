@@ -215,6 +215,9 @@ public:
     {
         uint64_t fullResolveCalls = 0;
         uint64_t fullResolveInputUnits = 0;
+        uint64_t batchRowsExamined = 0;
+        uint64_t batchRowsMatched = 0;
+        uint64_t catalogRowsProcessed = 0;
         uint64_t fullResolveNanoseconds = 0;
         uint64_t generationEndCalls = 0;
         uint64_t postEndBatchCalls = 0;
@@ -1425,6 +1428,7 @@ private:
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogLiveResources;
     unordered_flat_map<uint64_t, uint64_t> m_jnGpuCatalogDescriptorHeaps;
     uint64_t m_jnGpuCatalogNextDescriptorHeapId = 1;
+    bool m_offlinePassTimesPrepared = false;
     unordered_flat_map<uint32_t, uint32_t> m_jnCallsiteCallstacks;
     unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
     unordered_flat_map<uint32_t, std::vector<uint64_t>> m_jnPendingOfflineCpuCallsites;

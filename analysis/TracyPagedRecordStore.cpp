@@ -320,4 +320,10 @@ void PagedRecordReader::ValidateAll()
     }
     if(offset!=r.dataBytes || content.FinalHex()!=std::string(r.header.contentHash,64)) Fail("content_checksum");
 }
+PagedRecordReader::VisitStats PagedRecordReader::VisitValidated(const std::function<void(const void*,uint64_t)>& visitor)
+{
+    if(!visitor)Fail("visitor");auto& r=*m_impl;r.loaded=UINT64_MAX;Sha256Builder content;uint64_t offset=0;VisitStats stats;
+    for(uint64_t block=0;block<r.header.blocks;++block){const auto entry=r.Load(block);if(entry.offset!=offset)Fail("block_continuity");offset+=entry.stored;content.Update(r.buffer.data(),r.buffer.size());visitor(r.buffer.data(),entry.records);++stats.blocks;stats.records+=entry.records;stats.decodedBytes+=entry.decoded;stats.storedBytes+=entry.stored;}
+    if(offset!=r.dataBytes||stats.records!=r.header.records||content.FinalHex()!=std::string(r.header.contentHash,64))Fail("content_checksum");return stats;
+}
 }

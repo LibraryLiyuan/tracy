@@ -5,12 +5,14 @@
 #include "../../analysis/TracyPagedRecordStore.hpp"
 #include "../../storage/TracyMutableRecordStore.hpp"
 #include "../../storage/TracyDiskIndex64.hpp"
+#include "../../storage/TracyMappedHashIndex64.hpp"
 #include "../../storage/TracyResourceIntervals.hpp"
 #include "../../storage/TracyBoundedRecordTable.hpp"
 #include "../../storage/TracyOrderedForest.hpp"
 #include "../../storage/TracyOfflineStringStore.hpp"
 #include "../../storage/TracyOfflineCallstackStore.hpp"
 #include "../../storage/TracyOfflineSampleStore.hpp"
+#include "../../storage/TracyCatalogBatchDirectory.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -20,13 +22,24 @@ class OfflineConversionStorage final : public WorkerOfflineStorage
 public:
     OfflineConversionStorage(std::filesystem::path root,std::string identity,storage::ConversionResources& resources);
     void Check() override;
+    void SetFinalizeProgress(std::function<void(const char*,uint64_t,uint64_t,const char*)> callback){m_finalizeProgress=std::move(callback);}
+    void ReportFinalizeProgress(const char*,uint64_t,uint64_t,const char*) override;
+    OfflinePassTimeBuildStats PreparePassTimes() override;
+    OfflinePassTimeBuildStats PassTimeStatistics()const{return m_passTimeStats;}
     std::optional<int64_t> LookupPassTime(uint64_t) override;
     void BeginResourceIntervals() override;
     void AddResourceInterval(const JnGpuCatalogResourceRecordV1&) override;
     void SealResourceIntervals() override;
     uint64_t ResolveResource(uint64_t,int64_t) override;
     void EndResourceIntervals() noexcept override;
+    void BeginCatalogBatchDirectory() override;
+    void AddCatalogDirectoryGeneration(uint64_t) override;
+    void AddCatalogDirectoryBatch(uint64_t,uint64_t,uint8_t) override;
+    void SealCatalogBatchDirectory() override;
+    bool VisitCatalogDirectoryBatches(uint64_t,uint8_t,const std::function<void(uint64_t)>&) override;
+    storage::CatalogBatchDirectory::Stats CatalogBatchDirectoryStatistics()const{return m_batchDirectory?m_batchDirectory->Statistics():m_batchDirectoryStats;}
     std::array<uint64_t,3> ResourceIntervalPeaks()const{return m_intervalPeaks;}
+    storage::ResourceIntervals::Stats ResourceIntervalStatistics()const{return m_intervalStats;}
     uint64_t AppendCatalog(OfflineCatalogDomain,const void*,uint32_t) override;
     uint64_t CatalogCount(OfflineCatalogDomain) const override;
     void ReadCatalog(OfflineCatalogDomain,uint64_t,void*,uint32_t) override;
@@ -137,9 +150,14 @@ private:
     bool m_cpuZonesSealed=false;
     std::unique_ptr<storage::OrderedForest> m_gpuZones;
     bool m_gpuZonesSealed=false;
-    std::unique_ptr<storage::DiskIndex64> m_passTimes;
+    std::unique_ptr<storage::MappedHashIndex64> m_passTimes;
+    OfflinePassTimeBuildStats m_passTimeStats{};
+    bool m_passTimesPrepared=false;
     std::unique_ptr<storage::ResourceIntervals> m_resourceIntervals;
     std::array<uint64_t,3> m_intervalPeaks{};
+    storage::ResourceIntervals::Stats m_intervalStats{};
+    std::unique_ptr<storage::CatalogBatchDirectory> m_batchDirectory;
+    storage::CatalogBatchDirectory::Stats m_batchDirectoryStats{};
     std::array<std::unique_ptr<storage::BoundedRecordTable>,OfflineCatalogDomainCount> m_catalogTables;
     std::array<std::string,OfflineCatalogDomainCount> m_catalogHashes;
     OfflineCatalogQuality m_catalogQuality{};
@@ -149,6 +167,7 @@ private:
     std::string m_zoneHash;
     uint64_t m_jobCount=0,m_useCount=0,m_definitionCount=0;
     bool m_sealed=false,m_reclaimed=false;
+    std::function<void(const char*,uint64_t,uint64_t,const char*)> m_finalizeProgress;
 };
 }
 #endif

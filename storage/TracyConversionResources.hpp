@@ -36,6 +36,7 @@ public:
     void Cancel() noexcept { m_cancelled=true; }
     void Fail(const char* reason) noexcept;
     const char* Failure() const noexcept;
+    bool Cancelled() const noexcept { return m_cancelled.load(std::memory_order_acquire); }
     void StartMonitoring();
     void StopMonitoring() noexcept;
     bool SoftTargetExceeded() const { return m_soft.load(); }

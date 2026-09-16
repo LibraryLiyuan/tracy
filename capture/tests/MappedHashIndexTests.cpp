@@ -14,6 +14,8 @@ int main(int argc,char** argv){try{
  for(uint64_t i=1;i<5000;++i)Check(index.Find(i*0x9E3779B97F4A7C15ull)==i+100,"mapped_hash_lookup");
  Check(!index.Find(123456789),"mapped_hash_missing");const auto count=index.Count();Check(count==5001&&index.Capacity()>=count*10/7,"mapped_hash_count");index.Seal();index.Validate();
  bool sealed=false;try{index.Upsert(1,2);}catch(const std::exception&){sealed=true;}Check(sealed,"mapped_hash_sealed");
+ Check(budget.DiskCurrent()>0&&index.CloseAndRemove()&&budget.DiskCurrent()==0,"mapped_hash_early_cleanup");
+ bool closed=false;try{index.Find(0);}catch(const std::exception&){closed=true;}Check(closed,"mapped_hash_closed");
  tracy::storage::ResourceLimits tiny;tiny.streamBytes=8192;tiny.diskReserveBytes=0;tiny.absoluteDiskLimit=32768;tracy::storage::ConversionResources tight(tiny,[&]{return sample;},[]{return 1ull<<40;});
  tracy::storage::MappedHashIndex64 limited(root/"limited.index",tight,64);bool rejected=false;try{for(uint64_t i=0;i<5000;++i)limited.Upsert(i,i);}catch(const std::exception&){rejected=true;}Check(rejected&&limited.Count()<5000,"mapped_hash_budget");
  std::puts("mapped hash boundary, resize, update, validation and budget tests passed");return 0;

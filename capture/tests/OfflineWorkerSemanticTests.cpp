@@ -149,6 +149,7 @@ struct OfflineStorageSemanticTest {
     std::unique_ptr<FileRead> first(FileRead::Open(input)),second(FileRead::Open(input));Worker memory(*first,EventType::All,false),disk(*second,EventType::All,false);
     for(uint64_t i=1;i<disk.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&disk.m_data.zoneExtra[i]);MigrateStrings(disk,store);disk.m_offlineStorage=&store;
     FillProtocolCatalog(memory,missingCore);FillProtocolCatalog(disk,missingCore);disk.FinalizeOfflineStrings();store.Seal();disk.FinalizeOfflineCatalog();
+    const auto directory=store.CatalogBatchDirectoryStatistics();Check(directory.generations==1&&directory.batches==11&&directory.nonEmptyChains==10&&directory.visited==8);
     {std::unique_ptr<FileWrite> file(FileWrite::Open(root/"out.tracy",FileCompression::Zstd,1,1));disk.Write(*file,false);file->Finish();}
     std::unique_ptr<FileRead> out(FileRead::Open(root/"out.tracy"));Worker read(*out,EventType::All,false);CompareCatalog(memory,read);
     Check(read.m_data.jnTrace.gpuCatalogValid==!missingCore);Check(read.m_data.jnTrace.gpuCatalogViews[0].resourceId==1&&read.m_data.jnTrace.gpuCatalogViews[1].resourceId==0);
@@ -164,7 +165,7 @@ struct OfflineStorageSemanticTest {
 #undef X
     Check(a.gpuCatalogStrings.size()==b.gpuCatalogStrings.size());for(size_t i=0;i<a.gpuCatalogStrings.size();++i){const auto& x=a.gpuCatalogStrings[i];const auto& y=b.gpuCatalogStrings[i];Check(x.generation==y.generation&&std::memcmp(&x.header,&y.header,sizeof(x.header))==0&&x.value==y.value);}
  }
- static void PassLifetimeResolution(const char* input,const std::filesystem::path& root,storage::ConversionResources& budget,bool disk){
+ static void PassLifetimeResolution(const char* input,const std::filesystem::path& root,storage::ConversionResources& budget,bool disk,bool resolvedRange=false){
     std::unique_ptr<FileRead> file(FileRead::Open(input));Worker w(*file,EventType::All,false);auto& data=w.m_data.jnTrace;
 #define X(name,field,type,mut) data.field.clear();
     TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
@@ -175,12 +176,12 @@ struct OfflineStorageSemanticTest {
     for(uint64_t generation:{11ull,12ull}){
         const auto first=w.CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);
         for(unsigned i=0;i<4;++i){JnGpuCatalogResourceRecordV1 record{};record.resourceId=i<2?1:2;record.pointerToken=777;record.time=i==0?300:i==1?400:i==2?410:500;record.operation=uint8_t(i%2?JnGpuCatalogRecordOperation::Destroy:JnGpuCatalogRecordOperation::Create);w.AppendCatalogValue(OfflineCatalogDomain::CatalogResource,record,data.gpuCatalogResources);}
-        JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;const auto rangeId=w.AppendCatalogValue(OfflineCatalogDomain::CatalogRangeSet,range,data.gpuRangeSets);
+        JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;range.resourceId=resolvedRange?1:0;const auto rangeId=w.AppendCatalogValue(OfflineCatalogDomain::CatalogRangeSet,range,data.gpuRangeSets);
         JnGpuCatalogBatchData batch{};batch.generation=generation;batch.valid=1;batch.kind=uint8_t(JnGpuCatalogBatchKind::Resource);batch.recordCount=4;batch.firstRecordIndex=first;w.AppendCatalogValue(OfflineCatalogDomain::CatalogBatch,batch,data.gpuCatalogBatches);
         batch.kind=uint8_t(JnGpuCatalogBatchKind::RangeSet);batch.recordCount=1;batch.firstRecordIndex=rangeId;w.AppendCatalogValue(OfflineCatalogDomain::CatalogBatch,batch,data.gpuCatalogBatches);
     }
     if(store)store->Seal();
-    for(uint64_t generation:{11ull,12ull}){const auto result=w.ResolveJnGpuCatalogGeneration(generation,Worker::JnGpuCatalogResolveReason::FinalizeSave);const auto range=w.CatalogValue(OfflineCatalogDomain::CatalogRangeSet,generation-11,data.gpuRangeSets);Check(result.totalUnresolved==0&&range.resourceId==1&&range.pointerToken==0);}
+    for(uint64_t generation:{11ull,12ull}){const auto result=w.ResolveJnGpuCatalogGeneration(generation,Worker::JnGpuCatalogResolveReason::FinalizeSave);const auto range=w.CatalogValue(OfflineCatalogDomain::CatalogRangeSet,generation-11,data.gpuRangeSets);Check(result.totalUnresolved==0&&range.resourceId==1&&range.pointerToken==0);}if(store)Check(store->PassTimeStatistics().buildCount==(resolvedRange?0:1));
     w.m_offlineStorage=nullptr;
  }
  static void PersistentStrings(const char* input,const std::filesystem::path& output){
@@ -298,10 +299,13 @@ int main(int argc,char** argv) {
  OfflineStorageSemanticTest::Populate(oldWorker,nullptr);OfflineStorageSemanticTest::Populate(newWorker,&store);
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());
  Check(newWorker.GetJnTraceData().relations.empty());newWorker.FinalizeOfflineStrings();store.Seal();
+ const auto passBuild=store.PreparePassTimes();
+ Check(passBuild.sourceRows==12&&passBuild.candidateRows==5&&passBuild.uniqueKeys==2&&passBuild.upserts==5);
+ Check(store.PreparePassTimes().buildCount==1); // Explicit preparation is idempotent; Lookup never hides a rebuild.
  Check(store.LookupPassTime(701)==375); // (850 - baseTime 100) * 0.5; last completion overrides other sources
  Check(!store.LookupPassTime(0));
  Check(store.LookupPassTime(1ull<<40)==-25);Check(!store.LookupPassTime(42));
- OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"memory-lifetime",resources,false);OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"disk-lifetime",resources,true);
+ OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"memory-lifetime",resources,false);OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"disk-lifetime",resources,true);OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"disk-resolved-range",resources,true,true);
  OfflineStorageSemanticTest::CompareExtras(oldWorker,store);
 #define X(name,field,type) {uint64_t seen=0;Check(newWorker.GetJnTraceData().field.empty());store.VisitRecords(OfflineAppendDomain::name,[&](const void* rows,uint64_t n){Check(std::memcmp(rows,oldWorker.GetJnTraceData().field.data()+seen,size_t(n)*sizeof(type))==0);seen+=n;});Check(seen==oldWorker.GetJnTraceData().field.size());}
  TRACY_OFFLINE_APPEND_DOMAINS(X)

@@ -191,6 +191,10 @@ public:
 
     uint64_t Count() const { return m_header ? m_header->count : 0; }
     uint64_t Capacity() const { return m_header ? m_header->capacity : 0; }
+    bool CloseAndRemove() noexcept
+    {
+        if(m_closed)return true;m_mapping.reset();m_header=nullptr;const bool ok=m_resources.RemoveOwned(m_path);m_closed=true;if(!ok)m_resources.Fail("mapped_hash_cleanup_failed");return ok;
+    }
 
 private:
     static void Require( bool value, const char* message ) { if( !value ) throw std::runtime_error( message ); }
@@ -206,7 +210,7 @@ private:
         Require( IsPowerOfTwo( capacity ) && capacity <= ( UINT64_MAX - HeaderBytes ) / sizeof( Slot ), "mapped_hash_capacity" );
         return HeaderBytes + capacity * sizeof( Slot );
     }
-    void Check() const { m_resources.CheckFast(); Require( !m_failed && m_mapping && m_header, "mapped_hash_failed" ); }
+    void Check() const { m_resources.CheckFast(); Require(!m_closed,"mapped_hash_closed");Require( !m_failed && m_mapping && m_header, "mapped_hash_failed" ); }
     Slot* Slots() const { return reinterpret_cast<Slot*>( m_mapping->Data() + HeaderBytes ); }
     Slot* Locate( uint64_t key ) const
     {
@@ -292,7 +296,7 @@ private:
     analysis::AnalysisWorkspaceReservation m_control;
     std::unique_ptr<Mapping> m_mapping;
     Header* m_header = nullptr;
-    bool m_failed = false;
+    bool m_failed = false,m_closed=false;
 };
 
 }

@@ -4,6 +4,7 @@
 #include "../../storage/TracyZoneExtraCodec.hpp"
 #include "../../public/common/TracyQueue.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <bit>
 namespace tracy::conversion
@@ -26,7 +27,7 @@ OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,st
 void OfflineConversionStorage::Check()
 {
     m_resources.CheckFast();
-    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_strings)m_strings->ReduceCache();if(m_callstacks)m_callstacks->ReduceCache();if(m_samples)m_samples->ReduceCache();if(m_cpuZones)m_cpuZones->ReduceCache();if(m_gpuZones)m_gpuZones->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();if(m_descriptorHeaps)m_descriptorHeaps->ReduceCache();for(auto& table:m_catalogTables)if(table)table->ReduceCache();m_reclaimed=true;}
+    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_strings)m_strings->ReduceCache();if(m_callstacks)m_callstacks->ReduceCache();if(m_samples)m_samples->ReduceCache();if(m_cpuZones)m_cpuZones->ReduceCache();if(m_gpuZones)m_gpuZones->ReduceCache();if(m_descriptorHeaps)m_descriptorHeaps->ReduceCache();for(auto& table:m_catalogTables)if(table)table->ReduceCache();m_reclaimed=true;}
     if(!m_resources.SoftTargetExceeded())m_reclaimed=false;
 }
 bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,size_t bytes)
@@ -106,25 +107,36 @@ void OfflineConversionStorage::AppendRelation(const JnRelationData& row)
         m_relations->Append(&row,1);m_relationCount=m_relations->Count();
     }catch(...){m_relationFailed=true;throw;}
 }
+void OfflineConversionStorage::ReportFinalizeProgress(const char* phase,uint64_t completed,uint64_t total,const char* unit){if(m_finalizeProgress)m_finalizeProgress(phase,completed,total,unit);}
+OfflinePassTimeBuildStats OfflineConversionStorage::PreparePassTimes()
+{
+    Check();if(!m_sealed)throw std::runtime_error("pass_index_before_seal");if(m_passTimesPrepared)return m_passTimeStats;
+    try {
+        const auto started=std::chrono::steady_clock::now();auto index=std::make_unique<storage::MappedHashIndex64>(m_root/"pass-times.index",m_resources);const auto total=RecordCount(OfflineAppendDomain::GpuReferencePass)+RecordCount(OfflineAppendDomain::GfxEntity)+RecordCount(OfflineAppendDomain::GfxLink);ReportFinalizeProgress("pass_time_build",0,total,"source_rows");
+        const auto update=[&]{if((m_passTimeStats.sourceRows&0xFFFF)==0||m_passTimeStats.sourceRows==total)ReportFinalizeProgress("pass_time_build",m_passTimeStats.sourceRows,total,"source_rows");};
+        VisitRecords(OfflineAppendDomain::GpuReferencePass,[&](const void* p,uint64_t n){m_passTimeStats.sourceRows+=n;auto rows=static_cast<const JnGpuReferencePassData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].passId){++m_passTimeStats.candidateRows;++m_passTimeStats.upserts;index->Upsert(rows[i].passId,std::bit_cast<uint64_t>(rows[i].time));}update();});
+        VisitRecords(OfflineAppendDomain::GfxEntity,[&](const void* p,uint64_t n){m_passTimeStats.sourceRows+=n;auto rows=static_cast<const JnGfxEntityData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].entityId&&rows[i].kind==uint8_t(JnGfxEntityKind::ExplicitGpuPass)){++m_passTimeStats.candidateRows;++m_passTimeStats.upserts;index->Upsert(rows[i].entityId,std::bit_cast<uint64_t>(rows[i].time));}update();});
+        VisitRecords(OfflineAppendDomain::GfxLink,[&](const void* p,uint64_t n){m_passTimeStats.sourceRows+=n;auto rows=static_cast<const JnGfxLinkData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].sourceId&&rows[i].relation==uint8_t(JnGfxRelation::RangeEvidenceComplete)){++m_passTimeStats.candidateRows;++m_passTimeStats.upserts;index->Upsert(rows[i].sourceId,std::bit_cast<uint64_t>(rows[i].time));}update();});
+        m_passTimeStats.uniqueKeys=index->Count();m_passTimeStats.buildNanoseconds=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
+        ReportFinalizeProgress("pass_time_seal",0,index->Count(),"keys");const auto sealStarted=std::chrono::steady_clock::now();index->Seal();m_passTimeStats.sealNanoseconds=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-sealStarted).count());ReportFinalizeProgress("pass_time_seal",index->Count(),index->Count(),"keys");
+        m_passTimes=std::move(index);m_passTimesPrepared=true;m_passTimeStats.buildCount=1;return m_passTimeStats;
+    }catch(...){m_resources.Fail("pass_index_build_failed");throw;}
+}
 std::optional<int64_t> OfflineConversionStorage::LookupPassTime(uint64_t id)
 {
-    Check();if(!m_sealed)throw std::runtime_error("pass_index_before_seal");if(!id)return {};
-    if(!m_passTimes){
-        try {
-            auto index=std::make_unique<storage::DiskIndex64>(m_root/"pass-times.index",m_identity,m_resources);
-            VisitRecords(OfflineAppendDomain::GpuReferencePass,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGpuReferencePassData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].passId)index->Upsert(rows[i].passId,std::bit_cast<uint64_t>(rows[i].time));});
-            VisitRecords(OfflineAppendDomain::GfxEntity,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGfxEntityData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].entityId&&rows[i].kind==uint8_t(JnGfxEntityKind::ExplicitGpuPass))index->Upsert(rows[i].entityId,std::bit_cast<uint64_t>(rows[i].time));});
-            VisitRecords(OfflineAppendDomain::GfxLink,[&](const void* p,uint64_t n){auto rows=static_cast<const JnGfxLinkData*>(p);for(uint64_t i=0;i<n;++i)if(rows[i].sourceId&&rows[i].relation==uint8_t(JnGfxRelation::RangeEvidenceComplete))index->Upsert(rows[i].sourceId,std::bit_cast<uint64_t>(rows[i].time));});
-            index->Seal();m_passTimes=std::move(index);
-        }catch(...){m_resources.Fail("pass_index_build_failed");throw;}
-    }
+    Check();if(!m_sealed||!m_passTimesPrepared)throw std::runtime_error("pass_index_not_prepared");if(!id||!m_passTimes)return {};
     const auto value=m_passTimes->Find(id);return value?std::optional<int64_t>(std::bit_cast<int64_t>(*value)):std::nullopt;
 }
 void OfflineConversionStorage::BeginResourceIntervals(){Check();if(!m_sealed||m_resourceIntervals)throw std::runtime_error("resource_interval_begin_state");m_resourceIntervals=std::make_unique<storage::ResourceIntervals>(m_root/"resource-intervals",m_resources,m_identity);}
 void OfflineConversionStorage::AddResourceInterval(const JnGpuCatalogResourceRecordV1& row){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");m_resourceIntervals->Add(row);}
 void OfflineConversionStorage::SealResourceIntervals(){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");m_resourceIntervals->Seal();}
 uint64_t OfflineConversionStorage::ResolveResource(uint64_t pointer,int64_t time){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");return m_resourceIntervals->Resolve(pointer,time);}
-void OfflineConversionStorage::EndResourceIntervals() noexcept {if(m_resourceIntervals){m_intervalPeaks[0]=std::max(m_intervalPeaks[0],m_resourceIntervals->Count());m_intervalPeaks[1]=std::max(m_intervalPeaks[1],m_resourceIntervals->PointerCount());m_intervalPeaks[2]=std::max(m_intervalPeaks[2],m_resourceIntervals->LogicalBytes());m_resourceIntervals.reset();}}
+void OfflineConversionStorage::EndResourceIntervals() noexcept {if(m_resourceIntervals){m_intervalPeaks[0]=std::max(m_intervalPeaks[0],m_resourceIntervals->Count());m_intervalPeaks[1]=std::max(m_intervalPeaks[1],m_resourceIntervals->PointerCount());m_intervalPeaks[2]=std::max(m_intervalPeaks[2],m_resourceIntervals->LogicalBytes());const auto stats=m_resourceIntervals->Statistics();m_intervalStats.adds+=stats.adds;m_intervalStats.resolves+=stats.resolves;m_intervalStats.intervalNodeVisits+=stats.intervalNodeVisits;m_intervalStats.maxNodesPerResolve=std::max(m_intervalStats.maxNodesPerResolve,stats.maxNodesPerResolve);m_resourceIntervals.reset();}}
+void OfflineConversionStorage::BeginCatalogBatchDirectory(){Check();if(!m_sealed||m_catalogSealed||m_batchDirectory)throw std::runtime_error("catalog_batch_directory_begin_state");m_batchDirectory=std::make_unique<storage::CatalogBatchDirectory>(m_root/"catalog-batches",m_identity,m_resources);}
+void OfflineConversionStorage::AddCatalogDirectoryGeneration(uint64_t generation){Check();if(!m_batchDirectory)throw std::runtime_error("catalog_batch_directory_missing");m_batchDirectory->AddGeneration(generation);}
+void OfflineConversionStorage::AddCatalogDirectoryBatch(uint64_t batch,uint64_t generation,uint8_t kind){Check();if(!m_batchDirectory)throw std::runtime_error("catalog_batch_directory_missing");m_batchDirectory->AddBatch(batch,generation,kind);}
+void OfflineConversionStorage::SealCatalogBatchDirectory(){Check();if(!m_batchDirectory)throw std::runtime_error("catalog_batch_directory_missing");m_batchDirectory->Seal();m_batchDirectoryStats=m_batchDirectory->Statistics();}
+bool OfflineConversionStorage::VisitCatalogDirectoryBatches(uint64_t generation,uint8_t kind,const std::function<void(uint64_t)>& visitor){Check();if(!m_batchDirectory)return false;m_batchDirectory->Visit(generation,kind,visitor);return true;}
 uint64_t OfflineConversionStorage::AppendCatalog(OfflineCatalogDomain domain,const void* row,uint32_t width)
 {
     Check();const auto& info=OfflineCatalogInfo(domain);if(m_sealed||!row||width!=info.width)throw std::runtime_error("offline_catalog_append_state");
@@ -139,14 +151,14 @@ void OfflineConversionStorage::SealCatalog(OfflineCatalogQuality quality)
     if(m_descriptorHeaps)m_descriptorHeaps->Seal();
     if(quality[0]>1||quality[1]>1)throw std::runtime_error("offline_catalog_quality");
     if(!quality[0]){if(quality[1])throw std::runtime_error("offline_catalog_presence_mismatch");for(const auto& table:m_catalogTables)if(table&&table->Count())throw std::runtime_error("offline_catalog_presence_mismatch");}
-    for(size_t id=0;id<OfflineCatalogDomainCount;++id){analysis::Sha256Builder hash;auto& table=m_catalogTables[id];
+    ReportFinalizeProgress("catalog_seal",0,OfflineCatalogDomainCount,"domains");for(size_t id=0;id<OfflineCatalogDomainCount;++id){analysis::Sha256Builder hash;auto& table=m_catalogTables[id];
         if(table){table->Seal();table->Visit([&](const void* bytes,uint64_t count){
             if(id!=size_t(OfflineCatalogDomain::CatalogString)){hash.Update(bytes,size_t(count)*OfflineCatalogDescriptors[id].width);return;}
             for(uint64_t i=0;i<count;++i){OfflineCatalogString row;std::memcpy(&row,static_cast<const unsigned char*>(bytes)+i*sizeof(row),sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("offline_catalog_string_length");hash.Update(&row.generation,sizeof(row.generation));hash.Update(&row.header,sizeof(row.header));hash.Update(row.bytes.data(),row.header.byteLength);}
         });}
-        m_catalogHashes[id]=hash.FinalHex();
+        m_catalogHashes[id]=hash.FinalHex();ReportFinalizeProgress("catalog_seal",id+1,OfflineCatalogDomainCount,"domains");
     }
-    m_catalogQuality=quality;m_catalogSealed=true;
+    m_catalogQuality=quality;if(m_batchDirectory){m_batchDirectoryStats=m_batchDirectory->Statistics();if(!m_batchDirectory->CloseAndRemove())throw std::runtime_error("catalog_batch_directory_cleanup_failed");m_batchDirectory.reset();}if(m_passTimes){if(!m_passTimes->CloseAndRemove())throw std::runtime_error("pass_index_cleanup_failed");m_passTimes.reset();}m_catalogSealed=true;
 }
 void OfflineConversionStorage::VisitCatalog(OfflineCatalogDomain domain,const std::function<void(const void*,uint64_t)>& visitor){Check();OfflineCatalogInfo(domain);if(!m_catalogSealed)throw std::runtime_error("offline_catalog_not_sealed");auto& table=m_catalogTables[size_t(domain)];if(table)table->Visit(visitor);}
 std::string OfflineConversionStorage::CatalogHash(OfflineCatalogDomain domain)const{OfflineCatalogInfo(domain);if(!m_catalogSealed)throw std::runtime_error("offline_catalog_not_sealed");return m_catalogHashes[size_t(domain)];}
@@ -174,11 +186,8 @@ void OfflineConversionStorage::VisitRecords(OfflineAppendDomain domain,const std
 {
     Check();const auto& info=OfflineAppendInfo(domain);auto& table=m_appendTables[size_t(domain)];
     if(!m_sealed||table.failed)throw std::runtime_error("offline_append_not_sealed");if(!table.count)return;
-    auto options=Options();options.blockBytes=1024*1024;analysis::PagedRecordReader reader(m_root/info.name,m_identity,info.width,options);reader.ValidateAll();
-    if(reader.Count()!=table.count)throw std::runtime_error("offline_append_count");
-    const auto capacity=std::min<uint64_t>(65536,table.count);const auto bytes=capacity*info.width;
-    m_resources.Check(bytes+256);analysis::AnalysisWorkspaceReservation lease(m_resources.Workspace(),bytes+256);std::vector<char> rows(size_t(bytes),0);
-    for(uint64_t offset=0;offset<table.count;){Check();auto take=std::min(capacity,table.count-offset);reader.Read(offset,rows.data(),take);visitor(rows.data(),take);offset+=take;}
+    auto options=Options();options.blockBytes=1024*1024;analysis::PagedRecordReader reader(m_root/info.name,m_identity,info.width,options);const auto stats=reader.VisitValidated(visitor);
+    if(reader.Count()!=table.count||stats.records!=table.count)throw std::runtime_error("offline_append_count");
 }
 void OfflineConversionStorage::VisitRelations(const std::function<void(const JnRelationData*,uint64_t)>& visitor)
 {Check();if(!m_sealed||m_relationFailed)throw std::runtime_error("relation_store_not_sealed");if(m_relationCount)Visit("relations",visitor);}
@@ -187,13 +196,7 @@ std::string OfflineConversionStorage::RelationHash() const
 template<class T> void OfflineConversionStorage::Visit(const char* domain,const std::function<void(const T*,uint64_t)>& visitor)
 {
     Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");
-    analysis::PagedRecordReader reader(m_root/domain,m_identity,uint32_t(sizeof(T)),Options());reader.ValidateAll();
-    const auto capacity=std::min<uint64_t>(65536,reader.Count());
-    m_resources.Check(capacity*sizeof(T)+256);
-    analysis::AnalysisWorkspaceReservation memory(m_resources.Workspace(),capacity*sizeof(T)+256);std::vector<T> rows(size_t(capacity),T{});
-    for(uint64_t offset=0;offset<reader.Count();) {
-        Check();const auto take=std::min<uint64_t>(capacity,reader.Count()-offset);reader.Read(offset,rows.data(),take);visitor(rows.data(),take);offset+=take;
-    }
+    analysis::PagedRecordReader reader(m_root/domain,m_identity,uint32_t(sizeof(T)),Options());const auto count=reader.Count();const auto stats=reader.VisitValidated([&](const void* rows,uint64_t n){visitor(static_cast<const T*>(rows),n);});if(stats.records!=count)throw std::runtime_error("offline_store_count");
 }
 void OfflineConversionStorage::VisitReferenceUses(const std::function<void(const JnGpuReferenceUseData*,uint64_t)>& f){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_useCount)Visit("uses",f);}
 void OfflineConversionStorage::VisitJobStages(const std::function<void(const JnJobStageData*,uint64_t)>& f){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_jobCount)Visit("jobs",f);}
