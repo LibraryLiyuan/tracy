@@ -1256,6 +1256,17 @@ private:
         update(value);
         if(ev.extra)m_offlineStorage->PutZoneExtra(ev.extra,&value);
         else ev.extra=m_offlineStorage->AppendZoneExtra(&value);
+        const auto zone=m_offlineCpuZoneIds.find(&ev);
+        if(zone!=m_offlineCpuZoneIds.end()){
+            OfflineCpuZone row;m_offlineStorage->ReadCpuZone(zone->second,row);row.extra=ev.extra;m_offlineStorage->PutCpuZone(zone->second,row);
+        }
+    }
+    template<class F> void UpdateOfflineCpuZoneExtra(uint64_t id,F update) {
+        OfflineCpuZone row;m_offlineStorage->ReadCpuZone(id,row);ZoneExtra value{};
+        if(row.extra)m_offlineStorage->ReadZoneExtra(row.extra,&value);
+        update(value);
+        if(row.extra)m_offlineStorage->PutZoneExtra(row.extra,&value);else row.extra=m_offlineStorage->AppendZoneExtra(&value);
+        m_offlineStorage->PutCpuZone(id,row);
     }
 
 
@@ -1270,6 +1281,7 @@ private:
     void SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent );
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
+    void WriteOfflineCpuTimeline( FileWrite&, uint64_t, int64_t& );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
     template<typename Adapter, typename V>
     void WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime );
@@ -1388,6 +1400,9 @@ private:
     uint64_t m_jnGpuCatalogNextDescriptorHeapId = 1;
     unordered_flat_map<uint32_t, uint32_t> m_jnCallsiteCallstacks;
     unordered_flat_map<uint32_t, std::vector<ZoneEvent*>> m_jnPendingCpuCallsites;
+    unordered_flat_map<uint32_t, std::vector<uint64_t>> m_jnPendingOfflineCpuCallsites;
+    unordered_flat_map<uint64_t, uint64_t> m_offlineCpuThreadRoots;
+    unordered_flat_map<ZoneEvent*, uint64_t> m_offlineCpuZoneIds;
     unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
     int16_t m_pendingSourceLocationPayload = 0;

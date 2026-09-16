@@ -7,6 +7,7 @@
 #include "../../storage/TracyDiskIndex64.hpp"
 #include "../../storage/TracyResourceIntervals.hpp"
 #include "../../storage/TracyBoundedRecordTable.hpp"
+#include "../../storage/TracyOrderedForest.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -43,6 +44,16 @@ public:
     void ReadZoneExtra(uint32_t,void*) override;
     void PutZoneExtra(uint32_t,const void*) override;
     void VisitZoneExtras(const std::function<void(const void*,uint64_t)>&) override;
+    uint64_t CreateCpuThread() override;
+    uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&) override;
+    void ReadCpuZone(uint64_t,OfflineCpuZone&) override;
+    void PutCpuZone(uint64_t,const OfflineCpuZone&) override;
+    void SealCpuZones() override;
+    void VisitCpuZones(uint64_t,const std::function<void(uint64_t,const OfflineCpuZone&,uint32_t,bool)>&) override;
+    uint64_t CpuZoneCount() const override { return m_cpuZones ? m_cpuZones->Count() : 0; }
+    uint64_t CpuThreadCount() const override { return m_cpuZones ? m_cpuZones->RootCount() : 0; }
+    uint64_t CpuBranchCount() const override { return m_cpuZones ? m_cpuZones->BranchCount() : 0; }
+    uint32_t CpuRootChildren(uint64_t root) override { if(!m_cpuZones)throw std::runtime_error("cpu_zone_store_missing");return m_cpuZones->Children(root); }
     std::string ZoneExtraHash() const { if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");return m_zoneHash; }
     void Fail(const char* reason) noexcept override { m_resources.Fail(reason); }
     bool DefineResourceSet(uint32_t,const char*,size_t) override;
@@ -80,6 +91,8 @@ private:
     bool m_relationFailed=false;
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
+    std::unique_ptr<storage::OrderedForest> m_cpuZones;
+    bool m_cpuZonesSealed=false;
     std::unique_ptr<storage::DiskIndex64> m_passTimes;
     std::unique_ptr<storage::ResourceIntervals> m_resourceIntervals;
     std::array<uint64_t,3> m_intervalPeaks{};

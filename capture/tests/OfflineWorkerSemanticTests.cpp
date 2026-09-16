@@ -11,6 +11,29 @@ namespace tracy {
 static void Check(bool v,std::source_location at=std::source_location::current()){if(!v)throw std::runtime_error("offline Worker semantic mismatch at "+std::to_string(at.line()));}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void CpuZoneRoundTrip(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources){
+    std::filesystem::create_directories(root);std::unique_ptr<FileRead> file(FileRead::Open(input));Worker worker(*file,EventType::All,false);
+    conversion::OfflineConversionStorage store(root/"store",std::string(64,'c'),resources);
+    for(uint64_t i=1;i<worker.m_data.zoneExtra.size();++i)Check(store.AppendZoneExtra(&worker.m_data.zoneExtra[i])==i);
+#define X(name,field,type,mut) for(const auto& row:worker.m_data.jnTrace.field)store.AppendCatalog(OfflineCatalogDomain::name,&row,sizeof(row));
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;Check(value.value.size()<=256);std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+    Vector<ThreadData*> growingThreads;for(auto* thread:worker.m_data.threads)growingThreads.push_back(thread);worker.m_data.threads=std::move(growingThreads);
+    worker.m_offlineStorage=&store;worker.m_timerMul=1;worker.m_data.baseTime=0;worker.m_refTimeThread=0;worker.m_threadCtx=0xC0FFEE;worker.m_threadCtxData=nullptr;
+    Check(!worker.m_data.sourceLocationExpand.empty());const auto sourceIndex=worker.m_data.sourceLocationExpand.size()>1?1:0;const auto source=worker.m_data.sourceLocationExpand[sourceIndex];worker.m_sourceLocationShrink[source]=int16_t(sourceIndex);worker.m_data.shrinkSrclocLast={source,int16_t(sourceIndex)};const auto shrunk=worker.ShrinkSourceLocation(source);
+    auto parent=worker.AllocZoneEvent();parent->SetStartSrcLoc(10,shrunk);parent->SetEnd(-1);parent->SetChild(-1);worker.NewZone(parent);
+    QueueJnZoneBeginCallsite begin{};begin.time=20;begin.srcloc=source;begin.callsiteId=77;worker.ProcessJnZoneBeginCallsite(begin);
+    QueueZoneEnd end{};end.time=10;worker.ProcessZoneEnd(end);end.time=10;worker.ProcessZoneEnd(end);
+    QueueJnCallsiteDefinition definition{};definition.srcloc=source;definition.callsiteId=77;definition.flags=uint8_t(JnCallsiteFlags::HasCallstack);worker.m_serialNextCallstack=1;worker.ProcessJnCallsiteDefinition(definition);
+    Check(store.CpuZoneCount()==2&&store.CpuThreadCount()==1);
+    store.Seal();worker.FinalizeOfflineCatalog();
+    const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
+    std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto td=reopened.GetThreadData(0xC0FFEE);Check(td&&td->timeline.size()==1);
+    const auto top=td->timeline.is_magic()?&(*(const Vector<ZoneEvent>*)(&td->timeline))[0]:td->timeline[0].get();Check(top->Start()==10&&top->End()==40&&top->HasChildren());Check(top->Child()>=0&&uint64_t(top->Child())<reopened.m_data.zoneChildren.size());const auto& children=reopened.GetZoneChildren(top->Child());Check(children.size()==1);
+    const auto child=children.is_magic()?&(*(const Vector<ZoneEvent>*)(&children))[0]:children[0].get();Check(child->Start()==20&&child->End()==30&&reopened.GetZoneExtra(*child).callstack.Val()==1);
+    worker.m_offlineStorage=nullptr;
+ }
  static bool ProtocolBatch(Worker& w,uint32_t sequence,JnGpuCatalogBatchKind kind,const void* rows,uint32_t bytes,uint16_t width,uint32_t count){
     JnGpuCatalogBatchEnvelopeV1 envelope{};envelope.magic=JnGpuCatalogBatchMagic;envelope.catalogSchema=1;envelope.evidenceSchema=1;envelope.recordBytes=width;envelope.recordCount=count;envelope.payloadBytes=bytes;envelope.checksum=JnGpuCatalogChecksum64(rows,bytes);
     std::vector<uint8_t> payload(sizeof(envelope)+bytes);std::memcpy(payload.data(),&envelope,sizeof(envelope));std::memcpy(payload.data()+sizeof(envelope),rows,bytes);
@@ -180,6 +203,7 @@ int main(int argc,char** argv) {
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  auto root=std::filesystem::path(argv[2]);std::filesystem::create_directories(root);
+ OfflineStorageSemanticTest::CpuZoneRoundTrip(argv[1],root/"cpu-zones",resources);
  OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-valid",resources,false);OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-core-gap",resources,true);
  OfflineStorageSemanticTest::PersistentStrings(argv[1],root/"persistent-strings.tracy");
  conversion::OfflineConversionStorage store(root/"store",std::string(64,'d'),resources);

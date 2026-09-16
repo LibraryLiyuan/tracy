@@ -49,6 +49,12 @@ install(TARGETS ${PROJECT_NAME} tracy-stream-convert DESTINATION ${CMAKE_INSTALL
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(tracy-ordered-forest-tests tests/OrderedForestTests.cpp)
+    target_link_libraries(tracy-ordered-forest-tests PRIVATE TracyStorageCore)
+    add_test(NAME tracy-ordered-forest COMMAND tracy-ordered-forest-tests ${CMAKE_CURRENT_BINARY_DIR}/ordered-forest-test)
+    add_executable(tracy-cpu-zone-storage-tests tests/CpuZoneStorageTests.cpp)
+    target_link_libraries(tracy-cpu-zone-storage-tests PRIVATE TracyOfflineConversion)
+    add_test(NAME tracy-cpu-zone-storage COMMAND tracy-cpu-zone-storage-tests ${CMAKE_CURRENT_BINARY_DIR}/cpu-zone-storage-test)
     add_executable(tracy-catalog-storage-tests tests/CatalogStorageTests.cpp)
     target_link_libraries(tracy-catalog-storage-tests PRIVATE TracyOfflineConversion)
     add_test(NAME tracy-catalog-storage COMMAND tracy-catalog-storage-tests ${CMAKE_CURRENT_BINARY_DIR}/catalog-storage-test)

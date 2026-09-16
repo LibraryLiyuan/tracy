@@ -7,6 +7,17 @@
 #include <optional>
 namespace tracy
 {
+#pragma pack(push,1)
+struct OfflineCpuZone
+{
+    int64_t start;
+    int64_t end;
+    int16_t sourceLocation;
+    uint32_t extra;
+};
+#pragma pack(pop)
+static_assert( sizeof( OfflineCpuZone ) == 22 );
+
 class WorkerOfflineStorage
 {
 public:
@@ -19,6 +30,16 @@ public:
     virtual void ReadZoneExtra(uint32_t,void*)=0;
     virtual void PutZoneExtra(uint32_t,const void*)=0;
     virtual void VisitZoneExtras(const std::function<void(const void*,uint64_t)>&)=0;
+    virtual uint64_t CreateCpuThread()=0;
+    virtual uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&)=0;
+    virtual void ReadCpuZone(uint64_t,OfflineCpuZone&)=0;
+    virtual void PutCpuZone(uint64_t,const OfflineCpuZone&)=0;
+    virtual void SealCpuZones()=0;
+    virtual void VisitCpuZones(uint64_t,const std::function<void(uint64_t,const OfflineCpuZone&,uint32_t,bool)>&)=0;
+    virtual uint64_t CpuZoneCount() const=0;
+    virtual uint64_t CpuThreadCount() const=0;
+    virtual uint64_t CpuBranchCount() const=0;
+    virtual uint32_t CpuRootChildren(uint64_t)=0;
     virtual void Check()=0;
     virtual std::optional<int64_t> LookupPassTime(uint64_t)=0;
     virtual void BeginResourceIntervals()=0;

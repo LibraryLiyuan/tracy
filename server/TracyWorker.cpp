@@ -5259,7 +5259,24 @@ void Worker::NewZone( ZoneEvent* zone )
     td->count++;
     td->IncStackCount( zone->SrcLoc() );
     const auto ssz = td->stack.size();
-    if( ssz == 0 )
+    if( m_offlineStorage )
+    {
+        auto root = m_offlineCpuThreadRoots.find( td->id );
+        if( root == m_offlineCpuThreadRoots.end() ) root = m_offlineCpuThreadRoots.emplace( td->id, m_offlineStorage->CreateCpuThread() ).first;
+        uint64_t parent = root->second;
+        if( ssz != 0 )
+        {
+            ZoneEvent* parentZone = td->stack.data()[ssz-1];
+            const auto found = m_offlineCpuZoneIds.find( parentZone );
+            if( found == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_parent" );
+            parent = found->second;
+        }
+        const OfflineCpuZone row { zone->Start(), zone->End(), zone->SrcLoc(), zone->extra };
+        const auto id = m_offlineStorage->AppendCpuZone( parent, row );
+        m_offlineCpuZoneIds.emplace( zone, id );
+        td->stack.push_back( zone );
+    }
+    else if( ssz == 0 )
     {
         td->stack.push_back( zone );
         td->timeline.push_back( zone );
@@ -6947,6 +6964,18 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
         }
         m_jnPendingCpuCallsites.erase( cpuPending );
     }
+    const auto offlineCpuPending = m_jnPendingOfflineCpuCallsites.find( ev.callsiteId );
+    if( offlineCpuPending != m_jnPendingOfflineCpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( const auto zone : offlineCpuPending->second )
+            {
+                UpdateOfflineCpuZoneExtra( zone, [&]( ZoneExtra& extra ) { extra.callstack.SetVal( callstack ); } );
+            }
+        }
+        m_jnPendingOfflineCpuCallsites.erase( offlineCpuPending );
+    }
 
     const auto gpuPending = m_jnPendingGpuCallsites.find( ev.callsiteId );
     if( gpuPending != m_jnPendingGpuCallsites.end() )
@@ -7735,7 +7764,16 @@ void Worker::ProcessJnZoneBeginCallsite( const QueueJnZoneBeginCallsite& ev )
     }
     else
     {
-        m_jnPendingCpuCallsites[ev.callsiteId].push_back( zone );
+        if( m_offlineStorage )
+        {
+            const auto id = m_offlineCpuZoneIds.find( zone );
+            if( id == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_callsite" );
+            m_jnPendingOfflineCpuCallsites[ev.callsiteId].push_back( id->second );
+        }
+        else
+        {
+            m_jnPendingCpuCallsites[ev.callsiteId].push_back( zone );
+        }
     }
 }
 
@@ -7783,9 +7821,21 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
     zone->SetEnd( timeEnd );
     assert( timeEnd >= zone->Start() );
 
+    if( m_offlineStorage )
+    {
+        const auto found = m_offlineCpuZoneIds.find( zone );
+        if( found == m_offlineCpuZoneIds.end() ) throw std::runtime_error( "offline_cpu_zone_end" );
+        OfflineCpuZone row;
+        m_offlineStorage->ReadCpuZone( found->second, row );
+        if( row.start != zone->Start() || row.sourceLocation != zone->SrcLoc() ) throw std::runtime_error( "offline_cpu_zone_identity" );
+        row.end = timeEnd;
+        row.extra = zone->extra;
+        m_offlineStorage->PutCpuZone( found->second, row );
+    }
+
     if( m_data.lastTime < timeEnd ) m_data.lastTime = timeEnd;
 
-    if( zone->HasChildren() )
+    if( !m_offlineStorage && zone->HasChildren() )
     {
         auto& childVec = m_data.zoneChildren[zone->Child()];
         const auto sz = childVec.size();
@@ -7862,6 +7912,13 @@ void Worker::ProcessZoneEnd( const QueueZoneEnd& ev )
 #else
     CountZoneStatistics( zone );
 #endif
+    if( m_offlineStorage )
+    {
+        m_offlineCpuZoneIds.erase( zone );
+#ifdef TRACY_NO_STATISTICS
+        m_zoneEventPool.push_back( zone );
+#endif
+    }
 }
 
 void Worker::ZoneStackFailure( uint64_t thread, const ZoneEvent* ev )
@@ -11181,7 +11238,6 @@ void Worker::Write( FileWrite& f, bool fiDict )
             f.Write( &v->callstack, sizeof( v->callstack ) );
         }
     }
-
     sz = m_offlineStorage ? m_offlineStorage->ZoneExtraCount() : m_data.zoneExtra.size();
     f.Write( &sz, sizeof( sz ) );
     if(m_offlineStorage)m_offlineStorage->VisitZoneExtras([&](const void* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(ZoneExtra));});
@@ -11190,7 +11246,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     sz = 0;
     for( auto& v : m_data.threads ) sz += v->count;
     f.Write( &sz, sizeof( sz ) );
-    sz = m_data.zoneChildren.size();
+    sz = m_data.zoneChildren.size() + ( m_offlineStorage ? m_offlineStorage->CpuBranchCount() : 0 );
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.threads.size();
     f.Write( &sz, sizeof( sz ) );
@@ -11202,7 +11258,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->kernelSampleCnt, sizeof( thread->kernelSampleCnt ) );
         f.Write( &thread->isFiber, sizeof( thread->isFiber ) );
         f.Write( &thread->groupHint, sizeof( thread->groupHint ) );
-        WriteTimeline( f, thread->timeline, refTime );
+        const auto offlineRoot = m_offlineCpuThreadRoots.find( thread->id );
+        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ) WriteOfflineCpuTimeline( f, offlineRoot->second, refTime );
+        else WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
         for( auto& v : thread->messages )
@@ -11653,6 +11711,25 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& ve
     {
         WriteTimelineImpl<VectorAdapterPointer<ZoneEvent>>( f, vec, refTime );
     }
+}
+
+void Worker::WriteOfflineCpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime )
+{
+    const auto size = m_offlineStorage->CpuRootChildren( root );
+    f.Write( &size, sizeof( size ) );
+    m_offlineStorage->VisitCpuZones( root, [&]( uint64_t, const OfflineCpuZone& zone, uint32_t children, bool begin ) {
+        if( begin )
+        {
+            f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
+            WriteTimeOffset( f, refTime, zone.start );
+            f.Write( &zone.extra, sizeof( zone.extra ) );
+            f.Write( &children, sizeof( children ) );
+        }
+        else
+        {
+            WriteTimeOffset( f, refTime, zone.end );
+        }
+    } );
 }
 
 template<typename Adapter, typename V>
