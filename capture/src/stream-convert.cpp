@@ -1649,7 +1649,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         }
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
-        if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';const auto interval=diskStorage->ResourceIntervalStatistics();out<<",\"catalog_interval_activity\":{\"adds\":"<<interval.adds<<",\"resolves\":"<<interval.resolves<<",\"node_visits\":"<<interval.intervalNodeVisits<<",\"max_nodes_per_resolve\":"<<interval.maxNodesPerResolve<<'}';const auto pass=diskStorage->PassTimeStatistics();out<<",\"pass_time_build\":{\"source_rows\":"<<pass.sourceRows<<",\"candidate_rows\":"<<pass.candidateRows<<",\"unique_keys\":"<<pass.uniqueKeys<<",\"upserts\":"<<pass.upserts<<",\"build_count\":"<<pass.buildCount<<",\"build_nanoseconds\":"<<pass.buildNanoseconds<<",\"seal_nanoseconds\":"<<pass.sealNanoseconds<<'}';const auto directory=diskStorage->CatalogBatchDirectoryStatistics();out<<",\"catalog_batch_directory\":{\"generations\":"<<directory.generations<<",\"batches\":"<<directory.batches<<",\"non_empty_chains\":"<<directory.nonEmptyChains<<",\"visited\":"<<directory.visited<<",\"logical_bytes\":"<<directory.logicalBytes<<'}';}
+        if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';const auto interval=diskStorage->ResourceIntervalStatistics();out<<",\"catalog_interval_activity\":{\"adds\":"<<interval.adds<<",\"resolves\":"<<interval.resolves<<",\"node_visits\":"<<interval.intervalNodeVisits<<",\"max_nodes_per_resolve\":"<<interval.maxNodesPerResolve<<'}';const auto pass=diskStorage->PassTimeStatistics();out<<",\"pass_time_build\":{\"source_rows\":"<<pass.sourceRows<<",\"candidate_rows\":"<<pass.candidateRows<<",\"unique_keys\":"<<pass.uniqueKeys<<",\"upserts\":"<<pass.upserts<<",\"build_count\":"<<pass.buildCount<<",\"build_nanoseconds\":"<<pass.buildNanoseconds<<",\"seal_nanoseconds\":"<<pass.sealNanoseconds<<",\"digest_nanoseconds\":"<<pass.digestNanoseconds<<",\"flush_nanoseconds\":"<<pass.flushNanoseconds<<",\"digest_bytes\":"<<pass.digestBytes<<",\"hash_backend\":\""<<tracy::analysis::Sha256Backend()<<"\"}";const auto directory=diskStorage->CatalogBatchDirectoryStatistics();out<<",\"catalog_batch_directory\":{\"generations\":"<<directory.generations<<",\"batches\":"<<directory.batches<<",\"non_empty_chains\":"<<directory.nonEmptyChains<<",\"visited\":"<<directory.visited<<",\"logical_bytes\":"<<directory.logicalBytes<<'}';}
         if(diskStorage){out<<",\"catalog_records\":{";for(size_t i=0;i<tracy::OfflineCatalogDomainCount;++i){if(i)out<<',';out<<'"'<<tracy::OfflineCatalogDescriptors[i].name<<"\":"<<diskStorage->CatalogCount(tracy::OfflineCatalogDomain(i));}out<<"},\"catalog_sealed\":"<<(diskStorage->CatalogSealed()?"true":"false")<<",\"descriptor_heap_ids\":"<<diskStorage->DescriptorHeapCount();if(diskStorage->CatalogSealed()){const auto quality=diskStorage->CatalogQuality();out<<",\"catalog_quality\":{\"present\":"<<quality[0]<<",\"valid\":"<<quality[1]<<",\"schema\":"<<quality[2]<<",\"evidence_schema\":"<<quality[3]<<'}';}}
         out<<'}';conversionEvidence=out.str();
     }};
@@ -2433,7 +2433,7 @@ int main(int argc,char** argv)
         if(!limits.streamBytes||limits.streamBytes>UINT64_MAX/3)throw std::runtime_error("conversion_input_size_overflow");
         limits.clusterBytes=tracy::storage::ConversionResources::VolumeCluster(options.output);
         const auto disk=options.diskBudget?std::min(options.diskBudget,limits.streamBytes*3):limits.streamBytes*3;
-        limits.controlReserveBytes=std::min<uint64_t>(65536,disk/4);
+        limits.controlReserveBytes=std::min<uint64_t>(1ull<<20,disk/4);
         resources=std::make_unique<tracy::storage::ConversionResources>(limits,tracy::storage::ConversionResources::SystemSample,[&]{return tracy::storage::ConversionResources::VolumeFree(options.output);},[&]{return CancelRequested()||std::filesystem::exists(tracy::analysis::AnalysisIoPath(options.cancelFile));});
         files=std::make_unique<tracy::conversion::ConversionFiles>(*resources);conversionResources=resources.get();conversionFiles=files.get();
         hardLimit=std::make_unique<tracy::analysis::ProcessCommitLimit>(options.processMemoryLimit);
@@ -2461,6 +2461,14 @@ int main(int argc,char** argv)
             auto pending=resourceReport;pending+=".tmp";resources->BeforeControlGrowth(pending,resources->DiskLimit()>(1ull<<20)?16384:4096);
             if(outputValid&&cleaned){auto marker=completion;marker+=".tmp";resources->BeforeControlGrowth(marker,256);}
         }catch(const std::exception& e){std::fprintf(stderr,"Cannot reserve final evidence: %s\n",e.what());}
+        if(cancelled){
+            try{
+                const auto currentWorkspace=resources->Workspace()->Snapshot();std::ostringstream state;
+                state<<"{\"schema\":1,\"stage\":\"Cancelled\",\"substage\":\"\",\"completed\":\"0\",\"total\":\"0\",\"unit\":\"items\",\"percent\":-1,\"elapsed_seconds\":0,\"eta_seconds\":-1,\"rate\":0,\"threads\":"<<options.threads<<",\"working_set_bytes\":\""<<resources->PeakWorkingSet()<<"\",\"commit_bytes\":\""<<resources->PeakPrivate()<<"\",\"system_available_bytes\":\"0\",\"temporary_output_bytes\":\"0\",\"task_disk_current_bytes\":\""<<resources->DiskCurrent()<<"\",\"task_disk_peak_bytes\":\""<<resources->DiskPeak()<<"\",\"task_disk_limit_bytes\":\""<<resources->DiskLimit()<<"\",\"workspace_current_bytes\":\""<<currentWorkspace.currentBytes<<"\",\"workspace_peak_bytes\":\""<<currentWorkspace.peakBytes<<"\",\"workspace_limit_bytes\":\""<<currentWorkspace.maximumBytes<<"\",\"cancel_requested\":true}";
+                files->WriteText(options.progressJson,state.str());
+            }catch(const std::exception& e){std::fprintf(stderr,"Cancelled progress write failed: %s\n",e.what());}
+        }
+        uint64_t beforeCleanupBytes=0,beforeCleanupKept=0;for(const auto& file:beforeCleanup){beforeCleanupBytes+=file.bytes;if(file.kept)++beforeCleanupKept;}
         std::ostringstream report;
         report<<"{\"schema\":1,\"trace_format\":{\"family\":\"JNTRACYX\",\"version\":1,\"base_layout\":3330,\"string_index_bits\":32},\"success\":"<<(outputValid?"true":"false")
             <<",\"stage\":\""<<finishedStage<<"\",\"failure\":\""<<JsonEscape(reason)
@@ -2472,9 +2480,10 @@ int main(int argc,char** argv)
             <<",\"soft_target_met\":"<<(resources->PeakPrivate()<=(16ull<<30)?"true":"false")
             <<",\"workspace_peak_bytes\":"<<workspace.peakBytes<<",\"disk_limit_bytes\":"<<resources->DiskLimit()
             <<",\"disk_peak_bytes\":"<<resources->DiskPeak()<<",\"disk_retained_bytes\":"<<resources->DiskCurrent()<<",\"evidence\":"<<conversionEvidence
+            <<",\"owned_files_before_cleanup_count\":"<<beforeCleanup.size()<<",\"owned_files_before_cleanup_bytes\":"<<beforeCleanupBytes<<",\"owned_files_before_cleanup_kept\":"<<beforeCleanupKept
             <<",\"owned_files_before_cleanup\":[";
-        bool firstFile=true;for(const auto& file:beforeCleanup){if(!firstFile)report<<',';firstFile=false;report<<"{\"path\":\""<<JsonEscape(file.path.string())<<"\",\"reserved_bytes\":"<<file.bytes<<",\"kept\":"<<(file.kept?"true":"false")<<'}';}
-        report<<"],\"cleanup_residuals\":[";firstFile=true;
+        constexpr size_t EvidenceFileLimit=64;bool firstFile=true;size_t emittedFiles=0;for(const auto& file:beforeCleanup){if(emittedFiles==EvidenceFileLimit)break;if(!firstFile)report<<',';firstFile=false;report<<"{\"path\":\""<<JsonEscape(file.path.string())<<"\",\"reserved_bytes\":"<<file.bytes<<",\"kept\":"<<(file.kept?"true":"false")<<'}';++emittedFiles;}
+        report<<"],\"owned_files_before_cleanup_truncated\":"<<(emittedFiles<beforeCleanup.size()?"true":"false")<<",\"cleanup_residuals\":[";firstFile=true;
         for(const auto& file:resources->Files())if(!file.kept&&std::filesystem::exists(file.path)){if(!firstFile)report<<',';firstFile=false;report<<"{\"path\":\""<<JsonEscape(file.path.string())<<"\",\"reserved_bytes\":"<<file.bytes<<'}';}
         SetConversionStage("Report");report<<"],\"stages_seconds\":{";firstFile=true;
         for(const auto& [stage,seconds]:conversionStageSeconds){if(!firstFile)report<<',';firstFile=false;report<<'"'<<stage<<"\":"<<seconds;}report<<"}}";
@@ -2507,7 +2516,6 @@ int main(int argc,char** argv)
             }
             files->WriteText(resourceReport,text);
             if(outputValid&&cleaned)files->WriteText(completion,"{\"schema\":1,\"output_valid\":true,\"cleanup_complete\":true}");
-            if(cancelled){const auto currentWorkspace=resources->Workspace()->Snapshot();std::ostringstream state;state<<"{\"schema\":1,\"stage\":\"Cancelled\",\"substage\":\"\",\"completed\":\"0\",\"total\":\"0\",\"unit\":\"items\",\"percent\":-1,\"elapsed_seconds\":0,\"eta_seconds\":-1,\"rate\":0,\"threads\":"<<options.threads<<",\"working_set_bytes\":\""<<resources->PeakWorkingSet()<<"\",\"commit_bytes\":\""<<resources->PeakPrivate()<<"\",\"system_available_bytes\":\"0\",\"temporary_output_bytes\":\"0\",\"task_disk_current_bytes\":\""<<resources->DiskCurrent()<<"\",\"task_disk_peak_bytes\":\""<<resources->DiskPeak()<<"\",\"task_disk_limit_bytes\":\""<<resources->DiskLimit()<<"\",\"workspace_current_bytes\":\""<<currentWorkspace.currentBytes<<"\",\"workspace_peak_bytes\":\""<<currentWorkspace.peakBytes<<"\",\"workspace_limit_bytes\":\""<<currentWorkspace.maximumBytes<<"\",\"cancel_requested\":true}";files->WriteText(options.progressJson,state.str());}
         }catch(const std::exception& e){std::fprintf(stderr,"Resource report/marker failed: %s\n",e.what());if(code==0)code=7;}
         if(!cleaned){std::fprintf(stderr,"Temporary cleanup incomplete; task files remain at %s\n",workRoot.string().c_str());if(code==0)code=7;}
     }

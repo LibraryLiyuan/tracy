@@ -27,6 +27,7 @@ private:
 };
 
 std::string Sha256File( const std::filesystem::path& path );
+const char* Sha256Backend() noexcept;
 
 }
 

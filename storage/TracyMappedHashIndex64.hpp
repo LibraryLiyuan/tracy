@@ -5,7 +5,9 @@
 #include "../analysis/TracyAnalysisIoPath.hpp"
 #include "../analysis/TracyHash.hpp"
 #include <cstring>
+#include <chrono>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -116,6 +118,9 @@ class MappedHashIndex64
     };
 
 public:
+    enum class SealPhase { Digest, Flush };
+    struct SealStats { uint64_t digestBytes=0,digestNanoseconds=0,flushNanoseconds=0; };
+    using SealProgress = std::function<void(SealPhase,uint64_t,uint64_t)>;
     MappedHashIndex64( std::filesystem::path path, ConversionResources& resources, uint64_t initialCapacity = 1024 )
         : m_path( std::move( path ) ), m_resources( resources ), m_control( resources.Workspace(), 65536 )
     {
@@ -167,15 +172,24 @@ public:
         }
     }
 
-    void Seal()
+    SealStats Seal( const SealProgress& progress = {} )
     {
         Check();
         Require( !m_header->sealed, "mapped_hash_sealed" );
         m_header->sealed = 1;
         std::memset( m_header->checksum, 0, sizeof( m_header->checksum ) );
-        const auto digest = Digest();
+        const auto digestStarted = std::chrono::steady_clock::now();
+        const auto digest = Digest( progress );
+        SealStats stats;
+        stats.digestBytes = FileBytes();
+        stats.digestNanoseconds = uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>( std::chrono::steady_clock::now() - digestStarted ).count() );
         std::memcpy( m_header->checksum, digest.data(), digest.size() );
+        if( progress ) progress( SealPhase::Flush, 0, 1 );
+        const auto flushStarted = std::chrono::steady_clock::now();
         m_mapping->Flush();
+        stats.flushNanoseconds = uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>( std::chrono::steady_clock::now() - flushStarted ).count() );
+        if( progress ) progress( SealPhase::Flush, 1, 1 );
+        return stats;
     }
 
     void Validate() const
@@ -191,6 +205,7 @@ public:
 
     uint64_t Count() const { return m_header ? m_header->count : 0; }
     uint64_t Capacity() const { return m_header ? m_header->capacity : 0; }
+    uint64_t FileBytes() const { return m_header ? Bytes( m_header->capacity ) : 0; }
     bool CloseAndRemove() noexcept
     {
         if(m_closed)return true;m_mapping.reset();m_header=nullptr;const bool ok=m_resources.RemoveOwned(m_path);m_closed=true;if(!ok)m_resources.Fail("mapped_hash_cleanup_failed");return ok;
@@ -281,13 +296,28 @@ private:
         m_header = reinterpret_cast<Header*>( m_mapping->Data() );
         Require( m_header->capacity == capacity, "mapped_hash_resize_header" );
     }
-    std::string Digest() const
+    std::string Digest( const SealProgress& progress = {} ) const
     {
         Header header = *m_header;
         std::memset( header.checksum, 0, sizeof( header.checksum ) );
         analysis::Sha256Builder hash;
         hash.Update( &header, sizeof( header ) );
-        hash.Update( Slots(), size_t( m_header->capacity * sizeof( Slot ) ) );
+        const auto total = FileBytes();
+        uint64_t completed = sizeof( header );
+        if( progress ) progress( SealPhase::Digest, 0, total );
+        constexpr size_t ChunkBytes = 32 * 1024 * 1024;
+        auto bytes = reinterpret_cast<const unsigned char*>( Slots() );
+        auto remaining = size_t( m_header->capacity * sizeof( Slot ) );
+        while( remaining != 0 )
+        {
+            m_resources.CheckFast();
+            const auto chunk = std::min( remaining, ChunkBytes );
+            hash.Update( bytes, chunk );
+            bytes += chunk;
+            remaining -= chunk;
+            completed += chunk;
+            if( progress ) progress( SealPhase::Digest, completed, total );
+        }
         return hash.FinalHex();
     }
 

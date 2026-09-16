@@ -29,3 +29,13 @@ All measurements used the Release build, fixed deterministic inputs, and one run
 The 4,194,304-key B+ tree case was not started because the 1,048,576-key run consumed 76 seconds and its projected duration exceeded the fixed 180-second short-test window. The mapped-hash result justified changing only the equality-only Pass index; it does not replace ordered indexes.
 
 These measurements are local component evidence. They do not establish the 30-minute conversion time, the final 3J peak, or Query long-data acceptance.
+
+## Real-input correction after the first acceptance attempt
+
+The first 30-minute acceptance attempt reached the new mapped Pass index with 193,409,512 source rows and 52,532,087 unique keys. Replay completed in about 3,822 seconds, the Pass index build completed in about 83 seconds, and the 3,221,229,568-byte index stayed near 3.09 GiB process private bytes. The run was stopped when `pass_time_seal` reached the previous 113-minute Finalize stop baseline without completing. Task disk peaked at 67,123,949,568 bytes and workspace at 204,599,959 bytes, both within their fixed limits. Owned temporary files and the candidate output were removed.
+
+The cause was isolated to the Windows streaming SHA-256 path used for the complete mapped-index digest. The implementation now uses Windows CNG while preserving the SHA-256 bytes, processes the mapping in 32 MiB cancellation points, and reports `pass_time_digest` in bytes separately from `pass_time_flush`. Pass build progress no longer depends on block-size alignment. The resource evidence records digest bytes, digest time, flush time, and the hash backend.
+
+A single same-scale component run used exactly 52,532,087 keys and a 3,221,229,568-byte final index. It built in 11.457 seconds, digested in 1.276 seconds, flushed in 1.148 seconds, and sealed in 2.424 seconds with the `windows-cng` backend. The benchmark directory was deleted after the result was captured.
+
+Cancellation evidence was also made independent of the ordinary failure state: the final `Cancelled` progress document is written before the resource report, owned-file evidence is bounded to 64 path entries with aggregate counts and bytes, and the control-file reserve is 1 MiB. This corrected the real attempt's `conversion_control_budget` failure while retaining the 3J accounting contract.

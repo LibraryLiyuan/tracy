@@ -10,7 +10,7 @@ namespace tracy
 struct OfflinePassTimeBuildStats
 {
     uint64_t sourceRows=0,candidateRows=0,uniqueKeys=0,upserts=0,buildCount=0;
-    uint64_t buildNanoseconds=0,sealNanoseconds=0;
+    uint64_t buildNanoseconds=0,sealNanoseconds=0,digestNanoseconds=0,flushNanoseconds=0,digestBytes=0;
 };
 #pragma pack(push,1)
 struct OfflineCpuZone
