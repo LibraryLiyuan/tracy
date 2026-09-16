@@ -10,6 +10,38 @@ namespace tracy {
 static void Check(bool v){if(!v)throw std::runtime_error("offline Worker semantic mismatch");}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
+ static void PersistentStrings(const char* input,const std::filesystem::path& output){
+    std::unique_ptr<FileRead> in(FileRead::Open(input));Worker w(*in,EventType::All,false);
+    Check(w.m_data.stringData.size()>=4);
+    auto* lock=new(w.m_slab.AllocBig(sizeof(LockMap))) LockMap{};
+    lock->customName=StringIdx(0);w.m_data.lockMap.emplace(123,lock);
+    CallstackFrameId id{};id.data=0x1234;
+    auto* frame=new(w.m_slab.AllocBig(sizeof(CallstackFrameData))) CallstackFrameData{};
+    frame->size=1;frame->imageName=StringIdx(1);
+    frame->data=new(w.m_slab.AllocBig(sizeof(CallstackFrame))) CallstackFrame{};
+    frame->data[0].name=StringIdx(2);frame->data[0].file=StringIdx(3);frame->data[0].line=71;
+    w.m_data.callstackFrameMap.emplace(id,frame);
+    SymbolData symbol{};symbol.name=StringIdx(0);symbol.file=StringIdx(1);symbol.imageName=StringIdx(2);symbol.callFile=StringIdx(3);symbol.line=72;symbol.callLine=73;symbol.size.SetVal(16);
+    w.m_data.symbolMap.emplace(0x4567,symbol);
+    decltype(w.m_data.symbolLoc) symbols;for(const auto& row:w.m_data.symbolLoc)symbols.push_back(row);symbols.push_back(SymbolLocation{0x4567,16});w.m_data.symbolLoc=std::move(symbols);
+    auto* gpu=new(w.m_slab.AllocBig(sizeof(GpuCtxData))) GpuCtxData{};
+    gpu->name=StringIdx(2);gpu->period=1;gpu->noteNames[91]=StringIdx(3);
+    decltype(w.m_data.gpuData) contexts;for(const auto& row:w.m_data.gpuData)contexts.push_back(row);contexts.push_back(gpu);w.m_data.gpuData=std::move(contexts);
+    {std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));w.Write(*out,false);out->Finish();}
+    std::unique_ptr<FileRead> file(FileRead::Open(output));Worker read(*file,EventType::All,false);
+    const auto same=[&](StringIdx actual,uint64_t expected){Check(actual.Idx()==expected&&std::strcmp(read.GetString(actual),w.m_data.stringData[expected])==0);};
+    same(read.m_data.lockMap.at(123)->customName,0);
+    const auto* loaded=read.m_data.callstackFrameMap.at(id);same(loaded->imageName,1);same(loaded->data[0].name,2);same(loaded->data[0].file,3);Check(loaded->data[0].line==71);
+    const auto& sym=read.m_data.symbolMap.at(0x4567);same(sym.name,0);same(sym.file,1);same(sym.imageName,2);same(sym.callFile,3);Check(sym.line==72&&sym.callLine==73&&sym.size.Val()==16);
+    same(read.m_data.gpuData.back()->name,2);same(read.m_data.gpuData.back()->noteNames.at(91),3);
+ }
+ static void CheckMissingString(Worker& w,const std::filesystem::path& output){
+    const auto saved=w.m_data.zoneExtra[0];
+    w.m_data.zoneExtra[0].text=StringIdx(uint64_t(w.m_data.stringData.size()));
+    {std::unique_ptr<FileWrite> file(FileWrite::Open(output,FileCompression::Zstd,1,1));w.Write(*file,false);file->Finish();}
+    w.m_data.zoneExtra[0]=saved;
+    Refuses([&]{std::unique_ptr<FileRead> file(FileRead::Open(output));Worker rejected(*file,EventType::All,false);});
+ }
  static void CompareExtras(Worker& oldWorker,WorkerOfflineStorage& store){
     uint64_t seen=0;store.VisitZoneExtras([&](const void* p,uint64_t n){Check(std::memcmp(p,oldWorker.m_data.zoneExtra.data()+seen,size_t(n)*sizeof(ZoneExtra))==0);seen+=n;});
     Check(seen==oldWorker.m_data.zoneExtra.size());
@@ -67,9 +99,11 @@ int main(int argc,char** argv) {
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  auto root=std::filesystem::path(argv[2]);std::filesystem::create_directories(root);
+ OfflineStorageSemanticTest::PersistentStrings(argv[1],root/"persistent-strings.tracy");
  conversion::OfflineConversionStorage store(root/"store",std::string(64,'d'),resources);
  std::unique_ptr<FileRead> oldFile(FileRead::Open(argv[1])),newFile(FileRead::Open(argv[1]));
  Worker oldWorker(*oldFile,EventType::All,false),newWorker(*newFile,EventType::All,false);
+ OfflineStorageSemanticTest::CheckMissingString(oldWorker,root/"missing-string.tracy");
  OfflineStorageSemanticTest::Populate(oldWorker,nullptr);OfflineStorageSemanticTest::Populate(newWorker,&store);
  Check(newWorker.GetJnTraceData().gpuReferenceUses.empty()&&newWorker.GetJnTraceData().jobStages.empty());
  Check(newWorker.GetJnTraceData().relations.empty());store.Seal();

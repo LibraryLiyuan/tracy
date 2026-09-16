@@ -24,10 +24,14 @@ Temporary records contain four u32 values (16 bytes). Pages use schema 2 and rec
 
 ## Cache and tool identity
 
-Query index schema is 15. Analysis cache namespace is `query-analysis-cache-v2-jntracyx1-string32`; decoder identity is `jntracyx-v1-base-0.13.2-string32`. Old caches remain on disk but are not reused. Query API version remains 1.35. Trace metadata and capabilities identify the new format separately from program and base-layout versions.
+Query index schema is 15. Analysis cache namespace is `query-analysis-cache-v2`; decoder identity is `jntracyx-v1-base-0.13.2-string32`. The short directory name limits path growth; the full decoder descriptor is validated in the cache header. Old caches remain on disk but are not reused. Query API version remains 1.35. Trace metadata and capabilities identify the new format separately from program and base-layout versions.
 
 ## Validation status (2026-09-16)
 
 Passed: header / index codec boundaries, mutable 32-bit ZoneExtra roundtrip, canonical output hashing, existing relation / mutable / record-reader regressions, safe snapshot failure preserving an existing file, small stream conversion through validation / publication / cleanup, and Worker Full versus external storage field and order comparison with 65,535-member resource sets.
 
-Query and Profiler integration builds and further fault tests are in progress. No 30-minute acceptance has been run for this format. Catalog, zone/slab and dictionary storage work remains; format capacity does not establish bounded process memory. Final integrated acceptance remains one round with soft 16 GiB / hard 20 GiB, shared workspace 256 MiB and added disk 3J.
+Converter, Query, Profiler, capture, stream-inspect, update, CSV export, Chrome import and Fuchsia import build successfully in isolated directories. Query contract, analysis cache manager and cache table tests pass, including a dedicated long-path table roundtrip. Query reports unsupported legacy files as UNSUPPORTED_TRACE_VERSION. Native full-file fixtures cover lock names, callstack name/file/image, SymbolData strings and GPU name/noteNames. Sparse codec references exercise the high index boundaries without allocating millions of strings; full-file fixtures use real continuous dictionaries and reject missing references.
+
+Independent old/new tools agree on 218 CPU zones including name, text, source, times and hierarchy, all messages, counts and frame statistics for the same small stream. Auxiliary resave followed by Query reopen preserves the zone fields. Profiler GUI rendering has not been visually verified; successful compilation and field tests are not a visual acceptance claim.
+
+No 30-minute acceptance has been run for this format. Catalog, zone/slab and dictionary storage work remains; format capacity does not establish bounded process memory. Final integrated acceptance remains one round with soft 16 GiB / hard 20 GiB, shared workspace 256 MiB and added disk 3J.
