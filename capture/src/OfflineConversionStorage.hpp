@@ -6,6 +6,7 @@
 #include "../../storage/TracyMutableRecordStore.hpp"
 #include "../../storage/TracyDiskIndex64.hpp"
 #include "../../storage/TracyResourceIntervals.hpp"
+#include "../../storage/TracyBoundedRecordTable.hpp"
 #include <vector>
 #include <array>
 namespace tracy::conversion
@@ -22,6 +23,17 @@ public:
     uint64_t ResolveResource(uint64_t,int64_t) override;
     void EndResourceIntervals() noexcept override;
     std::array<uint64_t,3> ResourceIntervalPeaks()const{return m_intervalPeaks;}
+    uint64_t AppendCatalog(OfflineCatalogDomain,const void*,uint32_t) override;
+    uint64_t CatalogCount(OfflineCatalogDomain) const override;
+    void ReadCatalog(OfflineCatalogDomain,uint64_t,void*,uint32_t) override;
+    void PutCatalog(OfflineCatalogDomain,uint64_t,const void*,uint32_t) override;
+    void SealCatalog(OfflineCatalogQuality) override;
+    void VisitCatalog(OfflineCatalogDomain,const std::function<void(const void*,uint64_t)>&) override;
+    std::string CatalogHash(OfflineCatalogDomain)const;
+    OfflineCatalogQuality CatalogQuality()const;
+    bool CatalogSealed()const{return m_catalogSealed;}
+    uint64_t DescriptorHeapCount()const{return m_descriptorHeaps?m_descriptorHeaps->Count():0;}
+    uint64_t AnonymizeDescriptor(uint64_t) override;
     void AppendRecord(OfflineAppendDomain,const void*,uint32_t) override;
     uint64_t RecordCount(OfflineAppendDomain) const override;
     void VisitRecords(OfflineAppendDomain,const std::function<void(const void*,uint64_t)>&) override;
@@ -71,6 +83,12 @@ private:
     std::unique_ptr<storage::DiskIndex64> m_passTimes;
     std::unique_ptr<storage::ResourceIntervals> m_resourceIntervals;
     std::array<uint64_t,3> m_intervalPeaks{};
+    std::array<std::unique_ptr<storage::BoundedRecordTable>,OfflineCatalogDomainCount> m_catalogTables;
+    std::array<std::string,OfflineCatalogDomainCount> m_catalogHashes;
+    OfflineCatalogQuality m_catalogQuality{};
+    bool m_catalogSealed=false;
+    std::unique_ptr<storage::DiskIndex64> m_descriptorHeaps;
+    uint64_t m_nextDescriptorHeap=1;
     std::string m_zoneHash;
     uint64_t m_jobCount=0,m_useCount=0,m_definitionCount=0;
     bool m_sealed=false,m_reclaimed=false;

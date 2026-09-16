@@ -13,12 +13,26 @@ public:
         :m_resources(resources),m_buffer(resources.Workspace()),m_expected{storage.JobStageCount(),storage.ReferenceUseCount(),storage.RelationCount()},
          m_hashes{storage.JobStageHash(),storage.ReferenceUseHash(),storage.RelationHash()},m_zoneCount(storage.ZoneExtraCount()),m_zoneHash(storage.ZoneExtraHash()){
         for(size_t i=0;i<OfflineAppendDomainCount;++i){m_expected[3+i]=storage.RecordCount(OfflineAppendDomain(i));m_hashes[3+i]=storage.RecordHash(OfflineAppendDomain(i));}
+        for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();
     }
+    bool ValidatesCatalog()const override{return true;}
+    void CatalogMetadata(OfflineCatalogQuality quality)override{CheckRead();if(m_catalogMetadata||quality!=m_catalogQuality)throw std::runtime_error("conversion_validation_catalog_quality");m_catalogMetadata=true;}
+    bool WantsCatalogStrings()const override{return true;}
+    bool AllowsLargeCatalogStrings(uint64_t count)const override{return count==m_expected[StringSlot];}
+    void CatalogStringsBegin(uint64_t count)override{CheckRead();if(m_started[StringSlot]||count!=m_expected[StringSlot])throw std::runtime_error("conversion_validation_catalog_string_count");m_started[StringSlot]=true;}
+    void CatalogStringRecord(uint64_t index,uint64_t generation,const JnGpuCatalogStringRecordHeaderV1& header,const void* bytes)override{
+        CheckRead();if(!m_started[StringSlot]||m_done[StringSlot]||index!=m_seen[StringSlot]||index>=m_expected[StringSlot]||!generation||!header.stringId||header.byteLength>256)throw std::runtime_error("conversion_validation_catalog_string_record");
+        m_actual[StringSlot].Update(&generation,sizeof(generation));m_actual[StringSlot].Update(&header,sizeof(header));m_actual[StringSlot].Update(bytes,header.byteLength);++m_seen[StringSlot];
+    }
+    void CatalogStringsEnd()override{CheckRead();if(!m_started[StringSlot]||m_done[StringSlot]||m_seen[StringSlot]!=m_expected[StringSlot]||m_actual[StringSlot].FinalHex()!=m_hashes[StringSlot])throw std::runtime_error("conversion_validation_catalog_string_hash");m_done[StringSlot]=true;}
     bool WantsJnRecords(JnDomain domain,uint32_t width) const override
     {
         switch(domain){
 #define X(name,field,type) case JnDomain::name:return width==sizeof(type);
             TRACY_OFFLINE_APPEND_DOMAINS(X)
+#undef X
+#define X(name,field,type,mut) case JnDomain::name:return width==sizeof(type);
+            TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
             default:break;
         }
@@ -39,6 +53,7 @@ public:
     {CheckRead();const auto i=Slot(domain);if(!m_started[i]||m_done[i]||m_seen[i]!=m_expected[i]||m_actual[i].FinalHex()!=m_hashes[i])throw std::runtime_error("conversion_validation_hash");m_done[i]=true;}
     void Finish() const{
         if(!m_zoneDone)throw std::runtime_error("zone_extra_validation_missing");
+        if(!m_catalogMetadata)throw std::runtime_error("conversion_validation_catalog_metadata_missing");
         for(size_t i=0;i<m_expected.size();++i){
             if(!m_started[i]&&!m_expected[i])continue; // older schemas may omit an empty domain
             if(!m_done[i])throw std::runtime_error("conversion_validation_missing_domain");
@@ -60,13 +75,20 @@ private:
 #define X(name,field,type) case JnDomain::name:return 3+size_t(OfflineAppendDomain::name);
         TRACY_OFFLINE_APPEND_DOMAINS(X)
 #undef X
+#define X(name,field,type,mut) case JnDomain::name:return 3+OfflineAppendDomainCount+size_t(OfflineCatalogDomain::name);
+        TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
         default:throw std::runtime_error("conversion_validation_domain");}}
     storage::ConversionResources& m_resources;
     analysis::AnalysisWorkspaceReservation m_buffer;
-    std::array<uint64_t,3+OfflineAppendDomainCount> m_expected,m_seen{};
-    std::array<std::string,3+OfflineAppendDomainCount> m_hashes;
-    std::array<analysis::Sha256Builder,3+OfflineAppendDomainCount> m_actual;
-    std::array<bool,3+OfflineAppendDomainCount> m_started{},m_done{};
+    static constexpr size_t DomainCount=3+OfflineAppendDomainCount+OfflineCatalogDomainCount;
+    static constexpr size_t StringSlot=3+OfflineAppendDomainCount+size_t(OfflineCatalogDomain::CatalogString);
+    std::array<uint64_t,DomainCount> m_expected,m_seen{};
+    std::array<std::string,DomainCount> m_hashes;
+    std::array<analysis::Sha256Builder,DomainCount> m_actual;
+    std::array<bool,DomainCount> m_started{},m_done{};
+    OfflineCatalogQuality m_catalogQuality{};
+    bool m_catalogMetadata=false;
     uint64_t m_zoneCount,m_zoneSeen=0;
     std::string m_zoneHash;
     analysis::Sha256Builder m_zoneActual;

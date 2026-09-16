@@ -108,29 +108,44 @@ static uint64_t AppendJnCatalogRecords( std::vector<T>& target, const uint8_t* d
     if( count != 0 ) memcpy( target.data() + first, data, size_t( count ) * sizeof( T ) );
     return first;
 }
+template<class T> uint64_t Worker::AppendCatalogPayload(OfflineCatalogDomain domain,const uint8_t* bytes,uint32_t count,std::vector<T>& memory)
+{
+    if(!m_offlineStorage){const auto first=AppendJnCatalogRecords(memory,bytes,count);if constexpr(requires(T row){row.time;})for(size_t i=size_t(first);i<memory.size();++i)memory[i].time=TscTime(memory[i].time);return first;}
+    const auto first=m_offlineStorage->CatalogCount(domain);for(uint32_t i=0;i<count;++i){T row;std::memcpy(&row,bytes+size_t(i)*sizeof(T),sizeof(T));if constexpr(requires(T value){value.time;})row.time=TscTime(row.time);m_offlineStorage->AppendCatalog(domain,&row,sizeof(row));}return first;
+}
+JnGpuCatalogStringData Worker::CatalogStringValue(uint64_t id)const
+{
+    if(!m_offlineStorage)return m_data.jnTrace.gpuCatalogStrings.at(size_t(id));
+    OfflineCatalogString row;m_offlineStorage->ReadCatalog(OfflineCatalogDomain::CatalogString,id,&row,sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("catalog_string_length");
+    return {row.generation,row.header,std::string(reinterpret_cast<const char*>(row.bytes.data()),row.header.byteLength)};
+}
 
-static void ReadJnGpuCatalogStrings( FileRead& f, std::vector<JnGpuCatalogStringData>& target )
+static void ReadJnGpuCatalogStrings( FileRead& f, std::vector<JnGpuCatalogStringData>& target,SerializedZoneSink* sink=nullptr )
 {
     uint64_t size;
     f.Read( size );
-    if( size > JnTraceMaxRecordsPerDomain ) throw LoadFailure( "JN trace GPU Catalog string count is invalid." );
+    const bool external=sink&&sink->WantsCatalogStrings();
+    if( size > JnTraceMaxRecordsPerDomain && (!external||!sink->AllowsLargeCatalogStrings(size)) ) throw LoadFailure( "JN trace GPU Catalog string count is invalid." );
     target.clear();
-    target.reserve( size_t( size ) );
+    if(!external)target.reserve( size_t( size ) );else sink->CatalogStringsBegin(size);
     for( uint64_t i = 0; i < size; ++i )
     {
+        if(external)sink->CheckRead();
         uint64_t generation;
         JnGpuCatalogStringRecordHeaderV1 header;
         f.Read( generation );
         f.Read( header );
         if( generation == 0 || header.stringId == 0 || header.byteLength > 256 )
             throw LoadFailure( "JN trace GPU Catalog string metadata is invalid." );
-        std::string value( header.byteLength, '\0' );
+        std::array<char,256> value{};
         if( header.byteLength != 0 ) f.Read( value.data(), header.byteLength );
         if( header.byteLength != 0 && header.originalLength == header.byteLength &&
-            JnGpuCatalogChecksum64( value.data(), value.size() ) != header.hash )
+            JnGpuCatalogChecksum64( value.data(), header.byteLength ) != header.hash )
             throw LoadFailure( "JN trace GPU Catalog string checksum is invalid." );
-        target.push_back( JnGpuCatalogStringData { generation, header, std::move( value ) } );
+        if(external)sink->CatalogStringRecord(i,generation,header,value.data());
+        else target.push_back( JnGpuCatalogStringData { generation, header, std::string(value.data(),header.byteLength) } );
     }
+    if(external)sink->CatalogStringsEnd();
 }
 
 static void WriteJnGpuCatalogStrings( FileWrite& f, const std::vector<JnGpuCatalogStringData>& source )
@@ -175,16 +190,14 @@ static bool ValidateJnGpuCatalogStoredData( const JnTraceData& data )
         {
             if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
                 batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) ) return false;
-            std::vector<uint8_t> bytes;
+            auto hash=JnGpuCatalogChecksum64(nullptr,0);
             for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
             {
                 const auto& value = data.gpuCatalogStrings[i];
-                const auto offset = bytes.size();
-                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
-                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
-                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+                hash=JnGpuCatalogChecksum64Update(hash,&value.header,sizeof(value.header));
+                hash=JnGpuCatalogChecksum64Update(hash,value.value.data(),value.value.size());
             }
-            checksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            checksum = hash;
             break;
         }
         default: return false;
@@ -2064,26 +2077,28 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             uint8_t catalogValid;
             f.Read4( catalogPresent, catalogValid, jn.gpuCatalogSchemaVersion,
                 jn.gpuDetailedEvidenceSchemaVersion );
+            if(catalogPresent>1||catalogValid>1)throw LoadFailure("Invalid GPU Catalog presence or quality flag.");
             jn.gpuCatalogPresent = catalogPresent != 0;
             jn.gpuCatalogValid = catalogValid != 0;
             if( jn.gpuCatalogPresent &&
                 ( jn.gpuCatalogSchemaVersion != JnGpuCatalogSchemaVersion ||
                     jn.gpuDetailedEvidenceSchemaVersion != JnGpuDetailedEvidenceSchemaVersion ) )
                 throw LoadFailure( "Unsupported JN GPU Catalog or Detailed Evidence schema." );
-            ReadJnVector( f, jn.gpuCatalogControls, "GPU Catalog control" );
-            ReadJnVector( f, jn.gpuCatalogBatches, "GPU Catalog batch" );
-            ReadJnVector( f, jn.gpuCatalogGenerations, "GPU Catalog generation" );
-            ReadJnGpuCatalogStrings( f, jn.gpuCatalogStrings );
-            ReadJnVector( f, jn.gpuCatalogResources, "GPU Catalog resource" );
-            ReadJnVector( f, jn.gpuCatalogAllocations, "GPU Catalog allocation" );
-            ReadJnVector( f, jn.gpuCatalogViews, "GPU Catalog view" );
-            ReadJnVector( f, jn.gpuCatalogLogicals, "GPU Catalog logical resource" );
-            ReadJnVector( f, jn.gpuCatalogParts, "GPU Catalog part" );
-            ReadJnVector( f, jn.gpuCatalogRelations, "GPU Catalog relation" );
-            ReadJnVector( f, jn.gpuCatalogVg, "GPU Catalog virtual geometry" );
-            ReadJnVector( f, jn.gpuRangeSets, "GPU range set" );
-            ReadJnVector( f, jn.gpuDetailedEvidence, "GPU detailed evidence" );
-            if( jn.gpuCatalogPresent && !ValidateJnGpuCatalogStoredData( jn ) )
+            if(m_serializedZoneSink)m_serializedZoneSink->CatalogMetadata({catalogPresent,catalogValid,jn.gpuCatalogSchemaVersion,jn.gpuDetailedEvidenceSchemaVersion});
+            ReadJnVector(f,jn.gpuCatalogControls,"GPU Catalog control",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogControl);
+            ReadJnVector(f,jn.gpuCatalogBatches,"GPU Catalog batch",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogBatch);
+            ReadJnVector(f,jn.gpuCatalogGenerations,"GPU Catalog generation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogGeneration);
+            ReadJnGpuCatalogStrings(f,jn.gpuCatalogStrings,m_serializedZoneSink);
+            ReadJnVector(f,jn.gpuCatalogResources,"GPU Catalog resource",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogResource);
+            ReadJnVector(f,jn.gpuCatalogAllocations,"GPU Catalog allocation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogAllocation);
+            ReadJnVector(f,jn.gpuCatalogViews,"GPU Catalog view",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogView);
+            ReadJnVector(f,jn.gpuCatalogLogicals,"GPU Catalog logical",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogLogical);
+            ReadJnVector(f,jn.gpuCatalogParts,"GPU Catalog part",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogPart);
+            ReadJnVector(f,jn.gpuCatalogRelations,"GPU Catalog relation",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogRelation);
+            ReadJnVector(f,jn.gpuCatalogVg,"GPU Catalog virtual geometry",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogVg);
+            ReadJnVector(f,jn.gpuRangeSets,"GPU range set",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogRangeSet);
+            ReadJnVector(f,jn.gpuDetailedEvidence,"GPU detailed evidence",m_serializedZoneSink,SerializedZoneSink::JnDomain::CatalogDetailedEvidence);
+            if( jn.gpuCatalogPresent && !(m_serializedZoneSink&&m_serializedZoneSink->ValidatesCatalog()) && !ValidateJnGpuCatalogStoredData( jn ) )
             {
                 jn.gpuCatalogValid = false;
                 for( auto& generation : jn.gpuCatalogGenerations ) generation.valid = 0;
@@ -6958,11 +6973,12 @@ void Worker::InvalidateJnGpuCatalog( uint64_t generation, uint8_t state )
     const auto runtime = m_jnGpuCatalogRuntime.find( generation );
     if( runtime != m_jnGpuCatalogRuntime.end() ) runtime->second.valid = false;
     if( runtime != m_jnGpuCatalogRuntime.end() &&
-        runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
     {
-        auto& value = data.gpuCatalogGenerations[runtime->second.dataIndex];
+        auto value = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
         value.valid = 0;
         value.state = state;
+        PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,value,data.gpuCatalogGenerations);
     }
 }
 
@@ -6998,17 +7014,17 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
             data.present = true;
             data.schemaVersion = JnTraceSchemaVersion;
             data.gpuCatalogPresent = true;
-            if( data.gpuCatalogGenerations.empty() ) data.gpuCatalogValid = true;
+            if( CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations)==0 ) data.gpuCatalogValid = true;
             data.gpuCatalogValid = data.gpuCatalogValid && value.valid;
             data.gpuCatalogSchemaVersion = JnGpuCatalogSchemaVersion;
             data.gpuDetailedEvidenceSchemaVersion = JnGpuDetailedEvidenceSchemaVersion;
             const auto time = TscTime( ev.time );
-            runtime->second.dataIndex = data.gpuCatalogGenerations.size();
-            data.gpuCatalogGenerations.push_back( JnGpuCatalogGenerationData {
+            runtime->second.dataIndex = CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);
+            AppendCatalogValue(OfflineCatalogDomain::CatalogGeneration, JnGpuCatalogGenerationData {
                 ev.generation, ev.value, 0, time, 0, ev.sequence, 0, 0, 0, 0,
-                ev.state, ev.flags, 1, 0, uint8_t( value.valid ? 1 : 0 ) } );
-            data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
-                ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
+                ev.state, ev.flags, 1, 0, uint8_t( value.valid ? 1 : 0 ) },data.gpuCatalogGenerations);
+            AppendCatalogValue(OfflineCatalogDomain::CatalogControl, JnGpuCatalogControlData { time, ev.generation,
+                ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags },data.gpuCatalogControls);
             if( m_data.lastTime < time ) m_data.lastTime = time;
         }
         return true;
@@ -7034,11 +7050,11 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
     {
         auto& data = m_data.jnTrace;
         const auto time = TscTime( ev.time );
-        data.gpuCatalogControls.push_back( JnGpuCatalogControlData { time, ev.generation,
-            ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags } );
-        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+        AppendCatalogValue(OfflineCatalogDomain::CatalogControl, JnGpuCatalogControlData { time, ev.generation,
+            ev.value, m_threadCtx, ev.sequence, ev.kind, ev.state, ev.flags },data.gpuCatalogControls);
+        if( runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
         {
-            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            auto generation = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
             generation.lastSequence = ev.sequence;
             generation.state = ev.state;
             generation.flags |= ev.flags;
@@ -7055,6 +7071,7 @@ bool Worker::ValidateJnGpuCatalogControl( const QueueJnGpuCatalogControl& ev, bo
                     generation.unresolvedCount = resolved.totalUnresolved;
                 }
             }
+            PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,generation,data.gpuCatalogGenerations);
         }
         data.gpuCatalogValid = data.gpuCatalogValid && runtime->second.valid;
         if( m_data.lastTime < time ) m_data.lastTime = time;
@@ -7168,53 +7185,37 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
         switch( JnGpuCatalogBatchKind( ev.kind ) )
         {
         case JnGpuCatalogBatchKind::Resource:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogResources, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogResources.size(); ++i )
-                data.gpuCatalogResources[i].time = TscTime( data.gpuCatalogResources[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogResource,records,ev.recordCount,data.gpuCatalogResources);
             break;
         case JnGpuCatalogBatchKind::Allocation:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogAllocations, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogAllocations.size(); ++i )
-                data.gpuCatalogAllocations[i].time = TscTime( data.gpuCatalogAllocations[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogAllocation,records,ev.recordCount,data.gpuCatalogAllocations);
             break;
         case JnGpuCatalogBatchKind::View:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogViews, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogViews.size(); ++i )
-                data.gpuCatalogViews[i].time = TscTime( data.gpuCatalogViews[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogView,records,ev.recordCount,data.gpuCatalogViews);
             break;
         case JnGpuCatalogBatchKind::Logical:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogLogicals, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogLogicals.size(); ++i )
-                data.gpuCatalogLogicals[i].time = TscTime( data.gpuCatalogLogicals[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogLogical,records,ev.recordCount,data.gpuCatalogLogicals);
             break;
         case JnGpuCatalogBatchKind::Part:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogParts, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogParts.size(); ++i )
-                data.gpuCatalogParts[i].time = TscTime( data.gpuCatalogParts[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogPart,records,ev.recordCount,data.gpuCatalogParts);
             break;
         case JnGpuCatalogBatchKind::Relation:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogRelations, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogRelations.size(); ++i )
-                data.gpuCatalogRelations[i].time = TscTime( data.gpuCatalogRelations[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogRelation,records,ev.recordCount,data.gpuCatalogRelations);
             break;
         case JnGpuCatalogBatchKind::VirtualGeometry:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuCatalogVg, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuCatalogVg.size(); ++i )
-                data.gpuCatalogVg[i].time = TscTime( data.gpuCatalogVg[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogVg,records,ev.recordCount,data.gpuCatalogVg);
             break;
         case JnGpuCatalogBatchKind::RangeSet:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuRangeSets, records, ev.recordCount );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogRangeSet,records,ev.recordCount,data.gpuRangeSets);
             break;
         case JnGpuCatalogBatchKind::DetailedEvidence:
-            firstRecordIndex = AppendJnCatalogRecords( data.gpuDetailedEvidence, records, ev.recordCount );
-            for( size_t i = size_t( firstRecordIndex ); i < data.gpuDetailedEvidence.size(); ++i )
-                data.gpuDetailedEvidence[i].time = TscTime( data.gpuDetailedEvidence[i].time );
+            firstRecordIndex = AppendCatalogPayload(OfflineCatalogDomain::CatalogDetailedEvidence,records,ev.recordCount,data.gpuDetailedEvidence);
             break;
         case JnGpuCatalogBatchKind::String:
         {
-            firstRecordIndex = data.gpuCatalogStrings.size();
+            firstRecordIndex = CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings);
             std::vector<JnGpuCatalogStringData> parsed;
-            parsed.reserve( ev.recordCount );
+            if(!m_offlineStorage)parsed.reserve( ev.recordCount );
             const auto* cursor = records;
             const auto* end = records + recordPayloadBytes;
             for( uint32_t i = 0; i < ev.recordCount; ++i )
@@ -7234,7 +7235,7 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
                     error = "GPU Catalog string batch has an invalid id, length, or hash.";
                     return false;
                 }
-                parsed.push_back( JnGpuCatalogStringData { ev.generation, header,
+                if(!m_offlineStorage)parsed.push_back( JnGpuCatalogStringData { ev.generation, header,
                     std::string( reinterpret_cast<const char*>( cursor ), header.byteLength ) } );
                 cursor += header.byteLength;
             }
@@ -7243,22 +7244,26 @@ bool Worker::ConsumeJnGpuCatalogBatch( const QueueJnGpuCatalogBatch& ev, bool pe
                 error = "GPU Catalog string batch has trailing bytes.";
                 return false;
             }
-            data.gpuCatalogStrings.insert( data.gpuCatalogStrings.end(),
+            if(m_offlineStorage){
+                cursor=records;
+                for(uint32_t i=0;i<ev.recordCount;++i){OfflineCatalogString row;row.generation=ev.generation;std::memcpy(&row.header,cursor,sizeof(row.header));cursor+=sizeof(row.header);std::memcpy(row.bytes.data(),cursor,row.header.byteLength);cursor+=row.header.byteLength;m_offlineStorage->AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
+            }else data.gpuCatalogStrings.insert( data.gpuCatalogStrings.end(),
                 std::make_move_iterator( parsed.begin() ), std::make_move_iterator( parsed.end() ) );
             break;
         }
         }
 
-        data.gpuCatalogBatches.push_back( JnGpuCatalogBatchData { ev.generation, envelope.checksum, 0,
+        AppendCatalogValue(OfflineCatalogDomain::CatalogBatch, JnGpuCatalogBatchData { ev.generation, envelope.checksum, 0,
             firstRecordIndex, ev.sequence, ev.recordCount, envelope.payloadBytes,
-            ev.kind, ev.encoding, ev.flags, 1 } );
-        if( runtime->second.dataIndex < data.gpuCatalogGenerations.size() )
+            ev.kind, ev.encoding, ev.flags, 1 },data.gpuCatalogBatches);
+        if( runtime->second.dataIndex < CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations) )
         {
-            auto& generation = data.gpuCatalogGenerations[runtime->second.dataIndex];
+            auto generation = CatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,data.gpuCatalogGenerations);
             generation.lastSequence = ev.sequence;
             ++generation.batchCount;
             generation.recordCount += ev.recordCount;
             generation.payloadBytes += envelope.payloadBytes;
+            PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,runtime->second.dataIndex,generation,data.gpuCatalogGenerations);
         }
     }
 
@@ -7309,17 +7314,18 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     struct IntervalScope {WorkerOfflineStorage* storage;~IntervalScope(){if(storage)storage->EndResourceIntervals();}} intervalScope{m_offlineStorage};
     if(m_offlineStorage)m_offlineStorage->BeginResourceIntervals();
     auto& data = m_data.jnTrace;
-    stats.fullResolveInputUnits += uint64_t( data.gpuCatalogBatches.size() ) * 7 +
-        data.gpuCatalogResources.size() + data.gpuCatalogViews.size() +
-        data.gpuCatalogLogicals.size() + data.gpuCatalogVg.size() +
-        data.gpuRangeSets.size() + data.gpuCatalogRelations.size() +
-        data.gpuDetailedEvidence.size() +
+    stats.fullResolveInputUnits += CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches) * 7 +
+        CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources) + CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews) +
+        CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals) + CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg) +
+        CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets) + CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations) +
+        CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence) +
         (m_offlineStorage ? m_offlineStorage->RecordCount(OfflineAppendDomain::GpuReferencePass)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxEntity)+m_offlineStorage->RecordCount(OfflineAppendDomain::GfxLink) : data.gpuReferencePasses.size()+data.gfxEntities.size()+data.gfxLinks.size());
 
     auto forBatches = [&]( JnGpuCatalogBatchKind kind, auto&& fn )
     {
-        for( const auto& batch : data.gpuCatalogBatches )
+        for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);++index)
         {
+            const auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
             if(m_offlineStorage)m_offlineStorage->Check();
             if( batch.generation != generation || batch.kind != uint8_t( kind ) || batch.valid == 0 ) continue;
             fn( size_t( batch.firstRecordIndex ), size_t( batch.recordCount ) );
@@ -7328,12 +7334,10 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
 
     forBatches( JnGpuCatalogBatchKind::Resource, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogResources.size() || count > data.gpuCatalogResources.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            const auto& record = data.gpuCatalogResources[i];
-            if(m_offlineStorage){m_offlineStorage->AddResourceInterval(record);continue;}
-            if( record.pointerToken == 0 || record.resourceId == 0 ) continue;
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources,first,count,[&](const auto& record){
+            if(m_offlineStorage){m_offlineStorage->AddResourceInterval(record);return;}
+            if( record.pointerToken == 0 || record.resourceId == 0 ) return;
             const auto operation = JnGpuCatalogRecordOperation( record.operation );
             const auto key = record.pointerToken;
             if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
@@ -7361,7 +7365,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     std::numeric_limits<int64_t>::max() } );
                 openIntervals[key] = values.size() - 1;
             }
-        }
+        });
     } );
 
     auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
@@ -7411,10 +7415,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     uint64_t coreUnresolved = 0;
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogViews.size() || count > data.gpuCatalogViews.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogViews[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7422,14 +7424,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);
     } );
     forBatches( JnGpuCatalogBatchKind::Logical, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogLogicals.size() || count > data.gpuCatalogLogicals.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogLogicals[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7437,14 +7437,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);
     } );
     forBatches( JnGpuCatalogBatchKind::VirtualGeometry, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogVg.size() || count > data.gpuCatalogVg.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogVg[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ) record.resourceId = resolve( record.pointerToken, record.time );
             if( record.pointerToken != 0 && record.resourceId == 0 )
             {
@@ -7452,14 +7450,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);
     } );
     forBatches( JnGpuCatalogBatchKind::RangeSet, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuRangeSets.size() || count > data.gpuRangeSets.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuRangeSets[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets,first,count,[&](auto& record){
             auto time = std::numeric_limits<int64_t>::min();
             if(m_offlineStorage){const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
             else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
@@ -7470,14 +7466,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Unknown );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        }
+        },true);
     } );
     forBatches( JnGpuCatalogBatchKind::Relation, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuCatalogRelations.size() || count > data.gpuCatalogRelations.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuCatalogRelations[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations,first,count,[&](auto& record){
             if( ( record.flags & 1 ) != 0 )
             {
                 const auto resolved = resolve( record.sourceId, record.time );
@@ -7510,14 +7504,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     record.flags &= ~uint8_t( 2 );
                 }
             }
-        }
+        },true);
     } );
     forBatches( JnGpuCatalogBatchKind::DetailedEvidence, [&]( size_t first, size_t count )
     {
-        if( first > data.gpuDetailedEvidence.size() || count > data.gpuDetailedEvidence.size() - first ) return;
-        for( size_t i = first; i < first + count; ++i )
-        {
-            auto& record = data.gpuDetailedEvidence[i];
+        const auto size=CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence);if(first>size||count>size-first)return;
+        ForCatalogRows(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence,first,count,[&](auto& record){
             if( ( record.flags & uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer ) ) != 0 )
             {
                 const auto resolved = resolve( record.sourceId, record.time );
@@ -7540,6 +7532,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
             }
             auto anonymizeDescriptor = [&]( uint64_t token )
             {
+                if(m_offlineStorage)return m_offlineStorage->AnonymizeDescriptor(token);
                 const auto found = m_jnGpuCatalogDescriptorHeaps.find( token );
                 if( found != m_jnGpuCatalogDescriptorHeaps.end() ) return found->second;
                 const auto id = 0xD000000000000000ull | m_jnGpuCatalogNextDescriptorHeapId++;
@@ -7556,7 +7549,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.targetId = anonymizeDescriptor( record.targetId );
                 record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer );
             }
-        }
+        },true);
     } );
 
     stats.fullResolveNanoseconds += uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -7569,9 +7562,12 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
 void Worker::FinalizeJnGpuCatalogForSave()
 {
     auto& data = m_data.jnTrace;
-    if( !data.gpuCatalogPresent ) return;
-    for( auto& generation : data.gpuCatalogGenerations )
+    if(m_offlineStorage&&m_offlineCatalogFinalized)return;
+    const auto seal=[&]{if(m_offlineStorage){m_offlineStorage->SealCatalog({uint64_t(data.gpuCatalogPresent),uint64_t(data.gpuCatalogValid),data.gpuCatalogSchemaVersion,data.gpuDetailedEvidenceSchemaVersion});m_offlineCatalogFinalized=true;}};
+    if( !data.gpuCatalogPresent ){seal();return;}
+    for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogGeneration,data.gpuCatalogGenerations);++index)
     {
+        auto generation=CatalogValue(OfflineCatalogDomain::CatalogGeneration,index,data.gpuCatalogGenerations);
         if(m_offlineStorage)m_offlineStorage->Check();
         const auto resolved = ResolveJnGpuCatalogGeneration( generation.generation,
             JnGpuCatalogResolveReason::FinalizeSave );
@@ -7582,47 +7578,48 @@ void Worker::FinalizeJnGpuCatalogForSave()
             generation.state = uint8_t( JnGpuCatalogGenerationState::InvalidCoreGap );
             data.gpuCatalogValid = false;
         }
+        PutCatalogValue(OfflineCatalogDomain::CatalogGeneration,index,generation,data.gpuCatalogGenerations);
     }
 
-    auto checksumRecords = []( const auto& values, uint64_t first, uint32_t count ) -> uint64_t
+    auto checksumRecords = [&]( OfflineCatalogDomain domain,auto& values, uint64_t first, uint32_t count ) -> uint64_t
     {
         using Value = typename std::decay_t<decltype( values )>::value_type;
-        if( first > values.size() || count > values.size() - size_t( first ) ) return 0;
-        return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+        const auto size=CatalogSize(domain,values);if(first>size||count>size-first)return 0;
+        if(!m_offlineStorage)return JnGpuCatalogChecksum64( values.data() + first, size_t( count ) * sizeof( Value ) );
+        auto hash=JnGpuCatalogChecksum64(nullptr,0);ForCatalogRows(domain,values,first,count,[&](const auto& row){hash=JnGpuCatalogChecksum64Update(hash,&row,sizeof(row));});return hash;
     };
-    for( auto& batch : data.gpuCatalogBatches )
+    for(uint64_t index=0;index<CatalogSize(OfflineCatalogDomain::CatalogBatch,data.gpuCatalogBatches);++index)
     {
+        auto batch=CatalogValue(OfflineCatalogDomain::CatalogBatch,index,data.gpuCatalogBatches);
         if(m_offlineStorage)m_offlineStorage->Check();
         switch( JnGpuCatalogBatchKind( batch.kind ) )
         {
-        case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords( data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Allocation: batch.storedChecksum = checksumRecords( data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::View: batch.storedChecksum = checksumRecords( data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Logical: batch.storedChecksum = checksumRecords( data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Part: batch.storedChecksum = checksumRecords( data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::Relation: batch.storedChecksum = checksumRecords( data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::VirtualGeometry: batch.storedChecksum = checksumRecords( data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::RangeSet: batch.storedChecksum = checksumRecords( data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
-        case JnGpuCatalogBatchKind::DetailedEvidence: batch.storedChecksum = checksumRecords( data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Resource: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogResource, data.gpuCatalogResources, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Allocation: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogAllocation, data.gpuCatalogAllocations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::View: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogView, data.gpuCatalogViews, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Logical: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogLogical, data.gpuCatalogLogicals, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Part: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogPart, data.gpuCatalogParts, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::Relation: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogRelation, data.gpuCatalogRelations, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::VirtualGeometry: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogVg, data.gpuCatalogVg, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::RangeSet: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogRangeSet, data.gpuRangeSets, batch.firstRecordIndex, batch.recordCount ); break;
+        case JnGpuCatalogBatchKind::DetailedEvidence: batch.storedChecksum = checksumRecords(OfflineCatalogDomain::CatalogDetailedEvidence, data.gpuDetailedEvidence, batch.firstRecordIndex, batch.recordCount ); break;
         case JnGpuCatalogBatchKind::String:
         {
-            if( batch.firstRecordIndex > data.gpuCatalogStrings.size() ||
-                batch.recordCount > data.gpuCatalogStrings.size() - size_t( batch.firstRecordIndex ) )
+            const auto strings=CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings);
+            if( batch.firstRecordIndex > strings || batch.recordCount > strings-batch.firstRecordIndex )
             {
                 batch.valid = 0;
                 data.gpuCatalogValid = false;
                 break;
             }
-            std::vector<uint8_t> bytes;
+            auto hash=JnGpuCatalogChecksum64(nullptr,0);
             for( size_t i = size_t( batch.firstRecordIndex ); i < size_t( batch.firstRecordIndex ) + batch.recordCount; ++i )
             {
-                const auto& value = data.gpuCatalogStrings[i];
-                const auto offset = bytes.size();
-                bytes.resize( offset + sizeof( value.header ) + value.value.size() );
-                memcpy( bytes.data() + offset, &value.header, sizeof( value.header ) );
-                if( !value.value.empty() ) memcpy( bytes.data() + offset + sizeof( value.header ), value.value.data(), value.value.size() );
+                const auto value = CatalogStringValue(i);
+                hash=JnGpuCatalogChecksum64Update(hash,&value.header,sizeof(value.header));
+                hash=JnGpuCatalogChecksum64Update(hash,value.value.data(),value.value.size());
             }
-            batch.storedChecksum = JnGpuCatalogChecksum64( bytes.data(), bytes.size() );
+            batch.storedChecksum = hash;
             break;
         }
         }
@@ -7631,7 +7628,20 @@ void Worker::FinalizeJnGpuCatalogForSave()
             batch.valid = 0;
             data.gpuCatalogValid = false;
         }
+        PutCatalogValue(OfflineCatalogDomain::CatalogBatch,index,batch,data.gpuCatalogBatches);
     }
+    seal();
+}
+template<class T> static void WriteCatalogVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineCatalogDomain domain)
+{
+    if(!storage){WriteJnVector(file,memory);return;}const auto count=storage->CatalogCount(domain);file.Write(&count,sizeof(count));
+    if(OfflineCatalogInfo(domain).width!=sizeof(T))throw std::runtime_error("catalog_write_width");
+    storage->VisitCatalog(domain,[&](const void* rows,uint64_t n){file.Write(rows,size_t(n)*sizeof(T));});
+}
+static void WriteCatalogStrings(FileWrite& file,const std::vector<JnGpuCatalogStringData>& memory,WorkerOfflineStorage* storage)
+{
+    if(!storage){WriteJnGpuCatalogStrings(file,memory);return;}const auto count=storage->CatalogCount(OfflineCatalogDomain::CatalogString);file.Write(&count,sizeof(count));
+    storage->VisitCatalog(OfflineCatalogDomain::CatalogString,[&](const void* bytes,uint64_t n){for(uint64_t i=0;i<n;++i){OfflineCatalogString row;std::memcpy(&row,static_cast<const unsigned char*>(bytes)+i*sizeof(row),sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("catalog_write_string");file.Write(&row.generation,sizeof(row.generation));file.Write(&row.header,sizeof(row.header));file.Write(row.bytes.data(),row.header.byteLength);}});
 }
 
 static tracy_force_inline int64_t RefTime( int64_t& reference, int64_t delta )
@@ -11616,19 +11626,19 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &gpuCatalogValid, sizeof( gpuCatalogValid ) );
     f.Write( &m_data.jnTrace.gpuCatalogSchemaVersion, sizeof( m_data.jnTrace.gpuCatalogSchemaVersion ) );
     f.Write( &m_data.jnTrace.gpuDetailedEvidenceSchemaVersion, sizeof( m_data.jnTrace.gpuDetailedEvidenceSchemaVersion ) );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogControls );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogBatches );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogGenerations );
-    WriteJnGpuCatalogStrings( f, m_data.jnTrace.gpuCatalogStrings );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogResources );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogAllocations );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogViews );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogLogicals );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogParts );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogRelations );
-    WriteJnVector( f, m_data.jnTrace.gpuCatalogVg );
-    WriteJnVector( f, m_data.jnTrace.gpuRangeSets );
-    WriteJnVector( f, m_data.jnTrace.gpuDetailedEvidence );
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogControls,m_offlineStorage,OfflineCatalogDomain::CatalogControl);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogBatches,m_offlineStorage,OfflineCatalogDomain::CatalogBatch);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogGenerations,m_offlineStorage,OfflineCatalogDomain::CatalogGeneration);
+    WriteCatalogStrings(f,m_data.jnTrace.gpuCatalogStrings,m_offlineStorage);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogResources,m_offlineStorage,OfflineCatalogDomain::CatalogResource);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogAllocations,m_offlineStorage,OfflineCatalogDomain::CatalogAllocation);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogViews,m_offlineStorage,OfflineCatalogDomain::CatalogView);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogLogicals,m_offlineStorage,OfflineCatalogDomain::CatalogLogical);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogParts,m_offlineStorage,OfflineCatalogDomain::CatalogPart);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogRelations,m_offlineStorage,OfflineCatalogDomain::CatalogRelation);
+    WriteCatalogVector(f,m_data.jnTrace.gpuCatalogVg,m_offlineStorage,OfflineCatalogDomain::CatalogVg);
+    WriteCatalogVector(f,m_data.jnTrace.gpuRangeSets,m_offlineStorage,OfflineCatalogDomain::CatalogRangeSet);
+    WriteCatalogVector(f,m_data.jnTrace.gpuDetailedEvidence,m_offlineStorage,OfflineCatalogDomain::CatalogDetailedEvidence);
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )

@@ -2,6 +2,7 @@
 #define TRACY_OFFLINE_STORAGE_HPP
 #include "TracyJnData.hpp"
 #include "TracyOfflineDomains.hpp"
+#include "TracyOfflineCatalog.hpp"
 #include <functional>
 #include <optional>
 namespace tracy
@@ -25,6 +26,13 @@ public:
     virtual void SealResourceIntervals()=0;
     virtual uint64_t ResolveResource(uint64_t,int64_t)=0;
     virtual void EndResourceIntervals() noexcept=0;
+    virtual uint64_t AppendCatalog(OfflineCatalogDomain,const void*,uint32_t)=0;
+    virtual uint64_t CatalogCount(OfflineCatalogDomain) const=0;
+    virtual void ReadCatalog(OfflineCatalogDomain,uint64_t,void*,uint32_t)=0;
+    virtual void PutCatalog(OfflineCatalogDomain,uint64_t,const void*,uint32_t)=0;
+    virtual void SealCatalog(OfflineCatalogQuality)=0;
+    virtual void VisitCatalog(OfflineCatalogDomain,const std::function<void(const void*,uint64_t)>&)=0;
+    virtual uint64_t AnonymizeDescriptor(uint64_t)=0;
     virtual void Fail(const char*) noexcept=0;
     virtual bool DefineResourceSet(uint32_t,const char*,size_t)=0;
     virtual bool AppendReferenceSet(uint32_t,uint16_t,int64_t,uint64_t,uint64_t,uint8_t,uint8_t)=0;

@@ -50,8 +50,8 @@ public:
         return result;
     }
     bool CloseAndRemove() noexcept {
-        if(m_closed)return true;m_keys.reset();m_intervals.reset();bool ok=true;
-        for(const auto& path:m_paths)if(!m_resources.RemoveOwned(path))ok=false;
+        if(m_closed)return true;const bool rowsOwned=m_intervals&&m_intervals->HasDiskFile();m_keys.reset();m_intervals.reset();bool ok=true;
+        for(size_t i=0;i<m_paths.size();++i)if((i!=1||rowsOwned)&&!m_resources.RemoveOwned(m_paths[i]))ok=false;
         m_closed=true;if(!ok)m_resources.Fail("resource_interval_cleanup_failed");return ok;
     }
     uint64_t Count()const{return m_intervals?m_intervals->Count():0;}

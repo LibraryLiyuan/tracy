@@ -22,11 +22,11 @@ int main(int argc,char** argv){try{
  {tracy::storage::MutableRows empty(root/"empty.bin",16,budget);empty.Seal();uint64_t seen=0;empty.Visit([&](const void*,uint64_t n){seen+=n;});Check(seen==0);}
  for(const bool header:{false,true}){
      tracy::storage::ConversionResources guarded(limits,[&]{return sample;},[]{return 1ull<<40;});
-     const auto path=root/(header?"bad-width.bin":"bad-hash.bin");tracy::storage::MutableRows damaged(path,40,guarded);damaged.Append(row.data());damaged.Seal();
+     const auto path=root/(header?"bad-width.bin":"bad-hash.bin");tracy::storage::MutableRows damaged(path,40,guarded);damaged.Append(row.data());damaged.Seal();damaged.ClearCache();
      {std::fstream file(tracy::analysis::AnalysisIoPath(path),std::ios::in|std::ios::out|std::ios::binary);file.seekp(header?12:128);char byte=1;file.write(&byte,1);file.flush();Check(bool(file));}
      Reject([&]{damaged.Read(0,row.data());},header?"mutable_rows_header":"mutable_rows_checksum");
  }
- {auto tight=limits;tight.absoluteDiskLimit=4096;tracy::storage::ConversionResources denied(tight,[&]{return sample;},[]{return 1ull<<40;});tracy::storage::MutableRows bounded(root/"budget.bin",40,denied);Reject([&]{bounded.Append(row.data());},"disk");Check(bounded.Count()==0);}
+ {auto tight=limits;tight.absoluteDiskLimit=4096;tracy::storage::ConversionResources denied(tight,[&]{return sample;},[]{return 1ull<<40;});tracy::storage::MutableRows bounded(root/"budget.bin",40,denied,16384+1024);bool failed=false;for(uint64_t i=0;i<1000;++i){try{bounded.Append(row.data());}catch(const std::exception& e){Check(std::string(e.what()).find("disk")!=std::string::npos&&bounded.Count()==i);failed=true;break;}}Check(failed);}
  {tracy::storage::ConversionResources cancelled(limits,[&]{return sample;},[]{return 1ull<<40;});tracy::storage::MutableRows bounded(root/"cancel.bin",40,cancelled);cancelled.Cancel();Reject([&]{bounded.Append(row.data());},"cancelled");Check(bounded.Count()==0);}
  puts("mutable rows append, update, eviction and sealed traversal passed");return 0;
  }catch(const std::exception& e){fprintf(stderr,"%s\n",e.what());return 1;}}

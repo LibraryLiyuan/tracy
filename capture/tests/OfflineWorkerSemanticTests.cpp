@@ -11,19 +11,74 @@ namespace tracy {
 static void Check(bool v,std::source_location at=std::source_location::current()){if(!v)throw std::runtime_error("offline Worker semantic mismatch at "+std::to_string(at.line()));}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 struct OfflineStorageSemanticTest {
- static void PassLifetimeResolution(Worker& w){
+ static bool ProtocolBatch(Worker& w,uint32_t sequence,JnGpuCatalogBatchKind kind,const void* rows,uint32_t bytes,uint16_t width,uint32_t count){
+    JnGpuCatalogBatchEnvelopeV1 envelope{};envelope.magic=JnGpuCatalogBatchMagic;envelope.catalogSchema=1;envelope.evidenceSchema=1;envelope.recordBytes=width;envelope.recordCount=count;envelope.payloadBytes=bytes;envelope.checksum=JnGpuCatalogChecksum64(rows,bytes);
+    std::vector<uint8_t> payload(sizeof(envelope)+bytes);std::memcpy(payload.data(),&envelope,sizeof(envelope));std::memcpy(payload.data()+sizeof(envelope),rows,bytes);
+    QueueJnGpuCatalogBatch event{};event.generation=91;event.payloadId=sequence;event.sequence=sequence;event.recordCount=count;event.payloadBytes=uint32_t(payload.size());event.kind=uint8_t(kind);event.encoding=uint8_t(kind==JnGpuCatalogBatchKind::RangeSet?JnGpuCatalogBatchEncoding::RangeSetV1:kind==JnGpuCatalogBatchKind::DetailedEvidence?JnGpuCatalogBatchEncoding::DetailedEvidenceV1:JnGpuCatalogBatchEncoding::FixedV1);
+    w.m_jnGpuCatalogPayloads[event.payloadId].bytes=std::move(payload);const char* error=nullptr;return w.ConsumeJnGpuCatalogBatch(event,true,error);
+ }
+ static void FillProtocolCatalog(Worker& w,bool missingCore){
     auto& data=w.m_data.jnTrace;
-    auto resources=std::exchange(data.gpuCatalogResources,{});auto ranges=std::exchange(data.gpuRangeSets,{});auto batches=std::exchange(data.gpuCatalogBatches,{});
+#define X(name,field,type,mut) data.field.clear();data.field.shrink_to_fit();
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    data.gpuCatalogStrings.clear();data.gpuCatalogPresent=false;data.gpuCatalogValid=false;w.m_jnGpuCatalogRuntime.clear();w.m_jnGpuCatalogPayloads.clear();w.m_mode=Worker::Mode::OfflineConvert;w.m_timerMul=0.5;w.m_data.baseTime=100;w.m_threadCtx=901;
+    uint32_t sequence=1;QueueJnGpuCatalogControl control{};control.time=1000;control.generation=91;control.sequence=sequence++;control.kind=uint8_t(JnGpuCatalogControlKind::GenerationBegin);control.state=uint8_t(JnGpuCatalogGenerationState::Building);const char* error=nullptr;Check(w.ValidateJnGpuCatalogControl(control,true,error));
+    std::vector<JnGpuCatalogResourceRecordV1> resources(4097);for(size_t i=0;i<resources.size();++i){resources[i].time=200;resources[i].resourceId=i+1;resources[i].pointerToken=i?10000+i:777;resources[i].operation=uint8_t(JnGpuCatalogRecordOperation::Create);resources[i].width=64+i;}
+    Check(ProtocolBatch(w,sequence++,JnGpuCatalogBatchKind::Resource,resources.data(),uint32_t(resources.size()*sizeof(resources[0])),sizeof(resources[0]),uint32_t(resources.size())));
+    const auto emit=[&](JnGpuCatalogBatchKind kind,const auto& row){Check(ProtocolBatch(w,sequence++,kind,&row,sizeof(row),sizeof(row),1));};
+    JnGpuCatalogAllocationRecordV1 allocation{};allocation.time=210;allocation.allocationId=99;allocation.sizeBytes=4096;emit(JnGpuCatalogBatchKind::Allocation,allocation);
+    JnGpuCatalogViewRecordV1 view{};view.time=300;view.pointerToken=777;view.viewId=11;emit(JnGpuCatalogBatchKind::View,view);view.pointerToken=888;view.viewId=12;emit(JnGpuCatalogBatchKind::View,view);
+    JnGpuCatalogLogicalRecordV1 logical{};logical.time=300;logical.pointerToken=777;logical.logicalResourceId=21;logical.lengthBytes=128;emit(JnGpuCatalogBatchKind::Logical,logical);
+    JnGpuCatalogPartRecordV1 part{};part.time=310;part.partId=31;part.resourceId=1;part.lengthBytes=64;emit(JnGpuCatalogBatchKind::Part,part);
+    JnGpuCatalogVgRecordV1 vg{};vg.time=300;vg.pointerToken=777;vg.runtimeResourceId=41;emit(JnGpuCatalogBatchKind::VirtualGeometry,vg);
+    JnGpuCatalogRelationRecordV1 relation{};relation.time=300;relation.sourceId=777;relation.targetId=missingCore?888:777;relation.flags=3;relation.relation=uint8_t(JnGpuCatalogRelationKind::BackedBy);emit(JnGpuCatalogBatchKind::Relation,relation);
+    QueueJnGfxLink link{};link.time=500;link.sourceId=701;link.relation=uint8_t(JnGfxRelation::RangeEvidenceComplete);w.ProcessJnGfxLink(link);
+    JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;range.lengthBytes=64;emit(JnGpuCatalogBatchKind::RangeSet,range);
+    JnGpuDetailedEvidenceRecordV1 evidence{};evidence.time=300;evidence.sourceId=777;evidence.targetId=9000;evidence.flags=uint32_t(JnGpuDetailedEvidenceFlags::SourceResourcePointer)|uint32_t(JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer);emit(JnGpuCatalogBatchKind::DetailedEvidence,evidence);
+    std::array<uint8_t,sizeof(JnGpuCatalogStringRecordHeaderV1)+4> string{};JnGpuCatalogStringRecordHeaderV1 header{};header.stringId=3;header.originalLength=4;header.byteLength=4;std::memcpy(string.data()+sizeof(header),"name",4);header.hash=1;std::memcpy(string.data(),&header,sizeof(header));
+    const auto before=w.CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings);Check(!ProtocolBatch(w,sequence,JnGpuCatalogBatchKind::String,string.data(),uint32_t(string.size()),0,1));Check(w.CatalogSize(OfflineCatalogDomain::CatalogString,data.gpuCatalogStrings)==before);
+    header.hash=JnGpuCatalogChecksum64("name",4);std::memcpy(string.data(),&header,sizeof(header));Check(ProtocolBatch(w,sequence++,JnGpuCatalogBatchKind::String,string.data(),uint32_t(string.size()),0,1));
+    control.time=1200;control.sequence=sequence;control.kind=uint8_t(JnGpuCatalogControlKind::GenerationEnd);control.state=uint8_t(JnGpuCatalogGenerationState::Complete);Check(w.ValidateJnGpuCatalogControl(control,true,error));
+ }
+ static void ProtocolCatalog(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources,bool missingCore){
+    std::filesystem::create_directories(root);conversion::OfflineConversionStorage store(root/"store",std::string(64,'b'),resources);
+    std::unique_ptr<FileRead> first(FileRead::Open(input)),second(FileRead::Open(input));Worker memory(*first,EventType::All,false),disk(*second,EventType::All,false);
+    for(uint64_t i=1;i<disk.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&disk.m_data.zoneExtra[i]);disk.m_offlineStorage=&store;
+    FillProtocolCatalog(memory,missingCore);FillProtocolCatalog(disk,missingCore);store.Seal();disk.FinalizeOfflineCatalog();
+    {std::unique_ptr<FileWrite> file(FileWrite::Open(root/"out.tracy",FileCompression::Zstd,1,1));disk.Write(*file,false);file->Finish();}
+    std::unique_ptr<FileRead> out(FileRead::Open(root/"out.tracy"));Worker read(*out,EventType::All,false);CompareCatalog(memory,read);
+    Check(read.m_data.jnTrace.gpuCatalogValid==!missingCore);Check(read.m_data.jnTrace.gpuCatalogViews[0].resourceId==1&&read.m_data.jnTrace.gpuCatalogViews[1].resourceId==0);
+    Check(read.m_data.jnTrace.gpuDetailedEvidence[0].sourceId==1&&read.m_data.jnTrace.gpuDetailedEvidence[0].targetId==0xD000000000000001ull);
+    {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(root/"out.tracy"));Worker streamed(*file,EventType::All,false,false,&sink);sink.Finish();Check(streamed.m_data.jnTrace.gpuCatalogResources.empty());}
+    disk.m_offlineStorage=nullptr;memory.m_mode=Worker::Mode::Full;disk.m_mode=Worker::Mode::Full;
+ }
+ static void CompareCatalog(Worker& expected,Worker& actual){
+    expected.FinalizeJnGpuCatalogForSave();const auto& a=expected.m_data.jnTrace;const auto& b=actual.m_data.jnTrace;
+    Check(a.gpuCatalogPresent==b.gpuCatalogPresent&&a.gpuCatalogValid==b.gpuCatalogValid);
+#define X(name,field,type,mut) Check(a.field.size()==b.field.size());if(!a.field.empty())Check(std::memcmp(a.field.data(),b.field.data(),a.field.size()*sizeof(type))==0);
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    Check(a.gpuCatalogStrings.size()==b.gpuCatalogStrings.size());for(size_t i=0;i<a.gpuCatalogStrings.size();++i){const auto& x=a.gpuCatalogStrings[i];const auto& y=b.gpuCatalogStrings[i];Check(x.generation==y.generation&&std::memcmp(&x.header,&y.header,sizeof(x.header))==0&&x.value==y.value);}
+ }
+ static void PassLifetimeResolution(const char* input,const std::filesystem::path& root,storage::ConversionResources& budget,bool disk){
+    std::unique_ptr<FileRead> file(FileRead::Open(input));Worker w(*file,EventType::All,false);auto& data=w.m_data.jnTrace;
+#define X(name,field,type,mut) data.field.clear();
+    TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+    data.gpuCatalogStrings.clear();data.gfxLinks.clear();data.gfxEntities.clear();data.gpuReferencePasses.clear();
+    std::unique_ptr<conversion::OfflineConversionStorage> store;if(disk){store=std::make_unique<conversion::OfflineConversionStorage>(root,std::string(64,'f'),budget);w.m_offlineStorage=store.get();}
+    w.AppendOfflineRecord(OfflineAppendDomain::GfxLink,JnGfxLinkData{375,701,0,0,uint8_t(JnGfxRelation::RangeEvidenceComplete),0},data.gfxLinks);
     for(uint64_t generation:{11ull,12ull}){
-        for(unsigned i=0;i<4;++i){JnGpuCatalogResourceRecordV1 record{};record.resourceId=i<2?1:2;record.pointerToken=777;record.time=i==0?300:i==1?400:i==2?410:500;record.operation=uint8_t(i%2?JnGpuCatalogRecordOperation::Destroy:JnGpuCatalogRecordOperation::Create);data.gpuCatalogResources.push_back(record);}
-        JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;data.gpuRangeSets.push_back(range);
-        JnGpuCatalogBatchData batch{};batch.generation=generation;batch.valid=1;batch.kind=uint8_t(JnGpuCatalogBatchKind::Resource);batch.recordCount=4;data.gpuCatalogBatches.push_back(batch);
-        batch.kind=uint8_t(JnGpuCatalogBatchKind::RangeSet);batch.recordCount=1;data.gpuCatalogBatches.push_back(batch);
-        const auto result=w.ResolveJnGpuCatalogGeneration(generation,Worker::JnGpuCatalogResolveReason::FinalizeSave);
-        Check(result.totalUnresolved==0&&data.gpuRangeSets[0].resourceId==1&&data.gpuRangeSets[0].pointerToken==0);
-        data.gpuCatalogResources.clear();data.gpuRangeSets.clear();data.gpuCatalogBatches.clear();
+        const auto first=w.CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);
+        for(unsigned i=0;i<4;++i){JnGpuCatalogResourceRecordV1 record{};record.resourceId=i<2?1:2;record.pointerToken=777;record.time=i==0?300:i==1?400:i==2?410:500;record.operation=uint8_t(i%2?JnGpuCatalogRecordOperation::Destroy:JnGpuCatalogRecordOperation::Create);w.AppendCatalogValue(OfflineCatalogDomain::CatalogResource,record,data.gpuCatalogResources);}
+        JnGpuRangeSetRecordV1 range{};range.passInstanceId=701;range.pointerToken=777;const auto rangeId=w.AppendCatalogValue(OfflineCatalogDomain::CatalogRangeSet,range,data.gpuRangeSets);
+        JnGpuCatalogBatchData batch{};batch.generation=generation;batch.valid=1;batch.kind=uint8_t(JnGpuCatalogBatchKind::Resource);batch.recordCount=4;batch.firstRecordIndex=first;w.AppendCatalogValue(OfflineCatalogDomain::CatalogBatch,batch,data.gpuCatalogBatches);
+        batch.kind=uint8_t(JnGpuCatalogBatchKind::RangeSet);batch.recordCount=1;batch.firstRecordIndex=rangeId;w.AppendCatalogValue(OfflineCatalogDomain::CatalogBatch,batch,data.gpuCatalogBatches);
     }
-    data.gpuCatalogResources=std::move(resources);data.gpuRangeSets=std::move(ranges);data.gpuCatalogBatches=std::move(batches);
+    if(store)store->Seal();
+    for(uint64_t generation:{11ull,12ull}){const auto result=w.ResolveJnGpuCatalogGeneration(generation,Worker::JnGpuCatalogResolveReason::FinalizeSave);const auto range=w.CatalogValue(OfflineCatalogDomain::CatalogRangeSet,generation-11,data.gpuRangeSets);Check(result.totalUnresolved==0&&range.resourceId==1&&range.pointerToken==0);}
+    w.m_offlineStorage=nullptr;
  }
  static void PersistentStrings(const char* input,const std::filesystem::path& output){
     std::unique_ptr<FileRead> in(FileRead::Open(input));Worker w(*in,EventType::All,false);
@@ -66,6 +121,12 @@ struct OfflineStorageSemanticTest {
     // Replay's normal backend owns a growable vector; reproduce that here.
     if(!storage){Vector<ZoneExtra> growing;for(const auto& row:w.m_data.zoneExtra)growing.push_back(row);w.m_data.zoneExtra=std::move(growing);}
     if(storage)for(uint64_t i=1;i<w.m_data.zoneExtra.size();++i)Check(storage->AppendZoneExtra(&w.m_data.zoneExtra[i])==i);
+    if(storage){
+#define X(name,field,type,mut) for(const auto& row:w.m_data.jnTrace.field)storage->AppendCatalog(OfflineCatalogDomain::name,&row,sizeof(row));w.m_data.jnTrace.field.clear();w.m_data.jnTrace.field.shrink_to_fit();
+        TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+        for(const auto& value:w.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;Check(value.value.size()<=256);std::memcpy(row.bytes.data(),value.value.data(),value.value.size());storage->AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}w.m_data.jnTrace.gpuCatalogStrings.clear();w.m_data.jnTrace.gpuCatalogStrings.shrink_to_fit();
+    }
     w.m_offlineStorage=storage;w.m_threadCtx=901;w.m_timerMul=0.5;w.m_data.baseTime=100;
 #define X(name,field,type) w.m_data.jnTrace.field.clear(); {type row{};w.AppendOfflineRecord(OfflineAppendDomain::name,row,w.m_data.jnTrace.field);w.AppendOfflineRecord(OfflineAppendDomain::name,row,w.m_data.jnTrace.field);}
     TRACY_OFFLINE_APPEND_DOMAINS(X)
@@ -119,6 +180,7 @@ int main(int argc,char** argv) {
  storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
  auto root=std::filesystem::path(argv[2]);std::filesystem::create_directories(root);
+ OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-valid",resources,false);OfflineStorageSemanticTest::ProtocolCatalog(argv[1],root/"protocol-core-gap",resources,true);
  OfflineStorageSemanticTest::PersistentStrings(argv[1],root/"persistent-strings.tracy");
  conversion::OfflineConversionStorage store(root/"store",std::string(64,'d'),resources);
  std::unique_ptr<FileRead> oldFile(FileRead::Open(argv[1])),newFile(FileRead::Open(argv[1]));
@@ -130,7 +192,7 @@ int main(int argc,char** argv) {
  Check(store.LookupPassTime(701)==375); // (850 - baseTime 100) * 0.5; last completion overrides other sources
  Check(!store.LookupPassTime(0));
  Check(store.LookupPassTime(1ull<<40)==-25);Check(!store.LookupPassTime(42));
- OfflineStorageSemanticTest::PassLifetimeResolution(oldWorker);OfflineStorageSemanticTest::PassLifetimeResolution(newWorker);
+ OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"memory-lifetime",resources,false);OfflineStorageSemanticTest::PassLifetimeResolution(argv[1],root/"disk-lifetime",resources,true);
  OfflineStorageSemanticTest::CompareExtras(oldWorker,store);
 #define X(name,field,type) {uint64_t seen=0;Check(newWorker.GetJnTraceData().field.empty());store.VisitRecords(OfflineAppendDomain::name,[&](const void* rows,uint64_t n){Check(std::memcmp(rows,oldWorker.GetJnTraceData().field.data()+seen,size_t(n)*sizeof(type))==0);seen+=n;});Check(seen==oldWorker.GetJnTraceData().field.size());}
  TRACY_OFFLINE_APPEND_DOMAINS(X)
@@ -144,8 +206,12 @@ int main(int argc,char** argv) {
  Check(seen==131072);seen=0;
  store.VisitJobStages([&](const JnJobStageData* p,uint64_t n){Check(std::memcmp(p,oldWorker.GetJnTraceData().jobStages.data()+seen,size_t(n)*sizeof(*p))==0);seen+=n;});Check(seen==3);
  const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> file(FileWrite::Open(output,FileCompression::Zstd,1,1));newWorker.Write(*file,false);file->Finish();}
- {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false,false,&sink);sink.Finish();Check(reopened.GetZoneExtraCount()==0);Check(reopened.GetJnTraceData().relations.empty());Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());}
- {std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false);Check(reopened.GetJnTraceData().jobStages.size()==3&&reopened.GetJnTraceData().gpuReferenceUses.size()==131072);Check(reopened.GetJnTraceData().relations.size()==130002);Check(std::memcmp(reopened.GetJnTraceData().relations.data(),oldWorker.GetJnTraceData().relations.data(),130002*sizeof(JnRelationData))==0);}
+ {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false,false,&sink);sink.Finish();Check(reopened.GetZoneExtraCount()==0);Check(reopened.GetJnTraceData().relations.empty());Check(reopened.GetJnTraceData().gpuReferenceUses.empty()&&reopened.GetJnTraceData().jobStages.empty());
+#define X(name,field,type,mut) Check(reopened.GetJnTraceData().field.empty());
+ TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+ Check(reopened.GetJnTraceData().gpuCatalogStrings.empty());}
+ {std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false);Check(reopened.GetJnTraceData().jobStages.size()==3&&reopened.GetJnTraceData().gpuReferenceUses.size()==131072);Check(reopened.GetJnTraceData().relations.size()==130002);Check(std::memcmp(reopened.GetJnTraceData().relations.data(),oldWorker.GetJnTraceData().relations.data(),130002*sizeof(JnRelationData))==0);OfflineStorageSemanticTest::CompareCatalog(oldWorker,reopened);}
  {conversion::OfflineValidationSink sink(store,resources);Refuses([&]{sink.ZoneExtrasBegin(store.ZoneExtraCount()+1);});}
  {conversion::OfflineValidationSink sink(store,resources);sink.ZoneExtrasBegin(store.ZoneExtraCount());Refuses([&]{sink.ZoneExtrasEnd();});Refuses([&]{sink.ValidateZoneExtraIndex(uint32_t(store.ZoneExtraCount()));});}
  std::puts("Worker Full/disk fields, order, maximum set, callstack and reopen passed");

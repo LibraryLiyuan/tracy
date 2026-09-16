@@ -4,6 +4,7 @@
 #include <atomic>
 #include <array>
 #include <condition_variable>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <shared_mutex>
@@ -91,11 +92,21 @@ public:
 #define X(name,field,type) name,
         TRACY_OFFLINE_BASE_APPEND_DOMAINS(X)
 #undef X
+#define X(name,field,type,mut) name,
+        TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
     };
     // Query index section ordinals are stable even as offline storage domains grow.
     static_assert(uint8_t(JnDomain::GfxEntity)==1&&uint8_t(JnDomain::GfxLink)==2&&uint8_t(JnDomain::GpuReferencePass)==4&&uint8_t(JnDomain::GpuReferenceEnd)==6);
 
     virtual ~SerializedZoneSink() = default;
+    virtual bool ValidatesCatalog()const{return false;}
+    virtual void CatalogMetadata(OfflineCatalogQuality){}
+    virtual bool WantsCatalogStrings()const{return false;}
+    virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
+    virtual void CatalogStringsBegin(uint64_t){}
+    virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
+    virtual void CatalogStringsEnd(){}
     virtual bool WantsZoneExtras() const { return false; }
     virtual void ZoneExtrasRawBlock(uint64_t,const void*,uint64_t) {}
     virtual void ValidateZoneExtraIndex(uint32_t) {}
@@ -844,6 +855,7 @@ public:
     const JnGpuCatalogResolveStats& GetJnGpuCatalogResolveStats() const { return m_jnGpuCatalogResolveStats; }
 
     void Write( FileWrite& f, bool fiDict );
+    void FinalizeOfflineCatalog(){if(m_offlineStorage)FinalizeJnGpuCatalogForSave();}
     int GetTraceVersion() const { return m_traceVersion; }
     int64_t GetLegacyQueueDelay() const { return m_legacyQueueDelay; }
     uint8_t GetHandshakeStatus() const { return m_handshake.load( std::memory_order_relaxed ); }
@@ -1271,9 +1283,20 @@ private:
     Socket m_sock;
     WorkerOfflineTransport* m_offlineTransport = nullptr;
     WorkerOfflineStorage* m_offlineStorage = nullptr;
+    bool m_offlineCatalogFinalized=false;
     template<class T> void AppendOfflineRecord(OfflineAppendDomain domain,const T& row,std::vector<T>& memory){
         if(m_offlineStorage)m_offlineStorage->AppendRecord(domain,&row,sizeof(T));else memory.push_back(row);
     }
+    template<class T> uint64_t CatalogSize(OfflineCatalogDomain domain,const std::vector<T>& memory)const{return m_offlineStorage?m_offlineStorage->CatalogCount(domain):memory.size();}
+    template<class T> T CatalogValue(OfflineCatalogDomain domain,uint64_t id,const std::vector<T>& memory)const{T row;if(m_offlineStorage)m_offlineStorage->ReadCatalog(domain,id,&row,sizeof(row));else row=memory.at(size_t(id));return row;}
+    template<class T> uint64_t AppendCatalogValue(OfflineCatalogDomain domain,const T& row,std::vector<T>& memory){if(m_offlineStorage)return m_offlineStorage->AppendCatalog(domain,&row,sizeof(row));const auto id=memory.size();memory.push_back(row);return id;}
+    template<class T> void PutCatalogValue(OfflineCatalogDomain domain,uint64_t id,const T& row,std::vector<T>& memory){if(m_offlineStorage)m_offlineStorage->PutCatalog(domain,id,&row,sizeof(row));else memory.at(size_t(id))=row;}
+    template<class T,class F> void ForCatalogRows(OfflineCatalogDomain domain,std::vector<T>& memory,uint64_t first,uint64_t count,F&& action,bool update=false){
+        const auto size=CatalogSize(domain,memory);if(first>size||count>size-first)throw std::runtime_error("catalog_record_range");
+        for(uint64_t i=first;i<first+count;++i){if(m_offlineStorage){T row=CatalogValue(domain,i,memory);const T before=row;action(row);if(update&&std::memcmp(&row,&before,sizeof(row)))PutCatalogValue(domain,i,row,memory);}else action(memory[size_t(i)]);}
+    }
+    template<class T> uint64_t AppendCatalogPayload(OfflineCatalogDomain,const uint8_t*,uint32_t,std::vector<T>&);
+    JnGpuCatalogStringData CatalogStringValue(uint64_t)const;
 
 
     std::string m_addr;

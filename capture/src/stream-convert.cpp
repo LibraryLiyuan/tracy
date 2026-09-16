@@ -431,6 +431,7 @@ enum class ProgressStage : uint8_t
 {
     Scan,
     DecodeBuild,
+    Finalize,
     Write,
     Validate,
     Publish,
@@ -445,6 +446,7 @@ const char* ProgressStageName( ProgressStage stage )
     {
     case ProgressStage::Scan: return "Scan";
     case ProgressStage::DecodeBuild: return "DecodeBuild";
+    case ProgressStage::Finalize: return "Finalize";
     case ProgressStage::Write: return "Write";
     case ProgressStage::Validate: return "Validate";
     case ProgressStage::Publish: return "Publish";
@@ -1611,6 +1613,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
         if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';}
+        if(diskStorage){out<<",\"catalog_records\":{";for(size_t i=0;i<tracy::OfflineCatalogDomainCount;++i){if(i)out<<',';out<<'"'<<tracy::OfflineCatalogDescriptors[i].name<<"\":"<<diskStorage->CatalogCount(tracy::OfflineCatalogDomain(i));}out<<"},\"catalog_sealed\":"<<(diskStorage->CatalogSealed()?"true":"false")<<",\"descriptor_heap_ids\":"<<diskStorage->DescriptorHeapCount();if(diskStorage->CatalogSealed()){const auto quality=diskStorage->CatalogQuality();out<<",\"catalog_quality\":{\"present\":"<<quality[0]<<",\"valid\":"<<quality[1]<<",\"schema\":"<<quality[2]<<",\"evidence_schema\":"<<quality[3]<<'}';}}
         out<<'}';conversionEvidence=out.str();
     }};
 
@@ -2151,7 +2154,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     const auto replaySeconds = ElapsedSeconds( replayStart );
     CheckConversion();
     SetConversionStage("Finalize");
-    if(diskStorage)diskStorage->Seal();
+    if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");diskStorage->Seal();worker.FinalizeOfflineCatalog();}
     const auto writeStart = std::chrono::steady_clock::now();
     auto temporaryOutput = options.output;
     temporaryOutput += ".converting";
@@ -2230,7 +2233,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(sink)sink->Finish();
         const auto& actual=validationWorker.GetJnTraceData();
         tracy::analysis::Sha256Builder actualHash;actualHash.Update(actual.gpuCatalogGenerations.data(),actual.gpuCatalogGenerations.size()*sizeof(tracy::JnGpuCatalogGenerationData));
-        if(actual.gpuCatalogValid!=expectedCatalogValid||actualHash.FinalHex()!=expectedQualityHash)throw std::runtime_error("conversion_validation_catalog_quality");
+        if(actual.gpuCatalogValid!=expectedCatalogValid||(!sink&&actualHash.FinalHex()!=expectedQualityHash))throw std::runtime_error("conversion_validation_catalog_quality");
         if( !validationWorker.HasData() )
         {
             std::fprintf( stderr, "Temporary snapshot validation produced no data.\n" );

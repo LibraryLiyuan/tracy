@@ -4,7 +4,11 @@
 using namespace tracy;
 static void Check(bool v){if(!v)throw std::runtime_error("relation storage invariant");}
 template<class F> static void Refuses(F f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
-static void Zones(conversion::OfflineValidationSink& sink){ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();}
+static void Zones(conversion::OfflineValidationSink& sink){ZoneExtra zero{};sink.ZoneExtrasBegin(1);sink.ZoneExtrasRawBlock(0,&zero,1);sink.ZoneExtrasEnd();sink.CatalogMetadata({});
+#define X(name,field,type,mut) sink.JnRecordsBegin(SerializedZoneSink::JnDomain::name,0,sizeof(type));sink.JnRecordsEnd(SerializedZoneSink::JnDomain::name);
+ TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+ sink.CatalogStringsBegin(0);sink.CatalogStringsEnd();}
 int main(int argc,char** argv){try{
  StringIdx largest(0xFFFFFE);Check(largest.Active()&&largest.Idx()==0xFFFFFE);
  Check(StringIdx(0xFFFFFF).Idx()==0xFFFFFF);
@@ -21,7 +25,7 @@ int main(int argc,char** argv){try{
  for(size_t i=0;i<OfflineAppendDomainCount;++i){auto domain=OfflineAppendDomain(i);uint64_t seen=0;generic.VisitRecords(domain,[&](const void* p,uint64_t n){auto bytes=static_cast<const char*>(p);for(uint64_t j=0;j<n*OfflineAppendInfo(domain).width;++j)Check(bytes[j]==char(i+1));seen+=n;});Check(seen==3);}
  }
  {
- conversion::OfflineConversionStorage empty(root/"empty",identity,resources);empty.Seal();
+ conversion::OfflineConversionStorage empty(root/"empty",identity,resources);empty.Seal();empty.SealCatalog({});
  Check(empty.RelationCount()==0&&!std::filesystem::exists(root/"empty/relations"));
  conversion::OfflineValidationSink sink(empty,resources);Zones(sink);sink.Finish();
  conversion::OfflineValidationSink begun(empty,resources);Zones(begun);begun.JnRecordsBegin(Domain::Relation,0,37);Refuses([&]{begun.Finish();});begun.JnRecordsEnd(Domain::Relation);begun.Finish();
@@ -30,7 +34,7 @@ int main(int argc,char** argv){try{
  conversion::OfflineConversionStorage store(root/"rows",identity,resources);
  JnRelationData rows[3]={{10,1,2,3,4,5,6,7,8},{10,1,2,3,4,5,6,7,8},{-11,9,10,11,255,254,253,252,251}};
  for(const auto& row:rows)store.AppendRelation(row);Check(store.RelationCount()==3);
- Refuses([&]{store.RelationHash();});store.Seal();Refuses([&]{store.AppendRelation(rows[0]);});
+ Refuses([&]{store.RelationHash();});store.Seal();store.SealCatalog({});Refuses([&]{store.AppendRelation(rows[0]);});
  {conversion::OfflineValidationSink sink(store,resources);Zones(sink);Refuses([&]{sink.Finish();});sink.JnRecordsBegin(Domain::Relation,3,37);sink.JnRecordsBlock(Domain::Relation,0,rows,3,37);sink.JnRecordsEnd(Domain::Relation);sink.Finish();Refuses([&]{sink.JnRecordsEnd(Domain::Relation);});}
  {conversion::OfflineValidationSink sink(store,resources);Check(!sink.AllowsLargeJnRecords(Domain::Relation,100000001,37));Refuses([&]{sink.JnRecordsBegin(Domain::Relation,4,37);});Refuses([&]{sink.JnRecordsBegin(Domain::Relation,3,38);});sink.JnRecordsBegin(Domain::Relation,3,37);Refuses([&]{sink.JnRecordsBlock(Domain::Relation,1,rows,1,37);});Refuses([&]{sink.JnRecordsEnd(Domain::Relation);});}
  {conversion::OfflineValidationSink sink(store,resources);sink.JnRecordsBegin(Domain::Relation,3,37);rows[2].flags^=1;sink.JnRecordsBlock(Domain::Relation,0,rows,3,37);Refuses([&]{sink.JnRecordsEnd(Domain::Relation);});}

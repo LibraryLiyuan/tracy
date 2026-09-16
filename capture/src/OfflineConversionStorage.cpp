@@ -26,7 +26,7 @@ OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,st
 void OfflineConversionStorage::Check()
 {
     m_resources.CheckFast();
-    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();m_reclaimed=true;}
+    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();if(m_descriptorHeaps)m_descriptorHeaps->ReduceCache();for(auto& table:m_catalogTables)if(table)table->ReduceCache();m_reclaimed=true;}
     if(!m_resources.SoftTargetExceeded())m_reclaimed=false;
 }
 bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,size_t bytes)
@@ -61,6 +61,7 @@ void OfflineConversionStorage::AppendJobStage(const JnJobStageData& row)
 void OfflineConversionStorage::Seal()
 {
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
+    for(auto& table:m_catalogTables)if(table)table->FreezeAppend();
     m_jobHash=analysis::Sha256Builder().FinalHex();m_useHash=m_jobHash;
     m_relationHash=m_jobHash;
     for(auto& table:m_appendTables){
@@ -119,6 +120,40 @@ void OfflineConversionStorage::AddResourceInterval(const JnGpuCatalogResourceRec
 void OfflineConversionStorage::SealResourceIntervals(){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");m_resourceIntervals->Seal();}
 uint64_t OfflineConversionStorage::ResolveResource(uint64_t pointer,int64_t time){Check();if(!m_resourceIntervals)throw std::runtime_error("resource_interval_missing");return m_resourceIntervals->Resolve(pointer,time);}
 void OfflineConversionStorage::EndResourceIntervals() noexcept {if(m_resourceIntervals){m_intervalPeaks[0]=std::max(m_intervalPeaks[0],m_resourceIntervals->Count());m_intervalPeaks[1]=std::max(m_intervalPeaks[1],m_resourceIntervals->PointerCount());m_intervalPeaks[2]=std::max(m_intervalPeaks[2],m_resourceIntervals->LogicalBytes());m_resourceIntervals.reset();}}
+uint64_t OfflineConversionStorage::AppendCatalog(OfflineCatalogDomain domain,const void* row,uint32_t width)
+{
+    Check();const auto& info=OfflineCatalogInfo(domain);if(m_sealed||!row||width!=info.width)throw std::runtime_error("offline_catalog_append_state");
+    auto& table=m_catalogTables[size_t(domain)];if(!table)table=std::make_unique<storage::BoundedRecordTable>(m_root/(std::string(info.name)+".catalog"),m_identity,width,info.mutableRows,m_resources);return table->Append(row);
+}
+uint64_t OfflineConversionStorage::CatalogCount(OfflineCatalogDomain domain)const{OfflineCatalogInfo(domain);const auto& table=m_catalogTables[size_t(domain)];return table?table->Count():0;}
+void OfflineConversionStorage::ReadCatalog(OfflineCatalogDomain domain,uint64_t id,void* row,uint32_t width){Check();if(width!=OfflineCatalogInfo(domain).width||!row||id>=CatalogCount(domain))throw std::runtime_error("offline_catalog_read_range");m_catalogTables[size_t(domain)]->Read(id,row);}
+void OfflineConversionStorage::PutCatalog(OfflineCatalogDomain domain,uint64_t id,const void* row,uint32_t width){Check();if(m_catalogSealed||width!=OfflineCatalogInfo(domain).width||!row||id>=CatalogCount(domain))throw std::runtime_error("offline_catalog_update_range");m_catalogTables[size_t(domain)]->Put(id,row);}
+void OfflineConversionStorage::SealCatalog(OfflineCatalogQuality quality)
+{
+    Check();if(!m_sealed||m_catalogSealed)throw std::runtime_error("offline_catalog_seal_state");
+    if(m_descriptorHeaps)m_descriptorHeaps->Seal();
+    if(quality[0]>1||quality[1]>1)throw std::runtime_error("offline_catalog_quality");
+    if(!quality[0]){if(quality[1])throw std::runtime_error("offline_catalog_presence_mismatch");for(const auto& table:m_catalogTables)if(table&&table->Count())throw std::runtime_error("offline_catalog_presence_mismatch");}
+    for(size_t id=0;id<OfflineCatalogDomainCount;++id){analysis::Sha256Builder hash;auto& table=m_catalogTables[id];
+        if(table){table->Seal();table->Visit([&](const void* bytes,uint64_t count){
+            if(id!=size_t(OfflineCatalogDomain::CatalogString)){hash.Update(bytes,size_t(count)*OfflineCatalogDescriptors[id].width);return;}
+            for(uint64_t i=0;i<count;++i){OfflineCatalogString row;std::memcpy(&row,static_cast<const unsigned char*>(bytes)+i*sizeof(row),sizeof(row));if(row.header.byteLength>256)throw std::runtime_error("offline_catalog_string_length");hash.Update(&row.generation,sizeof(row.generation));hash.Update(&row.header,sizeof(row.header));hash.Update(row.bytes.data(),row.header.byteLength);}
+        });}
+        m_catalogHashes[id]=hash.FinalHex();
+    }
+    m_catalogQuality=quality;m_catalogSealed=true;
+}
+void OfflineConversionStorage::VisitCatalog(OfflineCatalogDomain domain,const std::function<void(const void*,uint64_t)>& visitor){Check();OfflineCatalogInfo(domain);if(!m_catalogSealed)throw std::runtime_error("offline_catalog_not_sealed");auto& table=m_catalogTables[size_t(domain)];if(table)table->Visit(visitor);}
+std::string OfflineConversionStorage::CatalogHash(OfflineCatalogDomain domain)const{OfflineCatalogInfo(domain);if(!m_catalogSealed)throw std::runtime_error("offline_catalog_not_sealed");return m_catalogHashes[size_t(domain)];}
+OfflineCatalogQuality OfflineConversionStorage::CatalogQuality()const{if(!m_catalogSealed)throw std::runtime_error("offline_catalog_not_sealed");return m_catalogQuality;}
+uint64_t OfflineConversionStorage::AnonymizeDescriptor(uint64_t token)
+{
+    Check();if(!m_sealed||m_catalogSealed)throw std::runtime_error("descriptor_index_state");
+    if(!m_descriptorHeaps)m_descriptorHeaps=std::make_unique<storage::DiskIndex64>(m_root/"descriptor-heaps.index",m_identity,m_resources,m_resources.SoftTargetExceeded()?(4ull<<20):(8ull<<20));
+    if(const auto existing=m_descriptorHeaps->Find(token))return *existing;
+    if(m_nextDescriptorHeap>0x0FFFFFFFFFFFFFFFull)throw std::runtime_error("descriptor_id_overflow");
+    const auto id=0xD000000000000000ull|m_nextDescriptorHeap;m_descriptorHeaps->Upsert(token,id);++m_nextDescriptorHeap;return id;
+}
 void OfflineConversionStorage::AppendRecord(OfflineAppendDomain domain,const void* row,uint32_t width)
 {
     Check();const auto& info=OfflineAppendInfo(domain);auto& table=m_appendTables[size_t(domain)];
