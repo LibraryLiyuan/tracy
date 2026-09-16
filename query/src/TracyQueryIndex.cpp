@@ -395,7 +395,7 @@ public:
     bool WantsJnRecords( JnDomain domain, uint32_t recordBytes ) const override
     {
         // Job consumers still read the compact Worker's in-memory stages.
-        if(domain==JnDomain::JobStage)return false;
+        if(domain==JnDomain::JobStage||size_t(domain)>=JnDomainCount)return false;
         return recordBytes == JnRecordBytes( domain );
     }
     void JnRecordsBegin( JnDomain domain, uint64_t count, uint32_t recordBytes ) override

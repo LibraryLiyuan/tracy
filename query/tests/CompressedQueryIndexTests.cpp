@@ -1,4 +1,5 @@
 #include "TracyQueryIndex.hpp"
+#include "../../analysis/TracyWorkerTraceSource.hpp"
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -12,6 +13,8 @@ int main(int argc,char** argv)
         std::filesystem::create_directories(root);
         const auto input=root/"fixture.tracy";
         std::filesystem::copy_file(argv[1],input);
+        auto full=tracy::analysis::WorkerTraceSource::Open(input);
+        const auto originalCounts=full->GetTraceInfo().counts;full.reset();
         const auto manifest=tracy::query::QueryIndex::Build(input);
         const auto validation=tracy::query::QueryIndex::Validate(input,true);
         if(!validation.manifest) throw std::runtime_error(validation.reason);
@@ -20,6 +23,8 @@ int main(int argc,char** argv)
         auto source=tracy::query::QueryIndex::Open(manifest);
         const auto info=source->GetTraceInfo();
         if(info.counts.cpuZones!=manifest.cpuZones.count) throw std::runtime_error("indexed count changed");
+        if(info.counts.jobStages!=originalCounts.jobStages || info.counts.gfxLinks!=originalCounts.gfxLinks || info.counts.gpuReferencePasses!=originalCounts.gpuReferencePasses)
+            throw std::runtime_error("indexed reader lost JN facts or changed stable domain ordinals");
         tracy::analysis::ScanRange range; range.limit=10;
         const auto zones=source->ScanCpuZones(range);
         if(zones.empty()) throw std::runtime_error("compressed indexed trace lost its zones");
