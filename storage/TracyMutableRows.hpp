@@ -7,6 +7,7 @@
 #include <array>
 #include <cstring>
 #include <fstream>
+#include <list>
 #include <map>
 namespace tracy::storage {
 // Fixed-width mutable temporary rows. Callers retain logical IDs, never cache pointers.
@@ -15,13 +16,16 @@ class MutableRows {
     struct Header {uint64_t magic=0x3153574f524e4aull;uint32_t schema=1,width=0;uint64_t id=0,rows=0;char checksum[64]{};char reserved[32]{};};
     static_assert(sizeof(Header)==HeaderBytes);
     struct Slot {
-        analysis::AnalysisWorkspaceReservation lease;std::array<unsigned char,PageBytes> bytes{};uint64_t touched=0;bool dirty=false;
+        analysis::AnalysisWorkspaceReservation lease;std::array<unsigned char,PageBytes> bytes{};std::list<uint64_t>::iterator lru;bool dirty=false;
         explicit Slot(ConversionResources& r):lease(r.Workspace(),PageCharge){}
     };
     static constexpr uint64_t PageCharge=sizeof(Slot)+256;
     std::filesystem::path m_path;ConversionResources& m_resources;analysis::AnalysisWorkspaceReservation m_fixedWork;std::fstream m_file;
-    std::map<uint64_t,std::unique_ptr<Slot>> m_cache;
-    uint64_t m_limit,m_count=0,m_pages=0,m_writtenPages=0,m_clock=0,m_rows;uint32_t m_width;
+public:
+    struct Stats {uint64_t pageLoads=0,pageWrites=0,evictions=0,evictionCandidates=0;};
+private:
+    std::map<uint64_t,std::unique_ptr<Slot>> m_cache;std::list<uint64_t> m_lru;
+    uint64_t m_limit,m_count=0,m_pages=0,m_writtenPages=0,m_rows;uint32_t m_width;Stats m_stats{};
     bool m_registered=false;
     bool m_frozen=false,m_sealed=false,m_failed=false,m_visiting=false;
     static void Require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
@@ -32,9 +36,9 @@ class MutableRows {
         if(!m_file.is_open())Require(!std::filesystem::exists(analysis::AnalysisIoPath(m_path)),"mutable_rows_exists");
         m_resources.BeforeFileGrowth(m_path,(id+1)*PageBytes);m_registered=true;m_writtenPages=std::max(m_writtenPages,id+1);
         if(!m_file.is_open()){m_file.open(analysis::AnalysisIoPath(m_path),std::ios::in|std::ios::out|std::ios::binary|std::ios::trunc);Require(bool(m_file),"mutable_rows_open");}
-        m_file.clear();m_file.seekp(std::streamoff(id*PageBytes));m_file.write(reinterpret_cast<const char*>(slot.bytes.data()),PageBytes);Require(bool(m_file),"mutable_rows_write");slot.dirty=false;
+        m_file.clear();m_file.seekp(std::streamoff(id*PageBytes));m_file.write(reinterpret_cast<const char*>(slot.bytes.data()),PageBytes);Require(bool(m_file),"mutable_rows_write");slot.dirty=false;++m_stats.pageWrites;
     }
-    void Evict(){Require(!m_cache.empty(),"mutable_rows_cache");auto victim=std::min_element(m_cache.begin(),m_cache.end(),[](const auto& a,const auto& b){return a.second->touched<b.second->touched;});Flush(victim->first,*victim->second);m_cache.erase(victim);}
+    void Evict(){Require(!m_lru.empty(),"mutable_rows_cache");++m_stats.evictions;++m_stats.evictionCandidates;const auto id=m_lru.front();m_lru.pop_front();auto victim=m_cache.find(id);Require(victim!=m_cache.end(),"mutable_rows_lru");Flush(victim->first,*victim->second);m_cache.erase(victim);}
     Slot& Get(uint64_t id,bool create=false){
         Check();Require(!m_visiting,"mutable_rows_reentrant_access");Require(id<m_pages||(create&&id==m_pages),"mutable_rows_page_id");auto found=m_cache.find(id);
         if(found==m_cache.end()){
@@ -47,9 +51,9 @@ class MutableRows {
                 Header header;std::memcpy(&header,slot->bytes.data(),sizeof(header));Require(bool(m_file)&&header.magic==Header{}.magic&&header.schema==1&&header.width==m_width&&header.id==id&&header.rows==m_rows,"mutable_rows_header");
                 Require(Digest(*slot)==std::string(header.checksum,64),"mutable_rows_checksum");
             }
-            found=m_cache.emplace(id,std::move(slot)).first;
-        }
-        found->second->touched=++m_clock;return *found->second;
+            m_lru.push_back(id);slot->lru=std::prev(m_lru.end());found=m_cache.emplace(id,std::move(slot)).first;++m_stats.pageLoads;
+        }else{m_lru.splice(m_lru.end(),m_lru,found->second->lru);found->second->lru=std::prev(m_lru.end());}
+        return *found->second;
     }
     template<class F> decltype(auto) Guard(F&& action){try{return action();}catch(const std::exception& e){m_failed=true;m_resources.Fail(e.what());throw;}catch(...){m_failed=true;m_resources.Fail("mutable_rows_failure");throw;}}
 public:
@@ -62,7 +66,7 @@ public:
     void Read(uint64_t id,void* row){Check();Require(row&&id<m_count,"mutable_rows_index");Guard([&]{auto& slot=Get(id/m_rows);std::memcpy(row,slot.bytes.data()+HeaderBytes+(id%m_rows)*m_width,m_width);});}
     void Put(uint64_t id,const void* row){Check();Require(!m_sealed&&row&&id<m_count,"mutable_rows_update_state");Guard([&]{auto& slot=Get(id/m_rows);std::memcpy(slot.bytes.data()+HeaderBytes+(id%m_rows)*m_width,row,m_width);slot.dirty=true;});}
     void FreezeAppend(){Check();m_frozen=true;}
-    void ClearCache(){Check();Require(!m_visiting,"mutable_rows_reentrant_access");Guard([&]{for(auto& entry:m_cache)Flush(entry.first,*entry.second);if(m_file.is_open()){m_file.flush();Require(bool(m_file),"mutable_rows_flush");}m_cache.clear();});}
+    void ClearCache(){Check();Require(!m_visiting,"mutable_rows_reentrant_access");Guard([&]{for(auto& entry:m_cache)Flush(entry.first,*entry.second);if(m_file.is_open()){m_file.flush();Require(bool(m_file),"mutable_rows_flush");}m_cache.clear();m_lru.clear();});}
     void Seal(){Check();Require(!m_sealed,"mutable_rows_already_sealed");m_frozen=true;m_sealed=true;}
     void ReduceCache(){Check();Require(!m_visiting,"mutable_rows_reentrant_access");m_limit=std::min<uint64_t>(m_limit,4*PageCharge);while(m_cache.size()*PageCharge>m_limit)Evict();}
     template<class F> void Visit(F&& visitor){
@@ -72,6 +76,7 @@ public:
     uint64_t LogicalBytes()const{return m_writtenPages*PageBytes;}
     bool HasDiskFile()const{return m_registered;}
     uint32_t Width()const{return m_width;}
+    Stats Statistics()const{return m_stats;}
 };
 }
 #endif

@@ -17,6 +17,10 @@ int main(int argc,char** argv){try{
  for(uint64_t i=0;i<5000;++i)index.Upsert((i<<40)+3,i*7);
  for(uint64_t i=5000;i>0;--i)index.Upsert(((i-1)<<40)+3,5000-i);
  index.Upsert(UINT64_MAX,UINT64_MAX);index.Upsert(0,42);index.Seal();
+ const auto statistics=index.Statistics();
+ Check(statistics.upserts==10002&&statistics.evictions>0);
+ Check(statistics.evictionCandidates==statistics.evictions); // O(1) LRU victim selection, never scan every cached page.
+ Check(statistics.pageCopies==0); // Lookup/traversal must not copy a full 16 KiB page.
  Check(index.Count()==5002&&index.Find(0)==42&&index.Find(UINT64_MAX)==UINT64_MAX);
  for(uint64_t i=0;i<5000;++i)Check(index.Find((i<<40)+3)==4999-i);
  std::vector<std::pair<uint64_t,uint64_t>> range;index.VisitRange((100ull<<40)+3,(109ull<<40)+3,[&](uint64_t key,uint64_t value){range.emplace_back(key,value);});Check(range.size()==10);for(uint64_t i=0;i<10;++i)Check(range[i].first==((i+100)<<40)+3&&range[i].second==4899-i);

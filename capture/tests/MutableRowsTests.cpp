@@ -17,6 +17,7 @@ int main(int argc,char** argv){try{
  store.FreezeAppend();
  for(uint64_t i=9999;i>0;i-=137){store.Read(i,row.data());Check(row[0]==i);row[3]=42;store.Put(i,row.data());if(i<137)break;}
  store.Seal();uint64_t count=0;store.Visit([&](const void* data,uint64_t n){auto p=static_cast<const unsigned char*>(data);for(uint64_t i=0;i<n;++i){std::memcpy(row.data(),p+i*40,40);Check(row[0]==count&&row[2]==UINT64_MAX-count&&row[3]==((9999-count)%137==0?42:0));++count;}});Check(count==10000);
+ const auto statistics=store.Statistics();Check(statistics.evictions>0&&statistics.evictionCandidates==statistics.evictions);
  bool refused=false;try{store.Put(0,row.data());}catch(const std::exception&){refused=true;}Check(refused);
  refused=false;try{store.Read(10000,row.data());}catch(const std::exception&){refused=true;}Check(refused);
  {tracy::storage::MutableRows empty(root/"empty.bin",16,budget);empty.Seal();uint64_t seen=0;empty.Visit([&](const void*,uint64_t n){seen+=n;});Check(seen==0);}
