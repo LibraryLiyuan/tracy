@@ -54,6 +54,18 @@ public:
     uint64_t CpuThreadCount() const override { return m_cpuZones ? m_cpuZones->RootCount() : 0; }
     uint64_t CpuBranchCount() const override { return m_cpuZones ? m_cpuZones->BranchCount() : 0; }
     uint32_t CpuRootChildren(uint64_t root) override { if(!m_cpuZones)throw std::runtime_error("cpu_zone_store_missing");return m_cpuZones->Children(root); }
+    uint64_t CpuZoneLogicalBytes() const { return m_cpuZones ? m_cpuZones->LogicalBytes() : 0; }
+    uint64_t CreateGpuThread() override;
+    uint64_t AppendGpuZone(uint64_t,const OfflineGpuZone&) override;
+    void ReadGpuZone(uint64_t,OfflineGpuZone&) override;
+    void PutGpuZone(uint64_t,const OfflineGpuZone&) override;
+    void SealGpuZones() override;
+    void VisitGpuZones(uint64_t,const std::function<void(uint64_t,const OfflineGpuZone&,uint32_t,bool)>&) override;
+    uint64_t GpuZoneCount() const override { return m_gpuZones ? m_gpuZones->Count() : 0; }
+    uint64_t GpuThreadCount() const override { return m_gpuZones ? m_gpuZones->RootCount() : 0; }
+    uint64_t GpuBranchCount() const override { return m_gpuZones ? m_gpuZones->BranchCount() : 0; }
+    uint32_t GpuRootChildren(uint64_t root) override { if(!m_gpuZones)throw std::runtime_error("gpu_zone_store_missing");return m_gpuZones->Children(root); }
+    uint64_t GpuZoneLogicalBytes() const { return m_gpuZones ? m_gpuZones->LogicalBytes() : 0; }
     std::string ZoneExtraHash() const { if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");return m_zoneHash; }
     void Fail(const char* reason) noexcept override { m_resources.Fail(reason); }
     bool DefineResourceSet(uint32_t,const char*,size_t) override;
@@ -93,6 +105,8 @@ private:
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::unique_ptr<storage::OrderedForest> m_cpuZones;
     bool m_cpuZonesSealed=false;
+    std::unique_ptr<storage::OrderedForest> m_gpuZones;
+    bool m_gpuZonesSealed=false;
     std::unique_ptr<storage::DiskIndex64> m_passTimes;
     std::unique_ptr<storage::ResourceIntervals> m_resourceIntervals;
     std::array<uint64_t,3> m_intervalPeaks{};

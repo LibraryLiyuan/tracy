@@ -1066,6 +1066,9 @@ private:
     void InvalidateJnGpuCatalog( uint64_t generation, uint8_t state );
 
     tracy_force_inline ZoneEvent* AllocZoneEvent();
+    tracy_force_inline GpuEvent* AllocGpuEvent();
+    void SyncOfflineGpuZone( GpuEvent* );
+    void ReleaseOfflineGpuZone( GpuEvent* );
     tracy_force_inline void ProcessZoneBeginImpl( ZoneEvent* zone, const QueueZoneBegin& ev );
     tracy_force_inline void ProcessZoneBeginAllocSrcLocImpl( ZoneEvent* zone, const QueueZoneBeginLean& ev );
     tracy_force_inline void ProcessGpuZoneBeginImpl( GpuEvent* zone, const QueueGpuZoneBegin& ev, bool serial );
@@ -1282,6 +1285,7 @@ private:
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
     void WriteOfflineCpuTimeline( FileWrite&, uint64_t, int64_t& );
+    void WriteOfflineGpuTimeline( FileWrite&, uint64_t, int64_t&, int64_t& );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
     template<typename Adapter, typename V>
     void WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime );
@@ -1404,6 +1408,9 @@ private:
     unordered_flat_map<uint64_t, uint64_t> m_offlineCpuThreadRoots;
     unordered_flat_map<ZoneEvent*, uint64_t> m_offlineCpuZoneIds;
     unordered_flat_map<uint32_t, std::vector<GpuEvent*>> m_jnPendingGpuCallsites;
+    unordered_flat_map<uint32_t, std::vector<uint64_t>> m_jnPendingOfflineGpuCallsites;
+    unordered_flat_map<GpuCtxData*, unordered_flat_map<uint64_t, uint64_t>> m_offlineGpuThreadRoots;
+    unordered_flat_map<GpuEvent*, uint64_t> m_offlineGpuZoneIds;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;
@@ -1504,6 +1511,7 @@ private:
 
 #ifdef TRACY_NO_STATISTICS
     Vector<ZoneEvent*> m_zoneEventPool;
+    Vector<GpuEvent*> m_gpuEventPool;
 #endif
 
     Vector<Parameter> m_params;

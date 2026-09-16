@@ -8,4 +8,4 @@ Active zones still use the existing `ZoneEvent` shape so stack checks, Zone text
 
 Tests cover two interleaved roots, sibling order, a 10,000-level tree with constant-stack traversal, cache eviction, mutable updates, root/branch counts, delayed callsite enrichment after both nested zones end, ordinary `.tracy` write/reopen and all prior Worker semantic cases. A 64,891-byte end-to-end conversion completed Scan, Replay, Finalize, Write, Validate, Publish and Cleanup. It produced a 29,575-byte trace with 83,066,880-byte private peak, 229,514,864-byte workspace peak and 118,784-byte disk peak under the 194,673-byte 3J limit; cleanup reported no residuals.
 
-GPU Zone history remains on the original Worker/slab path and is the next P4 step. Global string ownership and the remaining P5/P6 work are also pending. This checkpoint is not the integrated 30-minute acceptance.
+GPU Zone history was completed in the following P4 checkpoint; see `JN-Offline-GPU-Zone-Storage.md`. Global string ownership and the remaining P5/P6 work are pending. Neither checkpoint is the integrated 30-minute acceptance.

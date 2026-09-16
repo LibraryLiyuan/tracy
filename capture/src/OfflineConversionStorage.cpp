@@ -26,7 +26,7 @@ OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,st
 void OfflineConversionStorage::Check()
 {
     m_resources.CheckFast();
-    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_cpuZones)m_cpuZones->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();if(m_descriptorHeaps)m_descriptorHeaps->ReduceCache();for(auto& table:m_catalogTables)if(table)table->ReduceCache();m_reclaimed=true;}
+    if(m_resources.SoftTargetExceeded() && !m_reclaimed) {if(m_definitions)m_definitions->ReduceCaches();if(m_zoneExtras)m_zoneExtras->ReduceCache();if(m_cpuZones)m_cpuZones->ReduceCache();if(m_gpuZones)m_gpuZones->ReduceCache();if(m_passTimes)m_passTimes->ReduceCache();if(m_descriptorHeaps)m_descriptorHeaps->ReduceCache();for(auto& table:m_catalogTables)if(table)table->ReduceCache();m_reclaimed=true;}
     if(!m_resources.SoftTargetExceeded())m_reclaimed=false;
 }
 bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,size_t bytes)
@@ -62,6 +62,7 @@ void OfflineConversionStorage::Seal()
 {
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
     SealCpuZones();
+    SealGpuZones();
     for(auto& table:m_catalogTables)if(table)table->FreezeAppend();
     m_jobHash=analysis::Sha256Builder().FinalHex();m_useHash=m_jobHash;
     m_relationHash=m_jobHash;
@@ -215,4 +216,10 @@ void OfflineConversionStorage::ReadCpuZone(uint64_t id,OfflineCpuZone& row){Chec
 void OfflineConversionStorage::PutCpuZone(uint64_t id,const OfflineCpuZone& row){Check();if(m_sealed||m_cpuZonesSealed||!m_cpuZones)throw std::runtime_error("cpu_zone_store_closed");m_cpuZones->Put(id,&row);}
 void OfflineConversionStorage::SealCpuZones(){Check();if(m_cpuZonesSealed)return;if(m_cpuZones)m_cpuZones->Seal();m_cpuZonesSealed=true;}
 void OfflineConversionStorage::VisitCpuZones(uint64_t root,const std::function<void(uint64_t,const OfflineCpuZone&,uint32_t,bool)>& visitor){Check();if(!m_cpuZonesSealed||!m_cpuZones)throw std::runtime_error("cpu_zone_store_not_sealed");m_cpuZones->Visit(root,[&](uint64_t id,const void* bytes,uint32_t children,bool begin){OfflineCpuZone row;std::memcpy(&row,bytes,sizeof(row));visitor(id,row,children,begin);});}
+uint64_t OfflineConversionStorage::CreateGpuThread(){Check();if(m_sealed||m_gpuZonesSealed)throw std::runtime_error("gpu_zone_store_closed");if(!m_gpuZones)m_gpuZones=std::make_unique<storage::OrderedForest>(m_root/"gpu-zones.bin",sizeof(OfflineGpuZone),m_resources);return m_gpuZones->CreateRoot();}
+uint64_t OfflineConversionStorage::AppendGpuZone(uint64_t parent,const OfflineGpuZone& row){Check();if(m_sealed||m_gpuZonesSealed||!m_gpuZones)throw std::runtime_error("gpu_zone_store_closed");return m_gpuZones->Append(parent,&row);}
+void OfflineConversionStorage::ReadGpuZone(uint64_t id,OfflineGpuZone& row){Check();if(!m_gpuZones)throw std::runtime_error("gpu_zone_store_missing");m_gpuZones->Read(id,&row);}
+void OfflineConversionStorage::PutGpuZone(uint64_t id,const OfflineGpuZone& row){Check();if(m_sealed||m_gpuZonesSealed||!m_gpuZones)throw std::runtime_error("gpu_zone_store_closed");m_gpuZones->Put(id,&row);}
+void OfflineConversionStorage::SealGpuZones(){Check();if(m_gpuZonesSealed)return;if(m_gpuZones)m_gpuZones->Seal();m_gpuZonesSealed=true;}
+void OfflineConversionStorage::VisitGpuZones(uint64_t root,const std::function<void(uint64_t,const OfflineGpuZone&,uint32_t,bool)>& visitor){Check();if(!m_gpuZonesSealed||!m_gpuZones)throw std::runtime_error("gpu_zone_store_not_sealed");m_gpuZones->Visit(root,[&](uint64_t id,const void* bytes,uint32_t children,bool begin){OfflineGpuZone row;std::memcpy(&row,bytes,sizeof(row));visitor(id,row,children,begin);});}
 }

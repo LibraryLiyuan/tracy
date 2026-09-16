@@ -6986,6 +6986,21 @@ void Worker::ProcessJnCallsiteDefinition( const QueueJnCallsiteDefinition& ev )
         }
         m_jnPendingGpuCallsites.erase( gpuPending );
     }
+    const auto offlineGpuPending = m_jnPendingOfflineGpuCallsites.find( ev.callsiteId );
+    if( offlineGpuPending != m_jnPendingOfflineGpuCallsites.end() )
+    {
+        if( callstack != 0 )
+        {
+            for( const auto zone : offlineGpuPending->second )
+            {
+                OfflineGpuZone row;
+                m_offlineStorage->ReadGpuZone( zone, row );
+                row.callstack = callstack;
+                m_offlineStorage->PutGpuZone( zone, row );
+            }
+        }
+        m_jnPendingOfflineGpuCallsites.erase( offlineGpuPending );
+    }
 }
 
 void Worker::InvalidateJnGpuCatalog( uint64_t generation, uint8_t state )
@@ -8680,6 +8695,34 @@ void Worker::ProcessGpuNewContext( const QueueGpuNewContext& ev )
     m_gpuCtxMap[ev.context] = gpu;
 }
 
+GpuEvent* Worker::AllocGpuEvent()
+{
+#ifdef TRACY_NO_STATISTICS
+    if( !m_gpuEventPool.empty() ) return m_gpuEventPool.back_and_pop();
+#endif
+    return m_slab.Alloc<GpuEvent>();
+}
+
+void Worker::SyncOfflineGpuZone( GpuEvent* zone )
+{
+    if( !m_offlineStorage ) return;
+    const auto found = m_offlineGpuZoneIds.find( zone );
+    if( found == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_identity" );
+    const auto callstack = zone->callstack.Val();
+    if( callstack < 0 ) throw std::runtime_error( "offline_gpu_zone_callstack" );
+    const OfflineGpuZone row { zone->CpuStart(), zone->CpuEnd(), zone->GpuStart(), zone->GpuEnd(), zone->SrcLoc(), uint32_t( callstack ), zone->Thread(), zone->query_id };
+    m_offlineStorage->PutGpuZone( found->second, row );
+}
+
+void Worker::ReleaseOfflineGpuZone( GpuEvent* zone )
+{
+    if( !m_offlineStorage ) return;
+    if( m_offlineGpuZoneIds.erase( zone ) != 1 ) throw std::runtime_error( "offline_gpu_zone_release" );
+#ifdef TRACY_NO_STATISTICS
+    m_gpuEventPool.push_back( zone );
+#endif
+}
+
 void Worker::ProcessGpuZoneBeginImpl( GpuEvent* zone, const QueueGpuZoneBegin& ev, bool serial )
 {
     CheckSourceLocation( ev.srcloc );
@@ -8742,20 +8785,39 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
     {
         td = ctx->threadData.emplace( ztid, GpuCtxThreadData {} ).first;
     }
-    auto timeline = &td->second.timeline;
     auto& stack = td->second.stack;
-    if( !stack.empty() )
+    if( m_offlineStorage )
     {
-        auto back = stack.back();
-        if( back->Child() < 0 )
+        auto& roots = m_offlineGpuThreadRoots[ctx];
+        auto root = roots.find( ztid );
+        if( root == roots.end() ) root = roots.emplace( ztid, m_offlineStorage->CreateGpuThread() ).first;
+        uint64_t parent = root->second;
+        if( !stack.empty() )
         {
-            back->SetChild( int32_t( m_data.gpuChildren.size() ) );
-            m_data.gpuChildren.push_back( Vector<short_ptr<GpuEvent>>() );
+            GpuEvent* parentZone = stack.back();
+            const auto found = m_offlineGpuZoneIds.find( parentZone );
+            if( found == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_parent" );
+            parent = found->second;
         }
-        timeline = &m_data.gpuChildren[back->Child()];
+        const OfflineGpuZone row { zone->CpuStart(), zone->CpuEnd(), zone->GpuStart(), zone->GpuEnd(), zone->SrcLoc(), 0, zone->Thread(), zone->query_id };
+        const auto id = m_offlineStorage->AppendGpuZone( parent, row );
+        m_offlineGpuZoneIds.emplace( zone, id );
     }
-
-    timeline->push_back( zone );
+    else
+    {
+        auto timeline = &td->second.timeline;
+        if( !stack.empty() )
+        {
+            auto back = stack.back();
+            if( back->Child() < 0 )
+            {
+                back->SetChild( int32_t( m_data.gpuChildren.size() ) );
+                m_data.gpuChildren.push_back( Vector<short_ptr<GpuEvent>>() );
+            }
+            timeline = &m_data.gpuChildren[back->Child()];
+        }
+        timeline->push_back( zone );
+    }
     stack.push_back( zone );
 
     assert( !ctx->query[ev.queryId] );
@@ -8764,13 +8826,13 @@ void Worker::ProcessGpuZoneBeginImplCommon( GpuEvent* zone, const QueueGpuZoneBe
 
 void Worker::ProcessGpuZoneBegin( const QueueGpuZoneBegin& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, serial );
 }
 
 void Worker::ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, serial );
     if( serial )
     {
@@ -8786,17 +8848,18 @@ void Worker::ProcessGpuZoneBeginCallstack( const QueueGpuZoneBegin& ev, bool ser
         zone->callstack.SetVal( it->second );
         it->second = 0;
     }
+    SyncOfflineGpuZone( zone );
 }
 
 void Worker::ProcessGpuZoneBeginAllocSrcLoc( const QueueGpuZoneBeginLean& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginAllocSrcLocImpl( zone, ev, serial );
 }
 
 void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLean& ev, bool serial )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginAllocSrcLocImpl( zone, ev, serial );
     if( serial )
     {
@@ -8812,6 +8875,7 @@ void Worker::ProcessGpuZoneBeginAllocSrcLocCallstack( const QueueGpuZoneBeginLea
         zone->callstack.SetVal( it->second );
         it->second = 0;
     }
+    SyncOfflineGpuZone( zone );
 }
 
 void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
@@ -8849,6 +8913,7 @@ void Worker::ProcessGpuZoneEnd( const QueueGpuZoneEnd& ev, bool serial )
     }
     const auto time = TscTime( cpuTime );
     zone->SetCpuEnd( time );
+    SyncOfflineGpuZone( zone );
     if( m_data.lastTime < time ) m_data.lastTime = time;
 }
 
@@ -8916,6 +8981,7 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
     {
         zone->SetGpuStart( gpuTime );
         ctx->count++;
+        SyncOfflineGpuZone( zone );
     }
     else
     {
@@ -8938,6 +9004,8 @@ void Worker::ProcessGpuTime( const QueueGpuTime& ev )
 #else
         CountZoneStatistics( zone );
 #endif
+        SyncOfflineGpuZone( zone );
+        ReleaseOfflineGpuZone( zone );
     }
     if( m_data.lastTime < gpuTime ) m_data.lastTime = gpuTime;
 }
@@ -10936,16 +11004,29 @@ void Worker::SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t
 
 void Worker::ProcessJnGpuZoneBeginCallsite( const QueueJnGpuZoneBeginCallsite& ev )
 {
-    auto zone = m_slab.Alloc<GpuEvent>();
+    auto zone = AllocGpuEvent();
     ProcessGpuZoneBeginImpl( zone, ev, true );
     const auto found = m_jnCallsiteCallstacks.find( ev.callsiteId );
     if( found != m_jnCallsiteCallstacks.end() )
     {
-        if( found->second != 0 ) zone->callstack.SetVal( found->second );
+        if( found->second != 0 )
+        {
+            zone->callstack.SetVal( found->second );
+            SyncOfflineGpuZone( zone );
+        }
     }
     else
     {
-        m_jnPendingGpuCallsites[ev.callsiteId].push_back( zone );
+        if( m_offlineStorage )
+        {
+            const auto id = m_offlineGpuZoneIds.find( zone );
+            if( id == m_offlineGpuZoneIds.end() ) throw std::runtime_error( "offline_gpu_zone_callsite" );
+            m_jnPendingOfflineGpuCallsites[ev.callsiteId].push_back( id->second );
+        }
+        else
+        {
+            m_jnPendingGpuCallsites[ev.callsiteId].push_back( zone );
+        }
     }
 }
 
@@ -11299,7 +11380,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     // whose query result was still pending, so use the actual created-zone count.
     sz = m_data.gpuCnt;
     f.Write( &sz, sizeof( sz ) );
-    sz = m_data.gpuChildren.size();
+    sz = m_data.gpuChildren.size() + ( m_offlineStorage ? m_offlineStorage->GpuBranchCount() : 0 );
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.gpuData.size();
     f.Write( &sz, sizeof( sz ) );
@@ -11328,7 +11409,14 @@ void Worker::Write( FileWrite& f, bool fiDict )
             int64_t refGpuTime = 0;
             uint64_t tid = td.first;
             f.Write( &tid, sizeof( tid ) );
-            WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
+            const auto roots = m_offlineGpuThreadRoots.find( ctx );
+            if( m_offlineStorage && roots != m_offlineGpuThreadRoots.end() )
+            {
+                const auto offlineRoot = roots->second.find( tid );
+                if( offlineRoot != roots->second.end() ) WriteOfflineGpuTimeline( f, offlineRoot->second, refTime, refGpuTime );
+                else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
+            }
+            else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
         }
 
         sz = ctx->notes.size();
@@ -11769,6 +11857,32 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec
     {
         WriteTimelineImpl<VectorAdapterPointer<GpuEvent>>( f, vec, refTime, refGpuTime );
     }
+}
+
+void Worker::WriteOfflineGpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, int64_t& refGpuTime )
+{
+    const uint64_t size = m_offlineStorage->GpuRootChildren( root );
+    f.Write( &size, sizeof( size ) );
+    m_offlineStorage->VisitGpuZones( root, [&]( uint64_t, const OfflineGpuZone& zone, uint32_t children, bool begin ) {
+        if( begin )
+        {
+            WriteTimeOffset( f, refTime, zone.cpuStart );
+            WriteTimeOffset( f, refGpuTime, zone.gpuStart );
+            f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
+            Int24 callstack;
+            callstack.SetVal( zone.callstack );
+            f.Write( &callstack, sizeof( callstack ) );
+            f.Write( &zone.thread, sizeof( zone.thread ) );
+            const uint64_t childCount = children;
+            f.Write( &childCount, sizeof( childCount ) );
+        }
+        else
+        {
+            WriteTimeOffset( f, refTime, zone.cpuEnd );
+            WriteTimeOffset( f, refGpuTime, zone.gpuEnd );
+            f.Write( &zone.queryId, sizeof( zone.queryId ) );
+        }
+    } );
 }
 
 template<typename Adapter, typename V>

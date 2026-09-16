@@ -17,6 +17,20 @@ struct OfflineCpuZone
 };
 #pragma pack(pop)
 static_assert( sizeof( OfflineCpuZone ) == 22 );
+#pragma pack(push,1)
+struct OfflineGpuZone
+{
+    int64_t cpuStart;
+    int64_t cpuEnd;
+    int64_t gpuStart;
+    int64_t gpuEnd;
+    int16_t sourceLocation;
+    uint32_t callstack;
+    uint16_t thread;
+    uint16_t queryId;
+};
+#pragma pack(pop)
+static_assert( sizeof( OfflineGpuZone ) == 42 );
 
 class WorkerOfflineStorage
 {
@@ -40,6 +54,16 @@ public:
     virtual uint64_t CpuThreadCount() const=0;
     virtual uint64_t CpuBranchCount() const=0;
     virtual uint32_t CpuRootChildren(uint64_t)=0;
+    virtual uint64_t CreateGpuThread()=0;
+    virtual uint64_t AppendGpuZone(uint64_t,const OfflineGpuZone&)=0;
+    virtual void ReadGpuZone(uint64_t,OfflineGpuZone&)=0;
+    virtual void PutGpuZone(uint64_t,const OfflineGpuZone&)=0;
+    virtual void SealGpuZones()=0;
+    virtual void VisitGpuZones(uint64_t,const std::function<void(uint64_t,const OfflineGpuZone&,uint32_t,bool)>&)=0;
+    virtual uint64_t GpuZoneCount() const=0;
+    virtual uint64_t GpuThreadCount() const=0;
+    virtual uint64_t GpuBranchCount() const=0;
+    virtual uint32_t GpuRootChildren(uint64_t)=0;
     virtual void Check()=0;
     virtual std::optional<int64_t> LookupPassTime(uint64_t)=0;
     virtual void BeginResourceIntervals()=0;
