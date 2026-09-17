@@ -4,15 +4,24 @@
 #include "../../server/TracyWorker.hpp"
 #include "../../analysis/TracyHash.hpp"
 #include <array>
+#include <vector>
 namespace tracy::conversion
 {
+#pragma pack(push,1)
+struct ValidationCpuZoneBeginRow{uint8_t tag=1;uint64_t thread=0;int64_t start=0;int16_t sourceLocation=0;uint32_t extra=0,children=0;};
+struct ValidationCpuZoneEndRow{uint8_t tag=2;int64_t end=0;};
+struct ValidationGpuZoneBeginRow{uint8_t tag=3;uint32_t context=0;uint64_t thread=0;int64_t cpuStart=0,gpuStart=0;int16_t sourceLocation=0;uint32_t callstack=0;uint64_t children=0;};
+struct ValidationGpuZoneEndRow{uint8_t tag=4;int64_t cpuEnd=0,gpuEnd=0;uint16_t queryId=0;};
+#pragma pack(pop)
+static_assert(sizeof(ValidationCpuZoneBeginRow)==27&&sizeof(ValidationCpuZoneEndRow)==9&&sizeof(ValidationGpuZoneBeginRow)==43&&sizeof(ValidationGpuZoneEndRow)==19);
 static constexpr EventType::Type OfflineValidationEventMask=EventType::Type(EventType::All&~(EventType::CpuZones|EventType::GpuZones|EventType::Samples));
 class OfflineValidationSink final:public SerializedZoneSink
 {
 public:
     OfflineValidationSink(OfflineConversionStorage& storage,storage::ConversionResources& resources)
         :m_storage(storage),m_resources(resources),m_buffer(resources.Workspace()),m_expected{storage.JobStageCount(),storage.ReferenceUseCount(),storage.RelationCount()},
-         m_hashes{storage.JobStageHash(),storage.ReferenceUseHash(),storage.RelationHash()},m_zoneCount(storage.ZoneExtraCount()),m_zoneHash(storage.ZoneExtraHash()){
+        m_hashes{storage.JobStageHash(),storage.ReferenceUseHash(),storage.RelationHash()},m_zoneCount(storage.ZoneExtraCount()),m_zoneHash(storage.ZoneExtraHash()),m_zoneValidationMemory(resources.Workspace(),sizeof(m_zoneDigestBuffer)+1024*sizeof(ZoneNode)+512),m_cpuZoneExpected(storage.CpuZoneWriteCount()),m_gpuZoneExpected(storage.GpuZoneWriteCount()),m_cpuZoneHash(storage.CpuZoneWriteHash()),m_gpuZoneHash(storage.GpuZoneWriteHash()){
+        m_zoneStack.reserve(1024);
         for(size_t i=0;i<OfflineAppendDomainCount;++i){m_expected[3+i]=storage.RecordCount(OfflineAppendDomain(i));m_hashes[3+i]=storage.RecordHash(OfflineAppendDomain(i));}
         for(size_t i=0;i<OfflineCatalogDomainCount;++i){m_expected[3+OfflineAppendDomainCount+i]=storage.CatalogCount(OfflineCatalogDomain(i));m_hashes[3+OfflineAppendDomainCount+i]=storage.CatalogHash(OfflineCatalogDomain(i));}m_catalogQuality=storage.CatalogQuality();m_stringCount=storage.StringCount();m_stringHash=storage.StringHash();m_callstackCount=storage.CallstackCount()-1;m_callstackHash=storage.CallstackHash();m_sampleExpectedTotal=storage.TotalSampleCount();
     }
@@ -77,6 +86,7 @@ public:
         if(!m_callstackDone)throw std::runtime_error("conversion_validation_callstacks_missing");
         if((m_sampleExpectedTotal&&!m_sampleSaw)||m_sampleOpen||m_sampleSeenTotal!=m_sampleExpectedTotal)throw std::runtime_error("conversion_validation_samples_missing");
         if(!m_catalogMetadata)throw std::runtime_error("conversion_validation_catalog_metadata_missing");
+        if(!m_cpuZoneDone||!m_gpuZoneDone)throw std::runtime_error("conversion_validation_zone_timeline_missing");
         for(size_t i=0;i<m_expected.size();++i){
             if(!m_started[i]&&!m_expected[i])continue; // older schemas may omit an empty domain
             if(!m_done[i])throw std::runtime_error("conversion_validation_missing_domain");
@@ -90,10 +100,22 @@ public:
         m_zoneActual.Update(p,size_t(n)*sizeof(ZoneExtra));m_zoneSeen+=n;
     }
     void ZoneExtraRecord(uint64_t,uint32_t,bool,uint32_t,bool,uint32_t,uint32_t)override{} void ZoneExtrasEnd()override{if(!m_zoneStarted||m_zoneDone||m_zoneSeen!=m_zoneCount||m_zoneActual.FinalHex()!=m_zoneHash)throw std::runtime_error("zone_extra_validation_hash");m_zoneDone=true;}
-    void CpuZonesBegin(uint64_t)override{} void CpuZoneBegin(uint64_t,uint64_t,uint64_t,int64_t,int16_t,uint32_t,uint32_t)override{} void CpuZoneEnd(uint64_t,int64_t)override{} void CpuZonesEnd()override{}
-    void GpuZonesBegin(uint64_t)override{} void GpuZoneBegin(uint64_t,uint64_t,uint32_t,int64_t,int64_t,int16_t,uint32_t,uint64_t,uint64_t)override{}
-    void GpuZoneEnd(uint64_t,int64_t,int64_t,uint16_t)override{} void GpuZonesEnd()override{}
+    void CpuZonesBegin(uint64_t count)override{CheckRead();if(m_cpuZoneStarted||count!=m_cpuZoneExpected)throw std::runtime_error("conversion_validation_cpu_zone_count:"+std::to_string(count)+":"+std::to_string(m_cpuZoneExpected));BeginZoneDigest();m_cpuZoneStarted=true;}
+    void CpuZoneBegin(uint64_t index,uint64_t parent,uint64_t thread,int64_t start,int16_t source,uint32_t extra,uint32_t children)override{
+        CheckRead();if(!m_cpuZoneStarted||m_cpuZoneDone||index!=m_cpuZoneSeen||parent!=(m_zoneStack.empty()?UINT64_MAX:m_zoneStack.back().index))throw std::runtime_error("conversion_validation_cpu_zone_order");if(!m_zoneStack.empty()){if(!m_zoneStack.back().remaining)throw std::runtime_error("conversion_validation_cpu_zone_children");--m_zoneStack.back().remaining;}ValidateZoneExtraIndex(extra);PushZone(index,children);const ValidationCpuZoneBeginRow row{1,thread,start,source,extra,children};AppendZoneDigest(&row,sizeof(row));++m_cpuZoneSeen;}
+    void CpuZoneEnd(uint64_t index,int64_t end)override{CheckRead();if(m_zoneStack.empty()||m_zoneStack.back().index!=index||m_zoneStack.back().remaining)throw std::runtime_error("conversion_validation_cpu_zone_end");m_zoneStack.pop_back();const ValidationCpuZoneEndRow row{2,end};AppendZoneDigest(&row,sizeof(row));}
+    void CpuZonesEnd()override{if(!m_cpuZoneStarted||m_cpuZoneDone||!m_zoneStack.empty()||m_cpuZoneSeen!=m_cpuZoneExpected||FinishZoneDigest()!=m_cpuZoneHash)throw std::runtime_error("conversion_validation_cpu_zone_hash");m_cpuZoneDone=true;}
+    void GpuZonesBegin(uint64_t count)override{CheckRead();if(m_gpuZoneStarted||count!=m_gpuZoneExpected)throw std::runtime_error("conversion_validation_gpu_zone_count");BeginZoneDigest();m_gpuZoneStarted=true;}
+    void GpuZoneBegin(uint64_t index,uint64_t parent,uint32_t context,int64_t cpuStart,int64_t gpuStart,int16_t source,uint32_t callstack,uint64_t thread,uint64_t children)override{
+        CheckRead();if(!m_gpuZoneStarted||m_gpuZoneDone||index!=m_gpuZoneSeen||parent!=(m_zoneStack.empty()?UINT64_MAX:m_zoneStack.back().index)||(callstack&&callstack>m_callstackCount))throw std::runtime_error("conversion_validation_gpu_zone_order");if(!m_zoneStack.empty()){if(!m_zoneStack.back().remaining)throw std::runtime_error("conversion_validation_gpu_zone_children");--m_zoneStack.back().remaining;}PushZone(index,children);const ValidationGpuZoneBeginRow row{3,context,thread,cpuStart,gpuStart,source,callstack,children};AppendZoneDigest(&row,sizeof(row));++m_gpuZoneSeen;}
+    void GpuZoneEnd(uint64_t index,int64_t cpuEnd,int64_t gpuEnd,uint16_t query)override{CheckRead();if(m_zoneStack.empty()||m_zoneStack.back().index!=index||m_zoneStack.back().remaining)throw std::runtime_error("conversion_validation_gpu_zone_end");m_zoneStack.pop_back();const ValidationGpuZoneEndRow row{4,cpuEnd,gpuEnd,query};AppendZoneDigest(&row,sizeof(row));}
+    void GpuZonesEnd()override{if(!m_gpuZoneStarted||m_gpuZoneDone||!m_zoneStack.empty()||m_gpuZoneSeen!=m_gpuZoneExpected||FinishZoneDigest()!=m_gpuZoneHash)throw std::runtime_error("conversion_validation_gpu_zone_hash");m_gpuZoneDone=true;}
 private:
+    struct ZoneNode{uint64_t index=0,remaining=0;};
+    void BeginZoneDigest(){if(m_timelineZoneActual)throw std::runtime_error("conversion_validation_zone_digest_state");m_timelineZoneActual=std::make_unique<analysis::Sha256Builder>();m_zoneDigestBytes=0;m_zoneStack.clear();}
+    void AppendZoneDigest(const void* data,size_t bytes){const auto* src=static_cast<const unsigned char*>(data);while(bytes){const auto take=std::min(bytes,m_zoneDigestBuffer.size()-m_zoneDigestBytes);std::memcpy(m_zoneDigestBuffer.data()+m_zoneDigestBytes,src,take);m_zoneDigestBytes+=take;src+=take;bytes-=take;if(m_zoneDigestBytes==m_zoneDigestBuffer.size()){m_timelineZoneActual->Update(m_zoneDigestBuffer.data(),m_zoneDigestBytes);m_zoneDigestBytes=0;}}}
+    std::string FinishZoneDigest(){if(!m_timelineZoneActual)throw std::runtime_error("conversion_validation_zone_digest_state");if(m_zoneDigestBytes)m_timelineZoneActual->Update(m_zoneDigestBuffer.data(),m_zoneDigestBytes);auto value=m_timelineZoneActual->FinalHex();m_timelineZoneActual.reset();m_zoneDigestBytes=0;return value;}
+    void PushZone(uint64_t index,uint64_t children){if(m_zoneStack.size()==m_zoneStack.capacity()){const auto capacity=std::min<uint64_t>(1ull<<24,std::max<uint64_t>(2048,m_zoneStack.capacity()*2));if(capacity<=m_zoneStack.capacity())throw std::runtime_error("conversion_validation_zone_depth");m_zoneValidationMemory.Resize(sizeof(m_zoneDigestBuffer)+capacity*sizeof(ZoneNode)+512);m_zoneStack.reserve(size_t(capacity));}m_zoneStack.push_back({index,children});}
     static size_t Slot(JnDomain domain){if(domain==JnDomain::JobStage)return 0;if(domain==JnDomain::GpuReferenceUse)return 1;if(domain==JnDomain::Relation)return 2;switch(domain){
 #define X(name,field,type) case JnDomain::name:return 3+size_t(OfflineAppendDomain::name);
         TRACY_OFFLINE_APPEND_DOMAINS(X)
@@ -133,6 +155,14 @@ private:
     std::string m_sampleExpectedHash;
     std::unique_ptr<analysis::Sha256Builder> m_sampleActual;
     bool m_sampleSaw=false,m_sampleOpen=false;
+    analysis::AnalysisWorkspaceReservation m_zoneValidationMemory;
+    std::array<unsigned char,64*1024> m_zoneDigestBuffer{};
+    size_t m_zoneDigestBytes=0;
+    std::unique_ptr<analysis::Sha256Builder> m_timelineZoneActual;
+    std::vector<ZoneNode> m_zoneStack;
+    uint64_t m_cpuZoneExpected=0,m_cpuZoneSeen=0,m_gpuZoneExpected=0,m_gpuZoneSeen=0;
+    std::string m_cpuZoneHash,m_gpuZoneHash;
+    bool m_cpuZoneStarted=false,m_cpuZoneDone=false,m_gpuZoneStarted=false,m_gpuZoneDone=false;
 };
 }
 #endif

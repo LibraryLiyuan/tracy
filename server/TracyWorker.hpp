@@ -1310,8 +1310,8 @@ private:
     void SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent );
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
-    void WriteOfflineCpuTimeline( FileWrite&, uint64_t, int64_t& );
-    void WriteOfflineGpuTimeline( FileWrite&, uint64_t, int64_t&, int64_t& );
+    void WriteOfflineCpuTimeline( FileWrite&, uint64_t, int64_t&, uint64_t );
+    void WriteOfflineGpuTimeline( FileWrite&, uint64_t, int64_t&, int64_t&, uint32_t );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
     template<typename Adapter, typename V>
     void WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime );
@@ -1439,6 +1439,10 @@ private:
     unordered_flat_map<GpuCtxData*, unordered_flat_map<uint64_t, uint64_t>> m_offlineGpuThreadRoots;
     unordered_flat_map<GpuEvent*, uint64_t> m_offlineGpuZoneIds;
     unordered_flat_map<uint64_t, int64_t> m_jnGpuReferencePassTimes;
+    uint64_t m_offlineWriteCpuDone = 0, m_offlineWriteCpuTotal = 0;
+    uint64_t m_offlineWriteGpuDone = 0, m_offlineWriteGpuTotal = 0;
+    uint64_t m_offlineWriteCpuThread = 0;
+    uint32_t m_offlineWriteGpuContext = 0;
     int16_t m_pendingSourceLocationPayload = 0;
     Vector<uint64_t> m_sourceLocationQueue;
     unordered_flat_map<uint64_t, int16_t> m_sourceLocationShrink;

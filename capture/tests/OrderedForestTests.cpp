@@ -8,8 +8,10 @@ int main(int argc,char** argv){try{
  if(argc!=2)return 2;auto root=std::filesystem::path(argv[1])/std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());std::filesystem::create_directories(root);
  tracy::storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;
  tracy::storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
- tracy::storage::ConversionResources budget(limits,[&]{return sample;},[]{return 1ull<<40;});
+ uint64_t systemSamples=0;tracy::storage::ConversionResources budget(limits,[&]{++systemSamples;return sample;},[]{return 1ull<<40;});
+ const auto beforeForest=systemSamples;
  tracy::storage::OrderedForest forest(root/"cpu",8,budget,64*1024);
+ Check(systemSamples-beforeForest==2);
  const auto a=forest.CreateRoot(),b=forest.CreateRoot();uint64_t value=10;
  const auto parent=forest.Append(a,&value);value=20;const auto child=forest.Append(parent,&value);value=30;forest.Append(a,&value);
  value=99;forest.Put(child,&value);value=0;forest.Read(child,&value);Check(value==99);

@@ -13,7 +13,7 @@ int main(int argc,char** argv)
     const auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
     ResourceLimits limits;limits.streamBytes=256ull<<20;limits.workspaceBytes=8ull<<20;limits.diskReserveBytes=0;
     ResourceSample sample;sample.physicalTotal=64ull<<30;sample.physicalAvailable=32ull<<30;sample.systemCommitLimit=64ull<<30;
-    ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
+    uint64_t systemSamples=0;ConversionResources resources(limits,[&]{++systemSamples;return sample;},[]{return 1ull<<40;});
     ResourceSetStore sets(root/"sets",std::string(64,'a'),resources,3*16384,256*1024);
     const std::array<ResourceSetMember,2> initial={ResourceSetMember{101,3},ResourceSetMember{202,5}};
     Check(sets.Define(17,initial));Check(!sets.Define(17,initial));Check(!sets.Define(0,initial));
@@ -25,6 +25,12 @@ int main(int argc,char** argv)
     }
     // This exceeds one internal page's child count and forces root growth.
     sets.ClearCaches();
+    const auto samplesBeforeColdLookups=systemSamples;
+    for(uint32_t i=0;i<1000;++i) {
+        const uint32_t ordinal=(i*7919)%599999+1;
+        const auto d=sets.Lookup(ordinal*1009+17);Check(d && d->count==2);sets.Read(*d,0,read);Check(read[0].resourceId==uint64_t(ordinal)+1000);
+    }
+    Check(systemSamples-samplesBeforeColdLookups<=6);
     for(uint32_t i:std::array<uint32_t,5>{599999,1,411111,37,250000}) {
         const auto d=sets.Lookup(i*1009+17);Check(d && d->count==2);sets.Read(*d,0,read);
         Check(read[0].resourceId==uint64_t(i)+1000 && read[1].usageMask==2);

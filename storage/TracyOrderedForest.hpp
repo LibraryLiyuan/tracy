@@ -2,7 +2,8 @@
 #define TRACY_ORDERED_FOREST_HPP
 
 #include "TracyMutableRows.hpp"
-#include <array>
+#include <algorithm>
+#include <vector>
 
 namespace tracy::storage
 {
@@ -27,6 +28,8 @@ class OrderedForest
 public:
     OrderedForest( std::filesystem::path path, uint32_t payloadBytes, ConversionResources& resources, uint64_t cacheBytes = 2ull << 20 )
         : m_payloadBytes( payloadBytes )
+        , m_scratchLease( resources.Workspace(), uint64_t( sizeof( Header ) ) + payloadBytes + 256 )
+        , m_row( sizeof( Header ) + payloadBytes )
         , m_rows( std::move( path ), uint32_t( sizeof( Header ) + payloadBytes ), resources, cacheBytes )
     {
         Require( payloadBytes > 0 && payloadBytes <= MaxPayload, "ordered_forest_configuration" );
@@ -35,11 +38,10 @@ public:
     uint64_t CreateRoot()
     {
         Require( !m_sealed, "ordered_forest_sealed" );
-        std::array<unsigned char, 4096> row{};
-        Header header;
+        ClearRow();Header header;
         header.flags = RootFlag;
-        std::memcpy( row.data(), &header, sizeof( header ) );
-        const auto handle = ToHandle( m_rows.Append( row.data() ) );
+        std::memcpy( m_row.data(), &header, sizeof( header ) );
+        const auto handle = ToHandle( m_rows.Append( m_row.data() ) );
         ++m_roots;
         return handle;
     }
@@ -47,24 +49,20 @@ public:
     uint64_t Append( uint64_t parent, const void* payload )
     {
         Require( !m_sealed && payload, "ordered_forest_append_state" );
-        auto parentRow = ReadRow( parent );
-        auto parentHeader = HeaderOf( parentRow );
+        auto parentHeader = ReadHeader( parent );
 
-        std::array<unsigned char, 4096> row{};
-        Header header;
+        ClearRow();Header header;
         header.parent = parent;
-        std::memcpy( row.data(), &header, sizeof( header ) );
-        std::memcpy( row.data() + sizeof( Header ), payload, m_payloadBytes );
-        const auto handle = ToHandle( m_rows.Append( row.data() ) );
+        std::memcpy( m_row.data(), &header, sizeof( header ) );
+        std::memcpy( m_row.data() + sizeof( Header ), payload, m_payloadBytes );
+        const auto handle = ToHandle( m_rows.Append( m_row.data() ) );
 
         if( parentHeader.last )
         {
-            auto sibling = ReadRow( parentHeader.last );
-            auto siblingHeader = HeaderOf( sibling );
+            auto siblingHeader = ReadHeader( parentHeader.last );
             Require( siblingHeader.next == 0 && siblingHeader.parent == parent, "ordered_forest_sibling" );
             siblingHeader.next = handle;
-            SetHeader( sibling, siblingHeader );
-            WriteRow( parentHeader.last, sibling );
+            WriteHeader( parentHeader.last, siblingHeader );
         }
         else
         {
@@ -75,8 +73,7 @@ public:
         parentHeader.last = handle;
         Require( parentHeader.children < UINT32_MAX, "ordered_forest_child_count" );
         ++parentHeader.children;
-        SetHeader( parentRow, parentHeader );
-        WriteRow( parent, parentRow );
+        WriteHeader( parent, parentHeader );
         ++m_count;
         return handle;
     }
@@ -84,25 +81,23 @@ public:
     void Read( uint64_t handle, void* payload )
     {
         Require( payload, "ordered_forest_read" );
-        const auto row = ReadRow( handle );
-        const auto header = HeaderOf( row );
+        LoadRow( handle );const auto header = HeaderOfRow();
         Require( ( header.flags & RootFlag ) == 0, "ordered_forest_root_payload" );
-        std::memcpy( payload, row.data() + sizeof( Header ), m_payloadBytes );
+        std::memcpy( payload, m_row.data() + sizeof( Header ), m_payloadBytes );
     }
 
     void Put( uint64_t handle, const void* payload )
     {
         Require( !m_sealed && payload, "ordered_forest_update_state" );
-        auto row = ReadRow( handle );
-        const auto header = HeaderOf( row );
+        LoadRow( handle );const auto header = HeaderOfRow();
         Require( ( header.flags & RootFlag ) == 0, "ordered_forest_root_payload" );
-        std::memcpy( row.data() + sizeof( Header ), payload, m_payloadBytes );
-        WriteRow( handle, row );
+        std::memcpy( m_row.data() + sizeof( Header ), payload, m_payloadBytes );
+        m_rows.Put( handle - 1, m_row.data() );
     }
 
     uint32_t Children( uint64_t handle )
     {
-        return HeaderOf( ReadRow( handle ) ).children;
+        return ReadHeader( handle ).children;
     }
 
     void Seal()
@@ -116,15 +111,13 @@ public:
     void Visit( uint64_t root, Visitor&& visitor )
     {
         Require( m_sealed, "ordered_forest_not_sealed" );
-        auto rootRow = ReadRow( root );
-        const auto rootHeader = HeaderOf( rootRow );
+        const auto rootHeader = ReadHeader( root );
         Require( ( rootHeader.flags & RootFlag ) != 0, "ordered_forest_visit_root" );
         uint64_t current = rootHeader.first;
         while( current )
         {
-            auto row = ReadRow( current );
-            auto header = HeaderOf( row );
-            visitor( current, row.data() + sizeof( Header ), header.children, true );
+            LoadRow( current );auto header = HeaderOfRow();
+            visitor( current, m_row.data() + sizeof( Header ), header.children, true );
             if( header.first )
             {
                 current = header.first;
@@ -133,7 +126,7 @@ public:
 
             for( ;; )
             {
-                visitor( current, row.data() + sizeof( Header ), header.children, false );
+                LoadRow( current );header=HeaderOfRow();visitor( current, m_row.data() + sizeof( Header ), header.children, false );
                 if( header.next )
                 {
                     current = header.next;
@@ -145,8 +138,7 @@ public:
                     break;
                 }
                 current = header.parent;
-                row = ReadRow( current );
-                header = HeaderOf( row );
+                header = ReadHeader( current );
             }
         }
     }
@@ -157,6 +149,7 @@ public:
     uint64_t BranchCount() const { return m_branches; }
     uint64_t LogicalBytes() const { return m_rows.LogicalBytes(); }
     bool HasDiskFile() const { return m_rows.HasDiskFile(); }
+    MutableRows::Stats Statistics() const { return m_rows.Statistics(); }
 
 private:
     static void Require( bool value, const char* message )
@@ -168,30 +161,28 @@ private:
         Require( row < UINT64_MAX, "ordered_forest_handle" );
         return row + 1;
     }
-    std::array<unsigned char, 4096> ReadRow( uint64_t handle )
+    void LoadRow( uint64_t handle )
     {
         Require( handle > 0 && handle <= m_rows.Count(), "ordered_forest_handle" );
-        std::array<unsigned char, 4096> row{};
-        m_rows.Read( handle - 1, row.data() );
-        return row;
+        m_rows.Read( handle - 1, m_row.data() );
     }
-    void WriteRow( uint64_t handle, const std::array<unsigned char, 4096>& row )
+    Header ReadHeader( uint64_t handle )
     {
-        Require( handle > 0 && handle <= m_rows.Count(), "ordered_forest_handle" );
-        m_rows.Put( handle - 1, row.data() );
+        LoadRow(handle);return HeaderOfRow();
     }
-    static Header HeaderOf( const std::array<unsigned char, 4096>& row )
+    void WriteHeader( uint64_t handle, const Header& header )
     {
-        Header header;
-        std::memcpy( &header, row.data(), sizeof( header ) );
-        return header;
+        LoadRow(handle);std::memcpy(m_row.data(),&header,sizeof(header));m_rows.Put(handle-1,m_row.data());
     }
-    static void SetHeader( std::array<unsigned char, 4096>& row, const Header& header )
+    Header HeaderOfRow() const
     {
-        std::memcpy( row.data(), &header, sizeof( header ) );
+        Header header;std::memcpy(&header,m_row.data(),sizeof(header));return header;
     }
+    void ClearRow(){std::fill(m_row.begin(),m_row.end(),0);}
 
     uint32_t m_payloadBytes;
+    analysis::AnalysisWorkspaceReservation m_scratchLease;
+    std::vector<unsigned char> m_row;
     MutableRows m_rows;
     uint64_t m_count = 0;
     uint64_t m_roots = 0;

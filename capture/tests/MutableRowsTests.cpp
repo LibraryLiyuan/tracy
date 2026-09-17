@@ -4,13 +4,21 @@
 #include "../../storage/TracyMutableRows.hpp"
 #include <array>
 #include <chrono>
-static void Check(bool ok){if(!ok)throw std::runtime_error("mutable rows invariant");}
+#include <source_location>
+static void Check(bool ok,std::source_location at=std::source_location::current()){if(!ok)throw std::runtime_error("mutable rows invariant at "+std::to_string(at.line()));}
 template<class F> static void Reject(F&& action,const char* reason){try{action();}catch(const std::exception& e){if(std::string(e.what()).find(reason)!=std::string::npos)return;throw;}throw std::runtime_error("expected mutable row refusal");}
 int main(int argc,char** argv){try{
  if(argc!=2)return 2;auto root=std::filesystem::path(argv[1])/std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());std::filesystem::create_directories(root);
  tracy::storage::ResourceLimits limits;limits.streamBytes=32ull<<20;limits.diskReserveBytes=0;
  tracy::storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;
  tracy::storage::ConversionResources budget(limits,[&]{return sample;},[]{return 1ull<<40;});
+ {
+  uint64_t systemSamples=0;tracy::storage::ConversionResources reuseBudget(limits,[&]{++systemSamples;return sample;},[]{return 1ull<<40;});
+  tracy::storage::MutableRows reuse(root/"slot-reuse.bin",40,reuseBudget,2*(16384+1024));
+  std::array<uint64_t,5> value{};const auto before=systemSamples;
+  for(uint64_t i=0;i<10000;++i){value[0]=i;reuse.Append(value.data());}
+  if(systemSamples-before>3)throw std::runtime_error("mutable row slot allocations "+std::to_string(systemSamples-before));
+ }
  tracy::storage::MutableRows store(root/"records.bin",40,budget,2*(16384+1024));
  std::array<uint64_t,5> row{};
  for(uint64_t i=0;i<10000;++i){row={i,i*3,UINT64_MAX-i,0,i};Check(store.Append(row.data())==i);}

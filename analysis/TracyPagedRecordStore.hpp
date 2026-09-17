@@ -6,8 +6,29 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 namespace tracy::analysis
 {
+class PagedRecordScratch
+{
+public:
+    struct Stats { uint64_t grows=0,peakBytes=0; };
+    explicit PagedRecordScratch(std::shared_ptr<AnalysisWorkspaceBudget> workspace={});
+    ~PagedRecordScratch();
+    PagedRecordScratch(const PagedRecordScratch&)=delete;
+    PagedRecordScratch& operator=(const PagedRecordScratch&)=delete;
+    void Ensure(size_t bytes,size_t arenaBytes,const std::function<void(uint64_t)>& beforeAllocation);
+    char* Bytes() { return m_bytes.data(); }
+    size_t BytesSize() const { return m_bytes.size(); }
+    uint64_t* Arena() { return m_arena.data(); }
+    size_t ArenaSize() const { return m_arena.size()*sizeof(uint64_t); }
+    Stats Statistics() const { return m_stats; }
+private:
+    AnalysisWorkspaceReservation m_memory;
+    std::vector<char> m_bytes;
+    std::vector<uint64_t> m_arena;
+    Stats m_stats;
+};
 struct PagedRecordOptions
 {
     uint32_t blockBytes=4*1024*1024;
@@ -19,6 +40,7 @@ struct PagedRecordOptions
     std::function<void(const std::filesystem::path&,const std::filesystem::path&)> renameFile;
     uint64_t activeReadCacheBytes=0;
     std::function<void(uint64_t)> beforeMemoryAllocation;
+    std::shared_ptr<PagedRecordScratch> scratch;
 };
 // Fixed-width records (including byte records for string/blob storage). The
 // ordinal directory is on disk; neither open nor lookup materializes it.

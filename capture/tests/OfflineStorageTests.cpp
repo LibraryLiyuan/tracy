@@ -9,16 +9,20 @@ int main(int argc,char** argv)
     if(argc!=2)return 2;
     tracy::storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;
     tracy::storage::ResourceSample sample;sample.physicalTotal=64ull<<30;sample.physicalAvailable=32ull<<30;sample.systemCommitLimit=64ull<<30;
-    tracy::storage::ConversionResources resources(limits,[&]{return sample;},[]{return 1ull<<40;});
+    uint64_t systemSamples=0;tracy::storage::ConversionResources resources(limits,[&]{++systemSamples;return sample;},[]{return 1ull<<40;});
     tracy::conversion::OfflineConversionStorage store(argv[1],std::string(64,'b'),resources);
     const tracy::JnGpuReferenceSetEntry members[]={{101,3},{202,5}};
     Check(store.DefineResourceSet(7,reinterpret_cast<const char*>(members),sizeof(members)));
     Check(!store.DefineResourceSet(7,reinterpret_cast<const char*>(members),sizeof(members)));
+    const auto samplesBeforeDefinitions=systemSamples;
+    for(uint32_t i=0;i<100;++i)Check(store.DefineResourceSet(100+i,reinterpret_cast<const char*>(members),sizeof(members)));
+    Check(systemSamples-samplesBeforeDefinitions<20);
     store.AppendReferenceUse({10,5,333,9,7,0,4,1});
     Check(store.AppendReferenceSet(7,2,20,6,8,9,2));
     Check(!store.AppendReferenceSet(7,1,20,6,8,9,2));
     Check(!store.AppendReferenceSet(8,2,20,6,8,9,2));
     store.AppendJobStage({30,100,77,123,4,5,6,7});
+    for(uint32_t i=0;i<150000;++i)store.AppendSample(55,0,int64_t(i+1),i%17+1);
     Check(store.ReferenceUseCount()==3 && store.JobStageCount()==1);
     store.Seal();
     uint64_t seen=0;
@@ -30,6 +34,9 @@ int main(int argc,char** argv)
         }
     });Check(seen==3);
     store.VisitJobStages([&](const tracy::JnJobStageData* rows,uint64_t count){Check(count==1 && rows[0].spanId==123 && rows[0].thread==77);});
+    uint64_t sampleSeen=0;store.VisitSamples(55,0,[&](int64_t time,uint32_t callstack){Check(time==int64_t(sampleSeen+1)&&callstack==sampleSeen%17+1);++sampleSeen;});Check(sampleSeen==150000);
+    {std::fstream file(std::filesystem::path(argv[1])/"samples"/"rows.bin",std::ios::in|std::ios::out|std::ios::binary);file.seekg(128);char byte=0;file.read(&byte,1);file.seekp(128);byte^=0x5a;file.write(&byte,1);file.flush();Check(bool(file));}
+    Check(store.SampleHash(55,0).size()==64);
     Check(store.JobStageHash().size()==64 && store.ReferenceUseHash().size()==64);
     {
         tracy::storage::ResourceLimits small=limits;small.streamBytes=8192;

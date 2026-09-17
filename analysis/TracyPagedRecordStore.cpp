@@ -9,6 +9,7 @@
 #include <limits>
 #include <vector>
 #include <map>
+#include <list>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -67,6 +68,17 @@ void Seek(std::istream& in,uint64_t offset)
     in.clear(); in.seekg(std::streamoff(offset)); if(!in) Fail("seek");
 }
 }
+PagedRecordScratch::PagedRecordScratch(std::shared_ptr<AnalysisWorkspaceBudget> workspace):m_memory(std::move(workspace)){}
+PagedRecordScratch::~PagedRecordScratch()=default;
+void PagedRecordScratch::Ensure(size_t bytes,size_t arenaBytes,const std::function<void(uint64_t)>& beforeAllocation)
+{
+    if(arenaBytes>SIZE_MAX-7)Fail("scratch_size");const auto arenaWords=(arenaBytes+7)/8;
+    if(bytes>UINT64_MAX-arenaWords*sizeof(uint64_t)-4096)Fail("scratch_size");
+    const auto required=uint64_t(bytes)+uint64_t(arenaWords)*sizeof(uint64_t)+4096;
+    if(required>m_memory.Bytes()){if(beforeAllocation)beforeAllocation(required);m_memory.Resize(required);++m_stats.grows;m_stats.peakBytes=required;}
+    if(m_bytes.capacity()<bytes)m_bytes.reserve(bytes);m_bytes.resize(bytes);
+    if(m_arena.capacity()<arenaWords)m_arena.reserve(arenaWords);m_arena.resize(arenaWords);
+}
 struct PagedRecordWriter::Impl
 {
     std::filesystem::path root;
@@ -74,20 +86,24 @@ struct PagedRecordWriter::Impl
     AnalysisWorkspaceReservation memory;
     Header header;
     std::ofstream data,directory;
+    std::ifstream readData,readDirectory;
     std::vector<char> buffer;
+    std::shared_ptr<PagedRecordScratch> scratch;
     Sha256Builder content;
     uint64_t offset=0;
     struct CachedBlock {
         AnalysisWorkspaceReservation memory;
         std::vector<char> bytes;
-        uint64_t touched=0;
+        std::list<uint64_t>::iterator lru;
         CachedBlock(const PagedRecordOptions& o,size_t size):memory(o.workspace,size+256),bytes(size){}
+        void Resize(size_t size){if(size+256>memory.Bytes())memory.Resize(size+256);bytes.resize(size);}
     };
     std::map<uint64_t,std::unique_ptr<CachedBlock>> cache;
-    uint64_t cacheBytes=0,clock=0;
-    bool committed=false,failed=false;
+    std::list<uint64_t> cacheLru;
+    uint64_t cacheBytes=0;
+    bool outputDirty=false,committed=false,failed=false;
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
-        :root(std::move(path)),options(std::move(config)),memory(options.workspace)
+        :root(std::move(path)),options(std::move(config)),memory(options.workspace),scratch(options.scratch?options.scratch:std::make_shared<PagedRecordScratch>(options.workspace))
     {
         Validate(identity,width,options);
         if(std::filesystem::exists(AnalysisIoPath(root))) Fail("already_exists");
@@ -110,15 +126,12 @@ struct PagedRecordWriter::Impl
         entry.records=uint32_t(buffer.size()/header.recordBytes); entry.decoded=uint32_t(buffer.size());
         const auto bound=ZSTD_compressBound(buffer.size()),arenaBytes=ZSTD_estimateCCtxSize(1);
         if(ZSTD_isError(bound)||ZSTD_isError(arenaBytes)) Fail("codec");
-        if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(bound+arenaBytes+4096);
-        AnalysisWorkspaceReservation compression(options.workspace,bound+arenaBytes+4096);
-        std::vector<char> encoded(bound);
-        std::vector<uint64_t> arena((arenaBytes+7)/8);
-        auto* context=ZSTD_initStaticCCtx(arena.data(),arena.size()*8); if(!context) Fail("codec");
-        const auto bytes=ZSTD_compressCCtx(context,encoded.data(),encoded.size(),buffer.data(),buffer.size(),1);
+        scratch->Ensure(bound,arenaBytes,options.beforeMemoryAllocation);
+        auto* context=ZSTD_initStaticCCtx(scratch->Arena(),scratch->ArenaSize()); if(!context) Fail("codec");
+        const auto bytes=ZSTD_compressCCtx(context,scratch->Bytes(),scratch->BytesSize(),buffer.data(),buffer.size(),1);
         if(ZSTD_isError(bytes)) Fail("compress");
         const char* payload=buffer.data(); entry.stored=entry.decoded;
-        if(bytes<buffer.size()) { entry.codec=1; entry.stored=uint32_t(bytes); payload=encoded.data(); }
+        if(bytes<buffer.size()) { entry.codec=1; entry.stored=uint32_t(bytes); payload=scratch->Bytes(); }
         const auto digest=Hash(payload,entry.stored); std::memcpy(entry.hash,digest.data(),64);
         if(entry.stored>UINT64_MAX-offset) Fail("offset");
         AnalysisDiskGrow(options.disk,entry.stored);
@@ -127,6 +140,7 @@ struct PagedRecordWriter::Impl
         AnalysisDiskGrow(options.disk,sizeof(entry));
         if(options.beforeFileGrowth) options.beforeFileGrowth(root/"directory.bin",(header.blocks+1)*sizeof(entry));
         Write(directory,entry);
+        outputDirty=true;
         content.Update(buffer.data(),buffer.size());
         offset+=entry.stored; ++header.blocks; buffer.clear();
     }
@@ -179,8 +193,8 @@ void PagedRecordWriter::Commit()
 }
 void PagedRecordWriter::ClearReadCache()
 {
-    auto& w=*m_impl;w.cache.clear();w.cacheBytes=0;
-    if(w.data.is_open()) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush"); }
+    auto& w=*m_impl;w.cache.clear();w.cacheLru.clear();w.cacheBytes=0;
+    if(w.data.is_open()&&w.outputDirty) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush");w.outputDirty=false; }
 }
 void PagedRecordWriter::LimitReadCache(uint64_t bytes)
 {ClearReadCache();m_impl->options.activeReadCacheBytes=bytes;}
@@ -200,34 +214,34 @@ void PagedRecordWriter::Read(uint64_t ordinal,void* output,uint64_t count)
         const auto block=ordinal/w.header.blockRecords;
         auto found=w.cache.find(block);
         if(found==w.cache.end()) {
-            if(w.data.is_open()) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush"); }
-            std::ifstream index(AnalysisIoPath(w.root/"directory.bin"),std::ios::binary);
-            Seek(index,block*sizeof(Entry));const auto e=ReadObject<Entry>(index);
+            if(w.data.is_open()&&w.outputDirty) { w.data.flush();w.directory.flush();if(!w.data||!w.directory)Fail("flush");w.outputDirty=false; }
+            if(!w.readData.is_open()){w.readData.open(AnalysisIoPath(w.root/"data.bin"),std::ios::binary);w.readDirectory.open(AnalysisIoPath(w.root/"directory.bin"),std::ios::binary);if(!w.readData||!w.readDirectory)Fail("active_open");}
+            Seek(w.readDirectory,block*sizeof(Entry));const auto e=ReadObject<Entry>(w.readDirectory);
             const auto expected=std::min<uint64_t>(w.header.blockRecords,w.header.records-block*w.header.blockRecords);
             if(e.first!=block*w.header.blockRecords || e.records!=expected || uint64_t(e.decoded)!=expected*w.header.recordBytes ||
                 !e.stored || e.stored>e.decoded || e.codec>1 || (!e.codec&&e.stored!=e.decoded) || e.offset>w.offset || e.stored>w.offset-e.offset)
                 Fail("active_block_bounds");
             const auto limit=std::max<uint64_t>(w.options.blockBytes+256,w.options.activeReadCacheBytes);
+            std::unique_ptr<Impl::CachedBlock> page;
             while(!w.cache.empty() && w.cacheBytes+e.decoded+256>limit) {
-                auto victim=std::min_element(w.cache.begin(),w.cache.end(),[](const auto& a,const auto& b){return a.second->touched<b.second->touched;});
-                w.cacheBytes-=victim->second->bytes.size()+256;w.cache.erase(victim);
+                const auto victimId=w.cacheLru.front();w.cacheLru.pop_front();auto victim=w.cache.find(victimId);if(victim==w.cache.end())Fail("active_lru");
+                w.cacheBytes-=victim->second->bytes.size()+256;page=std::move(victim->second);w.cache.erase(victim);
             }
-            auto page=std::make_unique<Impl::CachedBlock>(w.options,e.decoded);
             const auto arenaBytes=ZSTD_estimateDCtxSize();
-            AnalysisWorkspaceReservation scratch(w.options.workspace,e.stored+arenaBytes+4096);
-            std::vector<char> encoded(e.stored);std::ifstream input(AnalysisIoPath(w.root/"data.bin"),std::ios::binary);
-            Seek(input,e.offset);input.read(encoded.data(),e.stored);
-            if(!input || Hash(encoded.data(),encoded.size())!=std::string(e.hash,64)) Fail("active_block_checksum");
+            if(ZSTD_isError(arenaBytes))Fail("codec");w.scratch->Ensure(e.stored,arenaBytes,w.options.beforeMemoryAllocation);
+            Seek(w.readData,e.offset);w.readData.read(w.scratch->Bytes(),e.stored);
+            if(!w.readData || Hash(w.scratch->Bytes(),e.stored)!=std::string(e.hash,64)) Fail("active_block_checksum");
+            if(!page)page=std::make_unique<Impl::CachedBlock>(w.options,e.decoded);else page->Resize(e.decoded);
             if(e.codec) {
-                if(ZSTD_getFrameContentSize(encoded.data(),encoded.size())!=e.decoded || ZSTD_findFrameCompressedSize(encoded.data(),encoded.size())!=encoded.size()) Fail("active_frame_size");
-                std::vector<uint64_t> arena((arenaBytes+7)/8);
-                auto* context=ZSTD_initStaticDCtx(arena.data(),arena.size()*8);if(!context)Fail("codec");
-                const auto bytes=ZSTD_decompressDCtx(context,page->bytes.data(),page->bytes.size(),encoded.data(),encoded.size());
+                if(ZSTD_getFrameContentSize(w.scratch->Bytes(),e.stored)!=e.decoded || ZSTD_findFrameCompressedSize(w.scratch->Bytes(),e.stored)!=e.stored) Fail("active_frame_size");
+                auto* context=ZSTD_initStaticDCtx(w.scratch->Arena(),w.scratch->ArenaSize());if(!context)Fail("codec");
+                const auto bytes=ZSTD_decompressDCtx(context,page->bytes.data(),page->bytes.size(),w.scratch->Bytes(),e.stored);
                 if(ZSTD_isError(bytes)||bytes!=e.decoded)Fail("active_decode");
-            }else std::memcpy(page->bytes.data(),encoded.data(),encoded.size());
-            w.cacheBytes+=page->bytes.size()+256;found=w.cache.emplace(block,std::move(page)).first;
+            }else std::memcpy(page->bytes.data(),w.scratch->Bytes(),e.stored);
+            w.cacheLru.push_back(block);page->lru=std::prev(w.cacheLru.end());w.cacheBytes+=page->bytes.size()+256;found=w.cache.emplace(block,std::move(page)).first;
         }
-        auto& page=*found->second;page.touched=++w.clock;
+        else{w.cacheLru.splice(w.cacheLru.end(),w.cacheLru,found->second->lru);found->second->lru=std::prev(w.cacheLru.end());}
+        auto& page=*found->second;
         const auto start=ordinal%w.header.blockRecords;
         const auto take=std::min<uint64_t>(count,page.bytes.size()/w.header.recordBytes-start);
         if(!take)Fail("active_block_count");
@@ -243,10 +257,11 @@ struct PagedRecordReader::Impl
     Header header;
     std::ifstream data,directory;
     std::vector<char> buffer;
+    std::shared_ptr<PagedRecordScratch> scratch;
     uint64_t loaded=UINT64_MAX,dataBytes=0;
     Entry loadedEntry;
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
-        :root(std::move(path)),options(std::move(config)),memory(options.workspace)
+        :root(std::move(path)),options(std::move(config)),memory(options.workspace),scratch(options.scratch?options.scratch:std::make_shared<PagedRecordScratch>(options.workspace))
     {
         Validate(identity,width,options); if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(options.blockBytes+4096); memory.Resize(options.blockBytes+4096);
         std::ifstream in(AnalysisIoPath(root/"header.bin"),std::ios::binary); header=ReadObject<Header>(in);
@@ -277,21 +292,18 @@ struct PagedRecordReader::Impl
             entry.codec>1 || (!entry.codec && entry.stored!=entry.decoded) ||
             entry.offset>dataBytes || entry.stored>dataBytes-entry.offset ||
             (block+1==header.blocks && entry.offset+entry.stored!=dataBytes)) Fail("block_bounds");
-        if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(entry.stored+ZSTD_estimateDCtxSize()+4096);
-        AnalysisWorkspaceReservation decoding(options.workspace,entry.stored+ZSTD_estimateDCtxSize()+4096);
-        std::vector<char> stored(entry.stored); Seek(data,entry.offset); data.read(stored.data(),entry.stored);
-        if(!data || Hash(stored.data(),stored.size())!=std::string(entry.hash,64)) Fail("block_checksum");
+        const auto arenaBytes=ZSTD_estimateDCtxSize();if(ZSTD_isError(arenaBytes)) Fail("codec");
+        scratch->Ensure(entry.stored,arenaBytes,options.beforeMemoryAllocation);
+        Seek(data,entry.offset); data.read(scratch->Bytes(),entry.stored);
+        if(!data || Hash(scratch->Bytes(),entry.stored)!=std::string(entry.hash,64)) Fail("block_checksum");
         buffer.resize(entry.decoded);
         if(entry.codec) {
-            if(ZSTD_getFrameContentSize(stored.data(),stored.size())!=entry.decoded ||
-                ZSTD_findFrameCompressedSize(stored.data(),stored.size())!=stored.size()) Fail("frame_size");
-            const auto arenaBytes=ZSTD_estimateDCtxSize();
-            if(ZSTD_isError(arenaBytes)) Fail("codec");
-            std::vector<uint64_t> arena((arenaBytes+7)/8);
-            auto* context=ZSTD_initStaticDCtx(arena.data(),arena.size()*8); if(!context) Fail("codec");
-            const auto size=ZSTD_decompressDCtx(context,buffer.data(),buffer.size(),stored.data(),stored.size());
+            if(ZSTD_getFrameContentSize(scratch->Bytes(),entry.stored)!=entry.decoded ||
+                ZSTD_findFrameCompressedSize(scratch->Bytes(),entry.stored)!=entry.stored) Fail("frame_size");
+            auto* context=ZSTD_initStaticDCtx(scratch->Arena(),scratch->ArenaSize()); if(!context) Fail("codec");
+            const auto size=ZSTD_decompressDCtx(context,buffer.data(),buffer.size(),scratch->Bytes(),entry.stored);
             if(ZSTD_isError(size)||size!=entry.decoded) Fail("decode");
-        } else std::memcpy(buffer.data(),stored.data(),stored.size());
+        } else std::memcpy(buffer.data(),scratch->Bytes(),entry.stored);
         loadedEntry=entry; loaded=block; return entry;
     }
 };

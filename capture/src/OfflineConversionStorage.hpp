@@ -15,6 +15,7 @@
 #include "../../storage/TracyCatalogBatchDirectory.hpp"
 #include <vector>
 #include <array>
+#include <map>
 namespace tracy::conversion
 {
 class OfflineConversionStorage final : public WorkerOfflineStorage
@@ -95,6 +96,12 @@ public:
     uint64_t CpuBranchCount() const override { return m_cpuZones ? m_cpuZones->BranchCount() : 0; }
     uint32_t CpuRootChildren(uint64_t root) override { if(!m_cpuZones)throw std::runtime_error("cpu_zone_store_missing");return m_cpuZones->Children(root); }
     uint64_t CpuZoneLogicalBytes() const { return m_cpuZones ? m_cpuZones->LogicalBytes() : 0; }
+    void BeginCpuZoneWrite(uint64_t) override;
+    void RecordCpuZoneWriteBegin(uint64_t,int64_t,int16_t,uint32_t,uint32_t) override;
+    void RecordCpuZoneWriteEnd(int64_t) override;
+    void EndCpuZoneWrite() override;
+    uint64_t CpuZoneWriteCount() const override { return m_cpuZoneWriteCount; }
+    std::string CpuZoneWriteHash() const override;
     uint64_t CreateGpuThread() override;
     uint64_t AppendGpuZone(uint64_t,const OfflineGpuZone&) override;
     void ReadGpuZone(uint64_t,OfflineGpuZone&) override;
@@ -106,6 +113,12 @@ public:
     uint64_t GpuBranchCount() const override { return m_gpuZones ? m_gpuZones->BranchCount() : 0; }
     uint32_t GpuRootChildren(uint64_t root) override { if(!m_gpuZones)throw std::runtime_error("gpu_zone_store_missing");return m_gpuZones->Children(root); }
     uint64_t GpuZoneLogicalBytes() const { return m_gpuZones ? m_gpuZones->LogicalBytes() : 0; }
+    void BeginGpuZoneWrite(uint64_t) override;
+    void RecordGpuZoneWriteBegin(uint32_t,uint64_t,int64_t,int64_t,int16_t,uint32_t,uint64_t) override;
+    void RecordGpuZoneWriteEnd(int64_t,int64_t,uint16_t) override;
+    void EndGpuZoneWrite() override;
+    uint64_t GpuZoneWriteCount() const override { return m_gpuZoneWriteCount; }
+    std::string GpuZoneWriteHash() const override;
     std::string ZoneExtraHash() const { if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");return m_zoneHash; }
     void Fail(const char* reason) noexcept override { m_resources.Fail(reason); }
     bool DefineResourceSet(uint32_t,const char*,size_t) override;
@@ -125,6 +138,10 @@ public:
     void Seal();
     std::string JobStageHash() const;
     std::string ReferenceUseHash() const;
+    analysis::PagedRecordScratch::Stats PagedScratchStatistics() const { return m_pagedScratch->Statistics(); }
+    storage::MutableRows::Stats CpuZoneStorageStatistics() const { return m_cpuZones?m_cpuZones->Statistics():storage::MutableRows::Stats{}; }
+    storage::MutableRows::Stats GpuZoneStorageStatistics() const { return m_gpuZones?m_gpuZones->Statistics():storage::MutableRows::Stats{}; }
+    storage::ResourceSetStore::Stats ResourceSetStatistics() const { return m_definitions?m_definitions->Statistics():m_resourceSetStats; }
 private:
     struct AppendTable {std::unique_ptr<analysis::PagedRecordWriter> writer;uint64_t count=0;std::string hash;bool failed=false;};
     std::array<AppendTable,OfflineAppendDomainCount> m_appendTables;
@@ -133,7 +150,22 @@ private:
     std::filesystem::path m_root;
     std::string m_identity,m_jobHash,m_useHash;
     storage::ConversionResources& m_resources;
+    std::shared_ptr<analysis::PagedRecordScratch> m_pagedScratch;
     analysis::AnalysisWorkspaceReservation m_expandLease;
+    analysis::AnalysisWorkspaceReservation m_definitionLease;
+    analysis::AnalysisWorkspaceReservation m_sampleHashLease;
+    analysis::AnalysisWorkspaceReservation m_sampleHashCacheLease;
+    analysis::AnalysisWorkspaceReservation m_zoneWriteHashLease;
+    std::array<storage::OfflineSampleRow,4096> m_sampleHashBuffer{};
+    std::array<unsigned char,64*1024> m_zoneWriteHashBuffer{};
+    size_t m_zoneWriteHashBytes=0;
+    uint8_t m_zoneWriteKind=0;
+    uint64_t m_zoneWriteExpected=0,m_zoneWriteSeen=0;
+    uint64_t m_cpuZoneWriteCount=0,m_gpuZoneWriteCount=0;
+    std::unique_ptr<analysis::Sha256Builder> m_zoneWriteHash;
+    std::string m_cpuZoneWriteHash,m_gpuZoneWriteHash;
+    std::map<std::pair<uint64_t,uint8_t>,std::string> m_sampleHashes;
+    std::vector<storage::ResourceSetMember> m_definitionMembers;
     std::vector<storage::ResourceSetMember> m_members;
     std::vector<JnGpuReferenceUseData> m_expanded;
     std::unique_ptr<analysis::PagedRecordWriter> m_jobs,m_uses;
@@ -142,6 +174,7 @@ private:
     std::string m_relationHash;
     bool m_relationFailed=false;
     std::unique_ptr<storage::ResourceSetStore> m_definitions;
+    storage::ResourceSetStore::Stats m_resourceSetStats{};
     std::unique_ptr<storage::MutableRecordStore> m_zoneExtras;
     std::unique_ptr<storage::OfflineStringStore> m_strings;
     std::unique_ptr<storage::OfflineCallstackStore> m_callstacks;
@@ -168,6 +201,8 @@ private:
     uint64_t m_jobCount=0,m_useCount=0,m_definitionCount=0;
     bool m_sealed=false,m_reclaimed=false;
     std::function<void(const char*,uint64_t,uint64_t,const char*)> m_finalizeProgress;
+    void AppendZoneWriteHash(const void*,size_t);
+    std::string FinishZoneWriteHash(uint8_t);
 };
 }
 #endif

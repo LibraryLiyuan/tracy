@@ -1,4 +1,5 @@
 #include "../../analysis/TracyPagedRecordStore.hpp"
+#include "../../storage/TracyConversionResources.hpp"
 #include <cstdio>
 #include <fstream>
 #include <source_location>
@@ -7,6 +8,13 @@ static void Check(bool value,std::source_location at=std::source_location::curre
 template<class F> static void Refuses(F&& f){bool failed=false;try{f();}catch(const std::exception&){failed=true;}Check(failed);}
 int main(int argc,char** argv){try{
  if(argc!=2)return 2;const auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);tracy::analysis::PagedRecordOptions options;options.blockBytes=4096;
+ {
+  tracy::storage::ResourceLimits limits;limits.streamBytes=64ull<<20;limits.diskReserveBytes=0;tracy::storage::ResourceSample sample;sample.systemCommitLimit=64ull<<30;uint64_t systemSamples=0;
+  tracy::storage::ConversionResources resources(limits,[&]{++systemSamples;return sample;},[]{return 1ull<<40;});
+  auto tracked=options;tracked.workspace=resources.Workspace();tracked.beforeMemoryAllocation=[&](uint64_t n){resources.Check(n);};tracked.beforeFileGrowth=[&](const auto& p,uint64_t n){resources.BeforeFileGrowth(p,n);};tracked.renameFile=[&](const auto& a,const auto& b){resources.RenameOwned(a,b);};
+  const auto writerBefore=systemSamples;{tracy::analysis::PagedRecordWriter writer(root/"scratch-reuse",std::string(64,'d'),sizeof(uint64_t),tracked);for(uint64_t i=0;i<10000;++i)writer.Append(&i,1);writer.Commit();}if(systemSamples-writerBefore>10)throw std::runtime_error("writer scratch samples "+std::to_string(systemSamples-writerBefore));
+  const auto readerBefore=systemSamples;tracy::analysis::PagedRecordReader trackedReader(root/"scratch-reuse",std::string(64,'d'),sizeof(uint64_t),tracked);trackedReader.VisitValidated([](const void*,uint64_t){});if(systemSamples-readerBefore>4)throw std::runtime_error("reader scratch samples "+std::to_string(systemSamples-readerBefore));
+ }
  {tracy::analysis::PagedRecordWriter writer(root/"valid",std::string(64,'a'),sizeof(uint64_t),options);for(uint64_t i=0;i<10000;++i)writer.Append(&i,1);writer.Commit();}
  tracy::analysis::PagedRecordReader reader(root/"valid",std::string(64,'a'),sizeof(uint64_t),options);uint64_t expected=0;
  const auto stats=reader.VisitValidated([&](const void* data,uint64_t count){const auto* rows=static_cast<const uint64_t*>(data);for(uint64_t i=0;i<count;++i)Check(rows[i]==expected++);});

@@ -22,7 +22,7 @@ class MutableRows {
     static constexpr uint64_t PageCharge=sizeof(Slot)+256;
     std::filesystem::path m_path;ConversionResources& m_resources;analysis::AnalysisWorkspaceReservation m_fixedWork;std::fstream m_file;
 public:
-    struct Stats {uint64_t pageLoads=0,pageWrites=0,evictions=0,evictionCandidates=0;};
+    struct Stats {uint64_t pageLoads=0,pageWrites=0,evictions=0,evictionCandidates=0,slotAllocations=0,slotReuses=0;};
 private:
     std::map<uint64_t,std::unique_ptr<Slot>> m_cache;std::list<uint64_t> m_lru;
     uint64_t m_limit,m_count=0,m_pages=0,m_writtenPages=0,m_rows;uint32_t m_width;Stats m_stats{};
@@ -38,14 +38,18 @@ private:
         if(!m_file.is_open()){m_file.open(analysis::AnalysisIoPath(m_path),std::ios::in|std::ios::out|std::ios::binary|std::ios::trunc);Require(bool(m_file),"mutable_rows_open");}
         m_file.clear();m_file.seekp(std::streamoff(id*PageBytes));m_file.write(reinterpret_cast<const char*>(slot.bytes.data()),PageBytes);Require(bool(m_file),"mutable_rows_write");slot.dirty=false;++m_stats.pageWrites;
     }
-    void Evict(){Require(!m_lru.empty(),"mutable_rows_cache");++m_stats.evictions;++m_stats.evictionCandidates;const auto id=m_lru.front();m_lru.pop_front();auto victim=m_cache.find(id);Require(victim!=m_cache.end(),"mutable_rows_lru");Flush(victim->first,*victim->second);m_cache.erase(victim);}
+    std::unique_ptr<Slot> TakeVictim(){Require(!m_lru.empty(),"mutable_rows_cache");++m_stats.evictions;++m_stats.evictionCandidates;const auto id=m_lru.front();m_lru.pop_front();auto victim=m_cache.find(id);Require(victim!=m_cache.end(),"mutable_rows_lru");Flush(victim->first,*victim->second);auto slot=std::move(victim->second);m_cache.erase(victim);return slot;}
+    void Evict(){TakeVictim();}
     Slot& Get(uint64_t id,bool create=false){
         Check();Require(!m_visiting,"mutable_rows_reentrant_access");Require(id<m_pages||(create&&id==m_pages),"mutable_rows_page_id");auto found=m_cache.find(id);
         if(found==m_cache.end()){
-            while((m_cache.size()+1)*PageCharge>m_limit)Evict();auto slot=std::make_unique<Slot>(m_resources);
+            std::unique_ptr<Slot> slot;
+            while((m_cache.size()+1)*PageCharge>m_limit)slot=TakeVictim();
+            if(!slot){slot=std::make_unique<Slot>(m_resources);++m_stats.slotAllocations;}else ++m_stats.slotReuses;
+            slot->dirty=false;
             if(id==m_pages){
                 Require(create&&id<uint64_t(INT64_MAX)/PageBytes,"mutable_rows_offset");
-                Header header;header.width=m_width;header.id=id;header.rows=m_rows;std::memcpy(slot->bytes.data(),&header,sizeof(header));slot->dirty=true;++m_pages;
+                slot->bytes.fill(0);Header header;header.width=m_width;header.id=id;header.rows=m_rows;std::memcpy(slot->bytes.data(),&header,sizeof(header));slot->dirty=true;++m_pages;
             }else{
                 Require(m_file.is_open(),"mutable_rows_missing_file");m_file.flush();Require(bool(m_file),"mutable_rows_flush");m_file.clear();m_file.seekg(std::streamoff(id*PageBytes));m_file.read(reinterpret_cast<char*>(slot->bytes.data()),PageBytes);
                 Header header;std::memcpy(&header,slot->bytes.data(),sizeof(header));Require(bool(m_file)&&header.magic==Header{}.magic&&header.schema==1&&header.width==m_width&&header.id==id&&header.rows==m_rows,"mutable_rows_header");

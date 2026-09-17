@@ -11137,6 +11137,7 @@ static void WriteHwSampleVec( FileWrite& f, SortedVector<Int48, Int48Sort>& vec 
 void Worker::Write( FileWrite& f, bool fiDict )
 {
     if(m_offlineStorage)m_offlineStorage->Check();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_metadata",0,1,"steps");
     DoPostponedWorkAll();
 
     f.Write( FileHeader.data(), FileHeader.size() );
@@ -11225,14 +11226,17 @@ void Worker::Write( FileWrite& f, bool fiDict )
     }
 
     sz = StringTableCount();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_strings",0,sz,"strings");
     f.Write( &sz, sizeof( sz ) );
     if( m_offlineStorage )
     {
+        uint64_t stringDone=0;
         m_offlineStorage->VisitStrings( [&]( uint32_t id, const char* value, uint64_t bytes ) {
             const uint64_t token = uint64_t( id ) + 1;
             f.Write( &token, sizeof( token ) );
             f.Write( &bytes, sizeof( bytes ) );
             f.Write( value, size_t( bytes ) );
+            if((++stringDone&0xFFFF)==0||stringDone==sz)m_offlineStorage->ReportFinalizeProgress("write_strings",stringDone,sz,"strings");
         } );
     }
     else
@@ -11388,8 +11392,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
     sz = m_offlineStorage ? m_offlineStorage->ZoneExtraCount() : m_data.zoneExtra.size();
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_zone_extras",0,sz,"rows");
     f.Write( &sz, sizeof( sz ) );
-    if(m_offlineStorage)m_offlineStorage->VisitZoneExtras([&](const void* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(ZoneExtra));});
+    if(m_offlineStorage){uint64_t done=0;m_offlineStorage->VisitZoneExtras([&](const void* rows,uint64_t n){f.Write(rows,size_t(n)*sizeof(ZoneExtra));done+=n;if((done&0xFFFF)==0||done==sz)m_offlineStorage->ReportFinalizeProgress("write_zone_extras",done,sz,"rows");});}
     else f.Write( m_data.zoneExtra.data(), sz * sizeof( ZoneExtra ) );
 
     sz = 0;
@@ -11399,6 +11404,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.threads.size();
     f.Write( &sz, sizeof( sz ) );
+    if(m_offlineStorage){m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",0,m_offlineWriteCpuTotal,"zones");}
     for( auto& thread : m_data.threads )
     {
         int64_t refTime = 0;
@@ -11407,8 +11413,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->kernelSampleCnt, sizeof( thread->kernelSampleCnt ) );
         f.Write( &thread->isFiber, sizeof( thread->isFiber ) );
         f.Write( &thread->groupHint, sizeof( thread->groupHint ) );
+        m_offlineWriteCpuThread=thread->id;
         const auto offlineRoot = m_offlineCpuThreadRoots.find( thread->id );
-        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ) WriteOfflineCpuTimeline( f, offlineRoot->second, refTime );
+        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ) WriteOfflineCpuTimeline( f, offlineRoot->second, refTime, thread->id );
         else WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
@@ -11444,6 +11451,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
             f.Write( &v.callstack, sizeof( v.callstack ) );
         }
     }
+    if(m_offlineStorage){m_offlineStorage->EndCpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuTotal,m_offlineWriteCpuTotal,"zones");}
 
     // GpuCtxData::count only advances after a timestamp query has returned. The
     // serialized timelines also contain zones that began before capture ended but
@@ -11454,8 +11462,11 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.gpuData.size();
     f.Write( &sz, sizeof( sz ) );
+    if(m_offlineStorage){m_offlineWriteGpuDone=0;m_offlineWriteGpuTotal=m_data.gpuCnt;m_offlineStorage->BeginGpuZoneWrite(m_offlineWriteGpuTotal);m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",0,m_offlineWriteGpuTotal,"zones");}
+    uint32_t gpuContextIndex=0;
     for( auto& ctx : m_data.gpuData )
     {
+        m_offlineWriteGpuContext=gpuContextIndex;
         f.Write( &ctx->thread, sizeof( ctx->thread ) );
         uint8_t calibration = ctx->hasCalibration;
         f.Write( &calibration, sizeof( calibration ) );
@@ -11483,7 +11494,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
             if( m_offlineStorage && roots != m_offlineGpuThreadRoots.end() )
             {
                 const auto offlineRoot = roots->second.find( tid );
-                if( offlineRoot != roots->second.end() ) WriteOfflineGpuTimeline( f, offlineRoot->second, refTime, refGpuTime );
+                if( offlineRoot != roots->second.end() ) WriteOfflineGpuTimeline( f, offlineRoot->second, refTime, refGpuTime, gpuContextIndex );
                 else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
             }
             else WriteTimeline( f, td.second.timeline, refTime, refGpuTime );
@@ -11502,7 +11513,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
                 f.Write( &note.second, sizeof( note.second ) );
             }
         }
+        ++gpuContextIndex;
     }
+    if(m_offlineStorage){m_offlineStorage->EndGpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuTotal,m_offlineWriteGpuTotal,"zones");}
 
     sz = m_data.plots.Data().size();
     for( auto& plot : m_data.plots.Data() ) { if( plot->type == PlotType::Memory ) sz--; }
@@ -11576,6 +11589,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &memdata.name, sizeof( memdata.name ) );
     }
 
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_callstacks",0,m_offlineStorage->CallstackCount()-1,"callstacks");
     sz = m_data.callstackPayload.size() - 1;
     f.Write( &sz, sizeof( sz ) );
     for( size_t i=1; i<=sz; i++ )
@@ -11801,6 +11815,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( v.second.data, v.second.len );
     }
 
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_jn_domains",0,1,"steps");
     FinalizeJnGpuCatalogForSave();
     f.Write( &JnTraceSectionMagic, sizeof( JnTraceSectionMagic ) );
     const uint16_t schemaVersion = JnTraceSchemaVersion;
@@ -11842,6 +11857,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &gpuCatalogValid, sizeof( gpuCatalogValid ) );
     f.Write( &m_data.jnTrace.gpuCatalogSchemaVersion, sizeof( m_data.jnTrace.gpuCatalogSchemaVersion ) );
     f.Write( &m_data.jnTrace.gpuDetailedEvidenceSchemaVersion, sizeof( m_data.jnTrace.gpuDetailedEvidenceSchemaVersion ) );
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_catalog",0,OfflineCatalogDomainCount,"domains");
     WriteCatalogVector(f,m_data.jnTrace.gpuCatalogControls,m_offlineStorage,OfflineCatalogDomain::CatalogControl);
     WriteCatalogVector(f,m_data.jnTrace.gpuCatalogBatches,m_offlineStorage,OfflineCatalogDomain::CatalogBatch);
     WriteCatalogVector(f,m_data.jnTrace.gpuCatalogGenerations,m_offlineStorage,OfflineCatalogDomain::CatalogGeneration);
@@ -11855,6 +11871,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
     WriteCatalogVector(f,m_data.jnTrace.gpuCatalogVg,m_offlineStorage,OfflineCatalogDomain::CatalogVg);
     WriteCatalogVector(f,m_data.jnTrace.gpuRangeSets,m_offlineStorage,OfflineCatalogDomain::CatalogRangeSet);
     WriteCatalogVector(f,m_data.jnTrace.gpuDetailedEvidence,m_offlineStorage,OfflineCatalogDomain::CatalogDetailedEvidence);
+    if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_catalog",OfflineCatalogDomainCount,OfflineCatalogDomainCount,"domains");
 }
 
 void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime )
@@ -11871,20 +11888,23 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& ve
     }
 }
 
-void Worker::WriteOfflineCpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime )
+void Worker::WriteOfflineCpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, uint64_t thread )
 {
     const auto size = m_offlineStorage->CpuRootChildren( root );
     f.Write( &size, sizeof( size ) );
     m_offlineStorage->VisitCpuZones( root, [&]( uint64_t, const OfflineCpuZone& zone, uint32_t children, bool begin ) {
         if( begin )
         {
+            m_offlineStorage->RecordCpuZoneWriteBegin(thread,zone.start,zone.sourceLocation,zone.extra,children);
             f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
             WriteTimeOffset( f, refTime, zone.start );
             f.Write( &zone.extra, sizeof( zone.extra ) );
             f.Write( &children, sizeof( children ) );
+            if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");
         }
         else
         {
+            m_offlineStorage->RecordCpuZoneWriteEnd(zone.end);
             WriteTimeOffset( f, refTime, zone.end );
         }
     } );
@@ -11897,6 +11917,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
     for( auto& val : vec )
     {
         auto& v = a(val);
+        if(m_offlineStorage){const uint32_t children=v.HasChildren()?uint32_t(GetZoneChildren(v.Child()).size()):0;m_offlineStorage->RecordCpuZoneWriteBegin(m_offlineWriteCpuThread,v.Start(),v.SrcLoc(),v.extra,children);if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");}
         int16_t srcloc = v.SrcLoc();
         f.Write( &srcloc, sizeof( srcloc ) );
         int64_t start = v.Start();
@@ -11912,6 +11933,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
             WriteTimeline( f, GetZoneChildren( v.Child() ), refTime );
         }
         WriteTimeOffset( f, refTime, v.End() );
+        if(m_offlineStorage)m_offlineStorage->RecordCpuZoneWriteEnd(v.End());
     }
 }
 
@@ -11929,13 +11951,14 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec
     }
 }
 
-void Worker::WriteOfflineGpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, int64_t& refGpuTime )
+void Worker::WriteOfflineGpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, int64_t& refGpuTime, uint32_t context )
 {
     const uint64_t size = m_offlineStorage->GpuRootChildren( root );
     f.Write( &size, sizeof( size ) );
     m_offlineStorage->VisitGpuZones( root, [&]( uint64_t, const OfflineGpuZone& zone, uint32_t children, bool begin ) {
         if( begin )
         {
+            m_offlineStorage->RecordGpuZoneWriteBegin(context,DecompressThread(zone.thread),zone.cpuStart,zone.gpuStart,zone.sourceLocation,zone.callstack,children);
             WriteTimeOffset( f, refTime, zone.cpuStart );
             WriteTimeOffset( f, refGpuTime, zone.gpuStart );
             f.Write( &zone.sourceLocation, sizeof( zone.sourceLocation ) );
@@ -11945,9 +11968,11 @@ void Worker::WriteOfflineGpuTimeline( FileWrite& f, uint64_t root, int64_t& refT
             f.Write( &zone.thread, sizeof( zone.thread ) );
             const uint64_t childCount = children;
             f.Write( &childCount, sizeof( childCount ) );
+            if((++m_offlineWriteGpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuDone,m_offlineWriteGpuTotal,"zones");
         }
         else
         {
+            m_offlineStorage->RecordGpuZoneWriteEnd(zone.cpuEnd,zone.gpuEnd,zone.queryId);
             WriteTimeOffset( f, refTime, zone.cpuEnd );
             WriteTimeOffset( f, refGpuTime, zone.gpuEnd );
             f.Write( &zone.queryId, sizeof( zone.queryId ) );
@@ -11962,6 +11987,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime, in
     for( auto& val : vec )
     {
         auto& v = a(val);
+        if(m_offlineStorage){const uint64_t children=v.Child()<0?0:GetGpuChildren(v.Child()).size();m_offlineStorage->RecordGpuZoneWriteBegin(m_offlineWriteGpuContext,DecompressThread(v.Thread()),v.CpuStart(),v.GpuStart(),v.SrcLoc(),v.callstack.Val(),children);if((++m_offlineWriteGpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_gpu_zones",m_offlineWriteGpuDone,m_offlineWriteGpuTotal,"zones");}
         WriteTimeOffset( f, refTime, v.CpuStart() );
         WriteTimeOffset( f, refGpuTime, v.GpuStart() );
         const int16_t srcloc = v.SrcLoc();
@@ -11983,6 +12009,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime, in
         WriteTimeOffset( f, refTime, v.CpuEnd() );
         WriteTimeOffset( f, refGpuTime, v.GpuEnd() );
         f.Write( &v.query_id, sizeof( v.query_id ) );
+        if(m_offlineStorage)m_offlineStorage->RecordGpuZoneWriteEnd(v.CpuEnd(),v.GpuEnd(),v.query_id);
     }
 }
 

@@ -72,6 +72,12 @@ public:
     virtual uint64_t CpuThreadCount() const=0;
     virtual uint64_t CpuBranchCount() const=0;
     virtual uint32_t CpuRootChildren(uint64_t)=0;
+    virtual void BeginCpuZoneWrite(uint64_t)=0;
+    virtual void RecordCpuZoneWriteBegin(uint64_t,int64_t,int16_t,uint32_t,uint32_t)=0;
+    virtual void RecordCpuZoneWriteEnd(int64_t)=0;
+    virtual void EndCpuZoneWrite()=0;
+    virtual uint64_t CpuZoneWriteCount() const=0;
+    virtual std::string CpuZoneWriteHash() const=0;
     virtual uint64_t CreateGpuThread()=0;
     virtual uint64_t AppendGpuZone(uint64_t,const OfflineGpuZone&)=0;
     virtual void ReadGpuZone(uint64_t,OfflineGpuZone&)=0;
@@ -82,6 +88,12 @@ public:
     virtual uint64_t GpuThreadCount() const=0;
     virtual uint64_t GpuBranchCount() const=0;
     virtual uint32_t GpuRootChildren(uint64_t)=0;
+    virtual void BeginGpuZoneWrite(uint64_t)=0;
+    virtual void RecordGpuZoneWriteBegin(uint32_t,uint64_t,int64_t,int64_t,int16_t,uint32_t,uint64_t)=0;
+    virtual void RecordGpuZoneWriteEnd(int64_t,int64_t,uint16_t)=0;
+    virtual void EndGpuZoneWrite()=0;
+    virtual uint64_t GpuZoneWriteCount() const=0;
+    virtual std::string GpuZoneWriteHash() const=0;
     virtual void Check()=0;
     virtual void ReportFinalizeProgress(const char*,uint64_t,uint64_t,const char*)=0;
     virtual OfflinePassTimeBuildStats PreparePassTimes()=0;

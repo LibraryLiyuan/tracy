@@ -9,17 +9,24 @@
 #include <bit>
 namespace tracy::conversion
 {
+#pragma pack(push,1)
+struct CpuZoneWriteBeginRow{uint8_t tag=1;uint64_t thread=0;int64_t start=0;int16_t sourceLocation=0;uint32_t extra=0,children=0;};
+struct CpuZoneWriteEndRow{uint8_t tag=2;int64_t end=0;};
+struct GpuZoneWriteBeginRow{uint8_t tag=3;uint32_t context=0;uint64_t thread=0;int64_t cpuStart=0,gpuStart=0;int16_t sourceLocation=0;uint32_t callstack=0;uint64_t children=0;};
+struct GpuZoneWriteEndRow{uint8_t tag=4;int64_t cpuEnd=0,gpuEnd=0;uint16_t queryId=0;};
+#pragma pack(pop)
+static_assert(sizeof(CpuZoneWriteBeginRow)==27&&sizeof(CpuZoneWriteEndRow)==9&&sizeof(GpuZoneWriteBeginRow)==43&&sizeof(GpuZoneWriteEndRow)==19);
 analysis::PagedRecordOptions OfflineConversionStorage::Options()
 {
-    analysis::PagedRecordOptions o;o.workspace=m_resources.Workspace();
+    analysis::PagedRecordOptions o;o.workspace=m_resources.Workspace();o.scratch=m_pagedScratch;
     o.beforeMemoryAllocation=[this](uint64_t bytes){m_resources.Check(bytes);};
     o.cancelled=[this]{m_resources.CheckFast();return false;};
     o.beforeFileGrowth=[this](const auto& p,uint64_t n){m_resources.BeforeFileGrowth(p,n);};
     o.renameFile=[this](const auto& a,const auto& b){m_resources.RenameOwned(a,b);};return o;
 }
 OfflineConversionStorage::OfflineConversionStorage(std::filesystem::path root,std::string identity,storage::ConversionResources& resources)
-    :m_root(std::move(root)),m_identity(std::move(identity)),m_resources(resources),
-     m_expandLease(resources.Workspace(),65536),m_members(1024),m_expanded(1024)
+    :m_root(std::move(root)),m_identity(std::move(identity)),m_resources(resources),m_pagedScratch(std::make_shared<analysis::PagedRecordScratch>(resources.Workspace())),
+     m_expandLease(resources.Workspace(),65536),m_definitionLease(resources.Workspace()),m_sampleHashLease(resources.Workspace(),sizeof(m_sampleHashBuffer)+256),m_sampleHashCacheLease(resources.Workspace(),256*1024),m_zoneWriteHashLease(resources.Workspace(),sizeof(m_zoneWriteHashBuffer)+256),m_members(1024),m_expanded(1024)
 {
     if(std::filesystem::exists(analysis::AnalysisIoPath(m_root)))throw std::runtime_error("offline_store_already_exists");
     resources.BeforeFileGrowth(m_root,0);std::filesystem::create_directories(analysis::AnalysisIoPath(m_root));
@@ -35,10 +42,13 @@ bool OfflineConversionStorage::DefineResourceSet(uint32_t id,const char* data,si
     Check();if(m_sealed)throw std::runtime_error("offline_store_closed");
     if(!data||!bytes||bytes%sizeof(storage::ResourceSetMember)||bytes/sizeof(storage::ResourceSetMember)>65535)return false;
     const auto count=bytes/sizeof(storage::ResourceSetMember);
-    analysis::AnalysisWorkspaceReservation memory(m_resources.Workspace(),bytes+256);
-    std::vector<storage::ResourceSetMember> members(count);std::memcpy(members.data(),data,bytes);
+    if(count>m_definitionMembers.capacity()){
+        m_definitionLease.Resize(bytes+256);m_definitionMembers.reserve(count);
+        m_definitionLease.Resize(uint64_t(m_definitionMembers.capacity())*sizeof(storage::ResourceSetMember)+256);
+    }
+    m_definitionMembers.resize(count);std::memcpy(m_definitionMembers.data(),data,bytes);
     if(!m_definitions)m_definitions=std::make_unique<storage::ResourceSetStore>(m_root/"sets",m_identity,m_resources);
-    const auto inserted=m_definitions->Define(id,members);if(inserted)++m_definitionCount;return inserted;
+    const auto inserted=m_definitions->Define(id,m_definitionMembers);if(inserted)++m_definitionCount;return inserted;
 }
 bool OfflineConversionStorage::AppendReferenceSet(uint32_t id,uint16_t count,int64_t time,uint64_t pass,uint64_t thread,uint8_t flags,uint8_t encoding)
 {
@@ -93,7 +103,7 @@ void OfflineConversionStorage::Seal()
     }
     else {std::array<uint8_t,storage::ZoneExtraWireBytes> zero{};zoneHash.Update(zero.data(),zero.size());}
     m_zoneHash=zoneHash.FinalHex();
-    m_jobs.reset();m_uses.reset();m_definitions.reset();m_members.clear();m_members.shrink_to_fit();m_expanded.clear();m_expanded.shrink_to_fit();m_expandLease.Resize(0);
+    m_jobs.reset();m_uses.reset();if(m_definitions)m_resourceSetStats=m_definitions->Statistics();m_definitions.reset();m_definitionMembers.clear();m_definitionMembers.shrink_to_fit();m_definitionLease.Resize(0);m_members.clear();m_members.shrink_to_fit();m_expanded.clear();m_expanded.shrink_to_fit();m_expandLease.Resize(0);
     m_sealed=true;
     m_relations.reset();
 }
@@ -228,8 +238,16 @@ bool OfflineConversionStorage::FindSample(uint64_t thread,uint8_t kind,int64_t t
 void OfflineConversionStorage::PutSample(uint64_t id,int64_t time,uint32_t callstack){Check();if(m_sealed||!m_samples)throw std::runtime_error("offline_sample_update_state");m_samples->Put(id,{time,callstack});}
 std::optional<int64_t> OfflineConversionStorage::LastSampleTime(uint64_t thread,uint8_t kind)const{return m_samples?m_samples->LastTime(thread,kind):std::nullopt;}
 uint64_t OfflineConversionStorage::SampleCount(uint64_t thread,uint8_t kind)const{return m_samples?m_samples->Count(thread,kind):0;}
-void OfflineConversionStorage::VisitSamples(uint64_t thread,uint8_t kind,const std::function<void(int64_t,uint32_t)>& visitor){Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");if(m_samples)m_samples->Visit(thread,kind,[&](const storage::OfflineSampleRow& row){visitor(row.time,row.callstack);});}
-std::string OfflineConversionStorage::SampleHash(uint64_t thread,uint8_t kind){analysis::Sha256Builder hash;VisitSamples(thread,kind,[&](int64_t time,uint32_t callstack){storage::OfflineSampleRow row{time,callstack};hash.Update(&row,sizeof(row));});return hash.FinalHex();}
+void OfflineConversionStorage::VisitSamples(uint64_t thread,uint8_t kind,const std::function<void(int64_t,uint32_t)>& visitor){
+    Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");analysis::Sha256Builder hash;size_t buffered=0;uint64_t seen=0;
+    if(m_samples)m_samples->Visit(thread,kind,[&](const storage::OfflineSampleRow& row){m_sampleHashBuffer[buffered++]=row;if(buffered==m_sampleHashBuffer.size()){hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));buffered=0;}visitor(row.time,row.callstack);++seen;});
+    if(buffered)hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));if(seen!=SampleCount(thread,kind))throw std::runtime_error("offline_sample_visit_count");
+    const auto key=std::make_pair(thread,kind);if(!m_sampleHashes.contains(key)){if((m_sampleHashes.size()+1)*256>m_sampleHashCacheLease.Bytes())m_sampleHashCacheLease.Resize((m_sampleHashes.size()+1)*256);m_sampleHashes.emplace(key,hash.FinalHex());}
+}
+std::string OfflineConversionStorage::SampleHash(uint64_t thread,uint8_t kind){
+    const auto key=std::make_pair(thread,kind);const auto found=m_sampleHashes.find(key);if(found!=m_sampleHashes.end())return found->second;
+    analysis::Sha256Builder hash;size_t buffered=0;uint64_t seen=0;if(m_samples)m_samples->Visit(thread,kind,[&](const storage::OfflineSampleRow& row){m_sampleHashBuffer[buffered++]=row;if(buffered==m_sampleHashBuffer.size()){hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));buffered=0;}++seen;});if(buffered)hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));if(seen!=SampleCount(thread,kind))throw std::runtime_error("offline_sample_hash_count");const auto value=hash.FinalHex();if((m_sampleHashes.size()+1)*256>m_sampleHashCacheLease.Bytes())m_sampleHashCacheLease.Resize((m_sampleHashes.size()+1)*256);m_sampleHashes.emplace(key,value);return value;
+}
 uint64_t OfflineConversionStorage::CreateCpuThread(){Check();if(m_sealed||m_cpuZonesSealed)throw std::runtime_error("cpu_zone_store_closed");if(!m_cpuZones)m_cpuZones=std::make_unique<storage::OrderedForest>(m_root/"cpu-zones.bin",sizeof(OfflineCpuZone),m_resources);return m_cpuZones->CreateRoot();}
 uint64_t OfflineConversionStorage::AppendCpuZone(uint64_t parent,const OfflineCpuZone& row){Check();if(m_sealed||m_cpuZonesSealed||!m_cpuZones)throw std::runtime_error("cpu_zone_store_closed");return m_cpuZones->Append(parent,&row);}
 void OfflineConversionStorage::ReadCpuZone(uint64_t id,OfflineCpuZone& row){Check();if(!m_cpuZones)throw std::runtime_error("cpu_zone_store_missing");m_cpuZones->Read(id,&row);}
@@ -242,4 +260,21 @@ void OfflineConversionStorage::ReadGpuZone(uint64_t id,OfflineGpuZone& row){Chec
 void OfflineConversionStorage::PutGpuZone(uint64_t id,const OfflineGpuZone& row){Check();if(m_sealed||m_gpuZonesSealed||!m_gpuZones)throw std::runtime_error("gpu_zone_store_closed");m_gpuZones->Put(id,&row);}
 void OfflineConversionStorage::SealGpuZones(){Check();if(m_gpuZonesSealed)return;if(m_gpuZones)m_gpuZones->Seal();m_gpuZonesSealed=true;}
 void OfflineConversionStorage::VisitGpuZones(uint64_t root,const std::function<void(uint64_t,const OfflineGpuZone&,uint32_t,bool)>& visitor){Check();if(!m_gpuZonesSealed||!m_gpuZones)throw std::runtime_error("gpu_zone_store_not_sealed");m_gpuZones->Visit(root,[&](uint64_t id,const void* bytes,uint32_t children,bool begin){OfflineGpuZone row;std::memcpy(&row,bytes,sizeof(row));visitor(id,row,children,begin);});}
+void OfflineConversionStorage::AppendZoneWriteHash(const void* data,size_t bytes){
+    if(!m_zoneWriteHash||!data||bytes>m_zoneWriteHashBuffer.size())throw std::runtime_error("offline_zone_write_hash_state");const auto* src=static_cast<const unsigned char*>(data);
+    while(bytes){const auto take=std::min(bytes,m_zoneWriteHashBuffer.size()-m_zoneWriteHashBytes);std::memcpy(m_zoneWriteHashBuffer.data()+m_zoneWriteHashBytes,src,take);m_zoneWriteHashBytes+=take;src+=take;bytes-=take;if(m_zoneWriteHashBytes==m_zoneWriteHashBuffer.size()){m_zoneWriteHash->Update(m_zoneWriteHashBuffer.data(),m_zoneWriteHashBytes);m_zoneWriteHashBytes=0;}}
+}
+std::string OfflineConversionStorage::FinishZoneWriteHash(uint8_t kind){
+    if(m_zoneWriteKind!=kind||!m_zoneWriteHash||m_zoneWriteSeen!=m_zoneWriteExpected)throw std::runtime_error("offline_zone_write_hash_count");if(m_zoneWriteHashBytes)m_zoneWriteHash->Update(m_zoneWriteHashBuffer.data(),m_zoneWriteHashBytes);auto value=m_zoneWriteHash->FinalHex();m_zoneWriteHash.reset();m_zoneWriteHashBytes=0;m_zoneWriteKind=0;return value;
+}
+void OfflineConversionStorage::BeginCpuZoneWrite(uint64_t count){Check();if(!m_sealed||m_zoneWriteKind)throw std::runtime_error("offline_cpu_zone_write_begin");m_zoneWriteKind=1;m_zoneWriteExpected=count;m_zoneWriteSeen=0;m_zoneWriteHashBytes=0;m_zoneWriteHash=std::make_unique<analysis::Sha256Builder>();}
+void OfflineConversionStorage::RecordCpuZoneWriteBegin(uint64_t thread,int64_t start,int16_t source,uint32_t extra,uint32_t children){if(m_zoneWriteKind!=1||m_zoneWriteSeen>=m_zoneWriteExpected)throw std::runtime_error("offline_cpu_zone_write_record");const CpuZoneWriteBeginRow row{1,thread,start,source,extra,children};AppendZoneWriteHash(&row,sizeof(row));++m_zoneWriteSeen;}
+void OfflineConversionStorage::RecordCpuZoneWriteEnd(int64_t end){if(m_zoneWriteKind!=1)throw std::runtime_error("offline_cpu_zone_write_record");const CpuZoneWriteEndRow row{2,end};AppendZoneWriteHash(&row,sizeof(row));}
+void OfflineConversionStorage::EndCpuZoneWrite(){m_cpuZoneWriteCount=m_zoneWriteExpected;m_cpuZoneWriteHash=FinishZoneWriteHash(1);}
+std::string OfflineConversionStorage::CpuZoneWriteHash()const{if(m_cpuZoneWriteHash.size()==64)return m_cpuZoneWriteHash;if(CpuZoneCount()==0)return analysis::Sha256Builder().FinalHex();throw std::runtime_error("offline_cpu_zone_write_hash");}
+void OfflineConversionStorage::BeginGpuZoneWrite(uint64_t count){Check();if(!m_sealed||m_zoneWriteKind)throw std::runtime_error("offline_gpu_zone_write_begin");m_zoneWriteKind=2;m_zoneWriteExpected=count;m_zoneWriteSeen=0;m_zoneWriteHashBytes=0;m_zoneWriteHash=std::make_unique<analysis::Sha256Builder>();}
+void OfflineConversionStorage::RecordGpuZoneWriteBegin(uint32_t context,uint64_t thread,int64_t cpuStart,int64_t gpuStart,int16_t source,uint32_t callstack,uint64_t children){if(m_zoneWriteKind!=2||m_zoneWriteSeen>=m_zoneWriteExpected)throw std::runtime_error("offline_gpu_zone_write_record");const GpuZoneWriteBeginRow row{3,context,thread,cpuStart,gpuStart,source,callstack,children};AppendZoneWriteHash(&row,sizeof(row));++m_zoneWriteSeen;}
+void OfflineConversionStorage::RecordGpuZoneWriteEnd(int64_t cpuEnd,int64_t gpuEnd,uint16_t query){if(m_zoneWriteKind!=2)throw std::runtime_error("offline_gpu_zone_write_record");const GpuZoneWriteEndRow row{4,cpuEnd,gpuEnd,query};AppendZoneWriteHash(&row,sizeof(row));}
+void OfflineConversionStorage::EndGpuZoneWrite(){m_gpuZoneWriteCount=m_zoneWriteExpected;m_gpuZoneWriteHash=FinishZoneWriteHash(2);}
+std::string OfflineConversionStorage::GpuZoneWriteHash()const{if(m_gpuZoneWriteHash.size()==64)return m_gpuZoneWriteHash;if(GpuZoneCount()==0)return analysis::Sha256Builder().FinalHex();throw std::runtime_error("offline_gpu_zone_write_hash");}
 }

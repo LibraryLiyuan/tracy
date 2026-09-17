@@ -329,6 +329,8 @@ int main(int argc,char** argv) {
  {std::unique_ptr<FileRead> file(FileRead::Open(output));Worker reopened(*file,EventType::All,false);Check(reopened.GetJnTraceData().jobStages.size()==3&&reopened.GetJnTraceData().gpuReferenceUses.size()==131072);Check(reopened.GetJnTraceData().relations.size()==130002);Check(std::memcmp(reopened.GetJnTraceData().relations.data(),oldWorker.GetJnTraceData().relations.data(),130002*sizeof(JnRelationData))==0);OfflineStorageSemanticTest::CompareCatalog(oldWorker,reopened);}
  {conversion::OfflineValidationSink sink(store,resources);Refuses([&]{sink.ZoneExtrasBegin(store.ZoneExtraCount()+1);});}
  {conversion::OfflineValidationSink sink(store,resources);sink.ZoneExtrasBegin(store.ZoneExtraCount());Refuses([&]{sink.ZoneExtrasEnd();});Refuses([&]{sink.ValidateZoneExtraIndex(uint32_t(store.ZoneExtraCount()));});}
+ {conversion::OfflineValidationSink sink(store,resources);sink.CpuZonesBegin(store.CpuZoneWriteCount());Refuses([&]{sink.CpuZoneBegin(1,UINT64_MAX,1,10,2,0,0);});}
+ {conversion::OfflineValidationSink sink(store,resources);sink.GpuZonesBegin(store.GpuZoneWriteCount());Refuses([&]{sink.GpuZoneBegin(1,UINT64_MAX,0,10,20,2,0,1,0);});}
  std::puts("Worker Full/disk fields, order, maximum set, callstack and reopen passed");
  } catch(const std::exception& e){std::fprintf(stderr,"Worker semantic failure: %s\n",e.what());return 1;}
 }

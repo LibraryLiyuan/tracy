@@ -32,6 +32,8 @@ private:
     };
     std::filesystem::path m_path;
     ConversionResources& m_resources;
+    analysis::AnalysisWorkspaceReservation m_visitLease;
+    std::unique_ptr<Page> m_visitPage;
     std::fstream m_file;
     std::map<uint64_t,std::unique_ptr<Slot>> m_cache;
     uint64_t m_count=0,m_pages=0,m_clock=0,m_limit;
@@ -78,7 +80,7 @@ private:
         m_last=found->second.get();m_last->touched=++m_clock;return *m_last;
     }
 public:
-    MutableRecordStore(std::filesystem::path path,ConversionResources& r,uint64_t cachedPages=0):m_path(std::move(path)),m_resources(r),m_limit(cachedPages?cachedPages:(32ull<<20)/(sizeof(Slot)+256)){
+    MutableRecordStore(std::filesystem::path path,ConversionResources& r,uint64_t cachedPages=0):m_path(std::move(path)),m_resources(r),m_visitLease(r.Workspace()),m_limit(cachedPages?cachedPages:(32ull<<20)/(sizeof(Slot)+256)){
         Require(m_limit>=1&&m_limit<=(32ull<<20)/(sizeof(Slot)+256),"zone_extra_cache_limit");
         Require(!std::filesystem::exists(analysis::AnalysisIoPath(m_path)),"zone_extra_file_exists");
         r.BeforeFileGrowth(m_path,0);
@@ -105,7 +107,8 @@ public:
     }
     template<class F> void Visit(F f){
         Require(m_sealed,"zone_extra_not_sealed");
-        for(uint64_t base=0;base<m_count;base+=Rows){auto& s=Get(base/Rows);f(s.page.rows.data(),std::min(Rows,m_count-base));}
+        if(!m_visitPage){m_visitLease.Resize(sizeof(Page)+256);m_visitPage=std::make_unique<Page>();}
+        for(uint64_t base=0;base<m_count;base+=Rows){m_resources.CheckFast();const auto id=base/Rows;m_file.clear();m_file.seekg(std::streamoff(id*sizeof(Page)));m_file.read(reinterpret_cast<char*>(m_visitPage.get()),sizeof(Page));const auto& page=*m_visitPage;Require(bool(m_file)&&page.magic==0x325058455a&&page.schema==2&&page.recordBytes==16&&page.id==id&&page.checksum==Digest(page),"zone_extra_page_integrity");f(page.rows.data(),std::min(Rows,m_count-base));}
     }
 };
 }
