@@ -1292,7 +1292,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ssz );
         if(externalSamples)
         {
-            m_serializedZoneSink->SamplesBegin(tid,1,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,1,j,refTime,callstack.Val());}m_serializedZoneSink->SamplesEnd(tid,1);
+            const bool retain = ( eventMask & EventType::Samples ) != 0;
+            if( retain ) td->ctxSwitchSamples.reserve_exact( ssz, m_slab );
+            m_serializedZoneSink->SamplesBegin(tid,1,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,1,j,refTime,callstack.Val());if(retain){td->ctxSwitchSamples[j].time.SetVal(refTime);td->ctxSwitchSamples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,1);
         }
         else if( ssz != 0 )
         {
@@ -1316,7 +1318,9 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ssz );
         if(externalSamples)
         {
-            m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());}m_serializedZoneSink->SamplesEnd(tid,0);
+            const bool retain = ( eventMask & EventType::Samples ) != 0;
+            if( retain ){m_data.samplesCnt+=ssz;td->samples.reserve_exact(ssz,m_slab);}
+            m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());if(retain){td->samples[j].time.SetVal(refTime);td->samples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,0);
         }
         else if( ssz != 0 )
         {

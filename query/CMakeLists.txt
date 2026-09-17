@@ -67,6 +67,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyPng.hpp
     src/TracyQueryIndex.cpp
     src/TracyQueryIndex.hpp
+    src/TracyQuerySampleStore.cpp
+    src/TracyQuerySampleStore.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
@@ -128,6 +130,15 @@ if(BUILD_TESTING)
     add_executable(tracy-compressed-query-index-tests tests/CompressedQueryIndexTests.cpp)
     target_link_libraries(tracy-compressed-query-index-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-compressed-query-index-tests)
+
+    add_executable(tracy-query-sample-store-tests tests/QuerySampleStoreTests.cpp)
+    target_link_libraries(tracy-query-sample-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-store-tests)
+    add_test(NAME tracy-query-sample-store COMMAND tracy-query-sample-store-tests)
+
+    add_executable(tracy-query-sample-index-integration-tests tests/QuerySampleIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-sample-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-index-integration-tests)
 
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)

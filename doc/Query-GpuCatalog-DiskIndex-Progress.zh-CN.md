@@ -29,3 +29,16 @@
 统一全部Query产物的8S/16S计账与发布门禁、完整启动资源Profile、Catalog原始表外置与质量权威迁移、所有定向查询与Scan迁移、GPU内存大JSON摘要拆表、真实输入转换及单轮初评。
 
 详细执行计划及证据位于工作区reviews/query-longtrace-gpucatalog-20260914和GpuCatalog-DiskIndex；原始录制及历史分析保持不变。未合并DevBase、未推送、未替换正式工具。
+
+## 2026-09-17：转换完成后的 Query 续作
+
+分支已包含 Converter 的磁盘外置、JNTRACYX v1 写出与30分钟真实录制验收。正式输入为12428310213字节；转换阻断解除。冻结 Query 对该文件仍以 `RESOURCE_LIMIT: not enough memory to load trace` 失败，因此 Query 冷启动仍是独立阻断。
+
+第一个续作检查点新增 Query Sample sidecar，索引 schema 升至16：
+
+- 主 Sample 与持久化上下文 Sample 按块压缩，线程/种类目录与记录正文均可冷重开、身份校验和有界范围分页；上下文 Sample 的原始乱序保持不变。
+- manifest 记录 sidecar 的文件身份、物理记录数，以及 Query 1.35 对外的主 Sample/派生上下文 Sample 计数。深校验覆盖两层分页表。
+- 小型真实 Sample Trace 的完整 QueryIndex 构建、manifest 发布、重开及6条 `sample.list` 事实逐字段等价通过。
+- Converter 离线验证 mask 仍不保留 Sample；相关 Worker 语义回归通过。Query CompactIndex 当前暂时同时保留 Worker Sample，以维持 ghost zone、符号统计等尚未迁移的能力。
+
+这个检查点建立了 Sample 外置格式，但尚未降低 Query 的 Sample 峰值。下一步必须迁移派生上下文 Sample、ghost zone、符号统计等消费者后，才能关闭 Compact Worker 中的完整 Sample 驻留并用12.43 GB真实输入验证冷启动。

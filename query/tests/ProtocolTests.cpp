@@ -139,7 +139,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 15 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 16 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
