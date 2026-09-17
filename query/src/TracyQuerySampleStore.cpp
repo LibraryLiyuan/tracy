@@ -211,6 +211,28 @@ uint64_t QuerySampleStoreReader::Count() const { return m_impl->mainCount + m_im
 uint64_t QuerySampleStoreReader::MainCount() const { return m_impl->mainCount; }
 uint64_t QuerySampleStoreReader::ContextSwitchCount() const { return m_impl->contextCount; }
 
+std::vector<QuerySampleMainSpan> QuerySampleStoreReader::MainSpans() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    std::vector<QuerySampleMainSpan> result;
+    for( uint64_t index = 0; index < m_impl->spans.Count(); index++ )
+    {
+        StoredSpan span;
+        m_impl->spans.Read( index, &span, 1 );
+        if( span.kind == uint8_t( QuerySampleKind::Main ) )
+            result.push_back( { span.thread, span.first, span.count, span.sorted != 0 } );
+    }
+    return result;
+}
+
+QuerySampleRow QuerySampleStoreReader::ReadPhysical( uint64_t ordinal, uint64_t thread, QuerySampleKind kind ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    StoredSample sample;
+    m_impl->records.Read( ordinal, &sample, 1 );
+    return { ordinal, thread, sample.timeNs, sample.callstack, kind };
+}
+
 std::vector<QuerySampleRow> QuerySampleStoreReader::Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit,
     std::optional<QuerySampleKind> kind ) const
 {

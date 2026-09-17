@@ -3200,6 +3200,17 @@ std::vector<ContextSwitchDto> WorkerTraceSource::ScanContextSwitchEvents( const 
     return result;
 }
 
+std::vector<int64_t> WorkerTraceSource::GetContextSwitchStartTimes( uint64_t thread ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    const auto* data = m_impl->worker->GetContextSwitchData( thread );
+    std::vector<int64_t> result;
+    if( !data ) return result;
+    result.reserve( data->v.size() );
+    for( const auto& event : data->v ) result.emplace_back( event.Start() );
+    return result;
+}
+
 std::vector<CpuContextSwitchDto> WorkerTraceSource::ScanCpuContextSwitchEvents( const ScanRange& range ) const
 {
     std::lock_guard lock( m_impl->readMutex );

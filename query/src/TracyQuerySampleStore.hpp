@@ -28,6 +28,14 @@ struct QuerySampleRow
     QuerySampleKind kind = QuerySampleKind::Main;
 };
 
+struct QuerySampleMainSpan
+{
+    uint64_t thread = 0;
+    uint64_t first = 0;
+    uint64_t count = 0;
+    bool sorted = true;
+};
+
 class QuerySampleStoreWriter
 {
 public:
@@ -61,6 +69,8 @@ public:
     uint64_t Count() const;
     uint64_t MainCount() const;
     uint64_t ContextSwitchCount() const;
+    std::vector<QuerySampleMainSpan> MainSpans() const;
+    QuerySampleRow ReadPhysical( uint64_t ordinal, uint64_t thread, QuerySampleKind kind ) const;
     std::vector<QuerySampleRow> Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit,
         std::optional<QuerySampleKind> kind = {} ) const;
     void ValidateAll();

@@ -141,6 +141,7 @@ public:
     std::vector<CpuTopologyDto> GetCpuTopology() const override;
     std::vector<CpuUsagePointDto> GetCpuUsage() const override;
     std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& range ) const override;
+    std::vector<int64_t> GetContextSwitchStartTimes( uint64_t thread ) const;
     std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
     std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& range ) const override;

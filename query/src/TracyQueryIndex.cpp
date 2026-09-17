@@ -1,6 +1,7 @@
 #include <type_traits>
 #include "TracyQueryIndex.hpp"
 #include "TracyQuerySampleStore.hpp"
+#include "TracyQuerySampleView.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyWorker.hpp"
 #include "TracyPagedRecordStore.hpp"
@@ -901,6 +902,13 @@ public:
                 item.indexed = true;
                 item.reason = "exact N16.10 memory-mapped zone sidecar";
             }
+            else if( item.domain == "sample" && m_samples.Count() != 0 )
+            {
+                item.present = true;
+                item.queryable = true;
+                item.indexed = true;
+                item.reason = "bounded Query sample sidecar";
+            }
         }
         return result;
     }
@@ -915,6 +923,8 @@ public:
         auto result = m_source->GetTraceInfo();
         result.counts.cpuZones = m_cpu.Count();
         result.counts.gpuZones = m_gpu.Count();
+        result.counts.samples = m_samples.MainCount();
+        result.counts.contextSwitchSamples = m_samples.ContextSwitchCount();
         result.counts.gfxEntities = m_gfxEntities.Count();
         result.counts.gfxLinks = m_gfxLinks.Count();
         result.counts.relations = m_relations.Count();
@@ -1209,7 +1219,14 @@ public:
     TRACY_INDEX_FORWARD1( std::vector<analysis::PlotPointDto>, ScanPlots, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanLocks, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanContextSwitches, const analysis::ScanRange&, range )
-    TRACY_INDEX_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
+    std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override
+    {
+        const auto rows = m_samples.Scan( range.startNs, range.endNs, range.offset, range.limit, QuerySampleKind::Main );
+        std::vector<std::string> result;
+        result.reserve( rows.size() );
+        for( const auto& row : rows ) result.emplace_back( m_source->MakeEntityRef( "sample", row.ordinal ) );
+        return result;
+    }
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
     TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
@@ -1362,7 +1379,24 @@ public:
     TRACY_INDEX_FORWARD0( std::vector<analysis::CpuUsagePointDto>, GetCpuUsage )
     TRACY_INDEX_FORWARD1( std::vector<analysis::ContextSwitchDto>, ScanContextSwitchEvents, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD1( std::vector<analysis::CpuContextSwitchDto>, ScanCpuContextSwitchEvents, const analysis::ScanRange&, range )
-    TRACY_INDEX_FORWARD1( std::vector<analysis::SampleDto>, ScanSampleEvents, const analysis::ScanRange&, range )
+    std::vector<analysis::SampleDto> ScanSampleEvents( const analysis::ScanRange& range ) const override
+    {
+        const auto rows = m_samples.Scan( range.startNs, range.endNs, range.offset, range.limit );
+        std::vector<analysis::SampleDto> result;
+        result.reserve( rows.size() );
+        for( const auto& row : rows )
+        {
+            analysis::SampleDto value;
+            value.ref = m_source->MakeEntityRef( row.kind == QuerySampleKind::Main ? "sample" : "context-switch-sample", row.ordinal );
+            value.threadRef = m_source->MakeEntityRef( "thread", row.thread );
+            value.timeNs = row.timeNs;
+            value.callstack = row.callstack;
+            if( value.callstack != 0 ) value.callstackRef = m_source->MakeEntityRef( "callstack", value.callstack );
+            value.kind = row.kind == QuerySampleKind::Main ? "sample" : "context_switch";
+            result.emplace_back( std::move( value ) );
+        }
+        return result;
+    }
     TRACY_INDEX_FORWARD1( std::vector<analysis::GhostZoneDto>, ScanGhostZones, const analysis::ScanRange&, range )
     TRACY_INDEX_FORWARD0( std::vector<analysis::HardwareSampleDto>, GetHardwareSamples )
     TRACY_INDEX_FORWARD4( std::vector<analysis::HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit )
@@ -2082,7 +2116,7 @@ private:
     QueryIndexManifest m_manifest;
     std::unique_ptr<analysis::WorkerTraceSource> m_source;
     ReadOnlyZoneSection m_extras, m_cpu, m_gpu;
-    QuerySampleStoreReader m_samples;
+    QuerySampleViewReader m_samples;
     ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     ReadOnlyZoneSection m_gpuMemoryCpuZones;
@@ -2322,6 +2356,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             analysis::WorkerTraceLoadMode::CompactIndex, &writer );
         writer.FinishMissingJnDomains();
         writer.CommitSamples();
+        BuildQuerySampleView( temporarySamples, result.sourceFingerprint,
+            [&]( uint64_t thread ) { return source->GetContextSwitchStartTimes( thread ); } );
         result.zoneExtras.count = writer.ExtraCount();
         result.cpuZones.count = writer.CpuCount();
         result.gpuZones.count = writer.GpuCount();
@@ -2330,11 +2366,15 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         result.gpuZones.declaredCount = writer.DeclaredGpuCount();
         result.samples.count = writer.SampleCount();
         result.samples.declaredCount = result.samples.count;
-        const auto sourceInfo = source->GetTraceInfo();
-        result.sampleMainCount = sourceInfo.counts.samples;
-        result.sampleContextSwitchCount = sourceInfo.counts.contextSwitchSamples;
-        if( writer.MainSampleCount() != result.sampleMainCount )
-            throw std::runtime_error( "sample sidecar main count mismatch" );
+        {
+            QuerySampleViewReader sampleView( temporarySamples, result.sourceFingerprint );
+            result.sampleMainCount = sampleView.MainCount();
+            result.sampleContextSwitchCount = sampleView.ContextSwitchCount();
+            const auto sourceInfo = source->GetTraceInfo();
+            if( sourceInfo.counts.samples != result.sampleMainCount ||
+                sourceInfo.counts.contextSwitchSamples != result.sampleContextSwitchCount )
+                throw std::runtime_error( "sample logical view count mismatch" );
+        }
         result.samples.bytes = SectionBytes( temporarySamples );
         result.samples.fingerprint = SectionFingerprint( temporarySamples );
         for( size_t index = 0; index < jnSections.size(); index++ )
@@ -2763,9 +2803,10 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         if( deep && SectionFingerprint( manifest.samples.path ) != manifest.samples.fingerprint )
             throw std::runtime_error( "sample section hash mismatch" );
         {
-            QuerySampleStoreReader samples( manifest.samples.path, manifest.sourceFingerprint );
-            if( samples.Count() != manifest.samples.count || samples.MainCount() != manifest.sampleMainCount ||
-                samples.ContextSwitchCount() != manifest.samples.count - manifest.sampleMainCount )
+            QuerySampleStoreReader rawSamples( manifest.samples.path, manifest.sourceFingerprint );
+            QuerySampleViewReader samples( manifest.samples.path, manifest.sourceFingerprint );
+            if( rawSamples.Count() != manifest.samples.count || samples.MainCount() != manifest.sampleMainCount ||
+                samples.ContextSwitchCount() != manifest.sampleContextSwitchCount )
                 throw std::runtime_error( "sample section count mismatch" );
             if( deep ) samples.ValidateAll();
         }

@@ -50,6 +50,10 @@ int main( int argc, char** argv )
         Require( indexedMain + indexedContext == expected.size(), "sample query count changed" );
         Require( std::stoull( json.at( "sections" ).at( "sample" ).at( "count" ).get<std::string>() ) >= indexedMain,
             "sample sidecar omitted main sample records" );
+        const auto sampleRoot = manifest.manifestPath.parent_path() /
+            json.at( "sections" ).at( "sample" ).at( "file" ).get<std::string>();
+        Require( fs::is_regular_file( sampleRoot / "query-spans" / "header.bin" ),
+            "Query index did not publish the derived sample logical view" );
 
         auto indexed = tracy::query::QueryIndex::Open( manifest );
         const auto indexedInfo = indexed->GetTraceInfo();

@@ -69,6 +69,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryIndex.hpp
     src/TracyQuerySampleStore.cpp
     src/TracyQuerySampleStore.hpp
+    src/TracyQuerySampleView.cpp
+    src/TracyQuerySampleView.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
@@ -139,6 +141,11 @@ if(BUILD_TESTING)
     add_executable(tracy-query-sample-index-integration-tests tests/QuerySampleIndexIntegrationTests.cpp)
     target_link_libraries(tracy-query-sample-index-integration-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-sample-index-integration-tests)
+
+    add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
+    target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-view-tests)
+    add_test(NAME tracy-query-sample-view COMMAND tracy-query-sample-view-tests)
 
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
