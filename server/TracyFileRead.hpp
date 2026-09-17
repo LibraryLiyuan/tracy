@@ -15,8 +15,12 @@
 #include <vector>
 #include <memory>
 #include <exception>
+#include <limits>
 #include "TracyFileReadHooks.hpp"
 #include "../analysis/TracyAnalysisIoPath.hpp"
+#ifndef ZSTD_STATIC_LINKING_ONLY
+#define ZSTD_STATIC_LINKING_ONLY
+#endif
 #include <zstd.h>
 
 #ifdef _MSC_VER
@@ -437,6 +441,26 @@ public:
     const std::string& GetFilename() const { return m_filename; }
 
 private:
+    static uint64_t EstimateStreamMemory( uint8_t type )
+    {
+        constexpr uint64_t FixedMemory = 2ull * FileBufSize + sizeof( StreamHandle ) + ( 1ull << 20 );
+        size_t codecMemory;
+        switch( type )
+        {
+        case 0:
+            codecMemory = sizeof( LZ4_streamDecode_t );
+            break;
+        case 1:
+            codecMemory = ZSTD_estimateDStreamSize( 1ull << 22 );
+            if( ZSTD_isError( codecMemory ) ) throw std::runtime_error( "file_decompression_memory_estimate" );
+            break;
+        default:
+            throw FileReadError();
+        }
+        if( codecMemory > std::numeric_limits<uint64_t>::max() - FixedMemory ) throw std::runtime_error( "file_decompression_memory_overflow" );
+        return FixedMemory + uint64_t( codecMemory );
+    }
+
     FileRead( FILE* f, const char* fn,std::shared_ptr<FileReadHooks> hooks )
         : m_data( nullptr )
         , m_offset( 0 )
@@ -496,7 +520,12 @@ private:
             throw FileReadError();
         }
 
-        if(m_hooks&&m_hooks->reserveMemory)m_hooks->reserveMemory(uint64_t(streams)*(8ull<<20));
+        if(m_hooks&&m_hooks->reserveMemory)
+        {
+            const auto streamMemory = EstimateStreamMemory( type );
+            if( streams > std::numeric_limits<uint64_t>::max() / streamMemory ) throw std::runtime_error( "file_decompression_memory_overflow" );
+            m_hooks->reserveMemory( uint64_t( streams ) * streamMemory );
+        }
 
         m_data = (char*)mmap( nullptr, m_dataSize, PROT_READ, MAP_SHARED, fileno( f ), 0 );
         fclose( f );f=nullptr;
@@ -522,6 +551,10 @@ private:
         }
 
         GetNextDataBlock();
+        }catch(const std::runtime_error& e) {
+            if(f)fclose(f);Cleanup();
+            try{if(m_hooks&&m_hooks->failed)m_hooks->failed(e.what());}catch(...){}
+            throw;
         }catch(...) {
             if(f)fclose(f);Cleanup();
             try{if(m_hooks&&m_hooks->failed)m_hooks->failed("file_read_open_or_decode_failed");}catch(...){}

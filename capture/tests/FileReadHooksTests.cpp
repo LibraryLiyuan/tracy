@@ -9,8 +9,8 @@ static void Check(bool value){if(!value)throw std::runtime_error("file reader in
 int main(int argc,char** argv)
 {
     if(argc!=2)return 2;auto root=std::filesystem::path(argv[1]);std::filesystem::create_directories(root);
-    auto hooks=std::make_shared<tracy::FileReadHooks>();uint64_t reserved=0,peak=0;bool failed=false;
-    hooks->reserveMemory=[&](uint64_t n){reserved=n;peak=std::max(peak,n);};hooks->failed=[&](const char*){failed=true;};
+    auto hooks=std::make_shared<tracy::FileReadHooks>();uint64_t reserved=0,peak=0;bool failed=false;std::string failure;
+    hooks->reserveMemory=[&](uint64_t n){if(n>(192ull<<20))throw std::runtime_error("analysis_workspace_budget");reserved=n;peak=std::max(peak,n);};hooks->failed=[&](const char* reason){failed=true;failure=reason;};
     auto path=root/"valid.tracy";
     {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(path,tracy::FileCompression::Zstd,1,1));uint64_t n=123;out->Write(&n,8);out->Finish();}
     {std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(path,hooks));uint64_t n;in->Read(n);Check(n==123&&reserved>0);}
@@ -19,8 +19,12 @@ int main(int argc,char** argv)
     const auto longFile=deep/std::filesystem::path(L"trace-\u957f\u8def\u5f84.tracy");
     {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(longFile,tracy::FileCompression::Zstd,1,1));uint64_t n=321;out->Write(&n,8);out->Finish();}
     {std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(longFile,hooks));uint64_t n;in->Read(n);Check(n==321);}
+    auto multi=root/"multi.tracy";std::vector<char> payload(tracy::FileBufSize*33+17);for(size_t i=0;i<payload.size();++i)payload[i]=char(i*131u);
+    {std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open(multi,tracy::FileCompression::Zstd,1,32));out->Write(payload.data(),payload.size());out->Finish();}
+    reserved=0;peak=0;{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(multi,hooks));std::vector<char> actual(payload.size());in->Read(actual.data(),actual.size());Check(actual==payload&&reserved>0);}
+    Check(reserved==0&&peak<(192ull<<20));
     bool rejected=false;hooks->check=[](){throw std::runtime_error("cancelled");};
-    try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(path,hooks));}catch(...){rejected=true;}Check(rejected&&failed&&reserved==0);hooks->check={};
+    try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(path,hooks));}catch(...){rejected=true;}Check(rejected&&failed&&failure=="cancelled"&&reserved==0);hooks->check={};
     for(int kind=0;kind<3;++kind){
         auto bad=root/(std::to_string(kind)+".tracy");{std::ofstream out(bad,std::ios::binary);out.write(reinterpret_cast<const char*>(tracy::TracyHeader),4);char type=1,streams=kind==0?0:1;out.put(type);out.put(streams);if(kind==2){uint32_t n=3;out.write(reinterpret_cast<char*>(&n),4);out.write("bad",3);}}
         rejected=false;try{std::unique_ptr<tracy::FileRead> in(tracy::FileRead::Open(bad,hooks));}catch(...){rejected=true;}Check(rejected&&reserved==0);
