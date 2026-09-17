@@ -45,3 +45,13 @@ Replay evidence shows 30.349 seconds of client payload reads and 915.290 seconds
 The run remained within all resource limits: private bytes peaked at 3,535,556,608, workspace at 212,287,527, and task disk at 67,128,279,040 bytes. Cleanup completed, retained 36,864 bytes of reports, and published no candidate, final trace, map, or completion marker.
 
 The failure exposed a pre-existing Sample ordering defect. `OfflineSampleStore::State::lastTime` tracked the last appended time rather than the maximum observed time. After a sequence such as 10, 5, 10 (or a zero-time sample), the later duplicate bypassed lookup; the time index replaced the previous key while the declared count increased. Commit `9675e6ff` keeps the maximum time, so every later timestamp at or below that maximum is checked and duplicate timestamps are merged. The 10, 5, 0, 10 regression and the complete small conversion both pass. Per the one-run stop rule, the 30-minute input was not rerun automatically.
+
+## Sample fix acceptance
+
+Commit `8ca23514` adds a constant-time guard against replacing an existing indexed main-Sample timestamp and preserves append order for context-switch Samples. The storage tests observed both failures before the production changes. The Worker regression now processes distinct A, B, A callstacks across time rollback and zero-time rows, verifies the exact six-frame merged stack, writes the Trace, reopens it, and completes streamed validation. Query 1.35 resolves the resulting Sample and callstack content.
+
+The frozen r8 converter completed the 26,193,953,055-byte input in 1,864.710 seconds. Replay took 1,067.32 seconds, Finalize 83.498 seconds, Write 486.535 seconds, and Validate 72.144 seconds. The published Trace is 12,428,310,213 bytes. It contains 114,809,633 Samples, 25,083 fewer than the invalid r6 declared count, and passed sequential write and reopen hashes.
+
+Private bytes peaked at 3,549,048,832, the shared workspace at 212,287,527, and task disk at 74,638,065,664 bytes. Cleanup removed the work tree and candidate; the snapshot map and completion marker identify the published r8 output.
+
+The frozen r8 Query could not open the 12.43 GB Trace: it returned `RESOURCE_LIMIT: not enough memory to load trace` after `WorkerTraceSource` translated a `std::bad_alloc`. Converter long-data acceptance is complete; Query long-data loading remains a separate implementation requirement.
