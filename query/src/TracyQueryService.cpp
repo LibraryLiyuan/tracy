@@ -8920,6 +8920,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "evidence.graph" || method == "frame.critical_path" || method == "frame.explain" )
     {
+        if( !source->JobDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "bounded Job aggregation has not been built" );
         const auto frameEvents = source->GetCorrelatedFrameEvents();
         if( frameEvents.empty() )
             return Success( id, { { "present", false }, { "complete", false },
@@ -9932,6 +9934,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "job.search" || method == "job.get" || method == "job.dependencies" || method == "job.critical_path" || method == "job.statistics" || method == "job.gfx.statistics" || method == "job.gfx_chain" )
     {
+        if( !source->JobDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "bounded Job aggregation has not been built" );
         const auto parseJobRef = [&]( const char* parameter = "ref" ) -> uint64_t {
             if( !params.contains( parameter ) || !params[parameter].is_string() ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is required" );
             const auto value = params[parameter].get<std::string>();
@@ -10522,6 +10526,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "sample.ghost_zones" )
     {
+        if( !source->SampleDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "sample ghost-zone index has not been built" );
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
         auto scanPage = ScanFiltered<analysis::GhostZoneDto>( *source, params, page,
@@ -10576,6 +10582,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "sample.symbol_statistics" || method == "symbol.search" || method == "symbol.get" || method == "symbol.address" || method == "symbol.address_map" )
     {
+        if( method == "sample.symbol_statistics" && !source->SampleDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "sample symbol-statistics index has not been built" );
         if( method == "symbol.address_map" )
         {
             const auto page = ParsePage( params, method, trace );

@@ -44,3 +44,11 @@
 这个检查点建立了 Sample 外置格式，但尚未降低 Query 的 Sample 峰值。下一步必须迁移派生上下文 Sample、ghost zone、符号统计等消费者后，才能关闭 Compact Worker 中的完整 Sample 驻留并用12.43 GB真实输入验证冷启动。
 
 随后完成 schema17 Sample 逻辑视图：按线程ID升序，将主 Sample 与“时间等于同线程切入区间起点”的派生上下文 Sample 合并，单独保存物理引用和逻辑跨度。小型真实 Trace 对6条 Sample 的 ref、线程、时间、调用栈、种类及分页顺序逐字段等价；原始持久化上下文 Sample仍保存在物理表中，不与Query派生口径混淆。Compact Worker仍暂时保留Sample，ghost zone与符号统计迁移尚未完成。
+
+## 2026-09-17：解除 Sample 与 JobStage 驻留后的真实诊断
+
+schema18 已从 Compact Worker 中移除完整 Sample 表；`sample.list`、主/派生上下文计数与稳定ordinal改由Sample逻辑视图提供。尚未迁移的ghost zone和sample符号统计不会静默返回空结果，而是以 `INDEX_NOT_READY` 报告。小型真实Sample Trace确认compact payload的Sample计数为0、indexed结果仍逐字段等价。
+
+JobStage也改为允许超大记录数的sidecar，compact payload不再保留全表；当前Job聚合消费者尚未迁移，因此Job、Job Gfx及依赖Job的Evidence能力明确标记未就绪并返回 `INDEX_NOT_READY`。小型JNTRACYX夹具验证3条JobStage的sidecar、compact移除和indexed计数一致。
+
+使用正式12428310213字节Trace执行一次非性能“索引构建诊断”：旧冻结Query在加载期失败；schema18版本已越过Sample与JobStage，最近一次观测Private Bytes约26832334848字节、Working Set约21071273984字节，随后仍以 `not enough memory to load trace` 失败。失败后本轮所有 `.s17/.s18` 临时索引均清理。此结果不是计划中的新版性能初评；下一确定方向是Catalog、字符串/调用栈及其派生结构继续外置。

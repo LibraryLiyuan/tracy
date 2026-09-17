@@ -147,6 +147,10 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-query-sample-view-tests)
     add_test(NAME tracy-query-sample-view COMMAND tracy-query-sample-view-tests)
 
+    add_executable(tracy-query-job-stage-index-integration-tests tests/QueryJobStageIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-job-stage-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-job-stage-index-integration-tests)
+
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
     add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)

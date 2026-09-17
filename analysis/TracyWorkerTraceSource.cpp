@@ -748,7 +748,7 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
         // locks, frame images, symbols, or source cache) into absent data.
         const auto eventMask = loadMode != WorkerTraceLoadMode::CompactIndex ? EventType::All : EventType::Type(
             EventType::Locks | EventType::Messages | EventType::Plots | EventType::Memory |
-            EventType::FrameImages | EventType::ContextSwitches | EventType::Samples |
+            EventType::FrameImages | EventType::ContextSwitches |
             EventType::SymbolCode | EventType::SourceCache );
         impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
         while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );

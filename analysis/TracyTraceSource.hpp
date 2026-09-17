@@ -924,6 +924,7 @@ public:
         const auto end = offset + std::min( limit, values.size() - offset );
         return { values.begin() + offset, values.begin() + end };
     }
+    virtual bool JobDerivedDataReady() const { return true; }
     virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
     virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
     {
@@ -1106,6 +1107,7 @@ public:
     virtual std::vector<ContextSwitchDto> ScanContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& ) const { return {}; }
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
+    virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
     virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }

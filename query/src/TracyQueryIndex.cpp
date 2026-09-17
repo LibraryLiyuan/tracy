@@ -420,9 +420,13 @@ public:
 
     bool WantsJnRecords( JnDomain domain, uint32_t recordBytes ) const override
     {
-        // Job consumers still read the compact Worker's in-memory stages.
-        if(domain==JnDomain::JobStage||size_t(domain)>=JnDomainCount)return false;
+        if(size_t(domain)>=JnDomainCount)return false;
         return recordBytes == JnRecordBytes( domain );
+    }
+    bool AllowsLargeJnRecords( JnDomain domain, uint64_t count, uint32_t recordBytes ) const override
+    {
+        return WantsJnRecords( domain, recordBytes ) &&
+            count <= ( std::numeric_limits<uint64_t>::max() - sizeof( ZoneSectionHeader ) ) / recordBytes;
     }
     void JnRecordsBegin( JnDomain domain, uint64_t count, uint32_t recordBytes ) override
     {
@@ -895,7 +899,7 @@ public:
         auto result = m_source->GetCapabilities();
         for( auto& item : result )
         {
-            if( item.domain == "zone.cpu" || item.domain == "zone.gpu" || item.domain == "timeline" || item.domain == "evidence" )
+            if( item.domain == "zone.cpu" || item.domain == "zone.gpu" || item.domain == "timeline" )
             {
                 item.present = item.domain == "zone.gpu" ? m_gpu.Count() != 0 : item.domain == "zone.cpu" ? m_cpu.Count() != 0 : item.present;
                 item.queryable = true;
@@ -907,7 +911,13 @@ public:
                 item.present = true;
                 item.queryable = true;
                 item.indexed = true;
-                item.reason = "bounded Query sample sidecar";
+                item.reason = "bounded Query sample sidecar; ghost-zone and symbol-statistics indices are pending";
+            }
+            else if( item.domain == "job" || item.domain == "job.gfx" || item.domain == "evidence" )
+            {
+                item.queryable = false;
+                item.indexed = true;
+                item.reason = "JobStage sidecar is present; bounded Job aggregation is pending";
             }
         }
         return result;
@@ -925,6 +935,7 @@ public:
         result.counts.gpuZones = m_gpu.Count();
         result.counts.samples = m_samples.MainCount();
         result.counts.contextSwitchSamples = m_samples.ContextSwitchCount();
+        result.counts.jobStages = m_jobStages.Count();
         result.counts.gfxEntities = m_gfxEntities.Count();
         result.counts.gfxLinks = m_gfxLinks.Count();
         result.counts.relations = m_relations.Count();
@@ -1227,6 +1238,8 @@ public:
         for( const auto& row : rows ) result.emplace_back( m_source->MakeEntityRef( "sample", row.ordinal ) );
         return result;
     }
+    bool SampleDerivedDataReady() const override { return false; }
+    bool JobDerivedDataReady() const override { return false; }
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
     TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
@@ -2370,10 +2383,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             QuerySampleViewReader sampleView( temporarySamples, result.sourceFingerprint );
             result.sampleMainCount = sampleView.MainCount();
             result.sampleContextSwitchCount = sampleView.ContextSwitchCount();
-            const auto sourceInfo = source->GetTraceInfo();
-            if( sourceInfo.counts.samples != result.sampleMainCount ||
-                sourceInfo.counts.contextSwitchSamples != result.sampleContextSwitchCount )
-                throw std::runtime_error( "sample logical view count mismatch" );
+            if( writer.MainSampleCount() != result.sampleMainCount )
+                throw std::runtime_error( "sample logical view main count mismatch" );
         }
         result.samples.bytes = SectionBytes( temporarySamples );
         result.samples.fingerprint = SectionFingerprint( temporarySamples );

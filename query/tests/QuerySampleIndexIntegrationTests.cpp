@@ -55,7 +55,14 @@ int main( int argc, char** argv )
         Require( fs::is_regular_file( sampleRoot / "query-spans" / "header.bin" ),
             "Query index did not publish the derived sample logical view" );
 
+        auto compact = tracy::analysis::WorkerTraceSource::Open( manifest.dataPath );
+        Require( compact->GetTraceInfo().counts.samples == 0,
+            "compact payload still retains the full main Sample table" );
+        compact.reset();
+
         auto indexed = tracy::query::QueryIndex::Open( manifest );
+        Require( !indexed->SampleDerivedDataReady(),
+            "indexed trace silently claims Worker-derived Sample data is ready" );
         const auto indexedInfo = indexed->GetTraceInfo();
         Require( indexedInfo.counts.samples == originalInfo.counts.samples,
             "indexed trace changed main sample count" );
