@@ -7374,6 +7374,8 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
         }
     };
 
+    const auto reportResolveProgress=[&](const char* phase,uint64_t completed,uint64_t total,uint64_t& published,bool force=false){if(m_offlineStorage&&(force||completed-published>=65536)){published=completed;m_offlineStorage->ReportFinalizeProgress(phase,completed,total,"rows");}};
+    const auto resourceTotal=CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);uint64_t resourceDone=0,resourcePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_resources",0,resourceTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Resource, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogResource,data.gpuCatalogResources);if(first>size||count>size-first)return;
@@ -7407,8 +7409,9 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     std::numeric_limits<int64_t>::max() } );
                 openIntervals[key] = values.size() - 1;
             }
-        });
+        });resourceDone+=count;reportResolveProgress("catalog_resolve_resources",resourceDone,resourceTotal,resourcePublished);
     } );
+    reportResolveProgress("catalog_resolve_resources",resourceDone,resourceTotal,resourcePublished,true);
 
     auto resolve = [&]( uint64_t pointerToken, int64_t time ) -> uint64_t
     {
@@ -7455,6 +7458,7 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
     }
     uint64_t unresolved = 0;
     uint64_t coreUnresolved = 0;
+    const auto viewTotal=CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews);uint64_t viewDone=0,viewPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_views",0,viewTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::View, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogView,data.gpuCatalogViews);if(first>size||count>size-first)return;
@@ -7466,8 +7470,10 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        },true);
+        },true);viewDone+=count;reportResolveProgress("catalog_resolve_views",viewDone,viewTotal,viewPublished);
     } );
+    reportResolveProgress("catalog_resolve_views",viewDone,viewTotal,viewPublished,true);
+    const auto logicalTotal=CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals);uint64_t logicalDone=0,logicalPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_logicals",0,logicalTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Logical, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogLogical,data.gpuCatalogLogicals);if(first>size||count>size-first)return;
@@ -7479,8 +7485,10 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        },true);
+        },true);logicalDone+=count;reportResolveProgress("catalog_resolve_logicals",logicalDone,logicalTotal,logicalPublished);
     } );
+    reportResolveProgress("catalog_resolve_logicals",logicalDone,logicalTotal,logicalPublished,true);
+    const auto vgTotal=CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg);uint64_t vgDone=0,vgPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_virtual_geometry",0,vgTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::VirtualGeometry, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogVg,data.gpuCatalogVg);if(first>size||count>size-first)return;
@@ -7492,15 +7500,17 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Partial );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        },true);
+        },true);vgDone+=count;reportResolveProgress("catalog_resolve_virtual_geometry",vgDone,vgTotal,vgPublished);
     } );
+    reportResolveProgress("catalog_resolve_virtual_geometry",vgDone,vgTotal,vgPublished,true);
+    const auto rangeTotal=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);uint64_t rangeDone=0,rangePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_range_sets",0,rangeTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::RangeSet, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets);if(first>size||count>size-first)return;
         ForCatalogRows(OfflineCatalogDomain::CatalogRangeSet,data.gpuRangeSets,first,count,[&](auto& record){
             if( record.resourceId == 0 && record.pointerToken != 0 ){
                 auto time = std::numeric_limits<int64_t>::min();
-                if(m_offlineStorage){if(!m_offlinePassTimesPrepared){m_offlineStorage->PreparePassTimes();m_offlinePassTimesPrepared=true;}const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
+                if(m_offlineStorage){if(!m_offlinePassTimesPrepared){m_offlineStorage->PreparePassTimes();m_offlinePassTimesPrepared=true;m_offlineStorage->ReportFinalizeProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,"rows");}const auto pass=m_offlineStorage->LookupPassTime(record.passInstanceId);if(pass)time=*pass;}
                 else {const auto pass=passTimes.find(record.passInstanceId);if(pass!=passTimes.end())time=pass->second;}
                 record.resourceId = resolve( record.pointerToken, time );
             }
@@ -7510,8 +7520,10 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.exactness = uint8_t( JnGpuCatalogExactness::Unknown );
             }
             if( record.resourceId != 0 ) record.pointerToken = 0;
-        },true);
+        },true);rangeDone+=count;reportResolveProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,rangePublished);
     } );
+    reportResolveProgress("catalog_resolve_range_sets",rangeDone,rangeTotal,rangePublished,true);
+    const auto relationTotal=CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations);uint64_t relationDone=0,relationPublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_relations",0,relationTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::Relation, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogRelation,data.gpuCatalogRelations);if(first>size||count>size-first)return;
@@ -7548,8 +7560,10 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                     record.flags &= ~uint8_t( 2 );
                 }
             }
-        },true);
+        },true);relationDone+=count;reportResolveProgress("catalog_resolve_relations",relationDone,relationTotal,relationPublished);
     } );
+    reportResolveProgress("catalog_resolve_relations",relationDone,relationTotal,relationPublished,true);
+    const auto evidenceTotal=CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence);uint64_t evidenceDone=0,evidencePublished=0;if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("catalog_resolve_detailed_evidence",0,evidenceTotal,"rows");
     forBatches( JnGpuCatalogBatchKind::DetailedEvidence, [&]( size_t first, size_t count )
     {
         const auto size=CatalogSize(OfflineCatalogDomain::CatalogDetailedEvidence,data.gpuDetailedEvidence);if(first>size||count>size-first)return;
@@ -7593,8 +7607,9 @@ Worker::JnGpuCatalogResolveResult Worker::ResolveJnGpuCatalogGeneration( uint64_
                 record.targetId = anonymizeDescriptor( record.targetId );
                 record.flags &= ~uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer );
             }
-        },true);
+        },true);evidenceDone+=count;reportResolveProgress("catalog_resolve_detailed_evidence",evidenceDone,evidenceTotal,evidencePublished);
     } );
+    reportResolveProgress("catalog_resolve_detailed_evidence",evidenceDone,evidenceTotal,evidencePublished,true);
 
     stats.fullResolveNanoseconds += uint64_t( std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - resolveStart ).count() );

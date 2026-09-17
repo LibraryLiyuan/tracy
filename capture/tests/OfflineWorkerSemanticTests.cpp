@@ -144,11 +144,13 @@ struct OfflineStorageSemanticTest {
     header.hash=JnGpuCatalogChecksum64("name",4);std::memcpy(string.data(),&header,sizeof(header));Check(ProtocolBatch(w,sequence++,JnGpuCatalogBatchKind::String,string.data(),uint32_t(string.size()),0,1));
     control.time=1200;control.sequence=sequence;control.kind=uint8_t(JnGpuCatalogControlKind::GenerationEnd);control.state=uint8_t(JnGpuCatalogGenerationState::Complete);Check(w.ValidateJnGpuCatalogControl(control,true,error));
  }
- static void ProtocolCatalog(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources,bool missingCore){
+static void ProtocolCatalog(const char* input,const std::filesystem::path& root,storage::ConversionResources& resources,bool missingCore){
     std::filesystem::create_directories(root);conversion::OfflineConversionStorage store(root/"store",std::string(64,'b'),resources);
+    std::vector<std::string> finalizePhases;store.SetFinalizeProgress([&](const char* phase,uint64_t,uint64_t,const char*){finalizePhases.emplace_back(phase);});
     std::unique_ptr<FileRead> first(FileRead::Open(input)),second(FileRead::Open(input));Worker memory(*first,EventType::All,false),disk(*second,EventType::All,false);
     for(uint64_t i=1;i<disk.m_data.zoneExtra.size();++i)store.AppendZoneExtra(&disk.m_data.zoneExtra[i]);MigrateStrings(disk,store);disk.m_offlineStorage=&store;
     FillProtocolCatalog(memory,missingCore);FillProtocolCatalog(disk,missingCore);disk.FinalizeOfflineStrings();store.Seal();disk.FinalizeOfflineCatalog();
+    for(const char* phase:{"catalog_resolve_resources","catalog_resolve_views","catalog_resolve_logicals","catalog_resolve_virtual_geometry","catalog_resolve_range_sets","catalog_resolve_relations","catalog_resolve_detailed_evidence"})Check(std::find(finalizePhases.begin(),finalizePhases.end(),phase)!=finalizePhases.end());
     const auto directory=store.CatalogBatchDirectoryStatistics();Check(directory.generations==1&&directory.batches==11&&directory.nonEmptyChains==10&&directory.visited==8);
     {std::unique_ptr<FileWrite> file(FileWrite::Open(root/"out.tracy",FileCompression::Zstd,1,1));disk.Write(*file,false);file->Finish();}
     std::unique_ptr<FileRead> out(FileRead::Open(root/"out.tracy"));Worker read(*out,EventType::All,false);CompareCatalog(memory,read);

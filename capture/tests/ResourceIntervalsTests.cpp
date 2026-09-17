@@ -28,7 +28,12 @@ int main(int argc,char** argv){try{
  Check(intervals.Resolve(UINT64_MAX,0)==1&&intervals.Resolve(UINT64_MAX,99995)==10000&&intervals.Resolve(UINT64_MAX,99996)==0);
  Check(intervals.Resolve(0,0)==0&&intervals.Resolve(999,0)==0);
  const auto statistics=intervals.Statistics();Check(statistics.resolves>0&&statistics.maxNodesPerResolve==10000&&statistics.intervalNodeVisits>=30000);
+ Check(statistics.smallIntervalBytes+statistics.mappedIntervalBytes==intervals.Count()*32&&statistics.mappedIntervalChunks>0);
  intervals.CloseAndRemove();Check(budget.DiskCurrent()==0);
+ tracy::storage::ResourceLimits tightLimits; tightLimits.streamBytes=16ull<<10;tightLimits.diskReserveBytes=0;
+ tracy::storage::ConversionResources tight(tightLimits,[&]{return sample;},[]{return 1ull<<40;});bool refused=false;
+ {try{tracy::storage::ResourceIntervals bounded(root/"bounded",tight);for(uint64_t i=0;i<=4096;++i){tracy::JnGpuCatalogResourceRecordV1 row{};row.pointerToken=9;row.resourceId=i+1;row.time=int64_t(i);row.operation=uint8_t(Op::Create);bounded.Add(row);}}catch(const std::exception& e){refused=std::string(e.what())=="conversion_disk_ratio_limit";}}
+ Check(refused&&tight.DiskCurrent()==0);
  puts("disk lifetimes preserve boundaries, gaps, ambiguity, mismatched destroy and long history");return 0;
  }catch(const std::exception& e){fprintf(stderr,"%s\n",e.what());return 1;}}
 #else

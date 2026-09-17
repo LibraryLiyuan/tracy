@@ -84,6 +84,11 @@ class MappedAppendArena
             Require( offset <= m_used && bytes <= m_used - offset, "mapped_arena_range" );
             return m_data + offset;
         }
+        char* AtMutable( uint64_t offset, uint64_t bytes )
+        {
+            Require( offset <= m_used && bytes <= m_used - offset, "mapped_arena_range" );
+            return m_data + offset;
+        }
         void Flush()
         {
 #ifdef _WIN32
@@ -128,6 +133,7 @@ public:
     Location Allocate( uint64_t bytes, uint64_t alignment )
     {
         m_resources.CheckFast();
+        Require( !m_closed, "mapped_arena_closed" );
         Require( bytes > 0 && alignment && bytes <= UINT64_MAX - alignment + 1, "mapped_arena_size" );
         const auto required = bytes + alignment - 1;
         if( m_chunks.empty() || required > m_chunks.back()->Capacity() - m_chunks.back()->Used() ) AddChunk( required );
@@ -139,19 +145,35 @@ public:
     }
     const char* Get( uint32_t chunk, uint64_t offset, uint64_t bytes ) const
     {
-        Require( chunk < m_chunks.size(), "mapped_arena_chunk" );
+        Require( !m_closed && chunk < m_chunks.size(), "mapped_arena_chunk" );
         const auto* result = m_chunks[chunk]->At( offset, bytes + 1 );
         Require( result[bytes] == 0, "mapped_arena_terminator" );
         return result;
     }
     const char* GetRaw( uint32_t chunk, uint64_t offset, uint64_t bytes ) const
     {
-        Require( chunk < m_chunks.size(), "mapped_arena_chunk" );
+        Require( !m_closed && chunk < m_chunks.size(), "mapped_arena_chunk" );
         return m_chunks[chunk]->At( offset, bytes );
     }
-    void Flush() { for( auto& chunk : m_chunks ) chunk->Flush(); }
+    char* GetRawMutable( uint32_t chunk, uint64_t offset, uint64_t bytes )
+    {
+        Require( !m_closed && chunk < m_chunks.size(), "mapped_arena_chunk" );
+        return m_chunks[chunk]->AtMutable( offset, bytes );
+    }
+    void Flush() { Require( !m_closed, "mapped_arena_closed" ); for( auto& chunk : m_chunks ) chunk->Flush(); }
     uint64_t UsedBytes() const { return m_used; }
     uint64_t ReservedBytes() const { uint64_t bytes=0;for(const auto& chunk:m_chunks)bytes+=chunk->Capacity();return bytes; }
+    uint64_t ChunkCount() const { return m_chunks.size(); }
+    bool CloseAndRemove() noexcept
+    {
+        if( m_closed ) return true;
+        m_chunks.clear();
+        bool ok = true;
+        for( auto it = m_paths.rbegin(); it != m_paths.rend(); ++it ) if( !m_resources.RemoveOwned( *it ) ) ok = false;
+        if( !m_resources.RemoveOwned( m_root ) ) ok = false;
+        m_closed = true;
+        return ok;
+    }
 private:
     static void Require( bool value, const char* message ) { if( !value ) throw std::runtime_error( message ); }
     void AddChunk( uint64_t required )
@@ -166,14 +188,18 @@ private:
         }
         char name[32];
         std::snprintf( name, sizeof( name ), "chunk-%08x.bin", unsigned( m_chunks.size() ) );
-        m_chunks.emplace_back( std::make_unique<Chunk>( m_root / name, capacity, m_resources ) );
+        const auto path = m_root / name;
+        m_chunks.emplace_back( std::make_unique<Chunk>( path, capacity, m_resources ) );
+        m_paths.emplace_back( path );
         m_nextCapacity = std::min<uint64_t>( 16ull << 20, std::max<uint64_t>( 64ull << 10, capacity * 2 ) );
     }
     std::filesystem::path m_root;
     ConversionResources& m_resources;
     std::vector<std::unique_ptr<Chunk>> m_chunks;
+    std::vector<std::filesystem::path> m_paths;
     uint64_t m_nextCapacity = 32ull << 10;
     uint64_t m_used = 0;
+    bool m_closed = false;
 };
 
 }

@@ -23,6 +23,8 @@ foreach($name in 'task_disk_current_bytes','task_disk_peak_bytes','task_disk_lim
 if($null -eq $resources.evidence.pass_time_build){throw 'finalize_progress_missing_pass_time_build'}
 if($null -eq $resources.evidence.catalog_batch_directory){throw 'finalize_progress_missing_catalog_batch_directory'}
 if($null -eq $resources.evidence.catalog_interval_activity){throw 'finalize_progress_missing_catalog_interval_activity'}
+if($resources.evidence.catalog_interval_activity.storage_backend -ne 'small-plus-mapped-arena-v1'){throw 'finalize_progress_interval_backend'}
+if($null -eq $resources.evidence.catalog_interval_activity.small_interval_bytes -or $null -eq $resources.evidence.catalog_interval_activity.mapped_interval_bytes -or $null -eq $resources.evidence.catalog_interval_activity.mapped_interval_chunks){throw 'finalize_progress_interval_mapping_evidence'}
 if($null -eq $conversion.finalize_substages){throw 'finalize_progress_missing_substages'}
 if(@($conversion.finalize_substages.PSObject.Properties).Count -lt 4){throw 'finalize_progress_incomplete_substages'}
 if(-not $resources.success -or -not $resources.cleanup_complete){throw 'finalize_progress_cleanup'}
