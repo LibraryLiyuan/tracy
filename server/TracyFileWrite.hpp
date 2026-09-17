@@ -27,6 +27,7 @@
 namespace tracy
 {
 enum class FileCompression { Fast,Slow,Extreme,Zstd };
+class BufferedFileWrite;
 class WriteStream
 {
 public:
@@ -86,6 +87,7 @@ public:
     {
         uint64_t logicalWriteCalls=0,logicalBlocks=0,physicalWrites=0,physicalBytes=0;
         uint64_t compressionBlocks=0,compressionWorkerNanoseconds=0,mainThreadWaitNanoseconds=0;
+        uint64_t bufferedInputCalls=0,bufferedFlushes=0;
     };
     static FileWrite* Open(const char* filename,FileCompression comp=FileCompression::Fast,int level=1,int streams=-1,
         std::shared_ptr<FileWriteHooks> hooks={})
@@ -103,17 +105,17 @@ public:
         std::shared_ptr<FileWriteHooks> hooks={})
     {
         if(streams<=0)streams=std::max<int>(1,int(std::thread::hardware_concurrency()));streams=std::min(streams,255);
-        FILE* file=nullptr;
+        FILE* file=nullptr;uint64_t reservedBytes=0;
         try {
             if(hooks&&hooks->check)hooks->check();
             if(hooks&&hooks->reserveMemory) {
                 const auto codec=comp==FileCompression::Zstd?ZSTD_estimateCStreamSize(level):size_t(comp==FileCompression::Fast?LZ4_sizeofState():LZ4_sizeofStateHC());
                 if(ZSTD_isError(codec))throw std::runtime_error("file_compression_memory_estimate");
-                hooks->reserveMemory(uint64_t(streams)*(2*FileBufSize+FileBoundSize+codec+sizeof(StreamHandle)+(1ull<<20)));
+                reservedBytes=uint64_t(streams)*(2*FileBufSize+FileBoundSize+codec+sizeof(StreamHandle)+(1ull<<20));hooks->reserveMemory(reservedBytes);
             }
             if(hooks&&hooks->beforeWrite)hooks->beforeWrite(sizeof(TracyHeader)+2);
             file=open();if(!file){Notify(hooks,"file_write_open_failed");if(hooks&&hooks->reserveMemory)hooks->reserveMemory(0);return nullptr;}
-            return new FileWrite(file,comp,level,streams,hooks);
+            return new FileWrite(file,comp,level,streams,hooks,reservedBytes);
         }catch(const std::exception& e){if(file)fclose(file);Notify(hooks,e.what());Release(hooks);throw;}
         catch(...){if(file)fclose(file);Notify(hooks,"file_write_open_failure");Release(hooks);throw;}
     }
@@ -150,12 +152,13 @@ public:
     std::pair<size_t,size_t> GetCompressionStatistics() const{return {m_srcBytes,m_dstBytes};}
     PipelineStatistics GetPipelineStatistics() const{return m_pipeline;}
 private:
+    friend class BufferedFileWrite;
     static void Notify(const std::shared_ptr<FileWriteHooks>& hooks,const char* message) noexcept
     {try{if(hooks&&hooks->failed)hooks->failed(message);}catch(...) {}}
     static void Release(const std::shared_ptr<FileWriteHooks>& hooks) noexcept
     {try{if(hooks&&hooks->reserveMemory)hooks->reserveMemory(0);}catch(...) {}}
     void Check(){if(m_hooks&&m_hooks->check)m_hooks->check();}
-    FileWrite(FILE* file,FileCompression comp,int level,int streams,std::shared_ptr<FileWriteHooks> hooks):m_output(new char[OutputBufferSize]),m_file(file),m_hooks(std::move(hooks))
+    FileWrite(FILE* file,FileCompression comp,int level,int streams,std::shared_ptr<FileWriteHooks> hooks,uint64_t reservedBytes):m_output(new char[OutputBufferSize]),m_file(file),m_hooks(std::move(hooks)),m_reservedBytes(reservedBytes)
     {
         try {
             char header[sizeof(TracyHeader)+2];std::memcpy(header,TracyHeader,sizeof(TracyHeader));header[sizeof(TracyHeader)]=comp==FileCompression::Zstd?1:0;header[sizeof(TracyHeader)+1]=char(streams);m_writtenBytes=sizeof(header);PhysicalWrite(header,sizeof(header));
@@ -173,6 +176,10 @@ private:
             const auto take=std::min(size,OutputBufferSize-m_outputBytes);std::memcpy(m_output.get()+m_outputBytes,src,take);m_outputBytes+=take;src+=take;size-=take;
             if(m_outputBytes==OutputBufferSize)FlushOutput();
         }
+    }
+    char* AcquireBufferedInput()
+    {
+        if(!m_bufferedInput){if(m_hooks&&m_hooks->reserveMemory)m_hooks->reserveMemory(m_reservedBytes+OutputBufferSize);m_bufferedInput=std::make_unique<char[]>(OutputBufferSize);m_reservedBytes+=OutputBufferSize;}return m_bufferedInput.get();
     }
     void PhysicalWrite(const void* data,size_t size)
     {
@@ -215,11 +222,27 @@ private:
             lock.lock();h->error=failure;h->inputReady=false;h->outputReady=true;h->signal.notify_one();
         }
     }
-    char* m_buf=nullptr;size_t m_offset=0;std::unique_ptr<char[]> m_output;size_t m_outputBytes=0;int m_streamId=0,m_streamPending=0;
+    char* m_buf=nullptr;size_t m_offset=0;std::unique_ptr<char[]> m_output,m_bufferedInput;size_t m_outputBytes=0;int m_streamId=0,m_streamPending=0;
     std::vector<std::unique_ptr<StreamHandle>> m_streams;FILE* m_file;
     std::shared_ptr<FileWriteHooks> m_hooks;
     PipelineStatistics m_pipeline;
-    size_t m_srcBytes=0,m_dstBytes=0;uint64_t m_writtenBytes=0,m_fileBytes=0;bool m_finished=false,m_failed=false;
+    size_t m_srcBytes=0,m_dstBytes=0;uint64_t m_writtenBytes=0,m_fileBytes=0,m_reservedBytes=0;bool m_finished=false,m_failed=false;
+};
+
+class BufferedFileWrite
+{
+    static constexpr size_t Capacity=1ull<<20;
+public:
+    explicit BufferedFileWrite(FileWrite& writer):m_writer(writer),m_buffer(writer.AcquireBufferedInput()){}
+    ~BufferedFileWrite(){assert(m_size==0);}
+    void Write(const void* data,size_t size)
+    {
+        ++m_writer.m_pipeline.bufferedInputCalls;const auto* source=static_cast<const char*>(data);
+        while(size){const auto bytes=std::min(size,Capacity-m_size);std::memcpy(m_buffer+m_size,source,bytes);m_size+=bytes;source+=bytes;size-=bytes;if(m_size==Capacity)Flush();}
+    }
+    void Flush(){if(!m_size)return;m_writer.Write(m_buffer,m_size);m_size=0;++m_writer.m_pipeline.bufferedFlushes;}
+private:
+    FileWrite& m_writer;char* m_buffer;size_t m_size=0;
 };
 }
 #endif

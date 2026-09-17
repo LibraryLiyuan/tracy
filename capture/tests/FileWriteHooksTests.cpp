@@ -2,6 +2,8 @@
 #if __has_include("../../server/TracyFileWriteHooks.hpp")
 #include "../../server/TracyFileWrite.hpp"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -32,6 +34,10 @@ int main(int argc,char** argv)
     hooks->write=[&](const void* p,size_t n,FILE* f){++writeCalls;return std::fwrite(p,1,n,f);};
     {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open((root/"batched.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));for(uint32_t i=0;i<100000;++i)writer->Write(&i,sizeof(i));writer->Finish();const auto stats=writer->GetPipelineStatistics();Check(stats.logicalWriteCalls==100000&&stats.logicalBlocks==7&&stats.physicalWrites==writeCalls&&stats.physicalBytes==std::filesystem::file_size(root/"batched.tracy")&&stats.compressionWorkerNanoseconds>0);}
     Check(checkCalls<100&&writeCalls<8);
+    const auto directPath=root/"direct-fields.tracy",bufferedPath=root/"buffered-fields.tracy";
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open(directPath.string().c_str(),tracy::FileCompression::Zstd,1,2));std::vector<uint32_t> values(100000);for(uint32_t i=0;i<values.size();++i)values[i]=i*17+3;writer->Write(values.data(),values.size()*sizeof(uint32_t));writer->Finish();}
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open(bufferedPath.string().c_str(),tracy::FileCompression::Zstd,1,2));tracy::BufferedFileWrite buffered(*writer);for(uint32_t i=0;i<100000;++i){const uint32_t value=i*17+3;buffered.Write(&value,sizeof(value));}buffered.Flush();writer->Finish();const auto stats=writer->GetPipelineStatistics();Check(stats.logicalWriteCalls==1&&stats.bufferedInputCalls==100000&&stats.bufferedFlushes==1);}
+    {std::ifstream direct(directPath,std::ios::binary),buffered(bufferedPath,std::ios::binary);const std::vector<char> a((std::istreambuf_iterator<char>(direct)),{}),b((std::istreambuf_iterator<char>(buffered)),{});Check(a==b);}
     hooks=std::make_shared<tracy::FileWriteHooks>();notified=false;const auto mainThread=std::this_thread::get_id();
     hooks->check=[&]{if(std::this_thread::get_id()!=mainThread)throw std::runtime_error("injected_compressor_thread_failure");};
     hooks->failed=[&](const char*){notified=true;};rejected=false;

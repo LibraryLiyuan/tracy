@@ -39,6 +39,7 @@ namespace tracy
 
 class FileRead;
 class FileWrite;
+class BufferedFileWrite;
 
 // Offline conversion uses the normal Full Worker data model without opening a
 // localhost socket.  The transport is deliberately small: the converter owns
@@ -1310,7 +1311,7 @@ private:
     void SkipTimeline( FileRead& f, uint64_t size, int64_t& refTime, int64_t& refGpuTime, bool hasQueryId, uint32_t context, uint64_t parent );
 
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& vec, int64_t& refTime );
-    void WriteOfflineCpuTimeline( FileWrite&, uint64_t, int64_t&, uint64_t );
+    void WriteOfflineCpuTimeline( BufferedFileWrite&, uint64_t, int64_t&, uint64_t );
     void WriteOfflineGpuTimeline( FileWrite&, uint64_t, int64_t&, int64_t&, uint32_t );
     tracy_force_inline void WriteTimeline( FileWrite& f, const Vector<short_ptr<GpuEvent>>& vec, int64_t& refTime, int64_t& refGpuTime );
     template<typename Adapter, typename V>

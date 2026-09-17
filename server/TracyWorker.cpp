@@ -366,7 +366,7 @@ static inline void UpdateLockCount( LockMap& lockmap, size_t pos )
     }
 }
 
-static tracy_force_inline void WriteTimeOffset( FileWrite& f, int64_t& refTime, int64_t time )
+template<class Writer>static tracy_force_inline void WriteTimeOffset( Writer& f, int64_t& refTime, int64_t time )
 {
     int64_t timeOffset = time - refTime;
     refTime += timeOffset;
@@ -11404,8 +11404,8 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.threads.size();
     f.Write( &sz, sizeof( sz ) );
-    uint64_t offlineContextSampleTotal=0,offlineMainSampleTotal=0,offlineContextSampleDone=0,offlineMainSampleDone=0;
-    if(m_offlineStorage){for(const auto* thread:m_data.threads){offlineContextSampleTotal+=m_offlineStorage->SampleCount(thread->id,1);offlineMainSampleTotal+=m_offlineStorage->SampleCount(thread->id,0);}m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",0,m_offlineWriteCpuTotal,"zones");}
+    uint64_t offlineContextSampleTotal=0,offlineMainSampleTotal=0,offlineContextSampleDone=0,offlineMainSampleDone=0;std::unique_ptr<BufferedFileWrite> offlineBuffered;
+    if(m_offlineStorage){offlineBuffered=std::make_unique<BufferedFileWrite>(f);for(const auto* thread:m_data.threads){offlineContextSampleTotal+=m_offlineStorage->SampleCount(thread->id,1);offlineMainSampleTotal+=m_offlineStorage->SampleCount(thread->id,0);}m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",0,m_offlineWriteCpuTotal,"zones");}
     for( auto& thread : m_data.threads )
     {
         int64_t refTime = 0;
@@ -11416,7 +11416,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->groupHint, sizeof( thread->groupHint ) );
         m_offlineWriteCpuThread=thread->id;
         const auto offlineRoot = m_offlineCpuThreadRoots.find( thread->id );
-        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ){m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");WriteOfflineCpuTimeline( f, offlineRoot->second, refTime, thread->id );}
+        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ){m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");WriteOfflineCpuTimeline( *offlineBuffered, offlineRoot->second, refTime, thread->id );offlineBuffered->Flush();}
         else WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
@@ -11428,7 +11428,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,1):thread->ctxSwitchSamples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));if((++offlineContextSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");});}
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(*offlineBuffered,refTime,time);Int24 value;value.SetVal(callstack);offlineBuffered->Write(&value,sizeof(value));if((++offlineContextSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");});offlineBuffered->Flush();}
         else for( auto& v : thread->ctxSwitchSamples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
@@ -11445,7 +11445,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,0):thread->samples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));if((++offlineMainSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");});}
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(*offlineBuffered,refTime,time);Int24 value;value.SetVal(callstack);offlineBuffered->Write(&value,sizeof(value));if((++offlineMainSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");});offlineBuffered->Flush();}
         else for( auto& v : thread->samples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
@@ -11889,7 +11889,7 @@ void Worker::WriteTimeline( FileWrite& f, const Vector<short_ptr<ZoneEvent>>& ve
     }
 }
 
-void Worker::WriteOfflineCpuTimeline( FileWrite& f, uint64_t root, int64_t& refTime, uint64_t thread )
+void Worker::WriteOfflineCpuTimeline( BufferedFileWrite& f, uint64_t root, int64_t& refTime, uint64_t thread )
 {
     const auto size = m_offlineStorage->CpuRootChildren( root );
     f.Write( &size, sizeof( size ) );
