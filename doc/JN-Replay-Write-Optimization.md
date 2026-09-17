@@ -35,3 +35,13 @@ These measurements establish local effects only. They do not predict the final 3
 Thirty-two Tracy component tests were run. Twenty-nine passed through CTest; three fixed-output-directory tests encountered prior artifacts, and all three passed when rerun once with fresh explicit directories. Offline Worker disk/full equivalence, maximum ResourceSet expansion, CPU/GPU tree round trips, Zone field/order validation, Sample ordering and hash reuse, file read/write failure propagation, and the small complete Scan-to-Cleanup conversion pass.
 
 The resource contract remains 20 GiB process private bytes, 256 MiB shared storage workspace, 2 GiB commit/free-space reserves, and 3J disk peak. No Trace layout, stream protocol, Unity path, Query/MCP 1.35 contract, or retry policy changed.
+
+## First real-input run
+
+The frozen r6 run completed Scan in 40.979 seconds, Replay in 948.018 seconds, and Finalize in 84.304 seconds. Relative to r4, Replay fell from 3,424.24 seconds to 948.018 seconds (72.3% reduction, 3.61x throughput) and Finalize fell from 132.449 seconds to 84.304 seconds (36.4% reduction). The run then stopped 92.079 seconds into Write with `offline_sample_visit_count`, after 85,393,408 of 422,576,574 CPU Zones had been emitted. A full Write comparison cannot be claimed from this partial result.
+
+Replay evidence shows 30.349 seconds of client payload reads and 915.290 seconds waiting for the one-record mailbox to become empty. This identifies Worker processing/storage as the Replay limiter; journal input is not the dominant cost. The optimized storage reused 2,195,077 CPU-page slots after 125 allocations and 186,129 GPU-page slots after 125 allocations. ResourceSet performed 21,655,059 lookups with 20,651 page-slot reuses.
+
+The run remained within all resource limits: private bytes peaked at 3,535,556,608, workspace at 212,287,527, and task disk at 67,128,279,040 bytes. Cleanup completed, retained 36,864 bytes of reports, and published no candidate, final trace, map, or completion marker.
+
+The failure exposed a pre-existing Sample ordering defect. `OfflineSampleStore::State::lastTime` tracked the last appended time rather than the maximum observed time. After a sequence such as 10, 5, 10 (or a zero-time sample), the later duplicate bypassed lookup; the time index replaced the previous key while the declared count increased. Commit `9675e6ff` keeps the maximum time, so every later timestamp at or below that maximum is checked and duplicate timestamps are merged. The 10, 5, 0, 10 regression and the complete small conversion both pass. Per the one-run stop rule, the 30-minute input was not rerun automatically.
