@@ -55,9 +55,9 @@ public:
     uint64_t Append( uint64_t thread, uint8_t kind, const OfflineSampleRow& value )
     {
         Check();Require( !m_sealed && kind < 2 && value.time >= 0 && value.time < ( int64_t( 1 ) << 47 ), "offline_sample_append" );
-        auto& state = GetState( thread, kind );OfflineSampleLink row;row.value=value;const auto id=m_rows->Append(&row);auto& first=value.time==0?state.zeroFirst:state.first;auto& last=value.time==0?state.zeroLast:state.last;
+        auto& state = GetState( thread, kind );OfflineSampleLink row;row.value=value;const auto id=m_rows->Append(&row);const bool appendOrdered=kind==1||value.time>0;auto& first=appendOrdered?state.first:state.zeroFirst;auto& last=appendOrdered?state.last:state.zeroLast;
         if(last){OfflineSampleLink prior;m_rows->Read(last-1,&prior);Require(prior.next==0,"offline_sample_tail");prior.next=id+1;m_rows->Put(last-1,&prior);}else first=id+1;last=id+1;
-        if(value.time>0&&state.indexed)m_timeIndex->Upsert(IndexKey(state,value.time),id);
+        if(value.time>0&&state.indexed){const auto indexed=m_timeIndex->Count();m_timeIndex->Upsert(IndexKey(state,value.time),id);if(kind==0&&m_timeIndex->Count()!=indexed+1)throw std::runtime_error("offline_sample_duplicate_index:"+std::to_string(thread)+":"+std::to_string(kind)+":"+std::to_string(value.time));}
         state.lastTime=std::max(state.lastTime,value.time);++state.count;++m_total;return id;
     }
     std::optional<std::pair<uint64_t,OfflineSampleRow>> Find( uint64_t thread, uint8_t kind, int64_t time )
@@ -67,7 +67,7 @@ public:
     void Put( uint64_t id, const OfflineSampleRow& value ){Check();Require(!m_sealed&&id<m_rows->Count(),"offline_sample_update");OfflineSampleLink row;m_rows->Read(id,&row);Require(row.value.time==value.time,"offline_sample_update_time");row.value=value;m_rows->Put(id,&row);}
     std::optional<int64_t> LastTime(uint64_t thread,uint8_t kind)const{const auto found=m_states.find({thread,kind});return found==m_states.end()?std::nullopt:std::optional<int64_t>(found->second.lastTime);}
     void Seal(){Check();Require(!m_sealed,"offline_sample_sealed");m_rows->Seal();if(m_timeIndex)m_timeIndex->Seal();m_sealed=true;}
-    template<class Visitor>void Visit(uint64_t thread,uint8_t kind,Visitor&& visitor){Check();Require(m_sealed&&kind<2,"offline_sample_not_sealed");const auto found=m_states.find({thread,kind});if(found==m_states.end())return;const auto& state=found->second;VisitList(state.zeroFirst,visitor);if(state.indexed){const auto first=uint64_t(state.ordinal)<<47;m_timeIndex->VisitRange(first+1,first+((uint64_t(1)<<47)-1),[&](uint64_t,uint64_t id){OfflineSampleLink row;m_rows->Read(id,&row);visitor(row.value);});}else VisitList(state.first,visitor);}
+    template<class Visitor>void Visit(uint64_t thread,uint8_t kind,Visitor&& visitor){Check();Require(m_sealed&&kind<2,"offline_sample_not_sealed");const auto found=m_states.find({thread,kind});if(found==m_states.end())return;const auto& state=found->second;if(kind==1){VisitList(state.first,visitor);return;}VisitList(state.zeroFirst,visitor);if(state.indexed){const auto first=uint64_t(state.ordinal)<<47;m_timeIndex->VisitRange(first+1,first+((uint64_t(1)<<47)-1),[&](uint64_t,uint64_t id){OfflineSampleLink row;m_rows->Read(id,&row);visitor(row.value);});}else VisitList(state.first,visitor);}
     uint64_t Count(uint64_t thread,uint8_t kind)const{const auto found=m_states.find({thread,kind});return found==m_states.end()?0:found->second.count;}
     uint64_t TotalCount()const{return m_total;}
     uint64_t ThreadCount()const{return m_threads.size();}

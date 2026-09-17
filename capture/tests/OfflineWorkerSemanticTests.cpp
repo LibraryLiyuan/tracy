@@ -18,16 +18,16 @@ struct OfflineStorageSemanticTest {
     TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X
     for(const auto& value:worker.m_data.jnTrace.gpuCatalogStrings){OfflineCatalogString row;row.generation=value.generation;row.header=value.header;std::memcpy(row.bytes.data(),value.value.data(),value.value.size());store.AppendCatalog(OfflineCatalogDomain::CatalogString,&row,sizeof(row));}
-    Vector<ThreadData*> growingThreads;for(auto* thread:worker.m_data.threads)growingThreads.push_back(thread);worker.m_data.threads=std::move(growingThreads);MakeCallstacksGrowable(worker);worker.m_offlineStorage=&store;worker.m_timerMul=1;worker.m_data.baseTime=0;const uint64_t raw[2]={0x1000,0x2000};worker.AddCallstackPayload(reinterpret_cast<const char*>(raw),sizeof(raw));const auto callstack=worker.m_pendingCallstackId;worker.m_pendingCallstackId=0;auto& thread=*worker.NoticeThread(0x515151);
-    const auto add=[&](int64_t time){SampleData sample;sample.time.SetVal(time);sample.callstack.SetVal(callstack);worker.ProcessCallstackSampleInsertSample(sample,thread);};add(10);add(20);add(20);add(15);add(0);add(0);
-    worker.m_refTimeCtx=0;worker.m_pendingCallstackId=callstack;QueueCallstackSample event{};event.time=5;event.thread=uint32_t(thread.id);worker.ProcessCallstackSampleContextSwitch(event);Check(store.SampleCount(thread.id,0)==6&&store.SampleCount(thread.id,1)==1);
+    Vector<ThreadData*> growingThreads;for(auto* thread:worker.m_data.threads)growingThreads.push_back(thread);worker.m_data.threads=std::move(growingThreads);MakeCallstacksGrowable(worker);worker.m_offlineStorage=&store;worker.m_timerMul=1;worker.m_data.baseTime=0;const uint64_t rawA[2]={0x1000,0x2000},rawB[2]={0x3000,0x4000};worker.AddCallstackPayload(reinterpret_cast<const char*>(rawA),sizeof(rawA));const auto callstackA=worker.m_pendingCallstackId;worker.m_pendingCallstackId=0;worker.AddCallstackPayload(reinterpret_cast<const char*>(rawB),sizeof(rawB));const auto callstackB=worker.m_pendingCallstackId;worker.m_pendingCallstackId=0;auto& thread=*worker.NoticeThread(0x515151);
+    const auto add=[&](int64_t time,uint32_t callstack){SampleData sample;sample.time.SetVal(time);sample.callstack.SetVal(callstack);worker.ProcessCallstackSampleInsertSample(sample,thread);};add(10,callstackA);add(20,callstackA);add(20,callstackB);add(15,callstackA);add(0,callstackA);add(0,callstackB);add(20,callstackA);
+    worker.m_refTimeCtx=0;worker.m_pendingCallstackId=callstackA;QueueCallstackSample event{};event.time=5;event.thread=uint32_t(thread.id);worker.ProcessCallstackSampleContextSwitch(event);Check(store.SampleCount(thread.id,0)==6&&store.SampleCount(thread.id,1)==1);
     worker.FinalizeOfflineStrings();store.Seal();worker.FinalizeOfflineCatalog();const auto output=root/"out.tracy";{std::unique_ptr<FileWrite> out(FileWrite::Open(output,FileCompression::Zstd,1,1));worker.Write(*out,false);out->Finish();}
     std::unique_ptr<FileRead> reopenedFile(FileRead::Open(output));Worker reopened(*reopenedFile,EventType::All,false);const auto td=reopened.GetThreadData(thread.id);
     Check(td!=nullptr);
     Check(td->samples.size()==6);
     Check(td->ctxSwitchSamples.size()==1);
     const int64_t times[]={0,0,5,10,15,20};for(size_t i=0;i<6;++i)Check(td->samples[i].time.Val()==times[i]);
-    Check(reopened.GetCallstack(td->samples[5].callstack.Val()).size()==4);
+    const auto& merged=reopened.GetCallstack(td->samples[5].callstack.Val());const uint64_t expectedFrames[]={0x1000,0x2000,0x3000,0x4000,0x1000,0x2000};Check(merged.size()==std::size(expectedFrames));for(size_t i=0;i<std::size(expectedFrames);++i)Check(reopened.GetCanonicalPointer(merged[i])==expectedFrames[i]);
     Check(td->ctxSwitchSamples[0].time.Val()==5);worker.m_offlineStorage=nullptr;
     {conversion::OfflineValidationSink sink(store,resources);std::unique_ptr<FileRead> streamedFile(FileRead::Open(output));Worker streamed(*streamedFile,conversion::OfflineValidationEventMask,false,false,&sink);sink.Finish();const auto streamedThread=streamed.GetThreadData(thread.id);Check(streamedThread&&streamedThread->samples.empty()&&streamedThread->ctxSwitchSamples.empty());}
  }
