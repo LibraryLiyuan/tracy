@@ -55,3 +55,13 @@ The frozen r8 converter completed the 26,193,953,055-byte input in 1,864.710 sec
 Private bytes peaked at 3,549,048,832, the shared workspace at 212,287,527, and task disk at 74,638,065,664 bytes. Cleanup removed the work tree and candidate; the snapshot map and completion marker identify the published r8 output.
 
 The frozen r8 Query could not open the 12.43 GB Trace: it returned `RESOURCE_LIMIT: not enough memory to load trace` after `WorkerTraceSource` translated a `std::bad_alloc`. Converter long-data acceptance is complete; Query long-data loading remains a separate implementation requirement.
+
+## Second timing pass acceptance
+
+Commits `8e995ae9`, `565a9a93`, and `af764efd` add pipeline attribution, a resource-accounted 1 MiB encoding buffer for offline CPU Zones and Samples, and per-thread temporary Sample rows with the existing global out-of-order time index. The final Trace layout, Sample ordering and merge rules, page reload checksum validation, JNTRACYX v1 header, and Query/MCP 1.35 contract are unchanged.
+
+The six-run component budget was fully used. Buffered scalar output reduced the 256 MiB FileWrite case from 0.233396 to 0.190969 seconds (18.2%) with identical output bytes and SHA-256. The representative 1,000,000-event, 64-thread Replay fixture fell from 6.846132 to 5.200850 seconds (24.0%) with the same checksum; candidate Sample traversal loaded 768 pages. A separate checksum-reuse experiment was rejected and reverted because it did not revalidate pages after reload.
+
+The frozen r9 converter at `af764efd69648cafcb27510f68df0f0e8ae90626` completed the 26,193,953,055-byte input in 1,381.493 seconds. Relative to r8, Replay fell from 1,067.32 to 796.733 seconds (25.4%), Write from 486.534 to 323.992 seconds (33.4%), and total time from 1,864.710 to 1,381.493 seconds (25.9%). The result is under the 25-minute engineering target.
+
+Private bytes peaked at 3,552,579,584, the shared workspace at 220,552,023, and task disk at 73,710,485,504 bytes. Minimum system commit headroom was 43,154,444,288 bytes. Validation, publication, and cleanup passed; no cleanup residuals remained, and the snapshot map points to the 12,428,309,810-byte r9 Trace. Frozen Query passed `trace.overview` on the small r9 output. The known large-Trace Query load limit was not rerun and remains separate from converter timing acceptance.
