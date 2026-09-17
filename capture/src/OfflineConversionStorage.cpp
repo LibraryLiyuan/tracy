@@ -241,7 +241,7 @@ uint64_t OfflineConversionStorage::SampleCount(uint64_t thread,uint8_t kind)cons
 void OfflineConversionStorage::VisitSamples(uint64_t thread,uint8_t kind,const std::function<void(int64_t,uint32_t)>& visitor){
     Check();if(!m_sealed)throw std::runtime_error("offline_store_not_sealed");analysis::Sha256Builder hash;size_t buffered=0;uint64_t seen=0;
     if(m_samples)m_samples->Visit(thread,kind,[&](const storage::OfflineSampleRow& row){m_sampleHashBuffer[buffered++]=row;if(buffered==m_sampleHashBuffer.size()){hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));buffered=0;}visitor(row.time,row.callstack);++seen;});
-    if(buffered)hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));if(seen!=SampleCount(thread,kind))throw std::runtime_error("offline_sample_visit_count");
+    if(buffered)hash.Update(m_sampleHashBuffer.data(),buffered*sizeof(storage::OfflineSampleRow));const auto expected=SampleCount(thread,kind);if(seen!=expected)throw std::runtime_error("offline_sample_visit_count:"+std::to_string(thread)+":"+std::to_string(kind)+":"+std::to_string(seen)+":"+std::to_string(expected));
     const auto key=std::make_pair(thread,kind);if(!m_sampleHashes.contains(key)){if((m_sampleHashes.size()+1)*256>m_sampleHashCacheLease.Bytes())m_sampleHashCacheLease.Resize((m_sampleHashes.size()+1)*256);m_sampleHashes.emplace(key,hash.FinalHex());}
 }
 std::string OfflineConversionStorage::SampleHash(uint64_t thread,uint8_t kind){

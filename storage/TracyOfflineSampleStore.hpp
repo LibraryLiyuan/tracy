@@ -4,6 +4,7 @@
 #include "TracyDiskIndex64.hpp"
 #include "TracyMutableRows.hpp"
 #include "../analysis/TracyAnalysisIoPath.hpp"
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <unordered_map>
@@ -57,7 +58,7 @@ public:
         auto& state = GetState( thread, kind );OfflineSampleLink row;row.value=value;const auto id=m_rows->Append(&row);auto& first=value.time==0?state.zeroFirst:state.first;auto& last=value.time==0?state.zeroLast:state.last;
         if(last){OfflineSampleLink prior;m_rows->Read(last-1,&prior);Require(prior.next==0,"offline_sample_tail");prior.next=id+1;m_rows->Put(last-1,&prior);}else first=id+1;last=id+1;
         if(value.time>0&&state.indexed)m_timeIndex->Upsert(IndexKey(state,value.time),id);
-        state.lastTime=value.time;++state.count;++m_total;return id;
+        state.lastTime=std::max(state.lastTime,value.time);++state.count;++m_total;return id;
     }
     std::optional<std::pair<uint64_t,OfflineSampleRow>> Find( uint64_t thread, uint8_t kind, int64_t time )
     {
