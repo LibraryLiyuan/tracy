@@ -67,6 +67,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyPng.hpp
     src/TracyQueryIndex.cpp
     src/TracyQueryIndex.hpp
+    src/TracyQueryCatalogStore.cpp
+    src/TracyQueryCatalogStore.hpp
     src/TracyQuerySampleStore.cpp
     src/TracyQuerySampleStore.hpp
     src/TracyQuerySampleView.cpp
@@ -150,6 +152,15 @@ if(BUILD_TESTING)
     add_executable(tracy-query-job-stage-index-integration-tests tests/QueryJobStageIndexIntegrationTests.cpp)
     target_link_libraries(tracy-query-job-stage-index-integration-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-job-stage-index-integration-tests)
+
+    add_executable(tracy-query-catalog-store-tests tests/QueryCatalogStoreTests.cpp)
+    target_link_libraries(tracy-query-catalog-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-store-tests)
+    add_test(NAME tracy-query-catalog-store COMMAND tracy-query-catalog-store-tests)
+
+    add_executable(tracy-query-catalog-index-integration-tests tests/QueryCatalogIndexIntegrationTests.cpp)
+    target_link_libraries(tracy-query-catalog-index-integration-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-index-integration-tests)
 
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)

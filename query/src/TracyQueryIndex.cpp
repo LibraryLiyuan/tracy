@@ -1,5 +1,6 @@
 #include <type_traits>
 #include "TracyQueryIndex.hpp"
+#include "TracyQueryCatalogStore.hpp"
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
 #include "TracyFileHeader.hpp"
@@ -268,12 +269,14 @@ public:
     static constexpr size_t JnDomainCount = 7;
 
     ZoneIndexWriter( std::filesystem::path extras, std::filesystem::path cpu, std::filesystem::path gpu,
-        std::filesystem::path samples, std::array<std::filesystem::path, JnDomainCount> jnPaths,
+        std::filesystem::path samples, std::filesystem::path catalog,
+        std::array<std::filesystem::path, JnDomainCount> jnPaths,
         std::string sourceFingerprint )
         : m_extraPath( std::move( extras ) ), m_cpuPath( std::move( cpu ) ), m_gpuPath( std::move( gpu ) )
         , m_samplePath( std::move( samples ) ), m_jnPaths( std::move( jnPaths ) )
         , m_sourceFingerprint( std::move( sourceFingerprint ) )
         , m_samples( m_samplePath, m_sourceFingerprint )
+        , m_catalog( std::move( catalog ), m_sourceFingerprint )
     {}
 
     void ZoneExtrasBegin( uint64_t count ) override { m_expectedExtras = count; m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint ); }
@@ -418,10 +421,30 @@ public:
     uint64_t MainSampleCount() const { return m_samples.MainCount(); }
     uint64_t ContextSwitchSampleCount() const { return m_samples.ContextSwitchCount(); }
 
+    void CatalogMetadata( OfflineCatalogQuality metadata ) override
+    {
+        m_catalog.SetMetadata( metadata );
+        m_catalogMetadata = true;
+    }
+    bool WantsCatalogStrings() const override { return true; }
+    bool AllowsLargeCatalogStrings( uint64_t ) const override { return true; }
+    void CatalogStringsBegin( uint64_t count ) override { m_catalog.BeginStrings( count ); }
+    void CatalogStringRecord( uint64_t index, uint64_t generation,
+        const JnGpuCatalogStringRecordHeaderV1& header, const void* bytes ) override
+    {
+        m_catalog.CatalogString( index, generation, header, bytes );
+    }
+    void CatalogStringsEnd() override { m_catalog.EndStrings(); }
+    void FinishCatalog()
+    {
+        if( !m_catalogMetadata ) m_catalog.SetMetadata( {} );
+        m_catalog.Finish();
+    }
+
     bool WantsJnRecords( JnDomain domain, uint32_t recordBytes ) const override
     {
-        if(size_t(domain)>=JnDomainCount)return false;
-        return recordBytes == JnRecordBytes( domain );
+        if( const auto catalog = CatalogDomain( domain ) ) return recordBytes == OfflineCatalogInfo( *catalog ).width;
+        return size_t(domain)<JnDomainCount && recordBytes == JnRecordBytes( domain );
     }
     bool AllowsLargeJnRecords( JnDomain domain, uint64_t count, uint32_t recordBytes ) const override
     {
@@ -430,6 +453,11 @@ public:
     }
     void JnRecordsBegin( JnDomain domain, uint64_t count, uint32_t recordBytes ) override
     {
+        if( const auto catalog = CatalogDomain( domain ) )
+        {
+            m_catalog.Begin( *catalog, count, recordBytes );
+            return;
+        }
         const auto index = size_t( domain );
         if( index >= JnDomainCount || recordBytes != JnRecordBytes( domain ) ) throw std::runtime_error( "JN index domain layout mismatch" );
         m_jnStarted[index] = true;
@@ -438,6 +466,11 @@ public:
     }
     void JnRecordsBlock( JnDomain domain, uint64_t offset, const void* records, uint64_t count, uint32_t recordBytes ) override
     {
+        if( const auto catalog = CatalogDomain( domain ) )
+        {
+            m_catalog.Append( *catalog, offset, records, count, recordBytes );
+            return;
+        }
         const auto index = size_t( domain );
         if( index >= JnDomainCount || recordBytes != JnRecordBytes( domain ) || offset != m_jnSeen[index] || count > m_jnExpected[index] - offset )
             throw std::runtime_error( "JN index block is out of sequence" );
@@ -446,6 +479,11 @@ public:
     }
     void JnRecordsEnd( JnDomain domain ) override
     {
+        if( const auto catalog = CatalogDomain( domain ) )
+        {
+            m_catalog.End( *catalog );
+            return;
+        }
         const auto index = size_t( domain );
         if( m_jnSeen[index] != m_jnExpected[index] ) throw std::runtime_error( "JN index count mismatch" );
         m_jn[index].Close( m_jnSeen[index] );
@@ -490,6 +528,17 @@ public:
     }
     static ZoneSectionKind JnSectionKind( JnDomain domain ) { return ZoneSectionKind( uint32_t( ZoneSectionKind::JobStage ) + uint32_t( domain ) ); }
 
+    static std::optional<OfflineCatalogDomain> CatalogDomain( JnDomain domain )
+    {
+        switch( domain )
+        {
+#define X(name,field,type,mut) case JnDomain::name: return OfflineCatalogDomain::name;
+        TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
+#undef X
+        default: return std::nullopt;
+        }
+    }
+
 private:
     struct CpuSpan { uint64_t thread; uint64_t start; uint64_t count; };
     std::filesystem::path m_extraPath, m_cpuPath, m_gpuPath, m_samplePath;
@@ -508,6 +557,8 @@ private:
     std::unordered_map<uint64_t, uint64_t> m_cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> m_gpuZonesByContext;
     QuerySampleStoreWriter m_samples;
+    QueryCatalogStoreWriter m_catalog;
+    bool m_catalogMetadata = false;
 };
 
 std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind)
@@ -877,6 +928,7 @@ public:
         , m_cpu( m_manifest.cpuZones, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), m_manifest.sourceFingerprint )
         , m_gpu( m_manifest.gpuZones, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), m_manifest.sourceFingerprint )
         , m_samples( m_manifest.samples.path, m_manifest.sourceFingerprint )
+        , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint )
         , m_jobStages( m_manifest.jobStages, ZoneSectionKind::JobStage, sizeof( JnJobStageData ), m_manifest.sourceFingerprint )
         , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint )
         , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint )
@@ -918,6 +970,14 @@ public:
                 item.queryable = false;
                 item.indexed = true;
                 item.reason = "JobStage sidecar is present; bounded Job aggregation is pending";
+            }
+            else if( item.domain == "gpu.catalog" || item.domain == "gpu.resource" || item.domain == "gpu.memory" )
+            {
+                const auto metadata = m_catalog.Metadata();
+                item.present = metadata[0] != 0;
+                item.queryable = false;
+                item.indexed = true;
+                item.reason = "GPU Catalog sidecar is present; bounded Catalog analysis indices are pending";
             }
         }
         return result;
@@ -1240,6 +1300,7 @@ public:
     }
     bool SampleDerivedDataReady() const override { return false; }
     bool JobDerivedDataReady() const override { return false; }
+    bool CatalogDerivedDataReady() const override { return false; }
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
     TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
@@ -2130,6 +2191,7 @@ private:
     std::unique_ptr<analysis::WorkerTraceSource> m_source;
     ReadOnlyZoneSection m_extras, m_cpu, m_gpu;
     QuerySampleViewReader m_samples;
+    QueryCatalogStoreReader m_catalog;
     ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     ReadOnlyZoneSection m_gpuMemoryCpuZones;
@@ -2253,6 +2315,7 @@ json ManifestJson( const QueryIndexManifest& value )
             { "cpu_zone", section( value.cpuZones ) },
             { "gpu_zone", section( value.gpuZones ) },
             { "sample", section( value.samples ) },
+            { "gpu_catalog", section( value.gpuCatalog ) },
             { "job_stage", section( value.jobStages ) },
             { "gfx_entity", section( value.gfxEntities ) },
             { "gfx_link", section( value.gfxLinks ) },
@@ -2317,6 +2380,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     result.cpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.cpu" );
     result.gpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu" );
     result.samples.path = tracePath.parent_path() / ( baseName + ".jnidx.sample" );
+    result.gpuCatalog.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-catalog" );
     result.jobStages.path = tracePath.parent_path() / ( baseName + ".jnidx.job-stage" );
     result.gfxEntities.path = tracePath.parent_path() / ( baseName + ".jnidx.gfx-entity" );
     result.gfxLinks.path = tracePath.parent_path() / ( baseName + ".jnidx.gfx-link" );
@@ -2331,6 +2395,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     result.cpuZones.recordBytes = sizeof( CpuZoneIndexRecord );
     result.gpuZones.recordBytes = sizeof( GpuZoneIndexRecord );
     result.samples.recordBytes = QuerySampleStoreRecordBytes;
+    result.gpuCatalog.recordBytes = 0;
     result.jobStages.recordBytes = sizeof( JnJobStageData );
     result.gfxEntities.recordBytes = sizeof( JnGfxEntityData );
     result.gfxLinks.recordBytes = sizeof( JnGfxLinkData );
@@ -2355,6 +2420,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     auto temporaryCpu = result.cpuZones.path; temporaryCpu += suffix;
     auto temporaryGpu = result.gpuZones.path; temporaryGpu += suffix;
     auto temporarySamples = result.samples.path; temporarySamples += suffix;
+    auto temporaryCatalog = result.gpuCatalog.path; temporaryCatalog += suffix;
     std::array<std::filesystem::path, ZoneIndexWriter::JnDomainCount> temporaryJn;
     for( size_t index = 0; index < temporaryJn.size(); index++ ) { temporaryJn[index] = jnSections[index]->path; temporaryJn[index] += suffix; }
     auto temporaryGpuMemoryCpuZones = result.gpuMemoryCpuZones.path; temporaryGpuMemoryCpuZones += suffix;
@@ -2364,11 +2430,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
 
     try
     {
-        ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryJn, result.sourceFingerprint );
+        ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryCatalog,
+            temporaryJn, result.sourceFingerprint );
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
             analysis::WorkerTraceLoadMode::CompactIndex, &writer );
         writer.FinishMissingJnDomains();
         writer.CommitSamples();
+        writer.FinishCatalog();
         BuildQuerySampleView( temporarySamples, result.sourceFingerprint,
             [&]( uint64_t thread ) { return source->GetContextSwitchStartTimes( thread ); } );
         result.zoneExtras.count = writer.ExtraCount();
@@ -2388,6 +2456,21 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         }
         result.samples.bytes = SectionBytes( temporarySamples );
         result.samples.fingerprint = SectionFingerprint( temporarySamples );
+        {
+            QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint );
+            uint64_t count = 0;
+            for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
+            {
+                const auto domainCount = catalog.Count( OfflineCatalogDomain( index ) );
+                if( domainCount > std::numeric_limits<uint64_t>::max() - count )
+                    throw std::runtime_error( "Catalog sidecar count overflow" );
+                count += domainCount;
+            }
+            result.gpuCatalog.count = count;
+            result.gpuCatalog.declaredCount = count;
+        }
+        result.gpuCatalog.bytes = SectionBytes( temporaryCatalog );
+        result.gpuCatalog.fingerprint = SectionFingerprint( temporaryCatalog );
         for( size_t index = 0; index < jnSections.size(); index++ )
         {
             jnSections[index]->count = writer.JnCount( SerializedZoneSink::JnDomain( index ) );
@@ -2569,6 +2652,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             buildManifest.dataPath = temporaryData;
             buildManifest.zoneExtras.path = temporaryExtras; buildManifest.cpuZones.path = temporaryCpu; buildManifest.gpuZones.path = temporaryGpu;
             buildManifest.samples.path = temporarySamples;
+            buildManifest.gpuCatalog.path = temporaryCatalog;
             for( size_t index = 0; index < jnSections.size(); index++ )
             {
                 QueryIndexSection* buildSections[] = { &buildManifest.jobStages, &buildManifest.gfxEntities, &buildManifest.gfxLinks,
@@ -2644,6 +2728,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         if( !AtomicReplace( temporaryCpu, result.cpuZones.path, error ) ) throw std::runtime_error( "cannot commit CPU-zone index: " + error );
         if( !AtomicReplace( temporaryGpu, result.gpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-zone index: " + error );
         if( !AtomicReplace( temporarySamples, result.samples.path, error ) ) throw std::runtime_error( "cannot commit sample index: " + error );
+        if( !AtomicReplace( temporaryCatalog, result.gpuCatalog.path, error ) ) throw std::runtime_error( "cannot commit GPU Catalog index: " + error );
         for( size_t index = 0; index < temporaryJn.size(); index++ )
             if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error ) ) throw std::runtime_error( "cannot commit JN domain index: " + error );
         if( !AtomicReplace( temporaryGpuMemoryCpuZones, result.gpuMemoryCpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory CPU-zone index: " + error );
@@ -2675,6 +2760,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         std::filesystem::remove( temporaryCpu, ignored );
         std::filesystem::remove( temporaryGpu, ignored );
         std::filesystem::remove_all( temporarySamples, ignored );
+        std::filesystem::remove_all( temporaryCatalog, ignored );
         for( const auto& path : temporaryJn ) std::filesystem::remove( path, ignored );
         std::filesystem::remove( temporaryGpuMemoryCpuZones, ignored );
         std::filesystem::remove( temporaryGpuMemorySummaryCpuZones, ignored );
@@ -2755,6 +2841,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         parseSection( "cpu_zone", manifest.cpuZones );
         parseSection( "gpu_zone", manifest.gpuZones );
         parseSection( "sample", manifest.samples );
+        parseSection( "gpu_catalog", manifest.gpuCatalog );
         parseSection( "job_stage", manifest.jobStages );
         parseSection( "gfx_entity", manifest.gfxEntities );
         parseSection( "gfx_link", manifest.gfxLinks );
@@ -2820,6 +2907,25 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
                 samples.ContextSwitchCount() != manifest.sampleContextSwitchCount )
                 throw std::runtime_error( "sample section count mismatch" );
             if( deep ) samples.ValidateAll();
+        }
+        if( manifest.gpuCatalog.recordBytes != 0 || !std::filesystem::is_directory( manifest.gpuCatalog.path ) ||
+            SectionBytes( manifest.gpuCatalog.path ) != manifest.gpuCatalog.bytes )
+            throw std::runtime_error( "GPU Catalog section identity mismatch" );
+        if( deep && SectionFingerprint( manifest.gpuCatalog.path ) != manifest.gpuCatalog.fingerprint )
+            throw std::runtime_error( "GPU Catalog section hash mismatch" );
+        {
+            QueryCatalogStoreReader catalog( manifest.gpuCatalog.path, manifest.sourceFingerprint );
+            uint64_t count = 0;
+            for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
+            {
+                const auto domainCount = catalog.Count( OfflineCatalogDomain( index ) );
+                if( domainCount > std::numeric_limits<uint64_t>::max() - count )
+                    throw std::runtime_error( "GPU Catalog section count overflow" );
+                count += domainCount;
+            }
+            if( count != manifest.gpuCatalog.count || manifest.gpuCatalog.declaredCount != count )
+                throw std::runtime_error( "GPU Catalog section count mismatch" );
+            if( deep ) catalog.ValidateAll();
         }
         validateSection( manifest.jobStages, sizeof( JnJobStageData ), "job-stage",ZoneSectionKind::JobStage );
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );

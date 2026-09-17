@@ -52,3 +52,9 @@ schema18 已从 Compact Worker 中移除完整 Sample 表；`sample.list`、主/
 JobStage也改为允许超大记录数的sidecar，compact payload不再保留全表；当前Job聚合消费者尚未迁移，因此Job、Job Gfx及依赖Job的Evidence能力明确标记未就绪并返回 `INDEX_NOT_READY`。小型JNTRACYX夹具验证3条JobStage的sidecar、compact移除和indexed计数一致。
 
 使用正式12428310213字节Trace执行一次非性能“索引构建诊断”：旧冻结Query在加载期失败；schema18版本已越过Sample与JobStage，最近一次观测Private Bytes约26832334848字节、Working Set约21071273984字节，随后仍以 `not enough memory to load trace` 失败。失败后本轮所有 `.s17/.s18` 临时索引均清理。此结果不是计划中的新版性能初评；下一确定方向是Catalog、字符串/调用栈及其派生结构继续外置。
+
+## 2026-09-18：Catalog原始表外置
+
+schema19新增GPU Catalog存储：12个固定域、Catalog字符串域和质量元数据分别使用压缩分页表，缺失域也发布空表；支持随机点读、冷重开、Trace身份拒绝与全块深校验。小型真实JNTRACYX夹具验证1001条资源及Batch/String计数，compact payload不再保留Catalog。Catalog分析索引与MCP消费者尚未迁移，当前明确返回INDEX_NOT_READY。
+
+正式Trace非性能索引诊断最近观测Private Bytes约23068401664字节、Working Set约51385528320字节，随后以bad allocation停止；相较schema18最近观测Private Bytes约减少3.76 GB，临时索引清理完成。下一内存层为全局字符串、调用栈和剩余派生映射；仍未进入正式单轮性能初评。

@@ -5440,6 +5440,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         method.rfind( "gpu.memory.", 0 ) == 0 || method == "gpu.pass.resources" || method == "gpu.pass.vg_evidence";
     if( gpuCatalogMethod )
     {
+        if( !source->CatalogDerivedDataReady() )
+            throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
         const auto catalog = source->GetGpuCatalogData();
         const bool present = catalog && catalog->gpuCatalogPresent;
         const auto statusJson = [&]() {

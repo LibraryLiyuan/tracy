@@ -1100,6 +1100,7 @@ public:
     // Immutable N27 Catalog snapshot. Pointer tokens are retained only for
     // validation and lifetime resolution and must never reach Query output.
     virtual std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const { return {}; }
+    virtual bool CatalogDerivedDataReady() const { return true; }
 
     virtual CrashDto GetCrash() const { return {}; }
     virtual std::vector<CpuTopologyDto> GetCpuTopology() const { return {}; }
