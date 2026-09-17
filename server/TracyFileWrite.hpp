@@ -1,8 +1,10 @@
 #ifndef __TRACYFILEWRITE_HPP__
 #define __TRACYFILEWRITE_HPP__
+#define TRACY_FILE_WRITE_PIPELINE_STATS 1
 #include <algorithm>
 #include <assert.h>
 #include <condition_variable>
+#include <chrono>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -69,15 +71,22 @@ private:
 };
 class FileWrite
 {
+    static constexpr size_t OutputBufferSize=1ull<<20;
     struct StreamHandle
     {
         StreamHandle(FileCompression comp,int level,std::shared_ptr<FileWriteHooks> callbacks):stream(comp,level),hooks(std::move(callbacks)){}
         WriteStream stream;std::shared_ptr<FileWriteHooks> hooks;
         std::mutex signalLock;std::condition_variable signal;
         bool inputReady=false,outputReady=false,exit=false;uint32_t size=0;
+        uint64_t blocks=0,compressionNanoseconds=0;
         std::exception_ptr error;std::thread thread;
     };
 public:
+    struct PipelineStatistics
+    {
+        uint64_t logicalWriteCalls=0,logicalBlocks=0,physicalWrites=0,physicalBytes=0;
+        uint64_t compressionBlocks=0,compressionWorkerNanoseconds=0,mainThreadWaitNanoseconds=0;
+    };
     static FileWrite* Open(const char* filename,FileCompression comp=FileCompression::Fast,int level=1,int streams=-1,
         std::shared_ptr<FileWriteHooks> hooks={})
     {return OpenWith([&](){return fopen(filename,"wb");},comp,level,streams,std::move(hooks));}
@@ -117,7 +126,7 @@ public:
     {
         if(m_finished)return;if(m_failed)throw std::runtime_error("file_writer_failed");
         try {
-            Check();if(m_offset)WriteBlock();while(m_streamPending)ProcessPending();
+            Check();if(m_offset)WriteBlock();while(m_streamPending)ProcessPending();FlushOutput();
             StopThreads();
             if(fflush(m_file)!=0||ferror(m_file))throw std::runtime_error("file_write_flush");
             auto* file=m_file;m_file=nullptr;if(fclose(file)!=0)throw std::runtime_error("file_write_close");
@@ -129,7 +138,8 @@ public:
     {
         if(m_finished||m_failed)throw std::runtime_error("file_writer_closed");
         try {
-            Check();const auto* src=static_cast<const char*>(ptr);
+            ++m_pipeline.logicalWriteCalls;
+            const auto* src=static_cast<const char*>(ptr);
             while(size) {
                 const auto take=std::min(size,FileBufSize-m_offset);memcpy(m_buf+m_offset,src,take);
                 src+=take;size-=take;m_offset+=take;if(m_offset==FileBufSize)WriteBlock();
@@ -138,16 +148,17 @@ public:
         catch(...){m_failed=true;Notify(m_hooks,"file_write_failure");throw;}
     }
     std::pair<size_t,size_t> GetCompressionStatistics() const{return {m_srcBytes,m_dstBytes};}
+    PipelineStatistics GetPipelineStatistics() const{return m_pipeline;}
 private:
     static void Notify(const std::shared_ptr<FileWriteHooks>& hooks,const char* message) noexcept
     {try{if(hooks&&hooks->failed)hooks->failed(message);}catch(...) {}}
     static void Release(const std::shared_ptr<FileWriteHooks>& hooks) noexcept
     {try{if(hooks&&hooks->reserveMemory)hooks->reserveMemory(0);}catch(...) {}}
     void Check(){if(m_hooks&&m_hooks->check)m_hooks->check();}
-    FileWrite(FILE* file,FileCompression comp,int level,int streams,std::shared_ptr<FileWriteHooks> hooks):m_file(file),m_hooks(std::move(hooks))
+    FileWrite(FILE* file,FileCompression comp,int level,int streams,std::shared_ptr<FileWriteHooks> hooks):m_output(new char[OutputBufferSize]),m_file(file),m_hooks(std::move(hooks))
     {
         try {
-            CheckedWrite(TracyHeader,sizeof(TracyHeader));uint8_t b=comp==FileCompression::Zstd?1:0;CheckedWrite(&b,1);b=uint8_t(streams);CheckedWrite(&b,1);
+            char header[sizeof(TracyHeader)+2];std::memcpy(header,TracyHeader,sizeof(TracyHeader));header[sizeof(TracyHeader)]=comp==FileCompression::Zstd?1:0;header[sizeof(TracyHeader)+1]=char(streams);m_writtenBytes=sizeof(header);PhysicalWrite(header,sizeof(header));
             m_streams.reserve(streams);
             for(int i=0;i<streams;++i){m_streams.emplace_back(std::make_unique<StreamHandle>(comp,level,m_hooks));auto* p=m_streams.back().get();p->thread=std::thread([p]{Worker(p);});}
             m_buf=m_streams[0]->stream.GetInputBuffer();
@@ -155,14 +166,25 @@ private:
     }
     void CheckedWrite(const void* data,size_t size)
     {
-        Check();if(size>UINT64_MAX-m_writtenBytes)throw std::runtime_error("file_write_size_overflow");
-        if(m_hooks&&m_hooks->beforeWrite)m_hooks->beforeWrite(m_writtenBytes+size);
-        const auto written=m_hooks&&m_hooks->write?m_hooks->write(data,size,m_file):fwrite(data,1,size,m_file);
-        m_writtenBytes+=written;if(written!=size)throw std::runtime_error("file_write_short_write");
+        if(size>UINT64_MAX-m_writtenBytes)throw std::runtime_error("file_write_size_overflow");m_writtenBytes+=size;
+        const auto* src=static_cast<const char*>(data);
+        while(size){
+            if(m_outputBytes==0&&size>=OutputBufferSize){PhysicalWrite(src,size);return;}
+            const auto take=std::min(size,OutputBufferSize-m_outputBytes);std::memcpy(m_output.get()+m_outputBytes,src,take);m_outputBytes+=take;src+=take;size-=take;
+            if(m_outputBytes==OutputBufferSize)FlushOutput();
+        }
     }
+    void PhysicalWrite(const void* data,size_t size)
+    {
+        Check();if(size>UINT64_MAX-m_fileBytes)throw std::runtime_error("file_write_size_overflow");
+        if(m_hooks&&m_hooks->beforeWrite)m_hooks->beforeWrite(m_fileBytes+size);
+        const auto written=m_hooks&&m_hooks->write?m_hooks->write(data,size,m_file):fwrite(data,1,size,m_file);
+        m_fileBytes+=written;++m_pipeline.physicalWrites;m_pipeline.physicalBytes=m_fileBytes;if(written!=size)throw std::runtime_error("file_write_short_write");
+    }
+    void FlushOutput(){if(!m_outputBytes)return;PhysicalWrite(m_output.get(),m_outputBytes);m_outputBytes=0;}
     void WriteBlock()
     {
-        Check();m_srcBytes+=m_offset;auto& h=*m_streams[m_streamId];
+        Check();m_srcBytes+=m_offset;++m_pipeline.logicalBlocks;auto& h=*m_streams[m_streamId];
         {std::lock_guard lock(h.signalLock);h.inputReady=true;h.size=uint32_t(m_offset);h.signal.notify_one();}
         ++m_streamPending;m_streamId=(m_streamId+1)%int(m_streams.size());m_offset=0;
         if(m_streamPending==int(m_streams.size()))ProcessPending();
@@ -171,7 +193,7 @@ private:
     void ProcessPending()
     {
         const int id=(m_streamId+int(m_streams.size())-m_streamPending)%int(m_streams.size());
-        auto& h=*m_streams[id];std::unique_lock lock(h.signalLock);h.signal.wait(lock,[&]{return h.outputReady;});
+        auto& h=*m_streams[id];std::unique_lock lock(h.signalLock);const auto waitStarted=std::chrono::steady_clock::now();h.signal.wait(lock,[&]{return h.outputReady;});m_pipeline.mainThreadWaitNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-waitStarted).count());
         const auto error=h.error;h.outputReady=false;lock.unlock();--m_streamPending;
         if(error)std::rethrow_exception(error);
         const uint32_t size=h.stream.GetSize();CheckedWrite(&size,sizeof(size));CheckedWrite(h.stream.GetCompressedData(),size);m_dstBytes+=size;
@@ -179,7 +201,9 @@ private:
     void StopThreads() noexcept
     {
         for(auto& h:m_streams){std::lock_guard lock(h->signalLock);h->exit=true;h->signal.notify_one();}
-        for(auto& h:m_streams)if(h->thread.joinable())h->thread.join();m_streams.clear();
+        for(auto& h:m_streams)if(h->thread.joinable())h->thread.join();
+        for(auto& h:m_streams){m_pipeline.compressionBlocks+=h->blocks;m_pipeline.compressionWorkerNanoseconds+=h->compressionNanoseconds;}
+        m_streams.clear();
     }
     static void Worker(StreamHandle* h)
     {
@@ -187,14 +211,15 @@ private:
         for(;;) {
             h->signal.wait(lock,[&]{return h->inputReady||h->exit;});if(h->exit)return;lock.unlock();
             std::exception_ptr failure;
-            try{if(h->hooks&&h->hooks->check)h->hooks->check();h->stream.Compress(h->size);}catch(...){failure=std::current_exception();}
+            try{if(h->hooks&&h->hooks->check)h->hooks->check();const auto started=std::chrono::steady_clock::now();h->stream.Compress(h->size);h->compressionNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());++h->blocks;}catch(...){failure=std::current_exception();}
             lock.lock();h->error=failure;h->inputReady=false;h->outputReady=true;h->signal.notify_one();
         }
     }
-    char* m_buf=nullptr;size_t m_offset=0;int m_streamId=0,m_streamPending=0;
+    char* m_buf=nullptr;size_t m_offset=0;std::unique_ptr<char[]> m_output;size_t m_outputBytes=0;int m_streamId=0,m_streamPending=0;
     std::vector<std::unique_ptr<StreamHandle>> m_streams;FILE* m_file;
     std::shared_ptr<FileWriteHooks> m_hooks;
-    size_t m_srcBytes=0,m_dstBytes=0;uint64_t m_writtenBytes=0;bool m_finished=false,m_failed=false;
+    PipelineStatistics m_pipeline;
+    size_t m_srcBytes=0,m_dstBytes=0;uint64_t m_writtenBytes=0,m_fileBytes=0;bool m_finished=false,m_failed=false;
 };
 }
 #endif

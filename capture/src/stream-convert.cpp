@@ -513,6 +513,8 @@ public:
 
     std::map<std::string,double> FinalizeSubstageSeconds()
     {std::lock_guard<std::mutex> lock(m_lock);return m_finalizeSubstageSeconds;}
+    std::map<std::string,double> WriteSubstageSeconds()
+    {std::lock_guard<std::mutex> lock(m_lock);AccumulateSubstageLocked(std::chrono::steady_clock::now());m_substage.clear();return m_writeSubstageSeconds;}
 
     void Update( uint64_t completed, uint64_t total = 0 )
     {
@@ -660,7 +662,8 @@ private:
     std::string m_substage;
     std::chrono::steady_clock::time_point m_substageStarted=m_started;
     std::map<std::string,double> m_finalizeSubstageSeconds;
-    void AccumulateSubstageLocked(std::chrono::steady_clock::time_point now){if(m_stage==ProgressStage::Finalize&&!m_substage.empty())m_finalizeSubstageSeconds[m_substage]+=std::chrono::duration<double>(now-m_substageStarted).count();m_substageStarted=now;}
+    std::map<std::string,double> m_writeSubstageSeconds;
+    void AccumulateSubstageLocked(std::chrono::steady_clock::time_point now){if(!m_substage.empty()){auto* target=m_stage==ProgressStage::Finalize?&m_finalizeSubstageSeconds:m_stage==ProgressStage::Write?&m_writeSubstageSeconds:nullptr;if(target)(*target)[m_substage]+=std::chrono::duration<double>(now-m_substageStarted).count();}m_substageStarted=now;}
 };
 
 class TemporaryOutputGuard
@@ -973,6 +976,23 @@ private:
     std::ifstream m_file;
 };
 
+struct ReplayPipelineStats
+{
+    std::atomic<uint64_t> clientPayloadBytes{0},clientReadNanoseconds{0},serverPayloadBytes{0},serverReadNanoseconds{0};
+    std::atomic<uint64_t> producerWaits{0},producerWaitNanoseconds{0},consumerWaits{0},consumerWaitNanoseconds{0};
+    std::atomic<uint64_t> dependencyWaits{0},dependencyWaitNanoseconds{0};
+};
+
+std::string ReplayPipelineJson(const ReplayPipelineStats& stats,const std::string& eventSamples)
+{
+    std::ostringstream out;out<<"{\"client_payload_bytes\":\""<<stats.clientPayloadBytes.load()<<"\",\"client_read_nanoseconds\":\""<<stats.clientReadNanoseconds.load()
+        <<"\",\"server_payload_bytes\":\""<<stats.serverPayloadBytes.load()<<"\",\"server_read_nanoseconds\":\""<<stats.serverReadNanoseconds.load()
+        <<"\",\"producer_waits\":\""<<stats.producerWaits.load()<<"\",\"producer_wait_nanoseconds\":\""<<stats.producerWaitNanoseconds.load()
+        <<"\",\"consumer_waits\":\""<<stats.consumerWaits.load()<<"\",\"consumer_wait_nanoseconds\":\""<<stats.consumerWaitNanoseconds.load()
+        <<"\",\"dependency_waits\":\""<<stats.dependencyWaits.load()<<"\",\"dependency_wait_nanoseconds\":\""<<stats.dependencyWaitNanoseconds.load()
+        <<"\",\"event_samples\":"<<eventSamples<<'}';return out.str();
+}
+
 struct SocketDeleter
 {
     void operator()( tracy::Socket* socket ) const
@@ -1019,12 +1039,14 @@ public:
         const std::vector<tracy::stream::RecordInfo>& serverRecords,
         bool complete,
         ReplayError& replayError,
-        std::atomic<uint64_t>& replayedServerSequence )
+        std::atomic<uint64_t>& replayedServerSequence,
+        ReplayPipelineStats& stats )
         : m_reader( path )
         , m_serverRecords( serverRecords )
         , m_complete( complete )
         , m_replayError( replayError )
         , m_replayedServerSequence( replayedServerSequence )
+        , m_stats( stats )
     {
         if( !m_reader.IsOpen() ) FailLocked( "cannot open journal for in-process server verification" );
     }
@@ -1046,8 +1068,10 @@ public:
             while( m_clientOffset == m_clientPayload.size() && !m_clientClosed && m_valid &&
                 !shutdown.load( std::memory_order_relaxed ) )
             {
+                const auto started=std::chrono::steady_clock::now();
                 if( timeoutMs > 0 ) m_cv.wait_for( lock, std::chrono::milliseconds( timeoutMs ) );
                 else m_cv.wait( lock );
+                ++m_stats.consumerWaits;m_stats.consumerWaitNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());
             }
             if( !m_valid || shutdown.load( std::memory_order_relaxed ) ) return false;
             if( m_clientOffset == m_clientPayload.size() )
@@ -1104,7 +1128,7 @@ public:
     bool PublishClient( std::vector<uint8_t>& payload )
     {
         std::unique_lock<std::mutex> lock( m_lock );
-        m_cv.wait( lock, [this] { return m_clientPayload.empty() || !m_valid; } );
+        if(!m_clientPayload.empty()&&m_valid){const auto started=std::chrono::steady_clock::now();m_cv.wait( lock, [this] { return m_clientPayload.empty() || !m_valid; } );++m_stats.producerWaits;m_stats.producerWaitNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-started).count());}
         if( !m_valid ) return false;
         m_clientPayload = std::move( payload );
         m_clientOffset = 0;
@@ -1157,11 +1181,13 @@ private:
             const auto& record = m_serverRecords[m_serverIndex];
             if( m_serverPending.size() - m_serverPendingOffset < record.payloadSize ) break;
             tracy::stream::ReplayServerPacket recorded { record.sequence, record.flags, {} };
+            const auto readStarted=std::chrono::steady_clock::now();
             if( !m_reader.Read( record, recorded.payload, error ) )
             {
                 FailLocked( "sequence " + std::to_string( record.sequence ) + ": " + error );
                 return false;
             }
+            m_stats.serverPayloadBytes+=record.payloadSize;m_stats.serverReadNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-readStarted).count());
             tracy::stream::ReplayServerPacket replayed { record.sequence, record.flags, {} };
             replayed.payload.assign( m_serverPending.begin() + m_serverPendingOffset,
                 m_serverPending.begin() + m_serverPendingOffset + size_t( record.payloadSize ) );
@@ -1202,6 +1228,7 @@ private:
     const bool m_complete;
     ReplayError& m_replayError;
     std::atomic<uint64_t>& m_replayedServerSequence;
+    ReplayPipelineStats& m_stats;
     mutable std::mutex m_lock;
     std::condition_variable m_cv;
     std::vector<uint8_t> m_clientPayload;
@@ -1619,10 +1646,13 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
 
     const bool replayProtocolOnly = deferSymbolExpansion || drainControlVersion >= 3;
     ReplayError replayError;
+    ReplayPipelineStats replayPipelineStats;
+    std::string replayEventEvidence="[]";
     std::atomic<uint64_t> replayedServerSequence { 0 };
     std::unique_ptr<OfflineReplayTransport> offlineTransport;
     std::unique_ptr<tracy::Socket, SocketDeleter> peer;
     std::unique_ptr<tracy::conversion::OfflineConversionStorage> diskStorage;
+    tracy::FileWrite::PipelineStatistics writePipelineStats {};
     if(options.mode==Options::Mode::Offline) {
         const auto identity=std::to_string(scan.fileSize)+":"+std::to_string(scan.prefixCrc32c)+":"+std::to_string(scan.lastSequence);
         tracy::analysis::Sha256Builder hash;hash.Update(identity.data(),identity.size());
@@ -1656,7 +1686,10 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
         if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';const auto interval=diskStorage->ResourceIntervalStatistics();out<<",\"catalog_interval_activity\":{\"adds\":"<<interval.adds<<",\"resolves\":"<<interval.resolves<<",\"node_visits\":"<<interval.intervalNodeVisits<<",\"max_nodes_per_resolve\":"<<interval.maxNodesPerResolve<<",\"small_interval_bytes\":"<<interval.smallIntervalBytes<<",\"mapped_interval_bytes\":"<<interval.mappedIntervalBytes<<",\"mapped_interval_chunks\":"<<interval.mappedIntervalChunks<<",\"storage_backend\":\"small-plus-mapped-arena-v1\"}";const auto pass=diskStorage->PassTimeStatistics();out<<",\"pass_time_build\":{\"source_rows\":"<<pass.sourceRows<<",\"candidate_rows\":"<<pass.candidateRows<<",\"unique_keys\":"<<pass.uniqueKeys<<",\"upserts\":"<<pass.upserts<<",\"build_count\":"<<pass.buildCount<<",\"build_nanoseconds\":"<<pass.buildNanoseconds<<",\"seal_nanoseconds\":"<<pass.sealNanoseconds<<",\"digest_nanoseconds\":"<<pass.digestNanoseconds<<",\"flush_nanoseconds\":"<<pass.flushNanoseconds<<",\"digest_bytes\":"<<pass.digestBytes<<",\"hash_backend\":\""<<tracy::analysis::Sha256Backend()<<"\"}";const auto directory=diskStorage->CatalogBatchDirectoryStatistics();out<<",\"catalog_batch_directory\":{\"generations\":"<<directory.generations<<",\"batches\":"<<directory.batches<<",\"non_empty_chains\":"<<directory.nonEmptyChains<<",\"visited\":"<<directory.visited<<",\"logical_bytes\":"<<directory.logicalBytes<<'}';}
+        if(diskStorage){const auto scratch=diskStorage->PagedScratchStatistics();const auto cpu=diskStorage->CpuZoneStorageStatistics();const auto gpu=diskStorage->GpuZoneStorageStatistics();const auto sets=diskStorage->ResourceSetStatistics();out<<",\"replay_storage\":{\"paged_scratch_grows\":"<<scratch.grows<<",\"paged_scratch_peak_bytes\":"<<scratch.peakBytes<<",\"cpu_page_loads\":"<<cpu.pageLoads<<",\"cpu_page_writes\":"<<cpu.pageWrites<<",\"cpu_evictions\":"<<cpu.evictions<<",\"cpu_slot_allocations\":"<<cpu.slotAllocations<<",\"cpu_slot_reuses\":"<<cpu.slotReuses<<",\"gpu_page_loads\":"<<gpu.pageLoads<<",\"gpu_page_writes\":"<<gpu.pageWrites<<",\"gpu_evictions\":"<<gpu.evictions<<",\"gpu_slot_allocations\":"<<gpu.slotAllocations<<",\"gpu_slot_reuses\":"<<gpu.slotReuses<<",\"resource_set_lookups\":"<<sets.lookups<<",\"resource_set_index_page_loads\":"<<sets.indexPageLoads<<",\"resource_set_index_page_writes\":"<<sets.indexPageWrites<<",\"resource_set_evictions\":"<<sets.evictions<<",\"resource_set_slot_allocations\":"<<sets.slotAllocations<<",\"resource_set_slot_reuses\":"<<sets.slotReuses<<'}';}
         if(diskStorage){out<<",\"catalog_records\":{";for(size_t i=0;i<tracy::OfflineCatalogDomainCount;++i){if(i)out<<',';out<<'"'<<tracy::OfflineCatalogDescriptors[i].name<<"\":"<<diskStorage->CatalogCount(tracy::OfflineCatalogDomain(i));}out<<"},\"catalog_sealed\":"<<(diskStorage->CatalogSealed()?"true":"false")<<",\"descriptor_heap_ids\":"<<diskStorage->DescriptorHeapCount();if(diskStorage->CatalogSealed()){const auto quality=diskStorage->CatalogQuality();out<<",\"catalog_quality\":{\"present\":"<<quality[0]<<",\"valid\":"<<quality[1]<<",\"schema\":"<<quality[2]<<",\"evidence_schema\":"<<quality[3]<<'}';}}
+        if(writePipelineStats.physicalWrites){out<<",\"write_pipeline\":{\"logical_write_calls\":"<<writePipelineStats.logicalWriteCalls<<",\"logical_blocks\":"<<writePipelineStats.logicalBlocks<<",\"physical_writes\":"<<writePipelineStats.physicalWrites<<",\"physical_bytes\":"<<writePipelineStats.physicalBytes<<",\"compression_blocks\":"<<writePipelineStats.compressionBlocks<<",\"compression_worker_nanoseconds\":"<<writePipelineStats.compressionWorkerNanoseconds<<",\"main_thread_wait_nanoseconds\":"<<writePipelineStats.mainThreadWaitNanoseconds<<'}';}
+        out<<",\"replay_pipeline\":"<<ReplayPipelineJson(replayPipelineStats,replayEventEvidence);
         out<<'}';conversionEvidence=out.str();
     }};
 
@@ -1665,11 +1698,11 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         std::printf( "Offline replay of %zu client records with in-process validation of %zu server records...\n",
             clientRecords.size(), serverRecords.size() );
         offlineTransport = std::make_unique<OfflineReplayTransport>(
-            options.input, serverRecords, scan.complete, replayError, replayedServerSequence );
+            options.input, serverRecords, scan.complete, replayError, replayedServerSequence, replayPipelineStats );
         workerStorage = std::make_unique<tracy::Worker>( "offline", 0, -1, nullptr, tracy::Worker::Mode::OfflineConvert,
             tracy::Worker::DefaultRecorderDefinitionLimit, tracy::Worker::DefaultRecorderQueryQueueLimit,
             replayProtocolOnly, serverQuerySpaceOverride, replayProtocolOnly, true, true, offlineTransport.get(),
-            options.diagnostics,diskStorage.get() );
+            true,diskStorage.get() );
     }
     else
     {
@@ -1914,6 +1947,8 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             }
             if( requiredServerSequence != 0 )
             {
+                const bool dependencyWaited=replayedServerSequence.load(std::memory_order_acquire)<requiredServerSequence;
+                const auto dependencyWaitStarted=std::chrono::steady_clock::now();
                 auto lastEventProgress = worker.GetProtocolEventCount();
                 auto lastFrameProgress = worker.GetProtocolFramesProcessed();
                 auto dependencyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds( 120 );
@@ -1944,12 +1979,15 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
                         std::to_string( worker.GetProtocolFramesProcessed() ) );
                     return false;
                 }
+                if(dependencyWaited){++replayPipelineStats.dependencyWaits;replayPipelineStats.dependencyWaitNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-dependencyWaitStarted).count());}
             }
+            const auto payloadReadStarted=std::chrono::steady_clock::now();
             if( !clientReader.Read( record, payload, error ) )
             {
                 replayError.Set( "sequence " + std::to_string( record.sequence ) + ": " + error );
                 return false;
             }
+            replayPipelineStats.clientPayloadBytes+=record.payloadSize;replayPipelineStats.clientReadNanoseconds+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-payloadReadStarted).count());
             const bool sent = options.mode == Options::Mode::Offline ?
                 offlineTransport->PublishClient( payload ) :
                 ( payload.empty() || peer->Send( payload.data(), int( payload.size() ) ) == int( payload.size() ) );
@@ -2163,6 +2201,10 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     const auto gpuReferenceUseCount = diskStorage?diskStorage->ReferenceUseCount():worker.GetJnTraceData().gpuReferenceUses.size();
     const auto gpuReferencePassCount = diskStorage ? diskStorage->RecordCount(tracy::OfflineAppendDomain::GpuReferencePass) : worker.GetJnTraceData().gpuReferencePasses.size();
     const auto jobStageCount = diskStorage?diskStorage->JobStageCount():worker.GetJnTraceData().jobStages.size();
+    {
+        std::ostringstream events;events<<'[';bool first=true;const auto& eventStats=worker.GetOfflineEventStats();
+        for(size_t index=0;index<eventStats.size();++index){const auto& stat=eventStats[index];if(!stat.count)continue;if(!first)events<<',';first=false;events<<"{\"type\":"<<index<<",\"name\":\""<<JsonEscape(QueueTypeName(tracy::QueueType(index)))<<"\",\"count\":\""<<stat.count<<"\",\"sampled\":\""<<stat.sampledCount<<"\",\"sampled_nanoseconds\":\""<<stat.sampledNanoseconds<<"\"}";}events<<']';replayEventEvidence=events.str();
+    }
 
     if( options.mode == Options::Mode::Offline && options.diagnostics )
     {
@@ -2200,7 +2242,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     if(diskStorage){progress.SetStage(ProgressStage::Finalize,0,"catalog");progress.SetSubstage("strings_finalize",0,1,"steps");worker.FinalizeOfflineStrings();progress.SetSubstage("strings_finalize",1,1,"steps");progress.SetSubstage("stores_seal",0,1,"steps");diskStorage->Seal();progress.SetSubstage("stores_seal",1,1,"steps");worker.FinalizeOfflineCatalog();}
     finalizeSeconds=ElapsedSeconds(finalizeStart);
     const auto writeStart = std::chrono::steady_clock::now();
-    auto temporaryOutput = options.output;
+    std::map<std::string,double> writeSubstageSeconds;auto temporaryOutput = options.output;
     temporaryOutput += ".converting";
     // Task-owned candidate is cleaned by the resource ledger after handles close.
     progress.SetStage( ProgressStage::Write, 0, "bytes" );finalizeSubstageSeconds=progress.FinalizeSubstageSeconds();
@@ -2224,7 +2266,9 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     worker.Write( *output, false );
     gpuCatalogResolveStats = worker.GetJnGpuCatalogResolveStats();
     output->Finish();
+    writeSubstageSeconds=progress.WriteSubstageSeconds();
     const auto statistics = output->GetCompressionStatistics();
+    writePipelineStats = output->GetPipelineStatistics();
     output.reset();
     const auto writeSeconds = ElapsedSeconds( writeStart );
     if( options.diagnostics )
@@ -2352,7 +2396,13 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             << ( outputSizeError ? 0 : outputSize ) << "\",\"peak_commit_bytes\":\"" << progress.PeakCommitBytes()
             << "\",\"peak_working_set_bytes\":\"" << progress.PeakWorkingSetBytes()
             << "\",\"progress_write_failures\":\"" << progress.ProgressWriteFailures()
-            << "\",\"gpu_catalog_resolver\":{\"full_resolve_calls\":\"" << gpuCatalogResolveStats.fullResolveCalls
+            << "\",\"write_pipeline\":{\"logical_write_calls\":\""<<writePipelineStats.logicalWriteCalls
+            << "\",\"logical_blocks\":\""<<writePipelineStats.logicalBlocks<<"\",\"physical_writes\":\""<<writePipelineStats.physicalWrites
+            << "\",\"physical_bytes\":\""<<writePipelineStats.physicalBytes<<"\",\"compression_blocks\":\""<<writePipelineStats.compressionBlocks
+            << "\",\"compression_worker_nanoseconds\":\""<<writePipelineStats.compressionWorkerNanoseconds
+            << "\",\"main_thread_wait_nanoseconds\":\""<<writePipelineStats.mainThreadWaitNanoseconds<<"\"}"
+            << ",\"replay_pipeline\":"<<ReplayPipelineJson(replayPipelineStats,replayEventEvidence)
+            << ",\"gpu_catalog_resolver\":{\"full_resolve_calls\":\"" << gpuCatalogResolveStats.fullResolveCalls
             << "\",\"generation_end_calls\":\"" << gpuCatalogResolveStats.generationEndCalls
             << "\",\"post_end_batch_calls\":\"" << gpuCatalogResolveStats.postEndBatchCalls
             << "\",\"finalize_save_calls\":\"" << gpuCatalogResolveStats.finalizeSaveCalls
@@ -2367,6 +2417,11 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         {
             bool first=true;
             for(const auto& [name,seconds]:finalizeSubstageSeconds){if(!first)report<<',';first=false;report<<'"'<<JsonEscape(name)<<"\":"<<seconds;}
+        }
+        report<<"},\"write_substages\":{";
+        {
+            bool first=true;
+            for(const auto& [name,seconds]:writeSubstageSeconds){if(!first)report<<',';first=false;report<<'"'<<JsonEscape(name)<<"\":"<<seconds;}
         }
         report<<"},\"stages_seconds\":{"
             << "\"scan\":" << scanSeconds << ",\"analysis\":" << analysisSeconds << ",\"replay\":" << replaySeconds

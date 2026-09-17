@@ -26,6 +26,12 @@ int main(int argc,char** argv)
     try{std::unique_ptr<tracy::FileWrite> out(tracy::FileWrite::Open((root/"short.tracy").string().c_str(),tracy::FileCompression::Zstd,1,1,hooks));}
     catch(const std::exception&){rejected=true;}
     Check(rejected&&notified);
+    uint64_t checkCalls=0,writeCalls=0;
+    hooks=std::make_shared<tracy::FileWriteHooks>();
+    hooks->check=[&]{++checkCalls;};
+    hooks->write=[&](const void* p,size_t n,FILE* f){++writeCalls;return std::fwrite(p,1,n,f);};
+    {std::unique_ptr<tracy::FileWrite> writer(tracy::FileWrite::Open((root/"batched.tracy").string().c_str(),tracy::FileCompression::Zstd,1,2,hooks));for(uint32_t i=0;i<100000;++i)writer->Write(&i,sizeof(i));writer->Finish();const auto stats=writer->GetPipelineStatistics();Check(stats.logicalWriteCalls==100000&&stats.logicalBlocks==7&&stats.physicalWrites==writeCalls&&stats.physicalBytes==std::filesystem::file_size(root/"batched.tracy")&&stats.compressionWorkerNanoseconds>0);}
+    Check(checkCalls<100&&writeCalls<8);
     hooks=std::make_shared<tracy::FileWriteHooks>();notified=false;const auto mainThread=std::this_thread::get_id();
     hooks->check=[&]{if(std::this_thread::get_id()!=mainThread)throw std::runtime_error("injected_compressor_thread_failure");};
     hooks->failed=[&](const char*){notified=true;};rejected=false;
