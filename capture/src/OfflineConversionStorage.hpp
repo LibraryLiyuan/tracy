@@ -84,6 +84,7 @@ public:
     uint64_t TotalSampleCount()const{return m_samples?m_samples->TotalCount():0;}
     uint64_t SampleThreadCount()const{return m_samples?m_samples->ThreadCount():0;}
     bool HasSampleTimeIndex()const{return m_samples&&m_samples->HasTimeIndex();}
+    storage::OfflineSampleStoreStats SampleStorageStatistics()const{return m_samples?m_samples->Statistics():storage::OfflineSampleStoreStats{};}
     std::string SampleHash(uint64_t,uint8_t);
     uint64_t CreateCpuThread() override;
     uint64_t AppendCpuZone(uint64_t,const OfflineCpuZone&) override;

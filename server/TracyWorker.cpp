@@ -11404,7 +11404,8 @@ void Worker::Write( FileWrite& f, bool fiDict )
     f.Write( &sz, sizeof( sz ) );
     sz = m_data.threads.size();
     f.Write( &sz, sizeof( sz ) );
-    if(m_offlineStorage){m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",0,m_offlineWriteCpuTotal,"zones");}
+    uint64_t offlineContextSampleTotal=0,offlineMainSampleTotal=0,offlineContextSampleDone=0,offlineMainSampleDone=0;
+    if(m_offlineStorage){for(const auto* thread:m_data.threads){offlineContextSampleTotal+=m_offlineStorage->SampleCount(thread->id,1);offlineMainSampleTotal+=m_offlineStorage->SampleCount(thread->id,0);}m_offlineWriteCpuDone=0;m_offlineWriteCpuTotal=m_data.zonesCnt;m_offlineStorage->BeginCpuZoneWrite(m_offlineWriteCpuTotal);m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",0,m_offlineWriteCpuTotal,"zones");}
     for( auto& thread : m_data.threads )
     {
         int64_t refTime = 0;
@@ -11415,7 +11416,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &thread->groupHint, sizeof( thread->groupHint ) );
         m_offlineWriteCpuThread=thread->id;
         const auto offlineRoot = m_offlineCpuThreadRoots.find( thread->id );
-        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ) WriteOfflineCpuTimeline( f, offlineRoot->second, refTime, thread->id );
+        if( m_offlineStorage && offlineRoot != m_offlineCpuThreadRoots.end() ){m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");WriteOfflineCpuTimeline( f, offlineRoot->second, refTime, thread->id );}
         else WriteTimeline( f, thread->timeline, refTime );
         sz = thread->messages.size();
         f.Write( &sz, sizeof( sz ) );
@@ -11427,7 +11428,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,1):thread->ctxSwitchSamples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        if(m_offlineStorage)m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));});
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,1,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));if((++offlineContextSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");});}
         else for( auto& v : thread->ctxSwitchSamples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
@@ -11444,14 +11445,14 @@ void Worker::Write( FileWrite& f, bool fiDict )
         sz = m_offlineStorage?m_offlineStorage->SampleCount(thread->id,0):thread->samples.size();
         f.Write( &sz, sizeof( sz ) );
         refTime = 0;
-        if(m_offlineStorage)m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));});
+        if(m_offlineStorage){m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");m_offlineStorage->VisitSamples(thread->id,0,[&](int64_t time,uint32_t callstack){WriteTimeOffset(f,refTime,time);Int24 value;value.SetVal(callstack);f.Write(&value,sizeof(value));if((++offlineMainSampleDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");});}
         else for( auto& v : thread->samples )
         {
             WriteTimeOffset( f, refTime, v.time.Val() );
             f.Write( &v.callstack, sizeof( v.callstack ) );
         }
     }
-    if(m_offlineStorage){m_offlineStorage->EndCpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuTotal,m_offlineWriteCpuTotal,"zones");}
+    if(m_offlineStorage){m_offlineStorage->EndCpuZoneWrite();m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuTotal,m_offlineWriteCpuTotal,"zones");m_offlineStorage->ReportFinalizeProgress("write_context_samples",offlineContextSampleDone,offlineContextSampleTotal,"samples");m_offlineStorage->ReportFinalizeProgress("write_main_samples",offlineMainSampleDone,offlineMainSampleTotal,"samples");}
 
     // GpuCtxData::count only advances after a timestamp query has returned. The
     // serialized timelines also contain zones that began before capture ended but
@@ -11900,7 +11901,7 @@ void Worker::WriteOfflineCpuTimeline( FileWrite& f, uint64_t root, int64_t& refT
             WriteTimeOffset( f, refTime, zone.start );
             f.Write( &zone.extra, sizeof( zone.extra ) );
             f.Write( &children, sizeof( children ) );
-            if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");
+            if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");
         }
         else
         {
@@ -11917,7 +11918,7 @@ void Worker::WriteTimelineImpl( FileWrite& f, const V& vec, int64_t& refTime )
     for( auto& val : vec )
     {
         auto& v = a(val);
-        if(m_offlineStorage){const uint32_t children=v.HasChildren()?uint32_t(GetZoneChildren(v.Child()).size()):0;m_offlineStorage->RecordCpuZoneWriteBegin(m_offlineWriteCpuThread,v.Start(),v.SrcLoc(),v.extra,children);if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones_samples",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");}
+        if(m_offlineStorage){const uint32_t children=v.HasChildren()?uint32_t(GetZoneChildren(v.Child()).size()):0;m_offlineStorage->RecordCpuZoneWriteBegin(m_offlineWriteCpuThread,v.Start(),v.SrcLoc(),v.extra,children);if((++m_offlineWriteCpuDone&0xFFFF)==0)m_offlineStorage->ReportFinalizeProgress("write_cpu_zones",m_offlineWriteCpuDone,m_offlineWriteCpuTotal,"zones");}
         int16_t srcloc = v.SrcLoc();
         f.Write( &srcloc, sizeof( srcloc ) );
         int64_t start = v.Start();

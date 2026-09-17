@@ -30,6 +30,11 @@ if($null -eq $conversion.finalize_substages){throw 'finalize_progress_missing_su
 if(@($conversion.finalize_substages.PSObject.Properties).Count -lt 4){throw 'finalize_progress_incomplete_substages'}
 if($null -eq $conversion.write_pipeline -or [uint64]$conversion.write_pipeline.logical_blocks -eq 0 -or [uint64]$conversion.write_pipeline.compression_blocks -eq 0 -or [uint64]$conversion.write_pipeline.physical_writes -eq 0){throw 'finalize_progress_missing_write_pipeline'}
 if($null -eq $conversion.write_substages -or @($conversion.write_substages.PSObject.Properties).Count -lt 5){throw 'finalize_progress_missing_write_substages'}
+foreach($name in 'write_cpu_zones','write_context_samples','write_main_samples','write_finish'){
+    if($null -eq $conversion.write_substages.$name){throw "finalize_progress_missing_$name"}
+}
+if($null -eq $conversion.scan_pipeline -or $null -eq $conversion.scan_pipeline.identity_nanoseconds -or $null -eq $conversion.scan_pipeline.cache_nanoseconds -or [uint64]$conversion.scan_pipeline.journal_nanoseconds -eq 0 -or [uint64]$conversion.scan_pipeline.journal_bytes -eq 0){throw 'finalize_progress_missing_scan_pipeline'}
+if($null -eq $resources.evidence.replay_storage.sample_appends -or $null -eq $resources.evidence.replay_storage.sample_finds -or $null -eq $resources.evidence.replay_storage.sample_index_builds){throw 'finalize_progress_missing_sample_storage'}
 if($null -eq $conversion.replay_pipeline -or [uint64]$conversion.replay_pipeline.client_payload_bytes -eq 0 -or @($conversion.replay_pipeline.event_samples).Count -eq 0){throw 'finalize_progress_missing_replay_pipeline'}
 if(-not $resources.success -or -not $resources.cleanup_complete){throw 'finalize_progress_cleanup'}
 Write-Output 'Finalize progress, resource accounting and substage evidence passed'

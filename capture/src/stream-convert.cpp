@@ -447,6 +447,7 @@ enum class ProgressStage : uint8_t
 {
     Scan,
     DecodeBuild,
+    Replay,
     Finalize,
     Write,
     Validate,
@@ -462,6 +463,7 @@ const char* ProgressStageName( ProgressStage stage )
     {
     case ProgressStage::Scan: return "Scan";
     case ProgressStage::DecodeBuild: return "DecodeBuild";
+    case ProgressStage::Replay: return "Replay";
     case ProgressStage::Finalize: return "Finalize";
     case ProgressStage::Write: return "Write";
     case ProgressStage::Validate: return "Validate";
@@ -983,6 +985,12 @@ struct ReplayPipelineStats
     std::atomic<uint64_t> dependencyWaits{0},dependencyWaitNanoseconds{0};
 };
 
+struct ScanPipelineStats
+{
+    uint64_t identityNanoseconds = 0, cacheNanoseconds = 0, journalNanoseconds = 0;
+    uint64_t identityBytes = 0, journalBytes = 0;
+};
+
 std::string ReplayPipelineJson(const ReplayPipelineStats& stats,const std::string& eventSamples)
 {
     std::ostringstream out;out<<"{\"client_payload_bytes\":\""<<stats.clientPayloadBytes.load()<<"\",\"client_read_nanoseconds\":\""<<stats.clientReadNanoseconds.load()
@@ -1418,11 +1426,15 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     InputIdentity inputIdentity;
     bool inputIdentityAvailable = false;
     bool scanCacheUsed = false;
+    ScanPipelineStats scanPipelineStats;
     std::filesystem::path scanCacheDirectory;
     if( !options.noCache )
     {
         std::string identityError;
+        const auto identityStarted=std::chrono::steady_clock::now();
         inputIdentityAvailable = ComputeInputIdentity( options.input, inputFileSize, inputIdentity, progress, identityError );
+        scanPipelineStats.identityNanoseconds=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-identityStarted).count());
+        if(inputIdentityAvailable)scanPipelineStats.identityBytes=inputFileSize;
         if( !inputIdentityAvailable )
         {
             if( CancelRequested() )
@@ -1434,6 +1446,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         }
         else
         {
+            const auto cacheStarted=std::chrono::steady_clock::now();
             scanCacheDirectory = GetScanCacheDirectory( options.input, inputFileSize, inputIdentity );
             const auto scanCacheFile = scanCacheDirectory / "scan.cache";
             std::string cacheError;
@@ -1444,12 +1457,16 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
                 std::error_code ignored;
                 // Invalid historical cache is left untouched.
             }
+            scanPipelineStats.cacheNanoseconds=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-cacheStarted).count());
         }
     }
     if( !scanCacheUsed )
     {
         progress.SetStage( ProgressStage::Scan, 0, "journal_bytes" );
+        const auto journalStarted=std::chrono::steady_clock::now();
         scan = tracy::stream::ScanJournal( options.input, scanOptions );
+        scanPipelineStats.journalNanoseconds=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-journalStarted).count());
+        scanPipelineStats.journalBytes=scan.validSize;
 
     }
     const auto scanSeconds = ElapsedSeconds( scanStart );
@@ -1686,7 +1703,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
         if(diskStorage&&std::strcmp(diskStorage->RelationState(),"sealed")==0)out<<",\"relation_sha256\":\""<<diskStorage->RelationHash()<<"\"";
         if(diskStorage){out<<",\"append_records\":{";for(size_t i=0;i<tracy::OfflineAppendDomainCount;++i){if(i)out<<',';auto d=tracy::OfflineAppendDomain(i);out<<'"'<<tracy::OfflineAppendInfo(d).name<<"\":"<<diskStorage->RecordCount(d);}out<<'}';}
         if(diskStorage){const auto peaks=diskStorage->ResourceIntervalPeaks();out<<",\"catalog_interval_peaks\":{\"rows\":"<<peaks[0]<<",\"pointers\":"<<peaks[1]<<",\"logical_file_bytes\":"<<peaks[2]<<'}';const auto interval=diskStorage->ResourceIntervalStatistics();out<<",\"catalog_interval_activity\":{\"adds\":"<<interval.adds<<",\"resolves\":"<<interval.resolves<<",\"node_visits\":"<<interval.intervalNodeVisits<<",\"max_nodes_per_resolve\":"<<interval.maxNodesPerResolve<<",\"small_interval_bytes\":"<<interval.smallIntervalBytes<<",\"mapped_interval_bytes\":"<<interval.mappedIntervalBytes<<",\"mapped_interval_chunks\":"<<interval.mappedIntervalChunks<<",\"storage_backend\":\"small-plus-mapped-arena-v1\"}";const auto pass=diskStorage->PassTimeStatistics();out<<",\"pass_time_build\":{\"source_rows\":"<<pass.sourceRows<<",\"candidate_rows\":"<<pass.candidateRows<<",\"unique_keys\":"<<pass.uniqueKeys<<",\"upserts\":"<<pass.upserts<<",\"build_count\":"<<pass.buildCount<<",\"build_nanoseconds\":"<<pass.buildNanoseconds<<",\"seal_nanoseconds\":"<<pass.sealNanoseconds<<",\"digest_nanoseconds\":"<<pass.digestNanoseconds<<",\"flush_nanoseconds\":"<<pass.flushNanoseconds<<",\"digest_bytes\":"<<pass.digestBytes<<",\"hash_backend\":\""<<tracy::analysis::Sha256Backend()<<"\"}";const auto directory=diskStorage->CatalogBatchDirectoryStatistics();out<<",\"catalog_batch_directory\":{\"generations\":"<<directory.generations<<",\"batches\":"<<directory.batches<<",\"non_empty_chains\":"<<directory.nonEmptyChains<<",\"visited\":"<<directory.visited<<",\"logical_bytes\":"<<directory.logicalBytes<<'}';}
-        if(diskStorage){const auto scratch=diskStorage->PagedScratchStatistics();const auto cpu=diskStorage->CpuZoneStorageStatistics();const auto gpu=diskStorage->GpuZoneStorageStatistics();const auto sets=diskStorage->ResourceSetStatistics();out<<",\"replay_storage\":{\"paged_scratch_grows\":"<<scratch.grows<<",\"paged_scratch_peak_bytes\":"<<scratch.peakBytes<<",\"cpu_page_loads\":"<<cpu.pageLoads<<",\"cpu_page_writes\":"<<cpu.pageWrites<<",\"cpu_evictions\":"<<cpu.evictions<<",\"cpu_slot_allocations\":"<<cpu.slotAllocations<<",\"cpu_slot_reuses\":"<<cpu.slotReuses<<",\"gpu_page_loads\":"<<gpu.pageLoads<<",\"gpu_page_writes\":"<<gpu.pageWrites<<",\"gpu_evictions\":"<<gpu.evictions<<",\"gpu_slot_allocations\":"<<gpu.slotAllocations<<",\"gpu_slot_reuses\":"<<gpu.slotReuses<<",\"resource_set_lookups\":"<<sets.lookups<<",\"resource_set_index_page_loads\":"<<sets.indexPageLoads<<",\"resource_set_index_page_writes\":"<<sets.indexPageWrites<<",\"resource_set_evictions\":"<<sets.evictions<<",\"resource_set_slot_allocations\":"<<sets.slotAllocations<<",\"resource_set_slot_reuses\":"<<sets.slotReuses<<'}';}
+        if(diskStorage){const auto scratch=diskStorage->PagedScratchStatistics();const auto cpu=diskStorage->CpuZoneStorageStatistics();const auto gpu=diskStorage->GpuZoneStorageStatistics();const auto sets=diskStorage->ResourceSetStatistics();const auto samples=diskStorage->SampleStorageStatistics();out<<",\"replay_storage\":{\"paged_scratch_grows\":"<<scratch.grows<<",\"paged_scratch_peak_bytes\":"<<scratch.peakBytes<<",\"cpu_page_loads\":"<<cpu.pageLoads<<",\"cpu_page_writes\":"<<cpu.pageWrites<<",\"cpu_evictions\":"<<cpu.evictions<<",\"cpu_slot_allocations\":"<<cpu.slotAllocations<<",\"cpu_slot_reuses\":"<<cpu.slotReuses<<",\"gpu_page_loads\":"<<gpu.pageLoads<<",\"gpu_page_writes\":"<<gpu.pageWrites<<",\"gpu_evictions\":"<<gpu.evictions<<",\"gpu_slot_allocations\":"<<gpu.slotAllocations<<",\"gpu_slot_reuses\":"<<gpu.slotReuses<<",\"resource_set_lookups\":"<<sets.lookups<<",\"resource_set_index_page_loads\":"<<sets.indexPageLoads<<",\"resource_set_index_page_writes\":"<<sets.indexPageWrites<<",\"resource_set_evictions\":"<<sets.evictions<<",\"resource_set_slot_allocations\":"<<sets.slotAllocations<<",\"resource_set_slot_reuses\":"<<sets.slotReuses<<",\"sample_appends\":"<<samples.appends<<",\"sample_finds\":"<<samples.finds<<",\"sample_updates\":"<<samples.updates<<",\"sample_visits\":"<<samples.visits<<",\"sample_visited_rows\":"<<samples.visitedRows<<",\"sample_index_builds\":"<<samples.indexBuilds<<",\"sample_index_build_rows\":"<<samples.indexBuildRows<<",\"sample_index_build_nanoseconds\":"<<samples.indexBuildNanoseconds<<",\"sample_find_nanoseconds\":"<<samples.findNanoseconds<<'}';}
         if(diskStorage){out<<",\"catalog_records\":{";for(size_t i=0;i<tracy::OfflineCatalogDomainCount;++i){if(i)out<<',';out<<'"'<<tracy::OfflineCatalogDescriptors[i].name<<"\":"<<diskStorage->CatalogCount(tracy::OfflineCatalogDomain(i));}out<<"},\"catalog_sealed\":"<<(diskStorage->CatalogSealed()?"true":"false")<<",\"descriptor_heap_ids\":"<<diskStorage->DescriptorHeapCount();if(diskStorage->CatalogSealed()){const auto quality=diskStorage->CatalogQuality();out<<",\"catalog_quality\":{\"present\":"<<quality[0]<<",\"valid\":"<<quality[1]<<",\"schema\":"<<quality[2]<<",\"evidence_schema\":"<<quality[3]<<'}';}}
         if(writePipelineStats.physicalWrites){out<<",\"write_pipeline\":{\"logical_write_calls\":"<<writePipelineStats.logicalWriteCalls<<",\"logical_blocks\":"<<writePipelineStats.logicalBlocks<<",\"physical_writes\":"<<writePipelineStats.physicalWrites<<",\"physical_bytes\":"<<writePipelineStats.physicalBytes<<",\"compression_blocks\":"<<writePipelineStats.compressionBlocks<<",\"compression_worker_nanoseconds\":"<<writePipelineStats.compressionWorkerNanoseconds<<",\"main_thread_wait_nanoseconds\":"<<writePipelineStats.mainThreadWaitNanoseconds<<'}';}
         out<<",\"replay_pipeline\":"<<ReplayPipelineJson(replayPipelineStats,replayEventEvidence);
@@ -1742,8 +1759,7 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
 
     const auto analysisSeconds = ElapsedSeconds( analysisStart );
     const auto replayStart = std::chrono::steady_clock::now();
-    progress.SetStage( ProgressStage::DecodeBuild, clientRecords.size(), "client_records" );
-    SetConversionStage("Replay");
+    progress.SetStage( ProgressStage::Replay, clientRecords.size(), "client_records" );
 
     auto& worker = *workerStorage;
     if( hasLocalDisconnect && drainControlSequence == 0 ) worker.MarkProtocolDisconnect();
@@ -2265,8 +2281,11 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
     }
     worker.Write( *output, false );
     gpuCatalogResolveStats = worker.GetJnGpuCatalogResolveStats();
+    progress.SetSubstage("write_finish",0,1,"steps");
     output->Finish();
+    progress.SetSubstage("write_finish",1,1,"steps");
     writeSubstageSeconds=progress.WriteSubstageSeconds();
+    writeSubstageSeconds["write_cpu_zones_samples"]=writeSubstageSeconds["write_cpu_zones"]+writeSubstageSeconds["write_context_samples"]+writeSubstageSeconds["write_main_samples"];
     const auto statistics = output->GetCompressionStatistics();
     writePipelineStats = output->GetPipelineStatistics();
     output.reset();
@@ -2396,7 +2415,10 @@ int RunConversion( Options& options,tracy::storage::ConversionResources& resourc
             << ( outputSizeError ? 0 : outputSize ) << "\",\"peak_commit_bytes\":\"" << progress.PeakCommitBytes()
             << "\",\"peak_working_set_bytes\":\"" << progress.PeakWorkingSetBytes()
             << "\",\"progress_write_failures\":\"" << progress.ProgressWriteFailures()
-            << "\",\"write_pipeline\":{\"logical_write_calls\":\""<<writePipelineStats.logicalWriteCalls
+            << "\",\"scan_pipeline\":{\"identity_nanoseconds\":\""<<scanPipelineStats.identityNanoseconds
+            << "\",\"identity_bytes\":\""<<scanPipelineStats.identityBytes<<"\",\"cache_nanoseconds\":\""<<scanPipelineStats.cacheNanoseconds
+            << "\",\"journal_nanoseconds\":\""<<scanPipelineStats.journalNanoseconds<<"\",\"journal_bytes\":\""<<scanPipelineStats.journalBytes<<"\"}"
+            << ",\"write_pipeline\":{\"logical_write_calls\":\""<<writePipelineStats.logicalWriteCalls
             << "\",\"logical_blocks\":\""<<writePipelineStats.logicalBlocks<<"\",\"physical_writes\":\""<<writePipelineStats.physicalWrites
             << "\",\"physical_bytes\":\""<<writePipelineStats.physicalBytes<<"\",\"compression_blocks\":\""<<writePipelineStats.compressionBlocks
             << "\",\"compression_worker_nanoseconds\":\""<<writePipelineStats.compressionWorkerNanoseconds
