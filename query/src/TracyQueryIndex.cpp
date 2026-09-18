@@ -1492,7 +1492,7 @@ public:
                 {
                     item.queryable = m_catalog.ResourceIndexReady();
                     item.reason = item.queryable ?
-                        "bounded GPU resource get and lifetime indices are ready; search and associations are pending" :
+                        "bounded GPU resource get, lifetime and basic search are ready; association filters are pending" :
                         "bounded GPU resource indices are pending";
                 }
                 else
@@ -1548,6 +1548,13 @@ public:
     std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const override
     {
         return m_catalog.ResourceState( resourceId );
+    }
+
+    uint64_t GetQueryCatalogResourceCount() const override { return m_catalog.ResourceIndexCount(); }
+
+    QueryCatalogResourceStateData GetQueryCatalogResourceStateAt( uint64_t ordinal ) const override
+    {
+        return m_catalog.ResourceStateAt( ordinal );
     }
 
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override

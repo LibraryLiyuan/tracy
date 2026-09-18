@@ -5475,7 +5475,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto* catalogStatusSource = dynamic_cast<const QueryCatalogStatusSource*>( source.get() );
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
-        const bool boundedResourceMethod = ( method == "gpu.resource.get" || method == "gpu.resource.lifetime" ) &&
+        const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
+            method == "gpu.resource.lifetime" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
@@ -5543,6 +5544,70 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
             if( !validation.healthy ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
                 { "reason", "Catalog disk semantic validation failed; dependent evidence is unavailable" } }, trace );
+            if( method == "gpu.resource.search" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto filter = params.value( "filter", json::object() );
+                const auto nameFilter = filter.value( "name", std::string() );
+                const auto kindFilter = filter.value( "primary_kind", std::string() );
+                const auto classFilter = filter.value( "resource_class", std::string() );
+                if( filter.value( "has_mesh_parts", false ) || filter.value( "has_ranges", false ) ||
+                    filter.value( "has_logical_bindings", false ) || filter.value( "has_alias_group", false ) ||
+                    filter.value( "has_shared_allocation", false ) )
+                    throw QueryError( "INDEX_NOT_READY", "bounded GPU resource association filters have not been built" );
+                const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
+                if( page.rawOffsetBound && page.rawOffset > count )
+                    throw QueryError( "STALE_CURSOR", "cursor raw offset is outside the resource index" );
+                const uint64_t start = page.rawOffsetBound ? page.rawOffset : 0;
+                uint64_t matched = page.rawOffsetBound ? page.offset : 0;
+                size_t returned = 0;
+                size_t nextRawOffset = size_t( start );
+                bool hasMore = false;
+                json values = json::array();
+                for( uint64_t ordinal = start; ordinal < count; ordinal++ )
+                {
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceStateAt( ordinal );
+                    const auto& value = state.latest;
+                    const auto nameValue = catalogResourceSource->GetQueryCatalogResourceName( state.generation, value.nameId );
+                    const std::string name = nameValue.value_or( std::string() );
+                    if( !nameFilter.empty() && name.find( nameFilter ) == std::string::npos ) continue;
+                    if( !kindFilter.empty() && kindFilter != GpuPrimaryKindName( value.primaryKind ) ) continue;
+                    if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
+                    const auto logicalPosition = matched++;
+                    if( !page.rawOffsetBound && logicalPosition < page.offset ) continue;
+                    if( returned >= page.limit )
+                    {
+                        if( !hasMore ) nextRawOffset = size_t( ordinal );
+                        hasMore = true;
+                        continue;
+                    }
+                    values.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
+                        { "resource_id", Decimal( value.resourceId ) }, { "generation", Decimal( state.generation ) },
+                        { "definition_revision", value.definitionRevision },
+                        { "resource_class", GpuResourceClassName( value.resourceClass ) },
+                        { "primary_kind", GpuPrimaryKindName( value.primaryKind ) },
+                        { "name", name.empty() ? json( nullptr ) : json( name ) }, { "name_id", value.nameId },
+                        { "name_provenance", value.nameProvenance }, { "name_truncated", value.nameOriginalLength > name.size() },
+                        { "capacity_bytes", Decimal( value.capacityBytes ) },
+                        { "allocation_id", value.allocationId == 0 ? json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                        { "allocation_offset_bytes", Decimal( value.allocationOffsetBytes ) }, { "memory_domain", value.memoryDomain },
+                        { "allocation_kind", value.allocationKind }, { "exactness", GpuExactnessName( value.exactness ) },
+                        { "create_time_ns", state.openBoundary ? json( nullptr ) : json( Decimal( state.createTime ) ) },
+                        { "create_time_boundary", state.openBoundary ? "open" : "closed" },
+                        { "destroy_time_ns", state.destroyTime == 0 ? json( nullptr ) : json( Decimal( state.destroyTime ) ) },
+                        { "alive_at_capture_end", state.destroyTime == 0 },
+                        { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
+                        { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
+                        { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) }
+                    } );
+                    returned++;
+                    nextRawOffset = size_t( ordinal + 1 );
+                }
+                const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, nextRawOffset, hasMore );
+                return Success( id, { { "present", true }, { "resources", std::move( values ) },
+                    { "total", Decimal( matched ) } }, trace, PageJson( page, returned, cursor ) );
+            }
             uint64_t resourceId = 0;
             if( params.contains( "resource_id" ) )
                 resourceId = UnsignedParameter( params, "resource_id", 0, std::numeric_limits<uint64_t>::max() );

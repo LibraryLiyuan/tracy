@@ -13,7 +13,7 @@
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource点查部分恢复 | schema27沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要与String点查索引采用分页表和外排构建，已恢复`gpu.resource.get/lifetime`；search、关联、Pass和GPU Memory仍待迁移 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource基础查询部分恢复 | schema27沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要与String点查索引采用分页表和外排构建，已恢复`gpu.resource.get/lifetime`及基础search；五类关联过滤、explain、Pass和GPU Memory仍待迁移 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
@@ -39,5 +39,6 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - 双Reader真实回归覆盖最后释放触发：第一个析构因另一个共享租约仍在而保留旧generation和延期报告；最后一个析构取得排他租约并在复核manifest后立即回收，未删除当前generation。Release全构建与CTest 39/39通过（124.78秒）。
 - Catalog名称元数据校验使用32字节定长外排记录，在`(generation,nameId)`组内先处理定义再核对Resource/Logical引用；512K记录run对应16 MiB工作区，多run归并、hash/长度破坏夹具和真实1,001资源Catalog通过。Release全构建与CTest 39/39通过（125.10秒）。
 - schema27 Resource摘要按`resourceId`有序分页，String点查按`(generation,nameId)`有序分页；构建仅保留外排run和当前聚合状态。1,001资源真实索引的`gpu.resource.get`与非索引基线data JSON逐字段一致，Release全构建与CTest 39/39通过（127.21秒）。
+- 基础`gpu.resource.search`按summary物理ordinal扫描并将下一ordinal写入v2 cursor；名称/类型/class过滤不物化全量ID，total在剩余流式扫描中精确累计。关联布尔过滤在反向索引完成前拒绝，不回退完整Catalog。Release全构建与CTest 39/39通过（124.74秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。

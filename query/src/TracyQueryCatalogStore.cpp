@@ -223,6 +223,23 @@ struct QueryCatalogStoreReader::Impl
     analysis::PagedRecordOptions options;
     OfflineCatalogQuality metadata {};
     mutable std::mutex mutex;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourceSummaries;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourceStringLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> rawStrings;
+
+    void EnsureResourceIndex() const
+    {
+        if( !resourceSummaries ) resourceSummaries = std::make_unique<analysis::PagedRecordReader>(
+            ResourceSummaryPath( root ), CatalogIdentity( sourceFingerprint, "resource-summary-v1" ),
+            uint32_t( sizeof( QueryCatalogResourceSummaryRecord ) ), options );
+        if( !resourceStringLookup ) resourceStringLookup = std::make_unique<analysis::PagedRecordReader>(
+            ResourceStringLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-string-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !rawStrings ) rawStrings = std::make_unique<analysis::PagedRecordReader>(
+            DomainPath( root, OfflineCatalogDomain::CatalogString ),
+            CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogString ),
+            uint32_t( sizeof( OfflineCatalogString ) ), options );
+    }
 };
 
 QueryCatalogStoreReader::QueryCatalogStoreReader( std::filesystem::path root, std::string sourceFingerprint,
@@ -329,14 +346,7 @@ bool QueryCatalogStoreReader::ResourceIndexReady() const
     std::lock_guard lock( m_impl->mutex );
     try
     {
-        analysis::PagedRecordReader resources( ResourceSummaryPath( m_impl->root ),
-            CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
-            sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
-        analysis::PagedRecordReader strings( ResourceStringLookupPath( m_impl->root ),
-            CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
-            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
-        (void)resources.Count();
-        (void)strings.Count();
+        m_impl->EnsureResourceIndex();
         return true;
     }
     catch( ... ) { return false; }
@@ -540,9 +550,8 @@ std::optional<QueryCatalogResourceStateData> QueryCatalogStoreReader::ResourceSt
 {
     if( resourceId == 0 ) return std::nullopt;
     std::lock_guard lock( m_impl->mutex );
-    analysis::PagedRecordReader records( ResourceSummaryPath( m_impl->root ),
-        CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
-        sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
+    m_impl->EnsureResourceIndex();
+    auto& records = *m_impl->resourceSummaries;
     uint64_t first = 0, length = records.Count();
     QueryCatalogResourceSummaryRecord row {};
     while( length != 0 )
@@ -560,13 +569,30 @@ std::optional<QueryCatalogResourceStateData> QueryCatalogStoreReader::ResourceSt
         row.destroyTime, row.openBoundary != 0 };
 }
 
+uint64_t QueryCatalogStoreReader::ResourceIndexCount() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    return m_impl->resourceSummaries->Count();
+}
+
+QueryCatalogResourceStateData QueryCatalogStoreReader::ResourceStateAt( uint64_t ordinal ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& records = *m_impl->resourceSummaries;
+    if( ordinal >= records.Count() ) throw std::out_of_range( "Catalog resource ordinal" );
+    QueryCatalogResourceSummaryRecord row {};
+    records.Read( ordinal, &row, 1 );
+    return { row.latest, row.generation, row.createTime, row.destroyTime, row.openBoundary != 0 };
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;
     std::lock_guard lock( m_impl->mutex );
-    analysis::PagedRecordReader lookup( ResourceStringLookupPath( m_impl->root ),
-        CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
-        sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourceStringLookup;
     uint64_t first = 0, length = lookup.Count();
     analysis::AnalysisKeyMetadataRecord row {};
     while( length != 0 )
@@ -581,9 +607,7 @@ std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t gener
     if( first >= lookup.Count() ) return std::nullopt;
     lookup.Read( first, &row, 1 );
     if( row.keyHigh != generation || row.keyLow != stringId ) return std::nullopt;
-    analysis::PagedRecordReader strings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
-        CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
-        sizeof( OfflineCatalogString ), m_impl->options );
+    auto& strings = *m_impl->rawStrings;
     if( row.metadata >= strings.Count() ) throw std::runtime_error( "Catalog string lookup ordinal mismatch" );
     OfflineCatalogString value {};
     strings.Read( row.metadata, &value, 1 );

@@ -99,8 +99,9 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 
 - 冷建在Catalog语义校验通过后生成`resource-summary`：原始Resource记录以`(resourceId,ordinal)`外排，generation使用顺序分页表，不构建全量resource map；每个Resource只保存最新定义、定义generation、create/destroy边界和open-boundary状态。`resourceId`有序分页表支持O(log N)点查。
 - Catalog String生成`(generation,nameId,ordinal)`有序分页索引，`gpu.resource.get/lifetime`按点查读取名称，不扫描或加载全字符串表。构建run使用共享workspace/disk预算，scratch完成即回收；深校验检查分页块、Resource严格递增和String ordinal身份。
-- 内部索引升至schema27，旧schema26保持隔离并受原有Reader lease保护。`gpu.resource.get`和`gpu.resource.lifetime`走统一磁盘后端；`gpu.resource.search`、explain、关联、Pass和GPU Memory继续明确`INDEX_NOT_READY`。能力表只声明已恢复的点查/生命周期范围。
+- 内部索引升至schema27，旧schema26保持隔离并受原有Reader lease保护。`gpu.resource.get`和`gpu.resource.lifetime`走统一磁盘后端；`gpu.resource.search`基础名称/primary-kind/resource-class过滤直接顺序读取ID有序摘要，v2 cursor绑定逻辑offset和下一物理ordinal，后续页不重扫已消费前缀。需要Part/Range/Logical/alias/共享Allocation反向索引的五种布尔过滤继续明确`INDEX_NOT_READY`。
 - 组件夹具覆盖命中、缺失、名称和生命周期字段；1,001资源真实Catalog完成构建、发布、深校验、重开和Reader生命周期。真实`gpu.resource.get`对resource 1返回4,194,304字节capacity与generation `14154813628825468929`，其完整data JSON与同Trace非索引基线逐字段相同。Release全构建与CTest 39/39通过（127.21秒）。
+- 同一真实夹具的1,001条Resource记录归并为1个resourceId生命周期；Indexed基础search首屏的资源、total和字段与非索引基线data完全一致。分页Reader在IndexedTraceSource生命周期内复用，不为每条记录重开分页文件。基础search接入后Release全构建与CTest 39/39通过（124.74秒）。
 
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 

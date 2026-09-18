@@ -63,6 +63,8 @@ class QueryCatalogResourceSource
 {
 public:
     virtual ~QueryCatalogResourceSource() = default;
+    virtual uint64_t GetQueryCatalogResourceCount() const = 0;
+    virtual QueryCatalogResourceStateData GetQueryCatalogResourceStateAt( uint64_t ordinal ) const = 0;
     virtual std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const = 0;
     virtual std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const = 0;
 };
@@ -109,6 +111,8 @@ public:
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
     void BuildResourceIndex( const std::filesystem::path& scratchRoot ) const;
     bool ResourceIndexReady() const;
+    uint64_t ResourceIndexCount() const;
+    QueryCatalogResourceStateData ResourceStateAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogResourceStateData> ResourceState( uint64_t resourceId ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
