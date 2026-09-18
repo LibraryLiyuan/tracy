@@ -2,6 +2,7 @@
 #define __TRACYQUERYINDEX_HPP__
 
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryResourceContext.hpp"
 
 #include <cstdint>
@@ -13,7 +14,7 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 24;
+inline constexpr uint32_t QueryIndexSchemaVersion = 25;
 inline constexpr uint8_t QueryIndexZoneExtraTextActive = 1;
 inline constexpr uint8_t QueryIndexZoneExtraNameActive = 2;
 inline constexpr uint8_t QueryIndexZoneExtraNameResolvedFlag = 4;
@@ -91,6 +92,7 @@ struct QueryIndexManifest
     bool gpuMemoryProtocol2 = false;
     bool zoneValidationPrecomputed = false;
     analysis::ZoneValidationSummaryDto zoneValidation;
+    QueryCatalogValidationResult catalogValidation;
     std::unordered_map<uint64_t, uint64_t> cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> gpuZonesByContext;
 };

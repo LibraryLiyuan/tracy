@@ -74,6 +74,15 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 
 同时移除了IndexedTraceSource中仅在manifest未预计算校验时触发的全量`extraNameState`和调用栈vector回退。schema24现要求已发布manifest包含完整预计算校验；缺失或未完成会使索引失效并走受控重建。小型夹具将`precomputed`改为false后确认新代次重建，`validation.run`恢复原16项finding和20,000条未解析调用栈计数，未把缺失质量权威静默报告为健康。
 
+## 2026-09-18：schema25 Catalog 磁盘语义质量权威
+
+- 新增有界Catalog语义校验器：分页读取12个固定域和字符串域；校验batch kind/encoding、全域范围与覆盖、transport checksum存在性、stored checksum、payload字节、generation引用及汇总、Control/Batch合并后的连续序列、字符串hash和字符串generation归属。
+- generation/sequence使用受共享workspace和磁盘预算约束的外部排序；checksum工作区固定1 MiB。scratch完成后删除并释放账本；Windows测试首次因排序输入句柄仍打开而拒绝清理，修正为显式关闭后再删除，没有把文件占用误报为清理成功。
+- manifest同时保留原始present/valid和完成后的重验证healthy/findings；深校验重新计算语义结果并与manifest逐项比较。缺失、原始无效、重验证异常和健康状态已可区分。Catalog能力在语义失败时不会说明为健康可用。
+- 健康夹具通过；修改batch范围、stored checksum、batch generation或字符串generation的夹具分别返回`CATALOG_BATCH_RANGE`、`CATALOG_STORED_CHECKSUM`、`CATALOG_GENERATION_REFERENCE`和`CATALOG_STRING_GENERATION`。
+- 小型真实Catalog Trace的1,001条资源完成schema25冷建、发布、重开和深校验，manifest质量为complete/present/original_valid/healthy且findings为空。Release全构建及CTest 38/38（125.92秒）通过。
+- P3尚未完成：Resource/Allocation/View/Logical/Part/Relation/VG/Range/Evidence之间的ID引用需按generation进一步校验；P4查询派生索引和消费者迁移仍未开始。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

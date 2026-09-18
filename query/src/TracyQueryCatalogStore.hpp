@@ -7,9 +7,25 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace tracy::query
 {
+
+struct QueryCatalogValidationFinding
+{
+    std::string code;
+    uint64_t count = 0;
+};
+
+struct QueryCatalogValidationResult
+{
+    bool complete = false;
+    bool present = false;
+    bool originalValid = false;
+    bool healthy = false;
+    std::vector<QueryCatalogValidationFinding> findings;
+};
 
 class QueryCatalogStoreWriter
 {
@@ -49,6 +65,7 @@ public:
     void Read( OfflineCatalogDomain domain, uint64_t ordinal, void* output, uint64_t count, uint32_t recordBytes ) const;
     JnGpuCatalogStringData String( uint64_t ordinal ) const;
     void ValidateAll() const;
+    QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
 
 private:
     struct Impl;

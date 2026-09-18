@@ -1,13 +1,20 @@
 #include "TracyQueryCatalogStore.hpp"
 
+#include "TracyAnalysisExternalSort.hpp"
 #include "TracyHash.hpp"
 #include "TracyPagedRecordStore.hpp"
+#include "TracyQueue.hpp"
 
 #include <array>
 #include <cstring>
+#include <exception>
+#include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <unordered_map>
+#include <vector>
 
 namespace tracy::query
 {
@@ -33,6 +40,34 @@ std::string CatalogIdentity( std::string_view sourceFingerprint, OfflineCatalogD
 std::filesystem::path DomainPath( const std::filesystem::path& root, OfflineCatalogDomain domain )
 {
     return root / OfflineCatalogInfo( domain ).name;
+}
+
+std::optional<OfflineCatalogDomain> BatchDomain( uint8_t kind )
+{
+    switch( JnGpuCatalogBatchKind( kind ) )
+    {
+    case JnGpuCatalogBatchKind::Resource: return OfflineCatalogDomain::CatalogResource;
+    case JnGpuCatalogBatchKind::Allocation: return OfflineCatalogDomain::CatalogAllocation;
+    case JnGpuCatalogBatchKind::View: return OfflineCatalogDomain::CatalogView;
+    case JnGpuCatalogBatchKind::Logical: return OfflineCatalogDomain::CatalogLogical;
+    case JnGpuCatalogBatchKind::Part: return OfflineCatalogDomain::CatalogPart;
+    case JnGpuCatalogBatchKind::Relation: return OfflineCatalogDomain::CatalogRelation;
+    case JnGpuCatalogBatchKind::VirtualGeometry: return OfflineCatalogDomain::CatalogVg;
+    case JnGpuCatalogBatchKind::RangeSet: return OfflineCatalogDomain::CatalogRangeSet;
+    case JnGpuCatalogBatchKind::DetailedEvidence: return OfflineCatalogDomain::CatalogDetailedEvidence;
+    case JnGpuCatalogBatchKind::String: return OfflineCatalogDomain::CatalogString;
+    }
+    return std::nullopt;
+}
+
+uint8_t BatchEncoding( uint8_t kind )
+{
+    switch( JnGpuCatalogBatchKind( kind ) )
+    {
+    case JnGpuCatalogBatchKind::RangeSet: return uint8_t( JnGpuCatalogBatchEncoding::RangeSetV1 );
+    case JnGpuCatalogBatchKind::DetailedEvidence: return uint8_t( JnGpuCatalogBatchEncoding::DetailedEvidenceV1 );
+    default: return uint8_t( JnGpuCatalogBatchEncoding::FixedV1 );
+    }
 }
 
 }
@@ -110,7 +145,7 @@ void QueryCatalogStoreWriter::BeginStrings( uint64_t count )
     const auto index = size_t( domain );
     if( m_impl->finished || m_impl->started[index] ) throw std::runtime_error( "Catalog strings are already open" );
     m_impl->writers[index] = std::make_unique<analysis::PagedRecordWriter>( DomainPath( m_impl->root, domain ),
-        CatalogIdentity( m_impl->sourceFingerprint, domain ), sizeof( OfflineCatalogString ), m_impl->options );
+        CatalogIdentity( m_impl->sourceFingerprint, domain ), uint32_t( sizeof( OfflineCatalogString ) ), m_impl->options );
     m_impl->expected[index] = count;
     m_impl->started[index] = true;
 }
@@ -225,6 +260,241 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
             CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
         records.ValidateAll();
+    }
+}
+
+QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const std::filesystem::path& scratchRoot ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    QueryCatalogValidationResult result;
+    result.present = m_impl->metadata[0] != 0;
+    result.originalValid = m_impl->metadata[1] != 0;
+    const auto note = [&]( std::string_view code, uint64_t count = 1 ) {
+        for( auto& finding : result.findings )
+        {
+            if( finding.code == code ) { finding.count += count; return; }
+        }
+        result.findings.push_back( { std::string( code ), count } );
+    };
+    if( !result.present ) note( "CATALOG_ABSENT" );
+    if( !result.originalValid ) note( "CATALOG_ORIGINAL_INVALID" );
+    if( m_impl->metadata[2] != JnGpuCatalogSchemaVersion ||
+        m_impl->metadata[3] != JnGpuDetailedEvidenceSchemaVersion ) note( "CATALOG_SCHEMA_MISMATCH" );
+
+    if( std::filesystem::exists( scratchRoot ) ) throw std::runtime_error( "Catalog semantic validation scratch already exists" );
+    std::filesystem::create_directories( scratchRoot );
+    const auto sequenceSource = scratchRoot / "sequence-source.work";
+    const auto sequenceSorted = scratchRoot / "sequence-sorted.work";
+    std::string sortError;
+    const auto cleanup = [&]() -> std::string {
+        std::error_code ignored;
+        if( !std::filesystem::exists( scratchRoot, ignored ) ) return ignored ? ignored.message() : std::string();
+        ignored.clear();
+        analysis::AnalysisDiskRemove( scratchRoot, m_impl->options.disk, ignored, true );
+        return ignored ? ignored.message() : std::string();
+    };
+
+    struct GenerationState
+    {
+        JnGpuCatalogGenerationData persisted {};
+        uint64_t observedBatchCount = 0;
+        uint64_t observedRecordCount = 0;
+        uint64_t observedPayloadBytes = 0;
+        bool beginControl = false;
+        bool endControl = false;
+    };
+
+    try
+    {
+        const auto open = [&]( OfflineCatalogDomain domain ) {
+            return std::make_unique<analysis::PagedRecordReader>( DomainPath( m_impl->root, domain ),
+                CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
+        };
+        auto generations = open( OfflineCatalogDomain::CatalogGeneration );
+        const auto generationCount = generations->Count();
+        if( generationCount > ( std::numeric_limits<uint64_t>::max() - 65536 ) / 256 )
+            throw std::runtime_error( "Catalog generation workspace overflow" );
+        analysis::AnalysisWorkspaceReservation generationWorkspace( m_impl->options.workspace, 65536 + generationCount * 256 );
+        std::unordered_map<uint64_t, GenerationState> generationState;
+        generationState.reserve( size_t( std::min<uint64_t>( generationCount * 2 + 1, std::numeric_limits<size_t>::max() ) ) );
+        for( uint64_t index = 0; index < generationCount; index++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() ) throw std::runtime_error( "Catalog semantic validation cancelled" );
+            JnGpuCatalogGenerationData row {};
+            generations->Read( index, &row, 1 );
+            if( row.generation == 0 || !generationState.emplace( row.generation, GenerationState { row } ).second )
+                note( "CATALOG_GENERATION_DUPLICATE" );
+            if( row.began == 0 || row.ended == 0 ) note( "CATALOG_GENERATION_INCOMPLETE" );
+            if( row.valid == 0 ) note( "CATALOG_GENERATION_ORIGINAL_INVALID" );
+        }
+
+        std::ofstream sequenceOutput( sequenceSource, std::ios::binary | std::ios::trunc );
+        if( !sequenceOutput ) throw std::runtime_error( "Catalog sequence scratch cannot be opened" );
+        uint64_t sequenceCount = 0;
+        const auto appendSequence = [&]( uint64_t generation, uint32_t sequence ) {
+            analysis::AnalysisUInt64Pair pair { generation, sequence };
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
+            sequenceOutput.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+            if( !sequenceOutput ) throw std::runtime_error( "Catalog sequence scratch write failed" );
+            sequenceCount++;
+        };
+
+        auto controls = open( OfflineCatalogDomain::CatalogControl );
+        for( uint64_t index = 0; index < controls->Count(); index++ )
+        {
+            JnGpuCatalogControlData row {};
+            controls->Read( index, &row, 1 );
+            appendSequence( row.generation, row.sequence );
+            const auto found = generationState.find( row.generation );
+            if( found == generationState.end() ) { note( "CATALOG_GENERATION_REFERENCE" ); continue; }
+            if( row.kind > uint8_t( JnGpuCatalogControlKind::GenerationEnd ) ||
+                row.state > uint8_t( JnGpuCatalogGenerationState::InvalidBootstrapTimeout ) )
+                note( "CATALOG_CONTROL_ENUM" );
+            if( row.kind == uint8_t( JnGpuCatalogControlKind::GenerationBegin ) ) found->second.beginControl = true;
+            if( row.kind == uint8_t( JnGpuCatalogControlKind::GenerationEnd ) ) found->second.endControl = true;
+        }
+
+        std::array<std::unique_ptr<analysis::PagedRecordReader>, OfflineCatalogDomainCount> domainReaders;
+        std::array<uint64_t, OfflineCatalogDomainCount> expectedOffsets {};
+        auto batches = open( OfflineCatalogDomain::CatalogBatch );
+        constexpr uint64_t ChecksumBufferBytes = 1024 * 1024;
+        analysis::AnalysisWorkspaceReservation checksumWorkspace( m_impl->options.workspace, ChecksumBufferBytes + 65536 );
+        std::vector<unsigned char> checksumBuffer( ChecksumBufferBytes );
+        for( uint64_t index = 0; index < batches->Count(); index++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() ) throw std::runtime_error( "Catalog semantic validation cancelled" );
+            JnGpuCatalogBatchData batch {};
+            batches->Read( index, &batch, 1 );
+            appendSequence( batch.generation, batch.sequence );
+            const auto generation = generationState.find( batch.generation );
+            if( generation == generationState.end() ) note( "CATALOG_GENERATION_REFERENCE" );
+            else
+            {
+                generation->second.observedBatchCount++;
+                generation->second.observedRecordCount += batch.recordCount;
+                generation->second.observedPayloadBytes += batch.payloadBytes;
+            }
+            const auto domain = batch.kind <= uint8_t( JnGpuCatalogBatchKind::String ) ? BatchDomain( batch.kind ) : std::nullopt;
+            if( !domain ) { note( "CATALOG_BATCH_KIND" ); continue; }
+            if( batch.encoding != BatchEncoding( batch.kind ) ) note( "CATALOG_BATCH_ENCODING" );
+            if( batch.valid == 0 ) note( "CATALOG_BATCH_ORIGINAL_INVALID" );
+            if( batch.transportChecksum == 0 ) note( "CATALOG_TRANSPORT_CHECKSUM_MISSING" );
+            const auto domainIndex = size_t( *domain );
+            if( !domainReaders[domainIndex] ) domainReaders[domainIndex] = open( *domain );
+            auto& records = *domainReaders[domainIndex];
+            const auto domainCount = records.Count();
+            const bool rangeValid = batch.firstRecordIndex <= domainCount && batch.recordCount <= domainCount - batch.firstRecordIndex;
+            if( !rangeValid || batch.firstRecordIndex != expectedOffsets[domainIndex] ) note( "CATALOG_BATCH_RANGE" );
+            if( rangeValid ) expectedOffsets[domainIndex] = std::max<uint64_t>( expectedOffsets[domainIndex], batch.firstRecordIndex + batch.recordCount );
+            if( !rangeValid ) continue;
+
+            uint64_t storedChecksum = JnGpuCatalogChecksum64( nullptr, 0 );
+            uint64_t payloadBytes = 0;
+            if( *domain == OfflineCatalogDomain::CatalogString )
+            {
+                OfflineCatalogString row {};
+                for( uint64_t ordinal = batch.firstRecordIndex; ordinal < batch.firstRecordIndex + batch.recordCount; ordinal++ )
+                {
+                    records.Read( ordinal, &row, 1 );
+                    if( row.generation != batch.generation ) note( "CATALOG_STRING_GENERATION" );
+                    if( row.header.stringId == 0 || row.header.byteLength > row.bytes.size() ||
+                        ( row.header.originalLength == row.header.byteLength &&
+                          JnGpuCatalogChecksum64( row.bytes.data(), row.header.byteLength ) != row.header.hash ) )
+                        note( "CATALOG_STRING_HASH" );
+                    storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, &row.header, sizeof( row.header ) );
+                    storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, row.bytes.data(), row.header.byteLength );
+                    payloadBytes += sizeof( row.header ) + row.header.byteLength;
+                }
+            }
+            else
+            {
+                const auto width = uint64_t( OfflineCatalogInfo( *domain ).width );
+                uint64_t remaining = batch.recordCount;
+                uint64_t ordinal = batch.firstRecordIndex;
+                while( remaining != 0 )
+                {
+                    const auto take = std::min<uint64_t>( remaining, std::max<uint64_t>( 1, checksumBuffer.size() / width ) );
+                    records.Read( ordinal, checksumBuffer.data(), take );
+                    const auto bytes = take * width;
+                    storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, checksumBuffer.data(), size_t( bytes ) );
+                    payloadBytes += bytes;
+                    ordinal += take;
+                    remaining -= take;
+                }
+            }
+            if( storedChecksum != batch.storedChecksum ) note( "CATALOG_STORED_CHECKSUM" );
+            if( payloadBytes != batch.payloadBytes ) note( "CATALOG_BATCH_PAYLOAD_BYTES" );
+        }
+        sequenceOutput.flush();
+        if( !sequenceOutput ) throw std::runtime_error( "Catalog sequence scratch flush failed" );
+        sequenceOutput.close();
+
+        for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
+        {
+            const auto domain = OfflineCatalogDomain( index );
+            if( domain == OfflineCatalogDomain::CatalogControl || domain == OfflineCatalogDomain::CatalogBatch ||
+                domain == OfflineCatalogDomain::CatalogGeneration ) continue;
+            if( !domainReaders[index] ) domainReaders[index] = open( domain );
+            if( expectedOffsets[index] != domainReaders[index]->Count() ) note( "CATALOG_DOMAIN_COVERAGE" );
+        }
+
+        if( !analysis::SortAnalysisUInt64Pairs( sequenceSource, sequenceSorted, scratchRoot, "catalog-sequence",
+            sequenceCount, 1024 * 1024, sortError, m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog sequence sort failed: " + sortError );
+        std::ifstream sorted( sequenceSorted, std::ios::binary );
+        if( !sorted ) throw std::runtime_error( "Catalog sorted sequence cannot be opened" );
+        analysis::AnalysisUInt64Pair pair {};
+        uint64_t previousGeneration = 0;
+        uint64_t previousSequence = 0;
+        bool havePrevious = false;
+        while( sorted.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        {
+            if( !havePrevious || pair.key != previousGeneration )
+            {
+                if( havePrevious )
+                {
+                    const auto found = generationState.find( previousGeneration );
+                    if( found != generationState.end() && found->second.persisted.lastSequence != previousSequence )
+                        note( "CATALOG_GENERATION_SUMMARY" );
+                }
+                if( pair.value != 1 ) note( "CATALOG_SEQUENCE" );
+                previousGeneration = pair.key;
+                previousSequence = pair.value;
+                havePrevious = true;
+            }
+            else
+            {
+                if( pair.value != previousSequence + 1 ) note( "CATALOG_SEQUENCE" );
+                previousSequence = pair.value;
+            }
+        }
+        if( !sorted.eof() ) throw std::runtime_error( "Catalog sorted sequence read failed" );
+        sorted.close();
+        if( havePrevious )
+        {
+            const auto found = generationState.find( previousGeneration );
+            if( found != generationState.end() && found->second.persisted.lastSequence != previousSequence )
+                note( "CATALOG_GENERATION_SUMMARY" );
+        }
+        for( const auto& [generation, state] : generationState )
+        {
+            (void)generation;
+            if( !state.beginControl || !state.endControl || state.persisted.batchCount != state.observedBatchCount ||
+                state.persisted.recordCount != state.observedRecordCount || state.persisted.payloadBytes != state.observedPayloadBytes )
+                note( "CATALOG_GENERATION_SUMMARY" );
+        }
+        result.complete = true;
+        result.healthy = result.present && result.originalValid && result.findings.empty();
+        if( const auto cleanupError = cleanup(); !cleanupError.empty() )
+            throw std::runtime_error( "Catalog semantic validation scratch cleanup failed: " + cleanupError );
+        return result;
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        if( const auto cleanupError = cleanup(); !cleanupError.empty() )
+            throw std::runtime_error( "Catalog semantic validation scratch cleanup failed: " + cleanupError );
+        std::rethrow_exception( failure );
     }
 }
 

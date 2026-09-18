@@ -1176,11 +1176,13 @@ public:
             }
             else if( item.domain == "gpu.catalog" || item.domain == "gpu.resource" || item.domain == "gpu.memory" )
             {
-                const auto metadata = m_catalog.Metadata();
-                item.present = metadata[0] != 0;
+                item.present = m_manifest.catalogValidation.present;
                 item.queryable = false;
                 item.indexed = true;
-                item.reason = "GPU Catalog sidecar is present; bounded Catalog analysis indices are pending";
+                if( !m_manifest.catalogValidation.healthy )
+                    item.reason = m_manifest.catalogValidation.present ?
+                        "GPU Catalog sidecar failed completed semantic validation" : "GPU Catalog data is absent";
+                else item.reason = "GPU Catalog sidecar passed semantic validation; bounded Catalog analysis indices are pending";
             }
         }
         return result;
@@ -2378,6 +2380,10 @@ json ManifestJson( const QueryIndexManifest& value )
         { "severity", finding.severity }, { "code", finding.code }, { "message", finding.message },
         { "count", std::to_string( finding.count ) }, { "refs", finding.refs }
     } );
+    json catalogValidationFindings = json::array();
+    for( const auto& finding : value.catalogValidation.findings ) catalogValidationFindings.push_back( {
+        { "code", finding.code }, { "count", std::to_string( finding.count ) }
+    } );
     return {
         { "magic", IndexMagic },
         { "schema_version", QueryIndexSchemaVersion },
@@ -2410,6 +2416,13 @@ json ManifestJson( const QueryIndexManifest& value )
             { "complete", value.zoneValidation.complete },
             { "scanned", std::to_string( value.zoneValidation.scanned ) },
             { "findings", std::move( zoneValidationFindings ) }
+        } },
+        { "catalog_validation", {
+            { "complete", value.catalogValidation.complete },
+            { "present", value.catalogValidation.present },
+            { "original_valid", value.catalogValidation.originalValid },
+            { "healthy", value.catalogValidation.healthy },
+            { "findings", std::move( catalogValidationFindings ) }
         } },
         { "sections", {
             { "zone_extra", section( value.zoneExtras ) },
@@ -2625,6 +2638,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         result.globalCallstackFrames.fingerprint = SectionFingerprint( temporaryCallstackFrames );
         {
             QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint, storageOptions );
+            resources->SetPhase( "catalog-validation" );
+            result.catalogValidation = catalog.ValidateSemantics( temporaryCatalog / "semantic-validation" );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
             {
@@ -3052,6 +3067,19 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
             value.refs = finding.at( "refs" ).get<std::vector<std::string>>();
             manifest.zoneValidation.findings.emplace_back( std::move( value ) );
         }
+        const auto& catalogValidation = parsed.at( "catalog_validation" );
+        manifest.catalogValidation.complete = catalogValidation.value( "complete", false );
+        manifest.catalogValidation.present = catalogValidation.value( "present", false );
+        manifest.catalogValidation.originalValid = catalogValidation.value( "original_valid", false );
+        manifest.catalogValidation.healthy = catalogValidation.value( "healthy", false );
+        if( !manifest.catalogValidation.complete )
+        {
+            result.reason = "catalog_validation_not_ready";
+            return result;
+        }
+        for( const auto& finding : catalogValidation.at( "findings" ) )
+            manifest.catalogValidation.findings.push_back( {
+                finding.at( "code" ).get<std::string>(), ParseUnsigned( finding, "count" ) } );
         const auto parseSection = [&]( const char* name, QueryIndexSection& output ) {
             const auto& section = parsed.at( "sections" ).at( name );
             const auto file = std::filesystem::path( section.at( "file" ).get<std::string>() );
@@ -3190,7 +3218,30 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
             }
             if( count != manifest.gpuCatalog.count || manifest.gpuCatalog.declaredCount != count )
                 throw std::runtime_error( "GPU Catalog section count mismatch" );
-            if( deep ) catalog.ValidateAll();
+            if( deep )
+            {
+                catalog.ValidateAll();
+                auto semanticScratch = manifest.gpuCatalog.path;
+                semanticScratch += ".semantic-validation." + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count() );
+                resources->IncludeDiskRoots( { semanticScratch } );
+                const auto semantic = catalog.ValidateSemantics( semanticScratch );
+                bool same = semantic.complete == manifest.catalogValidation.complete &&
+                    semantic.present == manifest.catalogValidation.present &&
+                    semantic.originalValid == manifest.catalogValidation.originalValid &&
+                    semantic.healthy == manifest.catalogValidation.healthy &&
+                    semantic.findings.size() == manifest.catalogValidation.findings.size();
+                if( same )
+                {
+                    for( size_t index = 0; index < semantic.findings.size(); index++ )
+                    {
+                        if( semantic.findings[index].code != manifest.catalogValidation.findings[index].code ||
+                            semantic.findings[index].count != manifest.catalogValidation.findings[index].count )
+                        { same = false; break; }
+                    }
+                }
+                if( !same ) throw std::runtime_error( "GPU Catalog semantic validation mismatch" );
+            }
         }
         validateSection( manifest.jobStages, sizeof( JnJobStageData ), "job-stage",ZoneSectionKind::JobStage );
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
