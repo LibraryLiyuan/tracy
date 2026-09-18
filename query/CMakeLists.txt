@@ -73,6 +73,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQuerySampleStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
+    src/TracyQueryStringStore.cpp
+    src/TracyQueryStringStore.hpp
     src/TracyQueryResourceContext.cpp
     src/TracyQueryResourceContext.hpp
     src/TracyQueryValidationStore.cpp
@@ -161,6 +163,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-catalog-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-catalog-store-tests)
     add_test(NAME tracy-query-catalog-store COMMAND tracy-query-catalog-store-tests)
+
+    add_executable(tracy-query-string-store-tests tests/QueryStringStoreTests.cpp)
+    target_link_libraries(tracy-query-string-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-string-store-tests)
+    add_test(NAME tracy-query-string-store COMMAND tracy-query-string-store-tests)
 
     add_executable(tracy-query-catalog-index-integration-tests tests/QueryCatalogIndexIntegrationTests.cpp)
     target_link_libraries(tracy-query-catalog-index-integration-tests PRIVATE TracyQueryProtocol)
