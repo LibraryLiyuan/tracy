@@ -17,7 +17,7 @@
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
-P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace排他owner锁、同源/schema `.tmp`崩溃残留清理和schema26 Reader代次租约。旧generation仅在取得排他租约且不属于当前manifest时回收；固定后缀白名单、指纹/schema边界和symlink/reparse检查限制删除范围。下一次Build会在Worker加载前回收已释放的旧/孤儿最终代次；最后Reader析构时的主动回收、删除失败持久化清单和长路径验收仍待完成。
+P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace排他owner锁、同源/schema `.tmp`崩溃残留清理和schema26 Reader代次租约。旧generation仅在取得排他租约且不属于当前manifest时回收；固定后缀白名单、指纹/schema边界和symlink/reparse检查限制删除范围。下一次Build会在Worker加载前回收已释放的旧/孤儿最终代次；延期/失败项持久化到有界cleanup报告，成功后删除并释放账本。最后Reader析构时的主动回收和长路径验收仍待完成。
 
 ## 本轮验证
 
@@ -33,6 +33,7 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - IndexedTraceSource原先在manifest缺少预计算Zone校验时会重新分配与全部Extra等长的名称状态和全量调用栈vector。该回退已删除；schema24把完整预计算校验作为可重开门禁，缺失或未完成时索引失效并重建。小型夹具把`precomputed`改为false后确认会重建并恢复20,000条调用栈引用告警，未把未就绪状态报告为健康。
 - schema26真实小型Catalog回归确认：IndexedTraceSource持有共享Reader租约时，再发布不会删除旧generation；释放后旧generation与租约可安全回收。回收只接受20种固定拥有后缀，同前缀未知文件和其他指纹文件均保留。Release全构建与CTest 39/39通过（123.53秒）。
 - 同一真实Catalog回归在当前Reader活跃时注入同源/schema26孤儿最终文件；下一次Build在首次Worker状态回调前删除孤儿，同时保留manifest当前generation，证明起始回收发生在大对象加载前。
+- Windows文件占用回归确认：孤儿最终文件被非共享delete句柄占用时，Build不进入Worker加载、不替换manifest，并原子保留有界失败报告；释放后重试、延期和最终成功三种状态一致，最终无cleanup报告。Release全构建与CTest 39/39通过（125.11秒）。
 - Catalog名称元数据校验使用32字节定长外排记录，在`(generation,nameId)`组内先处理定义再核对Resource/Logical引用；512K记录run对应16 MiB工作区，多run归并、hash/长度破坏夹具和真实1,001资源Catalog通过。Release全构建与CTest 39/39通过（125.10秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。

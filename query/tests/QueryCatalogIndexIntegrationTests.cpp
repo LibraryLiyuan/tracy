@@ -8,6 +8,10 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 namespace
 {
 
@@ -79,6 +83,27 @@ int main( int argc, char** argv )
             ".s" + std::to_string( query::QueryIndexSchemaVersion ) + ".g";
         const auto orphanFinal = root / ( generationPrefix + "1.jnidx.cpu" );
         std::ofstream( orphanFinal ) << "orphan";
+        auto cleanupReport = manifest.manifestPath;
+        cleanupReport += ".cleanup.json";
+#ifdef _WIN32
+        HANDLE blockedOrphan = CreateFileW( orphanFinal.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+        Require( blockedOrphan != INVALID_HANDLE_VALUE, "could not hold orphan generation file" );
+        bool cleanupRejected = false;
+        try { query::QueryIndex::Build( input ); }
+        catch( const std::exception& error )
+        { cleanupRejected = std::string( error.what() ).find( "generation cleanup failed" ) != std::string::npos; }
+        CloseHandle( blockedOrphan );
+        Require( cleanupRejected && fs::is_regular_file( cleanupReport ) && fs::exists( activeData ),
+            "occupied orphan generation did not fail before replacing the active manifest" );
+        {
+            std::ifstream cleanupInput( cleanupReport );
+            const auto cleanupJson = nlohmann::json::parse( cleanupInput );
+            Require( cleanupJson.at( "state" ) == "failed" &&
+                std::stoull( cleanupJson.at( "retained_count" ).get<std::string>() ) != 0,
+                "occupied orphan generation failure report lost its retained files" );
+        }
+#endif
         bool observedWorkerLoad = false;
         bool orphanAbsentAtWorkerLoad = false;
         const auto second = query::QueryIndex::Build( input, [&]( analysis::TraceSourceState ) {
@@ -88,6 +113,14 @@ int main( int argc, char** argv )
         } );
         Require( observedWorkerLoad && orphanAbsentAtWorkerLoad && fs::exists( activeData ) && !fs::exists( orphanFinal ),
             "build-start cleanup removed an active generation or retained an unreferenced final file" );
+        Require( fs::is_regular_file( cleanupReport ), "deferred generation cleanup did not persist a report" );
+        {
+            std::ifstream cleanupInput( cleanupReport );
+            const auto cleanupJson = nlohmann::json::parse( cleanupInput );
+            Require( cleanupJson.at( "state" ) == "deferred" &&
+                std::stoull( cleanupJson.at( "retained_count" ).get<std::string>() ) != 0,
+                "deferred generation cleanup report lost its retained files" );
+        }
         indexed.reset();
         auto currentBase = second.dataPath.filename().string();
         const std::string dataSuffix = ".jnidx.data";
@@ -98,6 +131,9 @@ int main( int argc, char** argv )
                 root, generationPrefix, currentBase, retained, cleanupError ) &&
             !fs::exists( activeData ) && fs::exists( second.dataPath ) && retained.empty(),
             "unused Query generations were not reclaimed after their reader lease ended" );
+        const auto third = query::QueryIndex::Build( input );
+        Require( !fs::exists( cleanupReport ) && !fs::exists( second.dataPath ) && fs::exists( third.dataPath ),
+            "successful generation cleanup retained a stale cleanup report or old generation" );
         std::cout << "GPU Catalog index integration passed resources=" << expectedResources << '\n';
         return 0;
     }

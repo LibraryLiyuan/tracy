@@ -2709,6 +2709,76 @@ std::string ReadManifest( const std::filesystem::path& path, uint64_t maximumByt
     return output.str();
 }
 
+bool ClearGenerationCleanupReport( const std::filesystem::path& path,
+    const std::shared_ptr<QueryResourceContext>& resources, std::string& error )
+{
+    error.clear();
+    std::error_code ec;
+    analysis::AnalysisDiskRemove( path, resources ? resources->Disk() : nullptr, ec );
+    if( ec )
+    {
+        error = "Query generation cleanup report removal failed: " + ec.message();
+        return false;
+    }
+    return true;
+}
+
+bool WriteGenerationCleanupReport( const std::filesystem::path& path, std::string_view state,
+    std::string_view reason, const std::vector<std::filesystem::path>& retained,
+    const std::shared_ptr<QueryResourceContext>& resources, std::string& error )
+{
+    error.clear();
+    try
+    {
+        constexpr size_t MaximumPaths = 256;
+        json paths = json::array();
+        uint64_t retainedCount = 0;
+        for( const auto& value : retained )
+        {
+            std::error_code statusError;
+            const auto status = std::filesystem::symlink_status( value, statusError );
+            if( !statusError && !std::filesystem::exists( status ) ) continue;
+            retainedCount++;
+            if( paths.size() < MaximumPaths ) paths.push_back( value.filename().string() );
+        }
+        const auto boundedReason = std::string( reason.substr( 0, std::min<size_t>( reason.size(), 4096 ) ) );
+        const auto payload = json {
+            { "schema", 1 }, { "state", state }, { "reason", boundedReason },
+            { "retained_count", std::to_string( retainedCount ) },
+            { "retained_paths", std::move( paths ) },
+            { "retained_paths_truncated", retainedCount > MaximumPaths }
+        }.dump( 2 );
+        if( payload.size() > 512 * 1024 ) throw std::runtime_error( "cleanup report exceeds bounded size" );
+        auto temporary = path;
+        temporary += ".tmp." + std::to_string( ProcessId() ) + "." +
+            std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+        const auto previous = resources && resources->Disk() && resources->Disk()->usage ?
+            analysis::AnalysisDiskUsage::Bytes( path ) : 0;
+        if( resources ) resources->BeforeFileGrowth( temporary, payload.size() );
+        std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+        if( !output ) throw std::runtime_error( "cleanup report cannot be opened" );
+        output.write( payload.data(), std::streamsize( payload.size() ) );
+        output.flush();
+        if( !output ) throw std::runtime_error( "cleanup report cannot be written" );
+        output.close();
+        std::string publishError;
+        if( !AtomicReplace( temporary, path, publishError, {} ) )
+        {
+            std::error_code ignored;
+            analysis::AnalysisDiskRemove( temporary, resources ? resources->Disk() : nullptr, ignored );
+            throw std::runtime_error( publishError );
+        }
+        if( previous != 0 && resources && resources->Disk() && resources->Disk()->usage )
+            resources->Disk()->usage->Release( previous );
+        return true;
+    }
+    catch( const std::exception& failure )
+    {
+        error = std::string( "Query generation cleanup report failed: " ) + failure.what();
+        return false;
+    }
+}
+
 json ManifestJson( const QueryIndexManifest& value )
 {
     const auto section = []( const QueryIndexSection& item ) {
@@ -2817,7 +2887,8 @@ std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::p
 {
     auto manifestPath=tracePath; manifestPath+=".jnidx";
     auto failurePath=manifestPath; failurePath+=".failure.json";
-    std::vector<std::filesystem::path> result{manifestPath,failurePath};
+    auto cleanupPath=manifestPath; cleanupPath+=".cleanup.json";
+    std::vector<std::filesystem::path> result{manifestPath,failurePath,cleanupPath};
     try
     {
         if(!std::filesystem::is_regular_file(manifestPath)) return result;
@@ -2994,6 +3065,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     auto temporaryGpuMemorySummary = result.gpuMemorySummary.path; temporaryGpuMemorySummary += suffix;
     auto temporaryValidation = tracePath.parent_path() / ( baseName + ".jnidx.validation" + suffix );
     auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
+    auto cleanupDiagnostic = result.manifestPath; cleanupDiagnostic += ".cleanup.json";
     auto ownerLockPath = result.manifestPath; ownerLockPath += ".owner.lock";
     std::vector<std::filesystem::path> packedScratch;
     std::vector<std::filesystem::path> publishedCandidates;
@@ -3005,7 +3077,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         result.samples.path,result.globalStrings.path,result.globalCallstacks.path,result.globalCallstackFrames.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
         result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
         result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,
-        failureDiagnostic,temporaryValidation,ownerLockPath
+        failureDiagnostic,cleanupDiagnostic,temporaryValidation,ownerLockPath
     });
     const auto storageOptions = ResourceStorageOptions( resources );
 
@@ -3024,7 +3096,21 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             std::vector<std::filesystem::path> retained;
             if( !CleanupUnreferencedGenerations( tracePath.parent_path(), identityPrefix,
                     *currentGeneration, storageOptions.disk, retained, cleanupError ) )
+            {
+                std::string reportError;
+                WriteGenerationCleanupReport( cleanupDiagnostic, "failed", cleanupError,
+                    retained, resources, reportError );
                 throw std::runtime_error( cleanupError );
+            }
+            std::string reportError;
+            if( retained.empty() )
+            {
+                if( !ClearGenerationCleanupReport( cleanupDiagnostic, resources, reportError ) )
+                    throw std::runtime_error( reportError );
+            }
+            else if( !WriteGenerationCleanupReport( cleanupDiagnostic, "deferred",
+                    "active reader or protected generation", retained, resources, reportError ) )
+                throw std::runtime_error( reportError );
             for( const auto& path : retained )
                 fprintf( stderr, "Query generation retained before build: %s\n", path.string().c_str() );
         }
@@ -3410,14 +3496,33 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         {
             std::vector<std::filesystem::path> retained;
             std::string cleanupError;
-            if( !CleanupUnreferencedGenerations( tracePath.parent_path(), identityPrefix, baseName,
-                    storageOptions.disk, retained, cleanupError ) )
+            const bool cleanupComplete = CleanupUnreferencedGenerations( tracePath.parent_path(),
+                identityPrefix, baseName, storageOptions.disk, retained, cleanupError );
+            std::string reportError;
+            if( !cleanupComplete )
+            {
+                if( !WriteGenerationCleanupReport( cleanupDiagnostic, "failed", cleanupError,
+                        retained, resources, reportError ) )
+                    fprintf( stderr, "%s\n", reportError.c_str() );
                 fprintf( stderr, "Query generation cleanup deferred: %s\n", cleanupError.c_str() );
+            }
+            else if( !retained.empty() )
+            {
+                if( !WriteGenerationCleanupReport( cleanupDiagnostic, "deferred",
+                        "active reader or protected generation", retained, resources, reportError ) )
+                    fprintf( stderr, "%s\n", reportError.c_str() );
+            }
+            else if( !ClearGenerationCleanupReport( cleanupDiagnostic, resources, reportError ) )
+                fprintf( stderr, "%s\n", reportError.c_str() );
             for( const auto& path : retained )
                 fprintf( stderr, "Query generation retained: %s\n", path.string().c_str() );
         }
         catch( const std::exception& cleanupFailure )
         {
+            std::vector<std::filesystem::path> retained;
+            std::string reportError;
+            WriteGenerationCleanupReport( cleanupDiagnostic, "failed", cleanupFailure.what(),
+                retained, resources, reportError );
             fprintf( stderr, "Query generation cleanup deferred: %s\n", cleanupFailure.what() );
         }
         return result;

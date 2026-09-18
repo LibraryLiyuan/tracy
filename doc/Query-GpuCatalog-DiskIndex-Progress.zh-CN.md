@@ -107,7 +107,9 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - 回收只扫描当前完整源指纹前16位和schema26的直接子项，并将20种已知section/lease后缀作为固定白名单；当前manifest所指generation、其他指纹、未知同前缀文件、symlink及reparse point均不会删除。schema25及更早索引不会被schema26回收，避免旧进程未持租约时发生交叉删除。
 - 1,001资源真实Catalog完成`Build → Open → 再次Build`：第二次发布时旧generation因活跃Reader被完整保留；释放Reader后定向回收删除旧generation和租约，当前generation保持可用。Release全构建及CTest 39/39通过（123.53秒），删除白名单回归随后单独通过。
 - 新构建取得owner锁后、加载Worker前，会读取同源/schema26当前manifest的generation并排除它，再回收其他无活跃Reader的最终代次；manifest缺失时回收无引用代次，manifest损坏或身份不匹配时保守跳过起始回收。真实Catalog回归在旧Reader仍活跃时注入孤儿最终文件，首次Worker回调前确认孤儿已删除且当前代次仍存在。
-- P6仍未完成：最后一个Reader释放时不会主动唤醒回收，只能在下一次Build或显式回收时处理；删除失败的持久化文件清单、Windows长路径与占用故障验收仍待实现。
+- 延期或失败清理现在原子发布`<trace>.jnidx.cleanup.json`：最多列出256个仍存直接子项、精确`retained_count`和截断标记，reason限制4 KiB、整份报告限制512 KiB；写入使用共享磁盘账本，清理完成后删除报告并释放额度。
+- Windows占用验收直接以不共享delete的句柄锁住孤儿generation文件：下一次Build在Worker加载前受控失败，当前manifest/Reader保持可用，报告为`state=failed`且包含仍存项；释放句柄后重建成功，活跃旧Reader报告转为`deferred`，最终释放并回收后报告消失。Release全构建与CTest 39/39通过（125.11秒）。
+- P6仍未完成：最后一个Reader释放时不会主动唤醒回收，只能在下一次Build或显式回收时处理；Windows长路径验收仍待实现。
 
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
