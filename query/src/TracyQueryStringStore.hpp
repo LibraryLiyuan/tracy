@@ -16,6 +16,10 @@ namespace tracy::query
 
 enum class QueryStringPointerKind : uint8_t { String = 0, Thread = 1, External = 2 };
 
+// The address stays valid until the reader is destroyed. The backing mapping
+// is never evicted, so Worker may retain these pointers without cache leases.
+struct QueryStableStringView { const char* data = nullptr; uint64_t bytes = 0; };
+
 class QueryStringStoreWriter
 {
 public:
@@ -48,6 +52,12 @@ public:
     uint64_t StringCount() const;
     uint64_t PointerCount( QueryStringPointerKind kind ) const;
     uint64_t StringLength( uint64_t ordinal ) const;
+    QueryStableStringView StableOrdinal( uint64_t ordinal ) const;
+    std::optional<QueryStableStringView> StableToken( uint64_t token ) const;
+    std::optional<QueryStableStringView> StablePointer( QueryStringPointerKind kind, uint64_t id ) const;
+    std::optional<std::pair<QueryStableStringView, QueryStableStringView>> StableExternal( uint64_t id ) const;
+    bool HasPointer( QueryStringPointerKind kind, uint64_t id ) const;
+    void VisitPointerIds( QueryStringPointerKind kind, const std::function<void( uint64_t )>& visitor ) const;
     std::string ReadOrdinal( uint64_t ordinal, uint64_t maximumBytes ) const;
     std::optional<std::string> ResolveToken( uint64_t token, uint64_t maximumBytes ) const;
     std::optional<std::string> ResolvePointer( QueryStringPointerKind kind, uint64_t id, uint64_t maximumBytes ) const;

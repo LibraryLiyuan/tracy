@@ -9,7 +9,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace tracy { class SerializedZoneSink; struct FileReadHooks; struct FileWriteHooks; }
+namespace tracy { class SerializedZoneSink; class SerializedStringSource; struct FileReadHooks; struct FileWriteHooks; }
 
 namespace tracy::analysis
 {
@@ -62,7 +62,8 @@ public:
 
     static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {},
         std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full,
-        SerializedZoneSink* serializedZoneSink = nullptr, std::shared_ptr<tracy::FileReadHooks> readHooks = {} );
+        SerializedZoneSink* serializedZoneSink = nullptr, std::shared_ptr<tracy::FileReadHooks> readHooks = {},
+        SerializedStringSource* serializedStringSource = nullptr );
     static WorkerLoadProgress GetLoadProgress();
     static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;

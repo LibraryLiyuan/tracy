@@ -55,10 +55,11 @@ int main( int argc, char** argv )
         Require( fs::is_regular_file( sampleRoot / "query-spans" / "header.bin" ),
             "Query index did not publish the derived sample logical view" );
 
-        auto compact = tracy::analysis::WorkerTraceSource::Open( manifest.dataPath );
-        Require( compact->GetTraceInfo().counts.samples == 0,
-            "compact payload still retains the full main Sample table" );
-        compact.reset();
+        bool rejectedUnboundCompact = false;
+        try { auto compact = tracy::analysis::WorkerTraceSource::Open( manifest.dataPath ); }
+        catch( const tracy::analysis::TraceLoadError& error )
+        { rejectedUnboundCompact = error.code == tracy::analysis::TraceLoadErrorCode::Corrupt; }
+        Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
 
         auto indexed = tracy::query::QueryIndex::Open( manifest );
         Require( !indexed->SampleDerivedDataReady(),

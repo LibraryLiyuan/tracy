@@ -78,6 +78,21 @@ namespace EventType
     };
 }
 
+// Read-only, stable-lifetime string storage supplied by a manifest-bound
+// Query sidecar. Returned pointers remain valid for the source lifetime.
+class SerializedStringSource
+{
+public:
+    virtual ~SerializedStringSource() = default;
+    virtual uint64_t StringCount() const = 0;
+    virtual uint64_t PointerCount( uint8_t kind ) const = 0;
+    virtual const char* StringAt( uint32_t ordinal ) const = 0;
+    virtual const char* PointerString( uint8_t kind, uint64_t id ) const = 0;
+    virtual std::pair<const char*, const char*> ExternalName( uint64_t id ) const = 0;
+    virtual bool HasPointer( uint8_t kind, uint64_t id ) const = 0;
+    virtual void VisitPointerIds( uint8_t kind, const std::function<void( uint64_t )>& visitor ) const = 0;
+};
+
 class SerializedZoneSink
 {
 public:
@@ -113,6 +128,7 @@ public:
     virtual void GlobalPointerTableBegin(uint8_t,uint64_t){}
     virtual void GlobalPointerRecord(uint8_t,uint64_t,uint64_t,uint64_t,uint64_t){}
     virtual void GlobalPointerTableEnd(uint8_t){}
+    virtual SerializedStringSource* GlobalStringSource(){return nullptr;}
     virtual bool WantsCallstacks()const{return false;}
     virtual void CallstacksBegin(uint64_t){}
     virtual void CallstackBegin(uint32_t,uint32_t){}
@@ -604,7 +620,8 @@ public:
         WorkerOfflineTransport* offlineTransport = nullptr, bool collectOfflineEventStats = false,
         WorkerOfflineStorage* offlineStorage = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
-    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false, SerializedZoneSink* serializedZoneSink = nullptr );
+    Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false,
+        SerializedZoneSink* serializedZoneSink = nullptr, SerializedStringSource* serializedStringSource = nullptr );
     ~Worker();
 
     const std::string& GetAddr() const { return m_addr; }
@@ -687,7 +704,7 @@ public:
     uint64_t GetSymbolCodeSize() const { return m_data.symbolCodeSize; }
     uint64_t GetGhostZonesCount() const { return m_data.ghostCnt; }
     uint32_t GetFrameImageCount() const { return (uint32_t)m_data.frameImage.size(); }
-    uint64_t GetStringsCount() const { return m_data.strings.size() + StringTableCount(); }
+    uint64_t GetStringsCount() const { return (m_externalStringSource?m_externalStringSource->PointerCount(0):m_data.strings.size()) + StringTableCount(); }
     uint64_t GetHwSampleCountAddress() const { return m_data.hwSamples.size(); }
     uint64_t GetHwSampleCount() const;
     bool HasHwBranchRetirement() const { return m_data.hasBranchRetirement; }
@@ -709,9 +726,12 @@ public:
     int GetCpuDataCpuCount() const { return m_data.cpuDataCount; }
     uint64_t GetPidFromTid( uint64_t tid ) const;
     const unordered_flat_map<uint64_t, CpuThreadData>& GetCpuThreadData() const { return m_data.cpuThreadData; }
-    bool HasExternalName( uint64_t id ) const { return m_data.externalNames.find( id ) != m_data.externalNames.end(); }
+    bool HasExternalName( uint64_t id ) const;
     const unordered_flat_map<uint64_t, const char*>& GetThreadNameMap() const { return m_data.threadNames; }
     const unordered_flat_map<uint64_t, std::pair<const char*, const char*>>& GetExternalNameMap() const { return m_data.externalNames; }
+    const char* TryGetLocalThreadName( uint64_t id ) const;
+    void VisitThreadNameIds( const std::function<void( uint64_t )>& visitor ) const;
+    void VisitExternalNameIds( const std::function<void( uint64_t )>& visitor ) const;
     const unordered_flat_map<uint64_t, uint64_t>& GetTidToPidMap() const { return m_data.tidToPid; }
     const unordered_flat_map<const char*, MemoryBlock, charutil::Hasher, charutil::Comparator>& GetSourceFileCache() const { return m_data.sourceFileCache; }
     uint64_t GetSourceFileCacheCount() const { return m_data.sourceFileCache.size(); }
@@ -782,16 +802,16 @@ public:
         if( !ref.active ) return nullptr;
         if( ref.isidx )
         {
-            return ref.str < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(ref.str)):m_data.stringData[ref.str]) : nullptr;
+            return ref.str < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(ref.str)):(m_externalStringSource?m_externalStringSource->StringAt(uint32_t(ref.str)):m_data.stringData[ref.str])) : nullptr;
         }
-        const auto it = m_data.strings.find( ref.str );
-        return it != m_data.strings.end() ? it->second : nullptr;
+        if(m_externalStringSource)return m_externalStringSource->PointerString(0,ref.str);
+        const auto it = m_data.strings.find( ref.str ); return it != m_data.strings.end() ? it->second : nullptr;
     }
     tracy_force_inline const char* TryGetString( const StringIdx& idx ) const
     {
         if( !idx.Active() ) return nullptr;
         const auto value = idx.Idx();
-        return value < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(value)):m_data.stringData[value]) : nullptr;
+        return value < StringTableCount() ? (m_offlineStorage?m_offlineStorage->StringAt(uint32_t(value)):(m_externalStringSource?m_externalStringSource->StringAt(uint32_t(value)):m_data.stringData[value])) : nullptr;
     }
     const char* GetThreadName( uint64_t id ) const;
     bool IsThreadLocal( uint64_t id );
@@ -913,7 +933,7 @@ public:
 
     StringLocation StoreString(const char* str, size_t sz);
     uint32_t StoreCallstackFrames(const CallstackFrameId*,uint16_t,bool);
-    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():(m_externalStrings?m_externalStringCount:m_data.stringData.size()); }
+    uint64_t StringTableCount() const { return m_offlineStorage?m_offlineStorage->StringCount():(m_externalStringSource?m_externalStringSource->StringCount():(m_externalStrings?m_externalStringCount:m_data.stringData.size())); }
     uint64_t PersistedStringToken(const char*) const;
 
     std::vector<uint32_t>& GetPendingThreadHints() { return m_pendingThreadHints; }
@@ -1497,6 +1517,7 @@ private:
     static LoadProgress s_loadProgress;
     int64_t m_loadTime;
     SerializedZoneSink* m_serializedZoneSink = nullptr;
+    SerializedStringSource* m_externalStringSource = nullptr;
     uint64_t m_serializedCpuZoneIndex = 0;
     uint64_t m_externalStringCount = 0;
     bool m_externalStrings = false;

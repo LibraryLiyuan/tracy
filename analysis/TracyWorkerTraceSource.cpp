@@ -732,7 +732,7 @@ std::string WorkerTraceSource::ComputeFingerprint( const std::filesystem::path& 
 
 std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback,
     std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink,
-    std::shared_ptr<tracy::FileReadHooks> readHooks )
+    std::shared_ptr<tracy::FileReadHooks> readHooks, SerializedStringSource* serializedStringSource )
 {
     auto impl = std::make_unique<Impl>( path, loadMode );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
@@ -753,7 +753,7 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
             EventType::Locks | EventType::Messages | EventType::Plots | EventType::Memory |
             EventType::FrameImages | EventType::ContextSwitches |
             EventType::SymbolCode | EventType::SourceCache );
-        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
+        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink, serializedStringSource );
         while( !impl->worker->IsBackgroundDone() )
         {
             if(loadHooks && loadHooks->check) loadHooks->check();
@@ -1582,8 +1582,8 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
         for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.emplace( thread );
         for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.emplace( thread );
         for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.emplace( thread );
-        for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.emplace( thread );
-        for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.emplace( thread );
+        worker.VisitThreadNameIds( [&]( uint64_t thread ) { threads.emplace( thread ); } );
+        worker.VisitExternalNameIds( [&]( uint64_t thread ) { threads.emplace( thread ); } );
         counts.threads = threads.size();
     }
     counts.locks = worker.GetLockCount();
@@ -1647,8 +1647,8 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
     for( const auto& [thread, data] : worker.GetContextSwitchMap() ) threads.try_emplace( thread, nullptr );
     for( const auto& [thread, data] : worker.GetCpuThreadData() ) threads.try_emplace( thread, nullptr );
     for( const auto& [thread, process] : worker.GetTidToPidMap() ) threads.try_emplace( thread, nullptr );
-    for( const auto& [thread, name] : worker.GetThreadNameMap() ) threads.try_emplace( thread, nullptr );
-    for( const auto& [thread, names] : worker.GetExternalNameMap() ) threads.try_emplace( thread, nullptr );
+    worker.VisitThreadNameIds( [&]( uint64_t thread ) { threads.try_emplace( thread, nullptr ); } );
+    worker.VisitExternalNameIds( [&]( uint64_t thread ) { threads.try_emplace( thread, nullptr ); } );
     result.reserve( threads.size() );
     for( const auto& [threadId, thread] : threads )
     {
@@ -1657,8 +1657,7 @@ std::vector<ThreadDto> WorkerTraceSource::GetThreads() const
         dto.nativeId = threadId;
         dto.processId = worker.GetPidFromTid( threadId );
         dto.name = Safe( worker.GetThreadName( threadId ) );
-        const auto localName = worker.GetThreadNameMap().find( threadId );
-        if( localName != worker.GetThreadNameMap().end() ) dto.localName = Safe( localName->second );
+        if( const auto* localName = worker.TryGetLocalThreadName( threadId ) ) dto.localName = Safe( localName );
         if( worker.HasExternalName( threadId ) )
         {
             const auto external = worker.GetExternalName( threadId );

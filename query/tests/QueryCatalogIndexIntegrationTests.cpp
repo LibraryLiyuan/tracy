@@ -55,10 +55,11 @@ int main( int argc, char** argv )
         Require( reader.Count( OfflineCatalogDomain::CatalogString ) == expectedStrings,
             "Catalog string sidecar count changed" );
 
-        auto compact = analysis::WorkerTraceSource::Open( manifest.dataPath );
-        Require( compact->GetGpuCatalogData()->gpuCatalogResources.empty(),
-            "compact payload still retains the full GPU Catalog" );
-        compact.reset();
+        bool rejectedUnboundCompact = false;
+        try { auto compact = analysis::WorkerTraceSource::Open( manifest.dataPath ); }
+        catch( const analysis::TraceLoadError& error )
+        { rejectedUnboundCompact = error.code == analysis::TraceLoadErrorCode::Corrupt; }
+        Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
         auto indexed = query::QueryIndex::Open( manifest );
         Require( !indexed->CatalogDerivedDataReady(),
             "indexed trace silently claims GPU Catalog indices are ready" );

@@ -34,10 +34,11 @@ int main( int argc, char** argv )
 
         const auto manifest = tracy::query::QueryIndex::Build( input );
         Require( manifest.jobStages.count == expectedStages, "Job-stage sidecar count changed" );
-        auto compact = tracy::analysis::WorkerTraceSource::Open( manifest.dataPath );
-        Require( compact->GetTraceInfo().counts.jobStages == 0,
-            "compact payload still retains the full Job-stage table" );
-        compact.reset();
+        bool rejectedUnboundCompact = false;
+        try { auto compact = tracy::analysis::WorkerTraceSource::Open( manifest.dataPath ); }
+        catch( const tracy::analysis::TraceLoadError& error )
+        { rejectedUnboundCompact = error.code == tracy::analysis::TraceLoadErrorCode::Corrupt; }
+        Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
 
         auto indexed = tracy::query::QueryIndex::Open( manifest );
         Require( indexed->GetTraceInfo().counts.jobStages == expectedStages,

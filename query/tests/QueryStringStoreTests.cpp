@@ -70,13 +70,22 @@ int main()
         assert( reader.PointerCount( QueryStringPointerKind::String ) == 3 );
         assert( reader.ReadOrdinal( 0, 32 ) == "alpha" );
         assert( reader.ReadOrdinal( 1, 32 ).empty() );
+        const auto stableAlpha = reader.StableOrdinal( 0 );
+        assert( stableAlpha.data && stableAlpha.bytes == 5 && std::string_view( stableAlpha.data, stableAlpha.bytes ) == "alpha" );
         assert( reader.ResolveToken( 0x10, 32 ) == std::optional<std::string>( "alpha" ) );
         assert( reader.ResolvePointer( QueryStringPointerKind::String, 100, 32 ) == std::optional<std::string>( "alpha" ) );
         assert( !reader.ResolvePointer( QueryStringPointerKind::String, 200, 32 ) );
+        assert( !reader.HasPointer( QueryStringPointerKind::String, 200 ) );
         assert( reader.ResolvePointer( QueryStringPointerKind::Thread, 77, 32 ) == std::optional<std::string>( "thread-main" ) );
         const auto external = reader.ResolveExternal( 77, 32 );
         assert( external && external->first == "alpha" && external->second == "thread-main" );
+        const auto stableThread = reader.StablePointer( QueryStringPointerKind::Thread, 77 );
+        assert( stableThread && std::string_view( stableThread->data, stableThread->bytes ) == "thread-main" );
+        const auto stableExternal = reader.StableExternal( 77 );
+        assert( stableExternal && std::string_view( stableExternal->first.data, stableExternal->first.bytes ) == "alpha" );
+        assert( std::string_view( stableAlpha.data, stableAlpha.bytes ) == "alpha" );
         assert( !reader.ResolveExternal( 88, 32 ) );
+        assert( !reader.HasPointer( QueryStringPointerKind::External, 88 ) );
 
         uint64_t streamed = 0;
         reader.VisitOrdinalBytes( 3, 1024, [&]( const void* data, uint64_t bytes ) {

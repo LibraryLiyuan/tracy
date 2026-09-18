@@ -29,6 +29,14 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 
 随后从冷建必经路径移除了完整 GPU Memory Attribution 和大 JSON：原 Worker 写出 compact 后立即释放，冷建不再为摘要打开第二个 compact Worker；manifest 将该派生摘要记录为未构建。GPU Memory 分页派生后端仍属于 P4，现阶段不会把缺失摘要误报为已完成。
 
+## 2026-09-18：schema20 全局字符串外置
+
+- 全局字符串正文改为磁盘字节 arena，并保留每条字符串的 NUL 边界；ordinal 目录使用分页表，原始 token、普通字符串 ID、线程名和外部双名称使用有界外部排序索引。重复 token/ID 保持原 Worker 的 first-wins 语义，缺失 token 不会被发布为有效名称。
+- Query 值接口返回拥有的 `std::string`；Worker 兼容接口指向不淘汰的只读文件映射，其生命周期由字符串 Reader 和 IndexedTraceSource 明确持有。映射页计入 Working Set 说明，不计为 Private Bytes 容器。
+- 冷建 Worker 不再建立 `stringData`、普通字符串、线程名和外部名称的全量内存表。compact payload 不再重复字符串正文，并写入 manifest 绑定标记；脱离 schema20 manifest/字典的普通 Worker 会立即拒绝，不能把缺失字典解释为空。
+- 小型真实 JNTRACYX v1 冷建、深校验、热开及 overview 通过：输入 1,309,833 字节，118 个全局字符串侧车 5,453 字节，compact 2,076 字节。Release 全目标构建通过，最终 CTest 37/37（120.77秒）通过，compressed/sample/job/catalog 四项真实后端集成回归通过。
+- P2 仍未完成：Callstack payload/Frame/父调用栈、其余 JN/Tracy 常驻域仍需按证据迁移；尚未运行 12.43 GB 正式 Trace。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

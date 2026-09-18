@@ -752,7 +752,8 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
     }
 }
 
-Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification, SerializedZoneSink* serializedZoneSink )
+Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification,
+    SerializedZoneSink* serializedZoneSink, SerializedStringSource* serializedStringSource )
     : m_hasData( true )
     , m_stream( nullptr )
     , m_buffer( nullptr )
@@ -760,6 +761,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     , m_memoryLimit( -1 )
     , m_allowStringModification( allowStringModification )
     , m_serializedZoneSink( serializedZoneSink )
+    , m_externalStringSource( serializedStringSource )
 {
     auto loadStart = std::chrono::high_resolution_clock::now();
 
@@ -918,11 +920,20 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     unordered_flat_map<uint64_t, const char*> pointerMap;
 
     f.Read( sz );
+    const bool manifestBoundStrings = sz == std::numeric_limits<uint64_t>::max();
+    if( manifestBoundStrings )
+    {
+        if( !m_externalStringSource ) throw LoadFailure( "compact trace requires its manifest-bound external string dictionary" );
+        sz = 0;
+    }
     if(sz>UINT32_MAX || sz>SIZE_MAX/sizeof(const char*))throw LoadFailure("string table count exceeds supported index range");
-    const bool externalStrings = m_serializedZoneSink && m_serializedZoneSink->WantsGlobalStrings();
+    const bool captureExternalStrings = m_serializedZoneSink && m_serializedZoneSink->WantsGlobalStrings();
+    const bool suppliedExternalStrings = m_externalStringSource != nullptr;
+    const bool externalStrings = captureExternalStrings || suppliedExternalStrings;
     m_externalStrings = externalStrings;
-    m_externalStringCount = externalStrings ? sz : 0;
-    if( externalStrings )
+    m_externalStringCount = suppliedExternalStrings ? m_externalStringSource->StringCount() : ( captureExternalStrings ? sz : 0 );
+    if( suppliedExternalStrings && ( !manifestBoundStrings || sz != 0 ) ) throw LoadFailure( "manifest-bound compact trace has an invalid external string marker" );
+    if( captureExternalStrings )
     {
         m_serializedZoneSink->GlobalStringsBegin( sz );
         std::array<char,64*1024> buffer;
@@ -953,42 +964,48 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
 
     f.Read( sz );
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(0,sz);
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds string pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(0,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
-        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(0,i,id,ptr,0);continue;}
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(0,i,id,ptr,0);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.strings.emplace( id, it->second );
         }
     }
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(0);
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableEnd(0);
 
     f.Read( sz );
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(1,sz);
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds thread-name pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(1,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr;
         f.Read2( id, ptr );
-        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(1,i,id,ptr,0);continue;}
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(1,i,id,ptr,0);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         if( it != pointerMap.end() )
         {
             m_data.threadNames.emplace( id, it->second );
         }
     }
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(1);
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableEnd(1);
 
     f.Read( sz );
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableBegin(2,sz);
+    if(suppliedExternalStrings && sz!=0)throw LoadFailure("manifest-bound compact trace unexpectedly embeds external-name pointers");
+    if(captureExternalStrings)m_serializedZoneSink->GlobalPointerTableBegin(2,sz);
     for( uint64_t i=0; i<sz; i++ )
     {
         uint64_t id, ptr, ptr2;
         f.Read3( id, ptr, ptr2 );
-        if(externalStrings){m_serializedZoneSink->GlobalPointerRecord(2,i,id,ptr,ptr2);continue;}
+        if(captureExternalStrings){m_serializedZoneSink->GlobalPointerRecord(2,i,id,ptr,ptr2);continue;}
+        if(suppliedExternalStrings)continue;
         auto it = pointerMap.find( ptr );
         auto it2 = pointerMap.find( ptr2 );
         if( it != pointerMap.end() && it2 != pointerMap.end() )
@@ -996,7 +1013,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             m_data.externalNames.emplace( id, std::make_pair( it->second, it2->second ) );
         }
     }
-    if(externalStrings)m_serializedZoneSink->GlobalPointerTableEnd(2);
+    if(captureExternalStrings)
+    {
+        m_serializedZoneSink->GlobalPointerTableEnd(2);
+        m_externalStringSource=m_serializedZoneSink->GlobalStringSource();
+        if(!m_externalStringSource || m_externalStringSource->StringCount()!=m_externalStringCount)
+            throw LoadFailure("external global string source was not published after serialization");
+    }
 
     m_data.localThreadCompress.Load( f );
     m_data.externalThreadCompress.Load( f );
@@ -2880,6 +2903,11 @@ uint32_t Worker::FindStringIdx( const char* str ) const
 
 const char* Worker::GetString( uint64_t ptr ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto* value = m_externalStringSource->PointerString( 0, ptr );
+        return value ? value : "???";
+    }
     const auto it = m_data.strings.find( ptr );
     if( it == m_data.strings.end() || it->second == nullptr )
     {
@@ -2896,7 +2924,8 @@ const char* Worker::GetString( const StringRef& ref ) const
     if( ref.isidx )
     {
         assert( ref.active );
-        return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( ref.str ) ) : m_data.stringData[ref.str];
+        return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( ref.str ) ) :
+            ( m_externalStringSource ? m_externalStringSource->StringAt( uint32_t( ref.str ) ) : m_data.stringData[ref.str] );
     }
     else
     {
@@ -2914,7 +2943,8 @@ const char* Worker::GetString( const StringRef& ref ) const
 const char* Worker::GetString( const StringIdx& idx ) const
 {
     assert( idx.Active() );
-    return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( idx.Idx() ) ) : m_data.stringData[idx.Idx()];
+    return m_offlineStorage ? m_offlineStorage->StringAt( uint32_t( idx.Idx() ) ) :
+        ( m_externalStringSource ? m_externalStringSource->StringAt( uint32_t( idx.Idx() ) ) : m_data.stringData[idx.Idx()] );
 }
 
 static const char* BadExternalThreadNames[] = {
@@ -2925,6 +2955,23 @@ static const char* BadExternalThreadNames[] = {
 
 const char* Worker::GetThreadName( uint64_t id ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto* local = m_externalStringSource->PointerString( 1, id );
+        const auto external = m_externalStringSource->ExternalName( id );
+        if( !local ) return external.second ? external.second : "???";
+        if( local[0] >= '0' && local[0] <= '9' && uint64_t( atoi( local ) ) == id && external.second )
+        {
+            const char** ptr = BadExternalThreadNames;
+            while( *ptr )
+            {
+                if( strcmp( *ptr, external.second ) == 0 ) return local;
+                ptr++;
+            }
+            return external.second;
+        }
+        return local;
+    }
     const auto it = m_data.threadNames.find( id );
     if( it == m_data.threadNames.end() )
     {
@@ -2994,6 +3041,11 @@ const SourceLocation& Worker::GetSourceLocation( int16_t srcloc ) const
 
 std::pair<const char*, const char*> Worker::GetExternalName( uint64_t id ) const
 {
+    if( m_externalStringSource )
+    {
+        const auto result = m_externalStringSource->ExternalName( id );
+        return { result.first ? result.first : "???", result.second ? result.second : "???" };
+    }
     const auto it = m_data.externalNames.find( id );
     if( it == m_data.externalNames.end() )
     {
@@ -7730,6 +7782,31 @@ void Worker::FinalizeOfflineStrings()
         value.second.second = intern( value.second.second );
     }
 }
+
+bool Worker::HasExternalName( uint64_t id ) const
+{
+    return m_externalStringSource ? m_externalStringSource->HasPointer( 2, id ) :
+        m_data.externalNames.find( id ) != m_data.externalNames.end();
+}
+
+const char* Worker::TryGetLocalThreadName( uint64_t id ) const
+{
+    if( m_externalStringSource ) return m_externalStringSource->PointerString( 1, id );
+    const auto it = m_data.threadNames.find( id );
+    return it == m_data.threadNames.end() ? nullptr : it->second;
+}
+
+void Worker::VisitThreadNameIds( const std::function<void( uint64_t )>& visitor ) const
+{
+    if( m_externalStringSource ) { m_externalStringSource->VisitPointerIds( 1, visitor ); return; }
+    for( const auto& [id, name] : m_data.threadNames ) visitor( id );
+}
+
+void Worker::VisitExternalNameIds( const std::function<void( uint64_t )>& visitor ) const
+{
+    if( m_externalStringSource ) { m_externalStringSource->VisitPointerIds( 2, visitor ); return; }
+    for( const auto& [id, names] : m_data.externalNames ) visitor( id );
+}
 template<class T> static void WriteCatalogVector(FileWrite& file,const std::vector<T>& memory,WorkerOfflineStorage* storage,OfflineCatalogDomain domain)
 {
     if(!storage){WriteJnVector(file,memory);return;}const auto count=storage->CatalogCount(domain);file.Write(&count,sizeof(count));
@@ -11229,7 +11306,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = StringTableCount();
+    // Query compact payloads bind their dictionary through the index manifest.
+    // Persist a reserved marker plus empty pointer tables so a normal Tracy
+    // open rejects the missing dictionary instead of treating it as empty.
+    sz = m_externalStringSource ? std::numeric_limits<uint64_t>::max() : StringTableCount();
     if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_strings",0,sz,"strings");
     f.Write( &sz, sizeof( sz ) );
     if( m_offlineStorage )
@@ -11255,7 +11335,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         }
     }
 
-    sz = m_data.strings.size();
+    sz = m_externalStringSource ? 0 : m_data.strings.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.strings )
     {
@@ -11264,7 +11344,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &ptr, sizeof( ptr ) );
     }
 
-    sz = m_data.threadNames.size();
+    sz = m_externalStringSource ? 0 : m_data.threadNames.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.threadNames )
     {
@@ -11273,7 +11353,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( &ptr, sizeof( ptr ) );
     }
 
-    sz = m_data.externalNames.size();
+    sz = m_externalStringSource ? 0 : m_data.externalNames.size();
     f.Write( &sz, sizeof( sz ) );
     for( auto& v : m_data.externalNames )
     {
