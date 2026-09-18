@@ -77,6 +77,18 @@ int main()
         ownerError.clear();
         Require( QueryIndex::ProbeOwnerLockForTesting( trace, ownerError ) && !fs::exists( ownerPath ),
             "stale Query owner lock could not be reacquired and cleaned" );
+        const std::string stalePrefix = "jnidx.0123456789abcdef.s25.g";
+        const auto staleFile = root / ( stalePrefix + "1.jnidx.cpu.tmp.100" );
+        const auto staleDirectory = root / ( stalePrefix + "2.jnidx.string.tmp.101" );
+        const auto unrelated = root / "jnidx.ffffffffffffffff.s25.g1.jnidx.cpu.tmp.100";
+        std::ofstream( staleFile ) << "stale";
+        fs::create_directories( staleDirectory );
+        std::ofstream( staleDirectory / "page" ) << "stale";
+        std::ofstream( unrelated ) << "keep";
+        std::string cleanupError;
+        Require( QueryIndex::CleanupStaleCandidatesForTesting( root, stalePrefix, cleanupError ) &&
+            !fs::exists( staleFile ) && !fs::exists( staleDirectory ) && fs::exists( unrelated ),
+            "Query stale candidate cleanup crossed its identity boundary" );
 #else
         const auto source = root / "source";
         const auto target = root / "target";

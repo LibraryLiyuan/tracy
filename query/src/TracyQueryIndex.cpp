@@ -773,6 +773,45 @@ std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind)
     const auto value=std::string(source)+":"+ExtendedTraceDecoderIdentity+":jnidx:"+std::to_string(QueryIndexSchemaVersion)+":"+std::to_string(uint32_t(kind));
     analysis::Sha256Builder hash; hash.Update(value.data(),value.size()); return hash.FinalHex();
 }
+
+bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view identityPrefix,
+    const std::shared_ptr<analysis::AnalysisDiskBudget>& disk, std::string& error )
+{
+    error.clear();
+    std::error_code ec;
+    if( !std::filesystem::exists( root, ec ) ) return !ec;
+    std::vector<std::filesystem::path> candidates;
+    for( std::filesystem::directory_iterator entry( root, ec ), end; entry != end && !ec; entry.increment( ec ) )
+    {
+        const auto name = entry->path().filename().string();
+        if( !name.starts_with( identityPrefix ) || name.find( ".tmp." ) == std::string::npos ) continue;
+        const auto status = std::filesystem::symlink_status( entry->path(), ec );
+        if( ec ) break;
+        if( std::filesystem::is_symlink( status ) ) continue;
+#ifdef _WIN32
+        const auto attributes = GetFileAttributesW( entry->path().c_str() );
+        if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
+#endif
+        candidates.emplace_back( entry->path() );
+    }
+    if( ec ) { error = "Query stale candidate scan failed: " + ec.message(); return false; }
+    try
+    {
+        if( disk && disk->usage ) disk->usage->AddRoots( candidates );
+    }
+    catch( const std::exception& failure )
+    {
+        error = std::string( "Query stale candidate accounting failed: " ) + failure.what();
+        return false;
+    }
+    for( const auto& candidate : candidates )
+    {
+        ec.clear();
+        analysis::AnalysisDiskRemove( candidate, disk, ec, true );
+        if( ec ) { error = "Query stale candidate cleanup failed: " + candidate.string() + ": " + ec.message(); return false; }
+    }
+    return true;
+}
 uint64_t SectionBytes(const std::filesystem::path& path)
 {
     return analysis::AnalysisDiskUsage::Bytes(path);
@@ -2579,6 +2618,12 @@ bool QueryIndex::ProbeOwnerLockForTesting( const std::filesystem::path& tracePat
     }
 }
 
+bool QueryIndex::CleanupStaleCandidatesForTesting( const std::filesystem::path& root,
+    std::string_view identityPrefix, std::string& error )
+{
+    return CleanupStaleCandidates( root, identityPrefix, {}, error );
+}
+
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
 {
     auto result = tracePath;
@@ -2602,8 +2647,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     // appended.  The manifest already validates the complete 256-bit source
     // fingerprint; this bounded basename is only a collision-resistant local
     // section identity within the trace directory.
-    const auto baseName = std::string( "jnidx." ) + result.sourceFingerprint.substr( 0, 16 ) +
-        ".s" + std::to_string( QueryIndexSchemaVersion ) + ".g" +
+    const auto identityPrefix = std::string( "jnidx." ) + result.sourceFingerprint.substr( 0, 16 ) +
+        ".s" + std::to_string( QueryIndexSchemaVersion ) + ".g";
+    const auto baseName = identityPrefix +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     const auto dataName = baseName + ".jnidx.data";
     result.dataPath = tracePath.parent_path() / dataName;
@@ -2686,6 +2732,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     try
     {
         QueryIndexOwnerLease ownerLease( ownerLockPath );
+        resources->SetPhase( "cleanup-stale-candidates" );
+        std::string cleanupError;
+        if( !CleanupStaleCandidates( tracePath.parent_path(), identityPrefix, storageOptions.disk, cleanupError ) )
+            throw std::runtime_error( cleanupError );
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();
