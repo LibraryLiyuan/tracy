@@ -72,6 +72,8 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 
 剩余热点是`ValidateMainPlayerLoopRoots`对全表第二次扫描时，每条Zone对两个`unordered_set<int16_t>`执行查找。修复将Main.PlayerLoop/PlayerLoop来源编码为64 KiB定长状态表，父链检查也直接索引；finding代码表改用`string_view`避免异常Trace的临时字符串分配。存储布局不变，schema保持24。Release全构建、CTest 38/38（120.13秒）及小型真实冷建/validation语义回归通过。R3证据、字段分布和清理记录位于`Query-Acceptance-20260918/diagnostics/P2-ZoneValidation-CpuFlags-R3`；没有机械启动第四轮正式诊断。
 
+同时移除了IndexedTraceSource中仅在manifest未预计算校验时触发的全量`extraNameState`和调用栈vector回退。schema24现要求已发布manifest包含完整预计算校验；缺失或未完成会使索引失效并走受控重建。小型夹具将`precomputed`改为false后确认新代次重建，`validation.run`恢复原16项finding和20,000条未解析调用栈计数，未把缺失质量权威静默报告为健康。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

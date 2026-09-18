@@ -1337,118 +1337,9 @@ public:
 
     std::optional<analysis::ZoneValidationSummaryDto> ValidateZoneIndex( const std::function<size_t( size_t )>& allowance ) const override
     {
-        if( m_manifest.zoneValidationPrecomputed )
-        {
-            auto result = m_manifest.zoneValidation;
-            if( allowance( 1 ) == 0 ) result.complete = false;
-            return result;
-        }
-        analysis::ZoneValidationSummaryDto result;
-        std::unordered_map<std::string_view, size_t> issueByCode;
-        const auto note = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
-            auto found = issueByCode.find( code );
-            if( found == issueByCode.end() )
-            {
-                found = issueByCode.emplace( code, result.findings.size() ).first;
-                result.findings.push_back( { severity, code, message, 0, {} } );
-            }
-            auto& issue = result.findings[found->second];
-            issue.count++;
-            if( issue.refs.size() < 20 ) issue.refs.emplace_back( ref );
-        };
-        std::unordered_set<uint64_t> threads;
-        const auto sourceThreads = m_source->GetThreads();
-        threads.reserve( sourceThreads.size() );
-        for( const auto& thread : sourceThreads ) threads.emplace( thread.nativeId );
-        std::unordered_set<uint64_t> contexts;
-        const auto sourceContexts = m_source->GetGpuContexts();
-        contexts.reserve( sourceContexts.size() );
-        for( const auto& context : sourceContexts ) contexts.emplace( context.index );
-        // Source-location ids are persisted as int16_t. Validation touches every
-        // zone, so replacing tens of millions of unordered-map lookups with a
-        // fixed 64 KiB state table materially reduces indexed validation time.
-        PlayerLoopSourceTable playerLoopSources {};
-        bool hasMainPlayerLoopSource = false;
-        for( const auto& [sourceId, source] : m_locations )
-        {
-            const auto& name = source.name.empty() ? source.function : source.name;
-            auto& sourceState = playerLoopSources[uint16_t( sourceId )];
-            if( name == "Main.PlayerLoop" ) { sourceState |= MainPlayerLoopSource; hasMainPlayerLoopSource = true; }
-            else if( name == "PlayerLoop" ) sourceState |= UnityPlayerLoopSource;
-        }
-        // 0 = missing, 1 = present without a stable name, 2 = present and named.
-        std::array<uint8_t, 1u << 16> sourceState {};
-        for( const auto& [sourceId, source] : m_locations )
-            sourceState[uint16_t( sourceId )] = source.name.empty() && source.function.empty() ? 1 : 2;
-        std::vector<int8_t> extraNameState( size_t( m_extras.Count() ), -1 );
-        std::vector<uint32_t> callstacks;
-        callstacks.reserve( size_t( std::min<uint64_t>( m_extras.Count(), 10000000 ) ) );
-        constexpr size_t Chunk = 4096;
-        for( uint64_t base = 0; base < m_cpu.Count(); )
-        {
-            const auto requested = size_t( std::min<uint64_t>( Chunk, m_cpu.Count() - base ) );
-            const auto allowed = std::min( requested, allowance( requested ) );
-            if( allowed == 0 ) { result.complete = false; break; }
-            for( size_t offset = 0; offset < allowed; offset++ )
-            {
-                const auto index = base + offset;
-                const auto& zone = m_cpu.At<CpuZoneIndexRecord>( index );
-                const auto ref = [&] { return m_source->MakeEntityRef( "cpu-zone", index ); };
-                if( !( zone.flags & 1 ) ) note( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", ref() );
-                else if( zone.end < zone.start ) note( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", ref() );
-                if( zone.parent != std::numeric_limits<uint64_t>::max() && zone.parent >= m_cpu.Count() ) note( "warning", "UNRESOLVED_CPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                if( threads.find( zone.thread ) == threads.end() ) note( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                const auto locationState = sourceState[uint16_t( zone.sourceLocation )];
-                if( locationState == 0 ) note( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                bool nameResolved = locationState == 2;
-                if( zone.extra < m_extras.Count() )
-                {
-                    const auto& extra = m_extras.At<ZoneExtraIndexRecord>( zone.extra );
-                    if( extra.callstack != 0 ) callstacks.emplace_back( extra.callstack );
-                    if( extra.flags & 2 )
-                    {
-                        auto& state = extraNameState[zone.extra];
-                        if( state < 0 ) state = m_source->ResolveStringIndex( extra.name ).has_value() ? 1 : 0;
-                        nameResolved = state != 0;
-                    }
-                }
-                else if( zone.extra != 0 ) nameResolved = false;
-                if( !nameResolved ) note( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", ref() );
-            }
-            result.scanned += allowed; base += allowed;
-            if( allowed < requested ) { result.complete = false; break; }
-        }
-        if( result.complete )
-            ValidateMainPlayerLoopRoots( m_cpu, playerLoopSources, hasMainPlayerLoopSource,
-                [&]( uint64_t index ) { return m_source->MakeEntityRef( "cpu-zone", index ); }, note );
-
-        if( result.complete )
-        {
-            for( uint64_t base = 0; base < m_gpu.Count(); )
-            {
-                const auto requested = size_t( std::min<uint64_t>( Chunk, m_gpu.Count() - base ) );
-                const auto allowed = std::min( requested, allowance( requested ) );
-                if( allowed == 0 ) { result.complete = false; break; }
-                for( size_t offset = 0; offset < allowed; offset++ )
-                {
-                    const auto index = base + offset;
-                    const auto& zone = m_gpu.At<GpuZoneIndexRecord>( index );
-                    const auto ref = [&] { return m_source->MakeEntityRef( "gpu-zone", index ); };
-                    if( !( zone.flags & 1 ) ) note( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", ref() );
-                    else if( zone.gpuEnd < zone.gpuStart || zone.cpuEnd < zone.cpuStart ) note( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", ref() );
-                    if( zone.parent != std::numeric_limits<uint64_t>::max() && zone.parent >= m_gpu.Count() ) note( "warning", "UNRESOLVED_GPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                    if( threads.find( zone.thread ) == threads.end() ) note( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                    if( contexts.find( zone.context ) == contexts.end() ) note( "warning", "UNRESOLVED_GPU_CONTEXT_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                    if( sourceState[uint16_t( zone.sourceLocation )] == 0 ) note( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", ref() );
-                    if( zone.callstack != 0 ) callstacks.emplace_back( zone.callstack );
-                }
-                result.scanned += allowed; base += allowed;
-                if( allowed < requested ) { result.complete = false; break; }
-            }
-        }
-        std::sort( callstacks.begin(), callstacks.end() );
-        callstacks.erase( std::unique( callstacks.begin(), callstacks.end() ), callstacks.end() );
-        result.referencedCallstacks = std::move( callstacks );
+        if( !m_manifest.zoneValidationPrecomputed ) return std::nullopt;
+        auto result = m_manifest.zoneValidation;
+        if( allowance( 1 ) == 0 ) result.complete = false;
         return result;
     }
     std::optional<analysis::ZoneValidationSummaryDto> ValidateSystemTrace( const std::function<size_t( size_t )>& allowance ) const override
@@ -3145,6 +3036,11 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         const auto& zoneValidation = parsed.at( "zone_validation" );
         manifest.zoneValidationPrecomputed = zoneValidation.value( "precomputed", false );
         manifest.zoneValidation.complete = zoneValidation.value( "complete", false );
+        if( !manifest.zoneValidationPrecomputed || !manifest.zoneValidation.complete )
+        {
+            result.reason = "zone_validation_not_ready";
+            return result;
+        }
         manifest.zoneValidation.scanned = ParseUnsigned( zoneValidation, "scanned" );
         for( const auto& finding : zoneValidation.at( "findings" ) )
         {

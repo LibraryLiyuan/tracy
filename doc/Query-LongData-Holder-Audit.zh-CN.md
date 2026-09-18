@@ -26,4 +26,5 @@
 - schema23 正式Trace范围诊断R2运行2,704.412秒后按45分钟停止；Private Bytes峰值9,844,264,960字节，无资源/数据错误，但仍未完成4.225亿CPU Zone校验。18项候选110,140,934,816字节已按PID清理；扣除验证scratch后仍比8S最终限额高4,421,743,640字节，作为P6容量风险保留。
 - schema24 将名称校验状态复制到CPU Zone现有flag，缓存连续线程合法性，以64 KiB定长表识别GPU Memory标记，并仅为每类质量发现的前20条样例生成引用。Release全构建、CTest 38/38（122.40秒）、小型真实冷建/热开/`validation.run`通过；正式Trace修复后范围诊断尚未执行。
 - schema24 正式Trace范围诊断R3仍在2,704.324秒达到45分钟边界；Private Bytes峰值9,771,753,472字节。停止后顺序扫描422,576,574条CPU记录确认动态名称未解析=0、非法Extra=0、线程run=28，剩余热点收敛到PlayerLoop第二次全表扫描的逐记录集合哈希。该来源判定已改成64 KiB定长表，finding键改为无分配`string_view`；Release全构建、CTest 38/38（120.13秒）和小型真实索引语义回归通过，未机械启动第四轮正式诊断。
+- IndexedTraceSource原先在manifest缺少预计算Zone校验时会重新分配与全部Extra等长的名称状态和全量调用栈vector。该回退已删除；schema24把完整预计算校验作为可重开门禁，缺失或未完成时索引失效并重建。小型夹具把`precomputed`改为false后确认会重建并恢复20,000条调用栈引用告警，未把未就绪状态报告为健康。
 - 未运行 12.43 GB 正式 Trace。
