@@ -3,6 +3,7 @@
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
+#include "TracyQueryValidationStore.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyFileReadHooks.hpp"
 #include "TracyWorker.hpp"
@@ -2505,6 +2506,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     auto temporaryGpuMemoryCpuZones = result.gpuMemoryCpuZones.path; temporaryGpuMemoryCpuZones += suffix;
     auto temporaryGpuMemorySummaryCpuZones = result.gpuMemorySummaryCpuZones.path; temporaryGpuMemorySummaryCpuZones += suffix;
     auto temporaryGpuMemorySummary = result.gpuMemorySummary.path; temporaryGpuMemorySummary += suffix;
+    auto temporaryValidation = tracePath.parent_path() / ( baseName + ".jnidx.validation" + suffix );
     auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
     std::vector<std::filesystem::path> packedScratch;
 
@@ -2514,7 +2516,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         result.manifestPath,result.dataPath,result.zoneExtras.path,result.cpuZones.path,result.gpuZones.path,
         result.samples.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
         result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
-        result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,failureDiagnostic
+        result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,
+        failureDiagnostic,temporaryValidation
     });
     const auto storageOptions = ResourceStorageOptions( resources );
 
@@ -2614,10 +2617,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             std::array<uint8_t, 1u << 16> validationSourceState {};
             for( const auto& location : source->GetSourceLocations() )
                 validationSourceState[uint16_t( int16_t( location.nativeId ) )] = location.name.empty() && location.function.empty() ? 1 : 2;
-            std::vector<int8_t> validationExtraNameState( size_t( extraSection.Count() ), -1 );
-            std::vector<uint8_t> validationExtraSeen( size_t( extraSection.Count() ), 0 );
-            std::vector<uint32_t> validationCallstacks;
-            validationCallstacks.reserve( size_t( std::min<uint64_t>( extraSection.Count() + gpuSection.Count(), 10000000 ) ) );
             std::unordered_map<int16_t, std::string> gpuMemoryMarkers;
             for( const auto& location : source->GetSourceLocations() )
             {
@@ -2626,14 +2625,36 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                     name == analysis::GpuMemoryOriginMarker || name == analysis::GpuMemoryResidencyMarker )
                     gpuMemoryMarkers.emplace( int16_t( location.nativeId ), name );
             }
-            std::vector<uint64_t> gpuMemoryCpuZones;
-            std::vector<uint64_t> gpuMemorySummaryCpuZones;
+            analysis::PagedRecordWriter gpuMemoryCpuZoneWriter(temporaryGpuMemoryCpuZones,
+                PagedSectionIdentity(result.sourceFingerprint,ZoneSectionKind::GpuMemoryCpuZone),sizeof(uint64_t),storageOptions);
+            analysis::PagedRecordWriter gpuMemorySummaryCpuZoneWriter(temporaryGpuMemorySummaryCpuZones,
+                PagedSectionIdentity(result.sourceFingerprint,ZoneSectionKind::GpuMemorySummaryCpuZone),sizeof(uint64_t),storageOptions);
+            uint64_t gpuMemoryCpuZoneCount=0,gpuMemorySummaryCpuZoneCount=0;
+            auto validationWriter=std::make_unique<QueryValidationStoreWriter>(temporaryValidation,result.sourceFingerprint,storageOptions);
+            resources->SetPhase("zone-validation:extra-state");
+            for(uint64_t index=0;index<extraSection.Count();++index)
+            {
+                if((index&0xffff)==0) { resources->SetProgress(index,extraSection.Count()); resources->CheckMemory(false); }
+                const auto extra=extraSection.At<ZoneExtraIndexRecord>(index);
+                uint8_t nameState=2;
+                if(extra.flags&2) nameState=source->ResolveStringIndex(extra.name).has_value()?1:0;
+                validationWriter->AppendExtraNameState(nameState);
+                validationWriter->AppendCallstack(extra.callstack);
+            }
+            resources->SetPhase("zone-validation:gpu-callstack-index");
+            for(uint64_t index=0;index<gpuSection.Count();++index)
+            {
+                if((index&0xffff)==0) { resources->SetProgress(index,gpuSection.Count()); resources->CheckMemory(false); }
+                validationWriter->AppendCallstack(gpuSection.At<GpuZoneIndexRecord>(index).callstack);
+            }
+            validationWriter->Commit();
+            validationWriter.reset();
+            auto validationStore=std::make_unique<QueryValidationStoreReader>(temporaryValidation,result.sourceFingerprint,storageOptions);
+            if(validationStore->ExtraCount()!=extraSection.Count()) throw std::runtime_error("zone validation extra-state count mismatch");
             const auto reportValidationContainers=[&] {
-                resources->SetContainer("validation_extra_name_state",validationExtraNameState.size(),validationExtraNameState.capacity());
-                resources->SetContainer("validation_extra_seen",validationExtraSeen.size(),validationExtraSeen.capacity());
-                resources->SetContainer("validation_callstacks",validationCallstacks.size(),validationCallstacks.capacity());
-                resources->SetContainer("gpu_memory_cpu_zone_ordinals",gpuMemoryCpuZones.size(),gpuMemoryCpuZones.capacity());
-                resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZones.size(),gpuMemorySummaryCpuZones.capacity());
+                resources->SetContainer("validation_extra_name_state_page",1,storageOptions.blockBytes);
+                resources->SetContainer("gpu_memory_cpu_zone_ordinals",gpuMemoryCpuZoneCount,0);
+                resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZoneCount,0);
             };
             reportValidationContainers();
             for( uint64_t index = 0; index < cpuSection.Count(); index++ )
@@ -2659,17 +2680,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 if( zone.extra < extraSection.Count() )
                 {
                     const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
-                    if( !validationExtraSeen[zone.extra] )
-                    {
-                        validationExtraSeen[zone.extra] = 1;
-                        if( extra.callstack != 0 ) validationCallstacks.emplace_back( extra.callstack );
-                    }
                     if( extra.flags & 2 )
-                    {
-                        auto& state = validationExtraNameState[zone.extra];
-                        if( state < 0 ) state = source->ResolveStringIndex( extra.name ).has_value() ? 1 : 0;
-                        nameResolved = state != 0;
-                    }
+                        nameResolved = validationStore->ExtraNameState(zone.extra)==1;
                 }
                 else if( zone.extra != 0 ) nameResolved = false;
                 if( !nameResolved )
@@ -2680,9 +2692,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 if( ( extra.flags & 1 ) == 0 ) continue;
                 const auto text = source->ResolveStringIndex( extra.text );
                 if( !text ) continue;
-                gpuMemoryCpuZones.emplace_back( index );
+                gpuMemoryCpuZoneWriter.Append(&index,1); ++gpuMemoryCpuZoneCount;
                 if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
-                    gpuMemorySummaryCpuZones.emplace_back( index );
+                { gpuMemorySummaryCpuZoneWriter.Append(&index,1); ++gpuMemorySummaryCpuZoneCount; }
                 else if( marker->second == analysis::GpuMemoryRequestMarker )
                 {
                     constexpr std::string_view prefix = "GTMEM1|RESOURCE|allocation=";
@@ -2691,7 +2703,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                     // summary so an allocation event can resolve the backing
                     // that was active in its own lifetime, not the final
                     // last-writer for that address.
-                    if( text->find( prefix ) != std::string::npos ) gpuMemorySummaryCpuZones.emplace_back( index );
+                    if( text->find( prefix ) != std::string::npos )
+                    { gpuMemorySummaryCpuZoneWriter.Append(&index,1); ++gpuMemorySummaryCpuZoneCount; }
                 }
                 if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
                     result.gpuMemoryProtocol2 = true;
@@ -2721,40 +2734,36 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                     noteValidation( "warning", "UNRESOLVED_GPU_CONTEXT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
                 if( validationSourceState[uint16_t( zone.sourceLocation )] == 0 )
                     noteValidation( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
-                if( zone.callstack != 0 ) validationCallstacks.emplace_back( zone.callstack );
             }
-            std::sort( validationCallstacks.begin(), validationCallstacks.end() );
-            validationCallstacks.erase( std::unique( validationCallstacks.begin(), validationCallstacks.end() ), validationCallstacks.end() );
-            if( !validationCallstacks.empty() )
-            {
+            resources->SetPhase("zone-validation:callstacks");
+            validationStore->VisitUniqueCallstacks(4096,[&](const std::vector<uint32_t>& callstacks) {
+                analysis::AnalysisWorkspaceReservation resolvedWorkspace(resources->Workspace(),65536+uint64_t(callstacks.size())*64);
                 std::unordered_set<uint32_t> resolvedCallstacks;
-                for( const auto& frame : source->ResolveCallstacks( validationCallstacks, 1 ) ) resolvedCallstacks.emplace( frame.callstack );
-                for( const auto callstack : validationCallstacks ) if( resolvedCallstacks.find( callstack ) == resolvedCallstacks.end() )
-                    noteValidation( "warning", "UNRESOLVED_CALLSTACK", "persisted zone references a callstack that cannot be resolved", source->MakeEntityRef( "callstack", callstack ) );
-            }
+                for(const auto& frame:source->ResolveCallstacks(callstacks,1)) resolvedCallstacks.emplace(frame.callstack);
+                for(const auto callstack:callstacks) if(!resolvedCallstacks.contains(callstack))
+                    noteValidation("warning","UNRESOLVED_CALLSTACK","persisted zone references a callstack that cannot be resolved",source->MakeEntityRef("callstack",callstack));
+                resources->SetContainer("validation_callstack_batch",callstacks.size(),callstacks.capacity());
+                resources->SetContainer("validation_resolved_callstacks",resolvedCallstacks.size(),resolvedCallstacks.bucket_count());
+                resources->CheckMemory(false);
+            });
             zoneValidation.complete = true;
             zoneValidation.scanned = cpuSection.Count() + gpuSection.Count();
             result.zoneValidationPrecomputed = true;
             result.zoneValidation = std::move( zoneValidation );
             reportValidationContainers();
-            std::sort( gpuMemorySummaryCpuZones.begin(), gpuMemorySummaryCpuZones.end() );
-            MappedSection filtered;
-            filtered.Open( temporaryGpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, gpuMemoryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint, storageOptions.disk );
-            if( !gpuMemoryCpuZones.empty() ) std::memcpy( filtered.Record( 0 ), gpuMemoryCpuZones.data(), gpuMemoryCpuZones.size() * sizeof( uint64_t ) );
-            filtered.Close( gpuMemoryCpuZones.size() );
-            result.gpuMemoryCpuZones.count = gpuMemoryCpuZones.size();
-            result.gpuMemoryCpuZones.declaredCount = gpuMemoryCpuZones.size();
-            result.gpuMemoryCpuZones.bytes = std::filesystem::file_size( temporaryGpuMemoryCpuZones );
-            result.gpuMemoryCpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemoryCpuZones );
-            MappedSection summaryFiltered;
-            summaryFiltered.Open( temporaryGpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone,
-                gpuMemorySummaryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint, storageOptions.disk );
-            if( !gpuMemorySummaryCpuZones.empty() ) std::memcpy( summaryFiltered.Record( 0 ), gpuMemorySummaryCpuZones.data(), gpuMemorySummaryCpuZones.size() * sizeof( uint64_t ) );
-            summaryFiltered.Close( gpuMemorySummaryCpuZones.size() );
-            result.gpuMemorySummaryCpuZones.count = gpuMemorySummaryCpuZones.size();
-            result.gpuMemorySummaryCpuZones.declaredCount = gpuMemorySummaryCpuZones.size();
-            result.gpuMemorySummaryCpuZones.bytes = std::filesystem::file_size( temporaryGpuMemorySummaryCpuZones );
-            result.gpuMemorySummaryCpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemorySummaryCpuZones );
+            gpuMemoryCpuZoneWriter.Commit(); gpuMemorySummaryCpuZoneWriter.Commit();
+            result.gpuMemoryCpuZones.count = gpuMemoryCpuZoneCount;
+            result.gpuMemoryCpuZones.declaredCount = gpuMemoryCpuZoneCount;
+            result.gpuMemoryCpuZones.bytes = SectionBytes( temporaryGpuMemoryCpuZones );
+            result.gpuMemoryCpuZones.fingerprint = SectionFingerprint( temporaryGpuMemoryCpuZones );
+            result.gpuMemorySummaryCpuZones.count = gpuMemorySummaryCpuZoneCount;
+            result.gpuMemorySummaryCpuZones.declaredCount = gpuMemorySummaryCpuZoneCount;
+            result.gpuMemorySummaryCpuZones.bytes = SectionBytes( temporaryGpuMemorySummaryCpuZones );
+            result.gpuMemorySummaryCpuZones.fingerprint = SectionFingerprint( temporaryGpuMemorySummaryCpuZones );
+            validationStore.reset();
+            std::error_code validationCleanup;
+            analysis::AnalysisDiskRemove(temporaryValidation,storageOptions.disk,validationCleanup,true);
+            if(validationCleanup) throw std::runtime_error("cannot clean validation scratch: "+validationCleanup.message());
         }
         result.zoneExtras.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryExtras );
         result.cpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryCpu );
@@ -2840,8 +2849,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         packSection(temporaryGpu,result.gpuZones,ZoneSectionKind::Gpu);
         for(size_t index=0;index<temporaryJn.size();++index)
             packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
-        packSection(temporaryGpuMemoryCpuZones,result.gpuMemoryCpuZones,ZoneSectionKind::GpuMemoryCpuZone);
-        packSection(temporaryGpuMemorySummaryCpuZones,result.gpuMemorySummaryCpuZones,ZoneSectionKind::GpuMemorySummaryCpuZone);
 
         {
             const auto payload = ManifestJson( result ).dump( 2 );
@@ -2900,9 +2907,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         analysis::AnalysisDiskRemove( temporarySamples, storageOptions.disk, ignored, true );
         analysis::AnalysisDiskRemove( temporaryCatalog, storageOptions.disk, ignored, true );
         for( const auto& path : temporaryJn ) analysis::AnalysisDiskRemove( path, storageOptions.disk, ignored );
-        analysis::AnalysisDiskRemove( temporaryGpuMemoryCpuZones, storageOptions.disk, ignored );
-        analysis::AnalysisDiskRemove( temporaryGpuMemorySummaryCpuZones, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryGpuMemoryCpuZones, storageOptions.disk, ignored, true );
+        analysis::AnalysisDiskRemove( temporaryGpuMemorySummaryCpuZones, storageOptions.disk, ignored, true );
         analysis::AnalysisDiskRemove( temporaryGpuMemorySummary, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryValidation, storageOptions.disk, ignored, true );
         try { resources->RunResourceBoundary([&] { std::rethrow_exception(failure); }); }
         catch(...)
         {

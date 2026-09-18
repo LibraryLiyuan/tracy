@@ -21,6 +21,12 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 
 下一步进入 P2 静态持有者审计和小型合成压力测试。已确认的优先项仍是分页 ZoneExtra 校验状态、调用栈引用外排、原/compact Worker 生命周期、字符串/调用栈按需读取和 GPU 摘要拆分；不会把这些候选提前写成 OOM 根因。
 
+## 2026-09-18：P2 首个有界化检查点
+
+静态持有者清单见 `doc/Query-LongData-Holder-Audit.zh-CN.md`。Zone 校验不再分配与全部 ZoneExtra 等长的两个 Private Bytes vector，也不再累积全部 Zone/GPU 调用栈引用；名称状态改为分页表，调用栈引用采用外部 run 排序、确定性去重和 4096 项解析批次。GPU Memory 的两个 CPU-zone ordinal vector 改为扫描时直接写分页表。所有 scratch 纳入统一账本并在阶段完成后删除。
+
+小型真实后端冷建、深校验、热开通过；新增分页校验存储测试和受影响的外部排序/预算测试 4/4 通过。P2 仍未完成：字符串、调用栈定义、其他 JN/Tracy 域和 GPU 摘要尚待迁移，未启动 12.43 GB 运行。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

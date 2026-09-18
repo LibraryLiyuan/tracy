@@ -20,8 +20,10 @@ bool PairLess( const AnalysisUInt64Pair& lhs, const AnalysisUInt64Pair& rhs )
 
 bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     const std::filesystem::path& output, uint64_t& written, std::string& error,
-    const std::shared_ptr<AnalysisDiskBudget>& disk )
+    const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
 {
+    AnalysisWorkspaceReservation mergeWorkspace(workspace,65536+uint64_t(inputs.size())*2048);
     struct Cursor
     {
         std::ifstream input;
@@ -129,7 +131,8 @@ bool CleanupAnalysisExternalSortFiles( const std::filesystem::path& temporaryRoo
 bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedPairs,
-    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
 {
     error.clear();
     if( maximumBufferedPairs == 0 ) maximumBufferedPairs = 1;
@@ -151,6 +154,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     while( remaining != 0 )
     {
         const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedPairs ) );
+        AnalysisWorkspaceReservation runWorkspace(workspace,uint64_t(take)*sizeof(AnalysisUInt64Pair));
         std::vector<AnalysisUInt64Pair> values( take );
         in.read( reinterpret_cast<char*>( values.data() ),
             std::streamsize( values.size() * sizeof( AnalysisUInt64Pair ) ) );
@@ -191,7 +195,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
             const auto merged = temporaryRoot / ( prefix + "-run-" +
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
-            if( !MergeRuns( group, merged, written, error,disk ) ) return false;
+            if( !MergeRuns( group, merged, written, error,disk,workspace ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {

@@ -75,6 +75,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQuerySampleView.hpp
     src/TracyQueryResourceContext.cpp
     src/TracyQueryResourceContext.hpp
+    src/TracyQueryValidationStore.cpp
+    src/TracyQueryValidationStore.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
@@ -217,6 +219,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-resource-context-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-resource-context-tests)
     add_test(NAME tracy-query-resource-context COMMAND tracy-query-resource-context-tests)
+
+    add_executable(tracy-query-validation-store-tests tests/QueryValidationStoreTests.cpp)
+    target_link_libraries(tracy-query-validation-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-validation-store-tests)
+    add_test(NAME tracy-query-validation-store COMMAND tracy-query-validation-store-tests)
     add_executable(tracy-analysis-dictionary-tests tests/AnalysisDictionaryTests.cpp)
     target_include_directories(tracy-analysis-dictionary-tests PRIVATE ../analysis)
     tracy_query_enable_assertions(tracy-analysis-dictionary-tests)

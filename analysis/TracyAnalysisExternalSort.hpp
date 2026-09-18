@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 namespace tracy::analysis
 {
@@ -24,7 +25,8 @@ bool SortAnalysisUInt64Pairs(
     const std::string& prefix,
     uint64_t expectedCount,
     uint64_t maximumBufferedPairs,
-    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
 
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,
