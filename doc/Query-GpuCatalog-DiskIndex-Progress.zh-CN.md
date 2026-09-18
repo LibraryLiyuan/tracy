@@ -111,7 +111,8 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - Windows占用验收直接以不共享delete的句柄锁住孤儿generation文件：下一次Build在Worker加载前受控失败，当前manifest/Reader保持可用，报告为`state=failed`且包含仍存项；释放句柄后重建成功，活跃旧Reader报告转为`deferred`，最终释放并回收后报告消失。Release全构建与CTest 39/39通过（125.11秒）。
 - QueryIndex的Build/Validate/CreateResourceContext/ManifestPath入口统一转为Win32 extended-length绝对路径；owner/Reader/cleanup lease、原子MoveFileEx、属性检查、manifest读取及映射文件句柄均使用同一`AnalysisIoPath`。普通短路径调用方无需预先加`\\?\`。
 - 334字符真实Catalog目录完成创建、复制、三次Build、深层sidecar发布、Reader租约、Windows占用失败报告、延期、回收和重开；此前同一路径在`create_directories`即失败。Release全构建与CTest 39/39通过（126.75秒）。
-- P6仍未完成：最后一个Reader释放时不会主动唤醒回收，只能在下一次Build或显式回收时处理。
+- Reader lease析构会先关闭共享句柄，再非阻塞取得同Trace owner锁并重新读取manifest；若自身generation已退休，则尝试排他租约回收并更新cleanup报告。builder仍活跃、其他Reader仍持有或manifest身份异常时不抢占，保留既有延期证据和下一次Build恢复路径。
+- 双Reader真实Catalog回归确认：第一个Reader释放后旧generation和`deferred`报告仍存在；最后一个Reader释放后旧generation、lease和cleanup报告立即消失，当前generation继续可用。Release全构建与CTest 39/39通过（124.78秒）。P6 generation生命周期组件已闭环；正式12.43 GB运行的8S最终容量和端到端发布仍是整项计划的未完成门禁。
 
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 

@@ -94,7 +94,8 @@ private:
 class QueryIndexReaderLease
 {
 public:
-    static std::shared_ptr<void> Acquire( const std::filesystem::path& path, std::string& error )
+    static std::shared_ptr<void> Acquire( const std::filesystem::path& path, std::string& error,
+        std::function<void()> cleanup = {} )
     {
         error.clear();
 #ifdef _WIN32
@@ -105,7 +106,7 @@ public:
             error = "Query generation reader lease failed: " + std::to_string( GetLastError() );
             return {};
         }
-        return std::shared_ptr<void>( new QueryIndexReaderLease( path, handle ), []( void* value ) {
+        return std::shared_ptr<void>( new QueryIndexReaderLease( path, handle, std::move( cleanup ) ), []( void* value ) {
             delete static_cast<QueryIndexReaderLease*>( value );
         } );
 #else
@@ -116,7 +117,7 @@ public:
             error = "Query generation reader lease failed";
             return {};
         }
-        return std::shared_ptr<void>( new QueryIndexReaderLease( path, fd ), []( void* value ) {
+        return std::shared_ptr<void>( new QueryIndexReaderLease( path, fd, std::move( cleanup ) ), []( void* value ) {
             delete static_cast<QueryIndexReaderLease*>( value );
         } );
 #endif
@@ -124,11 +125,11 @@ public:
 
 private:
 #ifdef _WIN32
-    QueryIndexReaderLease( std::filesystem::path path, HANDLE handle )
-        : m_path( std::move( path ) ), m_handle( handle ) {}
+    QueryIndexReaderLease( std::filesystem::path path, HANDLE handle, std::function<void()> cleanup )
+        : m_path( std::move( path ) ), m_cleanup( std::move( cleanup ) ), m_handle( handle ) {}
 #else
-    QueryIndexReaderLease( std::filesystem::path path, int fd )
-        : m_path( std::move( path ) ), m_fd( fd ) {}
+    QueryIndexReaderLease( std::filesystem::path path, int fd, std::function<void()> cleanup )
+        : m_path( std::move( path ) ), m_cleanup( std::move( cleanup ) ), m_fd( fd ) {}
 #endif
     ~QueryIndexReaderLease()
     {
@@ -137,9 +138,11 @@ private:
 #else
         if( m_fd >= 0 ) { flock( m_fd, LOCK_UN ); ::close( m_fd ); }
 #endif
+        if( m_cleanup ) try { m_cleanup(); } catch( ... ) {}
     }
 
     std::filesystem::path m_path;
+    std::function<void()> m_cleanup;
 #ifdef _WIN32
     HANDLE m_handle = INVALID_HANDLE_VALUE;
 #else
@@ -2935,6 +2938,49 @@ std::optional<std::string> CurrentPublishedGenerationBase( const std::filesystem
     }
 }
 
+std::shared_ptr<void> AcquireManifestReaderLease( const QueryIndexManifest& manifest,
+    const std::shared_ptr<QueryResourceContext>& resources, std::string& error )
+{
+    const auto root = manifest.dataPath.parent_path();
+    const auto identityPrefix = std::string( "jnidx." ) + manifest.sourceFingerprint.substr( 0, 16 ) +
+        ".s" + std::to_string( QueryIndexSchemaVersion ) + ".g";
+    const auto manifestPath = manifest.manifestPath;
+    auto cleanupDiagnostic = manifestPath;
+    cleanupDiagnostic += ".cleanup.json";
+    auto ownerLockPath = manifestPath;
+    ownerLockPath += ".owner.lock";
+    const auto sourceFingerprint = manifest.sourceFingerprint;
+    const auto cleanup = [root, identityPrefix, manifestPath, cleanupDiagnostic, ownerLockPath,
+            sourceFingerprint, resources] {
+        try
+        {
+            QueryIndexOwnerLease ownerLease( ownerLockPath );
+            const auto currentGeneration = CurrentPublishedGenerationBase(
+                manifestPath, identityPrefix, sourceFingerprint );
+            if( !currentGeneration ) return;
+            std::vector<std::filesystem::path> retained;
+            std::string cleanupError;
+            const auto disk = resources ? resources->Disk() : nullptr;
+            const bool complete = CleanupUnreferencedGenerations( root, identityPrefix,
+                *currentGeneration, disk, retained, cleanupError );
+            std::string reportError;
+            if( !complete )
+                WriteGenerationCleanupReport( cleanupDiagnostic, "failed", cleanupError,
+                    retained, resources, reportError );
+            else if( !retained.empty() )
+                WriteGenerationCleanupReport( cleanupDiagnostic, "deferred",
+                    "active reader or protected generation", retained, resources, reportError );
+            else ClearGenerationCleanupReport( cleanupDiagnostic, resources, reportError );
+        }
+        catch( ... )
+        {
+            // A builder or another final-reader callback owns the lock.  The
+            // durable deferred report and next Build remain the recovery path.
+        }
+    };
+    return QueryIndexReaderLease::Acquire( GenerationReaderLeasePath( manifest ), error, cleanup );
+}
+
 }
 
 bool QueryIndex::PublishPathForTesting( const std::filesystem::path& source, const std::filesystem::path& target,
@@ -3631,7 +3677,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         }
         manifest.dataPath = tracePath.parent_path() / dataFile;
         std::string leaseError;
-        manifest.readerLease = QueryIndexReaderLease::Acquire( GenerationReaderLeasePath( manifest ), leaseError );
+        manifest.readerLease = AcquireManifestReaderLease( manifest, resources, leaseError );
         if( !manifest.readerLease ) throw std::runtime_error( leaseError );
         manifest.cpuZoneIndex = parsed.at( "domains" ).value( "cpu_zone_index", false );
         manifest.gpuZoneIndex = parsed.at( "domains" ).value( "gpu_zone_index", false );
@@ -3864,18 +3910,17 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     std::shared_ptr<QueryResourceContext> resources )
 {
     auto leasedManifest = manifest;
-    if( !leasedManifest.readerLease )
-    {
-        std::string leaseError;
-        leasedManifest.readerLease = QueryIndexReaderLease::Acquire(
-            GenerationReaderLeasePath( leasedManifest ), leaseError );
-        if( !leasedManifest.readerLease ) throw std::runtime_error( leaseError );
-    }
     if(!resources)
     {
         auto tracePath=manifest.manifestPath;
         tracePath.replace_extension();
         resources=CreateResourceContext(tracePath);
+    }
+    if( !leasedManifest.readerLease )
+    {
+        std::string leaseError;
+        leasedManifest.readerLease = AcquireManifestReaderLease( leasedManifest, resources, leaseError );
+        if( !leasedManifest.readerLease ) throw std::runtime_error( leaseError );
     }
     resources->ValidateTraceIdentity(leasedManifest.sourceBytes,leasedManifest.sourceFingerprint);
     resources->SetPhase("compact-open");

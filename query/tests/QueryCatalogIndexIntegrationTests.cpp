@@ -69,6 +69,7 @@ int main( int argc, char** argv )
         { rejectedUnboundCompact = error.code == analysis::TraceLoadErrorCode::Corrupt; }
         Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
         auto indexed = query::QueryIndex::Open( manifest );
+        auto indexedPeer = query::QueryIndex::Open( manifest );
         Require( !indexed->CatalogDerivedDataReady(),
             "indexed trace silently claims GPU Catalog indices are ready" );
         const auto* statusSource = dynamic_cast<const query::QueryCatalogStatusSource*>( indexed.get() );
@@ -123,6 +124,11 @@ int main( int argc, char** argv )
                 "deferred generation cleanup report lost its retained files" );
         }
         indexed.reset();
+        Require( fs::exists( activeData ) && fs::is_regular_file( cleanupReport ),
+            "first Query reader release reclaimed a generation still held by another reader" );
+        indexedPeer.reset();
+        Require( !fs::exists( activeData ) && !fs::exists( cleanupReport ),
+            "last Query reader release did not reclaim its retired generation and cleanup report" );
         auto currentBase = second.dataPath.filename().string();
         const std::string dataSuffix = ".jnidx.data";
         currentBase.erase( currentBase.size() - dataSuffix.size() );
@@ -130,7 +136,7 @@ int main( int argc, char** argv )
         std::string cleanupError;
         Require( query::QueryIndex::CleanupUnreferencedGenerationsForTesting(
                 root, generationPrefix, currentBase, retained, cleanupError ) &&
-            !fs::exists( activeData ) && fs::exists( second.dataPath ) && retained.empty(),
+            fs::exists( second.dataPath ) && retained.empty(),
             "unused Query generations were not reclaimed after their reader lease ended" );
         const auto third = query::QueryIndex::Build( input );
         Require( !fs::exists( cleanupReport ) && !fs::exists( second.dataPath ) && fs::exists( third.dataPath ),

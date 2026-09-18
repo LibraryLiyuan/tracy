@@ -17,7 +17,7 @@
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
-P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace排他owner锁、同源/schema `.tmp`崩溃残留清理和schema26 Reader代次租约。旧generation仅在取得排他租约且不属于当前manifest时回收；固定后缀白名单、指纹/schema边界和symlink/reparse检查限制删除范围。下一次Build会在Worker加载前回收已释放的旧/孤儿最终代次；延期/失败项持久化到有界cleanup报告，成功后删除并释放账本。QueryIndex入口及直接Win32句柄统一使用extended-length路径，334字符真实Catalog流程通过。最后Reader析构时的主动回收仍待完成。
+P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace排他owner锁、同源/schema `.tmp`崩溃残留清理和schema26 Reader代次租约。旧generation仅在取得排他租约且不属于当前manifest时回收；固定后缀白名单、指纹/schema边界和symlink/reparse检查限制删除范围。下一次Build会在Worker加载前回收已释放的旧/孤儿最终代次；延期/失败项持久化到有界cleanup报告，成功后删除并释放账本。QueryIndex入口及直接Win32句柄统一使用extended-length路径，334字符真实Catalog流程通过。最后Reader析构会在owner锁和当前manifest复核后主动回收；双Reader先后释放回归通过。正式大文件8S容量与发布尚未验收。
 
 ## 本轮验证
 
@@ -35,6 +35,7 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - 同一真实Catalog回归在当前Reader活跃时注入同源/schema26孤儿最终文件；下一次Build在首次Worker状态回调前删除孤儿，同时保留manifest当前generation，证明起始回收发生在大对象加载前。
 - Windows文件占用回归确认：孤儿最终文件被非共享delete句柄占用时，Build不进入Worker加载、不替换manifest，并原子保留有界失败报告；释放后重试、延期和最终成功三种状态一致，最终无cleanup报告。Release全构建与CTest 39/39通过（125.11秒）。
 - Windows长路径回归使用334字符输出目录，覆盖Catalog复制、QueryIndex创建/校验/打开、三次generation发布、owner/Reader lease、MoveFileEx、清理报告和递归回收；完整流程通过，随后Release全构建与CTest 39/39通过（126.75秒）。
+- 双Reader真实回归覆盖最后释放触发：第一个析构因另一个共享租约仍在而保留旧generation和延期报告；最后一个析构取得排他租约并在复核manifest后立即回收，未删除当前generation。Release全构建与CTest 39/39通过（124.78秒）。
 - Catalog名称元数据校验使用32字节定长外排记录，在`(generation,nameId)`组内先处理定义再核对Resource/Logical引用；512K记录run对应16 MiB工作区，多run归并、hash/长度破坏夹具和真实1,001资源Catalog通过。Release全构建与CTest 39/39通过（125.10秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。
