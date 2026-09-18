@@ -346,6 +346,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
     std::filesystem::create_directories( scratchRoot );
     const auto sequenceSource = scratchRoot / "sequence-source.work";
     const auto sequenceSorted = scratchRoot / "sequence-sorted.work";
+    const auto nameMetadataSource = scratchRoot / "name-metadata-source.work";
+    const auto nameMetadataSorted = scratchRoot / "name-metadata-sorted.work";
     enum class ReferenceKind : size_t { Resource, Allocation, Logical, String, Count };
     constexpr size_t ReferenceKindCount = size_t( ReferenceKind::Count );
     const std::array<const char*, ReferenceKindCount> referenceNames { "resource", "allocation", "logical", "string" };
@@ -353,6 +355,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
     std::array<std::filesystem::path, ReferenceKindCount> definitionSorted, referenceSorted;
     std::array<std::ofstream, ReferenceKindCount> definitionOutputs, referenceOutputs;
     std::array<uint64_t, ReferenceKindCount> definitionCounts {}, referenceCounts {};
+    std::ofstream nameMetadataOutput;
+    uint64_t nameMetadataCount = 0;
     for( size_t index = 0; index < ReferenceKindCount; index++ )
     {
         definitionSources[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-definition-source.work" );
@@ -388,6 +392,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( !definitionOutputs[index] || !referenceOutputs[index] )
                 throw std::runtime_error( "Catalog reference scratch cannot be opened" );
         }
+        nameMetadataOutput.open( nameMetadataSource, std::ios::binary | std::ios::trunc );
+        if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch cannot be opened" );
         const auto appendReferencePair = [&]( ReferenceKind kind, bool definition, uint64_t generation, uint64_t id ) {
             if( id == 0 ) return;
             analysis::AnalysisUInt64Pair pair { generation, id };
@@ -398,6 +404,20 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( !output ) throw std::runtime_error( "Catalog reference scratch write failed" );
             if( definition ) definitionCounts[index]++;
             else referenceCounts[index]++;
+        };
+        const auto appendNameMetadata = [&]( bool definition, uint64_t generation, uint32_t id,
+            uint64_t hash, uint32_t originalLength ) {
+            if( id == 0 ) return;
+            analysis::AnalysisKeyMetadataRecord record;
+            record.keyHigh = generation;
+            record.keyLow = id;
+            record.metadata = hash;
+            record.auxiliary = originalLength;
+            record.kind = definition ? 0 : 1;
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( record ) );
+            nameMetadataOutput.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
+            if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch write failed" );
+            nameMetadataCount++;
         };
         const auto emitFixedReferences = [&]( OfflineCatalogDomain domain, uint64_t generation,
             const unsigned char* bytes, uint64_t count ) {
@@ -417,6 +437,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                     appendReferencePair( ReferenceKind::Resource, true, generation, row.resourceId );
                     appendReferencePair( ReferenceKind::Allocation, false, generation, row.allocationId );
                     appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
+                    appendNameMetadata( false, generation, row.nameId, row.nameHash, row.nameOriginalLength );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogAllocation:
@@ -434,6 +455,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                     appendReferencePair( ReferenceKind::Logical, true, generation, row.logicalResourceId );
                     appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
                     appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
+                    appendNameMetadata( false, generation, row.nameId, row.nameHash, row.nameOriginalLength );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogPart:
@@ -551,6 +573,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                           JnGpuCatalogChecksum64( row.bytes.data(), row.header.byteLength ) != row.header.hash ) )
                         note( "CATALOG_STRING_HASH" );
                     appendReferencePair( ReferenceKind::String, true, row.generation, row.header.stringId );
+                    appendNameMetadata( true, row.generation, row.header.stringId,
+                        row.header.hash, row.header.originalLength );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, &row.header, sizeof( row.header ) );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, row.bytes.data(), row.header.byteLength );
                     payloadBytes += sizeof( row.header ) + row.header.byteLength;
@@ -588,6 +612,9 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             definitionOutputs[index].close();
             referenceOutputs[index].close();
         }
+        nameMetadataOutput.flush();
+        if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch flush failed" );
+        nameMetadataOutput.close();
 
         for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
         {
@@ -675,6 +702,47 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             references.close();
             if( missing != 0 ) note( "CATALOG_CROSS_TABLE_REFERENCE", missing );
         }
+        if( !analysis::SortAnalysisKeyMetadataRecords( nameMetadataSource, nameMetadataSorted, scratchRoot,
+                "catalog-name-metadata", nameMetadataCount, 512 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog name metadata sort failed: " + sortError );
+        std::ifstream nameMetadata( nameMetadataSorted, std::ios::binary );
+        if( !nameMetadata ) throw std::runtime_error( "Catalog sorted name metadata cannot be opened" );
+        analysis::AnalysisKeyMetadataRecord record {};
+        uint64_t metadataGeneration = 0;
+        uint64_t metadataId = 0;
+        uint64_t definitionHash = 0;
+        uint32_t definitionLength = 0;
+        bool haveGroup = false;
+        bool haveDefinition = false;
+        while( nameMetadata.read( reinterpret_cast<char*>( &record ), sizeof( record ) ) )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog semantic validation cancelled" );
+            if( !haveGroup || record.keyHigh != metadataGeneration || record.keyLow != metadataId )
+            {
+                metadataGeneration = record.keyHigh;
+                metadataId = record.keyLow;
+                haveGroup = true;
+                haveDefinition = false;
+            }
+            if( record.kind == 0 )
+            {
+                if( haveDefinition && ( record.metadata != definitionHash || record.auxiliary != definitionLength ) )
+                    note( "CATALOG_NAME_METADATA" );
+                else if( !haveDefinition )
+                {
+                    definitionHash = record.metadata;
+                    definitionLength = record.auxiliary;
+                    haveDefinition = true;
+                }
+            }
+            else if( haveDefinition &&
+                ( record.metadata != definitionHash || record.auxiliary != definitionLength ) )
+                note( "CATALOG_NAME_METADATA" );
+        }
+        if( !nameMetadata.eof() ) throw std::runtime_error( "Catalog sorted name metadata read failed" );
+        nameMetadata.close();
         result.complete = true;
         result.healthy = result.present && result.originalValid && result.findings.empty();
         if( const auto cleanupError = cleanup(); !cleanupError.empty() )
@@ -686,6 +754,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
         const auto failure = std::current_exception();
         for( auto& output : definitionOutputs ) if( output.is_open() ) output.close();
         for( auto& output : referenceOutputs ) if( output.is_open() ) output.close();
+        if( nameMetadataOutput.is_open() ) nameMetadataOutput.close();
         if( const auto cleanupError = cleanup(); !cleanupError.empty() )
             throw std::runtime_error( "Catalog semantic validation scratch cleanup failed: " + cleanupError );
         std::rethrow_exception( failure );

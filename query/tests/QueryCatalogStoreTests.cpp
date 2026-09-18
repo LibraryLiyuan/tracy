@@ -2,11 +2,13 @@
 #include "TracyQueue.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
 #include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisExternalSort.hpp"
 #include "TracyPagedRecordStore.hpp"
 
 #if __has_include( "TracyQueryCatalogStore.hpp" )
@@ -45,6 +47,8 @@ int main()
         writer.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
         JnGpuCatalogResourceRecordV1 resources[3] {};
         resources[0].time = 10; resources[0].resourceId = 100; resources[0].capacityBytes = 4096;
+        resources[0].nameId = 7; resources[0].nameOriginalLength = 4;
+        resources[0].nameHash = JnGpuCatalogChecksum64( "main", 4 );
         resources[1].time = 20; resources[1].resourceId = 101; resources[1].capacityBytes = 8192;
         resources[2].time = 30; resources[2].resourceId = 102; resources[2].capacityBytes = 16384;
         writer.Begin( OfflineCatalogDomain::CatalogResource, 3, sizeof( resources[0] ) );
@@ -194,6 +198,56 @@ int main()
             hasFinding( crossReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
             "Catalog cross-table reference corruption was accepted" );
 
+        const auto nameMetadataRoot = root.parent_path() / "tracy-query-catalog-semantic-name-metadata";
+        writeVariant( nameMetadataRoot, []( auto* variantResources, auto* variantBatches, auto&, auto& ) {
+            variantResources[0].nameHash ^= 1;
+            variantResources[1].nameId = 7;
+            variantResources[1].nameHash = JnGpuCatalogChecksum64( "main", 4 );
+            variantResources[1].nameOriginalLength = 3;
+            variantBatches[0].storedChecksum = JnGpuCatalogChecksum64( variantResources,
+                sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
+        } );
+        QueryCatalogStoreReader nameMetadataReader( nameMetadataRoot, identity );
+        const auto nameMetadataValidation = nameMetadataReader.ValidateSemantics( nameMetadataRoot / "semantic-validation" );
+        Require( nameMetadataValidation.complete && !nameMetadataValidation.healthy &&
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_METADATA" ),
+            "Catalog name hash/length corruption was accepted" );
+
+        const auto metadataSortRoot = root.parent_path() / "tracy-query-catalog-metadata-sort";
+        fs::remove_all( metadataSortRoot, ignored );
+        fs::create_directories( metadataSortRoot );
+        const analysis::AnalysisKeyMetadataRecord unsortedMetadata[] = {
+            { 9, 7, 30, 4, 1, {} }, { 8, 9, 10, 1, 1, {} }, { 9, 7, 20, 4, 0, {} },
+            { 9, 6, 40, 2, 1, {} }, { 9, 7, 20, 3, 0, {} }
+        };
+        {
+            std::ofstream output( metadataSortRoot / "source.work", std::ios::binary );
+            output.write( reinterpret_cast<const char*>( unsortedMetadata ), sizeof( unsortedMetadata ) );
+        }
+        std::string metadataSortError;
+        Require( analysis::SortAnalysisKeyMetadataRecords( metadataSortRoot / "source.work",
+                metadataSortRoot / "sorted.work", metadataSortRoot, "metadata-test",
+                std::size( unsortedMetadata ), 2, metadataSortError ),
+            "Catalog metadata external multi-run sort failed" );
+        {
+            std::ifstream input( metadataSortRoot / "sorted.work", std::ios::binary );
+            analysis::AnalysisKeyMetadataRecord previous {};
+            for( size_t index = 0; index < std::size( unsortedMetadata ); index++ )
+            {
+                analysis::AnalysisKeyMetadataRecord current {};
+                input.read( reinterpret_cast<char*>( &current ), sizeof( current ) );
+                Require( input.good(), "Catalog metadata external sort output was truncated" );
+                if( index != 0 ) Require(
+                    previous.keyHigh < current.keyHigh ||
+                    ( previous.keyHigh == current.keyHigh && previous.keyLow < current.keyLow ) ||
+                    ( previous.keyHigh == current.keyHigh && previous.keyLow == current.keyLow &&
+                      ( previous.kind < current.kind ||
+                        ( previous.kind == current.kind && previous.metadata <= current.metadata ) ) ),
+                    "Catalog metadata external sort order changed" );
+                previous = current;
+            }
+        }
+
         bool identityRejected = false;
         try { QueryCatalogStoreReader mismatch( root, std::string( 64, 'e' ) ); }
         catch( const std::exception& ) { identityRejected = true; }
@@ -225,6 +279,8 @@ int main()
         fs::remove_all( generationRoot, ignored );
         fs::remove_all( stringGenerationRoot, ignored );
         fs::remove_all( crossReferenceRoot, ignored );
+        fs::remove_all( nameMetadataRoot, ignored );
+        fs::remove_all( metadataSortRoot, ignored );
         std::cout << "query Catalog store passed\n";
         return 0;
 #endif

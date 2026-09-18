@@ -13,7 +13,7 @@
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema25已持久化Catalog原始质量和磁盘重验证结果；显式Resource/Allocation/Logical/String定义与Resource/Allocation/View/Logical/Part/VG/Range引用使用generation-aware外排归并。Relation/Evidence多态source/target仍待按协议种类补齐，再建派生索引和迁移消费者 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema26沿用持久化Catalog原始质量和磁盘重验证结果；显式Resource/Allocation/Logical/String定义与Resource/Allocation/View/Logical/Part/VG/Range引用使用generation-aware外排归并。Resource/Logical名称hash和原始长度也与String定义通过32字节外排记录精确归并。Relation/Evidence多态source/target仍待按可证明协议种类补齐，再建派生索引和迁移消费者 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
@@ -32,4 +32,5 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - schema24 正式Trace范围诊断R3仍在2,704.324秒达到45分钟边界；Private Bytes峰值9,771,753,472字节。停止后顺序扫描422,576,574条CPU记录确认动态名称未解析=0、非法Extra=0、线程run=28，剩余热点收敛到PlayerLoop第二次全表扫描的逐记录集合哈希。该来源判定已改成64 KiB定长表，finding键改为无分配`string_view`；Release全构建、CTest 38/38（120.13秒）和小型真实索引语义回归通过，未机械启动第四轮正式诊断。
 - IndexedTraceSource原先在manifest缺少预计算Zone校验时会重新分配与全部Extra等长的名称状态和全量调用栈vector。该回退已删除；schema24把完整预计算校验作为可重开门禁，缺失或未完成时索引失效并重建。小型夹具把`precomputed`改为false后确认会重建并恢复20,000条调用栈引用告警，未把未就绪状态报告为健康。
 - schema26真实小型Catalog回归确认：IndexedTraceSource持有共享Reader租约时，再发布不会删除旧generation；释放后旧generation与租约可安全回收。回收只接受20种固定拥有后缀，同前缀未知文件和其他指纹文件均保留。Release全构建与CTest 39/39通过（123.53秒）。
+- Catalog名称元数据校验使用32字节定长外排记录，在`(generation,nameId)`组内先处理定义再核对Resource/Logical引用；512K记录run对应16 MiB工作区，多run归并、hash/长度破坏夹具和真实1,001资源Catalog通过。Release全构建与CTest 39/39通过（125.10秒）。
 - 未运行 12.43 GB 正式 Trace。

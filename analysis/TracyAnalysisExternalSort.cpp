@@ -4,6 +4,7 @@
 #include <fstream>
 #include <limits>
 #include <queue>
+#include <string_view>
 #include <vector>
 
 namespace tracy::analysis
@@ -18,46 +19,58 @@ bool PairLess( const AnalysisUInt64Pair& lhs, const AnalysisUInt64Pair& rhs )
     return lhs.key < rhs.key || ( lhs.key == rhs.key && lhs.value < rhs.value );
 }
 
+bool MetadataLess( const AnalysisKeyMetadataRecord& lhs, const AnalysisKeyMetadataRecord& rhs )
+{
+    if( lhs.keyHigh != rhs.keyHigh ) return lhs.keyHigh < rhs.keyHigh;
+    if( lhs.keyLow != rhs.keyLow ) return lhs.keyLow < rhs.keyLow;
+    if( lhs.kind != rhs.kind ) return lhs.kind < rhs.kind;
+    if( lhs.metadata != rhs.metadata ) return lhs.metadata < rhs.metadata;
+    return lhs.auxiliary < rhs.auxiliary;
+}
+
+template<typename Record, typename Less>
 bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     const std::filesystem::path& output, uint64_t& written, std::string& error,
     const std::shared_ptr<AnalysisDiskBudget>& disk,
-    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    Less less, std::string_view errorPrefix )
 {
     AnalysisWorkspaceReservation mergeWorkspace(workspace,65536+uint64_t(inputs.size())*2048);
     struct Cursor
     {
         std::ifstream input;
-        AnalysisUInt64Pair value;
+        Record value;
     };
     struct Head
     {
-        AnalysisUInt64Pair value;
+        Record value;
         size_t run = 0;
     };
     struct Greater
     {
+        Less less;
         bool operator()( const Head& lhs, const Head& rhs ) const
         {
-            if( PairLess( rhs.value, lhs.value ) ) return true;
-            if( PairLess( lhs.value, rhs.value ) ) return false;
+            if( less( rhs.value, lhs.value ) ) return true;
+            if( less( lhs.value, rhs.value ) ) return false;
             return lhs.run > rhs.run;
         }
     };
 
     std::ofstream out( output, std::ios::binary | std::ios::trunc );
-    if( !out ) { error = "analysis_pair_sort_merge_output_open_failed"; return false; }
+    if( !out ) { error = std::string( errorPrefix ) + "_merge_output_open_failed"; return false; }
     std::vector<Cursor> cursors( inputs.size() );
-    std::priority_queue<Head, std::vector<Head>, Greater> heap;
+    std::priority_queue<Head, std::vector<Head>, Greater> heap( Greater { less } );
     for( size_t index = 0; index < inputs.size(); ++index )
     {
         cursors[index].input.open( inputs[index], std::ios::binary );
         if( !cursors[index].input )
-        { error = "analysis_pair_sort_run_open_failed"; return false; }
+        { error = std::string( errorPrefix ) + "_run_open_failed"; return false; }
         if( cursors[index].input.read( reinterpret_cast<char*>( &cursors[index].value ),
-            sizeof( AnalysisUInt64Pair ) ) )
+            sizeof( Record ) ) )
             heap.push( { cursors[index].value, index } );
         else if( !cursors[index].input.eof() )
-        { error = "analysis_pair_sort_run_read_failed"; return false; }
+        { error = std::string( errorPrefix ) + "_run_read_failed"; return false; }
     }
 
     written = 0;
@@ -67,16 +80,16 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
         heap.pop();
         AnalysisDiskGrow(disk,sizeof(head.value));
         out.write( reinterpret_cast<const char*>( &head.value ), sizeof( head.value ) );
-        if( !out ) { error = "analysis_pair_sort_merge_write_failed"; return false; }
+        if( !out ) { error = std::string( errorPrefix ) + "_merge_write_failed"; return false; }
         ++written;
         auto& cursor = cursors[head.run];
-        if( cursor.input.read( reinterpret_cast<char*>( &cursor.value ), sizeof( cursor.value ) ) )
+        if( cursor.input.read( reinterpret_cast<char*>( &cursor.value ), sizeof( Record ) ) )
             heap.push( { cursor.value, head.run } );
         else if( !cursor.input.eof() )
-        { error = "analysis_pair_sort_run_read_failed"; return false; }
+        { error = std::string( errorPrefix ) + "_run_read_failed"; return false; }
     }
     out.flush();
-    if( !out ) { error = "analysis_pair_sort_merge_flush_failed"; return false; }
+    if( !out ) { error = std::string( errorPrefix ) + "_merge_flush_failed"; return false; }
     out.close();
     for( auto& cursor : cursors ) cursor.input.close();
     return true;
@@ -195,7 +208,8 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
             const auto merged = temporaryRoot / ( prefix + "-run-" +
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
-            if( !MergeRuns( group, merged, written, error,disk,workspace ) ) return false;
+            if( !MergeRuns<AnalysisUInt64Pair>( group, merged, written, error,disk,workspace,
+                    PairLess, "analysis_pair_sort" ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {
@@ -220,6 +234,103 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     const auto outputBytes = std::filesystem::file_size( output, ec );
     if( ec || outputBytes != expectedCount * sizeof( AnalysisUInt64Pair ) )
     { error = "analysis_pair_sort_output_size_mismatch"; return false; }
+    return true;
+}
+
+bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
+    const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
+    const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+{
+    using Record = AnalysisKeyMetadataRecord;
+    error.clear();
+    if( maximumBufferedRecords == 0 ) maximumBufferedRecords = 1;
+    maximumBufferedRecords = std::min<uint64_t>( maximumBufferedRecords,
+        std::numeric_limits<size_t>::max() );
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size( source, ec );
+    if( ec ) { error = "analysis_metadata_sort_source_size_failed:" + ec.message(); return false; }
+    if( expectedCount > std::numeric_limits<uint64_t>::max() / sizeof( Record ) ||
+        bytes != expectedCount * sizeof( Record ) )
+    { error = "analysis_metadata_sort_source_size_mismatch"; return false; }
+    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error,disk ) ) return false;
+
+    std::ifstream in( source, std::ios::binary );
+    if( !in ) { error = "analysis_metadata_sort_source_open_failed"; return false; }
+    std::vector<std::filesystem::path> runs;
+    uint64_t remaining = expectedCount;
+    size_t runIndex = 0;
+    while( remaining != 0 )
+    {
+        const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedRecords ) );
+        AnalysisWorkspaceReservation runWorkspace( workspace, uint64_t( take ) * sizeof( Record ) );
+        std::vector<Record> values( take );
+        in.read( reinterpret_cast<char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        if( !in ) { error = "analysis_metadata_sort_source_truncated"; return false; }
+        std::sort( values.begin(), values.end(), MetadataLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" +
+            std::to_string( runIndex++ ) + ".work" );
+        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
+        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        if( !out ) { error = "analysis_metadata_sort_run_write_open_failed"; return false; }
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) { error = "analysis_metadata_sort_run_write_failed"; return false; }
+        out.close();
+        runs.emplace_back( run );
+        remaining -= take;
+    }
+    in.close();
+
+    if( runs.empty() )
+    {
+        const auto previous = disk && disk->usage ? AnalysisDiskUsage::Bytes( output ) : 0;
+        std::ofstream out( output, std::ios::binary | std::ios::trunc );
+        if( !out ) { error = "analysis_metadata_sort_output_open_failed"; return false; }
+        if( disk && disk->usage ) disk->usage->Release( previous );
+        return true;
+    }
+
+    size_t pass = 1;
+    while( runs.size() > 1 )
+    {
+        std::vector<std::filesystem::path> next;
+        for( size_t first = 0; first < runs.size(); first += MergeFanIn )
+        {
+            const auto last = std::min( first + MergeFanIn, runs.size() );
+            const std::vector<std::filesystem::path> group( runs.begin() + first, runs.begin() + last );
+            const auto merged = temporaryRoot / ( prefix + "-run-" +
+                std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
+            uint64_t written = 0;
+            if( !MergeRuns<Record>( group, merged, written, error, disk, workspace,
+                    MetadataLess, "analysis_metadata_sort" ) ) return false;
+            uint64_t expected = 0;
+            for( const auto& path : group )
+            {
+                const auto size = std::filesystem::file_size( path, ec );
+                if( ec || size % sizeof( Record ) != 0 )
+                { error = "analysis_metadata_sort_run_size_invalid"; return false; }
+                expected += size / sizeof( Record );
+            }
+            if( written != expected )
+            { error = "analysis_metadata_sort_merge_count_mismatch"; return false; }
+            if( !RemoveFiles( group, error,disk ) ) return false;
+            next.emplace_back( merged );
+        }
+        runs = std::move( next );
+        ++pass;
+    }
+
+    AnalysisDiskRemove( output, disk, ec );
+    ec.clear();
+    std::filesystem::rename( runs.front(), output, ec );
+    if( ec ) { error = "analysis_metadata_sort_publish_failed:" + ec.message(); return false; }
+    const auto outputBytes = std::filesystem::file_size( output, ec );
+    if( ec || outputBytes != expectedCount * sizeof( Record ) )
+    { error = "analysis_metadata_sort_output_size_mismatch"; return false; }
     return true;
 }
 

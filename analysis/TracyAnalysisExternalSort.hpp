@@ -18,6 +18,18 @@ struct AnalysisUInt64Pair
 
 static_assert( sizeof( AnalysisUInt64Pair ) == 16 );
 
+struct AnalysisKeyMetadataRecord
+{
+    uint64_t keyHigh = 0;
+    uint64_t keyLow = 0;
+    uint64_t metadata = 0;
+    uint32_t auxiliary = 0;
+    uint8_t kind = 0;
+    uint8_t reserved[3] {};
+};
+
+static_assert( sizeof( AnalysisKeyMetadataRecord ) == 32 );
+
 bool SortAnalysisUInt64Pairs(
     const std::filesystem::path& source,
     const std::filesystem::path& output,
@@ -25,6 +37,16 @@ bool SortAnalysisUInt64Pairs(
     const std::string& prefix,
     uint64_t expectedCount,
     uint64_t maximumBufferedPairs,
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
+
+bool SortAnalysisKeyMetadataRecords(
+    const std::filesystem::path& source,
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t expectedCount,
+    uint64_t maximumBufferedRecords,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
 
