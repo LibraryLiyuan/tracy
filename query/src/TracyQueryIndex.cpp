@@ -313,14 +313,22 @@ class QuerySerializedCallstackSource final : public SerializedCallstackSource
 {
 public:
     explicit QuerySerializedCallstackSource( std::shared_ptr<QueryCallstackStoreReader> store ) : m_store( std::move( store ) ) {}
+    void SetFrames( std::shared_ptr<QueryCallstackFrameStoreReader> frames ) { m_frames=std::move(frames); }
     uint64_t CallstackCount() const override { return m_store->Count(); }
     const CallstackFrameId* Frames( uint32_t id, uint32_t& count ) const override
     {
         if( id == 0 || id > m_store->Count() ) { count = 0; return nullptr; }
         const auto value=m_store->Frames(id);count=uint32_t(value.size());return value.data();
     }
+    uint64_t FrameCount() const override { return m_frames?m_frames->Count():0; }
+    bool Frame( CallstackFrameId id, FrameView& output ) const override
+    {
+        if(!m_frames)return false;const auto value=m_frames->Find(id);if(!value)return false;
+        output.imageName=value->imageName;output.frames=value->frames.data();output.count=uint8_t(value->frames.size());return true;
+    }
 private:
     std::shared_ptr<QueryCallstackStoreReader> m_store;
+    std::shared_ptr<QueryCallstackFrameStoreReader> m_frames;
 };
 
 class ZoneIndexWriter final : public SerializedZoneSink
@@ -330,17 +338,18 @@ public:
 
     ZoneIndexWriter( std::filesystem::path extras, std::filesystem::path cpu, std::filesystem::path gpu,
         std::filesystem::path samples, std::filesystem::path catalog, std::filesystem::path strings,
-        std::filesystem::path callstacks,
+        std::filesystem::path callstacks, std::filesystem::path callstackFrames,
         std::array<std::filesystem::path, JnDomainCount> jnPaths,
         std::string sourceFingerprint, analysis::PagedRecordOptions storageOptions = {} )
         : m_extraPath( std::move( extras ) ), m_cpuPath( std::move( cpu ) ), m_gpuPath( std::move( gpu ) )
-        , m_samplePath( std::move( samples ) ), m_stringPath( std::move( strings ) ), m_callstackPath( std::move( callstacks ) ), m_jnPaths( std::move( jnPaths ) )
+        , m_samplePath( std::move( samples ) ), m_stringPath( std::move( strings ) ), m_callstackPath( std::move( callstacks ) ), m_callstackFramePath( std::move( callstackFrames ) ), m_jnPaths( std::move( jnPaths ) )
         , m_sourceFingerprint( std::move( sourceFingerprint ) )
         , m_storageOptions( std::move( storageOptions ) )
         , m_samples( m_samplePath, m_sourceFingerprint, m_storageOptions )
         , m_catalog( std::move( catalog ), m_sourceFingerprint, m_storageOptions )
         , m_stringWriter( std::make_unique<QueryStringStoreWriter>( m_stringPath, m_sourceFingerprint, m_storageOptions ) )
         , m_callstackWriter( std::make_unique<QueryCallstackStoreWriter>( m_callstackPath, m_sourceFingerprint, m_storageOptions ) )
+        , m_callstackFrameWriter( std::make_unique<QueryCallstackFrameStoreWriter>( m_callstackFramePath, m_sourceFingerprint, m_storageOptions ) )
     {}
 
     bool WantsGlobalStrings() const override { return true; }
@@ -378,7 +387,17 @@ public:
     }
     SerializedCallstackSource* GlobalCallstackSource() override { return m_callstackSource.get(); }
     uint64_t CallstackCount() const { return m_callstackReader?m_callstackReader->Count():0; }
-    void ReleaseExternalSources() { m_stringSource.reset(); m_stringReader.reset(); m_callstackSource.reset(); m_callstackReader.reset(); }
+    bool WantsCallstackFrames() const override { return true; }
+    void CallstackFrameDefinitionsBegin( uint64_t count ) override { m_callstackFrameWriter->Begin(count); }
+    void CallstackFrameDefinitionBegin( uint64_t ordinal, CallstackFrameId id, uint8_t count, StringIdx imageName ) override { m_callstackFrameWriter->FrameBegin(ordinal,id,count,imageName); }
+    void CallstackFrameDefinitionRecords( uint64_t ordinal, uint32_t offset, const CallstackFrame* frames, uint32_t count ) override { m_callstackFrameWriter->FrameRecords(ordinal,offset,frames,count); }
+    void CallstackFrameDefinitionEnd( uint64_t ordinal ) override { m_callstackFrameWriter->FrameEnd(ordinal); }
+    void CallstackFrameDefinitionsEnd() override
+    {
+        m_callstackFrameWriter->Commit();m_callstackFrameWriter.reset();m_callstackFrameReader=std::make_shared<QueryCallstackFrameStoreReader>(m_callstackFramePath,m_sourceFingerprint,m_storageOptions);m_callstackSource->SetFrames(m_callstackFrameReader);
+    }
+    uint64_t CallstackFrameCount() const { return m_callstackFrameReader?m_callstackFrameReader->Count():0; }
+    void ReleaseExternalSources() { m_stringSource.reset(); m_stringReader.reset(); m_callstackSource.reset(); m_callstackReader.reset(); m_callstackFrameReader.reset(); }
 
     void ZoneExtrasBegin( uint64_t count ) override { m_expectedExtras = count; m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint, m_storageOptions.disk ); }
     void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) override
@@ -646,7 +665,7 @@ public:
 
 private:
     struct CpuSpan { uint64_t thread; uint64_t start; uint64_t count; };
-    std::filesystem::path m_extraPath, m_cpuPath, m_gpuPath, m_samplePath, m_stringPath, m_callstackPath;
+    std::filesystem::path m_extraPath, m_cpuPath, m_gpuPath, m_samplePath, m_stringPath, m_callstackPath, m_callstackFramePath;
     std::array<std::filesystem::path, JnDomainCount> m_jnPaths;
     std::string m_sourceFingerprint;
     analysis::PagedRecordOptions m_storageOptions;
@@ -670,6 +689,8 @@ private:
     std::unique_ptr<QueryCallstackStoreWriter> m_callstackWriter;
     std::shared_ptr<QueryCallstackStoreReader> m_callstackReader;
     std::unique_ptr<QuerySerializedCallstackSource> m_callstackSource;
+    std::unique_ptr<QueryCallstackFrameStoreWriter> m_callstackFrameWriter;
+    std::shared_ptr<QueryCallstackFrameStoreReader> m_callstackFrameReader;
     bool m_catalogMetadata = false;
 };
 
@@ -2472,6 +2493,7 @@ json ManifestJson( const QueryIndexManifest& value )
             { "sample", section( value.samples ) },
             { "global_string", section( value.globalStrings ) },
             { "global_callstack", section( value.globalCallstacks ) },
+            { "global_callstack_frame", section( value.globalCallstackFrames ) },
             { "gpu_catalog", section( value.gpuCatalog ) },
             { "job_stage", section( value.jobStages ) },
             { "gfx_entity", section( value.gfxEntities ) },
@@ -2563,6 +2585,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     result.samples.path = tracePath.parent_path() / ( baseName + ".jnidx.sample" );
     result.globalStrings.path = tracePath.parent_path() / ( baseName + ".jnidx.string" );
     result.globalCallstacks.path = tracePath.parent_path() / ( baseName + ".jnidx.callstack" );
+    result.globalCallstackFrames.path = tracePath.parent_path() / ( baseName + ".jnidx.callstack-frame" );
     result.gpuCatalog.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-catalog" );
     result.jobStages.path = tracePath.parent_path() / ( baseName + ".jnidx.job-stage" );
     result.gfxEntities.path = tracePath.parent_path() / ( baseName + ".jnidx.gfx-entity" );
@@ -2580,6 +2603,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     result.samples.recordBytes = QuerySampleStoreRecordBytes;
     result.globalStrings.recordBytes = 0;
     result.globalCallstacks.recordBytes = 0;
+    result.globalCallstackFrames.recordBytes = 0;
     result.gpuCatalog.recordBytes = 0;
     result.jobStages.recordBytes = sizeof( JnJobStageData );
     result.gfxEntities.recordBytes = sizeof( JnGfxEntityData );
@@ -2607,6 +2631,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     auto temporarySamples = result.samples.path; temporarySamples += suffix;
     auto temporaryStrings = result.globalStrings.path; temporaryStrings += suffix;
     auto temporaryCallstacks = result.globalCallstacks.path; temporaryCallstacks += suffix;
+    auto temporaryCallstackFrames = result.globalCallstackFrames.path; temporaryCallstackFrames += suffix;
     auto temporaryCatalog = result.gpuCatalog.path; temporaryCatalog += suffix;
     std::array<std::filesystem::path, ZoneIndexWriter::JnDomainCount> temporaryJn;
     for( size_t index = 0; index < temporaryJn.size(); index++ ) { temporaryJn[index] = jnSections[index]->path; temporaryJn[index] += suffix; }
@@ -2621,7 +2646,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     resources->ValidateTraceIdentity(result.sourceBytes,result.sourceFingerprint);
     resources->IncludeDiskRoots({
         result.manifestPath,result.dataPath,result.zoneExtras.path,result.cpuZones.path,result.gpuZones.path,
-        result.samples.path,result.globalStrings.path,result.globalCallstacks.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
+        result.samples.path,result.globalStrings.path,result.globalCallstacks.path,result.globalCallstackFrames.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
         result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
         result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,
         failureDiagnostic,temporaryValidation
@@ -2633,7 +2658,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();
-        ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryCatalog, temporaryStrings, temporaryCallstacks,
+        ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryCatalog, temporaryStrings, temporaryCallstacks, temporaryCallstackFrames,
             temporaryJn, result.sourceFingerprint, storageOptions );
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
             analysis::WorkerTraceLoadMode::CompactIndex, &writer, ResourceReadHooks(resources,"worker-load:" ) );
@@ -2669,6 +2694,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         result.globalCallstacks.declaredCount = result.globalCallstacks.count;
         result.globalCallstacks.bytes = SectionBytes( temporaryCallstacks );
         result.globalCallstacks.fingerprint = SectionFingerprint( temporaryCallstacks );
+        result.globalCallstackFrames.count = writer.CallstackFrameCount();
+        result.globalCallstackFrames.declaredCount = result.globalCallstackFrames.count;
+        result.globalCallstackFrames.bytes = SectionBytes( temporaryCallstackFrames );
+        result.globalCallstackFrames.fingerprint = SectionFingerprint( temporaryCallstackFrames );
         {
             QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint, storageOptions );
             uint64_t count = 0;
@@ -2966,6 +2995,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         if( !AtomicReplace( temporarySamples, result.samples.path, error ) ) throw std::runtime_error( "cannot commit sample index: " + error );
         if( !AtomicReplace( temporaryStrings, result.globalStrings.path, error ) ) throw std::runtime_error( "cannot commit global string index: " + error );
         if( !AtomicReplace( temporaryCallstacks, result.globalCallstacks.path, error ) ) throw std::runtime_error( "cannot commit global callstack index: " + error );
+        if( !AtomicReplace( temporaryCallstackFrames, result.globalCallstackFrames.path, error ) ) throw std::runtime_error( "cannot commit global callstack frame index: " + error );
         if( !AtomicReplace( temporaryCatalog, result.gpuCatalog.path, error ) ) throw std::runtime_error( "cannot commit GPU Catalog index: " + error );
         for( size_t index = 0; index < temporaryJn.size(); index++ )
             if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error ) )
@@ -3004,6 +3034,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         analysis::AnalysisDiskRemove( temporarySamples, storageOptions.disk, ignored, true );
         analysis::AnalysisDiskRemove( temporaryStrings, storageOptions.disk, ignored, true );
         analysis::AnalysisDiskRemove( temporaryCallstacks, storageOptions.disk, ignored, true );
+        analysis::AnalysisDiskRemove( temporaryCallstackFrames, storageOptions.disk, ignored, true );
         analysis::AnalysisDiskRemove( temporaryCatalog, storageOptions.disk, ignored, true );
         for( const auto& path : temporaryJn ) analysis::AnalysisDiskRemove( path, storageOptions.disk, ignored );
         analysis::AnalysisDiskRemove( temporaryGpuMemoryCpuZones, storageOptions.disk, ignored, true );
@@ -3102,6 +3133,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         parseSection( "sample", manifest.samples );
         parseSection( "global_string", manifest.globalStrings );
         parseSection( "global_callstack", manifest.globalCallstacks );
+        parseSection( "global_callstack_frame", manifest.globalCallstackFrames );
         parseSection( "gpu_catalog", manifest.gpuCatalog );
         parseSection( "job_stage", manifest.jobStages );
         parseSection( "gfx_entity", manifest.gfxEntities );
@@ -3193,6 +3225,18 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
                 throw std::runtime_error( "global callstack section count mismatch" );
             if( deep ) callstacks.ValidateAll();
         }
+        if( manifest.globalCallstackFrames.recordBytes != 0 || !std::filesystem::is_directory( manifest.globalCallstackFrames.path ) ||
+            SectionBytes( manifest.globalCallstackFrames.path ) != manifest.globalCallstackFrames.bytes )
+            throw std::runtime_error( "global callstack frame section identity mismatch" );
+        if( deep && SectionFingerprint( manifest.globalCallstackFrames.path ) != manifest.globalCallstackFrames.fingerprint )
+            throw std::runtime_error( "global callstack frame section hash mismatch" );
+        {
+            QueryCallstackFrameStoreReader frames( manifest.globalCallstackFrames.path, manifest.sourceFingerprint, storageOptions );
+            if( frames.Count() != manifest.globalCallstackFrames.count ||
+                manifest.globalCallstackFrames.declaredCount != manifest.globalCallstackFrames.count )
+                throw std::runtime_error( "global callstack frame section count mismatch" );
+            if( deep ) frames.ValidateAll();
+        }
         if( manifest.gpuCatalog.recordBytes != 0 || !std::filesystem::is_directory( manifest.gpuCatalog.path ) ||
             SectionBytes( manifest.gpuCatalog.path ) != manifest.gpuCatalog.bytes )
             throw std::runtime_error( "GPU Catalog section identity mismatch" );
@@ -3254,6 +3298,9 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     auto callstackStore=std::make_shared<QueryCallstackStoreReader>(manifest.globalCallstacks.path,
         manifest.sourceFingerprint,storageOptions);
     auto callstackSource=std::make_unique<QuerySerializedCallstackSource>(std::move(callstackStore));
+    auto callstackFrames=std::make_shared<QueryCallstackFrameStoreReader>(manifest.globalCallstackFrames.path,
+        manifest.sourceFingerprint,storageOptions);
+    callstackSource->SetFrames(std::move(callstackFrames));
     auto source = analysis::WorkerTraceSource::Open( manifest.dataPath, std::move( stateCallback ),
         fingerprintOverride.empty() ? manifest.sourceFingerprint : std::move( fingerprintOverride ),
         analysis::WorkerTraceLoadMode::IndexedSidecar, nullptr, ResourceReadHooks(resources,"compact-load:" ),

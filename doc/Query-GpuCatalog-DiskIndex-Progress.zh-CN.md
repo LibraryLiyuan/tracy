@@ -45,6 +45,13 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 - Job 回归首次发布时复现一次已知 Windows `MoveFileExW error 5`；检查确认压缩 Writer/Reader 均已离开作用域，新的独立代次随后通过。该偶发目录发布失败和失败后已移动代次清理仍是 P6 的明确缺陷，未通过重跑改写为“已修复”。
 - P2 下一项为 Callstack Frame/inline 定义、父调用栈和符号地址映射；12.43 GB 正式 Trace 尚未运行。
 
+## 2026-09-18：schema22 Callstack Frame/inline 定义外置
+
+- `callstackFrameMap`、`CallstackFrameData` 和 inline frame 数组改为磁盘侧车：原 `CallstackFrameId.data` 经有界外部排序定位 ordinal，定义目录分页保存 image-name、offset/count，正文使用只读 `CallstackFrame` arena。
+- `ResolveCallstacks`、父调用栈中的普通 frame 及 ghost frame 均能读取外置定义；compact Frame 表使用 manifest 绑定标记，普通 Worker 脱离侧车会拒绝。父调用栈自定义 frame 和符号地址派生仍待迁移。
+- 独立回归覆盖缺失 ID、重复查找稳定地址、255 个 inline frame、跨块写入、深校验和 hash；小型真实 callstack 夹具完成 schema22 冷建、深校验、热开与两帧解析，但该夹具本身没有 Frame 定义，未把它误报为非空定义端到端证据。
+- Release 全目标构建和 CTest 38/38（131.55秒）通过；compressed/sample/job/catalog 四项真实索引回归均通过。12.43 GB 正式 Trace 尚未运行。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

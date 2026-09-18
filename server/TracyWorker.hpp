@@ -96,9 +96,12 @@ public:
 class SerializedCallstackSource
 {
 public:
+    struct FrameView { StringIdx imageName; const CallstackFrame* frames = nullptr; uint8_t count = 0; };
     virtual ~SerializedCallstackSource() = default;
     virtual uint64_t CallstackCount() const = 0;
     virtual const CallstackFrameId* Frames( uint32_t id, uint32_t& count ) const = 0;
+    virtual uint64_t FrameCount() const = 0;
+    virtual bool Frame( CallstackFrameId id, FrameView& output ) const = 0;
 };
 
 class SerializedZoneSink
@@ -143,6 +146,12 @@ public:
     virtual void CallstackFrames(uint32_t,uint32_t,const CallstackFrameId*,uint32_t){}
     virtual void CallstackEnd(uint32_t){}
     virtual void CallstacksEnd(){}
+    virtual bool WantsCallstackFrames()const{return false;}
+    virtual void CallstackFrameDefinitionsBegin(uint64_t){}
+    virtual void CallstackFrameDefinitionBegin(uint64_t,CallstackFrameId,uint8_t,StringIdx){}
+    virtual void CallstackFrameDefinitionRecords(uint64_t,uint32_t,const CallstackFrame*,uint32_t){}
+    virtual void CallstackFrameDefinitionEnd(uint64_t){}
+    virtual void CallstackFrameDefinitionsEnd(){}
     virtual SerializedCallstackSource* GlobalCallstackSource(){return nullptr;}
     virtual bool WantsSamples()const{return false;}
     virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
@@ -707,7 +716,7 @@ public:
     uint64_t GetCallstackParentPayloadCount() const { return m_data.parentCallstackPayload.size(); }
     uint64_t GetCallstackParentFrameCount() const { return m_callstackParentNextIdx; }
 #endif
-    uint64_t GetCallstackFrameCount() const { return m_data.callstackFrameMap.size() - m_pendingCallstackFrames; }
+    uint64_t GetCallstackFrameCount() const { return m_externalCallstackSource?m_externalCallstackSource->FrameCount():m_data.callstackFrameMap.size() - m_pendingCallstackFrames; }
     uint64_t GetCallstackSampleCount() const { return m_data.samplesCnt; }
     uint64_t GetSymbolsCount() const { return m_data.symbolMap.size(); }
     uint64_t GetSymbolCodeCount() const { return m_data.symbolCode.size(); }

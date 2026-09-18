@@ -3335,7 +3335,15 @@ std::vector<GhostZoneDto> WorkerTraceSource::ScanGhostZones( const ScanRange& ra
             if( intersects && skipped++ >= range.offset && result.size() < range.limit )
             {
                 const auto& key = m_impl->worker->GetGhostFrame( zone.frame );
-                const auto* frame = m_impl->worker->GetCallstackFrame( key.frame );
+                const CallstackFrame* frameData=nullptr;uint8_t frameCount=0;
+                SerializedCallstackSource::FrameView externalFrame;
+                if(m_impl->externalCallstacks&&m_impl->externalCallstacks->Frame(key.frame,externalFrame))
+                { frameData=externalFrame.frames;frameCount=externalFrame.count; }
+                else if(!m_impl->externalCallstacks)
+                {
+                    const auto* frame=m_impl->worker->GetCallstackFrame(key.frame);
+                    if(frame){frameData=frame->data;frameCount=frame->size;}
+                }
                 GhostZoneDto dto;
                 dto.ref = m_impl->MakeRef( "ghost-zone", currentOrdinal );
                 dto.threadRef = m_impl->MakeRef( "thread", thread.id );
@@ -3344,10 +3352,10 @@ std::vector<GhostZoneDto> WorkerTraceSource::ScanGhostZones( const ScanRange& ra
                 dto.endNs = zone.end.Val();
                 dto.address = Hex( m_impl->worker->GetCanonicalPointer( key.frame ) );
                 dto.depth = depth;
-                dto.inlineFrame = frame && key.inlineFrame + 1 < frame->size;
-                if( frame && key.inlineFrame < frame->size )
+                dto.inlineFrame = frameData && key.inlineFrame + 1 < frameCount;
+                if( frameData && key.inlineFrame < frameCount )
                 {
-                    const auto& symbol = frame->data[key.inlineFrame];
+                    const auto& symbol = frameData[key.inlineFrame];
                     dto.name = Safe( m_impl->worker->TryGetString( symbol.name ) );
                     dto.file = Safe( m_impl->worker->TryGetString( symbol.file ) );
                     dto.line = symbol.line;
@@ -3566,22 +3574,29 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
         const auto resolveEntry = [&]( const CallstackFrameId& entry )
         {
             if( depth >= maxDepth ) return;
-            const auto* frameData = worker.GetCallstackFrame( entry );
-            if( !frameData )
+            const CallstackFrame* frames=nullptr;uint8_t frameCount=0;StringIdx imageNameIndex;
+            if(m_impl->externalCallstacks)
+            {
+                SerializedCallstackSource::FrameView view;
+                if(m_impl->externalCallstacks->Frame(entry,view)){frames=view.frames;frameCount=view.count;imageNameIndex=view.imageName;}
+            }
+            else if(const auto* frameData=worker.GetCallstackFrame(entry))
+            { frames=frameData->data;frameCount=frameData->size;imageNameIndex=frameData->imageName; }
+            if( !frames && frameCount == 0 )
             {
                 result.push_back( { m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
                 depth++;
                 return;
             }
             std::optional<std::string> imageName;
-            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
-            for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
+            if( imageNameIndex.Active() ) imageName = Safe( worker.TryGetString( imageNameIndex ) );
+            for( uint8_t frameIndex = 0; frameIndex < frameCount && depth < maxDepth; frameIndex++ )
             {
-                const auto& frame = frameData->data[frameIndex];
+                const auto& frame = frames[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameCount, callstack, depth, imageName
                 } );
                 depth++;
             }
@@ -3623,22 +3638,29 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveParentCallstacks( const
         for( const auto& entry : entries )
         {
             if( depth >= maxDepth ) break;
-            const auto* frameData = entry.custom ? worker.GetParentCallstackFrame( entry ) : worker.GetCallstackFrame( entry );
-            if( !frameData )
+            const CallstackFrame* frames=nullptr;uint8_t frameCount=0;StringIdx imageNameIndex;
+            if(!entry.custom&&m_impl->externalCallstacks)
+            {
+                SerializedCallstackSource::FrameView view;
+                if(m_impl->externalCallstacks->Frame(entry,view)){frames=view.frames;frameCount=view.count;imageNameIndex=view.imageName;}
+            }
+            else if(const auto* frameData=entry.custom?worker.GetParentCallstackFrame(entry):worker.GetCallstackFrame(entry))
+            { frames=frameData->data;frameCount=frameData->size;imageNameIndex=frameData->imageName; }
+            if( !frames && frameCount == 0 )
             {
                 result.push_back( { m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
                 depth++;
                 continue;
             }
             std::optional<std::string> imageName;
-            if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
-            for( uint8_t frameIndex = 0; frameIndex < frameData->size && depth < maxDepth; frameIndex++ )
+            if( imageNameIndex.Active() ) imageName = Safe( worker.TryGetString( imageNameIndex ) );
+            for( uint8_t frameIndex = 0; frameIndex < frameCount && depth < maxDepth; frameIndex++ )
             {
-                const auto& frame = frameData->data[frameIndex];
+                const auto& frame = frames[frameIndex];
                 result.push_back( {
                     m_impl->MakeRef( "parent-callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ),
                     Safe( worker.TryGetString( frame.name ) ), Safe( worker.TryGetString( frame.file ) ), frame.line,
-                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
+                    Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameCount, callstack, depth, imageName
                 } );
                 depth++;
             }

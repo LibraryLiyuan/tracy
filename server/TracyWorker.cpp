@@ -1590,19 +1590,29 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
 
     f.Read( sz );
-    m_data.callstackFrameMap.reserve( sz );
-    for( uint64_t i=0; i<sz; i++ )
+    const bool manifestBoundCallstackFrames=sz==std::numeric_limits<uint64_t>::max();
+    if(manifestBoundCallstackFrames){if(!m_externalCallstackSource)throw LoadFailure("compact trace requires its manifest-bound external callstack frame definitions");sz=0;}
+    const bool captureExternalCallstackFrames=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstackFrames();
+    if(m_externalCallstackSource&&!captureExternalCallstackFrames&&(!manifestBoundCallstackFrames||sz!=0))throw LoadFailure("manifest-bound compact trace has an invalid external callstack frame marker");
+    if(captureExternalCallstackFrames)
     {
-        CallstackFrameId id;
-        auto frameData = m_slab.Alloc<CallstackFrameData>();
-        f.Read3( id, frameData->size, frameData->imageName );
-        ValidateStringIndex(frameData->imageName);
-
-        frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
-        f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
-        for(uint32_t j=0;j<frameData->size;++j){ValidateStringIndex(frameData->data[j].name);ValidateStringIndex(frameData->data[j].file);}
-
-        m_data.callstackFrameMap.emplace( id, frameData );
+        m_serializedZoneSink->CallstackFrameDefinitionsBegin(sz);std::array<CallstackFrame,1024> frames;
+        for(uint64_t i=0;i<sz;++i){m_serializedZoneSink->CheckRead();CallstackFrameId id;uint8_t count;StringIdx imageName;f.Read3(id,count,imageName);ValidateStringIndex(imageName);m_serializedZoneSink->CallstackFrameDefinitionBegin(i,id,count,imageName);for(uint32_t offset=0;offset<count;){const auto take=std::min<uint32_t>(uint32_t(frames.size()),count-offset);f.Read(frames.data(),size_t(take)*sizeof(CallstackFrame));for(uint32_t j=0;j<take;++j){ValidateStringIndex(frames[j].name);ValidateStringIndex(frames[j].file);}m_serializedZoneSink->CallstackFrameDefinitionRecords(i,offset,frames.data(),take);offset+=take;}m_serializedZoneSink->CallstackFrameDefinitionEnd(i);}m_serializedZoneSink->CallstackFrameDefinitionsEnd();if(!m_externalCallstackSource||m_externalCallstackSource->FrameCount()!=sz)throw LoadFailure("external callstack frame source was not published after serialization");
+    }
+    else if(!m_externalCallstackSource)
+    {
+        m_data.callstackFrameMap.reserve( sz );
+        for( uint64_t i=0; i<sz; i++ )
+        {
+            CallstackFrameId id;
+            auto frameData = m_slab.Alloc<CallstackFrameData>();
+            f.Read3( id, frameData->size, frameData->imageName );
+            ValidateStringIndex(frameData->imageName);
+            frameData->data = m_slab.Alloc<CallstackFrame>( frameData->size );
+            f.Read( frameData->data, sizeof( CallstackFrame ) * frameData->size );
+            for(uint32_t j=0;j<frameData->size;++j){ValidateStringIndex(frameData->data[j].name);ValidateStringIndex(frameData->data[j].file);}
+            m_data.callstackFrameMap.emplace( id, frameData );
+        }
     }
 
     f.Read( sz );
@@ -2729,6 +2739,7 @@ std::pair<int, int> Worker::GetFrameRange( const FrameData& fd, int64_t from, in
 const CallstackFrameData* Worker::GetCallstackFrame( const CallstackFrameId& ptr ) const
 {
     assert( ptr.custom == 0 );
+    if(m_externalCallstackSource)return nullptr;
     auto it = m_data.callstackFrameMap.find( ptr );
     if( it == m_data.callstackFrameMap.end() )
     {
@@ -11693,10 +11704,10 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( cs->data(), sizeof( CallstackFrameId ) * csz );
     }
 
-    sz = m_data.callstackFrameMap.size() - m_pendingCallstackFrames;
+    sz = m_externalCallstackSource ? std::numeric_limits<uint64_t>::max() : m_data.callstackFrameMap.size() - m_pendingCallstackFrames;
     f.Write( &sz, sizeof( sz ) );
     uint64_t check = 0;
-    for( auto& frame : m_data.callstackFrameMap )
+    if(!m_externalCallstackSource) for( auto& frame : m_data.callstackFrameMap )
     {
         if( !frame.second ) continue;
         f.Write( &frame.first, sizeof( CallstackFrameId ) );
@@ -11705,7 +11716,7 @@ void Worker::Write( FileWrite& f, bool fiDict )
         f.Write( frame.second->data, sizeof( CallstackFrame ) * frame.second->size );
         check++;
     }
-    assert( check == sz );
+    assert( m_externalCallstackSource || check == sz );
 
     sz = m_data.appInfo.size();
     f.Write( &sz, sizeof( sz ) );

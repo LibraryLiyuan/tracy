@@ -13,7 +13,7 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 21;
+inline constexpr uint32_t QueryIndexSchemaVersion = 22;
 
 constexpr bool QueryIndexCpuZoneTimingComplete( int64_t end ) noexcept
 {
@@ -50,6 +50,7 @@ struct QueryIndexManifest
     QueryIndexSection samples;
     QueryIndexSection globalStrings;
     QueryIndexSection globalCallstacks;
+    QueryIndexSection globalCallstackFrames;
     QueryIndexSection gpuCatalog;
     QueryIndexSection jobStages;
     QueryIndexSection gfxEntities;
