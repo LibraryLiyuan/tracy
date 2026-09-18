@@ -63,6 +63,14 @@ int main( int argc, char** argv )
         auto indexed = query::QueryIndex::Open( manifest );
         Require( !indexed->CatalogDerivedDataReady(),
             "indexed trace silently claims GPU Catalog indices are ready" );
+        const auto* statusSource = dynamic_cast<const query::QueryCatalogStatusSource*>( indexed.get() );
+        Require( statusSource != nullptr, "indexed trace does not expose bounded Catalog status" );
+        const auto status = statusSource->GetQueryCatalogStatus( 64, 16 );
+        const auto& validation = statusSource->GetQueryCatalogValidation();
+        Require( validation.complete && validation.healthy && status.metadata[0] == 1 &&
+            status.counts[size_t( OfflineCatalogDomain::CatalogResource )] == expectedResources &&
+            status.counts[size_t( OfflineCatalogDomain::CatalogBatch )] == expectedBatches,
+            "indexed bounded Catalog status changed" );
         std::cout << "GPU Catalog index integration passed resources=" << expectedResources << '\n';
         return 0;
     }

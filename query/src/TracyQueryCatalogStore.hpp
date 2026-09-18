@@ -27,6 +27,28 @@ struct QueryCatalogValidationResult
     std::vector<QueryCatalogValidationFinding> findings;
 };
 
+struct QueryCatalogStatusData
+{
+    OfflineCatalogQuality metadata {};
+    std::array<uint64_t, OfflineCatalogDomainCount> counts {};
+    std::vector<JnGpuCatalogGenerationData> generations;
+    std::vector<JnGpuDetailedEvidenceRecordV1> evidencePreview;
+    uint64_t recordCount = 0;
+    uint64_t payloadBytes = 0;
+    uint64_t unresolvedCount = 0;
+    bool building = false;
+    bool generationsTruncated = false;
+    bool evidencePreviewTruncated = false;
+};
+
+class QueryCatalogStatusSource
+{
+public:
+    virtual ~QueryCatalogStatusSource() = default;
+    virtual QueryCatalogStatusData GetQueryCatalogStatus( size_t generationLimit, size_t evidenceLimit ) const = 0;
+    virtual const QueryCatalogValidationResult& GetQueryCatalogValidation() const = 0;
+};
+
 class QueryCatalogStoreWriter
 {
 public:
@@ -64,6 +86,7 @@ public:
     uint64_t Count( OfflineCatalogDomain domain ) const;
     void Read( OfflineCatalogDomain domain, uint64_t ordinal, void* output, uint64_t count, uint32_t recordBytes ) const;
     JnGpuCatalogStringData String( uint64_t ordinal ) const;
+    QueryCatalogStatusData Status( size_t generationLimit, size_t evidenceLimit ) const;
     void ValidateAll() const;
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
 

@@ -1114,6 +1114,7 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
 class IndexedTraceSource final : public analysis::TraceSource,
     public analysis::NativeBoundedTraceSource,
     public analysis::GpuCatalogBoundedScanSource,
+    public QueryCatalogStatusSource,
     public QueryResourceContextSource
 {
 public:
@@ -1217,6 +1218,15 @@ public:
         // domains while forwarding Catalog evidence verbatim, so an indexed
         // open cannot silently report N27 as absent.
         return m_source->GetGpuCatalogData();
+    }
+
+    QueryCatalogStatusData GetQueryCatalogStatus( size_t generationLimit, size_t evidenceLimit ) const override
+    {
+        return m_catalog.Status( generationLimit, evidenceLimit );
+    }
+    const QueryCatalogValidationResult& GetQueryCatalogValidation() const override
+    {
+        return m_manifest.catalogValidation;
     }
 
     uint64_t GetGpuCatalogResourceCountBounded() const override { return m_source->GetGpuCatalogResourceCountBounded(); }

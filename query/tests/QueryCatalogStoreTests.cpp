@@ -117,6 +117,11 @@ int main()
         const auto semantic = reader.ValidateSemantics( root / "semantic-validation" );
         Require( semantic.complete && semantic.healthy && semantic.findings.empty(),
             "healthy Catalog failed semantic validation" );
+        const auto status = reader.Status( 8, 8 );
+        Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
+            status.generations.size() == 1 && status.generations[0].generation == 9 &&
+            status.counts[size_t( OfflineCatalogDomain::CatalogResource )] == 3,
+            "Catalog status did not use bounded sidecar data" );
         const auto hasFinding = []( const QueryCatalogValidationResult& value, std::string_view code ) {
             for( const auto& finding : value.findings ) if( finding.code == code && finding.count != 0 ) return true;
             return false;

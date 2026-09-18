@@ -14,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace tracy::query
@@ -246,6 +247,66 @@ JnGpuCatalogStringData QueryCatalogStoreReader::String( uint64_t ordinal ) const
         JnGpuCatalogChecksum64( bytes, row.header.byteLength ) != row.header.hash )
         throw std::runtime_error( "Catalog string checksum mismatch" );
     return { row.generation, row.header, std::string( bytes, row.header.byteLength ) };
+}
+
+QueryCatalogStatusData QueryCatalogStoreReader::Status( size_t generationLimit, size_t evidenceLimit ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    QueryCatalogStatusData result;
+    result.metadata = m_impl->metadata;
+    for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
+    {
+        const auto domain = OfflineCatalogDomain( index );
+        analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
+            CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
+        result.counts[index] = records.Count();
+    }
+    analysis::PagedRecordReader generations( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogGeneration ),
+        CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogGeneration ),
+        sizeof( JnGpuCatalogGenerationData ), m_impl->options );
+    const auto generationCount = generations.Count();
+    const auto generationTake = std::min<uint64_t>( generationCount, std::min<size_t>( generationLimit, 65536 ) );
+    const auto boundedEvidenceLimit = std::min<size_t>( evidenceLimit, 65536 );
+    analysis::AnalysisWorkspaceReservation statusWorkspace( m_impl->options.workspace,
+        65536 + generationTake * sizeof( JnGpuCatalogGenerationData ) +
+        uint64_t( boundedEvidenceLimit ) * sizeof( JnGpuDetailedEvidenceRecordV1 ) );
+    result.generations.reserve( size_t( generationTake ) );
+    for( uint64_t index = 0; index < generationCount; index++ )
+    {
+        if( m_impl->options.cancelled && m_impl->options.cancelled() ) throw std::runtime_error( "Catalog status cancelled" );
+        JnGpuCatalogGenerationData row {};
+        generations.Read( index, &row, 1 );
+        if( row.recordCount > std::numeric_limits<uint64_t>::max() - result.recordCount ||
+            row.payloadBytes > std::numeric_limits<uint64_t>::max() - result.payloadBytes ||
+            row.unresolvedCount > std::numeric_limits<uint64_t>::max() - result.unresolvedCount )
+            throw std::runtime_error( "Catalog status total overflow" );
+        result.recordCount += row.recordCount;
+        result.payloadBytes += row.payloadBytes;
+        result.unresolvedCount += row.unresolvedCount;
+        result.building = result.building || row.state == uint8_t( JnGpuCatalogGenerationState::Building );
+        if( result.generations.size() < generationTake ) result.generations.emplace_back( row );
+    }
+    result.generationsTruncated = generationTake != generationCount;
+
+    analysis::PagedRecordReader evidence( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogDetailedEvidence ),
+        CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
+        sizeof( JnGpuDetailedEvidenceRecordV1 ), m_impl->options );
+    const auto evidenceCount = evidence.Count();
+    const auto scanLimit = boundedEvidenceLimit == 0 ? uint64_t( 0 ) :
+        std::min<uint64_t>( evidenceCount, std::min<uint64_t>( 65536, uint64_t( boundedEvidenceLimit ) * 1024 + 1024 ) );
+    std::unordered_set<uint64_t> previewFrames;
+    previewFrames.reserve( boundedEvidenceLimit * 2 + 1 );
+    for( uint64_t index = 0; index < scanLimit && result.evidencePreview.size() < boundedEvidenceLimit; index++ )
+    {
+        JnGpuDetailedEvidenceRecordV1 row {};
+        evidence.Read( index, &row, 1 );
+        const auto checkpoint = row.evidenceFrameId != 0 ? row.evidenceFrameId : row.frameId;
+        if( checkpoint == 0 || !previewFrames.emplace( checkpoint ).second ) continue;
+        result.evidencePreview.emplace_back( row );
+    }
+    result.evidencePreviewTruncated = evidenceCount > scanLimit ||
+        ( result.evidencePreview.size() >= boundedEvidenceLimit && evidenceCount > result.evidencePreview.size() );
+    return result;
 }
 
 void QueryCatalogStoreReader::ValidateAll() const

@@ -15,6 +15,8 @@
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
 | Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema25已持久化Catalog原始质量和磁盘重验证结果；显式Resource/Allocation/Logical/String定义与Resource/Allocation/View/Logical/Part/VG/Range引用使用generation-aware外排归并。Relation/Evidence多态source/target仍待按协议种类补齐，再建派生索引和迁移消费者 |
 
+P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
+
 ## 本轮验证
 
 - `QueryValidationStoreTests` 覆盖分页状态随机读、有界两项 run、外部归并、确定性去重、workspace 上界和磁盘回收。

@@ -84,6 +84,13 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - 显式跨表引用已使用独立外排文件按`(generation,id)`精确归并：Resource→Allocation/String、View/Logical/Part/VG/Range→Resource、Part→Logical；破坏夹具返回`CATALOG_CROSS_TABLE_REFERENCE`。外排临时文件纳入同一磁盘/工作区预算并在句柄关闭后回收。小型真实1,001资源Catalog再次通过发布和深校验；Release全构建与CTest 38/38（124.78秒）通过。
 - P3尚未完成：Relation和DetailedEvidence的source/target是按relation/kind解释的多态ID，需按已验证协议语义分别校验；名称ID已验证存在及自身hash，名称记录与引用端的hash/长度一致性仍待补齐。P4查询派生索引和消费者迁移尚未开始。
 
+## 2026-09-18：P4 首个消费者——磁盘 Catalog 状态
+
+- `gpu.catalog.status`不再被全域`CatalogDerivedDataReady=false`一起阻断。IndexedTraceSource新增只读状态接口，直接从Catalog分页侧车读取各域精确计数、generation汇总和最多16个Evidence checkpoint预览，并复用schema25持久化语义质量。
+- generation响应最多4,096条，Evidence内部扫描最多65,536条；截断分别通过`generations_truncated`和`detailed_evidence_preview_truncated`明确返回。输出vector预留纳入共享workspace，generation总计以顺序扫描计算并检查uint64溢出/取消。
+- 其他`gpu.resource.*`、`gpu.memory.*`、Pass和`gpu.catalog.validation`仍返回`INDEX_NOT_READY`，没有因状态查询恢复而误开放完整快照路径。
+- 小型真实Catalog索引返回present/valid/complete、1个generation、1,001条resource和零质量finding；直接请求`gpu.resource.search`仍明确未就绪。真实后端状态合同、Catalog存储、Query合同和MCP transcript测试通过。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证
