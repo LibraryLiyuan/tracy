@@ -65,6 +65,18 @@ int main()
                     "Query publication retry was not cancellable" );
             }
         }
+        const auto trace = root / "owner.tracy";
+        auto ownerPath = trace; ownerPath += ".jnidx.owner.lock";
+        HANDLE owner = CreateFileW( ownerPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+        Require( owner != INVALID_HANDLE_VALUE, "could not establish Query owner lock" );
+        std::string ownerError;
+        Require( !QueryIndex::ProbeOwnerLockForTesting( trace, ownerError ) && !ownerError.empty(),
+            "Query owner lock allowed a second builder" );
+        CloseHandle( owner );
+        ownerError.clear();
+        Require( QueryIndex::ProbeOwnerLockForTesting( trace, ownerError ) && !fs::exists( ownerPath ),
+            "stale Query owner lock could not be reacquired and cleaned" );
 #else
         const auto source = root / "source";
         const auto target = root / "target";

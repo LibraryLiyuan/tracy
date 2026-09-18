@@ -109,6 +109,7 @@ class QueryIndex
 public:
     static bool PublishPathForTesting( const std::filesystem::path& source, const std::filesystem::path& target,
         std::string& error, const std::function<bool()>& cancelled );
+    static bool ProbeOwnerLockForTesting( const std::filesystem::path& tracePath, std::string& error );
     static std::filesystem::path ManifestPath( const std::filesystem::path& tracePath );
     static std::shared_ptr<QueryResourceContext> CreateResourceContext( const std::filesystem::path& tracePath,
         QueryResourceContextOptions options = {} );

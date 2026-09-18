@@ -17,7 +17,7 @@
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
-P6已补Windows发布临时占用重试和同轮半发布候选清理；owner锁、Reader代次租约和崩溃后清理仍待完成。
+P6已补Windows发布临时占用重试、同轮半发布候选清理和每Trace排他owner锁；Reader代次租约和崩溃后候选清理仍待完成。
 
 ## 本轮验证
 

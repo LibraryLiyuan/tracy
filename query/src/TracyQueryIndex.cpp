@@ -34,6 +34,7 @@
 #  include <windows.h>
 #else
 #  include <fcntl.h>
+#  include <sys/file.h>
 #  include <sys/mman.h>
 #  include <sys/stat.h>
 #  include <unistd.h>
@@ -43,6 +44,48 @@ namespace tracy::query
 {
 namespace
 {
+
+class QueryIndexOwnerLease
+{
+public:
+    explicit QueryIndexOwnerLease( std::filesystem::path path ) : m_path( std::move( path ) )
+    {
+#ifdef _WIN32
+        m_handle = CreateFileW( m_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+        if( m_handle == INVALID_HANDLE_VALUE )
+            throw std::runtime_error( "Query index owner lock is held: " + std::to_string( GetLastError() ) );
+#else
+        m_fd = ::open( m_path.c_str(), O_CREAT | O_RDWR, 0600 );
+        if( m_fd < 0 || flock( m_fd, LOCK_EX | LOCK_NB ) != 0 )
+        {
+            if( m_fd >= 0 ) ::close( m_fd );
+            m_fd = -1;
+            throw std::runtime_error( "Query index owner lock is held" );
+        }
+#endif
+    }
+    ~QueryIndexOwnerLease()
+    {
+#ifdef _WIN32
+        if( m_handle != INVALID_HANDLE_VALUE ) CloseHandle( m_handle );
+        std::error_code ignored;
+        std::filesystem::remove( m_path, ignored );
+#else
+        if( m_fd >= 0 ) { flock( m_fd, LOCK_UN ); ::close( m_fd ); }
+#endif
+    }
+    QueryIndexOwnerLease( const QueryIndexOwnerLease& ) = delete;
+    QueryIndexOwnerLease& operator=( const QueryIndexOwnerLease& ) = delete;
+
+private:
+    std::filesystem::path m_path;
+#ifdef _WIN32
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
+#else
+    int m_fd = -1;
+#endif
+};
 
 using nlohmann::json;
 constexpr const char* IndexMagic = "JNTRACY-QUERY-INDEX";
@@ -2520,6 +2563,22 @@ bool QueryIndex::PublishPathForTesting( const std::filesystem::path& source, con
     return AtomicReplace( source, target, error, cancelled );
 }
 
+bool QueryIndex::ProbeOwnerLockForTesting( const std::filesystem::path& tracePath, std::string& error )
+{
+    auto lockPath = ManifestPath( tracePath );
+    lockPath += ".owner.lock";
+    try
+    {
+        QueryIndexOwnerLease lease( lockPath );
+        return true;
+    }
+    catch( const std::exception& failure )
+    {
+        error = failure.what();
+        return false;
+    }
+}
+
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
 {
     auto result = tracePath;
@@ -2609,6 +2668,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     auto temporaryGpuMemorySummary = result.gpuMemorySummary.path; temporaryGpuMemorySummary += suffix;
     auto temporaryValidation = tracePath.parent_path() / ( baseName + ".jnidx.validation" + suffix );
     auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
+    auto ownerLockPath = result.manifestPath; ownerLockPath += ".owner.lock";
     std::vector<std::filesystem::path> packedScratch;
     std::vector<std::filesystem::path> publishedCandidates;
 
@@ -2619,12 +2679,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         result.samples.path,result.globalStrings.path,result.globalCallstacks.path,result.globalCallstackFrames.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
         result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
         result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,
-        failureDiagnostic,temporaryValidation
+        failureDiagnostic,temporaryValidation,ownerLockPath
     });
     const auto storageOptions = ResourceStorageOptions( resources );
 
     try
     {
+        QueryIndexOwnerLease ownerLease( ownerLockPath );
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();

@@ -97,7 +97,9 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - 新回归真实持有源目录句柄：80 ms临时占用后发布成功；永久占用在3秒内失败且目标不存在；取消在500 ms内停止并返回cancelled。
 - 构建发布时记录每个已从`.tmp.<pid>`移动到最终generation名的候选。如果manifest发布前后续步骤失败，按逆序及Trace父目录、名称前缀、symlink/reparse检查删除已移动候选，避免遗留“无manifest但看似最终”的孤儿代次；删除成功后磁盘账本同步释放。
 - 小型真实Catalog索引发布/重开仍通过；Release全构建及包含新增发布测试的CTest 39/39（125.57秒）通过。
-- P6仍未完成：排他owner锁、旧generation Reader租约、崩溃恢复清理、长路径和删除失败清单仍待实现。
+- 构建全生命周期新增每Trace排他owner锁。Windows使用无共享句柄，文件存在但无持有者的崩溃残留可重新取得；并发持有时第二个构建明确拒绝。成功或受控失败释放句柄并清理锁文件，小型真实发布后无owner文件残留。
+- owner锁接入后的Release全构建及CTest 39/39通过（126.17秒）。
+- P6仍未完成：旧generation Reader租约、崩溃恢复候选清理、长路径和删除失败清单仍待实现。
 
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
