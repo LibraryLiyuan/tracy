@@ -68,6 +68,10 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 - 先失败合同回归已转绿；Release全目标构建、CTest 38/38（122.40秒）通过。1,310,224字节真实夹具schema24冷建819毫秒，热开overview和`validation.run`成功；其中20,000条未解析调用栈仍准确计数且只返回20个样例ref。
 - schema24尚未运行正式Trace修复后范围诊断。父调用栈/符号映射、P3/P4消费者、P5分页恢复、P6事务发布和8S容量处理仍未完成。
 
+schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。Private Bytes峰值9,771,753,472字节，未发生资源或数据错误。停止后的CPU表字段统计覆盖422,576,574条记录：动态名称51,928,518条且未解析为0，非法Extra为0，时间不完整5条，排序后线程run仅28个。这排除了名称finding和线程哈希作为本轮主因。
+
+剩余热点是`ValidateMainPlayerLoopRoots`对全表第二次扫描时，每条Zone对两个`unordered_set<int16_t>`执行查找。修复将Main.PlayerLoop/PlayerLoop来源编码为64 KiB定长状态表，父链检查也直接索引；finding代码表改用`string_view`避免异常Trace的临时字符串分配。存储布局不变，schema保持24。Release全构建、CTest 38/38（120.13秒）及小型真实冷建/validation语义回归通过。R3证据、字段分布和清理记录位于`Query-Acceptance-20260918/diagnostics/P2-ZoneValidation-CpuFlags-R3`；没有机械启动第四轮正式诊断。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

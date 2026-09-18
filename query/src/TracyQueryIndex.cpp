@@ -878,32 +878,36 @@ struct MainPlayerLoopInterval
     int64_t end = 0;
 };
 
+inline constexpr uint8_t MainPlayerLoopSource = 1;
+inline constexpr uint8_t UnityPlayerLoopSource = 2;
+using PlayerLoopSourceTable = std::array<uint8_t, 1u << 16>;
+
 template<typename RefFn, typename NoteFn>
 void ValidateMainPlayerLoopRoots( const ReadOnlyZoneSection& cpu,
-    const std::unordered_set<int16_t>& mainPlayerLoopSources,
-    const std::unordered_set<int16_t>& unityPlayerLoopSources,
+    const PlayerLoopSourceTable& playerLoopSources, bool hasMainPlayerLoopSource,
     RefFn&& makeRef, NoteFn&& note )
 {
-    if( mainPlayerLoopSources.empty() ) return;
+    if( !hasMainPlayerLoopSource ) return;
 
     std::unordered_map<uint64_t, std::vector<MainPlayerLoopInterval>> rootsByThread;
     for( uint64_t index = 0; index < cpu.Count(); index++ )
     {
         const auto& zone = cpu.At<CpuZoneIndexRecord>( index );
-        if( unityPlayerLoopSources.find( zone.sourceLocation ) != unityPlayerLoopSources.end() )
+        const auto sourceState = playerLoopSources[uint16_t( zone.sourceLocation )];
+        if( sourceState & UnityPlayerLoopSource )
         {
             note( "error", "DUPLICATE_AUTHORITATIVE_PLAYERLOOP_ROOT",
                 "Unity's cross-frame PlayerLoop marker was mirrored beside the authoritative Main.PlayerLoop root",
                 makeRef( index ) );
         }
-        if( mainPlayerLoopSources.find( zone.sourceLocation ) == mainPlayerLoopSources.end() ) continue;
+        if( ( sourceState & MainPlayerLoopSource ) == 0 ) continue;
 
         auto parent = zone.parent;
         size_t parentDepth = 0;
         while( parent != std::numeric_limits<uint64_t>::max() && parent < cpu.Count() && parentDepth++ < 4096 )
         {
             const auto& parentZone = cpu.At<CpuZoneIndexRecord>( parent );
-            if( mainPlayerLoopSources.find( parentZone.sourceLocation ) != mainPlayerLoopSources.end() )
+            if( playerLoopSources[uint16_t( parentZone.sourceLocation )] & MainPlayerLoopSource )
             {
                 note( "error", "CPU_FRAME_ROOT_NESTED_SAME_SOURCE",
                     "Main.PlayerLoop is nested below another Main.PlayerLoop root", makeRef( index ) );
@@ -1340,7 +1344,7 @@ public:
             return result;
         }
         analysis::ZoneValidationSummaryDto result;
-        std::unordered_map<std::string, size_t> issueByCode;
+        std::unordered_map<std::string_view, size_t> issueByCode;
         const auto note = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
             auto found = issueByCode.find( code );
             if( found == issueByCode.end() )
@@ -1363,13 +1367,14 @@ public:
         // Source-location ids are persisted as int16_t. Validation touches every
         // zone, so replacing tens of millions of unordered-map lookups with a
         // fixed 64 KiB state table materially reduces indexed validation time.
-        std::unordered_set<int16_t> mainPlayerLoopSources;
-        std::unordered_set<int16_t> unityPlayerLoopSources;
+        PlayerLoopSourceTable playerLoopSources {};
+        bool hasMainPlayerLoopSource = false;
         for( const auto& [sourceId, source] : m_locations )
         {
             const auto& name = source.name.empty() ? source.function : source.name;
-            if( name == "Main.PlayerLoop" ) mainPlayerLoopSources.emplace( sourceId );
-            else if( name == "PlayerLoop" ) unityPlayerLoopSources.emplace( sourceId );
+            auto& sourceState = playerLoopSources[uint16_t( sourceId )];
+            if( name == "Main.PlayerLoop" ) { sourceState |= MainPlayerLoopSource; hasMainPlayerLoopSource = true; }
+            else if( name == "PlayerLoop" ) sourceState |= UnityPlayerLoopSource;
         }
         // 0 = missing, 1 = present without a stable name, 2 = present and named.
         std::array<uint8_t, 1u << 16> sourceState {};
@@ -1414,7 +1419,7 @@ public:
             if( allowed < requested ) { result.complete = false; break; }
         }
         if( result.complete )
-            ValidateMainPlayerLoopRoots( m_cpu, mainPlayerLoopSources, unityPlayerLoopSources,
+            ValidateMainPlayerLoopRoots( m_cpu, playerLoopSources, hasMainPlayerLoopSource,
                 [&]( uint64_t index ) { return m_source->MakeEntityRef( "cpu-zone", index ); }, note );
 
         if( result.complete )
@@ -2763,7 +2768,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             ReadOnlyZoneSection extraSection( temporaryExtraSection, ZoneSectionKind::Extra, sizeof( ZoneExtraIndexRecord ), result.sourceFingerprint );
             ReadOnlyZoneSection gpuSection( temporaryGpuSection, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), result.sourceFingerprint );
             analysis::ZoneValidationSummaryDto zoneValidation;
-            std::unordered_map<std::string, size_t> validationIssueByCode;
+            std::unordered_map<std::string_view, size_t> validationIssueByCode;
             const auto noteValidation = [&]( const char* severity, const char* code, const char* message, const auto& makeRef ) {
                 auto found = validationIssueByCode.find( code );
                 if( found == validationIssueByCode.end() )
@@ -2782,13 +2787,14 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             for( const auto& thread : source->GetThreads() ) validThreads.emplace( thread.nativeId );
             std::unordered_set<uint64_t> validContexts;
             for( const auto& context : source->GetGpuContexts() ) validContexts.emplace( context.index );
-            std::unordered_set<int16_t> mainPlayerLoopSources;
-            std::unordered_set<int16_t> unityPlayerLoopSources;
+            PlayerLoopSourceTable playerLoopSources {};
+            bool hasMainPlayerLoopSource = false;
             for( const auto& location : source->GetSourceLocations() )
             {
                 const auto& name = location.name.empty() ? location.function : location.name;
-                if( name == "Main.PlayerLoop" ) mainPlayerLoopSources.emplace( int16_t( location.nativeId ) );
-                else if( name == "PlayerLoop" ) unityPlayerLoopSources.emplace( int16_t( location.nativeId ) );
+                auto& sourceState = playerLoopSources[uint16_t( int16_t( location.nativeId ) )];
+                if( name == "Main.PlayerLoop" ) { sourceState |= MainPlayerLoopSource; hasMainPlayerLoopSource = true; }
+                else if( name == "PlayerLoop" ) sourceState |= UnityPlayerLoopSource;
             }
             std::array<uint8_t, 1u << 16> validationSourceState {};
             for( const auto& location : source->GetSourceLocations() )
@@ -2887,7 +2893,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 if( marker == GpuMemoryMarkerOrigin || marker == GpuMemoryMarkerResidency )
                     result.gpuMemoryProtocol2 = true;
             }
-            ValidateMainPlayerLoopRoots( cpuSection, mainPlayerLoopSources, unityPlayerLoopSources,
+            ValidateMainPlayerLoopRoots( cpuSection, playerLoopSources, hasMainPlayerLoopSource,
                 [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteMaterializedValidation );
 
             resources->SetPhase("zone-validation:gpu");
