@@ -91,6 +91,14 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - 其他`gpu.resource.*`、`gpu.memory.*`、Pass和`gpu.catalog.validation`仍返回`INDEX_NOT_READY`，没有因状态查询恢复而误开放完整快照路径。
 - 小型真实Catalog索引返回present/valid/complete、1个generation、1,001条resource和零质量finding；直接请求`gpu.resource.search`仍明确未就绪。真实后端状态合同通过，Release全构建与CTest 38/38（120.71秒）通过。
 
+## 2026-09-18：P6 Windows 发布重试与半发布清理
+
+- QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。
+- 新回归真实持有源目录句柄：80 ms临时占用后发布成功；永久占用在3秒内失败且目标不存在；取消在500 ms内停止并返回cancelled。
+- 构建发布时记录每个已从`.tmp.<pid>`移动到最终generation名的候选。如果manifest发布前后续步骤失败，按逆序及Trace父目录、名称前缀、symlink/reparse检查删除已移动候选，避免遗留“无manifest但看似最终”的孤儿代次；删除成功后磁盘账本同步释放。
+- 小型真实Catalog索引发布/重开仍通过；Release全构建及包含新增发布测试的CTest 39/39（125.57秒）通过。
+- P6仍未完成：排他owner锁、旧generation Reader租约、崩溃恢复清理、长路径和删除失败清单仍待实现。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

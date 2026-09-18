@@ -289,6 +289,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-cache-publish-retry-tests)
     add_test(NAME tracy-cache-publish-retry COMMAND tracy-cache-publish-retry-tests)
 
+    add_executable(tracy-query-index-publish-tests tests/QueryIndexPublishTests.cpp)
+    target_link_libraries(tracy-query-index-publish-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-index-publish-tests)
+    add_test(NAME tracy-query-index-publish COMMAND tracy-query-index-publish-tests)
+
     add_executable(tracy-frame-window-review-tests tests/FrameWindowReviewTests.cpp)
     target_link_libraries(tracy-frame-window-review-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-frame-window-review-tests)

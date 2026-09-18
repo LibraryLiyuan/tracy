@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -106,6 +107,8 @@ struct QueryIndexValidation
 class QueryIndex
 {
 public:
+    static bool PublishPathForTesting( const std::filesystem::path& source, const std::filesystem::path& target,
+        std::string& error, const std::function<bool()>& cancelled );
     static std::filesystem::path ManifestPath( const std::filesystem::path& tracePath );
     static std::shared_ptr<QueryResourceContext> CreateResourceContext( const std::filesystem::path& tracePath,
         QueryResourceContextOptions options = {} );

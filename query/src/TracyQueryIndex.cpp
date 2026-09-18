@@ -26,6 +26,7 @@
 #include <mutex>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -275,7 +276,8 @@ private:
 #endif
 };
 
-bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::path& target, std::string& error );
+bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::path& target, std::string& error,
+    const std::function<bool()>& cancelled = {} );
 std::string ReadManifest( const std::filesystem::path& path, uint64_t maximumBytes = MaximumManifestBytes );
 
 class QuerySerializedStringSource final : public SerializedStringSource
@@ -510,7 +512,7 @@ public:
             input.close(); output.close();
             const auto replacedBytes=std::filesystem::file_size(m_cpuPath);
             std::string error;
-            if( !AtomicReplace( sortedPath, m_cpuPath, error ) ) throw std::runtime_error( "cannot commit sorted CPU-zone index: " + error );
+            if( !AtomicReplace( sortedPath, m_cpuPath, error, m_storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit sorted CPU-zone index: " + error );
             if(m_storageOptions.disk && m_storageOptions.disk->usage) m_storageOptions.disk->usage->Release(replacedBytes);
             std::vector<bool>().swap( m_extraHasText );
             std::vector<bool>().swap( m_extraNameActive );
@@ -2345,13 +2347,26 @@ uint64_t ProcessId()
 #endif
 }
 
-bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::path& target, std::string& error )
+bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::path& target, std::string& error,
+    const std::function<bool()>& cancelled )
 {
 #ifdef _WIN32
-    if( MoveFileExW( source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
-    error = "MoveFileExW failed with error " + std::to_string( GetLastError() );
-    return false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds( 2 );
+    auto delay = std::chrono::milliseconds( 5 );
+    while( true )
+    {
+        if( MoveFileExW( source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
+        const auto code = GetLastError();
+        if( cancelled && cancelled() ) { error = "Query index publication cancelled"; return false; }
+        if( code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION && code != ERROR_LOCK_VIOLATION )
+        { error = "MoveFileExW failed with error " + std::to_string( code ); return false; }
+        if( std::chrono::steady_clock::now() >= deadline )
+        { error = "MoveFileExW failed with error " + std::to_string( code ); return false; }
+        std::this_thread::sleep_for( delay );
+        delay = std::min( delay * 2, std::chrono::milliseconds( 100 ) );
+    }
 #else
+    if( cancelled && cancelled() ) { error = "Query index publication cancelled"; return false; }
     std::error_code ec;
     std::filesystem::rename( source, target, ec );
     if( !ec ) return true;
@@ -2499,6 +2514,12 @@ std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::p
 
 }
 
+bool QueryIndex::PublishPathForTesting( const std::filesystem::path& source, const std::filesystem::path& target,
+    std::string& error, const std::function<bool()>& cancelled )
+{
+    return AtomicReplace( source, target, error, cancelled );
+}
+
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
 {
     auto result = tracePath;
@@ -2589,6 +2610,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     auto temporaryValidation = tracePath.parent_path() / ( baseName + ".jnidx.validation" + suffix );
     auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
     std::vector<std::filesystem::path> packedScratch;
+    std::vector<std::filesystem::path> publishedCandidates;
 
     if( !resources ) resources=CreateResourceContext(tracePath);
     resources->ValidateTraceIdentity(result.sourceBytes,result.sourceFingerprint);
@@ -2945,23 +2967,39 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         resources->CheckFinalDisk();
 
         std::string error;
-        if( !AtomicReplace( temporaryExtras, result.zoneExtras.path, error ) ) throw std::runtime_error( "cannot commit zone-extra index: " + error );
-        if( !AtomicReplace( temporaryCpu, result.cpuZones.path, error ) ) throw std::runtime_error( "cannot commit CPU-zone index: " + error );
-        if( !AtomicReplace( temporaryGpu, result.gpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-zone index: " + error );
-        if( !AtomicReplace( temporarySamples, result.samples.path, error ) ) throw std::runtime_error( "cannot commit sample index: " + error );
-        if( !AtomicReplace( temporaryStrings, result.globalStrings.path, error ) ) throw std::runtime_error( "cannot commit global string index: " + error );
-        if( !AtomicReplace( temporaryCallstacks, result.globalCallstacks.path, error ) ) throw std::runtime_error( "cannot commit global callstack index: " + error );
-        if( !AtomicReplace( temporaryCallstackFrames, result.globalCallstackFrames.path, error ) ) throw std::runtime_error( "cannot commit global callstack frame index: " + error );
-        if( !AtomicReplace( temporaryCatalog, result.gpuCatalog.path, error ) ) throw std::runtime_error( "cannot commit GPU Catalog index: " + error );
+        if( !AtomicReplace( temporaryExtras, result.zoneExtras.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit zone-extra index: " + error );
+        publishedCandidates.emplace_back( result.zoneExtras.path );
+        if( !AtomicReplace( temporaryCpu, result.cpuZones.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit CPU-zone index: " + error );
+        publishedCandidates.emplace_back( result.cpuZones.path );
+        if( !AtomicReplace( temporaryGpu, result.gpuZones.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit GPU-zone index: " + error );
+        publishedCandidates.emplace_back( result.gpuZones.path );
+        if( !AtomicReplace( temporarySamples, result.samples.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit sample index: " + error );
+        publishedCandidates.emplace_back( result.samples.path );
+        if( !AtomicReplace( temporaryStrings, result.globalStrings.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit global string index: " + error );
+        publishedCandidates.emplace_back( result.globalStrings.path );
+        if( !AtomicReplace( temporaryCallstacks, result.globalCallstacks.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit global callstack index: " + error );
+        publishedCandidates.emplace_back( result.globalCallstacks.path );
+        if( !AtomicReplace( temporaryCallstackFrames, result.globalCallstackFrames.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit global callstack frame index: " + error );
+        publishedCandidates.emplace_back( result.globalCallstackFrames.path );
+        if( !AtomicReplace( temporaryCatalog, result.gpuCatalog.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit GPU Catalog index: " + error );
+        publishedCandidates.emplace_back( result.gpuCatalog.path );
         for( size_t index = 0; index < temporaryJn.size(); index++ )
-            if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error ) )
+        {
+            if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error, storageOptions.cancelled ) )
                 throw std::runtime_error( "cannot commit JN domain index " + temporaryJn[index].string() +
                     " -> " + jnSections[index]->path.string() + ": " + error );
-        if( !AtomicReplace( temporaryGpuMemoryCpuZones, result.gpuMemoryCpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory CPU-zone index: " + error );
-        if( !AtomicReplace( temporaryGpuMemorySummaryCpuZones, result.gpuMemorySummaryCpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory summary CPU-zone index: " + error );
-        if( !AtomicReplace( temporaryGpuMemorySummary, result.gpuMemorySummary.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory summary index: " + error );
-        if( !AtomicReplace( temporaryData, result.dataPath, error ) ) throw std::runtime_error( "cannot commit index data: " + error );
-        if( !AtomicReplace( temporaryManifest, result.manifestPath, error ) ) throw std::runtime_error( "cannot commit index manifest: " + error );
+            publishedCandidates.emplace_back( jnSections[index]->path );
+        }
+        if( !AtomicReplace( temporaryGpuMemoryCpuZones, result.gpuMemoryCpuZones.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit GPU-memory CPU-zone index: " + error );
+        publishedCandidates.emplace_back( result.gpuMemoryCpuZones.path );
+        if( !AtomicReplace( temporaryGpuMemorySummaryCpuZones, result.gpuMemorySummaryCpuZones.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit GPU-memory summary CPU-zone index: " + error );
+        publishedCandidates.emplace_back( result.gpuMemorySummaryCpuZones.path );
+        if( !AtomicReplace( temporaryGpuMemorySummary, result.gpuMemorySummary.path, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit GPU-memory summary index: " + error );
+        publishedCandidates.emplace_back( result.gpuMemorySummary.path );
+        if( !AtomicReplace( temporaryData, result.dataPath, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit index data: " + error );
+        publishedCandidates.emplace_back( result.dataPath );
+        if( !AtomicReplace( temporaryManifest, result.manifestPath, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit index manifest: " + error );
+        publishedCandidates.emplace_back( result.manifestPath );
         return result;
     }
     catch( ... )
@@ -2969,6 +3007,19 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         const auto failure=std::current_exception();
         resources->SetLiveWorkers( 0 );
         std::error_code ignored;
+        for( auto candidate = publishedCandidates.rbegin(); candidate != publishedCandidates.rend(); ++candidate )
+        {
+            ignored.clear();
+            const auto parent = std::filesystem::absolute( tracePath ).parent_path().lexically_normal();
+            const auto target = std::filesystem::absolute( *candidate ).lexically_normal();
+            if( target.parent_path() != parent || !target.filename().string().starts_with( baseName ) ) continue;
+            if( std::filesystem::is_symlink( std::filesystem::symlink_status( target, ignored ) ) ) continue;
+#ifdef _WIN32
+            const auto attributes = GetFileAttributesW( target.c_str() );
+            if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
+#endif
+            analysis::AnalysisDiskRemove( target, storageOptions.disk, ignored, true );
+        }
         // Directory cleanup is limited to this build's explicitly recorded
         // direct children; never recurse through a link or another generation.
         for(const auto& packed:packedScratch) {
