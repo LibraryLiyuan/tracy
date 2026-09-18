@@ -27,6 +27,8 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 
 小型真实后端冷建、深校验、热开通过；新增分页校验存储测试和受影响的外部排序/预算测试 4/4 通过。P2 仍未完成：字符串、调用栈定义、其他 JN/Tracy 域和 GPU 摘要尚待迁移，未启动 12.43 GB 运行。
 
+随后从冷建必经路径移除了完整 GPU Memory Attribution 和大 JSON：原 Worker 写出 compact 后立即释放，冷建不再为摘要打开第二个 compact Worker；manifest 将该派生摘要记录为未构建。GPU Memory 分页派生后端仍属于 P4，现阶段不会把缺失摘要误报为已完成。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

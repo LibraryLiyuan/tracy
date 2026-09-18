@@ -11,7 +11,7 @@
 | Callstack | payload 已有 Converter 外置路径；Frame/inline 定义、父调用栈和符号地址映射仍由 Worker 持有 | 待迁移 | 按原 ID 建事实表和按需页；保留缺失引用语义；迁移 Sample/Zone/Job/Evidence 消费者 |
 | JN 固定域 | Schedule/Config/Dependency、GfxDispatch、Frame、I/O、Runtime、Script、Callsite | 待迁移 | 事实表＋键/ordinal 索引；逐域切换真实后端消费者后才从 compact 移除 |
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
-| GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 待拆分 | 从冷建必经路径移出；独立阶段输出分页事实与小型汇总，生命周期/Range 并集允许溢写 |
+| GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
 | Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3/P4 待恢复 | 先完成 Catalog 语义质量权威，再建外排索引和迁移消费者 |
 
@@ -19,5 +19,6 @@
 
 - `QueryValidationStoreTests` 覆盖分页状态随机读、有界两项 run、外部归并、确定性去重、workspace 上界和磁盘回收。
 - 小型 JNTRACYX v1 QueryIndex 完成冷建、深校验和重开，CPU Zone 218 条，压缩 sidecar 2,956 字节。
+- 冷建 manifest 明确记录 GPU Memory 完整摘要 count=0；原 Worker 写完 compact 后释放，不再为摘要打开第二个 Worker。
 - 受影响回归 4/4 通过：validation store、external exact statistics、workspace budget、resource context。
 - 未运行 12.43 GB 正式 Trace。

@@ -2779,37 +2779,16 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         source.reset();
         resources->SetLiveWorkers( 0 );
         {
-            resources->SetPhase( "gpu-memory-summary" );
-            auto buildManifest = result;
-            buildManifest.dataPath = temporaryData;
-            buildManifest.zoneExtras.path = temporaryExtras; buildManifest.cpuZones.path = temporaryCpu; buildManifest.gpuZones.path = temporaryGpu;
-            buildManifest.samples.path = temporarySamples;
-            buildManifest.gpuCatalog.path = temporaryCatalog;
-            for( size_t index = 0; index < jnSections.size(); index++ )
-            {
-                QueryIndexSection* buildSections[] = { &buildManifest.jobStages, &buildManifest.gfxEntities, &buildManifest.gfxLinks,
-                    &buildManifest.relations, &buildManifest.gpuReferencePasses, &buildManifest.gpuReferenceUses, &buildManifest.gpuReferenceEnds };
-                buildSections[index]->path = temporaryJn[index];
-            }
-            buildManifest.gpuMemoryCpuZones.path = temporaryGpuMemoryCpuZones;
-            buildManifest.gpuMemorySummaryCpuZones.path = temporaryGpuMemorySummaryCpuZones;
-            buildManifest.gpuMemorySummary.count = 0;
-            auto compact = analysis::WorkerTraceSource::Open( temporaryData, {}, result.sourceFingerprint,
-                analysis::WorkerTraceLoadMode::IndexedSidecar, nullptr, ResourceReadHooks(resources,"compact-load:" ) );
-            resources->SetLiveWorkers( 1 );
-            IndexedTraceSource indexed( std::move( buildManifest ), std::move( compact ), resources );
-            const auto summary = indexed.GetGpuMemorySummaryAttribution();
-            const auto payload = GpuMemorySummaryJson( summary ).dump();
-            resources->BeforeFileGrowth( temporaryGpuMemorySummary, payload.size() );
+            resources->SetPhase( "gpu-memory-summary-deferred" );
+            resources->BeforeFileGrowth( temporaryGpuMemorySummary, 0 );
             std::ofstream output( temporaryGpuMemorySummary, std::ios::binary | std::ios::trunc );
             if( !output ) throw std::runtime_error( "cannot create GPU-memory summary index" );
-            output.write( payload.data(), std::streamsize( payload.size() ) ); output.flush();
+            output.flush();
             if( !output ) throw std::runtime_error( "cannot flush GPU-memory summary index" );
-            result.gpuMemorySummary.count = 1; result.gpuMemorySummary.declaredCount = 1;
+            result.gpuMemorySummary.count = 0; result.gpuMemorySummary.declaredCount = 0;
             result.gpuMemorySummary.bytes = std::filesystem::file_size( temporaryGpuMemorySummary );
             result.gpuMemorySummary.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemorySummary );
         }
-        resources->SetLiveWorkers( 0 );
 
         // Mutable build extents are closed before compression. Publication
         // names are generation-specific, so existing readers retain their

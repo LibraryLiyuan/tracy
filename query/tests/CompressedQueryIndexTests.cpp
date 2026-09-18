@@ -36,6 +36,8 @@ int main(int argc,char** argv)
             failure.at("phase").get<std::string>().empty())
             throw std::runtime_error("resource-denied QueryIndex did not retain an actionable diagnostic");
         const auto manifest=tracy::query::QueryIndex::Build(input);
+        if(manifest.gpuMemorySummary.count!=0)
+            throw std::runtime_error("cold QueryIndex still built the full GPU-memory attribution summary");
         const auto validation=tracy::query::QueryIndex::Validate(input,true);
         if(!validation.manifest) throw std::runtime_error(validation.reason);
         if(!manifest.cpuZones.count || manifest.cpuZones.bytes>=manifest.cpuZones.count*52/2)
