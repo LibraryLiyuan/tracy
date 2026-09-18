@@ -753,7 +753,8 @@ Worker::Worker( const char* name, const char* program, const std::vector<ImportE
 }
 
 Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allowStringModification,
-    SerializedZoneSink* serializedZoneSink, SerializedStringSource* serializedStringSource )
+    SerializedZoneSink* serializedZoneSink, SerializedStringSource* serializedStringSource,
+    SerializedCallstackSource* serializedCallstackSource )
     : m_hasData( true )
     , m_stream( nullptr )
     , m_buffer( nullptr )
@@ -762,6 +763,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     , m_allowStringModification( allowStringModification )
     , m_serializedZoneSink( serializedZoneSink )
     , m_externalStringSource( serializedStringSource )
+    , m_externalCallstackSource( serializedCallstackSource )
 {
     auto loadStart = std::chrono::high_resolution_clock::now();
 
@@ -1563,13 +1565,19 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     s_loadProgress.subTotal.store( 0, std::memory_order_relaxed );
     s_loadProgress.progress.store( LoadProgress::CallStacks, std::memory_order_relaxed );
     f.Read( sz );
-    const bool externalCallstacks=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstacks();
-    m_externalCallstacks=externalCallstacks;m_externalCallstackCount=externalCallstacks?sz:0;
-    if(externalCallstacks)
+    const bool manifestBoundCallstacks=sz==std::numeric_limits<uint64_t>::max();
+    if(manifestBoundCallstacks){if(!m_externalCallstackSource)throw LoadFailure("compact trace requires its manifest-bound external callstack payloads");sz=0;}
+    const bool captureExternalCallstacks=m_serializedZoneSink&&m_serializedZoneSink->WantsCallstacks();
+    const bool suppliedExternalCallstacks=m_externalCallstackSource!=nullptr;
+    const bool externalCallstacks=captureExternalCallstacks||suppliedExternalCallstacks;
+    m_externalCallstacks=externalCallstacks;m_externalCallstackCount=suppliedExternalCallstacks?m_externalCallstackSource->CallstackCount():(captureExternalCallstacks?sz:0);
+    if(suppliedExternalCallstacks&&(!manifestBoundCallstacks||sz!=0))throw LoadFailure("manifest-bound compact trace has an invalid external callstack marker");
+    if(captureExternalCallstacks)
     {
         if(m_data.callstackPayload.empty())m_data.callstackPayload.push_back(nullptr);else if(m_data.callstackPayload.size()!=1)throw LoadFailure("callstack sentinel state");
         m_serializedZoneSink->CallstacksBegin(sz);std::array<CallstackFrameId,4096> frames;
         for(uint64_t i=0;i<sz;++i){m_serializedZoneSink->CheckRead();uint16_t count;f.Read(count);if(!count)throw LoadFailure("empty callstack payload");const auto id=uint32_t(i+1);m_serializedZoneSink->CallstackBegin(id,count);for(uint32_t offset=0;offset<count;){const auto take=std::min<uint32_t>(uint32_t(frames.size()),count-offset);f.Read(frames.data(),size_t(take)*sizeof(CallstackFrameId));m_serializedZoneSink->CallstackFrames(id,offset,frames.data(),take);offset+=take;}m_serializedZoneSink->CallstackEnd(id);}m_serializedZoneSink->CallstacksEnd();
+        m_externalCallstackSource=m_serializedZoneSink->GlobalCallstackSource();if(!m_externalCallstackSource||m_externalCallstackSource->CallstackCount()!=m_externalCallstackCount)throw LoadFailure("external callstack source was not published after serialization");
     }
     else
     {
@@ -11675,9 +11683,9 @@ void Worker::Write( FileWrite& f, bool fiDict )
     }
 
     if(m_offlineStorage)m_offlineStorage->ReportFinalizeProgress("write_callstacks",0,m_offlineStorage->CallstackCount()-1,"callstacks");
-    sz = m_data.callstackPayload.size() - 1;
+    sz = m_externalCallstackSource ? std::numeric_limits<uint64_t>::max() : m_data.callstackPayload.size() - 1;
     f.Write( &sz, sizeof( sz ) );
-    for( size_t i=1; i<=sz; i++ )
+    if(!m_externalCallstackSource) for( size_t i=1; i<=sz; i++ )
     {
         auto& cs = m_data.callstackPayload[i];
         uint16_t csz = cs->size();

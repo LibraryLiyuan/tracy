@@ -681,6 +681,7 @@ public:
     std::string fingerprint;
     std::unique_ptr<FileRead> file;
     std::unique_ptr<Worker> worker;
+    SerializedCallstackSource* externalCallstacks = nullptr;
     std::vector<CpuEntry> cpuZones;
     std::vector<GpuEntry> gpuZones;
     std::unordered_map<const ZoneEvent*, size_t> cpuLookup;
@@ -732,7 +733,8 @@ std::string WorkerTraceSource::ComputeFingerprint( const std::filesystem::path& 
 
 std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback,
     std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink,
-    std::shared_ptr<tracy::FileReadHooks> readHooks, SerializedStringSource* serializedStringSource )
+    std::shared_ptr<tracy::FileReadHooks> readHooks, SerializedStringSource* serializedStringSource,
+    SerializedCallstackSource* serializedCallstackSource )
 {
     auto impl = std::make_unique<Impl>( path, loadMode );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
@@ -753,13 +755,16 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
             EventType::Locks | EventType::Messages | EventType::Plots | EventType::Memory |
             EventType::FrameImages | EventType::ContextSwitches |
             EventType::SymbolCode | EventType::SourceCache );
-        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink, serializedStringSource );
+        impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink,
+            serializedStringSource, serializedCallstackSource );
         while( !impl->worker->IsBackgroundDone() )
         {
             if(loadHooks && loadHooks->check) loadHooks->check();
             std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
         }
         if(loadHooks && loadHooks->check) loadHooks->check();
+        impl->externalCallstacks=serializedCallstackSource?serializedCallstackSource:
+            (serializedZoneSink?serializedZoneSink->GlobalCallstackSource():nullptr);
         if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         impl->BuildIndexes();
         if(loadHooks && loadHooks->check) loadHooks->check();
@@ -3557,17 +3562,16 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
     for( const auto callstack : callstacks )
     {
         if( callstack == 0 || callstack > worker.GetCallstackPayloadCount() ) continue;
-        const auto& entries = worker.GetCallstack( callstack );
         size_t depth = 0;
-        for( const auto& entry : entries )
+        const auto resolveEntry = [&]( const CallstackFrameId& entry )
         {
-            if( depth >= maxDepth ) break;
+            if( depth >= maxDepth ) return;
             const auto* frameData = worker.GetCallstackFrame( entry );
             if( !frameData )
             {
                 result.push_back( { m_impl->MakeRef( "callstack-frame", ( uint64_t( callstack ) << 32 ) | depth ), "", "", 0, Hex( worker.GetCanonicalPointer( entry ) ), "0x0", false, callstack, depth } );
                 depth++;
-                continue;
+                return;
             }
             std::optional<std::string> imageName;
             if( frameData->imageName.Active() ) imageName = Safe( worker.TryGetString( frameData->imageName ) );
@@ -3580,6 +3584,21 @@ std::vector<CallstackFrameDto> WorkerTraceSource::ResolveCallstacks( const std::
                     Hex( worker.GetCanonicalPointer( entry ) ), Hex( frame.symAddr ), frameIndex + 1 != frameData->size, callstack, depth, imageName
                 } );
                 depth++;
+            }
+        };
+        if( m_impl->externalCallstacks )
+        {
+            uint32_t count=0;const auto* entries=m_impl->externalCallstacks->Frames(callstack,count);
+            if(!entries)continue;
+            for(uint32_t index=0;index<count&&depth<maxDepth;++index)resolveEntry(entries[index]);
+        }
+        else
+        {
+            const auto& entries = worker.GetCallstack( callstack );
+            for( const auto& entry : entries )
+            {
+                if(depth>=maxDepth)break;
+                resolveEntry(entry);
             }
         }
     }

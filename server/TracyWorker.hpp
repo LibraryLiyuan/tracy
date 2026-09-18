@@ -93,6 +93,14 @@ public:
     virtual void VisitPointerIds( uint8_t kind, const std::function<void( uint64_t )>& visitor ) const = 0;
 };
 
+class SerializedCallstackSource
+{
+public:
+    virtual ~SerializedCallstackSource() = default;
+    virtual uint64_t CallstackCount() const = 0;
+    virtual const CallstackFrameId* Frames( uint32_t id, uint32_t& count ) const = 0;
+};
+
 class SerializedZoneSink
 {
 public:
@@ -135,6 +143,7 @@ public:
     virtual void CallstackFrames(uint32_t,uint32_t,const CallstackFrameId*,uint32_t){}
     virtual void CallstackEnd(uint32_t){}
     virtual void CallstacksEnd(){}
+    virtual SerializedCallstackSource* GlobalCallstackSource(){return nullptr;}
     virtual bool WantsSamples()const{return false;}
     virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
     virtual void SampleRecord(uint64_t,uint8_t,uint64_t,int64_t,uint32_t){}
@@ -621,7 +630,8 @@ public:
         WorkerOfflineStorage* offlineStorage = nullptr );
     Worker( const char* name, const char* program, const std::vector<ImportEventTimeline>& timeline, const std::vector<ImportEventMessages>& messages, const std::vector<ImportEventPlots>& plots, const std::unordered_map<uint64_t, std::string>& threadNames );
     Worker( FileRead& f, EventType::Type eventMask = EventType::All, bool bgTasks = true, bool allowStringModification = false,
-        SerializedZoneSink* serializedZoneSink = nullptr, SerializedStringSource* serializedStringSource = nullptr );
+        SerializedZoneSink* serializedZoneSink = nullptr, SerializedStringSource* serializedStringSource = nullptr,
+        SerializedCallstackSource* serializedCallstackSource = nullptr );
     ~Worker();
 
     const std::string& GetAddr() const { return m_addr; }
@@ -681,7 +691,7 @@ public:
     }
     // Caller joins replay before reading; no traversal or large snapshot allocation.
     std::array<uint64_t,8> GetOfflineCoreCounts() const {
-        return {StringTableCount(),m_data.callstackPayload.size(),m_data.zonesCnt,m_data.gpuCnt,
+        return {StringTableCount(),GetCallstackPayloadCount(),m_data.zonesCnt,m_data.gpuCnt,
             m_data.zoneChildren.size(),m_data.callstackFrameMap.size(),m_data.stringMap.size(),m_slab.AllocatedBytes()};
     }
     uint64_t GetGpuZoneCount() const { return m_data.gpuCnt; }
@@ -692,7 +702,7 @@ public:
     uint64_t GetContextSwitchPerCpuCount() const;
     bool HasContextSwitches() const { return !m_data.ctxSwitch.empty(); }
     uint64_t GetSrcLocCount() const { return m_data.sourceLocationPayload.size() + m_data.sourceLocation.size(); }
-    uint64_t GetCallstackPayloadCount() const { return m_externalCallstacks?m_externalCallstackCount:m_data.callstackPayload.size() - 1; }
+    uint64_t GetCallstackPayloadCount() const { return m_externalCallstackSource?m_externalCallstackSource->CallstackCount():(m_externalCallstacks?m_externalCallstackCount:m_data.callstackPayload.size() - 1); }
 #ifndef TRACY_NO_STATISTICS
     uint64_t GetCallstackParentPayloadCount() const { return m_data.parentCallstackPayload.size(); }
     uint64_t GetCallstackParentFrameCount() const { return m_callstackParentNextIdx; }
@@ -759,7 +769,7 @@ public:
     const JnTraceData& GetJnTraceData() const { return m_data.jnTrace; }
     bool HasJnTraceData() const { return m_data.jnTrace.present; }
 
-    const VarArray<CallstackFrameId>& GetCallstack( uint32_t idx ) const { return *m_data.callstackPayload[idx]; }
+    const VarArray<CallstackFrameId>& GetCallstack( uint32_t idx ) const { if(m_externalCallstackSource)throw std::runtime_error("external_callstack_requires_value_access");return *m_data.callstackPayload[idx]; }
     const CallstackFrameData* GetCallstackFrame( const CallstackFrameId& ptr ) const;
     CallstackFrameId PackPointer( uint64_t ptr ) const;
     uint64_t GetCanonicalPointer( const CallstackFrameId& id ) const;
@@ -1518,6 +1528,7 @@ private:
     int64_t m_loadTime;
     SerializedZoneSink* m_serializedZoneSink = nullptr;
     SerializedStringSource* m_externalStringSource = nullptr;
+    SerializedCallstackSource* m_externalCallstackSource = nullptr;
     uint64_t m_serializedCpuZoneIndex = 0;
     uint64_t m_externalStringCount = 0;
     bool m_externalStrings = false;

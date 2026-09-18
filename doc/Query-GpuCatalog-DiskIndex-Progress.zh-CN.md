@@ -37,6 +37,14 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 - 小型真实 JNTRACYX v1 冷建、深校验、热开及 overview 通过：输入 1,309,833 字节，118 个全局字符串侧车 5,453 字节，compact 2,076 字节。Release 全目标构建通过，最终 CTest 37/37（120.77秒）通过，compressed/sample/job/catalog 四项真实后端集成回归通过。
 - P2 仍未完成：Callstack payload/Frame/父调用栈、其余 JN/Tracy 常驻域仍需按证据迁移；尚未运行 12.43 GB 正式 Trace。
 
+## 2026-09-18：schema21 Callstack payload 外置
+
+- Callstack payload 按原 ID 写入只读 frame arena，分页目录只保存 offset/count；单个超深 payload 支持分块写入和访问，不建立全量 `VarArray`/slab。arena 内容 hash、分页块校验和 manifest 目录 hash 分层保存。
+- `WorkerTraceSource::ResolveCallstacks` 直接读取稳定映射 payload，再解析 Worker 中暂时保留的 Frame/inline 定义。compact 使用 manifest 绑定标记；无调用栈侧车时普通 Worker 在加载阶段拒绝。
+- 小型真实 callstack Trace 冷建、深校验、热开和 `callstack.resolve` 通过，原始 `0x1000 → 0x2000` 两帧一致；payload 侧车755字节，compact 2,055字节。Release 全目标构建通过，CTest 38/38（160.95秒）通过，compressed/sample/job/catalog 四项真实后端回归通过。
+- Job 回归首次发布时复现一次已知 Windows `MoveFileExW error 5`；检查确认压缩 Writer/Reader 均已离开作用域，新的独立代次随后通过。该偶发目录发布失败和失败后已移动代次清理仍是 P6 的明确缺陷，未通过重跑改写为“已修复”。
+- P2 下一项为 Callstack Frame/inline 定义、父调用栈和符号地址映射；12.43 GB 正式 Trace 尚未运行。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证
