@@ -97,6 +97,41 @@ int main()
         Require( QueryIndex::PublishPathForTesting( source, target, error, {} ) && fs::is_directory( target ),
             "Query publication failed" );
 #endif
+        const std::string generationPrefix = "jnidx.0123456789abcdef.s26.g";
+        const auto oldBase = generationPrefix + "100";
+        const auto currentBase = generationPrefix + "200";
+        const auto oldFile = root / ( oldBase + ".jnidx.cpu" );
+        const auto oldDirectory = root / ( oldBase + ".jnidx.string" );
+        const auto currentFile = root / ( currentBase + ".jnidx.cpu" );
+        const auto unownedSameBase = root / ( oldBase + ".jnidx.unowned" );
+        const auto otherFingerprint = root / "jnidx.ffffffffffffffff.s26.g100.jnidx.cpu";
+        std::ofstream( oldFile ) << "old";
+        fs::create_directories( oldDirectory );
+        std::ofstream( oldDirectory / "page" ) << "old";
+        std::ofstream( currentFile ) << "current";
+        std::ofstream( unownedSameBase ) << "keep";
+        std::ofstream( otherFingerprint ) << "other";
+        std::string leaseError;
+        auto readerLease = QueryIndex::AcquireReaderLeaseForTesting(
+            root / ( oldBase + ".reader.lock" ), leaseError );
+        Require( readerLease && leaseError.empty(), "could not acquire Query reader lease" );
+        std::vector<fs::path> retained;
+        std::string generationCleanupError;
+        Require( QueryIndex::CleanupUnreferencedGenerationsForTesting(
+            root, generationPrefix, currentBase, retained, generationCleanupError ) &&
+            fs::exists( oldFile ) && fs::exists( oldDirectory ) && fs::exists( currentFile ) &&
+            fs::exists( otherFingerprint ) && !retained.empty(),
+            "Query generation cleanup removed an active or unrelated generation" );
+        readerLease.reset();
+        retained.clear();
+        generationCleanupError.clear();
+        Require( QueryIndex::CleanupUnreferencedGenerationsForTesting(
+            root, generationPrefix, currentBase, retained, generationCleanupError ) &&
+            !fs::exists( oldFile ) && !fs::exists( oldDirectory ) &&
+            !fs::exists( root / ( oldBase + ".reader.lock" ) ) &&
+            fs::exists( currentFile ) && fs::exists( unownedSameBase ) &&
+            fs::exists( otherFingerprint ) && retained.empty(),
+            "Query generation cleanup did not reclaim an unused generation safely" );
         std::error_code ignored;
         fs::remove_all( root, ignored );
         std::cout << "Query index publication tests passed\n";

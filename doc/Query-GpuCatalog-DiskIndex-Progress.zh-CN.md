@@ -101,7 +101,10 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - owner锁接入后的Release全构建及CTest 39/39通过（126.17秒）。
 - 取得owner锁后会扫描Trace目录的直接子项，只匹配当前完整源指纹前16位、当前schema及`.tmp.<pid>`命名的崩溃候选；reparse/symlink和其他指纹数据不会删除。候选先加入共享磁盘账本，删除成功后释放；扫描、计账或删除失败会中止新构建并保留错误。
 - 身份边界回归确认同指纹文件/目录被清理、其他指纹候选保留；小型真实Catalog构建后无`.tmp`或owner锁残留。
-- P6仍未完成：旧generation Reader租约、无`.tmp`但manifest未引用的半发布代次、长路径和删除失败清单仍待实现。
+- schema26为每个已发布generation增加跨进程Reader租约。`Validate`在读取任何generation文件前取得共享租约，`Open`把租约保持到IndexedTraceSource析构；重建发布新manifest后，只有能取得排他租约的旧generation才会回收，活跃Reader继续读取原不可变文件。
+- 回收只扫描当前完整源指纹前16位和schema26的直接子项，并将20种已知section/lease后缀作为固定白名单；当前manifest所指generation、其他指纹、未知同前缀文件、symlink及reparse point均不会删除。schema25及更早索引不会被schema26回收，避免旧进程未持租约时发生交叉删除。
+- 1,001资源真实Catalog完成`Build → Open → 再次Build`：第二次发布时旧generation因活跃Reader被完整保留；释放Reader后定向回收删除旧generation和租约，当前generation保持可用。Release全构建及CTest 39/39通过（123.53秒），删除白名单回归随后单独通过。
+- P6仍未完成：活跃Reader释放后的自动/下次启动回收触发、删除失败的持久化文件清单、Windows长路径与占用故障验收仍待实现。
 
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 

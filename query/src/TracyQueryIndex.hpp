@@ -12,11 +12,12 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 25;
+inline constexpr uint32_t QueryIndexSchemaVersion = 26;
 inline constexpr uint8_t QueryIndexZoneExtraTextActive = 1;
 inline constexpr uint8_t QueryIndexZoneExtraNameActive = 2;
 inline constexpr uint8_t QueryIndexZoneExtraNameResolvedFlag = 4;
@@ -97,6 +98,7 @@ struct QueryIndexManifest
     QueryCatalogValidationResult catalogValidation;
     std::unordered_map<uint64_t, uint64_t> cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> gpuZonesByContext;
+    std::shared_ptr<void> readerLease;
 };
 
 struct QueryIndexValidation
@@ -113,6 +115,11 @@ public:
     static bool ProbeOwnerLockForTesting( const std::filesystem::path& tracePath, std::string& error );
     static bool CleanupStaleCandidatesForTesting( const std::filesystem::path& root,
         std::string_view identityPrefix, std::string& error );
+    static std::shared_ptr<void> AcquireReaderLeaseForTesting( const std::filesystem::path& path,
+        std::string& error );
+    static bool CleanupUnreferencedGenerationsForTesting( const std::filesystem::path& root,
+        std::string_view identityPrefix, std::string_view currentBaseName,
+        std::vector<std::filesystem::path>& retained, std::string& error );
     static std::filesystem::path ManifestPath( const std::filesystem::path& tracePath );
     static std::shared_ptr<QueryResourceContext> CreateResourceContext( const std::filesystem::path& tracePath,
         QueryResourceContextOptions options = {} );

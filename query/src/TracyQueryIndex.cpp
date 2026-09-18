@@ -16,12 +16,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -79,6 +82,126 @@ public:
     QueryIndexOwnerLease& operator=( const QueryIndexOwnerLease& ) = delete;
 
 private:
+    std::filesystem::path m_path;
+#ifdef _WIN32
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
+#else
+    int m_fd = -1;
+#endif
+};
+
+class QueryIndexReaderLease
+{
+public:
+    static std::shared_ptr<void> Acquire( const std::filesystem::path& path, std::string& error )
+    {
+        error.clear();
+#ifdef _WIN32
+        const auto handle = CreateFileW( path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+        if( handle == INVALID_HANDLE_VALUE )
+        {
+            error = "Query generation reader lease failed: " + std::to_string( GetLastError() );
+            return {};
+        }
+        return std::shared_ptr<void>( new QueryIndexReaderLease( path, handle ), []( void* value ) {
+            delete static_cast<QueryIndexReaderLease*>( value );
+        } );
+#else
+        const auto fd = ::open( path.c_str(), O_CREAT | O_RDONLY, 0600 );
+        if( fd < 0 || flock( fd, LOCK_SH | LOCK_NB ) != 0 )
+        {
+            if( fd >= 0 ) ::close( fd );
+            error = "Query generation reader lease failed";
+            return {};
+        }
+        return std::shared_ptr<void>( new QueryIndexReaderLease( path, fd ), []( void* value ) {
+            delete static_cast<QueryIndexReaderLease*>( value );
+        } );
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    QueryIndexReaderLease( std::filesystem::path path, HANDLE handle )
+        : m_path( std::move( path ) ), m_handle( handle ) {}
+#else
+    QueryIndexReaderLease( std::filesystem::path path, int fd )
+        : m_path( std::move( path ) ), m_fd( fd ) {}
+#endif
+    ~QueryIndexReaderLease()
+    {
+#ifdef _WIN32
+        if( m_handle != INVALID_HANDLE_VALUE ) CloseHandle( m_handle );
+#else
+        if( m_fd >= 0 ) { flock( m_fd, LOCK_UN ); ::close( m_fd ); }
+#endif
+    }
+
+    std::filesystem::path m_path;
+#ifdef _WIN32
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
+#else
+    int m_fd = -1;
+#endif
+};
+
+class QueryIndexGenerationCleanupLease
+{
+public:
+    static std::unique_ptr<QueryIndexGenerationCleanupLease> TryAcquire(
+        const std::filesystem::path& path, bool& busy, std::string& error )
+    {
+        busy = false;
+        error.clear();
+#ifdef _WIN32
+        const auto handle = CreateFileW( path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
+        if( handle == INVALID_HANDLE_VALUE )
+        {
+            const auto code = GetLastError();
+            if( code == ERROR_SHARING_VIOLATION || code == ERROR_LOCK_VIOLATION ) busy = true;
+            else error = "Query generation cleanup lease failed: " + std::to_string( code );
+            return {};
+        }
+        return std::unique_ptr<QueryIndexGenerationCleanupLease>(
+            new QueryIndexGenerationCleanupLease( path, handle ) );
+#else
+        const auto fd = ::open( path.c_str(), O_CREAT | O_RDWR, 0600 );
+        if( fd < 0 )
+        {
+            error = "Query generation cleanup lease failed";
+            return {};
+        }
+        if( flock( fd, LOCK_EX | LOCK_NB ) != 0 )
+        {
+            busy = errno == EWOULDBLOCK || errno == EAGAIN;
+            if( !busy ) error = "Query generation cleanup lease failed";
+            ::close( fd );
+            return {};
+        }
+        return std::unique_ptr<QueryIndexGenerationCleanupLease>(
+            new QueryIndexGenerationCleanupLease( path, fd ) );
+#endif
+    }
+
+    ~QueryIndexGenerationCleanupLease()
+    {
+#ifdef _WIN32
+        if( m_handle != INVALID_HANDLE_VALUE ) CloseHandle( m_handle );
+#else
+        if( m_fd >= 0 ) { flock( m_fd, LOCK_UN ); ::close( m_fd ); }
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    QueryIndexGenerationCleanupLease( std::filesystem::path path, HANDLE handle )
+        : m_path( std::move( path ) ), m_handle( handle ) {}
+#else
+    QueryIndexGenerationCleanupLease( std::filesystem::path path, int fd )
+        : m_path( std::move( path ) ), m_fd( fd ) {}
+#endif
     std::filesystem::path m_path;
 #ifdef _WIN32
     HANDLE m_handle = INVALID_HANDLE_VALUE;
@@ -810,6 +933,124 @@ bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view
         analysis::AnalysisDiskRemove( candidate, disk, ec, true );
         if( ec ) { error = "Query stale candidate cleanup failed: " + candidate.string() + ": " + ec.message(); return false; }
     }
+    return true;
+}
+
+std::optional<std::string> PublishedGenerationBaseName( std::string_view name, std::string_view identityPrefix )
+{
+    if( !name.starts_with( identityPrefix ) || name.find( ".tmp." ) != std::string_view::npos ) return std::nullopt;
+    auto cursor = identityPrefix.size();
+    const auto digits = cursor;
+    while( cursor < name.size() && name[cursor] >= '0' && name[cursor] <= '9' ) ++cursor;
+    if( cursor == digits ) return std::nullopt;
+    const auto suffix = name.substr( cursor );
+    static constexpr std::array<std::string_view, 20> OwnedSuffixes = {
+        ".jnidx.data", ".jnidx.zextra", ".jnidx.cpu", ".jnidx.gpu", ".jnidx.sample",
+        ".jnidx.string", ".jnidx.callstack", ".jnidx.callstack-frame", ".jnidx.gpu-catalog",
+        ".jnidx.job-stage", ".jnidx.gfx-entity", ".jnidx.gfx-link", ".jnidx.relation",
+        ".jnidx.gpu-ref-pass", ".jnidx.gpu-ref-use", ".jnidx.gpu-ref-end",
+        ".jnidx.gpu-memory-cpu-zone", ".jnidx.gpu-memory-summary-cpu-zone",
+        ".jnidx.gpu-memory-summary.json", ".reader.lock"
+    };
+    if( std::find( OwnedSuffixes.begin(), OwnedSuffixes.end(), suffix ) == OwnedSuffixes.end() )
+        return std::nullopt;
+    return std::string( name.substr( 0, cursor ) );
+}
+
+std::string ManifestGenerationBaseName( const QueryIndexManifest& manifest )
+{
+    constexpr std::string_view suffix = ".jnidx.data";
+    const auto name = manifest.dataPath.filename().string();
+    if( !std::string_view( name ).ends_with( suffix ) || name.size() == suffix.size() )
+        throw std::runtime_error( "invalid Query generation data path" );
+    return name.substr( 0, name.size() - suffix.size() );
+}
+
+std::filesystem::path GenerationReaderLeasePath( const QueryIndexManifest& manifest )
+{
+    return manifest.dataPath.parent_path() / ( ManifestGenerationBaseName( manifest ) + ".reader.lock" );
+}
+
+bool CleanupUnreferencedGenerations( const std::filesystem::path& root, std::string_view identityPrefix,
+    std::string_view currentBaseName, const std::shared_ptr<analysis::AnalysisDiskBudget>& disk,
+    std::vector<std::filesystem::path>& retained, std::string& error )
+{
+    retained.clear();
+    error.clear();
+    std::map<std::string, std::vector<std::filesystem::path>> generations;
+    std::unordered_set<std::string> unsafe;
+    std::error_code ec;
+    for( std::filesystem::directory_iterator entry( root, ec ), end; entry != end && !ec; entry.increment( ec ) )
+    {
+        const auto baseName = PublishedGenerationBaseName( entry->path().filename().string(), identityPrefix );
+        if( !baseName || *baseName == currentBaseName ) continue;
+        const auto status = std::filesystem::symlink_status( entry->path(), ec );
+        if( ec ) break;
+        if( std::filesystem::is_symlink( status ) ) unsafe.emplace( *baseName );
+#ifdef _WIN32
+        const auto attributes = GetFileAttributesW( entry->path().c_str() );
+        if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
+            unsafe.emplace( *baseName );
+#endif
+        generations[*baseName].emplace_back( entry->path() );
+    }
+    if( ec )
+    {
+        error = "Query generation scan failed: " + ec.message();
+        return false;
+    }
+    for( auto& [baseName, paths] : generations )
+    {
+        const auto leasePath = root / ( baseName + ".reader.lock" );
+        if( unsafe.contains( baseName ) )
+        {
+            retained.insert( retained.end(), paths.begin(), paths.end() );
+            continue;
+        }
+        try
+        {
+            if( disk && disk->usage ) disk->usage->AddRoots( paths );
+        }
+        catch( const std::exception& failure )
+        {
+            retained.insert( retained.end(), paths.begin(), paths.end() );
+            error = std::string( "Query generation accounting failed: " ) + failure.what();
+            return false;
+        }
+        bool busy = false;
+        std::string leaseError;
+        auto lease = QueryIndexGenerationCleanupLease::TryAcquire( leasePath, busy, leaseError );
+        if( !lease )
+        {
+            retained.insert( retained.end(), paths.begin(), paths.end() );
+            if( busy ) continue;
+            error = std::move( leaseError );
+            return false;
+        }
+        for( const auto& path : paths )
+        {
+            if( path == leasePath ) continue;
+            ec.clear();
+            analysis::AnalysisDiskRemove( path, disk, ec, true );
+            if( ec )
+            {
+                retained.insert( retained.end(), paths.begin(), paths.end() );
+                error = "Query generation cleanup failed: " + path.string() + ": " + ec.message();
+                return false;
+            }
+        }
+        lease.reset();
+        ec.clear();
+        analysis::AnalysisDiskRemove( leasePath, disk, ec );
+        if( ec )
+        {
+            retained.emplace_back( leasePath );
+            error = "Query generation lease cleanup failed: " + leasePath.string() + ": " + ec.message();
+            return false;
+        }
+    }
+    std::sort( retained.begin(), retained.end() );
+    retained.erase( std::unique( retained.begin(), retained.end() ), retained.end() );
     return true;
 }
 uint64_t SectionBytes(const std::filesystem::path& path)
@@ -2624,6 +2865,19 @@ bool QueryIndex::CleanupStaleCandidatesForTesting( const std::filesystem::path& 
     return CleanupStaleCandidates( root, identityPrefix, {}, error );
 }
 
+std::shared_ptr<void> QueryIndex::AcquireReaderLeaseForTesting( const std::filesystem::path& path,
+    std::string& error )
+{
+    return QueryIndexReaderLease::Acquire( path, error );
+}
+
+bool QueryIndex::CleanupUnreferencedGenerationsForTesting( const std::filesystem::path& root,
+    std::string_view identityPrefix, std::string_view currentBaseName,
+    std::vector<std::filesystem::path>& retained, std::string& error )
+{
+    return CleanupUnreferencedGenerations( root, identityPrefix, currentBaseName, {}, retained, error );
+}
+
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
 {
     auto result = tracePath;
@@ -3111,6 +3365,23 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         publishedCandidates.emplace_back( result.dataPath );
         if( !AtomicReplace( temporaryManifest, result.manifestPath, error, storageOptions.cancelled ) ) throw std::runtime_error( "cannot commit index manifest: " + error );
         publishedCandidates.emplace_back( result.manifestPath );
+        // Publication is already durable.  Cleanup is best-effort from this
+        // point so a deferred Windows handle or a diagnostic allocation cannot
+        // roll back files referenced by the newly visible manifest.
+        try
+        {
+            std::vector<std::filesystem::path> retained;
+            std::string cleanupError;
+            if( !CleanupUnreferencedGenerations( tracePath.parent_path(), identityPrefix, baseName,
+                    storageOptions.disk, retained, cleanupError ) )
+                fprintf( stderr, "Query generation cleanup deferred: %s\n", cleanupError.c_str() );
+            for( const auto& path : retained )
+                fprintf( stderr, "Query generation retained: %s\n", path.string().c_str() );
+        }
+        catch( const std::exception& cleanupFailure )
+        {
+            fprintf( stderr, "Query generation cleanup deferred: %s\n", cleanupFailure.what() );
+        }
         return result;
     }
     catch( ... )
@@ -3210,6 +3481,9 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
             return result;
         }
         manifest.dataPath = tracePath.parent_path() / dataFile;
+        std::string leaseError;
+        manifest.readerLease = QueryIndexReaderLease::Acquire( GenerationReaderLeasePath( manifest ), leaseError );
+        if( !manifest.readerLease ) throw std::runtime_error( leaseError );
         manifest.cpuZoneIndex = parsed.at( "domains" ).value( "cpu_zone_index", false );
         manifest.gpuZoneIndex = parsed.at( "domains" ).value( "gpu_zone_index", false );
         manifest.gpuMemoryProtocol2 = parsed.at( "domains" ).at( "gpu_memory_protocol2" ).get<bool>();
@@ -3440,31 +3714,39 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     analysis::WorkerTraceSource::StateCallback stateCallback, std::string fingerprintOverride,
     std::shared_ptr<QueryResourceContext> resources )
 {
+    auto leasedManifest = manifest;
+    if( !leasedManifest.readerLease )
+    {
+        std::string leaseError;
+        leasedManifest.readerLease = QueryIndexReaderLease::Acquire(
+            GenerationReaderLeasePath( leasedManifest ), leaseError );
+        if( !leasedManifest.readerLease ) throw std::runtime_error( leaseError );
+    }
     if(!resources)
     {
         auto tracePath=manifest.manifestPath;
         tracePath.replace_extension();
         resources=CreateResourceContext(tracePath);
     }
-    resources->ValidateTraceIdentity(manifest.sourceBytes,manifest.sourceFingerprint);
+    resources->ValidateTraceIdentity(leasedManifest.sourceBytes,leasedManifest.sourceFingerprint);
     resources->SetPhase("compact-open");
     resources->SetLiveWorkers(1);
     resources->CheckMemory();
     const auto storageOptions=ResourceStorageOptions(resources);
-    auto stringStore=std::make_shared<QueryStringStoreReader>(manifest.globalStrings.path,
-        manifest.sourceFingerprint,storageOptions);
+    auto stringStore=std::make_shared<QueryStringStoreReader>(leasedManifest.globalStrings.path,
+        leasedManifest.sourceFingerprint,storageOptions);
     auto stringSource=std::make_unique<QuerySerializedStringSource>(std::move(stringStore));
-    auto callstackStore=std::make_shared<QueryCallstackStoreReader>(manifest.globalCallstacks.path,
-        manifest.sourceFingerprint,storageOptions);
+    auto callstackStore=std::make_shared<QueryCallstackStoreReader>(leasedManifest.globalCallstacks.path,
+        leasedManifest.sourceFingerprint,storageOptions);
     auto callstackSource=std::make_unique<QuerySerializedCallstackSource>(std::move(callstackStore));
-    auto callstackFrames=std::make_shared<QueryCallstackFrameStoreReader>(manifest.globalCallstackFrames.path,
-        manifest.sourceFingerprint,storageOptions);
+    auto callstackFrames=std::make_shared<QueryCallstackFrameStoreReader>(leasedManifest.globalCallstackFrames.path,
+        leasedManifest.sourceFingerprint,storageOptions);
     callstackSource->SetFrames(std::move(callstackFrames));
-    auto source = analysis::WorkerTraceSource::Open( manifest.dataPath, std::move( stateCallback ),
-        fingerprintOverride.empty() ? manifest.sourceFingerprint : std::move( fingerprintOverride ),
+    auto source = analysis::WorkerTraceSource::Open( leasedManifest.dataPath, std::move( stateCallback ),
+        fingerprintOverride.empty() ? leasedManifest.sourceFingerprint : std::move( fingerprintOverride ),
         analysis::WorkerTraceLoadMode::IndexedSidecar, nullptr, ResourceReadHooks(resources,"compact-load:" ),
         stringSource.get(),callstackSource.get() );
-    auto result=std::make_unique<IndexedTraceSource>(manifest,std::move(stringSource),std::move(callstackSource),std::move(source),resources);
+    auto result=std::make_unique<IndexedTraceSource>(std::move(leasedManifest),std::move(stringSource),std::move(callstackSource),std::move(source),resources);
     resources->SetPhase("ready");
     resources->CheckMemory();
     return result;

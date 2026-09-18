@@ -43,17 +43,20 @@ int main( int argc, char** argv )
         const auto manifest = query::QueryIndex::Build( input );
         std::ifstream manifestInput( manifest.manifestPath );
         const auto json = nlohmann::json::parse( manifestInput );
+        manifestInput.close();
         Require( json.at( "sections" ).contains( "gpu_catalog" ),
             "Query index did not publish a GPU Catalog sidecar" );
         const auto catalogRoot = manifest.manifestPath.parent_path() /
             json.at( "sections" ).at( "gpu_catalog" ).at( "file" ).get<std::string>();
-        query::QueryCatalogStoreReader reader( catalogRoot, manifest.sourceFingerprint );
-        Require( reader.Count( OfflineCatalogDomain::CatalogResource ) == expectedResources,
-            "Catalog resource sidecar count changed" );
-        Require( reader.Count( OfflineCatalogDomain::CatalogBatch ) == expectedBatches,
-            "Catalog batch sidecar count changed" );
-        Require( reader.Count( OfflineCatalogDomain::CatalogString ) == expectedStrings,
-            "Catalog string sidecar count changed" );
+        {
+            query::QueryCatalogStoreReader reader( catalogRoot, manifest.sourceFingerprint );
+            Require( reader.Count( OfflineCatalogDomain::CatalogResource ) == expectedResources,
+                "Catalog resource sidecar count changed" );
+            Require( reader.Count( OfflineCatalogDomain::CatalogBatch ) == expectedBatches,
+                "Catalog batch sidecar count changed" );
+            Require( reader.Count( OfflineCatalogDomain::CatalogString ) == expectedStrings,
+                "Catalog string sidecar count changed" );
+        }
 
         bool rejectedUnboundCompact = false;
         try { auto compact = analysis::WorkerTraceSource::Open( manifest.dataPath ); }
@@ -71,6 +74,21 @@ int main( int argc, char** argv )
             status.counts[size_t( OfflineCatalogDomain::CatalogResource )] == expectedResources &&
             status.counts[size_t( OfflineCatalogDomain::CatalogBatch )] == expectedBatches,
             "indexed bounded Catalog status changed" );
+        const auto activeData = manifest.dataPath;
+        const auto second = query::QueryIndex::Build( input );
+        Require( fs::exists( activeData ), "published rebuild removed a generation held by an active indexed reader" );
+        indexed.reset();
+        const std::string generationPrefix = "jnidx." + manifest.sourceFingerprint.substr( 0, 16 ) +
+            ".s" + std::to_string( query::QueryIndexSchemaVersion ) + ".g";
+        auto currentBase = second.dataPath.filename().string();
+        const std::string dataSuffix = ".jnidx.data";
+        currentBase.erase( currentBase.size() - dataSuffix.size() );
+        std::vector<fs::path> retained;
+        std::string cleanupError;
+        Require( query::QueryIndex::CleanupUnreferencedGenerationsForTesting(
+                root, generationPrefix, currentBase, retained, cleanupError ) &&
+            !fs::exists( activeData ) && fs::exists( second.dataPath ) && retained.empty(),
+            "unused Query generations were not reclaimed after their reader lease ended" );
         std::cout << "GPU Catalog index integration passed resources=" << expectedResources << '\n';
         return 0;
     }
