@@ -1,6 +1,7 @@
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyAnalysisIoPath.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -29,7 +30,7 @@ int main( int argc, char** argv )
         if( argc != 3 ) throw std::runtime_error( "expected Catalog Trace and isolated output directory" );
         namespace fs = std::filesystem;
         using namespace tracy;
-        const fs::path root = argv[2];
+        const fs::path root = analysis::AnalysisIoPath( argv[2] );
         if( fs::exists( root ) ) throw std::runtime_error( "refusing existing output directory" );
         fs::create_directories( root );
         const auto input = root / "catalog.tracy";

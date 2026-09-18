@@ -11,6 +11,7 @@
 #include "TracyWorker.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyHash.hpp"
+#include "TracyAnalysisIoPath.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -54,7 +55,7 @@ public:
     explicit QueryIndexOwnerLease( std::filesystem::path path ) : m_path( std::move( path ) )
     {
 #ifdef _WIN32
-        m_handle = CreateFileW( m_path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        m_handle = CreateFileW( analysis::AnalysisIoPath( m_path ).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
         if( m_handle == INVALID_HANDLE_VALUE )
             throw std::runtime_error( "Query index owner lock is held: " + std::to_string( GetLastError() ) );
@@ -97,7 +98,7 @@ public:
     {
         error.clear();
 #ifdef _WIN32
-        const auto handle = CreateFileW( path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+        const auto handle = CreateFileW( analysis::AnalysisIoPath( path ).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
         if( handle == INVALID_HANDLE_VALUE )
         {
@@ -155,7 +156,7 @@ public:
         busy = false;
         error.clear();
 #ifdef _WIN32
-        const auto handle = CreateFileW( path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+        const auto handle = CreateFileW( analysis::AnalysisIoPath( path ).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
             OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr );
         if( handle == INVALID_HANDLE_VALUE )
         {
@@ -319,7 +320,7 @@ public:
         m_bytes = sizeof( ZoneSectionHeader ) + count * recordBytes;
         m_disk = std::move( disk );
 #ifdef _WIN32
-        m_file = CreateFileW( path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr );
+        m_file = CreateFileW( analysis::AnalysisIoPath( path ).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr );
         if( m_file == INVALID_HANDLE_VALUE ) throw std::runtime_error( "cannot create zone index section" );
         try { analysis::AnalysisDiskGrow( m_disk, m_bytes ); }
         catch( ... ) { CloseHandle( m_file ); m_file = INVALID_HANDLE_VALUE; std::error_code ignored; std::filesystem::remove( path, ignored ); throw; }
@@ -912,7 +913,7 @@ bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view
         if( ec ) break;
         if( std::filesystem::is_symlink( status ) ) continue;
 #ifdef _WIN32
-        const auto attributes = GetFileAttributesW( entry->path().c_str() );
+        const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( entry->path() ).c_str() );
         if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
 #endif
         candidates.emplace_back( entry->path() );
@@ -988,7 +989,7 @@ bool CleanupUnreferencedGenerations( const std::filesystem::path& root, std::str
         if( ec ) break;
         if( std::filesystem::is_symlink( status ) ) unsafe.emplace( *baseName );
 #ifdef _WIN32
-        const auto attributes = GetFileAttributesW( entry->path().c_str() );
+        const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( entry->path() ).c_str() );
         if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) )
             unsafe.emplace( *baseName );
 #endif
@@ -1141,7 +1142,7 @@ private:
             throw std::runtime_error( "zone index section size mismatch" );
         if( expectedBytes > std::numeric_limits<size_t>::max() ) throw std::runtime_error( "zone index section exceeds address space" );
 #ifdef _WIN32
-        m_file = CreateFileW( section.path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+        m_file = CreateFileW( analysis::AnalysisIoPath( section.path ).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
         if( m_file == INVALID_HANDLE_VALUE ) throw std::runtime_error( "cannot open zone index section" );
         m_mapping = CreateFileMappingW( m_file, nullptr, PAGE_READONLY, 0, 0, nullptr );
         if( !m_mapping ) { Close(); throw std::runtime_error( "cannot create read-only zone index mapping" ); }
@@ -2678,7 +2679,8 @@ bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::
     auto delay = std::chrono::milliseconds( 5 );
     while( true )
     {
-        if( MoveFileExW( source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
+        if( MoveFileExW( analysis::AnalysisIoPath( source ).c_str(), analysis::AnalysisIoPath( target ).c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH ) ) return true;
         const auto code = GetLastError();
         if( cancelled && cancelled() ) { error = "Query index publication cancelled"; return false; }
         if( code != ERROR_ACCESS_DENIED && code != ERROR_SHARING_VIOLATION && code != ERROR_LOCK_VIOLATION )
@@ -2700,9 +2702,10 @@ bool AtomicReplace( const std::filesystem::path& source, const std::filesystem::
 
 std::string ReadManifest( const std::filesystem::path& path, uint64_t maximumBytes )
 {
-    const auto bytes = std::filesystem::file_size( path );
+    const auto native = analysis::AnalysisIoPath( path );
+    const auto bytes = std::filesystem::file_size( native );
     if( bytes > maximumBytes ) throw std::runtime_error( "index JSON exceeds configured size limit" );
-    std::ifstream input( path, std::ios::binary );
+    std::ifstream input( native, std::ios::binary );
     if( !input ) throw std::runtime_error( "cannot open index manifest" );
     std::ostringstream output;
     output << input.rdbuf();
@@ -2959,7 +2962,7 @@ bool QueryIndex::ProbeOwnerLockForTesting( const std::filesystem::path& tracePat
 bool QueryIndex::CleanupStaleCandidatesForTesting( const std::filesystem::path& root,
     std::string_view identityPrefix, std::string& error )
 {
-    return CleanupStaleCandidates( root, identityPrefix, {}, error );
+    return CleanupStaleCandidates( analysis::AnalysisIoPath( root ), identityPrefix, {}, error );
 }
 
 std::shared_ptr<void> QueryIndex::AcquireReaderLeaseForTesting( const std::filesystem::path& path,
@@ -2972,19 +2975,21 @@ bool QueryIndex::CleanupUnreferencedGenerationsForTesting( const std::filesystem
     std::string_view identityPrefix, std::string_view currentBaseName,
     std::vector<std::filesystem::path>& retained, std::string& error )
 {
-    return CleanupUnreferencedGenerations( root, identityPrefix, currentBaseName, {}, retained, error );
+    return CleanupUnreferencedGenerations( analysis::AnalysisIoPath( root ), identityPrefix,
+        currentBaseName, {}, retained, error );
 }
 
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
 {
-    auto result = tracePath;
+    auto result = analysis::AnalysisIoPath( tracePath );
     result += ".jnidx";
     return result;
 }
 
-QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
+QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePath,
     analysis::WorkerTraceSource::StateCallback stateCallback, std::shared_ptr<QueryResourceContext> resources )
 {
+    const auto tracePath = analysis::AnalysisIoPath( inputTracePath );
     QueryIndexManifest result;
     result.manifestPath = ManifestPath( tracePath );
     result.sourceBytes = std::filesystem::file_size( tracePath );
@@ -3540,7 +3545,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             if( target.parent_path() != parent || !target.filename().string().starts_with( baseName ) ) continue;
             if( std::filesystem::is_symlink( std::filesystem::symlink_status( target, ignored ) ) ) continue;
 #ifdef _WIN32
-            const auto attributes = GetFileAttributesW( target.c_str() );
+            const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( target ).c_str() );
             if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
 #endif
             analysis::AnalysisDiskRemove( target, storageOptions.disk, ignored, true );
@@ -3553,7 +3558,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             if(target.parent_path()!=parent || !target.filename().string().starts_with(baseName)) continue;
             if(std::filesystem::is_symlink(std::filesystem::symlink_status(target,ignored))) continue;
 #ifdef _WIN32
-            const auto attributes=GetFileAttributesW(target.c_str());
+            const auto attributes=GetFileAttributesW(analysis::AnalysisIoPath(target).c_str());
             if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) continue;
 #endif
             analysis::AnalysisDiskRemove(target,storageOptions.disk,ignored,true);
@@ -3583,9 +3588,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
     }
 }
 
-QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePath, bool deep,
+QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTracePath, bool deep,
     std::shared_ptr<QueryResourceContext> resources )
 {
+    const auto tracePath = analysis::AnalysisIoPath( inputTracePath );
     QueryIndexValidation result;
     try
     {
@@ -3895,9 +3901,10 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     return result;
 }
 
-std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const std::filesystem::path& tracePath,
+std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const std::filesystem::path& inputTracePath,
     QueryResourceContextOptions options)
 {
+    const auto tracePath=analysis::AnalysisIoPath(inputTracePath);
     const auto actualBytes=std::filesystem::file_size(tracePath);
     const auto limits=analysis::AnalysisDiskBudget::ForTrace(actualBytes);
     if((options.expectedTraceBytes && options.expectedTraceBytes!=actualBytes) ||
