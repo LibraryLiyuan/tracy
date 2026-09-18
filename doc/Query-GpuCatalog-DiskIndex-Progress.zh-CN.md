@@ -1,5 +1,15 @@
 # Query 长数据改造：存储基础检查点
 
+## 2026-09-18：修订计划 P0 完成，进入 P1
+
+当前执行基线为 `2acd13ed674ba04ab87948ba959e15524d707085`、索引 schema19。r8 JNTRACYX v1 Trace 已冻结为 12,428,310,213 字节、SHA256 `DA845BBC88E15688F262F979529E5904FCFD560B4FF0936CD8B6E525C3C5935A`；旧 `1ce08c45` 只作为历史源码基线。
+
+消费者审计确认：Zone、Sample、JobStage/Gfx/Relation/GPU Reference 七类 JN 表和原始 GPU Catalog 已有 sidecar，但 Job、Sample 派生、Catalog/GPU Memory、Evidence 和完整 Native Scan 尚未恢复。`SampleDerivedDataReady`、`JobDerivedDataReady`、`CatalogDerivedDataReady` 当前恒为 false，是防止把未迁移数据误报为空的门禁。
+
+Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 32 GiB 硬限制、最终派生文件 8S、构建存活峰值 16S。Working Set 只作映射页观测，不再与 Private Bytes 混作一个限额。Converter 的 20 GiB 是独立历史额度。
+
+先前 26.83 GB 与 23.07 GB 是失败前离散采样，不是可靠峰值或根因。P1 将先接通统一 `QueryResourceContext`、写前磁盘申请、阶段化 100 ms 采样和资源错误映射；P1 门禁满足前不再启动 12.43 GB 全量冷建。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证
