@@ -31,6 +31,7 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - schema24 将名称校验状态复制到CPU Zone现有flag，缓存连续线程合法性，以64 KiB定长表识别GPU Memory标记，并仅为每类质量发现的前20条样例生成引用。Release全构建、CTest 38/38（122.40秒）、小型真实冷建/热开/`validation.run`通过；正式Trace修复后范围诊断尚未执行。
 - schema24 正式Trace范围诊断R3仍在2,704.324秒达到45分钟边界；Private Bytes峰值9,771,753,472字节。停止后顺序扫描422,576,574条CPU记录确认动态名称未解析=0、非法Extra=0、线程run=28，剩余热点收敛到PlayerLoop第二次全表扫描的逐记录集合哈希。该来源判定已改成64 KiB定长表，finding键改为无分配`string_view`；Release全构建、CTest 38/38（120.13秒）和小型真实索引语义回归通过，未机械启动第四轮正式诊断。
 - IndexedTraceSource原先在manifest缺少预计算Zone校验时会重新分配与全部Extra等长的名称状态和全量调用栈vector。该回退已删除；schema24把完整预计算校验作为可重开门禁，缺失或未完成时索引失效并重建。小型夹具把`precomputed`改为false后确认会重建并恢复20,000条调用栈引用告警，未把未就绪状态报告为健康。
+- Main.PlayerLoop重复/嵌套/交叉检查已并入CPU Zone主校验遍历；只有Main根读取父链，受共享workspace约束的根区间在本阶段排序后立即释放。小型真实索引的完整`zone_validation`与改造前schema26结果相同，Release全构建与CTest 39/39通过（127.31秒）；未启动第四次45分钟诊断。
 - schema26真实小型Catalog回归确认：IndexedTraceSource持有共享Reader租约时，再发布不会删除旧generation；释放后旧generation与租约可安全回收。回收只接受20种固定拥有后缀，同前缀未知文件和其他指纹文件均保留。Release全构建与CTest 39/39通过（123.53秒）。
 - 同一真实Catalog回归在当前Reader活跃时注入同源/schema26孤儿最终文件；下一次Build在首次Worker状态回调前删除孤儿，同时保留manifest当前generation，证明起始回收发生在大对象加载前。
 - Windows文件占用回归确认：孤儿最终文件被非共享delete句柄占用时，Build不进入Worker加载、不替换manifest，并原子保留有界失败报告；释放后重试、延期和最终成功三种状态一致，最终无cleanup报告。Release全构建与CTest 39/39通过（125.11秒）。

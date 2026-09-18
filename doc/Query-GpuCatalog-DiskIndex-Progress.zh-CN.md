@@ -74,6 +74,8 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 
 同时移除了IndexedTraceSource中仅在manifest未预计算校验时触发的全量`extraNameState`和调用栈vector回退。schema24现要求已发布manifest包含完整预计算校验；缺失或未完成会使索引失效并走受控重建。小型夹具将`precomputed`改为false后确认新代次重建，`validation.run`恢复原16项finding和20,000条未解析调用栈计数，未把缺失质量权威静默报告为健康。
 
+schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历：普通Zone只做64 KiB来源表索引，只有实际Main.PlayerLoop根才读取父链；根区间按线程收集、排序并检查交叉，不再调用第二次4.225亿记录全表扫描。根集合以共享workspace保守计账，每1,024条扩容检查，CPU阶段后立即释放并清零容器指标。小型真实Catalog索引的`zone_validation`与改造前schema26基线JSON完全一致；Release全构建与CTest 39/39通过（127.31秒）。该证据足以删除已定位的第二遍，不机械启动R4；正式Trace是否能完成仍留给计划中的综合验收。
+
 ## 2026-09-18：schema25 Catalog 磁盘语义质量权威
 
 - 新增有界Catalog语义校验器：分页读取12个固定域和字符串域；校验batch kind/encoding、全域范围与覆盖、transport checksum存在性、stored checksum、payload字节、generation引用及汇总、Control/Batch合并后的连续序列、字符串hash和字符串generation归属。

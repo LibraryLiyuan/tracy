@@ -1210,45 +1210,12 @@ struct MainPlayerLoopInterval
 inline constexpr uint8_t MainPlayerLoopSource = 1;
 inline constexpr uint8_t UnityPlayerLoopSource = 2;
 using PlayerLoopSourceTable = std::array<uint8_t, 1u << 16>;
+using MainPlayerLoopRoots = std::unordered_map<uint64_t, std::vector<MainPlayerLoopInterval>>;
 
 template<typename RefFn, typename NoteFn>
-void ValidateMainPlayerLoopRoots( const ReadOnlyZoneSection& cpu,
-    const PlayerLoopSourceTable& playerLoopSources, bool hasMainPlayerLoopSource,
+void ValidateMainPlayerLoopRootOverlaps( MainPlayerLoopRoots& rootsByThread,
     RefFn&& makeRef, NoteFn&& note )
 {
-    if( !hasMainPlayerLoopSource ) return;
-
-    std::unordered_map<uint64_t, std::vector<MainPlayerLoopInterval>> rootsByThread;
-    for( uint64_t index = 0; index < cpu.Count(); index++ )
-    {
-        const auto& zone = cpu.At<CpuZoneIndexRecord>( index );
-        const auto sourceState = playerLoopSources[uint16_t( zone.sourceLocation )];
-        if( sourceState & UnityPlayerLoopSource )
-        {
-            note( "error", "DUPLICATE_AUTHORITATIVE_PLAYERLOOP_ROOT",
-                "Unity's cross-frame PlayerLoop marker was mirrored beside the authoritative Main.PlayerLoop root",
-                makeRef( index ) );
-        }
-        if( ( sourceState & MainPlayerLoopSource ) == 0 ) continue;
-
-        auto parent = zone.parent;
-        size_t parentDepth = 0;
-        while( parent != std::numeric_limits<uint64_t>::max() && parent < cpu.Count() && parentDepth++ < 4096 )
-        {
-            const auto& parentZone = cpu.At<CpuZoneIndexRecord>( parent );
-            if( playerLoopSources[uint16_t( parentZone.sourceLocation )] & MainPlayerLoopSource )
-            {
-                note( "error", "CPU_FRAME_ROOT_NESTED_SAME_SOURCE",
-                    "Main.PlayerLoop is nested below another Main.PlayerLoop root", makeRef( index ) );
-                break;
-            }
-            parent = parentZone.parent;
-        }
-
-        if( zone.flags & QueryIndexCpuZoneTimingCompleteFlag )
-            rootsByThread[zone.thread].push_back( { index, zone.start, zone.end } );
-    }
-
     for( auto& [thread, roots] : rootsByThread )
     {
         std::sort( roots.begin(), roots.end(), []( const auto& lhs, const auto& rhs ) {
@@ -1262,7 +1229,8 @@ void ValidateMainPlayerLoopRoots( const ReadOnlyZoneSection& cpu,
             if( current.start < longestOpen.end )
             {
                 note( "error", "CPU_FRAME_ROOT_CROSSING",
-                    "Main.PlayerLoop overlaps the next authoritative frame root", makeRef( current.index ) );
+                    "Main.PlayerLoop overlaps the next authoritative frame root",
+                    [&] { return makeRef( current.index ); } );
             }
             if( current.end > longestOpen.end ) longestOpen = current;
         }
@@ -3258,9 +3226,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 issue.count++;
                 if( issue.refs.size() < 20 ) issue.refs.emplace_back( makeRef() );
             };
-            const auto noteMaterializedValidation = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
-                noteValidation( severity, code, message, [&] { return ref; } );
-            };
             std::unordered_set<uint64_t> validThreads;
             for( const auto& thread : source->GetThreads() ) validThreads.emplace( thread.nativeId );
             std::unordered_set<uint64_t> validContexts;
@@ -3310,9 +3275,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             validationWriter->Commit();
             validationWriter.reset();
             auto validationStore=std::make_unique<QueryValidationStoreReader>(temporaryValidation,result.sourceFingerprint,storageOptions);
+            MainPlayerLoopRoots playerLoopRoots;
+            analysis::AnalysisWorkspaceReservation playerLoopWorkspace( resources->Workspace(), 65536 );
+            uint64_t playerLoopRootCount = 0;
             const auto reportValidationContainers=[&] {
                 resources->SetContainer("gpu_memory_cpu_zone_ordinals",gpuMemoryCpuZoneCount,0);
                 resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZoneCount,0);
+                resources->SetContainer("validation_playerloop_roots",playerLoopRootCount,playerLoopRootCount*64);
             };
             reportValidationContainers();
             uint64_t previousValidationThread = 0;
@@ -3348,6 +3317,39 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 else if( QueryIndexCpuZoneExtraMissing( zone.flags ) ) nameResolved = false;
                 if( !nameResolved )
                     noteValidation( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", validationRef );
+                if( hasMainPlayerLoopSource )
+                {
+                    const auto sourceState = playerLoopSources[uint16_t( zone.sourceLocation )];
+                    if( sourceState & UnityPlayerLoopSource )
+                        noteValidation( "error", "DUPLICATE_AUTHORITATIVE_PLAYERLOOP_ROOT",
+                            "Unity's cross-frame PlayerLoop marker was mirrored beside the authoritative Main.PlayerLoop root",
+                            validationRef );
+                    if( sourceState & MainPlayerLoopSource )
+                    {
+                        auto parent = zone.parent;
+                        size_t parentDepth = 0;
+                        while( parent != std::numeric_limits<uint64_t>::max() &&
+                            parent < cpuSection.Count() && parentDepth++ < 4096 )
+                        {
+                            const auto& parentZone = cpuSection.At<CpuZoneIndexRecord>( parent );
+                            if( playerLoopSources[uint16_t( parentZone.sourceLocation )] & MainPlayerLoopSource )
+                            {
+                                noteValidation( "error", "CPU_FRAME_ROOT_NESTED_SAME_SOURCE",
+                                    "Main.PlayerLoop is nested below another Main.PlayerLoop root", validationRef );
+                                break;
+                            }
+                            parent = parentZone.parent;
+                        }
+                        if( zone.flags & QueryIndexCpuZoneTimingCompleteFlag )
+                        {
+                            playerLoopRoots[zone.thread].push_back( { index, zone.start, zone.end } );
+                            playerLoopRootCount++;
+                            if( ( playerLoopRootCount & 0x3ff ) == 0 )
+                                playerLoopWorkspace.Resize( 65536 + playerLoopRootCount * 64 +
+                                    uint64_t( playerLoopRoots.size() ) * 128 );
+                        }
+                    }
+                }
                 const auto marker = gpuMemoryMarkers[uint16_t( zone.sourceLocation )];
                 if( marker == GpuMemoryMarkerNone || ( zone.flags & QueryIndexCpuZoneTimingCompleteFlag ) == 0 || zone.extra >= extraSection.Count() ) continue;
                 const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
@@ -3371,8 +3373,14 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 if( marker == GpuMemoryMarkerOrigin || marker == GpuMemoryMarkerResidency )
                     result.gpuMemoryProtocol2 = true;
             }
-            ValidateMainPlayerLoopRoots( cpuSection, playerLoopSources, hasMainPlayerLoopSource,
-                [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteMaterializedValidation );
+            playerLoopWorkspace.Resize( 65536 + playerLoopRootCount * 64 +
+                uint64_t( playerLoopRoots.size() ) * 128 );
+            ValidateMainPlayerLoopRootOverlaps( playerLoopRoots,
+                [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteValidation );
+            MainPlayerLoopRoots().swap( playerLoopRoots );
+            playerLoopRootCount = 0;
+            playerLoopWorkspace.Resize( 0 );
+            reportValidationContainers();
 
             resources->SetPhase("zone-validation:gpu");
             for( uint64_t index = 0; index < gpuSection.Count(); index++ )
