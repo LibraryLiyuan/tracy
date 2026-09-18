@@ -75,11 +75,20 @@ int main( int argc, char** argv )
             status.counts[size_t( OfflineCatalogDomain::CatalogBatch )] == expectedBatches,
             "indexed bounded Catalog status changed" );
         const auto activeData = manifest.dataPath;
-        const auto second = query::QueryIndex::Build( input );
-        Require( fs::exists( activeData ), "published rebuild removed a generation held by an active indexed reader" );
-        indexed.reset();
         const std::string generationPrefix = "jnidx." + manifest.sourceFingerprint.substr( 0, 16 ) +
             ".s" + std::to_string( query::QueryIndexSchemaVersion ) + ".g";
+        const auto orphanFinal = root / ( generationPrefix + "1.jnidx.cpu" );
+        std::ofstream( orphanFinal ) << "orphan";
+        bool observedWorkerLoad = false;
+        bool orphanAbsentAtWorkerLoad = false;
+        const auto second = query::QueryIndex::Build( input, [&]( analysis::TraceSourceState ) {
+            if( observedWorkerLoad ) return;
+            observedWorkerLoad = true;
+            orphanAbsentAtWorkerLoad = !fs::exists( orphanFinal );
+        } );
+        Require( observedWorkerLoad && orphanAbsentAtWorkerLoad && fs::exists( activeData ) && !fs::exists( orphanFinal ),
+            "build-start cleanup removed an active generation or retained an unreferenced final file" );
+        indexed.reset();
         auto currentBase = second.dataPath.filename().string();
         const std::string dataSuffix = ".jnidx.data";
         currentBase.erase( currentBase.size() - dataSuffix.size() );

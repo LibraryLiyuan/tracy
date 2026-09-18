@@ -2835,6 +2835,32 @@ std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::p
     return result;
 }
 
+std::optional<std::string> CurrentPublishedGenerationBase( const std::filesystem::path& manifestPath,
+    std::string_view identityPrefix, std::string_view expectedSourceFingerprint )
+{
+    std::error_code ec;
+    if( !std::filesystem::exists( manifestPath, ec ) )
+        return ec ? std::nullopt : std::optional<std::string>( std::string() );
+    if( ec || !std::filesystem::is_regular_file( manifestPath, ec ) || ec ) return std::nullopt;
+    try
+    {
+        const auto parsed = json::parse( ReadManifest( manifestPath ) );
+        if( parsed.value( "magic", "" ) != IndexMagic ||
+            parsed.value( "schema_version", 0u ) != QueryIndexSchemaVersion ||
+            parsed.at( "source" ).at( "sha256" ).get<std::string>() != expectedSourceFingerprint )
+            return std::nullopt;
+        const auto file = std::filesystem::path( parsed.at( "data" ).at( "file" ).get<std::string>() );
+        if( file.empty() || file != file.filename() ) return std::nullopt;
+        const auto baseName = PublishedGenerationBaseName( file.string(), identityPrefix );
+        if( !baseName || file.string() != *baseName + ".jnidx.data" ) return std::nullopt;
+        return *baseName;
+    }
+    catch( ... )
+    {
+        return std::nullopt;
+    }
+}
+
 }
 
 bool QueryIndex::PublishPathForTesting( const std::filesystem::path& source, const std::filesystem::path& target,
@@ -2990,6 +3016,18 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
         std::string cleanupError;
         if( !CleanupStaleCandidates( tracePath.parent_path(), identityPrefix, storageOptions.disk, cleanupError ) )
             throw std::runtime_error( cleanupError );
+        const auto currentGeneration = CurrentPublishedGenerationBase(
+            result.manifestPath, identityPrefix, result.sourceFingerprint );
+        if( currentGeneration )
+        {
+            resources->SetPhase( "cleanup-unreferenced-generations" );
+            std::vector<std::filesystem::path> retained;
+            if( !CleanupUnreferencedGenerations( tracePath.parent_path(), identityPrefix,
+                    *currentGeneration, storageOptions.disk, retained, cleanupError ) )
+                throw std::runtime_error( cleanupError );
+            for( const auto& path : retained )
+                fprintf( stderr, "Query generation retained before build: %s\n", path.string().c_str() );
+        }
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();
