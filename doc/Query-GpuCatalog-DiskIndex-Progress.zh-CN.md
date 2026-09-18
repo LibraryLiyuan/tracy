@@ -83,7 +83,8 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - 小型真实Catalog Trace的1,001条资源完成schema25冷建、发布、重开和深校验，manifest质量为complete/present/original_valid/healthy且findings为空。Release全构建及CTest 38/38（125.92秒）通过。
 - 显式跨表引用已使用独立外排文件按`(generation,id)`精确归并：Resource→Allocation/String、View/Logical/Part/VG/Range→Resource、Part→Logical；破坏夹具返回`CATALOG_CROSS_TABLE_REFERENCE`。外排临时文件纳入同一磁盘/工作区预算并在句柄关闭后回收。小型真实1,001资源Catalog再次通过发布和深校验；Release全构建与CTest 38/38（124.78秒）通过。
 - Resource/Logical名称引用新增32字节定长外排记录，按`(generation,nameId,definition/reference,hash,length)`排序归并；引用端`nameHash/nameOriginalLength`必须与Catalog String定义一致，定义冲突同样报告`CATALOG_NAME_METADATA`。工作区每个排序run最多16 MiB，所有run和源文件纳入共享磁盘账本并随语义scratch回收；hash与长度双破坏夹具、多run归并、1,001资源真实Catalog及Release全构建/CTest 39/39（125.10秒）通过。
-- P3尚未完成：Relation和DetailedEvidence的source/target是按relation/kind解释的多态ID；v1记录在Worker解析后会清除部分指针类型flag，当前源码不足以对所有已解析端点恢复原类型，因此只继续实施有协议证据的逐类校验，不以猜测制造误拒绝。P4其余查询派生索引和消费者迁移尚未开始。
+- Relation记录现校验operation/relation/exactness/flags枚举范围；Query现有`gpu.resource.raytracing_chain`明确把`RtasUses`两端解释为Resource ID，因此已解析端点按generation加入Resource外排引用归并，未解析pointer flag端点保留原有incomplete语义。DetailedEvidence校验kind/state和已定义flag掩码，非法记录返回`CATALOG_EVIDENCE_RECORD`。RTAS缺失资源与Evidence非法枚举破坏夹具转绿，1,001资源真实Catalog再次通过。
+- P3尚未完成：其他Relation和DetailedEvidence的source/target仍是按relation/kind解释的多态ID；v1记录在Worker解析后会清除部分指针类型flag，当前源码不足以对所有已解析端点恢复原类型，因此只继续实施有协议证据的逐类校验，不以猜测制造误拒绝。P4其余查询派生索引和消费者迁移尚未开始。
 
 ## 2026-09-18：P4 首个消费者——磁盘 Catalog 状态
 

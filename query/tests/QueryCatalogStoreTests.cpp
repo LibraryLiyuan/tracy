@@ -63,18 +63,35 @@ int main()
         stringChecksum = JnGpuCatalogChecksum64Update( stringChecksum, &header, sizeof( header ) );
         stringChecksum = JnGpuCatalogChecksum64Update( stringChecksum, "main", 4 );
 
+        JnGpuCatalogRelationRecordV1 relations[1] {};
+        relations[0].time = 40; relations[0].sourceId = 100; relations[0].targetId = 101;
+        relations[0].operation = uint8_t( JnGpuCatalogRecordOperation::Bind );
+        relations[0].relation = uint8_t( JnGpuCatalogRelationKind::RtasUses );
+        relations[0].exactness = uint8_t( JnGpuCatalogExactness::Exact );
+        writer.Begin( OfflineCatalogDomain::CatalogRelation, 1, sizeof( relations[0] ) );
+        writer.Append( OfflineCatalogDomain::CatalogRelation, 0, relations, 1, sizeof( relations[0] ) );
+        writer.End( OfflineCatalogDomain::CatalogRelation );
+
+        JnGpuDetailedEvidenceRecordV1 evidence[1] {};
+        evidence[0].time = 50; evidence[0].requestId = 1;
+        evidence[0].kind = uint8_t( JnGpuDetailedEvidenceKind::Request );
+        evidence[0].state = uint8_t( JnGpuEvidenceState::ContinuousExact );
+        writer.Begin( OfflineCatalogDomain::CatalogDetailedEvidence, 1, sizeof( evidence[0] ) );
+        writer.Append( OfflineCatalogDomain::CatalogDetailedEvidence, 0, evidence, 1, sizeof( evidence[0] ) );
+        writer.End( OfflineCatalogDomain::CatalogDetailedEvidence );
+
         JnGpuCatalogControlData controls[2] {};
         controls[0].generation = 9; controls[0].sequence = 1;
         controls[0].kind = uint8_t( JnGpuCatalogControlKind::GenerationBegin );
         controls[0].state = uint8_t( JnGpuCatalogGenerationState::Building );
-        controls[1].generation = 9; controls[1].sequence = 4;
+        controls[1].generation = 9; controls[1].sequence = 6;
         controls[1].kind = uint8_t( JnGpuCatalogControlKind::GenerationEnd );
         controls[1].state = uint8_t( JnGpuCatalogGenerationState::Complete );
         writer.Begin( OfflineCatalogDomain::CatalogControl, 2, sizeof( controls[0] ) );
         writer.Append( OfflineCatalogDomain::CatalogControl, 0, controls, 2, sizeof( controls[0] ) );
         writer.End( OfflineCatalogDomain::CatalogControl );
 
-        JnGpuCatalogBatchData batches[2] {};
+        JnGpuCatalogBatchData batches[4] {};
         batches[0].generation = 9; batches[0].transportChecksum = 1;
         batches[0].storedChecksum = JnGpuCatalogChecksum64( resources, sizeof( resources ) );
         batches[0].firstRecordIndex = 0; batches[0].sequence = 2; batches[0].recordCount = 3;
@@ -84,13 +101,24 @@ int main()
         batches[1].firstRecordIndex = 0; batches[1].sequence = 3; batches[1].recordCount = 1;
         batches[1].payloadBytes = sizeof( header ) + 4; batches[1].kind = uint8_t( JnGpuCatalogBatchKind::String );
         batches[1].encoding = uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ); batches[1].valid = 1;
-        writer.Begin( OfflineCatalogDomain::CatalogBatch, 2, sizeof( batches[0] ) );
-        writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches, 2, sizeof( batches[0] ) );
+        batches[2].generation = 9; batches[2].transportChecksum = 3;
+        batches[2].storedChecksum = JnGpuCatalogChecksum64( relations, sizeof( relations ) );
+        batches[2].firstRecordIndex = 0; batches[2].sequence = 4; batches[2].recordCount = 1;
+        batches[2].payloadBytes = sizeof( relations ); batches[2].kind = uint8_t( JnGpuCatalogBatchKind::Relation );
+        batches[2].encoding = uint8_t( JnGpuCatalogBatchEncoding::FixedV1 ); batches[2].valid = 1;
+        batches[3].generation = 9; batches[3].transportChecksum = 4;
+        batches[3].storedChecksum = JnGpuCatalogChecksum64( evidence, sizeof( evidence ) );
+        batches[3].firstRecordIndex = 0; batches[3].sequence = 5; batches[3].recordCount = 1;
+        batches[3].payloadBytes = sizeof( evidence ); batches[3].kind = uint8_t( JnGpuCatalogBatchKind::DetailedEvidence );
+        batches[3].encoding = uint8_t( JnGpuCatalogBatchEncoding::DetailedEvidenceV1 ); batches[3].valid = 1;
+        writer.Begin( OfflineCatalogDomain::CatalogBatch, 4, sizeof( batches[0] ) );
+        writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches, 4, sizeof( batches[0] ) );
         writer.End( OfflineCatalogDomain::CatalogBatch );
 
         JnGpuCatalogGenerationData generation {};
-        generation.generation = 9; generation.lastSequence = 4; generation.batchCount = 2;
-        generation.recordCount = 4; generation.payloadBytes = sizeof( resources ) + sizeof( header ) + 4;
+        generation.generation = 9; generation.lastSequence = 6; generation.batchCount = 4;
+        generation.recordCount = 6; generation.payloadBytes = sizeof( resources ) + sizeof( header ) + 4 +
+            sizeof( relations ) + sizeof( evidence );
         generation.state = uint8_t( JnGpuCatalogGenerationState::Complete );
         generation.began = 1; generation.ended = 1; generation.valid = 1;
         writer.Begin( OfflineCatalogDomain::CatalogGeneration, 1, sizeof( generation ) );
@@ -135,18 +163,27 @@ int main()
             QueryCatalogStoreWriter variant( variantRoot, identity );
             variant.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
             JnGpuCatalogResourceRecordV1 variantResources[3] { resources[0], resources[1], resources[2] };
-            JnGpuCatalogBatchData variantBatches[2] { batches[0], batches[1] };
+            JnGpuCatalogRelationRecordV1 variantRelations[1] { relations[0] };
+            JnGpuDetailedEvidenceRecordV1 variantEvidence[1] { evidence[0] };
+            JnGpuCatalogBatchData variantBatches[4] { batches[0], batches[1], batches[2], batches[3] };
             auto variantGeneration = generation;
             uint64_t stringGeneration = 9;
-            mutate( variantResources, variantBatches, variantGeneration, stringGeneration );
+            mutate( variantResources, variantRelations, variantEvidence, variantBatches,
+                variantGeneration, stringGeneration );
             variant.Begin( OfflineCatalogDomain::CatalogResource, 3, sizeof( resources[0] ) );
             variant.Append( OfflineCatalogDomain::CatalogResource, 0, variantResources, 3, sizeof( resources[0] ) );
             variant.End( OfflineCatalogDomain::CatalogResource );
             variant.Begin( OfflineCatalogDomain::CatalogControl, 2, sizeof( controls[0] ) );
             variant.Append( OfflineCatalogDomain::CatalogControl, 0, controls, 2, sizeof( controls[0] ) );
             variant.End( OfflineCatalogDomain::CatalogControl );
-            variant.Begin( OfflineCatalogDomain::CatalogBatch, 2, sizeof( variantBatches[0] ) );
-            variant.Append( OfflineCatalogDomain::CatalogBatch, 0, variantBatches, 2, sizeof( variantBatches[0] ) );
+            variant.Begin( OfflineCatalogDomain::CatalogRelation, 1, sizeof( variantRelations[0] ) );
+            variant.Append( OfflineCatalogDomain::CatalogRelation, 0, variantRelations, 1, sizeof( variantRelations[0] ) );
+            variant.End( OfflineCatalogDomain::CatalogRelation );
+            variant.Begin( OfflineCatalogDomain::CatalogDetailedEvidence, 1, sizeof( variantEvidence[0] ) );
+            variant.Append( OfflineCatalogDomain::CatalogDetailedEvidence, 0, variantEvidence, 1, sizeof( variantEvidence[0] ) );
+            variant.End( OfflineCatalogDomain::CatalogDetailedEvidence );
+            variant.Begin( OfflineCatalogDomain::CatalogBatch, 4, sizeof( variantBatches[0] ) );
+            variant.Append( OfflineCatalogDomain::CatalogBatch, 0, variantBatches, 4, sizeof( variantBatches[0] ) );
             variant.End( OfflineCatalogDomain::CatalogBatch );
             variant.Begin( OfflineCatalogDomain::CatalogGeneration, 1, sizeof( variantGeneration ) );
             variant.Append( OfflineCatalogDomain::CatalogGeneration, 0, &variantGeneration, 1, sizeof( variantGeneration ) );
@@ -158,28 +195,28 @@ int main()
         };
 
         const auto rangeRoot = root.parent_path() / "tracy-query-catalog-semantic-range";
-        writeVariant( rangeRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].firstRecordIndex = 2; } );
+        writeVariant( rangeRoot, []( auto*, auto*, auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].firstRecordIndex = 2; } );
         QueryCatalogStoreReader rangeReader( rangeRoot, identity );
         const auto rangeValidation = rangeReader.ValidateSemantics( rangeRoot / "semantic-validation" );
         Require( rangeValidation.complete && !rangeValidation.healthy && hasFinding( rangeValidation, "CATALOG_BATCH_RANGE" ),
             "Catalog batch range corruption was accepted" );
 
         const auto checksumRoot = root.parent_path() / "tracy-query-catalog-semantic-checksum";
-        writeVariant( checksumRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].storedChecksum ^= 1; } );
+        writeVariant( checksumRoot, []( auto*, auto*, auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].storedChecksum ^= 1; } );
         QueryCatalogStoreReader checksumReader( checksumRoot, identity );
         const auto checksumValidation = checksumReader.ValidateSemantics( checksumRoot / "semantic-validation" );
         Require( checksumValidation.complete && !checksumValidation.healthy && hasFinding( checksumValidation, "CATALOG_STORED_CHECKSUM" ),
             "Catalog stored checksum corruption was accepted" );
 
         const auto generationRoot = root.parent_path() / "tracy-query-catalog-semantic-generation";
-        writeVariant( generationRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].generation = 10; } );
+        writeVariant( generationRoot, []( auto*, auto*, auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].generation = 10; } );
         QueryCatalogStoreReader generationReader( generationRoot, identity );
         const auto generationValidation = generationReader.ValidateSemantics( generationRoot / "semantic-validation" );
         Require( generationValidation.complete && !generationValidation.healthy && hasFinding( generationValidation, "CATALOG_GENERATION_REFERENCE" ),
             "Catalog generation corruption was accepted" );
 
         const auto stringGenerationRoot = root.parent_path() / "tracy-query-catalog-semantic-string-generation";
-        writeVariant( stringGenerationRoot, []( auto*, auto*, auto&, auto& stringGeneration ) { stringGeneration = 10; } );
+        writeVariant( stringGenerationRoot, []( auto*, auto*, auto*, auto*, auto&, auto& stringGeneration ) { stringGeneration = 10; } );
         QueryCatalogStoreReader stringGenerationReader( stringGenerationRoot, identity );
         const auto stringGenerationValidation = stringGenerationReader.ValidateSemantics( stringGenerationRoot / "semantic-validation" );
         Require( stringGenerationValidation.complete && !stringGenerationValidation.healthy &&
@@ -187,7 +224,7 @@ int main()
             "Catalog string generation corruption was accepted" );
 
         const auto crossReferenceRoot = root.parent_path() / "tracy-query-catalog-semantic-cross-reference";
-        writeVariant( crossReferenceRoot, []( auto* variantResources, auto* variantBatches, auto&, auto& ) {
+        writeVariant( crossReferenceRoot, []( auto* variantResources, auto*, auto*, auto* variantBatches, auto&, auto& ) {
             variantResources[0].allocationId = 999;
             variantBatches[0].storedChecksum = JnGpuCatalogChecksum64( variantResources,
                 sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
@@ -199,7 +236,7 @@ int main()
             "Catalog cross-table reference corruption was accepted" );
 
         const auto nameMetadataRoot = root.parent_path() / "tracy-query-catalog-semantic-name-metadata";
-        writeVariant( nameMetadataRoot, []( auto* variantResources, auto* variantBatches, auto&, auto& ) {
+        writeVariant( nameMetadataRoot, []( auto* variantResources, auto*, auto*, auto* variantBatches, auto&, auto& ) {
             variantResources[0].nameHash ^= 1;
             variantResources[1].nameId = 7;
             variantResources[1].nameHash = JnGpuCatalogChecksum64( "main", 4 );
@@ -212,6 +249,32 @@ int main()
         Require( nameMetadataValidation.complete && !nameMetadataValidation.healthy &&
             hasFinding( nameMetadataValidation, "CATALOG_NAME_METADATA" ),
             "Catalog name hash/length corruption was accepted" );
+
+        const auto relationReferenceRoot = root.parent_path() / "tracy-query-catalog-semantic-relation-reference";
+        writeVariant( relationReferenceRoot, []( auto*, auto* variantRelations, auto*, auto* variantBatches, auto&, auto& ) {
+            variantRelations[0].sourceId = 999;
+            variantBatches[2].storedChecksum = JnGpuCatalogChecksum64( variantRelations,
+                sizeof( JnGpuCatalogRelationRecordV1 ) );
+        } );
+        QueryCatalogStoreReader relationReferenceReader( relationReferenceRoot, identity );
+        const auto relationReferenceValidation = relationReferenceReader.ValidateSemantics(
+            relationReferenceRoot / "semantic-validation" );
+        Require( relationReferenceValidation.complete && !relationReferenceValidation.healthy &&
+            hasFinding( relationReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
+            "Catalog RTAS relation resource corruption was accepted" );
+
+        const auto evidenceRecordRoot = root.parent_path() / "tracy-query-catalog-semantic-evidence-record";
+        writeVariant( evidenceRecordRoot, []( auto*, auto*, auto* variantEvidence, auto* variantBatches, auto&, auto& ) {
+            variantEvidence[0].kind = 255;
+            variantBatches[3].storedChecksum = JnGpuCatalogChecksum64( variantEvidence,
+                sizeof( JnGpuDetailedEvidenceRecordV1 ) );
+        } );
+        QueryCatalogStoreReader evidenceRecordReader( evidenceRecordRoot, identity );
+        const auto evidenceRecordValidation = evidenceRecordReader.ValidateSemantics(
+            evidenceRecordRoot / "semantic-validation" );
+        Require( evidenceRecordValidation.complete && !evidenceRecordValidation.healthy &&
+            hasFinding( evidenceRecordValidation, "CATALOG_EVIDENCE_RECORD" ),
+            "Catalog detailed evidence enum corruption was accepted" );
 
         const auto metadataSortRoot = root.parent_path() / "tracy-query-catalog-metadata-sort";
         fs::remove_all( metadataSortRoot, ignored );
@@ -280,6 +343,8 @@ int main()
         fs::remove_all( stringGenerationRoot, ignored );
         fs::remove_all( crossReferenceRoot, ignored );
         fs::remove_all( nameMetadataRoot, ignored );
+        fs::remove_all( relationReferenceRoot, ignored );
+        fs::remove_all( evidenceRecordRoot, ignored );
         fs::remove_all( metadataSortRoot, ignored );
         std::cout << "query Catalog store passed\n";
         return 0;

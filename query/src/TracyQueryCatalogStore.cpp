@@ -464,6 +464,21 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                     appendReferencePair( ReferenceKind::Logical, false, generation, row.logicalResourceId );
                 } );
                 break;
+            case OfflineCatalogDomain::CatalogRelation:
+                visit( JnGpuCatalogRelationRecordV1 {}, [&]( const auto& row ) {
+                    if( row.operation > uint8_t( JnGpuCatalogRecordOperation::Snapshot ) ||
+                        row.relation > uint8_t( JnGpuCatalogRelationKind::PrimaryOwner ) ||
+                        row.exactness > uint8_t( JnGpuCatalogExactness::Invalid ) || ( row.flags & ~uint8_t( 3 ) ) != 0 )
+                        note( "CATALOG_RELATION_RECORD" );
+                    if( row.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) )
+                    {
+                        if( ( row.flags & 1 ) == 0 )
+                            appendReferencePair( ReferenceKind::Resource, false, generation, row.sourceId );
+                        if( ( row.flags & 2 ) == 0 )
+                            appendReferencePair( ReferenceKind::Resource, false, generation, row.targetId );
+                    }
+                } );
+                break;
             case OfflineCatalogDomain::CatalogVg:
                 visit( JnGpuCatalogVgRecordV1 {}, [&]( const auto& row ) {
                     appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
@@ -472,6 +487,23 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             case OfflineCatalogDomain::CatalogRangeSet:
                 visit( JnGpuRangeSetRecordV1 {}, [&]( const auto& row ) {
                     appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogDetailedEvidence:
+                visit( JnGpuDetailedEvidenceRecordV1 {}, [&]( const auto& row ) {
+                    constexpr uint32_t KnownFlags =
+                        uint32_t( JnGpuDetailedEvidenceFlags::SourceResourcePointer ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::TargetResourcePointer ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::SourceDescriptorHeapPointer ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::TargetDescriptorHeapPointer ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::DescriptorRangePersistent ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::DescriptorRangeTransient ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::DescriptorRangeHitGroup ) |
+                        uint32_t( JnGpuDetailedEvidenceFlags::Incomplete );
+                    if( row.kind > uint8_t( JnGpuDetailedEvidenceKind::Descriptor ) ||
+                        row.state > uint8_t( JnGpuEvidenceState::UnavailableUnsafeResourceState ) ||
+                        ( row.flags & ~KnownFlags ) != 0 )
+                        note( "CATALOG_EVIDENCE_RECORD" );
                 } );
                 break;
             default: break;
