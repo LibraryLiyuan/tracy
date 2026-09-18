@@ -1,5 +1,6 @@
 #ifndef __TRACYANALYSISDISKBUDGET_HPP__
 #define __TRACYANALYSISDISKBUDGET_HPP__
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -10,6 +11,11 @@
 
 namespace tracy::analysis
 {
+struct AnalysisDiskUsageSnapshot
+{
+    uint64_t currentBytes=0,peakBytes=0,reservedBytes=0,activeOperations=0,rejectedGrowths=0;
+};
+
 // Logical live file bytes in the analysis namespaces, including unpublished
 // work. This is cooperative accounting, not an OS quota or allocated clusters.
 // No per-record/per-file registry is retained. Recount only at an idle operation
@@ -45,6 +51,7 @@ public:
                 bytes+=count;
             }
             m_bytes=bytes;
+            m_peak=std::max(m_peak,m_bytes);
         }
         if(controlReserve>UINT64_MAX-m_reserved) throw std::runtime_error("analysis_scan_cache_disk_budget");
         ++m_active; m_reserved+=controlReserve;
@@ -56,16 +63,25 @@ public:
         std::lock_guard lock(m_mutex);
         const auto reserved=respectReserve?m_reserved:0;
         if(m_bytes>limit || reserved>limit-m_bytes || bytes>limit-m_bytes-reserved)
+        {
+            ++m_rejected;
             throw std::runtime_error("analysis_scan_cache_disk_budget");
+        }
         m_bytes+=bytes;
+        m_peak=std::max(m_peak,m_bytes);
     }
     void Release(uint64_t bytes)
     { std::lock_guard lock(m_mutex); m_bytes=bytes>m_bytes?0:m_bytes-bytes; }
     uint64_t Current() const { std::lock_guard lock(m_mutex); return m_bytes; }
+    AnalysisDiskUsageSnapshot Snapshot() const
+    {
+        std::lock_guard lock(m_mutex);
+        return {m_bytes,m_peak,m_reserved,m_active,m_rejected};
+    }
 private:
     std::vector<std::filesystem::path> m_roots;
     mutable std::mutex m_mutex;
-    uint64_t m_bytes=0,m_reserved=0,m_active=0;
+    uint64_t m_bytes=0,m_peak=0,m_reserved=0,m_active=0,m_rejected=0;
 };
 class AnalysisDiskActivity
 {
@@ -98,10 +114,19 @@ struct AnalysisDiskBudget
     std::shared_ptr<AnalysisDiskUsage> usage;
     uint64_t maximumBytes=UINT64_MAX;
     std::function<void()> checkSpace;
+    std::function<void(uint64_t)> onReject;
     void Grow(uint64_t bytes) const
     {
-        if(checkSpace) checkSpace();
-        if(usage) usage->Grow(bytes,maximumBytes);
+        try
+        {
+            if(checkSpace) checkSpace();
+            if(usage) usage->Grow(bytes,maximumBytes);
+        }
+        catch(...)
+        {
+            if(onReject) try { onReject(bytes); } catch(...) {}
+            throw;
+        }
     }
 };
 inline void AnalysisDiskGrow(const std::shared_ptr<AnalysisDiskBudget>& budget,uint64_t bytes)

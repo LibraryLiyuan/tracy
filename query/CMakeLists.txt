@@ -73,6 +73,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQuerySampleStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
+    src/TracyQueryResourceContext.cpp
+    src/TracyQueryResourceContext.hpp
     src/TracyQueryService.cpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
@@ -210,6 +212,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-analysis-workspace-budget-tests PRIVATE TracyAnalysis nlohmann_json::nlohmann_json)
     tracy_query_enable_assertions(tracy-analysis-workspace-budget-tests)
     add_test(NAME tracy-analysis-workspace-budget COMMAND tracy-analysis-workspace-budget-tests)
+
+    add_executable(tracy-query-resource-context-tests tests/QueryResourceContextTests.cpp)
+    target_link_libraries(tracy-query-resource-context-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-resource-context-tests)
+    add_test(NAME tracy-query-resource-context COMMAND tracy-query-resource-context-tests)
     add_executable(tracy-analysis-dictionary-tests tests/AnalysisDictionaryTests.cpp)
     target_include_directories(tracy-analysis-dictionary-tests PRIVATE ../analysis)
     tracy_query_enable_assertions(tracy-analysis-dictionary-tests)

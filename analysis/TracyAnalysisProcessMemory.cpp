@@ -74,7 +74,7 @@ void AnalysisProcessMemoryGuard::Check(bool forceSample)
         m_snapshot.residentBytes=sample.residentBytes; m_snapshot.privateBytes=sample.privateBytes;
         m_snapshot.peakResidentBytes=std::max(m_snapshot.peakResidentBytes,sample.residentBytes);
         m_snapshot.peakPrivateBytes=std::max(m_snapshot.peakPrivateBytes,sample.privateBytes);
-        if(sample.residentBytes>m_options.maximumBytes || sample.privateBytes>m_options.maximumBytes)
+        if(sample.privateBytes>m_options.maximumBytes)
             m_snapshot.error="analysis_process_memory_budget";
     }
     if(!m_snapshot.error.empty()) throw std::runtime_error(m_snapshot.error);

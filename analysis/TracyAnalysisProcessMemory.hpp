@@ -31,6 +31,9 @@ struct AnalysisProcessMemorySnapshot
 };
 // Cooperative, sampled whole-process protection, NOT an allocator or OS cap.
 // Windows measures WorkingSetSize and PrivateUsage, including the source Worker.
+// Working set remains telemetry because mapped file pages can make it much
+// larger than committed private memory; maximumBytes is enforced on private
+// bytes only.
 // Linux private bytes are private resident + swap; macOS uses physical footprint.
 // Each execution owns a fresh guard: a failure is latched until that execution
 // has stopped. A later resume may succeed once capacity becomes available.

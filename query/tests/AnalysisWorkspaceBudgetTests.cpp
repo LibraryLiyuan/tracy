@@ -119,13 +119,16 @@ void ProcessMemoryGuard()
     AnalysisProcessMemorySample sample{true,128,256};
     options.sample=[&]{return sample;};
     AnalysisProcessMemoryGuard atLimit(options);
-    atLimit.Check(); // Equality is allowed; either metric exceeding it is not.
+    atLimit.Check(); // Equality is allowed for the enforced Private Bytes metric.
     sample.privateBytes=257;
     Reject([&]{atLimit.Check();},"process_memory_budget");
     sample={true,1,1};
     Reject([&]{atLimit.Check();},"process_memory_budget");
+    sample={true,257,1};
     AnalysisProcessMemoryGuard fresh(options); fresh.Check();
-    sample.residentBytes=257;
+    Require(fresh.Snapshot().peakResidentBytes==257,
+        "working set above the private-byte limit remains observable without rejecting mapped pages");
+    sample.privateBytes=257;
     Reject([&]{fresh.Check();},"process_memory_budget");
     sample={false,0,0};
     AnalysisProcessMemoryGuard unavailable(options);
