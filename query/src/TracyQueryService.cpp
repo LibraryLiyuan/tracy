@@ -4569,6 +4569,23 @@ json QueryService::Execute( const json& request, const std::optional<std::string
             if( stopToken.stop_requested() ) throw QueryError( "CANCELLED", "query was cancelled", true );
             QueryBudgetState budget( params, stopToken );
             QueryBudgetScope budgetScope( budget );
+            std::shared_ptr<QueryResourceContext> resources;
+            analysis::AnalysisWorkspaceReservation responseWorkspace;
+            if( method.rfind( "trace.", 0 ) != 0 && ( params.contains( "trace_id" ) || defaultTraceId ) )
+            {
+                const auto traceId=ResolveTraceId(params,defaultTraceId);
+                const auto source=m_sessions.GetReadySource(traceId);
+                if(const auto owner=std::dynamic_pointer_cast<QueryResourceContextSource>(source))
+                {
+                    resources=owner->GetQueryResourceContext();
+                    if(resources)
+                    {
+                        resources->SetPhase("query-response:"+method);
+                        resources->CheckMemory(false);
+                        responseWorkspace=analysis::AnalysisWorkspaceReservation(resources->Workspace(),MaximumResponseBytes);
+                    }
+                }
+            }
             auto response = Dispatch( id, method, params, defaultTraceId, stopToken );
             budget.Attach( response );
             if( DumpProtocolJson( response ).size() > MaximumResponseBytes )
@@ -4589,12 +4606,24 @@ json QueryService::Execute( const json& request, const std::optional<std::string
     {
         return Failure( id, error );
     }
+    catch( const QueryResourceError& error )
+    {
+        return Failure( id, error.Code(), error.what(), true );
+    }
+    catch( const std::bad_alloc& )
+    {
+        return Failure( id, "RESOURCE_LIMIT", "query allocation failed", true );
+    }
     catch( const json::exception& error )
     {
         return Failure( id, "INVALID_PARAMS", error.what() );
     }
     catch( const std::exception& error )
     {
+        const std::string message=error.what();
+        if(message.find("workspace_budget")!=std::string::npos || message.find("disk_budget")!=std::string::npos ||
+            message.find("process_memory_budget")!=std::string::npos)
+            return Failure(id,"RESOURCE_LIMIT",message,true);
         return Failure( id, "INTERNAL_ERROR", error.what() );
     }
 }
@@ -4668,6 +4697,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 request.traceSessionId = traceId;
                 request.tracePath = trace.path;
                 request.source = std::move( source );
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( request.source ) )
+                    request.resourceContext = owner->GetQueryResourceContext();
                 request.normalizedProfile = validation.normalized;
                 request.profileIdentity = validation.profileSha256;
                 return snapshot( m_scanManager->Start( request ) );

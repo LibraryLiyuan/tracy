@@ -5,6 +5,9 @@
 #include <stdexcept>
 #include <string>
 
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyPagedRecordStore.hpp"
+
 #if __has_include( "TracyQueryCatalogStore.hpp" )
 #  include "TracyQueryCatalogStore.hpp"
 #  define TRACY_HAS_QUERY_CATALOG_STORE 1
@@ -77,7 +80,28 @@ int main()
         try { QueryCatalogStoreReader mismatch( root, std::string( 64, 'e' ) ); }
         catch( const std::exception& ) { identityRejected = true; }
         Require( identityRejected, "Catalog store accepted another Trace identity" );
+
+        const auto deniedRoot = root.parent_path() / "tracy-query-catalog-store-budget-denied";
+        fs::remove_all( deniedRoot, ignored );
+        auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>( std::vector<fs::path> { deniedRoot } );
+        tracy::analysis::AnalysisDiskActivity activity( usage );
+        auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+        disk->usage = usage; disk->maximumBytes = 1;
+        tracy::analysis::PagedRecordOptions options; options.disk = disk;
+        QueryCatalogStoreWriter denied( deniedRoot, identity, options );
+        bool budgetRejected = false;
+        try
+        {
+            denied.Begin( OfflineCatalogDomain::CatalogResource, 1, sizeof( JnGpuCatalogResourceRecordV1 ) );
+            JnGpuCatalogResourceRecordV1 row {};
+            denied.Append( OfflineCatalogDomain::CatalogResource, 0, &row, 1, sizeof( row ) );
+            denied.End( OfflineCatalogDomain::CatalogResource );
+        }
+        catch( const std::exception& error ) { budgetRejected = std::string( error.what() ).find( "disk_budget" ) != std::string::npos; }
+        Require( budgetRejected && tracy::analysis::AnalysisDiskUsage::Bytes( deniedRoot ) == 0,
+            "Catalog store did not reject its first record extent before writing" );
         fs::remove_all( root, ignored );
+        fs::remove_all( deniedRoot, ignored );
         std::cout << "query Catalog store passed\n";
         return 0;
 #endif

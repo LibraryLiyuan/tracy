@@ -1,6 +1,8 @@
 #ifndef __TRACYQUERYSAMPLESTORE_HPP__
 #define __TRACYQUERYSAMPLESTORE_HPP__
 
+#include "TracyPagedRecordStore.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -39,7 +41,8 @@ struct QuerySampleMainSpan
 class QuerySampleStoreWriter
 {
 public:
-    QuerySampleStoreWriter( std::filesystem::path root, std::string sourceFingerprint );
+    QuerySampleStoreWriter( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
     ~QuerySampleStoreWriter();
     QuerySampleStoreWriter( const QuerySampleStoreWriter& ) = delete;
     QuerySampleStoreWriter& operator=( const QuerySampleStoreWriter& ) = delete;
@@ -61,7 +64,8 @@ private:
 class QuerySampleStoreReader
 {
 public:
-    QuerySampleStoreReader( std::filesystem::path root, std::string sourceFingerprint );
+    QuerySampleStoreReader( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
     ~QuerySampleStoreReader();
     QuerySampleStoreReader( const QuerySampleStoreReader& ) = delete;
     QuerySampleStoreReader& operator=( const QuerySampleStoreReader& ) = delete;

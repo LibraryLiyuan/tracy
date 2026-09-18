@@ -4,6 +4,7 @@
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
 #include "TracyFileHeader.hpp"
+#include "TracyFileReadHooks.hpp"
 #include "TracyWorker.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyHash.hpp"
@@ -15,6 +16,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -136,7 +138,8 @@ class MappedSection
 public:
     ~MappedSection() { try { Close(); } catch( ... ) {} }
 
-    void Open( const std::filesystem::path& path, ZoneSectionKind kind, uint64_t count, uint32_t recordBytes, std::string_view sourceFingerprint )
+    void Open( const std::filesystem::path& path, ZoneSectionKind kind, uint64_t count, uint32_t recordBytes,
+        std::string_view sourceFingerprint, std::shared_ptr<analysis::AnalysisDiskBudget> disk = {} )
     {
         if( m_data ) throw std::runtime_error( "zone index section is already open" );
         if( count > ( std::numeric_limits<uint64_t>::max() - sizeof( ZoneSectionHeader ) ) / recordBytes ) throw std::runtime_error( "zone index section size overflow" );
@@ -144,9 +147,12 @@ public:
         m_count = count;
         m_recordBytes = recordBytes;
         m_bytes = sizeof( ZoneSectionHeader ) + count * recordBytes;
+        m_disk = std::move( disk );
 #ifdef _WIN32
         m_file = CreateFileW( path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr );
         if( m_file == INVALID_HANDLE_VALUE ) throw std::runtime_error( "cannot create zone index section" );
+        try { analysis::AnalysisDiskGrow( m_disk, m_bytes ); }
+        catch( ... ) { CloseHandle( m_file ); m_file = INVALID_HANDLE_VALUE; std::error_code ignored; std::filesystem::remove( path, ignored ); throw; }
         LARGE_INTEGER size; size.QuadPart = m_bytes;
         if( !SetFilePointerEx( m_file, size, nullptr, FILE_BEGIN ) || !SetEndOfFile( m_file ) ) throw std::runtime_error( "cannot size zone index section" );
         m_mapping = CreateFileMappingW( m_file, nullptr, PAGE_READWRITE, size.HighPart, size.LowPart, nullptr );
@@ -155,7 +161,10 @@ public:
         if( !m_data ) throw std::runtime_error( "cannot map zone index section" );
 #else
         m_file = ::open( path.c_str(), O_CREAT | O_TRUNC | O_RDWR, 0600 );
-        if( m_file < 0 || ftruncate( m_file, off_t( m_bytes ) ) != 0 ) throw std::runtime_error( "cannot size zone index section" );
+        if( m_file < 0 ) throw std::runtime_error( "cannot create zone index section" );
+        try { analysis::AnalysisDiskGrow( m_disk, m_bytes ); }
+        catch( ... ) { close( m_file ); m_file = -1; std::error_code ignored; std::filesystem::remove( path, ignored ); throw; }
+        if( ftruncate( m_file, off_t( m_bytes ) ) != 0 ) throw std::runtime_error( "cannot size zone index section" );
         m_data = static_cast<uint8_t*>( mmap( nullptr, size_t( m_bytes ), PROT_READ | PROT_WRITE, MAP_SHARED, m_file, 0 ) );
         if( m_data == MAP_FAILED ) { m_data = nullptr; throw std::runtime_error( "cannot map zone index section" ); }
 #endif
@@ -207,6 +216,7 @@ public:
         close( m_file ); m_file = -1;
 #endif
         m_count = finalCount;
+        if( m_disk && m_disk->usage && finalBytes < m_bytes ) m_disk->usage->Release( m_bytes - finalBytes );
         m_bytes = finalBytes;
     }
 
@@ -221,6 +231,7 @@ private:
             throw std::runtime_error( "zone index section growth overflow" );
         const auto newBytes = sizeof( ZoneSectionHeader ) + newCount * m_recordBytes;
         if( newBytes > std::numeric_limits<size_t>::max() ) throw std::runtime_error( "zone index section growth exceeds address space" );
+        analysis::AnalysisDiskGrow( m_disk, newBytes - m_bytes );
 #ifdef _WIN32
         FlushViewOfFile( m_data, size_t( m_bytes ) );
         UnmapViewOfFile( m_data );
@@ -252,6 +263,7 @@ private:
     uint64_t m_count = 0;
     uint64_t m_bytes = 0;
     uint32_t m_recordBytes = 0;
+    std::shared_ptr<analysis::AnalysisDiskBudget> m_disk;
 #ifdef _WIN32
     HANDLE m_file = INVALID_HANDLE_VALUE;
     HANDLE m_mapping = nullptr;
@@ -271,15 +283,16 @@ public:
     ZoneIndexWriter( std::filesystem::path extras, std::filesystem::path cpu, std::filesystem::path gpu,
         std::filesystem::path samples, std::filesystem::path catalog,
         std::array<std::filesystem::path, JnDomainCount> jnPaths,
-        std::string sourceFingerprint )
+        std::string sourceFingerprint, analysis::PagedRecordOptions storageOptions = {} )
         : m_extraPath( std::move( extras ) ), m_cpuPath( std::move( cpu ) ), m_gpuPath( std::move( gpu ) )
         , m_samplePath( std::move( samples ) ), m_jnPaths( std::move( jnPaths ) )
         , m_sourceFingerprint( std::move( sourceFingerprint ) )
-        , m_samples( m_samplePath, m_sourceFingerprint )
-        , m_catalog( std::move( catalog ), m_sourceFingerprint )
+        , m_storageOptions( std::move( storageOptions ) )
+        , m_samples( m_samplePath, m_sourceFingerprint, m_storageOptions )
+        , m_catalog( std::move( catalog ), m_sourceFingerprint, m_storageOptions )
     {}
 
-    void ZoneExtrasBegin( uint64_t count ) override { m_expectedExtras = count; m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint ); }
+    void ZoneExtrasBegin( uint64_t count ) override { m_expectedExtras = count; m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint, m_storageOptions.disk ); }
     void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) override
     {
         auto* record = reinterpret_cast<ZoneExtraIndexRecord*>( m_extras.Record( index ) );
@@ -294,7 +307,7 @@ public:
     {
         m_expectedCpu = count;
         const auto slack = std::max<uint64_t>( 1024, count / 1000 );
-        m_cpu.Open( m_cpuPath, ZoneSectionKind::Cpu, count + slack, sizeof( CpuZoneIndexRecord ), m_sourceFingerprint );
+        m_cpu.Open( m_cpuPath, ZoneSectionKind::Cpu, count + slack, sizeof( CpuZoneIndexRecord ), m_sourceFingerprint, m_storageOptions.disk );
     }
     void CpuZoneBegin( uint64_t index, uint64_t parent, uint64_t thread, int64_t start, int16_t sourceLocation, uint32_t extra, uint32_t childCount ) override
     {
@@ -327,6 +340,8 @@ public:
         {
             m_cpu.Close( m_seenCpu );
             std::ifstream input( m_cpuPath, std::ios::binary );
+            const auto sortedBytes=sizeof(ZoneSectionHeader)+m_seenCpu*sizeof(CpuZoneIndexRecord);
+            analysis::AnalysisDiskGrow(m_storageOptions.disk,sortedBytes);
             std::ofstream output( sortedPath, std::ios::binary | std::ios::trunc );
             if( !input || !output ) throw std::runtime_error( "cannot open CPU-zone sorting streams" );
             ZoneSectionHeader header {};
@@ -364,13 +379,15 @@ public:
             output.flush();
             if( !output ) throw std::runtime_error( "cannot flush sorted CPU-zone section" );
             input.close(); output.close();
+            const auto replacedBytes=std::filesystem::file_size(m_cpuPath);
             std::string error;
             if( !AtomicReplace( sortedPath, m_cpuPath, error ) ) throw std::runtime_error( "cannot commit sorted CPU-zone index: " + error );
+            if(m_storageOptions.disk && m_storageOptions.disk->usage) m_storageOptions.disk->usage->Release(replacedBytes);
         }
         catch( ... )
         {
             std::error_code ignored;
-            std::filesystem::remove( sortedPath, ignored );
+            analysis::AnalysisDiskRemove(sortedPath,m_storageOptions.disk,ignored);
             throw;
         }
     }
@@ -379,7 +396,7 @@ public:
     {
         m_expectedGpu = count;
         const auto slack = std::max<uint64_t>( 1024, count / 1000 );
-        m_gpu.Open( m_gpuPath, ZoneSectionKind::Gpu, count + slack, sizeof( GpuZoneIndexRecord ), m_sourceFingerprint );
+        m_gpu.Open( m_gpuPath, ZoneSectionKind::Gpu, count + slack, sizeof( GpuZoneIndexRecord ), m_sourceFingerprint, m_storageOptions.disk );
     }
     void GpuZoneBegin( uint64_t index, uint64_t parent, uint32_t context, int64_t cpuStart, int64_t gpuStart,
         int16_t sourceLocation, uint32_t callstack, uint64_t thread, uint64_t childCount ) override
@@ -462,7 +479,7 @@ public:
         if( index >= JnDomainCount || recordBytes != JnRecordBytes( domain ) ) throw std::runtime_error( "JN index domain layout mismatch" );
         m_jnStarted[index] = true;
         m_jnExpected[index] = count;
-        m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), count, recordBytes, m_sourceFingerprint );
+        m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), count, recordBytes, m_sourceFingerprint, m_storageOptions.disk );
     }
     void JnRecordsBlock( JnDomain domain, uint64_t offset, const void* records, uint64_t count, uint32_t recordBytes ) override
     {
@@ -507,7 +524,7 @@ public:
         {
             if( m_jnStarted[index] ) continue;
             const auto domain = JnDomain( index );
-            m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), 0, JnRecordBytes( domain ), m_sourceFingerprint );
+            m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), 0, JnRecordBytes( domain ), m_sourceFingerprint, m_storageOptions.disk );
             m_jn[index].Close( 0 );
         }
     }
@@ -544,6 +561,7 @@ private:
     std::filesystem::path m_extraPath, m_cpuPath, m_gpuPath, m_samplePath;
     std::array<std::filesystem::path, JnDomainCount> m_jnPaths;
     std::string m_sourceFingerprint;
+    analysis::PagedRecordOptions m_storageOptions;
     MappedSection m_extras, m_cpu, m_gpu;
     std::array<MappedSection, JnDomainCount> m_jn;
     std::array<uint64_t, JnDomainCount> m_jnExpected {};
@@ -585,13 +603,41 @@ std::string SectionFingerprint(const std::filesystem::path& path)
     return hash.FinalHex();
 }
 
+analysis::PagedRecordOptions ResourceStorageOptions(const std::shared_ptr<QueryResourceContext>& resources)
+{
+    analysis::PagedRecordOptions options;
+    if(resources)
+    {
+        options.workspace=resources->Workspace();
+        options.disk=resources->Disk();
+    }
+    return options;
+}
+
+std::shared_ptr<tracy::FileReadHooks> ResourceReadHooks(
+    const std::shared_ptr<QueryResourceContext>& resources,std::string prefix)
+{
+    if(!resources) return {};
+    auto hooks=resources->CreateFileReadHooks();
+    auto check=hooks->check;
+    hooks->check=[resources,prefix=std::move(prefix),check=std::move(check)] {
+        const auto progress=analysis::WorkerTraceSource::GetLoadProgress();
+        resources->SetPhase(prefix+progress.stage);
+        resources->SetProgress(progress.subTotal?progress.subCompleted:progress.completed,
+            progress.subTotal?progress.subTotal:progress.total);
+        if(check) check();
+    };
+    return hooks;
+}
+
 class ReadOnlyZoneSection
 {
 public:
     ReadOnlyZoneSection() = default;
-    ReadOnlyZoneSection( const QueryIndexSection& section, ZoneSectionKind kind, uint32_t recordBytes, std::string_view sourceFingerprint )
+    ReadOnlyZoneSection( const QueryIndexSection& section, ZoneSectionKind kind, uint32_t recordBytes,
+        std::string_view sourceFingerprint, analysis::PagedRecordOptions options = {} )
     {
-        Open( section, kind, recordBytes, sourceFingerprint );
+        Open( section, kind, recordBytes, sourceFingerprint, std::move( options ) );
     }
     ~ReadOnlyZoneSection() { Close(); }
     ReadOnlyZoneSection( const ReadOnlyZoneSection& ) = delete;
@@ -610,13 +656,14 @@ public:
     uint64_t Count() const { return m_count; }
 
 private:
-    void Open( const QueryIndexSection& section, ZoneSectionKind kind, uint32_t recordBytes, std::string_view sourceFingerprint )
+    void Open( const QueryIndexSection& section, ZoneSectionKind kind, uint32_t recordBytes,
+        std::string_view sourceFingerprint, analysis::PagedRecordOptions options )
     {
         if( section.recordBytes != recordBytes || section.count > ( std::numeric_limits<uint64_t>::max() - sizeof( ZoneSectionHeader ) ) / recordBytes )
             throw std::runtime_error( "zone index section layout mismatch" );
         if(std::filesystem::is_directory(section.path)) {
             if(SectionBytes(section.path)!=section.bytes) throw std::runtime_error("paged index section size mismatch");
-            m_paged=std::make_unique<analysis::PagedRecordReader>(section.path,PagedSectionIdentity(sourceFingerprint,kind),recordBytes);
+            m_paged=std::make_unique<analysis::PagedRecordReader>(section.path,PagedSectionIdentity(sourceFingerprint,kind),recordBytes,std::move(options));
             if(m_paged->Count()!=section.count) throw std::runtime_error("paged index section count mismatch");
             m_count=section.count; m_recordBytes=recordBytes; return;
         }
@@ -918,26 +965,30 @@ analysis::GpuMemoryAttribution ParseGpuMemorySummary( const json& value )
 
 class IndexedTraceSource final : public analysis::TraceSource,
     public analysis::NativeBoundedTraceSource,
-    public analysis::GpuCatalogBoundedScanSource
+    public analysis::GpuCatalogBoundedScanSource,
+    public QueryResourceContextSource
 {
 public:
-    IndexedTraceSource( QueryIndexManifest manifest, std::unique_ptr<analysis::WorkerTraceSource> source )
+    IndexedTraceSource( QueryIndexManifest manifest, std::unique_ptr<analysis::WorkerTraceSource> source,
+        std::shared_ptr<QueryResourceContext> resources = {} )
         : m_manifest( std::move( manifest ) )
         , m_source( std::move( source ) )
-        , m_extras( m_manifest.zoneExtras, ZoneSectionKind::Extra, sizeof( ZoneExtraIndexRecord ), m_manifest.sourceFingerprint )
-        , m_cpu( m_manifest.cpuZones, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), m_manifest.sourceFingerprint )
-        , m_gpu( m_manifest.gpuZones, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), m_manifest.sourceFingerprint )
-        , m_samples( m_manifest.samples.path, m_manifest.sourceFingerprint )
-        , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint )
-        , m_jobStages( m_manifest.jobStages, ZoneSectionKind::JobStage, sizeof( JnJobStageData ), m_manifest.sourceFingerprint )
-        , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint )
-        , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint )
-        , m_relations( m_manifest.relations, ZoneSectionKind::Relation, sizeof( JnRelationData ), m_manifest.sourceFingerprint )
-        , m_gpuReferencePasses( m_manifest.gpuReferencePasses, ZoneSectionKind::GpuReferencePass, sizeof( JnGpuReferencePassData ), m_manifest.sourceFingerprint )
-        , m_gpuReferenceUses( m_manifest.gpuReferenceUses, ZoneSectionKind::GpuReferenceUse, sizeof( JnGpuReferenceUseData ), m_manifest.sourceFingerprint )
-        , m_gpuReferenceEnds( m_manifest.gpuReferenceEnds, ZoneSectionKind::GpuReferenceEnd, sizeof( JnGpuReferenceEndData ), m_manifest.sourceFingerprint )
-        , m_gpuMemoryCpuZones( m_manifest.gpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint )
-        , m_gpuMemorySummaryCpuZones( m_manifest.gpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint )
+        , m_resources( std::move( resources ) )
+        , m_storageOptions( ResourceStorageOptions( m_resources ) )
+        , m_extras( m_manifest.zoneExtras, ZoneSectionKind::Extra, sizeof( ZoneExtraIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_cpu( m_manifest.cpuZones, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpu( m_manifest.gpuZones, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_samples( m_manifest.samples.path, m_manifest.sourceFingerprint, m_storageOptions )
+        , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
+        , m_jobStages( m_manifest.jobStages, ZoneSectionKind::JobStage, sizeof( JnJobStageData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_relations( m_manifest.relations, ZoneSectionKind::Relation, sizeof( JnRelationData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuReferencePasses( m_manifest.gpuReferencePasses, ZoneSectionKind::GpuReferencePass, sizeof( JnGpuReferencePassData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuReferenceUses( m_manifest.gpuReferenceUses, ZoneSectionKind::GpuReferenceUse, sizeof( JnGpuReferenceUseData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuReferenceEnds( m_manifest.gpuReferenceEnds, ZoneSectionKind::GpuReferenceEnd, sizeof( JnGpuReferenceEndData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuMemoryCpuZones( m_manifest.gpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuMemorySummaryCpuZones( m_manifest.gpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
     {
         m_gpuQueryIdAvailable = m_source->GetTraceInfo().traceVersion >= FileVersion( 0, 12, 4 );
         const auto locations = m_source->GetSourceLocations();
@@ -1298,6 +1349,8 @@ public:
         for( const auto& row : rows ) result.emplace_back( m_source->MakeEntityRef( "sample", row.ordinal ) );
         return result;
     }
+
+    std::shared_ptr<QueryResourceContext> GetQueryResourceContext() const override { return m_resources; }
     bool SampleDerivedDataReady() const override { return false; }
     bool JobDerivedDataReady() const override { return false; }
     bool CatalogDerivedDataReady() const override { return false; }
@@ -2189,6 +2242,8 @@ private:
 
     QueryIndexManifest m_manifest;
     std::unique_ptr<analysis::WorkerTraceSource> m_source;
+    std::shared_ptr<QueryResourceContext> m_resources;
+    analysis::PagedRecordOptions m_storageOptions;
     ReadOnlyZoneSection m_extras, m_cpu, m_gpu;
     QuerySampleViewReader m_samples;
     QueryCatalogStoreReader m_catalog;
@@ -2348,6 +2403,28 @@ int64_t ParseSigned( const json& value, const char* field )
     return result;
 }
 
+std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::path& tracePath)
+{
+    auto manifestPath=tracePath; manifestPath+=".jnidx";
+    auto failurePath=manifestPath; failurePath+=".failure.json";
+    std::vector<std::filesystem::path> result{manifestPath,failurePath};
+    try
+    {
+        if(!std::filesystem::is_regular_file(manifestPath)) return result;
+        const auto parsed=json::parse(ReadManifest(manifestPath));
+        if(parsed.value("magic","")!=IndexMagic || parsed.value("schema_version",0u)!=QueryIndexSchemaVersion) return result;
+        const auto append=[&](const json& value,const char* field) {
+            const auto name=std::filesystem::path(value.at(field).get<std::string>());
+            if(name.empty() || name!=name.filename()) throw std::runtime_error("invalid index resource path");
+            result.emplace_back(tracePath.parent_path()/name);
+        };
+        append(parsed.at("data"),"file");
+        for(const auto& [_,section]:parsed.at("sections").items()) append(section,"file");
+    }
+    catch(...) {}
+    return result;
+}
+
 }
 
 std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tracePath )
@@ -2357,13 +2434,15 @@ std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tra
     return result;
 }
 
-QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, analysis::WorkerTraceSource::StateCallback stateCallback )
+QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
+    analysis::WorkerTraceSource::StateCallback stateCallback, std::shared_ptr<QueryResourceContext> resources )
 {
     QueryIndexManifest result;
     result.manifestPath = ManifestPath( tracePath );
     result.sourceBytes = std::filesystem::file_size( tracePath );
     result.sourceWriteTime = WriteTime( tracePath );
     result.sourceFingerprint = analysis::WorkerTraceSource::ComputeFingerprint( tracePath );
+    if(resources) resources->ValidateTraceIdentity(result.sourceBytes,result.sourceFingerprint);
     // The manifest remains adjacent to and named after the source trace, but
     // section files must not repeat an arbitrarily long trace filename.  The
     // old form could exceed the legacy Win32 MAX_PATH limit only after the
@@ -2426,19 +2505,35 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     auto temporaryGpuMemoryCpuZones = result.gpuMemoryCpuZones.path; temporaryGpuMemoryCpuZones += suffix;
     auto temporaryGpuMemorySummaryCpuZones = result.gpuMemorySummaryCpuZones.path; temporaryGpuMemorySummaryCpuZones += suffix;
     auto temporaryGpuMemorySummary = result.gpuMemorySummary.path; temporaryGpuMemorySummary += suffix;
+    auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
     std::vector<std::filesystem::path> packedScratch;
+
+    if( !resources ) resources=CreateResourceContext(tracePath);
+    resources->ValidateTraceIdentity(result.sourceBytes,result.sourceFingerprint);
+    resources->IncludeDiskRoots({
+        result.manifestPath,result.dataPath,result.zoneExtras.path,result.cpuZones.path,result.gpuZones.path,
+        result.samples.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
+        result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
+        result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,failureDiagnostic
+    });
+    const auto storageOptions = ResourceStorageOptions( resources );
 
     try
     {
+        resources->SetPhase( "worker-load" );
+        resources->SetLiveWorkers( 1 );
+        resources->CheckMemory();
         ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryCatalog,
-            temporaryJn, result.sourceFingerprint );
+            temporaryJn, result.sourceFingerprint, storageOptions );
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
-            analysis::WorkerTraceLoadMode::CompactIndex, &writer );
+            analysis::WorkerTraceLoadMode::CompactIndex, &writer, ResourceReadHooks(resources,"worker-load:" ) );
         writer.FinishMissingJnDomains();
         writer.CommitSamples();
         writer.FinishCatalog();
+        resources->SetPhase( "sample-view" );
+        resources->CheckMemory();
         BuildQuerySampleView( temporarySamples, result.sourceFingerprint,
-            [&]( uint64_t thread ) { return source->GetContextSwitchStartTimes( thread ); } );
+            [&]( uint64_t thread ) { return source->GetContextSwitchStartTimes( thread ); }, storageOptions );
         result.zoneExtras.count = writer.ExtraCount();
         result.cpuZones.count = writer.CpuCount();
         result.gpuZones.count = writer.GpuCount();
@@ -2448,7 +2543,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         result.samples.count = writer.SampleCount();
         result.samples.declaredCount = result.samples.count;
         {
-            QuerySampleViewReader sampleView( temporarySamples, result.sourceFingerprint );
+            QuerySampleViewReader sampleView( temporarySamples, result.sourceFingerprint, storageOptions );
             result.sampleMainCount = sampleView.MainCount();
             result.sampleContextSwitchCount = sampleView.ContextSwitchCount();
             if( writer.MainSampleCount() != result.sampleMainCount )
@@ -2457,7 +2552,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         result.samples.bytes = SectionBytes( temporarySamples );
         result.samples.fingerprint = SectionFingerprint( temporarySamples );
         {
-            QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint );
+            QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint, storageOptions );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
             {
@@ -2484,6 +2579,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         result.cpuZones.bytes = std::filesystem::file_size( temporaryCpu );
         result.gpuZones.bytes = std::filesystem::file_size( temporaryGpu );
         {
+            resources->SetPhase("zone-validation:cpu");
             QueryIndexSection temporaryCpuSection = result.cpuZones; temporaryCpuSection.path = temporaryCpu;
             QueryIndexSection temporaryExtraSection = result.zoneExtras; temporaryExtraSection.path = temporaryExtras;
             QueryIndexSection temporaryGpuSection = result.gpuZones; temporaryGpuSection.path = temporaryGpu;
@@ -2532,8 +2628,22 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             }
             std::vector<uint64_t> gpuMemoryCpuZones;
             std::vector<uint64_t> gpuMemorySummaryCpuZones;
+            const auto reportValidationContainers=[&] {
+                resources->SetContainer("validation_extra_name_state",validationExtraNameState.size(),validationExtraNameState.capacity());
+                resources->SetContainer("validation_extra_seen",validationExtraSeen.size(),validationExtraSeen.capacity());
+                resources->SetContainer("validation_callstacks",validationCallstacks.size(),validationCallstacks.capacity());
+                resources->SetContainer("gpu_memory_cpu_zone_ordinals",gpuMemoryCpuZones.size(),gpuMemoryCpuZones.capacity());
+                resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZones.size(),gpuMemorySummaryCpuZones.capacity());
+            };
+            reportValidationContainers();
             for( uint64_t index = 0; index < cpuSection.Count(); index++ )
             {
+                if((index&0xffff)==0)
+                {
+                    resources->SetProgress(index,cpuSection.Count());
+                    reportValidationContainers();
+                    resources->CheckMemory(false);
+                }
                 const auto& zone = cpuSection.At<CpuZoneIndexRecord>( index );
                 const auto validationRef = [&] { return source->MakeEntityRef( "cpu-zone", index ); };
                 if( !( zone.flags & 1 ) ) noteValidation( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", validationRef() );
@@ -2589,8 +2699,15 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             ValidateMainPlayerLoopRoots( cpuSection, mainPlayerLoopSources, unityPlayerLoopSources,
                 [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteValidation );
 
+            resources->SetPhase("zone-validation:gpu");
             for( uint64_t index = 0; index < gpuSection.Count(); index++ )
             {
+                if((index&0xffff)==0)
+                {
+                    resources->SetProgress(index,gpuSection.Count());
+                    reportValidationContainers();
+                    resources->CheckMemory(false);
+                }
                 const auto& zone = gpuSection.At<GpuZoneIndexRecord>( index );
                 const auto validationRef = [&] { return source->MakeEntityRef( "gpu-zone", index ); };
                 if( !( zone.flags & 1 ) ) noteValidation( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", validationRef() );
@@ -2619,9 +2736,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             zoneValidation.scanned = cpuSection.Count() + gpuSection.Count();
             result.zoneValidationPrecomputed = true;
             result.zoneValidation = std::move( zoneValidation );
+            reportValidationContainers();
             std::sort( gpuMemorySummaryCpuZones.begin(), gpuMemorySummaryCpuZones.end() );
             MappedSection filtered;
-            filtered.Open( temporaryGpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, gpuMemoryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint );
+            filtered.Open( temporaryGpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, gpuMemoryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint, storageOptions.disk );
             if( !gpuMemoryCpuZones.empty() ) std::memcpy( filtered.Record( 0 ), gpuMemoryCpuZones.data(), gpuMemoryCpuZones.size() * sizeof( uint64_t ) );
             filtered.Close( gpuMemoryCpuZones.size() );
             result.gpuMemoryCpuZones.count = gpuMemoryCpuZones.size();
@@ -2630,7 +2748,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             result.gpuMemoryCpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemoryCpuZones );
             MappedSection summaryFiltered;
             summaryFiltered.Open( temporaryGpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone,
-                gpuMemorySummaryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint );
+                gpuMemorySummaryCpuZones.size(), sizeof( uint64_t ), result.sourceFingerprint, storageOptions.disk );
             if( !gpuMemorySummaryCpuZones.empty() ) std::memcpy( summaryFiltered.Record( 0 ), gpuMemorySummaryCpuZones.data(), gpuMemorySummaryCpuZones.size() * sizeof( uint64_t ) );
             summaryFiltered.Close( gpuMemorySummaryCpuZones.size() );
             result.gpuMemorySummaryCpuZones.count = gpuMemorySummaryCpuZones.size();
@@ -2644,10 +2762,15 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         result.cpuZoneIndex = true;
         result.gpuZoneIndex = true;
 
-        source->WriteCompactSnapshot( temporaryData );
+        resources->SetPhase( "compact-write" );
+        resources->CheckMemory();
+        source->WriteCompactSnapshot( temporaryData, resources->CreateFileWriteHooks( temporaryData ) );
         result.dataBytes = std::filesystem::file_size( temporaryData );
         result.dataFingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryData );
+        source.reset();
+        resources->SetLiveWorkers( 0 );
         {
+            resources->SetPhase( "gpu-memory-summary" );
             auto buildManifest = result;
             buildManifest.dataPath = temporaryData;
             buildManifest.zoneExtras.path = temporaryExtras; buildManifest.cpuZones.path = temporaryCpu; buildManifest.gpuZones.path = temporaryGpu;
@@ -2662,18 +2785,22 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             buildManifest.gpuMemoryCpuZones.path = temporaryGpuMemoryCpuZones;
             buildManifest.gpuMemorySummaryCpuZones.path = temporaryGpuMemorySummaryCpuZones;
             buildManifest.gpuMemorySummary.count = 0;
-            auto compact = analysis::WorkerTraceSource::Open( temporaryData, {}, result.sourceFingerprint, analysis::WorkerTraceLoadMode::IndexedSidecar );
-            IndexedTraceSource indexed( std::move( buildManifest ), std::move( compact ) );
+            auto compact = analysis::WorkerTraceSource::Open( temporaryData, {}, result.sourceFingerprint,
+                analysis::WorkerTraceLoadMode::IndexedSidecar, nullptr, ResourceReadHooks(resources,"compact-load:" ) );
+            resources->SetLiveWorkers( 1 );
+            IndexedTraceSource indexed( std::move( buildManifest ), std::move( compact ), resources );
             const auto summary = indexed.GetGpuMemorySummaryAttribution();
+            const auto payload = GpuMemorySummaryJson( summary ).dump();
+            resources->BeforeFileGrowth( temporaryGpuMemorySummary, payload.size() );
             std::ofstream output( temporaryGpuMemorySummary, std::ios::binary | std::ios::trunc );
             if( !output ) throw std::runtime_error( "cannot create GPU-memory summary index" );
-            const auto payload = GpuMemorySummaryJson( summary ).dump();
             output.write( payload.data(), std::streamsize( payload.size() ) ); output.flush();
             if( !output ) throw std::runtime_error( "cannot flush GPU-memory summary index" );
             result.gpuMemorySummary.count = 1; result.gpuMemorySummary.declaredCount = 1;
             result.gpuMemorySummary.bytes = std::filesystem::file_size( temporaryGpuMemorySummary );
             result.gpuMemorySummary.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpuMemorySummary );
         }
+        resources->SetLiveWorkers( 0 );
 
         // Mutable build extents are closed before compression. Publication
         // names are generation-specific, so existing readers retain their
@@ -2688,7 +2815,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             if(!input || std::memcmp(header.magic,"JNIDXZ1",7) || header.count!=section.count ||
                 header.recordBytes!=section.recordBytes || header.kind!=uint32_t(kind))
                 throw std::runtime_error("index compression input mismatch");
-            analysis::PagedRecordOptions options;
+            auto options=storageOptions;
             const auto identity=PagedSectionIdentity(result.sourceFingerprint,kind);
             analysis::PagedRecordWriter output(packed,identity,section.recordBytes,options);
             const uint64_t perBlock=options.blockBytes/section.recordBytes;
@@ -2703,7 +2830,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             analysis::PagedRecordReader check(packed,identity,section.recordBytes,options); check.ValidateAll();
             input.close();
             // Only this invocation's known raw scratch file is reclaimed.
-            std::filesystem::remove(raw);
+            std::error_code removeError;
+            analysis::AnalysisDiskRemove(raw,storageOptions.disk,removeError);
+            if(removeError) throw std::runtime_error("cannot remove packed raw index section: "+removeError.message());
             temporary=packed; section.bytes=SectionBytes(packed); section.fingerprint=SectionFingerprint(packed);
         };
         packSection(temporaryExtras,result.zoneExtras,ZoneSectionKind::Extra);
@@ -2715,13 +2844,18 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         packSection(temporaryGpuMemorySummaryCpuZones,result.gpuMemorySummaryCpuZones,ZoneSectionKind::GpuMemorySummaryCpuZone);
 
         {
+            const auto payload = ManifestJson( result ).dump( 2 );
+            resources->BeforeFileGrowth( temporaryManifest, payload.size() );
             std::ofstream output( temporaryManifest, std::ios::binary | std::ios::trunc );
             if( !output ) throw std::runtime_error( "cannot create index manifest" );
-            const auto payload = ManifestJson( result ).dump( 2 );
             output.write( payload.data(), std::streamsize( payload.size() ) );
             output.flush();
             if( !output ) throw std::runtime_error( "cannot flush index manifest" );
         }
+
+        resources->SetPhase( "publish" );
+        resources->CheckMemory();
+        resources->CheckFinalDisk();
 
         std::string error;
         if( !AtomicReplace( temporaryExtras, result.zoneExtras.path, error ) ) throw std::runtime_error( "cannot commit zone-extra index: " + error );
@@ -2730,7 +2864,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
         if( !AtomicReplace( temporarySamples, result.samples.path, error ) ) throw std::runtime_error( "cannot commit sample index: " + error );
         if( !AtomicReplace( temporaryCatalog, result.gpuCatalog.path, error ) ) throw std::runtime_error( "cannot commit GPU Catalog index: " + error );
         for( size_t index = 0; index < temporaryJn.size(); index++ )
-            if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error ) ) throw std::runtime_error( "cannot commit JN domain index: " + error );
+            if( !AtomicReplace( temporaryJn[index], jnSections[index]->path, error ) )
+                throw std::runtime_error( "cannot commit JN domain index " + temporaryJn[index].string() +
+                    " -> " + jnSections[index]->path.string() + ": " + error );
         if( !AtomicReplace( temporaryGpuMemoryCpuZones, result.gpuMemoryCpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory CPU-zone index: " + error );
         if( !AtomicReplace( temporaryGpuMemorySummaryCpuZones, result.gpuMemorySummaryCpuZones.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory summary CPU-zone index: " + error );
         if( !AtomicReplace( temporaryGpuMemorySummary, result.gpuMemorySummary.path, error ) ) throw std::runtime_error( "cannot commit GPU-memory summary index: " + error );
@@ -2740,6 +2876,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
     }
     catch( ... )
     {
+        const auto failure=std::current_exception();
+        resources->SetLiveWorkers( 0 );
         std::error_code ignored;
         // Directory cleanup is limited to this build's explicitly recorded
         // direct children; never recurse through a link or another generation.
@@ -2752,28 +2890,39 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath, an
             const auto attributes=GetFileAttributesW(target.c_str());
             if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) continue;
 #endif
-            std::filesystem::remove_all(target,ignored);
+            analysis::AnalysisDiskRemove(target,storageOptions.disk,ignored,true);
         }
-        std::filesystem::remove( temporaryData, ignored );
-        std::filesystem::remove( temporaryManifest, ignored );
-        std::filesystem::remove( temporaryExtras, ignored );
-        std::filesystem::remove( temporaryCpu, ignored );
-        std::filesystem::remove( temporaryGpu, ignored );
-        std::filesystem::remove_all( temporarySamples, ignored );
-        std::filesystem::remove_all( temporaryCatalog, ignored );
-        for( const auto& path : temporaryJn ) std::filesystem::remove( path, ignored );
-        std::filesystem::remove( temporaryGpuMemoryCpuZones, ignored );
-        std::filesystem::remove( temporaryGpuMemorySummaryCpuZones, ignored );
-        std::filesystem::remove( temporaryGpuMemorySummary, ignored );
-        throw;
+        analysis::AnalysisDiskRemove( temporaryData, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryManifest, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryExtras, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryCpu, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryGpu, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporarySamples, storageOptions.disk, ignored, true );
+        analysis::AnalysisDiskRemove( temporaryCatalog, storageOptions.disk, ignored, true );
+        for( const auto& path : temporaryJn ) analysis::AnalysisDiskRemove( path, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryGpuMemoryCpuZones, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryGpuMemorySummaryCpuZones, storageOptions.disk, ignored );
+        analysis::AnalysisDiskRemove( temporaryGpuMemorySummary, storageOptions.disk, ignored );
+        try { resources->RunResourceBoundary([&] { std::rethrow_exception(failure); }); }
+        catch(...)
+        {
+            try { resources->WriteDiagnostic(failureDiagnostic); } catch(...) {}
+            throw;
+        }
+        std::rethrow_exception(failure);
     }
 }
 
-QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePath, bool deep )
+QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePath, bool deep,
+    std::shared_ptr<QueryResourceContext> resources )
 {
     QueryIndexValidation result;
     try
     {
+        if(!resources) resources=CreateResourceContext(tracePath);
+        resources->SetPhase(deep?"index-validate:deep":"index-validate:identity");
+        resources->CheckMemory();
+        const auto storageOptions=ResourceStorageOptions(resources);
         QueryIndexManifest manifest;
         manifest.manifestPath = ManifestPath( tracePath );
         if( !std::filesystem::is_regular_file( manifest.manifestPath ) )
@@ -2782,6 +2931,8 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
             return result;
         }
 
+        const auto manifestBytes=std::filesystem::file_size(manifest.manifestPath);
+        analysis::AnalysisWorkspaceReservation manifestWorkspace(resources->Workspace(),65536+16*manifestBytes);
         const auto parsed = json::parse( ReadManifest( manifest.manifestPath ) );
         if( parsed.value( "magic", "" ) != IndexMagic || parsed.value( "schema_version", 0u ) != QueryIndexSchemaVersion )
         {
@@ -2792,6 +2943,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         const auto& data = parsed.at( "data" );
         manifest.sourceFingerprint = source.at( "sha256" ).get<std::string>();
         manifest.sourceBytes = ParseUnsigned( source, "bytes" );
+        resources->ValidateTraceIdentity(manifest.sourceBytes,manifest.sourceFingerprint);
         manifest.sourceWriteTime = ParseSigned( source, "write_time" );
         manifest.dataFingerprint = data.at( "sha256" ).get<std::string>();
         manifest.dataBytes = ParseUnsigned( data, "bytes" );
@@ -2880,7 +3032,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
                     throw std::runtime_error(std::string(name)+" paged section identity mismatch");
                 if(deep && SectionFingerprint(section.path)!=section.fingerprint)
                     throw std::runtime_error(std::string(name)+" paged section hash mismatch");
-                analysis::PagedRecordReader records(section.path,PagedSectionIdentity(manifest.sourceFingerprint,kind),expectedRecordBytes);
+                analysis::PagedRecordReader records(section.path,PagedSectionIdentity(manifest.sourceFingerprint,kind),expectedRecordBytes,storageOptions);
                 if(records.Count()!=section.count) throw std::runtime_error(std::string(name)+" paged count mismatch");
                 if(deep) records.ValidateAll();
                 return;
@@ -2901,8 +3053,8 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         if( deep && SectionFingerprint( manifest.samples.path ) != manifest.samples.fingerprint )
             throw std::runtime_error( "sample section hash mismatch" );
         {
-            QuerySampleStoreReader rawSamples( manifest.samples.path, manifest.sourceFingerprint );
-            QuerySampleViewReader samples( manifest.samples.path, manifest.sourceFingerprint );
+            QuerySampleStoreReader rawSamples( manifest.samples.path, manifest.sourceFingerprint, storageOptions );
+            QuerySampleViewReader samples( manifest.samples.path, manifest.sourceFingerprint, storageOptions );
             if( rawSamples.Count() != manifest.samples.count || samples.MainCount() != manifest.sampleMainCount ||
                 samples.ContextSwitchCount() != manifest.sampleContextSwitchCount )
                 throw std::runtime_error( "sample section count mismatch" );
@@ -2914,7 +3066,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         if( deep && SectionFingerprint( manifest.gpuCatalog.path ) != manifest.gpuCatalog.fingerprint )
             throw std::runtime_error( "GPU Catalog section hash mismatch" );
         {
-            QueryCatalogStoreReader catalog( manifest.gpuCatalog.path, manifest.sourceFingerprint );
+            QueryCatalogStoreReader catalog( manifest.gpuCatalog.path, manifest.sourceFingerprint, storageOptions );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
             {
@@ -2937,6 +3089,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );
         validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone",ZoneSectionKind::GpuMemorySummaryCpuZone );
         validateSection( manifest.gpuMemorySummary, 0, "GPU-memory-summary" );
+        resources->CheckMemory();
         result.manifest = std::move( manifest );
         result.reason = "valid";
     }
@@ -2948,11 +3101,42 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& tracePat
 }
 
 std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifest& manifest,
-    analysis::WorkerTraceSource::StateCallback stateCallback, std::string fingerprintOverride )
+    analysis::WorkerTraceSource::StateCallback stateCallback, std::string fingerprintOverride,
+    std::shared_ptr<QueryResourceContext> resources )
 {
+    if(!resources)
+    {
+        auto tracePath=manifest.manifestPath;
+        tracePath.replace_extension();
+        resources=CreateResourceContext(tracePath);
+    }
+    resources->ValidateTraceIdentity(manifest.sourceBytes,manifest.sourceFingerprint);
+    resources->SetPhase("compact-open");
+    resources->SetLiveWorkers(1);
+    resources->CheckMemory();
     auto source = analysis::WorkerTraceSource::Open( manifest.dataPath, std::move( stateCallback ),
-        fingerprintOverride.empty() ? manifest.sourceFingerprint : std::move( fingerprintOverride ), analysis::WorkerTraceLoadMode::IndexedSidecar );
-    return std::make_unique<IndexedTraceSource>( manifest, std::move( source ) );
+        fingerprintOverride.empty() ? manifest.sourceFingerprint : std::move( fingerprintOverride ),
+        analysis::WorkerTraceLoadMode::IndexedSidecar, nullptr, ResourceReadHooks(resources,"compact-load:" ) );
+    auto result=std::make_unique<IndexedTraceSource>(manifest,std::move(source),resources);
+    resources->SetPhase("ready");
+    resources->CheckMemory();
+    return result;
+}
+
+std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const std::filesystem::path& tracePath,
+    QueryResourceContextOptions options)
+{
+    const auto actualBytes=std::filesystem::file_size(tracePath);
+    const auto limits=analysis::AnalysisDiskBudget::ForTrace(actualBytes);
+    if((options.expectedTraceBytes && options.expectedTraceBytes!=actualBytes) ||
+        (options.expectedFinalDiskLimit && options.expectedFinalDiskLimit!=limits.finalBytes) ||
+        (options.expectedPeakDiskLimit && options.expectedPeakDiskLimit!=limits.peakBytes))
+        throw std::runtime_error("query_resource_profile_identity_mismatch");
+    options.traceBytes=actualBytes;
+    options.derivedRoots=ExistingDerivedPaths(tracePath);
+    if(!options.diagnosticMemoryReserveBytes) options.diagnosticMemoryReserveBytes=64*1024;
+    options.diagnosticDiskReserveBytes=std::min<uint64_t>(options.diagnosticDiskReserveBytes,options.traceBytes);
+    return std::make_shared<QueryResourceContext>(std::move(options));
 }
 
 }

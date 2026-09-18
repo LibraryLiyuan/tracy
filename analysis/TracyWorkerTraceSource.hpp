@@ -9,7 +9,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace tracy { class SerializedZoneSink; }
+namespace tracy { class SerializedZoneSink; struct FileReadHooks; struct FileWriteHooks; }
 
 namespace tracy::analysis
 {
@@ -60,12 +60,15 @@ class WorkerTraceSource final : public TraceSource, public NativeBoundedTraceSou
 public:
     using StateCallback = std::function<void( TraceSourceState )>;
 
-    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {}, std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full, SerializedZoneSink* serializedZoneSink = nullptr );
+    static std::unique_ptr<WorkerTraceSource> Open( const std::filesystem::path& path, StateCallback stateCallback = {},
+        std::string fingerprintOverride = {}, WorkerTraceLoadMode loadMode = WorkerTraceLoadMode::Full,
+        SerializedZoneSink* serializedZoneSink = nullptr, std::shared_ptr<tracy::FileReadHooks> readHooks = {} );
     static WorkerLoadProgress GetLoadProgress();
     static std::string ComputeFingerprint( const std::filesystem::path& path );
     ~WorkerTraceSource() override;
 
-    void WriteCompactSnapshot( const std::filesystem::path& path );
+    void WriteCompactSnapshot( const std::filesystem::path& path,
+        std::shared_ptr<tracy::FileWriteHooks> hooks = {} );
     std::optional<std::string> ResolveStringIndex( uint32_t index ) const;
 
     WorkerTraceSource( const WorkerTraceSource& ) = delete;

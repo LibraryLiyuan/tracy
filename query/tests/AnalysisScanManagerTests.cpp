@@ -1338,6 +1338,35 @@ int main(int argc,char** argv)
             throw std::runtime_error("Budget-paused scan must complete after capacity becomes available");
     }
     {
+        testStage="manager Query resource context";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        auto managerWorkspace=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+        AnalysisWorkspaceReservation blockManagerWorkspace(managerWorkspace,1024*1024);
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=1024ull*1024*1024;
+        resourceOptions.derivedRoots={root/"resource-manager",cache/"resource-manager"};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=1024*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        std::atomic<bool> shared=false;
+        AnalysisScanExecutor executorWithContext=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string& error) {
+            shared=execution.workspace==resources->Workspace() && execution.disk->usage==resources->Disk()->usage;
+            return ExecuteDefaultAnalysisScan(execution,token,progress,products,error);
+        };
+        AnalysisScanManager manager(root/"resource-manager",cache/"resource-manager",std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},executorWithContext,managerWorkspace);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-context"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        const auto started=manager.Start(request);
+        WaitFor(manager,started.scanId,ScanState::Complete,6s);
+        if(!shared) throw std::runtime_error("Scan did not reuse the indexed Trace resource context");
+    }
+    {
         testStage="manager response workspace";
         auto native=std::make_shared<SourceDegradedTrace>();
         auto workspace=std::make_shared<AnalysisWorkspaceBudget>(1024ull*1024*1024,512ull*1024*1024);

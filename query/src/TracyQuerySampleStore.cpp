@@ -63,14 +63,16 @@ uint64_t PairKey( uint64_t thread, QuerySampleKind kind )
 
 struct QuerySampleStoreWriter::Impl
 {
-    explicit Impl( std::filesystem::path outputRoot, std::string identity )
+    explicit Impl( std::filesystem::path outputRoot, std::string identity, analysis::PagedRecordOptions storageOptions )
         : root( std::move( outputRoot ) )
         , sourceFingerprint( std::move( identity ) )
-        , records( root / "records", StoreIdentity( sourceFingerprint, "query-samples-records-v1" ), sizeof( StoredSample ) )
+        , options( std::move( storageOptions ) )
+        , records( root / "records", StoreIdentity( sourceFingerprint, "query-samples-records-v1" ), sizeof( StoredSample ), options )
     {}
 
     std::filesystem::path root;
     std::string sourceFingerprint;
+    analysis::PagedRecordOptions options;
     analysis::PagedRecordWriter records;
     std::vector<StoredSpan> spans;
     std::unordered_set<uint64_t> keys;
@@ -83,8 +85,9 @@ struct QuerySampleStoreWriter::Impl
     bool committed = false;
 };
 
-QuerySampleStoreWriter::QuerySampleStoreWriter( std::filesystem::path root, std::string sourceFingerprint )
-    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ) ) )
+QuerySampleStoreWriter::QuerySampleStoreWriter( std::filesystem::path root, std::string sourceFingerprint,
+    analysis::PagedRecordOptions options )
+    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ), std::move( options ) ) )
 {}
 
 QuerySampleStoreWriter::~QuerySampleStoreWriter() = default;
@@ -137,7 +140,7 @@ void QuerySampleStoreWriter::Commit()
         span.logicalFirst = logicalFirst;
         logicalFirst += span.count;
     }
-    analysis::PagedRecordWriter spans( value.root / "spans", StoreIdentity( value.sourceFingerprint, "query-samples-spans-v1" ), sizeof( StoredSpan ) );
+    analysis::PagedRecordWriter spans( value.root / "spans", StoreIdentity( value.sourceFingerprint, "query-samples-spans-v1" ), sizeof( StoredSpan ), value.options );
     if( !value.spans.empty() ) spans.Append( value.spans.data(), value.spans.size() );
     value.records.Commit();
     spans.Commit();
@@ -150,11 +153,11 @@ uint64_t QuerySampleStoreWriter::ContextSwitchCount() const { return m_impl->con
 
 struct QuerySampleStoreReader::Impl
 {
-    explicit Impl( std::filesystem::path inputRoot, std::string identity )
+    explicit Impl( std::filesystem::path inputRoot, std::string identity, analysis::PagedRecordOptions options )
         : root( std::move( inputRoot ) )
         , sourceFingerprint( std::move( identity ) )
-        , records( root / "records", StoreIdentity( sourceFingerprint, "query-samples-records-v1" ), sizeof( StoredSample ) )
-        , spans( root / "spans", StoreIdentity( sourceFingerprint, "query-samples-spans-v1" ), sizeof( StoredSpan ) )
+        , records( root / "records", StoreIdentity( sourceFingerprint, "query-samples-records-v1" ), sizeof( StoredSample ), options )
+        , spans( root / "spans", StoreIdentity( sourceFingerprint, "query-samples-spans-v1" ), sizeof( StoredSpan ), options )
     {
         uint64_t expectedLogical = 0;
         uint64_t previousThread = 0;
@@ -202,8 +205,9 @@ struct QuerySampleStoreReader::Impl
     mutable std::mutex mutex;
 };
 
-QuerySampleStoreReader::QuerySampleStoreReader( std::filesystem::path root, std::string sourceFingerprint )
-    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ) ) )
+QuerySampleStoreReader::QuerySampleStoreReader( std::filesystem::path root, std::string sourceFingerprint,
+    analysis::PagedRecordOptions options )
+    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ), std::move( options ) ) )
 {}
 
 QuerySampleStoreReader::~QuerySampleStoreReader() = default;

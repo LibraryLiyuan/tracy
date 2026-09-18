@@ -5,6 +5,9 @@
 #include <string>
 #include <vector>
 
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyPagedRecordStore.hpp"
+
 #if __has_include( "TracyQuerySampleStore.hpp" )
 #  include "TracyQuerySampleStore.hpp"
 #  define TRACY_HAS_QUERY_SAMPLE_STORE 1
@@ -84,7 +87,28 @@ int main()
         catch( const std::exception& ) { identityRejected = true; }
         Require( identityRejected, "sample store accepted another Trace identity" );
 
+        const auto deniedRoot = root.parent_path() / "tracy-query-sample-store-budget-denied";
+        fs::remove_all( deniedRoot, ignored );
+        auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>( std::vector<fs::path> { deniedRoot } );
+        tracy::analysis::AnalysisDiskActivity activity( usage );
+        auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+        disk->usage = usage; disk->maximumBytes = 1;
+        tracy::analysis::PagedRecordOptions options; options.disk = disk;
+        bool budgetRejected = false;
+        try
+        {
+            QuerySampleStoreWriter denied( deniedRoot, std::string( 64, 'a' ), options );
+            denied.Begin( 1, QuerySampleKind::Main, 1 );
+            denied.Append( 0, 1, 1 );
+            denied.End();
+            denied.Commit();
+        }
+        catch( const std::exception& error ) { budgetRejected = std::string( error.what() ).find( "disk_budget" ) != std::string::npos; }
+        Require( budgetRejected && tracy::analysis::AnalysisDiskUsage::Bytes( deniedRoot ) == 0,
+            "sample store did not reject its first record extent before writing" );
+
         fs::remove_all( root, ignored );
+        fs::remove_all( deniedRoot, ignored );
         std::cout << "query sample store passed\n";
         return 0;
 #endif

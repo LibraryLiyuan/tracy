@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -23,7 +24,14 @@ struct AnalysisDiskUsageSnapshot
 class AnalysisDiskUsage
 {
 public:
-    explicit AnalysisDiskUsage(std::vector<std::filesystem::path> roots):m_roots(std::move(roots)) {}
+    explicit AnalysisDiskUsage(std::vector<std::filesystem::path> roots)
+    {
+        for(auto& root:roots)
+        {
+            root=std::filesystem::absolute(root).lexically_normal();
+            if(std::find(m_roots.begin(),m_roots.end(),root)==m_roots.end()) m_roots.emplace_back(std::move(root));
+        }
+    }
     static uint64_t Bytes(const std::filesystem::path& path)
     {
         if(!std::filesystem::exists(path)) return 0;
@@ -58,6 +66,25 @@ public:
     }
     void End(uint64_t controlReserve)
     { std::lock_guard lock(m_mutex); --m_active; m_reserved-=controlReserve; }
+    void AddRoots(const std::vector<std::filesystem::path>& roots,uint64_t limit=UINT64_MAX)
+    {
+        std::lock_guard lock(m_mutex);
+        std::vector<std::filesystem::path> added;
+        uint64_t bytes=0;
+        for(auto root:roots)
+        {
+            root=std::filesystem::absolute(root).lexically_normal();
+            if(std::find(m_roots.begin(),m_roots.end(),root)!=m_roots.end() ||
+                std::find(added.begin(),added.end(),root)!=added.end()) continue;
+            const auto count=Bytes(root);
+            if(count>UINT64_MAX-bytes) { ++m_rejected; throw std::runtime_error("analysis_scan_cache_disk_budget"); }
+            bytes+=count; added.emplace_back(std::move(root));
+        }
+        if(m_bytes>limit || m_reserved>limit-m_bytes || bytes>limit-m_bytes-m_reserved)
+        { ++m_rejected; throw std::runtime_error("analysis_scan_cache_disk_budget"); }
+        m_roots.insert(m_roots.end(),std::make_move_iterator(added.begin()),std::make_move_iterator(added.end()));
+        m_bytes+=bytes; m_peak=std::max(m_peak,m_bytes);
+    }
     void Grow(uint64_t bytes,uint64_t limit=UINT64_MAX,bool respectReserve=true)
     {
         std::lock_guard lock(m_mutex);

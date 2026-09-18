@@ -730,7 +730,9 @@ std::string WorkerTraceSource::ComputeFingerprint( const std::filesystem::path& 
     return Sha256File( path );
 }
 
-std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback, std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink )
+std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesystem::path& path, StateCallback stateCallback,
+    std::string fingerprintOverride, WorkerTraceLoadMode loadMode, SerializedZoneSink* serializedZoneSink,
+    std::shared_ptr<tracy::FileReadHooks> readHooks )
 {
     auto impl = std::make_unique<Impl>( path, loadMode );
     if( stateCallback ) stateCallback( TraceSourceState::Loading );
@@ -739,7 +741,8 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
     try
     {
         impl->fingerprint = fingerprintOverride.empty() ? Sha256File( path ) : std::move( fingerprintOverride );
-        impl->file.reset( FileRead::Open( path.string().c_str() ) );
+        const auto loadHooks=readHooks;
+        impl->file.reset( FileRead::Open( path, std::move( readHooks ) ) );
         if( !impl->file ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to open trace file" );
         // CPU/GPU zones and the high-volume JN relation streams are written to
         // dedicated memory-mapped sidecar sections. Every other persisted domain
@@ -751,9 +754,15 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
             EventType::FrameImages | EventType::ContextSwitches |
             EventType::SymbolCode | EventType::SourceCache );
         impl->worker = std::make_unique<Worker>( *impl->file, eventMask, true, false, serializedZoneSink );
-        while( !impl->worker->IsBackgroundDone() ) std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+        while( !impl->worker->IsBackgroundDone() )
+        {
+            if(loadHooks && loadHooks->check) loadHooks->check();
+            std::this_thread::sleep_for( std::chrono::milliseconds( 5 ) );
+        }
+        if(loadHooks && loadHooks->check) loadHooks->check();
         if( stateCallback ) stateCallback( TraceSourceState::Indexing );
         impl->BuildIndexes();
+        if(loadHooks && loadHooks->check) loadHooks->check();
         if( stateCallback ) stateCallback( TraceSourceState::Ready );
         return std::unique_ptr<WorkerTraceSource>( new WorkerTraceSource( std::move( impl ) ) );
     }
@@ -791,6 +800,10 @@ std::unique_ptr<WorkerTraceSource> WorkerTraceSource::Open( const std::filesyste
     }
     catch( const std::exception& error )
     {
+        if( std::string_view( error.what() ).starts_with( "query_resource_" ) ||
+            std::string_view( error.what() ).find( "analysis_workspace_budget" ) != std::string_view::npos ||
+            std::string_view( error.what() ).find( "analysis_process_memory_budget" ) != std::string_view::npos )
+            throw TraceLoadError( TraceLoadErrorCode::ResourceLimit, error.what() );
         throw TraceLoadError( TraceLoadErrorCode::Internal, error.what() );
     }
 }
@@ -810,10 +823,11 @@ std::optional<std::string> WorkerTraceSource::ResolveStringIndex( uint32_t index
     return Safe( value );
 }
 
-void WorkerTraceSource::WriteCompactSnapshot( const std::filesystem::path& path )
+void WorkerTraceSource::WriteCompactSnapshot( const std::filesystem::path& path,
+    std::shared_ptr<tracy::FileWriteHooks> hooks )
 {
     std::lock_guard lock( m_impl->readMutex );
-    auto output = std::unique_ptr<FileWrite>( FileWrite::Open( path.string().c_str(), FileCompression::Zstd, 3, 4 ) );
+    auto output = std::unique_ptr<FileWrite>( FileWrite::Open( path, FileCompression::Zstd, 3, 4, std::move( hooks ) ) );
     if( !output ) throw TraceLoadError( TraceLoadErrorCode::OpenFailed, "unable to create compact trace index payload" );
     m_impl->worker->Write( *output, false );
     output->Finish();

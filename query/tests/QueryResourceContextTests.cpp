@@ -1,4 +1,7 @@
 #include "TracyQueryResourceContext.hpp"
+#include "TracyFileWrite.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -34,7 +37,7 @@ void SharedBudgetsAndDiagnostics( const std::filesystem::path& root )
     std::filesystem::create_directories( root );
     std::ofstream( root / "existing.bin", std::ios::binary ).write( "01234567890123456789", 20 );
 
-    AnalysisProcessMemorySample process { true, 200, 70 };
+    AnalysisProcessMemorySample process { true, 200, 70, true, 1000, 600, 400 };
     uint64_t pressureCallbacks = 0;
     QueryResourceContextOptions options;
     options.traceBytes = 10;
@@ -57,7 +60,7 @@ void SharedBudgetsAndDiagnostics( const std::filesystem::path& root )
     context.CheckMemory();
     Require( pressureCallbacks == 0, "working set incorrectly triggered private-memory pressure" );
 
-    process = { true, 300, 81 };
+    process = { true, 300, 81, true, 1000, 650, 350 };
     context.CheckMemory();
     context.CheckMemory();
     Require( pressureCallbacks == 1, "one soft-target crossing must trigger one pressure response" );
@@ -82,6 +85,9 @@ void SharedBudgetsAndDiagnostics( const std::filesystem::path& root )
     Require( snapshot.liveWorkers == 2, "live Worker count was not preserved" );
     Require( snapshot.memory.peakResidentBytes == 300 && snapshot.memory.peakPrivateBytes == 90,
         "memory telemetry lost a peak" );
+    Require( snapshot.memory.systemCommitAvailable && snapshot.memory.systemCommitLimitBytes == 1000 &&
+        snapshot.memory.peakSystemCommitBytes == 650 && snapshot.memory.minimumSystemCommitHeadroomBytes == 350,
+        "system commit telemetry was not preserved independently of process memory" );
     Require( snapshot.disk.currentBytes == 151 && snapshot.disk.peakBytes == 151,
         "disk ledger did not include existing and admitted live bytes" );
     Require( snapshot.disk.rejectedGrowths == 1 && snapshot.failureReason == "disk_peak_limit" &&
@@ -139,6 +145,106 @@ void AllocationFailureMapping( const std::filesystem::path& root )
     Require( hardLimit.Snapshot().failureReason == "process_private_hard_limit",
         "hard private-memory rejection did not preserve its cause" );
 }
+
+void FileWriteAccounting( const std::filesystem::path& root )
+{
+    QueryResourceContextOptions options;
+    options.traceBytes = 1024;
+    options.derivedRoots = { root };
+    options.privateBytesSoftTarget = 80;
+    options.processCommitHardLimit = 100;
+    options.workspaceMaximumBytes = 64 * 1024 * 1024;
+    options.workspaceTargetBytes = 32 * 1024 * 1024;
+    options.diagnosticDiskReserveBytes = 0;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+    QueryResourceContext context( options );
+    context.SetPhase( "compact-write" );
+    std::filesystem::create_directories( root );
+    const auto outputPath = root / "candidate.tracy";
+    std::vector<uint8_t> bytes( 64 * 1024 );
+    uint32_t value = 0x12345678;
+    for( auto& byte : bytes ) { value ^= value << 13; value ^= value >> 17; value ^= value << 5; byte = uint8_t( value ); }
+
+    bool rejected = false;
+    try
+    {
+        auto output = std::unique_ptr<tracy::FileWrite>( tracy::FileWrite::Open(
+            outputPath, tracy::FileCompression::Fast, 1, 1, context.CreateFileWriteHooks( outputPath ) ) );
+        Require( output != nullptr, "test FileWrite did not open" );
+        output->Write( bytes.data(), bytes.size() );
+        output->Finish();
+    }
+    catch( const QueryResourceError& error )
+    {
+        rejected = error.Code() == "RESOURCE_LIMIT" && error.Reason() == "disk_peak_limit";
+    }
+    Require( rejected, "compressed snapshot bypassed cumulative write accounting" );
+    const auto snapshot = context.Snapshot();
+    Require( snapshot.failureReason == "disk_peak_limit" && snapshot.disk.currentBytes <= snapshot.disk.peakLimitBytes,
+        "FileWrite rejection lost its disk-limit diagnostic" );
+}
+
+void ReservedFailureDiagnostic( const std::filesystem::path& root )
+{
+    QueryResourceContextOptions options;
+    options.traceBytes = 1024;
+    options.derivedRoots = { root };
+    options.privateBytesSoftTarget = 80;
+    options.processCommitHardLimit = 100;
+    options.workspaceMaximumBytes = 1024 * 1024;
+    options.workspaceTargetBytes = 512 * 1024;
+    options.diagnosticMemoryReserveBytes = 4096;
+    options.diagnosticDiskReserveBytes = 4096;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+    QueryResourceContext context( options );
+    context.SetPhase( "catalog-validate" );
+    context.SetProgress( 3, 9 );
+    context.SetContainer( "validation_callstacks", 5, 8 );
+    try { context.RunResourceBoundary( [] { throw std::bad_alloc(); } ); }
+    catch( const QueryResourceError& ) {}
+
+    std::filesystem::create_directories( root );
+    const auto report = root / "failure.json";
+    context.WriteDiagnostic( report );
+    std::ifstream input( report, std::ios::binary );
+    const auto parsed = nlohmann::json::parse( input );
+    Require( parsed.at( "phase" ) == "catalog-validate" && parsed.at( "progress_current" ) == "3" &&
+        parsed.at( "failure_reason" ) == "allocation_failed" && parsed.at( "requested_bytes" ).is_null(),
+        "reserved diagnostic did not preserve the failure context" );
+    Require( parsed.at( "containers" ).size() == 1 &&
+        parsed.at( "containers" )[0].at( "name" ) == "validation_callstacks" &&
+        parsed.at( "containers" )[0].at( "capacity" ) == "8",
+        "reserved diagnostic lost container size and capacity" );
+    Require( context.Snapshot().workspace.currentBytes >= 4096,
+        "diagnostic workspace was not reserved before the failure" );
+}
+
+void ReusedDiskRoots( const std::filesystem::path& root )
+{
+    QueryResourceContextOptions options;
+    options.traceBytes = 10;
+    options.derivedRoots = { root / "initial" };
+    options.privateBytesSoftTarget = 80;
+    options.processCommitHardLimit = 100;
+    options.workspaceMaximumBytes = 64;
+    options.workspaceTargetBytes = 32;
+    options.diagnosticDiskReserveBytes = 0;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+    QueryResourceContext context( options );
+    const auto reused = root / "reused";
+    std::filesystem::create_directories( reused );
+    std::ofstream( reused / "cache.bin", std::ios::binary ).write( std::string( 120, 'x' ).data(), 120 );
+    context.IncludeDiskRoots( { reused } );
+    context.IncludeDiskRoots( { reused } );
+    Require( context.Snapshot().disk.currentBytes == 120,
+        "reused Query roots were omitted or counted twice" );
+    const auto overflow = root / "overflow";
+    std::filesystem::create_directories( overflow );
+    std::ofstream( overflow / "cache.bin", std::ios::binary ).write( std::string( 60, 'x' ).data(), 60 );
+    Reject( [&] { context.IncludeDiskRoots( { overflow } ); }, "query_resource_disk" );
+    Require( context.Snapshot().disk.currentBytes == 120,
+        "rejected reused roots changed the admitted disk ledger" );
+}
 }
 
 int main( int argc, char** argv )
@@ -151,6 +257,9 @@ int main( int argc, char** argv )
         std::filesystem::remove_all( base, ignored );
         SharedBudgetsAndDiagnostics( base / "shared" );
         AllocationFailureMapping( base / "allocation" );
+        FileWriteAccounting( base / "file-write" );
+        ReservedFailureDiagnostic( base / "diagnostic" );
+        ReusedDiskRoots( base / "reused-roots" );
         std::filesystem::remove_all( base, ignored );
         std::cout << "query resource context tests passed\n";
         return 0;

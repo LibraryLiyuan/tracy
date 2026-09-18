@@ -10,6 +10,17 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 
 先前 26.83 GB 与 23.07 GB 是失败前离散采样，不是可靠峰值或根因。P1 将先接通统一 `QueryResourceContext`、写前磁盘申请、阶段化 100 ms 采样和资源错误映射；P1 门禁满足前不再启动 12.43 GB 全量冷建。
 
+## 2026-09-18：P1 统一资源计账与失败诊断完成
+
+- 新增单 Trace/Profile 的 `QueryResourceContext`。索引 Reader/Writer、映射表、compact 写出、压缩 scratch、摘要、manifest、深校验、Native Scan、分析缓存和响应预留共享 workspace 与磁盘账本；复用的索引/Scan 根目录可在使用前纳入同一账本。
+- Private Bytes 是 16 GiB 软压力和 32 GiB 硬限制的判定指标；Working Set 仅记录映射页影响。Windows/Linux 同时记录系统 commit 上限、已用量、当前和最小余量。Worker 读取和后台加载每 100 ms 检查，阶段、子进度、存活 Worker 及主要验证容器 size/capacity 进入快照。
+- CLI/MCP 支持 `--resource-profile`。Profile 的 Trace 大小/hash、8S/16S、Private Bytes、采样周期和单重型构建配置会在冷建、热开及 Scan 复用时核验；Windows 进程提交仍由启动时的 32 GiB Job Object 硬限制保护。
+- Working Set 的 16 GiB OS 硬限制已移除，避免把文件映射页误当作提交内存。`bad_alloc`、workspace、磁盘和进程 Private Bytes 拒绝统一映射为 `RESOURCE_LIMIT`。
+- 失败预留 64 KiB workspace 和 1 MiB 磁盘报告空间。小型真实 JNTRACYX v1 回归先以 16 KiB 峰值限额写前拒绝，清理所有候选并保留诊断；同一输入随后正常冷建、深校验和重开成功。输入 1,310,224 字节，最终派生 1,338,846 字节，目录无 `.tmp.*`。
+- P1 最终 Release 全量构建通过；CTest 35/35 通过，119.63 秒。P1 完成前后均未启动 12.43 GB 全量冷建。
+
+下一步进入 P2 静态持有者审计和小型合成压力测试。已确认的优先项仍是分页 ZoneExtra 校验状态、调用栈引用外排、原/compact Worker 生命周期、字符串/调用栈按需读取和 GPU 摘要拆分；不会把这些候选提前写成 OOM 根因。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证

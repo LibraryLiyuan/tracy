@@ -41,14 +41,14 @@ std::string ViewIdentity( std::string_view sourceFingerprint, std::string_view d
 }
 
 void BuildQuerySampleView( const std::filesystem::path& root, std::string sourceFingerprint,
-    const QueryContextSwitchStarts& contextSwitchStarts )
+    const QueryContextSwitchStarts& contextSwitchStarts, analysis::PagedRecordOptions options )
 {
     if( !contextSwitchStarts ) throw std::runtime_error( "sample view context provider is missing" );
-    QuerySampleStoreReader raw( root, sourceFingerprint );
+    QuerySampleStoreReader raw( root, sourceFingerprint, options );
     analysis::PagedRecordWriter contexts( root / "query-contexts",
-        ViewIdentity( sourceFingerprint, "query-samples-contexts-v1" ), sizeof( uint64_t ) );
+        ViewIdentity( sourceFingerprint, "query-samples-contexts-v1" ), sizeof( uint64_t ), options );
     analysis::PagedRecordWriter spans( root / "query-spans",
-        ViewIdentity( sourceFingerprint, "query-samples-view-spans-v1" ), sizeof( ViewSpan ) );
+        ViewIdentity( sourceFingerprint, "query-samples-view-spans-v1" ), sizeof( ViewSpan ), options );
     uint64_t logicalFirst = 0;
     for( const auto& main : raw.MainSpans() )
     {
@@ -77,12 +77,12 @@ void BuildQuerySampleView( const std::filesystem::path& root, std::string source
 
 struct QuerySampleViewReader::Impl
 {
-    explicit Impl( std::filesystem::path inputRoot, std::string identity )
+    explicit Impl( std::filesystem::path inputRoot, std::string identity, analysis::PagedRecordOptions options )
         : root( std::move( inputRoot ) )
         , sourceFingerprint( std::move( identity ) )
-        , raw( root, sourceFingerprint )
-        , contexts( root / "query-contexts", ViewIdentity( sourceFingerprint, "query-samples-contexts-v1" ), sizeof( uint64_t ) )
-        , spans( root / "query-spans", ViewIdentity( sourceFingerprint, "query-samples-view-spans-v1" ), sizeof( ViewSpan ) )
+        , raw( root, sourceFingerprint, options )
+        , contexts( root / "query-contexts", ViewIdentity( sourceFingerprint, "query-samples-contexts-v1" ), sizeof( uint64_t ), options )
+        , spans( root / "query-spans", ViewIdentity( sourceFingerprint, "query-samples-view-spans-v1" ), sizeof( ViewSpan ), options )
     {
         uint64_t logical = 0;
         uint64_t previousThread = 0;
@@ -134,8 +134,9 @@ struct QuerySampleViewReader::Impl
     std::mutex mutex;
 };
 
-QuerySampleViewReader::QuerySampleViewReader( std::filesystem::path root, std::string sourceFingerprint )
-    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ) ) )
+QuerySampleViewReader::QuerySampleViewReader( std::filesystem::path root, std::string sourceFingerprint,
+    analysis::PagedRecordOptions options )
+    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ), std::move( options ) ) )
 {}
 
 QuerySampleViewReader::~QuerySampleViewReader() = default;

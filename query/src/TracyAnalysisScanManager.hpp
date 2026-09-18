@@ -4,6 +4,7 @@
 #include "TracyCandidatePolicy.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyTraceSource.hpp"
+#include "TracyQueryResourceContext.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyAnalysisProcessMemory.hpp"
 #include "TracyAnalysisDiskBudget.hpp"
@@ -99,6 +100,7 @@ struct AnalysisScanStartRequest
     std::string traceSessionId;
     std::filesystem::path tracePath;
     std::shared_ptr<analysis::TraceSource> source;
+    std::shared_ptr<QueryResourceContext> resourceContext;
     nlohmann::json normalizedProfile;
     std::string profileIdentity;
 };
@@ -163,6 +165,10 @@ private:
         std::string_view error = {} ) const;
     bool SaveStateLocked( const Entry& entry, std::string& error ) const;
     std::shared_ptr<Entry> LoadEntry( const std::string& scanId ) const;
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> WorkspaceFor( const Entry& entry ) const;
+    std::shared_ptr<analysis::AnalysisDiskUsage> DiskUsageFor( const Entry& entry ) const;
+    std::shared_ptr<analysis::AnalysisDiskBudget> DiskBudgetFor( const Entry& entry, uint64_t maximumBytes,
+        std::function<void()> checkSpace ) const;
     // Caller holds Entry::readMutex; readers are pinned to completed generations.
     void EnsureReaders( const std::shared_ptr<Entry>& entry ) const;
     std::filesystem::path m_root;

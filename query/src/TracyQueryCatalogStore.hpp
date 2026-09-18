@@ -2,6 +2,7 @@
 #define __TRACYQUERYCATALOGSTORE_HPP__
 
 #include "TracyOfflineCatalog.hpp"
+#include "TracyPagedRecordStore.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -13,7 +14,8 @@ namespace tracy::query
 class QueryCatalogStoreWriter
 {
 public:
-    QueryCatalogStoreWriter( std::filesystem::path root, std::string sourceFingerprint );
+    QueryCatalogStoreWriter( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
     ~QueryCatalogStoreWriter();
     QueryCatalogStoreWriter( const QueryCatalogStoreWriter& ) = delete;
     QueryCatalogStoreWriter& operator=( const QueryCatalogStoreWriter& ) = delete;
@@ -36,7 +38,8 @@ private:
 class QueryCatalogStoreReader
 {
 public:
-    QueryCatalogStoreReader( std::filesystem::path root, std::string sourceFingerprint );
+    QueryCatalogStoreReader( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
     ~QueryCatalogStoreReader();
     QueryCatalogStoreReader( const QueryCatalogStoreReader& ) = delete;
     QueryCatalogStoreReader& operator=( const QueryCatalogStoreReader& ) = delete;

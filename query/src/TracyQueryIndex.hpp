@@ -2,6 +2,7 @@
 #define __TRACYQUERYINDEX_HPP__
 
 #include "TracyWorkerTraceSource.hpp"
+#include "TracyQueryResourceContext.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -79,10 +80,16 @@ class QueryIndex
 {
 public:
     static std::filesystem::path ManifestPath( const std::filesystem::path& tracePath );
-    static QueryIndexManifest Build( const std::filesystem::path& tracePath, analysis::WorkerTraceSource::StateCallback stateCallback = {} );
-    static QueryIndexValidation Validate( const std::filesystem::path& tracePath, bool deep = false );
+    static std::shared_ptr<QueryResourceContext> CreateResourceContext( const std::filesystem::path& tracePath,
+        QueryResourceContextOptions options = {} );
+    static QueryIndexManifest Build( const std::filesystem::path& tracePath,
+        analysis::WorkerTraceSource::StateCallback stateCallback = {},
+        std::shared_ptr<QueryResourceContext> resources = {} );
+    static QueryIndexValidation Validate( const std::filesystem::path& tracePath, bool deep = false,
+        std::shared_ptr<QueryResourceContext> resources = {} );
     static std::unique_ptr<analysis::TraceSource> Open( const QueryIndexManifest& manifest,
-        analysis::WorkerTraceSource::StateCallback stateCallback = {}, std::string fingerprintOverride = {} );
+        analysis::WorkerTraceSource::StateCallback stateCallback = {}, std::string fingerprintOverride = {},
+        std::shared_ptr<QueryResourceContext> resources = {} );
 };
 
 }

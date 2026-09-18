@@ -951,12 +951,48 @@ struct AnalysisScanManager::Entry
     std::jthread worker;
 };
 
+std::shared_ptr<AnalysisWorkspaceBudget> AnalysisScanManager::WorkspaceFor(const Entry& entry) const
+{
+    return entry.request.resourceContext ? entry.request.resourceContext->Workspace() : m_workspace;
+}
+
+std::shared_ptr<AnalysisDiskUsage> AnalysisScanManager::DiskUsageFor(const Entry& entry) const
+{
+    return entry.request.resourceContext ? entry.request.resourceContext->Disk()->usage : m_diskUsage;
+}
+
+std::shared_ptr<AnalysisDiskBudget> AnalysisScanManager::DiskBudgetFor(const Entry& entry,uint64_t maximumBytes,
+    std::function<void()> checkSpace) const
+{
+    auto result=std::make_shared<AnalysisDiskBudget>();
+    if(entry.request.resourceContext)
+    {
+        const auto shared=entry.request.resourceContext->Disk();
+        result->usage=shared->usage;
+        result->maximumBytes=std::min(maximumBytes,shared->maximumBytes);
+        result->onReject=shared->onReject;
+    }
+    else
+    {
+        result->usage=m_diskUsage;
+        result->maximumBytes=maximumBytes;
+    }
+    result->checkSpace=std::move(checkSpace);
+    return result;
+}
+
 json AnalysisProcessMemorySnapshotJson(const AnalysisProcessMemorySnapshot& value)
 {
     return {{"maximum_bytes",std::to_string(value.maximumBytes)},{"samples",std::to_string(value.samples)},
         {"resident_bytes",std::to_string(value.residentBytes)},{"private_bytes",std::to_string(value.privateBytes)},
         {"peak_resident_bytes",std::to_string(value.peakResidentBytes)},
         {"peak_private_bytes",std::to_string(value.peakPrivateBytes)},
+        {"system_commit_available",value.systemCommitAvailable},
+        {"system_commit_limit_bytes",std::to_string(value.systemCommitLimitBytes)},
+        {"system_commit_bytes",std::to_string(value.systemCommitBytes)},
+        {"peak_system_commit_bytes",std::to_string(value.peakSystemCommitBytes)},
+        {"system_commit_headroom_bytes",std::to_string(value.systemCommitHeadroomBytes)},
+        {"minimum_system_commit_headroom_bytes",std::to_string(value.minimumSystemCommitHeadroomBytes)},
         {"error",value.error.empty()?json(nullptr):json(value.error)}};
 }
 
@@ -1018,7 +1054,7 @@ bool AnalysisScanManager::SaveStateLocked( const Entry& entry, std::string& erro
         { "aggregate_root", entry.aggregateRoot.generic_string() },
         { "neutral_generation", entry.neutralGeneration }, { "neutral_header_sha256", entry.neutralHeaderSha256 },
         { "policy_generation", entry.policyGeneration }, { "policy_identity", entry.policyIdentity }
-    }, error, m_diskUsage );
+    }, error, DiskUsageFor(entry) );
 }
 
 void AnalysisScanManager::Update( const std::shared_ptr<Entry>& entry, ScanState state,
@@ -1085,19 +1121,23 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     }
     if( auto existing = LoadEntry( scanId ) )
     {
+        existing->request.source=request.source;
+        existing->request.resourceContext=request.resourceContext;
         std::lock_guard lock( m_mutex );
         m_entries.emplace( scanId, existing );
         std::lock_guard entryLock( existing->mutex );
         return existing->snapshot;
     }
 
-    AnalysisWorkspaceReservation controlWorkspace(m_workspace,65536+32ull*
+    const auto requestWorkspace=request.resourceContext?request.resourceContext->Workspace():m_workspace;
+    const auto requestDiskUsage=request.resourceContext?request.resourceContext->Disk()->usage:m_diskUsage;
+    AnalysisWorkspaceReservation controlWorkspace(requestWorkspace,65536+32ull*
         (request.traceSessionId.size()+request.tracePath.native().size()*sizeof(std::filesystem::path::value_type)+
             request.profileIdentity.size()+traceStrongId.size()));
     ReserveControlJson(request.normalizedProfile,controlWorkspace);
     auto entry = std::make_shared<Entry>();
     entry->controlWorkspace=std::move(controlWorkspace);
-    AnalysisDiskActivity diskActivity(m_diskUsage);
+    AnalysisDiskActivity diskActivity(requestDiskUsage);
     entry->snapshot.scanId = scanId;
     entry->snapshot.state = ScanState::Queued;
     entry->snapshot.stage = "queued";
@@ -1105,9 +1145,11 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     entry->aggregateIdentity = std::move( aggregateIdentity );
     entry->scanRoot = m_root / "scans" / scanId;
     entry->aggregateRoot = m_cacheRoot / AnalysisScanCacheFormatId / aggregateId;
+    if(request.resourceContext)
+        request.resourceContext->IncludeDiskRoots({entry->scanRoot,entry->aggregateRoot});
     std::filesystem::create_directories( entry->scanRoot );
     std::string error;
-    if( !WriteJson( entry->scanRoot / "profile.json", request.normalizedProfile, error,m_diskUsage,
+    if( !WriteJson( entry->scanRoot / "profile.json", request.normalizedProfile, error,requestDiskUsage,
         std::min(traceLimits.peakBytes,request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>()) ) ||
         !SaveStateLocked( *entry, error ) ) throw std::runtime_error( error );
     {
@@ -1152,9 +1194,11 @@ void AnalysisScanManager::StartWorker( const std::shared_ptr<Entry>& entry )
 void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_token stopToken,
     AnalysisProcessMemoryGuard& memory )
 {
+    const auto workspace=WorkspaceFor(*entry);
+    const auto diskUsage=DiskUsageFor(*entry);
     // Reserve bounded state-journal headroom before bulk growth. An already
     // over-quota namespace is never evicted; only its pause state may be saved.
-    AnalysisDiskActivity diskActivity(m_diskUsage,65536);
+    AnalysisDiskActivity diskActivity(diskUsage,65536);
     Update( entry, ScanState::Validating, 0, 4, "validating" );
     auto disk=std::make_shared<DiskSpaceCheck>(std::array{m_root,m_cacheRoot},
         entry->request.normalizedProfile.at("limits").at("minimum_free_disk_bytes").get<uint64_t>(),m_diskAvailable);
@@ -1169,11 +1213,11 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     const auto identity=ComputeNeutralAggregateIdentity(entry->aggregateIdentity);
     AnalysisCacheTableOptions options;
     options.cancelled=[stopToken,disk] { disk->Check(); return stopToken.stop_requested(); };
-    options.workspace=m_workspace;
-    options.disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{m_diskUsage,
+    options.workspace=workspace;
+    options.disk=DiskBudgetFor(*entry,
         std::min(AnalysisDiskBudget::ForTrace(std::filesystem::file_size(entry->request.tracePath)).peakBytes,
             entry->request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>()),
-        [disk]{disk->Check();}});
+        [disk]{disk->Check();});
     const auto recordNeutral=[&](const std::string& generation,const std::string& sha) {
         std::lock_guard lock(entry->mutex);
         entry->neutralGeneration=generation; entry->neutralHeaderSha256=sha;
@@ -1181,7 +1225,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     const auto loadCurrent=[&] {
         const auto pointer=entry->aggregateRoot/"current.json";
         if(!std::filesystem::exists(pointer)) return false;
-        AnalysisWorkspaceReservation pointerWorkspace(m_workspace);
+        AnalysisWorkspaceReservation pointerWorkspace(workspace);
         const auto current=ReadJson(pointer,pointerWorkspace);
         const auto generation=current.at("generation").get<std::string>();
         const auto sha=current.at("header_sha256").get<std::string>();
@@ -1222,7 +1266,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         request.profileIdentity = entry->request.profileIdentity;
         request.aggregateIdentity = entry->aggregateIdentity;
         request.aggregateRoot = entry->aggregateRoot;
-        request.workspace=m_workspace;
+        request.workspace=workspace;
         request.checkDiskSpace=[disk]{disk->Check();};
         request.disk=options.disk;
         const auto generation=NewGeneration(entry->aggregateRoot/"generations");
@@ -1258,7 +1302,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         memory.Check();
         disk->Check(true);
         if(!WriteJson(entry->aggregateRoot/"current.json",{{"schema",1},{"identity",identity},
-            {"generation",generation},{"header_sha256",sha}},error,m_diskUsage,limit)) throw std::runtime_error(error);
+            {"generation",generation},{"header_sha256",sha}},error,diskUsage,limit)) throw std::runtime_error(error);
         recordNeutral(generation,sha);
         CleanupPublishedTables(products.neutralCachePath,identity,false,true,options);
         }
@@ -1275,7 +1319,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table=options;
     NeutralStatisticsCacheReader neutral(products.neutralCachePath,identity,neutralOptions);
     {
-        AnalysisWorkspaceReservation summaryWorkspace(m_workspace,65536+32ull*neutral.SummaryBytes());
+        AnalysisWorkspaceReservation summaryWorkspace(workspace,65536+32ull*neutral.SummaryBytes());
         const auto neutralSummary=json::parse(neutral.SummaryJson());
         policy.aggregate.qualityComplete=neutralSummary.at("quality").at("complete").get<bool>();
         policy.aggregate.unreportedGapCount=JsonU64(neutralSummary.at("quality").at("unreported_gap_count"));
@@ -1297,7 +1341,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     ValidateFinalTables(candidateRoot,policyIdentity,true,options);
     CandidatePolicyCacheReader verified(candidateRoot,policyIdentity,policyOptions);
     {
-        AnalysisWorkspaceReservation summaryWorkspace(m_workspace,65536+32ull*verified.SummaryBytes());
+        AnalysisWorkspaceReservation summaryWorkspace(workspace,65536+32ull*verified.SummaryBytes());
         const auto checked=json::parse(verified.SummaryJson());
         if(checked.at("neutral_cache_content_sha256")!=neutral.ContentSha256())
             throw std::runtime_error("analysis_scan_policy_neutral_identity");
@@ -1345,6 +1389,12 @@ std::shared_ptr<AnalysisScanManager::Entry> AnalysisScanManager::LoadEntry( cons
             value.maximumBytes=JsonU64(memory.at("maximum_bytes")); value.samples=JsonU64(memory.at("samples"));
             value.residentBytes=JsonU64(memory.at("resident_bytes")); value.privateBytes=JsonU64(memory.at("private_bytes"));
             value.peakResidentBytes=JsonU64(memory.at("peak_resident_bytes")); value.peakPrivateBytes=JsonU64(memory.at("peak_private_bytes"));
+            value.systemCommitAvailable=memory.value("system_commit_available",false);
+            if(memory.contains("system_commit_limit_bytes")) value.systemCommitLimitBytes=JsonU64(memory.at("system_commit_limit_bytes"));
+            if(memory.contains("system_commit_bytes")) value.systemCommitBytes=JsonU64(memory.at("system_commit_bytes"));
+            if(memory.contains("peak_system_commit_bytes")) value.peakSystemCommitBytes=JsonU64(memory.at("peak_system_commit_bytes"));
+            if(memory.contains("system_commit_headroom_bytes")) value.systemCommitHeadroomBytes=JsonU64(memory.at("system_commit_headroom_bytes"));
+            if(memory.contains("minimum_system_commit_headroom_bytes")) value.minimumSystemCommitHeadroomBytes=JsonU64(memory.at("minimum_system_commit_headroom_bytes"));
             if(!memory.at("error").is_null()) value.error=memory.at("error").get<std::string>();
         }
         if( state.contains( "error" ) && !state.at( "error" ).is_null() ) entry->snapshot.error = state.at( "error" ).get<std::string>();
@@ -1487,6 +1537,7 @@ AnalysisScanSnapshot AnalysisScanManager::Close( const std::string& scanId )
 
 void AnalysisScanManager::EnsureReaders( const std::shared_ptr<Entry>& entry ) const
 {
+    const auto workspace=WorkspaceFor(*entry);
     entry->readMemory=std::make_shared<AnalysisProcessMemoryGuard>(ProfileMemoryOptions(m_processMemory,entry->request.normalizedProfile));
     entry->readMemory->Check();
     std::string neutralGeneration,neutralSha,policyGeneration,policyIdentity;
@@ -1499,27 +1550,27 @@ void AnalysisScanManager::EnsureReaders( const std::shared_ptr<Entry>& entry ) c
     if(entry->signatureQuery && entry->candidateQuery) return;
     const auto identity=ComputeNeutralAggregateIdentity(entry->aggregateIdentity);
     const auto neutralRoot=entry->aggregateRoot/"generations"/neutralGeneration;
-    AnalysisCacheTableOptions options; options.workspace=m_workspace;
+    AnalysisCacheTableOptions options; options.workspace=workspace;
     options.cancelled=[owner=entry.get()] { owner->readMemory->Check(false); return false; };
     auto disk=std::make_shared<DiskSpaceCheck>(std::array{m_root,m_cacheRoot},
         entry->request.normalizedProfile.at("limits").at("minimum_free_disk_bytes").get<uint64_t>(),m_diskAvailable);
-    options.disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{m_diskUsage,
+    options.disk=DiskBudgetFor(*entry,
         entry->request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>(),
-        [disk]{disk->Check();}});
+        [disk]{disk->Check();});
     NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table=options;
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;
     AnalysisCacheTableReader header(neutralRoot/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
     if(header.RecordCount()!=1 || header.Descriptor().contentSha256!=neutralSha)
         throw std::runtime_error("analysis_scan_neutral_header_identity");
     const auto headerRecord=header.GetAt(0);
-    AnalysisWorkspaceReservation headerWorkspace(m_workspace,65536+32ull*headerRecord.payload.size());
+    AnalysisWorkspaceReservation headerWorkspace(workspace,65536+32ull*headerRecord.payload.size());
     const auto bundle=json::parse(headerRecord.payload);
     auto neutral=std::make_unique<NeutralStatisticsCacheReader>(neutralRoot/"neutral-statistics-v1",identity,neutralOptions);
     if(neutral->ContentSha256()!=bundle.at("neutral_content_sha256").get<std::string>())
         throw std::runtime_error("analysis_scan_neutral_content_identity");
     const auto policyRoot=entry->scanRoot/"policy-generations"/policyGeneration;
     auto policy=std::make_unique<CandidatePolicyCacheReader>(policyRoot/"policy-cache",policyIdentity,policyOptions);
-    AnalysisWorkspaceReservation summaryWorkspace(m_workspace,65536+32ull*policy->SummaryBytes());
+    AnalysisWorkspaceReservation summaryWorkspace(workspace,65536+32ull*policy->SummaryBytes());
     const auto summary=json::parse(policy->SummaryJson());
     if(summary.at("neutral_cache_content_sha256")!=neutral->ContentSha256() ||
         summary.at("profile_identity")!=entry->request.profileIdentity)
@@ -1583,7 +1634,7 @@ json AnalysisScanManager::Summary( const std::string& scanId ) const
 {
     const auto entry = FindOrLoad( scanId );
     std::lock_guard lock(entry->readMutex); EnsureReaders(entry);
-    AnalysisWorkspaceReservation responseWorkspace(m_workspace,65536+32ull*
+    AnalysisWorkspaceReservation responseWorkspace(WorkspaceFor(*entry),65536+32ull*
         (entry->neutralReader->SummaryBytes()+entry->policyReader->SummaryBytes()));
     const auto aggregate = json::parse(entry->neutralReader->SummaryJson());
     const auto candidates = json::parse(entry->policyReader->SummaryJson());
@@ -1620,7 +1671,7 @@ json AnalysisScanManager::Candidate( const std::string& scanId, const std::strin
     std::lock_guard lock(entry->readMutex); EnsureReaders(entry);
     const auto candidate=entry->policyReader->Candidate(candidateId);
     if(candidate) {
-        AnalysisWorkspaceReservation responseWorkspace(m_workspace,65536+32ull*candidate->payload.size());
+        AnalysisWorkspaceReservation responseWorkspace(WorkspaceFor(*entry),65536+32ull*candidate->payload.size());
         auto result=json::parse(candidate->payload);
         entry->readMemory->Check(); return result;
     }
@@ -1634,7 +1685,7 @@ json AnalysisScanManager::RepresentativeFrames( const std::string& scanId,
     std::lock_guard lock(entry->readMutex); EnsureReaders(entry);
     const auto record=entry->policyReader->Candidate(candidateId);
     if(!record) throw std::runtime_error("analysis_scan_candidate_not_found");
-    AnalysisWorkspaceReservation responseWorkspace(m_workspace,65536+32ull*record->payload.size());
+    AnalysisWorkspaceReservation responseWorkspace(WorkspaceFor(*entry),65536+32ull*record->payload.size());
     const auto candidate=json::parse(record->payload);
     json result={ { "scan_id", scanId }, { "candidate_id", candidateId },
         { "frames", candidate.at( "representative_frame_details" ) } };
@@ -1645,7 +1696,7 @@ json AnalysisScanManager::Quality( const std::string& scanId ) const
 {
     const auto entry = FindOrLoad( scanId );
     std::lock_guard lock(entry->readMutex); EnsureReaders(entry);
-    AnalysisWorkspaceReservation responseWorkspace(m_workspace,65536+32ull*
+    AnalysisWorkspaceReservation responseWorkspace(WorkspaceFor(*entry),65536+32ull*
         (entry->neutralReader->SummaryBytes()+entry->policyReader->SummaryBytes()));
     const auto aggregate = json::parse(entry->neutralReader->SummaryJson());
     auto quality = aggregate.at( "quality" );

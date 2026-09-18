@@ -15,12 +15,13 @@ namespace tracy::query
 using QueryContextSwitchStarts = std::function<std::vector<int64_t>( uint64_t thread )>;
 
 void BuildQuerySampleView( const std::filesystem::path& root, std::string sourceFingerprint,
-    const QueryContextSwitchStarts& contextSwitchStarts );
+    const QueryContextSwitchStarts& contextSwitchStarts, analysis::PagedRecordOptions options = {} );
 
 class QuerySampleViewReader
 {
 public:
-    QuerySampleViewReader( std::filesystem::path root, std::string sourceFingerprint );
+    QuerySampleViewReader( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
     ~QuerySampleViewReader();
     QuerySampleViewReader( const QuerySampleViewReader& ) = delete;
     QuerySampleViewReader& operator=( const QuerySampleViewReader& ) = delete;

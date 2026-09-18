@@ -99,6 +99,7 @@ struct TemporaryTraceFiles
         conflictingIdentity = root / "conflicting-identity.tracy";
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
+        resourceLimit = root / "resource-limit.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
         outside = outsideRoot / "outside.tracy";
@@ -112,6 +113,7 @@ struct TemporaryTraceFiles
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
+        std::ofstream( resourceLimit, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
 
@@ -133,6 +135,7 @@ struct TemporaryTraceFiles
     std::filesystem::path conflictingIdentity;
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
+    std::filesystem::path resourceLimit;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
 };
@@ -539,6 +542,7 @@ int main()
             callback( tracy::analysis::TraceSourceState::Indexing );
             const auto filename = path.filename().string();
             if( filename == "baseline.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( true, true );
+            if( filename == "resource-limit.tracy" ) throw tracy::query::QueryResourceError( "allocation", "allocation_failed" );
             if( filename == "n11.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, true );
             if( filename == "n16.tracy" ) return std::make_unique<tracy::query::test::FakeTraceSource>( false, false, false, true );
             if( filename == "profile-mismatch.tracy" )
@@ -655,6 +659,11 @@ int main()
     assert( openCandidate.at( "ok" ) );
     const auto candidateId = openCandidate.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( candidateId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto openResourceLimit = service.Execute( Request( 102, "trace.open", { { "path", files.resourceLimit.string() } } ) );
+    assert( openResourceLimit.at( "ok" ) );
+    const auto resourceLimitId = openResourceLimit.at( "data" ).at( "trace_id" ).get<std::string>();
+    const auto resourceLimitStatus = sessions.WaitReady( resourceLimitId, std::chrono::seconds( 5 ) );
+    assert( resourceLimitStatus.state == TraceSourceState::Failed && resourceLimitStatus.errorCode == "RESOURCE_LIMIT" );
 
     const auto oldScript = service.Execute( Request( 1000, "runtime.script.summary", { { "trace_id", candidateId } } ) );
     assert( oldScript.at( "ok" ) && oldScript.at( "data" ).at( "present" ) == false && oldScript.at( "data" ).at( "complete" ) == false );

@@ -6,6 +6,9 @@
 #include <string>
 #include <vector>
 
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyPagedRecordStore.hpp"
+
 #if __has_include( "TracyQuerySampleView.hpp" )
 #  include "TracyQuerySampleView.hpp"
 #  define TRACY_HAS_QUERY_SAMPLE_VIEW 1
@@ -76,7 +79,26 @@ int main()
 
         QuerySampleViewReader reopened( root, identity );
         Require( reopened.Scan( 0, 40, 5, 2 ).front().ordinal == 5, "cold logical pagination changed" );
+
+        const auto deniedRoot = root.parent_path() / "tracy-query-sample-view-budget-denied";
+        fs::remove_all( deniedRoot, ignored );
+        {
+            QuerySampleStoreWriter raw( deniedRoot, identity );
+            raw.Begin( 1, QuerySampleKind::Main, 1 ); raw.Append( 0, 1, 1 ); raw.End(); raw.Commit();
+        }
+        auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>( std::vector<fs::path> {
+            deniedRoot / "query-contexts", deniedRoot / "query-spans" } );
+        tracy::analysis::AnalysisDiskActivity activity( usage );
+        auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+        disk->usage = usage; disk->maximumBytes = 1;
+        tracy::analysis::PagedRecordOptions options; options.disk = disk;
+        bool budgetRejected = false;
+        try { BuildQuerySampleView( deniedRoot, identity, []( uint64_t ) { return std::vector<int64_t> {}; }, options ); }
+        catch( const std::exception& error ) { budgetRejected = std::string( error.what() ).find( "disk_budget" ) != std::string::npos; }
+        Require( budgetRejected && usage->Current() == 0,
+            "sample logical view did not reject its derived extents before writing" );
         fs::remove_all( root, ignored );
+        fs::remove_all( deniedRoot, ignored );
         std::cout << "query sample logical view passed\n";
         return 0;
 #endif

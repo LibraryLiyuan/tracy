@@ -77,7 +77,8 @@ const char* ToString( SessionErrorCode code )
     return "INTERNAL_ERROR";
 }
 
-SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions, SourceLoader sourceLoader, bool preferIndex )
+SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, size_t maxSessions,
+    SourceLoader sourceLoader, bool preferIndex, QueryResourceContextOptions resourceOptions )
     : m_maxSessions( maxSessions )
     , m_sourceLoader( std::move( sourceLoader ) )
 {
@@ -96,25 +97,26 @@ SessionManager::SessionManager( std::vector<std::filesystem::path> allowRoots, s
     m_allowRoots.erase( std::unique( m_allowRoots.begin(), m_allowRoots.end() ), m_allowRoots.end() );
     if( !m_sourceLoader )
     {
-        m_sourceLoader = [preferIndex]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
+        m_sourceLoader = [preferIndex,resourceOptions=std::move(resourceOptions)]( const std::filesystem::path& path, StateCallback callback ) -> std::unique_ptr<analysis::TraceSource> {
             if( Lower( path.extension().string() ) == ".tracy-stream" )
             {
                 return SegmentTraceSource::Open( path, std::move( callback ), preferIndex );
             }
             if( preferIndex )
             {
-                auto validation = QueryIndex::Validate( path );
+                auto resources=QueryIndex::CreateResourceContext(path,resourceOptions);
+                auto validation = QueryIndex::Validate( path, false, resources );
                 if( !validation.manifest )
                 {
                     auto buildCallback = callback;
-                    QueryIndex::Build( path, std::move( buildCallback ) );
-                    validation = QueryIndex::Validate( path );
+                    QueryIndex::Build( path, std::move( buildCallback ), resources );
+                    validation = QueryIndex::Validate( path, false, resources );
                 }
                 if( !validation.manifest )
                 {
                     throw analysis::TraceLoadError( analysis::TraceLoadErrorCode::Corrupt, "query index validation failed: " + validation.reason );
                 }
-                return QueryIndex::Open( *validation.manifest, std::move( callback ) );
+                return QueryIndex::Open( *validation.manifest, std::move( callback ), {}, resources );
             }
             return analysis::WorkerTraceSource::Open( path, std::move( callback ) );
         };
@@ -421,6 +423,14 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
             case analysis::TraceLoadErrorCode::ResourceLimit: session->errorCode = "RESOURCE_LIMIT"; break;
             case analysis::TraceLoadErrorCode::Internal: session->errorCode = "INTERNAL_ERROR"; break;
             }
+        }
+        catch( const QueryResourceError& error )
+        {
+            std::lock_guard lock( m_mutex );
+            session->state = analysis::TraceSourceState::Failed;
+            session->complete = false;
+            session->errorCode = error.Code();
+            session->errorMessage = error.what();
         }
         catch( const std::exception& error )
         {

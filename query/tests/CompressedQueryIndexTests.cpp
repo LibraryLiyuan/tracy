@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <fstream>
+#include <nlohmann/json.hpp>
 int main(int argc,char** argv)
 {
     try {
@@ -15,6 +17,24 @@ int main(int argc,char** argv)
         std::filesystem::copy_file(argv[1],input);
         auto full=tracy::analysis::WorkerTraceSource::Open(input);
         const auto originalCounts=full->GetTraceInfo().counts;full.reset();
+        tracy::query::QueryResourceContextOptions deniedOptions;
+        deniedOptions.traceBytes=1024;
+        deniedOptions.derivedRoots={tracy::query::QueryIndex::ManifestPath(input)};
+        deniedOptions.diagnosticMemoryReserveBytes=4096;
+        deniedOptions.diagnosticDiskReserveBytes=4096;
+        auto deniedResources=std::make_shared<tracy::query::QueryResourceContext>(std::move(deniedOptions));
+        bool denied=false;
+        try { tracy::query::QueryIndex::Build(input,{},deniedResources); }
+        catch(const tracy::query::QueryResourceError& error) { denied=error.Code()=="RESOURCE_LIMIT"; }
+        if(!denied) throw std::runtime_error("QueryIndex bypassed the injected shared disk limit");
+        auto failurePath=tracy::query::QueryIndex::ManifestPath(input); failurePath+=".failure.json";
+        for(const auto& entry:std::filesystem::directory_iterator(root))
+            if(entry.path()!=input && entry.path()!=failurePath) throw std::runtime_error("resource-denied QueryIndex left a candidate behind");
+        std::ifstream failureInput(failurePath,std::ios::binary);
+        const auto failure=nlohmann::json::parse(failureInput);
+        if(failure.at("failure_reason") != "disk_peak_limit" || failure.at("requested_bytes").is_null() ||
+            failure.at("phase").get<std::string>().empty())
+            throw std::runtime_error("resource-denied QueryIndex did not retain an actionable diagnostic");
         const auto manifest=tracy::query::QueryIndex::Build(input);
         const auto validation=tracy::query::QueryIndex::Validate(input,true);
         if(!validation.manifest) throw std::runtime_error(validation.reason);

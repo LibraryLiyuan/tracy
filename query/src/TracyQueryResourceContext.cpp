@@ -1,7 +1,14 @@
 #include "TracyQueryResourceContext.hpp"
+#include "TracyFileReadHooks.hpp"
+#include "TracyFileWriteHooks.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <fstream>
 #include <mutex>
 #include <new>
+#include <unordered_map>
 #include <utility>
 
 namespace tracy::query
@@ -17,12 +24,15 @@ std::string ErrorMessage(const std::string& category,const std::string& reason)
 struct QueryResourceContext::State
 {
     mutable std::mutex mutex;
+    std::mutex fileMutex;
     std::string phase;
     uint64_t progressCurrent=0,progressTotal=0;
     uint32_t liveWorkers=0;
     std::string failureReason;
     std::optional<uint64_t> requestedBytes;
     bool softPressureActive=false;
+    std::unordered_map<std::string,uint64_t> fileBytes;
+    std::unordered_map<std::string,std::pair<uint64_t,uint64_t>> containers;
 };
 
 QueryResourceError::QueryResourceError(std::string category,std::string reason,
@@ -35,7 +45,8 @@ QueryResourceContext::QueryResourceContext(QueryResourceContextOptions options)
     m_state(std::make_shared<State>())
 {
     if(m_options.derivedRoots.empty() || !m_options.privateBytesSoftTarget ||
-        m_options.privateBytesSoftTarget>m_options.processCommitHardLimit || !m_options.memorySample)
+        m_options.privateBytesSoftTarget>m_options.processCommitHardLimit || !m_options.memorySample ||
+        (!m_options.expectedTraceSha256.empty() && m_options.expectedTraceSha256.size()!=64))
         throw std::runtime_error("query_resource_configuration");
 
     analysis::AnalysisProcessMemoryOptions memoryOptions;
@@ -72,6 +83,7 @@ QueryResourceContext::QueryResourceContext(QueryResourceContextOptions options)
                 value->requestedBytes=requested;
             }
         });
+    m_diagnosticWorkspace=analysis::AnalysisWorkspaceReservation(m_workspace,m_options.diagnosticMemoryReserveBytes);
 
     m_usage=std::make_shared<analysis::AnalysisDiskUsage>(m_options.derivedRoots);
     m_diskActivity=std::make_unique<analysis::AnalysisDiskActivity>(m_usage,m_options.diagnosticDiskReserveBytes);
@@ -107,6 +119,12 @@ void QueryResourceContext::SetLiveWorkers(uint32_t workers)
 {
     std::lock_guard lock(m_state->mutex);
     m_state->liveWorkers=workers;
+}
+
+void QueryResourceContext::SetContainer(std::string name,uint64_t size,uint64_t capacity)
+{
+    std::lock_guard lock(m_state->mutex);
+    m_state->containers[std::move(name)]={size,capacity};
 }
 
 void QueryResourceContext::RecordFailure(std::string reason,std::optional<uint64_t> requestedBytes) const
@@ -153,6 +171,123 @@ void QueryResourceContext::CheckFinalDisk()
     }
 }
 
+void QueryResourceContext::ValidateTraceIdentity(uint64_t bytes,std::string_view sha256) const
+{
+    if((m_options.expectedTraceBytes && m_options.expectedTraceBytes!=bytes) ||
+        (m_options.expectedFinalDiskLimit && m_options.expectedFinalDiskLimit!=m_limits.finalBytes) ||
+        (m_options.expectedPeakDiskLimit && m_options.expectedPeakDiskLimit!=m_limits.peakBytes) ||
+        (!m_options.expectedTraceSha256.empty() && m_options.expectedTraceSha256!=sha256))
+        throw std::runtime_error("query_resource_profile_identity_mismatch");
+}
+
+void QueryResourceContext::BeforeFileGrowth(const std::filesystem::path& path,uint64_t proposedBytes)
+{
+    const auto key=std::filesystem::absolute(path).lexically_normal().generic_string();
+    std::lock_guard fileLock(m_state->fileMutex);
+    auto& charged=m_state->fileBytes[key];
+    if(proposedBytes<=charged) return;
+    const auto growth=proposedBytes-charged;
+    try { m_disk->Grow(growth); }
+    catch(const std::exception&)
+    {
+        RecordFailure("disk_peak_limit",growth);
+        throw QueryResourceError("disk","disk_peak_limit",growth);
+    }
+    charged=proposedBytes;
+}
+
+std::shared_ptr<tracy::FileWriteHooks> QueryResourceContext::CreateFileWriteHooks(const std::filesystem::path& path)
+{
+    auto hooks=std::make_shared<tracy::FileWriteHooks>();
+    auto workspace=std::make_shared<analysis::AnalysisWorkspaceReservation>(m_workspace);
+    hooks->check=[this] { CheckMemory(false); };
+    hooks->beforeWrite=[this,path](uint64_t bytes) { BeforeFileGrowth(path,bytes); };
+    hooks->reserveMemory=[workspace](uint64_t bytes) { workspace->Resize(bytes); };
+    return hooks;
+}
+
+std::shared_ptr<tracy::FileReadHooks> QueryResourceContext::CreateFileReadHooks()
+{
+    auto hooks=std::make_shared<tracy::FileReadHooks>();
+    auto workspace=std::make_shared<analysis::AnalysisWorkspaceReservation>(m_workspace);
+    hooks->check=[this] { CheckMemory(false); };
+    hooks->reserveMemory=[workspace](uint64_t bytes) { workspace->Resize(bytes); };
+    return hooks;
+}
+
+void QueryResourceContext::IncludeDiskRoots(const std::vector<std::filesystem::path>& roots)
+{
+    try { m_usage->AddRoots(roots,m_limits.peakBytes); }
+    catch(const std::exception&)
+    {
+        RecordFailure("disk_existing_limit");
+        throw QueryResourceError("disk","disk_existing_limit");
+    }
+}
+
+void QueryResourceContext::WriteDiagnostic(const std::filesystem::path& path)
+{
+    const auto snapshot=Snapshot();
+    nlohmann::json containers=nlohmann::json::array();
+    for(const auto& value:snapshot.containers) containers.push_back({
+        {"name",value.name},{"size",std::to_string(value.size)},{"capacity",std::to_string(value.capacity)}});
+    nlohmann::json report={
+        {"schema",1},
+        {"phase",snapshot.phase},
+        {"progress_current",std::to_string(snapshot.progressCurrent)},
+        {"progress_total",std::to_string(snapshot.progressTotal)},
+        {"live_workers",snapshot.liveWorkers},
+        {"failure_reason",snapshot.failureReason},
+        {"requested_bytes",snapshot.requestedBytesKnown?nlohmann::json(std::to_string(snapshot.requestedBytes)):nlohmann::json(nullptr)},
+        {"containers",std::move(containers)},
+        {"memory",{
+            {"private_bytes",std::to_string(snapshot.memory.privateBytes)},
+            {"peak_private_bytes",std::to_string(snapshot.memory.peakPrivateBytes)},
+            {"working_set_bytes",std::to_string(snapshot.memory.residentBytes)},
+            {"peak_working_set_bytes",std::to_string(snapshot.memory.peakResidentBytes)},
+            {"system_commit_available",snapshot.memory.systemCommitAvailable},
+            {"system_commit_limit_bytes",std::to_string(snapshot.memory.systemCommitLimitBytes)},
+            {"system_commit_bytes",std::to_string(snapshot.memory.systemCommitBytes)},
+            {"system_commit_headroom_bytes",std::to_string(snapshot.memory.systemCommitHeadroomBytes)},
+            {"minimum_system_commit_headroom_bytes",std::to_string(snapshot.memory.minimumSystemCommitHeadroomBytes)}
+        }},
+        {"workspace",{
+            {"current_bytes",std::to_string(snapshot.workspace.currentBytes)},
+            {"peak_bytes",std::to_string(snapshot.workspace.peakBytes)},
+            {"maximum_bytes",std::to_string(snapshot.workspace.maximumBytes)},
+            {"rejected_reservations",std::to_string(snapshot.workspace.rejectedReservations)}
+        }},
+        {"disk",{
+            {"current_bytes",std::to_string(snapshot.disk.currentBytes)},
+            {"peak_bytes",std::to_string(snapshot.disk.peakBytes)},
+            {"final_limit_bytes",std::to_string(snapshot.disk.finalLimitBytes)},
+            {"peak_limit_bytes",std::to_string(snapshot.disk.peakLimitBytes)},
+            {"rejected_growths",std::to_string(snapshot.disk.rejectedGrowths)}
+        }}
+    };
+    const auto payload=report.dump(2);
+    if(!m_options.diagnosticDiskReserveBytes || payload.size()>m_options.diagnosticDiskReserveBytes)
+        throw std::runtime_error("query_resource_diagnostic_reserve");
+
+    const auto key=std::filesystem::absolute(path).lexically_normal().generic_string();
+    {
+        std::lock_guard fileLock(m_state->fileMutex);
+        auto& charged=m_state->fileBytes[key];
+        if(payload.size()>charged)
+        {
+            const auto growth=uint64_t(payload.size())-charged;
+            if(m_disk->checkSpace) m_disk->checkSpace();
+            m_usage->Grow(growth,m_limits.peakBytes,false);
+            charged=payload.size();
+        }
+    }
+    std::ofstream output(path,std::ios::binary|std::ios::trunc);
+    if(!output) throw std::runtime_error("query_resource_diagnostic_open");
+    output.write(payload.data(),std::streamsize(payload.size()));
+    output.flush();
+    if(!output) throw std::runtime_error("query_resource_diagnostic_write");
+}
+
 void QueryResourceContext::RunResourceBoundary(const std::function<void()>& operation)
 {
     try { operation(); }
@@ -165,20 +300,48 @@ void QueryResourceContext::RunResourceBoundary(const std::function<void()>& oper
     catch(const std::exception& error)
     {
         const std::string message=error.what();
+        if(message.starts_with("query_resource_memory:"))
+        {
+            RecordFailure("process_private_hard_limit");
+            throw QueryResourceError("memory","process_private_hard_limit");
+        }
+        if(message.starts_with("query_resource_disk:"))
+        {
+            auto snapshot=Snapshot();
+            if(snapshot.failureReason.empty()) { RecordFailure("disk_limit"); snapshot=Snapshot(); }
+            throw QueryResourceError("disk",snapshot.failureReason,
+                snapshot.requestedBytesKnown?std::optional<uint64_t>(snapshot.requestedBytes):std::nullopt);
+        }
+        if(message.starts_with("query_resource_workspace:"))
+        {
+            auto snapshot=Snapshot();
+            if(snapshot.failureReason.empty()) { RecordFailure("workspace_limit"); snapshot=Snapshot(); }
+            throw QueryResourceError("workspace",snapshot.failureReason,
+                snapshot.requestedBytesKnown?std::optional<uint64_t>(snapshot.requestedBytes):std::nullopt);
+        }
         if(message.find("analysis_workspace_budget")!=std::string::npos)
         {
-            RecordFailure("workspace_limit");
-            throw QueryResourceError("workspace","workspace_limit");
+            auto snapshot=Snapshot();
+            if(snapshot.failureReason.empty()) { RecordFailure("workspace_limit"); snapshot=Snapshot(); }
+            throw QueryResourceError("workspace",snapshot.failureReason,
+                snapshot.requestedBytesKnown?std::optional<uint64_t>(snapshot.requestedBytes):std::nullopt);
         }
         if(message.find("disk_budget")!=std::string::npos || message.find("final_disk_ratio")!=std::string::npos)
         {
-            RecordFailure("disk_limit");
-            throw QueryResourceError("disk","disk_limit");
+            auto snapshot=Snapshot();
+            if(snapshot.failureReason.empty()) { RecordFailure("disk_limit"); snapshot=Snapshot(); }
+            throw QueryResourceError("disk",snapshot.failureReason,
+                snapshot.requestedBytesKnown?std::optional<uint64_t>(snapshot.requestedBytes):std::nullopt);
         }
         if(message.find("process_memory_budget")!=std::string::npos)
         {
             RecordFailure("process_private_hard_limit");
             throw QueryResourceError("memory","process_private_hard_limit");
+        }
+        if(message.find("not enough memory to load trace")!=std::string::npos)
+        {
+            RecordFailure("allocation_failed");
+            throw QueryResourceError("allocation","allocation_failed");
         }
         throw;
     }
@@ -196,7 +359,10 @@ QueryResourceSnapshot QueryResourceContext::Snapshot() const
         result.failureReason=m_state->failureReason;
         result.requestedBytesKnown=m_state->requestedBytes.has_value();
         result.requestedBytes=m_state->requestedBytes.value_or(0);
+        for(const auto& [name,value]:m_state->containers)
+            result.containers.push_back({name,value.first,value.second});
     }
+    std::sort(result.containers.begin(),result.containers.end(),[](const auto& lhs,const auto& rhs) { return lhs.name<rhs.name; });
     result.memory=m_memory->Snapshot();
     result.workspace=m_workspace->Snapshot();
     const auto disk=m_usage->Snapshot();

@@ -15,6 +15,8 @@ struct AnalysisProcessMemorySample
 {
     bool available=false;
     uint64_t residentBytes=0,privateBytes=0;
+    bool systemCommitAvailable=false;
+    uint64_t systemCommitLimitBytes=0,systemCommitBytes=0,systemCommitHeadroomBytes=0;
 };
 AnalysisProcessMemorySample ReadAnalysisProcessMemory();
 struct AnalysisProcessMemoryOptions
@@ -27,6 +29,9 @@ struct AnalysisProcessMemorySnapshot
 {
     uint64_t maximumBytes=0,samples=0,residentBytes=0,privateBytes=0;
     uint64_t peakResidentBytes=0,peakPrivateBytes=0;
+    bool systemCommitAvailable=false;
+    uint64_t systemCommitLimitBytes=0,systemCommitBytes=0,peakSystemCommitBytes=0;
+    uint64_t systemCommitHeadroomBytes=0,minimumSystemCommitHeadroomBytes=0;
     std::string error;
 };
 // Cooperative, sampled whole-process protection, NOT an allocator or OS cap.

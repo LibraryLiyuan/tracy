@@ -39,12 +39,13 @@ std::filesystem::path DomainPath( const std::filesystem::path& root, OfflineCata
 
 struct QueryCatalogStoreWriter::Impl
 {
-    explicit Impl( std::filesystem::path outputRoot, std::string identity )
-        : root( std::move( outputRoot ) ), sourceFingerprint( std::move( identity ) )
+    explicit Impl( std::filesystem::path outputRoot, std::string identity, analysis::PagedRecordOptions storageOptions )
+        : root( std::move( outputRoot ) ), sourceFingerprint( std::move( identity ) ), options( std::move( storageOptions ) )
     {}
 
     std::filesystem::path root;
     std::string sourceFingerprint;
+    analysis::PagedRecordOptions options;
     OfflineCatalogQuality metadata {};
     bool metadataSet = false;
     bool finished = false;
@@ -55,8 +56,9 @@ struct QueryCatalogStoreWriter::Impl
     std::array<bool, OfflineCatalogDomainCount> ended {};
 };
 
-QueryCatalogStoreWriter::QueryCatalogStoreWriter( std::filesystem::path root, std::string sourceFingerprint )
-    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ) ) )
+QueryCatalogStoreWriter::QueryCatalogStoreWriter( std::filesystem::path root, std::string sourceFingerprint,
+    analysis::PagedRecordOptions options )
+    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ), std::move( options ) ) )
 {}
 
 QueryCatalogStoreWriter::~QueryCatalogStoreWriter() = default;
@@ -75,7 +77,7 @@ void QueryCatalogStoreWriter::Begin( OfflineCatalogDomain domain, uint64_t count
         m_impl->started[index] || recordBytes != OfflineCatalogInfo( domain ).width )
         throw std::runtime_error( "Catalog domain layout mismatch" );
     m_impl->writers[index] = std::make_unique<analysis::PagedRecordWriter>( DomainPath( m_impl->root, domain ),
-        CatalogIdentity( m_impl->sourceFingerprint, domain ), recordBytes );
+        CatalogIdentity( m_impl->sourceFingerprint, domain ), recordBytes, m_impl->options );
     m_impl->expected[index] = count;
     m_impl->started[index] = true;
 }
@@ -108,7 +110,7 @@ void QueryCatalogStoreWriter::BeginStrings( uint64_t count )
     const auto index = size_t( domain );
     if( m_impl->finished || m_impl->started[index] ) throw std::runtime_error( "Catalog strings are already open" );
     m_impl->writers[index] = std::make_unique<analysis::PagedRecordWriter>( DomainPath( m_impl->root, domain ),
-        CatalogIdentity( m_impl->sourceFingerprint, domain ), sizeof( OfflineCatalogString ) );
+        CatalogIdentity( m_impl->sourceFingerprint, domain ), sizeof( OfflineCatalogString ), m_impl->options );
     m_impl->expected[index] = count;
     m_impl->started[index] = true;
 }
@@ -148,7 +150,7 @@ void QueryCatalogStoreWriter::Finish()
         if( !m_impl->ended[index] ) End( domain );
     }
     analysis::PagedRecordWriter metadata( m_impl->root / "metadata",
-        CatalogIdentity( m_impl->sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ) );
+        CatalogIdentity( m_impl->sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ), m_impl->options );
     metadata.Append( &m_impl->metadata, 1 );
     metadata.Commit();
     m_impl->finished = true;
@@ -156,23 +158,25 @@ void QueryCatalogStoreWriter::Finish()
 
 struct QueryCatalogStoreReader::Impl
 {
-    explicit Impl( std::filesystem::path inputRoot, std::string identity )
-        : root( std::move( inputRoot ) ), sourceFingerprint( std::move( identity ) )
+    explicit Impl( std::filesystem::path inputRoot, std::string identity, analysis::PagedRecordOptions storageOptions )
+        : root( std::move( inputRoot ) ), sourceFingerprint( std::move( identity ) ), options( std::move( storageOptions ) )
     {
         analysis::PagedRecordReader metadataReader( root / "metadata",
-            CatalogIdentity( sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ) );
+            CatalogIdentity( sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ), options );
         if( metadataReader.Count() != 1 ) throw std::runtime_error( "Catalog metadata count mismatch" );
         metadataReader.Read( 0, &metadata, 1 );
     }
 
     std::filesystem::path root;
     std::string sourceFingerprint;
+    analysis::PagedRecordOptions options;
     OfflineCatalogQuality metadata {};
     mutable std::mutex mutex;
 };
 
-QueryCatalogStoreReader::QueryCatalogStoreReader( std::filesystem::path root, std::string sourceFingerprint )
-    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ) ) )
+QueryCatalogStoreReader::QueryCatalogStoreReader( std::filesystem::path root, std::string sourceFingerprint,
+    analysis::PagedRecordOptions options )
+    : m_impl( std::make_unique<Impl>( std::move( root ), std::move( sourceFingerprint ), std::move( options ) ) )
 {}
 
 QueryCatalogStoreReader::~QueryCatalogStoreReader() = default;
@@ -182,7 +186,7 @@ uint64_t QueryCatalogStoreReader::Count( OfflineCatalogDomain domain ) const
 {
     std::lock_guard lock( m_impl->mutex );
     analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
-        CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width );
+        CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
     return records.Count();
 }
 
@@ -192,7 +196,7 @@ void QueryCatalogStoreReader::Read( OfflineCatalogDomain domain, uint64_t ordina
     if( recordBytes != OfflineCatalogInfo( domain ).width ) throw std::runtime_error( "Catalog read layout mismatch" );
     std::lock_guard lock( m_impl->mutex );
     analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
-        CatalogIdentity( m_impl->sourceFingerprint, domain ), recordBytes );
+        CatalogIdentity( m_impl->sourceFingerprint, domain ), recordBytes, m_impl->options );
     records.Read( ordinal, output, count );
 }
 
@@ -213,13 +217,13 @@ void QueryCatalogStoreReader::ValidateAll() const
 {
     std::lock_guard lock( m_impl->mutex );
     analysis::PagedRecordReader metadataReader( m_impl->root / "metadata",
-        CatalogIdentity( m_impl->sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ) );
+        CatalogIdentity( m_impl->sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ), m_impl->options );
     metadataReader.ValidateAll();
     for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
     {
         const auto domain = OfflineCatalogDomain( index );
         analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
-            CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width );
+            CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
         records.ValidateAll();
     }
 }
