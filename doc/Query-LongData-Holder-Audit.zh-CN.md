@@ -1,10 +1,10 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-18。当前索引 schema22。本文对应修订计划 P2，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-18。当前索引 schema23。本文对应修订计划 P2，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
-| QueryIndex Zone 校验 | ZoneExtra 名称状态两个全量 vector；Zone/GPU 调用栈引用 vector；GPU Memory CPU-zone ordinal 两个 vector | 已移除 | 名称状态使用压缩分页表；调用栈引用使用有界 run 外排、归并、去重和 4096 项解析批次；GPU ordinal 在扫描时直接写分页表；scratch 完成后立即删除并释放账本 |
+| QueryIndex Zone 校验 | ZoneExtra 名称状态两个全量 vector；Zone/GPU 调用栈引用 vector；GPU Memory CPU-zone ordinal 两个 vector | 已移除 | schema23 将名称解析结果固化到 ZoneExtra 空闲 flag，CPU Zone 校验不再逐条随机读取分页状态；调用栈引用使用有界 run 外排、归并、去重和4096项解析批次；GPU ordinal扫描时直接写分页表；scratch完成后立即删除并释放账本 |
 | QueryIndex Worker 生命周期 | 原 Worker 写出 compact 后仍与 compact Worker 重叠 | 已修正 | compact 写出和 fingerprint 完成后立即 `source.reset()`，再打开 compact；资源快照记录存活 Worker 数 |
 | QueryIndex CPU 排序/section pack | 原始映射文件、排序副本、分页副本同时存活 | 部分完成 | 全部写入已计入 16S；每个 section pack 后立即删除 raw。CPU 排序仍有一个临时等尺寸副本，属于有界磁盘而非 Private Bytes |
 | 全局字符串 | Worker 字符串正文、普通字符串 ID、线程名 token、外部名称 pair；消费者长期持有 `const char*` | 已从冷建及 compact 外置 | 原始字节＋NUL 的只读映射、分页 ordinal 目录、token 外排索引和三类 ID 外排索引；Query 对外返回拥有值，Worker 只使用在 Reader 生命周期内不淘汰的稳定映射地址。schema20 compact 使用 manifest 绑定标记，脱离字典会在加载时拒绝 |
@@ -22,4 +22,6 @@
 - 冷建 manifest 明确记录 GPU Memory 完整摘要 count=0；原 Worker 写完 compact 后释放，不再为摘要打开第二个 Worker。
 - schema22 callstack 真实夹具完成冷建、深校验、热开和 `callstack.resolve`，原始两帧 `0x1000 → 0x2000` 一致；该夹具 Frame 定义为空，非空/255-inline 定义由二进制侧车回归覆盖。
 - Release 全目标构建通过；最终 CTest 38/38 通过（131.55秒）；compressed/sample/job/catalog 四项真实 Worker 索引集成回归通过。此前 Job 发布复现的 `MoveFileExW error 5` 仍归 P6 修复。
+- schema22 正式 Trace 受控诊断运行2,700.815秒后按45分钟停止：Private Bytes峰值9,831,661,568字节，Working Set峰值38,914,113,536字节；未发生内存/磁盘错误，进程持续单核扫描约4.225亿 CPU Zone。18项未发布候选共103,992,920,640字节，已按PID清理。该轮不是性能验收。
+- schema23 删除 CPU Zone→分页名称状态的逐记录随机读；Release全构建、小型真实索引和CTest 38/38（130.67秒）通过。正式输入修复后范围重跑尚未开始。
 - 未运行 12.43 GB 正式 Trace。

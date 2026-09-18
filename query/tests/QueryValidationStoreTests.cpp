@@ -1,4 +1,5 @@
 #include "TracyQueryValidationStore.hpp"
+#include "TracyQueryIndex.hpp"
 
 #include <chrono>
 #include <filesystem>
@@ -16,6 +17,9 @@ void Require(bool value,const char* message) { if(!value) throw std::runtime_err
 
 int main()
 {
+    static_assert(QueryIndexZoneExtraNameResolved(QueryIndexZoneExtraNameActive|QueryIndexZoneExtraNameResolvedFlag));
+    static_assert(!QueryIndexZoneExtraNameResolved(QueryIndexZoneExtraNameActive));
+    static_assert(!QueryIndexZoneExtraNameResolved(0));
     try
     {
         const auto root=std::filesystem::current_path()/

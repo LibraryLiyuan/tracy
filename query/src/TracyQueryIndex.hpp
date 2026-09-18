@@ -13,7 +13,15 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 22;
+inline constexpr uint32_t QueryIndexSchemaVersion = 23;
+inline constexpr uint8_t QueryIndexZoneExtraTextActive = 1;
+inline constexpr uint8_t QueryIndexZoneExtraNameActive = 2;
+inline constexpr uint8_t QueryIndexZoneExtraNameResolvedFlag = 4;
+constexpr bool QueryIndexZoneExtraNameResolved( uint8_t flags ) noexcept
+{
+    return ( flags & ( QueryIndexZoneExtraNameActive | QueryIndexZoneExtraNameResolvedFlag ) ) ==
+        ( QueryIndexZoneExtraNameActive | QueryIndexZoneExtraNameResolvedFlag );
+}
 
 constexpr bool QueryIndexCpuZoneTimingComplete( int64_t end ) noexcept
 {

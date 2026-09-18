@@ -403,7 +403,9 @@ public:
     void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) override
     {
         auto* record = reinterpret_cast<ZoneExtraIndexRecord*>( m_extras.Record( index ) );
-        *record = { callstack, text, name, color, uint8_t( ( textActive ? 1 : 0 ) | ( nameActive ? 2 : 0 ) ), {} };
+        uint8_t flags=uint8_t((textActive?QueryIndexZoneExtraTextActive:0)|(nameActive?QueryIndexZoneExtraNameActive:0));
+        if(nameActive&&name!=0&&m_stringReader&&name<m_stringReader->StringCount())flags|=QueryIndexZoneExtraNameResolvedFlag;
+        *record = { callstack, text, name, color, flags, {} };
         if( m_extraHasText.size() <= index ) m_extraHasText.resize( size_t( index + 1 ) );
         m_extraHasText[size_t( index )] = textActive;
         m_seenExtras++;
@@ -2775,14 +2777,11 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 PagedSectionIdentity(result.sourceFingerprint,ZoneSectionKind::GpuMemorySummaryCpuZone),sizeof(uint64_t),storageOptions);
             uint64_t gpuMemoryCpuZoneCount=0,gpuMemorySummaryCpuZoneCount=0;
             auto validationWriter=std::make_unique<QueryValidationStoreWriter>(temporaryValidation,result.sourceFingerprint,storageOptions);
-            resources->SetPhase("zone-validation:extra-state");
+            resources->SetPhase("zone-validation:extra-callstack-index");
             for(uint64_t index=0;index<extraSection.Count();++index)
             {
                 if((index&0xffff)==0) { resources->SetProgress(index,extraSection.Count()); resources->CheckMemory(false); }
                 const auto extra=extraSection.At<ZoneExtraIndexRecord>(index);
-                uint8_t nameState=2;
-                if(extra.flags&2) nameState=source->ResolveStringIndex(extra.name).has_value()?1:0;
-                validationWriter->AppendExtraNameState(nameState);
                 validationWriter->AppendCallstack(extra.callstack);
             }
             resources->SetPhase("zone-validation:gpu-callstack-index");
@@ -2794,9 +2793,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             validationWriter->Commit();
             validationWriter.reset();
             auto validationStore=std::make_unique<QueryValidationStoreReader>(temporaryValidation,result.sourceFingerprint,storageOptions);
-            if(validationStore->ExtraCount()!=extraSection.Count()) throw std::runtime_error("zone validation extra-state count mismatch");
             const auto reportValidationContainers=[&] {
-                resources->SetContainer("validation_extra_name_state_page",1,storageOptions.blockBytes);
                 resources->SetContainer("gpu_memory_cpu_zone_ordinals",gpuMemoryCpuZoneCount,0);
                 resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZoneCount,0);
             };
@@ -2824,8 +2821,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 if( zone.extra < extraSection.Count() )
                 {
                     const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
-                    if( extra.flags & 2 )
-                        nameResolved = validationStore->ExtraNameState(zone.extra)==1;
+                    if( extra.flags & QueryIndexZoneExtraNameActive )
+                        nameResolved = QueryIndexZoneExtraNameResolved(extra.flags);
                 }
                 else if( zone.extra != 0 ) nameResolved = false;
                 if( !nameResolved )
@@ -2833,7 +2830,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 const auto marker = gpuMemoryMarkers.find( zone.sourceLocation );
                 if( marker == gpuMemoryMarkers.end() || ( zone.flags & 1 ) == 0 || zone.extra >= extraSection.Count() ) continue;
                 const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
-                if( ( extra.flags & 1 ) == 0 ) continue;
+                if( ( extra.flags & QueryIndexZoneExtraTextActive ) == 0 ) continue;
                 const auto text = source->ResolveStringIndex( extra.text );
                 if( !text ) continue;
                 gpuMemoryCpuZoneWriter.Append(&index,1); ++gpuMemoryCpuZoneCount;

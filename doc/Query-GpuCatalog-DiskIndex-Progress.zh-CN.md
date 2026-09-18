@@ -52,6 +52,13 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 - 独立回归覆盖缺失 ID、重复查找稳定地址、255 个 inline frame、跨块写入、深校验和 hash；小型真实 callstack 夹具完成 schema22 冷建、深校验、热开与两帧解析，但该夹具本身没有 Frame 定义，未把它误报为非空定义端到端证据。
 - Release 全目标构建和 CTest 38/38（131.55秒）通过；compressed/sample/job/catalog 四项真实索引回归均通过。12.43 GB 正式 Trace 尚未运行。
 
+## 2026-09-18：正式 Trace 内存诊断与 schema23 校验优化
+
+- schema22 对12,428,310,213字节正式Trace运行一次45分钟受控诊断。Private Bytes峰值9,831,661,568字节，低于16 GiB软目标并显著越过schema19约23.07 GB失败区间；Working Set峰值38,914,113,536字节后回落，按映射页口径解释。
+- 诊断没有资源或数据错误，但未在45分钟内完成：CPU时间2,601.375秒，持续单核扫描约4.225亿CPU Zone。停止时18项未发布候选共103,992,920,640字节，已按本轮PID清理，manifest未发布。该轮是非性能诊断，不计入最终综合验收。
+- 代码审计定位到 CPU Zone 校验对每条记录调用分页 `ExtraNameState` 随机读。schema23 将名称active/resolved状态固化到ZoneExtra flag，移除该分页随机读，同时保留index0未解析和无动态名称回退语义。
+- schema23 Release全目标构建、小型真实压缩索引回归及CTest 38/38（130.67秒）通过。下一步只执行一次修复后范围重跑，验证校验耗时；父调用栈/符号映射和P6事务发布仍未完成。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证
