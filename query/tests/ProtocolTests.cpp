@@ -142,7 +142,7 @@ struct TemporaryTraceFiles
 
 int main()
 {
-    static_assert( tracy::query::QueryIndexSchemaVersion == 23 );
+    static_assert( tracy::query::QueryIndexSchemaVersion == 24 );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUseFat ) <
         uint8_t( tracy::QueueType::Terminate ) );
     static_assert( uint8_t( tracy::QueueType::JnGpuReferenceSetUse ) >
@@ -153,6 +153,11 @@ int main()
         sizeof( tracy::QueueHeader ) + sizeof( tracy::QueueJnGpuReferenceSetUse ) );
     static_assert( tracy::query::QueryIndexCpuZoneTimingComplete( 0 ) );
     static_assert( !tracy::query::QueryIndexCpuZoneTimingComplete( -1 ) );
+    static_assert( tracy::query::QueryIndexCpuZoneNameResolved(
+        tracy::query::QueryIndexCpuZoneNameActive | tracy::query::QueryIndexCpuZoneNameResolvedFlag ) );
+    static_assert( !tracy::query::QueryIndexCpuZoneNameResolved( tracy::query::QueryIndexCpuZoneNameActive ) );
+    static_assert( tracy::query::QueryIndexCpuZoneExtraMissing( tracy::query::QueryIndexCpuZoneExtraMissingFlag ) );
+    static_assert( !tracy::query::QueryIndexCpuZoneExtraMissing( 0 ) );
     static_assert( tracy::query::QueryIndexGpuZoneTimingComplete( 0, 0 ) );
     static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( -1, 0 ) );
     static_assert( !tracy::query::QueryIndexGpuZoneTimingComplete( 0, -1 ) );

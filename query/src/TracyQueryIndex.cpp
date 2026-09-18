@@ -399,15 +399,28 @@ public:
     uint64_t CallstackFrameCount() const { return m_callstackFrameReader?m_callstackFrameReader->Count():0; }
     void ReleaseExternalSources() { m_stringSource.reset(); m_stringReader.reset(); m_callstackSource.reset(); m_callstackReader.reset(); m_callstackFrameReader.reset(); }
 
-    void ZoneExtrasBegin( uint64_t count ) override { m_expectedExtras = count; m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint, m_storageOptions.disk ); }
+    void ZoneExtrasBegin( uint64_t count ) override
+    {
+        if( count > std::numeric_limits<size_t>::max() ) throw std::runtime_error( "zone extra state exceeds address space" );
+        m_expectedExtras = count;
+        const auto stateBytes = count / 8 + ( count % 8 != 0 );
+        if( stateBytes > ( std::numeric_limits<uint64_t>::max() - 65536 ) / 3 ) throw std::runtime_error( "zone extra state size overflow" );
+        m_extraStateWorkspace = analysis::AnalysisWorkspaceReservation( m_storageOptions.workspace, 65536 + stateBytes * 3 );
+        m_extraHasText.assign( size_t( count ), false );
+        m_extraNameActive.assign( size_t( count ), false );
+        m_extraNameResolved.assign( size_t( count ), false );
+        m_extras.Open( m_extraPath, ZoneSectionKind::Extra, count, sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint, m_storageOptions.disk );
+    }
     void ZoneExtraRecord( uint64_t index, uint32_t callstack, bool textActive, uint32_t text, bool nameActive, uint32_t name, uint32_t color ) override
     {
         auto* record = reinterpret_cast<ZoneExtraIndexRecord*>( m_extras.Record( index ) );
         uint8_t flags=uint8_t((textActive?QueryIndexZoneExtraTextActive:0)|(nameActive?QueryIndexZoneExtraNameActive:0));
         if(nameActive&&name!=0&&m_stringReader&&name<m_stringReader->StringCount())flags|=QueryIndexZoneExtraNameResolvedFlag;
         *record = { callstack, text, name, color, flags, {} };
-        if( m_extraHasText.size() <= index ) m_extraHasText.resize( size_t( index + 1 ) );
+        if( index >= m_extraHasText.size() ) throw std::runtime_error( "zone extra index exceeds declared count" );
         m_extraHasText[size_t( index )] = textActive;
+        m_extraNameActive[size_t( index )] = nameActive;
+        m_extraNameResolved[size_t( index )] = QueryIndexZoneExtraNameResolved( flags );
         m_seenExtras++;
     }
     void ZoneExtrasEnd() override { if( m_seenExtras != m_expectedExtras ) throw std::runtime_error( "zone extra index count mismatch" ); m_extras.Close(); }
@@ -424,8 +437,15 @@ public:
         m_cpuSpans.back().count++;
         m_cpuZonesByThread[thread]++;
         if( extra < m_extraHasText.size() && m_extraHasText[extra] ) m_cpuSourcesWithText.emplace( sourceLocation );
+        uint16_t flags = 0;
+        if( extra < m_extraNameActive.size() )
+        {
+            if( m_extraNameActive[extra] ) flags |= QueryIndexCpuZoneNameActive;
+            if( m_extraNameResolved[extra] ) flags |= QueryIndexCpuZoneNameResolvedFlag;
+        }
+        else if( extra != 0 ) flags |= QueryIndexCpuZoneExtraMissingFlag;
         auto* record = reinterpret_cast<CpuZoneIndexRecord*>( m_cpu.Record( index ) );
-        *record = { start, 0, 0, thread, parent, extra, childCount, sourceLocation, 0 };
+        *record = { start, 0, 0, thread, parent, extra, childCount, sourceLocation, flags };
         m_seenCpu++;
     }
     void CpuZoneEnd( uint64_t index, int64_t end ) override
@@ -433,7 +453,7 @@ public:
         auto* record = reinterpret_cast<CpuZoneIndexRecord*>( m_cpu.Record( index ) );
         if( !QueryIndexCpuZoneTimingComplete( end ) ) return;
         record->end = end;
-        record->flags |= 1;
+        record->flags |= QueryIndexCpuZoneTimingCompleteFlag;
         if( record->parent != std::numeric_limits<uint64_t>::max() && end >= record->start )
             reinterpret_cast<CpuZoneIndexRecord*>( m_cpu.Record( record->parent ) )->childTime += end - record->start;
     }
@@ -492,6 +512,10 @@ public:
             std::string error;
             if( !AtomicReplace( sortedPath, m_cpuPath, error ) ) throw std::runtime_error( "cannot commit sorted CPU-zone index: " + error );
             if(m_storageOptions.disk && m_storageOptions.disk->usage) m_storageOptions.disk->usage->Release(replacedBytes);
+            std::vector<bool>().swap( m_extraHasText );
+            std::vector<bool>().swap( m_extraNameActive );
+            std::vector<bool>().swap( m_extraNameResolved );
+            m_extraStateWorkspace.Resize( 0 );
         }
         catch( ... )
         {
@@ -680,6 +704,9 @@ private:
     uint64_t m_seenExtras = 0, m_seenCpu = 0, m_seenGpu = 0;
     std::vector<CpuSpan> m_cpuSpans;
     std::vector<bool> m_extraHasText;
+    std::vector<bool> m_extraNameActive;
+    std::vector<bool> m_extraNameResolved;
+    analysis::AnalysisWorkspaceReservation m_extraStateWorkspace;
     std::unordered_set<int16_t> m_cpuSourcesWithText;
     std::unordered_map<uint64_t, uint64_t> m_cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> m_gpuZonesByContext;
@@ -885,7 +912,7 @@ void ValidateMainPlayerLoopRoots( const ReadOnlyZoneSection& cpu,
             parent = parentZone.parent;
         }
 
-        if( zone.flags & 1 )
+        if( zone.flags & QueryIndexCpuZoneTimingCompleteFlag )
             rootsByThread[zone.thread].push_back( { index, zone.start, zone.end } );
     }
 
@@ -2737,7 +2764,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             ReadOnlyZoneSection gpuSection( temporaryGpuSection, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), result.sourceFingerprint );
             analysis::ZoneValidationSummaryDto zoneValidation;
             std::unordered_map<std::string, size_t> validationIssueByCode;
-            const auto noteValidation = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
+            const auto noteValidation = [&]( const char* severity, const char* code, const char* message, const auto& makeRef ) {
                 auto found = validationIssueByCode.find( code );
                 if( found == validationIssueByCode.end() )
                 {
@@ -2746,7 +2773,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 }
                 auto& issue = zoneValidation.findings[found->second];
                 issue.count++;
-                if( issue.refs.size() < 20 ) issue.refs.emplace_back( ref );
+                if( issue.refs.size() < 20 ) issue.refs.emplace_back( makeRef() );
+            };
+            const auto noteMaterializedValidation = [&]( const char* severity, const char* code, const char* message, const std::string& ref ) {
+                noteValidation( severity, code, message, [&] { return ref; } );
             };
             std::unordered_set<uint64_t> validThreads;
             for( const auto& thread : source->GetThreads() ) validThreads.emplace( thread.nativeId );
@@ -2763,13 +2793,16 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
             std::array<uint8_t, 1u << 16> validationSourceState {};
             for( const auto& location : source->GetSourceLocations() )
                 validationSourceState[uint16_t( int16_t( location.nativeId ) )] = location.name.empty() && location.function.empty() ? 1 : 2;
-            std::unordered_map<int16_t, std::string> gpuMemoryMarkers;
+            enum : uint8_t { GpuMemoryMarkerNone, GpuMemoryMarkerRequest, GpuMemoryMarkerPass, GpuMemoryMarkerOrigin, GpuMemoryMarkerResidency };
+            std::array<uint8_t, 1u << 16> gpuMemoryMarkers {};
             for( const auto& location : source->GetSourceLocations() )
             {
                 const auto& name = location.name.empty() ? location.function : location.name;
-                if( name == analysis::GpuMemoryRequestMarker || name == analysis::GpuMemoryPassMarker ||
-                    name == analysis::GpuMemoryOriginMarker || name == analysis::GpuMemoryResidencyMarker )
-                    gpuMemoryMarkers.emplace( int16_t( location.nativeId ), name );
+                auto& marker = gpuMemoryMarkers[uint16_t( int16_t( location.nativeId ) )];
+                if( name == analysis::GpuMemoryRequestMarker ) marker = GpuMemoryMarkerRequest;
+                else if( name == analysis::GpuMemoryPassMarker ) marker = GpuMemoryMarkerPass;
+                else if( name == analysis::GpuMemoryOriginMarker ) marker = GpuMemoryMarkerOrigin;
+                else if( name == analysis::GpuMemoryResidencyMarker ) marker = GpuMemoryMarkerResidency;
             }
             analysis::PagedRecordWriter gpuMemoryCpuZoneWriter(temporaryGpuMemoryCpuZones,
                 PagedSectionIdentity(result.sourceFingerprint,ZoneSectionKind::GpuMemoryCpuZone),sizeof(uint64_t),storageOptions);
@@ -2798,6 +2831,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 resources->SetContainer("gpu_memory_summary_cpu_zone_ordinals",gpuMemorySummaryCpuZoneCount,0);
             };
             reportValidationContainers();
+            uint64_t previousValidationThread = 0;
+            bool havePreviousValidationThread = false;
+            bool previousValidationThreadIsValid = false;
             for( uint64_t index = 0; index < cpuSection.Count(); index++ )
             {
                 if((index&0xffff)==0)
@@ -2808,35 +2844,36 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 }
                 const auto& zone = cpuSection.At<CpuZoneIndexRecord>( index );
                 const auto validationRef = [&] { return source->MakeEntityRef( "cpu-zone", index ); };
-                if( !( zone.flags & 1 ) ) noteValidation( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", validationRef() );
-                else if( zone.end < zone.start ) noteValidation( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", validationRef() );
+                if( !( zone.flags & QueryIndexCpuZoneTimingCompleteFlag ) ) noteValidation( "warning", "INCOMPLETE_CPU_ZONES", "CPU zones have no persisted end event", validationRef );
+                else if( zone.end < zone.start ) noteValidation( "error", "INVALID_CPU_ZONE_TIMING", "CPU zones end before they begin", validationRef );
                 if( zone.parent != std::numeric_limits<uint64_t>::max() && zone.parent >= cpuSection.Count() )
-                    noteValidation( "warning", "UNRESOLVED_CPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
-                if( validThreads.find( zone.thread ) == validThreads.end() )
-                    noteValidation( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_CPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
+                if( !havePreviousValidationThread || previousValidationThread != zone.thread )
+                {
+                    previousValidationThread = zone.thread;
+                    havePreviousValidationThread = true;
+                    previousValidationThreadIsValid = validThreads.find( zone.thread ) != validThreads.end();
+                }
+                if( !previousValidationThreadIsValid )
+                    noteValidation( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
                 const auto locationState = validationSourceState[uint16_t( zone.sourceLocation )];
                 if( locationState == 0 )
-                    noteValidation( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
                 bool nameResolved = locationState == 2;
-                if( zone.extra < extraSection.Count() )
-                {
-                    const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
-                    if( extra.flags & QueryIndexZoneExtraNameActive )
-                        nameResolved = QueryIndexZoneExtraNameResolved(extra.flags);
-                }
-                else if( zone.extra != 0 ) nameResolved = false;
+                if( zone.flags & QueryIndexCpuZoneNameActive ) nameResolved = QueryIndexCpuZoneNameResolved( zone.flags );
+                else if( QueryIndexCpuZoneExtraMissing( zone.flags ) ) nameResolved = false;
                 if( !nameResolved )
-                    noteValidation( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", validationRef() );
-                const auto marker = gpuMemoryMarkers.find( zone.sourceLocation );
-                if( marker == gpuMemoryMarkers.end() || ( zone.flags & 1 ) == 0 || zone.extra >= extraSection.Count() ) continue;
+                    noteValidation( "warning", "UNRESOLVED_CPU_ZONE_NAME", "CPU zones reference dynamic names that are absent from the persisted string table; source-location names were used as fallback", validationRef );
+                const auto marker = gpuMemoryMarkers[uint16_t( zone.sourceLocation )];
+                if( marker == GpuMemoryMarkerNone || ( zone.flags & QueryIndexCpuZoneTimingCompleteFlag ) == 0 || zone.extra >= extraSection.Count() ) continue;
                 const auto& extra = extraSection.At<ZoneExtraIndexRecord>( zone.extra );
                 if( ( extra.flags & QueryIndexZoneExtraTextActive ) == 0 ) continue;
                 const auto text = source->ResolveStringIndex( extra.text );
                 if( !text ) continue;
                 gpuMemoryCpuZoneWriter.Append(&index,1); ++gpuMemoryCpuZoneCount;
-                if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
+                if( marker == GpuMemoryMarkerOrigin || marker == GpuMemoryMarkerResidency )
                 { gpuMemorySummaryCpuZoneWriter.Append(&index,1); ++gpuMemorySummaryCpuZoneCount; }
-                else if( marker->second == analysis::GpuMemoryRequestMarker )
+                else if( marker == GpuMemoryMarkerRequest )
                 {
                     constexpr std::string_view prefix = "GTMEM1|RESOURCE|allocation=";
                     // Pointer values are reused across resource generations.
@@ -2847,11 +2884,11 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                     if( text->find( prefix ) != std::string::npos )
                     { gpuMemorySummaryCpuZoneWriter.Append(&index,1); ++gpuMemorySummaryCpuZoneCount; }
                 }
-                if( marker->second == analysis::GpuMemoryOriginMarker || marker->second == analysis::GpuMemoryResidencyMarker )
+                if( marker == GpuMemoryMarkerOrigin || marker == GpuMemoryMarkerResidency )
                     result.gpuMemoryProtocol2 = true;
             }
             ValidateMainPlayerLoopRoots( cpuSection, mainPlayerLoopSources, unityPlayerLoopSources,
-                [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteValidation );
+                [&]( uint64_t index ) { return source->MakeEntityRef( "cpu-zone", index ); }, noteMaterializedValidation );
 
             resources->SetPhase("zone-validation:gpu");
             for( uint64_t index = 0; index < gpuSection.Count(); index++ )
@@ -2864,17 +2901,17 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 }
                 const auto& zone = gpuSection.At<GpuZoneIndexRecord>( index );
                 const auto validationRef = [&] { return source->MakeEntityRef( "gpu-zone", index ); };
-                if( !( zone.flags & 1 ) ) noteValidation( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", validationRef() );
+                if( !( zone.flags & 1 ) ) noteValidation( "warning", "INCOMPLETE_GPU_ZONES", "GPU zones have incomplete CPU or GPU timing", validationRef );
                 else if( zone.gpuEnd < zone.gpuStart || zone.cpuEnd < zone.cpuStart )
-                    noteValidation( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", validationRef() );
+                    noteValidation( "error", "INVALID_GPU_ZONE_TIMING", "GPU zones contain reversed CPU or GPU timing", validationRef );
                 if( zone.parent != std::numeric_limits<uint64_t>::max() && zone.parent >= gpuSection.Count() )
-                    noteValidation( "warning", "UNRESOLVED_GPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_GPU_ZONE_PARENT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
                 if( validThreads.find( zone.thread ) == validThreads.end() )
-                    noteValidation( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_THREAD_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
                 if( validContexts.find( zone.context ) == validContexts.end() )
-                    noteValidation( "warning", "UNRESOLVED_GPU_CONTEXT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_GPU_CONTEXT_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
                 if( validationSourceState[uint16_t( zone.sourceLocation )] == 0 )
-                    noteValidation( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef() );
+                    noteValidation( "warning", "UNRESOLVED_SOURCE_LOCATION_REFERENCE", "persisted entity reference cannot be resolved in this trace", validationRef );
             }
             resources->SetPhase("zone-validation:callstacks");
             validationStore->VisitUniqueCallstacks(4096,[&](const std::vector<uint32_t>& callstacks) {
@@ -2882,7 +2919,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& tracePath,
                 std::unordered_set<uint32_t> resolvedCallstacks;
                 for(const auto& frame:source->ResolveCallstacks(callstacks,1)) resolvedCallstacks.emplace(frame.callstack);
                 for(const auto callstack:callstacks) if(!resolvedCallstacks.contains(callstack))
-                    noteValidation("warning","UNRESOLVED_CALLSTACK","persisted zone references a callstack that cannot be resolved",source->MakeEntityRef("callstack",callstack));
+                    noteValidation("warning","UNRESOLVED_CALLSTACK","persisted zone references a callstack that cannot be resolved",[&] { return source->MakeEntityRef("callstack",callstack); });
                 resources->SetContainer("validation_callstack_batch",callstacks.size(),callstacks.capacity());
                 resources->SetContainer("validation_resolved_callstacks",resolvedCallstacks.size(),resolvedCallstacks.bucket_count());
                 resources->CheckMemory(false);

@@ -59,6 +59,15 @@ Query 的资源合同为 Private Bytes 16 GiB 软目标、Windows 进程提交 3
 - 代码审计定位到 CPU Zone 校验对每条记录调用分页 `ExtraNameState` 随机读。schema23 将名称active/resolved状态固化到ZoneExtra flag，移除该分页随机读，同时保留index0未解析和无动态名称回退语义。
 - schema23 Release全目标构建、小型真实压缩索引回归及CTest 38/38（130.67秒）通过。下一步只执行一次修复后范围重跑，验证校验耗时；父调用栈/符号映射和P6事务发布仍未完成。
 
+## 2026-09-18：schema23 R2 证据与 schema24 校验热路径
+
+- schema23修复后范围诊断R2仍在2,704.412秒达到45分钟停止条件。Private Bytes峰值9,844,264,960字节，Working Set峰值47,719,985,152字节；没有资源拒绝、数据错误或manifest发布，进程持续单核工作。分页名称状态不是唯一吞吐瓶颈。
+- 停止时18项、107个文件的未发布候选共110,140,934,816字节，已在确认PID退出、目录所有权和无reparse point后清理。扣除6,292,709,472字节验证scratch，其余候选仍比8S最终限额高4,421,743,640字节；最终发布前必须由阶段回收或布局优化消除。
+- schema24在ZoneExtra流式写入阶段用三组压缩bitset保存text/name状态，受共享workspace预算约束；写CPU表时将name active/resolved和非法Extra引用复制到现有CPU Zone flag，CPU表完成后立即释放bitset。验证普通Zone不再读取8.37 GB ZoneExtra映射。
+- CPU校验缓存连续线程合法性，GPU Memory标记使用64 KiB定长表；发现计数仍完整累计，但每类只在需要保留前20个样例时构造实体ref，避免数亿条相同告警反复生成字符串。
+- 先失败合同回归已转绿；Release全目标构建、CTest 38/38（122.40秒）通过。1,310,224字节真实夹具schema24冷建819毫秒，热开overview和`validation.run`成功；其中20,000条未解析调用栈仍准确计数且只返回20个样例ref。
+- schema24尚未运行正式Trace修复后范围诊断。父调用栈/符号映射、P3/P4消费者、P5分页恢复、P6事务发布和8S容量处理仍未完成。
+
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 
 ## 已实现并验证
