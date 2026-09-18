@@ -149,6 +149,19 @@ int main()
         const auto semantic = reader.ValidateSemantics( root / "semantic-validation" );
         Require( semantic.complete && semantic.healthy && semantic.findings.empty(),
             "healthy Catalog failed semantic validation" );
+        Require( !reader.ResourceIndexReady(), "raw Catalog unexpectedly claimed a resource index" );
+        reader.BuildResourceIndex( root / "resource-index-scratch" );
+        Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
+        const auto indexedResource = reader.ResourceState( 100 );
+        Require( indexedResource && indexedResource->latest.resourceId == 100 &&
+            indexedResource->latest.capacityBytes == 4096 && indexedResource->generation == 9 &&
+            indexedResource->createTime == 10 && indexedResource->destroyTime == 0 &&
+            !indexedResource->openBoundary,
+            "Catalog resource point index changed lifecycle state" );
+        const auto indexedName = reader.ResourceName( 9, 7 );
+        Require( indexedName && *indexedName == "main" && !reader.ResourceState( 999 ) &&
+            !reader.ResourceName( 9, 999 ), "Catalog resource/string point index changed missing-key behavior" );
+        reader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
             status.generations.size() == 1 && status.generations[0].generation == 9 &&

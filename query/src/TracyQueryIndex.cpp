@@ -1412,6 +1412,7 @@ class IndexedTraceSource final : public analysis::TraceSource,
     public analysis::NativeBoundedTraceSource,
     public analysis::GpuCatalogBoundedScanSource,
     public QueryCatalogStatusSource,
+    public QueryCatalogResourceSource,
     public QueryResourceContextSource
 {
 public:
@@ -1475,12 +1476,30 @@ public:
             else if( item.domain == "gpu.catalog" || item.domain == "gpu.resource" || item.domain == "gpu.memory" )
             {
                 item.present = m_manifest.catalogValidation.present;
-                item.queryable = false;
                 item.indexed = true;
                 if( !m_manifest.catalogValidation.healthy )
+                {
+                    item.queryable = item.domain == "gpu.catalog";
                     item.reason = m_manifest.catalogValidation.present ?
                         "GPU Catalog sidecar failed completed semantic validation" : "GPU Catalog data is absent";
-                else item.reason = "GPU Catalog sidecar passed semantic validation; bounded Catalog analysis indices are pending";
+                }
+                else if( item.domain == "gpu.catalog" )
+                {
+                    item.queryable = true;
+                    item.reason = "bounded GPU Catalog status is ready; full validation diagnostics are pending";
+                }
+                else if( item.domain == "gpu.resource" )
+                {
+                    item.queryable = m_catalog.ResourceIndexReady();
+                    item.reason = item.queryable ?
+                        "bounded GPU resource get and lifetime indices are ready; search and associations are pending" :
+                        "bounded GPU resource indices are pending";
+                }
+                else
+                {
+                    item.queryable = false;
+                    item.reason = "bounded GPU memory analysis indices are pending";
+                }
             }
         }
         return result;
@@ -1524,6 +1543,16 @@ public:
     const QueryCatalogValidationResult& GetQueryCatalogValidation() const override
     {
         return m_manifest.catalogValidation;
+    }
+
+    std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const override
+    {
+        return m_catalog.ResourceState( resourceId );
+    }
+
+    std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override
+    {
+        return m_catalog.ResourceName( generation, stringId );
     }
 
     uint64_t GetGpuCatalogResourceCountBounded() const override { return m_source->GetGpuCatalogResourceCountBounded(); }
@@ -3180,6 +3209,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint, storageOptions );
             resources->SetPhase( "catalog-validation" );
             result.catalogValidation = catalog.ValidateSemantics( temporaryCatalog / "semantic-validation" );
+            resources->SetPhase( "catalog-resource-index" );
+            catalog.BuildResourceIndex( temporaryCatalog / "resource-index-scratch" );
+            if( !catalog.ResourceIndexReady() ) throw std::runtime_error( "Catalog resource index is not ready" );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
             {
@@ -3857,6 +3889,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             throw std::runtime_error( "GPU Catalog section hash mismatch" );
         {
             QueryCatalogStoreReader catalog( manifest.gpuCatalog.path, manifest.sourceFingerprint, storageOptions );
+            if( !catalog.ResourceIndexReady() ) throw std::runtime_error( "GPU Catalog resource index is not ready" );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
             {

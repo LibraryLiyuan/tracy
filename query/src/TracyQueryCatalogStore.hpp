@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,12 +42,29 @@ struct QueryCatalogStatusData
     bool evidencePreviewTruncated = false;
 };
 
+struct QueryCatalogResourceStateData
+{
+    JnGpuCatalogResourceRecordV1 latest {};
+    uint64_t generation = 0;
+    int64_t createTime = 0;
+    int64_t destroyTime = 0;
+    bool openBoundary = false;
+};
+
 class QueryCatalogStatusSource
 {
 public:
     virtual ~QueryCatalogStatusSource() = default;
     virtual QueryCatalogStatusData GetQueryCatalogStatus( size_t generationLimit, size_t evidenceLimit ) const = 0;
     virtual const QueryCatalogValidationResult& GetQueryCatalogValidation() const = 0;
+};
+
+class QueryCatalogResourceSource
+{
+public:
+    virtual ~QueryCatalogResourceSource() = default;
+    virtual std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const = 0;
+    virtual std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -89,6 +107,10 @@ public:
     QueryCatalogStatusData Status( size_t generationLimit, size_t evidenceLimit ) const;
     void ValidateAll() const;
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
+    void BuildResourceIndex( const std::filesystem::path& scratchRoot ) const;
+    bool ResourceIndexReady() const;
+    std::optional<QueryCatalogResourceStateData> ResourceState( uint64_t resourceId ) const;
+    std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:
     struct Impl;

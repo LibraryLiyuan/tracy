@@ -43,6 +43,8 @@ int main( int argc, char** argv )
         const auto expectedResources = catalog->gpuCatalogResources.size();
         const auto expectedBatches = catalog->gpuCatalogBatches.size();
         const auto expectedStrings = catalog->gpuCatalogStrings.size();
+        const auto expectedFirstResourceId = catalog->gpuCatalogResources.front().resourceId;
+        const auto expectedFirstResourceCapacity = catalog->gpuCatalogResources.front().capacityBytes;
         original.reset(); catalog.reset();
 
         const auto manifest = query::QueryIndex::Build( input );
@@ -61,6 +63,11 @@ int main( int argc, char** argv )
                 "Catalog batch sidecar count changed" );
             Require( reader.Count( OfflineCatalogDomain::CatalogString ) == expectedStrings,
                 "Catalog string sidecar count changed" );
+            const auto resource = reader.ResourceState( expectedFirstResourceId );
+            Require( reader.ResourceIndexReady() && resource &&
+                resource->latest.resourceId == expectedFirstResourceId &&
+                resource->latest.capacityBytes == expectedFirstResourceCapacity,
+                "Catalog real resource point index changed" );
         }
 
         bool rejectedUnboundCompact = false;

@@ -1,6 +1,6 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-18。当前索引 schema26。本文对应修订计划 P2/P3/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-18。当前索引 schema27。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
@@ -13,7 +13,7 @@
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema26沿用持久化Catalog原始质量和磁盘重验证结果；显式Resource/Allocation/Logical/String定义与Resource/Allocation/View/Logical/Part/VG/Range引用使用generation-aware外排归并。Resource/Logical名称hash和原始长度也与String定义通过32字节外排记录精确归并。Relation/Evidence校验枚举/flag，且可证明为Resource的RtasUses端点加入跨表归并；其余多态source/target仍待协议证据，再建派生索引和迁移消费者 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource点查部分恢复 | schema27沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要与String点查索引采用分页表和外排构建，已恢复`gpu.resource.get/lifetime`；search、关联、Pass和GPU Memory仍待迁移 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
@@ -38,5 +38,6 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - Windows长路径回归使用334字符输出目录，覆盖Catalog复制、QueryIndex创建/校验/打开、三次generation发布、owner/Reader lease、MoveFileEx、清理报告和递归回收；完整流程通过，随后Release全构建与CTest 39/39通过（126.75秒）。
 - 双Reader真实回归覆盖最后释放触发：第一个析构因另一个共享租约仍在而保留旧generation和延期报告；最后一个析构取得排他租约并在复核manifest后立即回收，未删除当前generation。Release全构建与CTest 39/39通过（124.78秒）。
 - Catalog名称元数据校验使用32字节定长外排记录，在`(generation,nameId)`组内先处理定义再核对Resource/Logical引用；512K记录run对应16 MiB工作区，多run归并、hash/长度破坏夹具和真实1,001资源Catalog通过。Release全构建与CTest 39/39通过（125.10秒）。
+- schema27 Resource摘要按`resourceId`有序分页，String点查按`(generation,nameId)`有序分页；构建仅保留外排run和当前聚合状态。1,001资源真实索引的`gpu.resource.get`与非索引基线data JSON逐字段一致，Release全构建与CTest 39/39通过（127.21秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。

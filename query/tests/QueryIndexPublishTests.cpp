@@ -77,7 +77,8 @@ int main()
         ownerError.clear();
         Require( QueryIndex::ProbeOwnerLockForTesting( trace, ownerError ) && !fs::exists( ownerPath ),
             "stale Query owner lock could not be reacquired and cleaned" );
-        const std::string stalePrefix = "jnidx.0123456789abcdef.s25.g";
+        const std::string stalePrefix = "jnidx.0123456789abcdef.s" +
+            std::to_string( QueryIndexSchemaVersion ) + ".g";
         const auto staleFile = root / ( stalePrefix + "1.jnidx.cpu.tmp.100" );
         const auto staleDirectory = root / ( stalePrefix + "2.jnidx.string.tmp.101" );
         const auto unrelated = root / "jnidx.ffffffffffffffff.s25.g1.jnidx.cpu.tmp.100";
@@ -97,14 +98,16 @@ int main()
         Require( QueryIndex::PublishPathForTesting( source, target, error, {} ) && fs::is_directory( target ),
             "Query publication failed" );
 #endif
-        const std::string generationPrefix = "jnidx.0123456789abcdef.s26.g";
+        const std::string generationPrefix = "jnidx.0123456789abcdef.s" +
+            std::to_string( QueryIndexSchemaVersion ) + ".g";
         const auto oldBase = generationPrefix + "100";
         const auto currentBase = generationPrefix + "200";
         const auto oldFile = root / ( oldBase + ".jnidx.cpu" );
         const auto oldDirectory = root / ( oldBase + ".jnidx.string" );
         const auto currentFile = root / ( currentBase + ".jnidx.cpu" );
         const auto unownedSameBase = root / ( oldBase + ".jnidx.unowned" );
-        const auto otherFingerprint = root / "jnidx.ffffffffffffffff.s26.g100.jnidx.cpu";
+        const auto otherFingerprint = root / ( "jnidx.ffffffffffffffff.s" +
+            std::to_string( QueryIndexSchemaVersion ) + ".g100.jnidx.cpu" );
         std::ofstream( oldFile ) << "old";
         fs::create_directories( oldDirectory );
         std::ofstream( oldDirectory / "page" ) << "old";

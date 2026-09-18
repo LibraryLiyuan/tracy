@@ -1,11 +1,13 @@
 #include "TracyQueryCatalogStore.hpp"
 
 #include "TracyAnalysisExternalSort.hpp"
+#include "TracyAnalysisIoPath.hpp"
 #include "TracyHash.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyQueue.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -70,6 +72,19 @@ uint8_t BatchEncoding( uint8_t kind )
     default: return uint8_t( JnGpuCatalogBatchEncoding::FixedV1 );
     }
 }
+
+struct QueryCatalogResourceSummaryRecord
+{
+    JnGpuCatalogResourceRecordV1 latest {};
+    uint64_t generation = 0;
+    int64_t createTime = 0;
+    int64_t destroyTime = 0;
+    uint8_t openBoundary = 0;
+    uint8_t reserved[7] {};
+};
+
+std::filesystem::path ResourceSummaryPath( const std::filesystem::path& root ) { return root / "resource-summary"; }
+std::filesystem::path ResourceStringLookupPath( const std::filesystem::path& root ) { return root / "resource-string-lookup"; }
 
 }
 
@@ -309,6 +324,274 @@ QueryCatalogStatusData QueryCatalogStoreReader::Status( size_t generationLimit, 
     return result;
 }
 
+bool QueryCatalogStoreReader::ResourceIndexReady() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    try
+    {
+        analysis::PagedRecordReader resources( ResourceSummaryPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
+            sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
+        analysis::PagedRecordReader strings( ResourceStringLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        (void)resources.Count();
+        (void)strings.Count();
+        return true;
+    }
+    catch( ... ) { return false; }
+}
+
+void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& scratchRoot ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    const auto resourceOutput = ResourceSummaryPath( m_impl->root );
+    const auto stringOutput = ResourceStringLookupPath( m_impl->root );
+    if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( stringOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
+        throw std::runtime_error( "Catalog resource index already exists" );
+    std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
+    const auto resourcePairsSource = scratchRoot / "resource-pairs-source.work";
+    const auto resourcePairsSorted = scratchRoot / "resource-pairs-sorted.work";
+    const auto resourceGenerationsPath = scratchRoot / "resource-generations";
+    const auto stringSource = scratchRoot / "string-lookup-source.work";
+    const auto stringSorted = scratchRoot / "string-lookup-sorted.work";
+    std::string sortError;
+    const auto cleanup = [&]( bool outputs ) {
+        std::error_code ignored;
+        analysis::AnalysisDiskRemove( scratchRoot, m_impl->options.disk, ignored, true );
+        if( outputs )
+        {
+            ignored.clear(); analysis::AnalysisDiskRemove( resourceOutput, m_impl->options.disk, ignored, true );
+            ignored.clear(); analysis::AnalysisDiskRemove( stringOutput, m_impl->options.disk, ignored, true );
+        }
+    };
+    try
+    {
+        analysis::PagedRecordReader resourceRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogResource ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogResource ),
+            sizeof( JnGpuCatalogResourceRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader batches( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogBatch ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogBatch ),
+            sizeof( JnGpuCatalogBatchData ), m_impl->options );
+        analysis::PagedRecordWriter resourceGenerations( resourceGenerationsPath,
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ), sizeof( uint64_t ), m_impl->options );
+        uint64_t expectedResourceOrdinal = 0;
+        std::array<uint64_t, 4096> generationBuffer {};
+        for( uint64_t index = 0; index < batches.Count(); index++ )
+        {
+            JnGpuCatalogBatchData batch {};
+            batches.Read( index, &batch, 1 );
+            if( batch.kind != uint8_t( JnGpuCatalogBatchKind::Resource ) ) continue;
+            if( batch.firstRecordIndex != expectedResourceOrdinal || batch.firstRecordIndex > resourceRows.Count() ||
+                batch.recordCount > resourceRows.Count() - batch.firstRecordIndex )
+                throw std::runtime_error( "Catalog resource generation coverage mismatch" );
+            generationBuffer.fill( batch.generation );
+            uint64_t remaining = batch.recordCount;
+            while( remaining != 0 )
+            {
+                const auto take = std::min<uint64_t>( remaining, generationBuffer.size() );
+                resourceGenerations.Append( generationBuffer.data(), take );
+                remaining -= take;
+            }
+            expectedResourceOrdinal += batch.recordCount;
+        }
+        if( expectedResourceOrdinal != resourceRows.Count() )
+            throw std::runtime_error( "Catalog resource generation coverage mismatch" );
+        resourceGenerations.Commit();
+
+        std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
+        if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
+        uint64_t resourcePairCount = 0;
+        for( uint64_t ordinal = 0; ordinal < resourceRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            JnGpuCatalogResourceRecordV1 row {};
+            resourceRows.Read( ordinal, &row, 1 );
+            if( row.resourceId == 0 ) continue;
+            const analysis::AnalysisUInt64Pair pair { row.resourceId, ordinal };
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
+            resourcePairs.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+            if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source write failed" );
+            resourcePairCount++;
+        }
+        resourcePairs.flush();
+        if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source flush failed" );
+        resourcePairs.close();
+        if( !analysis::SortAnalysisUInt64Pairs( resourcePairsSource, resourcePairsSorted, scratchRoot,
+                "catalog-resource-index", resourcePairCount, 1024 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog resource pair sort failed: " + sortError );
+
+        analysis::PagedRecordReader generations( resourceGenerationsPath,
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ), sizeof( uint64_t ), m_impl->options );
+        analysis::PagedRecordWriter summaries( resourceOutput,
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
+            sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
+        std::ifstream sortedPairs( analysis::AnalysisIoPath( resourcePairsSorted ), std::ios::binary );
+        if( !sortedPairs ) throw std::runtime_error( "Catalog sorted resource pairs cannot be opened" );
+        QueryCatalogResourceSummaryRecord state {};
+        bool haveState = false;
+        bool haveLatest = false;
+        analysis::AnalysisUInt64Pair pair {};
+        const auto flushState = [&] {
+            if( haveState && haveLatest ) summaries.Append( &state, 1 );
+        };
+        while( sortedPairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+        {
+            if( !haveState || state.latest.resourceId != pair.key )
+            {
+                flushState();
+                state = {};
+                state.latest.resourceId = pair.key;
+                haveState = true;
+                haveLatest = false;
+            }
+            JnGpuCatalogResourceRecordV1 row {};
+            uint64_t generation = 0;
+            resourceRows.Read( pair.value, &row, 1 );
+            generations.Read( pair.value, &generation, 1 );
+            const auto operation = JnGpuCatalogRecordOperation( row.operation );
+            const bool definition = operation == JnGpuCatalogRecordOperation::Create ||
+                operation == JnGpuCatalogRecordOperation::Update || operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot;
+            if( operation == JnGpuCatalogRecordOperation::Create || operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot )
+            {
+                if( state.createTime == 0 || row.time < state.createTime ) state.createTime = row.time;
+                state.openBoundary = state.openBoundary || operation == JnGpuCatalogRecordOperation::Open ||
+                    operation == JnGpuCatalogRecordOperation::Snapshot ||
+                    row.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
+            }
+            if( operation == JnGpuCatalogRecordOperation::Destroy )
+                state.destroyTime = std::max( state.destroyTime, row.time );
+            if( definition && ( !haveLatest || row.time >= state.latest.time ) )
+            {
+                state.latest = row;
+                state.generation = generation;
+                haveLatest = true;
+            }
+        }
+        if( !sortedPairs.eof() ) throw std::runtime_error( "Catalog sorted resource pair read failed" );
+        flushState();
+        summaries.Commit();
+        sortedPairs.close();
+
+        analysis::PagedRecordReader stringRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
+            sizeof( OfflineCatalogString ), m_impl->options );
+        std::ofstream stringRecords( analysis::AnalysisIoPath( stringSource ), std::ios::binary | std::ios::trunc );
+        if( !stringRecords ) throw std::runtime_error( "Catalog string lookup source cannot be opened" );
+        uint64_t stringRecordCount = 0;
+        for( uint64_t ordinal = 0; ordinal < stringRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            OfflineCatalogString row {};
+            stringRows.Read( ordinal, &row, 1 );
+            if( row.generation == 0 || row.header.stringId == 0 ) continue;
+            analysis::AnalysisKeyMetadataRecord record;
+            record.keyHigh = row.generation;
+            record.keyLow = row.header.stringId;
+            record.metadata = ordinal;
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( record ) );
+            stringRecords.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
+            if( !stringRecords ) throw std::runtime_error( "Catalog string lookup source write failed" );
+            stringRecordCount++;
+        }
+        stringRecords.flush();
+        if( !stringRecords ) throw std::runtime_error( "Catalog string lookup source flush failed" );
+        stringRecords.close();
+        if( !analysis::SortAnalysisKeyMetadataRecords( stringSource, stringSorted, scratchRoot,
+                "catalog-string-lookup", stringRecordCount, 512 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog string lookup sort failed: " + sortError );
+        analysis::PagedRecordWriter stringLookup( stringOutput,
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        std::ifstream sortedStrings( analysis::AnalysisIoPath( stringSorted ), std::ios::binary );
+        if( !sortedStrings ) throw std::runtime_error( "Catalog sorted string lookup cannot be opened" );
+        std::array<analysis::AnalysisKeyMetadataRecord, 4096> stringBuffer;
+        while( sortedStrings )
+        {
+            sortedStrings.read( reinterpret_cast<char*>( stringBuffer.data() ),
+                std::streamsize( sizeof( stringBuffer ) ) );
+            const auto bytes = size_t( sortedStrings.gcount() );
+            if( bytes % sizeof( stringBuffer[0] ) != 0 )
+                throw std::runtime_error( "Catalog sorted string lookup is truncated" );
+            if( bytes != 0 ) stringLookup.Append( stringBuffer.data(), bytes / sizeof( stringBuffer[0] ) );
+        }
+        if( !sortedStrings.eof() ) throw std::runtime_error( "Catalog sorted string lookup read failed" );
+        stringLookup.Commit();
+        sortedStrings.close();
+        cleanup( false );
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        cleanup( true );
+        std::rethrow_exception( failure );
+    }
+}
+
+std::optional<QueryCatalogResourceStateData> QueryCatalogStoreReader::ResourceState( uint64_t resourceId ) const
+{
+    if( resourceId == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    analysis::PagedRecordReader records( ResourceSummaryPath( m_impl->root ),
+        CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
+        sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
+    uint64_t first = 0, length = records.Count();
+    QueryCatalogResourceSummaryRecord row {};
+    while( length != 0 )
+    {
+        const auto half = length / 2;
+        const auto middle = first + half;
+        records.Read( middle, &row, 1 );
+        if( row.latest.resourceId < resourceId ) { first = middle + 1; length -= half + 1; }
+        else length = half;
+    }
+    if( first >= records.Count() ) return std::nullopt;
+    records.Read( first, &row, 1 );
+    if( row.latest.resourceId != resourceId ) return std::nullopt;
+    return QueryCatalogResourceStateData { row.latest, row.generation, row.createTime,
+        row.destroyTime, row.openBoundary != 0 };
+}
+
+std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
+{
+    if( generation == 0 || stringId == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    analysis::PagedRecordReader lookup( ResourceStringLookupPath( m_impl->root ),
+        CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
+        sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+    uint64_t first = 0, length = lookup.Count();
+    analysis::AnalysisKeyMetadataRecord row {};
+    while( length != 0 )
+    {
+        const auto half = length / 2;
+        const auto middle = first + half;
+        lookup.Read( middle, &row, 1 );
+        if( row.keyHigh < generation || ( row.keyHigh == generation && row.keyLow < stringId ) )
+        { first = middle + 1; length -= half + 1; }
+        else length = half;
+    }
+    if( first >= lookup.Count() ) return std::nullopt;
+    lookup.Read( first, &row, 1 );
+    if( row.keyHigh != generation || row.keyLow != stringId ) return std::nullopt;
+    analysis::PagedRecordReader strings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
+        CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
+        sizeof( OfflineCatalogString ), m_impl->options );
+    if( row.metadata >= strings.Count() ) throw std::runtime_error( "Catalog string lookup ordinal mismatch" );
+    OfflineCatalogString value {};
+    strings.Read( row.metadata, &value, 1 );
+    if( value.generation != generation || value.header.stringId != stringId || value.header.byteLength > value.bytes.size() )
+        throw std::runtime_error( "Catalog string lookup identity mismatch" );
+    return std::string( reinterpret_cast<const char*>( value.bytes.data() ), value.header.byteLength );
+}
+
 void QueryCatalogStoreReader::ValidateAll() const
 {
     std::lock_guard lock( m_impl->mutex );
@@ -321,6 +604,48 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
             CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
         records.ValidateAll();
+    }
+    const bool resourcesPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceSummaryPath( m_impl->root ) ) );
+    const bool stringsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceStringLookupPath( m_impl->root ) ) );
+    if( resourcesPresent != stringsPresent ) throw std::runtime_error( "Catalog resource index is incomplete" );
+    if( resourcesPresent )
+    {
+        analysis::PagedRecordReader resources( ResourceSummaryPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
+            sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
+        analysis::PagedRecordReader strings( ResourceStringLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        resources.ValidateAll();
+        strings.ValidateAll();
+        uint64_t previousResource = 0;
+        for( uint64_t index = 0; index < resources.Count(); index++ )
+        {
+            QueryCatalogResourceSummaryRecord row {};
+            resources.Read( index, &row, 1 );
+            if( row.latest.resourceId == 0 || row.generation == 0 ||
+                ( index != 0 && row.latest.resourceId <= previousResource ) )
+                throw std::runtime_error( "Catalog resource index order mismatch" );
+            previousResource = row.latest.resourceId;
+        }
+        analysis::PagedRecordReader rawStrings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
+            sizeof( OfflineCatalogString ), m_impl->options );
+        analysis::AnalysisKeyMetadataRecord previous {};
+        for( uint64_t index = 0; index < strings.Count(); index++ )
+        {
+            analysis::AnalysisKeyMetadataRecord row {};
+            strings.Read( index, &row, 1 );
+            if( row.metadata >= rawStrings.Count() || ( index != 0 &&
+                ( row.keyHigh < previous.keyHigh ||
+                  ( row.keyHigh == previous.keyHigh && row.keyLow < previous.keyLow ) ) ) )
+                throw std::runtime_error( "Catalog string lookup order mismatch" );
+            OfflineCatalogString raw {};
+            rawStrings.Read( row.metadata, &raw, 1 );
+            if( raw.generation != row.keyHigh || raw.header.stringId != row.keyLow )
+                throw std::runtime_error( "Catalog string lookup identity mismatch" );
+            previous = row;
+        }
     }
 }
 

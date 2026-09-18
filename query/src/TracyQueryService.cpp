@@ -5474,7 +5474,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto* catalogStatusSource = dynamic_cast<const QueryCatalogStatusSource*>( source.get() );
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
-        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod )
+        const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
+        const bool boundedResourceMethod = ( method == "gpu.resource.get" || method == "gpu.resource.lifetime" ) &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
         if( boundedStatusMethod )
         {
@@ -5531,6 +5534,58 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "detailed_evidence", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogDetailedEvidence )] ) }
                 } }
             }, trace );
+        }
+        if( boundedResourceMethod )
+        {
+            const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
+            if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            if( !validation.present ) return Success( id, { { "present", false }, { "status", "absent" },
+                { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
+            if( !validation.healthy ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
+                { "reason", "Catalog disk semantic validation failed; dependent evidence is unavailable" } }, trace );
+            uint64_t resourceId = 0;
+            if( params.contains( "resource_id" ) )
+                resourceId = UnsignedParameter( params, "resource_id", 0, std::numeric_limits<uint64_t>::max() );
+            else
+            {
+                if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "ref or resource_id is required" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "gpu-resource" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "resource ref does not belong to this trace" );
+                resourceId = *parsed;
+            }
+            const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
+            if( !state ) throw QueryError( "ENTITY_NOT_FOUND", "GPU resource was not found" );
+            const auto& value = state->latest;
+            const auto nameValue = catalogResourceSource->GetQueryCatalogResourceName( state->generation, value.nameId );
+            const std::string name = nameValue.value_or( std::string() );
+            json result = {
+                { "ref", source->MakeEntityRef( "gpu-resource", resourceId ) }, { "resource_id", Decimal( resourceId ) },
+                { "generation", Decimal( state->generation ) }, { "definition_revision", value.definitionRevision },
+                { "resource_class", GpuResourceClassName( value.resourceClass ) }, { "primary_kind", GpuPrimaryKindName( value.primaryKind ) },
+                { "name", name.empty() ? json( nullptr ) : json( name ) }, { "name_id", value.nameId },
+                { "name_provenance", value.nameProvenance }, { "name_truncated", value.nameOriginalLength > name.size() },
+                { "capacity_bytes", Decimal( value.capacityBytes ) },
+                { "allocation_id", value.allocationId == 0 ? json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                { "allocation_offset_bytes", Decimal( value.allocationOffsetBytes ) }, { "memory_domain", value.memoryDomain },
+                { "allocation_kind", value.allocationKind }, { "exactness", GpuExactnessName( value.exactness ) },
+                { "create_time_ns", state->openBoundary ? json( nullptr ) : json( Decimal( state->createTime ) ) },
+                { "create_time_boundary", state->openBoundary ? "open" : "closed" },
+                { "destroy_time_ns", state->destroyTime == 0 ? json( nullptr ) : json( Decimal( state->destroyTime ) ) },
+                { "alive_at_capture_end", state->destroyTime == 0 },
+                { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
+                { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
+                { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) },
+                { "present", true }
+            };
+            if( method == "gpu.resource.get" ) result["description"] = {
+                { "width", Decimal( value.width ) }, { "height", value.height },
+                { "depth_or_array_size", value.depthOrArraySize }, { "mip_levels", value.mipLevels },
+                { "format", value.format }, { "sample_count", value.sampleCount },
+                { "declared_usage_mask", value.declaredUsageMask }, { "observed_usage_mask", value.observedUsageMask },
+                { "backend_flags", value.backendFlags }, { "classification_provenance", value.classificationProvenance }
+            };
+            return Success( id, std::move( result ), trace );
         }
         const auto catalog = source->GetGpuCatalogData();
         const bool present = catalog && catalog->gpuCatalogPresent;
