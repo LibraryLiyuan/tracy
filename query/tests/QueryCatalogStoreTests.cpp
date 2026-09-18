@@ -125,16 +125,17 @@ int main()
             fs::remove_all( variantRoot, ignored );
             QueryCatalogStoreWriter variant( variantRoot, identity );
             variant.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
+            JnGpuCatalogResourceRecordV1 variantResources[3] { resources[0], resources[1], resources[2] };
+            JnGpuCatalogBatchData variantBatches[2] { batches[0], batches[1] };
+            auto variantGeneration = generation;
+            uint64_t stringGeneration = 9;
+            mutate( variantResources, variantBatches, variantGeneration, stringGeneration );
             variant.Begin( OfflineCatalogDomain::CatalogResource, 3, sizeof( resources[0] ) );
-            variant.Append( OfflineCatalogDomain::CatalogResource, 0, resources, 3, sizeof( resources[0] ) );
+            variant.Append( OfflineCatalogDomain::CatalogResource, 0, variantResources, 3, sizeof( resources[0] ) );
             variant.End( OfflineCatalogDomain::CatalogResource );
             variant.Begin( OfflineCatalogDomain::CatalogControl, 2, sizeof( controls[0] ) );
             variant.Append( OfflineCatalogDomain::CatalogControl, 0, controls, 2, sizeof( controls[0] ) );
             variant.End( OfflineCatalogDomain::CatalogControl );
-            JnGpuCatalogBatchData variantBatches[2] { batches[0], batches[1] };
-            auto variantGeneration = generation;
-            uint64_t stringGeneration = 9;
-            mutate( variantBatches, variantGeneration, stringGeneration );
             variant.Begin( OfflineCatalogDomain::CatalogBatch, 2, sizeof( variantBatches[0] ) );
             variant.Append( OfflineCatalogDomain::CatalogBatch, 0, variantBatches, 2, sizeof( variantBatches[0] ) );
             variant.End( OfflineCatalogDomain::CatalogBatch );
@@ -148,33 +149,45 @@ int main()
         };
 
         const auto rangeRoot = root.parent_path() / "tracy-query-catalog-semantic-range";
-        writeVariant( rangeRoot, []( auto* variantBatches, auto&, auto& ) { variantBatches[0].firstRecordIndex = 2; } );
+        writeVariant( rangeRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].firstRecordIndex = 2; } );
         QueryCatalogStoreReader rangeReader( rangeRoot, identity );
         const auto rangeValidation = rangeReader.ValidateSemantics( rangeRoot / "semantic-validation" );
         Require( rangeValidation.complete && !rangeValidation.healthy && hasFinding( rangeValidation, "CATALOG_BATCH_RANGE" ),
             "Catalog batch range corruption was accepted" );
 
         const auto checksumRoot = root.parent_path() / "tracy-query-catalog-semantic-checksum";
-        writeVariant( checksumRoot, []( auto* variantBatches, auto&, auto& ) { variantBatches[0].storedChecksum ^= 1; } );
+        writeVariant( checksumRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].storedChecksum ^= 1; } );
         QueryCatalogStoreReader checksumReader( checksumRoot, identity );
         const auto checksumValidation = checksumReader.ValidateSemantics( checksumRoot / "semantic-validation" );
         Require( checksumValidation.complete && !checksumValidation.healthy && hasFinding( checksumValidation, "CATALOG_STORED_CHECKSUM" ),
             "Catalog stored checksum corruption was accepted" );
 
         const auto generationRoot = root.parent_path() / "tracy-query-catalog-semantic-generation";
-        writeVariant( generationRoot, []( auto* variantBatches, auto&, auto& ) { variantBatches[0].generation = 10; } );
+        writeVariant( generationRoot, []( auto*, auto* variantBatches, auto&, auto& ) { variantBatches[0].generation = 10; } );
         QueryCatalogStoreReader generationReader( generationRoot, identity );
         const auto generationValidation = generationReader.ValidateSemantics( generationRoot / "semantic-validation" );
         Require( generationValidation.complete && !generationValidation.healthy && hasFinding( generationValidation, "CATALOG_GENERATION_REFERENCE" ),
             "Catalog generation corruption was accepted" );
 
         const auto stringGenerationRoot = root.parent_path() / "tracy-query-catalog-semantic-string-generation";
-        writeVariant( stringGenerationRoot, []( auto*, auto&, auto& stringGeneration ) { stringGeneration = 10; } );
+        writeVariant( stringGenerationRoot, []( auto*, auto*, auto&, auto& stringGeneration ) { stringGeneration = 10; } );
         QueryCatalogStoreReader stringGenerationReader( stringGenerationRoot, identity );
         const auto stringGenerationValidation = stringGenerationReader.ValidateSemantics( stringGenerationRoot / "semantic-validation" );
         Require( stringGenerationValidation.complete && !stringGenerationValidation.healthy &&
             hasFinding( stringGenerationValidation, "CATALOG_STRING_GENERATION" ),
             "Catalog string generation corruption was accepted" );
+
+        const auto crossReferenceRoot = root.parent_path() / "tracy-query-catalog-semantic-cross-reference";
+        writeVariant( crossReferenceRoot, []( auto* variantResources, auto* variantBatches, auto&, auto& ) {
+            variantResources[0].allocationId = 999;
+            variantBatches[0].storedChecksum = JnGpuCatalogChecksum64( variantResources,
+                sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
+        } );
+        QueryCatalogStoreReader crossReferenceReader( crossReferenceRoot, identity );
+        const auto crossReferenceValidation = crossReferenceReader.ValidateSemantics( crossReferenceRoot / "semantic-validation" );
+        Require( crossReferenceValidation.complete && !crossReferenceValidation.healthy &&
+            hasFinding( crossReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
+            "Catalog cross-table reference corruption was accepted" );
 
         bool identityRejected = false;
         try { QueryCatalogStoreReader mismatch( root, std::string( 64, 'e' ) ); }
@@ -206,6 +219,7 @@ int main()
         fs::remove_all( checksumRoot, ignored );
         fs::remove_all( generationRoot, ignored );
         fs::remove_all( stringGenerationRoot, ignored );
+        fs::remove_all( crossReferenceRoot, ignored );
         std::cout << "query Catalog store passed\n";
         return 0;
 #endif

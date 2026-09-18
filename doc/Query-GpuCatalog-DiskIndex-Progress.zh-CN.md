@@ -81,7 +81,8 @@ schema24正式Trace范围诊断R3仍在2,704.324秒达到45分钟停止条件。
 - manifest同时保留原始present/valid和完成后的重验证healthy/findings；深校验重新计算语义结果并与manifest逐项比较。缺失、原始无效、重验证异常和健康状态已可区分。Catalog能力在语义失败时不会说明为健康可用。
 - 健康夹具通过；修改batch范围、stored checksum、batch generation或字符串generation的夹具分别返回`CATALOG_BATCH_RANGE`、`CATALOG_STORED_CHECKSUM`、`CATALOG_GENERATION_REFERENCE`和`CATALOG_STRING_GENERATION`。
 - 小型真实Catalog Trace的1,001条资源完成schema25冷建、发布、重开和深校验，manifest质量为complete/present/original_valid/healthy且findings为空。Release全构建及CTest 38/38（125.92秒）通过。
-- P3尚未完成：Resource/Allocation/View/Logical/Part/Relation/VG/Range/Evidence之间的ID引用需按generation进一步校验；P4查询派生索引和消费者迁移仍未开始。
+- 显式跨表引用已使用独立外排文件按`(generation,id)`精确归并：Resource→Allocation/String、View/Logical/Part/VG/Range→Resource、Part→Logical；破坏夹具返回`CATALOG_CROSS_TABLE_REFERENCE`。外排临时文件纳入同一磁盘/工作区预算并在句柄关闭后回收。小型真实1,001资源Catalog再次通过发布和深校验；Release全构建与CTest 38/38（124.78秒）通过。
+- P3尚未完成：Relation和DetailedEvidence的source/target是按relation/kind解释的多态ID，需按已验证协议语义分别校验；名称ID已验证存在及自身hash，名称记录与引用端的hash/长度一致性仍待补齐。P4查询派生索引和消费者迁移尚未开始。
 
 2026-09-15，基于1ce08c45，工作分支feature/JNTracy-GpuCatalog-DiskIndex。本检查点不是GPUCatalog长数据改造完成声明。
 

@@ -13,7 +13,7 @@
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema25已持久化Catalog原始质量和磁盘重验证结果，覆盖batch范围/覆盖度、stored checksum、payload、generation、Control/Batch连续序列、字符串hash及归属；跨表ID引用仍待补齐，再建外排索引和迁移消费者 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4待恢复 | schema25已持久化Catalog原始质量和磁盘重验证结果；显式Resource/Allocation/Logical/String定义与Resource/Allocation/View/Logical/Part/VG/Range引用使用generation-aware外排归并。Relation/Evidence多态source/target仍待按协议种类补齐，再建派生索引和迁移消费者 |
 
 ## 本轮验证
 

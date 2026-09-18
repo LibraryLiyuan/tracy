@@ -285,6 +285,20 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
     std::filesystem::create_directories( scratchRoot );
     const auto sequenceSource = scratchRoot / "sequence-source.work";
     const auto sequenceSorted = scratchRoot / "sequence-sorted.work";
+    enum class ReferenceKind : size_t { Resource, Allocation, Logical, String, Count };
+    constexpr size_t ReferenceKindCount = size_t( ReferenceKind::Count );
+    const std::array<const char*, ReferenceKindCount> referenceNames { "resource", "allocation", "logical", "string" };
+    std::array<std::filesystem::path, ReferenceKindCount> definitionSources, referenceSources;
+    std::array<std::filesystem::path, ReferenceKindCount> definitionSorted, referenceSorted;
+    std::array<std::ofstream, ReferenceKindCount> definitionOutputs, referenceOutputs;
+    std::array<uint64_t, ReferenceKindCount> definitionCounts {}, referenceCounts {};
+    for( size_t index = 0; index < ReferenceKindCount; index++ )
+    {
+        definitionSources[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-definition-source.work" );
+        referenceSources[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-reference-source.work" );
+        definitionSorted[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-definition-sorted.work" );
+        referenceSorted[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-reference-sorted.work" );
+    }
     std::string sortError;
     const auto cleanup = [&]() -> std::string {
         std::error_code ignored;
@@ -306,6 +320,80 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
 
     try
     {
+        for( size_t index = 0; index < ReferenceKindCount; index++ )
+        {
+            definitionOutputs[index].open( definitionSources[index], std::ios::binary | std::ios::trunc );
+            referenceOutputs[index].open( referenceSources[index], std::ios::binary | std::ios::trunc );
+            if( !definitionOutputs[index] || !referenceOutputs[index] )
+                throw std::runtime_error( "Catalog reference scratch cannot be opened" );
+        }
+        const auto appendReferencePair = [&]( ReferenceKind kind, bool definition, uint64_t generation, uint64_t id ) {
+            if( id == 0 ) return;
+            analysis::AnalysisUInt64Pair pair { generation, id };
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
+            const auto index = size_t( kind );
+            auto& output = definition ? definitionOutputs[index] : referenceOutputs[index];
+            output.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+            if( !output ) throw std::runtime_error( "Catalog reference scratch write failed" );
+            if( definition ) definitionCounts[index]++;
+            else referenceCounts[index]++;
+        };
+        const auto emitFixedReferences = [&]( OfflineCatalogDomain domain, uint64_t generation,
+            const unsigned char* bytes, uint64_t count ) {
+            const auto visit = [&]( auto example, const auto& visitor ) {
+                using Row = std::decay_t<decltype( example )>;
+                for( uint64_t index = 0; index < count; index++ )
+                {
+                    Row row {};
+                    std::memcpy( &row, bytes + index * sizeof( Row ), sizeof( Row ) );
+                    visitor( row );
+                }
+            };
+            switch( domain )
+            {
+            case OfflineCatalogDomain::CatalogResource:
+                visit( JnGpuCatalogResourceRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Resource, true, generation, row.resourceId );
+                    appendReferencePair( ReferenceKind::Allocation, false, generation, row.allocationId );
+                    appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogAllocation:
+                visit( JnGpuCatalogAllocationRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Allocation, true, generation, row.allocationId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogView:
+                visit( JnGpuCatalogViewRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogLogical:
+                visit( JnGpuCatalogLogicalRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Logical, true, generation, row.logicalResourceId );
+                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogPart:
+                visit( JnGpuCatalogPartRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendReferencePair( ReferenceKind::Logical, false, generation, row.logicalResourceId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogVg:
+                visit( JnGpuCatalogVgRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                } );
+                break;
+            case OfflineCatalogDomain::CatalogRangeSet:
+                visit( JnGpuRangeSetRecordV1 {}, [&]( const auto& row ) {
+                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                } );
+                break;
+            default: break;
+            }
+        };
         const auto open = [&]( OfflineCatalogDomain domain ) {
             return std::make_unique<analysis::PagedRecordReader>( DomainPath( m_impl->root, domain ),
                 CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
@@ -401,6 +489,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                         ( row.header.originalLength == row.header.byteLength &&
                           JnGpuCatalogChecksum64( row.bytes.data(), row.header.byteLength ) != row.header.hash ) )
                         note( "CATALOG_STRING_HASH" );
+                    appendReferencePair( ReferenceKind::String, true, row.generation, row.header.stringId );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, &row.header, sizeof( row.header ) );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, row.bytes.data(), row.header.byteLength );
                     payloadBytes += sizeof( row.header ) + row.header.byteLength;
@@ -415,6 +504,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                 {
                     const auto take = std::min<uint64_t>( remaining, std::max<uint64_t>( 1, checksumBuffer.size() / width ) );
                     records.Read( ordinal, checksumBuffer.data(), take );
+                    emitFixedReferences( *domain, batch.generation, checksumBuffer.data(), take );
                     const auto bytes = take * width;
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, checksumBuffer.data(), size_t( bytes ) );
                     payloadBytes += bytes;
@@ -428,6 +518,15 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
         sequenceOutput.flush();
         if( !sequenceOutput ) throw std::runtime_error( "Catalog sequence scratch flush failed" );
         sequenceOutput.close();
+        for( size_t index = 0; index < ReferenceKindCount; index++ )
+        {
+            definitionOutputs[index].flush();
+            referenceOutputs[index].flush();
+            if( !definitionOutputs[index] || !referenceOutputs[index] )
+                throw std::runtime_error( "Catalog reference scratch flush failed" );
+            definitionOutputs[index].close();
+            referenceOutputs[index].close();
+        }
 
         for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
         {
@@ -483,6 +582,38 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                 state.persisted.recordCount != state.observedRecordCount || state.persisted.payloadBytes != state.observedPayloadBytes )
                 note( "CATALOG_GENERATION_SUMMARY" );
         }
+        const auto pairLess = []( const analysis::AnalysisUInt64Pair& lhs, const analysis::AnalysisUInt64Pair& rhs ) {
+            return lhs.key < rhs.key || ( lhs.key == rhs.key && lhs.value < rhs.value );
+        };
+        for( size_t index = 0; index < ReferenceKindCount; index++ )
+        {
+            const auto prefix = std::string( "catalog-reference-" ) + referenceNames[index];
+            if( !analysis::SortAnalysisUInt64Pairs( definitionSources[index], definitionSorted[index], scratchRoot,
+                prefix + "-definition", definitionCounts[index], 1024 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+                throw std::runtime_error( "Catalog definition sort failed: " + sortError );
+            if( !analysis::SortAnalysisUInt64Pairs( referenceSources[index], referenceSorted[index], scratchRoot,
+                prefix + "-reference", referenceCounts[index], 1024 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+                throw std::runtime_error( "Catalog reference sort failed: " + sortError );
+            std::ifstream definitions( definitionSorted[index], std::ios::binary );
+            std::ifstream references( referenceSorted[index], std::ios::binary );
+            if( !definitions || !references ) throw std::runtime_error( "Catalog reference join cannot be opened" );
+            analysis::AnalysisUInt64Pair definition {}, reference {};
+            bool haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
+            uint64_t missing = 0;
+            while( references.read( reinterpret_cast<char*>( &reference ), sizeof( reference ) ) )
+            {
+                while( haveDefinition && pairLess( definition, reference ) )
+                    haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
+                if( !haveDefinition || pairLess( reference, definition ) ) missing++;
+            }
+            if( !references.eof() || ( !haveDefinition && !definitions.eof() ) )
+                throw std::runtime_error( "Catalog reference join read failed" );
+            definitions.close();
+            references.close();
+            if( missing != 0 ) note( "CATALOG_CROSS_TABLE_REFERENCE", missing );
+        }
         result.complete = true;
         result.healthy = result.present && result.originalValid && result.findings.empty();
         if( const auto cleanupError = cleanup(); !cleanupError.empty() )
@@ -492,6 +623,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
     catch( ... )
     {
         const auto failure = std::current_exception();
+        for( auto& output : definitionOutputs ) if( output.is_open() ) output.close();
+        for( auto& output : referenceOutputs ) if( output.is_open() ) output.close();
         if( const auto cleanupError = cleanup(); !cleanupError.empty() )
             throw std::runtime_error( "Catalog semantic validation scratch cleanup failed: " + cleanupError );
         std::rethrow_exception( failure );
