@@ -288,6 +288,7 @@ GpuAnalysisSnapshot BuildGpuAnalysisSnapshotImpl( JnTraceData& data, bool consum
             out.allocations[found->second].resources.emplace_back( resource.resourceId );
         if( resource.aliveAtEnd ) out.logicalCapacityBytes += resource.capacityBytes;
     }
+    for( auto& allocation : out.allocations ) allocation.resourceCount = allocation.resources.size();
     for( const auto& allocation : out.allocations ) if( allocation.aliveAtEnd && allocation.parentAllocationId == 0 )
     {
         out.engineKnownPhysicalBytes += allocation.sizeBytes;

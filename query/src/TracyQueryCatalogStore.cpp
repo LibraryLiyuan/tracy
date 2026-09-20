@@ -87,6 +87,7 @@ struct QueryCatalogResourceSummaryRecord
 
 std::filesystem::path ResourceSummaryPath( const std::filesystem::path& root ) { return root / "resource-summary"; }
 std::filesystem::path ResourceAssociationPath( const std::filesystem::path& root ) { return root / "resource-associations"; }
+std::filesystem::path AllocationSummaryPath( const std::filesystem::path& root ) { return root / "allocation-summary"; }
 std::filesystem::path ResourceAllocationLookupPath( const std::filesystem::path& root ) { return root / "resource-allocation-lookup"; }
 std::filesystem::path ResourceAllocationGenerationPath( const std::filesystem::path& root ) { return root / "resource-allocation-generations"; }
 std::filesystem::path ResourceViewLookupPath( const std::filesystem::path& root ) { return root / "resource-view-lookup"; }
@@ -137,7 +138,11 @@ enum class ResourceAssociationKind : uint8_t
     Range = 2,
     LogicalBinding = 3,
     AliasGroup = 4,
-    SharedAllocation = 5
+    SharedAllocation = 5,
+    Part = 6,
+    View = 7,
+    Relation = 8,
+    VirtualGeometry = 9
 };
 
 }
@@ -279,6 +284,7 @@ struct QueryCatalogStoreReader::Impl
     mutable std::mutex mutex;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceSummaries;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceAssociations;
+    mutable std::unique_ptr<analysis::PagedRecordReader> allocationSummaries;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceAllocationLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceAllocationGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawAllocations;
@@ -322,6 +328,9 @@ struct QueryCatalogStoreReader::Impl
         if( !resourceAssociations ) resourceAssociations = std::make_unique<analysis::PagedRecordReader>(
             ResourceAssociationPath( root ), CatalogIdentity( sourceFingerprint, "resource-associations-v1" ),
             uint32_t( sizeof( QueryCatalogResourceAssociationData ) ), options );
+        if( !allocationSummaries ) allocationSummaries = std::make_unique<analysis::PagedRecordReader>(
+            AllocationSummaryPath( root ), CatalogIdentity( sourceFingerprint, "allocation-summary-v1" ),
+            uint32_t( sizeof( QueryCatalogAllocationSummaryData ) ), options );
         if( !resourceAllocationLookup ) resourceAllocationLookup = std::make_unique<analysis::PagedRecordReader>(
             ResourceAllocationLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-allocation-lookup-v1" ),
             uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
@@ -551,6 +560,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     std::lock_guard lock( m_impl->mutex );
     const auto resourceOutput = ResourceSummaryPath( m_impl->root );
     const auto associationOutput = ResourceAssociationPath( m_impl->root );
+    const auto allocationSummaryOutput = AllocationSummaryPath( m_impl->root );
     const auto allocationLookupOutput = ResourceAllocationLookupPath( m_impl->root );
     const auto allocationGenerationOutput = ResourceAllocationGenerationPath( m_impl->root );
     const auto viewLookupOutput = ResourceViewLookupPath( m_impl->root );
@@ -578,6 +588,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto logicalGenerationOutput = LogicalGenerationPath( m_impl->root );
     if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( associationOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( allocationSummaryOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( allocationLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( allocationGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( viewLookupOutput ) ) ||
@@ -664,6 +675,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         {
             remove( resourceOutput, "Catalog resource summary cleanup failed" );
             remove( associationOutput, "Catalog resource association cleanup failed" );
+            remove( allocationSummaryOutput, "Catalog allocation summary cleanup failed" );
             remove( allocationLookupOutput, "Catalog allocation lookup cleanup failed" );
             remove( allocationGenerationOutput, "Catalog allocation generation cleanup failed" );
             remove( viewLookupOutput, "Catalog view lookup cleanup failed" );
@@ -1041,10 +1053,37 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                     throw std::runtime_error( "Catalog resource index cancelled" );
                 JnGpuCatalogPartRecordV1 row {};
                 parts.Read( ordinal, &row, 1 );
+                appendAssociation( row.resourceId, ResourceAssociationKind::Part );
                 const auto kind = JnGpuCatalogPartKind( row.partKind );
                 if( kind == JnGpuCatalogPartKind::MeshVertexStream || kind == JnGpuCatalogPartKind::MeshIndex )
                     appendAssociation( row.resourceId, ResourceAssociationKind::MeshPart );
             }
+        }
+        for( uint64_t ordinal = 0; ordinal < viewRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            JnGpuCatalogViewRecordV1 row {};
+            viewRows.Read( ordinal, &row, 1 );
+            appendAssociation( row.resourceId, ResourceAssociationKind::View );
+        }
+        for( uint64_t ordinal = 0; ordinal < relationRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            JnGpuCatalogRelationRecordV1 row {};
+            relationRows.Read( ordinal, &row, 1 );
+            appendAssociation( row.sourceId, ResourceAssociationKind::Relation );
+            if( row.targetId != row.sourceId )
+                appendAssociation( row.targetId, ResourceAssociationKind::Relation );
+        }
+        for( uint64_t ordinal = 0; ordinal < vgRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            JnGpuCatalogVgRecordV1 row {};
+            vgRows.Read( ordinal, &row, 1 );
+            appendAssociation( row.resourceId, ResourceAssociationKind::VirtualGeometry );
         }
         {
             analysis::PagedRecordReader ranges( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRangeSet ),
@@ -1224,8 +1263,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 switch( ResourceAssociationKind( associationFact.kind ) )
                 {
                 case ResourceAssociationKind::MeshPart: association.meshPartCount++; break;
+                case ResourceAssociationKind::Part: association.partCount++; break;
+                case ResourceAssociationKind::View: association.viewCount++; break;
                 case ResourceAssociationKind::Range: association.rangeCount++; break;
                 case ResourceAssociationKind::LogicalBinding: association.logicalBindingCount++; break;
+                case ResourceAssociationKind::Relation: association.relationCount++; break;
+                case ResourceAssociationKind::VirtualGeometry: association.vgRecordCount++; break;
                 case ResourceAssociationKind::AliasGroup: association.hasAliasGroup = 1; break;
                 case ResourceAssociationKind::SharedAllocation:
                     association.allocationResourceCount = std::max( association.allocationResourceCount,
@@ -1291,6 +1334,111 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             throw std::runtime_error( "Catalog sorted allocation lookup read failed" );
         allocationLookup.Commit();
         sortedAllocationLookup.close();
+
+        {
+            analysis::PagedRecordReader generations( allocationGenerationOutput,
+                CatalogIdentity( m_impl->sourceFingerprint, "resource-allocation-generations-v1" ),
+                sizeof( uint64_t ), m_impl->options );
+            analysis::PagedRecordWriter summaries( allocationSummaryOutput,
+                CatalogIdentity( m_impl->sourceFingerprint, "allocation-summary-v1" ),
+                sizeof( QueryCatalogAllocationSummaryData ), m_impl->options );
+            std::ifstream history( analysis::AnalysisIoPath( allocationLookupSorted ), std::ios::binary );
+            std::ifstream resources( analysis::AnalysisIoPath( allocationPairsSorted ), std::ios::binary );
+            if( !history || !resources )
+                throw std::runtime_error( "Catalog allocation summary inputs cannot be opened" );
+            analysis::AnalysisUInt64Pair resourcePair {};
+            bool haveResourcePair = bool( resources.read(
+                reinterpret_cast<char*>( &resourcePair ), sizeof( resourcePair ) ) );
+            if( !haveResourcePair && !resources.eof() )
+                throw std::runtime_error( "Catalog allocation summary resource read failed" );
+            analysis::AnalysisKeyMetadataRecord record {};
+            bool haveRecord = bool( history.read( reinterpret_cast<char*>( &record ), sizeof( record ) ) );
+            if( !haveRecord && !history.eof() )
+                throw std::runtime_error( "Catalog allocation summary history read failed" );
+            while( haveRecord )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( "Catalog allocation summary cancelled" );
+                const auto allocationId = record.keyHigh;
+                QueryCatalogAllocationSummaryData summary {};
+                summary.latest.allocationId = allocationId;
+                bool haveLatest = false;
+                uint64_t latestOrdinal = 0;
+                int64_t lifecycleTime = std::numeric_limits<int64_t>::min();
+                uint64_t lifecycleOrdinal = 0;
+                while( haveRecord && record.keyHigh == allocationId )
+                {
+                    if( record.metadata >= allocationRows.Count() || record.metadata >= generations.Count() )
+                        throw std::runtime_error( "Catalog allocation summary ordinal mismatch" );
+                    JnGpuCatalogAllocationRecordV1 row {};
+                    uint64_t generation = 0;
+                    allocationRows.Read( record.metadata, &row, 1 );
+                    generations.Read( record.metadata, &generation, 1 );
+                    if( row.allocationId != allocationId )
+                        throw std::runtime_error( "Catalog allocation summary identity mismatch" );
+                    const auto operation = JnGpuCatalogRecordOperation( row.operation );
+                    const bool definition = IsCatalogDefinition( operation );
+                    if( operation == JnGpuCatalogRecordOperation::Create && summary.createTime == 0 )
+                        summary.createTime = row.time;
+                    summary.openBoundary = summary.openBoundary ||
+                        operation == JnGpuCatalogRecordOperation::Open ||
+                        operation == JnGpuCatalogRecordOperation::Snapshot ||
+                        row.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
+                    if( operation == JnGpuCatalogRecordOperation::Destroy ||
+                        operation == JnGpuCatalogRecordOperation::Close )
+                        summary.destroyTime = std::max( summary.destroyTime, row.time );
+                    if( definition && ( !haveLatest || row.time > summary.latest.time ||
+                        ( row.time == summary.latest.time && record.metadata >= latestOrdinal ) ) )
+                    {
+                        summary.latest = row;
+                        summary.generation = generation;
+                        summary.lastUpdateTime = row.time;
+                        summary.invalid = row.exactness == uint8_t( JnGpuCatalogExactness::Invalid );
+                        latestOrdinal = record.metadata;
+                        haveLatest = true;
+                    }
+                    if( row.time > lifecycleTime ||
+                        ( row.time == lifecycleTime && record.metadata >= lifecycleOrdinal ) )
+                    {
+                        lifecycleTime = row.time;
+                        lifecycleOrdinal = record.metadata;
+                        if( definition ) summary.aliveAtEnd = 1;
+                        else if( operation == JnGpuCatalogRecordOperation::Destroy ||
+                            operation == JnGpuCatalogRecordOperation::Close )
+                            summary.aliveAtEnd = 0;
+                    }
+                    haveRecord = bool( history.read( reinterpret_cast<char*>( &record ), sizeof( record ) ) );
+                    if( !haveRecord && !history.eof() )
+                        throw std::runtime_error( "Catalog allocation summary history read failed" );
+                }
+                while( haveResourcePair && resourcePair.key < allocationId )
+                {
+                    haveResourcePair = bool( resources.read(
+                        reinterpret_cast<char*>( &resourcePair ), sizeof( resourcePair ) ) );
+                    if( !haveResourcePair && !resources.eof() )
+                        throw std::runtime_error( "Catalog allocation summary resource read failed" );
+                }
+                uint64_t previousResource = 0;
+                while( haveResourcePair && resourcePair.key == allocationId )
+                {
+                    if( resourcePair.value != 0 && resourcePair.value != previousResource )
+                    {
+                        summary.resourceCount++;
+                        previousResource = resourcePair.value;
+                    }
+                    haveResourcePair = bool( resources.read(
+                        reinterpret_cast<char*>( &resourcePair ), sizeof( resourcePair ) ) );
+                    if( !haveResourcePair && !resources.eof() )
+                        throw std::runtime_error( "Catalog allocation summary resource read failed" );
+                }
+                if( haveLatest ) summaries.Append( &summary, 1 );
+            }
+            if( !history.eof() || ( !haveResourcePair && !resources.eof() ) )
+                throw std::runtime_error( "Catalog allocation summary input read failed" );
+            summaries.Commit();
+            history.close();
+            resources.close();
+        }
 
         QueryCatalogGpuMemorySummary gpuMemorySummary {};
         uint64_t allocationTimelineCount = 0;
@@ -2517,6 +2665,24 @@ std::optional<QueryCatalogAllocationData> QueryCatalogStoreReader::AllocationSta
     return result;
 }
 
+uint64_t QueryCatalogStoreReader::AllocationSummaryCount() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    return m_impl->allocationSummaries->Count();
+}
+
+QueryCatalogAllocationSummaryData QueryCatalogStoreReader::AllocationSummaryAt( uint64_t ordinal ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    if( ordinal >= m_impl->allocationSummaries->Count() )
+        throw std::out_of_range( "Catalog allocation summary ordinal" );
+    QueryCatalogAllocationSummaryData result {};
+    m_impl->allocationSummaries->Read( ordinal, &result, 1 );
+    return result;
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;
@@ -2561,6 +2727,7 @@ void QueryCatalogStoreReader::ValidateAll() const
     }
     const bool resourcesPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceSummaryPath( m_impl->root ) ) );
     const bool associationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceAssociationPath( m_impl->root ) ) );
+    const bool allocationSummariesPresent = std::filesystem::exists( analysis::AnalysisIoPath( AllocationSummaryPath( m_impl->root ) ) );
     const bool allocationLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceAllocationLookupPath( m_impl->root ) ) );
     const bool allocationGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceAllocationGenerationPath( m_impl->root ) ) );
     const bool viewLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceViewLookupPath( m_impl->root ) ) );
@@ -2587,6 +2754,7 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool logicalDefinitionLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( LogicalDefinitionLookupPath( m_impl->root ) ) );
     const bool logicalGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( LogicalGenerationPath( m_impl->root ) ) );
     if( resourcesPresent != stringsPresent || resourcesPresent != associationsPresent ||
+        resourcesPresent != allocationSummariesPresent ||
         resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent ||
         resourcesPresent != gpuMemorySummaryPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
@@ -2618,6 +2786,9 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader associations( ResourceAssociationPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-associations-v1" ),
             sizeof( QueryCatalogResourceAssociationData ), m_impl->options );
+        analysis::PagedRecordReader allocationSummaries( AllocationSummaryPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "allocation-summary-v1" ),
+            sizeof( QueryCatalogAllocationSummaryData ), m_impl->options );
         analysis::PagedRecordReader allocationLookup( ResourceAllocationLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-allocation-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -2717,6 +2888,7 @@ void QueryCatalogStoreReader::ValidateAll() const
         resources.ValidateAll();
         strings.ValidateAll();
         associations.ValidateAll();
+        allocationSummaries.ValidateAll();
         allocationLookup.ValidateAll();
         allocationGenerations.ValidateAll();
         gpuMemorySummary.ValidateAll();
@@ -2814,6 +2986,18 @@ void QueryCatalogStoreReader::ValidateAll() const
             if( raw.allocationId != row.keyHigh )
                 throw std::runtime_error( "Catalog allocation lookup identity mismatch" );
             previousAllocation = row;
+        }
+        uint64_t previousAllocationSummary = 0;
+        for( uint64_t index = 0; index < allocationSummaries.Count(); index++ )
+        {
+            QueryCatalogAllocationSummaryData row {};
+            allocationSummaries.Read( index, &row, 1 );
+            if( row.latest.allocationId == 0 || row.generation == 0 ||
+                ( index != 0 && row.latest.allocationId <= previousAllocationSummary ) ||
+                ( row.destroyTime != 0 && row.destroyTime < row.createTime ) ||
+                row.lastUpdateTime != row.latest.time )
+                throw std::runtime_error( "Catalog allocation summary order mismatch" );
+            previousAllocationSummary = row.latest.allocationId;
         }
         const auto validateLookup = [&]( analysis::PagedRecordReader& lookup, uint64_t rawCount,
             const auto& readRaw, const auto& keyFor, const auto& includeRaw, std::string_view label ) {

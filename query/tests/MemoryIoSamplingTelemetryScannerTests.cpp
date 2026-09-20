@@ -97,7 +97,7 @@ public:
         contextSwitches = { mainRun, renderRun };
 
         GpuAllocationAnalysisRecord a;
-        a.allocationId = 100; a.sizeBytes = 100; a.residentBytes = 80; a.resources = { 1, 2 };
+        a.allocationId = 100; a.sizeBytes = 100; a.residentBytes = 80; a.resourceCount = 2;
         GpuAllocationAnalysisRecord b;
         b.allocationId = 200; b.sizeBytes = 200; b.residentBytes = 200; b.resources = { 3 };
         allocations = { a, b };
@@ -521,6 +521,7 @@ int main()
     assert( result.gpuMemory.residentBytes == 280 );
     assert( result.gpuMemory.logicalCapacityBytes == 220 );
     assert( result.gpuMemory.ownedPhysicalBytes == 300 );
+    assert( result.gpuMemory.sharedAllocationCount == 1 );
     assert( result.gpuMemory.aliasResourceCount == 1 );
     assert( result.gpuMemory.rangeEvidenceBytes == 64 );
     assert( result.gpuMemory.maximumDirectWorkingSetBytes == 100 );

@@ -487,7 +487,8 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
                 if( allocation.destroyTime == 0 )
                     result.gpuMemory.residentBytes = SaturatingAdd( result.gpuMemory.residentBytes, allocation.residentBytes );
             }
-            if( allocation.resources.size() > 1 ) result.gpuMemory.sharedAllocationCount++;
+            if( std::max<uint64_t>( allocation.resourceCount, allocation.resources.size() ) > 1 )
+                result.gpuMemory.sharedAllocationCount++;
         } );
         std::sort( physicalPoints.begin(), physicalPoints.end(), [&]( const auto& a, const auto& b ) {
             checkCancelled();

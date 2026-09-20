@@ -202,6 +202,15 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - QueryService真实后端合同覆盖健康但enrichment未完成、checksum/sequence/cross-table finding无效状态、兼容字段和不可用诊断字段。N27静态协议检查、Release全构建及CTest 42/42通过（164.18秒）。索引布局未变，schema保持37。
 - Catalog validation主要消费路径已恢复；P3仍需按协议证据补齐多态Relation/DetailedEvidence语义，Job、Sample派生及Scan仍待完成。
 
+## 2026-09-20：schema38 GPU Native Scan有界投影
+
+- Native Scan的GPU Resource、Allocation、Pass和Range四域不再转发compact Worker。Resource按resource-summary/association逐ordinal分页；Range直接分页原始RangeSet及generation；Pass读取固定64字节聚合摘要；Allocation新增按allocationId唯一的固定摘要。
+- Allocation摘要由现有历史外排表流式归并，保存最终定义、create/destroy/update时间、alive/open/invalid状态及共享Resource总数；扫描DTO新增`resourceCount`，无需为共享判定构造或伪造Resource ID vector。GPU analysis cache schema升至3。
+- Resource association固定记录由48字节扩展到80字节，增加全部Part、View、Relation和VG总数；Native Resource分页每条只读Resource/association摘要，不再执行四次详情范围二分。
+- Indexed `gpu.catalog/gpu.resource/gpu.memory` capability与`CatalogDerivedDataReady`改由持久化validation和实际Resource索引计算；全部当前Catalog/Resource/Memory/Pass方法及Native GPU Scan均已有有界后端。
+- Query index升至schema38，旧schema37保持隔离。非空组件夹具覆盖Allocation最终状态/共享计数、Pass摘要顺序和Scanner共享聚合；1,001 Resource真实Catalog完成冷建、深校验、热开、四域计数对照、Resource字段对照、Native Scan summary及二次事务发布。
+- N27静态协议、Release全构建和CTest 42/42通过（161.67秒）。正式12.43 GB综合验收、Job、Sample派生以及Native Scan其他转发域仍待完成。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

@@ -131,7 +131,7 @@ bool ReadResource( std::ifstream& in, GpuResourceAnalysisRecord& value )
 bool WriteAllocation( std::ofstream& out, const GpuAllocationAnalysisRecord& value )
 {
     W( generation ); W( allocationId ); W( heapId ); W( parentAllocationId ); W( sizeBytes ); W( offsetBytes ); W( residentBytes ); W( alignmentBytes );
-    W( createTime ); W( destroyTime ); W( lastUpdateTime ); W( primaryKind ); W( memoryDomain ); W( allocationKind );
+    W( createTime ); W( destroyTime ); W( lastUpdateTime ); W( resourceCount ); W( primaryKind ); W( memoryDomain ); W( allocationKind );
     W( residencyState ); W( exactness ); W( flags ); W( openBoundary ); W( aliveAtEnd ); W( invalid );
     return WriteVector( out, value.history ) && WriteVector( out, value.resources );
 }
@@ -139,7 +139,7 @@ bool WriteAllocation( std::ofstream& out, const GpuAllocationAnalysisRecord& val
 bool ReadAllocation( std::ifstream& in, GpuAllocationAnalysisRecord& value )
 {
     R( generation ); R( allocationId ); R( heapId ); R( parentAllocationId ); R( sizeBytes ); R( offsetBytes ); R( residentBytes ); R( alignmentBytes );
-    R( createTime ); R( destroyTime ); R( lastUpdateTime ); R( primaryKind ); R( memoryDomain ); R( allocationKind );
+    R( createTime ); R( destroyTime ); R( lastUpdateTime ); R( resourceCount ); R( primaryKind ); R( memoryDomain ); R( allocationKind );
     R( residencyState ); R( exactness ); R( flags ); R( openBoundary ); R( aliveAtEnd ); R( invalid );
     return ReadVector( in, value.history ) && ReadVector( in, value.resources );
 }

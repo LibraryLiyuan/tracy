@@ -1492,19 +1492,21 @@ public:
                 else if( item.domain == "gpu.catalog" )
                 {
                     item.queryable = true;
-                    item.reason = "bounded GPU Catalog status is ready; full validation diagnostics are pending";
+                    item.reason = "bounded GPU Catalog status and persisted semantic validation are ready";
                 }
                 else if( item.domain == "gpu.resource" )
                 {
                     item.queryable = m_catalog.ResourceIndexReady();
                     item.reason = item.queryable ?
-                        "bounded GPU resource histories and pass VG evidence are ready" :
+                        "bounded GPU resource histories, references, explain and pass evidence are ready" :
                         "bounded GPU resource indices are pending";
                 }
                 else
                 {
-                    item.queryable = false;
-                    item.reason = "bounded GPU memory analysis indices are pending";
+                    item.queryable = m_catalog.ResourceIndexReady();
+                    item.reason = item.queryable ?
+                        "bounded GPU memory summaries, pass aggregates and native scan projections are ready" :
+                        "bounded GPU memory analysis indices are pending";
                 }
             }
         }
@@ -1690,29 +1692,125 @@ public:
         return m_catalog.ResourceName( generation, stringId );
     }
 
-    uint64_t GetGpuCatalogResourceCountBounded() const override { return m_source->GetGpuCatalogResourceCountBounded(); }
-    uint64_t GetGpuCatalogAllocationCountBounded() const override { return m_source->GetGpuCatalogAllocationCountBounded(); }
-    uint64_t GetGpuCatalogPassCountBounded() const override { return m_source->GetGpuCatalogPassCountBounded(); }
-    uint64_t GetGpuCatalogRangeCountBounded() const override { return m_source->GetGpuCatalogRangeCountBounded(); }
+    uint64_t GetGpuCatalogResourceCountBounded() const override { return m_catalog.ResourceIndexCount(); }
+    uint64_t GetGpuCatalogAllocationCountBounded() const override { return m_catalog.AllocationSummaryCount(); }
+    uint64_t GetGpuCatalogPassCountBounded() const override { return m_gpuPassResources.SummaryCount(); }
+    uint64_t GetGpuCatalogRangeCountBounded() const override { return m_catalog.RangeCount(); }
     std::vector<analysis::GpuAnalysisResourceSummary> ScanGpuCatalogResourcesBounded(
         size_t offset, size_t limit ) const override
     {
-        return m_source->ScanGpuCatalogResourcesBounded( offset, limit );
+        const auto begin = std::min<uint64_t>( offset, m_catalog.ResourceIndexCount() );
+        const auto end = begin + std::min<uint64_t>( limit, m_catalog.ResourceIndexCount() - begin );
+        std::vector<analysis::GpuAnalysisResourceSummary> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
+        {
+            const auto state = m_catalog.ResourceStateAt( ordinal );
+            const auto associations = m_catalog.ResourceAssociationsAt( ordinal );
+            analysis::GpuAnalysisResourceSummary value;
+            value.generation = state.generation;
+            value.resourceId = state.latest.resourceId;
+            value.allocationId = state.latest.allocationId;
+            value.capacityBytes = state.latest.capacityBytes;
+            value.allocationOffsetBytes = state.latest.allocationOffsetBytes;
+            value.createTime = state.createTime < 0 ? 0 : uint64_t( state.createTime );
+            value.destroyTime = state.destroyTime < 0 ? 0 : uint64_t( state.destroyTime );
+            value.nameHash = state.latest.nameHash;
+            value.createCallsiteId = state.latest.createCallsiteId;
+            value.definitionRevision = state.latest.definitionRevision;
+            value.nameOriginalLength = state.latest.nameOriginalLength;
+            value.viewCount = associations.viewCount;
+            value.logicalBindingCount = associations.logicalBindingCount;
+            value.partCount = associations.partCount;
+            value.rangeCount = associations.rangeCount;
+            value.relationCount = associations.relationCount;
+            value.vgRecordCount = associations.vgRecordCount;
+            value.allocationResourceCount = associations.allocationResourceCount;
+            value.primaryKind = state.latest.primaryKind;
+            value.resourceClass = state.latest.resourceClass;
+            value.memoryDomain = state.latest.memoryDomain;
+            value.allocationKind = state.latest.allocationKind;
+            value.nameProvenance = state.latest.nameProvenance;
+            value.stackProvenance = state.latest.stackProvenance;
+            value.exactness = state.latest.exactness;
+            value.openBoundary = state.openBoundary;
+            value.aliveAtEnd = state.aliveAtEnd;
+            value.hasAliasGroup = associations.hasAliasGroup != 0;
+            if( const auto name = m_catalog.ResourceName( state.generation, state.latest.nameId ) )
+                value.name = *name;
+            result.emplace_back( std::move( value ) );
+        }
+        return result;
     }
     std::vector<analysis::GpuAllocationAnalysisRecord> ScanGpuCatalogAllocationsBounded(
         size_t offset, size_t limit ) const override
     {
-        return m_source->ScanGpuCatalogAllocationsBounded( offset, limit );
+        const auto begin = std::min<uint64_t>( offset, m_catalog.AllocationSummaryCount() );
+        const auto end = begin + std::min<uint64_t>( limit, m_catalog.AllocationSummaryCount() - begin );
+        std::vector<analysis::GpuAllocationAnalysisRecord> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
+        {
+            const auto summary = m_catalog.AllocationSummaryAt( ordinal );
+            analysis::GpuAllocationAnalysisRecord value;
+            value.generation = summary.generation;
+            value.allocationId = summary.latest.allocationId;
+            value.heapId = summary.latest.heapId;
+            value.parentAllocationId = summary.latest.parentAllocationId;
+            value.sizeBytes = summary.latest.sizeBytes;
+            value.offsetBytes = summary.latest.offsetBytes;
+            value.residentBytes = summary.latest.residentBytes;
+            value.alignmentBytes = summary.latest.alignmentBytes;
+            value.createTime = summary.createTime < 0 ? 0 : uint64_t( summary.createTime );
+            value.destroyTime = summary.destroyTime < 0 ? 0 : uint64_t( summary.destroyTime );
+            value.lastUpdateTime = summary.lastUpdateTime < 0 ? 0 : uint64_t( summary.lastUpdateTime );
+            value.resourceCount = summary.resourceCount;
+            value.primaryKind = summary.latest.primaryKind;
+            value.memoryDomain = summary.latest.memoryDomain;
+            value.allocationKind = summary.latest.allocationKind;
+            value.residencyState = summary.latest.residencyState;
+            value.exactness = summary.latest.exactness;
+            value.flags = summary.latest.flags;
+            value.openBoundary = summary.openBoundary != 0;
+            value.aliveAtEnd = summary.aliveAtEnd != 0;
+            value.invalid = summary.invalid != 0;
+            result.emplace_back( std::move( value ) );
+        }
+        return result;
     }
     std::vector<analysis::GpuPassWorkingSet> ScanGpuCatalogPassesBounded(
         size_t offset, size_t limit ) const override
     {
-        return m_source->ScanGpuCatalogPassesBounded( offset, limit );
+        const auto begin = std::min<uint64_t>( offset, m_gpuPassResources.SummaryCount() );
+        const auto end = begin + std::min<uint64_t>( limit, m_gpuPassResources.SummaryCount() - begin );
+        std::vector<analysis::GpuPassWorkingSet> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
+        {
+            const auto summary = m_gpuPassResources.SummaryAt( ordinal );
+            analysis::GpuPassWorkingSet value;
+            value.passId = summary.passId;
+            value.directRangeBytes = summary.directRangeBytes;
+            value.directPhysicalBytes = summary.referencedPhysicalBytes;
+            value.inclusivePhysicalBytes = summary.referencedPhysicalBytes;
+            value.complete = true;
+            result.emplace_back( std::move( value ) );
+        }
+        return result;
     }
     std::vector<analysis::GpuAnalysisRangeStoreEntry> ScanGpuCatalogRangesBounded(
         size_t offset, size_t limit ) const override
     {
-        return m_source->ScanGpuCatalogRangesBounded( offset, limit );
+        const auto begin = std::min<uint64_t>( offset, m_catalog.RangeCount() );
+        const auto end = begin + std::min<uint64_t>( limit, m_catalog.RangeCount() - begin );
+        std::vector<analysis::GpuAnalysisRangeStoreEntry> result;
+        result.reserve( size_t( end - begin ) );
+        for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
+        {
+            const auto range = m_catalog.RangeAt( ordinal );
+            result.push_back( { range.record.resourceId, range.generation, range.record } );
+        }
+        return result;
     }
 
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
@@ -1870,7 +1968,10 @@ public:
     std::shared_ptr<QueryResourceContext> GetQueryResourceContext() const override { return m_resources; }
     bool SampleDerivedDataReady() const override { return false; }
     bool JobDerivedDataReady() const override { return false; }
-    bool CatalogDerivedDataReady() const override { return false; }
+    bool CatalogDerivedDataReady() const override
+    {
+        return m_manifest.catalogValidation.complete && m_catalog.ResourceIndexReady();
+    }
     TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
     TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )

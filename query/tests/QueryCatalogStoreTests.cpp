@@ -363,7 +363,23 @@ int main()
         const auto logicals100 = associationReader.ResourceLogicals( 100, 0, 10 );
         const auto logical700 = associationReader.ResolveLogical( 700, 2 );
         const auto allocation500 = associationReader.AllocationState( 500 );
+        Require( associationReader.AllocationSummaryCount() == 2,
+            "Catalog allocation summary did not preserve unique allocation count" );
+        const auto allocationSummary500 = associationReader.AllocationSummaryAt( 0 );
+        const auto allocationSummary600 = associationReader.AllocationSummaryAt( 1 );
+        Require( allocationSummary500.latest.allocationId == 500 &&
+            allocationSummary500.latest.sizeBytes == 8192 && allocationSummary500.generation == 10 &&
+            allocationSummary500.createTime == 10 && allocationSummary500.destroyTime == 0 &&
+            allocationSummary500.lastUpdateTime == 20 && allocationSummary500.resourceCount == 2 &&
+            allocationSummary500.aliveAtEnd && !allocationSummary500.openBoundary && !allocationSummary500.invalid,
+            "Catalog allocation summary changed update or shared-resource semantics" );
+        Require( allocationSummary600.latest.allocationId == 600 &&
+            allocationSummary600.latest.sizeBytes == 16384 && allocationSummary600.resourceCount == 1 &&
+            allocationSummary600.aliveAtEnd,
+            "Catalog allocation summary changed unique allocation state" );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
+            associations100->partCount == 2 && associations100->viewCount == 2 &&
+            associations100->relationCount == 3 && associations100->vgRecordCount == 2 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
             "Catalog resource association index changed mesh/range/logical/alias/shared-allocation counts" );

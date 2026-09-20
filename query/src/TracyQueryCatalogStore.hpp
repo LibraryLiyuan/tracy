@@ -57,19 +57,37 @@ struct QueryCatalogResourceAssociationData
 {
     uint64_t resourceId = 0;
     uint64_t meshPartCount = 0;
+    uint64_t partCount = 0;
+    uint64_t viewCount = 0;
     uint64_t rangeCount = 0;
     uint64_t logicalBindingCount = 0;
+    uint64_t relationCount = 0;
+    uint64_t vgRecordCount = 0;
     uint64_t allocationResourceCount = 0;
     uint8_t hasAliasGroup = 0;
     uint8_t reserved[7] {};
 };
 
-static_assert( sizeof( QueryCatalogResourceAssociationData ) == 48 );
+static_assert( sizeof( QueryCatalogResourceAssociationData ) == 80 );
 
 struct QueryCatalogAllocationData
 {
     JnGpuCatalogAllocationRecordV1 record {};
     uint64_t generation = 0;
+};
+
+struct QueryCatalogAllocationSummaryData
+{
+    JnGpuCatalogAllocationRecordV1 latest {};
+    uint64_t generation = 0;
+    int64_t createTime = 0;
+    int64_t destroyTime = 0;
+    int64_t lastUpdateTime = 0;
+    uint64_t resourceCount = 0;
+    uint8_t openBoundary = 0;
+    uint8_t aliveAtEnd = 0;
+    uint8_t invalid = 0;
+    uint8_t reserved[5] {};
 };
 
 struct QueryCatalogAllocationPage
@@ -290,6 +308,8 @@ public:
     QueryCatalogResourceAssociationData ResourceAssociationsAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogResourceAssociationData> ResourceAssociations( uint64_t resourceId ) const;
     QueryCatalogAllocationPage ResourceAllocations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    uint64_t AllocationSummaryCount() const;
+    QueryCatalogAllocationSummaryData AllocationSummaryAt( uint64_t ordinal ) const;
     QueryCatalogViewPage ResourceViews( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogPartPage ResourceMeshParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogPartPage ResourceParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;

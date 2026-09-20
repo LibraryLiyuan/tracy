@@ -102,6 +102,8 @@ public:
     QueryGpuPassResourceStoreReader& operator=( const QueryGpuPassResourceStoreReader& ) = delete;
 
     std::optional<QueryGpuPassResourceSummary> Summary( uint64_t passId ) const;
+    uint64_t SummaryCount() const;
+    QueryGpuPassResourceSummary SummaryAt( uint64_t ordinal ) const;
     QueryGpuPassRangePage Ranges( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassUsePage Uses( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassIdPage EvidencePassIds( uint64_t passId, uint64_t offset, size_t limit ) const;

@@ -136,6 +136,9 @@ int main()
             "GPU pass resource scratch was retained" );
         QueryGpuPassResourceStoreReader reader( passRoot, catalogRoot, referenceRoot, identity );
         reader.ValidateAll();
+        Require( reader.SummaryCount() == 3 && reader.SummaryAt( 0 ).passId == 10 &&
+            reader.SummaryAt( 1 ).passId == 20 && reader.SummaryAt( 2 ).passId == 1000,
+            "GPU pass summary ordinal scan changed count or order" );
         const auto summary = reader.Summary( 1000 );
         Require( summary && summary->resourceCount == 2 && summary->allocationCount == 2 &&
             summary->directRangeBytes == 192 && summary->referencedPhysicalBytes == 3000 &&

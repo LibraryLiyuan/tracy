@@ -1,6 +1,6 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-20。当前索引 schema37。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-20。当前索引 schema38。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
@@ -11,10 +11,10 @@
 | Callstack | payload、Frame/inline 定义、父调用栈和符号地址映射 | payload 与 Frame/inline 已外置；父调用栈/符号映射待迁移 | schema21 payload 使用分页 ordinal 目录和只读 frame arena；schema22 Frame 定义使用原 `CallstackFrameId` 外排索引、分页目录和只读 inline-frame arena。`ResolveCallstacks`/ghost frame 可直接读取侧车；父调用栈和符号地址映射仍需按需页化 |
 | JN 固定域 | Schedule/Config/Dependency、GfxDispatch、Frame、I/O、Runtime、Script、Callsite | 待迁移 | 事实表＋键/ordinal 索引；逐域切换真实后端消费者后才从 compact 移除 |
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
-| GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 主要Query已迁移 | schema34流式聚合Resource类型并用Allocation外排生成56字节峰值/churn摘要；schema37将Pass→Resource/Allocation事实多阶段外排为64字节摘要及Range/Use分页。Indexed `gpu.memory.by_type/peak/churn/by_pass`和`gpu.pass.resources`不再构造完整Snapshot；Native Scan内部剩余归因消费者仍待审计 |
+| GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 主要Query与Native GPU Scan已迁移 | schema34流式聚合Resource类型并用Allocation外排生成56字节峰值/churn摘要；schema37将Pass→Resource/Allocation事实多阶段外排为64字节摘要及Range/Use分页；schema38增加Allocation最终状态固定摘要并让Native Scan的Resource/Allocation/Pass/Range四域直接分页磁盘后端。Indexed路径不再构造完整GPU Snapshot |
 | GPU Reference反向读取 | Pass/End时间map和按Resource聚合的全部Use vector | 已移除 | schema33起使用Pass时间表和48字节解析Use；schema35增加Catalog Resource反向索引。Resource、Catalog Resource及指定Pass均二分直接分页并保持原始Use顺序；Allocation只读取总数及最多100个Pass预览，旧Ensure、map和once flag均已删除 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；Catalog主要查询已恢复 | schema37沿用持久化质量校验，并用generation-aware外排覆盖Resource历史/引用/Explain、Pass evidence/resource和GPU Memory主要方法。Pass映射、Resource/Allocation唯一集合及详情均磁盘归并；validation详细响应、Job和Sample派生仍待迁移 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | Catalog完成；Job待迁移 | schema38的持久化质量、Resource历史/引用/Explain、Pass evidence/resource、GPU Memory主要方法和Native GPU Scan均使用有界后端，Catalog readiness/capability已发布；Job和Sample派生仍待迁移 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 

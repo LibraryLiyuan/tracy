@@ -474,6 +474,20 @@ QueryGpuPassResourceStoreReader::QueryGpuPassResourceStoreReader( std::filesyste
 
 QueryGpuPassResourceStoreReader::~QueryGpuPassResourceStoreReader() = default;
 
+uint64_t QueryGpuPassResourceStoreReader::SummaryCount() const
+{
+    return m_impl->summaries.Count();
+}
+
+QueryGpuPassResourceSummary QueryGpuPassResourceStoreReader::SummaryAt( uint64_t ordinal ) const
+{
+    if( ordinal >= m_impl->summaries.Count() )
+        throw std::out_of_range( "GPU pass summary ordinal" );
+    QueryGpuPassResourceSummary result {};
+    m_impl->summaries.Read( ordinal, &result, 1 );
+    return result;
+}
+
 std::optional<QueryGpuPassResourceSummary> QueryGpuPassResourceStoreReader::Summary( uint64_t passId ) const
 {
     if( passId == 0 ) return std::nullopt;

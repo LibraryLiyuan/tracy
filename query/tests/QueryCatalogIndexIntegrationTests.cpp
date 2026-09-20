@@ -2,7 +2,10 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
 #include "TracyAnalysisIoPath.hpp"
+#include "TracyBoundedScanCursor.hpp"
+#include "TracyMemoryIoSamplingTelemetryScanner.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -47,6 +50,15 @@ int main( int argc, char** argv )
         const auto expectedStrings = catalog->gpuCatalogStrings.size();
         const auto expectedFirstResourceId = catalog->gpuCatalogResources.front().resourceId;
         const auto expectedFirstResourceCapacity = catalog->gpuCatalogResources.front().capacityBytes;
+        const auto* originalGpuScan = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( original.get() );
+        Require( originalGpuScan != nullptr, "fixture has no bounded GPU scan source" );
+        const auto expectedGpuResourceCount = originalGpuScan->GetGpuCatalogResourceCountBounded();
+        const auto expectedGpuAllocationCount = originalGpuScan->GetGpuCatalogAllocationCountBounded();
+        const auto expectedGpuPassCount = originalGpuScan->GetGpuCatalogPassCountBounded();
+        const auto expectedGpuRangeCount = originalGpuScan->GetGpuCatalogRangeCountBounded();
+        Require( expectedGpuResourceCount != 0,
+            "fixture has no bounded GPU Resource scan projection" );
+        const auto expectedGpuResourcePage = originalGpuScan->ScanGpuCatalogResourcesBounded( 0, 4 );
         std::unordered_map<uint64_t, uint64_t> expectedMeshParts;
         std::unordered_map<uint64_t, uint64_t> expectedRanges;
         std::unordered_map<uint64_t, uint64_t> expectedLogicalBindings;
@@ -155,8 +167,8 @@ int main( int argc, char** argv )
         Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
         auto indexed = query::QueryIndex::Open( manifest );
         auto indexedPeer = query::QueryIndex::Open( manifest );
-        Require( !indexed->CatalogDerivedDataReady(),
-            "indexed trace silently claims GPU Catalog indices are ready" );
+        Require( indexed->CatalogDerivedDataReady(),
+            "indexed trace did not publish completed GPU Catalog readiness" );
         const auto* statusSource = dynamic_cast<const query::QueryCatalogStatusSource*>( indexed.get() );
         Require( statusSource != nullptr, "indexed trace does not expose bounded Catalog status" );
         const auto status = statusSource->GetQueryCatalogStatus( 64, 16 );
@@ -165,6 +177,42 @@ int main( int argc, char** argv )
             status.counts[size_t( OfflineCatalogDomain::CatalogResource )] == expectedResources &&
             status.counts[size_t( OfflineCatalogDomain::CatalogBatch )] == expectedBatches,
             "indexed bounded Catalog status changed" );
+        const auto capabilities = indexed->GetCapabilities();
+        const auto capability = [&]( std::string_view domain ) -> const analysis::Capability* {
+            const auto found = std::find_if( capabilities.begin(), capabilities.end(),
+                [&]( const auto& value ) { return value.domain == domain; } );
+            return found == capabilities.end() ? nullptr : &*found;
+        };
+        const auto* catalogCapability = capability( "gpu.catalog" );
+        const auto* resourceCapability = capability( "gpu.resource" );
+        const auto* memoryCapability = capability( "gpu.memory" );
+        Require( catalogCapability && catalogCapability->queryable && resourceCapability &&
+            resourceCapability->queryable && memoryCapability && memoryCapability->queryable,
+            "indexed GPU Catalog capabilities do not expose completed bounded backends" );
+        const auto* indexedGpuScan = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( indexed.get() );
+        Require( indexedGpuScan != nullptr &&
+            indexedGpuScan->GetGpuCatalogResourceCountBounded() == expectedGpuResourceCount,
+            "indexed GPU Resource scan did not use the Catalog sidecar" );
+        Require( indexedGpuScan->GetGpuCatalogAllocationCountBounded() == expectedGpuAllocationCount &&
+            indexedGpuScan->GetGpuCatalogPassCountBounded() == expectedGpuPassCount &&
+            indexedGpuScan->GetGpuCatalogRangeCountBounded() == expectedGpuRangeCount,
+            "indexed GPU Allocation/Pass/Range scan counts changed" );
+        const auto indexedGpuResourcePage = indexedGpuScan->ScanGpuCatalogResourcesBounded( 0, 4 );
+        Require( indexedGpuResourcePage.size() == expectedGpuResourcePage.size() &&
+            !indexedGpuResourcePage.empty() &&
+            indexedGpuResourcePage.front().resourceId == expectedGpuResourcePage.front().resourceId &&
+            indexedGpuResourcePage.front().capacityBytes == expectedGpuResourcePage.front().capacityBytes,
+            "indexed GPU Resource scan changed the bounded Worker projection" );
+        auto scanWorkspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+            64 * 1024 * 1024, 32 * 1024 * 1024 );
+        const auto scan = analysis::MemoryIoSamplingTelemetryScanner( *indexed, 64 ).ScanSummary(
+            {}, scanWorkspace );
+        Require( scan.gpuMemory.catalogState == analysis::GpuCatalogState::Complete &&
+            scan.inputGpuResourceCount == expectedGpuResourceCount &&
+            scan.inputGpuAllocationCount == expectedGpuAllocationCount &&
+            scan.inputGpuPassCount == expectedGpuPassCount &&
+            scan.inputGpuRangeCount == expectedGpuRangeCount && scan.maximumBatchObserved <= 64,
+            "Native Scan did not consume the bounded Indexed GPU projections" );
         const auto activeData = manifest.dataPath;
         const std::string generationPrefix = "jnidx." + manifest.sourceFingerprint.substr( 0, 16 ) +
             ".s" + std::to_string( query::QueryIndexSchemaVersion ) + ".g";
