@@ -12,7 +12,7 @@
 | JN 固定域 | Schedule/Config/Dependency、GfxDispatch、Frame、I/O、Runtime、Script、Callsite | 待迁移 | 事实表＋键/ordinal 索引；逐域切换真实后端消费者后才从 compact 移除 |
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 类型、物理峰值与churn已迁移；Pass归因待完成 | schema34流式聚合Resource类型；Allocation按ID/时间外排生成增减事件，再按时间/原始ordinal外排为56字节固定摘要。Indexed `gpu.memory.by_type/peak/churn`不再构造完整Snapshot；`gpu.memory.by_pass`及完整Pass归因仍待磁盘后端 |
-| GPU Reference反向读取 | Pass/End时间map和按Resource聚合的全部Use vector | 已移除 | schema33以Pass/End外排时间表、48字节解析Use分页表和Resource反向ordinal索引替代全量`unordered_map<vector>`；保持原始Use顺序。`ScanGpuMemoryUsesByResource`直接分页，`ScanGpuMemoryAllocations`逐allocation读取总数及最多100个Pass预览；旧Ensure、map和once flag均已删除 |
+| GPU Reference反向读取 | Pass/End时间map和按Resource聚合的全部Use vector | 已移除 | schema33起使用Pass时间表和48字节解析Use；schema35增加Catalog Resource反向索引。Resource、Catalog Resource及指定Pass均二分直接分页并保持原始Use顺序；Allocation只读取总数及最多100个Pass预览，旧Ensure、map和once flag均已删除 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
 | Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；Resource单体查询与部分GPU Memory已恢复 | schema36沿用持久化Catalog质量校验；Resource摘要、String点查、多域历史、指针生命周期、RangeSet双向索引、已解析GPU Use、全部Part、Logical定义/绑定及通用Relation均采用generation-aware外排。Resource查询含Explain、Pass VG Evidence和GPU类型/峰值/churn已走真实磁盘后端；Pass Resource/by_pass、validation详细响应、Job和Sample派生仍待迁移 |
 

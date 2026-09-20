@@ -68,6 +68,9 @@ Require ($allocationScan.Contains('m_gpuReferenceIndex.UsesByResource')) `
     'GPU allocation paging does not reuse the bounded reverse ResourceSet sidecar.'
 Require (-not $allocationScan.Contains('EnsureGpuResourcePassRefs')) `
     'GPU allocation paging still materializes the complete resource-to-pass map.'
+$passScan = [regex]::Match($queryIndex, 'ScanGpuMemoryPasses[\s\S]*?ScanGpuMemoryUsesByResource').Value
+Require ($passScan.Contains('m_gpuReferenceIndex.UsesByPass')) `
+    'Directed GPU pass use paging still scans the complete GPU Reference Use table.'
 Require ($service -match 'gpu\.resource\.raytracing_chain[\s\S]{0,4096}"has_more"') `
     'RTAS relation results are not paginated.'
 Require (($service | Select-String -Pattern 'resolvedPhysicalAllocationId' -AllMatches).Matches.Count -ge 3) `

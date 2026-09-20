@@ -79,6 +79,12 @@ int main()
             catalog201.total == 1 && catalog201.values.size() == 1 &&
             catalog201.values[0].passId == 2 && catalog201.values[0].resourceId == 100,
             "GPU reference Catalog resource lifetime resolution changed" );
+        const auto pass1 = reader.UsesByPass( 1, 0, 10 );
+        const auto pass2 = reader.UsesByPass( 2, 0, 10 );
+        Require( pass1.total == 1 && pass1.values.size() == 1 && pass1.values[0].passId == 1 &&
+            pass2.total == 1 && pass2.values.size() == 1 && pass2.values[0].passId == 2 &&
+            reader.UsesByPass( 999, 0, 10 ).total == 0,
+            "GPU reference pass paging changed" );
         fs::remove_all( root, ignored );
         std::cout << "query GPU reference store passed\n";
         return 0;

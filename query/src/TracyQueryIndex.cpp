@@ -2180,12 +2180,16 @@ public:
             const auto child = selectedById.find( value.sourceId ); if( child != selectedById.end() ) selected[child->second].pass.parentPassId = value.targetId;
             const auto parent = selectedById.find( value.targetId ); if( parent != selectedById.end() ) selected[parent->second].hasChild = true;
         }
-        for( uint64_t index = 0; index < m_gpuReferenceUses.Count(); index++ )
+        std::optional<uint64_t> indexedUseTotal;
+        if( requestedPassId && !selected.empty() )
         {
-            const auto& value = m_gpuReferenceUses.At<JnGpuReferenceUseData>( index ); const auto found = selectedById.find( value.passId );
-            if( found == selectedById.end() || value.resourceId == 0 ) continue;
-            auto& pass = selected[found->second].pass; const auto useIndex = pass.emittedUseCount++;
-            if( requestedPassId && useIndex >= useOffset && pass.uses.size() < useLimit )
+            auto& pass = selected.front().pass;
+            const auto stored = m_gpuReferenceIndex.UsesByPass( *requestedPassId, useOffset, useLimit );
+            indexedUseTotal = stored.total;
+            pass.emittedUseCount = uint32_t( std::min<uint64_t>( stored.total,
+                std::numeric_limits<uint32_t>::max() ) );
+            pass.uses.reserve( stored.values.size() );
+            for( const auto& value : stored.values )
             {
                 char kind = 'U';
                 if( m_precomputedGpuMemorySummary )
@@ -2193,11 +2197,21 @@ public:
                     const auto logical = m_precomputedGpuMemorySummary->logicalById.find( value.resourceId );
                     if( logical != m_precomputedGpuMemorySummary->logicalById.end() ) kind = m_precomputedGpuMemorySummary->logicalResources[logical->second].kind;
                 }
-                pass.uses.push_back( { value.resourceId, value.usageMask, kind, value.resourceSetId, value.encoding } );
+                pass.uses.push_back( { value.resourceId, value.usageMask, kind,
+                    value.resourceSetId, value.encoding } );
             }
-            else if( !requestedPassId && pass.uses.empty() ) pass.uses.push_back( {} );
         }
-        if( requestedPassId && !selected.empty() ) page.totalUses = selected.front().pass.emittedUseCount;
+        else for( uint64_t index = 0; index < m_gpuReferenceUses.Count(); index++ )
+        {
+            const auto& value = m_gpuReferenceUses.At<JnGpuReferenceUseData>( index ); const auto found = selectedById.find( value.passId );
+            if( found == selectedById.end() || value.resourceId == 0 ) continue;
+            auto& pass = selected[found->second].pass;
+            pass.emittedUseCount++;
+            if( pass.uses.empty() ) pass.uses.push_back( {} );
+        }
+        if( requestedPassId && !selected.empty() ) page.totalUses = indexedUseTotal ?
+            size_t( std::min<uint64_t>( *indexedUseTotal, std::numeric_limits<size_t>::max() ) ) :
+            selected.front().pass.emittedUseCount;
 
         std::unordered_map<uint64_t, size_t> passEntityToSelected, segmentToSelected;
         std::unordered_set<uint64_t> selectedCommandLists;

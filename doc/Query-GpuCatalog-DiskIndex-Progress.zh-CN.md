@@ -178,6 +178,12 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 真实夹具Catalog section为34,271字节，四个新增空lookup各224字节，独立目录全部文件93,655字节；只保留一个generation且无scratch。Release全构建与CTest 41/41通过（124.99秒）。
 - Resource单体查询已基本迁移；`gpu.pass.resources`/`gpu.memory.by_pass`、Catalog validation详细响应、Job、Sample派生及Scan仍待完成。
 
+## 2026-09-20：指定Pass的GPU Use直接分页
+
+- schema36的`resolved-uses`写入顺序本身已按`(passId, 原始Use ordinal)`有序；Reader新增Pass ID二分范围读取，不增加磁盘文件或schema。
+- Indexed `ScanGpuMemoryPasses(passId, useOffset, useLimit)`改为直接读取该Pass的一页Use和精确总数，不再为一个Pass从头扫描全部GPU Reference Use。非定向Pass列表的摘要扫描暂保持原路径。
+- GPU Reference组件、QueryService Catalog合同和N27静态回归通过；本小改动未重复完整41项套件，沿用同一schema36阶段已通过的Release全构建与CTest证据。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

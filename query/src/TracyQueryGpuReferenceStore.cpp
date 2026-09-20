@@ -389,6 +389,43 @@ QueryGpuReferenceUsePage QueryGpuReferenceStoreReader::UsesByCatalogResource(
     return result;
 }
 
+QueryGpuReferenceUsePage QueryGpuReferenceStoreReader::UsesByPass(
+    uint64_t passId, uint64_t offset, size_t limit ) const
+{
+    QueryGpuReferenceUsePage result;
+    if( passId == 0 || limit == 0 ) return result;
+    auto& uses = m_impl->uses;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = uses.Count();
+        QueryGpuReferenceResolvedUseRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            uses.Read( middle, &row, 1 );
+            if( row.passId < passId || ( upper && row.passId == passId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto begin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto end = begin + std::min<uint64_t>( limit, rangeEnd - begin );
+    result.values.reserve( size_t( end - begin ) );
+    for( auto index = begin; index < end; index++ )
+    {
+        QueryGpuReferenceResolvedUseRecord value {};
+        uses.Read( index, &value, 1 );
+        if( value.passId != passId )
+            throw std::runtime_error( "GPU reference pass range identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
 void QueryGpuReferenceStoreReader::ValidateAll(
     const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource ) const
 {
@@ -403,6 +440,16 @@ void QueryGpuReferenceStoreReader::ValidateAll(
         m_impl->passTimes.Read( index, &row, 1 );
         if( row.passId == 0 || row.end < row.start || ( index != 0 && row.passId <= previousPass ) )
             throw std::runtime_error( "GPU reference pass time order mismatch" );
+        previousPass = row.passId;
+    }
+    previousPass = 0;
+    for( uint64_t index = 0; index < m_impl->uses.Count(); index++ )
+    {
+        QueryGpuReferenceResolvedUseRecord row {};
+        m_impl->uses.Read( index, &row, 1 );
+        if( row.passId == 0 || row.resourceId == 0 || row.passEnd < row.passStart ||
+            ( index != 0 && row.passId < previousPass ) )
+            throw std::runtime_error( "GPU reference resolved use order mismatch" );
         previousPass = row.passId;
     }
     analysis::AnalysisKeyMetadataRecord previous {};
