@@ -103,6 +103,14 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 组件夹具覆盖命中、缺失、名称和生命周期字段；1,001资源真实Catalog完成构建、发布、深校验、重开和Reader生命周期。真实`gpu.resource.get`对resource 1返回4,194,304字节capacity与generation `14154813628825468929`，其完整data JSON与同Trace非索引基线逐字段相同。Release全构建与CTest 39/39通过（127.21秒）。
 - 同一真实夹具的1,001条Resource记录归并为1个resourceId生命周期；Indexed基础search首屏的资源、total和字段与非索引基线data完全一致。分页Reader在IndexedTraceSource生命周期内复用，不为每条记录重开分页文件。基础search接入后Release全构建与CTest 39/39通过（124.74秒）。
 
+## 2026-09-20：schema28 Resource关联过滤
+
+- `gpu.resource.search`的`has_mesh_parts`、`has_ranges`、`has_logical_bindings`、`has_alias_group`和`has_shared_allocation`已迁移到48字节定长的按`resourceId`有序关联摘要；查询按Resource物理ordinal点读，不重建旧Worker中的全量map/set。
+- Part、Range和Logical计数写入统一关联事实外排。Alias语义按`logicalResourceId`分别外排alias声明和Resource绑定后归并，保留“alias声明与绑定可位于不同历史记录”的旧语义。共享Allocation仅使用每个Resource的最新定义，以`(allocationId,resourceId)`外排分组获得精确资源数。
+- 所有source/sorted run、generation临时表和分页scratch使用共享workspace/磁盘预算。检查真实产物时发现schema27以来`resource-index-scratch`会因generation Reader仍持有句柄而残留；schema28缩短句柄生命周期，并把删除失败从忽略改为构建失败和候选清理。新真实产物不含该目录。
+- 新增真实`SessionManager → QueryService`合同测试，逐项验证五种过滤和返回计数字段。1,001条Resource真实Catalog完成冷建、深校验、重开及与旧Worker关联语义逐资源对照；该夹具聚合为1个resourceId，关联分页表337字节，Catalog section 28,402字节，完整独立输出81,187字节。
+- Release全构建和CTest 40/40通过（124.08秒）。本检查点没有运行12.43 GB正式Trace，也不计入约定的单轮综合性能验收。Resource explain和关联详情页、Pass、GPU Memory、Job、Sample派生及Scan迁移仍待继续。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

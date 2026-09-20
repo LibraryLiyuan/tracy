@@ -5551,10 +5551,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto nameFilter = filter.value( "name", std::string() );
                 const auto kindFilter = filter.value( "primary_kind", std::string() );
                 const auto classFilter = filter.value( "resource_class", std::string() );
-                if( filter.value( "has_mesh_parts", false ) || filter.value( "has_ranges", false ) ||
-                    filter.value( "has_logical_bindings", false ) || filter.value( "has_alias_group", false ) ||
-                    filter.value( "has_shared_allocation", false ) )
-                    throw QueryError( "INDEX_NOT_READY", "bounded GPU resource association filters have not been built" );
+                const auto requireMeshParts = filter.value( "has_mesh_parts", false );
+                const auto requireRanges = filter.value( "has_ranges", false );
+                const auto requireLogicalBindings = filter.value( "has_logical_bindings", false );
+                const auto requireAliasGroup = filter.value( "has_alias_group", false );
+                const auto requireSharedAllocation = filter.value( "has_shared_allocation", false );
+                const bool requireAssociations = requireMeshParts || requireRanges || requireLogicalBindings ||
+                    requireAliasGroup || requireSharedAllocation;
                 const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
                 if( page.rawOffsetBound && page.rawOffset > count )
                     throw QueryError( "STALE_CURSOR", "cursor raw offset is outside the resource index" );
@@ -5573,6 +5576,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     if( !nameFilter.empty() && name.find( nameFilter ) == std::string::npos ) continue;
                     if( !kindFilter.empty() && kindFilter != GpuPrimaryKindName( value.primaryKind ) ) continue;
                     if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
+                    QueryCatalogResourceAssociationData associations {};
+                    if( requireAssociations )
+                    {
+                        associations = catalogResourceSource->GetQueryCatalogResourceAssociationsAt( ordinal );
+                        if( associations.resourceId != value.resourceId )
+                            throw QueryError( "INTERNAL_ERROR", "GPU resource association index identity mismatch" );
+                        if( requireMeshParts && associations.meshPartCount == 0 ) continue;
+                        if( requireRanges && associations.rangeCount == 0 ) continue;
+                        if( requireLogicalBindings && associations.logicalBindingCount == 0 ) continue;
+                        if( requireAliasGroup && associations.hasAliasGroup == 0 ) continue;
+                        if( requireSharedAllocation && associations.allocationResourceCount <= 1 ) continue;
+                    }
                     const auto logicalPosition = matched++;
                     if( !page.rawOffsetBound && logicalPosition < page.offset ) continue;
                     if( returned >= page.limit )
@@ -5581,7 +5596,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         hasMore = true;
                         continue;
                     }
-                    values.push_back( {
+                    json result = {
                         { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
                         { "resource_id", Decimal( value.resourceId ) }, { "generation", Decimal( state.generation ) },
                         { "definition_revision", value.definitionRevision },
@@ -5600,7 +5615,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
                         { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
                         { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) }
-                    } );
+                    };
+                    if( requireMeshParts ) result["mesh_part_count"] = Decimal( associations.meshPartCount );
+                    if( requireRanges ) result["pass_range_count"] = Decimal( associations.rangeCount );
+                    if( requireLogicalBindings || requireAliasGroup )
+                        result["logical_binding_count"] = Decimal( associations.logicalBindingCount );
+                    if( requireSharedAllocation )
+                        result["allocation_resource_count"] = Decimal( associations.allocationResourceCount );
+                    values.push_back( std::move( result ) );
                     returned++;
                     nextRawOffset = size_t( ordinal + 1 );
                 }

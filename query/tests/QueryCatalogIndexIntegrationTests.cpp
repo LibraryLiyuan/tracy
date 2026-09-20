@@ -8,6 +8,8 @@
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -45,6 +47,39 @@ int main( int argc, char** argv )
         const auto expectedStrings = catalog->gpuCatalogStrings.size();
         const auto expectedFirstResourceId = catalog->gpuCatalogResources.front().resourceId;
         const auto expectedFirstResourceCapacity = catalog->gpuCatalogResources.front().capacityBytes;
+        std::unordered_map<uint64_t, uint64_t> expectedMeshParts;
+        std::unordered_map<uint64_t, uint64_t> expectedRanges;
+        std::unordered_map<uint64_t, uint64_t> expectedLogicalBindings;
+        std::unordered_set<uint64_t> aliasLogicalIds;
+        std::unordered_set<uint64_t> expectedAliasResources;
+        std::unordered_map<uint64_t, const JnGpuCatalogResourceRecordV1*> latestResources;
+        std::unordered_map<uint64_t, uint64_t> allocationResourceCounts;
+        for( const auto& value : catalog->gpuCatalogParts )
+        {
+            const auto kind = JnGpuCatalogPartKind( value.partKind );
+            if( kind == JnGpuCatalogPartKind::MeshVertexStream || kind == JnGpuCatalogPartKind::MeshIndex )
+                ++expectedMeshParts[value.resourceId];
+        }
+        for( const auto& value : catalog->gpuRangeSets ) ++expectedRanges[value.resourceId];
+        for( const auto& value : catalog->gpuCatalogLogicals )
+        {
+            if( value.aliasGroupId != 0 ) aliasLogicalIds.emplace( value.logicalResourceId );
+            if( value.resourceId != 0 ) ++expectedLogicalBindings[value.resourceId];
+        }
+        for( const auto& value : catalog->gpuCatalogLogicals )
+            if( value.resourceId != 0 && aliasLogicalIds.contains( value.logicalResourceId ) )
+                expectedAliasResources.emplace( value.resourceId );
+        for( const auto& value : catalog->gpuCatalogResources )
+        {
+            const auto operation = JnGpuCatalogRecordOperation( value.operation );
+            const bool definition = operation == JnGpuCatalogRecordOperation::Create ||
+                operation == JnGpuCatalogRecordOperation::Update || operation == JnGpuCatalogRecordOperation::Open ||
+                operation == JnGpuCatalogRecordOperation::Snapshot;
+            auto& latest = latestResources[value.resourceId];
+            if( definition && ( latest == nullptr || value.time >= latest->time ) ) latest = &value;
+        }
+        for( const auto& [unused, latest] : latestResources )
+            if( latest != nullptr && latest->allocationId != 0 ) ++allocationResourceCounts[latest->allocationId];
         original.reset(); catalog.reset();
 
         const auto manifest = query::QueryIndex::Build( input );
@@ -55,6 +90,8 @@ int main( int argc, char** argv )
             "Query index did not publish a GPU Catalog sidecar" );
         const auto catalogRoot = manifest.manifestPath.parent_path() /
             json.at( "sections" ).at( "gpu_catalog" ).at( "file" ).get<std::string>();
+        Require( !fs::exists( catalogRoot / "resource-index-scratch" ),
+            "Query index published completed Catalog resource scratch files" );
         {
             query::QueryCatalogStoreReader reader( catalogRoot, manifest.sourceFingerprint );
             Require( reader.Count( OfflineCatalogDomain::CatalogResource ) == expectedResources,
@@ -68,6 +105,21 @@ int main( int argc, char** argv )
                 resource->latest.resourceId == expectedFirstResourceId &&
                 resource->latest.capacityBytes == expectedFirstResourceCapacity,
                 "Catalog real resource point index changed" );
+            for( uint64_t ordinal = 0; ordinal < reader.ResourceIndexCount(); ordinal++ )
+            {
+                const auto state = reader.ResourceStateAt( ordinal );
+                const auto associations = reader.ResourceAssociationsAt( ordinal );
+                const auto resourceId = state.latest.resourceId;
+                const auto allocationCount = state.latest.allocationId == 0 ? 0 :
+                    allocationResourceCounts[state.latest.allocationId];
+                Require( associations.resourceId == resourceId &&
+                    associations.meshPartCount == expectedMeshParts[resourceId] &&
+                    associations.rangeCount == expectedRanges[resourceId] &&
+                    associations.logicalBindingCount == expectedLogicalBindings[resourceId] &&
+                    bool( associations.hasAliasGroup ) == expectedAliasResources.contains( resourceId ) &&
+                    associations.allocationResourceCount == allocationCount,
+                    "Catalog real resource association index changed Worker search semantics" );
+            }
         }
 
         bool rejectedUnboundCompact = false;

@@ -151,6 +151,10 @@ int main()
             "healthy Catalog failed semantic validation" );
         Require( !reader.ResourceIndexReady(), "raw Catalog unexpectedly claimed a resource index" );
         reader.BuildResourceIndex( root / "resource-index-scratch" );
+        Require( fs::is_directory( root / "resource-associations" ),
+            "Catalog resource index did not publish bounded association summaries" );
+        Require( !fs::exists( root / "resource-index-scratch" ),
+            "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
         const auto indexedResource = reader.ResourceState( 100 );
         Require( indexedResource && indexedResource->latest.resourceId == 100 &&
@@ -162,6 +166,80 @@ int main()
         Require( indexedName && *indexedName == "main" && !reader.ResourceState( 999 ) &&
             !reader.ResourceName( 9, 999 ), "Catalog resource/string point index changed missing-key behavior" );
         reader.ValidateAll();
+
+        const auto associationRoot = root.parent_path() / "tracy-query-catalog-resource-associations";
+        fs::remove_all( associationRoot, ignored );
+        {
+            QueryCatalogStoreWriter associationWriter( associationRoot, identity );
+            associationWriter.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
+            JnGpuCatalogResourceRecordV1 associationResources[3] {};
+            associationResources[0].time = 1; associationResources[0].resourceId = 100;
+            associationResources[0].allocationId = 500;
+            associationResources[1].time = 2; associationResources[1].resourceId = 101;
+            associationResources[1].allocationId = 500;
+            associationResources[2].time = 3; associationResources[2].resourceId = 102;
+            associationResources[2].allocationId = 600;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogResource, 3, sizeof( associationResources[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogResource, 0, associationResources, 3,
+                sizeof( associationResources[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogResource );
+
+            JnGpuCatalogPartRecordV1 associationParts[3] {};
+            associationParts[0].resourceId = 100;
+            associationParts[0].partKind = uint8_t( JnGpuCatalogPartKind::MeshVertexStream );
+            associationParts[1].resourceId = 100;
+            associationParts[1].partKind = uint8_t( JnGpuCatalogPartKind::MeshIndex );
+            associationParts[2].resourceId = 101;
+            associationParts[2].partKind = uint8_t( JnGpuCatalogPartKind::BufferRange );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogPart, 3, sizeof( associationParts[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogPart, 0, associationParts, 3,
+                sizeof( associationParts[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogPart );
+
+            JnGpuCatalogLogicalRecordV1 associationLogicals[3] {};
+            associationLogicals[0].logicalResourceId = 700;
+            associationLogicals[0].aliasGroupId = 77;
+            associationLogicals[1].logicalResourceId = 700; associationLogicals[1].resourceId = 100;
+            associationLogicals[2].logicalResourceId = 701; associationLogicals[2].resourceId = 101;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogLogical, 3, sizeof( associationLogicals[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogLogical, 0, associationLogicals, 3,
+                sizeof( associationLogicals[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogLogical );
+
+            JnGpuRangeSetRecordV1 associationRanges[2] {};
+            associationRanges[0].resourceId = 100;
+            associationRanges[1].resourceId = 102;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogRangeSet, 2, sizeof( associationRanges[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogRangeSet, 0, associationRanges, 2,
+                sizeof( associationRanges[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogRangeSet );
+
+            JnGpuCatalogBatchData associationBatch {};
+            associationBatch.generation = 9; associationBatch.firstRecordIndex = 0;
+            associationBatch.recordCount = 3; associationBatch.kind = uint8_t( JnGpuCatalogBatchKind::Resource );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( associationBatch ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, &associationBatch, 1,
+                sizeof( associationBatch ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogBatch );
+            associationWriter.Finish();
+        }
+        QueryCatalogStoreReader associationReader( associationRoot, identity );
+        associationReader.BuildResourceIndex( associationRoot / "resource-index-scratch" );
+        const auto associations100 = associationReader.ResourceAssociations( 100 );
+        const auto associations101 = associationReader.ResourceAssociations( 101 );
+        const auto associations102 = associationReader.ResourceAssociations( 102 );
+        Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
+            associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
+            associations100->allocationResourceCount == 2,
+            "Catalog resource association index changed mesh/range/logical/alias/shared-allocation counts" );
+        Require( associations101 && associations101->meshPartCount == 0 && associations101->rangeCount == 0 &&
+            associations101->logicalBindingCount == 1 && !associations101->hasAliasGroup &&
+            associations101->allocationResourceCount == 2,
+            "Catalog resource association index changed non-mesh/shared-allocation semantics" );
+        Require( associations102 && associations102->rangeCount == 1 &&
+            associations102->allocationResourceCount == 1 && !associationReader.ResourceAssociations( 999 ),
+            "Catalog resource association index changed unique-allocation or missing-key semantics" );
+        associationReader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
             status.generations.size() == 1 && status.generations[0].generation == 9 &&
@@ -359,6 +437,7 @@ int main()
         fs::remove_all( relationReferenceRoot, ignored );
         fs::remove_all( evidenceRecordRoot, ignored );
         fs::remove_all( metadataSortRoot, ignored );
+        fs::remove_all( associationRoot, ignored );
         std::cout << "query Catalog store passed\n";
         return 0;
 #endif

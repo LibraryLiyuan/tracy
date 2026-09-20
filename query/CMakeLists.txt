@@ -166,6 +166,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-query-catalog-store-tests)
     add_test(NAME tracy-query-catalog-store COMMAND tracy-query-catalog-store-tests)
 
+    add_executable(tracy-query-catalog-association-search-tests tests/QueryCatalogAssociationSearchTests.cpp)
+    target_link_libraries(tracy-query-catalog-association-search-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-catalog-association-search-tests)
+    add_test(NAME tracy-query-catalog-association-search COMMAND tracy-query-catalog-association-search-tests)
+
     add_executable(tracy-query-callstack-store-tests tests/QueryCallstackStoreTests.cpp)
     target_link_libraries(tracy-query-callstack-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-callstack-store-tests)

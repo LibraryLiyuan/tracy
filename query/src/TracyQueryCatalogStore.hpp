@@ -51,6 +51,19 @@ struct QueryCatalogResourceStateData
     bool openBoundary = false;
 };
 
+struct QueryCatalogResourceAssociationData
+{
+    uint64_t resourceId = 0;
+    uint64_t meshPartCount = 0;
+    uint64_t rangeCount = 0;
+    uint64_t logicalBindingCount = 0;
+    uint64_t allocationResourceCount = 0;
+    uint8_t hasAliasGroup = 0;
+    uint8_t reserved[7] {};
+};
+
+static_assert( sizeof( QueryCatalogResourceAssociationData ) == 48 );
+
 class QueryCatalogStatusSource
 {
 public:
@@ -67,6 +80,7 @@ public:
     virtual QueryCatalogResourceStateData GetQueryCatalogResourceStateAt( uint64_t ordinal ) const = 0;
     virtual std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const = 0;
     virtual std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const = 0;
+    virtual QueryCatalogResourceAssociationData GetQueryCatalogResourceAssociationsAt( uint64_t ordinal ) const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -114,6 +128,8 @@ public:
     uint64_t ResourceIndexCount() const;
     QueryCatalogResourceStateData ResourceStateAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogResourceStateData> ResourceState( uint64_t resourceId ) const;
+    QueryCatalogResourceAssociationData ResourceAssociationsAt( uint64_t ordinal ) const;
+    std::optional<QueryCatalogResourceAssociationData> ResourceAssociations( uint64_t resourceId ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:
