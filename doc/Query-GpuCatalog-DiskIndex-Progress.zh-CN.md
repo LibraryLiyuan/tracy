@@ -125,6 +125,13 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 非空组件夹具覆盖两个View的首尾页、两个Mesh Part、一个被排除的非Mesh Part及各自generation。真实QueryService合同验证两个接口的第一页和续页cursor。1,001 Resource真实Catalog完成schema30冷建、深校验、热开及无scratch发布；该夹具的View/Part域为空。
 - 真实夹具Catalog section为29,746字节，四个空lookup/generation分页目录各224字节，完整独立输出82,531字节。Release全构建与CTest 40/40通过（128.76秒）。Range/Reference、Logical/Relation、VG/RTAS及Explain仍待迁移。
 
+## 2026-09-20：schema31 VG与RTAS关系分页
+
+- `gpu.resource.vg_pages`按`(resourceId, 原始ordinal)`外排全部Virtual Geometry记录；`gpu.resource.raytracing_chain`仅索引`RtasUses`中协议已证明为Resource ID的source/target端点。同一记录两端相同只写一次，仍带pointer flag的未解析端点不会因数值相同而误入结果。
+- VG和Relation逐记录generation分别使用同ordinal分页表。两个接口保留既有嵌套`data.page`，同时接入Query 1.35顶层v2 cursor；查询二分定位Resource范围，不扫描完整VG或Relation域。
+- 非空组件夹具覆盖两个VG分页、双向RTAS、未解析source端点排除、非RTAS排除及generation。真实QueryService合同验证VG/RTAS响应字段。1,001 Resource真实Catalog完成schema31冷建、深校验、热开和无scratch发布；该夹具VG/Relation域为空。
+- 真实夹具Catalog section为30,642字节，四个空lookup/generation分页目录各224字节，完整独立输出83,427字节。Release全构建与CTest 40/40通过（124.89秒）。Range/Reference、Logical详情、通用Relation及Explain仍待迁移。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

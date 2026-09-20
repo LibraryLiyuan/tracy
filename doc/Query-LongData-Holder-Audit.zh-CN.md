@@ -1,6 +1,6 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-20。当前索引 schema30。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-20。当前索引 schema31。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
@@ -13,7 +13,7 @@
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource get/lifetime/search、五类过滤、Allocation、View及Mesh Part历史已恢复 | schema30沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要、String点查、48字节关联摘要及Allocation/View/Mesh Part ordinal/generation分页索引采用外部排序构建；explain、其余关联详情页、Pass和GPU Memory仍待迁移 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource get/lifetime/search、五类过滤、Allocation/View/Mesh/VG/RTAS历史已恢复 | schema31沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要、String点查、48字节关联摘要及多域ordinal/generation分页索引采用外部排序构建；explain、Range/Reference、Logical/通用Relation、Pass和GPU Memory仍待迁移 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 
@@ -42,6 +42,7 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - schema28将Mesh Part、Range、Logical Binding、Alias Group和共享Allocation聚合为与Resource摘要同ordinal的48字节分页记录；alias声明/绑定和allocation分组均以外部排序归并。真实1,001条Resource记录与旧Worker五类语义逐资源一致，发布后无`resource-index-scratch`，Release全构建与CTest 40/40通过（124.08秒）。
 - schema29按Allocation ID和原始ordinal外排完整Allocation历史，逐记录generation另存分页表；`gpu.resource.allocations`使用Query 1.35 cursor直接定位页范围。非空Create/Update分页由组件和真实QueryService合同覆盖；小型真实Catalog完成冷建/深校验/热开，Release全构建与CTest 40/40通过（131.66秒）。
 - schema30为View历史和两类Mesh Part建立按Resource ID/原始ordinal有序的独立索引及generation分页表；`gpu.resource.views/mesh_buffers`使用v2 cursor直接定位。非空组件与QueryService合同、真实小Catalog冷建/深校验/热开通过，Release全构建与CTest 40/40通过（128.76秒）。
+- schema31为VG历史和已解析RtasUses端点建立按Resource ID/原始ordinal索引及generation分页表；pointer flag端点不索引。`gpu.resource.vg_pages/raytracing_chain`同时保留旧嵌套页字段并提供v2 cursor，Release全构建与CTest 40/40通过（124.89秒）。
 - `gpu.resource.search`按summary物理ordinal扫描并将下一ordinal写入v2 cursor；名称/类型/class及五种关联布尔过滤均不物化全量ID，total在剩余流式扫描中精确累计。关联过滤只点读同ordinal定长摘要，不回退完整Catalog。Release全构建与CTest 40/40通过（124.08秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。

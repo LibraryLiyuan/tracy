@@ -100,6 +100,30 @@ struct QueryCatalogPartPage
     uint64_t total = 0;
 };
 
+struct QueryCatalogVgData
+{
+    JnGpuCatalogVgRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogVgPage
+{
+    std::vector<QueryCatalogVgData> values;
+    uint64_t total = 0;
+};
+
+struct QueryCatalogRelationData
+{
+    JnGpuCatalogRelationRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogRelationPage
+{
+    std::vector<QueryCatalogRelationData> values;
+    uint64_t total = 0;
+};
+
 class QueryCatalogStatusSource
 {
 public:
@@ -122,6 +146,10 @@ public:
     virtual QueryCatalogViewPage GetQueryCatalogResourceViews(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogPartPage GetQueryCatalogResourceMeshParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogVgPage GetQueryCatalogResourceVgPages(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogRelationPage GetQueryCatalogResourceRtasRelations(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
 };
 
@@ -175,6 +203,8 @@ public:
     QueryCatalogAllocationPage ResourceAllocations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogViewPage ResourceViews( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogPartPage ResourceMeshParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogVgPage ResourceVgPages( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogRelationPage ResourceRtasRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:

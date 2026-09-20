@@ -125,6 +125,41 @@ public:
         }
         return page;
     }
+    QueryCatalogVgPage GetQueryCatalogResourceVgPages(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogVgPage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogVgData value {};
+            value.record.resourceId = 100;
+            value.record.runtimeResourceId = 1000 + index;
+            value.record.pageIndex = uint32_t( index + 1 );
+            value.generation = 13;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
+    QueryCatalogRelationPage GetQueryCatalogResourceRtasRelations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogRelationPage page;
+        if( resourceId != 100 ) return page;
+        page.total = 1;
+        if( offset == 0 && limit != 0 )
+        {
+            QueryCatalogRelationData value {};
+            value.record.time = 60;
+            value.record.sourceId = 100;
+            value.record.targetId = 102;
+            value.record.relation = uint8_t( JnGpuCatalogRelationKind::RtasUses );
+            value.generation = 14;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -210,8 +245,21 @@ int main()
     assert( meshParts.at( "ok" ) && meshParts.at( "data" ).at( "parts" ).size() == 1 &&
         meshParts.at( "data" ).at( "parts" )[0].at( "part_id" ) == "900" &&
         meshParts.at( "data" ).at( "total" ) == "2" && meshParts.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto vgPages = service.Execute( Request( 11, "gpu.resource.vg_pages", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( vgPages.at( "ok" ) && vgPages.at( "data" ).at( "pages" ).size() == 1 &&
+        vgPages.at( "data" ).at( "pages" )[0].at( "page_index" ) == 1 &&
+        vgPages.at( "data" ).at( "page" ).at( "total" ) == "2" );
+    const auto rtas = service.Execute( Request( 12, "gpu.resource.raytracing_chain", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( rtas.at( "ok" ) && rtas.at( "data" ).at( "relations" ).size() == 1 &&
+        rtas.at( "data" ).at( "relations" )[0].at( "source_id" ) == "100" &&
+        rtas.at( "data" ).at( "relations" )[0].at( "target_id" ) == "102" &&
+        rtas.at( "data" ).at( "page" ).at( "total" ) == "1" );
 
-    assert( service.Execute( Request( 11, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    assert( service.Execute( Request( 13, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

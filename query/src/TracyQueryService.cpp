@@ -5477,7 +5477,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
             method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
-            method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ) &&
+            method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
+            method == "gpu.resource.vg_pages" || method == "gpu.resource.raytracing_chain" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
@@ -5731,6 +5732,63 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     page.offset + returned < partPage.total );
                 return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
                     { "parts", std::move( values ) }, { "total", Decimal( partPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.vg_pages" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto vgPage = catalogResourceSource->GetQueryCatalogResourceVgPages(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : vgPage.values )
+                {
+                    const auto& value = item.record;
+                    values.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "runtime_resource_id", Decimal( value.runtimeResourceId ) },
+                        { "page_definition_id", Decimal( value.pageDefinitionId ) },
+                        { "episode_id", Decimal( value.episodeId ) }, { "page_index", value.pageIndex },
+                        { "gpu_page_index", value.gpuPageIndex }, { "cluster_index", value.clusterIndex },
+                        { "offset_bytes", Decimal( value.offsetBytes ) }, { "length_bytes", Decimal( value.lengthBytes ) },
+                        { "frame_id", Decimal( value.frameId ) }, { "page_kind", value.pageKind },
+                        { "operation", GpuCatalogOperationName( value.operation ) },
+                        { "exactness", GpuExactnessName( value.exactness ) }, { "time_ns", Decimal( value.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < vgPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "pages", std::move( values ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( vgPage.total ) },
+                        { "has_more", page.offset + returned < vgPage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.raytracing_chain" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto relationPage = catalogResourceSource->GetQueryCatalogResourceRtasRelations(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : relationPage.values )
+                {
+                    const auto& value = item.record;
+                    values.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "source_id", Decimal( value.sourceId ) }, { "target_id", Decimal( value.targetId ) },
+                        { "relation", "rtas_uses" }, { "time_ns", Decimal( value.time ) },
+                        { "exactness", GpuExactnessName( value.exactness ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < relationPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "relations", std::move( values ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( relationPage.total ) },
+                        { "has_more", page.offset + returned < relationPage.total } } } },
                     trace, PageJson( page, returned, cursor ) );
             }
             const auto& value = state->latest;

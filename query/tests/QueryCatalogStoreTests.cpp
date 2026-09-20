@@ -161,6 +161,11 @@ int main()
             fs::is_directory( root / "resource-mesh-part-lookup" ) &&
             fs::is_directory( root / "resource-part-generations" ),
             "Catalog resource index did not publish bounded view and mesh-part history indices" );
+        Require( fs::is_directory( root / "resource-vg-lookup" ) &&
+            fs::is_directory( root / "resource-vg-generations" ) &&
+            fs::is_directory( root / "resource-rtas-relation-lookup" ) &&
+            fs::is_directory( root / "resource-relation-generations" ),
+            "Catalog resource index did not publish bounded VG and RTAS history indices" );
         Require( !fs::exists( root / "resource-index-scratch" ),
             "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
@@ -245,7 +250,32 @@ int main()
                 sizeof( associationRanges[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogRangeSet );
 
-            JnGpuCatalogBatchData associationBatches[4] {};
+            JnGpuCatalogVgRecordV1 associationVg[2] {};
+            associationVg[0].time = 50; associationVg[0].resourceId = 100;
+            associationVg[0].runtimeResourceId = 1000; associationVg[0].pageIndex = 1;
+            associationVg[1].time = 51; associationVg[1].resourceId = 100;
+            associationVg[1].runtimeResourceId = 1001; associationVg[1].pageIndex = 2;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogVg, 2, sizeof( associationVg[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogVg, 0, associationVg, 2,
+                sizeof( associationVg[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogVg );
+
+            JnGpuCatalogRelationRecordV1 associationRelations[3] {};
+            associationRelations[0].time = 60; associationRelations[0].sourceId = 100;
+            associationRelations[0].targetId = 102;
+            associationRelations[0].relation = uint8_t( JnGpuCatalogRelationKind::RtasUses );
+            associationRelations[1].time = 61; associationRelations[1].sourceId = 100;
+            associationRelations[1].targetId = 101; associationRelations[1].flags = 1;
+            associationRelations[1].relation = uint8_t( JnGpuCatalogRelationKind::RtasUses );
+            associationRelations[2].time = 62; associationRelations[2].sourceId = 100;
+            associationRelations[2].targetId = 101;
+            associationRelations[2].relation = uint8_t( JnGpuCatalogRelationKind::BackedBy );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogRelation, 3, sizeof( associationRelations[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogRelation, 0, associationRelations, 3,
+                sizeof( associationRelations[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogRelation );
+
+            JnGpuCatalogBatchData associationBatches[6] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
             associationBatches[0].recordCount = 3;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
@@ -258,8 +288,14 @@ int main()
             associationBatches[3].generation = 12; associationBatches[3].firstRecordIndex = 0;
             associationBatches[3].recordCount = 3;
             associationBatches[3].kind = uint8_t( JnGpuCatalogBatchKind::Part );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 4, sizeof( associationBatches[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 4,
+            associationBatches[4].generation = 13; associationBatches[4].firstRecordIndex = 0;
+            associationBatches[4].recordCount = 2;
+            associationBatches[4].kind = uint8_t( JnGpuCatalogBatchKind::VirtualGeometry );
+            associationBatches[5].generation = 14; associationBatches[5].firstRecordIndex = 0;
+            associationBatches[5].recordCount = 3;
+            associationBatches[5].kind = uint8_t( JnGpuCatalogBatchKind::Relation );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 6, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 6,
                 sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
@@ -311,6 +347,19 @@ int main()
             meshParts100.values[1].record.partKind == uint8_t( JnGpuCatalogPartKind::MeshIndex ) &&
             meshParts101.total == 0,
             "Catalog resource mesh-part history filtering changed" );
+        const auto vg100First = associationReader.ResourceVgPages( 100, 0, 1 );
+        const auto vg100Second = associationReader.ResourceVgPages( 100, 1, 1 );
+        const auto rtas100 = associationReader.ResourceRtasRelations( 100, 0, 10 );
+        const auto rtas101 = associationReader.ResourceRtasRelations( 101, 0, 10 );
+        Require( vg100First.total == 2 && vg100First.values.size() == 1 &&
+            vg100First.values[0].record.pageIndex == 1 && vg100First.values[0].generation == 13 &&
+            vg100Second.values.size() == 1 && vg100Second.values[0].record.pageIndex == 2,
+            "Catalog resource VG history paging changed" );
+        Require( rtas100.total == 1 && rtas100.values.size() == 1 &&
+            rtas100.values[0].record.targetId == 102 && rtas100.values[0].generation == 14 &&
+            rtas101.total == 1 && rtas101.values.size() == 1 &&
+            rtas101.values[0].record.sourceId == 100,
+            "Catalog RTAS relation history resolved-endpoint filtering changed" );
         associationReader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
