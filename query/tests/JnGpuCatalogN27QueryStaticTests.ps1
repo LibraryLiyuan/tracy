@@ -53,6 +53,11 @@ Require ($traceSource.Contains('ScanGpuMemoryUsesByResource')) `
     'TraceSource does not expose the bounded reverse ResourceSet sidecar.'
 Require ($queryIndex.Contains('ScanGpuMemoryUsesByResource')) `
     'Indexed Query does not provide bounded reverse ResourceSet lookup.'
+$allocationScan = [regex]::Match($queryIndex, 'ScanGpuMemoryAllocations[\s\S]*?BuildIndexedGpuMemoryAttribution').Value
+Require ($allocationScan.Contains('m_gpuReferenceIndex.UsesByResource')) `
+    'GPU allocation paging does not reuse the bounded reverse ResourceSet sidecar.'
+Require (-not $allocationScan.Contains('EnsureGpuResourcePassRefs')) `
+    'GPU allocation paging still materializes the complete resource-to-pass map.'
 Require ($service -match 'gpu\.resource\.raytracing_chain[\s\S]{0,4096}"has_more"') `
     'RTAS relation results are not paginated.'
 Require (($service | Select-String -Pattern 'resolvedPhysicalAllocationId' -AllMatches).Matches.Count -ge 3) `

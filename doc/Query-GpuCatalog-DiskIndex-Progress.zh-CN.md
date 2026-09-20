@@ -146,6 +146,12 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 新组件夹具覆盖乱序Pass对应的原始Use顺序、两页读取、结束/未结束Pass、缺失Pass、零Resource和scratch回收。真实小Catalog完成schema33冷建、深校验、热开和事务发布；其GPU Reference域为空。
 - 真实夹具GPU Reference Use section为896字节，三个空分页子表各224字节，完整独立输出84,547字节。Release全构建与CTest 41/41通过（126.79秒）。现有`ScanGpuMemoryAllocations`等其他入口仍会调用旧全量map，须随GPU Memory消费者继续迁移；本检查点不宣称GPU Reference路径整体完成。
 
+## 2026-09-20：GPU Allocation移除全量Pass引用缓存
+
+- `ScanGpuMemoryAllocations`改为逐条点读schema33的Resource反向索引，只读取精确总数和最多100个Pass预览；关系状态、`passRefCount`与`passIds`的现有响应语义保持不变。
+- Indexed Trace中的`EnsureGpuResourcePassRefs`、进程级`unordered_map<uint64_t, vector<...>>`及其`once_flag`已删除。GPU Reference的Resource反查不再存在把全部Use重新聚合到内存的入口。
+- 静态回归先验证旧路径会失败，再固定allocation查询必须使用磁盘sidecar且不得恢复全量Ensure。Release `tracy-query`构建和CTest 41/41通过（122.96秒）。本检查点未改变索引布局，schema保持33。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。
