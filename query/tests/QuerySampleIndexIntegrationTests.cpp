@@ -39,6 +39,8 @@ int main( int argc, char** argv )
         range.limit = size_t( originalInfo.counts.samples + originalInfo.counts.contextSwitchSamples );
         const auto expected = original->ScanSampleEvents( range );
         Require( expected.size() == range.limit, "fixture sample counts and scan disagree" );
+        const auto expectedGhostZones = original->ScanGhostZones( range );
+        const auto expectedSymbols = original->GetSymbols();
         original.reset();
 
         const auto manifest = tracy::query::QueryIndex::Build( input );
@@ -78,6 +80,48 @@ int main( int argc, char** argv )
                 actual[index].callstackRef == expected[index].callstackRef && actual[index].kind == expected[index].kind,
                 "indexed sample event changed" );
         }
+        const auto actualGhostZones = indexed->ScanGhostZones( range );
+        const auto actualSymbols = indexed->GetSymbols();
+        Require( actualGhostZones.size() == expectedGhostZones.size(),
+            "indexed compact Worker changed ghost-zone availability" );
+        for( size_t index = 0; index < expectedGhostZones.size(); index++ )
+        {
+            const auto& expectedZone = expectedGhostZones[index];
+            const auto& actualZone = actualGhostZones[index];
+            Require( actualZone.ref == expectedZone.ref && actualZone.threadRef == expectedZone.threadRef &&
+                actualZone.parentRef == expectedZone.parentRef && actualZone.startNs == expectedZone.startNs &&
+                actualZone.endNs == expectedZone.endNs && actualZone.name == expectedZone.name &&
+                actualZone.file == expectedZone.file && actualZone.line == expectedZone.line &&
+                actualZone.address == expectedZone.address && actualZone.depth == expectedZone.depth &&
+                actualZone.childCount == expectedZone.childCount && actualZone.inlineFrame == expectedZone.inlineFrame,
+                "indexed ghost zone changed" );
+        }
+        if( expectedGhostZones.size() >= 2 )
+        {
+            auto pageRange = range;
+            pageRange.offset = 1;
+            pageRange.limit = 1;
+            const auto page = indexed->ScanGhostZones( pageRange );
+            Require( page.size() == 1 && page.front().ref == expectedGhostZones[1].ref,
+                "indexed ghost-zone ordinal pagination changed" );
+        }
+        if( !expectedGhostZones.empty() )
+        {
+            auto timeRange = range;
+            timeRange.startNs = expectedGhostZones.front().startNs;
+            timeRange.endNs = expectedGhostZones.front().startNs + 1;
+            timeRange.offset = 0;
+            timeRange.limit = expectedGhostZones.size();
+            const auto expectedTime = originalInfo.counts.ghostZones == 0 ? std::vector<tracy::analysis::GhostZoneDto>() :
+                expectedGhostZones;
+            size_t intersections = 0;
+            for( const auto& zone : expectedTime )
+                if( zone.startNs < timeRange.endNs && zone.endNs > timeRange.startNs ) intersections++;
+            Require( indexed->ScanGhostZones( timeRange ).size() == intersections,
+                "indexed ghost-zone time pagination changed" );
+        }
+        Require( actualSymbols.size() == expectedSymbols.size(),
+            "indexed compact Worker changed symbol-statistics availability" );
         std::cout << "sample index integration passed records=" << actual.size() << '\n';
         return 0;
     }

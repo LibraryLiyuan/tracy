@@ -157,6 +157,7 @@ public:
     virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
     virtual void SampleRecord(uint64_t,uint8_t,uint64_t,int64_t,uint32_t){}
     virtual void SamplesEnd(uint64_t,uint8_t){}
+    virtual bool WantsGhostZones()const{return false;}
     virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
     virtual void CatalogStringsBegin(uint64_t){}
     virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
@@ -1296,7 +1297,9 @@ private:
     void UpdateSampleStatisticsImpl( const CallstackFrameData** frames, uint16_t framesCount, uint32_t count, const VarArray<CallstackFrameId>& cs );
     void CanonicalizeSampleStatistics();
     tracy_force_inline void GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<CallstackFrameId>& cs );
+    tracy_force_inline void GetStackWithInlines( Vector<InlineStackData>& ret, const CallstackFrameId* cs, size_t count );
     tracy_force_inline int AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone>* vec, uint64_t t );
+    tracy_force_inline int AddGhostZone( const CallstackFrameId* cs, size_t count, Vector<GhostZone>* vec, uint64_t t );
 #endif
 
     tracy_force_inline int64_t ReadTimeline( FileRead& f, ZoneEvent* zone, int64_t refTime, int32_t& childIdx );

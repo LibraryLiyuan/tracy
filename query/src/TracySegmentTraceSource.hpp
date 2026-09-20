@@ -98,6 +98,7 @@ public:
     std::vector<analysis::CpuContextSwitchDto> ScanCpuContextSwitchEvents( const analysis::ScanRange& range ) const override;
     std::vector<analysis::SampleDto> ScanSampleEvents( const analysis::ScanRange& range ) const override;
     std::vector<analysis::GhostZoneDto> ScanGhostZones( const analysis::ScanRange& range ) const override;
+    void EnumerateGhostZones( const std::function<bool( const analysis::GhostZoneDto& )>& visitor ) const override;
     std::vector<analysis::HardwareSampleDto> GetHardwareSamples() const override;
     std::vector<analysis::HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const override;
     std::vector<analysis::LockEventDto> ScanLockEvents( const analysis::ScanRange& range ) const override;

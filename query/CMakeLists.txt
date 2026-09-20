@@ -77,6 +77,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryCallstackStore.hpp
     src/TracyQuerySampleStore.cpp
     src/TracyQuerySampleStore.hpp
+    src/TracyQueryGhostZoneStore.cpp
+    src/TracyQueryGhostZoneStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
     src/TracyQueryStringStore.cpp

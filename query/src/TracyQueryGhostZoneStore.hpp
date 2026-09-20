@@ -1,0 +1,74 @@
+#ifndef __TRACYQUERYGHOSTZONESTORE_HPP__
+#define __TRACYQUERYGHOSTZONESTORE_HPP__
+
+#include "TracyQueryStringStore.hpp"
+#include "TracyTraceSource.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace tracy::query
+{
+
+inline constexpr uint32_t QueryGhostZoneStoreRecordBytes = 72;
+
+struct QueryGhostZoneRow
+{
+    uint64_t ordinal = 0;
+    uint64_t thread = 0;
+    std::optional<uint64_t> parent;
+    int64_t startNs = 0;
+    int64_t endNs = 0;
+    std::string name;
+    std::string file;
+    uint32_t line = 0;
+    std::string address;
+    uint32_t depth = 0;
+    uint32_t childCount = 0;
+    bool inlineFrame = false;
+};
+
+class QueryGhostZoneStoreWriter
+{
+public:
+    QueryGhostZoneStoreWriter( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
+    ~QueryGhostZoneStoreWriter();
+    QueryGhostZoneStoreWriter( const QueryGhostZoneStoreWriter& ) = delete;
+    QueryGhostZoneStoreWriter& operator=( const QueryGhostZoneStoreWriter& ) = delete;
+
+    void Begin( uint64_t count );
+    void Append( uint64_t ordinal, const analysis::GhostZoneDto& value );
+    void Commit();
+    uint64_t Count() const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+class QueryGhostZoneStoreReader
+{
+public:
+    QueryGhostZoneStoreReader( std::filesystem::path root, std::string sourceFingerprint,
+        analysis::PagedRecordOptions options = {} );
+    ~QueryGhostZoneStoreReader();
+    QueryGhostZoneStoreReader( const QueryGhostZoneStoreReader& ) = delete;
+    QueryGhostZoneStoreReader& operator=( const QueryGhostZoneStoreReader& ) = delete;
+
+    uint64_t Count() const;
+    std::vector<QueryGhostZoneRow> Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit ) const;
+    void ValidateAll();
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
+}
+
+#endif

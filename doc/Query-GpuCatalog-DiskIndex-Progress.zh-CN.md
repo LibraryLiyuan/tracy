@@ -285,6 +285,14 @@ JobStage也改为允许超大记录数的sidecar，compact payload不再保留�
 
 使用正式12428310213字节Trace执行一次非性能“索引构建诊断”：旧冻结Query在加载期失败；schema18版本已越过Sample与JobStage，最近一次观测Private Bytes约26832334848字节、Working Set约21071273984字节，随后仍以 `not enough memory to load trace` 失败。失败后本轮所有 `.s17/.s18` 临时索引均清理。此结果不是计划中的新版性能初评；下一确定方向是Catalog、字符串/调用栈及其派生结构继续外置。
 
+## 2026-09-20：schema39 Sample 派生 Ghost Zone 侧车
+
+- Query Sample sidecar 新增 Ghost Zone 记录与独立字符串侧车，Indexed 查询按有界分页读取 Ghost Zone；保留原始 thread/parent、时间、深度、childCount、inline frame 和名称/文件/地址字段。
+- `QueryIndex::Build`、深校验和 Indexed 热开均覆盖 Ghost Zone 侧车；小型真实 Sample 集成回归逐字段比较原 Worker 与 Indexed 结果，并覆盖 ordinal 分页和半开时间区间边界。
+- Indexed 热开在外置 Callstack 模式下跳过 Worker 的 Sample 统计、Ghost Zone 和符号派生背景任务，避免旧 Worker 重新读取已外置的调用栈 payload；侧车消费者继续提供 Query 结果。
+- schema39 协议断言已同步；Release `ALL_BUILD` 通过，CTest 42/42 通过（162.22 秒），独立 Sample 集成测试通过（6 条 Sample）。
+- 本检查点不宣称 P2 完成：冷建阶段 Ghost Zone 生成仍暂时依赖 Worker Sample 驻留，完整有界重建、Job 消费者、P5 以及 12.43 GB 综合验收仍待继续。
+
 ## 2026-09-18：Catalog原始表外置
 
 schema19新增GPU Catalog存储：12个固定域、Catalog字符串域和质量元数据分别使用压缩分页表，缺失域也发布空表；支持随机点读、冷重开、Trace身份拒绝与全块深校验。小型真实JNTRACYX夹具验证1001条资源及Batch/String计数，compact payload不再保留Catalog。Catalog分析索引与MCP消费者尚未迁移，当前明确返回INDEX_NOT_READY。

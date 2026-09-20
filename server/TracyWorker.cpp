@@ -1270,6 +1270,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
     int32_t childIdx = 0;
     const bool externalSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsSamples();
+    const bool retainGhostSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsGhostZones();
     f.Read( sz );
     m_data.threads.reserve_exact( sz, m_slab );
     for( uint64_t i=0; i<sz; i++ )
@@ -1343,13 +1344,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ssz );
         if(externalSamples)
         {
-            const bool retain = ( eventMask & EventType::Samples ) != 0;
+            const bool retain = ( eventMask & EventType::Samples ) != 0 || retainGhostSamples;
             if( retain ){m_data.samplesCnt+=ssz;td->samples.reserve_exact(ssz,m_slab);}
             m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());if(retain){td->samples[j].time.SetVal(refTime);td->samples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,0);
         }
         else if( ssz != 0 )
         {
-            if( eventMask & EventType::Samples )
+            if( ( eventMask & EventType::Samples ) || retainGhostSamples )
             {
                 m_data.samplesCnt += ssz;
                 int64_t refTime = 0;
@@ -2275,7 +2276,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                 m_data.gpuSourceLocationZonesReady = true;
             }
 
-            if( eventMask & EventType::Samples )
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
             {
                 jobs.emplace_back( std::thread( [this] {
                     unordered_flat_map<uint32_t, uint32_t> counts;
@@ -2348,7 +2349,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                     m_data.callstackSamplesReady = true;
                 } ) );
 
+            }
+
+            if( ( ( eventMask & EventType::Samples ) && !m_externalCallstackSource ) ||
+                ( m_serializedZoneSink && m_serializedZoneSink->WantsGhostZones() ) )
+            {
                 jobs.emplace_back( std::thread( [this] {
+                    try
+                    {
                     uint32_t gcnt = 0;
                     for( auto& t : m_data.threads )
                     {
@@ -2359,7 +2367,14 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                             {
                                 for( auto& sd : t->samples )
                                 {
-                                    gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, sd.time.Val() );
+                                    const auto callstack = sd.callstack.Val();
+                                    if( m_externalCallstackSource )
+                                    {
+                                        uint32_t count = 0;
+                                        const auto* frames = m_externalCallstackSource->Frames( callstack, count );
+                                        if( frames && count != 0 ) gcnt += AddGhostZone( frames, count, &t->ghostZones, sd.time.Val() );
+                                    }
+                                    else gcnt += AddGhostZone( GetCallstack( callstack ), &t->ghostZones, sd.time.Val() );
                                 }
                             }
                             else
@@ -2367,7 +2382,17 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                                 for( auto& sd : t->samples )
                                 {
                                     const auto st = sd.time.Val();
-                                    if( st != 0 ) gcnt += AddGhostZone( GetCallstack( sd.callstack.Val() ), &t->ghostZones, st );
+                                    if( st != 0 )
+                                    {
+                                        const auto callstack = sd.callstack.Val();
+                                        if( m_externalCallstackSource )
+                                        {
+                                            uint32_t count = 0;
+                                            const auto* frames = m_externalCallstackSource->Frames( callstack, count );
+                                            if( frames && count != 0 ) gcnt += AddGhostZone( frames, count, &t->ghostZones, st );
+                                        }
+                                        else gcnt += AddGhostZone( GetCallstack( callstack ), &t->ghostZones, st );
+                                    }
                                 }
                             }
                         }
@@ -2375,8 +2400,17 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
                     std::lock_guard<std::mutex> lock( m_data.lock );
                     m_data.ghostZonesReady = true;
                     m_data.ghostCnt = gcnt;
+                    }
+                    catch( const std::exception& error )
+                    {
+                        fprintf( stderr, "ghost-zone reconstruction failed: %s\n", error.what() );
+                    }
                 } ) );
 
+            }
+
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
+            {
                 jobs.emplace_back( std::thread( [this] {
                     for( auto& t : m_data.threads )
                     {
@@ -6153,19 +6187,40 @@ void Worker::HandlePostponedSamples()
 
 void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<CallstackFrameId>& cs )
 {
+    GetStackWithInlines( ret, cs.empty() ? nullptr : cs.data(), cs.size() );
+}
+
+void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const CallstackFrameId* cs, size_t count )
+{
     ret.clear();
-    int idx = cs.size() - 1;
+    if( !cs || count == 0 ) return;
+    int idx = int( count ) - 1;
     do
     {
         auto& entry = cs[idx];
-        const auto frame = GetCallstackFrame( entry );
-        if( frame )
+        SerializedCallstackSource::FrameView externalFrame;
+        const CallstackFrame* frameData = nullptr;
+        uint8_t frameCount = 0;
+        if( m_externalCallstackSource )
         {
-            uint8_t i = frame->size;
+            if( m_externalCallstackSource->Frame( entry, externalFrame ) )
+            {
+                frameData = externalFrame.frames;
+                frameCount = externalFrame.count;
+            }
+        }
+        else if( const auto* frame = GetCallstackFrame( entry ) )
+        {
+            frameData = frame->data;
+            frameCount = frame->size;
+        }
+        if( frameData && frameCount != 0 )
+        {
+            uint8_t i = frameCount;
             do
             {
                 i--;
-                ret.push_back( InlineStackData { frame->data[i].symAddr, entry, i } );
+                ret.push_back( InlineStackData { frameData[i].symAddr, entry, i } );
             }
             while( i != 0 );
         }
@@ -6179,7 +6234,12 @@ void Worker::GetStackWithInlines( Vector<InlineStackData>& ret, const VarArray<C
 
 int Worker::AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone>* vec, uint64_t t )
 {
-    GetStackWithInlines( m_inlineStack, cs );
+    return AddGhostZone( cs.empty() ? nullptr : cs.data(), cs.size(), vec, t );
+}
+
+int Worker::AddGhostZone( const CallstackFrameId* cs, size_t count, Vector<GhostZone>* vec, uint64_t t )
+{
+    GetStackWithInlines( m_inlineStack, cs, count );
 
     if( !vec->empty() && vec->back().end.Val() > (int64_t)t )
     {
@@ -6201,9 +6261,24 @@ int Worker::AddGhostZone( const VarArray<CallstackFrameId>& cs, Vector<GhostZone
     {
         auto& back = vec->back();
         const auto& backKey = m_data.ghostFrames[back.frame.Val()];
-        const auto backFrame = GetCallstackFrame( backKey.frame );
-        if( !backFrame ) break;
-        const auto& inlineFrame = backFrame->data[backKey.inlineFrame];
+        SerializedCallstackSource::FrameView externalFrame;
+        const CallstackFrame* frameData = nullptr;
+        uint8_t frameCount = 0;
+        if( m_externalCallstackSource )
+        {
+            if( m_externalCallstackSource->Frame( backKey.frame, externalFrame ) )
+            {
+                frameData = externalFrame.frames;
+                frameCount = externalFrame.count;
+            }
+        }
+        else if( const auto* backFrame = GetCallstackFrame( backKey.frame ) )
+        {
+            frameData = backFrame->data;
+            frameCount = backFrame->size;
+        }
+        if( !frameData || backKey.inlineFrame >= frameCount ) break;
+        const auto& inlineFrame = frameData[backKey.inlineFrame];
         if( inlineFrame.symAddr != m_inlineStack[idx].symAddr ) break;
         if( back.end.Val() != refBackTime ) break;
         back.end.SetVal( t + m_samplingPeriod );
