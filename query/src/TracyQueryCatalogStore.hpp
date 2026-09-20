@@ -3,6 +3,7 @@
 
 #include "TracyOfflineCatalog.hpp"
 #include "TracyPagedRecordStore.hpp"
+#include "TracyQueryGpuReferenceStore.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -152,6 +153,34 @@ struct QueryCatalogGpuMemorySummary
 
 static_assert( sizeof( QueryCatalogGpuMemorySummary ) == 56 );
 
+struct QueryCatalogResourcePointerInterval
+{
+    uint64_t pointerToken = 0;
+    uint64_t resourceId = 0;
+    int64_t begin = 0;
+    int64_t end = 0;
+};
+
+static_assert( sizeof( QueryCatalogResourcePointerInterval ) == 32 );
+
+struct QueryCatalogPointerIntervalPage
+{
+    std::vector<QueryCatalogResourcePointerInterval> values;
+    uint64_t total = 0;
+};
+
+struct QueryCatalogRangeData
+{
+    JnGpuRangeSetRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogRangePage
+{
+    std::vector<QueryCatalogRangeData> values;
+    uint64_t total = 0;
+};
+
 class QueryCatalogStatusSource
 {
 public:
@@ -182,6 +211,15 @@ public:
     virtual QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
         uint64_t passId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogGpuMemorySummary GetQueryCatalogGpuMemorySummary() const = 0;
+    virtual uint64_t ResolveQueryCatalogResourcePointer( uint64_t pointerToken, int64_t time ) const = 0;
+    virtual QueryCatalogPointerIntervalPage GetQueryCatalogResourcePointerIntervals(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogRangePage GetQueryCatalogResourceRanges(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogRangePage GetQueryCatalogPassRanges(
+        uint64_t passId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryGpuReferenceUsePage GetQueryCatalogResourceUses(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -238,6 +276,11 @@ public:
     QueryCatalogRelationPage ResourceRtasRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogEvidencePage PassEvidence( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryCatalogGpuMemorySummary GpuMemorySummary() const;
+    uint64_t ResolveResourcePointer( uint64_t pointerToken, int64_t time ) const;
+    QueryCatalogPointerIntervalPage ResourcePointerIntervals(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogRangePage ResourceRanges( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogRangePage PassRanges( uint64_t passId, uint64_t offset, size_t limit ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:

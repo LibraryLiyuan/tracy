@@ -192,15 +192,16 @@ int main()
             associationWriter.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
             JnGpuCatalogResourceRecordV1 associationResources[5] {};
             associationResources[0].time = 1; associationResources[0].resourceId = 100;
-            associationResources[0].allocationId = 500;
+            associationResources[0].allocationId = 500; associationResources[0].pointerToken = 1000;
             associationResources[1].time = 2; associationResources[1].resourceId = 101;
-            associationResources[1].allocationId = 500;
+            associationResources[1].allocationId = 500; associationResources[1].pointerToken = 1001;
             associationResources[2].time = 3; associationResources[2].resourceId = 102;
-            associationResources[2].allocationId = 600;
+            associationResources[2].allocationId = 600; associationResources[2].pointerToken = 1002;
             associationResources[3].time = 4; associationResources[3].resourceId = 102;
+            associationResources[3].pointerToken = 1002;
             associationResources[3].operation = uint8_t( JnGpuCatalogRecordOperation::Destroy );
             associationResources[4].time = 5; associationResources[4].resourceId = 102;
-            associationResources[4].allocationId = 600;
+            associationResources[4].allocationId = 600; associationResources[4].pointerToken = 1002;
             associationWriter.Begin( OfflineCatalogDomain::CatalogResource, 5, sizeof( associationResources[0] ) );
             associationWriter.Append( OfflineCatalogDomain::CatalogResource, 0, associationResources, 5,
                 sizeof( associationResources[0] ) );
@@ -252,8 +253,8 @@ int main()
             associationWriter.End( OfflineCatalogDomain::CatalogLogical );
 
             JnGpuRangeSetRecordV1 associationRanges[2] {};
-            associationRanges[0].resourceId = 100;
-            associationRanges[1].resourceId = 102;
+            associationRanges[0].resourceId = 100; associationRanges[0].passInstanceId = 300;
+            associationRanges[1].resourceId = 102; associationRanges[1].passInstanceId = 300;
             associationWriter.Begin( OfflineCatalogDomain::CatalogRangeSet, 2, sizeof( associationRanges[0] ) );
             associationWriter.Append( OfflineCatalogDomain::CatalogRangeSet, 0, associationRanges, 2,
                 sizeof( associationRanges[0] ) );
@@ -301,7 +302,7 @@ int main()
                 associationEvidence, 2, sizeof( associationEvidence[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogDetailedEvidence );
 
-            JnGpuCatalogBatchData associationBatches[7] {};
+            JnGpuCatalogBatchData associationBatches[8] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
             associationBatches[0].recordCount = 5;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
@@ -323,8 +324,11 @@ int main()
             associationBatches[6].generation = 15; associationBatches[6].firstRecordIndex = 0;
             associationBatches[6].recordCount = 2;
             associationBatches[6].kind = uint8_t( JnGpuCatalogBatchKind::DetailedEvidence );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 7, sizeof( associationBatches[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 7,
+            associationBatches[7].generation = 16; associationBatches[7].firstRecordIndex = 0;
+            associationBatches[7].recordCount = 2;
+            associationBatches[7].kind = uint8_t( JnGpuCatalogBatchKind::RangeSet );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 8, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 8,
                 sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
@@ -343,6 +347,9 @@ int main()
         const auto associations101 = associationReader.ResourceAssociations( 101 );
         const auto associations102 = associationReader.ResourceAssociations( 102 );
         const auto recreated102 = associationReader.ResourceState( 102 );
+        const auto pointer102 = associationReader.ResourcePointerIntervals( 102, 0, 10 );
+        const auto ranges100 = associationReader.ResourceRanges( 100, 0, 10 );
+        const auto passRanges = associationReader.PassRanges( 300, 0, 10 );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
@@ -355,6 +362,20 @@ int main()
             associations102->allocationResourceCount == 1 && recreated102 && recreated102->aliveAtEnd &&
             recreated102->destroyTime == 0 && !associationReader.ResourceAssociations( 999 ),
             "Catalog resource association index changed unique-allocation or missing-key semantics" );
+        Require( pointer102.total == 2 && pointer102.values.size() == 2 &&
+            pointer102.values[0].pointerToken == 1002 && pointer102.values[0].begin == 3 &&
+            pointer102.values[0].end == 4 && pointer102.values[1].begin == 5 &&
+            associationReader.ResolveResourcePointer( 1002, 3 ) == 102 &&
+            associationReader.ResolveResourcePointer( 1002, 4 ) == 102 &&
+            associationReader.ResolveResourcePointer( 1002, 5 ) == 102 &&
+            associationReader.ResolveResourcePointer( 1002, 2 ) == 0,
+            "Catalog pointer lifetime index changed boundary or reconnect semantics" );
+        Require( ranges100.total == 1 && ranges100.values.size() == 1 &&
+            ranges100.values[0].record.resourceId == 100 &&
+            ranges100.values[0].record.passInstanceId == 300 &&
+            ranges100.values[0].generation == 16 && passRanges.total == 2 &&
+            passRanges.values.size() == 2 && passRanges.values[1].record.resourceId == 102,
+            "Catalog RangeSet resource/pass lookup changed paging or generation semantics" );
         const auto allocations100First = associationReader.ResourceAllocations( 100, 0, 1 );
         const auto allocations100Second = associationReader.ResourceAllocations( 100, 1, 1 );
         const auto allocations102 = associationReader.ResourceAllocations( 102, 0, 10 );

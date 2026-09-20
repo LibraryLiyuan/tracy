@@ -93,11 +93,19 @@ int main( int argc, char** argv )
         const auto gpuReferenceUseRoot = manifest.manifestPath.parent_path() /
             json.at( "sections" ).at( "gpu_reference_use" ).at( "file" ).get<std::string>();
         Require( fs::is_directory( gpuReferenceUseRoot / "by-resource" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "by-catalog-resource" ) &&
             fs::is_directory( gpuReferenceUseRoot / "pass-times" ) &&
             fs::is_directory( gpuReferenceUseRoot / "resolved-uses" ),
             "Query index did not publish bounded GPU-reference reverse indices" );
         Require( !fs::exists( catalogRoot / "resource-index-scratch" ),
             "Query index published completed Catalog resource scratch files" );
+        Require( fs::is_directory( catalogRoot / "resource-pointer-intervals" ) &&
+            fs::is_directory( catalogRoot / "pointer-interval-by-pointer" ) &&
+            fs::is_directory( catalogRoot / "pointer-interval-by-resource" ) &&
+            fs::is_directory( catalogRoot / "resource-range-lookup" ) &&
+            fs::is_directory( catalogRoot / "pass-range-lookup" ) &&
+            fs::is_directory( catalogRoot / "range-generations" ),
+            "Query index did not publish bounded resource lifetime and RangeSet indices" );
         {
             query::QueryCatalogStoreReader reader( catalogRoot, manifest.sourceFingerprint );
             Require( reader.Count( OfflineCatalogDomain::CatalogResource ) == expectedResources,

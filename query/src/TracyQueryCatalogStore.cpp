@@ -8,6 +8,7 @@
 
 #include <array>
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <exception>
 #include <fstream>
@@ -100,6 +101,12 @@ std::filesystem::path PassEvidenceLookupPath( const std::filesystem::path& root 
 std::filesystem::path DetailedEvidenceGenerationPath( const std::filesystem::path& root ) { return root / "detailed-evidence-generations"; }
 std::filesystem::path ResourceStringLookupPath( const std::filesystem::path& root ) { return root / "resource-string-lookup"; }
 std::filesystem::path GpuMemorySummaryPath( const std::filesystem::path& root ) { return root / "gpu-memory-summary"; }
+std::filesystem::path ResourcePointerIntervalPath( const std::filesystem::path& root ) { return root / "resource-pointer-intervals"; }
+std::filesystem::path PointerIntervalPointerLookupPath( const std::filesystem::path& root ) { return root / "pointer-interval-by-pointer"; }
+std::filesystem::path PointerIntervalResourceLookupPath( const std::filesystem::path& root ) { return root / "pointer-interval-by-resource"; }
+std::filesystem::path ResourceRangeLookupPath( const std::filesystem::path& root ) { return root / "resource-range-lookup"; }
+std::filesystem::path PassRangeLookupPath( const std::filesystem::path& root ) { return root / "pass-range-lookup"; }
+std::filesystem::path RangeGenerationPath( const std::filesystem::path& root ) { return root / "range-generations"; }
 
 uint64_t SortableSignedTime( int64_t value )
 {
@@ -108,7 +115,7 @@ uint64_t SortableSignedTime( int64_t value )
 
 int64_t SignedTimeFromSortable( uint64_t value )
 {
-    return int64_t( value ^ ( uint64_t( 1 ) << 63 ) );
+    return std::bit_cast<int64_t>( value ^ ( uint64_t( 1 ) << 63 ) );
 }
 
 bool IsCatalogDefinition( JnGpuCatalogRecordOperation operation )
@@ -288,6 +295,13 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceStringLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawStrings;
     mutable std::unique_ptr<analysis::PagedRecordReader> gpuMemorySummary;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourcePointerIntervals;
+    mutable std::unique_ptr<analysis::PagedRecordReader> pointerIntervalByPointer;
+    mutable std::unique_ptr<analysis::PagedRecordReader> pointerIntervalByResource;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourceRangeLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> passRangeLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> rangeGenerations;
+    mutable std::unique_ptr<analysis::PagedRecordReader> rawRanges;
 
     void EnsureResourceIndex() const
     {
@@ -367,6 +381,28 @@ struct QueryCatalogStoreReader::Impl
         if( !gpuMemorySummary ) gpuMemorySummary = std::make_unique<analysis::PagedRecordReader>(
             GpuMemorySummaryPath( root ), CatalogIdentity( sourceFingerprint, "gpu-memory-summary-v1" ),
             uint32_t( sizeof( QueryCatalogGpuMemorySummary ) ), options );
+        if( !resourcePointerIntervals ) resourcePointerIntervals = std::make_unique<analysis::PagedRecordReader>(
+            ResourcePointerIntervalPath( root ), CatalogIdentity( sourceFingerprint, "resource-pointer-intervals-v1" ),
+            uint32_t( sizeof( QueryCatalogResourcePointerInterval ) ), options );
+        if( !pointerIntervalByPointer ) pointerIntervalByPointer = std::make_unique<analysis::PagedRecordReader>(
+            PointerIntervalPointerLookupPath( root ), CatalogIdentity( sourceFingerprint, "pointer-interval-by-pointer-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !pointerIntervalByResource ) pointerIntervalByResource = std::make_unique<analysis::PagedRecordReader>(
+            PointerIntervalResourceLookupPath( root ), CatalogIdentity( sourceFingerprint, "pointer-interval-by-resource-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !resourceRangeLookup ) resourceRangeLookup = std::make_unique<analysis::PagedRecordReader>(
+            ResourceRangeLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-range-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !passRangeLookup ) passRangeLookup = std::make_unique<analysis::PagedRecordReader>(
+            PassRangeLookupPath( root ), CatalogIdentity( sourceFingerprint, "pass-range-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !rangeGenerations ) rangeGenerations = std::make_unique<analysis::PagedRecordReader>(
+            RangeGenerationPath( root ), CatalogIdentity( sourceFingerprint, "range-generations-v1" ),
+            uint32_t( sizeof( uint64_t ) ), options );
+        if( !rawRanges ) rawRanges = std::make_unique<analysis::PagedRecordReader>(
+            DomainPath( root, OfflineCatalogDomain::CatalogRangeSet ),
+            CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
+            uint32_t( sizeof( JnGpuRangeSetRecordV1 ) ), options );
     }
 };
 
@@ -499,6 +535,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto detailedEvidenceGenerationOutput = DetailedEvidenceGenerationPath( m_impl->root );
     const auto stringOutput = ResourceStringLookupPath( m_impl->root );
     const auto gpuMemorySummaryOutput = GpuMemorySummaryPath( m_impl->root );
+    const auto pointerIntervalsOutput = ResourcePointerIntervalPath( m_impl->root );
+    const auto pointerByPointerOutput = PointerIntervalPointerLookupPath( m_impl->root );
+    const auto pointerByResourceOutput = PointerIntervalResourceLookupPath( m_impl->root );
+    const auto resourceRangeLookupOutput = ResourceRangeLookupPath( m_impl->root );
+    const auto passRangeLookupOutput = PassRangeLookupPath( m_impl->root );
+    const auto rangeGenerationOutput = RangeGenerationPath( m_impl->root );
     if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( associationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( allocationLookupOutput ) ) ||
@@ -515,6 +557,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::filesystem::exists( analysis::AnalysisIoPath( detailedEvidenceGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( stringOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( gpuMemorySummaryOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( pointerIntervalsOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( pointerByPointerOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( pointerByResourceOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( resourceRangeLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( passRangeLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( rangeGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
         throw std::runtime_error( "Catalog resource index already exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
@@ -547,6 +595,14 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto allocationTimelineSorted = scratchRoot / "allocation-timeline-sorted.work";
     const auto physicalEventSource = scratchRoot / "physical-event-source.work";
     const auto physicalEventSorted = scratchRoot / "physical-event-sorted.work";
+    const auto pointerByPointerSource = scratchRoot / "pointer-by-pointer-source.work";
+    const auto pointerByPointerSorted = scratchRoot / "pointer-by-pointer-sorted.work";
+    const auto pointerByResourceSource = scratchRoot / "pointer-by-resource-source.work";
+    const auto pointerByResourceSorted = scratchRoot / "pointer-by-resource-sorted.work";
+    const auto resourceRangeLookupSource = scratchRoot / "resource-range-lookup-source.work";
+    const auto resourceRangeLookupSorted = scratchRoot / "resource-range-lookup-sorted.work";
+    const auto passRangeLookupSource = scratchRoot / "pass-range-lookup-source.work";
+    const auto passRangeLookupSorted = scratchRoot / "pass-range-lookup-sorted.work";
     std::string sortError;
     const auto cleanup = [&]( bool outputs ) -> std::string {
         std::string failure;
@@ -574,6 +630,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             remove( detailedEvidenceGenerationOutput, "Catalog detailed evidence generation cleanup failed" );
             remove( stringOutput, "Catalog resource string cleanup failed" );
             remove( gpuMemorySummaryOutput, "Catalog GPU memory summary cleanup failed" );
+            remove( pointerIntervalsOutput, "Catalog pointer interval cleanup failed" );
+            remove( pointerByPointerOutput, "Catalog pointer lookup cleanup failed" );
+            remove( pointerByResourceOutput, "Catalog resource interval lookup cleanup failed" );
+            remove( resourceRangeLookupOutput, "Catalog resource range lookup cleanup failed" );
+            remove( passRangeLookupOutput, "Catalog pass range lookup cleanup failed" );
+            remove( rangeGenerationOutput, "Catalog range generation cleanup failed" );
         }
         return failure;
     };
@@ -603,6 +665,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         analysis::PagedRecordReader evidenceRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogDetailedEvidence ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
             sizeof( JnGpuDetailedEvidenceRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader rangeRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRangeSet ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
+            sizeof( JnGpuRangeSetRecordV1 ), m_impl->options );
         {
             analysis::PagedRecordWriter resourceGenerations( resourceGenerationsPath,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ),
@@ -698,6 +763,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             "resource-relation-generations-v1", "Catalog relation" );
         buildGenerations( JnGpuCatalogBatchKind::DetailedEvidence, evidenceRows.Count(),
             detailedEvidenceGenerationOutput, "detailed-evidence-generations-v1", "Catalog detailed evidence" );
+        buildGenerations( JnGpuCatalogBatchKind::RangeSet, rangeRows.Count(), rangeGenerationOutput,
+            "range-generations-v1", "Catalog RangeSet" );
 
         std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
@@ -803,6 +870,86 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             allocationPairs.flush();
             if( !allocationPairs ) throw std::runtime_error( "Catalog allocation pair source flush failed" );
             allocationPairs.close();
+        }
+
+        uint64_t pointerByPointerCount = 0;
+        uint64_t pointerByResourceCount = 0;
+        {
+            std::ifstream sortedPairs( analysis::AnalysisIoPath( resourcePairsSorted ), std::ios::binary );
+            std::ofstream byPointer( analysis::AnalysisIoPath( pointerByPointerSource ),
+                std::ios::binary | std::ios::trunc );
+            std::ofstream byResource( analysis::AnalysisIoPath( pointerByResourceSource ),
+                std::ios::binary | std::ios::trunc );
+            if( !sortedPairs || !byPointer || !byResource )
+                throw std::runtime_error( "Catalog pointer lifetime intermediates cannot be opened" );
+            analysis::PagedRecordWriter intervals( pointerIntervalsOutput,
+                CatalogIdentity( m_impl->sourceFingerprint, "resource-pointer-intervals-v1" ),
+                sizeof( QueryCatalogResourcePointerInterval ), m_impl->options );
+            QueryCatalogResourcePointerInterval active {};
+            uint64_t activeResource = 0;
+            bool haveActive = false;
+            uint64_t intervalOrdinal = 0;
+            const auto flush = [&] {
+                if( !haveActive ) return;
+                intervals.Append( &active, 1 );
+                analysis::AnalysisKeyMetadataRecord pointerLookup {};
+                pointerLookup.keyHigh = active.pointerToken;
+                pointerLookup.keyLow = SortableSignedTime( active.begin );
+                pointerLookup.metadata = intervalOrdinal;
+                analysis::AnalysisKeyMetadataRecord resourceLookup {};
+                resourceLookup.keyHigh = active.resourceId;
+                resourceLookup.keyLow = SortableSignedTime( active.begin );
+                resourceLookup.metadata = intervalOrdinal;
+                analysis::AnalysisDiskGrow( m_impl->options.disk,
+                    sizeof( pointerLookup ) + sizeof( resourceLookup ) );
+                byPointer.write( reinterpret_cast<const char*>( &pointerLookup ), sizeof( pointerLookup ) );
+                byResource.write( reinterpret_cast<const char*>( &resourceLookup ), sizeof( resourceLookup ) );
+                if( !byPointer || !byResource )
+                    throw std::runtime_error( "Catalog pointer lifetime lookup write failed" );
+                pointerByPointerCount++;
+                pointerByResourceCount++;
+                intervalOrdinal++;
+                haveActive = false;
+            };
+            analysis::AnalysisUInt64Pair pair {};
+            while( sortedPairs.read( reinterpret_cast<char*>( &pair ), sizeof( pair ) ) )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( "Catalog pointer lifetime index cancelled" );
+                if( pair.key != activeResource )
+                {
+                    flush();
+                    activeResource = pair.key;
+                }
+                JnGpuCatalogResourceRecordV1 row {};
+                resourceRows.Read( pair.value, &row, 1 );
+                if( row.resourceId != pair.key || row.pointerToken == 0 ) continue;
+                const auto operation = JnGpuCatalogRecordOperation( row.operation );
+                if( operation == JnGpuCatalogRecordOperation::Create ||
+                    operation == JnGpuCatalogRecordOperation::Open ||
+                    operation == JnGpuCatalogRecordOperation::Snapshot )
+                {
+                    flush();
+                    active.pointerToken = row.pointerToken;
+                    active.resourceId = row.resourceId;
+                    active.begin = operation == JnGpuCatalogRecordOperation::Create ? row.time :
+                        std::numeric_limits<int64_t>::min();
+                    active.end = std::numeric_limits<int64_t>::max();
+                    haveActive = true;
+                }
+                else if( operation == JnGpuCatalogRecordOperation::Destroy && haveActive )
+                {
+                    active.end = row.time;
+                    flush();
+                }
+            }
+            if( !sortedPairs.eof() ) throw std::runtime_error( "Catalog pointer lifetime source read failed" );
+            flush();
+            intervals.Commit();
+            byPointer.flush();
+            byResource.flush();
+            if( !byPointer || !byResource )
+                throw std::runtime_error( "Catalog pointer lifetime lookup flush failed" );
         }
 
         if( !analysis::SortAnalysisUInt64Pairs( allocationPairsSource, allocationPairsSorted, scratchRoot,
@@ -1277,6 +1424,14 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             [&]( uint64_t ordinal ) { JnGpuCatalogVgRecordV1 row {}; vgRows.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId != 0; },
             []( const auto& row ) { return row.resourceId; }, "Catalog VG" );
+        const auto resourceRangeLookupCount = writeLookupSource( resourceRangeLookupSource, rangeRows.Count(),
+            [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rangeRows.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId != 0; },
+            []( const auto& row ) { return row.resourceId; }, "Catalog resource RangeSet" );
+        const auto passRangeLookupCount = writeLookupSource( passRangeLookupSource, rangeRows.Count(),
+            [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rangeRows.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.passInstanceId != 0; },
+            []( const auto& row ) { return row.passInstanceId; }, "Catalog pass RangeSet" );
         std::ofstream rtasRelationSource( analysis::AnalysisIoPath( rtasRelationLookupSource ),
             std::ios::binary | std::ios::trunc );
         if( !rtasRelationSource ) throw std::runtime_error( "Catalog RTAS relation lookup source cannot be opened" );
@@ -1373,6 +1528,18 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         publishLookup( passEvidenceLookupSource, passEvidenceLookupSorted, passEvidenceLookupOutput,
             "catalog-pass-evidence-lookup", "pass-evidence-lookup-v1",
             passEvidenceLookupCount, "Catalog pass evidence" );
+        publishLookup( pointerByPointerSource, pointerByPointerSorted, pointerByPointerOutput,
+            "catalog-pointer-interval-by-pointer", "pointer-interval-by-pointer-v1",
+            pointerByPointerCount, "Catalog pointer interval" );
+        publishLookup( pointerByResourceSource, pointerByResourceSorted, pointerByResourceOutput,
+            "catalog-pointer-interval-by-resource", "pointer-interval-by-resource-v1",
+            pointerByResourceCount, "Catalog resource pointer interval" );
+        publishLookup( resourceRangeLookupSource, resourceRangeLookupSorted, resourceRangeLookupOutput,
+            "catalog-resource-range-lookup", "resource-range-lookup-v1",
+            resourceRangeLookupCount, "Catalog resource RangeSet" );
+        publishLookup( passRangeLookupSource, passRangeLookupSorted, passRangeLookupOutput,
+            "catalog-pass-range-lookup", "pass-range-lookup-v1",
+            passRangeLookupCount, "Catalog pass RangeSet" );
 
         analysis::PagedRecordReader stringRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
@@ -1828,6 +1995,179 @@ QueryCatalogGpuMemorySummary QueryCatalogStoreReader::GpuMemorySummary() const
     return result;
 }
 
+uint64_t QueryCatalogStoreReader::ResolveResourcePointer( uint64_t pointerToken, int64_t time ) const
+{
+    if( pointerToken == 0 ) return 0;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->pointerIntervalByPointer;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < pointerToken || ( upper && row.keyHigh == pointerToken ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    uint64_t resolved = 0;
+    for( auto index = rangeBegin; index < rangeEnd; index++ )
+    {
+        if( ( index & 4095 ) == 0 && m_impl->options.cancelled && m_impl->options.cancelled() )
+            throw std::runtime_error( "Catalog pointer resolution cancelled" );
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->resourcePointerIntervals->Count() )
+            throw std::runtime_error( "Catalog pointer interval ordinal mismatch" );
+        QueryCatalogResourcePointerInterval interval {};
+        m_impl->resourcePointerIntervals->Read( row.metadata, &interval, 1 );
+        if( interval.pointerToken != pointerToken )
+            throw std::runtime_error( "Catalog pointer interval identity mismatch" );
+        if( time < interval.begin || time > interval.end ) continue;
+        if( resolved != 0 && resolved != interval.resourceId ) return 0;
+        resolved = interval.resourceId;
+    }
+    return resolved;
+}
+
+QueryCatalogPointerIntervalPage QueryCatalogStoreReader::ResourcePointerIntervals(
+    uint64_t resourceId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogPointerIntervalPage result;
+    if( resourceId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->pointerIntervalByResource;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < resourceId || ( upper && row.keyHigh == resourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->resourcePointerIntervals->Count() )
+            throw std::runtime_error( "Catalog resource pointer interval ordinal mismatch" );
+        QueryCatalogResourcePointerInterval interval {};
+        m_impl->resourcePointerIntervals->Read( row.metadata, &interval, 1 );
+        if( interval.resourceId != resourceId )
+            throw std::runtime_error( "Catalog resource pointer interval identity mismatch" );
+        result.values.emplace_back( interval );
+    }
+    return result;
+}
+
+QueryCatalogRangePage QueryCatalogStoreReader::ResourceRanges(
+    uint64_t resourceId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogRangePage result;
+    if( resourceId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourceRangeLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < resourceId || ( upper && row.keyHigh == resourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawRanges->Count() || row.metadata >= m_impl->rangeGenerations->Count() )
+            throw std::runtime_error( "Catalog resource RangeSet ordinal mismatch" );
+        QueryCatalogRangeData value {};
+        m_impl->rawRanges->Read( row.metadata, &value.record, 1 );
+        m_impl->rangeGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.resourceId != resourceId )
+            throw std::runtime_error( "Catalog resource RangeSet identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
+QueryCatalogRangePage QueryCatalogStoreReader::PassRanges(
+    uint64_t passId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogRangePage result;
+    if( passId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->passRangeLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < passId || ( upper && row.keyHigh == passId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawRanges->Count() || row.metadata >= m_impl->rangeGenerations->Count() )
+            throw std::runtime_error( "Catalog pass RangeSet ordinal mismatch" );
+        QueryCatalogRangeData value {};
+        m_impl->rawRanges->Read( row.metadata, &value.record, 1 );
+        m_impl->rangeGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.passInstanceId != passId )
+            throw std::runtime_error( "Catalog pass RangeSet identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;
@@ -1886,6 +2226,12 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool detailedEvidenceGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( DetailedEvidenceGenerationPath( m_impl->root ) ) );
     const bool stringsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceStringLookupPath( m_impl->root ) ) );
     const bool gpuMemorySummaryPresent = std::filesystem::exists( analysis::AnalysisIoPath( GpuMemorySummaryPath( m_impl->root ) ) );
+    const bool pointerIntervalsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourcePointerIntervalPath( m_impl->root ) ) );
+    const bool pointerByPointerPresent = std::filesystem::exists( analysis::AnalysisIoPath( PointerIntervalPointerLookupPath( m_impl->root ) ) );
+    const bool pointerByResourcePresent = std::filesystem::exists( analysis::AnalysisIoPath( PointerIntervalResourceLookupPath( m_impl->root ) ) );
+    const bool resourceRangeLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRangeLookupPath( m_impl->root ) ) );
+    const bool passRangeLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( PassRangeLookupPath( m_impl->root ) ) );
+    const bool rangeGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( RangeGenerationPath( m_impl->root ) ) );
     if( resourcesPresent != stringsPresent || resourcesPresent != associationsPresent ||
         resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent ||
         resourcesPresent != gpuMemorySummaryPresent )
@@ -1897,6 +2243,10 @@ void QueryCatalogStoreReader::ValidateAll() const
         resourcesPresent != rtasRelationLookupPresent || resourcesPresent != relationGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != passEvidenceLookupPresent || resourcesPresent != detailedEvidenceGenerationsPresent )
+        throw std::runtime_error( "Catalog resource index is incomplete" );
+    if( resourcesPresent != pointerIntervalsPresent || resourcesPresent != pointerByPointerPresent ||
+        resourcesPresent != pointerByResourcePresent || resourcesPresent != resourceRangeLookupPresent ||
+        resourcesPresent != passRangeLookupPresent || resourcesPresent != rangeGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent )
     {
@@ -1921,6 +2271,27 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader gpuMemorySummary( GpuMemorySummaryPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "gpu-memory-summary-v1" ),
             sizeof( QueryCatalogGpuMemorySummary ), m_impl->options );
+        analysis::PagedRecordReader pointerIntervals( ResourcePointerIntervalPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-pointer-intervals-v1" ),
+            sizeof( QueryCatalogResourcePointerInterval ), m_impl->options );
+        analysis::PagedRecordReader pointerByPointer( PointerIntervalPointerLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "pointer-interval-by-pointer-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader pointerByResource( PointerIntervalResourceLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "pointer-interval-by-resource-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader resourceRangeLookup( ResourceRangeLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-range-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader passRangeLookup( PassRangeLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "pass-range-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader rangeGenerations( RangeGenerationPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "range-generations-v1" ),
+            sizeof( uint64_t ), m_impl->options );
+        analysis::PagedRecordReader rawRanges( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRangeSet ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
+            sizeof( JnGpuRangeSetRecordV1 ), m_impl->options );
         analysis::PagedRecordReader viewLookup( ResourceViewLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-view-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -1972,6 +2343,12 @@ void QueryCatalogStoreReader::ValidateAll() const
         allocationLookup.ValidateAll();
         allocationGenerations.ValidateAll();
         gpuMemorySummary.ValidateAll();
+        pointerIntervals.ValidateAll();
+        pointerByPointer.ValidateAll();
+        pointerByResource.ValidateAll();
+        resourceRangeLookup.ValidateAll();
+        passRangeLookup.ValidateAll();
+        rangeGenerations.ValidateAll();
         viewLookup.ValidateAll();
         viewGenerations.ValidateAll();
         meshPartLookup.ValidateAll();
@@ -1990,6 +2367,34 @@ void QueryCatalogStoreReader::ValidateAll() const
         gpuMemorySummary.Read( 0, &summary, 1 );
         if( summary.livePhysicalBytes > summary.peakPhysicalBytes )
             throw std::runtime_error( "Catalog GPU memory summary peak mismatch" );
+        if( pointerByPointer.Count() != pointerIntervals.Count() ||
+            pointerByResource.Count() != pointerIntervals.Count() )
+            throw std::runtime_error( "Catalog pointer interval lookup count mismatch" );
+        if( rangeGenerations.Count() != rawRanges.Count() )
+            throw std::runtime_error( "Catalog RangeSet generation count mismatch" );
+        const auto validatePointerLookup = [&]( analysis::PagedRecordReader& lookup,
+            bool byPointer, std::string_view label ) {
+            analysis::AnalysisKeyMetadataRecord previous {};
+            for( uint64_t index = 0; index < lookup.Count(); index++ )
+            {
+                analysis::AnalysisKeyMetadataRecord row {};
+                lookup.Read( index, &row, 1 );
+                if( row.keyHigh == 0 || row.metadata >= pointerIntervals.Count() ||
+                    ( index != 0 && ( row.keyHigh < previous.keyHigh ||
+                        ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
+                            ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
+                    throw std::runtime_error( std::string( label ) + " order mismatch" );
+                QueryCatalogResourcePointerInterval interval {};
+                pointerIntervals.Read( row.metadata, &interval, 1 );
+                const auto key = byPointer ? interval.pointerToken : interval.resourceId;
+                if( key != row.keyHigh || row.keyLow != SortableSignedTime( interval.begin ) ||
+                    interval.pointerToken == 0 || interval.resourceId == 0 || interval.end < interval.begin )
+                    throw std::runtime_error( std::string( label ) + " identity mismatch" );
+                previous = row;
+            }
+        };
+        validatePointerLookup( pointerByPointer, true, "Catalog pointer interval" );
+        validatePointerLookup( pointerByResource, false, "Catalog resource pointer interval" );
         if( viewGenerations.Count() != rawViews.Count() || partGenerations.Count() != rawParts.Count() )
             throw std::runtime_error( "Catalog resource detail generation count mismatch" );
         if( vgGenerations.Count() != rawVg.Count() || relationGenerations.Count() != rawRelations.Count() )
@@ -2059,6 +2464,14 @@ void QueryCatalogStoreReader::ValidateAll() const
             [&]( uint64_t ordinal ) { JnGpuCatalogVgRecordV1 row {}; rawVg.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog VG" );
+        validateLookup( resourceRangeLookup, rawRanges.Count(),
+            [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rawRanges.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId; },
+            []( const auto& row ) { return row.resourceId != 0; }, "Catalog resource RangeSet" );
+        validateLookup( passRangeLookup, rawRanges.Count(),
+            [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rawRanges.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.passInstanceId; },
+            []( const auto& row ) { return row.passInstanceId != 0; }, "Catalog pass RangeSet" );
         analysis::AnalysisKeyMetadataRecord previousRtas {};
         for( uint64_t index = 0; index < rtasRelationLookup.Count(); index++ )
         {

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@ public:
     virtual JnGpuReferencePassData Pass( uint64_t ordinal ) const = 0;
     virtual JnGpuReferenceUseData Use( uint64_t ordinal ) const = 0;
     virtual JnGpuReferenceEndData End( uint64_t ordinal ) const = 0;
+    virtual uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const = 0;
 };
 
 struct QueryGpuReferenceResolvedUseRecord
@@ -62,7 +64,8 @@ public:
     QueryGpuReferenceStoreReader& operator=( const QueryGpuReferenceStoreReader& ) = delete;
 
     QueryGpuReferenceUsePage UsesByResource( uint64_t resourceId, uint64_t offset, size_t limit ) const;
-    void ValidateAll() const;
+    QueryGpuReferenceUsePage UsesByCatalogResource( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    void ValidateAll( const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource = {} ) const;
 
 private:
     struct Impl;

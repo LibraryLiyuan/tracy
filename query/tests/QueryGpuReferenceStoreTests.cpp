@@ -22,6 +22,11 @@ public:
     tracy::JnGpuReferencePassData Pass( uint64_t ordinal ) const override { return passes.at( size_t( ordinal ) ); }
     tracy::JnGpuReferenceUseData Use( uint64_t ordinal ) const override { return uses.at( size_t( ordinal ) ); }
     tracy::JnGpuReferenceEndData End( uint64_t ordinal ) const override { return ends.at( size_t( ordinal ) ); }
+    uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
+    {
+        if( pointerToken != 100 ) return 0;
+        return time <= 20 ? 200 : 201;
+    }
 
     std::vector<tracy::JnGpuReferencePassData> passes;
     std::vector<tracy::JnGpuReferenceUseData> uses;
@@ -52,7 +57,9 @@ int main()
         tracy::query::QueryGpuReferenceStore::Build( root, identity, input );
         Require( !fs::exists( root / "reverse-scratch" ), "GPU reference scratch was retained" );
         tracy::query::QueryGpuReferenceStoreReader reader( root, identity );
-        reader.ValidateAll();
+        reader.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+            return input.ResolveCatalogResource( pointerToken, time );
+        } );
         const auto first = reader.UsesByResource( 100, 0, 1 );
         const auto second = reader.UsesByResource( 100, 1, 1 );
         Require( first.total == 2 && first.values.size() == 1 && first.values[0].passId == 2 &&
@@ -65,6 +72,13 @@ int main()
             "GPU reference continuation or open pass boundary changed" );
         Require( reader.UsesByResource( 999, 0, 10 ).total == 0,
             "GPU reference missing resource behavior changed" );
+        const auto catalog200 = reader.UsesByCatalogResource( 200, 0, 10 );
+        const auto catalog201 = reader.UsesByCatalogResource( 201, 0, 10 );
+        Require( catalog200.total == 1 && catalog200.values.size() == 1 &&
+            catalog200.values[0].passId == 1 && catalog200.values[0].resourceId == 100 &&
+            catalog201.total == 1 && catalog201.values.size() == 1 &&
+            catalog201.values[0].passId == 2 && catalog201.values[0].resourceId == 100,
+            "GPU reference Catalog resource lifetime resolution changed" );
         fs::remove_all( root, ignored );
         std::cout << "query GPU reference store passed\n";
         return 0;

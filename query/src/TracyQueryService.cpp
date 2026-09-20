@@ -5478,7 +5478,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
             method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
             method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
-            method == "gpu.resource.vg_pages" || method == "gpu.resource.raytracing_chain" ||
+            method == "gpu.resource.references" || method == "gpu.resource.vg_pages" ||
+            method == "gpu.resource.raytracing_chain" ||
             method == "gpu.memory.by_type" || method == "gpu.memory.peak" ||
             method == "gpu.memory.churn" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
@@ -5727,6 +5728,66 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
             if( !state ) throw QueryError( "ENTITY_NOT_FOUND", "GPU resource was not found" );
+            if( method == "gpu.resource.references" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto rangePage = catalogResourceSource->GetQueryCatalogResourceRanges(
+                    resourceId, page.offset, page.limit );
+                const auto usePage = catalogResourceSource->GetQueryCatalogResourceUses(
+                    resourceId, page.offset, page.limit );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& value = item.record;
+                    ranges.push_back( {
+                        { "pass_id", Decimal( value.passInstanceId ) },
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "view_id", value.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( value.viewDefinitionId ) ) },
+                        { "range_kind", value.rangeKind }, { "offset_bytes", Decimal( value.offsetBytes ) },
+                        { "length_bytes", Decimal( value.lengthBytes ) },
+                        { "first_subresource", value.firstSubresource }, { "subresource_count", value.subresourceCount },
+                        { "usage_mask", value.usageMask }, { "exactness", GpuExactnessName( value.exactness ) }
+                    } );
+                }
+                json uses = json::array();
+                const auto physicalAllocationId = state->latest.allocationId;
+                for( const auto& value : usePage.values )
+                {
+                    uses.push_back( {
+                        { "pass_id", Decimal( value.passId ) },
+                        { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", value.passId ) },
+                        { "allocation_id", Decimal( physicalAllocationId ) },
+                        { "logical_resource_id", Decimal( value.resourceId ) },
+                        { "catalog_resource_id", Decimal( resourceId ) },
+                        { "resolved_physical_allocation_id", physicalAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( physicalAllocationId ) ) },
+                        { "usage_mask", value.usageMask },
+                        { "resource_set_id", value.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( value.resourceSetId ) ) ) },
+                        { "encoding", value.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "resolution", "pointer_lifetime_exact" },
+                        { "range_status", "query_gpu_range_set_for_exact_range" }
+                    } );
+                }
+                const auto returned = std::max( ranges.size(), uses.size() );
+                const auto rangeTotal = size_t( std::min<uint64_t>( rangePage.total,
+                    std::numeric_limits<size_t>::max() ) );
+                const auto useTotal = size_t( std::min<uint64_t>( usePage.total,
+                    std::numeric_limits<size_t>::max() ) );
+                const bool hasMore = page.offset + ranges.size() < rangePage.total ||
+                    page.offset + uses.size() < usePage.total;
+                const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "ranges", std::move( ranges ) }, { "resource_set_uses", std::move( uses ) },
+                    { "ranges_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", rangePage.values.size() }, { "total", rangeTotal },
+                        { "has_more", page.offset + rangePage.values.size() < rangePage.total } } },
+                    { "resource_set_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", usePage.values.size() }, { "total", useTotal },
+                        { "has_more", page.offset + usePage.values.size() < usePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
             if( method == "gpu.resource.allocations" )
             {
                 const auto page = ParsePage( params, method, trace );

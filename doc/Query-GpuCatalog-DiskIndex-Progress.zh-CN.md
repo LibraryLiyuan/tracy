@@ -160,6 +160,15 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 1,001 Resource真实Catalog完成schema34冷建、深校验、三次独立热开查询和第二次事务发布；只保留一个generation，无scratch。真实夹具Catalog section为31,427字节，摘要337字节，独立目录全部文件89,582字节。其Allocation域为空，因此peak/churn为0；`by_type`从真实Resource summary返回1个4 MiB structured_buffer。
 - Release全构建与CTest 41/41通过（124.39秒）。`gpu.memory.by_pass`、完整Pass/Resource关联和其他GPU归因消费者仍待迁移。
 
+## 2026-09-20：schema35 Resource引用双向索引
+
+- Catalog Resource记录按`(resourceId, 原始ordinal)`外排，生成32字节指针生命周期区间；Create使用事件时间，Open/Snapshot使用开放起点，Destroy闭合且边界包含。按Pointer和按Resource分别建立ordinal索引；同一时刻解析到不同Resource时明确返回未解析。
+- RangeSet补齐generation表，并按Resource ID和Pass ID建立双向分页索引。GPU Reference在解析Pass结束时间后，通过Catalog指针生命周期生成`by-catalog-resource`反向索引；保持原始Use ordinal顺序，并在深校验时重新跨表解析验证。
+- Indexed `gpu.resource.references`现在同时读取Resource→RangeSet和Resource→已解析Use，沿用原字段及两个嵌套page，并增加Query 1.35顶层cursor。查询不再构造完整Catalog、指针区间map或GPU attribution。
+- 组件夹具覆盖销毁/重建、开放/闭合边界、Range generation、Resource/Pass双向读取、Use在不同Pass结束时间解析到不同Resource；真实QueryService合同覆盖两页cursor。
+- 1,001 Resource真实Catalog完成schema35冷建、深校验、热开references和第二次事务发布；该夹具Range/Use为空。Catalog section为33,151字节，GPU Reference Use section为1,120字节，独立目录全部文件91,436字节；只保留一个generation且无scratch。
+- Release全构建与CTest 41/41通过（125.76秒）。`gpu.pass.resources`/`gpu.memory.by_pass`的聚合摘要、Logical/通用Relation和Explain仍待迁移。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

@@ -198,6 +198,49 @@ public:
         value.freedPhysicalBytes = 4096;
         return value;
     }
+    uint64_t ResolveQueryCatalogResourcePointer( uint64_t, int64_t ) const override { return 0; }
+    QueryCatalogPointerIntervalPage GetQueryCatalogResourcePointerIntervals(
+        uint64_t, uint64_t, size_t ) const override { return {}; }
+    QueryCatalogRangePage GetQueryCatalogResourceRanges(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogRangePage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogRangeData value {};
+            value.record.passInstanceId = 200 + index;
+            value.record.resourceId = 100;
+            value.record.lengthBytes = 1024 * ( index + 1 );
+            value.record.usageMask = uint32_t( index + 1 );
+            value.generation = 16;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
+    QueryCatalogRangePage GetQueryCatalogPassRanges(
+        uint64_t, uint64_t, size_t ) const override { return {}; }
+    QueryGpuReferenceUsePage GetQueryCatalogResourceUses(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryGpuReferenceUsePage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryGpuReferenceResolvedUseRecord value {};
+            value.resourceId = 900 + index;
+            value.passId = 300 + index;
+            value.passStart = int64_t( 70 + index );
+            value.passEnd = int64_t( 80 + index );
+            value.usageMask = uint32_t( 4 + index );
+            value.resourceSetId = uint32_t( 20 + index );
+            value.encoding = uint8_t( index == 0 ? 2 : 1 );
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -304,7 +347,25 @@ int main()
         evidencePage.at( "data" ).at( "sample_status" ) == "periodic_exact" &&
         evidencePage.at( "data" ).at( "page" ).at( "total" ) == "2" );
 
-    const auto byType = service.Execute( Request( 14, "gpu.memory.by_type", {
+    const auto referencesFirst = service.Execute( Request( 14, "gpu.resource.references", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( referencesFirst.at( "ok" ) && referencesFirst.at( "data" ).at( "ranges" ).size() == 1 &&
+        referencesFirst.at( "data" ).at( "ranges" )[0].at( "pass_id" ) == "200" &&
+        referencesFirst.at( "data" ).at( "ranges" )[0].at( "generation" ) == "16" &&
+        referencesFirst.at( "data" ).at( "resource_set_uses" ).size() == 1 &&
+        referencesFirst.at( "data" ).at( "resource_set_uses" )[0].at( "logical_resource_id" ) == "900" &&
+        referencesFirst.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto referencesSecond = service.Execute( Request( 15, "gpu.resource.references", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 },
+        { "cursor", referencesFirst.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( referencesSecond.at( "ok" ) && referencesSecond.at( "data" ).at( "ranges" ).size() == 1 &&
+        referencesSecond.at( "data" ).at( "ranges" )[0].at( "pass_id" ) == "201" &&
+        referencesSecond.at( "data" ).at( "resource_set_uses" )[0].at( "logical_resource_id" ) == "901" &&
+        referencesSecond.at( "page" ).at( "next_cursor" ).is_null() );
+
+    const auto byType = service.Execute( Request( 16, "gpu.memory.by_type", {
         { "trace_id", traceId }
     } ) );
     assert( byType.at( "ok" ) && byType.at( "data" ).at( "groups" ).size() == 2 &&
@@ -315,14 +376,14 @@ int main()
         byType.at( "data" ).at( "groups" )[1].at( "live_resource_count" ) == "2" &&
         byType.at( "data" ).at( "groups" )[1].at( "resource_capacity_bytes" ) == "3072" );
 
-    const auto peak = service.Execute( Request( 15, "gpu.memory.peak", {
+    const auto peak = service.Execute( Request( 17, "gpu.memory.peak", {
         { "trace_id", traceId }
     } ) );
     assert( peak.at( "ok" ) &&
         peak.at( "data" ).at( "engine_known_physical_peak_bytes" ) == "12288" &&
         peak.at( "data" ).at( "peak_time_ns" ) == "77" &&
         peak.at( "data" ).at( "peak_provenance" ) == "event_exact" );
-    const auto churn = service.Execute( Request( 16, "gpu.memory.churn", {
+    const auto churn = service.Execute( Request( 18, "gpu.memory.churn", {
         { "trace_id", traceId }
     } ) );
     assert( churn.at( "ok" ) && churn.at( "data" ).at( "create_count" ) == "4" &&
@@ -331,7 +392,7 @@ int main()
         churn.at( "data" ).at( "freed_bytes" ) == "4096" &&
         churn.at( "data" ).at( "live_bytes_at_end" ) == "12288" );
 
-    assert( service.Execute( Request( 17, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    assert( service.Execute( Request( 19, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

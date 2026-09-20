@@ -53,6 +53,10 @@ Require ($traceSource.Contains('ScanGpuMemoryUsesByResource')) `
     'TraceSource does not expose the bounded reverse ResourceSet sidecar.'
 Require ($queryIndex.Contains('ScanGpuMemoryUsesByResource')) `
     'Indexed Query does not provide bounded reverse ResourceSet lookup.'
+Require ($service -match 'boundedResourceMethod[\s\S]{0,1024}gpu\.resource\.references') `
+    'GPU resource references are not routed through the bounded Catalog backend.'
+Require ($service.Contains('GetQueryCatalogResourceRanges') -and $service.Contains('GetQueryCatalogResourceUses')) `
+    'GPU resource references do not use both bounded RangeSet and resolved ResourceSet indices.'
 $allocationScan = [regex]::Match($queryIndex, 'ScanGpuMemoryAllocations[\s\S]*?BuildIndexedGpuMemoryAttribution').Value
 Require ($allocationScan.Contains('m_gpuReferenceIndex.UsesByResource')) `
     'GPU allocation paging does not reuse the bounded reverse ResourceSet sidecar.'

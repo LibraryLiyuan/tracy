@@ -1605,6 +1605,35 @@ public:
         return m_catalog.GpuMemorySummary();
     }
 
+    uint64_t ResolveQueryCatalogResourcePointer( uint64_t pointerToken, int64_t time ) const override
+    {
+        return m_catalog.ResolveResourcePointer( pointerToken, time );
+    }
+
+    QueryCatalogPointerIntervalPage GetQueryCatalogResourcePointerIntervals(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourcePointerIntervals( resourceId, offset, limit );
+    }
+
+    QueryCatalogRangePage GetQueryCatalogResourceRanges(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceRanges( resourceId, offset, limit );
+    }
+
+    QueryCatalogRangePage GetQueryCatalogPassRanges(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.PassRanges( passId, offset, limit );
+    }
+
+    QueryGpuReferenceUsePage GetQueryCatalogResourceUses(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_gpuReferenceIndex.UsesByCatalogResource( resourceId, offset, limit );
+    }
+
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override
     {
         return m_catalog.ResourceName( generation, stringId );
@@ -3563,11 +3592,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 sizeof( JnGpuReferenceUseData ), result.sourceFingerprint, storageOptions );
             ReadOnlyZoneSection ends( endManifest, ZoneSectionKind::GpuReferenceEnd,
                 sizeof( JnGpuReferenceEndData ), result.sourceFingerprint, storageOptions );
+            QueryCatalogStoreReader catalog( temporaryCatalog, result.sourceFingerprint, storageOptions );
             class Input final : public QueryGpuReferenceInput
             {
             public:
                 Input( const ReadOnlyZoneSection& passes, const ReadOnlyZoneSection& uses,
-                    const ReadOnlyZoneSection& ends ) : m_passes( passes ), m_uses( uses ), m_ends( ends ) {}
+                    const ReadOnlyZoneSection& ends, const QueryCatalogStoreReader& catalog )
+                    : m_passes( passes ), m_uses( uses ), m_ends( ends ), m_catalog( catalog ) {}
                 uint64_t PassCount() const override { return m_passes.Count(); }
                 uint64_t UseCount() const override { return m_uses.Count(); }
                 uint64_t EndCount() const override { return m_ends.Count(); }
@@ -3577,15 +3608,20 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 { return m_uses.At<JnGpuReferenceUseData>( ordinal ); }
                 JnGpuReferenceEndData End( uint64_t ordinal ) const override
                 { return m_ends.At<JnGpuReferenceEndData>( ordinal ); }
+                uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
+                { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
             private:
                 const ReadOnlyZoneSection& m_passes;
                 const ReadOnlyZoneSection& m_uses;
                 const ReadOnlyZoneSection& m_ends;
-            } input( passes, uses, ends );
+                const QueryCatalogStoreReader& m_catalog;
+            } input( passes, uses, ends, catalog );
             resources->SetPhase( "gpu-reference-reverse-index" );
             QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input, storageOptions );
             QueryGpuReferenceStoreReader check( temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
-            check.ValidateAll();
+            check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                return catalog.ResolveResourcePointer( pointerToken, time );
+            } );
             result.gpuReferenceUses.bytes = SectionBytes( temporaryJn[useIndex] );
             result.gpuReferenceUses.fingerprint = SectionFingerprint( temporaryJn[useIndex] );
         }
@@ -3993,7 +4029,14 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         {
             QueryGpuReferenceStoreReader gpuReferences( manifest.gpuReferenceUses.path,
                 manifest.sourceFingerprint, storageOptions );
-            if( deep ) gpuReferences.ValidateAll();
+            if( deep )
+            {
+                QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
+                    manifest.sourceFingerprint, storageOptions );
+                gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                    return catalog.ResolveResourcePointer( pointerToken, time );
+                } );
+            }
         }
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );
         validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone",ZoneSectionKind::GpuMemorySummaryCpuZone );
