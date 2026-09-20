@@ -89,6 +89,42 @@ public:
         }
         return page;
     }
+    QueryCatalogViewPage GetQueryCatalogResourceViews(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogViewPage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogViewData value {};
+            value.record.viewId = 800 + index;
+            value.record.resourceId = 100;
+            value.record.bufferLengthBytes = 1024 * ( index + 1 );
+            value.generation = 11;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
+    QueryCatalogPartPage GetQueryCatalogResourceMeshParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogPartPage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogPartData value {};
+            value.record.partId = 900 + index;
+            value.record.resourceId = 100;
+            value.record.partKind = uint8_t( index == 0 ?
+                JnGpuCatalogPartKind::MeshVertexStream : JnGpuCatalogPartKind::MeshIndex );
+            value.record.lengthBytes = 2048 * ( index + 1 );
+            value.generation = 12;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -162,7 +198,20 @@ int main()
         allocationSecond.at( "data" ).at( "allocations" )[0].at( "size_bytes" ) == "8192" &&
         allocationSecond.at( "page" ).at( "next_cursor" ).is_null() );
 
-    assert( service.Execute( Request( 9, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    const auto views = service.Execute( Request( 9, "gpu.resource.views", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( views.at( "ok" ) && views.at( "data" ).at( "views" ).size() == 1 &&
+        views.at( "data" ).at( "views" )[0].at( "view_id" ) == "800" &&
+        views.at( "data" ).at( "total" ) == "2" && views.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto meshParts = service.Execute( Request( 10, "gpu.resource.mesh_buffers", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( meshParts.at( "ok" ) && meshParts.at( "data" ).at( "parts" ).size() == 1 &&
+        meshParts.at( "data" ).at( "parts" )[0].at( "part_id" ) == "900" &&
+        meshParts.at( "data" ).at( "total" ) == "2" && meshParts.at( "page" ).at( "next_cursor" ).is_string() );
+
+    assert( service.Execute( Request( 11, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

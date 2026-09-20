@@ -1492,7 +1492,7 @@ public:
                 {
                     item.queryable = m_catalog.ResourceIndexReady();
                     item.reason = item.queryable ?
-                        "bounded GPU resource get, lifetime, association search and allocation history are ready" :
+                        "bounded GPU resource get, lifetime, search, allocation, view and mesh-part history are ready" :
                         "bounded GPU resource indices are pending";
                 }
                 else
@@ -1566,6 +1566,18 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
         return m_catalog.ResourceAllocations( resourceId, offset, limit );
+    }
+
+    QueryCatalogViewPage GetQueryCatalogResourceViews(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceViews( resourceId, offset, limit );
+    }
+
+    QueryCatalogPartPage GetQueryCatalogResourceMeshParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceMeshParts( resourceId, offset, limit );
     }
 
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override

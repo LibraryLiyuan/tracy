@@ -5476,7 +5476,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
-            method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ) &&
+            method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
+            method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
@@ -5677,6 +5678,59 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     page.offset + returned < allocationPage.total );
                 return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
                     { "allocations", std::move( values ) }, { "total", Decimal( allocationPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.views" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto viewPage = catalogResourceSource->GetQueryCatalogResourceViews(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : viewPage.values )
+                {
+                    const auto& view = item.record;
+                    values.push_back( {
+                        { "view_id", Decimal( view.viewId ) }, { "generation", Decimal( item.generation ) },
+                        { "operation", GpuCatalogOperationName( view.operation ) }, { "view_kind", view.viewKind },
+                        { "format", view.format }, { "buffer_offset_bytes", Decimal( view.bufferOffsetBytes ) },
+                        { "buffer_length_bytes", Decimal( view.bufferLengthBytes ) },
+                        { "first_subresource", view.firstSubresource }, { "subresource_count", view.subresourceCount },
+                        { "stride_bytes", view.strideBytes }, { "exactness", GpuExactnessName( view.exactness ) },
+                        { "time_ns", Decimal( view.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < viewPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "views", std::move( values ) }, { "total", Decimal( viewPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.resource.mesh_buffers" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto partPage = catalogResourceSource->GetQueryCatalogResourceMeshParts(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : partPage.values )
+                {
+                    const auto& part = item.record;
+                    values.push_back( {
+                        { "part_id", Decimal( part.partId ) }, { "generation", Decimal( item.generation ) },
+                        { "part_kind", part.partKind }, { "operation", GpuCatalogOperationName( part.operation ) },
+                        { "offset_bytes", Decimal( part.offsetBytes ) }, { "length_bytes", Decimal( part.lengthBytes ) },
+                        { "first_subresource", part.firstSubresource }, { "subresource_count", part.subresourceCount },
+                        { "semantic_index", part.semanticIndex }, { "element_count", part.elementCount },
+                        { "stride_bytes", part.strideBytes }, { "format", part.format },
+                        { "definition_revision", part.definitionRevision },
+                        { "exactness", GpuExactnessName( part.exactness ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < partPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "parts", std::move( values ) }, { "total", Decimal( partPage.total ) } },
                     trace, PageJson( page, returned, cursor ) );
             }
             const auto& value = state->latest;

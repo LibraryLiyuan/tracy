@@ -156,6 +156,11 @@ int main()
         Require( fs::is_directory( root / "resource-allocation-lookup" ) &&
             fs::is_directory( root / "resource-allocation-generations" ),
             "Catalog resource index did not publish bounded allocation history indices" );
+        Require( fs::is_directory( root / "resource-view-lookup" ) &&
+            fs::is_directory( root / "resource-view-generations" ) &&
+            fs::is_directory( root / "resource-mesh-part-lookup" ) &&
+            fs::is_directory( root / "resource-part-generations" ),
+            "Catalog resource index did not publish bounded view and mesh-part history indices" );
         Require( !fs::exists( root / "resource-index-scratch" ),
             "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
@@ -200,6 +205,16 @@ int main()
                 sizeof( associationAllocations[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogAllocation );
 
+            JnGpuCatalogViewRecordV1 associationViews[2] {};
+            associationViews[0].time = 40; associationViews[0].viewId = 800;
+            associationViews[0].resourceId = 100; associationViews[0].bufferLengthBytes = 1024;
+            associationViews[1].time = 41; associationViews[1].viewId = 801;
+            associationViews[1].resourceId = 100; associationViews[1].bufferLengthBytes = 2048;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogView, 2, sizeof( associationViews[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogView, 0, associationViews, 2,
+                sizeof( associationViews[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogView );
+
             JnGpuCatalogPartRecordV1 associationParts[3] {};
             associationParts[0].resourceId = 100;
             associationParts[0].partKind = uint8_t( JnGpuCatalogPartKind::MeshVertexStream );
@@ -230,15 +245,21 @@ int main()
                 sizeof( associationRanges[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogRangeSet );
 
-            JnGpuCatalogBatchData associationBatches[2] {};
+            JnGpuCatalogBatchData associationBatches[4] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
             associationBatches[0].recordCount = 3;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
             associationBatches[1].generation = 10; associationBatches[1].firstRecordIndex = 0;
             associationBatches[1].recordCount = 3;
             associationBatches[1].kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 2, sizeof( associationBatches[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 2,
+            associationBatches[2].generation = 11; associationBatches[2].firstRecordIndex = 0;
+            associationBatches[2].recordCount = 2;
+            associationBatches[2].kind = uint8_t( JnGpuCatalogBatchKind::View );
+            associationBatches[3].generation = 12; associationBatches[3].firstRecordIndex = 0;
+            associationBatches[3].recordCount = 3;
+            associationBatches[3].kind = uint8_t( JnGpuCatalogBatchKind::Part );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 4, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 4,
                 sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
@@ -275,6 +296,21 @@ int main()
             allocations102.values[0].record.allocationId == 600 &&
             associationReader.ResourceAllocations( 999, 0, 10 ).total == 0,
             "Catalog allocation history unique or missing resource behavior changed" );
+        const auto views100First = associationReader.ResourceViews( 100, 0, 1 );
+        const auto views100Second = associationReader.ResourceViews( 100, 1, 1 );
+        const auto meshParts100 = associationReader.ResourceMeshParts( 100, 0, 10 );
+        const auto meshParts101 = associationReader.ResourceMeshParts( 101, 0, 10 );
+        Require( views100First.total == 2 && views100First.values.size() == 1 &&
+            views100First.values[0].record.viewId == 800 && views100First.values[0].generation == 11 &&
+            views100Second.total == 2 && views100Second.values.size() == 1 &&
+            views100Second.values[0].record.viewId == 801,
+            "Catalog resource view history paging changed" );
+        Require( meshParts100.total == 2 && meshParts100.values.size() == 2 &&
+            meshParts100.values[0].generation == 12 &&
+            meshParts100.values[0].record.partKind == uint8_t( JnGpuCatalogPartKind::MeshVertexStream ) &&
+            meshParts100.values[1].record.partKind == uint8_t( JnGpuCatalogPartKind::MeshIndex ) &&
+            meshParts101.total == 0,
+            "Catalog resource mesh-part history filtering changed" );
         associationReader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
