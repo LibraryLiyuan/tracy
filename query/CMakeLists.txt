@@ -69,6 +69,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryIndex.hpp
     src/TracyQueryCatalogStore.cpp
     src/TracyQueryCatalogStore.hpp
+    src/TracyQueryGpuReferenceStore.cpp
+    src/TracyQueryGpuReferenceStore.hpp
     src/TracyQueryCallstackStore.cpp
     src/TracyQueryCallstackStore.hpp
     src/TracyQuerySampleStore.cpp
@@ -165,6 +167,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-catalog-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-catalog-store-tests)
     add_test(NAME tracy-query-catalog-store COMMAND tracy-query-catalog-store-tests)
+
+    add_executable(tracy-query-gpu-reference-store-tests tests/QueryGpuReferenceStoreTests.cpp)
+    target_link_libraries(tracy-query-gpu-reference-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-reference-store-tests)
+    add_test(NAME tracy-query-gpu-reference-store COMMAND tracy-query-gpu-reference-store-tests)
 
     add_executable(tracy-query-catalog-association-search-tests tests/QueryCatalogAssociationSearchTests.cpp)
     target_link_libraries(tracy-query-catalog-association-search-tests PRIVATE TracyQueryProtocol)

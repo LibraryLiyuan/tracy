@@ -1,6 +1,7 @@
 #include <type_traits>
 #include "TracyQueryIndex.hpp"
 #include "TracyQueryCatalogStore.hpp"
+#include "TracyQueryGpuReferenceStore.hpp"
 #include "TracyQueryCallstackStore.hpp"
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
@@ -1438,6 +1439,7 @@ public:
         , m_gpuReferencePasses( m_manifest.gpuReferencePasses, ZoneSectionKind::GpuReferencePass, sizeof( JnGpuReferencePassData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuReferenceUses( m_manifest.gpuReferenceUses, ZoneSectionKind::GpuReferenceUse, sizeof( JnGpuReferenceUseData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuReferenceEnds( m_manifest.gpuReferenceEnds, ZoneSectionKind::GpuReferenceEnd, sizeof( JnGpuReferenceEndData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuReferenceIndex( m_manifest.gpuReferenceUses.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuMemoryCpuZones( m_manifest.gpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuMemorySummaryCpuZones( m_manifest.gpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
     {
@@ -2198,15 +2200,13 @@ public:
     std::optional<analysis::GpuMemoryUseReferencePage> ScanGpuMemoryUsesByResource( uint64_t resourceId,
         size_t offset, size_t limit ) const override
     {
-        EnsureGpuResourcePassRefs();
         analysis::GpuMemoryUseReferencePage page;
-        const auto found = m_gpuResourcePassRefs.find( resourceId );
-        if( found == m_gpuResourcePassRefs.end() ) return page;
-        page.totalUses = found->second.references.size();
-        const auto begin = std::min( offset, found->second.references.size() );
-        const auto end = begin + std::min( limit, found->second.references.size() - begin );
-        page.references.insert( page.references.end(), found->second.references.begin() + begin,
-            found->second.references.begin() + end );
+        const auto stored = m_gpuReferenceIndex.UsesByResource( resourceId, offset, limit );
+        page.totalUses = size_t( std::min<uint64_t>( stored.total, std::numeric_limits<size_t>::max() ) );
+        page.references.reserve( stored.values.size() );
+        for( const auto& value : stored.values )
+            page.references.push_back( { value.passId, value.passStart, value.passEnd,
+                { value.resourceId, value.usageMask, 'U', value.resourceSetId, value.encoding } } );
         return page;
     }
     std::optional<analysis::GpuMemoryRequestScopePage> ScanGpuMemoryRequestScopes( size_t offset, size_t limit ) const override
@@ -2681,6 +2681,7 @@ private:
     QueryCatalogStoreReader m_catalog;
     ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
+    QueryGpuReferenceStoreReader m_gpuReferenceIndex;
     ReadOnlyZoneSection m_gpuMemoryCpuZones;
     ReadOnlyZoneSection m_gpuMemorySummaryCpuZones;
     std::unordered_map<int32_t, analysis::SourceLocationDto> m_locations;
@@ -3581,6 +3582,46 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
 
         {
+            const auto passIndex = size_t( SerializedZoneSink::JnDomain::GpuReferencePass );
+            const auto useIndex = size_t( SerializedZoneSink::JnDomain::GpuReferenceUse );
+            const auto endIndex = size_t( SerializedZoneSink::JnDomain::GpuReferenceEnd );
+            auto passManifest = result.gpuReferencePasses; passManifest.path = temporaryJn[passIndex];
+            auto useManifest = result.gpuReferenceUses; useManifest.path = temporaryJn[useIndex];
+            auto endManifest = result.gpuReferenceEnds; endManifest.path = temporaryJn[endIndex];
+            ReadOnlyZoneSection passes( passManifest, ZoneSectionKind::GpuReferencePass,
+                sizeof( JnGpuReferencePassData ), result.sourceFingerprint, storageOptions );
+            ReadOnlyZoneSection uses( useManifest, ZoneSectionKind::GpuReferenceUse,
+                sizeof( JnGpuReferenceUseData ), result.sourceFingerprint, storageOptions );
+            ReadOnlyZoneSection ends( endManifest, ZoneSectionKind::GpuReferenceEnd,
+                sizeof( JnGpuReferenceEndData ), result.sourceFingerprint, storageOptions );
+            class Input final : public QueryGpuReferenceInput
+            {
+            public:
+                Input( const ReadOnlyZoneSection& passes, const ReadOnlyZoneSection& uses,
+                    const ReadOnlyZoneSection& ends ) : m_passes( passes ), m_uses( uses ), m_ends( ends ) {}
+                uint64_t PassCount() const override { return m_passes.Count(); }
+                uint64_t UseCount() const override { return m_uses.Count(); }
+                uint64_t EndCount() const override { return m_ends.Count(); }
+                JnGpuReferencePassData Pass( uint64_t ordinal ) const override
+                { return m_passes.At<JnGpuReferencePassData>( ordinal ); }
+                JnGpuReferenceUseData Use( uint64_t ordinal ) const override
+                { return m_uses.At<JnGpuReferenceUseData>( ordinal ); }
+                JnGpuReferenceEndData End( uint64_t ordinal ) const override
+                { return m_ends.At<JnGpuReferenceEndData>( ordinal ); }
+            private:
+                const ReadOnlyZoneSection& m_passes;
+                const ReadOnlyZoneSection& m_uses;
+                const ReadOnlyZoneSection& m_ends;
+            } input( passes, uses, ends );
+            resources->SetPhase( "gpu-reference-reverse-index" );
+            QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input, storageOptions );
+            QueryGpuReferenceStoreReader check( temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
+            check.ValidateAll();
+            result.gpuReferenceUses.bytes = SectionBytes( temporaryJn[useIndex] );
+            result.gpuReferenceUses.fingerprint = SectionFingerprint( temporaryJn[useIndex] );
+        }
+
+        {
             const auto payload = ManifestJson( result ).dump( 2 );
             resources->BeforeFileGrowth( temporaryManifest, payload.size() );
             std::ofstream output( temporaryManifest, std::ios::binary | std::ios::trunc );
@@ -3980,6 +4021,11 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         validateSection( manifest.gpuReferencePasses, sizeof( JnGpuReferencePassData ), "GPU-reference-pass",ZoneSectionKind::GpuReferencePass );
         validateSection( manifest.gpuReferenceUses, sizeof( JnGpuReferenceUseData ), "GPU-reference-use",ZoneSectionKind::GpuReferenceUse );
         validateSection( manifest.gpuReferenceEnds, sizeof( JnGpuReferenceEndData ), "GPU-reference-end",ZoneSectionKind::GpuReferenceEnd );
+        {
+            QueryGpuReferenceStoreReader gpuReferences( manifest.gpuReferenceUses.path,
+                manifest.sourceFingerprint, storageOptions );
+            if( deep ) gpuReferences.ValidateAll();
+        }
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );
         validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone",ZoneSectionKind::GpuMemorySummaryCpuZone );
         validateSection( manifest.gpuMemorySummary, 0, "GPU-memory-summary" );

@@ -90,6 +90,12 @@ int main( int argc, char** argv )
             "Query index did not publish a GPU Catalog sidecar" );
         const auto catalogRoot = manifest.manifestPath.parent_path() /
             json.at( "sections" ).at( "gpu_catalog" ).at( "file" ).get<std::string>();
+        const auto gpuReferenceUseRoot = manifest.manifestPath.parent_path() /
+            json.at( "sections" ).at( "gpu_reference_use" ).at( "file" ).get<std::string>();
+        Require( fs::is_directory( gpuReferenceUseRoot / "by-resource" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "pass-times" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "resolved-uses" ),
+            "Query index did not publish bounded GPU-reference reverse indices" );
         Require( !fs::exists( catalogRoot / "resource-index-scratch" ),
             "Query index published completed Catalog resource scratch files" );
         {

@@ -1,6 +1,6 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-20。当前索引 schema32。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-20。当前索引 schema33。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
@@ -12,6 +12,7 @@
 | JN 固定域 | Schedule/Config/Dependency、GfxDispatch、Frame、I/O、Runtime、Script、Callsite | 待迁移 | 事实表＋键/ordinal 索引；逐域切换真实后端消费者后才从 compact 移除 |
 | Tracy 域 | Frames、Memory、Messages、Plots、Locks、ContextSwitch、FrameImages、SymbolCode、SourceCache | 待审计 | 为每个容器记录输入关系和常驻上界；选择保留、分页、溢写或明确拒绝 |
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 已移出冷建；派生后端待完成 | 冷建不再打开第二个 compact Worker，也不再计算/序列化完整 Attribution；P4 独立阶段输出分页事实与小型汇总。当前按需 fallback 仍可能构建完整对象，相关入口在派生后端完成前保持未就绪 |
+| GPU Reference反向读取 | Pass/End时间map和按Resource聚合的全部Use vector | `ScanGpuMemoryUsesByResource`已迁移；其他GPU Memory入口待迁移 | schema33以Pass/End外排时间表、48字节解析Use分页表和Resource反向ordinal索引替代该方法的全量`unordered_map<vector>`；保持原始Use顺序。`ScanGpuMemoryAllocations`等仍调用旧Ensure路径，不能提前删除旧容器 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
 | Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；P4 Resource多类历史及Pass VG Evidence已恢复 | schema32沿用持久化Catalog质量校验；显式跨表和名称元数据使用generation-aware外排归并，Relation/Evidence继续只验证可证明端点。Resource摘要、String点查、48字节关联摘要及多域ordinal/generation分页索引采用外部排序构建；explain、Range/Reference、Logical/通用Relation、Pass Resource和GPU Memory仍待迁移 |
 
@@ -44,6 +45,7 @@ P6已补Windows发布临时占用重试、同轮半发布候选清理、每Trace
 - schema30为View历史和两类Mesh Part建立按Resource ID/原始ordinal有序的独立索引及generation分页表；`gpu.resource.views/mesh_buffers`使用v2 cursor直接定位。非空组件与QueryService合同、真实小Catalog冷建/深校验/热开通过，Release全构建与CTest 40/40通过（128.76秒）。
 - schema31为VG历史和已解析RtasUses端点建立按Resource ID/原始ordinal索引及generation分页表；pointer flag端点不索引。`gpu.resource.vg_pages/raytracing_chain`同时保留旧嵌套页字段并提供v2 cursor，Release全构建与CTest 40/40通过（124.89秒）。
 - schema32按Evidence的三个Pass关联字段建立去重反向索引和generation分页表；`gpu.pass.vg_evidence`使用v2 cursor直接定位，最终sample状态不受页大小影响。Release全构建与CTest 40/40通过（129.76秒）。
+- schema33将GPU Reference Pass/End/Use外排归并为Pass时间表、解析Use表和Resource反向索引；`ScanGpuMemoryUsesByResource`直接分页且保持原始Use ordinal顺序。组件、真实小Catalog和Release全构建通过，CTest 41/41通过（126.79秒）。
 - `gpu.resource.search`按summary物理ordinal扫描并将下一ordinal写入v2 cursor；名称/类型/class及五种关联布尔过滤均不物化全量ID，total在剩余流式扫描中精确累计。关联过滤只点读同ordinal定长摘要，不回退完整Catalog。Release全构建与CTest 40/40通过（124.08秒）。
 - Relation/Evidence语义回归加入健康RtasUses和DetailedEvidence记录；RtasUses已解析端点缺少同generation Resource定义会返回跨表引用异常，Relation/Evidence非法枚举或flag分别返回记录异常。定向回归与真实1,001资源Catalog通过。
 - 未运行 12.43 GB 正式 Trace。

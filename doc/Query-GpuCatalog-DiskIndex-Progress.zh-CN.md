@@ -139,6 +139,13 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 非空组件夹具覆盖三个匹配键、重复键去重、两页记录和generation；真实QueryService合同验证第一页及最终状态。1,001 Resource真实Catalog完成schema32冷建、深校验、热开和无scratch发布；该夹具DetailedEvidence域为空。
 - 真实夹具Catalog section为31,090字节，空Evidence lookup和generation分页目录各224字节，完整独立输出83,874字节。Release全构建与CTest 40/40通过（129.76秒）。`gpu.pass.resources`、Range/Reference、Logical/Relation及Explain仍待迁移。
 
+## 2026-09-20：schema33 GPU Reference Use磁盘反向索引
+
+- 原`EnsureGpuResourcePassRefs`会把全部Pass时间和全部Use按Resource聚合到进程内`unordered_map<vector>`。schema33新增独立磁盘Store：Pass/End先外排为按Pass ID有序的起止时间；Use按Pass ID外排归并为48字节解析记录，再建立`resourceId→原始Use ordinal`反向索引。
+- Indexed `ScanGpuMemoryUsesByResource`改为二分定位并读取一页，不再触发全量map。输出保持原始Use顺序；无End的Pass沿用start作为end，缺失Pass和零Resource Use不发布。Reader对Pass严格递增、时间边界、lookup排序及Resource身份执行深校验。
+- 新组件夹具覆盖乱序Pass对应的原始Use顺序、两页读取、结束/未结束Pass、缺失Pass、零Resource和scratch回收。真实小Catalog完成schema33冷建、深校验、热开和事务发布；其GPU Reference域为空。
+- 真实夹具GPU Reference Use section为896字节，三个空分页子表各224字节，完整独立输出84,547字节。Release全构建与CTest 41/41通过（126.79秒）。现有`ScanGpuMemoryAllocations`等其他入口仍会调用旧全量map，须随GPU Memory消费者继续迁移；本检查点不宣称GPU Reference路径整体完成。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。
