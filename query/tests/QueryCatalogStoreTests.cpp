@@ -362,6 +362,7 @@ int main()
         const auto allRelations100 = associationReader.ResourceRelations( 100, 0, 10 );
         const auto logicals100 = associationReader.ResourceLogicals( 100, 0, 10 );
         const auto logical700 = associationReader.ResolveLogical( 700, 2 );
+        const auto allocation500 = associationReader.AllocationState( 500 );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
@@ -396,6 +397,12 @@ int main()
             logical700->record.stableKey == 99 && logical700->generation == 17 &&
             !associationReader.ResolveLogical( 701, 3 ),
             "Catalog Resource explain detail indices changed part, relation or logical semantics" );
+        Require( associationReader.RangeCount() == 2 &&
+            associationReader.RangeAt( 1 ).record.resourceId == 102 && allocation500 &&
+            allocation500->record.sizeBytes == 8192 &&
+            allocation500->record.operation == uint8_t( JnGpuCatalogRecordOperation::Update ) &&
+            !associationReader.AllocationState( 999 ),
+            "Catalog pass-index source reads changed RangeSet or allocation final-state semantics" );
         const auto allocations100First = associationReader.ResourceAllocations( 100, 0, 1 );
         const auto allocations100Second = associationReader.ResourceAllocations( 100, 1, 1 );
         const auto allocations102 = associationReader.ResourceAllocations( 102, 0, 10 );

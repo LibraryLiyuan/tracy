@@ -66,6 +66,8 @@ public:
     QueryGpuReferenceUsePage UsesByResource( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryGpuReferenceUsePage UsesByCatalogResource( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryGpuReferenceUsePage UsesByPass( uint64_t passId, uint64_t offset, size_t limit ) const;
+    uint64_t UseCount() const;
+    QueryGpuReferenceResolvedUseRecord UseAt( uint64_t ordinal ) const;
     void ValidateAll( const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource = {} ) const;
 
 private:

@@ -1,4 +1,5 @@
 #include "TracyQueryCatalogStore.hpp"
+#include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyQueryService.hpp"
 #include "TracySessionManager.hpp"
 #include "FakeTraceSource.hpp"
@@ -18,7 +19,8 @@ using namespace tracy;
 using namespace tracy::query;
 
 class BoundedCatalogSource final : public test::FakeTraceSource,
-    public QueryCatalogStatusSource, public QueryCatalogResourceSource
+    public QueryCatalogStatusSource, public QueryCatalogResourceSource,
+    public QueryGpuPassResourceSource
 {
 public:
     BoundedCatalogSource()
@@ -212,7 +214,8 @@ public:
         value.freedPhysicalBytes = 4096;
         return value;
     }
-    uint64_t ResolveQueryCatalogResourcePointer( uint64_t, int64_t ) const override { return 0; }
+    uint64_t ResolveQueryCatalogResourcePointer( uint64_t pointerToken, int64_t ) const override
+    { return pointerToken == 900 ? 100 : 0; }
     QueryCatalogPointerIntervalPage GetQueryCatalogResourcePointerIntervals(
         uint64_t, uint64_t, size_t ) const override { return {}; }
     QueryCatalogRangePage GetQueryCatalogResourceRanges(
@@ -253,6 +256,62 @@ public:
             value.encoding = uint8_t( index == 0 ? 2 : 1 );
             page.values.emplace_back( value );
         }
+        return page;
+    }
+    std::optional<QueryGpuPassResourceSummary> GetQueryGpuPassResourceSummary( uint64_t passId ) const override
+    {
+        if( passId != 200 ) return std::nullopt;
+        QueryGpuPassResourceSummary value;
+        value.passId = 200; value.resourceCount = 1; value.allocationCount = 1;
+        value.directRangeBytes = 3072; value.referencedPhysicalBytes = 4096;
+        value.rangedResourceCount = 1; value.rangeCount = 2; value.useCount = 2;
+        return value;
+    }
+    QueryGpuPassRangePage GetQueryGpuPassRanges(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        QueryGpuPassRangePage page;
+        if( passId != 200 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryGpuPassRangeData value {};
+            value.record.passInstanceId = 300 + index;
+            value.record.resourceId = 100;
+            value.record.lengthBytes = 1024 * ( index + 1 );
+            value.generation = 16;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
+    QueryGpuPassUsePage GetQueryGpuPassUses(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        QueryGpuPassUsePage page;
+        if( passId != 200 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryGpuReferenceResolvedUseRecord value {};
+            value.resourceId = 900;
+            value.passId = 300 + index;
+            value.passEnd = 80;
+            value.usageMask = uint32_t( 4 + index );
+            value.resourceSetId = uint32_t( 20 + index );
+            value.encoding = 2;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
+    QueryGpuPassIdPage GetQueryGpuPassEvidenceIds(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        QueryGpuPassIdPage page;
+        if( passId != 200 ) return page;
+        const uint64_t values[2] { 300, 301 };
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+            page.values.emplace_back( values[index] );
         return page;
     }
 
@@ -360,6 +419,30 @@ int main()
         evidencePage.at( "data" ).at( "records" )[0].at( "request_id" ) == "1" &&
         evidencePage.at( "data" ).at( "sample_status" ) == "periodic_exact" &&
         evidencePage.at( "data" ).at( "page" ).at( "total" ) == "2" );
+
+    const auto passResources = service.Execute( Request( 30, "gpu.pass.resources", {
+        { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 }
+    } ) );
+    assert( passResources.at( "ok" ) && passResources.at( "data" ).at( "resource_count" ) == "1" &&
+        passResources.at( "data" ).at( "allocation_count" ) == "1" &&
+        passResources.at( "data" ).at( "direct_range_bytes" ) == "3072" &&
+        passResources.at( "data" ).at( "referenced_physical_bytes" ) == "4096" &&
+        passResources.at( "data" ).at( "evidence_pass_ids" ).size() == 2 &&
+        passResources.at( "data" ).at( "ranges" ).size() == 1 &&
+        passResources.at( "data" ).at( "resource_set_uses" ).size() == 1 &&
+        passResources.at( "data" ).at( "resource_set_uses" )[0].at( "catalog_resource_id" ) == "100" &&
+        passResources.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto passResourcesNext = service.Execute( Request( 31, "gpu.pass.resources", {
+        { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 },
+        { "cursor", passResources.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( passResourcesNext.at( "ok" ) && passResourcesNext.at( "data" ).at( "ranges" ).size() == 1 &&
+        passResourcesNext.at( "data" ).at( "resource_set_uses" ).size() == 1 &&
+        passResourcesNext.at( "page" ).at( "next_cursor" ).is_null() );
+    const auto memoryByPass = service.Execute( Request( 32, "gpu.memory.by_pass", {
+        { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 }
+    } ) );
+    assert( memoryByPass.at( "ok" ) && memoryByPass.at( "data" ).at( "resource_count" ) == "1" );
 
     const auto referencesFirst = service.Execute( Request( 14, "gpu.resource.references", {
         { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }

@@ -83,6 +83,8 @@ Require ($service -match 'validation\.run[\s\S]{0,8192}gpuCatalogControls[\s\S]{
     'validation.run checks Batch sequences without including Catalog control records from the shared sequence space.'
 Require ($service -match 'gpu\.pass\.vg_evidence[\s\S]{0,4096}"page"[\s\S]{0,512}"has_more"') `
     'Detailed GPU evidence query is not paginated.'
+Require ($service -match 'boundedPassResourceMethod[\s\S]{0,1024}GetQueryGpuPassResourceSummary') `
+    'GPU pass resource queries do not use the bounded aggregate backend.'
 Require ($tracyWorker.Contains('entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass )')) `
     'RangeSet lifetime resolution does not use the authoritative explicit GPU pass time.'
 Require ($tracyWorker.Contains('link.relation == uint8_t( JnGfxRelation::RangeEvidenceComplete )')) `

@@ -184,6 +184,16 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - Indexed `ScanGpuMemoryPasses(passId, useOffset, useLimit)`改为直接读取该Pass的一页Use和精确总数，不再为一个Pass从头扫描全部GPU Reference Use。非定向Pass列表的摘要扫描暂保持原路径。
 - GPU Reference组件、QueryService Catalog合同和N27静态回归通过；本小改动未重复完整41项套件，沿用同一schema36阶段已通过的Release全构建与CTest证据。
 
+## 2026-09-20：schema37 Pass→Resource聚合与分页
+
+- 新增独立Pass Resource磁盘Store。GPU Reference Pass自身映射、显式Pass的typed `ReferencesResources`映射及RangeSet直连Pass先外排去重；Range和按生命周期解析后的Use再按查询Pass展开。
+- 展开事实按`(queryPassId, catalogResourceId, kind, 原始ordinal)`外排，流式计算唯一Resource、range coverage、direct range bytes及详情数；Resource→Allocation对再次外排去重，生成唯一Allocation数和capture末尾仍有效的物理字节。最终每Pass摘要固定64字节。
+- Range、Use和evidence pass ID分别按Query Pass分页；单Pass大集合不构造进程内set/vector。构建中间文件使用共享磁盘/workspace预算，阶段边界显式关闭Windows句柄，成功后scratch必须为零。
+- Indexed `gpu.pass.resources`与`gpu.memory.by_pass`已切换到该后端，保留旧汇总字段并增加Range/Use分页及Query 1.35 cursor。Use按Pass结束时间返回Catalog Resource和物理Allocation。
+- 非空组件夹具覆盖两个evidence pass合并、重复mapping、Resource/Allocation去重、Range字节、物理字节、coverage、详情分页和直接Reference Pass查询；QueryService合同覆盖两个方法及续页。
+- 1,001 Resource真实Catalog完成schema37冷建、深校验、热开Pass查询和二次事务发布；该夹具Pass事实为空。GPU Reference Use section为2,016字节，四个新增空表各224字节，独立目录全部文件92,191字节；只保留一个generation且无scratch。Release全构建与CTest 42/42通过（132.34秒）。
+- GPU Catalog Resource/Pass/GPU Memory主要查询已具备有界后端；Catalog validation详细响应、Job、Sample派生及Scan仍待完成。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

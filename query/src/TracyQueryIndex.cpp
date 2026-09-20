@@ -2,6 +2,7 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryGpuReferenceStore.hpp"
+#include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyQueryCallstackStore.hpp"
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
@@ -1414,6 +1415,7 @@ class IndexedTraceSource final : public analysis::TraceSource,
     public analysis::GpuCatalogBoundedScanSource,
     public QueryCatalogStatusSource,
     public QueryCatalogResourceSource,
+    public QueryGpuPassResourceSource,
     public QueryResourceContextSource
 {
 public:
@@ -1440,6 +1442,8 @@ public:
         , m_gpuReferenceUses( m_manifest.gpuReferenceUses, ZoneSectionKind::GpuReferenceUse, sizeof( JnGpuReferenceUseData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuReferenceEnds( m_manifest.gpuReferenceEnds, ZoneSectionKind::GpuReferenceEnd, sizeof( JnGpuReferenceEndData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuReferenceIndex( m_manifest.gpuReferenceUses.path, m_manifest.sourceFingerprint, m_storageOptions )
+        , m_gpuPassResources( m_manifest.gpuReferenceUses.path, m_manifest.gpuCatalog.path,
+            m_manifest.gpuReferenceUses.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuMemoryCpuZones( m_manifest.gpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuMemorySummaryCpuZones( m_manifest.gpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
     {
@@ -1656,6 +1660,29 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
         return m_gpuReferenceIndex.UsesByCatalogResource( resourceId, offset, limit );
+    }
+
+    std::optional<QueryGpuPassResourceSummary> GetQueryGpuPassResourceSummary( uint64_t passId ) const override
+    {
+        return m_gpuPassResources.Summary( passId );
+    }
+
+    QueryGpuPassRangePage GetQueryGpuPassRanges(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        return m_gpuPassResources.Ranges( passId, offset, limit );
+    }
+
+    QueryGpuPassUsePage GetQueryGpuPassUses(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        return m_gpuPassResources.Uses( passId, offset, limit );
+    }
+
+    QueryGpuPassIdPage GetQueryGpuPassEvidenceIds(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        return m_gpuPassResources.EvidencePassIds( passId, offset, limit );
     }
 
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override
@@ -2720,6 +2747,7 @@ private:
     ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     QueryGpuReferenceStoreReader m_gpuReferenceIndex;
+    QueryGpuPassResourceStoreReader m_gpuPassResources;
     ReadOnlyZoneSection m_gpuMemoryCpuZones;
     ReadOnlyZoneSection m_gpuMemorySummaryCpuZones;
     std::unordered_map<int32_t, analysis::SourceLocationDto> m_locations;
@@ -3660,6 +3688,59 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                 return catalog.ResolveResourcePointer( pointerToken, time );
             } );
+            const auto linkIndex = size_t( SerializedZoneSink::JnDomain::GfxLink );
+            auto linkManifest = result.gfxLinks; linkManifest.path = temporaryJn[linkIndex];
+            ReadOnlyZoneSection links( linkManifest, ZoneSectionKind::GfxLink,
+                sizeof( JnGfxLinkData ), result.sourceFingerprint, storageOptions );
+            class PassResourceInput final : public QueryGpuPassResourceInput
+            {
+            public:
+                PassResourceInput( const ReadOnlyZoneSection& passes, const ReadOnlyZoneSection& links,
+                    const QueryCatalogStoreReader& catalog, const QueryGpuReferenceStoreReader& references )
+                    : m_passes( passes ), m_links( links ), m_catalog( catalog ), m_references( references ) {}
+                uint64_t MappingCount() const override { return m_passes.Count() + m_links.Count(); }
+                QueryGpuPassMapping Mapping( uint64_t ordinal ) const override
+                {
+                    if( ordinal < m_passes.Count() )
+                    {
+                        const auto& pass = m_passes.At<JnGpuReferencePassData>( ordinal );
+                        return { pass.passId, pass.passId };
+                    }
+                    const auto& link = m_links.At<JnGfxLinkData>( ordinal - m_passes.Count() );
+                    return link.relation == uint8_t( JnGfxRelation::ReferencesResources ) ?
+                        QueryGpuPassMapping { link.targetId, link.sourceId } : QueryGpuPassMapping {};
+                }
+                uint64_t RangeCount() const override { return m_catalog.RangeCount(); }
+                JnGpuRangeSetRecordV1 Range( uint64_t ordinal ) const override
+                { return m_catalog.RangeAt( ordinal ).record; }
+                uint64_t UseCount() const override { return m_references.UseCount(); }
+                QueryGpuReferenceResolvedUseRecord Use( uint64_t ordinal ) const override
+                { return m_references.UseAt( ordinal ); }
+                uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
+                { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
+                uint64_t ResourceAllocation( uint64_t resourceId ) const override
+                {
+                    const auto state = m_catalog.ResourceState( resourceId );
+                    return state ? state->latest.allocationId : 0;
+                }
+                uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const override
+                {
+                    const auto state = m_catalog.AllocationState( allocationId );
+                    return state && state->record.operation != uint8_t( JnGpuCatalogRecordOperation::Destroy ) ?
+                        state->record.sizeBytes : 0;
+                }
+            private:
+                const ReadOnlyZoneSection& m_passes;
+                const ReadOnlyZoneSection& m_links;
+                const QueryCatalogStoreReader& m_catalog;
+                const QueryGpuReferenceStoreReader& m_references;
+            } passResourceInput( passes, links, catalog, check );
+            resources->SetPhase( "gpu-pass-resource-index" );
+            QueryGpuPassResourceStore::Build( temporaryJn[useIndex], result.sourceFingerprint,
+                passResourceInput, storageOptions );
+            QueryGpuPassResourceStoreReader passResources( temporaryJn[useIndex], temporaryCatalog,
+                temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
+            passResources.ValidateAll();
             result.gpuReferenceUses.bytes = SectionBytes( temporaryJn[useIndex] );
             result.gpuReferenceUses.fingerprint = SectionFingerprint( temporaryJn[useIndex] );
         }
@@ -4074,6 +4155,10 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                     return catalog.ResolveResourcePointer( pointerToken, time );
                 } );
+                QueryGpuPassResourceStoreReader passResources( manifest.gpuReferenceUses.path,
+                    manifest.gpuCatalog.path, manifest.gpuReferenceUses.path,
+                    manifest.sourceFingerprint, storageOptions );
+                passResources.ValidateAll();
             }
         }
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );

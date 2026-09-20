@@ -1,5 +1,6 @@
 #include "TracyQueryService.hpp"
 #include "TracyQueryCatalogStore.hpp"
+#include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyDeterministicScanTypes.hpp"
 #include "TracyAnalysisProfile.hpp"
 #include "TracyHash.hpp"
@@ -5475,6 +5476,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto* catalogStatusSource = dynamic_cast<const QueryCatalogStatusSource*>( source.get() );
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
+        const auto* gpuPassResourceSource = dynamic_cast<const QueryGpuPassResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
             method == "gpu.resource.explain" || method == "gpu.resource.lifetime" ||
             method == "gpu.resource.allocations" ||
@@ -5486,8 +5488,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         const bool boundedEvidenceMethod = method == "gpu.pass.vg_evidence" &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        const bool boundedPassResourceMethod = ( method == "gpu.pass.resources" ||
+            method == "gpu.memory.by_pass" ) && gpuPassResourceSource != nullptr &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod &&
-            !boundedEvidenceMethod )
+            !boundedEvidenceMethod && !boundedPassResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
         if( boundedStatusMethod )
         {
@@ -5545,7 +5550,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 } }
             }, trace );
         }
-        if( boundedResourceMethod || boundedEvidenceMethod )
+        if( boundedResourceMethod || boundedEvidenceMethod || boundedPassResourceMethod )
         {
             const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
             if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
@@ -5553,6 +5558,81 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
             if( !validation.healthy ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
                 { "reason", "Catalog disk semantic validation failed; dependent evidence is unavailable" } }, trace );
+            if( boundedPassResourceMethod )
+            {
+                const auto passId = UnsignedParameter( params, "pass_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                const auto page = ParsePage( params, method, trace );
+                const auto storedSummary = gpuPassResourceSource->GetQueryGpuPassResourceSummary( passId );
+                QueryGpuPassResourceSummary summary {};
+                summary.passId = passId;
+                if( storedSummary ) summary = *storedSummary;
+                const auto rangePage = gpuPassResourceSource->GetQueryGpuPassRanges(
+                    passId, page.offset, page.limit );
+                const auto usePage = gpuPassResourceSource->GetQueryGpuPassUses(
+                    passId, page.offset, page.limit );
+                const auto evidencePage = gpuPassResourceSource->GetQueryGpuPassEvidenceIds(
+                    passId, 0, DefaultPageSize );
+                json evidenceIds = json::array();
+                for( const auto value : evidencePage.values ) evidenceIds.push_back( Decimal( value ) );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& range = item.record;
+                    ranges.push_back( {
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", range.resourceId ) },
+                        { "resource_id", Decimal( range.resourceId ) },
+                        { "view_id", range.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.viewDefinitionId ) ) },
+                        { "range_kind", range.rangeKind }, { "offset_bytes", Decimal( range.offsetBytes ) },
+                        { "length_bytes", Decimal( range.lengthBytes ) },
+                        { "first_subresource", range.firstSubresource }, { "subresource_count", range.subresourceCount },
+                        { "usage_mask", range.usageMask }, { "exactness", GpuExactnessName( range.exactness ) }
+                    } );
+                }
+                json uses = json::array();
+                for( const auto& use : usePage.values )
+                {
+                    const auto resourceId = catalogResourceSource->ResolveQueryCatalogResourcePointer(
+                        use.resourceId, use.passEnd );
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
+                    const auto allocationId = state ? state->latest.allocationId : 0;
+                    uses.push_back( {
+                        { "allocation_id", allocationId == 0 ? json( nullptr ) : json( Decimal( allocationId ) ) },
+                        { "logical_resource_id", Decimal( use.resourceId ) },
+                        { "catalog_resource_id", resourceId == 0 ? json( nullptr ) : json( Decimal( resourceId ) ) },
+                        { "resolved_physical_allocation_id", allocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocationId ) ) },
+                        { "resource_set_id", use.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "usage_mask", use.usageMask }, { "resolved_resource_count", resourceId == 0 ? "0" : "1" },
+                        { "resolution", resourceId == 0 ? "unresolved_logical_resource" : "pointer_lifetime_exact" }
+                    } );
+                }
+                const auto returned = std::max( ranges.size(), uses.size() );
+                const bool hasMore = page.offset + ranges.size() < rangePage.total ||
+                    page.offset + uses.size() < usePage.total;
+                const auto cursor = NextCursor( page, method, trace, returned, hasMore );
+                return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
+                    { "evidence_pass_ids", std::move( evidenceIds ) },
+                    { "evidence_pass_ids_truncated", evidencePage.total > evidencePage.values.size() },
+                    { "sample_status", "continuous_exact" },
+                    { "resource_count", Decimal( summary.resourceCount ) },
+                    { "allocation_count", Decimal( summary.allocationCount ) },
+                    { "direct_range_bytes", Decimal( summary.directRangeBytes ) },
+                    { "referenced_physical_bytes", Decimal( summary.referencedPhysicalBytes ) },
+                    { "range_coverage", summary.resourceCount == 0 ? 1.0 :
+                        double( summary.rangedResourceCount ) / double( summary.resourceCount ) },
+                    { "unknown_range_resource_count", Decimal( summary.resourceCount - summary.rangedResourceCount ) },
+                    { "ranges", std::move( ranges ) }, { "resource_set_uses", std::move( uses ) },
+                    { "ranges_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", rangePage.values.size() }, { "total", Decimal( rangePage.total ) },
+                        { "has_more", page.offset + rangePage.values.size() < rangePage.total } } },
+                    { "resource_set_page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", usePage.values.size() }, { "total", Decimal( usePage.total ) },
+                        { "has_more", page.offset + usePage.values.size() < usePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
             if( method == "gpu.pass.vg_evidence" )
             {
                 const auto passId = UnsignedParameter( params, "pass_id", 0,

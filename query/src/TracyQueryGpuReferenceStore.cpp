@@ -426,6 +426,19 @@ QueryGpuReferenceUsePage QueryGpuReferenceStoreReader::UsesByPass(
     return result;
 }
 
+uint64_t QueryGpuReferenceStoreReader::UseCount() const
+{
+    return m_impl->uses.Count();
+}
+
+QueryGpuReferenceResolvedUseRecord QueryGpuReferenceStoreReader::UseAt( uint64_t ordinal ) const
+{
+    if( ordinal >= m_impl->uses.Count() ) throw std::out_of_range( "GPU reference use ordinal" );
+    QueryGpuReferenceResolvedUseRecord result {};
+    m_impl->uses.Read( ordinal, &result, 1 );
+    return result;
+}
+
 void QueryGpuReferenceStoreReader::ValidateAll(
     const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource ) const
 {

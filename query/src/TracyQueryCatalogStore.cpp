@@ -2451,6 +2451,72 @@ QueryCatalogRangePage QueryCatalogStoreReader::PassRanges(
     return result;
 }
 
+uint64_t QueryCatalogStoreReader::RangeCount() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    return m_impl->rawRanges->Count();
+}
+
+QueryCatalogRangeData QueryCatalogStoreReader::RangeAt( uint64_t ordinal ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    if( ordinal >= m_impl->rawRanges->Count() || ordinal >= m_impl->rangeGenerations->Count() )
+        throw std::out_of_range( "Catalog RangeSet ordinal" );
+    QueryCatalogRangeData result {};
+    m_impl->rawRanges->Read( ordinal, &result.record, 1 );
+    m_impl->rangeGenerations->Read( ordinal, &result.generation, 1 );
+    return result;
+}
+
+std::optional<QueryCatalogAllocationData> QueryCatalogStoreReader::AllocationState(
+    uint64_t allocationId ) const
+{
+    if( allocationId == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourceAllocationLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < allocationId || ( upper && row.keyHigh == allocationId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    std::optional<QueryCatalogAllocationData> result;
+    uint64_t resultOrdinal = 0;
+    for( auto index = rangeBegin; index < rangeEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawAllocations->Count() ||
+            row.metadata >= m_impl->resourceAllocationGenerations->Count() )
+            throw std::runtime_error( "Catalog allocation state ordinal mismatch" );
+        QueryCatalogAllocationData value {};
+        m_impl->rawAllocations->Read( row.metadata, &value.record, 1 );
+        m_impl->resourceAllocationGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.allocationId != allocationId )
+            throw std::runtime_error( "Catalog allocation state identity mismatch" );
+        if( !result || value.record.time > result->record.time ||
+            ( value.record.time == result->record.time && row.metadata >= resultOrdinal ) )
+        {
+            result = value;
+            resultOrdinal = row.metadata;
+        }
+    }
+    return result;
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;

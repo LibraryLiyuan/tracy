@@ -95,8 +95,14 @@ int main( int argc, char** argv )
         Require( fs::is_directory( gpuReferenceUseRoot / "by-resource" ) &&
             fs::is_directory( gpuReferenceUseRoot / "by-catalog-resource" ) &&
             fs::is_directory( gpuReferenceUseRoot / "pass-times" ) &&
-            fs::is_directory( gpuReferenceUseRoot / "resolved-uses" ),
+            fs::is_directory( gpuReferenceUseRoot / "resolved-uses" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "pass-resource-summary" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "pass-resource-ranges" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "pass-resource-uses" ) &&
+            fs::is_directory( gpuReferenceUseRoot / "pass-resource-evidence-ids" ),
             "Query index did not publish bounded GPU-reference reverse indices" );
+        Require( !fs::exists( gpuReferenceUseRoot / "pass-resource-scratch" ),
+            "Query index published completed GPU pass resource scratch files" );
         Require( !fs::exists( catalogRoot / "resource-index-scratch" ),
             "Query index published completed Catalog resource scratch files" );
         Require( fs::is_directory( catalogRoot / "resource-pointer-intervals" ) &&

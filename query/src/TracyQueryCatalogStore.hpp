@@ -305,6 +305,9 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogRangePage ResourceRanges( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogRangePage PassRanges( uint64_t passId, uint64_t offset, size_t limit ) const;
+    uint64_t RangeCount() const;
+    QueryCatalogRangeData RangeAt( uint64_t ordinal ) const;
+    std::optional<QueryCatalogAllocationData> AllocationState( uint64_t allocationId ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:
