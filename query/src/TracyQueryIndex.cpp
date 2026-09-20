@@ -1582,6 +1582,12 @@ public:
         return m_catalog.ResourceMeshParts( resourceId, offset, limit );
     }
 
+    QueryCatalogPartPage GetQueryCatalogResourceParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceParts( resourceId, offset, limit );
+    }
+
     QueryCatalogVgPage GetQueryCatalogResourceVgPages(
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
@@ -1592,6 +1598,24 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
         return m_catalog.ResourceRtasRelations( resourceId, offset, limit );
+    }
+
+    QueryCatalogRelationPage GetQueryCatalogResourceRelations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceRelations( resourceId, offset, limit );
+    }
+
+    QueryCatalogLogicalPage GetQueryCatalogResourceLogicals(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.ResourceLogicals( resourceId, offset, limit );
+    }
+
+    std::optional<QueryCatalogLogicalData> ResolveQueryCatalogLogical(
+        uint64_t logicalResourceId, int64_t time ) const override
+    {
+        return m_catalog.ResolveLogical( logicalResourceId, time );
     }
 
     QueryCatalogEvidencePage GetQueryCatalogPassEvidence(

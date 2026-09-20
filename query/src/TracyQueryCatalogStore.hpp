@@ -181,6 +181,18 @@ struct QueryCatalogRangePage
     uint64_t total = 0;
 };
 
+struct QueryCatalogLogicalData
+{
+    JnGpuCatalogLogicalRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogLogicalPage
+{
+    std::vector<QueryCatalogLogicalData> values;
+    uint64_t total = 0;
+};
+
 class QueryCatalogStatusSource
 {
 public:
@@ -204,10 +216,18 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogPartPage GetQueryCatalogResourceMeshParts(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogPartPage GetQueryCatalogResourceParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogVgPage GetQueryCatalogResourceVgPages(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogRelationPage GetQueryCatalogResourceRtasRelations(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogRelationPage GetQueryCatalogResourceRelations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogLogicalPage GetQueryCatalogResourceLogicals(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual std::optional<QueryCatalogLogicalData> ResolveQueryCatalogLogical(
+        uint64_t logicalResourceId, int64_t time ) const = 0;
     virtual QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
         uint64_t passId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogGpuMemorySummary GetQueryCatalogGpuMemorySummary() const = 0;
@@ -272,8 +292,12 @@ public:
     QueryCatalogAllocationPage ResourceAllocations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogViewPage ResourceViews( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogPartPage ResourceMeshParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogPartPage ResourceParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogVgPage ResourceVgPages( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogRelationPage ResourceRtasRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogRelationPage ResourceRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogLogicalPage ResourceLogicals( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    std::optional<QueryCatalogLogicalData> ResolveLogical( uint64_t logicalResourceId, int64_t time ) const;
     QueryCatalogEvidencePage PassEvidence( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryCatalogGpuMemorySummary GpuMemorySummary() const;
     uint64_t ResolveResourcePointer( uint64_t pointerToken, int64_t time ) const;

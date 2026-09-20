@@ -1,6 +1,6 @@
 # Query 长数据静态持有者审计
 
-更新：2026-09-20。当前索引 schema35。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
+更新：2026-09-20。当前索引 schema36。本文对应修订计划 P2/P3/P4/P6，只记录源码可证实的持有者和处理状态；“候选”不等于已证明的 OOM 根因。
 
 | 路径 | 随录制增长的对象 | 2026-09-18 状态 | 有界策略/下一步 |
 |---|---|---|---|
@@ -14,7 +14,7 @@
 | GPU Memory 摘要 | `BuildGpuMemoryAttribution`/`BuildGpuAnalysisSnapshot` 的完整 vector/map 和大 JSON | 类型、物理峰值与churn已迁移；Pass归因待完成 | schema34流式聚合Resource类型；Allocation按ID/时间外排生成增减事件，再按时间/原始ordinal外排为56字节固定摘要。Indexed `gpu.memory.by_type/peak/churn`不再构造完整Snapshot；`gpu.memory.by_pass`及完整Pass归因仍待磁盘后端 |
 | GPU Reference反向读取 | Pass/End时间map和按Resource聚合的全部Use vector | 已移除 | schema33以Pass/End外排时间表、48字节解析Use分页表和Resource反向ordinal索引替代全量`unordered_map<vector>`；保持原始Use顺序。`ScanGpuMemoryUsesByResource`直接分页，`ScanGpuMemoryAllocations`逐allocation读取总数及最多100个Pass预览；旧Ensure、map和once flag均已删除 |
 | Sample 派生 | ghost zone、symbol statistics、父调用栈等仍依赖 compact Worker | P4 待恢复 | 建派生索引后由 readiness 清单发布；当前继续明确 `INDEX_NOT_READY` |
-| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；Resource引用与部分GPU Memory已恢复 | schema35沿用持久化Catalog质量校验；Resource摘要、String点查、多域历史、指针生命周期、RangeSet Resource/Pass双向索引及已解析GPU Use均采用generation-aware外排。`gpu.resource.references`、资源历史、Pass VG Evidence和GPU类型/峰值/churn已走真实磁盘后端；explain、Logical/通用Relation、Pass Resource/by_pass、Job和Sample派生仍待迁移 |
+| Job/Catalog 派生 | Job 聚合、依赖图、Catalog 历史、Pass 双向关联和 GPU Memory 查询 | P3质量校验部分完成；Resource单体查询与部分GPU Memory已恢复 | schema36沿用持久化Catalog质量校验；Resource摘要、String点查、多域历史、指针生命周期、RangeSet双向索引、已解析GPU Use、全部Part、Logical定义/绑定及通用Relation均采用generation-aware外排。Resource查询含Explain、Pass VG Evidence和GPU类型/峰值/churn已走真实磁盘后端；Pass Resource/by_pass、validation详细响应、Job和Sample派生仍待迁移 |
 
 P4已恢复`gpu.catalog.status`的真实磁盘后端：generation和Evidence预览有明确上界与截断字段，各域计数直接读分页目录；其余Catalog查询继续未就绪。
 

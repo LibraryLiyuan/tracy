@@ -169,6 +169,15 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 1,001 Resource真实Catalog完成schema35冷建、深校验、热开references和第二次事务发布；该夹具Range/Use为空。Catalog section为33,151字节，GPU Reference Use section为1,120字节，独立目录全部文件91,436字节；只保留一个generation且无scratch。
 - Release全构建与CTest 41/41通过（125.76秒）。`gpu.pass.resources`/`gpu.memory.by_pass`的聚合摘要、Logical/通用Relation和Explain仍待迁移。
 
+## 2026-09-20：schema36 Resource Explain有界后端
+
+- Part新增按Resource的全类型索引，保持`gpu.resource.mesh_buffers`原有的mesh-only索引；Relation新增两端点通用反向索引，同一记录两端相同只发布一次，保留旧Explain对多态数值端点的展示语义。
+- Logical新增generation表、Resource binding索引和Logical ID定义索引。查询按binding时间选择不晚于该时刻的最新定义，同时间用原始ordinal确定；名称、stable key、family、物理范围、alias、primary kind和definition revision继续按binding优先、definition回填。
+- Indexed `gpu.resource.explain`统一使用有界后端读取Resource基本信息、allocation、view、全部part、RangeSet、已解析ResourceSet Use、logical binding和relation。每一类最多返回默认页，新增对应总数和截断字段，避免单个Resource构造无界JSON。
+- 组件夹具覆盖非mesh Part、三种通用Relation、Logical binding有/无定义及generation；QueryService合同覆盖Explain完整组合。1,001 Resource真实Catalog完成schema36冷建、深校验、热开Explain和第二次事务发布；该夹具首个Resource的详情集合为空。
+- 真实夹具Catalog section为34,271字节，四个新增空lookup各224字节，独立目录全部文件93,655字节；只保留一个generation且无scratch。Release全构建与CTest 41/41通过（124.99秒）。
+- Resource单体查询已基本迁移；`gpu.pass.resources`/`gpu.memory.by_pass`、Catalog validation详细响应、Job、Sample派生及Scan仍待完成。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

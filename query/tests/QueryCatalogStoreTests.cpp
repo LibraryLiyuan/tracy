@@ -244,9 +244,14 @@ int main()
 
             JnGpuCatalogLogicalRecordV1 associationLogicals[3] {};
             associationLogicals[0].logicalResourceId = 700;
-            associationLogicals[0].aliasGroupId = 77;
+            associationLogicals[0].aliasGroupId = 77; associationLogicals[0].stableKey = 99;
+            associationLogicals[0].time = 1; associationLogicals[0].nameId = 7;
             associationLogicals[1].logicalResourceId = 700; associationLogicals[1].resourceId = 100;
+            associationLogicals[1].time = 2;
+            associationLogicals[1].operation = uint8_t( JnGpuCatalogRecordOperation::Bind );
             associationLogicals[2].logicalResourceId = 701; associationLogicals[2].resourceId = 101;
+            associationLogicals[2].time = 3;
+            associationLogicals[2].operation = uint8_t( JnGpuCatalogRecordOperation::Bind );
             associationWriter.Begin( OfflineCatalogDomain::CatalogLogical, 3, sizeof( associationLogicals[0] ) );
             associationWriter.Append( OfflineCatalogDomain::CatalogLogical, 0, associationLogicals, 3,
                 sizeof( associationLogicals[0] ) );
@@ -302,7 +307,7 @@ int main()
                 associationEvidence, 2, sizeof( associationEvidence[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogDetailedEvidence );
 
-            JnGpuCatalogBatchData associationBatches[8] {};
+            JnGpuCatalogBatchData associationBatches[9] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
             associationBatches[0].recordCount = 5;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
@@ -327,8 +332,11 @@ int main()
             associationBatches[7].generation = 16; associationBatches[7].firstRecordIndex = 0;
             associationBatches[7].recordCount = 2;
             associationBatches[7].kind = uint8_t( JnGpuCatalogBatchKind::RangeSet );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 8, sizeof( associationBatches[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 8,
+            associationBatches[8].generation = 17; associationBatches[8].firstRecordIndex = 0;
+            associationBatches[8].recordCount = 3;
+            associationBatches[8].kind = uint8_t( JnGpuCatalogBatchKind::Logical );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 9, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 9,
                 sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
@@ -350,6 +358,10 @@ int main()
         const auto pointer102 = associationReader.ResourcePointerIntervals( 102, 0, 10 );
         const auto ranges100 = associationReader.ResourceRanges( 100, 0, 10 );
         const auto passRanges = associationReader.PassRanges( 300, 0, 10 );
+        const auto allParts101 = associationReader.ResourceParts( 101, 0, 10 );
+        const auto allRelations100 = associationReader.ResourceRelations( 100, 0, 10 );
+        const auto logicals100 = associationReader.ResourceLogicals( 100, 0, 10 );
+        const auto logical700 = associationReader.ResolveLogical( 700, 2 );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
@@ -376,6 +388,14 @@ int main()
             ranges100.values[0].generation == 16 && passRanges.total == 2 &&
             passRanges.values.size() == 2 && passRanges.values[1].record.resourceId == 102,
             "Catalog RangeSet resource/pass lookup changed paging or generation semantics" );
+        Require( allParts101.total == 1 && allParts101.values.size() == 1 &&
+            allParts101.values[0].record.partKind == uint8_t( JnGpuCatalogPartKind::BufferRange ) &&
+            allRelations100.total == 3 && allRelations100.values.size() == 3 &&
+            logicals100.total == 1 && logicals100.values.size() == 1 &&
+            logicals100.values[0].generation == 17 && logical700 &&
+            logical700->record.stableKey == 99 && logical700->generation == 17 &&
+            !associationReader.ResolveLogical( 701, 3 ),
+            "Catalog Resource explain detail indices changed part, relation or logical semantics" );
         const auto allocations100First = associationReader.ResourceAllocations( 100, 0, 1 );
         const auto allocations100Second = associationReader.ResourceAllocations( 100, 1, 1 );
         const auto allocations102 = associationReader.ResourceAllocations( 102, 0, 10 );

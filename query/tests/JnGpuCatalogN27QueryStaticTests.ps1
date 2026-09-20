@@ -57,6 +57,12 @@ Require ($service -match 'boundedResourceMethod[\s\S]{0,1024}gpu\.resource\.refe
     'GPU resource references are not routed through the bounded Catalog backend.'
 Require ($service.Contains('GetQueryCatalogResourceRanges') -and $service.Contains('GetQueryCatalogResourceUses')) `
     'GPU resource references do not use both bounded RangeSet and resolved ResourceSet indices.'
+Require ($service -match 'boundedResourceMethod[\s\S]{0,512}gpu\.resource\.explain') `
+    'GPU resource explain is not routed through the bounded Catalog backend.'
+Require ($service.Contains('GetQueryCatalogResourceLogicals') -and
+    $service.Contains('ResolveQueryCatalogLogical') -and
+    $service.Contains('GetQueryCatalogResourceRelations')) `
+    'GPU resource explain does not use bounded logical and relation indices.'
 $allocationScan = [regex]::Match($queryIndex, 'ScanGpuMemoryAllocations[\s\S]*?BuildIndexedGpuMemoryAttribution').Value
 Require ($allocationScan.Contains('m_gpuReferenceIndex.UsesByResource')) `
     'GPU allocation paging does not reuse the bounded reverse ResourceSet sidecar.'

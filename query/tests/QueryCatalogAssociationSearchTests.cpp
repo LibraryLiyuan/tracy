@@ -129,6 +129,11 @@ public:
         }
         return page;
     }
+    QueryCatalogPartPage GetQueryCatalogResourceParts(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return GetQueryCatalogResourceMeshParts( resourceId, offset, limit );
+    }
     QueryCatalogVgPage GetQueryCatalogResourceVgPages(
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
@@ -164,6 +169,15 @@ public:
         }
         return page;
     }
+    QueryCatalogRelationPage GetQueryCatalogResourceRelations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        return GetQueryCatalogResourceRtasRelations( resourceId, offset, limit );
+    }
+    QueryCatalogLogicalPage GetQueryCatalogResourceLogicals(
+        uint64_t, uint64_t, size_t ) const override { return {}; }
+    std::optional<QueryCatalogLogicalData> ResolveQueryCatalogLogical(
+        uint64_t, int64_t ) const override { return std::nullopt; }
     QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
         uint64_t passId, uint64_t offset, size_t limit ) const override
     {
@@ -365,7 +379,20 @@ int main()
         referencesSecond.at( "data" ).at( "resource_set_uses" )[0].at( "logical_resource_id" ) == "901" &&
         referencesSecond.at( "page" ).at( "next_cursor" ).is_null() );
 
-    const auto byType = service.Execute( Request( 16, "gpu.memory.by_type", {
+    const auto explain = service.Execute( Request( 16, "gpu.resource.explain", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }
+    } ) );
+    assert( explain.at( "ok" ) && explain.at( "data" ).at( "allocations" ).size() == 2 &&
+        explain.at( "data" ).at( "views" ).size() == 2 &&
+        explain.at( "data" ).at( "parts" ).size() == 2 &&
+        explain.at( "data" ).at( "pass_ranges" ).size() == 2 &&
+        explain.at( "data" ).at( "resource_set_uses" ).size() == 2 &&
+        explain.at( "data" ).at( "relations" ).size() == 1 &&
+        explain.at( "data" ).at( "pass_range_count" ) == "2" &&
+        explain.at( "data" ).at( "resource_set_use_count" ) == "2" &&
+        !explain.at( "data" ).at( "pass_ranges_truncated" ).get<bool>() );
+
+    const auto byType = service.Execute( Request( 17, "gpu.memory.by_type", {
         { "trace_id", traceId }
     } ) );
     assert( byType.at( "ok" ) && byType.at( "data" ).at( "groups" ).size() == 2 &&
@@ -376,14 +403,14 @@ int main()
         byType.at( "data" ).at( "groups" )[1].at( "live_resource_count" ) == "2" &&
         byType.at( "data" ).at( "groups" )[1].at( "resource_capacity_bytes" ) == "3072" );
 
-    const auto peak = service.Execute( Request( 17, "gpu.memory.peak", {
+    const auto peak = service.Execute( Request( 18, "gpu.memory.peak", {
         { "trace_id", traceId }
     } ) );
     assert( peak.at( "ok" ) &&
         peak.at( "data" ).at( "engine_known_physical_peak_bytes" ) == "12288" &&
         peak.at( "data" ).at( "peak_time_ns" ) == "77" &&
         peak.at( "data" ).at( "peak_provenance" ) == "event_exact" );
-    const auto churn = service.Execute( Request( 18, "gpu.memory.churn", {
+    const auto churn = service.Execute( Request( 19, "gpu.memory.churn", {
         { "trace_id", traceId }
     } ) );
     assert( churn.at( "ok" ) && churn.at( "data" ).at( "create_count" ) == "4" &&
@@ -392,7 +419,7 @@ int main()
         churn.at( "data" ).at( "freed_bytes" ) == "4096" &&
         churn.at( "data" ).at( "live_bytes_at_end" ) == "12288" );
 
-    assert( service.Execute( Request( 19, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    assert( service.Execute( Request( 20, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

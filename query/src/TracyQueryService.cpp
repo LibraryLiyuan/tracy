@@ -5476,7 +5476,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
-            method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
+            method == "gpu.resource.explain" || method == "gpu.resource.lifetime" ||
+            method == "gpu.resource.allocations" ||
             method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
             method == "gpu.resource.references" || method == "gpu.resource.vg_pages" ||
             method == "gpu.resource.raytracing_chain" ||
@@ -5956,13 +5957,194 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) },
                 { "present", true }
             };
-            if( method == "gpu.resource.get" ) result["description"] = {
+            if( method == "gpu.resource.get" || method == "gpu.resource.explain" ) result["description"] = {
                 { "width", Decimal( value.width ) }, { "height", value.height },
                 { "depth_or_array_size", value.depthOrArraySize }, { "mip_levels", value.mipLevels },
                 { "format", value.format }, { "sample_count", value.sampleCount },
                 { "declared_usage_mask", value.declaredUsageMask }, { "observed_usage_mask", value.observedUsageMask },
                 { "backend_flags", value.backendFlags }, { "classification_provenance", value.classificationProvenance }
             };
+            if( method == "gpu.resource.explain" )
+            {
+                const auto allocationPage = catalogResourceSource->GetQueryCatalogResourceAllocations(
+                    resourceId, 0, DefaultPageSize );
+                json allocations = json::array();
+                for( const auto& item : allocationPage.values )
+                {
+                    const auto& allocation = item.record;
+                    allocations.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-allocation", allocation.allocationId ) },
+                        { "allocation_id", Decimal( allocation.allocationId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "heap_id", allocation.heapId == 0 ? json( nullptr ) : json( Decimal( allocation.heapId ) ) },
+                        { "parent_allocation_id", allocation.parentAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocation.parentAllocationId ) ) },
+                        { "size_bytes", Decimal( allocation.sizeBytes ) }, { "offset_bytes", Decimal( allocation.offsetBytes ) },
+                        { "resident_bytes", Decimal( allocation.residentBytes ) },
+                        { "alignment_bytes", Decimal( allocation.alignmentBytes ) },
+                        { "primary_kind", GpuPrimaryKindName( allocation.primaryKind ) },
+                        { "memory_domain", allocation.memoryDomain }, { "allocation_kind", allocation.allocationKind },
+                        { "residency_state", allocation.residencyState },
+                        { "exactness", GpuExactnessName( allocation.exactness ) },
+                        { "operation", GpuCatalogOperationName( allocation.operation ) },
+                        { "time_ns", Decimal( allocation.time ) }
+                    } );
+                }
+                const auto viewPage = catalogResourceSource->GetQueryCatalogResourceViews(
+                    resourceId, 0, DefaultPageSize );
+                json views = json::array();
+                for( const auto& item : viewPage.values )
+                {
+                    const auto& view = item.record;
+                    views.push_back( {
+                        { "view_id", Decimal( view.viewId ) }, { "generation", Decimal( item.generation ) },
+                        { "operation", GpuCatalogOperationName( view.operation ) }, { "view_kind", view.viewKind },
+                        { "format", view.format }, { "buffer_offset_bytes", Decimal( view.bufferOffsetBytes ) },
+                        { "buffer_length_bytes", Decimal( view.bufferLengthBytes ) },
+                        { "first_subresource", view.firstSubresource }, { "subresource_count", view.subresourceCount },
+                        { "stride_bytes", view.strideBytes }, { "exactness", GpuExactnessName( view.exactness ) },
+                        { "time_ns", Decimal( view.time ) }
+                    } );
+                }
+                const auto partPage = catalogResourceSource->GetQueryCatalogResourceParts(
+                    resourceId, 0, DefaultPageSize );
+                json parts = json::array();
+                for( const auto& item : partPage.values )
+                {
+                    const auto& part = item.record;
+                    parts.push_back( {
+                        { "part_id", Decimal( part.partId ) }, { "generation", Decimal( item.generation ) },
+                        { "part_kind", part.partKind }, { "operation", GpuCatalogOperationName( part.operation ) },
+                        { "offset_bytes", Decimal( part.offsetBytes ) }, { "length_bytes", Decimal( part.lengthBytes ) },
+                        { "first_subresource", part.firstSubresource }, { "subresource_count", part.subresourceCount },
+                        { "semantic_index", part.semanticIndex }, { "element_count", part.elementCount },
+                        { "stride_bytes", part.strideBytes }, { "format", part.format },
+                        { "definition_revision", part.definitionRevision },
+                        { "exactness", GpuExactnessName( part.exactness ) }
+                    } );
+                }
+                const auto rangePage = catalogResourceSource->GetQueryCatalogResourceRanges(
+                    resourceId, 0, DefaultPageSize );
+                json ranges = json::array();
+                for( const auto& item : rangePage.values )
+                {
+                    const auto& range = item.record;
+                    ranges.push_back( {
+                        { "pass_id", Decimal( range.passInstanceId ) },
+                        { "resource_ref", source->MakeEntityRef( "gpu-resource", range.resourceId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "view_id", range.viewDefinitionId == 0 ? json( nullptr ) : json( Decimal( range.viewDefinitionId ) ) },
+                        { "range_kind", range.rangeKind }, { "offset_bytes", Decimal( range.offsetBytes ) },
+                        { "length_bytes", Decimal( range.lengthBytes ) },
+                        { "first_subresource", range.firstSubresource }, { "subresource_count", range.subresourceCount },
+                        { "usage_mask", range.usageMask }, { "exactness", GpuExactnessName( range.exactness ) }
+                    } );
+                }
+                const auto usePage = catalogResourceSource->GetQueryCatalogResourceUses(
+                    resourceId, 0, DefaultPageSize );
+                json uses = json::array();
+                for( const auto& use : usePage.values )
+                {
+                    uses.push_back( {
+                        { "pass_id", Decimal( use.passId ) },
+                        { "pass_ref", source->MakeEntityRef( "gpu-memory-pass", use.passId ) },
+                        { "allocation_id", Decimal( value.allocationId ) },
+                        { "logical_resource_id", Decimal( use.resourceId ) },
+                        { "catalog_resource_id", Decimal( resourceId ) },
+                        { "resolved_physical_allocation_id", value.allocationId == 0 ?
+                            json( nullptr ) : json( Decimal( value.allocationId ) ) },
+                        { "usage_mask", use.usageMask },
+                        { "resource_set_id", use.resourceSetId == 0 ?
+                            json( nullptr ) : json( Decimal( uint64_t( use.resourceSetId ) ) ) },
+                        { "encoding", use.encoding == 2 ? "ResourceSetV2" : "PerUseV1" },
+                        { "resolution", "pointer_lifetime_exact" },
+                        { "range_status", "query_gpu_range_set_for_exact_range" }
+                    } );
+                }
+                const auto logicalPage = catalogResourceSource->GetQueryCatalogResourceLogicals(
+                    resourceId, 0, DefaultPageSize );
+                json logicals = json::array();
+                for( const auto& item : logicalPage.values )
+                {
+                    const auto& binding = item.record;
+                    const auto definition = catalogResourceSource->ResolveQueryCatalogLogical(
+                        binding.logicalResourceId, binding.time );
+                    const auto* resolved = definition ? &definition->record : nullptr;
+                    const auto definitionGeneration = definition ? definition->generation : item.generation;
+                    const auto nameId = binding.nameId != 0 ? binding.nameId : ( resolved ? resolved->nameId : 0 );
+                    const auto nameGeneration = binding.nameId != 0 ? item.generation : definitionGeneration;
+                    const auto logicalName = catalogResourceSource->GetQueryCatalogResourceName( nameGeneration, nameId );
+                    const auto stableKey = binding.stableKey != 0 ? binding.stableKey : ( resolved ? resolved->stableKey : 0 );
+                    const auto familyId = binding.familyId != 0 ? binding.familyId : ( resolved ? resolved->familyId : 0 );
+                    const auto physicalOffset = binding.physicalOffsetBytes != 0 ? binding.physicalOffsetBytes :
+                        ( resolved ? resolved->physicalOffsetBytes : 0 );
+                    const auto length = binding.lengthBytes != 0 ? binding.lengthBytes : ( resolved ? resolved->lengthBytes : 0 );
+                    const auto aliasGroupId = binding.aliasGroupId != 0 ? binding.aliasGroupId :
+                        ( resolved ? resolved->aliasGroupId : 0 );
+                    const auto primaryKind = binding.primaryKind != 0 ? binding.primaryKind :
+                        ( resolved ? resolved->primaryKind : 0 );
+                    const auto definitionRevision = binding.definitionRevision != 0 ? binding.definitionRevision :
+                        ( resolved ? resolved->definitionRevision : 0 );
+                    logicals.push_back( {
+                        { "logical_resource_id", Decimal( binding.logicalResourceId ) },
+                        { "stable_key", Decimal( stableKey ) }, { "generation", Decimal( item.generation ) },
+                        { "definition_generation", Decimal( definitionGeneration ) }, { "family_id", Decimal( familyId ) },
+                        { "operation", GpuCatalogOperationName( binding.operation ) },
+                        { "name", logicalName && !logicalName->empty() ? json( *logicalName ) : json( nullptr ) },
+                        { "name_provenance", binding.nameId != 0 ? binding.nameProvenance :
+                            ( resolved ? resolved->nameProvenance : 0 ) },
+                        { "physical_offset_bytes", Decimal( physicalOffset ) }, { "length_bytes", Decimal( length ) },
+                        { "alias_group_id", aliasGroupId == 0 ? json( nullptr ) : json( Decimal( aliasGroupId ) ) },
+                        { "frame_id", binding.frameId == 0 ? json( nullptr ) : json( Decimal( binding.frameId ) ) },
+                        { "definition_revision", definitionRevision },
+                        { "primary_kind", GpuPrimaryKindName( primaryKind ) },
+                        { "definition_status", definition ? "resolved" : "unavailable" },
+                        { "exactness", GpuExactnessName( binding.exactness ) },
+                        { "time_ns", Decimal( binding.time ) }
+                    } );
+                }
+                const auto relationPage = catalogResourceSource->GetQueryCatalogResourceRelations(
+                    resourceId, 0, DefaultPageSize );
+                json relations = json::array();
+                for( const auto& item : relationPage.values )
+                {
+                    const auto& relation = item.record;
+                    relations.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "source_id", Decimal( relation.sourceId ) }, { "target_id", Decimal( relation.targetId ) },
+                        { "relation", GpuCatalogRelationName( relation.relation ) },
+                        { "operation", GpuCatalogOperationName( relation.operation ) },
+                        { "frame_id", relation.frameId == 0 ? json( nullptr ) : json( Decimal( relation.frameId ) ) },
+                        { "value0", Decimal( relation.value0 ) }, { "value1", Decimal( relation.value1 ) },
+                        { "exactness", GpuExactnessName( relation.exactness ) },
+                        { "time_ns", Decimal( relation.time ) }
+                    } );
+                }
+                result["allocations"] = std::move( allocations );
+                result["views"] = std::move( views );
+                result["parts"] = std::move( parts );
+                result["pass_ranges"] = std::move( ranges );
+                result["resource_set_uses"] = std::move( uses );
+                result["logical_bindings"] = std::move( logicals );
+                result["relations"] = std::move( relations );
+                result["allocation_count"] = Decimal( allocationPage.total );
+                result["view_count"] = Decimal( viewPage.total );
+                result["part_count"] = Decimal( partPage.total );
+                result["pass_range_count"] = Decimal( rangePage.total );
+                result["resource_set_use_count"] = Decimal( usePage.total );
+                result["logical_binding_count"] = Decimal( logicalPage.total );
+                result["relation_count"] = Decimal( relationPage.total );
+                result["allocations_truncated"] = allocationPage.total > allocationPage.values.size();
+                result["views_truncated"] = viewPage.total > viewPage.values.size();
+                result["parts_truncated"] = partPage.total > partPage.values.size();
+                result["pass_ranges_truncated"] = rangePage.total > rangePage.values.size();
+                result["resource_set_uses_truncated"] = usePage.total > usePage.values.size();
+                result["logical_bindings_truncated"] = logicalPage.total > logicalPage.values.size();
+                result["relations_truncated"] = relationPage.total > relationPage.values.size();
+                result["provenance"] = { { "identity", "exact_gpu_resource_lifetime" },
+                    { "high_level_owner", "unavailable_n27_gpu_layer_only" } };
+                result["unavailable"] = { "unity_object", "asset_guid", "asset_path", "prefab", "scene", "load_instance" };
+            }
             return Success( id, std::move( result ), trace );
         }
         const auto catalog = source->GetGpuCatalogData();

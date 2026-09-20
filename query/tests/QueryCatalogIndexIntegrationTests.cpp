@@ -106,6 +106,12 @@ int main( int argc, char** argv )
             fs::is_directory( catalogRoot / "pass-range-lookup" ) &&
             fs::is_directory( catalogRoot / "range-generations" ),
             "Query index did not publish bounded resource lifetime and RangeSet indices" );
+        Require( fs::is_directory( catalogRoot / "resource-part-lookup" ) &&
+            fs::is_directory( catalogRoot / "resource-relation-lookup" ) &&
+            fs::is_directory( catalogRoot / "resource-logical-lookup" ) &&
+            fs::is_directory( catalogRoot / "logical-definition-lookup" ) &&
+            fs::is_directory( catalogRoot / "logical-generations" ),
+            "Query index did not publish bounded resource explain indices" );
         {
             query::QueryCatalogStoreReader reader( catalogRoot, manifest.sourceFingerprint );
             Require( reader.Count( OfflineCatalogDomain::CatalogResource ) == expectedResources,

@@ -17,7 +17,7 @@
 namespace tracy::query
 {
 
-inline constexpr uint32_t QueryIndexSchemaVersion = 35;
+inline constexpr uint32_t QueryIndexSchemaVersion = 36;
 inline constexpr uint8_t QueryIndexZoneExtraTextActive = 1;
 inline constexpr uint8_t QueryIndexZoneExtraNameActive = 2;
 inline constexpr uint8_t QueryIndexZoneExtraNameResolvedFlag = 4;

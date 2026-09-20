@@ -92,10 +92,12 @@ std::filesystem::path ResourceAllocationGenerationPath( const std::filesystem::p
 std::filesystem::path ResourceViewLookupPath( const std::filesystem::path& root ) { return root / "resource-view-lookup"; }
 std::filesystem::path ResourceViewGenerationPath( const std::filesystem::path& root ) { return root / "resource-view-generations"; }
 std::filesystem::path ResourceMeshPartLookupPath( const std::filesystem::path& root ) { return root / "resource-mesh-part-lookup"; }
+std::filesystem::path ResourcePartLookupPath( const std::filesystem::path& root ) { return root / "resource-part-lookup"; }
 std::filesystem::path ResourcePartGenerationPath( const std::filesystem::path& root ) { return root / "resource-part-generations"; }
 std::filesystem::path ResourceVgLookupPath( const std::filesystem::path& root ) { return root / "resource-vg-lookup"; }
 std::filesystem::path ResourceVgGenerationPath( const std::filesystem::path& root ) { return root / "resource-vg-generations"; }
 std::filesystem::path ResourceRtasRelationLookupPath( const std::filesystem::path& root ) { return root / "resource-rtas-relation-lookup"; }
+std::filesystem::path ResourceRelationLookupPath( const std::filesystem::path& root ) { return root / "resource-relation-lookup"; }
 std::filesystem::path ResourceRelationGenerationPath( const std::filesystem::path& root ) { return root / "resource-relation-generations"; }
 std::filesystem::path PassEvidenceLookupPath( const std::filesystem::path& root ) { return root / "pass-evidence-lookup"; }
 std::filesystem::path DetailedEvidenceGenerationPath( const std::filesystem::path& root ) { return root / "detailed-evidence-generations"; }
@@ -107,6 +109,9 @@ std::filesystem::path PointerIntervalResourceLookupPath( const std::filesystem::
 std::filesystem::path ResourceRangeLookupPath( const std::filesystem::path& root ) { return root / "resource-range-lookup"; }
 std::filesystem::path PassRangeLookupPath( const std::filesystem::path& root ) { return root / "pass-range-lookup"; }
 std::filesystem::path RangeGenerationPath( const std::filesystem::path& root ) { return root / "range-generations"; }
+std::filesystem::path ResourceLogicalLookupPath( const std::filesystem::path& root ) { return root / "resource-logical-lookup"; }
+std::filesystem::path LogicalDefinitionLookupPath( const std::filesystem::path& root ) { return root / "logical-definition-lookup"; }
+std::filesystem::path LogicalGenerationPath( const std::filesystem::path& root ) { return root / "logical-generations"; }
 
 uint64_t SortableSignedTime( int64_t value )
 {
@@ -281,12 +286,14 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceViewGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawViews;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceMeshPartLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourcePartLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourcePartGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawParts;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceVgLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceVgGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawVg;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRtasRelationLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourceRelationLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRelationGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawRelations;
     mutable std::unique_ptr<analysis::PagedRecordReader> passEvidenceLookup;
@@ -302,6 +309,10 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> passRangeLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> rangeGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawRanges;
+    mutable std::unique_ptr<analysis::PagedRecordReader> resourceLogicalLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> logicalDefinitionLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> logicalGenerations;
+    mutable std::unique_ptr<analysis::PagedRecordReader> rawLogicals;
 
     void EnsureResourceIndex() const
     {
@@ -334,6 +345,9 @@ struct QueryCatalogStoreReader::Impl
         if( !resourceMeshPartLookup ) resourceMeshPartLookup = std::make_unique<analysis::PagedRecordReader>(
             ResourceMeshPartLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-mesh-part-lookup-v1" ),
             uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !resourcePartLookup ) resourcePartLookup = std::make_unique<analysis::PagedRecordReader>(
+            ResourcePartLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-part-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
         if( !resourcePartGenerations ) resourcePartGenerations = std::make_unique<analysis::PagedRecordReader>(
             ResourcePartGenerationPath( root ), CatalogIdentity( sourceFingerprint, "resource-part-generations-v1" ),
             uint32_t( sizeof( uint64_t ) ), options );
@@ -353,6 +367,9 @@ struct QueryCatalogStoreReader::Impl
             uint32_t( sizeof( JnGpuCatalogVgRecordV1 ) ), options );
         if( !resourceRtasRelationLookup ) resourceRtasRelationLookup = std::make_unique<analysis::PagedRecordReader>(
             ResourceRtasRelationLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-rtas-relation-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !resourceRelationLookup ) resourceRelationLookup = std::make_unique<analysis::PagedRecordReader>(
+            ResourceRelationLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-relation-lookup-v1" ),
             uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
         if( !resourceRelationGenerations ) resourceRelationGenerations = std::make_unique<analysis::PagedRecordReader>(
             ResourceRelationGenerationPath( root ), CatalogIdentity( sourceFingerprint, "resource-relation-generations-v1" ),
@@ -403,6 +420,19 @@ struct QueryCatalogStoreReader::Impl
             DomainPath( root, OfflineCatalogDomain::CatalogRangeSet ),
             CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
             uint32_t( sizeof( JnGpuRangeSetRecordV1 ) ), options );
+        if( !resourceLogicalLookup ) resourceLogicalLookup = std::make_unique<analysis::PagedRecordReader>(
+            ResourceLogicalLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-logical-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !logicalDefinitionLookup ) logicalDefinitionLookup = std::make_unique<analysis::PagedRecordReader>(
+            LogicalDefinitionLookupPath( root ), CatalogIdentity( sourceFingerprint, "logical-definition-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !logicalGenerations ) logicalGenerations = std::make_unique<analysis::PagedRecordReader>(
+            LogicalGenerationPath( root ), CatalogIdentity( sourceFingerprint, "logical-generations-v1" ),
+            uint32_t( sizeof( uint64_t ) ), options );
+        if( !rawLogicals ) rawLogicals = std::make_unique<analysis::PagedRecordReader>(
+            DomainPath( root, OfflineCatalogDomain::CatalogLogical ),
+            CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogLogical ),
+            uint32_t( sizeof( JnGpuCatalogLogicalRecordV1 ) ), options );
     }
 };
 
@@ -526,10 +556,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto viewLookupOutput = ResourceViewLookupPath( m_impl->root );
     const auto viewGenerationOutput = ResourceViewGenerationPath( m_impl->root );
     const auto meshPartLookupOutput = ResourceMeshPartLookupPath( m_impl->root );
+    const auto partLookupOutput = ResourcePartLookupPath( m_impl->root );
     const auto partGenerationOutput = ResourcePartGenerationPath( m_impl->root );
     const auto vgLookupOutput = ResourceVgLookupPath( m_impl->root );
     const auto vgGenerationOutput = ResourceVgGenerationPath( m_impl->root );
     const auto rtasRelationLookupOutput = ResourceRtasRelationLookupPath( m_impl->root );
+    const auto resourceRelationLookupOutput = ResourceRelationLookupPath( m_impl->root );
     const auto relationGenerationOutput = ResourceRelationGenerationPath( m_impl->root );
     const auto passEvidenceLookupOutput = PassEvidenceLookupPath( m_impl->root );
     const auto detailedEvidenceGenerationOutput = DetailedEvidenceGenerationPath( m_impl->root );
@@ -541,6 +573,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto resourceRangeLookupOutput = ResourceRangeLookupPath( m_impl->root );
     const auto passRangeLookupOutput = PassRangeLookupPath( m_impl->root );
     const auto rangeGenerationOutput = RangeGenerationPath( m_impl->root );
+    const auto resourceLogicalLookupOutput = ResourceLogicalLookupPath( m_impl->root );
+    const auto logicalDefinitionLookupOutput = LogicalDefinitionLookupPath( m_impl->root );
+    const auto logicalGenerationOutput = LogicalGenerationPath( m_impl->root );
     if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( associationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( allocationLookupOutput ) ) ||
@@ -548,10 +583,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::filesystem::exists( analysis::AnalysisIoPath( viewLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( viewGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( meshPartLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( partLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( partGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( vgLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( vgGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( rtasRelationLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( resourceRelationLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( relationGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( passEvidenceLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( detailedEvidenceGenerationOutput ) ) ||
@@ -563,6 +600,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::filesystem::exists( analysis::AnalysisIoPath( resourceRangeLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( passRangeLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( rangeGenerationOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( resourceLogicalLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( logicalDefinitionLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( logicalGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
         throw std::runtime_error( "Catalog resource index already exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
@@ -576,10 +616,14 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto viewLookupSorted = scratchRoot / "view-lookup-sorted.work";
     const auto meshPartLookupSource = scratchRoot / "mesh-part-lookup-source.work";
     const auto meshPartLookupSorted = scratchRoot / "mesh-part-lookup-sorted.work";
+    const auto partLookupSource = scratchRoot / "part-lookup-source.work";
+    const auto partLookupSorted = scratchRoot / "part-lookup-sorted.work";
     const auto vgLookupSource = scratchRoot / "vg-lookup-source.work";
     const auto vgLookupSorted = scratchRoot / "vg-lookup-sorted.work";
     const auto rtasRelationLookupSource = scratchRoot / "rtas-relation-lookup-source.work";
     const auto rtasRelationLookupSorted = scratchRoot / "rtas-relation-lookup-sorted.work";
+    const auto resourceRelationLookupSource = scratchRoot / "resource-relation-lookup-source.work";
+    const auto resourceRelationLookupSorted = scratchRoot / "resource-relation-lookup-sorted.work";
     const auto passEvidenceLookupSource = scratchRoot / "pass-evidence-lookup-source.work";
     const auto passEvidenceLookupSorted = scratchRoot / "pass-evidence-lookup-sorted.work";
     const auto logicalAliasesSource = scratchRoot / "resource-logical-aliases-source.work";
@@ -603,6 +647,10 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto resourceRangeLookupSorted = scratchRoot / "resource-range-lookup-sorted.work";
     const auto passRangeLookupSource = scratchRoot / "pass-range-lookup-source.work";
     const auto passRangeLookupSorted = scratchRoot / "pass-range-lookup-sorted.work";
+    const auto resourceLogicalLookupSource = scratchRoot / "resource-logical-lookup-source.work";
+    const auto resourceLogicalLookupSorted = scratchRoot / "resource-logical-lookup-sorted.work";
+    const auto logicalDefinitionLookupSource = scratchRoot / "logical-definition-lookup-source.work";
+    const auto logicalDefinitionLookupSorted = scratchRoot / "logical-definition-lookup-sorted.work";
     std::string sortError;
     const auto cleanup = [&]( bool outputs ) -> std::string {
         std::string failure;
@@ -621,10 +669,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             remove( viewLookupOutput, "Catalog view lookup cleanup failed" );
             remove( viewGenerationOutput, "Catalog view generation cleanup failed" );
             remove( meshPartLookupOutput, "Catalog mesh-part lookup cleanup failed" );
+            remove( partLookupOutput, "Catalog part lookup cleanup failed" );
             remove( partGenerationOutput, "Catalog part generation cleanup failed" );
             remove( vgLookupOutput, "Catalog VG lookup cleanup failed" );
             remove( vgGenerationOutput, "Catalog VG generation cleanup failed" );
             remove( rtasRelationLookupOutput, "Catalog RTAS relation lookup cleanup failed" );
+            remove( resourceRelationLookupOutput, "Catalog resource relation lookup cleanup failed" );
             remove( relationGenerationOutput, "Catalog relation generation cleanup failed" );
             remove( passEvidenceLookupOutput, "Catalog pass evidence lookup cleanup failed" );
             remove( detailedEvidenceGenerationOutput, "Catalog detailed evidence generation cleanup failed" );
@@ -636,6 +686,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             remove( resourceRangeLookupOutput, "Catalog resource range lookup cleanup failed" );
             remove( passRangeLookupOutput, "Catalog pass range lookup cleanup failed" );
             remove( rangeGenerationOutput, "Catalog range generation cleanup failed" );
+            remove( resourceLogicalLookupOutput, "Catalog resource logical lookup cleanup failed" );
+            remove( logicalDefinitionLookupOutput, "Catalog logical definition lookup cleanup failed" );
+            remove( logicalGenerationOutput, "Catalog logical generation cleanup failed" );
         }
         return failure;
     };
@@ -668,6 +721,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         analysis::PagedRecordReader rangeRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRangeSet ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
             sizeof( JnGpuRangeSetRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader logicalRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogLogical ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogLogical ),
+            sizeof( JnGpuCatalogLogicalRecordV1 ), m_impl->options );
         {
             analysis::PagedRecordWriter resourceGenerations( resourceGenerationsPath,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ),
@@ -765,6 +821,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             detailedEvidenceGenerationOutput, "detailed-evidence-generations-v1", "Catalog detailed evidence" );
         buildGenerations( JnGpuCatalogBatchKind::RangeSet, rangeRows.Count(), rangeGenerationOutput,
             "range-generations-v1", "Catalog RangeSet" );
+        buildGenerations( JnGpuCatalogBatchKind::Logical, logicalRows.Count(), logicalGenerationOutput,
+            "logical-generations-v1", "Catalog logical" );
 
         std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
@@ -1420,6 +1478,10 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 return row.resourceId != 0 && ( kind == JnGpuCatalogPartKind::MeshVertexStream ||
                     kind == JnGpuCatalogPartKind::MeshIndex );
             }, []( const auto& row ) { return row.resourceId; }, "Catalog mesh-part" );
+        const auto partLookupCount = writeLookupSource( partLookupSource, partRows.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogPartRecordV1 row {}; partRows.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId != 0; },
+            []( const auto& row ) { return row.resourceId; }, "Catalog part" );
         const auto vgLookupCount = writeLookupSource( vgLookupSource, vgRows.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogVgRecordV1 row {}; vgRows.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId != 0; },
@@ -1432,10 +1494,24 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rangeRows.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.passInstanceId != 0; },
             []( const auto& row ) { return row.passInstanceId; }, "Catalog pass RangeSet" );
+        const auto resourceLogicalLookupCount = writeLookupSource( resourceLogicalLookupSource, logicalRows.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; logicalRows.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId != 0; },
+            []( const auto& row ) { return row.resourceId; }, "Catalog resource logical" );
+        const auto logicalDefinitionLookupCount = writeLookupSource( logicalDefinitionLookupSource, logicalRows.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; logicalRows.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) {
+                const auto operation = JnGpuCatalogRecordOperation( row.operation );
+                return row.logicalResourceId != 0 && IsCatalogDefinition( operation );
+            }, []( const auto& row ) { return row.logicalResourceId; }, "Catalog logical definition" );
         std::ofstream rtasRelationSource( analysis::AnalysisIoPath( rtasRelationLookupSource ),
             std::ios::binary | std::ios::trunc );
-        if( !rtasRelationSource ) throw std::runtime_error( "Catalog RTAS relation lookup source cannot be opened" );
+        std::ofstream resourceRelationSource( analysis::AnalysisIoPath( resourceRelationLookupSource ),
+            std::ios::binary | std::ios::trunc );
+        if( !rtasRelationSource || !resourceRelationSource )
+            throw std::runtime_error( "Catalog relation lookup source cannot be opened" );
         uint64_t rtasRelationLookupCount = 0;
+        uint64_t resourceRelationLookupCount = 0;
         const auto appendRtasRelation = [&]( uint64_t resourceId, uint64_t ordinal ) {
             if( resourceId == 0 ) return;
             analysis::AnalysisKeyMetadataRecord lookup {};
@@ -1446,20 +1522,35 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             if( !rtasRelationSource ) throw std::runtime_error( "Catalog RTAS relation lookup source write failed" );
             rtasRelationLookupCount++;
         };
+        const auto appendResourceRelation = [&]( uint64_t resourceId, uint64_t ordinal ) {
+            if( resourceId == 0 ) return;
+            analysis::AnalysisKeyMetadataRecord lookup {};
+            lookup.keyHigh = resourceId;
+            lookup.metadata = ordinal;
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( lookup ) );
+            resourceRelationSource.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );
+            if( !resourceRelationSource ) throw std::runtime_error( "Catalog resource relation lookup write failed" );
+            resourceRelationLookupCount++;
+        };
         for( uint64_t ordinal = 0; ordinal < relationRows.Count(); ordinal++ )
         {
             if( m_impl->options.cancelled && m_impl->options.cancelled() )
                 throw std::runtime_error( "Catalog resource index cancelled" );
             JnGpuCatalogRelationRecordV1 row {};
             relationRows.Read( ordinal, &row, 1 );
+            appendResourceRelation( row.sourceId, ordinal );
+            if( row.targetId != row.sourceId ) appendResourceRelation( row.targetId, ordinal );
             if( row.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) ) continue;
             if( ( row.flags & 1 ) == 0 ) appendRtasRelation( row.sourceId, ordinal );
             if( row.targetId != row.sourceId && ( row.flags & 2 ) == 0 )
                 appendRtasRelation( row.targetId, ordinal );
         }
         rtasRelationSource.flush();
-        if( !rtasRelationSource ) throw std::runtime_error( "Catalog RTAS relation lookup source flush failed" );
+        resourceRelationSource.flush();
+        if( !rtasRelationSource || !resourceRelationSource )
+            throw std::runtime_error( "Catalog relation lookup source flush failed" );
         rtasRelationSource.close();
+        resourceRelationSource.close();
         std::ofstream passEvidenceSource( analysis::AnalysisIoPath( passEvidenceLookupSource ),
             std::ios::binary | std::ios::trunc );
         if( !passEvidenceSource ) throw std::runtime_error( "Catalog pass evidence lookup source cannot be opened" );
@@ -1520,11 +1611,17 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         publishLookup( meshPartLookupSource, meshPartLookupSorted, meshPartLookupOutput,
             "catalog-resource-mesh-part-lookup", "resource-mesh-part-lookup-v1",
             meshPartLookupCount, "Catalog mesh-part" );
+        publishLookup( partLookupSource, partLookupSorted, partLookupOutput,
+            "catalog-resource-part-lookup", "resource-part-lookup-v1",
+            partLookupCount, "Catalog part" );
         publishLookup( vgLookupSource, vgLookupSorted, vgLookupOutput,
             "catalog-resource-vg-lookup", "resource-vg-lookup-v1", vgLookupCount, "Catalog VG" );
         publishLookup( rtasRelationLookupSource, rtasRelationLookupSorted, rtasRelationLookupOutput,
             "catalog-resource-rtas-relation-lookup", "resource-rtas-relation-lookup-v1",
             rtasRelationLookupCount, "Catalog RTAS relation" );
+        publishLookup( resourceRelationLookupSource, resourceRelationLookupSorted, resourceRelationLookupOutput,
+            "catalog-resource-relation-lookup", "resource-relation-lookup-v1",
+            resourceRelationLookupCount, "Catalog resource relation" );
         publishLookup( passEvidenceLookupSource, passEvidenceLookupSorted, passEvidenceLookupOutput,
             "catalog-pass-evidence-lookup", "pass-evidence-lookup-v1",
             passEvidenceLookupCount, "Catalog pass evidence" );
@@ -1540,6 +1637,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         publishLookup( passRangeLookupSource, passRangeLookupSorted, passRangeLookupOutput,
             "catalog-pass-range-lookup", "pass-range-lookup-v1",
             passRangeLookupCount, "Catalog pass RangeSet" );
+        publishLookup( resourceLogicalLookupSource, resourceLogicalLookupSorted, resourceLogicalLookupOutput,
+            "catalog-resource-logical-lookup", "resource-logical-lookup-v1",
+            resourceLogicalLookupCount, "Catalog resource logical" );
+        publishLookup( logicalDefinitionLookupSource, logicalDefinitionLookupSorted, logicalDefinitionLookupOutput,
+            "catalog-logical-definition-lookup", "logical-definition-lookup-v1",
+            logicalDefinitionLookupCount, "Catalog logical definition" );
 
         analysis::PagedRecordReader stringRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
@@ -1834,6 +1937,50 @@ QueryCatalogPartPage QueryCatalogStoreReader::ResourceMeshParts(
     return result;
 }
 
+QueryCatalogPartPage QueryCatalogStoreReader::ResourceParts(
+    uint64_t resourceId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogPartPage result;
+    if( resourceId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourcePartLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < resourceId || ( upper && row.keyHigh == resourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawParts->Count() || row.metadata >= m_impl->resourcePartGenerations->Count() )
+            throw std::runtime_error( "Catalog part lookup ordinal mismatch" );
+        QueryCatalogPartData value {};
+        m_impl->rawParts->Read( row.metadata, &value.record, 1 );
+        m_impl->resourcePartGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.resourceId != resourceId )
+            throw std::runtime_error( "Catalog part lookup identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
 QueryCatalogVgPage QueryCatalogStoreReader::ResourceVgPages(
     uint64_t resourceId, uint64_t offset, size_t limit ) const
 {
@@ -1923,6 +2070,142 @@ QueryCatalogRelationPage QueryCatalogStoreReader::ResourceRtasRelations(
             ( !sourceMatch && !targetMatch ) )
             throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
         result.values.emplace_back( value );
+    }
+    return result;
+}
+
+QueryCatalogRelationPage QueryCatalogStoreReader::ResourceRelations(
+    uint64_t resourceId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogRelationPage result;
+    if( resourceId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourceRelationLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < resourceId || ( upper && row.keyHigh == resourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawRelations->Count() ||
+            row.metadata >= m_impl->resourceRelationGenerations->Count() )
+            throw std::runtime_error( "Catalog resource relation ordinal mismatch" );
+        QueryCatalogRelationData value {};
+        m_impl->rawRelations->Read( row.metadata, &value.record, 1 );
+        m_impl->resourceRelationGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.sourceId != resourceId && value.record.targetId != resourceId )
+            throw std::runtime_error( "Catalog resource relation identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
+QueryCatalogLogicalPage QueryCatalogStoreReader::ResourceLogicals(
+    uint64_t resourceId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogLogicalPage result;
+    if( resourceId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->resourceLogicalLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < resourceId || ( upper && row.keyHigh == resourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawLogicals->Count() || row.metadata >= m_impl->logicalGenerations->Count() )
+            throw std::runtime_error( "Catalog resource logical ordinal mismatch" );
+        QueryCatalogLogicalData value {};
+        m_impl->rawLogicals->Read( row.metadata, &value.record, 1 );
+        m_impl->logicalGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.resourceId != resourceId )
+            throw std::runtime_error( "Catalog resource logical identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
+std::optional<QueryCatalogLogicalData> QueryCatalogStoreReader::ResolveLogical(
+    uint64_t logicalResourceId, int64_t time ) const
+{
+    if( logicalResourceId == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->logicalDefinitionLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < logicalResourceId || ( upper && row.keyHigh == logicalResourceId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    std::optional<QueryCatalogLogicalData> result;
+    uint64_t resultOrdinal = 0;
+    for( auto index = rangeBegin; index < rangeEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.metadata >= m_impl->rawLogicals->Count() || row.metadata >= m_impl->logicalGenerations->Count() )
+            throw std::runtime_error( "Catalog logical definition ordinal mismatch" );
+        QueryCatalogLogicalData value {};
+        m_impl->rawLogicals->Read( row.metadata, &value.record, 1 );
+        m_impl->logicalGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.logicalResourceId != logicalResourceId ||
+            !IsCatalogDefinition( JnGpuCatalogRecordOperation( value.record.operation ) ) )
+            throw std::runtime_error( "Catalog logical definition identity mismatch" );
+        if( value.record.time <= time && ( !result || value.record.time > result->record.time ||
+            ( value.record.time == result->record.time && row.metadata >= resultOrdinal ) ) )
+        {
+            result = value;
+            resultOrdinal = row.metadata;
+        }
     }
     return result;
 }
@@ -2217,10 +2500,12 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool viewLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceViewLookupPath( m_impl->root ) ) );
     const bool viewGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceViewGenerationPath( m_impl->root ) ) );
     const bool meshPartLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceMeshPartLookupPath( m_impl->root ) ) );
+    const bool partLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourcePartLookupPath( m_impl->root ) ) );
     const bool partGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourcePartGenerationPath( m_impl->root ) ) );
     const bool vgLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceVgLookupPath( m_impl->root ) ) );
     const bool vgGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceVgGenerationPath( m_impl->root ) ) );
     const bool rtasRelationLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRtasRelationLookupPath( m_impl->root ) ) );
+    const bool resourceRelationLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRelationLookupPath( m_impl->root ) ) );
     const bool relationGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRelationGenerationPath( m_impl->root ) ) );
     const bool passEvidenceLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( PassEvidenceLookupPath( m_impl->root ) ) );
     const bool detailedEvidenceGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( DetailedEvidenceGenerationPath( m_impl->root ) ) );
@@ -2232,21 +2517,29 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool resourceRangeLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRangeLookupPath( m_impl->root ) ) );
     const bool passRangeLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( PassRangeLookupPath( m_impl->root ) ) );
     const bool rangeGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( RangeGenerationPath( m_impl->root ) ) );
+    const bool resourceLogicalLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceLogicalLookupPath( m_impl->root ) ) );
+    const bool logicalDefinitionLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( LogicalDefinitionLookupPath( m_impl->root ) ) );
+    const bool logicalGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( LogicalGenerationPath( m_impl->root ) ) );
     if( resourcesPresent != stringsPresent || resourcesPresent != associationsPresent ||
         resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent ||
         resourcesPresent != gpuMemorySummaryPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != viewLookupPresent || resourcesPresent != viewGenerationsPresent ||
-        resourcesPresent != meshPartLookupPresent || resourcesPresent != partGenerationsPresent )
+        resourcesPresent != meshPartLookupPresent || resourcesPresent != partLookupPresent ||
+        resourcesPresent != partGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != vgLookupPresent || resourcesPresent != vgGenerationsPresent ||
-        resourcesPresent != rtasRelationLookupPresent || resourcesPresent != relationGenerationsPresent )
+        resourcesPresent != rtasRelationLookupPresent || resourcesPresent != resourceRelationLookupPresent ||
+        resourcesPresent != relationGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != passEvidenceLookupPresent || resourcesPresent != detailedEvidenceGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != pointerIntervalsPresent || resourcesPresent != pointerByPointerPresent ||
         resourcesPresent != pointerByResourcePresent || resourcesPresent != resourceRangeLookupPresent ||
         resourcesPresent != passRangeLookupPresent || resourcesPresent != rangeGenerationsPresent )
+        throw std::runtime_error( "Catalog resource index is incomplete" );
+    if( resourcesPresent != resourceLogicalLookupPresent || resourcesPresent != logicalDefinitionLookupPresent ||
+        resourcesPresent != logicalGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent )
     {
@@ -2292,6 +2585,18 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader rawRanges( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRangeSet ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRangeSet ),
             sizeof( JnGpuRangeSetRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader resourceLogicalLookup( ResourceLogicalLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-logical-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader logicalDefinitionLookup( LogicalDefinitionLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "logical-definition-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader logicalGenerations( LogicalGenerationPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "logical-generations-v1" ),
+            sizeof( uint64_t ), m_impl->options );
+        analysis::PagedRecordReader rawLogicals( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogLogical ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogLogical ),
+            sizeof( JnGpuCatalogLogicalRecordV1 ), m_impl->options );
         analysis::PagedRecordReader viewLookup( ResourceViewLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-view-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -2303,6 +2608,9 @@ void QueryCatalogStoreReader::ValidateAll() const
             sizeof( JnGpuCatalogViewRecordV1 ), m_impl->options );
         analysis::PagedRecordReader meshPartLookup( ResourceMeshPartLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-mesh-part-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader partLookup( ResourcePartLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-part-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
         analysis::PagedRecordReader partGenerations( ResourcePartGenerationPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-part-generations-v1" ),
@@ -2321,6 +2629,9 @@ void QueryCatalogStoreReader::ValidateAll() const
             sizeof( JnGpuCatalogVgRecordV1 ), m_impl->options );
         analysis::PagedRecordReader rtasRelationLookup( ResourceRtasRelationLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-rtas-relation-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader resourceRelationLookup( ResourceRelationLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "resource-relation-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
         analysis::PagedRecordReader relationGenerations( ResourceRelationGenerationPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-relation-generations-v1" ),
@@ -2349,13 +2660,18 @@ void QueryCatalogStoreReader::ValidateAll() const
         resourceRangeLookup.ValidateAll();
         passRangeLookup.ValidateAll();
         rangeGenerations.ValidateAll();
+        resourceLogicalLookup.ValidateAll();
+        logicalDefinitionLookup.ValidateAll();
+        logicalGenerations.ValidateAll();
         viewLookup.ValidateAll();
         viewGenerations.ValidateAll();
         meshPartLookup.ValidateAll();
+        partLookup.ValidateAll();
         partGenerations.ValidateAll();
         vgLookup.ValidateAll();
         vgGenerations.ValidateAll();
         rtasRelationLookup.ValidateAll();
+        resourceRelationLookup.ValidateAll();
         relationGenerations.ValidateAll();
         passEvidenceLookup.ValidateAll();
         detailedEvidenceGenerations.ValidateAll();
@@ -2372,6 +2688,8 @@ void QueryCatalogStoreReader::ValidateAll() const
             throw std::runtime_error( "Catalog pointer interval lookup count mismatch" );
         if( rangeGenerations.Count() != rawRanges.Count() )
             throw std::runtime_error( "Catalog RangeSet generation count mismatch" );
+        if( logicalGenerations.Count() != rawLogicals.Count() )
+            throw std::runtime_error( "Catalog logical generation count mismatch" );
         const auto validatePointerLookup = [&]( analysis::PagedRecordReader& lookup,
             bool byPointer, std::string_view label ) {
             analysis::AnalysisKeyMetadataRecord previous {};
@@ -2460,6 +2778,10 @@ void QueryCatalogStoreReader::ValidateAll() const
                 return row.resourceId != 0 && ( kind == JnGpuCatalogPartKind::MeshVertexStream ||
                     kind == JnGpuCatalogPartKind::MeshIndex );
             }, "Catalog mesh-part" );
+        validateLookup( partLookup, rawParts.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogPartRecordV1 row {}; rawParts.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId; },
+            []( const auto& row ) { return row.resourceId != 0; }, "Catalog part" );
         validateLookup( vgLookup, rawVg.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogVgRecordV1 row {}; rawVg.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
@@ -2472,6 +2794,17 @@ void QueryCatalogStoreReader::ValidateAll() const
             [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rawRanges.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.passInstanceId; },
             []( const auto& row ) { return row.passInstanceId != 0; }, "Catalog pass RangeSet" );
+        validateLookup( resourceLogicalLookup, rawLogicals.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; rawLogicals.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.resourceId; },
+            []( const auto& row ) { return row.resourceId != 0; }, "Catalog resource logical" );
+        validateLookup( logicalDefinitionLookup, rawLogicals.Count(),
+            [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; rawLogicals.Read( ordinal, &row, 1 ); return row; },
+            []( const auto& row ) { return row.logicalResourceId; },
+            []( const auto& row ) {
+                return row.logicalResourceId != 0 &&
+                    IsCatalogDefinition( JnGpuCatalogRecordOperation( row.operation ) );
+            }, "Catalog logical definition" );
         analysis::AnalysisKeyMetadataRecord previousRtas {};
         for( uint64_t index = 0; index < rtasRelationLookup.Count(); index++ )
         {
@@ -2489,6 +2822,21 @@ void QueryCatalogStoreReader::ValidateAll() const
                 ( !sourceMatch && !targetMatch ) )
                 throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
             previousRtas = row;
+        }
+        analysis::AnalysisKeyMetadataRecord previousRelation {};
+        for( uint64_t index = 0; index < resourceRelationLookup.Count(); index++ )
+        {
+            analysis::AnalysisKeyMetadataRecord row {};
+            resourceRelationLookup.Read( index, &row, 1 );
+            if( row.keyHigh == 0 || row.metadata >= rawRelations.Count() ||
+                ( index != 0 && ( row.keyHigh < previousRelation.keyHigh ||
+                    ( row.keyHigh == previousRelation.keyHigh && row.metadata < previousRelation.metadata ) ) ) )
+                throw std::runtime_error( "Catalog resource relation lookup order mismatch" );
+            JnGpuCatalogRelationRecordV1 raw {};
+            rawRelations.Read( row.metadata, &raw, 1 );
+            if( raw.sourceId != row.keyHigh && raw.targetId != row.keyHigh )
+                throw std::runtime_error( "Catalog resource relation lookup identity mismatch" );
+            previousRelation = row;
         }
         analysis::AnalysisKeyMetadataRecord previousEvidence {};
         for( uint64_t index = 0; index < passEvidenceLookup.Count(); index++ )
