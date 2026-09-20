@@ -153,6 +153,9 @@ int main()
         reader.BuildResourceIndex( root / "resource-index-scratch" );
         Require( fs::is_directory( root / "resource-associations" ),
             "Catalog resource index did not publish bounded association summaries" );
+        Require( fs::is_directory( root / "resource-allocation-lookup" ) &&
+            fs::is_directory( root / "resource-allocation-generations" ),
+            "Catalog resource index did not publish bounded allocation history indices" );
         Require( !fs::exists( root / "resource-index-scratch" ),
             "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
@@ -184,6 +187,19 @@ int main()
                 sizeof( associationResources[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogResource );
 
+            JnGpuCatalogAllocationRecordV1 associationAllocations[3] {};
+            associationAllocations[0].time = 10; associationAllocations[0].allocationId = 500;
+            associationAllocations[0].sizeBytes = 4096;
+            associationAllocations[1].time = 20; associationAllocations[1].allocationId = 500;
+            associationAllocations[1].sizeBytes = 8192;
+            associationAllocations[1].operation = uint8_t( JnGpuCatalogRecordOperation::Update );
+            associationAllocations[2].time = 30; associationAllocations[2].allocationId = 600;
+            associationAllocations[2].sizeBytes = 16384;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogAllocation, 3, sizeof( associationAllocations[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogAllocation, 0, associationAllocations, 3,
+                sizeof( associationAllocations[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogAllocation );
+
             JnGpuCatalogPartRecordV1 associationParts[3] {};
             associationParts[0].resourceId = 100;
             associationParts[0].partKind = uint8_t( JnGpuCatalogPartKind::MeshVertexStream );
@@ -214,12 +230,16 @@ int main()
                 sizeof( associationRanges[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogRangeSet );
 
-            JnGpuCatalogBatchData associationBatch {};
-            associationBatch.generation = 9; associationBatch.firstRecordIndex = 0;
-            associationBatch.recordCount = 3; associationBatch.kind = uint8_t( JnGpuCatalogBatchKind::Resource );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( associationBatch ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, &associationBatch, 1,
-                sizeof( associationBatch ) );
+            JnGpuCatalogBatchData associationBatches[2] {};
+            associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
+            associationBatches[0].recordCount = 3;
+            associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
+            associationBatches[1].generation = 10; associationBatches[1].firstRecordIndex = 0;
+            associationBatches[1].recordCount = 3;
+            associationBatches[1].kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 2, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 2,
+                sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
         }
@@ -239,6 +259,22 @@ int main()
         Require( associations102 && associations102->rangeCount == 1 &&
             associations102->allocationResourceCount == 1 && !associationReader.ResourceAssociations( 999 ),
             "Catalog resource association index changed unique-allocation or missing-key semantics" );
+        const auto allocations100First = associationReader.ResourceAllocations( 100, 0, 1 );
+        const auto allocations100Second = associationReader.ResourceAllocations( 100, 1, 1 );
+        const auto allocations102 = associationReader.ResourceAllocations( 102, 0, 10 );
+        Require( allocations100First.total == 2 && allocations100First.values.size() == 1 &&
+            allocations100First.values[0].record.allocationId == 500 &&
+            allocations100First.values[0].record.sizeBytes == 4096 &&
+            allocations100First.values[0].generation == 10,
+            "Catalog allocation history first page changed" );
+        Require( allocations100Second.total == 2 && allocations100Second.values.size() == 1 &&
+            allocations100Second.values[0].record.sizeBytes == 8192 &&
+            allocations100Second.values[0].record.operation == uint8_t( JnGpuCatalogRecordOperation::Update ),
+            "Catalog allocation history continuation changed" );
+        Require( allocations102.total == 1 && allocations102.values.size() == 1 &&
+            allocations102.values[0].record.allocationId == 600 &&
+            associationReader.ResourceAllocations( 999, 0, 10 ).total == 0,
+            "Catalog allocation history unique or missing resource behavior changed" );
         associationReader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&

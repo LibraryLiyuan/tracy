@@ -64,6 +64,18 @@ struct QueryCatalogResourceAssociationData
 
 static_assert( sizeof( QueryCatalogResourceAssociationData ) == 48 );
 
+struct QueryCatalogAllocationData
+{
+    JnGpuCatalogAllocationRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogAllocationPage
+{
+    std::vector<QueryCatalogAllocationData> values;
+    uint64_t total = 0;
+};
+
 class QueryCatalogStatusSource
 {
 public:
@@ -81,6 +93,8 @@ public:
     virtual std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const = 0;
     virtual std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const = 0;
     virtual QueryCatalogResourceAssociationData GetQueryCatalogResourceAssociationsAt( uint64_t ordinal ) const = 0;
+    virtual QueryCatalogAllocationPage GetQueryCatalogResourceAllocations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -130,6 +144,7 @@ public:
     std::optional<QueryCatalogResourceStateData> ResourceState( uint64_t resourceId ) const;
     QueryCatalogResourceAssociationData ResourceAssociationsAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogResourceAssociationData> ResourceAssociations( uint64_t resourceId ) const;
+    QueryCatalogAllocationPage ResourceAllocations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:

@@ -111,6 +111,13 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 新增真实`SessionManager → QueryService`合同测试，逐项验证五种过滤和返回计数字段。1,001条Resource真实Catalog完成冷建、深校验、重开及与旧Worker关联语义逐资源对照；该夹具聚合为1个resourceId，关联分页表337字节，Catalog section 28,402字节，完整独立输出81,187字节。
 - Release全构建和CTest 40/40通过（124.08秒）。本检查点没有运行12.43 GB正式Trace，也不计入约定的单轮综合性能验收。Resource explain和关联详情页、Pass、GPU Memory、Job、Sample派生及Scan迁移仍待继续。
 
+## 2026-09-20：schema29 Allocation历史分页
+
+- Resource最新定义的`allocationId`通过`allocationId→原始ordinal`外排索引读取完整Allocation历史；逐记录generation使用独立分页表保存。索引按Allocation ID和原始ordinal排序，分页通过二分范围直接定位，不扫描完整Allocation域。
+- `gpu.resource.allocations`加入统一v2 cursor，默认及显式页大小上限沿用Query 1.35；每页保留旧接口的Allocation字段，并增加精确`total`和顶层`page`。不存在Resource仍返回`ENTITY_NOT_FOUND`，无Allocation绑定返回空页而非未就绪。
+- 组件夹具覆盖同一Allocation的Create/Update两页、独立Allocation、generation及缺失Resource。真实`SessionManager → QueryService`测试验证cursor首尾页。1,001 Resource真实Catalog完成schema29冷建、深校验、热开和无scratch发布；该真实夹具没有Allocation记录，因此非空历史由组件与服务合同覆盖。
+- 真实夹具Catalog section为28,850字节；空Allocation lookup和generation分页目录各224字节，完整独立输出81,637字节。Release全构建与CTest 40/40通过（131.66秒）。未运行12.43 GB正式Trace；Views、Parts详情、Range/Reference、Logical/Relation、VG/RTAS及Explain仍待迁移。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

@@ -70,6 +70,25 @@ public:
     {
         return m_associations.at( size_t( ordinal ) );
     }
+    QueryCatalogAllocationPage GetQueryCatalogResourceAllocations(
+        uint64_t resourceId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogAllocationPage page;
+        if( resourceId != 100 ) return page;
+        page.total = 2;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogAllocationData value {};
+            value.record.time = int64_t( 10 + index );
+            value.record.allocationId = 500;
+            value.record.sizeBytes = 4096 * ( index + 1 );
+            value.record.operation = uint8_t( index == 0 ?
+                JnGpuCatalogRecordOperation::Create : JnGpuCatalogRecordOperation::Update );
+            value.generation = 9;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -127,7 +146,23 @@ int main()
     const auto shared = search( 6, "has_shared_allocation" );
     assert( shared.at( "total" ) == "2" && shared.at( "resources" )[0].at( "allocation_resource_count" ) == "2" );
 
-    assert( service.Execute( Request( 7, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    const auto allocationFirst = service.Execute( Request( 7, "gpu.resource.allocations", {
+        { "trace_id", traceId }, { "ref", "fake:gpu-resource:100" }, { "limit", 1 }
+    } ) );
+    assert( allocationFirst.at( "ok" ) && allocationFirst.at( "data" ).at( "allocations" ).size() == 1 &&
+        allocationFirst.at( "data" ).at( "allocations" )[0].at( "allocation_id" ) == "500" &&
+        allocationFirst.at( "data" ).at( "allocations" )[0].at( "size_bytes" ) == "4096" &&
+        allocationFirst.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto allocationSecond = service.Execute( Request( 8, "gpu.resource.allocations", {
+        { "trace_id", traceId },
+        { "ref", "fake:gpu-resource:100" },
+        { "limit", 1 }, { "cursor", allocationFirst.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( allocationSecond.at( "ok" ) && allocationSecond.at( "data" ).at( "allocations" ).size() == 1 &&
+        allocationSecond.at( "data" ).at( "allocations" )[0].at( "size_bytes" ) == "8192" &&
+        allocationSecond.at( "page" ).at( "next_cursor" ).is_null() );
+
+    assert( service.Execute( Request( 9, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

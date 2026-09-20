@@ -5476,7 +5476,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
-            method == "gpu.resource.lifetime" ) &&
+            method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
@@ -5643,6 +5643,42 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             const auto state = catalogResourceSource->GetQueryCatalogResourceState( resourceId );
             if( !state ) throw QueryError( "ENTITY_NOT_FOUND", "GPU resource was not found" );
+            if( method == "gpu.resource.allocations" )
+            {
+                const auto page = ParsePage( params, method, trace );
+                const auto allocationPage = catalogResourceSource->GetQueryCatalogResourceAllocations(
+                    resourceId, page.offset, page.limit );
+                json values = json::array();
+                for( const auto& item : allocationPage.values )
+                {
+                    const auto& allocation = item.record;
+                    values.push_back( {
+                        { "ref", source->MakeEntityRef( "gpu-allocation", allocation.allocationId ) },
+                        { "allocation_id", Decimal( allocation.allocationId ) },
+                        { "generation", Decimal( item.generation ) },
+                        { "heap_id", allocation.heapId == 0 ? json( nullptr ) : json( Decimal( allocation.heapId ) ) },
+                        { "parent_allocation_id", allocation.parentAllocationId == 0 ?
+                            json( nullptr ) : json( Decimal( allocation.parentAllocationId ) ) },
+                        { "size_bytes", Decimal( allocation.sizeBytes ) },
+                        { "offset_bytes", Decimal( allocation.offsetBytes ) },
+                        { "resident_bytes", Decimal( allocation.residentBytes ) },
+                        { "alignment_bytes", Decimal( allocation.alignmentBytes ) },
+                        { "primary_kind", GpuPrimaryKindName( allocation.primaryKind ) },
+                        { "memory_domain", allocation.memoryDomain },
+                        { "allocation_kind", allocation.allocationKind },
+                        { "residency_state", allocation.residencyState },
+                        { "exactness", GpuExactnessName( allocation.exactness ) },
+                        { "operation", GpuCatalogOperationName( allocation.operation ) },
+                        { "time_ns", Decimal( allocation.time ) }
+                    } );
+                }
+                const auto returned = values.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < allocationPage.total );
+                return Success( id, { { "present", true }, { "resource_id", Decimal( resourceId ) },
+                    { "allocations", std::move( values ) }, { "total", Decimal( allocationPage.total ) } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
             const auto& value = state->latest;
             const auto nameValue = catalogResourceSource->GetQueryCatalogResourceName( state->generation, value.nameId );
             const std::string name = nameValue.value_or( std::string() );
