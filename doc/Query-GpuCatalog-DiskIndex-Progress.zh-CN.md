@@ -132,6 +132,13 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 非空组件夹具覆盖两个VG分页、双向RTAS、未解析source端点排除、非RTAS排除及generation。真实QueryService合同验证VG/RTAS响应字段。1,001 Resource真实Catalog完成schema31冷建、深校验、热开和无scratch发布；该夹具VG/Relation域为空。
 - 真实夹具Catalog section为30,642字节，四个空lookup/generation分页目录各224字节，完整独立输出83,427字节。Release全构建与CTest 40/40通过（124.89秒）。Range/Reference、Logical详情、通用Relation及Explain仍待迁移。
 
+## 2026-09-20：schema32 Pass DetailedEvidence分页
+
+- `gpu.pass.vg_evidence`按`evidenceFrameId`、`frameId`和`sourceId`建立Pass ID反向索引；同一记录的三个键相同或重复时只写一次。索引保存原始ordinal，DetailedEvidence generation使用同ordinal分页表。
+- 查询二分定位Pass范围并使用Query 1.35 v2 cursor；保留旧嵌套`data.page`和全部记录字段。`sample_status`按该Pass最后一条原始ordinal记录计算，与当前页大小无关；无记录明确返回`not_sampled`。
+- 非空组件夹具覆盖三个匹配键、重复键去重、两页记录和generation；真实QueryService合同验证第一页及最终状态。1,001 Resource真实Catalog完成schema32冷建、深校验、热开和无scratch发布；该夹具DetailedEvidence域为空。
+- 真实夹具Catalog section为31,090字节，空Evidence lookup和generation分页目录各224字节，完整独立输出83,874字节。Release全构建与CTest 40/40通过（129.76秒）。`gpu.pass.resources`、Range/Reference、Logical/Relation及Explain仍待迁移。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

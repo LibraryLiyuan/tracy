@@ -5480,7 +5480,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
             method == "gpu.resource.vg_pages" || method == "gpu.resource.raytracing_chain" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
-        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod )
+        const bool boundedEvidenceMethod = method == "gpu.pass.vg_evidence" &&
+            catalogResourceSource != nullptr && catalogStatusSource != nullptr;
+        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod &&
+            !boundedEvidenceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
         if( boundedStatusMethod )
         {
@@ -5538,7 +5541,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 } }
             }, trace );
         }
-        if( boundedResourceMethod )
+        if( boundedResourceMethod || boundedEvidenceMethod )
         {
             const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
             if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
@@ -5546,6 +5549,40 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "reason", "trace predates N27 or contains no GPU Resource Catalog" } }, trace );
             if( !validation.healthy ) return Success( id, { { "present", true }, { "status", "unavailable_catalog_invalid" },
                 { "reason", "Catalog disk semantic validation failed; dependent evidence is unavailable" } }, trace );
+            if( method == "gpu.pass.vg_evidence" )
+            {
+                const auto passId = UnsignedParameter( params, "pass_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                const auto page = ParsePage( params, method, trace );
+                const auto evidencePage = catalogResourceSource->GetQueryCatalogPassEvidence(
+                    passId, page.offset, page.limit );
+                json records = json::array();
+                for( const auto& item : evidencePage.values )
+                {
+                    const auto& value = item.record;
+                    records.push_back( {
+                        { "generation", Decimal( item.generation ) },
+                        { "request_id", Decimal( value.requestId ) },
+                        { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                        { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) },
+                        { "target_id", Decimal( value.targetId ) }, { "kind", value.kind },
+                        { "state", GpuEvidenceStateName( value.state ) }, { "sequence", value.sequence },
+                        { "time_ns", Decimal( value.time ) }
+                    } );
+                }
+                const auto returned = records.size();
+                const auto cursor = NextCursor( page, method, trace, returned,
+                    page.offset + returned < evidencePage.total );
+                const std::string sampleStatus = evidencePage.hasState ?
+                    GpuEvidenceStateName( evidencePage.lastState ) : "not_sampled";
+                return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
+                    { "sample_status", sampleStatus }, { "sampled", sampleStatus != "not_sampled" },
+                    { "records", std::move( records ) },
+                    { "page", { { "offset", page.offset }, { "limit", page.limit },
+                        { "returned", returned }, { "total", Decimal( evidencePage.total ) },
+                        { "has_more", page.offset + returned < evidencePage.total } } } },
+                    trace, PageJson( page, returned, cursor ) );
+            }
             if( method == "gpu.resource.search" )
             {
                 const auto page = ParsePage( params, method, trace );

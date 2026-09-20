@@ -1492,7 +1492,7 @@ public:
                 {
                     item.queryable = m_catalog.ResourceIndexReady();
                     item.reason = item.queryable ?
-                        "bounded GPU resource get, lifetime, search and allocation/view/mesh/VG/RTAS histories are ready" :
+                        "bounded GPU resource histories and pass VG evidence are ready" :
                         "bounded GPU resource indices are pending";
                 }
                 else
@@ -1590,6 +1590,12 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const override
     {
         return m_catalog.ResourceRtasRelations( resourceId, offset, limit );
+    }
+
+    QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        return m_catalog.PassEvidence( passId, offset, limit );
     }
 
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override

@@ -160,6 +160,28 @@ public:
         }
         return page;
     }
+    QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
+        uint64_t passId, uint64_t offset, size_t limit ) const override
+    {
+        QueryCatalogEvidencePage page;
+        if( passId != 200 ) return page;
+        page.total = 2;
+        page.hasState = true;
+        page.lastState = uint8_t( JnGpuEvidenceState::PeriodicExact );
+        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        {
+            QueryCatalogEvidenceData value {};
+            value.record.time = int64_t( 70 + index );
+            value.record.requestId = index + 1;
+            value.record.evidenceFrameId = 200;
+            value.record.state = uint8_t( index == 0 ?
+                JnGpuEvidenceState::ContinuousExact : JnGpuEvidenceState::PeriodicExact );
+            value.record.kind = uint8_t( JnGpuDetailedEvidenceKind::VgPage );
+            value.generation = 15;
+            page.values.emplace_back( value );
+        }
+        return page;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -258,8 +280,15 @@ int main()
         rtas.at( "data" ).at( "relations" )[0].at( "source_id" ) == "100" &&
         rtas.at( "data" ).at( "relations" )[0].at( "target_id" ) == "102" &&
         rtas.at( "data" ).at( "page" ).at( "total" ) == "1" );
+    const auto evidencePage = service.Execute( Request( 13, "gpu.pass.vg_evidence", {
+        { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 }
+    } ) );
+    assert( evidencePage.at( "ok" ) && evidencePage.at( "data" ).at( "records" ).size() == 1 &&
+        evidencePage.at( "data" ).at( "records" )[0].at( "request_id" ) == "1" &&
+        evidencePage.at( "data" ).at( "sample_status" ) == "periodic_exact" &&
+        evidencePage.at( "data" ).at( "page" ).at( "total" ) == "2" );
 
-    assert( service.Execute( Request( 13, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    assert( service.Execute( Request( 14, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

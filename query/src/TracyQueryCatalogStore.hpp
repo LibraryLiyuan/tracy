@@ -124,6 +124,20 @@ struct QueryCatalogRelationPage
     uint64_t total = 0;
 };
 
+struct QueryCatalogEvidenceData
+{
+    JnGpuDetailedEvidenceRecordV1 record {};
+    uint64_t generation = 0;
+};
+
+struct QueryCatalogEvidencePage
+{
+    std::vector<QueryCatalogEvidenceData> values;
+    uint64_t total = 0;
+    uint8_t lastState = uint8_t( JnGpuEvidenceState::NotSampled );
+    bool hasState = false;
+};
+
 class QueryCatalogStatusSource
 {
 public:
@@ -151,6 +165,8 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogRelationPage GetQueryCatalogResourceRtasRelations(
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
+        uint64_t passId, uint64_t offset, size_t limit ) const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -205,6 +221,7 @@ public:
     QueryCatalogPartPage ResourceMeshParts( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogVgPage ResourceVgPages( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogRelationPage ResourceRtasRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
+    QueryCatalogEvidencePage PassEvidence( uint64_t passId, uint64_t offset, size_t limit ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:

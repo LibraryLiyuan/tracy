@@ -166,6 +166,9 @@ int main()
             fs::is_directory( root / "resource-rtas-relation-lookup" ) &&
             fs::is_directory( root / "resource-relation-generations" ),
             "Catalog resource index did not publish bounded VG and RTAS history indices" );
+        Require( fs::is_directory( root / "pass-evidence-lookup" ) &&
+            fs::is_directory( root / "detailed-evidence-generations" ),
+            "Catalog resource index did not publish bounded pass evidence indices" );
         Require( !fs::exists( root / "resource-index-scratch" ),
             "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
@@ -275,7 +278,24 @@ int main()
                 sizeof( associationRelations[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogRelation );
 
-            JnGpuCatalogBatchData associationBatches[6] {};
+            JnGpuDetailedEvidenceRecordV1 associationEvidence[2] {};
+            associationEvidence[0].time = 70; associationEvidence[0].requestId = 1;
+            associationEvidence[0].evidenceFrameId = 200; associationEvidence[0].frameId = 201;
+            associationEvidence[0].sourceId = 202;
+            associationEvidence[0].state = uint8_t( JnGpuEvidenceState::ContinuousExact );
+            associationEvidence[0].kind = uint8_t( JnGpuDetailedEvidenceKind::VgPage );
+            associationEvidence[1].time = 71; associationEvidence[1].requestId = 2;
+            associationEvidence[1].evidenceFrameId = 200; associationEvidence[1].frameId = 200;
+            associationEvidence[1].sourceId = 200;
+            associationEvidence[1].state = uint8_t( JnGpuEvidenceState::PeriodicExact );
+            associationEvidence[1].kind = uint8_t( JnGpuDetailedEvidenceKind::Completion );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogDetailedEvidence, 2,
+                sizeof( associationEvidence[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogDetailedEvidence, 0,
+                associationEvidence, 2, sizeof( associationEvidence[0] ) );
+            associationWriter.End( OfflineCatalogDomain::CatalogDetailedEvidence );
+
+            JnGpuCatalogBatchData associationBatches[7] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
             associationBatches[0].recordCount = 3;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
@@ -294,8 +314,11 @@ int main()
             associationBatches[5].generation = 14; associationBatches[5].firstRecordIndex = 0;
             associationBatches[5].recordCount = 3;
             associationBatches[5].kind = uint8_t( JnGpuCatalogBatchKind::Relation );
-            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 6, sizeof( associationBatches[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 6,
+            associationBatches[6].generation = 15; associationBatches[6].firstRecordIndex = 0;
+            associationBatches[6].recordCount = 2;
+            associationBatches[6].kind = uint8_t( JnGpuCatalogBatchKind::DetailedEvidence );
+            associationWriter.Begin( OfflineCatalogDomain::CatalogBatch, 7, sizeof( associationBatches[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, associationBatches, 7,
                 sizeof( associationBatches[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogBatch );
             associationWriter.Finish();
@@ -360,6 +383,15 @@ int main()
             rtas101.total == 1 && rtas101.values.size() == 1 &&
             rtas101.values[0].record.sourceId == 100,
             "Catalog RTAS relation history resolved-endpoint filtering changed" );
+        const auto evidence200First = associationReader.PassEvidence( 200, 0, 1 );
+        const auto evidence200Second = associationReader.PassEvidence( 200, 1, 1 );
+        const auto evidence201 = associationReader.PassEvidence( 201, 0, 10 );
+        Require( evidence200First.total == 2 && evidence200First.values.size() == 1 &&
+            evidence200First.values[0].record.requestId == 1 && evidence200First.values[0].generation == 15 &&
+            evidence200Second.values.size() == 1 && evidence200Second.values[0].record.requestId == 2 &&
+            evidence201.total == 1 && evidence201.values.size() == 1 &&
+            evidence201.values[0].record.requestId == 1,
+            "Catalog pass evidence lookup paging or duplicate-key semantics changed" );
         associationReader.ValidateAll();
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&

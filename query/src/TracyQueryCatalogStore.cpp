@@ -95,6 +95,8 @@ std::filesystem::path ResourceVgLookupPath( const std::filesystem::path& root ) 
 std::filesystem::path ResourceVgGenerationPath( const std::filesystem::path& root ) { return root / "resource-vg-generations"; }
 std::filesystem::path ResourceRtasRelationLookupPath( const std::filesystem::path& root ) { return root / "resource-rtas-relation-lookup"; }
 std::filesystem::path ResourceRelationGenerationPath( const std::filesystem::path& root ) { return root / "resource-relation-generations"; }
+std::filesystem::path PassEvidenceLookupPath( const std::filesystem::path& root ) { return root / "pass-evidence-lookup"; }
+std::filesystem::path DetailedEvidenceGenerationPath( const std::filesystem::path& root ) { return root / "detailed-evidence-generations"; }
 std::filesystem::path ResourceStringLookupPath( const std::filesystem::path& root ) { return root / "resource-string-lookup"; }
 
 enum class ResourceAssociationKind : uint8_t
@@ -260,6 +262,9 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRtasRelationLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRelationGenerations;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawRelations;
+    mutable std::unique_ptr<analysis::PagedRecordReader> passEvidenceLookup;
+    mutable std::unique_ptr<analysis::PagedRecordReader> detailedEvidenceGenerations;
+    mutable std::unique_ptr<analysis::PagedRecordReader> rawDetailedEvidence;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceStringLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawStrings;
 
@@ -321,6 +326,16 @@ struct QueryCatalogStoreReader::Impl
             DomainPath( root, OfflineCatalogDomain::CatalogRelation ),
             CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogRelation ),
             uint32_t( sizeof( JnGpuCatalogRelationRecordV1 ) ), options );
+        if( !passEvidenceLookup ) passEvidenceLookup = std::make_unique<analysis::PagedRecordReader>(
+            PassEvidenceLookupPath( root ), CatalogIdentity( sourceFingerprint, "pass-evidence-lookup-v1" ),
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+        if( !detailedEvidenceGenerations ) detailedEvidenceGenerations = std::make_unique<analysis::PagedRecordReader>(
+            DetailedEvidenceGenerationPath( root ), CatalogIdentity( sourceFingerprint, "detailed-evidence-generations-v1" ),
+            uint32_t( sizeof( uint64_t ) ), options );
+        if( !rawDetailedEvidence ) rawDetailedEvidence = std::make_unique<analysis::PagedRecordReader>(
+            DomainPath( root, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            uint32_t( sizeof( JnGpuDetailedEvidenceRecordV1 ) ), options );
         if( !resourceStringLookup ) resourceStringLookup = std::make_unique<analysis::PagedRecordReader>(
             ResourceStringLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-string-lookup-v1" ),
             uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
@@ -456,6 +471,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto vgGenerationOutput = ResourceVgGenerationPath( m_impl->root );
     const auto rtasRelationLookupOutput = ResourceRtasRelationLookupPath( m_impl->root );
     const auto relationGenerationOutput = ResourceRelationGenerationPath( m_impl->root );
+    const auto passEvidenceLookupOutput = PassEvidenceLookupPath( m_impl->root );
+    const auto detailedEvidenceGenerationOutput = DetailedEvidenceGenerationPath( m_impl->root );
     const auto stringOutput = ResourceStringLookupPath( m_impl->root );
     if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( associationOutput ) ) ||
@@ -469,6 +486,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::filesystem::exists( analysis::AnalysisIoPath( vgGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( rtasRelationLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( relationGenerationOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( passEvidenceLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( detailedEvidenceGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( stringOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
         throw std::runtime_error( "Catalog resource index already exists" );
@@ -487,6 +506,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto vgLookupSorted = scratchRoot / "vg-lookup-sorted.work";
     const auto rtasRelationLookupSource = scratchRoot / "rtas-relation-lookup-source.work";
     const auto rtasRelationLookupSorted = scratchRoot / "rtas-relation-lookup-sorted.work";
+    const auto passEvidenceLookupSource = scratchRoot / "pass-evidence-lookup-source.work";
+    const auto passEvidenceLookupSorted = scratchRoot / "pass-evidence-lookup-sorted.work";
     const auto logicalAliasesSource = scratchRoot / "resource-logical-aliases-source.work";
     const auto logicalAliasesSorted = scratchRoot / "resource-logical-aliases-sorted.work";
     const auto logicalBindingsSource = scratchRoot / "resource-logical-bindings-source.work";
@@ -519,6 +540,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             remove( vgGenerationOutput, "Catalog VG generation cleanup failed" );
             remove( rtasRelationLookupOutput, "Catalog RTAS relation lookup cleanup failed" );
             remove( relationGenerationOutput, "Catalog relation generation cleanup failed" );
+            remove( passEvidenceLookupOutput, "Catalog pass evidence lookup cleanup failed" );
+            remove( detailedEvidenceGenerationOutput, "Catalog detailed evidence generation cleanup failed" );
             remove( stringOutput, "Catalog resource string cleanup failed" );
         }
         return failure;
@@ -546,6 +569,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         analysis::PagedRecordReader relationRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRelation ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRelation ),
             sizeof( JnGpuCatalogRelationRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader evidenceRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            sizeof( JnGpuDetailedEvidenceRecordV1 ), m_impl->options );
         {
             analysis::PagedRecordWriter resourceGenerations( resourceGenerationsPath,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ),
@@ -639,6 +665,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             "resource-vg-generations-v1", "Catalog VG" );
         buildGenerations( JnGpuCatalogBatchKind::Relation, relationRows.Count(), relationGenerationOutput,
             "resource-relation-generations-v1", "Catalog relation" );
+        buildGenerations( JnGpuCatalogBatchKind::DetailedEvidence, evidenceRows.Count(),
+            detailedEvidenceGenerationOutput, "detailed-evidence-generations-v1", "Catalog detailed evidence" );
 
         std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
@@ -1087,6 +1115,37 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         rtasRelationSource.flush();
         if( !rtasRelationSource ) throw std::runtime_error( "Catalog RTAS relation lookup source flush failed" );
         rtasRelationSource.close();
+        std::ofstream passEvidenceSource( analysis::AnalysisIoPath( passEvidenceLookupSource ),
+            std::ios::binary | std::ios::trunc );
+        if( !passEvidenceSource ) throw std::runtime_error( "Catalog pass evidence lookup source cannot be opened" );
+        uint64_t passEvidenceLookupCount = 0;
+        for( uint64_t ordinal = 0; ordinal < evidenceRows.Count(); ordinal++ )
+        {
+            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog resource index cancelled" );
+            JnGpuDetailedEvidenceRecordV1 row {};
+            evidenceRows.Read( ordinal, &row, 1 );
+            const std::array<uint64_t, 3> keys { row.evidenceFrameId, row.frameId, row.sourceId };
+            for( size_t keyIndex = 0; keyIndex < keys.size(); keyIndex++ )
+            {
+                const auto key = keys[keyIndex];
+                if( key == 0 ) continue;
+                bool duplicate = false;
+                for( size_t previous = 0; previous < keyIndex; previous++ ) duplicate |= keys[previous] == key;
+                if( duplicate ) continue;
+                analysis::AnalysisKeyMetadataRecord lookup {};
+                lookup.keyHigh = key;
+                lookup.metadata = ordinal;
+                analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( lookup ) );
+                passEvidenceSource.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );
+                if( !passEvidenceSource )
+                    throw std::runtime_error( "Catalog pass evidence lookup source write failed" );
+                passEvidenceLookupCount++;
+            }
+        }
+        passEvidenceSource.flush();
+        if( !passEvidenceSource ) throw std::runtime_error( "Catalog pass evidence lookup source flush failed" );
+        passEvidenceSource.close();
         const auto publishLookup = [&]( const std::filesystem::path& source,
             const std::filesystem::path& sorted, const std::filesystem::path& output,
             const char* prefix, std::string_view identity, uint64_t count, std::string_view label ) {
@@ -1121,6 +1180,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         publishLookup( rtasRelationLookupSource, rtasRelationLookupSorted, rtasRelationLookupOutput,
             "catalog-resource-rtas-relation-lookup", "resource-rtas-relation-lookup-v1",
             rtasRelationLookupCount, "Catalog RTAS relation" );
+        publishLookup( passEvidenceLookupSource, passEvidenceLookupSorted, passEvidenceLookupOutput,
+            "catalog-pass-evidence-lookup", "pass-evidence-lookup-v1",
+            passEvidenceLookupCount, "Catalog pass evidence" );
 
         analysis::PagedRecordReader stringRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
@@ -1507,6 +1569,63 @@ QueryCatalogRelationPage QueryCatalogStoreReader::ResourceRtasRelations(
     return result;
 }
 
+QueryCatalogEvidencePage QueryCatalogStoreReader::PassEvidence(
+    uint64_t passId, uint64_t offset, size_t limit ) const
+{
+    QueryCatalogEvidencePage result;
+    if( passId == 0 || limit == 0 ) return result;
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    auto& lookup = *m_impl->passEvidenceLookup;
+    const auto lowerBound = [&]( bool upper ) {
+        uint64_t begin = 0, count = lookup.Count();
+        analysis::AnalysisKeyMetadataRecord row {};
+        while( count != 0 )
+        {
+            const auto half = count / 2;
+            const auto middle = begin + half;
+            lookup.Read( middle, &row, 1 );
+            if( row.keyHigh < passId || ( upper && row.keyHigh == passId ) )
+            { begin = middle + 1; count -= half + 1; }
+            else count = half;
+        }
+        return begin;
+    };
+    const auto rangeBegin = lowerBound( false );
+    const auto rangeEnd = lowerBound( true );
+    result.total = rangeEnd - rangeBegin;
+    if( result.total != 0 )
+    {
+        analysis::AnalysisKeyMetadataRecord last {};
+        lookup.Read( rangeEnd - 1, &last, 1 );
+        if( last.metadata >= m_impl->rawDetailedEvidence->Count() )
+            throw std::runtime_error( "Catalog pass evidence lookup identity mismatch" );
+        JnGpuDetailedEvidenceRecordV1 lastRecord {};
+        m_impl->rawDetailedEvidence->Read( last.metadata, &lastRecord, 1 );
+        result.lastState = lastRecord.state;
+        result.hasState = true;
+    }
+    const auto selectedBegin = rangeBegin + std::min<uint64_t>( offset, result.total );
+    const auto selectedEnd = selectedBegin + std::min<uint64_t>( limit, rangeEnd - selectedBegin );
+    result.values.reserve( size_t( selectedEnd - selectedBegin ) );
+    for( auto index = selectedBegin; index < selectedEnd; index++ )
+    {
+        analysis::AnalysisKeyMetadataRecord row {};
+        lookup.Read( index, &row, 1 );
+        if( row.keyHigh != passId || row.metadata >= m_impl->rawDetailedEvidence->Count() ||
+            row.metadata >= m_impl->detailedEvidenceGenerations->Count() )
+            throw std::runtime_error( "Catalog pass evidence lookup identity mismatch" );
+        QueryCatalogEvidenceData value {};
+        m_impl->rawDetailedEvidence->Read( row.metadata, &value.record, 1 );
+        m_impl->detailedEvidenceGenerations->Read( row.metadata, &value.generation, 1 );
+        if( value.record.evidenceFrameId != passId && value.record.frameId != passId &&
+            value.record.sourceId != passId )
+            throw std::runtime_error( "Catalog pass evidence lookup identity mismatch" );
+        result.values.emplace_back( value );
+    }
+    return result;
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;
@@ -1561,6 +1680,8 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool vgGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceVgGenerationPath( m_impl->root ) ) );
     const bool rtasRelationLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRtasRelationLookupPath( m_impl->root ) ) );
     const bool relationGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceRelationGenerationPath( m_impl->root ) ) );
+    const bool passEvidenceLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( PassEvidenceLookupPath( m_impl->root ) ) );
+    const bool detailedEvidenceGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( DetailedEvidenceGenerationPath( m_impl->root ) ) );
     const bool stringsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceStringLookupPath( m_impl->root ) ) );
     if( resourcesPresent != stringsPresent || resourcesPresent != associationsPresent ||
         resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent )
@@ -1570,6 +1691,8 @@ void QueryCatalogStoreReader::ValidateAll() const
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != vgLookupPresent || resourcesPresent != vgGenerationsPresent ||
         resourcesPresent != rtasRelationLookupPresent || resourcesPresent != relationGenerationsPresent )
+        throw std::runtime_error( "Catalog resource index is incomplete" );
+    if( resourcesPresent != passEvidenceLookupPresent || resourcesPresent != detailedEvidenceGenerationsPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent )
     {
@@ -1627,6 +1750,15 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader rawRelations( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogRelation ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogRelation ),
             sizeof( JnGpuCatalogRelationRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader passEvidenceLookup( PassEvidenceLookupPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "pass-evidence-lookup-v1" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
+        analysis::PagedRecordReader detailedEvidenceGenerations( DetailedEvidenceGenerationPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "detailed-evidence-generations-v1" ),
+            sizeof( uint64_t ), m_impl->options );
+        analysis::PagedRecordReader rawDetailedEvidence( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
+            sizeof( JnGpuDetailedEvidenceRecordV1 ), m_impl->options );
         resources.ValidateAll();
         strings.ValidateAll();
         associations.ValidateAll();
@@ -1640,12 +1772,16 @@ void QueryCatalogStoreReader::ValidateAll() const
         vgGenerations.ValidateAll();
         rtasRelationLookup.ValidateAll();
         relationGenerations.ValidateAll();
+        passEvidenceLookup.ValidateAll();
+        detailedEvidenceGenerations.ValidateAll();
         if( allocationGenerations.Count() != rawAllocations.Count() )
             throw std::runtime_error( "Catalog allocation generation count mismatch" );
         if( viewGenerations.Count() != rawViews.Count() || partGenerations.Count() != rawParts.Count() )
             throw std::runtime_error( "Catalog resource detail generation count mismatch" );
         if( vgGenerations.Count() != rawVg.Count() || relationGenerations.Count() != rawRelations.Count() )
             throw std::runtime_error( "Catalog resource relation generation count mismatch" );
+        if( detailedEvidenceGenerations.Count() != rawDetailedEvidence.Count() )
+            throw std::runtime_error( "Catalog detailed evidence generation count mismatch" );
         if( associations.Count() != resources.Count() )
             throw std::runtime_error( "Catalog resource association count mismatch" );
         uint64_t previousResource = 0;
@@ -1726,6 +1862,21 @@ void QueryCatalogStoreReader::ValidateAll() const
                 ( !sourceMatch && !targetMatch ) )
                 throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
             previousRtas = row;
+        }
+        analysis::AnalysisKeyMetadataRecord previousEvidence {};
+        for( uint64_t index = 0; index < passEvidenceLookup.Count(); index++ )
+        {
+            analysis::AnalysisKeyMetadataRecord row {};
+            passEvidenceLookup.Read( index, &row, 1 );
+            if( row.keyHigh == 0 || row.metadata >= rawDetailedEvidence.Count() ||
+                ( index != 0 && ( row.keyHigh < previousEvidence.keyHigh ||
+                    ( row.keyHigh == previousEvidence.keyHigh && row.metadata < previousEvidence.metadata ) ) ) )
+                throw std::runtime_error( "Catalog pass evidence lookup order mismatch" );
+            JnGpuDetailedEvidenceRecordV1 raw {};
+            rawDetailedEvidence.Read( row.metadata, &raw, 1 );
+            if( raw.evidenceFrameId != row.keyHigh && raw.frameId != row.keyHigh && raw.sourceId != row.keyHigh )
+                throw std::runtime_error( "Catalog pass evidence lookup identity mismatch" );
+            previousEvidence = row;
         }
         analysis::PagedRecordReader rawStrings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
