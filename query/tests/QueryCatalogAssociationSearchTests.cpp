@@ -29,6 +29,22 @@ public:
         m_validation.present = true;
         m_validation.originalValid = true;
         m_validation.healthy = true;
+        m_status.metadata[2] = 27;
+        m_status.metadata[3] = 4;
+        m_status.counts[size_t( OfflineCatalogDomain::CatalogBatch )] = 3;
+        m_status.counts[size_t( OfflineCatalogDomain::CatalogGeneration )] = 1;
+        m_status.counts[size_t( OfflineCatalogDomain::CatalogResource )] = 3;
+        JnGpuDetailedEvidenceRecordV1 preview {};
+        preview.evidenceFrameId = 700;
+        preview.frameId = 701;
+        preview.sourceId = 702;
+        preview.requestId = 703;
+        preview.state = uint8_t( JnGpuEvidenceState::PeriodicExact );
+        preview.kind = uint8_t( JnGpuDetailedEvidenceKind::VgPage );
+        m_status.evidencePreview.emplace_back( preview );
+        m_status.recordCount = 21;
+        m_status.payloadBytes = 4096;
+        m_status.unresolvedCount = 5;
         for( uint64_t id = 100; id <= 102; id++ )
         {
             QueryCatalogResourceStateData state {};
@@ -55,8 +71,19 @@ public:
         m_associations[2].allocationResourceCount = 1;
     }
 
+    void SetInvalidValidation()
+    {
+        m_validation.healthy = false;
+        m_validation.findings = {
+            { "CATALOG_TRANSPORT_CHECKSUM_MISSING", 1 },
+            { "CATALOG_STORED_CHECKSUM", 1 },
+            { "CATALOG_SEQUENCE", 2 },
+            { "CATALOG_CROSS_TABLE_REFERENCE", 1 }
+        };
+    }
+
     bool CatalogDerivedDataReady() const override { return false; }
-    QueryCatalogStatusData GetQueryCatalogStatus( size_t, size_t ) const override { return {}; }
+    QueryCatalogStatusData GetQueryCatalogStatus( size_t, size_t ) const override { return m_status; }
     const QueryCatalogValidationResult& GetQueryCatalogValidation() const override { return m_validation; }
     uint64_t GetQueryCatalogResourceCount() const override { return m_states.size(); }
     QueryCatalogResourceStateData GetQueryCatalogResourceStateAt( uint64_t ordinal ) const override
@@ -316,6 +343,7 @@ public:
     }
 
 private:
+    QueryCatalogStatusData m_status;
     QueryCatalogValidationResult m_validation;
     std::array<QueryCatalogResourceStateData, 3> m_states;
     std::array<QueryCatalogResourceAssociationData, 3> m_associations;
@@ -339,11 +367,14 @@ int main()
     const auto trace = root / "catalog.tracy";
     std::ofstream( trace, std::ios::binary ).put( '\0' );
 
+    BoundedCatalogSource* catalogSource = nullptr;
     tracy::query::SessionManager sessions( { root }, 1,
-        []( const fs::path&, tracy::query::SessionManager::StateCallback callback )
+        [&catalogSource]( const fs::path&, tracy::query::SessionManager::StateCallback callback )
             -> std::unique_ptr<tracy::analysis::TraceSource> {
             callback( tracy::analysis::TraceSourceState::Indexing );
-            return std::make_unique<BoundedCatalogSource>();
+            auto source = std::make_unique<BoundedCatalogSource>();
+            catalogSource = source.get();
+            return source;
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
     const auto opened = service.Execute( Request( 1, "trace.open", { { "path", trace.string() } } ) );
@@ -502,7 +533,52 @@ int main()
         churn.at( "data" ).at( "freed_bytes" ) == "4096" &&
         churn.at( "data" ).at( "live_bytes_at_end" ) == "12288" );
 
-    assert( service.Execute( Request( 20, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    const auto validation = service.Execute( Request( 20, "gpu.catalog.validation", {
+        { "trace_id", traceId }
+    } ) );
+    assert( validation.at( "ok" ) && validation.at( "data" ).at( "present" ) &&
+        validation.at( "data" ).at( "valid" ) && validation.at( "data" ).at( "complete" ) &&
+        validation.at( "data" ).at( "status" ) == "complete" &&
+        validation.at( "data" ).at( "catalog_schema" ) == 27 &&
+        validation.at( "data" ).at( "record_count" ) == "21" &&
+        validation.at( "data" ).at( "unresolved_count" ) == "5" &&
+        validation.at( "data" ).at( "counts" ).at( "resources" ) == "3" &&
+        validation.at( "data" ).at( "detailed_evidence_checkpoint_preview" ).size() == 1 &&
+        validation.at( "data" ).at( "detailed_evidence_checkpoint_preview" )[0].at( "evidence_frame_id" ) == "700" &&
+        !validation.at( "data" ).at( "detailed_evidence_preview_truncated" ).get<bool>() &&
+        validation.at( "data" ).at( "transport" ).at( "batch_count" ) == "3" &&
+        validation.at( "data" ).at( "transport" ).at( "transport_checksums_verified" ) == "3" &&
+        validation.at( "data" ).at( "transport" ).at( "canonical_checksums_verified" ) == "3" &&
+        validation.at( "data" ).at( "transport" ).at( "checksum_failures" ).is_null() &&
+        validation.at( "data" ).at( "transport" ).at( "sequence_gaps" ).is_null() &&
+        validation.at( "data" ).at( "transport" ).at( "sequence_duplicates" ).is_null() &&
+        validation.at( "data" ).at( "unresolved_breakdown" ).at( "total" ) == "5" &&
+        !validation.at( "data" ).at( "diagnostic_details_available" ).get<bool>() );
+
+    assert( catalogSource != nullptr );
+    catalogSource->SetInvalidValidation();
+    const auto invalidValidation = service.Execute( Request( 21, "gpu.catalog.validation", {
+        { "trace_id", traceId }
+    } ) );
+    assert( invalidValidation.at( "ok" ) && invalidValidation.at( "data" ).at( "present" ) &&
+        !invalidValidation.at( "data" ).at( "valid" ).get<bool>() &&
+        !invalidValidation.at( "data" ).at( "complete" ).get<bool>() &&
+        invalidValidation.at( "data" ).at( "status" ) == "invalid_core_gap" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "batch_count" ) == "3" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "invalid_batches" ) == "0" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "transport_checksums_verified" ) == "2" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "canonical_checksums_verified" ) == "2" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "checksum_failures" ).is_null() &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "checksum_mismatch" ) == "1" &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "sequence_gaps" ).is_null() &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "sequence_duplicates" ).is_null() &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "core_unresolved" ).is_null() &&
+        invalidValidation.at( "data" ).at( "transport" ).at( "enrichment_unresolved" ).is_null() &&
+        invalidValidation.at( "data" ).at( "unresolved_breakdown" ).at( "total" ) == "5" &&
+        invalidValidation.at( "data" ).at( "unresolved_breakdown" ).at( "detail_status" ) == "not_persisted" &&
+        !invalidValidation.at( "data" ).at( "diagnostic_details_available" ).get<bool>() );
+
+    assert( service.Execute( Request( 22, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

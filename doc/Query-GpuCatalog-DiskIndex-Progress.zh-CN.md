@@ -194,6 +194,14 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - 1,001 Resource真实Catalog完成schema37冷建、深校验、热开Pass查询和二次事务发布；该夹具Pass事实为空。GPU Reference Use section为2,016字节，四个新增空表各224字节，独立目录全部文件92,191字节；只保留一个generation且无scratch。Release全构建与CTest 42/42通过（132.34秒）。
 - GPU Catalog Resource/Pass/GPU Memory主要查询已具备有界后端；Catalog validation详细响应、Job、Sample派生及Scan仍待完成。
 
+## 2026-09-20：Indexed Catalog validation有界响应
+
+- Indexed `gpu.catalog.validation`不再被`CatalogDerivedDataReady=false`门禁阻断，直接复用schema25持久化的语义校验权威和Catalog状态分页数据，不重建完整Catalog、GPU attribution或诊断哈希表。
+- 响应保留status的generation、计数和DetailedEvidence checkpoint预览，并发布原始质量标记、重验证finding、精确batch数及可证明的transport/canonical checksum验证数。
+- 旧Worker依赖逐batch身份才能计算的checksum failure并集、sequence gap/duplicate分类、canonicalization变化及core/enrichment未解析拆分未持久化；Indexed响应明确返回`null`和`detail_status`，不把未知伪装为0或精确数字。总unresolved、generation汇总和语义finding仍保持权威。
+- QueryService真实后端合同覆盖健康但enrichment未完成、checksum/sequence/cross-table finding无效状态、兼容字段和不可用诊断字段。N27静态协议检查、Release全构建及CTest 42/42通过（164.18秒）。索引布局未变，schema保持37。
+- Catalog validation主要消费路径已恢复；P3仍需按协议证据补齐多态Relation/DetailedEvidence语义，Job、Sample派生及Scan仍待完成。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

@@ -5475,6 +5475,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         const auto* catalogStatusSource = dynamic_cast<const QueryCatalogStatusSource*>( source.get() );
         const bool boundedStatusMethod = method == "gpu.catalog.status" && catalogStatusSource != nullptr;
+        const bool boundedValidationMethod = method == "gpu.catalog.validation" && catalogStatusSource != nullptr;
         const auto* catalogResourceSource = dynamic_cast<const QueryCatalogResourceSource*>( source.get() );
         const auto* gpuPassResourceSource = dynamic_cast<const QueryGpuPassResourceSource*>( source.get() );
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
@@ -5491,7 +5492,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedPassResourceMethod = ( method == "gpu.pass.resources" ||
             method == "gpu.memory.by_pass" ) && gpuPassResourceSource != nullptr &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
-        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedResourceMethod &&
+        if( !source->CatalogDerivedDataReady() && !boundedStatusMethod && !boundedValidationMethod && !boundedResourceMethod &&
             !boundedEvidenceMethod && !boundedPassResourceMethod )
             throw QueryError( "INDEX_NOT_READY", "bounded GPU Catalog analysis indices have not been built" );
         if( boundedStatusMethod )
@@ -5548,6 +5549,104 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "range_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRangeSet )] ) },
                     { "detailed_evidence", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogDetailedEvidence )] ) }
                 } }
+            }, trace );
+        }
+        if( boundedValidationMethod )
+        {
+            const auto status = catalogStatusSource->GetQueryCatalogStatus( 4096, 16 );
+            const auto& validation = catalogStatusSource->GetQueryCatalogValidation();
+            if( !validation.complete ) throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            const auto findingCount = [&]( std::string_view code ) {
+                uint64_t count = 0;
+                for( const auto& finding : validation.findings )
+                    if( finding.code == code )
+                    {
+                        if( finding.count > std::numeric_limits<uint64_t>::max() - count )
+                            throw QueryError( "RESOURCE_LIMIT", "Catalog validation finding count overflow" );
+                        count += finding.count;
+                    }
+                return count;
+            };
+            json findings = json::array();
+            for( const auto& finding : validation.findings ) findings.push_back( {
+                { "code", finding.code }, { "count", Decimal( finding.count ) }
+            } );
+            json generations = json::array();
+            for( const auto& generation : status.generations ) generations.push_back( {
+                { "generation", Decimal( generation.generation ) },
+                { "state", GpuCatalogGenerationStateName( generation.state ) },
+                { "valid", generation.valid != 0 }, { "began", generation.began != 0 },
+                { "ended", generation.ended != 0 }, { "begin_time_ns", Decimal( generation.beginTime ) },
+                { "end_time_ns", Decimal( generation.endTime ) },
+                { "batch_count", Decimal( uint64_t( generation.batchCount ) ) },
+                { "record_count", Decimal( generation.recordCount ) },
+                { "payload_bytes", Decimal( generation.payloadBytes ) },
+                { "unresolved_count", Decimal( generation.unresolvedCount ) },
+                { "last_sequence", generation.lastSequence }
+            } );
+            json evidencePreview = json::array();
+            for( const auto& value : status.evidencePreview ) evidencePreview.push_back( {
+                { "evidence_frame_id", Decimal( value.evidenceFrameId ) },
+                { "frame_id", Decimal( value.frameId ) }, { "source_id", Decimal( value.sourceId ) },
+                { "request_id", Decimal( value.requestId ) },
+                { "state", GpuEvidenceStateName( value.state ) }, { "kind", value.kind }
+            } );
+            const auto batchCount = status.counts[size_t( OfflineCatalogDomain::CatalogBatch )];
+            const auto invalidBatches = findingCount( "CATALOG_BATCH_ORIGINAL_INVALID" );
+            const auto missingTransport = findingCount( "CATALOG_TRANSPORT_CHECKSUM_MISSING" );
+            const auto storedChecksumFailures = findingCount( "CATALOG_STORED_CHECKSUM" );
+            const bool present = validation.present;
+            const bool valid = present && validation.healthy;
+            const std::string validationState = !present ? "absent" : valid ?
+                ( status.building ? "building" : "complete" ) : "invalid_core_gap";
+            const json reason = !present ? json( "trace predates N27 or contains no GPU Resource Catalog" ) :
+                !valid ? json( "Catalog disk semantic validation failed; dependent evidence is unavailable" ) :
+                status.unresolvedCount != 0 ? json( "Catalog Core is valid; some enrichment records remain unresolved" ) : json( nullptr );
+            return Success( id, {
+                { "present", present }, { "valid", valid }, { "status", validationState },
+                { "partial", valid && status.unresolvedCount != 0 },
+                { "enrichment_complete", valid && status.unresolvedCount == 0 }, { "reason", reason },
+                { "catalog_schema", status.metadata[2] }, { "detailed_evidence_schema", status.metadata[3] },
+                { "generation_count", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogGeneration )] ) },
+                { "record_count", Decimal( status.recordCount ) }, { "payload_bytes", Decimal( status.payloadBytes ) },
+                { "unresolved_count", Decimal( status.unresolvedCount ) }, { "generations", std::move( generations ) },
+                { "generations_truncated", status.generationsTruncated },
+                { "detailed_evidence_checkpoint_preview", std::move( evidencePreview ) },
+                { "detailed_evidence_preview_truncated", status.evidencePreviewTruncated },
+                { "quality", { { "revalidated", validation.complete }, { "original_valid", validation.originalValid },
+                    { "findings", std::move( findings ) } } },
+                { "counts", {
+                    { "resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogResource )] ) },
+                    { "allocations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogAllocation )] ) },
+                    { "views", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogView )] ) },
+                    { "logical_resources", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogLogical )] ) },
+                    { "parts", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogPart )] ) },
+                    { "relations", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRelation )] ) },
+                    { "vg_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogVg )] ) },
+                    { "range_records", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogRangeSet )] ) },
+                    { "detailed_evidence", Decimal( status.counts[size_t( OfflineCatalogDomain::CatalogDetailedEvidence )] ) }
+                } },
+                { "transport", {
+                    { "batch_count", Decimal( batchCount ) }, { "invalid_batches", Decimal( invalidBatches ) },
+                    { "checksum_failures", nullptr },
+                    { "checksum_mismatch", Decimal( storedChecksumFailures ) },
+                    { "transport_checksums_verified", Decimal( batchCount >= missingTransport ? batchCount - missingTransport : 0 ) },
+                    { "canonical_checksums_verified", Decimal( batchCount >= storedChecksumFailures ? batchCount - storedChecksumFailures : 0 ) },
+                    { "canonicalization_changes", nullptr }, { "sequence_gaps", nullptr },
+                    { "sequence_duplicates", nullptr }, { "sequence_gap_details", json::array() },
+                    { "completed_lifecycle_unresolved", Decimal( status.unresolvedCount ) },
+                    { "core_unresolved", nullptr }, { "enrichment_unresolved", nullptr },
+                    { "detail_status", "aggregate_only" }
+                } },
+                { "unresolved_breakdown", {
+                    { "view", nullptr }, { "logical", nullptr }, { "virtual_geometry", nullptr },
+                    { "range_set", nullptr }, { "relation_source", nullptr }, { "relation_target", nullptr },
+                    { "detailed_evidence_source", nullptr }, { "detailed_evidence_target", nullptr },
+                    { "total", Decimal( status.unresolvedCount ) }, { "matches_generation_total", true },
+                    { "detail_status", "not_persisted" }
+                } },
+                { "complete", valid }, { "diagnostic_details_available", false },
+                { "diagnostic_details_reason", "legacy per-record samples and gap classification are not persisted in the bounded index" }
             }, trace );
         }
         if( boundedResourceMethod || boundedEvidenceMethod || boundedPassResourceMethod )
