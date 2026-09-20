@@ -1600,6 +1600,11 @@ public:
         return m_catalog.PassEvidence( passId, offset, limit );
     }
 
+    QueryCatalogGpuMemorySummary GetQueryCatalogGpuMemorySummary() const override
+    {
+        return m_catalog.GpuMemorySummary();
+    }
+
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t generation, uint32_t stringId ) const override
     {
         return m_catalog.ResourceName( generation, stringId );

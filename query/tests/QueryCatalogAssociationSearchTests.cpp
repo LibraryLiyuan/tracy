@@ -32,9 +32,13 @@ public:
             QueryCatalogResourceStateData state {};
             state.latest.resourceId = id;
             state.latest.allocationId = id == 102 ? 600 : 500;
+            state.latest.capacityBytes = ( id - 99 ) * 1024;
+            state.latest.primaryKind = uint16_t( id == 102 ?
+                JnGpuCatalogPrimaryKind::RenderTarget : JnGpuCatalogPrimaryKind::Texture );
             state.latest.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
             state.generation = 9;
             state.createTime = int64_t( id );
+            state.aliveAtEnd = true;
             m_states[id - 100] = state;
             m_associations[id - 100].resourceId = id;
         }
@@ -182,6 +186,18 @@ public:
         }
         return page;
     }
+    QueryCatalogGpuMemorySummary GetQueryCatalogGpuMemorySummary() const override
+    {
+        QueryCatalogGpuMemorySummary value;
+        value.livePhysicalBytes = 12288;
+        value.peakPhysicalBytes = 12288;
+        value.peakTime = 77;
+        value.allocationCreateCount = 4;
+        value.allocationDestroyCount = 2;
+        value.allocatedPhysicalBytes = 16384;
+        value.freedPhysicalBytes = 4096;
+        return value;
+    }
 
 private:
     QueryCatalogValidationResult m_validation;
@@ -288,7 +304,34 @@ int main()
         evidencePage.at( "data" ).at( "sample_status" ) == "periodic_exact" &&
         evidencePage.at( "data" ).at( "page" ).at( "total" ) == "2" );
 
-    assert( service.Execute( Request( 14, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
+    const auto byType = service.Execute( Request( 14, "gpu.memory.by_type", {
+        { "trace_id", traceId }
+    } ) );
+    assert( byType.at( "ok" ) && byType.at( "data" ).at( "groups" ).size() == 2 &&
+        byType.at( "data" ).at( "groups" )[0].at( "primary_kind" ) == "render_target" &&
+        byType.at( "data" ).at( "groups" )[0].at( "live_resource_count" ) == "1" &&
+        byType.at( "data" ).at( "groups" )[0].at( "resource_capacity_bytes" ) == "3072" &&
+        byType.at( "data" ).at( "groups" )[1].at( "primary_kind" ) == "texture" &&
+        byType.at( "data" ).at( "groups" )[1].at( "live_resource_count" ) == "2" &&
+        byType.at( "data" ).at( "groups" )[1].at( "resource_capacity_bytes" ) == "3072" );
+
+    const auto peak = service.Execute( Request( 15, "gpu.memory.peak", {
+        { "trace_id", traceId }
+    } ) );
+    assert( peak.at( "ok" ) &&
+        peak.at( "data" ).at( "engine_known_physical_peak_bytes" ) == "12288" &&
+        peak.at( "data" ).at( "peak_time_ns" ) == "77" &&
+        peak.at( "data" ).at( "peak_provenance" ) == "event_exact" );
+    const auto churn = service.Execute( Request( 16, "gpu.memory.churn", {
+        { "trace_id", traceId }
+    } ) );
+    assert( churn.at( "ok" ) && churn.at( "data" ).at( "create_count" ) == "4" &&
+        churn.at( "data" ).at( "destroy_count" ) == "2" &&
+        churn.at( "data" ).at( "allocated_bytes" ) == "16384" &&
+        churn.at( "data" ).at( "freed_bytes" ) == "4096" &&
+        churn.at( "data" ).at( "live_bytes_at_end" ) == "12288" );
+
+    assert( service.Execute( Request( 17, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );
     return 0;
 }

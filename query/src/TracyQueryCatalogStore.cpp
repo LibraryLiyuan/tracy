@@ -80,7 +80,8 @@ struct QueryCatalogResourceSummaryRecord
     int64_t createTime = 0;
     int64_t destroyTime = 0;
     uint8_t openBoundary = 0;
-    uint8_t reserved[7] {};
+    uint8_t aliveAtEnd = 0;
+    uint8_t reserved[6] {};
 };
 
 std::filesystem::path ResourceSummaryPath( const std::filesystem::path& root ) { return root / "resource-summary"; }
@@ -98,6 +99,25 @@ std::filesystem::path ResourceRelationGenerationPath( const std::filesystem::pat
 std::filesystem::path PassEvidenceLookupPath( const std::filesystem::path& root ) { return root / "pass-evidence-lookup"; }
 std::filesystem::path DetailedEvidenceGenerationPath( const std::filesystem::path& root ) { return root / "detailed-evidence-generations"; }
 std::filesystem::path ResourceStringLookupPath( const std::filesystem::path& root ) { return root / "resource-string-lookup"; }
+std::filesystem::path GpuMemorySummaryPath( const std::filesystem::path& root ) { return root / "gpu-memory-summary"; }
+
+uint64_t SortableSignedTime( int64_t value )
+{
+    return uint64_t( value ) ^ ( uint64_t( 1 ) << 63 );
+}
+
+int64_t SignedTimeFromSortable( uint64_t value )
+{
+    return int64_t( value ^ ( uint64_t( 1 ) << 63 ) );
+}
+
+bool IsCatalogDefinition( JnGpuCatalogRecordOperation operation )
+{
+    return operation == JnGpuCatalogRecordOperation::Create ||
+        operation == JnGpuCatalogRecordOperation::Update ||
+        operation == JnGpuCatalogRecordOperation::Open ||
+        operation == JnGpuCatalogRecordOperation::Snapshot;
+}
 
 enum class ResourceAssociationKind : uint8_t
 {
@@ -267,6 +287,7 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> rawDetailedEvidence;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceStringLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> rawStrings;
+    mutable std::unique_ptr<analysis::PagedRecordReader> gpuMemorySummary;
 
     void EnsureResourceIndex() const
     {
@@ -343,6 +364,9 @@ struct QueryCatalogStoreReader::Impl
             DomainPath( root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogString ),
             uint32_t( sizeof( OfflineCatalogString ) ), options );
+        if( !gpuMemorySummary ) gpuMemorySummary = std::make_unique<analysis::PagedRecordReader>(
+            GpuMemorySummaryPath( root ), CatalogIdentity( sourceFingerprint, "gpu-memory-summary-v1" ),
+            uint32_t( sizeof( QueryCatalogGpuMemorySummary ) ), options );
     }
 };
 
@@ -474,6 +498,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto passEvidenceLookupOutput = PassEvidenceLookupPath( m_impl->root );
     const auto detailedEvidenceGenerationOutput = DetailedEvidenceGenerationPath( m_impl->root );
     const auto stringOutput = ResourceStringLookupPath( m_impl->root );
+    const auto gpuMemorySummaryOutput = GpuMemorySummaryPath( m_impl->root );
     if( std::filesystem::exists( analysis::AnalysisIoPath( resourceOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( associationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( allocationLookupOutput ) ) ||
@@ -489,6 +514,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::filesystem::exists( analysis::AnalysisIoPath( passEvidenceLookupOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( detailedEvidenceGenerationOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( stringOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( gpuMemorySummaryOutput ) ) ||
         std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
         throw std::runtime_error( "Catalog resource index already exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
@@ -517,6 +543,10 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     const auto resourceGenerationsPath = scratchRoot / "resource-generations";
     const auto stringSource = scratchRoot / "string-lookup-source.work";
     const auto stringSorted = scratchRoot / "string-lookup-sorted.work";
+    const auto allocationTimelineSource = scratchRoot / "allocation-timeline-source.work";
+    const auto allocationTimelineSorted = scratchRoot / "allocation-timeline-sorted.work";
+    const auto physicalEventSource = scratchRoot / "physical-event-source.work";
+    const auto physicalEventSorted = scratchRoot / "physical-event-sorted.work";
     std::string sortError;
     const auto cleanup = [&]( bool outputs ) -> std::string {
         std::string failure;
@@ -543,6 +573,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             remove( passEvidenceLookupOutput, "Catalog pass evidence lookup cleanup failed" );
             remove( detailedEvidenceGenerationOutput, "Catalog detailed evidence generation cleanup failed" );
             remove( stringOutput, "Catalog resource string cleanup failed" );
+            remove( gpuMemorySummaryOutput, "Catalog GPU memory summary cleanup failed" );
         }
         return failure;
     };
@@ -747,13 +778,22 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                         operation == JnGpuCatalogRecordOperation::Snapshot ||
                         row.exactness == uint8_t( JnGpuCatalogExactness::OpenBoundary );
                 }
-                if( operation == JnGpuCatalogRecordOperation::Destroy )
+                if( operation == JnGpuCatalogRecordOperation::Destroy ||
+                    operation == JnGpuCatalogRecordOperation::Close )
+                {
                     state.destroyTime = std::max( state.destroyTime, row.time );
+                    state.aliveAtEnd = 0;
+                }
                 if( definition && ( !haveLatest || row.time >= state.latest.time ) )
                 {
                     state.latest = row;
                     state.generation = generation;
                     haveLatest = true;
+                }
+                if( definition )
+                {
+                    state.aliveAtEnd = 1;
+                    if( state.destroyTime != 0 && row.time >= state.destroyTime ) state.destroyTime = 0;
                 }
             }
             if( !sortedPairs.eof() ) throw std::runtime_error( "Catalog sorted resource pair read failed" );
@@ -1047,6 +1087,156 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         allocationLookup.Commit();
         sortedAllocationLookup.close();
 
+        QueryCatalogGpuMemorySummary gpuMemorySummary {};
+        uint64_t allocationTimelineCount = 0;
+        {
+            std::ofstream timeline( analysis::AnalysisIoPath( allocationTimelineSource ),
+                std::ios::binary | std::ios::trunc );
+            if( !timeline ) throw std::runtime_error( "Catalog allocation timeline source cannot be opened" );
+            for( uint64_t ordinal = 0; ordinal < allocationRows.Count(); ordinal++ )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( "Catalog GPU memory summary cancelled" );
+                JnGpuCatalogAllocationRecordV1 row {};
+                allocationRows.Read( ordinal, &row, 1 );
+                if( row.allocationId == 0 ) continue;
+                const auto operation = JnGpuCatalogRecordOperation( row.operation );
+                if( operation == JnGpuCatalogRecordOperation::Create ||
+                    operation == JnGpuCatalogRecordOperation::Open ||
+                    operation == JnGpuCatalogRecordOperation::Snapshot )
+                    gpuMemorySummary.allocationCreateCount++;
+                else if( operation == JnGpuCatalogRecordOperation::Destroy )
+                    gpuMemorySummary.allocationDestroyCount++;
+                analysis::AnalysisKeyMetadataRecord record {};
+                record.keyHigh = row.allocationId;
+                record.keyLow = SortableSignedTime( row.time );
+                record.metadata = ordinal;
+                analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( record ) );
+                timeline.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
+                if( !timeline ) throw std::runtime_error( "Catalog allocation timeline write failed" );
+                allocationTimelineCount++;
+            }
+            timeline.flush();
+            if( !timeline ) throw std::runtime_error( "Catalog allocation timeline flush failed" );
+        }
+        if( !analysis::SortAnalysisKeyMetadataRecords( allocationTimelineSource, allocationTimelineSorted,
+                scratchRoot, "catalog-allocation-timeline", allocationTimelineCount, 512 * 1024,
+                sortError, m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog allocation timeline sort failed: " + sortError );
+
+        uint64_t physicalEventCount = 0;
+        {
+            std::ifstream timeline( analysis::AnalysisIoPath( allocationTimelineSorted ), std::ios::binary );
+            std::ofstream events( analysis::AnalysisIoPath( physicalEventSource ),
+                std::ios::binary | std::ios::trunc );
+            if( !timeline || !events )
+                throw std::runtime_error( "Catalog GPU memory summary intermediates cannot be opened" );
+            uint64_t allocationId = 0;
+            uint64_t liveSize = 0;
+            const auto checkedAdd = []( uint64_t& target, uint64_t value, const char* label ) {
+                if( value > std::numeric_limits<uint64_t>::max() - target )
+                    throw std::runtime_error( std::string( label ) + " overflow" );
+                target += value;
+            };
+            const auto appendEvent = [&]( const JnGpuCatalogAllocationRecordV1& row,
+                uint64_t ordinal, uint64_t magnitude, uint8_t kind ) {
+                if( magnitude == 0 ) return;
+                analysis::AnalysisKeyMetadataRecord event {};
+                event.keyHigh = SortableSignedTime( row.time );
+                event.keyLow = ordinal;
+                event.metadata = magnitude;
+                event.kind = kind;
+                analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( event ) );
+                events.write( reinterpret_cast<const char*>( &event ), sizeof( event ) );
+                if( !events ) throw std::runtime_error( "Catalog physical memory event write failed" );
+                physicalEventCount++;
+            };
+            analysis::AnalysisKeyMetadataRecord record {};
+            while( timeline.read( reinterpret_cast<char*>( &record ), sizeof( record ) ) )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( "Catalog GPU memory summary cancelled" );
+                if( record.keyHigh != allocationId )
+                {
+                    allocationId = record.keyHigh;
+                    liveSize = 0;
+                }
+                if( record.metadata >= allocationRows.Count() )
+                    throw std::runtime_error( "Catalog allocation timeline ordinal is invalid" );
+                JnGpuCatalogAllocationRecordV1 row {};
+                allocationRows.Read( record.metadata, &row, 1 );
+                if( row.allocationId != record.keyHigh || SortableSignedTime( row.time ) != record.keyLow )
+                    throw std::runtime_error( "Catalog allocation timeline identity changed" );
+                if( row.parentAllocationId != 0 ) continue;
+                const auto operation = JnGpuCatalogRecordOperation( row.operation );
+                if( operation == JnGpuCatalogRecordOperation::Destroy ||
+                    operation == JnGpuCatalogRecordOperation::Close )
+                {
+                    if( liveSize != 0 )
+                    {
+                        appendEvent( row, record.metadata, liveSize, 2 );
+                        checkedAdd( gpuMemorySummary.freedPhysicalBytes, liveSize,
+                            "Catalog freed physical bytes" );
+                        liveSize = 0;
+                    }
+                }
+                else if( IsCatalogDefinition( operation ) )
+                {
+                    if( row.sizeBytes > liveSize )
+                        appendEvent( row, record.metadata, row.sizeBytes - liveSize, 1 );
+                    else if( liveSize > row.sizeBytes )
+                        appendEvent( row, record.metadata, liveSize - row.sizeBytes, 2 );
+                    liveSize = row.sizeBytes;
+                    if( operation != JnGpuCatalogRecordOperation::Update )
+                        checkedAdd( gpuMemorySummary.allocatedPhysicalBytes, row.sizeBytes,
+                            "Catalog allocated physical bytes" );
+                }
+            }
+            if( !timeline.eof() ) throw std::runtime_error( "Catalog allocation timeline read failed" );
+            events.flush();
+            if( !events ) throw std::runtime_error( "Catalog physical memory event flush failed" );
+        }
+        if( !analysis::SortAnalysisKeyMetadataRecords( physicalEventSource, physicalEventSorted,
+                scratchRoot, "catalog-physical-memory-events", physicalEventCount, 512 * 1024,
+                sortError, m_impl->options.disk, m_impl->options.workspace ) )
+            throw std::runtime_error( "Catalog physical memory event sort failed: " + sortError );
+        {
+            std::ifstream events( analysis::AnalysisIoPath( physicalEventSorted ), std::ios::binary );
+            if( !events ) throw std::runtime_error( "Catalog sorted physical memory events cannot be opened" );
+            uint64_t current = 0;
+            analysis::AnalysisKeyMetadataRecord event {};
+            while( events.read( reinterpret_cast<char*>( &event ), sizeof( event ) ) )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( "Catalog GPU memory summary cancelled" );
+                if( event.kind == 1 )
+                {
+                    if( event.metadata > std::numeric_limits<uint64_t>::max() - current )
+                        throw std::runtime_error( "Catalog physical memory total overflow" );
+                    current += event.metadata;
+                }
+                else if( event.kind == 2 )
+                {
+                    if( event.metadata > current )
+                        throw std::runtime_error( "Catalog physical memory total underflow" );
+                    current -= event.metadata;
+                }
+                else throw std::runtime_error( "Catalog physical memory event kind is invalid" );
+                if( current > gpuMemorySummary.peakPhysicalBytes )
+                {
+                    gpuMemorySummary.peakPhysicalBytes = current;
+                    gpuMemorySummary.peakTime = SignedTimeFromSortable( event.keyHigh );
+                }
+            }
+            if( !events.eof() ) throw std::runtime_error( "Catalog physical memory event read failed" );
+            gpuMemorySummary.livePhysicalBytes = current;
+        }
+        analysis::PagedRecordWriter gpuSummaryWriter( gpuMemorySummaryOutput,
+            CatalogIdentity( m_impl->sourceFingerprint, "gpu-memory-summary-v1" ),
+            sizeof( QueryCatalogGpuMemorySummary ), m_impl->options );
+        gpuSummaryWriter.Append( &gpuMemorySummary, 1 );
+        gpuSummaryWriter.Commit();
+
         const auto writeLookupSource = [&]( const std::filesystem::path& path, uint64_t count,
             const auto& readRecord, const auto& includeRecord, const auto& keyFor,
             std::string_view label ) {
@@ -1269,7 +1459,7 @@ std::optional<QueryCatalogResourceStateData> QueryCatalogStoreReader::ResourceSt
     records.Read( first, &row, 1 );
     if( row.latest.resourceId != resourceId ) return std::nullopt;
     return QueryCatalogResourceStateData { row.latest, row.generation, row.createTime,
-        row.destroyTime, row.openBoundary != 0 };
+        row.destroyTime, row.openBoundary != 0, row.aliveAtEnd != 0 };
 }
 
 uint64_t QueryCatalogStoreReader::ResourceIndexCount() const
@@ -1287,7 +1477,8 @@ QueryCatalogResourceStateData QueryCatalogStoreReader::ResourceStateAt( uint64_t
     if( ordinal >= records.Count() ) throw std::out_of_range( "Catalog resource ordinal" );
     QueryCatalogResourceSummaryRecord row {};
     records.Read( ordinal, &row, 1 );
-    return { row.latest, row.generation, row.createTime, row.destroyTime, row.openBoundary != 0 };
+    return { row.latest, row.generation, row.createTime, row.destroyTime,
+        row.openBoundary != 0, row.aliveAtEnd != 0 };
 }
 
 QueryCatalogResourceAssociationData QueryCatalogStoreReader::ResourceAssociationsAt( uint64_t ordinal ) const
@@ -1626,6 +1817,17 @@ QueryCatalogEvidencePage QueryCatalogStoreReader::PassEvidence(
     return result;
 }
 
+QueryCatalogGpuMemorySummary QueryCatalogStoreReader::GpuMemorySummary() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    if( m_impl->gpuMemorySummary->Count() != 1 )
+        throw std::runtime_error( "Catalog GPU memory summary count mismatch" );
+    QueryCatalogGpuMemorySummary result {};
+    m_impl->gpuMemorySummary->Read( 0, &result, 1 );
+    return result;
+}
+
 std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t generation, uint32_t stringId ) const
 {
     if( generation == 0 || stringId == 0 ) return std::nullopt;
@@ -1683,8 +1885,10 @@ void QueryCatalogStoreReader::ValidateAll() const
     const bool passEvidenceLookupPresent = std::filesystem::exists( analysis::AnalysisIoPath( PassEvidenceLookupPath( m_impl->root ) ) );
     const bool detailedEvidenceGenerationsPresent = std::filesystem::exists( analysis::AnalysisIoPath( DetailedEvidenceGenerationPath( m_impl->root ) ) );
     const bool stringsPresent = std::filesystem::exists( analysis::AnalysisIoPath( ResourceStringLookupPath( m_impl->root ) ) );
+    const bool gpuMemorySummaryPresent = std::filesystem::exists( analysis::AnalysisIoPath( GpuMemorySummaryPath( m_impl->root ) ) );
     if( resourcesPresent != stringsPresent || resourcesPresent != associationsPresent ||
-        resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent )
+        resourcesPresent != allocationLookupPresent || resourcesPresent != allocationGenerationsPresent ||
+        resourcesPresent != gpuMemorySummaryPresent )
         throw std::runtime_error( "Catalog resource index is incomplete" );
     if( resourcesPresent != viewLookupPresent || resourcesPresent != viewGenerationsPresent ||
         resourcesPresent != meshPartLookupPresent || resourcesPresent != partGenerationsPresent )
@@ -1714,6 +1918,9 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader rawAllocations( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogAllocation ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogAllocation ),
             sizeof( JnGpuCatalogAllocationRecordV1 ), m_impl->options );
+        analysis::PagedRecordReader gpuMemorySummary( GpuMemorySummaryPath( m_impl->root ),
+            CatalogIdentity( m_impl->sourceFingerprint, "gpu-memory-summary-v1" ),
+            sizeof( QueryCatalogGpuMemorySummary ), m_impl->options );
         analysis::PagedRecordReader viewLookup( ResourceViewLookupPath( m_impl->root ),
             CatalogIdentity( m_impl->sourceFingerprint, "resource-view-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -1764,6 +1971,7 @@ void QueryCatalogStoreReader::ValidateAll() const
         associations.ValidateAll();
         allocationLookup.ValidateAll();
         allocationGenerations.ValidateAll();
+        gpuMemorySummary.ValidateAll();
         viewLookup.ValidateAll();
         viewGenerations.ValidateAll();
         meshPartLookup.ValidateAll();
@@ -1776,6 +1984,12 @@ void QueryCatalogStoreReader::ValidateAll() const
         detailedEvidenceGenerations.ValidateAll();
         if( allocationGenerations.Count() != rawAllocations.Count() )
             throw std::runtime_error( "Catalog allocation generation count mismatch" );
+        if( gpuMemorySummary.Count() != 1 )
+            throw std::runtime_error( "Catalog GPU memory summary count mismatch" );
+        QueryCatalogGpuMemorySummary summary {};
+        gpuMemorySummary.Read( 0, &summary, 1 );
+        if( summary.livePhysicalBytes > summary.peakPhysicalBytes )
+            throw std::runtime_error( "Catalog GPU memory summary peak mismatch" );
         if( viewGenerations.Count() != rawViews.Count() || partGenerations.Count() != rawParts.Count() )
             throw std::runtime_error( "Catalog resource detail generation count mismatch" );
         if( vgGenerations.Count() != rawVg.Count() || relationGenerations.Count() != rawRelations.Count() )

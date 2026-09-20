@@ -5478,7 +5478,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const bool boundedResourceMethod = ( method == "gpu.resource.search" || method == "gpu.resource.get" ||
             method == "gpu.resource.lifetime" || method == "gpu.resource.allocations" ||
             method == "gpu.resource.views" || method == "gpu.resource.mesh_buffers" ||
-            method == "gpu.resource.vg_pages" || method == "gpu.resource.raytracing_chain" ) &&
+            method == "gpu.resource.vg_pages" || method == "gpu.resource.raytracing_chain" ||
+            method == "gpu.memory.by_type" || method == "gpu.memory.peak" ||
+            method == "gpu.memory.churn" ) &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
         const bool boundedEvidenceMethod = method == "gpu.pass.vg_evidence" &&
             catalogResourceSource != nullptr && catalogStatusSource != nullptr;
@@ -5650,7 +5652,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "create_time_ns", state.openBoundary ? json( nullptr ) : json( Decimal( state.createTime ) ) },
                         { "create_time_boundary", state.openBoundary ? "open" : "closed" },
                         { "destroy_time_ns", state.destroyTime == 0 ? json( nullptr ) : json( Decimal( state.destroyTime ) ) },
-                        { "alive_at_capture_end", state.destroyTime == 0 },
+                        { "alive_at_capture_end", state.aliveAtEnd },
                         { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
                         { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
                         { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) }
@@ -5668,6 +5670,49 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, nextRawOffset, hasMore );
                 return Success( id, { { "present", true }, { "resources", std::move( values ) },
                     { "total", Decimal( matched ) } }, trace, PageJson( page, returned, cursor ) );
+            }
+            if( method == "gpu.memory.by_type" )
+            {
+                struct Totals { uint64_t count = 0; uint64_t capacity = 0; };
+                std::map<std::string, Totals> totals;
+                const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
+                for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+                {
+                    checkCancelled();
+                    const auto state = catalogResourceSource->GetQueryCatalogResourceStateAt( ordinal );
+                    if( !state.aliveAtEnd ) continue;
+                    auto& value = totals[GpuPrimaryKindName( state.latest.primaryKind )];
+                    value.count++;
+                    if( state.latest.capacityBytes > std::numeric_limits<uint64_t>::max() - value.capacity )
+                        throw QueryError( "DATA_CORRUPT", "GPU resource capacity total overflow" );
+                    value.capacity += state.latest.capacityBytes;
+                }
+                json values = json::array();
+                for( const auto& [kind, value] : totals ) values.push_back( {
+                    { "primary_kind", kind }, { "live_resource_count", Decimal( value.count ) },
+                    { "resource_capacity_bytes", Decimal( value.capacity ) }
+                } );
+                return Success( id, { { "present", true }, { "groups", std::move( values ) },
+                    { "note", "resource capacity is not physical allocation ownership and must not be summed across aliases" } }, trace );
+            }
+            if( method == "gpu.memory.peak" || method == "gpu.memory.churn" )
+            {
+                const auto summary = catalogResourceSource->GetQueryCatalogGpuMemorySummary();
+                if( method == "gpu.memory.peak" ) return Success( id, {
+                    { "present", true },
+                    { "engine_known_physical_peak_bytes", Decimal( summary.peakPhysicalBytes ) },
+                    { "peak_time_ns", Decimal( summary.peakTime ) }, { "peak_provenance", "event_exact" },
+                    { "dxgi_peak", nullptr },
+                    { "dxgi_peak_provenance", "sampled_4hz_unavailable_in_catalog_section" }
+                }, trace );
+                return Success( id, { { "present", true },
+                    { "create_count", Decimal( summary.allocationCreateCount ) },
+                    { "destroy_count", Decimal( summary.allocationDestroyCount ) },
+                    { "allocated_bytes", Decimal( summary.allocatedPhysicalBytes ) },
+                    { "freed_bytes", Decimal( summary.freedPhysicalBytes ) },
+                    { "live_bytes_at_end", Decimal( summary.livePhysicalBytes ) },
+                    { "semantics", "snapshot/open-boundary allocations are included in baseline and are not proof of within-capture churn" }
+                }, trace );
             }
             uint64_t resourceId = 0;
             if( params.contains( "resource_id" ) )
@@ -5844,7 +5889,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "create_time_ns", state->openBoundary ? json( nullptr ) : json( Decimal( state->createTime ) ) },
                 { "create_time_boundary", state->openBoundary ? "open" : "closed" },
                 { "destroy_time_ns", state->destroyTime == 0 ? json( nullptr ) : json( Decimal( state->destroyTime ) ) },
-                { "alive_at_capture_end", state->destroyTime == 0 },
+                { "alive_at_capture_end", state->aliveAtEnd },
                 { "create_callsite_id", value.createCallsiteId == 0 ? json( nullptr ) : json( value.createCallsiteId ) },
                 { "create_stack_ref", value.createCallsiteId == 0 ? json( nullptr ) : json( source->MakeEntityRef( "callsite", value.createCallsiteId ) ) },
                 { "stack_provenance", value.stackProvenance }, { "operation", GpuCatalogOperationName( value.operation ) },

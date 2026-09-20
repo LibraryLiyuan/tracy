@@ -152,6 +152,14 @@ schema26进一步把Main.PlayerLoop语义检查并入原有CPU Zone校验遍历�
 - Indexed Trace中的`EnsureGpuResourcePassRefs`、进程级`unordered_map<uint64_t, vector<...>>`及其`once_flag`已删除。GPU Reference的Resource反查不再存在把全部Use重新聚合到内存的入口。
 - 静态回归先验证旧路径会失败，再固定allocation查询必须使用磁盘sidecar且不得恢复全量Ensure。Release `tracy-query`构建和CTest 41/41通过（122.96秒）。本检查点未改变索引布局，schema保持33。
 
+## 2026-09-20：schema34 GPU Memory固定摘要
+
+- `gpu.memory.by_type`直接流式读取Resource summary，只保留协议主类型这一固定小集合；容量求和增加溢出拒绝。Resource summary补充明确的`aliveAtEnd`，资源ID销毁后重新定义不再被旧`destroyTime`误判为死亡。
+- `gpu.memory.peak`和`gpu.memory.churn`不再构造完整`GpuAnalysisSnapshot`。Allocation记录先按`(allocationId, time, 原始ordinal)`外排，逐allocation生成物理字节增减事件，再按`(time, 原始ordinal)`外排折叠为56字节摘要。父分配不重复计入物理总量，Update只改变live/peak而不计入allocated，Close释放但不计入destroy count，语义与既有实现一致。
+- scratch和分页摘要使用共享磁盘/workspace预算；成功、失败和深校验均覆盖`gpu-memory-summary`。组件夹具固定同时间事件、Update、子分配、Destroy/Close以及资源ID重建语义；QueryService真实后端合同覆盖三个方法。
+- 1,001 Resource真实Catalog完成schema34冷建、深校验、三次独立热开查询和第二次事务发布；只保留一个generation，无scratch。真实夹具Catalog section为31,427字节，摘要337字节，独立目录全部文件89,582字节。其Allocation域为空，因此peak/churn为0；`by_type`从真实Resource summary返回1个4 MiB structured_buffer。
+- Release全构建与CTest 41/41通过（124.39秒）。`gpu.memory.by_pass`、完整Pass/Resource关联和其他GPU归因消费者仍待迁移。
+
 ## 2026-09-18：P6 Windows 发布重试与半发布清理
 
 - QueryIndex的文件/目录原子移动对Windows `ERROR_ACCESS_DENIED`、sharing violation和lock violation进行最多2秒的有界退避重试；每次重试检查取消。其他错误立即失败，不掩盖错误码。

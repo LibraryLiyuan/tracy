@@ -169,6 +169,8 @@ int main()
         Require( fs::is_directory( root / "pass-evidence-lookup" ) &&
             fs::is_directory( root / "detailed-evidence-generations" ),
             "Catalog resource index did not publish bounded pass evidence indices" );
+        Require( fs::is_directory( root / "gpu-memory-summary" ),
+            "Catalog resource index did not publish the bounded GPU memory summary" );
         Require( !fs::exists( root / "resource-index-scratch" ),
             "Catalog resource index retained completed scratch files" );
         Require( reader.ResourceIndexReady(), "Catalog resource index was not published" );
@@ -176,7 +178,7 @@ int main()
         Require( indexedResource && indexedResource->latest.resourceId == 100 &&
             indexedResource->latest.capacityBytes == 4096 && indexedResource->generation == 9 &&
             indexedResource->createTime == 10 && indexedResource->destroyTime == 0 &&
-            !indexedResource->openBoundary,
+            !indexedResource->openBoundary && indexedResource->aliveAtEnd,
             "Catalog resource point index changed lifecycle state" );
         const auto indexedName = reader.ResourceName( 9, 7 );
         Require( indexedName && *indexedName == "main" && !reader.ResourceState( 999 ) &&
@@ -188,15 +190,19 @@ int main()
         {
             QueryCatalogStoreWriter associationWriter( associationRoot, identity );
             associationWriter.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
-            JnGpuCatalogResourceRecordV1 associationResources[3] {};
+            JnGpuCatalogResourceRecordV1 associationResources[5] {};
             associationResources[0].time = 1; associationResources[0].resourceId = 100;
             associationResources[0].allocationId = 500;
             associationResources[1].time = 2; associationResources[1].resourceId = 101;
             associationResources[1].allocationId = 500;
             associationResources[2].time = 3; associationResources[2].resourceId = 102;
             associationResources[2].allocationId = 600;
-            associationWriter.Begin( OfflineCatalogDomain::CatalogResource, 3, sizeof( associationResources[0] ) );
-            associationWriter.Append( OfflineCatalogDomain::CatalogResource, 0, associationResources, 3,
+            associationResources[3].time = 4; associationResources[3].resourceId = 102;
+            associationResources[3].operation = uint8_t( JnGpuCatalogRecordOperation::Destroy );
+            associationResources[4].time = 5; associationResources[4].resourceId = 102;
+            associationResources[4].allocationId = 600;
+            associationWriter.Begin( OfflineCatalogDomain::CatalogResource, 5, sizeof( associationResources[0] ) );
+            associationWriter.Append( OfflineCatalogDomain::CatalogResource, 0, associationResources, 5,
                 sizeof( associationResources[0] ) );
             associationWriter.End( OfflineCatalogDomain::CatalogResource );
 
@@ -297,7 +303,7 @@ int main()
 
             JnGpuCatalogBatchData associationBatches[7] {};
             associationBatches[0].generation = 9; associationBatches[0].firstRecordIndex = 0;
-            associationBatches[0].recordCount = 3;
+            associationBatches[0].recordCount = 5;
             associationBatches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
             associationBatches[1].generation = 10; associationBatches[1].firstRecordIndex = 0;
             associationBatches[1].recordCount = 3;
@@ -325,9 +331,18 @@ int main()
         }
         QueryCatalogStoreReader associationReader( associationRoot, identity );
         associationReader.BuildResourceIndex( associationRoot / "resource-index-scratch" );
+        const auto gpuMemorySummary = associationReader.GpuMemorySummary();
+        Require( gpuMemorySummary.livePhysicalBytes == 24576 &&
+            gpuMemorySummary.peakPhysicalBytes == 24576 && gpuMemorySummary.peakTime == 30 &&
+            gpuMemorySummary.allocationCreateCount == 2 &&
+            gpuMemorySummary.allocationDestroyCount == 0 &&
+            gpuMemorySummary.allocatedPhysicalBytes == 20480 &&
+            gpuMemorySummary.freedPhysicalBytes == 0,
+            "Catalog GPU memory summary changed event-exact allocation semantics" );
         const auto associations100 = associationReader.ResourceAssociations( 100 );
         const auto associations101 = associationReader.ResourceAssociations( 101 );
         const auto associations102 = associationReader.ResourceAssociations( 102 );
+        const auto recreated102 = associationReader.ResourceState( 102 );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
@@ -337,7 +352,8 @@ int main()
             associations101->allocationResourceCount == 2,
             "Catalog resource association index changed non-mesh/shared-allocation semantics" );
         Require( associations102 && associations102->rangeCount == 1 &&
-            associations102->allocationResourceCount == 1 && !associationReader.ResourceAssociations( 999 ),
+            associations102->allocationResourceCount == 1 && recreated102 && recreated102->aliveAtEnd &&
+            recreated102->destroyTime == 0 && !associationReader.ResourceAssociations( 999 ),
             "Catalog resource association index changed unique-allocation or missing-key semantics" );
         const auto allocations100First = associationReader.ResourceAllocations( 100, 0, 1 );
         const auto allocations100Second = associationReader.ResourceAllocations( 100, 1, 1 );
@@ -520,6 +536,48 @@ int main()
             hasFinding( evidenceRecordValidation, "CATALOG_EVIDENCE_RECORD" ),
             "Catalog detailed evidence enum corruption was accepted" );
 
+        const auto gpuSummaryRoot = root.parent_path() / "tracy-query-catalog-gpu-memory-summary";
+        fs::remove_all( gpuSummaryRoot, ignored );
+        {
+            QueryCatalogStoreWriter summaryWriter( gpuSummaryRoot, identity );
+            summaryWriter.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
+            JnGpuCatalogAllocationRecordV1 rows[8] {};
+            rows[0].allocationId = 1; rows[0].time = 10; rows[0].sizeBytes = 100;
+            rows[1].allocationId = 1; rows[1].time = 20; rows[1].sizeBytes = 120;
+            rows[1].operation = uint8_t( JnGpuCatalogRecordOperation::Update );
+            rows[2].allocationId = 1; rows[2].time = 30;
+            rows[2].operation = uint8_t( JnGpuCatalogRecordOperation::Destroy );
+            rows[3].allocationId = 2; rows[3].time = 10; rows[3].sizeBytes = 50;
+            rows[4].allocationId = 2; rows[4].time = 20;
+            rows[4].operation = uint8_t( JnGpuCatalogRecordOperation::Destroy );
+            rows[5].allocationId = 3; rows[5].time = 15; rows[5].sizeBytes = 1000;
+            rows[5].parentAllocationId = 1;
+            rows[6].allocationId = 4; rows[6].time = 5; rows[6].sizeBytes = 25;
+            rows[6].operation = uint8_t( JnGpuCatalogRecordOperation::Open );
+            rows[7].allocationId = 4; rows[7].time = 25;
+            rows[7].operation = uint8_t( JnGpuCatalogRecordOperation::Close );
+            summaryWriter.Begin( OfflineCatalogDomain::CatalogAllocation, std::size( rows ), sizeof( rows[0] ) );
+            summaryWriter.Append( OfflineCatalogDomain::CatalogAllocation, 0, rows, std::size( rows ), sizeof( rows[0] ) );
+            summaryWriter.End( OfflineCatalogDomain::CatalogAllocation );
+            JnGpuCatalogBatchData allocationBatch {};
+            allocationBatch.generation = 1;
+            allocationBatch.recordCount = std::size( rows );
+            allocationBatch.kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
+            summaryWriter.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( allocationBatch ) );
+            summaryWriter.Append( OfflineCatalogDomain::CatalogBatch, 0, &allocationBatch, 1, sizeof( allocationBatch ) );
+            summaryWriter.End( OfflineCatalogDomain::CatalogBatch );
+            summaryWriter.Finish();
+        }
+        QueryCatalogStoreReader summaryReader( gpuSummaryRoot, identity );
+        summaryReader.BuildResourceIndex( gpuSummaryRoot / "resource-index-scratch" );
+        const auto exactSummary = summaryReader.GpuMemorySummary();
+        Require( exactSummary.livePhysicalBytes == 0 && exactSummary.peakPhysicalBytes == 195 &&
+            exactSummary.peakTime == 20 && exactSummary.allocationCreateCount == 4 &&
+            exactSummary.allocationDestroyCount == 2 && exactSummary.allocatedPhysicalBytes == 175 &&
+            exactSummary.freedPhysicalBytes == 195,
+            "Catalog GPU memory summary changed same-time, update, child-allocation or close semantics" );
+        summaryReader.ValidateAll();
+
         const auto metadataSortRoot = root.parent_path() / "tracy-query-catalog-metadata-sort";
         fs::remove_all( metadataSortRoot, ignored );
         fs::create_directories( metadataSortRoot );
@@ -589,6 +647,7 @@ int main()
         fs::remove_all( nameMetadataRoot, ignored );
         fs::remove_all( relationReferenceRoot, ignored );
         fs::remove_all( evidenceRecordRoot, ignored );
+        fs::remove_all( gpuSummaryRoot, ignored );
         fs::remove_all( metadataSortRoot, ignored );
         fs::remove_all( associationRoot, ignored );
         std::cout << "query Catalog store passed\n";

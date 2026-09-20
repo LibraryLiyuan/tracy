@@ -49,6 +49,7 @@ struct QueryCatalogResourceStateData
     int64_t createTime = 0;
     int64_t destroyTime = 0;
     bool openBoundary = false;
+    bool aliveAtEnd = false;
 };
 
 struct QueryCatalogResourceAssociationData
@@ -138,6 +139,19 @@ struct QueryCatalogEvidencePage
     bool hasState = false;
 };
 
+struct QueryCatalogGpuMemorySummary
+{
+    uint64_t livePhysicalBytes = 0;
+    uint64_t peakPhysicalBytes = 0;
+    int64_t peakTime = 0;
+    uint64_t allocationCreateCount = 0;
+    uint64_t allocationDestroyCount = 0;
+    uint64_t allocatedPhysicalBytes = 0;
+    uint64_t freedPhysicalBytes = 0;
+};
+
+static_assert( sizeof( QueryCatalogGpuMemorySummary ) == 56 );
+
 class QueryCatalogStatusSource
 {
 public:
@@ -167,6 +181,7 @@ public:
         uint64_t resourceId, uint64_t offset, size_t limit ) const = 0;
     virtual QueryCatalogEvidencePage GetQueryCatalogPassEvidence(
         uint64_t passId, uint64_t offset, size_t limit ) const = 0;
+    virtual QueryCatalogGpuMemorySummary GetQueryCatalogGpuMemorySummary() const = 0;
 };
 
 class QueryCatalogStoreWriter
@@ -222,6 +237,7 @@ public:
     QueryCatalogVgPage ResourceVgPages( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogRelationPage ResourceRtasRelations( uint64_t resourceId, uint64_t offset, size_t limit ) const;
     QueryCatalogEvidencePage PassEvidence( uint64_t passId, uint64_t offset, size_t limit ) const;
+    QueryCatalogGpuMemorySummary GpuMemorySummary() const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
 
 private:
