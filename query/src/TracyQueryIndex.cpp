@@ -7,6 +7,7 @@
 #include "TracyQuerySampleStore.hpp"
 #include "TracyQuerySampleView.hpp"
 #include "TracyQueryGhostZoneStore.hpp"
+#include "TracyQuerySampleDerivedStore.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
 #include "TracyFileHeader.hpp"
@@ -233,6 +234,16 @@ uint64_t UnsignedProtocolField( std::string_view line, std::string_view key )
     uint64_t result = 0;
     const auto parsed = std::from_chars( value.data(), value.data() + value.size(), result );
     return parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() ? result : 0;
+}
+
+std::optional<uint64_t> ParseHexAddress( std::string_view value )
+{
+    if( value.starts_with( "0x" ) || value.starts_with( "0X" ) ) value.remove_prefix( 2 );
+    if( value.empty() ) return std::nullopt;
+    uint64_t result = 0;
+    const auto parsed = std::from_chars( value.data(), value.data() + value.size(), result, 16 );
+    if( parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() ) return std::nullopt;
+    return result;
 }
 
 enum class ZoneSectionKind : uint32_t
@@ -1435,6 +1446,7 @@ public:
         , m_gpu( m_manifest.gpuZones, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_samples( m_manifest.samples.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_ghostZones( m_manifest.samples.path / "ghost", m_manifest.sourceFingerprint, m_storageOptions )
+        , m_sampleDerived( m_manifest.samples.path / "derived", m_manifest.sourceFingerprint, m_storageOptions )
         , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_jobStages( m_manifest.jobStages, ZoneSectionKind::JobStage, sizeof( JnJobStageData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint, m_storageOptions )
@@ -1473,7 +1485,7 @@ public:
                 item.present = true;
                 item.queryable = true;
                 item.indexed = true;
-                item.reason = "bounded Query sample and ghost-zone sidecars; symbol-statistics index is pending";
+                item.reason = "bounded Query sample, ghost-zone and symbol-statistics sidecars are ready";
             }
             else if( item.domain == "job" || item.domain == "job.gfx" || item.domain == "evidence" )
             {
@@ -1528,6 +1540,8 @@ public:
         result.counts.samples = m_samples.MainCount();
         result.counts.contextSwitchSamples = m_samples.ContextSwitchCount();
         result.counts.ghostZones = m_ghostZones.Count();
+        result.counts.childSampleSymbols = m_sampleDerived.ChildSampleSymbolCount();
+        result.counts.childSamples = m_sampleDerived.ChildSampleCount();
         result.counts.jobStages = m_jobStages.Count();
         result.counts.gfxEntities = m_gfxEntities.Count();
         result.counts.gfxLinks = m_gfxLinks.Count();
@@ -1969,7 +1983,7 @@ public:
     }
 
     std::shared_ptr<QueryResourceContext> GetQueryResourceContext() const override { return m_resources; }
-    bool SampleDerivedDataReady() const override { return false; }
+    bool SampleDerivedDataReady() const override { return true; }
     bool JobDerivedDataReady() const override { return false; }
     bool CatalogDerivedDataReady() const override
     {
@@ -2172,7 +2186,27 @@ public:
     TRACY_INDEX_FORWARD0( std::vector<analysis::HardwareSampleDto>, GetHardwareSamples )
     TRACY_INDEX_FORWARD4( std::vector<analysis::HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::vector<analysis::LockEventDto>, ScanLockEvents, const analysis::ScanRange&, range )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::SymbolDto>, GetSymbols )
+    std::vector<analysis::SymbolDto> GetSymbols() const override
+    {
+        auto result = m_source->GetSymbols();
+        for( auto& symbol : result )
+        {
+            const auto address = ParseHexAddress( symbol.address );
+            if( !address ) continue;
+            const auto statistics = m_sampleDerived.Find( *address );
+            if( !statistics )
+            {
+                symbol.inclusiveSamples = 0;
+                symbol.exclusiveSamples = 0;
+                symbol.childSamples = 0;
+                continue;
+            }
+            symbol.inclusiveSamples = statistics->inclusiveSamples;
+            symbol.exclusiveSamples = statistics->exclusiveSamples;
+            symbol.childSamples = statistics->childSamples;
+        }
+        return result;
+    }
     TRACY_INDEX_FORWARD2( std::vector<analysis::SymbolAddressMappingDto>, GetSymbolAddressMappings, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::optional<analysis::SymbolAddressMappingDto>, ResolveSymbolAddress, uint64_t, address )
     TRACY_INDEX_FORWARD0( std::vector<analysis::SourceLocationDto>, GetSourceLocations )
@@ -2871,6 +2905,7 @@ private:
     ReadOnlyZoneSection m_extras, m_cpu, m_gpu;
     QuerySampleViewReader m_samples;
     QueryGhostZoneStoreReader m_ghostZones;
+    QuerySampleDerivedStoreReader m_sampleDerived;
     QueryCatalogStoreReader m_catalog;
     ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
@@ -3421,6 +3456,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         BuildQueryGhostZoneStore( temporarySamples / "ghost", temporarySamples, temporaryCallstacks,
             temporaryCallstackFrames, temporaryStrings, result.sourceFingerprint,
             source->GetTraceInfo().samplingPeriodNs, storageOptions );
+        resources->SetPhase( "sample-symbol-statistics" );
+        BuildQuerySampleDerivedStore( temporarySamples / "derived", temporarySamples, temporaryCallstacks,
+            temporaryCallstackFrames, result.sourceFingerprint, storageOptions );
         result.zoneExtras.count = writer.ExtraCount();
         result.cpuZones.count = writer.CpuCount();
         result.gpuZones.count = writer.GpuCount();
@@ -4190,7 +4228,8 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 samples.ContextSwitchCount() != manifest.sampleContextSwitchCount )
                 throw std::runtime_error( "sample section count mismatch" );
             QueryGhostZoneStoreReader ghostZones( manifest.samples.path / "ghost", manifest.sourceFingerprint, storageOptions );
-            if( deep ) { samples.ValidateAll(); ghostZones.ValidateAll(); }
+            QuerySampleDerivedStoreReader sampleDerived( manifest.samples.path / "derived", manifest.sourceFingerprint, storageOptions );
+            if( deep ) { samples.ValidateAll(); ghostZones.ValidateAll(); sampleDerived.ValidateAll(); }
         }
         if( manifest.globalStrings.recordBytes != 0 || !std::filesystem::is_directory( manifest.globalStrings.path ) ||
             SectionBytes( manifest.globalStrings.path ) != manifest.globalStrings.bytes )

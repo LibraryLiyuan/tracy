@@ -301,6 +301,15 @@ JobStage也改为允许超大记录数的sidecar，compact payload不再保留�
 - Release `ALL_BUILD` 通过；CTest 新增 Ghost Zone 重建测试后为 43/43 通过（193.87 秒）。首轮 `tracy-default-analysis-cache` 的 Windows 故障注入瞬态失败已保留，随后该目标隔离 1/1 及完整套件 43/43 均通过。
 - Sample 冷建对 Worker Sample 驻留的依赖已解除。Sample 符号统计、Job 消费者、P5 和正式 12.43 GB 综合验收仍待继续。
 
+## 2026-09-21：schema40 Sample 符号统计派生索引
+
+- 新增 Sample 派生统计侧车。构建过程顺序读取逻辑 Sample，按 symbol address 写贡献记录并外部排序归并；主统计排除上下文切换起点的重复 Sample，child sample 仍按原始主 Sample 计数。
+- inclusive/exclusive/child 统计按地址有界点读，Indexed `GetSymbols` 仅装饰现有 Symbol 元数据；缺 Frame 定义的调用栈保持 Worker 的跳过语义，不伪造 Symbol。
+- `SampleDerivedDataReady` 改由 schema40 已发布派生表满足；`sample.list`、`sample.ghost_zones`、`sample.symbol_statistics`、`sample.flamegraph` 共用持久化 Sample/Callstack 后端。trace counts 的 child sample 数改读派生表。
+- 最小红/绿回归覆盖上下文起点去重、inline inclusive、exclusive、child 和缺 Frame；派生 builder 在独立 16 MiB 工作区内通过。小型真实 Sample 的 6 条 Sample、10 条 Ghost Zone 和全部 SymbolDto 字段与原 Worker 一致。
+- Release `ALL_BUILD` 和 CTest 44/44 通过（233.01 秒）；证据目录为 `GpuCatalog-DiskIndex/sample-derived-schema40-green-20260921`。
+- Query 1.35 Sample 方法集已恢复。保存 Trace 不包含的 runtime-only `callstack.parent` 映射仍按独立 Callstack 数据缺口跟踪；Job、P5 和正式 12.43 GB 综合验收仍待继续。
+
 ## 2026-09-18：Catalog原始表外置
 
 schema19新增GPU Catalog存储：12个固定域、Catalog字符串域和质量元数据分别使用压缩分页表，缺失域也发布空表；支持随机点读、冷重开、Trace身份拒绝与全块深校验。小型真实JNTRACYX夹具验证1001条资源及Batch/String计数，compact payload不再保留Catalog。Catalog分析索引与MCP消费者尚未迁移，当前明确返回INDEX_NOT_READY。

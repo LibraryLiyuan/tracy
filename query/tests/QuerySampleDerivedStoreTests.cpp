@@ -1,0 +1,143 @@
+#include "TracyQueryCallstackStore.hpp"
+#include "TracyQuerySampleStore.hpp"
+#include "TracyQuerySampleView.hpp"
+
+#if __has_include( "TracyQuerySampleDerivedStore.hpp" )
+#  include "TracyQuerySampleDerivedStore.hpp"
+#  define TRACY_HAS_QUERY_SAMPLE_DERIVED_STORE 1
+#else
+#  define TRACY_HAS_QUERY_SAMPLE_DERIVED_STORE 0
+#endif
+
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
+
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+namespace
+{
+
+void Require( bool condition, const char* message )
+{
+    if( !condition ) throw std::runtime_error( message );
+}
+
+}
+
+int main()
+{
+    try
+    {
+#if !TRACY_HAS_QUERY_SAMPLE_DERIVED_STORE
+        throw std::runtime_error( "Query sample derived store is not implemented" );
+#else
+        namespace fs = std::filesystem;
+        using namespace tracy;
+        using namespace tracy::analysis;
+        using namespace tracy::query;
+
+        const auto root = fs::temp_directory_path() /
+            ( "query-sample-derived-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
+        fs::create_directories( root );
+        const std::string fingerprint( 64, 'd' );
+        auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
+        auto disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 64 * 1024 * 1024, {} } );
+        auto workspace = std::make_shared<AnalysisWorkspaceBudget>( 64 * 1024 * 1024, 32 * 1024 * 1024 );
+        PagedRecordOptions options;
+        options.blockBytes = 4096;
+        options.disk = disk;
+        options.workspace = workspace;
+
+        CallstackFrameId leafId{}; leafId.data = 0x1000;
+        CallstackFrameId rootId{}; rootId.data = 0x2000;
+        CallstackFrameId unresolvedId{}; unresolvedId.data = 0x3000;
+
+        {
+            QueryCallstackFrameStoreWriter frames( root / "frames", fingerprint, options );
+            frames.Begin( 2 );
+            CallstackFrame leaf[2]{};
+            leaf[0].symAddr = 0x1100;
+            leaf[1].symAddr = 0x1200;
+            CallstackFrame parent{};
+            parent.symAddr = 0x2000;
+            frames.FrameBegin( 0, leafId, 2, StringIdx{} );
+            frames.FrameRecords( 0, 0, leaf, 2 );
+            frames.FrameEnd( 0 );
+            frames.FrameBegin( 1, rootId, 1, StringIdx{} );
+            frames.FrameRecords( 1, 0, &parent, 1 );
+            frames.FrameEnd( 1 );
+            frames.Commit();
+        }
+        {
+            QueryCallstackStoreWriter callstacks( root / "callstacks", fingerprint, options );
+            callstacks.Begin( 2 );
+            const CallstackFrameId resolved[] = { leafId, rootId };
+            callstacks.CallstackBegin( 1, 2 );
+            callstacks.CallstackFrames( 1, 0, resolved, 2 );
+            callstacks.CallstackEnd( 1 );
+            callstacks.CallstackBegin( 2, 1 );
+            callstacks.CallstackFrames( 2, 0, &unresolvedId, 1 );
+            callstacks.CallstackEnd( 2 );
+            callstacks.Commit();
+        }
+        {
+            QuerySampleStoreWriter samples( root / "samples", fingerprint, options );
+            samples.Begin( 7, QuerySampleKind::Main, 3 );
+            samples.Append( 0, 10, 1 );
+            samples.Append( 1, 20, 1 );
+            samples.Append( 2, 30, 2 );
+            samples.End();
+            samples.Commit();
+        }
+        BuildQuerySampleView( root / "samples", fingerprint,
+            []( uint64_t thread ) { return thread == 7 ? std::vector<int64_t>{ 20 } : std::vector<int64_t>{}; }, options );
+
+        auto derivedWorkspace = std::make_shared<AnalysisWorkspaceBudget>( 16 * 1024 * 1024, 8 * 1024 * 1024 );
+        auto derivedOptions = options;
+        derivedOptions.workspace = derivedWorkspace;
+        uint64_t count = 0;
+        try
+        {
+            count = BuildQuerySampleDerivedStore( root / "derived", root / "samples", root / "callstacks",
+                root / "frames", fingerprint, derivedOptions );
+        }
+        catch( const std::exception& error )
+        {
+            const auto snapshot = derivedWorkspace->Snapshot();
+            throw std::runtime_error( std::string( error.what() ) + " current=" + std::to_string( snapshot.currentBytes ) +
+                " peak=" + std::to_string( snapshot.peakBytes ) + " rejected=" + std::to_string( snapshot.rejectedReservations ) );
+        }
+        Require( derivedWorkspace->Snapshot().peakBytes <= 16 * 1024 * 1024,
+            "sample derived build exceeded its workspace limit" );
+        Require( count == 3, "sample symbol-statistics record count changed" );
+        Require( !fs::exists( root / "derived" / "build-scratch" ), "sample derived scratch was not removed" );
+
+        QuerySampleDerivedStoreReader reader( root / "derived", fingerprint, options );
+        const auto leafStats = reader.Find( 0x1100 );
+        const auto inlineStats = reader.Find( 0x1200 );
+        const auto rootStats = reader.Find( 0x2000 );
+        Require( leafStats && leafStats->inclusiveSamples == 0 && leafStats->exclusiveSamples == 1 && leafStats->childSamples == 0,
+            "exclusive sample statistics changed" );
+        Require( inlineStats && inlineStats->inclusiveSamples == 1 && inlineStats->exclusiveSamples == 0,
+            "inline inclusive sample statistics changed" );
+        Require( rootStats && rootStats->inclusiveSamples == 1 && rootStats->exclusiveSamples == 0 && rootStats->childSamples == 2,
+            "parent symbol statistics or raw child-sample count changed" );
+        Require( !reader.Find( 0x3000 ), "missing Frame definition produced symbol statistics" );
+        reader.ValidateAll();
+
+        std::error_code ignored;
+        fs::remove_all( root, ignored );
+        std::cout << "query sample derived store tests passed\n";
+        return 0;
+#endif
+    }
+    catch( const std::exception& error )
+    {
+        std::cerr << error.what() << '\n';
+        return 1;
+    }
+}

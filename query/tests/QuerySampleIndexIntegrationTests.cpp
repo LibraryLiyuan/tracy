@@ -64,8 +64,8 @@ int main( int argc, char** argv )
         Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
 
         auto indexed = tracy::query::QueryIndex::Open( manifest );
-        Require( !indexed->SampleDerivedDataReady(),
-            "indexed trace silently claims Worker-derived Sample data is ready" );
+        Require( indexed->SampleDerivedDataReady(),
+            "indexed trace did not publish complete Sample derived data" );
         const auto indexedInfo = indexed->GetTraceInfo();
         Require( indexedInfo.counts.samples == originalInfo.counts.samples,
             "indexed trace changed main sample count" );
@@ -122,6 +122,20 @@ int main( int argc, char** argv )
         }
         Require( actualSymbols.size() == expectedSymbols.size(),
             "indexed compact Worker changed symbol-statistics availability" );
+        for( size_t index = 0; index < expectedSymbols.size(); index++ )
+        {
+            const auto& expectedSymbol = expectedSymbols[index];
+            const auto& actualSymbol = actualSymbols[index];
+            Require( actualSymbol.ref == expectedSymbol.ref && actualSymbol.address == expectedSymbol.address &&
+                actualSymbol.name == expectedSymbol.name && actualSymbol.file == expectedSymbol.file &&
+                actualSymbol.line == expectedSymbol.line && actualSymbol.size == expectedSymbol.size &&
+                actualSymbol.inclusiveSamples == expectedSymbol.inclusiveSamples &&
+                actualSymbol.exclusiveSamples == expectedSymbol.exclusiveSamples &&
+                actualSymbol.childSamples == expectedSymbol.childSamples && actualSymbol.hasCode == expectedSymbol.hasCode &&
+                actualSymbol.imageName == expectedSymbol.imageName && actualSymbol.callFile == expectedSymbol.callFile &&
+                actualSymbol.callLine == expectedSymbol.callLine && actualSymbol.inlineFrame == expectedSymbol.inlineFrame,
+                "indexed symbol statistics changed" );
+        }
         std::cout << "sample index integration passed records=" << actual.size() << '\n';
         return 0;
     }

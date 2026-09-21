@@ -79,6 +79,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQuerySampleStore.hpp
     src/TracyQueryGhostZoneStore.cpp
     src/TracyQueryGhostZoneStore.hpp
+    src/TracyQuerySampleDerivedStore.cpp
+    src/TracyQuerySampleDerivedStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
     src/TracyQueryStringStore.cpp
@@ -162,6 +164,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-ghost-zone-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-ghost-zone-store-tests)
     add_test(NAME tracy-query-ghost-zone-store COMMAND tracy-query-ghost-zone-store-tests)
+
+    add_executable(tracy-query-sample-derived-store-tests tests/QuerySampleDerivedStoreTests.cpp)
+    target_link_libraries(tracy-query-sample-derived-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-sample-derived-store-tests)
+    add_test(NAME tracy-query-sample-derived-store COMMAND tracy-query-sample-derived-store-tests)
 
     add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
     target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)

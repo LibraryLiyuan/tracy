@@ -31,6 +31,7 @@ public:
     uint64_t ContextSwitchCount() const;
     std::vector<QuerySampleRow> Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit,
         std::optional<QuerySampleKind> kind = {} ) const;
+    void Visit( const std::function<bool( const QuerySampleRow& )>& visitor ) const;
     void ValidateAll();
 
 private:

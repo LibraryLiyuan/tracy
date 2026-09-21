@@ -163,6 +163,31 @@ std::vector<QuerySampleRow> QuerySampleViewReader::Scan( int64_t startNs, int64_
     return result;
 }
 
+void QuerySampleViewReader::Visit( const std::function<bool( const QuerySampleRow& )>& visitor ) const
+{
+    if( !visitor ) return;
+    std::lock_guard lock( m_impl->mutex );
+    for( uint64_t spanIndex = 0; spanIndex < m_impl->spans.Count(); spanIndex++ )
+    {
+        ViewSpan span;
+        m_impl->spans.Read( spanIndex, &span, 1 );
+        for( uint64_t index = 0; index < span.mainCount; index++ )
+        {
+            auto row = m_impl->raw.ReadPhysical( span.mainFirst + index, span.thread, QuerySampleKind::Main );
+            row.ordinal = span.logicalFirst + index;
+            if( !visitor( row ) ) return;
+        }
+        for( uint64_t index = 0; index < span.contextCount; index++ )
+        {
+            uint64_t physical = 0;
+            m_impl->contexts.Read( span.contextFirst + index, &physical, 1 );
+            auto row = m_impl->raw.ReadPhysical( physical, span.thread, QuerySampleKind::ContextSwitch );
+            row.ordinal = span.logicalFirst + span.mainCount + index;
+            if( !visitor( row ) ) return;
+        }
+    }
+}
+
 void QuerySampleViewReader::ValidateAll()
 {
     std::lock_guard lock( m_impl->mutex );
