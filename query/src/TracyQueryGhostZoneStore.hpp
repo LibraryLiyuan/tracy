@@ -69,6 +69,14 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
+// Rebuilds Ghost Zone facts from the persisted Sample/Callstack/Frame/String
+// sidecars without reopening a Worker with the full Sample table resident.
+uint64_t BuildQueryGhostZoneStore( std::filesystem::path output,
+    std::filesystem::path samples, std::filesystem::path callstacks,
+    std::filesystem::path callstackFrames, std::filesystem::path strings,
+    std::string sourceFingerprint, int64_t samplingPeriodNs,
+    analysis::PagedRecordOptions options = {} );
+
 }
 
 #endif

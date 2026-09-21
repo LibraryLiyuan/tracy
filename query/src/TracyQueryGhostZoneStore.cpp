@@ -1,13 +1,18 @@
 #include "TracyQueryGhostZoneStore.hpp"
 
 #include "TracyHash.hpp"
+#include "TracyAnalysisIoPath.hpp"
+#include "TracyQueryCallstackStore.hpp"
+#include "TracyQuerySampleStore.hpp"
 #include "TracyPagedRecordStore.hpp"
 
 #include <cstring>
 #include <charconv>
 #include <limits>
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
+#include <algorithm>
 
 namespace tracy::query
 {
@@ -51,6 +56,99 @@ void WriteString( QueryStringStoreWriter& writer, uint64_t ordinal, std::string_
     writer.StringEnd( ordinal );
 }
 
+struct BuildFrame
+{
+    uint64_t id = 0;
+    uint64_t symAddr = 0;
+    uint8_t inlineFrame = 0;
+    bool reusable = false;
+    std::string name;
+    std::string file;
+    uint32_t line = 0;
+};
+
+#pragma pack( push, 1 )
+struct ScratchGhostZone
+{
+    uint64_t thread = 0;
+    uint64_t parent = NoParent;
+    int64_t startNs = 0;
+    int64_t endNs = 0;
+    uint64_t symAddr = 0;
+    uint64_t nameOffset = 0;
+    uint64_t fileOffset = 0;
+    uint64_t addressOffset = 0;
+    uint32_t nameBytes = 0;
+    uint32_t fileBytes = 0;
+    uint32_t addressBytes = 0;
+    uint32_t line = 0;
+    uint32_t depth = 0;
+    uint32_t childCount = 0;
+    uint8_t inlineFrame = 0;
+    uint8_t reusable = 0;
+    uint8_t reserved[2] = {};
+};
+#pragma pack( pop )
+
+static_assert( sizeof( ScratchGhostZone ) == 92 );
+
+uint64_t CanonicalPointer( CallstackFrameId id )
+{
+    return ( id.idx & 0x3FFFFFFFFFFFFFFF ) | ( ( id.idx & 0x3000000000000000 ) << 2 );
+}
+
+std::string Ref( std::string_view fingerprint, std::string_view kind, uint64_t value )
+{
+    std::ostringstream out;
+    out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << value;
+    return out.str();
+}
+
+void GrowScratch( const analysis::PagedRecordOptions& options, const std::filesystem::path& path,
+    uint64_t growth, uint64_t proposedBytes )
+{
+    analysis::AnalysisDiskGrow( options.disk, growth );
+    if( options.beforeFileGrowth ) options.beforeFileGrowth( path, proposedBytes );
+}
+
+std::string ResolveString( const QueryStringStoreReader& reader, const StringIdx& value )
+{
+    return value.Active() ? reader.ReadOrdinal( value.Idx(), 1 << 20 ) : std::string();
+}
+
+std::vector<BuildFrame> BuildPath( const QueryCallstackStoreReader& callstacks,
+    const QueryCallstackFrameStoreReader& frames, const QueryStringStoreReader& strings, uint32_t callstack )
+{
+    std::vector<BuildFrame> result;
+    const auto stack = callstacks.Frames( callstack );
+    for( size_t stackIndex = stack.size(); stackIndex != 0; stackIndex-- )
+    {
+        const auto entry = stack[stackIndex - 1];
+        const auto definition = frames.Find( entry );
+        if( !definition )
+        {
+            result.push_back( { entry.data, CanonicalPointer( entry ), 0, false, {}, {}, 0 } );
+            continue;
+        }
+        for( size_t index = definition->frames.size(); index != 0; index-- )
+        {
+            const auto& frame = definition->frames[index - 1];
+            result.push_back( { entry.data, CanonicalPointer( entry ), uint8_t( index < definition->frames.size() ), true,
+                ResolveString( strings, frame.name ), ResolveString( strings, frame.file ), frame.line } );
+        }
+    }
+    return result;
+}
+
+void ReadScratchString( std::ifstream& input, uint64_t offset, uint32_t bytes, std::string& output )
+{
+    output.resize( bytes );
+    if( bytes == 0 ) return;
+    input.seekg( std::streamoff( offset ) );
+    input.read( output.data(), std::streamsize( bytes ) );
+    if( !input ) throw std::runtime_error( "ghost-zone scratch string read" );
+}
+
 uint64_t ParseRefOrdinal( std::string_view ref, const char* kind )
 {
     const auto marker = ref.rfind( ':' );
@@ -63,6 +161,169 @@ uint64_t ParseRefOrdinal( std::string_view ref, const char* kind )
     return value;
 }
 
+uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
+    std::filesystem::path samplesPath, std::filesystem::path callstacksPath,
+    std::filesystem::path callstackFramesPath, std::filesystem::path stringsPath,
+    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options )
+{
+    const auto scratchPath = output / "build-scratch.bin";
+    const auto stringsScratchPath = output / "build-strings.bin";
+    std::filesystem::create_directories( analysis::AnalysisIoPath( output ) );
+    GrowScratch( options, scratchPath, 0, 0 );
+    GrowScratch( options, stringsScratchPath, 0, 0 );
+    std::fstream scratch( analysis::AnalysisIoPath( scratchPath ), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc );
+    std::ofstream scratchStrings( analysis::AnalysisIoPath( stringsScratchPath ), std::ios::binary | std::ios::trunc );
+    if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch open" );
+
+    QuerySampleStoreReader samples( samplesPath, sourceFingerprint, options );
+    QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, options );
+    QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, options );
+    QueryStringStoreReader strings( stringsPath, sourceFingerprint, options );
+    std::vector<QuerySampleMainSpan> spans = samples.MainSpans();
+    std::sort( spans.begin(), spans.end(), []( const auto& lhs, const auto& rhs ) { return lhs.thread < rhs.thread; } );
+
+    uint64_t count = 0;
+    const auto period = samplingPeriodNs;
+    std::vector<uint64_t> active;
+    const auto writeRecord = [&]( uint64_t ordinal, const ScratchGhostZone& value ) {
+        scratch.seekp( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
+        scratch.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !scratch ) throw std::runtime_error( "ghost-zone scratch record write" );
+    };
+    const auto readRecord = [&]( uint64_t ordinal ) {
+        ScratchGhostZone value;
+        scratch.seekg( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
+        scratch.read( reinterpret_cast<char*>( &value ), sizeof( value ) );
+        if( !scratch ) throw std::runtime_error( "ghost-zone scratch record read" );
+        return value;
+    };
+    for( const auto& span : spans )
+    {
+        active.clear();
+        const bool skipZeroTime = span.count != 0 &&
+            samples.ReadPhysical( span.first, span.thread, QuerySampleKind::Main ).timeNs == 0;
+        for( uint64_t index = 0; index < span.count; index++ )
+        {
+            const auto sample = samples.ReadPhysical( span.first + index, span.thread, QuerySampleKind::Main );
+            if( skipZeroTime && sample.timeNs == 0 ) continue;
+            const auto path = BuildPath( callstacks, frames, strings, sample.callstack );
+            if( !active.empty() )
+            {
+                const auto previousEnd = readRecord( active.front() ).endNs;
+                if( previousEnd > sample.timeNs )
+                {
+                    for( const auto ordinal : active )
+                    {
+                        auto record = readRecord( ordinal );
+                        if( record.endNs != previousEnd ) break;
+                        record.endNs = sample.timeNs;
+                        writeRecord( ordinal, record );
+                    }
+                }
+            }
+            const auto referenceEnd = active.empty() ? int64_t( 0 ) : readRecord( active.front() ).endNs;
+            size_t common = 0;
+            while( common < active.size() && common < path.size() )
+            {
+                const auto record = readRecord( active[common] );
+                if( record.endNs != referenceEnd ) break;
+                if( record.reusable == 0 ) break;
+                if( record.symAddr != path[common].symAddr ) break;
+                common++;
+            }
+            for( size_t i = 0; i < common; i++ )
+            {
+                auto record = readRecord( active[i] );
+                record.endNs = sample.timeNs + period;
+                writeRecord( active[i], record );
+            }
+            active.resize( common );
+            for( size_t i = common; i < path.size(); i++ )
+            {
+                const auto& frame = path[i];
+                ScratchGhostZone record;
+                record.thread = span.thread;
+                record.parent = active.empty() ? NoParent : active.back();
+                record.startNs = sample.timeNs;
+                record.endNs = sample.timeNs + period;
+                record.symAddr = frame.symAddr;
+                record.depth = uint32_t( i );
+                record.inlineFrame = frame.inlineFrame;
+                record.reusable = frame.reusable;
+                record.line = frame.line;
+                record.addressOffset = std::numeric_limits<uint64_t>::max();
+                const auto append = [&]( const std::string& value, uint64_t& offset, uint32_t& bytes ) {
+                    offset = uint64_t( scratchStrings.tellp() );
+                    bytes = uint32_t( value.size() );
+                    GrowScratch( options, stringsScratchPath, bytes, offset + bytes );
+                    if( bytes ) scratchStrings.write( value.data(), std::streamsize( bytes ) );
+                };
+                append( frame.name, record.nameOffset, record.nameBytes );
+                append( frame.file, record.fileOffset, record.fileBytes );
+                std::ostringstream address; address << "0x" << std::hex << frame.symAddr;
+                append( address.str(), record.addressOffset, record.addressBytes );
+                if( record.parent != NoParent )
+                {
+                    auto parent = readRecord( record.parent );
+                    parent.childCount++;
+                    writeRecord( record.parent, parent );
+                }
+                GrowScratch( options, scratchPath, sizeof( ScratchGhostZone ),
+                    ( count + 1 ) * sizeof( ScratchGhostZone ) );
+                scratch.seekp( std::streamoff( count * sizeof( ScratchGhostZone ) ) );
+                scratch.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
+                if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch append" );
+                active.push_back( count++ );
+            }
+        }
+    }
+    scratch.flush(); scratchStrings.flush();
+    if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch flush" );
+    scratch.close(); scratchStrings.close();
+
+    QueryGhostZoneStoreWriter writer( output, sourceFingerprint, options );
+    writer.Begin( count );
+    std::ifstream recordsInput( analysis::AnalysisIoPath( scratchPath ), std::ios::binary );
+    std::ifstream stringsInput( analysis::AnalysisIoPath( stringsScratchPath ), std::ios::binary );
+    if( !recordsInput || !stringsInput ) throw std::runtime_error( "ghost-zone scratch reopen" );
+    for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+    {
+        ScratchGhostZone record;
+        recordsInput.read( reinterpret_cast<char*>( &record ), sizeof( record ) );
+        if( !recordsInput ) throw std::runtime_error( "ghost-zone scratch sequential read" );
+        analysis::GhostZoneDto value;
+        value.ref = Ref( sourceFingerprint, "ghost-zone", ordinal );
+        value.threadRef = Ref( sourceFingerprint, "thread", record.thread );
+        if( record.parent != NoParent ) value.parentRef = Ref( sourceFingerprint, "ghost-zone", record.parent );
+        value.startNs = record.startNs; value.endNs = record.endNs; value.line = record.line;
+        value.depth = record.depth; value.childCount = record.childCount; value.inlineFrame = record.inlineFrame != 0;
+        ReadScratchString( stringsInput, record.nameOffset, record.nameBytes, value.name );
+        ReadScratchString( stringsInput, record.fileOffset, record.fileBytes, value.file );
+        ReadScratchString( stringsInput, record.addressOffset, record.addressBytes, value.address );
+        writer.Append( ordinal, value );
+    }
+    writer.Commit();
+    recordsInput.close();
+    stringsInput.close();
+    std::error_code error;
+    analysis::AnalysisDiskRemove( scratchPath, options.disk, error );
+    if( error ) throw std::runtime_error( "ghost-zone scratch remove: " + error.message() );
+    error.clear();
+    analysis::AnalysisDiskRemove( stringsScratchPath, options.disk, error );
+    if( error ) throw std::runtime_error( "ghost-zone string scratch remove: " + error.message() );
+    return count;
+}
+
+}
+
+uint64_t BuildQueryGhostZoneStore( std::filesystem::path output,
+    std::filesystem::path samplesPath, std::filesystem::path callstacksPath,
+    std::filesystem::path callstackFramesPath, std::filesystem::path stringsPath,
+    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options )
+{
+    return BuildQueryGhostZoneStoreImpl( std::move( output ), std::move( samplesPath ), std::move( callstacksPath ),
+        std::move( callstackFramesPath ), std::move( stringsPath ), std::move( sourceFingerprint ), samplingPeriodNs,
+        std::move( options ) );
 }
 
 struct QueryGhostZoneStoreWriter::Impl

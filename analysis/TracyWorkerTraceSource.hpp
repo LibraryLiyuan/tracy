@@ -150,7 +150,6 @@ public:
     std::vector<CpuContextSwitchDto> ScanCpuContextSwitchEvents( const ScanRange& range ) const override;
     std::vector<SampleDto> ScanSampleEvents( const ScanRange& range ) const override;
     std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& range ) const override;
-    void EnumerateGhostZones( const std::function<bool( const GhostZoneDto& )>& visitor ) const override;
     std::vector<HardwareSampleDto> GetHardwareSamples() const override;
     std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t address, std::string_view kind, size_t offset, size_t limit ) const override;
     std::vector<LockEventDto> ScanLockEvents( const ScanRange& range ) const override;

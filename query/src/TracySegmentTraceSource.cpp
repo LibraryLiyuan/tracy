@@ -967,7 +967,6 @@ TRACY_SEGMENT_FORWARD1( std::vector<analysis::ContextSwitchDto>, ScanContextSwit
 TRACY_SEGMENT_FORWARD1( std::vector<analysis::CpuContextSwitchDto>, ScanCpuContextSwitchEvents, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD1( std::vector<analysis::SampleDto>, ScanSampleEvents, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD1( std::vector<analysis::GhostZoneDto>, ScanGhostZones, const analysis::ScanRange&, range )
-TRACY_SEGMENT_FORWARD1( void, EnumerateGhostZones, const std::function<bool( const analysis::GhostZoneDto& )>&, visitor )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::HardwareSampleDto>, GetHardwareSamples )
 TRACY_SEGMENT_FORWARD4( std::vector<analysis::HardwareSampleEventDto>, GetHardwareSampleEvents, uint64_t, address, std::string_view, kind, size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD1( std::vector<analysis::LockEventDto>, ScanLockEvents, const analysis::ScanRange&, range )

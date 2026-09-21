@@ -727,7 +727,6 @@ public:
     void GpuZonesEnd() override { m_gpu.Close( m_seenGpu ); }
 
     bool WantsSamples() const override { return true; }
-    bool WantsGhostZones() const override { return true; }
     void SamplesBegin( uint64_t thread, uint8_t kind, uint64_t count ) override
     {
         m_samples.Begin( thread, kind == 0 ? QuerySampleKind::Main : QuerySampleKind::ContextSwitch, count );
@@ -746,23 +745,6 @@ public:
     uint64_t SampleCount() const { return m_samples.Count(); }
     uint64_t MainSampleCount() const { return m_samples.MainCount(); }
     uint64_t ContextSwitchSampleCount() const { return m_samples.ContextSwitchCount(); }
-    void BeginGhostZones( uint64_t count )
-    {
-        if( m_ghostZones ) throw std::runtime_error( "ghost-zone writer already started" );
-        m_ghostZones = std::make_unique<QueryGhostZoneStoreWriter>( m_samplePath / "ghost", m_sourceFingerprint, m_storageOptions );
-        m_ghostZones->Begin( count );
-    }
-    void AppendGhostZone( uint64_t ordinal, const analysis::GhostZoneDto& value )
-    {
-        if( !m_ghostZones ) throw std::runtime_error( "ghost-zone writer is not started" );
-        m_ghostZones->Append( ordinal, value );
-    }
-    void CommitGhostZones()
-    {
-        if( !m_ghostZones ) throw std::runtime_error( "ghost-zone writer is not started" );
-        m_ghostZones->Commit();
-    }
-    uint64_t GhostZoneCount() const { return m_ghostZones ? m_ghostZones->Count() : 0; }
 
     void CatalogMetadata( OfflineCatalogQuality metadata ) override
     {
@@ -904,7 +886,6 @@ private:
     std::unordered_map<uint64_t, uint64_t> m_cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> m_gpuZonesByContext;
     QuerySampleStoreWriter m_samples;
-    std::unique_ptr<QueryGhostZoneStoreWriter> m_ghostZones;
     QueryCatalogStoreWriter m_catalog;
     std::unique_ptr<QueryStringStoreWriter> m_stringWriter;
     std::shared_ptr<QueryStringStoreReader> m_stringReader;
@@ -3429,12 +3410,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             temporaryJn, result.sourceFingerprint, storageOptions );
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
             analysis::WorkerTraceLoadMode::CompactIndex, &writer, ResourceReadHooks(resources,"worker-load:" ) );
-        writer.BeginGhostZones( source->GetTraceInfo().counts.ghostZones );
-        source->EnumerateGhostZones( [&]( const analysis::GhostZoneDto& value ) {
-            writer.AppendGhostZone( writer.GhostZoneCount(), value );
-            return true;
-        } );
-        writer.CommitGhostZones();
         writer.FinishMissingJnDomains();
         writer.CommitSamples();
         writer.FinishCatalog();
@@ -3442,6 +3417,10 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         resources->CheckMemory();
         BuildQuerySampleView( temporarySamples, result.sourceFingerprint,
             [&]( uint64_t thread ) { return source->GetContextSwitchStartTimes( thread ); }, storageOptions );
+        resources->SetPhase( "sample-ghost-zones" );
+        BuildQueryGhostZoneStore( temporarySamples / "ghost", temporarySamples, temporaryCallstacks,
+            temporaryCallstackFrames, temporaryStrings, result.sourceFingerprint,
+            source->GetTraceInfo().samplingPeriodNs, storageOptions );
         result.zoneExtras.count = writer.ExtraCount();
         result.cpuZones.count = writer.CpuCount();
         result.gpuZones.count = writer.GpuCount();

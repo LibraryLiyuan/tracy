@@ -293,6 +293,14 @@ JobStage也改为允许超大记录数的sidecar，compact payload不再保留�
 - schema39 协议断言已同步；Release `ALL_BUILD` 通过，CTest 42/42 通过（162.22 秒），独立 Sample 集成测试通过（6 条 Sample）。
 - 本检查点不宣称 P2 完成：冷建阶段 Ghost Zone 生成仍暂时依赖 Worker Sample 驻留，完整有界重建、Job 消费者、P5 以及 12.43 GB 综合验收仍待继续。
 
+## 2026-09-21：schema39 Sample Ghost Zone 冷建去驻留
+
+- Ghost Zone 冷建改为直接读取已发布的 Sample、Callstack、Frame 和 String 侧车，使用磁盘 scratch 保存可变树状态；写出后按资源账本删除 scratch，不再要求 Worker 保留完整 Sample 或公开整树枚举接口。
+- 保留 Worker 的缺 Frame 定义语义：缺失定义的帧仍生成 Ghost Zone，但不会跨 Sample 复用。最小回归先以“missing Frame definitions must prevent Ghost Zone reuse across samples”失败，修复后通过。
+- 小型真实 Sample 集成回归通过：6 条 Sample、10 条 Ghost Zone 与原 Worker 逐字段一致，ordinal 分页和半开时间范围不变；证据目录为 `GpuCatalog-DiskIndex/sample-sidecar-rebuild-schema39-green2-20260921`。
+- Release `ALL_BUILD` 通过；CTest 新增 Ghost Zone 重建测试后为 43/43 通过（193.87 秒）。首轮 `tracy-default-analysis-cache` 的 Windows 故障注入瞬态失败已保留，随后该目标隔离 1/1 及完整套件 43/43 均通过。
+- Sample 冷建对 Worker Sample 驻留的依赖已解除。Sample 符号统计、Job 消费者、P5 和正式 12.43 GB 综合验收仍待继续。
+
 ## 2026-09-18：Catalog原始表外置
 
 schema19新增GPU Catalog存储：12个固定域、Catalog字符串域和质量元数据分别使用压缩分页表，缺失域也发布空表；支持随机点读、冷重开、Trace身份拒绝与全块深校验。小型真实JNTRACYX夹具验证1001条资源及Batch/String计数，compact payload不再保留Catalog。Catalog分析索引与MCP消费者尚未迁移，当前明确返回INDEX_NOT_READY。

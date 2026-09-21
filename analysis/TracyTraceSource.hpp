@@ -1110,10 +1110,6 @@ public:
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
     virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
-    // Enumerates the complete ghost-zone tree once in the stable query order.
-    // Disk-backed builders use this to avoid repeatedly rescanning the tree
-    // while materializing paged sidecar records.
-    virtual void EnumerateGhostZones( const std::function<bool( const GhostZoneDto& )>& ) const {}
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
     virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }
     virtual std::vector<LockEventDto> ScanLockEvents( const ScanRange& ) const { return {}; }

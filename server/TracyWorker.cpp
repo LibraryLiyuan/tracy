@@ -1270,7 +1270,6 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
     }
     int32_t childIdx = 0;
     const bool externalSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsSamples();
-    const bool retainGhostSamples=m_serializedZoneSink&&m_serializedZoneSink->WantsGhostZones();
     f.Read( sz );
     m_data.threads.reserve_exact( sz, m_slab );
     for( uint64_t i=0; i<sz; i++ )
@@ -1344,13 +1343,13 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         f.Read( ssz );
         if(externalSamples)
         {
-            const bool retain = ( eventMask & EventType::Samples ) != 0 || retainGhostSamples;
+            const bool retain = ( eventMask & EventType::Samples ) != 0;
             if( retain ){m_data.samplesCnt+=ssz;td->samples.reserve_exact(ssz,m_slab);}
             m_serializedZoneSink->SamplesBegin(tid,0,ssz);int64_t refTime=0;for(uint64_t j=0;j<ssz;++j){int64_t delta;Int24 callstack;f.Read2(delta,callstack);refTime+=delta;m_serializedZoneSink->SampleRecord(tid,0,j,refTime,callstack.Val());if(retain){td->samples[j].time.SetVal(refTime);td->samples[j].callstack=callstack;}}m_serializedZoneSink->SamplesEnd(tid,0);
         }
         else if( ssz != 0 )
         {
-            if( ( eventMask & EventType::Samples ) || retainGhostSamples )
+            if( eventMask & EventType::Samples )
             {
                 m_data.samplesCnt += ssz;
                 int64_t refTime = 0;
@@ -2351,8 +2350,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
 
             }
 
-            if( ( ( eventMask & EventType::Samples ) && !m_externalCallstackSource ) ||
-                ( m_serializedZoneSink && m_serializedZoneSink->WantsGhostZones() ) )
+            if( ( eventMask & EventType::Samples ) && !m_externalCallstackSource )
             {
                 jobs.emplace_back( std::thread( [this] {
                     try

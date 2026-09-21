@@ -157,7 +157,6 @@ public:
     virtual void SamplesBegin(uint64_t,uint8_t,uint64_t){}
     virtual void SampleRecord(uint64_t,uint8_t,uint64_t,int64_t,uint32_t){}
     virtual void SamplesEnd(uint64_t,uint8_t){}
-    virtual bool WantsGhostZones()const{return false;}
     virtual bool AllowsLargeCatalogStrings(uint64_t)const{return false;}
     virtual void CatalogStringsBegin(uint64_t){}
     virtual void CatalogStringRecord(uint64_t,uint64_t,const JnGpuCatalogStringRecordHeaderV1&,const void*){}
