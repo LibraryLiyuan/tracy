@@ -119,6 +119,7 @@ public:
 #define X(name,field,type) name,
         TRACY_OFFLINE_BASE_APPEND_DOMAINS(X)
 #undef X
+        JobType,
 #define X(name,field,type,mut) name,
         TRACY_OFFLINE_CATALOG_FIXED_DOMAINS(X)
 #undef X

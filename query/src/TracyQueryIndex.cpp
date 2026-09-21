@@ -8,6 +8,7 @@
 #include "TracyQuerySampleView.hpp"
 #include "TracyQueryGhostZoneStore.hpp"
 #include "TracyQuerySampleDerivedStore.hpp"
+#include "TracyQueryJobStore.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
 #include "TracyFileHeader.hpp"
@@ -532,6 +533,7 @@ public:
         , m_sourceFingerprint( std::move( sourceFingerprint ) )
         , m_storageOptions( std::move( storageOptions ) )
         , m_samples( m_samplePath, m_sourceFingerprint, m_storageOptions )
+        , m_jobs( m_jnPaths[0], m_sourceFingerprint, m_storageOptions )
         , m_catalog( std::move( catalog ), m_sourceFingerprint, m_storageOptions )
         , m_stringWriter( std::make_unique<QueryStringStoreWriter>( m_stringPath, m_sourceFingerprint, m_storageOptions ) )
         , m_callstackWriter( std::make_unique<QueryCallstackStoreWriter>( m_callstackPath, m_sourceFingerprint, m_storageOptions ) )
@@ -779,6 +781,7 @@ public:
 
     bool WantsJnRecords( JnDomain domain, uint32_t recordBytes ) const override
     {
+        if( const auto job = JobDomain( domain ) ) return recordBytes == JobRecordBytes( *job );
         if( const auto catalog = CatalogDomain( domain ) ) return recordBytes == OfflineCatalogInfo( *catalog ).width;
         return size_t(domain)<JnDomainCount && recordBytes == JnRecordBytes( domain );
     }
@@ -789,6 +792,12 @@ public:
     }
     void JnRecordsBegin( JnDomain domain, uint64_t count, uint32_t recordBytes ) override
     {
+        if( const auto job = JobDomain( domain ) )
+        {
+            if( recordBytes != JobRecordBytes( *job ) ) throw std::runtime_error( "Job index domain layout mismatch" );
+            m_jobs.Begin( *job, count );
+            return;
+        }
         if( const auto catalog = CatalogDomain( domain ) )
         {
             m_catalog.Begin( *catalog, count, recordBytes );
@@ -802,6 +811,12 @@ public:
     }
     void JnRecordsBlock( JnDomain domain, uint64_t offset, const void* records, uint64_t count, uint32_t recordBytes ) override
     {
+        if( const auto job = JobDomain( domain ) )
+        {
+            if( recordBytes != JobRecordBytes( *job ) ) throw std::runtime_error( "Job index block layout mismatch" );
+            m_jobs.Append( *job, offset, records, count );
+            return;
+        }
         if( const auto catalog = CatalogDomain( domain ) )
         {
             m_catalog.Append( *catalog, offset, records, count, recordBytes );
@@ -815,6 +830,11 @@ public:
     }
     void JnRecordsEnd( JnDomain domain ) override
     {
+        if( const auto job = JobDomain( domain ) )
+        {
+            m_jobs.End( *job );
+            return;
+        }
         if( const auto catalog = CatalogDomain( domain ) )
         {
             m_catalog.End( *catalog );
@@ -836,17 +856,24 @@ public:
     bool CpuSourceHasText( int16_t sourceLocation ) const { return m_cpuSourcesWithText.find( sourceLocation ) != m_cpuSourcesWithText.end(); }
     const std::unordered_map<uint64_t, uint64_t>& CpuZonesByThread() const { return m_cpuZonesByThread; }
     const std::unordered_map<uint32_t, uint64_t>& GpuZonesByContext() const { return m_gpuZonesByContext; }
-    uint64_t JnCount( JnDomain domain ) const { return m_jnSeen[size_t( domain )]; }
+    uint64_t JnCount( JnDomain domain ) const
+    {
+        if( const auto job = JobDomain( domain ) ) return m_jobs.Count( *job );
+        return m_jnSeen[size_t( domain )];
+    }
     void FinishMissingJnDomains()
     {
+        m_jobs.FinishMissing();
         for( size_t index = 0; index < JnDomainCount; index++ )
         {
+            if( index == size_t( JnDomain::JobStage ) ) continue;
             if( m_jnStarted[index] ) continue;
             const auto domain = JnDomain( index );
             m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), 0, JnRecordBytes( domain ), m_sourceFingerprint, m_storageOptions.disk );
             m_jn[index].Close( 0 );
         }
     }
+    void BuildJobIndexes() { m_jobs.BuildIndexes( m_stringPath ); }
 
     static uint32_t JnRecordBytes( JnDomain domain )
     {
@@ -863,6 +890,38 @@ public:
         throw std::runtime_error( "unknown JN index domain" );
     }
     static ZoneSectionKind JnSectionKind( JnDomain domain ) { return ZoneSectionKind( uint32_t( ZoneSectionKind::JobStage ) + uint32_t( domain ) ); }
+
+    static std::optional<QueryJobDomain> JobDomain( JnDomain domain )
+    {
+        switch( domain )
+        {
+        case JnDomain::JobType: return QueryJobDomain::Type;
+        case JnDomain::JobSchedule: return QueryJobDomain::Schedule;
+        case JnDomain::JobConfig: return QueryJobDomain::Config;
+        case JnDomain::JobDependency: return QueryJobDomain::Dependency;
+        case JnDomain::JobStage: return QueryJobDomain::Stage;
+        case JnDomain::GfxDispatch: return QueryJobDomain::GfxDispatch;
+        case JnDomain::Frame: return QueryJobDomain::Frame;
+        case JnDomain::Callsite: return QueryJobDomain::Callsite;
+        default: return std::nullopt;
+        }
+    }
+
+    static uint32_t JobRecordBytes( QueryJobDomain domain )
+    {
+        switch( domain )
+        {
+        case QueryJobDomain::Type: return sizeof( JnJobTypeData );
+        case QueryJobDomain::Schedule: return sizeof( JnJobScheduleData );
+        case QueryJobDomain::Config: return sizeof( JnJobConfigData );
+        case QueryJobDomain::Dependency: return sizeof( JnJobDependencyData );
+        case QueryJobDomain::Stage: return sizeof( JnJobStageData );
+        case QueryJobDomain::GfxDispatch: return sizeof( JnGfxDispatchData );
+        case QueryJobDomain::Frame: return sizeof( JnFrameData );
+        case QueryJobDomain::Callsite: return sizeof( JnCallsiteData );
+        default: throw std::runtime_error( "unknown Job index domain" );
+        }
+    }
 
     static std::optional<OfflineCatalogDomain> CatalogDomain( JnDomain domain )
     {
@@ -897,6 +956,7 @@ private:
     std::unordered_map<uint64_t, uint64_t> m_cpuZonesByThread;
     std::unordered_map<uint32_t, uint64_t> m_gpuZonesByContext;
     QuerySampleStoreWriter m_samples;
+    QueryJobStoreWriter m_jobs;
     QueryCatalogStoreWriter m_catalog;
     std::unique_ptr<QueryStringStoreWriter> m_stringWriter;
     std::shared_ptr<QueryStringStoreReader> m_stringReader;
@@ -1448,7 +1508,7 @@ public:
         , m_ghostZones( m_manifest.samples.path / "ghost", m_manifest.sourceFingerprint, m_storageOptions )
         , m_sampleDerived( m_manifest.samples.path / "derived", m_manifest.sourceFingerprint, m_storageOptions )
         , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
-        , m_jobStages( m_manifest.jobStages, ZoneSectionKind::JobStage, sizeof( JnJobStageData ), m_manifest.sourceFingerprint, m_storageOptions )
+        , m_jobs( m_manifest.jobStages.path, m_manifest.globalStrings.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_relations( m_manifest.relations, ZoneSectionKind::Relation, sizeof( JnRelationData ), m_manifest.sourceFingerprint, m_storageOptions )
@@ -1491,7 +1551,8 @@ public:
             {
                 item.queryable = false;
                 item.indexed = true;
-                item.reason = "JobStage sidecar is present; bounded Job aggregation is pending";
+                item.queryable = true;
+                item.reason = "bounded Job facts, aggregation, dependency and Frame indexes are ready";
             }
             else if( item.domain == "gpu.catalog" || item.domain == "gpu.resource" || item.domain == "gpu.memory" )
             {
@@ -1542,7 +1603,13 @@ public:
         result.counts.ghostZones = m_ghostZones.Count();
         result.counts.childSampleSymbols = m_sampleDerived.ChildSampleSymbolCount();
         result.counts.childSamples = m_sampleDerived.ChildSampleCount();
-        result.counts.jobStages = m_jobStages.Count();
+        result.counts.jobTypes = m_jobs.Count( QueryJobDomain::Type );
+        result.counts.jobs = m_jobs.GetJobCount();
+        result.counts.jobDependencies = m_jobs.Count( QueryJobDomain::Dependency );
+        result.counts.jobStages = m_jobs.Count( QueryJobDomain::Stage );
+        result.counts.gfxDispatches = m_jobs.GetGfxDispatchCount();
+        result.counts.correlatedFrameEvents = m_jobs.Count( QueryJobDomain::Frame );
+        result.counts.callsites = m_jobs.GetCallsiteCount();
         result.counts.gfxEntities = m_gfxEntities.Count();
         result.counts.gfxLinks = m_gfxLinks.Count();
         result.counts.relations = m_relations.Count();
@@ -1984,30 +2051,36 @@ public:
 
     std::shared_ptr<QueryResourceContext> GetQueryResourceContext() const override { return m_resources; }
     bool SampleDerivedDataReady() const override { return true; }
-    bool JobDerivedDataReady() const override { return false; }
+    bool JobDerivedDataReady() const override { return true; }
     bool CatalogDerivedDataReady() const override
     {
         return m_manifest.catalogValidation.complete && m_catalog.ResourceIndexReady();
     }
-    TRACY_INDEX_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
-    TRACY_INDEX_FORWARD0( uint64_t, GetJobCount )
-    TRACY_INDEX_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )
-    TRACY_INDEX_FORWARD1( std::vector<analysis::JobDto>, GetEvidenceJobs, uint64_t, frameId )
+    std::vector<analysis::JobDto> GetJobs() const override { return m_jobs.GetJobs(); }
+    uint64_t GetJobCount() const override { return m_jobs.GetJobCount(); }
+    bool HasJobIdentityIndex() const override { return true; }
+    std::optional<std::string> FindJobRef( uint64_t jobId, const std::function<void()>& check ) const override
+    { return m_jobs.FindJobRef( jobId, check ); }
+    std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const override { return m_jobs.ScanJobs( offset, limit ); }
+    bool HasJobScheduleIndex() const override { return true; }
+    std::vector<analysis::JobDto> ScanJobsBySchedule( size_t offset, size_t limit,
+        const std::function<void()>& check ) const override { return m_jobs.ScanJobsBySchedule( offset, limit, check ); }
+    std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId ) const override { return m_jobs.GetEvidenceJobs( frameId, {} ); }
     std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId, const std::function<void()>& check ) const override
     {
-        return m_source->GetEvidenceJobs( frameId, check );
+        return m_jobs.GetEvidenceJobs( frameId, check );
     }
     std::vector<analysis::JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,
         const std::function<void()>& check ) const override
     {
-        return m_source->GetDirectedJobs( jobId, includeNeighbors, check );
+        return m_jobs.GetDirectedJobs( jobId, includeNeighbors, check );
     }
     TRACY_INDEX_FORWARD0( std::vector<analysis::IoRequestDto>, GetIoRequests )
     TRACY_INDEX_FORWARD0( uint64_t, GetIoRequestCount )
     TRACY_INDEX_FORWARD2( std::vector<analysis::IoRequestDto>, ScanIoRequests, size_t, offset, size_t, limit )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::GfxDispatchDto>, GetGfxDispatches )
-    TRACY_INDEX_FORWARD0( uint64_t, GetGfxDispatchCount )
-    TRACY_INDEX_FORWARD2( std::vector<analysis::GfxDispatchDto>, ScanGfxDispatches, size_t, offset, size_t, limit )
+    std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override { return m_jobs.GetGfxDispatches(); }
+    uint64_t GetGfxDispatchCount() const override { return m_jobs.GetGfxDispatchCount(); }
+    std::vector<analysis::GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const override { return m_jobs.ScanGfxDispatches( offset, limit ); }
     std::vector<analysis::GfxEntityDto> GetGfxEntities() const override
     {
         std::vector<analysis::GfxEntityDto> result;
@@ -2109,7 +2182,7 @@ public:
         }
         return result;
     }
-    TRACY_INDEX_FORWARD0( std::vector<analysis::CorrelatedFrameEventDto>, GetCorrelatedFrameEvents )
+    std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override { return m_jobs.GetCorrelatedFrameEvents(); }
     std::vector<analysis::RelationDto> GetRelations() const override { return ScanRelations( 0, size_t( m_relations.Count() ) ); }
     uint64_t GetRelationCount() const override { return m_relations.Count(); }
     std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override
@@ -2210,9 +2283,9 @@ public:
     TRACY_INDEX_FORWARD2( std::vector<analysis::SymbolAddressMappingDto>, GetSymbolAddressMappings, size_t, offset, size_t, limit )
     TRACY_INDEX_FORWARD1( std::optional<analysis::SymbolAddressMappingDto>, ResolveSymbolAddress, uint64_t, address )
     TRACY_INDEX_FORWARD0( std::vector<analysis::SourceLocationDto>, GetSourceLocations )
-    TRACY_INDEX_FORWARD0( std::vector<analysis::CallsiteDto>, GetCallsites )
-    TRACY_INDEX_FORWARD0( uint64_t, GetCallsiteCount )
-    TRACY_INDEX_FORWARD2( std::vector<analysis::CallsiteDto>, ScanCallsites, size_t, offset, size_t, limit )
+    std::vector<analysis::CallsiteDto> GetCallsites() const override { return m_jobs.GetCallsites(); }
+    uint64_t GetCallsiteCount() const override { return m_jobs.GetCallsiteCount(); }
+    std::vector<analysis::CallsiteDto> ScanCallsites( size_t offset, size_t limit ) const override { return m_jobs.ScanCallsites( offset, limit ); }
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::CallstackFrameDto>, ResolveParentCallstacks, const std::vector<uint32_t>&, callstacks, size_t, maxDepth )
     TRACY_INDEX_FORWARD2( std::vector<analysis::SourceTextDto>, ResolveSources, const std::vector<std::string>&, sourceRefs, size_t, maxBytes )
@@ -2907,7 +2980,8 @@ private:
     QueryGhostZoneStoreReader m_ghostZones;
     QuerySampleDerivedStoreReader m_sampleDerived;
     QueryCatalogStoreReader m_catalog;
-    ReadOnlyZoneSection m_jobStages, m_gfxEntities, m_gfxLinks, m_relations;
+    QueryJobStoreReader m_jobs;
+    ReadOnlyZoneSection m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     QueryGpuReferenceStoreReader m_gpuReferenceIndex;
     QueryGpuPassResourceStoreReader m_gpuPassResources;
@@ -3354,7 +3428,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
     result.globalCallstacks.recordBytes = 0;
     result.globalCallstackFrames.recordBytes = 0;
     result.gpuCatalog.recordBytes = 0;
-    result.jobStages.recordBytes = sizeof( JnJobStageData );
+    result.jobStages.recordBytes = 0;
     result.gfxEntities.recordBytes = sizeof( JnGfxEntityData );
     result.gfxLinks.recordBytes = sizeof( JnGfxLinkData );
     result.relations.recordBytes = sizeof( JnRelationData );
@@ -3446,6 +3520,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
             analysis::WorkerTraceLoadMode::CompactIndex, &writer, ResourceReadHooks(resources,"worker-load:" ) );
         writer.FinishMissingJnDomains();
+        resources->SetPhase( "job-index" );
+        writer.BuildJobIndexes();
         writer.CommitSamples();
         writer.FinishCatalog();
         resources->SetPhase( "sample-view" );
@@ -3512,8 +3588,16 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         {
             jnSections[index]->count = writer.JnCount( SerializedZoneSink::JnDomain( index ) );
             jnSections[index]->declaredCount = jnSections[index]->count;
-            jnSections[index]->bytes = std::filesystem::file_size( temporaryJn[index] );
-            jnSections[index]->fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryJn[index] );
+            if( index == size_t( SerializedZoneSink::JnDomain::JobStage ) )
+            {
+                jnSections[index]->bytes = SectionBytes( temporaryJn[index] );
+                jnSections[index]->fingerprint = SectionFingerprint( temporaryJn[index] );
+            }
+            else
+            {
+                jnSections[index]->bytes = std::filesystem::file_size( temporaryJn[index] );
+                jnSections[index]->fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryJn[index] );
+            }
         }
         result.cpuZonesByThread = writer.CpuZonesByThread();
         result.gpuZonesByContext = writer.GpuZonesByContext();
@@ -3812,7 +3896,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         packSection(temporaryExtras,result.zoneExtras,ZoneSectionKind::Extra);
         packSection(temporaryCpu,result.cpuZones,ZoneSectionKind::Cpu);
         packSection(temporaryGpu,result.gpuZones,ZoneSectionKind::Gpu);
-        for(size_t index=0;index<temporaryJn.size();++index)
+        for(size_t index=1;index<temporaryJn.size();++index)
             packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
 
         {
@@ -4310,7 +4394,18 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 if( !same ) throw std::runtime_error( "GPU Catalog semantic validation mismatch" );
             }
         }
-        validateSection( manifest.jobStages, sizeof( JnJobStageData ), "job-stage",ZoneSectionKind::JobStage );
+        if( manifest.jobStages.recordBytes != 0 || !std::filesystem::is_directory( manifest.jobStages.path ) ||
+            SectionBytes( manifest.jobStages.path ) != manifest.jobStages.bytes )
+            throw std::runtime_error( "Job store section identity mismatch" );
+        if( deep && SectionFingerprint( manifest.jobStages.path ) != manifest.jobStages.fingerprint )
+            throw std::runtime_error( "Job store section hash mismatch" );
+        {
+            QueryJobStoreReader jobs( manifest.jobStages.path, manifest.globalStrings.path,
+                manifest.sourceFingerprint, storageOptions );
+            if( jobs.Count( QueryJobDomain::Stage ) != manifest.jobStages.count )
+                throw std::runtime_error( "Job store stage count mismatch" );
+            if( deep ) jobs.ValidateAll();
+        }
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
         validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link",ZoneSectionKind::GfxLink );
         validateSection( manifest.relations, sizeof( JnRelationData ), "relation",ZoneSectionKind::Relation );

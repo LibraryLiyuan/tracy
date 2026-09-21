@@ -917,6 +917,18 @@ public:
 
     virtual std::vector<JobDto> GetJobs() const { return {}; }
     virtual uint64_t GetJobCount() const { return GetJobs().size(); }
+    virtual bool HasJobIdentityIndex() const { return false; }
+    virtual std::optional<std::string> FindJobRef( uint64_t jobId, const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        const auto jobs = GetJobs();
+        for( const auto& job : jobs )
+        {
+            if( check ) check();
+            if( job.jobId == jobId ) return job.ref;
+        }
+        return std::nullopt;
+    }
     virtual std::vector<JobDto> ScanJobs( size_t offset, size_t limit ) const
     {
         const auto values = GetJobs();
@@ -925,6 +937,20 @@ public:
         return { values.begin() + offset, values.begin() + end };
     }
     virtual bool JobDerivedDataReady() const { return true; }
+    virtual bool HasJobScheduleIndex() const { return false; }
+    virtual std::vector<JobDto> ScanJobsBySchedule( size_t offset, size_t limit,
+        const std::function<void()>& check ) const
+    {
+        if( check ) check();
+        auto values = GetJobs();
+        std::sort( values.begin(), values.end(), []( const auto& lhs, const auto& rhs ) {
+            return lhs.scheduleNs != rhs.scheduleNs ? lhs.scheduleNs < rhs.scheduleNs : lhs.jobId < rhs.jobId;
+        } );
+        if( check ) check();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual uint64_t GetIoRequestCount() const { return GetIoRequests().size(); }
     virtual std::vector<IoRequestDto> ScanIoRequests( size_t offset, size_t limit ) const
     {

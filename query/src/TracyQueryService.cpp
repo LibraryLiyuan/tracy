@@ -1,4 +1,6 @@
 #include "TracyQueryService.hpp"
+#include "TracyQuerySpillStatistics.hpp"
+#include <array>
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryGpuPassResourceStore.hpp"
 #include "TracyDeterministicScanTypes.hpp"
@@ -10829,18 +10831,99 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( !parsed ) throw QueryError( "INVALID_PARAMS", std::string( parameter ) + " is not a Job ref from this trace" );
             return *parsed;
         };
+        if( method == "job.search" && source->HasJobScheduleIndex() )
+        {
+            const auto page = ParsePage( params, method, trace );
+            const std::string kind = params.value( "kind", "" );
+            const std::string state = params.value( "state", "" );
+            size_t rawOffset = page.rawOffsetBound ? page.rawOffset : 0;
+            size_t legacySkip = page.rawOffsetBound ? 0 : page.offset;
+            bool hasMore = false;
+            size_t responseBytes = 0;
+            json values = json::array();
+            while( true )
+            {
+                checkDirectedJobRead();
+                const auto allowed = BudgetScanAllowance( 1 );
+                if( allowed == 0 )
+                {
+                    if( legacySkip != 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Job search budget exhausted before locating the legacy cursor; increase max_scan_events", true );
+                    hasMore = true;
+                    break;
+                }
+                auto rows = source->ScanJobsBySchedule( rawOffset, 1, checkDirectedJobRead );
+                BudgetScanned( rows.size(), 1, allowed );
+                if( rows.empty() ) break;
+                const auto& job = rows.front();
+                const char* currentState = job.cancelled ? "cancelled" : job.incomplete ? "incomplete" : job.completedNs ? "completed" : job.truncated ? "truncated" : "scheduled";
+                const bool matches = TextMatches( job.name, params ) &&
+                    ( kind.empty() || kind == JobKindName( job.kind ) ) && ( state.empty() || state == currentState );
+                if( matches && legacySkip == 0 && values.size() == page.limit ) { hasMore = true; break; }
+                rawOffset++;
+                if( !matches ) continue;
+                if( legacySkip != 0 ) { legacySkip--; continue; }
+                auto value = ProjectFields( JobJson( *source, job, false ), params );
+                const auto valueBytes = DumpProtocolJson( value ).size() + 1;
+                if( valueBytes > MaximumResponseBytes - responseBytes )
+                    throw QueryError( "RESOURCE_LIMIT", "Job search response exceeds the 8 MiB budget; use pagination or field projection", true );
+                responseBytes += valueBytes;
+                values.push_back( std::move( value ) );
+            }
+            const auto returned = values.size();
+            values = ProjectFields( std::move( values ), params );
+            const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, rawOffset, hasMore );
+            return Success( id, { { "jobs", std::move( values ) } }, trace, PageJson( page, returned, cursor, BudgetPartial() ) );
+        }
         const bool directed = method == "job.get" || method == "job.dependencies";
-        auto jobs = directed ? source->GetDirectedJobs( parseJobRef(), method == "job.dependencies", checkDirectedJobRead ) : source->GetJobs();
+        const bool indexedGfxStatistics = method == "job.gfx.statistics" && source->HasJobIdentityIndex();
+        const bool indexedJobStatistics = ( method == "job.statistics" || method == "job.critical_path" || method == "job.gfx_chain" ) && source->HasJobIdentityIndex();
+        std::vector<analysis::JobDto> jobs;
+        if( !indexedGfxStatistics && !indexedJobStatistics )
+            jobs = directed ? source->GetDirectedJobs( parseJobRef(), method == "job.dependencies", checkDirectedJobRead ) : source->GetJobs();
         const auto findJob = [&]( uint64_t jobId ) { return std::find_if( jobs.begin(), jobs.end(), [&]( const auto& job ) { return job.jobId == jobId; } ); };
 
         if( method == "job.statistics" )
         {
-            std::vector<int64_t> scheduleToReady;
-            std::vector<int64_t> readyToQueue;
-            std::vector<int64_t> queueToFirstRun;
-            std::vector<int64_t> dependencyReady;
-            std::vector<int64_t> execution;
-            std::vector<int64_t> wait;
+            const auto jobCount = indexedJobStatistics ? source->GetJobCount() : jobs.size();
+            const auto visitJobs = [&]( const auto& visitor ) {
+                for( size_t offset = 0; offset < jobCount; offset++ )
+                {
+                    checkDirectedJobRead();
+                    if( indexedJobStatistics )
+                    {
+                        const auto allowed = BudgetScanAllowance( 1 );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Job statistics scan budget exhausted", true );
+                        auto page = source->ScanJobs( offset, 1 );
+                        checkDirectedJobRead();
+                        if( page.size() != 1 ) throw QueryError( "INDEX_NOT_READY", "Job statistics row missing from index" );
+                        BudgetScanned( page.size(), 1, allowed );
+                        visitor( page.front() );
+                    }
+                    else visitor( jobs[offset] );
+                }
+            };
+            std::array<std::vector<int64_t>, 6> latencyValues;
+            std::array<std::unique_ptr<QuerySpillStatistics>, 6> latencySpills;
+            if( indexedJobStatistics )
+            {
+                std::shared_ptr<QueryResourceContext> resources;
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                    resources = owner->GetQueryResourceContext();
+                const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                    std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                for( auto& spill : latencySpills )
+                    spill = std::make_unique<QuerySpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkDirectedJobRead );
+            }
+            const auto appendLatency = [&]( size_t metric, int64_t value ) {
+                if( latencySpills[metric] ) latencySpills[metric]->Append( value );
+                else latencyValues[metric].push_back( value );
+            };
+            const auto latencyStatistics = [&]( size_t metric ) {
+                return latencySpills[metric] ? latencySpills[metric]->Finish() : analysis::ComputeStatistics( latencyValues[metric] );
+            };
             std::map<uint32_t, uint64_t> laneDispatches;
             std::map<uint32_t, uint64_t> laneStealsAsThief;
             std::map<uint32_t, uint64_t> laneStealsAsVictim;
@@ -10888,50 +10971,50 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 json sameSlotJobs = json::array();
                 if( job.packedHandle != 0 )
                 {
-                    for( const auto& candidate : jobs )
+                    struct SlotCandidate
                     {
-                        if( candidate.jobId == job.jobId || candidate.packedHandle != job.packedHandle ) continue;
-                        sameHandleJobs.push_back( {
-                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
-                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
-                            { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
-                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
-                        } );
-                        if( sameHandleJobs.size() >= 8 ) break;
-                    }
-
-                    std::vector<const analysis::JobDto*> slotCandidates;
+                        uint64_t distance;
+                        uint64_t jobId;
+                        json value;
+                    };
+                    std::vector<SlotCandidate> slotCandidates;
                     const auto slotIndex = uint32_t( job.packedHandle );
-                    for( const auto& candidate : jobs )
-                    {
-                        if( candidate.jobId == job.jobId || uint32_t( candidate.packedHandle ) != slotIndex ) continue;
-                        slotCandidates.push_back( &candidate );
-                    }
-                    std::sort( slotCandidates.begin(), slotCandidates.end(), [&]( const auto* lhs, const auto* rhs ) {
-                        const auto lhsDelta = lhs->jobId > job.jobId ? lhs->jobId - job.jobId : job.jobId - lhs->jobId;
-                        const auto rhsDelta = rhs->jobId > job.jobId ? rhs->jobId - job.jobId : job.jobId - rhs->jobId;
-                        return lhsDelta != rhsDelta ? lhsDelta < rhsDelta : lhs->jobId < rhs->jobId;
-                    } );
-                    for( const auto* candidate : slotCandidates )
-                    {
+                    visitJobs( [&]( const analysis::JobDto& candidate ) {
+                        if( candidate.jobId == job.jobId ) return;
+                        if( candidate.packedHandle == job.packedHandle && sameHandleJobs.size() < 8 )
+                            sameHandleJobs.push_back( {
+                                { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                                { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
+                                { "ready", candidate.readyNs.has_value() }, { "queue_enter", candidate.queueEnterNs.has_value() },
+                                { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                            } );
+                        if( uint32_t( candidate.packedHandle ) != slotIndex ) return;
+                        const auto distance = candidate.jobId > job.jobId ? candidate.jobId - job.jobId : job.jobId - candidate.jobId;
+                        const auto position = std::lower_bound( slotCandidates.begin(), slotCandidates.end(),
+                            std::make_pair( distance, candidate.jobId ), []( const auto& entry, const auto& key ) {
+                                return std::make_pair( entry.distance, entry.jobId ) < key;
+                            } );
+                        if( position == slotCandidates.end() && slotCandidates.size() == 8 ) return;
                         uint32_t readyCount = 0;
                         uint32_t queueCount = 0;
-                        for( const auto& candidateStage : candidate->stages )
+                        for( const auto& candidateStage : candidate.stages )
                         {
                             readyCount += candidateStage.stage == uint8_t( JnJobStage::Ready );
                             queueCount += candidateStage.stage == uint8_t( JnJobStage::QueueEnter );
                         }
-                        sameSlotJobs.push_back( {
-                            { "job_ref", candidate->ref }, { "job_id", Decimal( candidate->jobId ) },
-                            { "packed_handle", Decimal( candidate->packedHandle ) },
-                            { "generation", uint32_t( candidate->packedHandle >> 32 ) },
-                            { "schedule_ns", Decimal( candidate->scheduleNs ) },
-                            { "capture_boundary", candidate->captureBoundary }, { "orphan", candidate->orphan },
+                        json value = {
+                            { "job_ref", candidate.ref }, { "job_id", Decimal( candidate.jobId ) },
+                            { "packed_handle", Decimal( candidate.packedHandle ) },
+                            { "generation", uint32_t( candidate.packedHandle >> 32 ) },
+                            { "schedule_ns", Decimal( candidate.scheduleNs ) },
+                            { "capture_boundary", candidate.captureBoundary }, { "orphan", candidate.orphan },
                             { "ready_count", readyCount }, { "queue_enter_count", queueCount },
-                            { "dispatch_count", candidate->dispatchCount }, { "stage_count", candidate->stages.size() }
-                        } );
-                        if( sameSlotJobs.size() >= 8 ) break;
-                    }
+                            { "dispatch_count", candidate.dispatchCount }, { "stage_count", candidate.stages.size() }
+                        };
+                        slotCandidates.insert( position, { distance, candidate.jobId, std::move( value ) } );
+                        if( slotCandidates.size() > 8 ) slotCandidates.pop_back();
+                    } );
+                    for( auto& candidate : slotCandidates ) sameSlotJobs.push_back( std::move( candidate.value ) );
                 }
                 examples.push_back( {
                     { "job_ref", job.ref }, { "job_id", Decimal( job.jobId ) }, { "name", job.name },
@@ -10954,7 +11037,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "delta_ns", Decimal( end - begin ) }
                 } );
             };
-            for( const auto& job : jobs )
+            visitJobs( [&]( const analysis::JobDto& job )
             {
                 checkCancelled();
                 const bool captureBoundary = job.orphan || job.truncated;
@@ -10989,8 +11072,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 waitEnds += job.waitEndCount;
                 continuations += job.continuationCount;
                 jobsWithoutWaiter += job.waitEndCount == 0 && job.continuationCount == 0;
-                if( job.waitNs > 0 ) { waitJobs++; wait.push_back( job.waitNs ); }
-                if( job.executionNs > 0 ) execution.push_back( job.executionNs );
+                if( job.waitNs > 0 ) { waitJobs++; appendLatency( 5, job.waitNs ); }
+                if( job.executionNs > 0 ) appendLatency( 4, job.executionNs );
                 if( job.jobSchemaVersion >= 2 )
                 {
                     v2++;
@@ -11034,22 +11117,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( !captureBoundary && job.readyNs )
                 {
                     const auto value = *job.readyNs - job.scheduleNs;
-                    if( value >= 0 ) scheduleToReady.push_back( value );
+                    if( value >= 0 ) appendLatency( 0, value );
                     else { invalidOrder++; invalidScheduleToReady++; recordInvalidOrder( job, "schedule_to_ready", job.scheduleNs, *job.readyNs ); }
                 }
                 if( !captureBoundary && job.readyNs && job.queueEnterNs )
                 {
                     const auto value = *job.queueEnterNs - *job.readyNs;
-                    if( value >= 0 ) readyToQueue.push_back( value );
+                    if( value >= 0 ) appendLatency( 1, value );
                     else { invalidOrder++; invalidReadyToQueue++; recordInvalidOrder( job, "ready_to_queue", *job.readyNs, *job.queueEnterNs ); }
                 }
                 if( !captureBoundary && job.queueEnterNs && job.firstRunNs )
                 {
                     const auto value = *job.firstRunNs - *job.queueEnterNs;
-                    if( value >= 0 ) queueToFirstRun.push_back( value );
+                    if( value >= 0 ) appendLatency( 2, value );
                     else { invalidOrder++; invalidQueueToFirstRun++; recordInvalidOrder( job, "queue_to_first_run", *job.queueEnterNs, *job.firstRunNs ); }
                 }
-                if( !captureBoundary && job.dependencyReadyLatencyNs ) dependencyReady.push_back( *job.dependencyReadyLatencyNs );
+                if( !captureBoundary && job.dependencyReadyLatencyNs ) appendLatency( 3, *job.dependencyReadyLatencyNs );
                 for( const auto& stage : job.stages )
                 {
                     if( stage.stage == uint8_t( JnJobStage::Dispatch ) ) laneDispatches[stage.arg0]++;
@@ -11059,7 +11142,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         laneStealsAsVictim[stage.arg1]++;
                     }
                 }
-            }
+            } );
             json lanes = json::array();
             std::set<uint32_t> laneIds;
             for( const auto& [lane, count] : laneDispatches ) laneIds.insert( lane );
@@ -11071,10 +11154,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "steals_as_victim", Decimal( laneStealsAsVictim[lane] ) }
             } );
             return Success( id, {
-                { "present", !jobs.empty() }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
+                { "present", jobCount != 0 }, { "job_schema_version", v3 != 0 ? 3 : v2 != 0 ? 2 : 1 },
                 { "source_mode", v3 != 0 ? "native-hooks-job-v3" : v2 != 0 ? "native-hooks-job-v2" : "native-hooks-job-v1" }, { "callstack_kind", "native" },
                 { "counts", {
-                    { "jobs", Decimal( jobs.size() ) }, { "completed", Decimal( completed ) },
+                    { "jobs", Decimal( jobCount ) }, { "completed", Decimal( completed ) },
                     { "managed", Decimal( managed ) }, { "burst", Decimal( burst ) },
                     { "v2", Decimal( v2 ) }, { "v2_or_newer", Decimal( v2 ) }, { "v3", Decimal( v3 ) },
                     { "scheduler_steals", Decimal( schedulerSteals ) },
@@ -11084,12 +11167,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     { "jobs_without_waiter", Decimal( jobsWithoutWaiter ) }
                 } },
                 { "latency", {
-                    { "schedule_to_ready", StatisticsJson( analysis::ComputeStatistics( scheduleToReady ) ) },
-                    { "ready_to_queue", StatisticsJson( analysis::ComputeStatistics( readyToQueue ) ) },
-                    { "queue_to_first_run", StatisticsJson( analysis::ComputeStatistics( queueToFirstRun ) ) },
-                    { "dependency_complete_to_ready", StatisticsJson( analysis::ComputeStatistics( dependencyReady ) ) },
-                    { "execution", StatisticsJson( analysis::ComputeStatistics( execution ) ) },
-                    { "wait", StatisticsJson( analysis::ComputeStatistics( wait ) ) }
+                    { "schedule_to_ready", StatisticsJson( latencyStatistics( 0 ) ) },
+                    { "ready_to_queue", StatisticsJson( latencyStatistics( 1 ) ) },
+                    { "queue_to_first_run", StatisticsJson( latencyStatistics( 2 ) ) },
+                    { "dependency_complete_to_ready", StatisticsJson( latencyStatistics( 3 ) ) },
+                    { "execution", StatisticsJson( latencyStatistics( 4 ) ) },
+                    { "wait", StatisticsJson( latencyStatistics( 5 ) ) }
                 } },
                 { "lanes", std::move( lanes ) },
                 { "quality", {
@@ -11167,41 +11250,78 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
         if( method == "job.critical_path" )
         {
-            if( jobs.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
-            std::unordered_map<uint64_t, size_t> indexById;
-            indexById.reserve( jobs.size() );
-            for( size_t index = 0; index < jobs.size(); index++ ) indexById.emplace( jobs[index].jobId, index );
-            std::vector<std::vector<size_t>> outgoing( jobs.size() );
-            std::vector<size_t> indegree( jobs.size(), 0 );
-            for( size_t index = 0; index < jobs.size(); index++ )
+            struct CriticalJob
             {
-                for( const auto& dependency : jobs[index].dependencies )
+                uint64_t id = 0;
+                int64_t executionNs = 0;
+                std::vector<uint64_t> prerequisites;
+            };
+            std::vector<CriticalJob> graph;
+            std::unordered_map<uint64_t, size_t> indexById;
+            const auto jobCount = indexedJobStatistics ? source->GetJobCount() : jobs.size();
+            constexpr size_t maximumCriticalNodes = 1000000;
+            constexpr size_t maximumCriticalEdges = 4000000;
+            const auto visitCriticalJobs = [&]( const auto& visitor ) {
+                for( size_t offset = 0; offset < jobCount; offset++ )
                 {
-                    const auto prerequisite = indexById.find( dependency.prerequisiteJobId );
+                    checkDirectedJobRead();
+                    analysis::JobDto value;
+                    if( indexedJobStatistics )
+                    {
+                        const auto allowed = BudgetScanAllowance( 1 );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "critical path scan budget exhausted", true );
+                        auto page = source->ScanJobs( offset, 1 );
+                        if( page.size() != 1 ) throw QueryError( "INDEX_NOT_READY", "critical path row missing from index" );
+                        BudgetScanned( page.size(), 1, allowed );
+                        value = std::move( page.front() );
+                    }
+                    else value = jobs[offset];
+                    visitor( std::move( value ) );
+                }
+            };
+            visitCriticalJobs( [&]( analysis::JobDto job ) {
+                checkDirectedJobRead();
+                if( graph.size() >= maximumCriticalNodes ) throw QueryError( "RESOURCE_LIMIT", "critical path node budget exhausted", true );
+                if( job.dependencies.size() > maximumCriticalEdges - std::min( maximumCriticalEdges, size_t( std::accumulate( graph.begin(), graph.end(), size_t( 0 ),
+                    []( size_t total, const CriticalJob& current ) { return total + current.prerequisites.size(); } ) ) ) )
+                    throw QueryError( "RESOURCE_LIMIT", "critical path edge budget exhausted", true );
+                CriticalJob compact;
+                compact.id = job.jobId;
+                compact.executionNs = job.executionNs;
+                compact.prerequisites.reserve( job.dependencies.size() );
+                for( const auto& dependency : job.dependencies ) compact.prerequisites.push_back( dependency.prerequisiteJobId );
+                indexById.emplace( compact.id, graph.size() );
+                graph.push_back( std::move( compact ) );
+            } );
+            if( graph.empty() ) return Success( id, { { "jobs", json::array() }, { "total_execution_ns", "0" }, { "has_cycle", false } }, trace );
+            std::vector<std::vector<size_t>> outgoing( graph.size() );
+            std::vector<size_t> indegree( graph.size(), 0 );
+            size_t edgeCount = 0;
+            for( size_t index = 0; index < graph.size(); index++ )
+            {
+                for( const auto prerequisiteId : graph[index].prerequisites )
+                {
+                    checkDirectedJobRead();
+                    const auto prerequisite = indexById.find( prerequisiteId );
                     if( prerequisite == indexById.end() ) continue;
+                    if( ++edgeCount > maximumCriticalEdges ) throw QueryError( "RESOURCE_LIMIT", "critical path edge budget exhausted", true );
                     outgoing[prerequisite->second].push_back( index );
                     indegree[index]++;
                 }
             }
             std::queue<size_t> ready;
             for( size_t index = 0; index < indegree.size(); index++ ) if( indegree[index] == 0 ) ready.push( index );
-            std::vector<int64_t> cost( jobs.size(), 0 );
-            std::vector<std::optional<size_t>> parent( jobs.size() );
+            std::vector<int64_t> cost( graph.size(), 0 );
+            std::vector<std::optional<size_t>> parent( graph.size() );
             size_t processed = 0;
             while( !ready.empty() )
             {
                 checkCancelled();
-                const auto current = ready.front();
-                ready.pop();
-                processed++;
-                cost[current] += std::max<int64_t>( jobs[current].executionNs, 0 );
+                const auto current = ready.front(); ready.pop(); processed++;
+                cost[current] += std::max<int64_t>( graph[current].executionNs, 0 );
                 for( const auto next : outgoing[current] )
                 {
-                    if( cost[next] < cost[current] )
-                    {
-                        cost[next] = cost[current];
-                        parent[next] = current;
-                    }
+                    if( cost[next] < cost[current] ) { cost[next] = cost[current]; parent[next] = current; }
                     if( --indegree[next] == 0 ) ready.push( next );
                 }
             }
@@ -11213,26 +11333,61 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( found == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "Job ref was not found" );
                 endIndex = found->second;
             }
-            else
-            {
-                endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
-            }
+            else endIndex = size_t( std::distance( cost.begin(), std::max_element( cost.begin(), cost.end() ) ) );
             std::vector<size_t> path;
             for( std::optional<size_t> current = endIndex; current; current = parent[*current] ) path.push_back( *current );
             std::reverse( path.begin(), path.end() );
             json values = json::array();
-            for( const auto index : path ) values.push_back( JobJson( *source, jobs[index], false ) );
-            return Success( id, {
-                { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
-                { "has_cycle", processed != jobs.size() }, { "processed_jobs", processed }, { "total_jobs", jobs.size() }
-            }, trace );
+            for( const auto index : path )
+            {
+                const auto find = indexById.find( graph[index].id );
+                if( find == indexById.end() ) throw QueryError( "ENTITY_NOT_FOUND", "critical path Job disappeared" );
+                const auto detail = indexedJobStatistics ? source->ScanJobs( find->second, 1 ) : std::vector<analysis::JobDto>{ jobs[find->second] };
+                if( detail.size() != 1 ) throw QueryError( "ENTITY_NOT_FOUND", "critical path Job detail missing" );
+                values.push_back( JobJson( *source, detail.front(), false ) );
+            }
+            return Success( id, { { "jobs", std::move( values ) }, { "total_execution_ns", Decimal( cost[endIndex] ) },
+                { "has_cycle", processed != graph.size() }, { "processed_jobs", processed }, { "total_jobs", graph.size() } }, trace );
         }
+
 
         if( method == "job.gfx.statistics" )
         {
-            const auto dispatches = source->GetGfxDispatches();
-            const auto entities = source->GetGfxEntities();
-            const auto links = source->GetGfxLinks();
+            const auto dispatches = indexedGfxStatistics ? std::vector<analysis::GfxDispatchDto>{} : source->GetGfxDispatches();
+            const auto entities = indexedGfxStatistics ? std::vector<analysis::GfxEntityDto>{} : source->GetGfxEntities();
+            const auto links = indexedGfxStatistics ? std::vector<analysis::GfxLinkDto>{} : source->GetGfxLinks();
+            const auto dispatchCount = indexedGfxStatistics ? source->GetGfxDispatchCount() : dispatches.size();
+            const auto entityCount = indexedGfxStatistics ? source->GetGfxEntityCount() : entities.size();
+            const auto linkCount = indexedGfxStatistics ? source->GetGfxLinkCount() : links.size();
+            const auto visitRows = [&]( uint64_t count, const auto& values, const auto& read, const auto& visitor ) {
+                if( !indexedGfxStatistics )
+                {
+                    for( const auto& value : values ) { checkDirectedJobRead(); visitor( value ); }
+                    return;
+                }
+                for( uint64_t offset = 0; offset < count; )
+                {
+                    checkDirectedJobRead();
+                    const auto requested = size_t( std::min<uint64_t>( 256, count - offset ) );
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Gfx statistics scan budget exhausted; no complete result was published", true );
+                    const auto page = read( size_t( offset ), allowed );
+                    checkDirectedJobRead();
+                    if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY", "Gfx statistics page does not match its index count" );
+                    BudgetScanned( page.size(), requested, allowed );
+                    for( const auto& value : page ) { checkDirectedJobRead(); visitor( value ); }
+                    offset += page.size();
+                }
+            };
+            const auto visitDispatches = [&]( const auto& visitor ) {
+                visitRows( dispatchCount, dispatches, [&]( size_t offset, size_t count ) { return source->ScanGfxDispatches( offset, count ); }, visitor );
+            };
+            const auto visitEntities = [&]( const auto& visitor ) {
+                visitRows( entityCount, entities, [&]( size_t offset, size_t count ) { return source->ScanGfxEntities( offset, count ); }, visitor );
+            };
+            const auto visitLinks = [&]( const auto& visitor ) {
+                visitRows( linkCount, links, [&]( size_t offset, size_t count ) { return source->ScanGfxLinks( offset, count ); }, visitor );
+            };
             std::set<uint64_t> dispatchIds;
             std::set<uint64_t> entityIds;
             std::map<uint64_t, std::string> jobRefs;
@@ -11241,56 +11396,63 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             json sampleDispatchRef = nullptr;
             json sampleEntityRef = nullptr;
             json sampleLinkedJobRef = nullptr;
-            for( const auto& dispatch : dispatches )
+            visitDispatches( [&]( const analysis::GfxDispatchDto& dispatch )
             {
                 dispatchIds.emplace( dispatch.dispatchId );
                 if( sampleDispatchRef.is_null() ) sampleDispatchRef = dispatch.ref;
-            }
-            for( const auto& entity : entities )
+            } );
+            visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
                 entityIds.emplace( entity.entityId );
                 const auto name = GfxEntityKindName( entity.kind );
                 entitiesByKind[name] = Decimal( entitiesByKind.contains( name ) ? std::stoull( entitiesByKind[name].get<std::string>() ) + 1 : 1 );
                 if( sampleEntityRef.is_null() ) sampleEntityRef = entity.ref;
-            }
+            } );
             for( const auto& job : jobs ) jobRefs.emplace( job.jobId, job.ref );
+            const auto jobCount = indexedGfxStatistics ? source->GetJobCount() : jobs.size();
+            const auto findJobRef = [&]( uint64_t jobId ) -> std::optional<std::string> {
+                if( indexedGfxStatistics ) return source->FindJobRef( jobId, checkDirectedJobRead );
+                const auto found = jobRefs.find( jobId );
+                return found == jobRefs.end() ? std::nullopt : std::optional<std::string>( found->second );
+            };
 
             uint64_t danglingParents = 0;
-            for( const auto& entity : entities )
+            visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
                 if( entity.parentId != 0 && !dispatchIds.contains( entity.parentId ) && !entityIds.contains( entity.parentId ) ) danglingParents++;
-            }
+            } );
             uint64_t danglingSources = 0;
             uint64_t danglingTargets = 0;
             uint64_t capturedExecuteLinks = 0;
             uint64_t uncapturedExecuteLinks = 0;
-            for( const auto& link : links )
+            visitLinks( [&]( const analysis::GfxLinkDto& link )
             {
                 const auto relationName = GfxRelationName( link.relation );
                 linksByRelation[relationName] = Decimal( linksByRelation.contains( relationName ) ? std::stoull( linksByRelation[relationName].get<std::string>() ) + 1 : 1 );
-                const bool sourceKnown = dispatchIds.contains( link.sourceId ) || entityIds.contains( link.sourceId ) || jobRefs.contains( link.sourceId );
-                const bool targetKnown = dispatchIds.contains( link.targetId ) || entityIds.contains( link.targetId ) || jobRefs.contains( link.targetId );
+                checkDirectedJobRead();
+                const auto sourceJob = findJobRef( link.sourceId );
+                const auto targetJob = findJobRef( link.targetId );
+                const bool sourceKnown = dispatchIds.contains( link.sourceId ) || entityIds.contains( link.sourceId ) || sourceJob.has_value();
+                const bool targetKnown = dispatchIds.contains( link.targetId ) || entityIds.contains( link.targetId ) || targetJob.has_value();
                 if( !sourceKnown ) danglingSources++;
                 if( !targetKnown && link.relation != 5 ) danglingTargets++;
                 if( link.relation == 2 )
                 {
-                    const auto sourceJob = jobRefs.find( link.sourceId );
-                    const auto targetJob = jobRefs.find( link.targetId );
-                    if( sourceJob != jobRefs.end() || targetJob != jobRefs.end() )
+                    if( sourceJob || targetJob )
                     {
                         capturedExecuteLinks++;
-                        if( sampleLinkedJobRef.is_null() ) sampleLinkedJobRef = sourceJob != jobRefs.end() ? sourceJob->second : targetJob->second;
+                        if( sampleLinkedJobRef.is_null() ) sampleLinkedJobRef = sourceJob ? *sourceJob : *targetJob;
                     }
                     else
                     {
                         uncapturedExecuteLinks++;
                     }
                 }
-            }
+            } );
             return Success( id, {
                 { "counts", {
-                    { "dispatches", Decimal( dispatches.size() ) }, { "entities", Decimal( entities.size() ) },
-                    { "links", Decimal( links.size() ) }, { "jobs", Decimal( jobs.size() ) }
+                    { "dispatches", Decimal( dispatchCount ) }, { "entities", Decimal( entityCount ) },
+                    { "links", Decimal( linkCount ) }, { "jobs", Decimal( jobCount ) }
                 } },
                 { "entities_by_kind", std::move( entitiesByKind ) },
                 { "links_by_relation", std::move( linksByRelation ) },
@@ -11318,6 +11480,63 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             if( parsed ) { rootId = *parsed; break; }
         }
         if( rootId == 0 ) throw QueryError( "INVALID_PARAMS", "ref must identify a Job, GfxDispatch, or GfxEntity in this trace" );
+        if( source->HasJobIdentityIndex() )
+        {
+            const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+            std::unordered_map<uint64_t, std::vector<uint64_t>> adjacency;
+            size_t edgeCount = 0;
+            const auto addEdge = [&]( uint64_t lhs, uint64_t rhs ) {
+                if( ++edgeCount > 4000000 ) throw QueryError( "RESOURCE_LIMIT", "Gfx chain edge budget exhausted", true );
+                adjacency[lhs].push_back( rhs ); adjacency[rhs].push_back( lhs );
+            };
+            const auto visitRows = [&]( uint64_t total, const auto& read, const auto& visitor ) {
+                for( uint64_t offset = 0; offset < total; )
+                {
+                    checkDirectedJobRead();
+                    const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT", "Gfx chain scan budget exhausted", true );
+                    const auto page = read( size_t( offset ), allowed );
+                    if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY", "Gfx chain page is incomplete" );
+                    BudgetScanned( page.size(), requested, allowed );
+                    for( const auto& row : page ) { checkDirectedJobRead(); visitor( row ); }
+                    offset += page.size();
+                }
+            };
+            visitRows( source->GetGfxLinkCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                [&]( const auto& link ) { addEdge( link.sourceId, link.targetId ); } );
+            visitRows( source->GetGfxEntityCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                [&]( const auto& entity ) { if( entity.parentId != 0 ) addEdge( entity.entityId, entity.parentId ); } );
+            std::set<uint64_t> visited;
+            std::queue<uint64_t> frontier;
+            visited.emplace( rootId ); frontier.push( rootId ); BudgetConsumeNode();
+            bool truncated = false;
+            while( !frontier.empty() )
+            {
+                checkDirectedJobRead();
+                const auto current = frontier.front(); frontier.pop();
+                for( const auto next : adjacency[current] )
+                {
+                    if( visited.contains( next ) ) continue;
+                    if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; break; }
+                    visited.emplace( next ); frontier.push( next );
+                }
+                if( truncated ) break;
+            }
+            json dispatchJson = json::array(), entityJson = json::array(), linkJson = json::array(), jobJson = json::array();
+            visitRows( source->GetGfxDispatchCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxDispatches( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.dispatchId ) ) dispatchJson.push_back( GfxDispatchJson( row ) ); } );
+            visitRows( source->GetGfxEntityCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.entityId ) ) entityJson.push_back( GfxEntityJson( row ) ); } );
+            visitRows( source->GetGfxLinkCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.sourceId ) && visited.contains( row.targetId ) ) linkJson.push_back( GfxLinkJson( row ) ); } );
+            const auto jobCount = source->GetJobCount();
+            visitRows( jobCount, [&]( size_t offset, size_t limit ) { return source->ScanJobs( offset, limit ); },
+                [&]( const auto& row ) { if( visited.contains( row.jobId ) ) jobJson.push_back( JobJson( *source, row, false ) ); } );
+            return Success( id, { { "root_ref", rootRef }, { "jobs", std::move( jobJson ) },
+                { "dispatches", std::move( dispatchJson ) }, { "entities", std::move( entityJson ) },
+                { "links", std::move( linkJson ) }, { "visited_nodes", visited.size() }, { "truncated", truncated } }, trace );
+        }
         const auto dispatches = source->GetGfxDispatches();
         const auto entities = source->GetGfxEntities();
         const auto links = source->GetGfxLinks();

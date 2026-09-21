@@ -2056,7 +2056,7 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
         auto& jn = m_data.jnTrace;
         jn.present = present != 0;
         jn.schemaVersion = schemaVersion;
-        ReadJnVector( f, jn.jobTypes, "job type" );
+        ReadJnVector( f, jn.jobTypes, "job type", m_serializedZoneSink, SerializedZoneSink::JnDomain::JobType );
         ReadJnVector(f,jn.jobSchedules,"job schedule",m_serializedZoneSink,SerializedZoneSink::JnDomain::JobSchedule);
         if( schemaVersion == 1 )
         {
@@ -2077,6 +2077,15 @@ Worker::Worker( FileRead& f, EventType::Type eventMask, bool bgTasks, bool allow
             jn.jobConfigs.reserve( oldConfigs.size() );
             for( const auto& value : oldConfigs )
                 jn.jobConfigs.push_back( { value.jobId, value.typeId, value.count, value.grainSize, value.unityFlowId, 0, value.kind, value.flags } );
+            if( m_serializedZoneSink && m_serializedZoneSink->WantsJnRecords( SerializedZoneSink::JnDomain::JobConfig, sizeof( JnJobConfigData ) ) )
+            {
+                m_serializedZoneSink->JnRecordsBegin( SerializedZoneSink::JnDomain::JobConfig, jn.jobConfigs.size(), sizeof( JnJobConfigData ) );
+                if( !jn.jobConfigs.empty() ) m_serializedZoneSink->JnRecordsBlock( SerializedZoneSink::JnDomain::JobConfig,
+                    0, jn.jobConfigs.data(), jn.jobConfigs.size(), sizeof( JnJobConfigData ) );
+                m_serializedZoneSink->JnRecordsEnd( SerializedZoneSink::JnDomain::JobConfig );
+                jn.jobConfigs.clear();
+                jn.jobConfigs.shrink_to_fit();
+            }
         }
         else
         {

@@ -81,6 +81,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryGhostZoneStore.hpp
     src/TracyQuerySampleDerivedStore.cpp
     src/TracyQuerySampleDerivedStore.hpp
+    src/TracyQueryJobStore.cpp
+    src/TracyQueryJobStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
     src/TracyQueryStringStore.cpp
@@ -90,6 +92,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryValidationStore.cpp
     src/TracyQueryValidationStore.hpp
     src/TracyQueryService.cpp
+    src/TracyQuerySpillStatistics.cpp
+    src/TracyQuerySpillStatistics.hpp
     src/TracyQueryService.hpp
     src/TracySegmentTraceSource.cpp
     src/TracySegmentTraceSource.hpp
@@ -170,6 +174,11 @@ if(BUILD_TESTING)
     tracy_query_enable_assertions(tracy-query-sample-derived-store-tests)
     add_test(NAME tracy-query-sample-derived-store COMMAND tracy-query-sample-derived-store-tests)
 
+    add_executable(tracy-query-job-store-tests tests/QueryJobStoreTests.cpp)
+    target_link_libraries(tracy-query-job-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-job-store-tests)
+    add_test(NAME tracy-query-job-store COMMAND tracy-query-job-store-tests)
+
     add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
     target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-sample-view-tests)
@@ -216,6 +225,10 @@ if(BUILD_TESTING)
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
     add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)
+
+    add_executable(tracy-query-spill-statistics-tests tests/QuerySpillStatisticsTests.cpp)
+    target_link_libraries(tracy-query-spill-statistics-tests PRIVATE TracyQueryProtocol)
+    add_test(NAME tracy-query-spill-statistics COMMAND tracy-query-spill-statistics-tests)
 
     add_executable(tracy-query-contract-tests tests/ProtocolTests.cpp)
     target_link_libraries(tracy-query-contract-tests PRIVATE TracyQueryProtocol)

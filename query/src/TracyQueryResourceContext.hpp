@@ -96,6 +96,7 @@ public:
     std::shared_ptr<tracy::FileReadHooks> CreateFileReadHooks();
     std::shared_ptr<tracy::FileWriteHooks> CreateFileWriteHooks(const std::filesystem::path& path);
     void IncludeDiskRoots(const std::vector<std::filesystem::path>& roots);
+    std::filesystem::path StatisticsTemporaryRoot();
     void WriteDiagnostic(const std::filesystem::path& path);
     void RunResourceBoundary(const std::function<void()>& operation);
     QueryResourceSnapshot Snapshot() const;

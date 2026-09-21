@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <new>
@@ -25,6 +26,8 @@ struct QueryResourceContext::State
 {
     mutable std::mutex mutex;
     std::mutex fileMutex;
+    std::mutex temporaryMutex;
+    std::filesystem::path statisticsTemporaryRoot;
     std::string phase;
     uint64_t progressCurrent=0,progressTotal=0;
     uint32_t liveWorkers=0;
@@ -100,7 +103,42 @@ QueryResourceContext::QueryResourceContext(QueryResourceContextOptions options)
     };
 }
 
-QueryResourceContext::~QueryResourceContext()=default;
+QueryResourceContext::~QueryResourceContext()
+{
+    if(!m_state->statisticsTemporaryRoot.empty())
+    {
+        std::error_code error;
+        analysis::AnalysisDiskRemove(m_state->statisticsTemporaryRoot,m_disk,error,true);
+    }
+}
+
+std::filesystem::path QueryResourceContext::StatisticsTemporaryRoot()
+{
+    std::lock_guard lock(m_state->temporaryMutex);
+    if(!m_state->statisticsTemporaryRoot.empty()) return m_state->statisticsTemporaryRoot;
+    const auto parent=std::filesystem::temp_directory_path()/"tracy-query-statistics";
+    std::filesystem::create_directories(parent);
+    static std::atomic<uint64_t> sequence{0};
+    for(size_t attempt=0;attempt<100;attempt++)
+    {
+        const auto path=parent/("owner-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+
+            "-"+std::to_string(sequence.fetch_add(1)));
+        if(!std::filesystem::create_directory(path)) continue;
+        try
+        {
+            IncludeDiskRoots({path});
+            m_state->statisticsTemporaryRoot=path;
+        }
+        catch(...)
+        {
+            std::error_code error;
+            std::filesystem::remove(path,error);
+            throw;
+        }
+        return path;
+    }
+    throw std::runtime_error("query_statistics_temporary_collision");
+}
 
 void QueryResourceContext::SetPhase(std::string phase)
 {
