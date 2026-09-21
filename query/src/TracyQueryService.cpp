@@ -11388,8 +11388,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto visitLinks = [&]( const auto& visitor ) {
                 visitRows( linkCount, links, [&]( size_t offset, size_t count ) { return source->ScanGfxLinks( offset, count ); }, visitor );
             };
-            std::set<uint64_t> dispatchIds;
-            std::set<uint64_t> entityIds;
+            std::set<uint64_t> workerDispatchIds;
+            std::set<uint64_t> workerEntityIds;
+            std::unique_ptr<QuerySpillUInt64Set> indexedDispatchIds;
+            std::unique_ptr<QuerySpillUInt64Set> indexedEntityIds;
+            if( indexedGfxStatistics )
+            {
+                std::shared_ptr<QueryResourceContext> resources;
+                if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                    resources = owner->GetQueryResourceContext();
+                const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                    std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                indexedDispatchIds = std::make_unique<QuerySpillUInt64Set>( temporaryRoot,
+                    resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                    checkDirectedJobRead );
+                indexedEntityIds = std::make_unique<QuerySpillUInt64Set>( temporaryRoot,
+                    resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                    checkDirectedJobRead );
+            }
             std::map<uint64_t, std::string> jobRefs;
             json entitiesByKind = json::object();
             json linksByRelation = json::object();
@@ -11398,16 +11414,26 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             json sampleLinkedJobRef = nullptr;
             visitDispatches( [&]( const analysis::GfxDispatchDto& dispatch )
             {
-                dispatchIds.emplace( dispatch.dispatchId );
+                if( indexedDispatchIds ) indexedDispatchIds->Append( dispatch.dispatchId );
+                else workerDispatchIds.emplace( dispatch.dispatchId );
                 if( sampleDispatchRef.is_null() ) sampleDispatchRef = dispatch.ref;
             } );
             visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
-                entityIds.emplace( entity.entityId );
+                if( indexedEntityIds ) indexedEntityIds->Append( entity.entityId );
+                else workerEntityIds.emplace( entity.entityId );
                 const auto name = GfxEntityKindName( entity.kind );
                 entitiesByKind[name] = Decimal( entitiesByKind.contains( name ) ? std::stoull( entitiesByKind[name].get<std::string>() ) + 1 : 1 );
                 if( sampleEntityRef.is_null() ) sampleEntityRef = entity.ref;
             } );
+            if( indexedDispatchIds ) indexedDispatchIds->Finish();
+            if( indexedEntityIds ) indexedEntityIds->Finish();
+            const auto hasDispatch = [&]( uint64_t value ) {
+                return indexedDispatchIds ? indexedDispatchIds->Contains( value ) : workerDispatchIds.contains( value );
+            };
+            const auto hasEntity = [&]( uint64_t value ) {
+                return indexedEntityIds ? indexedEntityIds->Contains( value ) : workerEntityIds.contains( value );
+            };
             for( const auto& job : jobs ) jobRefs.emplace( job.jobId, job.ref );
             const auto jobCount = indexedGfxStatistics ? source->GetJobCount() : jobs.size();
             const auto findJobRef = [&]( uint64_t jobId ) -> std::optional<std::string> {
@@ -11419,7 +11445,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             uint64_t danglingParents = 0;
             visitEntities( [&]( const analysis::GfxEntityDto& entity )
             {
-                if( entity.parentId != 0 && !dispatchIds.contains( entity.parentId ) && !entityIds.contains( entity.parentId ) ) danglingParents++;
+                if( entity.parentId != 0 && !hasDispatch( entity.parentId ) && !hasEntity( entity.parentId ) ) danglingParents++;
             } );
             uint64_t danglingSources = 0;
             uint64_t danglingTargets = 0;
@@ -11432,8 +11458,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 checkDirectedJobRead();
                 const auto sourceJob = findJobRef( link.sourceId );
                 const auto targetJob = findJobRef( link.targetId );
-                const bool sourceKnown = dispatchIds.contains( link.sourceId ) || entityIds.contains( link.sourceId ) || sourceJob.has_value();
-                const bool targetKnown = dispatchIds.contains( link.targetId ) || entityIds.contains( link.targetId ) || targetJob.has_value();
+                const bool sourceKnown = hasDispatch( link.sourceId ) || hasEntity( link.sourceId ) || sourceJob.has_value();
+                const bool targetKnown = hasDispatch( link.targetId ) || hasEntity( link.targetId ) || targetJob.has_value();
                 if( !sourceKnown ) danglingSources++;
                 if( !targetKnown && link.relation != 5 ) danglingTargets++;
                 if( link.relation == 2 )
@@ -11483,11 +11509,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         if( source->HasJobIdentityIndex() )
         {
             const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
-            std::unordered_map<uint64_t, std::vector<uint64_t>> adjacency;
+            std::shared_ptr<QueryResourceContext> resources;
+            if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                resources = owner->GetQueryResourceContext();
+            const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                std::filesystem::temp_directory_path() / "tracy-query-statistics";
+            QuerySpillUInt64Graph adjacency( temporaryRoot,
+                resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                checkDirectedJobRead );
             size_t edgeCount = 0;
             const auto addEdge = [&]( uint64_t lhs, uint64_t rhs ) {
                 if( ++edgeCount > 4000000 ) throw QueryError( "RESOURCE_LIMIT", "Gfx chain edge budget exhausted", true );
-                adjacency[lhs].push_back( rhs ); adjacency[rhs].push_back( lhs );
+                adjacency.AppendUndirected( lhs, rhs );
             };
             const auto visitRows = [&]( uint64_t total, const auto& read, const auto& visitor ) {
                 for( uint64_t offset = 0; offset < total; )
@@ -11507,6 +11540,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 [&]( const auto& link ) { addEdge( link.sourceId, link.targetId ); } );
             visitRows( source->GetGfxEntityCount(), [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
                 [&]( const auto& entity ) { if( entity.parentId != 0 ) addEdge( entity.entityId, entity.parentId ); } );
+            adjacency.Finish();
             std::set<uint64_t> visited;
             std::queue<uint64_t> frontier;
             visited.emplace( rootId ); frontier.push( rootId ); BudgetConsumeNode();
@@ -11515,12 +11549,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 checkDirectedJobRead();
                 const auto current = frontier.front(); frontier.pop();
-                for( const auto next : adjacency[current] )
-                {
-                    if( visited.contains( next ) ) continue;
-                    if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; break; }
+                adjacency.VisitNeighbors( current, [&]( uint64_t next ) {
+                    if( visited.contains( next ) ) return true;
+                    if( !BudgetConsumeNode() || visited.size() >= maxNodes ) { truncated = true; return false; }
                     visited.emplace( next ); frontier.push( next );
-                }
+                    return true;
+                } );
                 if( truncated ) break;
             }
             json dispatchJson = json::array(), entityJson = json::array(), linkJson = json::array(), jobJson = json::array();

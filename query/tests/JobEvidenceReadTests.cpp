@@ -315,6 +315,17 @@ int main()
         Require( observed->reads["all_jobs"] == 0, "Gfx chain materialized all Jobs" );
         for( const auto* suffix : {"Dispatches", "Entities", "Links"} )
             Require( observed->reads[std::string("all_gfx_") + suffix] == 0, "Gfx chain materialized a complete Gfx table" );
+        query::QueryResourceContextOptions chainLimitedOptions;
+        chainLimitedOptions.traceBytes = 1;
+        chainLimitedOptions.derivedRoots = { path.string() + ".gfx-chain" };
+        chainLimitedOptions.diagnosticDiskReserveBytes = 0;
+        observed->resources = std::make_shared<query::QueryResourceContext>( chainLimitedOptions );
+        const auto diskLimitedChain = service.Execute( chainRequest );
+        Require( !diskLimitedChain.at("ok") && diskLimitedChain.at("error").at("code") == "RESOURCE_LIMIT",
+            "Gfx chain bypassed the shared spill disk budget" );
+        Require( observed->resources->Snapshot().disk.rejectedGrowths != 0,
+            "Gfx chain did not charge its adjacency spill files" );
+        observed->resources.reset();
         auto limitedChain = chainRequest;
         limitedChain["params"]["max_scan_events"] = 1;
         const auto limitedChainResult = service.Execute( limitedChain );
@@ -348,6 +359,18 @@ int main()
         Require( !stoppedGfx.at("ok") && stoppedGfx.at("error").at("code") == "CANCELLED",
             "Gfx Job identity lookup ignored cancellation" );
         observed->duringJobRead = {};
+        query::QueryResourceContextOptions gfxLimitedOptions;
+        gfxLimitedOptions.traceBytes = 1;
+        gfxLimitedOptions.derivedRoots = { path.string() + ".gfx-identities" };
+        gfxLimitedOptions.diagnosticDiskReserveBytes = 0;
+        observed->resources = std::make_shared<query::QueryResourceContext>( gfxLimitedOptions );
+        const auto diskLimitedGfxStatistics = service.Execute( gfxRequest );
+        Require( !diskLimitedGfxStatistics.at("ok") &&
+            diskLimitedGfxStatistics.at("error").at("code") == "RESOURCE_LIMIT",
+            "Gfx statistics bypassed the shared spill disk budget" );
+        Require( observed->resources->Snapshot().disk.rejectedGrowths != 0,
+            "Gfx statistics did not charge its identity spill files" );
+        observed->resources.reset();
         observed->reads.clear();
         const auto search = service.Execute({{"protocol", "tracy-query/1"}, {"id", 4}, {"method", "job.search"},
             {"params", {{"trace_id", opened.id}, {"limit", 1}}}});

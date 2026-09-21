@@ -195,6 +195,33 @@ int main()
         const auto resumedPage = cancelReader.ScanJobs( 1, 1 );
         Require( resumedPage.size() == 1 && resumedPage.front().jobId == 2, "Job page did not resume at its ordinal" );
 
+        QueryJobStoreWriter oversizedWriter( root / "oversized-jobs", fingerprint, options );
+        JnJobScheduleData oversizedSchedule{};
+        oversizedSchedule.jobId = 77;
+        oversizedWriter.Begin( QueryJobDomain::Schedule, 1 );
+        oversizedWriter.Append( QueryJobDomain::Schedule, 0, &oversizedSchedule, 1 );
+        oversizedWriter.End( QueryJobDomain::Schedule );
+        std::vector<JnJobStageData> oversizedStages( 32769 );
+        for( size_t index = 0; index < oversizedStages.size(); index++ )
+        {
+            oversizedStages[index].jobId = 77;
+            oversizedStages[index].time = int64_t( index );
+            oversizedStages[index].stage = uint8_t( JnJobStage::Ready );
+        }
+        oversizedWriter.Begin( QueryJobDomain::Stage, oversizedStages.size() );
+        oversizedWriter.Append( QueryJobDomain::Stage, 0, oversizedStages.data(), oversizedStages.size() );
+        oversizedWriter.End( QueryJobDomain::Stage );
+        oversizedWriter.FinishMissing();
+        oversizedWriter.BuildIndexes( root / "strings" );
+        QueryJobStoreReader oversizedReader( root / "oversized-jobs", root / "strings", fingerprint, options );
+        bool oversizedRejected = false;
+        try { (void)oversizedReader.ScanJobs( 0, 1 ); }
+        catch( const std::runtime_error& error )
+        {
+            oversizedRejected = std::string( error.what() ).find( "workspace_budget" ) != std::string::npos;
+        }
+        Require( oversizedRejected, "single Job detail exceeded its bounded collection limit" );
+
         std::error_code ignored;
         fs::remove_all( root, ignored );
         std::cout << "query Job store tests passed\n";

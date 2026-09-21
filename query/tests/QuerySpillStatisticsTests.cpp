@@ -78,6 +78,47 @@ int main()
                 "statistics workspace grew with input count" );
         }
         clean();
+        {
+            auto setWorkspace = std::make_shared<analysis::AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+            query::QuerySpillUInt64Set values( root, disk, setWorkspace, {}, 1024 );
+            for( uint64_t index = 0; index < 50000; index++ )
+            {
+                values.Append( ( index * 47 ) % 5003 );
+                values.Append( ( index * 47 ) % 5003 );
+            }
+            values.Finish();
+            Require( values.Count() == 5003, "spill set did not remove duplicate IDs" );
+            for( uint64_t value : { uint64_t( 0 ), uint64_t( 1 ), uint64_t( 2501 ), uint64_t( 5002 ) } )
+                Require( values.Contains( value ), "spill set lost an inserted ID" );
+            Require( !values.Contains( 5003 ) && !values.Contains( UINT64_MAX ),
+                "spill set reported an absent ID" );
+            Require( setWorkspace->Snapshot().peakBytes <= 1024 * sizeof( uint64_t ) + 131072,
+                "spill set workspace grew with the input count" );
+        }
+        clean();
+        {
+            auto graphWorkspace = std::make_shared<analysis::AnalysisWorkspaceBudget>( 1024 * 1024, 1024 * 1024 );
+            query::QuerySpillUInt64Graph graph( root, disk, graphWorkspace, {} );
+            graph.AppendUndirected( 1, 2 );
+            graph.AppendUndirected( 1, 3 );
+            graph.AppendUndirected( 1, 2 );
+            for( uint64_t value = 10; value < 100010; value++ ) graph.AppendUndirected( value, value + 1 );
+            graph.Finish();
+            std::vector<uint64_t> neighbors;
+            graph.VisitNeighbors( 1, [&]( uint64_t value ) { neighbors.push_back( value ); return true; } );
+            Require( neighbors == std::vector<uint64_t>{ 2, 2, 3 },
+                "spill graph changed sorted edge multiplicity" );
+            neighbors.clear();
+            graph.VisitNeighbors( 2, [&]( uint64_t value ) { neighbors.push_back( value ); return true; } );
+            Require( neighbors == std::vector<uint64_t>{ 1, 1 }, "spill graph lost reverse edges" );
+            neighbors.clear();
+            graph.VisitNeighbors( 999999, [&]( uint64_t value ) { neighbors.push_back( value ); return true; } );
+            Require( neighbors.empty(), "spill graph returned edges for an absent node" );
+            Require( graph.EdgeRecordCount() == 200006, "spill graph edge count changed" );
+            Require( graphWorkspace->Snapshot().peakBytes <= 512 * 1024,
+                "spill graph workspace grew with edge count" );
+        }
+        clean();
         bool cancelled = false;
         {
             size_t checks = 0;

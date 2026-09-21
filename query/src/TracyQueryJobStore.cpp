@@ -29,6 +29,7 @@ constexpr uint8_t JobIncomplete = 1 << 2;
 constexpr uint8_t JobOrphan = 1 << 3;
 constexpr uint8_t JobTruncated = 1 << 4;
 constexpr uint8_t JobHasSchedule = 1 << 5;
+constexpr uint32_t MaximumJobDetailReferences = 32768;
 
 #pragma pack( push, 1 )
 struct StoredFactRef
@@ -768,6 +769,8 @@ struct QueryJobStoreReader::Impl
 
     analysis::JobDto BuildJob( uint64_t ordinal, const StoredJob& stored, const std::function<void()>& check ) const
     {
+        if( stored.refsCount > MaximumJobDetailReferences )
+            throw std::runtime_error( "workspace_budget: single Job detail exceeds 32768 fact references" );
         analysis::JobDto job;
         job.ref = Ref( source, "job", stored.jobId ); job.jobId = stored.jobId; job.packedHandle = stored.packedHandle;
         job.name = names.ReadOrdinal( ordinal, 1024 * 1024 ); job.typeId = stored.typeId; job.kind = stored.kind; job.flags = stored.flags;
