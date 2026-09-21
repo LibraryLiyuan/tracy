@@ -1741,6 +1741,34 @@ int main(int argc,char** argv)
         assert( status.state == ScanState::Complete && status.completed );
         assert( !restarted.Candidates( scanId, 100, "", {}, json::object() ).at( "items" ).empty() );
 
+        // Preserve the last durable journal exactly as an abruptly terminated
+        // process would leave it, then verify a cold manager converts the
+        // non-terminal state to a resumable checkpoint before publishing any
+        // further result.
+        const auto abruptRoot = root / "abrupt-restart-state";
+        const auto abruptScanRoot = abruptRoot / "scans" / scanId;
+        std::filesystem::create_directories( abruptScanRoot );
+        std::filesystem::copy_file( root / "scans" / scanId / "profile.json",
+            abruptScanRoot / "profile.json", std::filesystem::copy_options::overwrite_existing );
+        json abruptState;
+        { std::ifstream input( root / "scans" / scanId / "scan-state.json" ); input >> abruptState; }
+        abruptState["state"] = "scanning";
+        abruptState["resumable"] = false;
+        abruptState["completed"] = false;
+        abruptState["closed"] = false;
+        abruptState["stage"] = "fixture_scan";
+        abruptState["error"] = nullptr;
+        { std::ofstream output( abruptScanRoot / "scan-state.json", std::ios::binary | std::ios::trunc ); output << abruptState.dump(); }
+        const auto beforeAbruptResume = executions.load();
+        AnalysisScanManager abruptRestarted( abruptRoot, cache, std::string( 64, 'e' ), resolver, executor );
+        const auto interrupted = abruptRestarted.Status( scanId );
+        assert( interrupted.state == ScanState::CancelledResumable && interrupted.resumable &&
+            !interrupted.completed && interrupted.stage == "query_process_restart" );
+        abruptRestarted.Resume( scanId );
+        const auto recovered = WaitFor( abruptRestarted, scanId, ScanState::Complete );
+        assert( recovered.completed && executions == beforeAbruptResume );
+        assert( !abruptRestarted.Candidates( scanId, 100, "", {}, json::object() ).at( "items" ).empty() );
+
         // Changing only policy creates a new scan but reuses the completed neutral aggregate.
         const auto changedValidation = ValidateAndNormalizeAnalysisProfile( Profile( 3 ) );
         assert( changedValidation.valid );
