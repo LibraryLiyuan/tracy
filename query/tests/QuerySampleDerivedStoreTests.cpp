@@ -128,6 +128,10 @@ int main( int argc, char** argv )
         auto derivedWorkspace = std::make_shared<AnalysisWorkspaceBudget>( 16 * 1024 * 1024, 8 * 1024 * 1024 );
         auto derivedOptions = options;
         derivedOptions.workspace = derivedWorkspace;
+        uint64_t contributionBytes = 0;
+        derivedOptions.beforeFileGrowth = [&]( const fs::path& file, uint64_t bytes ) {
+            if( file.filename() == "contributions.work" ) contributionBytes = bytes;
+        };
         uint64_t count = 0;
         QuerySampleDerivedBuildStatistics buildStatistics;
         try
@@ -147,6 +151,7 @@ int main( int argc, char** argv )
             buildStatistics.callstackCacheHits != 0,
             "sample derived statistics repeated callstack expansion" );
         Require( count == 3, "sample symbol-statistics record count changed" );
+        Require( contributionBytes == 7 * 32, "repeated symbol contributions must be coalesced before disk writes" );
         Require( !fs::exists( root / "derived" / "build-scratch" ), "sample derived scratch was not removed" );
 
         QuerySampleDerivedStoreReader reader( root / "derived", fingerprint, options );
@@ -161,6 +166,32 @@ int main( int argc, char** argv )
             "parent symbol statistics or raw child-sample count changed" );
         Require( !reader.Find( 0x3000 ), "missing Frame definition produced symbol statistics" );
         reader.ValidateAll();
+
+        // More unique child addresses than the grouping cap must spill without losing weights.
+        {
+            constexpr uint32_t childCount = 20000;
+            std::vector<CallstackFrameId> stack( childCount + 1 );
+            for( uint32_t i = 0; i <= childCount; ++i ) stack[i].data = 0x100000 + i;
+            QueryCallstackStoreWriter stacks( root / "spill-stacks", fingerprint, options );
+            stacks.Begin( 1 ); stacks.CallstackBegin( 1, uint32_t( stack.size() ) );
+            stacks.CallstackFrames( 1, 0, stack.data(), uint32_t( stack.size() ) );
+            stacks.CallstackEnd( 1 ); stacks.Commit();
+            QuerySampleStoreWriter samples( root / "spill-samples", fingerprint, options );
+            samples.Begin( 7, QuerySampleKind::Main, 2 );
+            samples.Append( 0, 10, 1 ); samples.Append( 1, 20, 1 ); samples.End(); samples.Commit();
+            BuildQuerySampleView( root / "spill-samples", fingerprint,
+                []( uint64_t ) { return std::vector<int64_t>{}; }, options );
+            const auto records = BuildQuerySampleDerivedStore( root / "spill-derived", root / "spill-samples",
+                root / "spill-stacks", root / "frames", fingerprint, derivedOptions );
+            Require( records == childCount, "group spill lost child addresses" );
+            QuerySampleDerivedStoreReader spilled( root / "spill-derived", fingerprint, options );
+            for( uint32_t i = 1; i <= childCount; ++i ) {
+                const auto row = spilled.Find( 0x100000 + i );
+                Require( row && row->childSamples == 2 && row->inclusiveSamples == 0 && row->exclusiveSamples == 0,
+                    "group spill changed exact child weights" );
+            }
+            spilled.ValidateAll();
+        }
 
         std::error_code ignored;
         fs::remove_all( root, ignored );

@@ -9,6 +9,8 @@
 #include <fstream>
 #include <cstdio>
 #include <list>
+#include <map>
+#include <tuple>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -90,10 +92,12 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
         std::ofstream contributions( analysis::AnalysisIoPath( sourcePath ), std::ios::binary | std::ios::trunc );
         if( !contributions ) throw std::runtime_error( "sample derived contribution open" );
         uint64_t contributionCount = 0;
-        const auto append = [&]( uint64_t address, ContributionKind kind, bool subtract ) {
+        const auto writeContribution = [&]( uint64_t address, ContributionKind kind, bool subtract, uint64_t weight ) {
             analysis::AnalysisKeyMetadataRecord value;
             value.keyHigh = address;
-            value.metadata = 1;
+            // Sort additions before subtractions, independently of their weights.
+            value.keyLow = subtract ? 1 : 0;
+            value.metadata = weight;
             value.kind = uint8_t( kind );
             value.auxiliary = subtract ? 1 : 0;
             analysis::AnalysisDiskGrow( options.disk, sizeof( value ) );
@@ -106,6 +110,28 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
         QuerySampleDerivedBuildStatistics localStatistics;
         auto& statistics = outputStatistics ? *outputStatistics : localStatistics;
         {
+            constexpr size_t maximumContributionGroups = 16384;
+            analysis::AnalysisWorkspaceReservation groupMemory( options.workspace, maximumContributionGroups * 128 );
+            using GroupKey = std::tuple<uint64_t, uint8_t, bool>;
+            std::map<GroupKey, uint64_t> groups;
+            const auto flushGroups = [&] {
+                for( const auto& [key, weight] : groups ) {
+                    CheckCancelled( options );
+                    writeContribution( std::get<0>( key ), ContributionKind( std::get<1>( key ) ), std::get<2>( key ), weight );
+                }
+                groups.clear();
+            };
+            const auto append = [&]( uint64_t address, ContributionKind kind, bool subtract ) {
+                const GroupKey key{ address, uint8_t( kind ), subtract };
+                auto found = groups.find( key );
+                if( found == groups.end() ) {
+                    if( groups.size() == maximumContributionGroups ) flushGroups();
+                    found = groups.emplace( key, 0 ).first;
+                }
+                if( found->second == std::numeric_limits<uint64_t>::max() )
+                    throw std::runtime_error( "sample derived contribution weight overflow" );
+                ++found->second;
+            };
             struct SymbolContribution { uint64_t address = 0; ContributionKind kind = ContributionKind::Inclusive; };
             struct ResolvedCallstack
             {
@@ -200,6 +226,7 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
                     append( address, ContributionKind::Child, false );
                 return true;
             } );
+            flushGroups();
         }
         contributions.flush();
         if( !contributions ) throw std::runtime_error( "sample derived contribution flush" );
@@ -251,17 +278,19 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
                 haveCurrent = true;
             }
             const bool subtract = contribution.auxiliary != 0;
+            const auto weight = contribution.metadata;
+            if( weight == 0 ) throw std::runtime_error( "sample derived zero contribution weight" );
             auto apply = [&]( uint64_t& value ) {
                 if( subtract )
                 {
-                    if( value == 0 ) throw std::runtime_error( "sample derived contribution underflow" );
-                    value--;
+                    if( value < weight ) throw std::runtime_error( "sample derived contribution underflow" );
+                    value -= weight;
                 }
                 else
                 {
-                    if( value == std::numeric_limits<uint64_t>::max() )
+                    if( value > std::numeric_limits<uint64_t>::max() - weight )
                         throw std::runtime_error( "sample derived contribution overflow" );
-                    value++;
+                    value += weight;
                 }
             };
             switch( ContributionKind( contribution.kind ) )
@@ -270,9 +299,9 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
             case ContributionKind::Exclusive: apply( exclusive ); break;
             case ContributionKind::Child:
                 if( subtract ) throw std::runtime_error( "sample derived child subtraction" );
-                if( current.childSamples == std::numeric_limits<uint64_t>::max() )
+                if( current.childSamples > std::numeric_limits<uint64_t>::max() - weight )
                     throw std::runtime_error( "sample derived child count overflow" );
-                current.childSamples++;
+                current.childSamples += weight;
                 break;
             default: throw std::runtime_error( "sample derived contribution kind" );
             }
