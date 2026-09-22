@@ -7,6 +7,7 @@
 #include "TracyPagedRecordStore.hpp"
 
 #include <cstring>
+#include <cstdio>
 #include <charconv>
 #include <limits>
 #include <fstream>
@@ -187,7 +188,13 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
 
     uint64_t count = 0;
     const auto period = samplingPeriodNs;
-    std::vector<uint64_t> active;
+    struct ActiveGhostZone
+    {
+        uint64_t ordinal = 0;
+        ScratchGhostZone record;
+    };
+    std::vector<ActiveGhostZone> active;
+    analysis::AnalysisWorkspaceReservation activeMemory( options.workspace );
     if( outputStatistics ) *outputStatistics = {};
     QueryGhostZoneBuildStatistics localStatistics;
     auto& statistics = outputStatistics ? *outputStatistics : localStatistics;
@@ -243,14 +250,24 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         scratch.seekp( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
         scratch.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
         if( !scratch ) throw std::runtime_error( "ghost-zone scratch record write" );
+        statistics.scratchRecordWrites++;
     };
-    const auto readRecord = [&]( uint64_t ordinal ) {
-        ScratchGhostZone value;
-        scratch.seekg( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
-        scratch.read( reinterpret_cast<char*>( &value ), sizeof( value ) );
-        if( !scratch ) throw std::runtime_error( "ghost-zone scratch record read" );
-        return value;
+    const auto flushActiveFrom = [&]( size_t first ) {
+        for( size_t index = active.size(); index > first; index-- )
+            writeRecord( active[index - 1].ordinal, active[index - 1].record );
+        active.resize( first );
     };
+    uint64_t processedSamples = 0;
+    uint64_t totalSamples = 0;
+    for( const auto& span : spans ) totalSamples += span.count;
+    const auto reportProgress = [&] {
+        fprintf( stderr, "Query ghost progress samples=%llu/%llu zones=%llu resolutions=%llu hits=%llu scratch_writes=%llu\n",
+            (unsigned long long)processedSamples, (unsigned long long)totalSamples, (unsigned long long)count,
+            (unsigned long long)statistics.pathResolutions, (unsigned long long)statistics.pathCacheHits,
+            (unsigned long long)statistics.scratchRecordWrites );
+        fflush( stderr );
+    };
+    reportProgress();
     for( const auto& span : spans )
     {
         active.clear();
@@ -258,47 +275,50 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
             samples.ReadPhysical( span.first, span.thread, QuerySampleKind::Main ).timeNs == 0;
         for( uint64_t index = 0; index < span.count; index++ )
         {
+            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
+            if( ++processedSamples % 1000000 == 0 ) reportProgress();
             const auto sample = samples.ReadPhysical( span.first + index, span.thread, QuerySampleKind::Main );
             if( skipZeroTime && sample.timeNs == 0 ) continue;
             std::vector<BuildFrame> uncachedPath;
             const auto& path = resolvePath( sample.callstack, uncachedPath );
+            if( path.size() > active.capacity() )
+            {
+                // Include both old and replacement allocations during vector growth.
+                activeMemory.Resize( ( uint64_t( active.capacity() ) + path.size() ) * sizeof( ActiveGhostZone ) );
+                active.reserve( path.size() );
+                activeMemory.Resize( uint64_t( active.capacity() ) * sizeof( ActiveGhostZone ) );
+            }
             if( !active.empty() )
             {
-                const auto previousEnd = readRecord( active.front() ).endNs;
+                const auto previousEnd = active.front().record.endNs;
                 if( previousEnd > sample.timeNs )
                 {
-                    for( const auto ordinal : active )
+                    for( auto& value : active )
                     {
-                        auto record = readRecord( ordinal );
-                        if( record.endNs != previousEnd ) break;
-                        record.endNs = sample.timeNs;
-                        writeRecord( ordinal, record );
+                        if( value.record.endNs != previousEnd ) break;
+                        value.record.endNs = sample.timeNs;
                     }
                 }
             }
-            const auto referenceEnd = active.empty() ? int64_t( 0 ) : readRecord( active.front() ).endNs;
+            const auto referenceEnd = active.empty() ? int64_t( 0 ) : active.front().record.endNs;
             size_t common = 0;
             while( common < active.size() && common < path.size() )
             {
-                const auto record = readRecord( active[common] );
+                const auto& record = active[common].record;
                 if( record.endNs != referenceEnd ) break;
                 if( record.reusable == 0 ) break;
                 if( record.symAddr != path[common].symAddr ) break;
                 common++;
             }
             for( size_t i = 0; i < common; i++ )
-            {
-                auto record = readRecord( active[i] );
-                record.endNs = sample.timeNs + period;
-                writeRecord( active[i], record );
-            }
-            active.resize( common );
+                active[i].record.endNs = sample.timeNs + period;
+            flushActiveFrom( common );
             for( size_t i = common; i < path.size(); i++ )
             {
                 const auto& frame = path[i];
                 ScratchGhostZone record;
                 record.thread = span.thread;
-                record.parent = active.empty() ? NoParent : active.back();
+                record.parent = active.empty() ? NoParent : active.back().ordinal;
                 record.startNs = sample.timeNs;
                 record.endNs = sample.timeNs + period;
                 record.symAddr = frame.symAddr;
@@ -318,20 +338,15 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
                 std::ostringstream address; address << "0x" << std::hex << frame.symAddr;
                 append( address.str(), record.addressOffset, record.addressBytes );
                 if( record.parent != NoParent )
-                {
-                    auto parent = readRecord( record.parent );
-                    parent.childCount++;
-                    writeRecord( record.parent, parent );
-                }
+                    active.back().record.childCount++;
                 GrowScratch( options, scratchPath, sizeof( ScratchGhostZone ),
                     ( count + 1 ) * sizeof( ScratchGhostZone ) );
-                scratch.seekp( std::streamoff( count * sizeof( ScratchGhostZone ) ) );
-                scratch.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
-                if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch append" );
-                active.push_back( count++ );
+                active.push_back( { count++, record } );
             }
         }
+        flushActiveFrom( 0 );
     }
+    reportProgress();
     scratch.flush(); scratchStrings.flush();
     if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch flush" );
     scratch.close(); scratchStrings.close();
@@ -343,6 +358,7 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     if( !recordsInput || !stringsInput ) throw std::runtime_error( "ghost-zone scratch reopen" );
     for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
     {
+        if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
         ScratchGhostZone record;
         recordsInput.read( reinterpret_cast<char*>( &record ), sizeof( record ) );
         if( !recordsInput ) throw std::runtime_error( "ghost-zone scratch sequential read" );

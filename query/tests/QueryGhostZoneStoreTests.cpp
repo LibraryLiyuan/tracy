@@ -108,6 +108,8 @@ int main()
         Require( buildStatistics.pathRequests == 3 && buildStatistics.pathResolutions == 2 &&
             buildStatistics.pathCacheHits == 1,
             "Ghost Zone repeated callstack paths were not reused" );
+        Require( buildStatistics.scratchRecordReads == 0 && buildStatistics.scratchRecordWrites == count,
+            "active Ghost Zones must stay in memory and be written to scratch once" );
         if( count != 2 ) throw std::runtime_error( "streamed Ghost Zone count changed: " + std::to_string( count ) );
         Require( !fs::exists( root / "ghost" / "build-scratch.bin" ), "Ghost Zone scratch was not removed" );
 
@@ -123,6 +125,23 @@ int main()
             rows[1].address == "0x2000" && rows[1].depth == 1 && rows[1].childCount == 0 && !rows[1].inlineFrame,
             "child Ghost Zone changed" );
         reader.ValidateAll();
+
+        // A long unchanged stack must extend two zones, not rewrite them per sample.
+        constexpr uint64_t repeatedCount = 100000;
+        QuerySampleStoreWriter repeated( root / "repeated-samples", fingerprint, options );
+        repeated.Begin( 77, QuerySampleKind::Main, repeatedCount );
+        for( uint64_t i = 0; i < repeatedCount; i++ ) repeated.Append( i, 5 + i * 5, 1 );
+        repeated.End();
+        repeated.Commit();
+        QueryGhostZoneBuildStatistics repeatedStatistics;
+        const auto repeatedZones = BuildQueryGhostZoneStore( root / "repeated-ghost", root / "repeated-samples",
+            root / "callstacks", root / "frames", root / "strings", fingerprint, 5, options, &repeatedStatistics );
+        Require( repeatedZones == 2 && repeatedStatistics.scratchRecordReads == 0 &&
+            repeatedStatistics.scratchRecordWrites == 2, "repeated samples amplified scratch I/O" );
+        QueryGhostZoneStoreReader repeatedReader( root / "repeated-ghost", fingerprint, options );
+        const auto repeatedRows = repeatedReader.Scan( 0, 1000000, 0, 10 );
+        Require( repeatedRows.size() == 2 && repeatedRows[0].endNs == 500005 &&
+            repeatedRows[1].endNs == 500005, "repeated samples changed zone endpoints" );
 
         QueryCallstackFrameStoreWriter unresolvedFrames( root / "unresolved-frames", fingerprint, options );
         unresolvedFrames.Begin( 0 );

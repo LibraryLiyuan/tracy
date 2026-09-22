@@ -7,6 +7,7 @@
 #include "TracyQuerySampleView.hpp"
 
 #include <fstream>
+#include <cstdio>
 #include <list>
 #include <limits>
 #include <mutex>
@@ -120,6 +121,13 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
             uint64_t cacheBytes = 0;
             const auto resolve = [&]( uint32_t callstack, ResolvedCallstack& uncached ) -> const ResolvedCallstack& {
                 statistics.callstackRequests++;
+                if( statistics.callstackRequests % 1000000 == 0 )
+                {
+                    fprintf( stderr, "Query sample-symbol progress samples=%llu resolutions=%llu hits=%llu contributions=%llu\n",
+                        (unsigned long long)statistics.callstackRequests, (unsigned long long)statistics.callstackResolutions,
+                        (unsigned long long)statistics.callstackCacheHits, (unsigned long long)contributionCount );
+                    fflush( stderr );
+                }
                 if( const auto found = index.find( callstack ); found != index.end() )
                 {
                     statistics.callstackCacheHits++;

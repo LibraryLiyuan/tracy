@@ -39,6 +39,8 @@ struct QueryGhostZoneBuildStatistics
     uint64_t pathCacheHits = 0;
     uint64_t pathCacheEvictions = 0;
     uint64_t pathCachePeakBytes = 0;
+    uint64_t scratchRecordReads = 0;
+    uint64_t scratchRecordWrites = 0;
 };
 
 class QueryGhostZoneStoreWriter
