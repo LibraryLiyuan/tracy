@@ -181,7 +181,7 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
 
     QuerySampleStoreReader samples( samplesPath, sourceFingerprint, options );
     auto dictionaryOptions = options;
-    dictionaryOptions.readerCacheBytes = 16 * 1024 * 1024;
+    if( dictionaryOptions.readerCacheBytes == 0 ) dictionaryOptions.readerCacheBytes = 16 * 1024 * 1024;
     QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, dictionaryOptions );
     QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, dictionaryOptions );
     QueryStringStoreReader strings( stringsPath, sourceFingerprint, dictionaryOptions );

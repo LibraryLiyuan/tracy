@@ -39,7 +39,8 @@ int main( int argc, char** argv )
 
     // Bounded stage replay: reads existing sidecars, writes only a new output directory.
     // A one-nanosecond period is deliberate: this measures storage work, not acceptance semantics.
-    if( argc == 9 && std::string( argv[1] ) == "--replay" )
+    const bool slice = argc == 11 && std::string( argv[1] ) == "--slice";
+    if( ( argc == 9 && std::string( argv[1] ) == "--replay" ) || slice )
     {
         QueryGhostZoneBuildStatistics stats;
         const auto maximum = std::stoull( argv[8] );
@@ -48,13 +49,40 @@ int main( int argc, char** argv )
         options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 256ull * 1024 * 1024, 128ull * 1024 * 1024 );
         auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ argv[6] } );
         options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 2ull * 1024 * 1024 * 1024, {} } );
-        options.cancelled = [&] { return stats.pathRequests >= maximum; };
+        std::filesystem::path samplesPath = argv[2];
+        if( slice ) {
+            auto skip = std::stoull( argv[9] );
+            const auto cacheMiB = std::stoull( argv[10] );
+            if( cacheMiB < 4 || cacheMiB > 64 ) return 2;
+            QuerySampleStoreReader sourceSamples( samplesPath, argv[7], options );
+            auto spans = sourceSamples.MainSpans();
+            std::sort( spans.begin(), spans.end(), []( const auto& a, const auto& b ) { return a.thread < b.thread; } );
+            samplesPath = std::string( argv[6] ) + "-samples";
+            if( fs::exists( samplesPath ) ) return 2;
+            QuerySampleStoreWriter selected( samplesPath, argv[7], options );
+            uint64_t remaining = maximum;
+            for( const auto& span : spans ) {
+                if( skip >= span.count ) { skip -= span.count; continue; }
+                const auto take = std::min<uint64_t>( remaining, span.count - skip );
+                selected.Begin( span.thread, QuerySampleKind::Main, take );
+                for( uint64_t i = 0; i < take; ++i ) {
+                    const auto row = sourceSamples.ReadPhysical( span.first + skip + i, span.thread, QuerySampleKind::Main );
+                    selected.Append( i, row.timeNs, row.callstack );
+                }
+                selected.End(); remaining -= take; skip = 0;
+                if( remaining == 0 ) break;
+            }
+            if( remaining ) throw std::runtime_error( "diagnostic slice exceeds source" );
+            selected.Commit();
+            options.readerCacheBytes = cacheMiB * 1024 * 1024;
+        } else options.cancelled = [&] { return stats.pathRequests >= maximum; };
         const auto start = std::chrono::steady_clock::now();
         bool boundedStop = false;
-        try { BuildQueryGhostZoneStore( argv[6], argv[2], argv[3], argv[4], argv[5], argv[7], 1, options, &stats ); }
+        try { BuildQueryGhostZoneStore( argv[6], samplesPath, argv[3], argv[4], argv[5], argv[7], 1, options, &stats ); }
         catch( const std::exception& e )
         {
-            if( stats.pathRequests < maximum ) { std::cerr << e.what() << '\n'; return 1; }
+            if( slice || stats.pathRequests < maximum || std::string( e.what() ).find( "cancel" ) == std::string::npos )
+            { std::cerr << e.what() << '\n'; return 1; }
             boundedStop = true;
         }
         std::cout << "bounded_stop=" << boundedStop << " requests=" << stats.pathRequests
