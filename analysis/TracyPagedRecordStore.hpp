@@ -63,9 +63,11 @@ class PagedRecordReader
 {
 public:
     struct VisitStats {uint64_t blocks=0,records=0,decodedBytes=0,storedBytes=0;};
+    struct ReadStats {uint64_t blockLoads=0,storedBytes=0,decodedBytes=0,checksumBytes=0,decompressions=0;};
     PagedRecordReader(std::filesystem::path root,std::string identity,uint32_t recordBytes,PagedRecordOptions options={});
     ~PagedRecordReader();
     uint64_t Count() const;
+    ReadStats Statistics() const;
     void Read(uint64_t ordinal,void* output,uint64_t count);
     void ValidateAll();
     VisitStats VisitValidated(const std::function<void(const void*,uint64_t)>&);

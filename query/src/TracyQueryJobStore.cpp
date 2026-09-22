@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -16,6 +17,13 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace tracy::query
 {
@@ -146,6 +154,94 @@ std::filesystem::path FactPath( const std::filesystem::path& root, QueryJobDomai
     return root / "facts" / DomainName( domain );
 }
 
+bool IsAggregationFact( QueryJobDomain domain )
+{
+    return domain == QueryJobDomain::Schedule || domain == QueryJobDomain::Config ||
+        domain == QueryJobDomain::Dependency || domain == QueryJobDomain::Stage;
+}
+
+std::filesystem::path FlatFactPath( const std::filesystem::path& root, QueryJobDomain domain )
+{
+    return root / "build-scratch" / ( std::string( DomainName( domain ) ) + ".raw" );
+}
+
+class ReadOnlyFactMapping
+{
+public:
+    ReadOnlyFactMapping( const std::filesystem::path& path, uint64_t bytes )
+        : m_bytes( bytes )
+    {
+        const auto native = analysis::AnalysisIoPath( path );
+        if( std::filesystem::file_size( native ) != bytes ) throw std::runtime_error( "Job raw fact size" );
+        if( bytes == 0 ) return;
+        if( bytes > SIZE_MAX ) throw std::runtime_error( "Job raw fact address space" );
+#ifdef _WIN32
+        m_file = CreateFileW( native.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, nullptr );
+        if( m_file == INVALID_HANDLE_VALUE ) throw std::runtime_error( "Job raw fact open" );
+        m_mapping = CreateFileMappingW( m_file, nullptr, PAGE_READONLY, 0, 0, nullptr );
+        if( !m_mapping )
+        {
+            CloseHandle( m_file );
+            m_file = INVALID_HANDLE_VALUE;
+            throw std::runtime_error( "Job raw fact map" );
+        }
+        m_data = static_cast<const char*>( MapViewOfFile( m_mapping, FILE_MAP_READ, 0, 0, size_t( bytes ) ) );
+        if( !m_data )
+        {
+            CloseHandle( m_mapping );
+            m_mapping = nullptr;
+            CloseHandle( m_file );
+            m_file = INVALID_HANDLE_VALUE;
+            throw std::runtime_error( "Job raw fact view" );
+        }
+#else
+        m_file = open( native.c_str(), O_RDONLY );
+        if( m_file < 0 ) throw std::runtime_error( "Job raw fact open" );
+        const auto view = mmap( nullptr, size_t( bytes ), PROT_READ, MAP_SHARED, m_file, 0 );
+        if( view == MAP_FAILED )
+        {
+            close( m_file );
+            m_file = -1;
+            throw std::runtime_error( "Job raw fact view" );
+        }
+        m_data = static_cast<const char*>( view );
+#endif
+    }
+
+    ~ReadOnlyFactMapping()
+    {
+#ifdef _WIN32
+        if( m_data ) UnmapViewOfFile( m_data );
+        if( m_mapping ) CloseHandle( m_mapping );
+        if( m_file != INVALID_HANDLE_VALUE ) CloseHandle( m_file );
+#else
+        if( m_data ) munmap( const_cast<char*>( m_data ), size_t( m_bytes ) );
+        if( m_file >= 0 ) close( m_file );
+#endif
+    }
+
+    template<typename T>
+    T Read( uint64_t ordinal ) const
+    {
+        if( ordinal > m_bytes / sizeof( T ) || ordinal == m_bytes / sizeof( T ) )
+            throw std::runtime_error( "Job raw fact ordinal" );
+        T value;
+        std::memcpy( &value, m_data + ordinal * sizeof( T ), sizeof( T ) );
+        return value;
+    }
+
+private:
+    const char* m_data = nullptr;
+    uint64_t m_bytes = 0;
+#ifdef _WIN32
+    HANDLE m_file = INVALID_HANDLE_VALUE;
+    HANDLE m_mapping = nullptr;
+#else
+    int m_file = -1;
+#endif
+};
+
 void CheckCancelled( const analysis::PagedRecordOptions& options )
 {
     if( options.cancelled && options.cancelled() ) throw std::runtime_error( "Job store cancelled" );
@@ -228,6 +324,65 @@ std::optional<uint64_t> FindLookup( analysis::PagedRecordReader& reader, uint64_
     StoredLookup row;
     reader.Read( begin, &row, 1 );
     return row.key == key ? std::optional<uint64_t>( row.value ) : std::nullopt;
+}
+
+void BuildDependencyCompletionJoin( const std::filesystem::path& completionSorted,
+    const std::filesystem::path& requestSorted, const std::filesystem::path& output,
+    uint64_t expected, const analysis::PagedRecordOptions& options )
+{
+    std::ifstream completions( analysis::AnalysisIoPath( completionSorted ), std::ios::binary );
+    std::ifstream requests( analysis::AnalysisIoPath( requestSorted ), std::ios::binary );
+    std::ofstream resolved( analysis::AnalysisIoPath( output ), std::ios::binary | std::ios::trunc );
+    if( !completions || !requests || !resolved ) throw std::runtime_error( "Job dependency completion join open" );
+
+    analysis::AnalysisKeyMetadataRecord pendingCompletion;
+    bool havePending = bool( completions.read( reinterpret_cast<char*>( &pendingCompletion ), sizeof( pendingCompletion ) ) );
+    if( !havePending && !completions.eof() ) throw std::runtime_error( "Job dependency completion input read" );
+    analysis::AnalysisKeyMetadataRecord selectedCompletion;
+    bool haveCompletion = false;
+    const auto nextCompletion = [&]() {
+        if( !havePending ) return false;
+        selectedCompletion = pendingCompletion;
+        const auto key = selectedCompletion.keyHigh;
+        for( ;; )
+        {
+            analysis::AnalysisKeyMetadataRecord value;
+            if( !completions.read( reinterpret_cast<char*>( &value ), sizeof( value ) ) )
+            {
+                if( !completions.eof() ) throw std::runtime_error( "Job dependency completion input read" );
+                havePending = false;
+                return true;
+            }
+            if( value.keyHigh != key )
+            {
+                pendingCompletion = value;
+                havePending = true;
+                return true;
+            }
+            selectedCompletion = value;
+        }
+    };
+    haveCompletion = nextCompletion();
+
+    uint64_t count = 0;
+    analysis::AnalysisUInt64Pair request;
+    while( requests.read( reinterpret_cast<char*>( &request ), sizeof( request ) ) )
+    {
+        if( ( count & 4095 ) == 0 ) CheckCancelled( options );
+        while( haveCompletion && selectedCompletion.keyHigh < request.key ) haveCompletion = nextCompletion();
+        analysis::AnalysisKeyMetadataRecord value;
+        value.keyHigh = request.value;
+        if( request.key != 0 && haveCompletion && selectedCompletion.keyHigh == request.key )
+        {
+            value.kind = 1;
+            value.metadata = selectedCompletion.metadata;
+        }
+        AppendMetadata( resolved, output, value, count, options );
+    }
+    if( !requests.eof() || count != expected ) throw std::runtime_error( "Job dependency completion request read" );
+    resolved.flush();
+    if( !resolved ) throw std::runtime_error( "Job dependency completion join flush" );
+    resolved.close();
 }
 
 void BuildSpans( const std::filesystem::path& sorted, const std::filesystem::path& recordsPath,
@@ -315,6 +470,8 @@ struct QueryJobStoreWriter::Impl
     std::string source;
     analysis::PagedRecordOptions options;
     std::array<std::unique_ptr<analysis::PagedRecordWriter>, QueryJobDomainCount> writers;
+    std::array<std::ofstream, QueryJobDomainCount> flatFacts;
+    std::array<uint64_t, QueryJobDomainCount> flatFactBytes {};
     std::array<uint64_t, QueryJobDomainCount> expected {};
     std::array<uint64_t, QueryJobDomainCount> seen {};
     std::array<bool, QueryJobDomainCount> finished {};
@@ -336,6 +493,14 @@ void QueryJobStoreWriter::Begin( QueryJobDomain domain, uint64_t count )
     m_impl->writers[index] = std::make_unique<analysis::PagedRecordWriter>( FactPath( m_impl->root, domain ),
         Identity( m_impl->source, std::string( "query-job-fact-" ) + DomainName( domain ) + "-v1" ),
         DomainWidth( domain ), m_impl->options );
+    if( IsAggregationFact( domain ) )
+    {
+        const auto path = FlatFactPath( m_impl->root, domain );
+        std::filesystem::create_directories( analysis::AnalysisIoPath( path.parent_path() ) );
+        m_impl->flatFacts[index].open( analysis::AnalysisIoPath( path ), std::ios::binary | std::ios::trunc );
+        if( !m_impl->flatFacts[index] ) throw std::runtime_error( "Job raw fact open" );
+        if( m_impl->options.beforeFileGrowth ) m_impl->options.beforeFileGrowth( path, 0 );
+    }
 }
 
 void QueryJobStoreWriter::Append( QueryJobDomain domain, uint64_t offset, const void* records, uint64_t count )
@@ -345,6 +510,21 @@ void QueryJobStoreWriter::Append( QueryJobDomain domain, uint64_t offset, const 
         count > m_impl->expected[index] - offset )
         throw std::runtime_error( "Job store append" );
     m_impl->writers[index]->Append( records, count );
+    if( IsAggregationFact( domain ) && count != 0 )
+    {
+        const auto width = uint64_t( DomainWidth( domain ) );
+        if( count > std::numeric_limits<uint64_t>::max() / width ||
+            count * width > std::numeric_limits<uint64_t>::max() - m_impl->flatFactBytes[index] )
+            throw std::runtime_error( "Job raw fact size" );
+        const auto bytes = count * width;
+        analysis::AnalysisDiskGrow( m_impl->options.disk, bytes );
+        const auto path = FlatFactPath( m_impl->root, domain );
+        if( m_impl->options.beforeFileGrowth )
+            m_impl->options.beforeFileGrowth( path, m_impl->flatFactBytes[index] + bytes );
+        m_impl->flatFacts[index].write( static_cast<const char*>( records ), std::streamsize( bytes ) );
+        if( !m_impl->flatFacts[index] ) throw std::runtime_error( "Job raw fact write" );
+        m_impl->flatFactBytes[index] += bytes;
+    }
     m_impl->seen[index] += count;
 }
 
@@ -355,6 +535,14 @@ void QueryJobStoreWriter::End( QueryJobDomain domain )
         throw std::runtime_error( "Job store end" );
     m_impl->writers[index]->Commit();
     m_impl->writers[index].reset();
+    if( IsAggregationFact( domain ) )
+    {
+        const auto expectedBytes = m_impl->expected[index] * uint64_t( DomainWidth( domain ) );
+        if( m_impl->flatFactBytes[index] != expectedBytes ) throw std::runtime_error( "Job raw fact count" );
+        m_impl->flatFacts[index].flush();
+        if( !m_impl->flatFacts[index] ) throw std::runtime_error( "Job raw fact flush" );
+        m_impl->flatFacts[index].close();
+    }
     m_impl->finished[index] = true;
 }
 
@@ -375,14 +563,14 @@ uint64_t QueryJobStoreWriter::Count( QueryJobDomain domain ) const
     return m_impl->seen[index];
 }
 
-void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath )
+QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath )
 {
     auto& state = *m_impl;
+    QueryJobBuildStatistics statistics;
     for( const auto finished : state.finished ) if( !finished ) throw std::runtime_error( "Job facts incomplete" );
     const auto indexRoot = state.root / "index";
     const auto scratch = state.root / "build-scratch";
-    if( std::filesystem::exists( analysis::AnalysisIoPath( indexRoot ) ) ||
-        std::filesystem::exists( analysis::AnalysisIoPath( scratch ) ) )
+    if( std::filesystem::exists( analysis::AnalysisIoPath( indexRoot ) ) )
         throw std::runtime_error( "Job index already exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratch ) );
 
@@ -392,6 +580,10 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
     const auto reverseSorted = scratch / "reverse-sorted.work";
     const auto completionSource = scratch / "completion-source.work";
     const auto completionSorted = scratch / "completion-sorted.work";
+    const auto dependencyCompletionRequestSource = scratch / "dependency-completion-request-source.work";
+    const auto dependencyCompletionRequestSorted = scratch / "dependency-completion-request-sorted.work";
+    const auto dependencyCompletionSource = scratch / "dependency-completion-source.work";
+    const auto dependencyCompletionSorted = scratch / "dependency-completion-sorted.work";
     const auto typeSource = scratch / "type-source.work";
     const auto typeSorted = scratch / "type-sorted.work";
     const auto frameSource = scratch / "frame-source.work";
@@ -408,16 +600,27 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             facts[index] = std::make_unique<analysis::PagedRecordReader>( FactPath( state.root, QueryJobDomain( index ) ),
                 Identity( state.source, std::string( "query-job-fact-" ) + DomainName( QueryJobDomain( index ) ) + "-v1" ),
                 DomainWidth( QueryJobDomain( index ) ), state.options );
+        std::array<std::unique_ptr<ReadOnlyFactMapping>, QueryJobDomainCount> flatFacts;
+        for( size_t index = 0; index < QueryJobDomainCount; index++ )
+        {
+            const auto domain = QueryJobDomain( index );
+            if( !IsAggregationFact( domain ) ) continue;
+            const auto bytes = state.flatFactBytes[index];
+            flatFacts[index] = std::make_unique<ReadOnlyFactMapping>( FlatFactPath( state.root, domain ), bytes );
+            statistics.mappedFactBytes += bytes;
+        }
 
         std::ofstream jobs( analysis::AnalysisIoPath( jobSource ), std::ios::binary | std::ios::trunc );
         std::ofstream reverse( analysis::AnalysisIoPath( reverseSource ), std::ios::binary | std::ios::trunc );
         std::ofstream completions( analysis::AnalysisIoPath( completionSource ), std::ios::binary | std::ios::trunc );
+        std::ofstream dependencyCompletionRequests( analysis::AnalysisIoPath( dependencyCompletionRequestSource ), std::ios::binary | std::ios::trunc );
         std::ofstream types( analysis::AnalysisIoPath( typeSource ), std::ios::binary | std::ios::trunc );
         std::ofstream frames( analysis::AnalysisIoPath( frameSource ), std::ios::binary | std::ios::trunc );
         std::ofstream callsites( analysis::AnalysisIoPath( callsiteSource ), std::ios::binary | std::ios::trunc );
-        if( !jobs || !reverse || !completions || !types || !frames || !callsites )
+        if( !jobs || !reverse || !completions || !dependencyCompletionRequests || !types || !frames || !callsites )
             throw std::runtime_error( "Job index scratch open" );
-        uint64_t jobCount = 0, reverseCount = 0, completionCount = 0, typeCount = 0, frameCount = 0, callsiteCount = 0;
+        uint64_t jobCount = 0, reverseCount = 0, completionCount = 0, dependencyCompletionRequestCount = 0;
+        uint64_t typeCount = 0, frameCount = 0, callsiteCount = 0;
         const auto emitJob = [&]( uint64_t jobId, QueryJobDomain domain, uint64_t ordinal ) {
             analysis::AnalysisKeyMetadataRecord value;
             value.keyHigh = jobId;
@@ -433,19 +636,21 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             AppendMetadata( types, typeSource, item, typeCount, state.options );
         }
         for( uint64_t ordinal = 0; ordinal < facts[size_t( QueryJobDomain::Schedule )]->Count(); ordinal++ )
-            emitJob( ReadFact<JnJobScheduleData>( *facts[size_t( QueryJobDomain::Schedule )], ordinal ).jobId, QueryJobDomain::Schedule, ordinal );
+            emitJob( flatFacts[size_t( QueryJobDomain::Schedule )]->Read<JnJobScheduleData>( ordinal ).jobId, QueryJobDomain::Schedule, ordinal );
         for( uint64_t ordinal = 0; ordinal < facts[size_t( QueryJobDomain::Config )]->Count(); ordinal++ )
-            emitJob( ReadFact<JnJobConfigData>( *facts[size_t( QueryJobDomain::Config )], ordinal ).jobId, QueryJobDomain::Config, ordinal );
+            emitJob( flatFacts[size_t( QueryJobDomain::Config )]->Read<JnJobConfigData>( ordinal ).jobId, QueryJobDomain::Config, ordinal );
         for( uint64_t ordinal = 0; ordinal < facts[size_t( QueryJobDomain::Dependency )]->Count(); ordinal++ )
         {
-            const auto value = ReadFact<JnJobDependencyData>( *facts[size_t( QueryJobDomain::Dependency )], ordinal );
+            const auto value = flatFacts[size_t( QueryJobDomain::Dependency )]->Read<JnJobDependencyData>( ordinal );
             emitJob( value.jobId, QueryJobDomain::Dependency, ordinal );
+            AppendPair( dependencyCompletionRequests, dependencyCompletionRequestSource,
+                { value.prerequisiteJobId, ordinal }, dependencyCompletionRequestCount, state.options );
             if( value.prerequisiteJobId != 0 )
                 AppendPair( reverse, reverseSource, { value.prerequisiteJobId, value.jobId }, reverseCount, state.options );
         }
         for( uint64_t ordinal = 0; ordinal < facts[size_t( QueryJobDomain::Stage )]->Count(); ordinal++ )
         {
-            const auto value = ReadFact<JnJobStageData>( *facts[size_t( QueryJobDomain::Stage )], ordinal );
+            const auto value = flatFacts[size_t( QueryJobDomain::Stage )]->Read<JnJobStageData>( ordinal );
             emitJob( value.jobId, QueryJobDomain::Stage, ordinal );
             if( JnJobStage( value.stage ) == JnJobStage::Completed )
             {
@@ -469,17 +674,28 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             item.keyHigh = value.callsiteId; item.keyLow = ordinal; item.metadata = ordinal;
             AppendMetadata( callsites, callsiteSource, item, callsiteCount, state.options );
         }
-        for( auto* output : { &jobs, &reverse, &completions, &types, &frames, &callsites } )
+        for( auto* output : { &jobs, &reverse, &completions, &dependencyCompletionRequests, &types, &frames, &callsites } )
         { output->flush(); if( !*output ) throw std::runtime_error( "Job index scratch flush" ); output->close(); }
+        for( auto& mapping : flatFacts ) mapping.reset();
 
         std::string error;
         if( !analysis::SortAnalysisKeyMetadataRecords( jobSource, jobSorted, scratch, "jobs", jobCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisUInt64Pairs( reverseSource, reverseSorted, scratch, "job-reverse", reverseCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisKeyMetadataRecords( completionSource, completionSorted, scratch, "job-completion", completionCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
+            !analysis::SortAnalysisUInt64Pairs( dependencyCompletionRequestSource, dependencyCompletionRequestSorted, scratch,
+                "job-dependency-completion-request", dependencyCompletionRequestCount, 128 * 1024, error,
+                state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisKeyMetadataRecords( typeSource, typeSorted, scratch, "job-type", typeCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisKeyMetadataRecords( frameSource, frameSorted, scratch, "job-frame", frameCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisKeyMetadataRecords( callsiteSource, callsiteSorted, scratch, "job-callsite", callsiteCount, 128 * 1024, error, state.options.disk, state.options.workspace ) )
             throw std::runtime_error( "Job index sort: " + error );
+
+        BuildDependencyCompletionJoin( completionSorted, dependencyCompletionRequestSorted,
+            dependencyCompletionSource, dependencyCompletionRequestCount, state.options );
+        if( !analysis::SortAnalysisKeyMetadataRecords( dependencyCompletionSource, dependencyCompletionSorted, scratch,
+            "job-dependency-completion", dependencyCompletionRequestCount, 128 * 1024, error,
+            state.options.disk, state.options.workspace ) )
+            throw std::runtime_error( "Job dependency completion sort: " + error );
 
         BuildLookup( completionSorted, indexRoot / "completion", state.source, "query-job-completion-v1", state.options );
         BuildLookup( typeSorted, indexRoot / "types", state.source, "query-job-types-v1", state.options );
@@ -488,10 +704,21 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
         BuildSpans( reverseSorted, indexRoot / "reverse-records", indexRoot / "reverse-spans",
             state.source, "query-job-reverse-v1", state.options );
 
-        analysis::PagedRecordReader completionLookup( indexRoot / "completion", Identity( state.source, "query-job-completion-v1" ), sizeof( StoredLookup ), state.options );
         analysis::PagedRecordReader typeLookup( indexRoot / "types", Identity( state.source, "query-job-types-v1" ), sizeof( StoredLookup ), state.options );
         analysis::PagedRecordReader frameLookup( indexRoot / "frames", Identity( state.source, "query-job-frames-v1" ), sizeof( StoredLookup ), state.options );
         analysis::PagedRecordReader callsiteLookup( indexRoot / "callsites", Identity( state.source, "query-job-callsites-v1" ), sizeof( StoredLookup ), state.options );
+        for( size_t index = 0; index < QueryJobDomainCount; index++ )
+        {
+            const auto domain = QueryJobDomain( index );
+            if( !IsAggregationFact( domain ) ) continue;
+            flatFacts[index] = std::make_unique<ReadOnlyFactMapping>( FlatFactPath( state.root, domain ),
+                state.flatFactBytes[index] );
+        }
+        std::array<analysis::PagedRecordReader::ReadStats, QueryJobDomainCount> factStatsBefore;
+        for( size_t index = 0; index < QueryJobDomainCount; index++ )
+            factStatsBefore[index] = facts[index]->Statistics();
+        auto dependencyCompletions = std::make_unique<ReadOnlyFactMapping>( dependencyCompletionSorted,
+            dependencyCompletionRequestCount * sizeof( analysis::AnalysisKeyMetadataRecord ) );
         analysis::PagedRecordWriter jobRecords( indexRoot / "jobs", Identity( state.source, "query-jobs-v1" ), sizeof( StoredJob ), state.options );
         analysis::PagedRecordWriter jobRefs( indexRoot / "job-refs", Identity( state.source, "query-job-refs-v1" ), sizeof( StoredFactRef ), state.options );
         std::ofstream evidence( analysis::AnalysisIoPath( evidenceSource ), std::ios::binary | std::ios::trunc );
@@ -553,7 +780,8 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             {
             case QueryJobDomain::Schedule:
             {
-                const auto value = ReadFact<JnJobScheduleData>( *facts[size_t( domain )], contribution.metadata );
+                const auto value = flatFacts[size_t( domain )]->Read<JnJobScheduleData>( contribution.metadata );
+                statistics.aggregationMappedFactReads++;
                 current.packedHandle = value.packedHandle; current.kind = value.kind; current.flags = value.flags;
                 if( value.flags & uint8_t( 1 << 6 ) ) current.jobSchemaVersion = 3;
                 if( value.flags & uint8_t( 1 << 7 ) ) current.state |= JobCaptureBoundary;
@@ -564,7 +792,8 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             }
             case QueryJobDomain::Config:
             {
-                const auto value = ReadFact<JnJobConfigData>( *facts[size_t( domain )], contribution.metadata );
+                const auto value = flatFacts[size_t( domain )]->Read<JnJobConfigData>( contribution.metadata );
+                statistics.aggregationMappedFactReads++;
                 if( value.typeId != 0 ) current.typeId = value.typeId;
                 if( value.count != 0 || current.count == 0 ) current.count = value.count;
                 if( value.grainSize != 0 || current.grainSize == 0 ) current.grainSize = value.grainSize;
@@ -577,15 +806,17 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             }
             case QueryJobDomain::Dependency:
             {
-                const auto value = ReadFact<JnJobDependencyData>( *facts[size_t( domain )], contribution.metadata );
+                const auto value = flatFacts[size_t( domain )]->Read<JnJobDependencyData>( contribution.metadata );
+                statistics.aggregationMappedFactReads++;
                 if( value.prerequisiteJobId != 0 )
                 {
                     haveDependency = true;
-                    const auto completed = FindLookup( completionLookup, value.prerequisiteJobId );
-                    if( !completed ) dependencyComplete = false;
+                    const auto completed = dependencyCompletions->Read<analysis::AnalysisKeyMetadataRecord>( contribution.metadata );
+                    if( completed.keyHigh != contribution.metadata ) throw std::runtime_error( "Job dependency completion ordinal" );
+                    if( completed.kind == 0 ) dependencyComplete = false;
                     else
                     {
-                        const auto time = std::bit_cast<int64_t>( *completed );
+                        const auto time = std::bit_cast<int64_t>( completed.metadata );
                         if( !maximumPrerequisiteCompleted || time > *maximumPrerequisiteCompleted ) maximumPrerequisiteCompleted = time;
                     }
                 }
@@ -593,7 +824,8 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
             }
             case QueryJobDomain::Stage:
             {
-                const auto value = ReadFact<JnJobStageData>( *facts[size_t( domain )], contribution.metadata );
+                const auto value = flatFacts[size_t( domain )]->Read<JnJobStageData>( contribution.metadata );
+                statistics.aggregationMappedFactReads++;
                 switch( JnJobStage( value.stage ) )
                 {
                 case JnJobStage::WorkerSliceBegin:
@@ -646,6 +878,15 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
         }
         if( !sortedJobs.eof() ) throw std::runtime_error( "Job sorted facts read" );
         flushJob();
+        for( size_t index = 0; index < QueryJobDomainCount; index++ )
+        {
+            if( !IsAggregationFact( QueryJobDomain( index ) ) ) continue;
+            const auto after = facts[index]->Statistics();
+            statistics.aggregationCompressedFactPageLoads += after.blockLoads - factStatsBefore[index].blockLoads;
+            statistics.aggregationCompressedFactStoredBytes += after.storedBytes - factStatsBefore[index].storedBytes;
+            statistics.aggregationCompressedFactDecodedBytes += after.decodedBytes - factStatsBefore[index].decodedBytes;
+            statistics.aggregationCompressedFactDecompressions += after.decompressions - factStatsBefore[index].decompressions;
+        }
         sortedJobs.close();
         jobRefs.Commit();
         jobRecords.Commit();
@@ -706,9 +947,12 @@ void QueryJobStoreWriter::BuildIndexes( const std::filesystem::path& stringsPath
         BuildSpans( evidenceSorted, indexRoot / "evidence-records", indexRoot / "evidence-spans",
             state.source, "query-job-evidence-v1", state.options );
 
+        dependencyCompletions.reset();
+        for( auto& mapping : flatFacts ) mapping.reset();
         std::error_code cleanupError;
         analysis::AnalysisDiskRemove( scratch, state.options.disk, cleanupError, true );
         if( cleanupError ) throw std::runtime_error( "Job index scratch cleanup: " + cleanupError.message() );
+        return statistics;
     }
     catch( ... )
     {

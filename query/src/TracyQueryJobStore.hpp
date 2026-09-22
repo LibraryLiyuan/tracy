@@ -31,6 +31,20 @@ enum class QueryJobDomain : uint8_t
 
 inline constexpr size_t QueryJobDomainCount = size_t( QueryJobDomain::Count );
 
+struct QueryJobBuildStatistics
+{
+    uint64_t aggregationCompressedFactPageLoads = 0;
+    uint64_t aggregationCompressedFactStoredBytes = 0;
+    uint64_t aggregationCompressedFactDecodedBytes = 0;
+    uint64_t aggregationCompressedFactDecompressions = 0;
+    uint64_t aggregationMappedFactReads = 0;
+    uint64_t mappedFactBytes = 0;
+    uint64_t completionLookupBlockLoads = 0;
+    uint64_t completionLookupStoredBytes = 0;
+    uint64_t completionLookupDecodedBytes = 0;
+    uint64_t completionLookupDecompressions = 0;
+};
+
 class QueryJobStoreWriter
 {
 public:
@@ -44,7 +58,7 @@ public:
     void Append( QueryJobDomain domain, uint64_t offset, const void* records, uint64_t count );
     void End( QueryJobDomain domain );
     void FinishMissing();
-    void BuildIndexes( const std::filesystem::path& strings );
+    QueryJobBuildStatistics BuildIndexes( const std::filesystem::path& strings );
     uint64_t Count( QueryJobDomain domain ) const;
 
 private:

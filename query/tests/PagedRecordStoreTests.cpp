@@ -55,6 +55,12 @@ static void Run()
         }
         std::array<uint64_t,8> rows{}; reader.Read(62,rows.data(),4);
         Require(rows[0]==62 && rows[6]==65,"range read crosses block boundary");
+        const auto readStats=reader.Statistics();
+        Require(readStats.blockLoads==6,"reader reports real compressed block reloads");
+        Require(readStats.decodedBytes==5376 && readStats.storedBytes>0,
+            "reader reports bytes processed by block reloads");
+        Require(readStats.checksumBytes==readStats.storedBytes && readStats.decompressions==6,
+            "reader reports checksum and decompression work");
         bool rejected=false; try { reader.Read(10000,rows.data(),1); } catch(const std::exception&) { rejected=true; }
         Require(rejected,"out-of-range read rejected");
         reader.ValidateAll();

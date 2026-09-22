@@ -115,7 +115,11 @@ int main()
         dispatch.time = 5; dispatch.dispatchId = 50; dispatch.frameIndex = frameId; dispatch.thread = 10; dispatch.expectedJobs = 2;
         writer.Begin( QueryJobDomain::GfxDispatch, 1 ); writer.Append( QueryJobDomain::GfxDispatch, 0, &dispatch, 1 ); writer.End( QueryJobDomain::GfxDispatch );
         writer.FinishMissing();
-        writer.BuildIndexes( root / "strings" );
+        const auto buildStatistics = writer.BuildIndexes( root / "strings" );
+        Require( buildStatistics.aggregationCompressedFactPageLoads == 0,
+            "Job aggregation reloaded compressed fact pages" );
+        Require( buildStatistics.aggregationMappedFactReads == 14,
+            "Job aggregation mapped fact count changed" );
 
         QueryJobStoreReader reader( root / "jobs", root / "strings", fingerprint, options );
         Require( reader.GetJobCount() == 2 && reader.GetGfxDispatchCount() == 1, "Job derived counts changed" );
@@ -158,6 +162,80 @@ int main()
                 "Job schedule ordering or ordinal continuation changed" );
         }
         Require( orderedReader.ScanJobsBySchedule( 3, 1, {} ).empty(), "Job schedule page exceeded end" );
+
+        QueryJobStoreWriter shuffledWriter( root / "shuffled-jobs", fingerprint, options );
+        constexpr size_t ShuffledJobs = 120;
+        constexpr size_t StagesPerJob = 1000;
+        std::vector<JnJobScheduleData> shuffledSchedules( ShuffledJobs );
+        for( size_t job = 0; job < ShuffledJobs; job++ )
+        {
+            shuffledSchedules[job].jobId = job + 1;
+            shuffledSchedules[job].time = int64_t( job );
+        }
+        shuffledWriter.Begin( QueryJobDomain::Schedule, shuffledSchedules.size() );
+        shuffledWriter.Append( QueryJobDomain::Schedule, 0, shuffledSchedules.data(), shuffledSchedules.size() );
+        shuffledWriter.End( QueryJobDomain::Schedule );
+        std::vector<JnJobStageData> shuffledStages( ShuffledJobs * StagesPerJob );
+        for( size_t index = 0; index < shuffledStages.size(); index++ )
+        {
+            shuffledStages[index].jobId = index % ShuffledJobs + 1;
+            shuffledStages[index].time = int64_t( index );
+            shuffledStages[index].stage = uint8_t( JnJobStage::Ready );
+        }
+        shuffledWriter.Begin( QueryJobDomain::Stage, shuffledStages.size() );
+        shuffledWriter.Append( QueryJobDomain::Stage, 0, shuffledStages.data(), shuffledStages.size() );
+        shuffledWriter.End( QueryJobDomain::Stage );
+        shuffledWriter.FinishMissing();
+        const auto shuffledBuild = shuffledWriter.BuildIndexes( root / "strings" );
+        Require( shuffledBuild.aggregationCompressedFactPageLoads == 0,
+            "jobId order thrashed compressed fact pages" );
+        Require( shuffledBuild.aggregationMappedFactReads == ShuffledJobs * ( StagesPerJob + 1 ),
+            "shuffled Job aggregation did not consume every mapped fact" );
+
+        QueryJobStoreWriter dependencyWriter( root / "dependency-jobs", fingerprint, options );
+        constexpr size_t DependencyJobs = 2048;
+        std::vector<JnJobScheduleData> dependencySchedules( DependencyJobs );
+        std::vector<JnJobDependencyData> dependencyEdges( DependencyJobs );
+        std::vector<JnJobStageData> dependencyStages( DependencyJobs * 2 );
+        for( size_t index = 0; index < DependencyJobs; index++ )
+        {
+            const auto jobId = uint64_t( index + 1 );
+            const auto prerequisite = index + 1 == DependencyJobs ? uint64_t( DependencyJobs + 99 ) :
+                uint64_t( ( index * 40503 ) % DependencyJobs + 1 );
+            dependencySchedules[index].jobId = jobId;
+            dependencySchedules[index].time = int64_t( jobId * 10 );
+            dependencyEdges[index].jobId = jobId;
+            dependencyEdges[index].prerequisiteJobId = prerequisite;
+            dependencyStages[index * 2].jobId = jobId;
+            dependencyStages[index * 2].time = int64_t( jobId * 10 + 5 );
+            dependencyStages[index * 2].stage = uint8_t( JnJobStage::Completed );
+            dependencyStages[index * 2 + 1].jobId = jobId;
+            dependencyStages[index * 2 + 1].time = 1000000 + int64_t( jobId );
+            dependencyStages[index * 2 + 1].stage = uint8_t( JnJobStage::Ready );
+        }
+        dependencyWriter.Begin( QueryJobDomain::Schedule, dependencySchedules.size() );
+        dependencyWriter.Append( QueryJobDomain::Schedule, 0, dependencySchedules.data(), dependencySchedules.size() );
+        dependencyWriter.End( QueryJobDomain::Schedule );
+        dependencyWriter.Begin( QueryJobDomain::Dependency, dependencyEdges.size() );
+        dependencyWriter.Append( QueryJobDomain::Dependency, 0, dependencyEdges.data(), dependencyEdges.size() );
+        dependencyWriter.End( QueryJobDomain::Dependency );
+        dependencyWriter.Begin( QueryJobDomain::Stage, dependencyStages.size() );
+        dependencyWriter.Append( QueryJobDomain::Stage, 0, dependencyStages.data(), dependencyStages.size() );
+        dependencyWriter.End( QueryJobDomain::Stage );
+        dependencyWriter.FinishMissing();
+        const auto dependencyBuild = dependencyWriter.BuildIndexes( root / "strings" );
+        Require( dependencyBuild.completionLookupBlockLoads == 0,
+            "Dependency aggregation repeated compressed completion lookup blocks" );
+        QueryJobStoreReader dependencyReader( root / "dependency-jobs", root / "strings", fingerprint, options );
+        const auto firstDependencyJob = dependencyReader.ScanJobs( 0, 1 );
+        Require( firstDependencyJob.size() == 1 && firstDependencyJob[0].dependencyReadyLatencyNs == 999986,
+            "Dependency completion join changed ready latency" );
+        const auto missingDependencyJob = dependencyReader.ScanJobs( DependencyJobs - 1, 1 );
+        Require( missingDependencyJob.size() == 1 && !missingDependencyJob[0].dependencyReadyLatencyNs,
+            "missing prerequisite completion was reported as available" );
+        Require( !fs::exists( root / "dependency-jobs" / "build-scratch" ) &&
+            !fs::exists( root / "shuffled-jobs" / "build-scratch" ),
+            "Job build scratch survived successful aggregation" );
 
         bool cancelled = false;
         auto cancelOptions = options;
@@ -221,6 +299,28 @@ int main()
             oversizedRejected = std::string( error.what() ).find( "workspace_budget" ) != std::string::npos;
         }
         Require( oversizedRejected, "single Job detail exceeded its bounded collection limit" );
+
+        Require( usage->Snapshot().currentBytes == AnalysisDiskUsage::Bytes( root ),
+            "Job scratch cleanup did not release the disk ledger" );
+        {
+            const auto limitedRoot = root / "limited-jobs";
+            auto limitedUsage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ limitedRoot } );
+            auto limitedDisk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ limitedUsage, 2048, {} } );
+            auto limitedOptions = options;
+            limitedOptions.disk = limitedDisk;
+            QueryJobStoreWriter limitedWriter( limitedRoot, fingerprint, limitedOptions );
+            std::vector<JnJobScheduleData> limitedSchedules( 100 );
+            for( size_t index = 0; index < limitedSchedules.size(); index++ ) limitedSchedules[index].jobId = index + 1;
+            limitedWriter.Begin( QueryJobDomain::Schedule, limitedSchedules.size() );
+            bool limitedRejected = false;
+            try { limitedWriter.Append( QueryJobDomain::Schedule, 0, limitedSchedules.data(), limitedSchedules.size() ); }
+            catch( const std::runtime_error& error )
+            {
+                limitedRejected = std::string( error.what() ).find( "disk_budget" ) != std::string::npos;
+            }
+            Require( limitedRejected && limitedUsage->Snapshot().rejectedGrowths == 1,
+                "temporary flat Job facts bypassed the disk budget" );
+        }
 
         std::error_code ignored;
         fs::remove_all( root, ignored );

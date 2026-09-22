@@ -260,6 +260,7 @@ struct PagedRecordReader::Impl
     std::shared_ptr<PagedRecordScratch> scratch;
     uint64_t loaded=UINT64_MAX,dataBytes=0;
     Entry loadedEntry;
+    PagedRecordReader::ReadStats stats;
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
         :root(std::move(path)),options(std::move(config)),memory(options.workspace),scratch(options.scratch?options.scratch:std::make_shared<PagedRecordScratch>(options.workspace))
     {
@@ -304,6 +305,8 @@ struct PagedRecordReader::Impl
             const auto size=ZSTD_decompressDCtx(context,buffer.data(),buffer.size(),scratch->Bytes(),entry.stored);
             if(ZSTD_isError(size)||size!=entry.decoded) Fail("decode");
         } else std::memcpy(buffer.data(),scratch->Bytes(),entry.stored);
+        ++stats.blockLoads;stats.storedBytes+=entry.stored;stats.decodedBytes+=entry.decoded;
+        stats.checksumBytes+=entry.stored;if(entry.codec)++stats.decompressions;
         loadedEntry=entry; loaded=block; return entry;
     }
 };
@@ -311,6 +314,7 @@ PagedRecordReader::PagedRecordReader(std::filesystem::path root,std::string iden
     :m_impl(std::make_unique<Impl>(std::move(root),std::move(identity),width,std::move(options))) {}
 PagedRecordReader::~PagedRecordReader()=default;
 uint64_t PagedRecordReader::Count() const { return m_impl->header.records; }
+PagedRecordReader::ReadStats PagedRecordReader::Statistics() const { return m_impl->stats; }
 void PagedRecordReader::Read(uint64_t ordinal,void* output,uint64_t count)
 {
     auto& r=*m_impl;
