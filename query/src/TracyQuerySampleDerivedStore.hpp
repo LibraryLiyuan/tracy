@@ -27,6 +27,7 @@ struct QuerySampleDerivedBuildStatistics
     uint64_t callstackCacheHits = 0;
     uint64_t callstackCacheEvictions = 0;
     uint64_t callstackCachePeakBytes = 0;
+    uint64_t callstackDecodedBytes = 0, frameDecodedBytes = 0;
 };
 
 uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,

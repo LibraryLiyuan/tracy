@@ -86,7 +86,7 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
     {
         QuerySampleViewReader samples( samplesPath, sourceFingerprint, options );
         auto dictionaryOptions = options;
-        dictionaryOptions.readerCacheBytes = 16 * 1024 * 1024;
+        if( dictionaryOptions.readerCacheBytes == 0 ) dictionaryOptions.readerCacheBytes = 64 * 1024 * 1024;
         QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, dictionaryOptions );
         QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, dictionaryOptions );
         std::ofstream contributions( analysis::AnalysisIoPath( sourcePath ), std::ios::binary | std::ios::trunc );
@@ -227,6 +227,8 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
                 return true;
             } );
             flushGroups();
+            statistics.callstackDecodedBytes = callstacks.RecordReadStatistics().decodedBytes;
+            statistics.frameDecodedBytes = frames.RecordReadStatistics().decodedBytes;
         }
         contributions.flush();
         if( !contributions ) throw std::runtime_error( "sample derived contribution flush" );

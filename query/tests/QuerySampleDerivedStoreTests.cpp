@@ -40,6 +40,30 @@ int main( int argc, char** argv )
         using namespace tracy::analysis;
         using namespace tracy::query;
 
+        if( argc == 8 && std::string( argv[1] ) == "--slice" )
+        {
+            const auto cacheMiB = std::stoull( argv[7] );
+            const fs::path output = argv[5], selected = std::string( argv[5] ) + "-samples";
+            if( cacheMiB < 4 || cacheMiB > 128 || fs::exists( output ) || fs::exists( selected ) ) return 2;
+            PagedRecordOptions options;
+            options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 512ull << 20, 256ull << 20 );
+            options.readerCacheBytes = cacheMiB << 20;
+            auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ output, selected } );
+            options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 512ull << 20, {} } );
+            QuerySampleStoreReader input( argv[2], argv[6], options );
+            if( input.Count() > 10000 ) throw std::runtime_error( "slice is limited to10000 records" );
+            fs::copy( argv[2], selected, fs::copy_options::recursive );
+            BuildQuerySampleView( selected, argv[6], [](uint64_t){return std::vector<int64_t>{};}, options );
+            QuerySampleDerivedBuildStatistics stats;
+            const auto begin = std::chrono::steady_clock::now();
+            const auto count = BuildQuerySampleDerivedStore( output, selected, argv[3], argv[4], argv[6], options, &stats );
+            std::cout << "records=" << count << " requests=" << stats.callstackRequests
+                << " decoded_bytes=" << stats.callstackDecodedBytes + stats.frameDecodedBytes
+                << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-begin).count() << '\n';
+            if( cacheMiB >= 64 && stats.callstackDecodedBytes + stats.frameDecodedBytes > (128ull << 20) )
+                throw std::runtime_error( "configured dictionary cache must avoid repeated dense-slice decoding" );
+            return 0;
+        }
         if( argc == 8 && std::string( argv[1] ) == "--replay" )
         {
             QuerySampleDerivedBuildStatistics stats;
