@@ -370,6 +370,7 @@ target_compile_definitions(tracy-candidate-policy-tests PRIVATE
     target_compile_definitions(tracy-analysis-cache-manager-tests PRIVATE TRACY_SCAN_MANAGER_TEST_ONLY)
     tracy_query_enable_assertions(tracy-analysis-cache-manager-tests)
     add_test(NAME tracy-analysis-cache-manager COMMAND tracy-analysis-cache-manager-tests)
+    add_test(NAME tracy-analysis-state-publication-lock COMMAND tracy-analysis-cache-manager-tests --publication-lock-only)
 
     add_executable(tracy-gpu-analysis-tests tests/GpuAnalysisTests.cpp)
     target_link_libraries(tracy-gpu-analysis-tests PRIVATE TracyAnalysis)

@@ -1022,6 +1022,37 @@ int main(int argc,char** argv)
     // Other tests use an injected source; its physical fixture must have
     // sufficient capacity for the cache they intentionally construct.
     std::filesystem::resize_file(tracePath,16*1024*1024);
+    if(argc==2 && std::string(argv[1])=="--publication-lock-only") {
+#ifdef _WIN32
+        for(const bool transient : {true,false}) {
+            const auto stateRoot=root/(transient?"transient-lock":"permanent-lock");
+            AnalysisScanExecutor locked=[&](const auto& execution,std::stop_token,const auto& progress,auto& products,auto&) {
+                const auto scans=stateRoot/"scans";
+                const auto state=std::filesystem::directory_iterator(scans)->path()/"scan-state.json";
+                const auto handle=CreateFileW(state.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,
+                    nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+                if(handle==INVALID_HANDLE_VALUE) throw std::runtime_error("publication lock setup failed");
+                std::jthread release([handle,transient]{std::this_thread::sleep_for(transient?80ms:800ms);CloseHandle(handle);});
+                progress(ScanState::Scanning,1,2,"locked_publication");
+                products=Products(execution.temporaryRoot);
+                return true;
+            };
+            AnalysisScanManager manager(stateRoot,root/(transient?"transient-cache":"permanent-cache"),
+                std::string(64,'e'),AnalysisScanSourceResolver{},locked);
+            AnalysisScanStartRequest start;
+            start.tracePath=tracePath; start.traceSessionId="publication-lock";
+            start.source=std::make_shared<tracy::query::test::FakeTraceSource>();
+            start.normalizedProfile=validation.normalized; start.profileIdentity=validation.profileSha256;
+            const auto begin=std::chrono::steady_clock::now();
+            const auto id=manager.Start(start).scanId;
+            const auto result=WaitFor(manager,id,transient?ScanState::Complete:ScanState::Failed,3s);
+            if(!transient && (result.completed || result.error.find("atomic_replace_failed")==std::string::npos))
+                throw std::runtime_error("permanent publication lock must remain explicit failure");
+            if(std::chrono::steady_clock::now()-begin>2s) throw std::runtime_error("publication retry exceeded bound");
+        }
+#endif
+        RemoveTestRoot(root); std::cout<<"publication lock regression passed\n"; return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--gpu-frame-scope-probe") {
         testStage="GPU L0 denominator diagnostic"; GpuFrameScopeProbe(root); RemoveTestRoot(root); return 0;
     }

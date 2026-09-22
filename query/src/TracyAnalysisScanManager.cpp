@@ -106,9 +106,20 @@ bool ReplaceFile( const std::filesystem::path& from, const std::filesystem::path
     if(file==INVALID_HANDLE_VALUE) { error="analysis_scan_flush_open_failed"; return false; }
     const bool flushed=FlushFileBuffers(file)!=0; CloseHandle(file);
     if(!flushed) { error="analysis_scan_flush_failed"; return false; }
-    if( MoveFileExW( from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING |
-        MOVEFILE_WRITE_THROUGH ) != FALSE ) return true;
-    error = "analysis_scan_atomic_replace_failed:" + std::to_string( GetLastError() );
+    // Readers without delete sharing (including external file scanners) may
+    // briefly hold the old state file. Keep atomic replacement and bound the
+    // entire retry window so permanent access failures still stop publication.
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
+    DWORD failure=ERROR_SUCCESS;
+    for(;;) {
+        if( MoveFileExW( from.c_str(), to.c_str(), MOVEFILE_REPLACE_EXISTING |
+            MOVEFILE_WRITE_THROUGH ) != FALSE ) return true;
+        failure=GetLastError();
+        if((failure!=ERROR_ACCESS_DENIED && failure!=ERROR_SHARING_VIOLATION && failure!=ERROR_LOCK_VIOLATION) ||
+            std::chrono::steady_clock::now()>=deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    error = "analysis_scan_atomic_replace_failed:" + std::to_string( failure ) + ":" + to.generic_string();
 #else
     std::error_code ec;
     std::filesystem::rename( from, to, ec );
