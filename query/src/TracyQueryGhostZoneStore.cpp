@@ -180,9 +180,11 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch open" );
 
     QuerySampleStoreReader samples( samplesPath, sourceFingerprint, options );
-    QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, options );
-    QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, options );
-    QueryStringStoreReader strings( stringsPath, sourceFingerprint, options );
+    auto dictionaryOptions = options;
+    dictionaryOptions.readerCacheBytes = 16 * 1024 * 1024;
+    QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, dictionaryOptions );
+    QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, dictionaryOptions );
+    QueryStringStoreReader strings( stringsPath, sourceFingerprint, dictionaryOptions );
     std::vector<QuerySampleMainSpan> spans = samples.MainSpans();
     std::sort( spans.begin(), spans.end(), []( const auto& lhs, const auto& rhs ) { return lhs.thread < rhs.thread; } );
 
@@ -227,6 +229,12 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         }
         statistics.pathResolutions++;
         uncached = BuildPath( callstacks, frames, strings, callstack );
+        const auto ss = strings.RecordReadStatistics();
+        const auto fs = frames.RecordReadStatistics();
+        const auto cs = callstacks.RecordReadStatistics();
+        statistics.stringBlockLoads = ss.blockLoads; statistics.stringDecodedBytes = ss.decodedBytes;
+        statistics.frameBlockLoads = fs.blockLoads; statistics.frameDecodedBytes = fs.decodedBytes;
+        statistics.callstackBlockLoads = cs.blockLoads; statistics.callstackDecodedBytes = cs.decodedBytes;
         const auto footprint = pathFootprint( uncached );
         while( !pathCache.empty() &&
             ( pathCache.size() >= maximumPathCacheEntries || footprint > pathCacheBudget - pathCacheBytes ) )

@@ -28,7 +28,7 @@ void Require( bool condition, const char* message )
 
 }
 
-int main()
+int main( int argc, char** argv )
 {
     try
     {
@@ -39,6 +39,35 @@ int main()
         using namespace tracy;
         using namespace tracy::analysis;
         using namespace tracy::query;
+
+        if( argc == 8 && std::string( argv[1] ) == "--replay" )
+        {
+            QuerySampleDerivedBuildStatistics stats;
+            const auto maximum = std::stoull( argv[7] );
+            if( maximum == 0 || maximum > 1000000 || fs::exists( argv[5] ) ) return 2;
+            PagedRecordOptions options;
+            options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 256ull * 1024 * 1024, 128ull * 1024 * 1024 );
+            auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ argv[5] } );
+            options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 256ull * 1024 * 1024, {} } );
+            options.cancelled = [&] { return stats.callstackRequests >= maximum; };
+            uint64_t contributionBytes = 0;
+            options.beforeFileGrowth = [&]( const fs::path& file, uint64_t bytes ) {
+                if( file.filename() == "contributions.work" ) contributionBytes = bytes;
+            };
+            const auto start = std::chrono::steady_clock::now();
+            bool boundedStop = false;
+            try { BuildQuerySampleDerivedStore( argv[5], argv[2], argv[3], argv[4], argv[6], options, &stats ); }
+            catch( const std::exception& e ) {
+                if( stats.callstackRequests < maximum ) { std::cerr << e.what() << '\n'; return 1; }
+                boundedStop = true;
+            }
+            std::cout << "bounded_stop=" << boundedStop << " requests=" << stats.callstackRequests
+                << " resolutions=" << stats.callstackResolutions << " hits=" << stats.callstackCacheHits
+                << " contribution_bytes=" << contributionBytes << " elapsed_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - start ).count() << '\n';
+            return 0;
+        }
+        if( argc != 1 ) return 2;
 
         const auto root = fs::temp_directory_path() /
             ( "query-sample-derived-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );

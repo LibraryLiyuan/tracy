@@ -253,6 +253,7 @@ struct QueryStringStoreReader::Impl
 
 QueryStringStoreReader::QueryStringStoreReader(std::filesystem::path root,std::string sourceFingerprint,analysis::PagedRecordOptions options):m_impl(std::make_unique<Impl>(std::move(root),std::move(sourceFingerprint),std::move(options))){}
 QueryStringStoreReader::~QueryStringStoreReader()=default;
+analysis::PagedRecordReader::ReadStats QueryStringStoreReader::RecordReadStatistics()const { std::lock_guard lock(m_impl->mutex); return m_impl->strings.Statistics(); }
 uint64_t QueryStringStoreReader::StringCount()const{return m_impl->metadata.stringCount;}
 uint64_t QueryStringStoreReader::PointerCount(QueryStringPointerKind kind)const{return m_impl->metadata.pointerCounts[KindIndex(kind)];}
 uint64_t QueryStringStoreReader::StringLength(uint64_t ordinal)const{std::lock_guard lock(m_impl->mutex);return m_impl->Record(ordinal).bytes;}

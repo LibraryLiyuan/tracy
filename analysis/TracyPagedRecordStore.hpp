@@ -39,6 +39,7 @@ struct PagedRecordOptions
     std::function<void(const std::filesystem::path&,uint64_t)> beforeFileGrowth;
     std::function<void(const std::filesystem::path&,const std::filesystem::path&)> renameFile;
     uint64_t activeReadCacheBytes=0;
+    uint64_t readerCacheBytes=0;
     std::function<void(uint64_t)> beforeMemoryAllocation;
     std::shared_ptr<PagedRecordScratch> scratch;
 };

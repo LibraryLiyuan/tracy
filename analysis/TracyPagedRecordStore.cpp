@@ -261,6 +261,10 @@ struct PagedRecordReader::Impl
     uint64_t loaded=UINT64_MAX,dataBytes=0;
     Entry loadedEntry;
     PagedRecordReader::ReadStats stats;
+    struct CachedPage { uint64_t block=UINT64_MAX,used=0; Entry entry{}; std::vector<char> bytes; };
+    std::vector<CachedPage> pages;
+    uint64_t clock=0;
+    void InvalidateCache() { loaded=UINT64_MAX; for(auto& page:pages)page.block=UINT64_MAX; }
     Impl(std::filesystem::path path,std::string identity,uint32_t width,PagedRecordOptions config)
         :root(std::move(path)),options(std::move(config)),memory(options.workspace),scratch(options.scratch?options.scratch:std::make_shared<PagedRecordScratch>(options.workspace))
     {
@@ -281,11 +285,33 @@ struct PagedRecordReader::Impl
         data.open(AnalysisIoPath(root/"data.bin"),std::ios::binary); directory.open(AnalysisIoPath(root/"directory.bin"),std::ios::binary);
         if(!data||!directory) Fail("open");
         buffer.reserve(options.blockBytes);
+        const auto slots=std::min<uint64_t>(header.blocks,std::max<uint64_t>(1,options.readerCacheBytes/options.blockBytes));
+        if(slots>1) {
+            if(slots>UINT64_MAX/(uint64_t(options.blockBytes)+256))Fail("cache_size");
+            const auto bytes=slots*(uint64_t(options.blockBytes)+256)+4096;
+            if(options.beforeMemoryAllocation)options.beforeMemoryAllocation(bytes);
+            memory.Resize(bytes);
+            pages.resize(size_t(slots-1));
+        }
     }
     Entry Load(uint64_t block)
     {
         Check(options); if(block>=header.blocks) Fail("ordinal");
         if(block==loaded) return loadedEntry;
+        for(auto& page:pages) if(page.block==block) {
+            buffer.swap(page.bytes);std::swap(loaded,page.block);std::swap(loadedEntry,page.entry);
+            page.used=++clock;return loadedEntry;
+        }
+        if(loaded!=UINT64_MAX && !pages.empty()) {
+            auto victim=pages.begin();
+            for(auto it=pages.begin();it!=pages.end();++it) {
+                if(it->block==UINT64_MAX){victim=it;break;}
+                if(it->used<victim->used)victim=it;
+            }
+            buffer.swap(victim->bytes);victim->block=loaded;victim->entry=loadedEntry;victim->used=++clock;
+            loaded=UINT64_MAX;
+            buffer.reserve(options.blockBytes);
+        }
         Seek(directory,block*sizeof(Entry)); const auto entry=ReadObject<Entry>(directory);
         const auto expectedCount=std::min<uint64_t>(header.blockRecords,header.records-block*header.blockRecords);
         if(entry.first!=block*header.blockRecords || entry.records!=expectedCount ||
@@ -329,7 +355,7 @@ void PagedRecordReader::Read(uint64_t ordinal,void* output,uint64_t count)
 }
 void PagedRecordReader::ValidateAll()
 {
-    auto& r=*m_impl; r.loaded=UINT64_MAX; Sha256Builder content; uint64_t offset=0;
+    auto& r=*m_impl; r.InvalidateCache(); Sha256Builder content; uint64_t offset=0;
     for(uint64_t block=0;block<r.header.blocks;++block) {
         const auto entry=r.Load(block); if(entry.offset!=offset) Fail("block_continuity");
         offset+=entry.stored; content.Update(r.buffer.data(),r.buffer.size());
@@ -338,7 +364,7 @@ void PagedRecordReader::ValidateAll()
 }
 PagedRecordReader::VisitStats PagedRecordReader::VisitValidated(const std::function<void(const void*,uint64_t)>& visitor)
 {
-    if(!visitor)Fail("visitor");auto& r=*m_impl;r.loaded=UINT64_MAX;Sha256Builder content;uint64_t offset=0;VisitStats stats;
+    if(!visitor)Fail("visitor");auto& r=*m_impl;r.InvalidateCache();Sha256Builder content;uint64_t offset=0;VisitStats stats;
     for(uint64_t block=0;block<r.header.blocks;++block){const auto entry=r.Load(block);if(entry.offset!=offset)Fail("block_continuity");offset+=entry.stored;content.Update(r.buffer.data(),r.buffer.size());visitor(r.buffer.data(),entry.records);++stats.blocks;stats.records+=entry.records;stats.decodedBytes+=entry.decoded;stats.storedBytes+=entry.stored;}
     if(offset!=r.dataBytes||stats.records!=r.header.records||content.FinalHex()!=std::string(r.header.contentHash,64))Fail("content_checksum");return stats;
 }

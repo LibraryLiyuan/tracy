@@ -83,8 +83,10 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
     try
     {
         QuerySampleViewReader samples( samplesPath, sourceFingerprint, options );
-        QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, options );
-        QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, options );
+        auto dictionaryOptions = options;
+        dictionaryOptions.readerCacheBytes = 16 * 1024 * 1024;
+        QueryCallstackStoreReader callstacks( callstacksPath, sourceFingerprint, dictionaryOptions );
+        QueryCallstackFrameStoreReader frames( callstackFramesPath, sourceFingerprint, dictionaryOptions );
         std::ofstream contributions( analysis::AnalysisIoPath( sourcePath ), std::ios::binary | std::ios::trunc );
         if( !contributions ) throw std::runtime_error( "sample derived contribution open" );
         uint64_t contributionCount = 0;

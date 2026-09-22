@@ -117,6 +117,7 @@ struct QueryCallstackStoreReader::Impl
 
 QueryCallstackStoreReader::QueryCallstackStoreReader(std::filesystem::path root,std::string sourceFingerprint,analysis::PagedRecordOptions options):m_impl(std::make_unique<Impl>(std::move(root),std::move(sourceFingerprint),std::move(options))){}
 QueryCallstackStoreReader::~QueryCallstackStoreReader()=default;
+analysis::PagedRecordReader::ReadStats QueryCallstackStoreReader::RecordReadStatistics()const { std::lock_guard lock(m_impl->mutex); return m_impl->records.Statistics(); }
 uint64_t QueryCallstackStoreReader::Count()const{return m_impl->metadata.count;}
 std::span<const CallstackFrameId> QueryCallstackStoreReader::Frames(uint32_t id)const{std::lock_guard lock(m_impl->mutex);const auto record=m_impl->Record(id);return {m_impl->arena->Frames(record.offset,record.count),record.count};}
 void QueryCallstackStoreReader::VisitFrames(uint32_t id,uint32_t maximumFramesPerChunk,const std::function<void(const CallstackFrameId*,uint32_t)>& visitor)const
@@ -183,6 +184,7 @@ struct QueryCallstackFrameStoreReader::Impl
 
 QueryCallstackFrameStoreReader::QueryCallstackFrameStoreReader(std::filesystem::path root,std::string sourceFingerprint,analysis::PagedRecordOptions options):m_impl(std::make_unique<Impl>(std::move(root),std::move(sourceFingerprint),std::move(options))){}
 QueryCallstackFrameStoreReader::~QueryCallstackFrameStoreReader()=default;
+analysis::PagedRecordReader::ReadStats QueryCallstackFrameStoreReader::RecordReadStatistics()const { std::lock_guard lock(m_impl->mutex); return m_impl->records.Statistics(); }
 uint64_t QueryCallstackFrameStoreReader::Count()const{return m_impl->metadata.count;}
 std::optional<QueryCallstackFrameDefinition> QueryCallstackFrameStoreReader::Find(CallstackFrameId id)const
 {

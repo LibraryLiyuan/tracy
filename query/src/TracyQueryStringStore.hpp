@@ -50,6 +50,7 @@ public:
     QueryStringStoreReader( const QueryStringStoreReader& ) = delete;
     QueryStringStoreReader& operator=( const QueryStringStoreReader& ) = delete;
     uint64_t StringCount() const;
+    analysis::PagedRecordReader::ReadStats RecordReadStatistics() const;
     uint64_t PointerCount( QueryStringPointerKind kind ) const;
     uint64_t StringLength( uint64_t ordinal ) const;
     QueryStableStringView StableOrdinal( uint64_t ordinal ) const;

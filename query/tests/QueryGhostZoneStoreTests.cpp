@@ -30,12 +30,43 @@ void WriteString( tracy::query::QueryStringStoreWriter& writer, uint64_t ordinal
 
 }
 
-int main()
+int main( int argc, char** argv )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
     using namespace tracy::analysis;
     using namespace tracy::query;
+
+    // Bounded stage replay: reads existing sidecars, writes only a new output directory.
+    // A one-nanosecond period is deliberate: this measures storage work, not acceptance semantics.
+    if( argc == 9 && std::string( argv[1] ) == "--replay" )
+    {
+        QueryGhostZoneBuildStatistics stats;
+        const auto maximum = std::stoull( argv[8] );
+        if( maximum == 0 || maximum > 1000000 || fs::exists( argv[6] ) ) return 2;
+        PagedRecordOptions options;
+        options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 256ull * 1024 * 1024, 128ull * 1024 * 1024 );
+        auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ argv[6] } );
+        options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 256ull * 1024 * 1024, {} } );
+        options.cancelled = [&] { return stats.pathRequests >= maximum; };
+        const auto start = std::chrono::steady_clock::now();
+        bool boundedStop = false;
+        try { BuildQueryGhostZoneStore( argv[6], argv[2], argv[3], argv[4], argv[5], argv[7], 1, options, &stats ); }
+        catch( const std::exception& e )
+        {
+            if( stats.pathRequests < maximum ) { std::cerr << e.what() << '\n'; return 1; }
+            boundedStop = true;
+        }
+        std::cout << "bounded_stop=" << boundedStop << " requests=" << stats.pathRequests
+            << " resolutions=" << stats.pathResolutions << " hits=" << stats.pathCacheHits
+            << " scratch_writes=" << stats.scratchRecordWrites
+            << " string_blocks=" << stats.stringBlockLoads << " frame_blocks=" << stats.frameBlockLoads
+            << " callstack_blocks=" << stats.callstackBlockLoads
+            << " decoded_bytes=" << stats.stringDecodedBytes + stats.frameDecodedBytes + stats.callstackDecodedBytes
+            << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - start ).count() << '\n';
+        return 0;
+    }
+    if( argc != 1 ) return 2;
 
     const auto root = fs::temp_directory_path() /
         ( "query-ghost-zone-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );

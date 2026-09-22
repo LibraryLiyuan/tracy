@@ -67,6 +67,33 @@ static void Run()
         Require(memory->Snapshot().currentBytes<128*1024,"directory memory does not grow with block count");
     }
     Require(memory->Snapshot().currentBytes==0,"reader resources released");
+    {
+        auto cachedOptions=options; cachedOptions.readerCacheBytes=2048;
+        PagedRecordReader reader(root/"table",identity,16,cachedOptions);
+        for(uint64_t i=0;i<1000;++i) {
+            std::array<uint64_t,2> row{}; const auto ordinal=(i%2)*64;
+            reader.Read(ordinal,row.data(),1);
+            Require(row[0]==ordinal,"cached pages preserve row identity");
+        }
+        Require(reader.Statistics().blockLoads==2,"alternating dictionary pages must decode once per cached page");
+        std::array<uint64_t,2> row{};
+        for(auto ordinal:{uint64_t(128),uint64_t(64),uint64_t(0)}) {
+            reader.Read(ordinal,row.data(),1);Require(row[0]==ordinal,"cache eviction preserves data");
+        }
+        Require(reader.Statistics().blockLoads==4,"two-page cache must evict the least recently used page");
+        const auto before=reader.Statistics().blockLoads;
+        reader.ValidateAll();
+        Require(reader.Statistics().blockLoads-before==157,"deep validation must bypass cached pages");
+    }
+    Require(memory->Snapshot().currentBytes==0,"multi-page cache resources released");
+    {
+        auto limited=options;limited.readerCacheBytes=8192;
+        limited.workspace=std::make_shared<AnalysisWorkspaceBudget>(10000,5000);
+        bool rejected=false;
+        try { PagedRecordReader reader(root/"table",identity,16,limited); }
+        catch(const std::exception&) { rejected=limited.workspace->Snapshot().rejectedReservations==1; }
+        Require(rejected && limited.workspace->Snapshot().currentBytes==0,"reader cache must reserve shared budget before growth");
+    }
     bool wrongIdentity=false; try { PagedRecordReader bad(root/"table",std::string(64,'c'),16,options); }
     catch(const std::exception&) { wrongIdentity=true; }
     Require(wrongIdentity,"different trace cannot read table");

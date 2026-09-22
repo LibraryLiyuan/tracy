@@ -42,6 +42,7 @@ public:
     QueryCallstackStoreReader& operator=( const QueryCallstackStoreReader& ) = delete;
     uint64_t Count() const;
     std::span<const CallstackFrameId> Frames( uint32_t id ) const;
+    analysis::PagedRecordReader::ReadStats RecordReadStatistics() const;
     void VisitFrames( uint32_t id, uint32_t maximumFramesPerChunk,
         const std::function<void( const CallstackFrameId*, uint32_t )>& visitor ) const;
     void ValidateAll() const;
@@ -83,6 +84,7 @@ public:
     QueryCallstackFrameStoreReader& operator=( const QueryCallstackFrameStoreReader& ) = delete;
     uint64_t Count() const;
     std::optional<QueryCallstackFrameDefinition> Find( CallstackFrameId id ) const;
+    analysis::PagedRecordReader::ReadStats RecordReadStatistics() const;
     void ValidateAll() const;
 private:
     struct Impl; std::unique_ptr<Impl> m_impl;
