@@ -20,10 +20,19 @@ struct QuerySampleSymbolStatsRow
     uint64_t childSamples = 0;
 };
 
+struct QuerySampleDerivedBuildStatistics
+{
+    uint64_t callstackRequests = 0;
+    uint64_t callstackResolutions = 0;
+    uint64_t callstackCacheHits = 0;
+    uint64_t callstackCacheEvictions = 0;
+    uint64_t callstackCachePeakBytes = 0;
+};
+
 uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
     std::filesystem::path samples, std::filesystem::path callstacks,
     std::filesystem::path callstackFrames, std::string sourceFingerprint,
-    analysis::PagedRecordOptions options = {} );
+    analysis::PagedRecordOptions options = {}, QuerySampleDerivedBuildStatistics* statistics = nullptr );
 
 class QuerySampleDerivedStoreReader
 {

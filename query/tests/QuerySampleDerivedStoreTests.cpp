@@ -100,10 +100,11 @@ int main()
         auto derivedOptions = options;
         derivedOptions.workspace = derivedWorkspace;
         uint64_t count = 0;
+        QuerySampleDerivedBuildStatistics buildStatistics;
         try
         {
             count = BuildQuerySampleDerivedStore( root / "derived", root / "samples", root / "callstacks",
-                root / "frames", fingerprint, derivedOptions );
+                root / "frames", fingerprint, derivedOptions, &buildStatistics );
         }
         catch( const std::exception& error )
         {
@@ -113,6 +114,9 @@ int main()
         }
         Require( derivedWorkspace->Snapshot().peakBytes <= 16 * 1024 * 1024,
             "sample derived build exceeded its workspace limit" );
+        Require( buildStatistics.callstackRequests > buildStatistics.callstackResolutions &&
+            buildStatistics.callstackCacheHits != 0,
+            "sample derived statistics repeated callstack expansion" );
         Require( count == 3, "sample symbol-statistics record count changed" );
         Require( !fs::exists( root / "derived" / "build-scratch" ), "sample derived scratch was not removed" );
 

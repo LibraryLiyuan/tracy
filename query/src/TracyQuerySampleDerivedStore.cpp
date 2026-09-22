@@ -7,9 +7,11 @@
 #include "TracyQuerySampleView.hpp"
 
 #include <fstream>
+#include <list>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace tracy::query
 {
@@ -68,7 +70,7 @@ void CheckCancelled( const analysis::PagedRecordOptions& options )
 uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
     std::filesystem::path samplesPath, std::filesystem::path callstacksPath,
     std::filesystem::path callstackFramesPath, std::string sourceFingerprint,
-    analysis::PagedRecordOptions options )
+    analysis::PagedRecordOptions options, QuerySampleDerivedBuildStatistics* outputStatistics )
 {
     const auto scratchRoot = output / "build-scratch";
     const auto sourcePath = scratchRoot / "contributions.work";
@@ -97,43 +99,98 @@ uint64_t BuildQuerySampleDerivedStore( std::filesystem::path output,
             if( !contributions ) throw std::runtime_error( "sample derived contribution write" );
             contributionCount++;
         };
-        const auto appendSymbolContributions = [&]( uint32_t callstack, bool subtract ) {
-            if( callstack == 0 ) return;
-            const auto stack = callstacks.Frames( callstack );
-            if( stack.empty() ) return;
-            for( const auto entry : stack )
+        if( outputStatistics ) *outputStatistics = {};
+        QuerySampleDerivedBuildStatistics localStatistics;
+        auto& statistics = outputStatistics ? *outputStatistics : localStatistics;
+        {
+            struct SymbolContribution { uint64_t address = 0; ContributionKind kind = ContributionKind::Inclusive; };
+            struct ResolvedCallstack
             {
-                const auto definition = frames.Find( entry );
-                if( !definition || definition->frames.empty() ) return;
-            }
-            for( size_t stackIndex = 0; stackIndex < stack.size(); stackIndex++ )
-            {
-                const auto definition = frames.Find( stack[stackIndex] );
-                if( stackIndex == 0 )
+                uint32_t callstack = 0;
+                uint64_t footprint = 0;
+                std::vector<SymbolContribution> symbols;
+                std::vector<uint64_t> children;
+            };
+            constexpr uint64_t cacheBudget = 8 * 1024 * 1024;
+            constexpr size_t maximumCacheEntries = 16384;
+            analysis::AnalysisWorkspaceReservation cacheMemory( options.workspace, cacheBudget );
+            std::list<ResolvedCallstack> cache;
+            std::unordered_map<uint32_t, std::list<ResolvedCallstack>::iterator> index;
+            index.reserve( maximumCacheEntries );
+            uint64_t cacheBytes = 0;
+            const auto resolve = [&]( uint32_t callstack, ResolvedCallstack& uncached ) -> const ResolvedCallstack& {
+                statistics.callstackRequests++;
+                if( const auto found = index.find( callstack ); found != index.end() )
                 {
-                    append( definition->frames.front().symAddr, ContributionKind::Exclusive, subtract );
-                    for( size_t frame = 1; frame < definition->frames.size(); frame++ )
-                        append( definition->frames[frame].symAddr, ContributionKind::Inclusive, subtract );
+                    statistics.callstackCacheHits++;
+                    cache.splice( cache.begin(), cache, found->second );
+                    found->second = cache.begin();
+                    return *found->second;
                 }
-                else
+                statistics.callstackResolutions++;
+                uncached.callstack = callstack;
+                if( callstack != 0 )
                 {
-                    for( const auto& frame : definition->frames )
-                        append( frame.symAddr, ContributionKind::Inclusive, subtract );
+                    const auto stack = callstacks.Frames( callstack );
+                    for( size_t child = 1; child < stack.size(); child++ )
+                        uncached.children.push_back( CanonicalPointer( stack[child] ) );
+                    bool complete = !stack.empty();
+                    std::vector<QueryCallstackFrameDefinition> definitions;
+                    definitions.reserve( stack.size() );
+                    for( const auto entry : stack )
+                    {
+                        const auto definition = frames.Find( entry );
+                        if( !definition || definition->frames.empty() ) { complete = false; break; }
+                        definitions.emplace_back( *definition );
+                    }
+                    if( complete )
+                    {
+                        for( size_t stackIndex = 0; stackIndex < definitions.size(); stackIndex++ )
+                        {
+                            const auto& definition = definitions[stackIndex];
+                            if( stackIndex == 0 )
+                            {
+                                uncached.symbols.push_back( { definition.frames.front().symAddr, ContributionKind::Exclusive } );
+                                for( size_t frame = 1; frame < definition.frames.size(); frame++ )
+                                    uncached.symbols.push_back( { definition.frames[frame].symAddr, ContributionKind::Inclusive } );
+                            }
+                            else for( const auto& frame : definition.frames )
+                                uncached.symbols.push_back( { frame.symAddr, ContributionKind::Inclusive } );
+                        }
+                    }
                 }
-            }
-        };
-        samples.Visit( [&]( const QuerySampleRow& sample ) {
-            CheckCancelled( options );
-            const bool context = sample.kind == QuerySampleKind::ContextSwitch;
-            appendSymbolContributions( sample.callstack, context );
-            if( !context && sample.callstack != 0 )
-            {
-                const auto stack = callstacks.Frames( sample.callstack );
-                for( size_t index = 1; index < stack.size(); index++ )
-                    append( CanonicalPointer( stack[index] ), ContributionKind::Child, false );
-            }
-            return true;
-        } );
+                uncached.footprint = 256 + uint64_t( uncached.symbols.size() ) * sizeof( SymbolContribution ) +
+                    uint64_t( uncached.children.size() ) * sizeof( uint64_t );
+                while( !cache.empty() &&
+                    ( cache.size() >= maximumCacheEntries || uncached.footprint > cacheBudget - cacheBytes ) )
+                {
+                    cacheBytes -= cache.back().footprint;
+                    index.erase( cache.back().callstack );
+                    cache.pop_back();
+                    statistics.callstackCacheEvictions++;
+                }
+                if( uncached.footprint <= cacheBudget - cacheBytes )
+                {
+                    cache.push_front( std::move( uncached ) );
+                    index[callstack] = cache.begin();
+                    cacheBytes += cache.front().footprint;
+                    statistics.callstackCachePeakBytes = std::max( statistics.callstackCachePeakBytes, cacheBytes );
+                    return cache.front();
+                }
+                return uncached;
+            };
+            samples.Visit( [&]( const QuerySampleRow& sample ) {
+                CheckCancelled( options );
+                ResolvedCallstack uncached;
+                const auto& resolved = resolve( sample.callstack, uncached );
+                const bool context = sample.kind == QuerySampleKind::ContextSwitch;
+                for( const auto& contribution : resolved.symbols )
+                    append( contribution.address, contribution.kind, context );
+                if( !context ) for( const auto address : resolved.children )
+                    append( address, ContributionKind::Child, false );
+                return true;
+            } );
+        }
         contributions.flush();
         if( !contributions ) throw std::runtime_error( "sample derived contribution flush" );
         contributions.close();

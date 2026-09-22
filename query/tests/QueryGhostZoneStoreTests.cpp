@@ -102,8 +102,12 @@ int main()
         samples.End();
         samples.Commit();
 
+        QueryGhostZoneBuildStatistics buildStatistics;
         const auto count = BuildQueryGhostZoneStore( root / "ghost", root / "samples", root / "callstacks",
-            root / "frames", root / "strings", fingerprint, 5, options );
+            root / "frames", root / "strings", fingerprint, 5, options, &buildStatistics );
+        Require( buildStatistics.pathRequests == 3 && buildStatistics.pathResolutions == 2 &&
+            buildStatistics.pathCacheHits == 1,
+            "Ghost Zone repeated callstack paths were not reused" );
         if( count != 2 ) throw std::runtime_error( "streamed Ghost Zone count changed: " + std::to_string( count ) );
         Require( !fs::exists( root / "ghost" / "build-scratch.bin" ), "Ghost Zone scratch was not removed" );
 

@@ -10,9 +10,11 @@
 #include <charconv>
 #include <limits>
 #include <fstream>
+#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <algorithm>
+#include <unordered_map>
 
 namespace tracy::query
 {
@@ -164,7 +166,8 @@ uint64_t ParseRefOrdinal( std::string_view ref, const char* kind )
 uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     std::filesystem::path samplesPath, std::filesystem::path callstacksPath,
     std::filesystem::path callstackFramesPath, std::filesystem::path stringsPath,
-    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options )
+    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options,
+    QueryGhostZoneBuildStatistics* outputStatistics )
 {
     const auto scratchPath = output / "build-scratch.bin";
     const auto stringsScratchPath = output / "build-strings.bin";
@@ -185,6 +188,57 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     uint64_t count = 0;
     const auto period = samplingPeriodNs;
     std::vector<uint64_t> active;
+    if( outputStatistics ) *outputStatistics = {};
+    QueryGhostZoneBuildStatistics localStatistics;
+    auto& statistics = outputStatistics ? *outputStatistics : localStatistics;
+    constexpr uint64_t pathCacheBudget = 8 * 1024 * 1024;
+    constexpr size_t maximumPathCacheEntries = 16384;
+    analysis::AnalysisWorkspaceReservation pathCacheMemory( options.workspace, pathCacheBudget );
+    struct CachedPath
+    {
+        uint32_t callstack = 0;
+        uint64_t footprint = 0;
+        std::vector<BuildFrame> frames;
+    };
+    std::list<CachedPath> pathCache;
+    std::unordered_map<uint32_t, std::list<CachedPath>::iterator> pathIndex;
+    pathIndex.reserve( maximumPathCacheEntries );
+    uint64_t pathCacheBytes = 0;
+    const auto pathFootprint = []( const std::vector<BuildFrame>& path ) {
+        uint64_t bytes = 256 + uint64_t( path.size() ) * sizeof( BuildFrame );
+        for( const auto& frame : path ) bytes += frame.name.size() + frame.file.size();
+        return bytes;
+    };
+    const auto resolvePath = [&]( uint32_t callstack, std::vector<BuildFrame>& uncached ) -> const std::vector<BuildFrame>& {
+        statistics.pathRequests++;
+        if( const auto found = pathIndex.find( callstack ); found != pathIndex.end() )
+        {
+            statistics.pathCacheHits++;
+            pathCache.splice( pathCache.begin(), pathCache, found->second );
+            found->second = pathCache.begin();
+            return found->second->frames;
+        }
+        statistics.pathResolutions++;
+        uncached = BuildPath( callstacks, frames, strings, callstack );
+        const auto footprint = pathFootprint( uncached );
+        while( !pathCache.empty() &&
+            ( pathCache.size() >= maximumPathCacheEntries || footprint > pathCacheBudget - pathCacheBytes ) )
+        {
+            pathCacheBytes -= pathCache.back().footprint;
+            pathIndex.erase( pathCache.back().callstack );
+            pathCache.pop_back();
+            statistics.pathCacheEvictions++;
+        }
+        if( footprint <= pathCacheBudget - pathCacheBytes )
+        {
+            pathCache.push_front( { callstack, footprint, std::move( uncached ) } );
+            pathIndex[callstack] = pathCache.begin();
+            pathCacheBytes += footprint;
+            statistics.pathCachePeakBytes = std::max( statistics.pathCachePeakBytes, pathCacheBytes );
+            return pathCache.front().frames;
+        }
+        return uncached;
+    };
     const auto writeRecord = [&]( uint64_t ordinal, const ScratchGhostZone& value ) {
         scratch.seekp( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
         scratch.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
@@ -206,7 +260,8 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         {
             const auto sample = samples.ReadPhysical( span.first + index, span.thread, QuerySampleKind::Main );
             if( skipZeroTime && sample.timeNs == 0 ) continue;
-            const auto path = BuildPath( callstacks, frames, strings, sample.callstack );
+            std::vector<BuildFrame> uncachedPath;
+            const auto& path = resolvePath( sample.callstack, uncachedPath );
             if( !active.empty() )
             {
                 const auto previousEnd = readRecord( active.front() ).endNs;
@@ -319,11 +374,12 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
 uint64_t BuildQueryGhostZoneStore( std::filesystem::path output,
     std::filesystem::path samplesPath, std::filesystem::path callstacksPath,
     std::filesystem::path callstackFramesPath, std::filesystem::path stringsPath,
-    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options )
+    std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options,
+    QueryGhostZoneBuildStatistics* statistics )
 {
     return BuildQueryGhostZoneStoreImpl( std::move( output ), std::move( samplesPath ), std::move( callstacksPath ),
         std::move( callstackFramesPath ), std::move( stringsPath ), std::move( sourceFingerprint ), samplingPeriodNs,
-        std::move( options ) );
+        std::move( options ), statistics );
 }
 
 struct QueryGhostZoneStoreWriter::Impl

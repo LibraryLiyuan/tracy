@@ -32,6 +32,15 @@ struct QueryGhostZoneRow
     bool inlineFrame = false;
 };
 
+struct QueryGhostZoneBuildStatistics
+{
+    uint64_t pathRequests = 0;
+    uint64_t pathResolutions = 0;
+    uint64_t pathCacheHits = 0;
+    uint64_t pathCacheEvictions = 0;
+    uint64_t pathCachePeakBytes = 0;
+};
+
 class QueryGhostZoneStoreWriter
 {
 public:
@@ -75,7 +84,7 @@ uint64_t BuildQueryGhostZoneStore( std::filesystem::path output,
     std::filesystem::path samples, std::filesystem::path callstacks,
     std::filesystem::path callstackFrames, std::filesystem::path strings,
     std::string sourceFingerprint, int64_t samplingPeriodNs,
-    analysis::PagedRecordOptions options = {} );
+    analysis::PagedRecordOptions options = {}, QueryGhostZoneBuildStatistics* statistics = nullptr );
 
 }
 
