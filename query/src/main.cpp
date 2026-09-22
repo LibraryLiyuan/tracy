@@ -355,28 +355,37 @@ int RunBuildIndex( const Arguments& args )
     std::unique_ptr<SegmentTraceSource> streamSource;
     QueryIndexManifest index;
     QueryIndexValidation validation;
+    std::shared_ptr<QueryResourceContext> resources;
     if( streamInput )
     {
         streamSource = SegmentTraceSource::Open( path, {}, true );
         indexedPath = streamSource->SnapshotPath();
         const auto view = streamSource->RefreshView();
         if( view ) streamRevision = view->revision;
-        auto resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
+        resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
         validation = QueryIndex::Validate( indexedPath, true, resources );
         if( !validation.manifest ) throw std::runtime_error( "stream query index validation failed: " + validation.reason );
         index = *validation.manifest;
     }
     else
     {
-        auto resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
+        resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
         index = QueryIndex::Build( indexedPath, {}, resources );
         validation = QueryIndex::Validate( indexedPath, true, resources );
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
+    const auto resourceSnapshot = resources->Snapshot();
     const json result = {
         { "program", "tracy-query" }, { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
         { "operation", "build-index" }, { "ok", validation.manifest.has_value() },
         { "elapsed_ms", std::to_string( elapsed ) },
+        { "resources", {
+            { "disk_current_bytes", std::to_string( resourceSnapshot.disk.currentBytes ) },
+            { "disk_peak_bytes", std::to_string( resourceSnapshot.disk.peakBytes ) },
+            { "disk_final_limit_bytes", std::to_string( resourceSnapshot.disk.finalLimitBytes ) },
+            { "disk_peak_limit_bytes", std::to_string( resourceSnapshot.disk.peakLimitBytes ) },
+            { "workspace_peak_bytes", std::to_string( resourceSnapshot.workspace.peakBytes ) }
+        } },
         { "input", {
             { "kind", streamInput ? "stream" : "snapshot" }, { "path", path.string() },
             { "indexed_snapshot", indexedPath.string() }, { "stream_revision", std::to_string( streamRevision ) }
