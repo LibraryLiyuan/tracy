@@ -1,8 +1,16 @@
 #include "TracyQueryGpuReferenceStore.hpp"
+#include "TracyQueryCatalogStore.hpp"
+#include "TracyAnalysisExternalSort.hpp"
+#include "TracyHash.hpp"
+#include "TracyPagedRecordStore.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -35,11 +43,94 @@ public:
 
 }
 
-int main()
+int main( int argc, char** argv )
 {
     try
     {
         namespace fs = std::filesystem;
+        if( argc == 6 && std::string_view( argv[1] ) == "--validate-existing" )
+        {
+            const auto referenceRoot = fs::path( argv[2] );
+            const auto catalogRoot = fs::path( argv[3] );
+            const std::string source = argv[4];
+            const auto scratch = fs::path( argv[5] );
+            if( source.size() != 64 || fs::exists( scratch ) )
+                throw std::runtime_error( "GPU reference diagnostic identity or scratch path" );
+            tracy::analysis::PagedRecordOptions options;
+            options.workspace = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+            options.disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+            options.disk->usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                std::vector<fs::path> { scratch } );
+            options.disk->maximumBytes = 120ull << 30;
+            tracy::query::QueryCatalogStoreReader catalog( catalogRoot, source, options );
+            if( !catalog.PreparePointerResolutionFastPath() )
+                throw std::runtime_error( "GPU reference diagnostic pointer fast path was unavailable" );
+            tracy::query::QueryGpuReferenceStoreReader reader( referenceRoot, source, options );
+            const auto start = std::chrono::steady_clock::now();
+            const auto stats = reader.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                return catalog.ResolveResourcePointer( pointerToken, time );
+            }, scratch );
+            const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start ).count();
+            std::cout << "gpu_reference_real_validation elapsed_ms=" << milliseconds
+                << " use_block_loads=" << stats.useBlockLoads
+                << " use_decoded_bytes=" << stats.useDecodedBytes
+                << " sorted_references=" << stats.sortedReferenceCount
+                << " scratch_peak_bytes=" << options.disk->usage->Snapshot().peakBytes
+                << " scratch_remaining_bytes=" << options.disk->usage->Snapshot().currentBytes << '\n';
+            return 0;
+        }
+        if( argc == 5 && std::string_view( argv[1] ) == "--validation-probe" )
+        {
+            const auto root = fs::path( argv[2] );
+            const std::string source = argv[3];
+            const auto count = std::stoull( argv[4] );
+            if( source.size() != 64 || count == 0 || count > 4096 )
+                throw std::runtime_error( "GPU reference validation probe arguments" );
+            const auto identity = [&]( std::string_view kind ) {
+                tracy::analysis::Sha256Builder hash;
+                hash.Update( source.data(), source.size() );
+                hash.Update( kind.data(), kind.size() );
+                constexpr std::string_view version = "query-gpu-reference-v1";
+                hash.Update( version.data(), version.size() );
+                return hash.FinalHex();
+            };
+            for( const uint64_t cacheBytes : { uint64_t( 0 ), uint64_t( 64 ) << 20 } )
+            {
+                tracy::analysis::PagedRecordOptions options;
+                options.readerCacheBytes = cacheBytes;
+                options.workspace = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+                tracy::analysis::PagedRecordReader lookup( root / "by-resource", identity( "by-resource" ),
+                    sizeof( tracy::analysis::AnalysisKeyMetadataRecord ), options );
+                tracy::analysis::PagedRecordReader uses( root / "resolved-uses", identity( "resolved-uses" ),
+                    sizeof( tracy::query::QueryGpuReferenceResolvedUseRecord ), options );
+                const auto start = std::chrono::steady_clock::now();
+                uint64_t hash = 14695981039346656037ull;
+                uint64_t minimum = UINT64_MAX, maximum = 0;
+                for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+                {
+                    tracy::analysis::AnalysisKeyMetadataRecord row {};
+                    lookup.Read( ordinal, &row, 1 );
+                    if( row.metadata >= uses.Count() ) throw std::runtime_error( "GPU reference probe ordinal" );
+                    tracy::query::QueryGpuReferenceResolvedUseRecord use {};
+                    uses.Read( row.metadata, &use, 1 );
+                    if( use.resourceId != row.keyHigh ) throw std::runtime_error( "GPU reference probe identity" );
+                    minimum = std::min( minimum, row.metadata );
+                    maximum = std::max( maximum, row.metadata );
+                    hash ^= use.resourceId ^ use.passId ^ row.metadata;
+                    hash *= 1099511628211ull;
+                }
+                const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start ).count();
+                const auto stats = uses.Statistics();
+                std::cout << "gpu_reference_validation_probe cache_bytes=" << cacheBytes
+                    << " count=" << count << " elapsed_ms=" << milliseconds
+                    << " minimum_use_ordinal=" << minimum << " maximum_use_ordinal=" << maximum
+                    << " use_block_loads=" << stats.blockLoads << " use_decoded_bytes=" << stats.decodedBytes
+                    << " use_decompressions=" << stats.decompressions << " hash=" << hash << '\n';
+            }
+            return 0;
+        }
         const auto root = fs::temp_directory_path() / "tracy-query-gpu-reference-store";
         std::error_code ignored;
         fs::remove_all( root, ignored );
@@ -85,6 +176,109 @@ int main()
             pass2.total == 1 && pass2.values.size() == 1 && pass2.values[0].passId == 2 &&
             reader.UsesByPass( 999, 0, 10 ).total == 0,
             "GPU reference pass paging changed" );
+        const auto scaleRoot = root.parent_path() / "tracy-query-gpu-reference-validation-scale";
+        const auto scaleScratch = root.parent_path() / "tracy-query-gpu-reference-validation-scale-scratch";
+        fs::remove_all( scaleRoot, ignored );
+        fs::remove_all( scaleScratch, ignored );
+        tracy::analysis::PagedRecordOptions scaleOptions;
+        scaleOptions.blockBytes = 4096;
+        scaleOptions.workspace = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>( 64ull << 20, 32ull << 20 );
+        Input scaleInput;
+        scaleInput.passes = { { 10, 1, 0, 1, 0, 0, 0 } };
+        scaleInput.ends = { { 20, 1, 0, 1, 0, 0, 0 } };
+        for( unsigned i = 0; i < 4096; i++ )
+            scaleInput.uses.push_back( { 10, 1, 100 + i % 8, 1, 1, 0, 0, 1 } );
+        tracy::query::QueryGpuReferenceStore::Build( scaleRoot, identity, scaleInput, scaleOptions );
+        tracy::query::QueryGpuReferenceStoreReader scaleReader( scaleRoot, identity, scaleOptions );
+        const auto validation = scaleReader.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+            return scaleInput.ResolveCatalogResource( pointerToken, time );
+        }, scaleScratch );
+        Require( validation.sortedReferenceCount == scaleInput.uses.size() + scaleInput.uses.size() / 8 &&
+            validation.useDecodedBytes <= scaleInput.uses.size() *
+                sizeof( tracy::query::QueryGpuReferenceResolvedUseRecord ) * 5 &&
+            !fs::exists( scaleScratch ),
+            "GPU reference deep validation repeated compressed random reads or retained scratch" );
+        const auto deniedScratch = root.parent_path() / "tracy-query-gpu-reference-validation-denied";
+        fs::remove_all( deniedScratch, ignored );
+        auto deniedOptions = scaleOptions;
+        auto diskUsage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+            std::vector<fs::path> { deniedScratch } );
+        deniedOptions.disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+        deniedOptions.disk->usage = diskUsage;
+        deniedOptions.disk->maximumBytes = 1;
+        bool diskRejected = false;
+        try
+        {
+            tracy::query::QueryGpuReferenceStoreReader denied( scaleRoot, identity, deniedOptions );
+            denied.ValidateAll( {}, deniedScratch );
+        }
+        catch( const std::exception& error )
+        { diskRejected = std::string_view( error.what() ).find( "analysis_scan_cache_disk_budget" ) != std::string_view::npos; }
+        Require( diskRejected && !fs::exists( deniedScratch ),
+            "GPU reference validation did not reject disk growth and clean its owned scratch" );
+        const auto cancelledScratch = root.parent_path() / "tracy-query-gpu-reference-validation-cancelled";
+        fs::remove_all( cancelledScratch, ignored );
+        auto cancelledOptions = scaleOptions;
+        cancelledOptions.cancelled = [&]() {
+            std::error_code error;
+            const auto source = cancelledScratch / "resource-source.work";
+            return fs::exists( source, error ) && !error &&
+                fs::file_size( source, error ) == scaleInput.uses.size() *
+                    sizeof( tracy::analysis::AnalysisKeyMetadataRecord );
+        };
+        bool cancelledDuringSort = false;
+        try
+        {
+            tracy::query::QueryGpuReferenceStoreReader cancelled( scaleRoot, identity, cancelledOptions );
+            cancelled.ValidateAll( {}, cancelledScratch );
+        }
+        catch( const std::exception& error )
+        { cancelledDuringSort = std::string_view( error.what() ).find( "analysis_metadata_sort_cancelled" ) != std::string_view::npos; }
+        Require( cancelledDuringSort && !fs::exists( cancelledScratch ),
+            "GPU reference validation did not cancel external sorting and clean scratch" );
+        const auto corruptedRoot = root.parent_path() / "tracy-query-gpu-reference-validation-corrupt";
+        const auto corruptedScratch = root.parent_path() / "tracy-query-gpu-reference-validation-corrupt-scratch";
+        fs::remove_all( corruptedRoot, ignored );
+        fs::remove_all( corruptedScratch, ignored );
+        tracy::query::QueryGpuReferenceStore::Build( corruptedRoot, identity, scaleInput, scaleOptions );
+        tracy::analysis::Sha256Builder lookupHash;
+        lookupHash.Update( identity.data(), identity.size() );
+        constexpr std::string_view lookupKind = "by-resource";
+        lookupHash.Update( lookupKind.data(), lookupKind.size() );
+        constexpr std::string_view lookupVersion = "query-gpu-reference-v1";
+        lookupHash.Update( lookupVersion.data(), lookupVersion.size() );
+        const auto lookupIdentity = lookupHash.FinalHex();
+        const auto replacement = corruptedRoot / "by-resource-replacement";
+        {
+            tracy::analysis::PagedRecordReader original( corruptedRoot / "by-resource", lookupIdentity,
+                sizeof( tracy::analysis::AnalysisKeyMetadataRecord ), scaleOptions );
+            tracy::analysis::PagedRecordWriter changed( replacement, lookupIdentity,
+                sizeof( tracy::analysis::AnalysisKeyMetadataRecord ), scaleOptions );
+            for( uint64_t ordinal = 0; ordinal < original.Count(); ordinal++ )
+            {
+                tracy::analysis::AnalysisKeyMetadataRecord row {};
+                original.Read( ordinal, &row, 1 );
+                if( ordinal == 0 ) row.metadata = 1;
+                changed.Append( &row, 1 );
+            }
+            changed.Commit();
+        }
+        fs::remove_all( corruptedRoot / "by-resource" );
+        fs::rename( replacement, corruptedRoot / "by-resource" );
+        bool rejectedCorruption = false;
+        try
+        {
+            tracy::query::QueryGpuReferenceStoreReader corrupted( corruptedRoot, identity, scaleOptions );
+            corrupted.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                return scaleInput.ResolveCatalogResource( pointerToken, time );
+            }, corruptedScratch );
+        }
+        catch( const std::exception& error )
+        { rejectedCorruption = std::string_view( error.what() ).find( "resource lookup ordinal mismatch" ) != std::string_view::npos; }
+        Require( rejectedCorruption && !fs::exists( corruptedScratch ),
+            "GPU reference validation accepted a valid-checksum but missing Use ordinal" );
+        fs::remove_all( corruptedRoot, ignored );
+        fs::remove_all( scaleRoot, ignored );
         fs::remove_all( root, ignored );
         std::cout << "query GPU reference store passed\n";
         return 0;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <queue>
 #include <string_view>
@@ -33,7 +34,7 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     const std::filesystem::path& output, uint64_t& written, std::string& error,
     const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
-    Less less, std::string_view errorPrefix )
+    Less less, std::string_view errorPrefix, const std::function<bool()>& cancelled = {} )
 {
     AnalysisWorkspaceReservation mergeWorkspace(workspace,65536+uint64_t(inputs.size())*2048);
     struct Cursor
@@ -63,6 +64,8 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     std::priority_queue<Head, std::vector<Head>, Greater> heap( Greater { less } );
     for( size_t index = 0; index < inputs.size(); ++index )
     {
+        if( cancelled && cancelled() )
+        { error = std::string( errorPrefix ) + "_cancelled"; return false; }
         cursors[index].input.open( inputs[index], std::ios::binary );
         if( !cursors[index].input )
         { error = std::string( errorPrefix ) + "_run_open_failed"; return false; }
@@ -76,6 +79,8 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     written = 0;
     while( !heap.empty() )
     {
+        if( ( written & 4095 ) == 0 && cancelled && cancelled() )
+        { error = std::string( errorPrefix ) + "_cancelled"; return false; }
         const auto head = heap.top();
         heap.pop();
         AnalysisDiskGrow(disk,sizeof(head.value));
@@ -241,7 +246,8 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,
     std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
-    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    const std::function<bool()>& cancelled )
 {
     using Record = AnalysisKeyMetadataRecord;
     error.clear();
@@ -263,6 +269,8 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     size_t runIndex = 0;
     while( remaining != 0 )
     {
+        if( cancelled && cancelled() )
+        { error = "analysis_metadata_sort_cancelled"; return false; }
         const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedRecords ) );
         AnalysisWorkspaceReservation runWorkspace( workspace, uint64_t( take ) * sizeof( Record ) );
         std::vector<Record> values( take );
@@ -297,6 +305,8 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     size_t pass = 1;
     while( runs.size() > 1 )
     {
+        if( cancelled && cancelled() )
+        { error = "analysis_metadata_sort_cancelled"; return false; }
         std::vector<std::filesystem::path> next;
         for( size_t first = 0; first < runs.size(); first += MergeFanIn )
         {
@@ -306,7 +316,7 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
             if( !MergeRuns<Record>( group, merged, written, error, disk, workspace,
-                    MetadataLess, "analysis_metadata_sort" ) ) return false;
+                    MetadataLess, "analysis_metadata_sort", cancelled ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {
@@ -324,6 +334,8 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
         ++pass;
     }
 
+    if( cancelled && cancelled() )
+    { error = "analysis_metadata_sort_cancelled"; return false; }
     AnalysisDiskRemove( output, disk, ec );
     ec.clear();
     std::filesystem::rename( runs.front(), output, ec );

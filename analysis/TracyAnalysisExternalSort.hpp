@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
@@ -48,7 +49,8 @@ bool SortAnalysisKeyMetadataRecords(
     uint64_t expectedCount,
     uint64_t maximumBufferedRecords,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
-    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {} );
 
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,

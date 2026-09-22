@@ -3958,9 +3958,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap; using paged lookup\n";
             QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input, storageOptions );
             QueryGpuReferenceStoreReader check( temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
+            auto referenceValidationScratch = temporaryJn[useIndex];
+            referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
+                std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+            resources->IncludeDiskRoots( { referenceValidationScratch } );
             check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                 return catalog.ResolveResourcePointer( pointerToken, time );
-            } );
+            }, referenceValidationScratch );
             const auto linkIndex = size_t( SerializedZoneSink::JnDomain::GfxLink );
             auto linkManifest = result.gfxLinks; linkManifest.path = temporaryJn[linkIndex];
             ReadOnlyZoneSection links( linkManifest, ZoneSectionKind::GfxLink,
@@ -4438,9 +4442,15 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             {
                 QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
                     manifest.sourceFingerprint, storageOptions );
+                if( !catalog.PreparePointerResolutionFastPath() )
+                    std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap during validation; using paged lookup\n";
+                auto referenceValidationScratch = manifest.gpuReferenceUses.path;
+                referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
+                    std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+                resources->IncludeDiskRoots( { referenceValidationScratch } );
                 gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                     return catalog.ResolveResourcePointer( pointerToken, time );
-                } );
+                }, referenceValidationScratch );
                 QueryGpuPassResourceStoreReader passResources( manifest.gpuReferenceUses.path,
                     manifest.gpuCatalog.path, manifest.gpuReferenceUses.path,
                     manifest.sourceFingerprint, storageOptions );

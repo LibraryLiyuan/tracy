@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -39,6 +40,47 @@ std::filesystem::path ResourceLookupPath( const std::filesystem::path& root ) { 
 std::filesystem::path CatalogResourceLookupPath( const std::filesystem::path& root ) { return root / "by-catalog-resource"; }
 std::filesystem::path PassTimesPath( const std::filesystem::path& root ) { return root / "pass-times"; }
 std::filesystem::path ResolvedUsesPath( const std::filesystem::path& root ) { return root / "resolved-uses"; }
+
+class ValidationSortedRows
+{
+public:
+    ValidationSortedRows( const std::filesystem::path& path,
+        const std::shared_ptr<analysis::AnalysisWorkspaceBudget>& workspace )
+        : m_memory( workspace, sizeof( analysis::AnalysisKeyMetadataRecord ) * 4096 )
+        , m_rows( 4096 )
+        , m_input( analysis::AnalysisIoPath( path ), std::ios::binary )
+    {
+        if( !m_input ) throw std::runtime_error( "GPU reference validation sort output cannot be opened" );
+    }
+
+    bool Next( analysis::AnalysisKeyMetadataRecord& row )
+    {
+        if( m_position == m_count )
+        {
+            m_input.read( reinterpret_cast<char*>( m_rows.data() ),
+                std::streamsize( m_rows.size() * sizeof( m_rows[0] ) ) );
+            const auto bytes = size_t( m_input.gcount() );
+            if( bytes == 0 )
+            {
+                if( !m_input.eof() ) throw std::runtime_error( "GPU reference validation sort read failed" );
+                return false;
+            }
+            if( bytes % sizeof( m_rows[0] ) != 0 )
+                throw std::runtime_error( "GPU reference validation sort is truncated" );
+            m_position = 0;
+            m_count = bytes / sizeof( m_rows[0] );
+        }
+        row = m_rows[m_position++];
+        return true;
+    }
+
+private:
+    analysis::AnalysisWorkspaceReservation m_memory;
+    std::vector<analysis::AnalysisKeyMetadataRecord> m_rows;
+    std::ifstream m_input;
+    size_t m_position = 0;
+    size_t m_count = 0;
+};
 
 }
 
@@ -287,15 +329,19 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
 struct QueryGpuReferenceStoreReader::Impl
 {
     Impl( std::filesystem::path root, std::string source, analysis::PagedRecordOptions options )
-        : lookup( ResourceLookupPath( root ), Identity( source, "by-resource" ),
-            sizeof( analysis::AnalysisKeyMetadataRecord ), options )
-        , catalogLookup( CatalogResourceLookupPath( root ), Identity( source, "by-catalog-resource" ),
-            sizeof( analysis::AnalysisKeyMetadataRecord ), options )
-        , passTimes( PassTimesPath( root ), Identity( source, "pass-times" ),
-            sizeof( QueryGpuReferencePassTimeRecord ), options )
-        , uses( ResolvedUsesPath( root ), Identity( source, "resolved-uses" ),
-            sizeof( QueryGpuReferenceResolvedUseRecord ), options )
+        : root( std::move( root ) )
+        , options( std::move( options ) )
+        , lookup( ResourceLookupPath( this->root ), Identity( source, "by-resource" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), this->options )
+        , catalogLookup( CatalogResourceLookupPath( this->root ), Identity( source, "by-catalog-resource" ),
+            sizeof( analysis::AnalysisKeyMetadataRecord ), this->options )
+        , passTimes( PassTimesPath( this->root ), Identity( source, "pass-times" ),
+            sizeof( QueryGpuReferencePassTimeRecord ), this->options )
+        , uses( ResolvedUsesPath( this->root ), Identity( source, "resolved-uses" ),
+            sizeof( QueryGpuReferenceResolvedUseRecord ), this->options )
     {}
+    std::filesystem::path root;
+    analysis::PagedRecordOptions options;
     analysis::PagedRecordReader lookup;
     analysis::PagedRecordReader catalogLookup;
     analysis::PagedRecordReader passTimes;
@@ -439,65 +485,178 @@ QueryGpuReferenceResolvedUseRecord QueryGpuReferenceStoreReader::UseAt( uint64_t
     return result;
 }
 
-void QueryGpuReferenceStoreReader::ValidateAll(
-    const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource ) const
+QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
+    const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource,
+    const std::filesystem::path& scratchRoot ) const
 {
-    m_impl->lookup.ValidateAll();
-    m_impl->catalogLookup.ValidateAll();
-    m_impl->passTimes.ValidateAll();
-    m_impl->uses.ValidateAll();
-    uint64_t previousPass = 0;
-    for( uint64_t index = 0; index < m_impl->passTimes.Count(); index++ )
+    using Record = analysis::AnalysisKeyMetadataRecord;
+    const auto scratch = scratchRoot.empty() ? m_impl->root / "validation-scratch" : scratchRoot;
+    if( std::filesystem::exists( analysis::AnalysisIoPath( scratch ) ) )
+        throw std::runtime_error( "GPU reference validation scratch already exists" );
+    std::filesystem::create_directories( analysis::AnalysisIoPath( scratch ) );
+    const auto cleanup = [&]() {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( scratch, m_impl->options.disk, error, true );
+        if( error ) throw std::runtime_error( "GPU reference validation scratch cleanup failed: " + error.message() );
+    };
+    const auto removeFile = [&]( const std::filesystem::path& path ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, m_impl->options.disk, error );
+        if( error ) throw std::runtime_error( "GPU reference validation scratch removal failed: " + error.message() );
+    };
+    const auto before = m_impl->uses.Statistics();
+    try
     {
-        QueryGpuReferencePassTimeRecord row {};
-        m_impl->passTimes.Read( index, &row, 1 );
-        if( row.passId == 0 || row.end < row.start || ( index != 0 && row.passId <= previousPass ) )
-            throw std::runtime_error( "GPU reference pass time order mismatch" );
-        previousPass = row.passId;
-    }
-    previousPass = 0;
-    for( uint64_t index = 0; index < m_impl->uses.Count(); index++ )
-    {
-        QueryGpuReferenceResolvedUseRecord row {};
-        m_impl->uses.Read( index, &row, 1 );
-        if( row.passId == 0 || row.resourceId == 0 || row.passEnd < row.passStart ||
-            ( index != 0 && row.passId < previousPass ) )
-            throw std::runtime_error( "GPU reference resolved use order mismatch" );
-        previousPass = row.passId;
-    }
-    analysis::AnalysisKeyMetadataRecord previous {};
-    for( uint64_t index = 0; index < m_impl->lookup.Count(); index++ )
-    {
-        analysis::AnalysisKeyMetadataRecord row {};
-        m_impl->lookup.Read( index, &row, 1 );
-        if( row.keyHigh == 0 || row.metadata >= m_impl->uses.Count() ||
-            ( index != 0 && ( row.keyHigh < previous.keyHigh ||
-                ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
-                    ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
-            throw std::runtime_error( "GPU reference resource lookup order mismatch" );
-        QueryGpuReferenceResolvedUseRecord use {};
-        m_impl->uses.Read( row.metadata, &use, 1 );
-        if( use.resourceId != row.keyHigh ) throw std::runtime_error( "GPU reference resource lookup identity mismatch" );
-        previous = row;
-    }
-    previous = {};
-    for( uint64_t index = 0; index < m_impl->catalogLookup.Count(); index++ )
-    {
-        analysis::AnalysisKeyMetadataRecord row {};
-        m_impl->catalogLookup.Read( index, &row, 1 );
-        if( row.keyHigh == 0 || row.metadata >= m_impl->uses.Count() ||
-            ( index != 0 && ( row.keyHigh < previous.keyHigh ||
-                ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
-                    ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
-            throw std::runtime_error( "GPU reference Catalog resource lookup order mismatch" );
-        if( resolveCatalogResource )
+        uint64_t previousPass = 0, passOrdinal = 0;
+        m_impl->passTimes.VisitValidated( [&]( const void* data, uint64_t count ) {
+            const auto* bytes = static_cast<const char*>( data );
+            for( uint64_t index = 0; index < count; index++, passOrdinal++ )
+            {
+                QueryGpuReferencePassTimeRecord row {};
+                std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                if( row.passId == 0 || row.end < row.start ||
+                    ( passOrdinal != 0 && row.passId <= previousPass ) )
+                    throw std::runtime_error( "GPU reference pass time order mismatch" );
+                previousPass = row.passId;
+            }
+        } );
+        previousPass = 0;
+        uint64_t useOrdinal = 0;
+        m_impl->uses.VisitValidated( [&]( const void* data, uint64_t count ) {
+            const auto* bytes = static_cast<const char*>( data );
+            for( uint64_t index = 0; index < count; index++, useOrdinal++ )
+            {
+                QueryGpuReferenceResolvedUseRecord row {};
+                std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                if( row.passId == 0 || row.resourceId == 0 || row.passEnd < row.passStart ||
+                    ( useOrdinal != 0 && row.passId < previousPass ) )
+                    throw std::runtime_error( "GPU reference resolved use order mismatch" );
+                previousPass = row.passId;
+            }
+        } );
+
+        const auto writeByUseOrdinal = [&]( analysis::PagedRecordReader& source,
+            const std::filesystem::path& path, const char* orderError ) {
+            std::ofstream output( analysis::AnalysisIoPath( path ), std::ios::binary | std::ios::trunc );
+            if( !output ) throw std::runtime_error( "GPU reference validation source cannot be opened" );
+            analysis::AnalysisWorkspaceReservation memory( m_impl->options.workspace,
+                uint64_t( m_impl->options.blockBytes ) + 4096 );
+            std::vector<Record> reordered;
+            Record previous {};
+            uint64_t ordinal = 0;
+            source.VisitValidated( [&]( const void* data, uint64_t count ) {
+                const auto* bytes = static_cast<const char*>( data );
+                reordered.resize( size_t( count ) );
+                for( uint64_t index = 0; index < count; index++, ordinal++ )
+                {
+                    Record row {};
+                    std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                    if( row.keyHigh == 0 || row.metadata >= m_impl->uses.Count() ||
+                        ( ordinal != 0 && ( row.keyHigh < previous.keyHigh ||
+                            ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
+                                ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
+                        throw std::runtime_error( orderError );
+                    reordered[size_t( index )].keyHigh = row.metadata;
+                    reordered[size_t( index )].metadata = row.keyHigh;
+                    previous = row;
+                }
+                const auto length = count * sizeof( Record );
+                analysis::AnalysisDiskGrow( m_impl->options.disk, length );
+                output.write( reinterpret_cast<const char*>( reordered.data() ), std::streamsize( length ) );
+                if( !output ) throw std::runtime_error( "GPU reference validation source write failed" );
+            } );
+            output.flush();
+            if( !output ) throw std::runtime_error( "GPU reference validation source flush failed" );
+        };
+        const auto sortByUseOrdinal = [&]( const std::filesystem::path& source,
+            const std::filesystem::path& sorted, const char* prefix, uint64_t count ) {
+            std::string error;
+            if( !analysis::SortAnalysisKeyMetadataRecords( source, sorted, scratch, prefix, count,
+                    512 * 1024, error, m_impl->options.disk, m_impl->options.workspace,
+                    m_impl->options.cancelled ) )
+                throw std::runtime_error( "GPU reference validation sort failed: " + error );
+            removeFile( source );
+        };
+
+        const auto resourceSource = scratch / "resource-source.work";
+        const auto resourceSorted = scratch / "resource-sorted.work";
+        writeByUseOrdinal( m_impl->lookup, resourceSource, "GPU reference resource lookup order mismatch" );
+        sortByUseOrdinal( resourceSource, resourceSorted, "gpu-reference-validation-resource",
+            m_impl->lookup.Count() );
         {
-            QueryGpuReferenceResolvedUseRecord use {};
-            m_impl->uses.Read( row.metadata, &use, 1 );
-            if( resolveCatalogResource( use.resourceId, use.passEnd ) != row.keyHigh )
-                throw std::runtime_error( "GPU reference Catalog resource lookup identity mismatch" );
+            ValidationSortedRows sorted( resourceSorted, m_impl->options.workspace );
+            uint64_t ordinal = 0;
+            m_impl->uses.VisitValidated( [&]( const void* data, uint64_t count ) {
+                const auto* bytes = static_cast<const char*>( data );
+                for( uint64_t index = 0; index < count; index++, ordinal++ )
+                {
+                    if( ( ordinal & 4095 ) == 0 && m_impl->options.cancelled && m_impl->options.cancelled() )
+                        throw std::runtime_error( "GPU reference validation cancelled" );
+                    Record lookup {};
+                    if( !sorted.Next( lookup ) || lookup.keyHigh != ordinal )
+                        throw std::runtime_error( "GPU reference resource lookup ordinal mismatch" );
+                    QueryGpuReferenceResolvedUseRecord use {};
+                    std::memcpy( &use, bytes + index * sizeof( use ), sizeof( use ) );
+                    if( lookup.metadata != use.resourceId )
+                        throw std::runtime_error( "GPU reference resource lookup identity mismatch" );
+                }
+            } );
+            Record extra {};
+            if( sorted.Next( extra ) ) throw std::runtime_error( "GPU reference resource lookup duplicate ordinal" );
         }
-        previous = row;
+        removeFile( resourceSorted );
+
+        const auto catalogSource = scratch / "catalog-source.work";
+        const auto catalogSorted = scratch / "catalog-sorted.work";
+        writeByUseOrdinal( m_impl->catalogLookup, catalogSource,
+            "GPU reference Catalog resource lookup order mismatch" );
+        sortByUseOrdinal( catalogSource, catalogSorted, "gpu-reference-validation-catalog",
+            m_impl->catalogLookup.Count() );
+        {
+            ValidationSortedRows sorted( catalogSorted, m_impl->options.workspace );
+            Record next {};
+            bool haveNext = sorted.Next( next );
+            uint64_t ordinal = 0;
+            m_impl->uses.VisitValidated( [&]( const void* data, uint64_t count ) {
+                const auto* bytes = static_cast<const char*>( data );
+                for( uint64_t index = 0; index < count; index++, ordinal++ )
+                {
+                    if( ( ordinal & 4095 ) == 0 && m_impl->options.cancelled && m_impl->options.cancelled() )
+                        throw std::runtime_error( "GPU reference validation cancelled" );
+                    QueryGpuReferenceResolvedUseRecord use {};
+                    std::memcpy( &use, bytes + index * sizeof( use ), sizeof( use ) );
+                    const auto expected = resolveCatalogResource ?
+                        resolveCatalogResource( use.resourceId, use.passEnd ) : 0;
+                    if( haveNext && next.keyHigh < ordinal )
+                        throw std::runtime_error( "GPU reference Catalog lookup ordinal mismatch" );
+                    if( haveNext && next.keyHigh == ordinal )
+                    {
+                        if( next.metadata == 0 || ( resolveCatalogResource && next.metadata != expected ) )
+                            throw std::runtime_error( "GPU reference Catalog resource lookup identity mismatch" );
+                        haveNext = sorted.Next( next );
+                        if( haveNext && next.keyHigh == ordinal )
+                            throw std::runtime_error( "GPU reference Catalog lookup duplicate ordinal" );
+                    }
+                    else if( resolveCatalogResource && expected != 0 )
+                        throw std::runtime_error( "GPU reference Catalog lookup missing ordinal" );
+                }
+            } );
+            if( haveNext ) throw std::runtime_error( "GPU reference Catalog lookup ordinal out of range" );
+        }
+        removeFile( catalogSorted );
+        cleanup();
+        const auto after = m_impl->uses.Statistics();
+        QueryGpuReferenceValidationStats result;
+        result.useBlockLoads = after.blockLoads - before.blockLoads;
+        result.useDecodedBytes = after.decodedBytes - before.decodedBytes;
+        result.sortedReferenceCount = m_impl->lookup.Count() + m_impl->catalogLookup.Count();
+        return result;
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        cleanup();
+        std::rethrow_exception( failure );
     }
 }
 

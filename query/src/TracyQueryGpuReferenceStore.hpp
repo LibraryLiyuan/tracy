@@ -47,6 +47,13 @@ struct QueryGpuReferenceUsePage
     uint64_t total = 0;
 };
 
+struct QueryGpuReferenceValidationStats
+{
+    uint64_t useBlockLoads = 0;
+    uint64_t useDecodedBytes = 0;
+    uint64_t sortedReferenceCount = 0;
+};
+
 class QueryGpuReferenceStore
 {
 public:
@@ -68,7 +75,9 @@ public:
     QueryGpuReferenceUsePage UsesByPass( uint64_t passId, uint64_t offset, size_t limit ) const;
     uint64_t UseCount() const;
     QueryGpuReferenceResolvedUseRecord UseAt( uint64_t ordinal ) const;
-    void ValidateAll( const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource = {} ) const;
+    QueryGpuReferenceValidationStats ValidateAll(
+        const std::function<uint64_t( uint64_t, int64_t )>& resolveCatalogResource = {},
+        const std::filesystem::path& scratchRoot = {} ) const;
 
 private:
     struct Impl;
