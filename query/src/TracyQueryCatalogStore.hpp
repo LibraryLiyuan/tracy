@@ -330,6 +330,10 @@ public:
     std::optional<QueryCatalogAllocationData> AllocationState( uint64_t allocationId ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
     uint64_t ResourceNameLookupDecodedBytes() const;
+    uint64_t ResourcePointerLookupDecodedBytes() const;
+    uint64_t ResourcePointerIntervalDecodedBytes() const;
+    bool PreparePointerResolutionFastPath();
+    uint64_t PointerResolutionFastPathBytes() const;
 
 private:
     struct Impl;

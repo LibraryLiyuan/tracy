@@ -4,8 +4,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisExternalSort.hpp"
@@ -28,7 +31,7 @@ void Require( bool condition, const char* message )
 
 }
 
-int main()
+int main( int argc, char** argv )
 {
     try
     {
@@ -38,6 +41,57 @@ int main()
         namespace fs = std::filesystem;
         using namespace tracy;
         using namespace tracy::query;
+        if( argc == 6 && ( std::string_view( argv[1] ) == "--pointer-probe" ||
+            std::string_view( argv[1] ) == "--pointer-fast-probe" ) )
+        {
+            const bool fastOnly = std::string_view( argv[1] ) == "--pointer-fast-probe";
+            const auto root = fs::path( argv[2] );
+            const std::string identity = argv[3];
+            const auto source = fs::path( argv[4] );
+            const auto count = std::stoull( argv[5] );
+            if( count == 0 || count > ( fastOnly ? 100000 : 4096 ) )
+                throw std::runtime_error( "pointer probe count out of range" );
+            std::ifstream input( source, std::ios::binary );
+            if( !input ) throw std::runtime_error( "pointer probe source cannot be opened" );
+            std::vector<uint64_t> tokens;
+            tokens.reserve( size_t( count ) );
+            analysis::AnalysisKeyMetadataRecord row {};
+            while( tokens.size() < count && input.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) )
+            {
+                if( row.keyHigh != 0 ) tokens.push_back( row.keyHigh );
+                for( int skip = 0; skip < ( fastOnly && count > 4096 ? 2 : 9 ); skip++ )
+                    if( !input.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) ) break;
+            }
+            if( tokens.size() != count ) throw std::runtime_error( "pointer probe source is too short" );
+            const std::vector<uint64_t> cacheModes = fastOnly ? std::vector<uint64_t> { 0 } :
+                std::vector<uint64_t> { uint64_t( 4 ) << 20, 0, uint64_t( 96 ) << 20 };
+            for( const auto cacheBytes : cacheModes )
+            {
+                analysis::PagedRecordOptions options;
+                options.readerCacheBytes = cacheBytes;
+                options.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+                QueryCatalogStoreReader catalog( root, identity, options );
+                if( fastOnly && !catalog.PreparePointerResolutionFastPath() )
+                    throw std::runtime_error( "pointer fast probe exceeded shared workspace cap" );
+                const auto start = std::chrono::steady_clock::now();
+                uint64_t hash = 14695981039346656037ull;
+                for( const auto token : tokens )
+                {
+                    const auto resolved = catalog.ResolveResourcePointer( token, std::numeric_limits<int64_t>::max() );
+                    hash ^= resolved;
+                    hash *= 1099511628211ull;
+                }
+                const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start ).count();
+                std::cout << "pointer_probe cache_bytes=" << cacheBytes << " count=" << tokens.size()
+                    << " fast_bytes=" << catalog.PointerResolutionFastPathBytes()
+                    << " elapsed_ms=" << milliseconds
+                    << " lookup_decoded_bytes=" << catalog.ResourcePointerLookupDecodedBytes()
+                    << " interval_decoded_bytes=" << catalog.ResourcePointerIntervalDecodedBytes()
+                    << " hash=" << hash << '\n';
+            }
+            return 0;
+        }
         const auto root = fs::temp_directory_path() / "tracy-query-catalog-store-test";
         std::error_code ignored;
         fs::remove_all( root, ignored );
@@ -343,6 +397,9 @@ int main()
         }
         QueryCatalogStoreReader associationReader( associationRoot, identity );
         associationReader.BuildResourceIndex( associationRoot / "resource-index-scratch" );
+        Require( associationReader.PreparePointerResolutionFastPath() &&
+            associationReader.PointerResolutionFastPathBytes() != 0,
+            "Catalog pointer fast path was not prepared for small derived tables" );
         const auto gpuMemorySummary = associationReader.GpuMemorySummary();
         Require( gpuMemorySummary.livePhysicalBytes == 24576 &&
             gpuMemorySummary.peakPhysicalBytes == 24576 && gpuMemorySummary.peakTime == 30 &&
@@ -741,6 +798,61 @@ int main()
                 Require(lookup.ResourceNameLookupDecodedBytes()<=65536,"name point queries repeatedly decoded the search spine");
             }
             fs::remove_all(namesRoot,ignored);
+        }
+        {
+            const auto pointerRoot=fs::temp_directory_path()/"query-catalog-pointer-cache";
+            fs::remove_all(pointerRoot,ignored);
+            analysis::PagedRecordOptions pointerOptions;
+            pointerOptions.blockBytes=4096;
+            pointerOptions.workspace=std::make_shared<analysis::AnalysisWorkspaceBudget>(64ull<<20,32ull<<20);
+            QueryCatalogStoreWriter pointerWriter(pointerRoot,identity,pointerOptions);
+            pointerWriter.SetMetadata({1,1,JnGpuCatalogSchemaVersion,JnGpuDetailedEvidenceSchemaVersion});
+            std::vector<JnGpuCatalogResourceRecordV1> pointerResources(1024);
+            for(uint64_t i=0;i<pointerResources.size();++i) {
+                pointerResources[size_t(i)].time=1;
+                pointerResources[size_t(i)].resourceId=1000+i;
+                pointerResources[size_t(i)].pointerToken=1000+i;
+            }
+            pointerWriter.Begin(OfflineCatalogDomain::CatalogResource,pointerResources.size(),
+                sizeof(pointerResources[0]));
+            pointerWriter.Append(OfflineCatalogDomain::CatalogResource,0,pointerResources.data(),
+                pointerResources.size(),sizeof(pointerResources[0]));
+            pointerWriter.End(OfflineCatalogDomain::CatalogResource);
+            JnGpuCatalogBatchData pointerBatch{};
+            pointerBatch.generation=9;
+            pointerBatch.firstRecordIndex=0;
+            pointerBatch.recordCount=uint32_t(pointerResources.size());
+            pointerBatch.kind=uint8_t(JnGpuCatalogBatchKind::Resource);
+            pointerWriter.Begin(OfflineCatalogDomain::CatalogBatch,1,sizeof(pointerBatch));
+            pointerWriter.Append(OfflineCatalogDomain::CatalogBatch,0,&pointerBatch,1,sizeof(pointerBatch));
+            pointerWriter.End(OfflineCatalogDomain::CatalogBatch);
+            pointerWriter.Finish();
+            {
+                QueryCatalogStoreReader pointers(pointerRoot,identity,pointerOptions);
+                pointers.BuildResourceIndex(pointerRoot/"scratch");
+                for(unsigned i=0;i<100;++i) {
+                    Require(pointers.ResolveResourcePointer(1000,1)==1000 &&
+                        pointers.ResolveResourcePointer(2023,1)==2023,
+                        "Catalog pointer cache changed pointer lifetime lookup");
+                }
+                Require(pointers.ResourcePointerLookupDecodedBytes()<=131072 &&
+                    pointers.ResourcePointerIntervalDecodedBytes()<=131072,
+                    "Catalog pointer lookup repeatedly decoded its binary-search pages");
+                Require(pointers.PreparePointerResolutionFastPath() &&
+                    pointers.PointerResolutionFastPathBytes()<=uint64_t(64)<<20,
+                    "Catalog pointer fast path exceeded the shared small-workspace cap");
+                const auto before=pointers.ResourcePointerLookupDecodedBytes()+
+                    pointers.ResourcePointerIntervalDecodedBytes();
+                for(unsigned i=0;i<100;++i) {
+                    Require(pointers.ResolveResourcePointer(1000,1)==1000 &&
+                        pointers.ResolveResourcePointer(2023,1)==2023,
+                        "Catalog pointer fast path changed pointer lifetime lookup");
+                }
+                Require(pointers.ResourcePointerLookupDecodedBytes()+
+                    pointers.ResourcePointerIntervalDecodedBytes()==before,
+                    "Catalog pointer fast path returned to compressed random reads");
+            }
+            fs::remove_all(pointerRoot,ignored);
         }
         std::cout << "query Catalog store passed\n";
         return 0;

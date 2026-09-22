@@ -2,6 +2,7 @@
 
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisIoPath.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyHash.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyQueue.hpp"
@@ -310,6 +311,10 @@ struct QueryCatalogStoreReader::Impl
     mutable std::unique_ptr<analysis::PagedRecordReader> gpuMemorySummary;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourcePointerIntervals;
     mutable std::unique_ptr<analysis::PagedRecordReader> pointerIntervalByPointer;
+    analysis::AnalysisWorkspaceReservation pointerFastWorkspace;
+    std::vector<analysis::AnalysisKeyMetadataRecord> pointerFastLookup;
+    std::vector<QueryCatalogResourcePointerInterval> pointerFastIntervals;
+    bool pointerFastReady = false;
     mutable std::unique_ptr<analysis::PagedRecordReader> pointerIntervalByResource;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRangeLookup;
     mutable std::unique_ptr<analysis::PagedRecordReader> passRangeLookup;
@@ -409,12 +414,23 @@ struct QueryCatalogStoreReader::Impl
         if( !gpuMemorySummary ) gpuMemorySummary = std::make_unique<analysis::PagedRecordReader>(
             GpuMemorySummaryPath( root ), CatalogIdentity( sourceFingerprint, "gpu-memory-summary-v1" ),
             uint32_t( sizeof( QueryCatalogGpuMemorySummary ) ), options );
+        auto pointerReadOptions = options;
+        if( pointerReadOptions.readerCacheBytes == 0 )
+        {
+            // GPU reference construction resolves every Use against these two
+            // tables. Two binary searches per Use thrash the one-block default.
+            uint64_t cap = 96ull << 20;
+            if( pointerReadOptions.workspace )
+                cap = std::min( cap, std::max<uint64_t>( pointerReadOptions.blockBytes,
+                    pointerReadOptions.workspace->Snapshot().maximumBytes / 8 ) );
+            pointerReadOptions.readerCacheBytes = cap;
+        }
         if( !resourcePointerIntervals ) resourcePointerIntervals = std::make_unique<analysis::PagedRecordReader>(
             ResourcePointerIntervalPath( root ), CatalogIdentity( sourceFingerprint, "resource-pointer-intervals-v1" ),
-            uint32_t( sizeof( QueryCatalogResourcePointerInterval ) ), options );
+            uint32_t( sizeof( QueryCatalogResourcePointerInterval ) ), pointerReadOptions );
         if( !pointerIntervalByPointer ) pointerIntervalByPointer = std::make_unique<analysis::PagedRecordReader>(
             PointerIntervalPointerLookupPath( root ), CatalogIdentity( sourceFingerprint, "pointer-interval-by-pointer-v1" ),
-            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), pointerReadOptions );
         if( !pointerIntervalByResource ) pointerIntervalByResource = std::make_unique<analysis::PagedRecordReader>(
             PointerIntervalResourceLookupPath( root ), CatalogIdentity( sourceFingerprint, "pointer-interval-by-resource-v1" ),
             uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
@@ -2428,11 +2444,75 @@ QueryCatalogGpuMemorySummary QueryCatalogStoreReader::GpuMemorySummary() const
     return result;
 }
 
+bool QueryCatalogStoreReader::PreparePointerResolutionFastPath()
+{
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    if( m_impl->pointerFastReady ) return true;
+    const auto lookupCount = m_impl->pointerIntervalByPointer->Count();
+    const auto intervalCount = m_impl->resourcePointerIntervals->Count();
+    if( lookupCount > SIZE_MAX / sizeof( analysis::AnalysisKeyMetadataRecord ) ||
+        intervalCount > SIZE_MAX / sizeof( QueryCatalogResourcePointerInterval ) ) return false;
+    const auto lookupBytes = lookupCount * sizeof( analysis::AnalysisKeyMetadataRecord );
+    const auto intervalBytes = intervalCount * sizeof( QueryCatalogResourcePointerInterval );
+    const auto cap = m_impl->options.workspace ?
+        std::min<uint64_t>( 1ull << 30, m_impl->options.workspace->Snapshot().maximumBytes / 4 ) : 1ull << 30;
+    if( lookupBytes > cap || intervalBytes > cap - lookupBytes ||
+        lookupBytes + intervalBytes > UINT64_MAX - 4096 ) return false;
+    analysis::AnalysisWorkspaceReservation reservation( m_impl->options.workspace,
+        lookupBytes + intervalBytes + 4096 );
+    std::vector<analysis::AnalysisKeyMetadataRecord> lookup;
+    std::vector<QueryCatalogResourcePointerInterval> intervals;
+    lookup.resize( size_t( lookupCount ) );
+    intervals.resize( size_t( intervalCount ) );
+    for( uint64_t ordinal = 0; ordinal < lookupCount; ordinal += 4096 )
+        m_impl->pointerIntervalByPointer->Read( ordinal, lookup.data() + size_t( ordinal ),
+            std::min<uint64_t>( 4096, lookupCount - ordinal ) );
+    for( uint64_t ordinal = 0; ordinal < intervalCount; ordinal += 4096 )
+        m_impl->resourcePointerIntervals->Read( ordinal, intervals.data() + size_t( ordinal ),
+            std::min<uint64_t>( 4096, intervalCount - ordinal ) );
+    m_impl->pointerFastLookup.swap( lookup );
+    m_impl->pointerFastIntervals.swap( intervals );
+    m_impl->pointerFastWorkspace = std::move( reservation );
+    m_impl->pointerFastReady = true;
+    return true;
+}
+
+uint64_t QueryCatalogStoreReader::PointerResolutionFastPathBytes() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->pointerFastReady ? m_impl->pointerFastWorkspace.Bytes() : 0;
+}
+
 uint64_t QueryCatalogStoreReader::ResolveResourcePointer( uint64_t pointerToken, int64_t time ) const
 {
     if( pointerToken == 0 ) return 0;
     std::lock_guard lock( m_impl->mutex );
     m_impl->EnsureResourceIndex();
+    if( m_impl->pointerFastReady )
+    {
+        const auto& lookup = m_impl->pointerFastLookup;
+        const auto begin = std::lower_bound( lookup.begin(), lookup.end(), pointerToken,
+            []( const analysis::AnalysisKeyMetadataRecord& row, uint64_t token ) {
+                return row.keyHigh < token;
+            } );
+        uint64_t resolved = 0;
+        for( auto row = begin; row != lookup.end() && row->keyHigh == pointerToken; ++row )
+        {
+            if( ( size_t( row - lookup.begin() ) & 4095 ) == 0 &&
+                m_impl->options.cancelled && m_impl->options.cancelled() )
+                throw std::runtime_error( "Catalog pointer resolution cancelled" );
+            if( row->metadata >= m_impl->pointerFastIntervals.size() )
+                throw std::runtime_error( "Catalog pointer interval ordinal mismatch" );
+            const auto& interval = m_impl->pointerFastIntervals[size_t( row->metadata )];
+            if( interval.pointerToken != pointerToken )
+                throw std::runtime_error( "Catalog pointer interval identity mismatch" );
+            if( time < interval.begin || time > interval.end ) continue;
+            if( resolved != 0 && resolved != interval.resourceId ) return 0;
+            resolved = interval.resourceId;
+        }
+        return resolved;
+    }
     auto& lookup = *m_impl->pointerIntervalByPointer;
     const auto lowerBound = [&]( bool upper ) {
         uint64_t begin = 0, count = lookup.Count();
@@ -2718,6 +2798,18 @@ uint64_t QueryCatalogStoreReader::ResourceNameLookupDecodedBytes() const
 {
     std::lock_guard lock(m_impl->mutex);
     return m_impl->resourceStringLookup ? m_impl->resourceStringLookup->Statistics().decodedBytes : 0;
+}
+
+uint64_t QueryCatalogStoreReader::ResourcePointerLookupDecodedBytes() const
+{
+    std::lock_guard lock(m_impl->mutex);
+    return m_impl->pointerIntervalByPointer ? m_impl->pointerIntervalByPointer->Statistics().decodedBytes : 0;
+}
+
+uint64_t QueryCatalogStoreReader::ResourcePointerIntervalDecodedBytes() const
+{
+    std::lock_guard lock(m_impl->mutex);
+    return m_impl->resourcePointerIntervals ? m_impl->resourcePointerIntervals->Statistics().decodedBytes : 0;
 }
 
 void QueryCatalogStoreReader::ValidateAll() const

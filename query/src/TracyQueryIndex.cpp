@@ -29,6 +29,7 @@
 #include <cstring>
 #include <exception>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -3953,6 +3954,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 const QueryCatalogStoreReader& m_catalog;
             } input( passes, uses, ends, catalog );
             resources->SetPhase( "gpu-reference-reverse-index" );
+            if( !catalog.PreparePointerResolutionFastPath() )
+                std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap; using paged lookup\n";
             QueryGpuReferenceStore::Build( temporaryJn[useIndex], result.sourceFingerprint, input, storageOptions );
             QueryGpuReferenceStoreReader check( temporaryJn[useIndex], result.sourceFingerprint, storageOptions );
             check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
