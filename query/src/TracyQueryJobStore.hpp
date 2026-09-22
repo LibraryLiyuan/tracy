@@ -43,6 +43,9 @@ struct QueryJobBuildStatistics
     uint64_t completionLookupStoredBytes = 0;
     uint64_t completionLookupDecodedBytes = 0;
     uint64_t completionLookupDecompressions = 0;
+    uint64_t jobNameRequests = 0;
+    uint64_t jobNameResolutions = 0;
+    uint64_t jobNameCacheHits = 0;
 };
 
 class QueryJobStoreWriter

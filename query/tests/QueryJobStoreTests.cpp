@@ -195,6 +195,7 @@ int main()
         QueryJobStoreWriter dependencyWriter( root / "dependency-jobs", fingerprint, options );
         constexpr size_t DependencyJobs = 2048;
         std::vector<JnJobScheduleData> dependencySchedules( DependencyJobs );
+        std::vector<JnJobConfigData> dependencyConfigs( DependencyJobs );
         std::vector<JnJobDependencyData> dependencyEdges( DependencyJobs );
         std::vector<JnJobStageData> dependencyStages( DependencyJobs * 2 );
         for( size_t index = 0; index < DependencyJobs; index++ )
@@ -204,6 +205,8 @@ int main()
                 uint64_t( ( index * 40503 ) % DependencyJobs + 1 );
             dependencySchedules[index].jobId = jobId;
             dependencySchedules[index].time = int64_t( jobId * 10 );
+            dependencyConfigs[index].jobId = jobId;
+            dependencyConfigs[index].typeId = uint32_t( index % 2 + 1 );
             dependencyEdges[index].jobId = jobId;
             dependencyEdges[index].prerequisiteJobId = prerequisite;
             dependencyStages[index * 2].jobId = jobId;
@@ -213,9 +216,15 @@ int main()
             dependencyStages[index * 2 + 1].time = 1000000 + int64_t( jobId );
             dependencyStages[index * 2 + 1].stage = uint8_t( JnJobStage::Ready );
         }
+        dependencyWriter.Begin( QueryJobDomain::Type, 2 );
+        dependencyWriter.Append( QueryJobDomain::Type, 0, types, 2 );
+        dependencyWriter.End( QueryJobDomain::Type );
         dependencyWriter.Begin( QueryJobDomain::Schedule, dependencySchedules.size() );
         dependencyWriter.Append( QueryJobDomain::Schedule, 0, dependencySchedules.data(), dependencySchedules.size() );
         dependencyWriter.End( QueryJobDomain::Schedule );
+        dependencyWriter.Begin( QueryJobDomain::Config, dependencyConfigs.size() );
+        dependencyWriter.Append( QueryJobDomain::Config, 0, dependencyConfigs.data(), dependencyConfigs.size() );
+        dependencyWriter.End( QueryJobDomain::Config );
         dependencyWriter.Begin( QueryJobDomain::Dependency, dependencyEdges.size() );
         dependencyWriter.Append( QueryJobDomain::Dependency, 0, dependencyEdges.data(), dependencyEdges.size() );
         dependencyWriter.End( QueryJobDomain::Dependency );
@@ -226,10 +235,17 @@ int main()
         const auto dependencyBuild = dependencyWriter.BuildIndexes( root / "strings" );
         Require( dependencyBuild.completionLookupBlockLoads == 0,
             "Dependency aggregation repeated compressed completion lookup blocks" );
+        Require( dependencyBuild.jobNameRequests == DependencyJobs && dependencyBuild.jobNameResolutions == 2 &&
+            dependencyBuild.jobNameCacheHits == DependencyJobs - 2,
+            "Job names were resolved more than once per unique type" );
         QueryJobStoreReader dependencyReader( root / "dependency-jobs", root / "strings", fingerprint, options );
         const auto firstDependencyJob = dependencyReader.ScanJobs( 0, 1 );
-        Require( firstDependencyJob.size() == 1 && firstDependencyJob[0].dependencyReadyLatencyNs == 999986,
-            "Dependency completion join changed ready latency" );
+        if( firstDependencyJob.size() != 1 || firstDependencyJob[0].name != "RootJob" ||
+            firstDependencyJob[0].dependencyReadyLatencyNs != 999986 )
+            throw std::runtime_error( "Dependency completion/name result changed: name=" +
+                ( firstDependencyJob.empty() ? std::string( "<missing>" ) : firstDependencyJob[0].name ) +
+                " latency=" + ( firstDependencyJob.empty() || !firstDependencyJob[0].dependencyReadyLatencyNs ?
+                    std::string( "<missing>" ) : std::to_string( *firstDependencyJob[0].dependencyReadyLatencyNs ) ) );
         const auto missingDependencyJob = dependencyReader.ScanJobs( DependencyJobs - 1, 1 );
         Require( missingDependencyJob.size() == 1 && !missingDependencyJob[0].dependencyReadyLatencyNs,
             "missing prerequisite completion was reported as available" );

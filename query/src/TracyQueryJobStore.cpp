@@ -17,6 +17,7 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -925,16 +926,45 @@ QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem
         QueryStringStoreReader globalStrings( stringsPath, state.source, state.options );
         QueryStringStoreWriter names( indexRoot / "names", state.source, state.options );
         names.StringsBegin( jobRecords.Count() );
-        for( uint64_t ordinal = 0; ordinal < jobRecords.Count(); ordinal++ )
         {
-            StoredJob job;
-            jobRecords.Read( ordinal, &job, 1 );
-            std::string name = "<unknown job type>";
-            if( const auto pointer = FindLookup( typeLookup, job.typeId ) )
-                if( const auto resolved = globalStrings.ResolvePointer( QueryStringPointerKind::String, *pointer, 1024 * 1024 ) ) name = *resolved;
-            names.StringBegin( ordinal, ordinal, name.size() );
-            if( !name.empty() ) names.StringBytes( ordinal, 0, name.data(), name.size() );
-            names.StringEnd( ordinal );
+            constexpr uint64_t cacheBudgetBytes = 2 * 1024 * 1024;
+            constexpr size_t maximumCacheEntries = 1024;
+            constexpr uint64_t estimatedEntryOverhead = 512;
+            analysis::AnalysisWorkspaceReservation cacheMemory( state.options.workspace, cacheBudgetBytes );
+            std::unordered_map<uint32_t, std::string> cache;
+            cache.reserve( size_t( std::min<uint64_t>( typeLookup.Count(), maximumCacheEntries ) ) );
+            uint64_t cachedBytes = 0;
+            for( uint64_t ordinal = 0; ordinal < jobRecords.Count(); ordinal++ )
+            {
+                StoredJob job;
+                jobRecords.Read( ordinal, &job, 1 );
+                statistics.jobNameRequests++;
+                const std::string* name = nullptr;
+                std::string resolvedName;
+                if( const auto found = cache.find( job.typeId ); found != cache.end() )
+                {
+                    statistics.jobNameCacheHits++;
+                    name = &found->second;
+                }
+                else
+                {
+                    statistics.jobNameResolutions++;
+                    resolvedName = "<unknown job type>";
+                    if( const auto pointer = FindLookup( typeLookup, job.typeId ) )
+                        if( const auto resolved = globalStrings.ResolvePointer( QueryStringPointerKind::String, *pointer, 1024 * 1024 ) )
+                            resolvedName = *resolved;
+                    const auto footprint = uint64_t( resolvedName.size() ) + estimatedEntryOverhead;
+                    if( cache.size() < maximumCacheEntries && footprint <= cacheBudgetBytes - cachedBytes )
+                    {
+                        cachedBytes += footprint;
+                        name = &cache.emplace( job.typeId, std::move( resolvedName ) ).first->second;
+                    }
+                    else name = &resolvedName;
+                }
+                names.StringBegin( ordinal, ordinal, name->size() );
+                if( !name->empty() ) names.StringBytes( ordinal, 0, name->data(), name->size() );
+                names.StringEnd( ordinal );
+            }
         }
         names.StringsEnd();
         for( size_t kind = 0; kind < 3; kind++ )
