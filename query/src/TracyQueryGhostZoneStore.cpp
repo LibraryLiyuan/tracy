@@ -254,11 +254,33 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         }
         return uncached;
     };
+    struct FinalizedRecord { uint64_t ordinal; ScratchGhostZone value; };
+    constexpr size_t writeBatchRecords = 8192;
+    analysis::AnalysisWorkspaceReservation batchMemory( options.workspace,
+        writeBatchRecords * ( sizeof( FinalizedRecord ) + sizeof( ScratchGhostZone ) ) + 4096 );
+    std::vector<FinalizedRecord> pending;
+    std::vector<ScratchGhostZone> serialized;
+    pending.reserve( writeBatchRecords ); serialized.reserve( writeBatchRecords );
+    const auto flushPending = [&] {
+        std::sort( pending.begin(), pending.end(), []( const auto& a, const auto& b ) { return a.ordinal < b.ordinal; } );
+        for( size_t first = 0; first < pending.size(); ) {
+            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
+            size_t end = first + 1;
+            while( end < pending.size() && pending[end].ordinal == pending[end - 1].ordinal + 1 ) ++end;
+            serialized.clear();
+            for( size_t i = first; i < end; ++i ) serialized.push_back( pending[i].value );
+            scratch.seekp( std::streamoff( pending[first].ordinal * sizeof( ScratchGhostZone ) ) );
+            scratch.write( reinterpret_cast<const char*>( serialized.data() ), std::streamsize( serialized.size() * sizeof( ScratchGhostZone ) ) );
+            if( !scratch ) throw std::runtime_error( "ghost-zone scratch record write" );
+            ++statistics.scratchWriteCalls;
+            first = end;
+        }
+        pending.clear();
+    };
     const auto writeRecord = [&]( uint64_t ordinal, const ScratchGhostZone& value ) {
-        scratch.seekp( std::streamoff( ordinal * sizeof( ScratchGhostZone ) ) );
-        scratch.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
-        if( !scratch ) throw std::runtime_error( "ghost-zone scratch record write" );
-        statistics.scratchRecordWrites++;
+        pending.push_back( { ordinal, value } );
+        ++statistics.scratchRecordWrites;
+        if( pending.size() == writeBatchRecords ) flushPending();
     };
     const auto flushActiveFrom = [&]( size_t first ) {
         for( size_t index = active.size(); index > first; index-- )
@@ -354,6 +376,7 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         }
         flushActiveFrom( 0 );
     }
+    flushPending();
     reportProgress();
     scratch.flush(); scratchStrings.flush();
     if( !scratch || !scratchStrings ) throw std::runtime_error( "ghost-zone scratch flush" );

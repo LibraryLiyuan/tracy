@@ -177,9 +177,20 @@ struct QueryCallstackFrameStoreReader::Impl
     {
         if(metadataReader.Count()!=1)throw std::runtime_error("query_callstack_frame_metadata_count");metadataReader.Read(0,&metadata,1);if(std::memcmp(metadata.magic,"JNQCF1",6)||metadata.version!=1||metadata.count!=records.Count()||metadata.arenaBytes%sizeof(CallstackFrame))throw std::runtime_error("query_callstack_frame_metadata");const auto indexBytes=std::filesystem::file_size(analysis::AnalysisIoPath(root/"index.bin"));if(indexBytes!=metadata.count*sizeof(analysis::AnalysisUInt64Pair))throw std::runtime_error("query_callstack_frame_index_size");index.open(analysis::AnalysisIoPath(root/"index.bin"),std::ios::binary);if(!index)throw std::runtime_error("query_callstack_frame_index_open");arena=std::make_unique<ReadOnlyMapping>(root/"arena.bin",metadata.arenaBytes);
     }
-    bool FindOrdinal(uint64_t key,uint64_t& value)const{uint64_t first=0,length=metadata.count;while(length){const auto half=length/2,middle=first+half;analysis::AnalysisUInt64Pair pair;index.clear();index.seekg(std::streamoff(middle*sizeof(pair)),std::ios::beg);index.read(reinterpret_cast<char*>(&pair),sizeof(pair));if(!index)throw std::runtime_error("query_callstack_frame_index_read");if(pair.key<key){first=middle+1;length-=half+1;}else length=half;}if(first>=metadata.count)return false;analysis::AnalysisUInt64Pair pair;index.clear();index.seekg(std::streamoff(first*sizeof(pair)),std::ios::beg);index.read(reinterpret_cast<char*>(&pair),sizeof(pair));if(!index)throw std::runtime_error("query_callstack_frame_index_read");if(pair.key!=key)return false;value=pair.value;return true;}
+    bool FindOrdinal(uint64_t key,uint64_t& value)const
+    {
+        if(!indexMapping)indexMapping=std::make_unique<ReadOnlyMapping>(root/"index.bin",metadata.count*sizeof(analysis::AnalysisUInt64Pair));
+        const auto at=[&](uint64_t ordinal) {
+            return *static_cast<const analysis::AnalysisUInt64Pair*>(indexMapping->At(
+                ordinal*sizeof(analysis::AnalysisUInt64Pair),sizeof(analysis::AnalysisUInt64Pair),alignof(analysis::AnalysisUInt64Pair)));
+        };
+        uint64_t first=0,length=metadata.count;
+        while(length){const auto half=length/2,middle=first+half;const auto pair=at(middle);if(pair.key<key){first=middle+1;length-=half+1;}else length=half;}
+        if(first>=metadata.count)return false;
+        const auto pair=at(first);if(pair.key!=key)return false;value=pair.value;return true;
+    }
     FrameRecord Record(uint64_t ordinal)const{if(ordinal>=metadata.count)throw std::out_of_range("query_callstack_frame_ordinal");FrameRecord record;records.Read(ordinal,&record,1);if(record.reserved[0]||record.reserved[1]||record.reserved[2])throw std::runtime_error("query_callstack_frame_record");const auto bytes=uint64_t(record.count)*sizeof(CallstackFrame);arena->At(record.offset,bytes,alignof(CallstackFrame));return record;}
-    std::filesystem::path root;std::string source;analysis::PagedRecordOptions options;FrameMetadata metadata{};mutable analysis::PagedRecordReader metadataReader,records;mutable std::ifstream index;std::unique_ptr<ReadOnlyMapping> arena;mutable std::mutex mutex;
+    std::filesystem::path root;std::string source;analysis::PagedRecordOptions options;FrameMetadata metadata{};mutable analysis::PagedRecordReader metadataReader,records;mutable std::ifstream index;std::unique_ptr<ReadOnlyMapping> arena;mutable std::unique_ptr<ReadOnlyMapping> indexMapping;mutable std::mutex mutex;
 };
 
 QueryCallstackFrameStoreReader::QueryCallstackFrameStoreReader(std::filesystem::path root,std::string sourceFingerprint,analysis::PagedRecordOptions options):m_impl(std::make_unique<Impl>(std::move(root),std::move(sourceFingerprint),std::move(options))){}

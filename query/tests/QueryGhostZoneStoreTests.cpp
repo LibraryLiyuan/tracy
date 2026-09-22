@@ -47,7 +47,7 @@ int main( int argc, char** argv )
         PagedRecordOptions options;
         options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 256ull * 1024 * 1024, 128ull * 1024 * 1024 );
         auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ argv[6] } );
-        options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 256ull * 1024 * 1024, {} } );
+        options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 2ull * 1024 * 1024 * 1024, {} } );
         options.cancelled = [&] { return stats.pathRequests >= maximum; };
         const auto start = std::chrono::steady_clock::now();
         bool boundedStop = false;
@@ -60,6 +60,7 @@ int main( int argc, char** argv )
         std::cout << "bounded_stop=" << boundedStop << " requests=" << stats.pathRequests
             << " resolutions=" << stats.pathResolutions << " hits=" << stats.pathCacheHits
             << " scratch_writes=" << stats.scratchRecordWrites
+            << " scratch_write_calls=" << stats.scratchWriteCalls
             << " string_blocks=" << stats.stringBlockLoads << " frame_blocks=" << stats.frameBlockLoads
             << " callstack_blocks=" << stats.callstackBlockLoads
             << " decoded_bytes=" << stats.stringDecodedBytes + stats.frameDecodedBytes + stats.callstackDecodedBytes
@@ -141,6 +142,7 @@ int main( int argc, char** argv )
             "Ghost Zone repeated callstack paths were not reused" );
         Require( buildStatistics.scratchRecordReads == 0 && buildStatistics.scratchRecordWrites == count,
             "active Ghost Zones must stay in memory and be written to scratch once" );
+        Require( buildStatistics.scratchWriteCalls == 1, "adjacent finalized Ghost records must share one write" );
         if( count != 2 ) throw std::runtime_error( "streamed Ghost Zone count changed: " + std::to_string( count ) );
         Require( !fs::exists( root / "ghost" / "build-scratch.bin" ), "Ghost Zone scratch was not removed" );
 
@@ -187,6 +189,26 @@ int main( int argc, char** argv )
             !unresolvedRows[2].parent && unresolvedRows[3].parent == 2 && !unresolvedRows[4].parent,
             "missing Frame definitions changed Ghost Zone tree boundaries" );
         unresolvedReader.ValidateAll();
+        QuerySampleStoreWriter batchSamples( root / "batch-samples", fingerprint, options );
+        batchSamples.Begin( 77, QuerySampleKind::Main, 5000 );
+        for( uint64_t i = 0; i < 5000; ++i ) batchSamples.Append( i, 5 + i * 5, 1 );
+        batchSamples.End(); batchSamples.Commit();
+        QueryGhostZoneBuildStatistics batchStats;
+        Require( BuildQueryGhostZoneStore( root / "batch-ghost", root / "batch-samples", root / "callstacks",
+            root / "unresolved-frames", root / "strings", fingerprint, 5, options, &batchStats ) == 10000,
+            "batched Ghost write lost records" );
+        Require( batchStats.scratchWriteCalls < 10, "batched Ghost writes retained per-record system calls" );
+        QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, options );
+        const auto boundary = batchReader.Scan( 0, 100000, 8190, 6 );
+        Require( boundary.size() == 6, "batch boundary page is incomplete" );
+        for( size_t i = 0; i < boundary.size(); ++i ) {
+            const auto ordinal = 8190 + i;
+            const auto& row = boundary[i];
+            Require( row.ordinal == ordinal && row.startNs == int64_t( 5 + ( ordinal / 2 ) * 5 ) &&
+                row.endNs == row.startNs + 5 && row.depth == ordinal % 2 &&
+                ( ordinal % 2 ? row.parent == ordinal - 1 : !row.parent ), "batched Ghost record semantics changed" );
+        }
+        batchReader.ValidateAll();
     }
     catch( const std::exception& error )
     {

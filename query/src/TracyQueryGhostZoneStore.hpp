@@ -41,6 +41,7 @@ struct QueryGhostZoneBuildStatistics
     uint64_t pathCachePeakBytes = 0;
     uint64_t scratchRecordReads = 0;
     uint64_t scratchRecordWrites = 0;
+    uint64_t scratchWriteCalls = 0;
     uint64_t stringBlockLoads = 0, frameBlockLoads = 0, callstackBlockLoads = 0;
     uint64_t stringDecodedBytes = 0, frameDecodedBytes = 0, callstackDecodedBytes = 0;
 };

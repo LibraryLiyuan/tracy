@@ -8,6 +8,12 @@
 #include <filesystem>
 #include <iostream>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -65,6 +71,14 @@ int main()
         QueryCallstackFrameStoreReader frames(root/"frames",fingerprint,options);assert(frames.Count()==2);
         const auto firstDefinition=frames.Find(firstId);assert(firstDefinition&&firstDefinition->imageName.Active()&&firstDefinition->imageName.Idx()==3&&firstDefinition->frames.size()==2&&firstDefinition->frames[0].line==10);
         const auto secondDefinition=frames.Find(secondId);assert(secondDefinition&&secondDefinition->frames.size()==255&&secondDefinition->frames[254].symAddr==0x20fe);
+#ifdef _WIN32
+        IO_COUNTERS before{},after{};
+        if(!GetProcessIoCounters(GetCurrentProcess(),&before))throw std::runtime_error("cannot observe frame-index reads");
+        for(size_t i=0;i<1000;++i){const auto value=frames.Find(i%2?firstId:secondId);assert(value);}
+        if(!GetProcessIoCounters(GetCurrentProcess(),&after))throw std::runtime_error("cannot observe frame-index reads");
+        if(after.ReadOperationCount-before.ReadOperationCount>10)
+            throw std::runtime_error("repeated frame-index lookup issues per-probe file reads");
+#endif
         CallstackFrameId missingId{};missingId.data=0x9999;assert(!frames.Find(missingId));frames.ValidateAll();
     }
     catch(const std::exception& error)
