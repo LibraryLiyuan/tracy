@@ -46,6 +46,15 @@ struct QueryGhostZoneBuildStatistics
     uint64_t stringDecodedBytes = 0, frameDecodedBytes = 0, callstackDecodedBytes = 0;
 };
 
+struct QueryGhostZoneFact
+{
+    int64_t startNs = 0, endNs = 0;
+    uint64_t thread = 0, parent = UINT64_MAX;
+    uint64_t name = UINT64_MAX, file = UINT64_MAX, address = 0;
+    uint32_t line = 0, depth = 0, childCount = 0;
+    bool inlineFrame = false;
+};
+
 class QueryGhostZoneStoreWriter
 {
 public:
@@ -56,7 +65,7 @@ public:
     QueryGhostZoneStoreWriter& operator=( const QueryGhostZoneStoreWriter& ) = delete;
 
     void Begin( uint64_t count );
-    void Append( uint64_t ordinal, const analysis::GhostZoneDto& value );
+    void Append( uint64_t ordinal, const QueryGhostZoneFact& value );
     void Commit();
     uint64_t Count() const;
 
@@ -69,7 +78,7 @@ class QueryGhostZoneStoreReader
 {
 public:
     QueryGhostZoneStoreReader( std::filesystem::path root, std::string sourceFingerprint,
-        analysis::PagedRecordOptions options = {} );
+        std::filesystem::path globalStrings, analysis::PagedRecordOptions options = {} );
     ~QueryGhostZoneStoreReader();
     QueryGhostZoneStoreReader( const QueryGhostZoneStoreReader& ) = delete;
     QueryGhostZoneStoreReader& operator=( const QueryGhostZoneStoreReader& ) = delete;

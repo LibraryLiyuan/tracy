@@ -1505,7 +1505,7 @@ public:
         , m_cpu( m_manifest.cpuZones, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpu( m_manifest.gpuZones, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_samples( m_manifest.samples.path, m_manifest.sourceFingerprint, m_storageOptions )
-        , m_ghostZones( m_manifest.samples.path / "ghost", m_manifest.sourceFingerprint, m_storageOptions )
+        , m_ghostZones( m_manifest.samples.path / "ghost", m_manifest.sourceFingerprint, m_manifest.globalStrings.path, m_storageOptions )
         , m_sampleDerived( m_manifest.samples.path / "derived", m_manifest.sourceFingerprint, m_storageOptions )
         , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_jobs( m_manifest.jobStages.path, m_manifest.globalStrings.path, m_manifest.sourceFingerprint, m_storageOptions )
@@ -4311,7 +4311,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             if( rawSamples.Count() != manifest.samples.count || samples.MainCount() != manifest.sampleMainCount ||
                 samples.ContextSwitchCount() != manifest.sampleContextSwitchCount )
                 throw std::runtime_error( "sample section count mismatch" );
-            QueryGhostZoneStoreReader ghostZones( manifest.samples.path / "ghost", manifest.sourceFingerprint, storageOptions );
+            QueryGhostZoneStoreReader ghostZones( manifest.samples.path / "ghost", manifest.sourceFingerprint, manifest.globalStrings.path, storageOptions );
             QuerySampleDerivedStoreReader sampleDerived( manifest.samples.path / "derived", manifest.sourceFingerprint, storageOptions );
             if( deep ) { samples.ValidateAll(); ghostZones.ValidateAll(); sampleDerived.ValidateAll(); }
         }

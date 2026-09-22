@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace
 {
@@ -37,6 +38,89 @@ int main( int argc, char** argv )
     using namespace tracy::analysis;
     using namespace tracy::query;
 
+    if( argc == 7 && std::string( argv[1] ) == "--capacity" )
+    {
+        try {
+            PagedRecordOptions options;
+            options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 2ull << 30, 2ull << 30 );
+            QuerySampleStoreReader samples( argv[2], argv[6], options );
+            options.readerCacheBytes = 1ull << 30;
+            QueryCallstackStoreReader stacks( argv[3], argv[6], options );
+            QueryCallstackFrameStoreReader frames( argv[4], argv[6], options );
+            QueryStringStoreReader strings( argv[5], argv[6], options );
+            struct Node { uint64_t key, bytes; bool reusable; };
+            constexpr uint64_t cacheBytes = 16ull << 20;
+            AnalysisWorkspaceReservation cacheMemory( options.workspace, 2 * cacheBytes + ( 4ull << 20 ) );
+            std::unordered_map<uint64_t, std::vector<Node>> definitions;
+            std::unordered_map<uint32_t, std::vector<Node>> paths;
+            uint64_t definitionBytes = 0, pathBytes = 0;
+            auto spans = samples.MainSpans();
+            std::sort( spans.begin(), spans.end(), []( const auto& a, const auto& b ) { return a.thread < b.thread; } );
+            uint64_t visited = 0, ghosts = 0, stringBytes = 0, total = 0;
+            for( const auto& span : spans ) total += span.count;
+            const auto started = std::chrono::steady_clock::now();
+            const auto report = [&]( bool complete ) {
+                std::cout << "capacity_complete=" << complete << " samples=" << visited << '/' << total
+                    << " ghosts=" << ghosts << " string_bytes=" << stringBytes
+                    << " legacy_ghost_only_peak_lower_bound_bytes=" << ghosts * 191 + stringBytes * 2
+                    << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count() << '\n';
+                std::cout.flush();
+            };
+            for( const auto& span : spans ) {
+                std::vector<Node> active;
+                const bool skipZero = span.count && samples.ReadPhysical( span.first, span.thread, QuerySampleKind::Main ).timeNs == 0;
+                for( uint64_t i = 0; i < span.count; ++i ) {
+                    if( visited % 65536 == 0 && std::chrono::steady_clock::now() - started > std::chrono::seconds(120) ) { report(false); return 2; }
+                    const auto sample = samples.ReadPhysical( span.first + i, span.thread, QuerySampleKind::Main );
+                    ++visited;
+                    if( skipZero && sample.timeNs == 0 ) continue;
+                    std::vector<Node> uncached;
+                    auto foundPath = paths.find( sample.callstack );
+                    if( foundPath == paths.end() ) {
+                        const auto stack = stacks.Frames( sample.callstack );
+                        for( size_t n = stack.size(); n != 0; --n ) {
+                            const auto id = stack[n-1];
+                            auto found = definitions.find( id.data );
+                            std::vector<Node> definition;
+                            if( found == definitions.end() ) {
+                                const uint64_t key = ( id.idx & 0x3FFFFFFFFFFFFFFF ) | ( ( id.idx & 0x3000000000000000 ) << 2 );
+                                uint64_t digits = 1; for( auto value = key; value >= 16; value >>= 4 ) ++digits;
+                                const auto entry = frames.Find( id );
+                                if( !entry ) definition.push_back( { key, 2 + digits, false } );
+                                else for( size_t j = entry->frames.size(); j != 0; --j ) {
+                                    const auto& frame = entry->frames[j-1];
+                                    const auto nameBytes = frame.name.Active() ? strings.StringLength(frame.name.Idx()) : 0;
+                                    const auto fileBytes = frame.file.Active() ? strings.StringLength(frame.file.Idx()) : 0;
+                                    if( nameBytes > (1<<20) || fileBytes > (1<<20) ) throw std::runtime_error("preflight string exceeds Ghost limit");
+                                    definition.push_back( { key, nameBytes + fileBytes + 2 + digits, true } );
+                                }
+                                const auto footprint = 256 + definition.capacity() * sizeof(Node);
+                                if( definitionBytes + footprint > cacheBytes ) { definitions.clear(); definitionBytes = 0; }
+                                definitionBytes += footprint;
+                                found = definitions.emplace( id.data, std::move(definition) ).first;
+                            }
+                            if( uncached.size() + found->second.size() > 65536 ) throw std::runtime_error("preflight path depth limit");
+                            uncached.insert( uncached.end(), found->second.begin(), found->second.end() );
+                        }
+                        const auto footprint = 256 + uncached.capacity() * sizeof(Node);
+                        if( pathBytes + footprint > cacheBytes ) { paths.clear(); pathBytes = 0; }
+                        pathBytes += footprint;
+                        foundPath = paths.emplace( sample.callstack, std::move(uncached) ).first;
+                    }
+                    const auto& path = foundPath->second;
+                    // All currently active records have the same end after each sample.
+                    // Therefore period/clamping cannot alter common-prefix cardinality.
+                    size_t common = 0;
+                    while( common < active.size() && common < path.size() && active[common].reusable && active[common].key == path[common].key ) ++common;
+                    active.resize(common);
+                    for( size_t n = common; n < path.size(); ++n ) { ++ghosts; stringBytes += path[n].bytes; active.push_back(path[n]); }
+                    if( visited % 10000000 == 0 ) report(false);
+                }
+            }
+            report(true); return 0;
+        } catch( const std::exception& e ) { std::cerr << e.what() << '\n'; return 1; }
+    }
+
     // Bounded stage replay: reads existing sidecars, writes only a new output directory.
     // A one-nanosecond period is deliberate: this measures storage work, not acceptance semantics.
     const bool slice = argc == 11 && std::string( argv[1] ) == "--slice";
@@ -46,14 +130,14 @@ int main( int argc, char** argv )
         const auto maximum = std::stoull( argv[8] );
         if( maximum == 0 || maximum > 1000000 || fs::exists( argv[6] ) ) return 2;
         PagedRecordOptions options;
-        options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 256ull * 1024 * 1024, 128ull * 1024 * 1024 );
+        options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 512ull * 1024 * 1024, 256ull * 1024 * 1024 );
         auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ argv[6] } );
         options.disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 2ull * 1024 * 1024 * 1024, {} } );
         std::filesystem::path samplesPath = argv[2];
         if( slice ) {
             auto skip = std::stoull( argv[9] );
             const auto cacheMiB = std::stoull( argv[10] );
-            if( cacheMiB < 4 || cacheMiB > 64 ) return 2;
+            if( cacheMiB < 4 || cacheMiB > 128 ) return 2;
             QuerySampleStoreReader sourceSamples( samplesPath, argv[7], options );
             auto spans = sourceSamples.MainSpans();
             std::sort( spans.begin(), spans.end(), []( const auto& a, const auto& b ) { return a.thread < b.thread; } );
@@ -173,8 +257,9 @@ int main( int argc, char** argv )
         Require( buildStatistics.scratchWriteCalls == 1, "adjacent finalized Ghost records must share one write" );
         if( count != 2 ) throw std::runtime_error( "streamed Ghost Zone count changed: " + std::to_string( count ) );
         Require( !fs::exists( root / "ghost" / "build-scratch.bin" ), "Ghost Zone scratch was not removed" );
+        Require( !fs::exists( root / "ghost" / "strings" ), "Ghost records must reuse the global dictionary instead of duplicating three strings per zone" );
 
-        QueryGhostZoneStoreReader reader( root / "ghost", fingerprint, options );
+        QueryGhostZoneStoreReader reader( root / "ghost", fingerprint, root / "strings", options );
         const auto rows = reader.Scan( 0, 30, 0, 10 );
         Require( rows.size() == 2, "Ghost Zone page size changed" );
         Require( rows[0].thread == 77 && !rows[0].parent && rows[0].startNs == 5 && rows[0].endNs == 25 &&
@@ -186,6 +271,28 @@ int main( int argc, char** argv )
             rows[1].address == "0x2000" && rows[1].depth == 1 && rows[1].childCount == 0 && !rows[1].inlineFrame,
             "child Ghost Zone changed" );
         reader.ValidateAll();
+        bool rejectedMissingDictionary = false;
+        try { QueryGhostZoneStoreReader missing( root / "ghost", fingerprint, root / "missing-dictionary", options ); }
+        catch( const std::exception& ) { rejectedMissingDictionary = true; }
+        Require( rejectedMissingDictionary, "Ghost opened without its manifest-bound dictionary" );
+        {
+            QueryStringStoreWriter other( root / "other-strings", std::string(64,'x'), options );
+            other.StringsBegin(0); other.StringsEnd();
+            for(size_t kind=0;kind<3;++kind){other.PointerTableBegin(QueryStringPointerKind(kind),0);other.PointerTableEnd(QueryStringPointerKind(kind));}
+            other.Commit();
+            bool rejectedIdentity = false;
+            try { QueryGhostZoneStoreReader mismatch( root / "ghost", fingerprint, root / "other-strings", options ); }
+            catch( const std::exception& ) { rejectedIdentity = true; }
+            Require( rejectedIdentity, "Ghost accepted a dictionary from another source" );
+        }
+        {
+            QueryGhostZoneStoreWriter invalid( root / "invalid-global-ref", fingerprint, options );
+            invalid.Begin(1); QueryGhostZoneFact fact; fact.name=999; invalid.Append(0,fact); invalid.Commit();
+            QueryGhostZoneStoreReader invalidReader( root / "invalid-global-ref", fingerprint, root / "strings", options );
+            bool rejectedReference=false;
+            try { invalidReader.ValidateAll(); } catch(const std::exception&) { rejectedReference=true; }
+            Require(rejectedReference,"deep validation accepted an invalid global name reference");
+        }
 
         // A long unchanged stack must extend two zones, not rewrite them per sample.
         constexpr uint64_t repeatedCount = 100000;
@@ -199,7 +306,7 @@ int main( int argc, char** argv )
             root / "callstacks", root / "frames", root / "strings", fingerprint, 5, options, &repeatedStatistics );
         Require( repeatedZones == 2 && repeatedStatistics.scratchRecordReads == 0 &&
             repeatedStatistics.scratchRecordWrites == 2, "repeated samples amplified scratch I/O" );
-        QueryGhostZoneStoreReader repeatedReader( root / "repeated-ghost", fingerprint, options );
+        QueryGhostZoneStoreReader repeatedReader( root / "repeated-ghost", fingerprint, root / "strings", options );
         const auto repeatedRows = repeatedReader.Scan( 0, 1000000, 0, 10 );
         Require( repeatedRows.size() == 2 && repeatedRows[0].endNs == 500005 &&
             repeatedRows[1].endNs == 500005, "repeated samples changed zone endpoints" );
@@ -211,7 +318,7 @@ int main( int argc, char** argv )
             root / "callstacks", root / "unresolved-frames", root / "strings", fingerprint, 5, options );
         Require( unresolvedCount == 5,
             "missing Frame definitions must prevent Ghost Zone reuse across samples" );
-        QueryGhostZoneStoreReader unresolvedReader( root / "unresolved-ghost", fingerprint, options );
+        QueryGhostZoneStoreReader unresolvedReader( root / "unresolved-ghost", fingerprint, root / "strings", options );
         const auto unresolvedRows = unresolvedReader.Scan( 0, 30, 0, 10 );
         Require( unresolvedRows.size() == 5 && !unresolvedRows[0].parent && unresolvedRows[1].parent == 0 &&
             !unresolvedRows[2].parent && unresolvedRows[3].parent == 2 && !unresolvedRows[4].parent,
@@ -226,7 +333,7 @@ int main( int argc, char** argv )
             root / "unresolved-frames", root / "strings", fingerprint, 5, options, &batchStats ) == 10000,
             "batched Ghost write lost records" );
         Require( batchStats.scratchWriteCalls < 10, "batched Ghost writes retained per-record system calls" );
-        QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, options );
+        QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, root / "strings", options );
         const auto boundary = batchReader.Scan( 0, 100000, 8190, 6 );
         Require( boundary.size() == 6, "batch boundary page is incomplete" );
         for( size_t i = 0; i < boundary.size(); ++i ) {
