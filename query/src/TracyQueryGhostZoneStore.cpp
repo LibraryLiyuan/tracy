@@ -434,7 +434,7 @@ struct QueryGhostZoneStoreReader::Impl
     Impl( std::filesystem::path input, std::string identity, std::filesystem::path globalStrings, analysis::PagedRecordOptions storage )
         : root( std::move( input ) ), source( std::move( identity ) )
         , records( root / "records", Identity( source, "query-ghost-zones-v2-global-records" ), sizeof( StoredGhostZone ), storage )
-        , strings( std::move(globalStrings), source, storage )
+        , strings( std::move(globalStrings), source, QueryDictionaryReadOptions(storage,false) )
     {}
 
     void CheckRecord( uint64_t ordinal, const StoredGhostZone& record ) const

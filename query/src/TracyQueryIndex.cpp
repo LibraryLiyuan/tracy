@@ -571,7 +571,7 @@ public:
         {
             m_stringWriter->Commit();
             m_stringWriter.reset();
-            m_stringReader = std::make_shared<QueryStringStoreReader>( m_stringPath, m_sourceFingerprint, m_storageOptions );
+            m_stringReader = std::make_shared<QueryStringStoreReader>( m_stringPath, m_sourceFingerprint, QueryDictionaryReadOptions(m_storageOptions,true) );
             m_stringSource = std::make_unique<QuerySerializedStringSource>( m_stringReader );
         }
     }
@@ -585,7 +585,7 @@ public:
     void CallstacksEnd() override
     {
         m_callstackWriter->Commit();m_callstackWriter.reset();
-        m_callstackReader=std::make_shared<QueryCallstackStoreReader>(m_callstackPath,m_sourceFingerprint,m_storageOptions);
+        m_callstackReader=std::make_shared<QueryCallstackStoreReader>(m_callstackPath,m_sourceFingerprint,QueryDictionaryReadOptions(m_storageOptions,false));
         m_callstackSource=std::make_unique<QuerySerializedCallstackSource>(m_callstackReader);
     }
     SerializedCallstackSource* GlobalCallstackSource() override { return m_callstackSource.get(); }
@@ -597,7 +597,7 @@ public:
     void CallstackFrameDefinitionEnd( uint64_t ordinal ) override { m_callstackFrameWriter->FrameEnd(ordinal); }
     void CallstackFrameDefinitionsEnd() override
     {
-        m_callstackFrameWriter->Commit();m_callstackFrameWriter.reset();m_callstackFrameReader=std::make_shared<QueryCallstackFrameStoreReader>(m_callstackFramePath,m_sourceFingerprint,m_storageOptions);m_callstackSource->SetFrames(m_callstackFrameReader);
+        m_callstackFrameWriter->Commit();m_callstackFrameWriter.reset();m_callstackFrameReader=std::make_shared<QueryCallstackFrameStoreReader>(m_callstackFramePath,m_sourceFingerprint,QueryDictionaryReadOptions(m_storageOptions,false));m_callstackSource->SetFrames(m_callstackFrameReader);
     }
     uint64_t CallstackFrameCount() const { return m_callstackFrameReader?m_callstackFrameReader->Count():0; }
     void ReleaseExternalSources() { m_stringSource.reset(); m_stringReader.reset(); m_callstackSource.reset(); m_callstackReader.reset(); m_callstackFrameReader.reset(); }
@@ -4337,7 +4337,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         if( deep && SectionFingerprint( manifest.globalStrings.path ) != manifest.globalStrings.fingerprint )
             throw std::runtime_error( "global string section hash mismatch" );
         {
-            QueryStringStoreReader strings( manifest.globalStrings.path, manifest.sourceFingerprint, storageOptions );
+            QueryStringStoreReader strings( manifest.globalStrings.path, manifest.sourceFingerprint, QueryDictionaryReadOptions(storageOptions,true) );
             if( strings.StringCount() != manifest.globalStrings.count ||
                 manifest.globalStrings.declaredCount != manifest.globalStrings.count )
                 throw std::runtime_error( "global string section count mismatch" );
@@ -4349,7 +4349,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         if( deep && SectionFingerprint( manifest.globalCallstacks.path ) != manifest.globalCallstacks.fingerprint )
             throw std::runtime_error( "global callstack section hash mismatch" );
         {
-            QueryCallstackStoreReader callstacks( manifest.globalCallstacks.path, manifest.sourceFingerprint, storageOptions );
+            QueryCallstackStoreReader callstacks( manifest.globalCallstacks.path, manifest.sourceFingerprint, QueryDictionaryReadOptions(storageOptions,false) );
             if( callstacks.Count() != manifest.globalCallstacks.count ||
                 manifest.globalCallstacks.declaredCount != manifest.globalCallstacks.count )
                 throw std::runtime_error( "global callstack section count mismatch" );
@@ -4361,7 +4361,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         if( deep && SectionFingerprint( manifest.globalCallstackFrames.path ) != manifest.globalCallstackFrames.fingerprint )
             throw std::runtime_error( "global callstack frame section hash mismatch" );
         {
-            QueryCallstackFrameStoreReader frames( manifest.globalCallstackFrames.path, manifest.sourceFingerprint, storageOptions );
+            QueryCallstackFrameStoreReader frames( manifest.globalCallstackFrames.path, manifest.sourceFingerprint, QueryDictionaryReadOptions(storageOptions,false) );
             if( frames.Count() != manifest.globalCallstackFrames.count ||
                 manifest.globalCallstackFrames.declaredCount != manifest.globalCallstackFrames.count )
                 throw std::runtime_error( "global callstack frame section count mismatch" );
@@ -4482,13 +4482,13 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     resources->CheckMemory();
     const auto storageOptions=ResourceStorageOptions(resources);
     auto stringStore=std::make_shared<QueryStringStoreReader>(leasedManifest.globalStrings.path,
-        leasedManifest.sourceFingerprint,storageOptions);
+        leasedManifest.sourceFingerprint,QueryDictionaryReadOptions(storageOptions,true));
     auto stringSource=std::make_unique<QuerySerializedStringSource>(std::move(stringStore));
     auto callstackStore=std::make_shared<QueryCallstackStoreReader>(leasedManifest.globalCallstacks.path,
-        leasedManifest.sourceFingerprint,storageOptions);
+        leasedManifest.sourceFingerprint,QueryDictionaryReadOptions(storageOptions,false));
     auto callstackSource=std::make_unique<QuerySerializedCallstackSource>(std::move(callstackStore));
     auto callstackFrames=std::make_shared<QueryCallstackFrameStoreReader>(leasedManifest.globalCallstackFrames.path,
-        leasedManifest.sourceFingerprint,storageOptions);
+        leasedManifest.sourceFingerprint,QueryDictionaryReadOptions(storageOptions,false));
     callstackSource->SetFrames(std::move(callstackFrames));
     auto source = analysis::WorkerTraceSource::Open( leasedManifest.dataPath, std::move( stateCallback ),
         fingerprintOverride.empty() ? leasedManifest.sourceFingerprint : std::move( fingerprintOverride ),

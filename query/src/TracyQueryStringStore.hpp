@@ -14,6 +14,10 @@
 namespace tracy::query
 {
 
+// Broad ordinal access is used only by the primary Worker string dictionary.
+// All defaults remain capped by a fraction of the same shared workspace.
+analysis::PagedRecordOptions QueryDictionaryReadOptions(analysis::PagedRecordOptions options, bool broadOrdinals);
+
 enum class QueryStringPointerKind : uint8_t { String = 0, Thread = 1, External = 2 };
 
 // The address stays valid until the reader is destroyed. The backing mapping

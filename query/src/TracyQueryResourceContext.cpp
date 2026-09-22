@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <fstream>
 #include <mutex>
 #include <new>
@@ -29,6 +31,7 @@ struct QueryResourceContext::State
     std::mutex temporaryMutex;
     std::filesystem::path statisticsTemporaryRoot;
     std::string phase;
+    std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now(),nextProgressLog=started;
     uint64_t progressCurrent=0,progressTotal=0;
     uint32_t liveWorkers=0;
     std::string failureReason;
@@ -142,15 +145,31 @@ std::filesystem::path QueryResourceContext::StatisticsTemporaryRoot()
 
 void QueryResourceContext::SetPhase(std::string phase)
 {
-    std::lock_guard lock(m_state->mutex);
-    m_state->phase=std::move(phase);
+    int64_t elapsed=0;
+    {
+        std::lock_guard lock(m_state->mutex);
+        if(m_state->phase==phase)return;
+        m_state->phase=phase;
+        elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-m_state->started).count();
+    }
+    std::fprintf(stderr,"Query phase=%.*s elapsed_ms=%lld\n",128,phase.c_str(),(long long)elapsed);
 }
 
 void QueryResourceContext::SetProgress(uint64_t current,uint64_t total)
 {
-    std::lock_guard lock(m_state->mutex);
-    m_state->progressCurrent=current;
-    m_state->progressTotal=total;
+    std::string phase;int64_t elapsed=0;bool emit=false;
+    {
+        std::lock_guard lock(m_state->mutex);
+        m_state->progressCurrent=current;m_state->progressTotal=total;
+        const auto now=std::chrono::steady_clock::now();
+        if(now>=m_state->nextProgressLog) {
+            m_state->nextProgressLog=now+std::chrono::seconds(5);
+            phase=m_state->phase.substr(0,128);emit=true;
+            elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(now-m_state->started).count();
+        }
+    }
+    if(emit)std::fprintf(stderr,"Query progress phase=%s current=%llu total=%llu elapsed_ms=%lld\n",phase.c_str(),
+        (unsigned long long)current,(unsigned long long)total,(long long)elapsed);
 }
 
 void QueryResourceContext::SetLiveWorkers(uint32_t workers)

@@ -3,6 +3,7 @@
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisIoPath.hpp"
 #include "TracyHash.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,18 @@
 
 namespace tracy::query
 {
+analysis::PagedRecordOptions QueryDictionaryReadOptions(analysis::PagedRecordOptions options, bool broadOrdinals)
+{
+    if(options.readerCacheBytes==0) {
+        // The primary Worker dictionary serves broad ordinal lookups during
+        // validation and queries. Reserve from the shared budget; secondary
+        // count-only readers keep their existing small default.
+        uint64_t cap=broadOrdinals ? (1ull<<30) : (64ull<<20);
+        if(options.workspace) cap=std::min(cap,std::max<uint64_t>(options.blockBytes,options.workspace->Snapshot().maximumBytes/4));
+        options.readerCacheBytes=cap;
+    }
+    return options;
+}
 namespace
 {
 constexpr uint64_t StoreVersion = 1;

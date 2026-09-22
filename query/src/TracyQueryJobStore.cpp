@@ -923,7 +923,7 @@ QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem
         scheduleIndex.Commit();
         evidence.flush(); if( !evidence ) throw std::runtime_error( "Job evidence scratch flush" ); evidence.close();
 
-        QueryStringStoreReader globalStrings( stringsPath, state.source, state.options );
+        QueryStringStoreReader globalStrings( stringsPath, state.source, QueryDictionaryReadOptions(state.options,false) );
         QueryStringStoreWriter names( indexRoot / "names", state.source, state.options );
         names.StringsBegin( jobRecords.Count() );
         {
@@ -1002,7 +1002,7 @@ struct QueryJobStoreReader::Impl
         , jobs( root / "index" / "jobs", Identity( source, "query-jobs-v1" ), sizeof( StoredJob ), options )
         , schedule( root / "index" / "schedule", Identity( source, "query-job-schedule-v1" ), sizeof( analysis::AnalysisUInt64Pair ), options )
         , refs( root / "index" / "job-refs", Identity( source, "query-job-refs-v1" ), sizeof( StoredFactRef ), options )
-        , names( root / "index" / "names", source, options )
+        , names( root / "index" / "names", source, QueryDictionaryReadOptions(options,false) )
         , completion( root / "index" / "completion", Identity( source, "query-job-completion-v1" ), sizeof( StoredLookup ), options )
         , callsiteLookup( root / "index" / "callsites", Identity( source, "query-job-callsites-v1" ), sizeof( StoredLookup ), options )
         , reverseRecords( root / "index" / "reverse-records", Identity( source, "query-job-reverse-v1-records" ), sizeof( analysis::AnalysisUInt64Pair ), options )

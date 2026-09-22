@@ -1,4 +1,5 @@
 #include "TracyQueryStringStore.hpp"
+#include "TracyHash.hpp"
 
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
@@ -14,8 +15,36 @@
 using namespace tracy::analysis;
 using namespace tracy::query;
 
-int main()
+int main(int argc,char** argv)
 {
+    if(argc==5 && std::string(argv[1])=="--primary-probe") {
+        try {
+            const auto count=std::stoull(argv[4]);
+            if(count==0 || count>4096) throw std::runtime_error("probe count out of range");
+            PagedRecordOptions options;
+            options.workspace=std::make_shared<AnalysisWorkspaceBudget>(4ull<<30,2ull<<30);
+            options=QueryDictionaryReadOptions(options,true);
+            QueryStringStoreReader reader(argv[2],argv[3],options);
+            if(!reader.StringCount()) throw std::runtime_error("empty probe dictionary");
+            Sha256Builder hash; uint64_t seed=20260922,skipped=0;
+            const auto start=std::chrono::steady_clock::now();
+            for(uint64_t i=0;i<count;++i) {
+                seed=seed*6364136223846793005ull+1442695040888963407ull;
+                const auto ordinal=seed%reader.StringCount();
+                const auto length=reader.StringLength(ordinal);
+                hash.Update(&ordinal,sizeof(ordinal));hash.Update(&length,sizeof(length));
+                if(length>(1ull<<20)){++skipped;continue;}
+                const auto value=reader.ReadOrdinal(ordinal,1<<20);hash.Update(value.data(),value.size());
+            }
+            const auto stats=reader.RecordReadStatistics();
+            std::cout<<"queries="<<count<<" skipped_large="<<skipped<<" decoded_bytes="<<stats.decodedBytes
+                <<" blocks="<<stats.blockLoads<<" sha256="<<hash.FinalHex()<<" elapsed_ms="
+                <<std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-start).count()<<'\n';
+            if(stats.decodedBytes>(1ull<<30)) throw std::runtime_error("primary dictionary repeatedly decoded ordinal pages");
+            return 0;
+        } catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
+    }
+    if(argc!=1)return 2;
     const auto root = std::filesystem::temp_directory_path() /
         ( "query-string-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
     std::filesystem::create_directories( root );
