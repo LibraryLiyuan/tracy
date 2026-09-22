@@ -3,8 +3,10 @@
 #include "TracyAnalysisIoPath.hpp"
 #include "TracyHash.hpp"
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #ifdef _WIN32
 #include <Windows.h>
 #else
@@ -34,10 +36,23 @@ void Publish(const std::filesystem::path& temporary,const std::filesystem::path&
 {
     // A completed table is nonempty and immutable. A concurrent builder may
     // have published the same source/filter first; never replace its table.
-    if(std::filesystem::exists(target)) return;
+    if(std::filesystem::exists(target)) {
+        if(std::filesystem::exists(target/"manifest.json")) return;
+        Fail("filter_target_incomplete");
+    }
 #ifdef _WIN32
-    if(!MoveFileExW(temporary.c_str(),target.c_str(),MOVEFILE_WRITE_THROUGH) &&
-        !std::filesystem::exists(target/"manifest.json")) Fail("filter_publish_failed");
+    const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
+    for(;;) {
+        if(MoveFileExW(temporary.c_str(),target.c_str(),MOVEFILE_WRITE_THROUGH)) return;
+        const auto code=GetLastError();
+        if(std::filesystem::exists(target/"manifest.json")) return;
+        const bool transient=code==ERROR_ACCESS_DENIED || code==ERROR_SHARING_VIOLATION ||
+            code==ERROR_LOCK_VIOLATION || code==ERROR_ALREADY_EXISTS;
+        if(!transient || std::chrono::steady_clock::now()>=deadline)
+            throw std::runtime_error("analysis_scan_filter_publish_failed:"+std::to_string(code)+":"+
+                temporary.string()+"->"+target.string());
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
 #else
     std::error_code ec;
     std::filesystem::rename(temporary,target,ec);
@@ -159,6 +174,9 @@ AnalysisCacheQuery::AnalysisCacheQuery(std::filesystem::path root,std::string id
     std::function<AnalysisCacheRecord(uint64_t)> read,AnalysisCacheTableOptions options,uint64_t bytes)
     :m_impl(std::make_unique<Impl>(std::move(root),std::move(identity),records,std::move(read),std::move(options),bytes)) {}
 AnalysisCacheQuery::~AnalysisCacheQuery()=default;
+void AnalysisCacheQuery::PublishFilterForTesting(const std::filesystem::path& temporary,
+    const std::filesystem::path& target)
+{ Publish(temporary,target); }
 nlohmann::json AnalysisCacheQuery::Page(size_t limit,const std::string& cursor,
     const std::vector<std::string>& fields,const nlohmann::json& filter)
 { return m_impl->Page(limit,cursor,fields,filter); }

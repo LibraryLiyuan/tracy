@@ -16,6 +16,8 @@ public:
     ~AnalysisCacheQuery();
     nlohmann::json Page(size_t limit, const std::string& cursor,
         const std::vector<std::string>& fields, const nlohmann::json& filter);
+    static void PublishFilterForTesting(const std::filesystem::path& temporary,
+        const std::filesystem::path& target);
 private:
     struct Impl;
     std::unique_ptr<Impl> m_impl;
