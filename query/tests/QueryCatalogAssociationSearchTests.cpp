@@ -23,6 +23,7 @@ class BoundedCatalogSource final : public test::FakeTraceSource,
     public QueryGpuPassResourceSource
 {
 public:
+    mutable uint64_t resourceReads = 0, nameReads = 0;
     BoundedCatalogSource()
     {
         m_validation.complete = true;
@@ -88,6 +89,7 @@ public:
     uint64_t GetQueryCatalogResourceCount() const override { return m_states.size(); }
     QueryCatalogResourceStateData GetQueryCatalogResourceStateAt( uint64_t ordinal ) const override
     {
+        ++resourceReads;
         return m_states.at( size_t( ordinal ) );
     }
     std::optional<QueryCatalogResourceStateData> GetQueryCatalogResourceState( uint64_t resourceId ) const override
@@ -97,6 +99,7 @@ public:
     }
     std::optional<std::string> GetQueryCatalogResourceName( uint64_t, uint32_t ) const override
     {
+        ++nameReads;
         return std::nullopt;
     }
     QueryCatalogResourceAssociationData GetQueryCatalogResourceAssociationsAt( uint64_t ordinal ) const override
@@ -382,6 +385,26 @@ int main()
     const auto traceId = opened.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( traceId, std::chrono::seconds( 5 ) ).state ==
         tracy::analysis::TraceSourceState::Ready );
+
+    {
+        nlohmann::json cursor;
+        for( int page = 0; page < 3; ++page ) {
+            nlohmann::json params={{"trace_id",traceId},{"limit",1}};
+            if( !cursor.is_null() ) params["cursor"]=cursor;
+            const auto result=service.Execute(Request(900+page,"gpu.resource.search",params));
+            assert(result.at("ok") && result.at("data").at("total")=="3");
+            assert(result.at("data").at("resources")[0].at("resource_id")==std::to_string(100+page));
+            cursor=result.at("page").at("next_cursor");
+            assert(catalogSource->resourceReads==uint64_t(page+1) && catalogSource->nameReads==uint64_t(page+1));
+        }
+        assert(cursor.is_null());
+        catalogSource->resourceReads=0;catalogSource->nameReads=0;
+        const auto first=service.Execute(Request(904,"gpu.resource.search",{{"trace_id",traceId},{"limit",1},{"filter",{{"has_shared_allocation",true}}}}));
+        const auto second=service.Execute(Request(905,"gpu.resource.search",{{"trace_id",traceId},{"limit",1},{"filter",{{"has_shared_allocation",true}}},{"cursor",first.at("page").at("next_cursor")}}));
+        assert(first.at("ok") && second.at("ok") && second.at("data").at("total")=="2");
+        assert(second.at("page").at("next_cursor").is_null());
+        assert(catalogSource->resourceReads==4 && catalogSource->nameReads==2);
+    }
 
     const auto search = [&]( int id, const char* filter ) {
         auto response = service.Execute( Request( id, "gpu.resource.search", {

@@ -329,6 +329,7 @@ public:
     QueryCatalogRangeData RangeAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogAllocationData> AllocationState( uint64_t allocationId ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
+    uint64_t ResourceNameLookupDecodedBytes() const;
 
 private:
     struct Impl;

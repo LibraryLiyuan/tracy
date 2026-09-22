@@ -54,6 +54,21 @@ namespace tracy::query
 namespace
 {
 
+void EnsureQueryStreamCapacity()
+{
+#ifdef _WIN32
+    // Multiple live generations and the candidate builder legitimately keep
+    // more than the CRT default of512 streams open. This is process-local;
+    // allocation and disk limits continue to use QueryResourceContext.
+    static const bool initialized=[] {
+        if(_getmaxstdio()<8192 && _setmaxstdio(8192)<8192)
+            throw QueryResourceError("file_handles","windows_stdio_capacity_unavailable",0);
+        return true;
+    }();
+    (void)initialized;
+#endif
+}
+
 class QueryIndexOwnerLease
 {
 public:
@@ -3382,6 +3397,7 @@ std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tra
 QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePath,
     analysis::WorkerTraceSource::StateCallback stateCallback, std::shared_ptr<QueryResourceContext> resources )
 {
+    EnsureQueryStreamCapacity();
     const auto tracePath = analysis::AnalysisIoPath( inputTracePath );
     QueryIndexManifest result;
     result.manifestPath = ManifestPath( tracePath );
@@ -4446,6 +4462,7 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     analysis::WorkerTraceSource::StateCallback stateCallback, std::string fingerprintOverride,
     std::shared_ptr<QueryResourceContext> resources )
 {
+    EnsureQueryStreamCapacity();
     auto leasedManifest = manifest;
     if(!resources)
     {

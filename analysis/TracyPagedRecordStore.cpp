@@ -1,4 +1,5 @@
 #include "TracyPagedRecordStore.hpp"
+#include <cerrno>
 #include "TracyHash.hpp"
 #include "TracyAnalysisIoPath.hpp"
 #define ZSTD_STATIC_LINKING_ONLY
@@ -116,7 +117,7 @@ struct PagedRecordWriter::Impl
         }
         std::filesystem::create_directories(AnalysisIoPath(root));
         data.open(AnalysisIoPath(root/"data.bin"),std::ios::binary); directory.open(AnalysisIoPath(root/"directory.bin"),std::ios::binary);
-        if(!data || !directory) Fail("open");
+        if(!data || !directory) throw std::runtime_error("paged_record_open:writer:"+root.generic_string()+":errno="+std::to_string(errno));
     }
     void Flush()
     {
@@ -283,7 +284,7 @@ struct PagedRecordReader::Impl
         dataBytes=std::filesystem::file_size(AnalysisIoPath(root/"data.bin"));
         if(!header.blocks && dataBytes) Fail("data_size");
         data.open(AnalysisIoPath(root/"data.bin"),std::ios::binary); directory.open(AnalysisIoPath(root/"directory.bin"),std::ios::binary);
-        if(!data||!directory) Fail("open");
+        if(!data||!directory) throw std::runtime_error("paged_record_open:reader:"+root.generic_string()+":errno="+std::to_string(errno));
         buffer.reserve(options.blockBytes);
         const auto slots=std::min<uint64_t>(header.blocks,std::max<uint64_t>(1,options.readerCacheBytes/options.blockBytes));
         if(slots>1) {

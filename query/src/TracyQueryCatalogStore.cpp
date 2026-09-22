@@ -397,13 +397,15 @@ struct QueryCatalogStoreReader::Impl
             DomainPath( root, OfflineCatalogDomain::CatalogDetailedEvidence ),
             CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
             uint32_t( sizeof( JnGpuDetailedEvidenceRecordV1 ) ), options );
+        auto nameOptions=options;
+        if(nameOptions.readerCacheBytes==0) nameOptions.readerCacheBytes=64ull*1024*1024;
         if( !resourceStringLookup ) resourceStringLookup = std::make_unique<analysis::PagedRecordReader>(
             ResourceStringLookupPath( root ), CatalogIdentity( sourceFingerprint, "resource-string-lookup-v1" ),
-            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), options );
+            uint32_t( sizeof( analysis::AnalysisKeyMetadataRecord ) ), nameOptions );
         if( !rawStrings ) rawStrings = std::make_unique<analysis::PagedRecordReader>(
             DomainPath( root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( sourceFingerprint, OfflineCatalogDomain::CatalogString ),
-            uint32_t( sizeof( OfflineCatalogString ) ), options );
+            uint32_t( sizeof( OfflineCatalogString ) ), nameOptions );
         if( !gpuMemorySummary ) gpuMemorySummary = std::make_unique<analysis::PagedRecordReader>(
             GpuMemorySummaryPath( root ), CatalogIdentity( sourceFingerprint, "gpu-memory-summary-v1" ),
             uint32_t( sizeof( QueryCatalogGpuMemorySummary ) ), options );
@@ -2710,6 +2712,12 @@ std::optional<std::string> QueryCatalogStoreReader::ResourceName( uint64_t gener
     if( value.generation != generation || value.header.stringId != stringId || value.header.byteLength > value.bytes.size() )
         throw std::runtime_error( "Catalog string lookup identity mismatch" );
     return std::string( reinterpret_cast<const char*>( value.bytes.data() ), value.header.byteLength );
+}
+
+uint64_t QueryCatalogStoreReader::ResourceNameLookupDecodedBytes() const
+{
+    std::lock_guard lock(m_impl->mutex);
+    return m_impl->resourceStringLookup ? m_impl->resourceStringLookup->Statistics().decodedBytes : 0;
 }
 
 void QueryCatalogStoreReader::ValidateAll() const

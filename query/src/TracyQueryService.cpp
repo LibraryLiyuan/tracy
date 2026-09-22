@@ -695,6 +695,7 @@ struct PageRequest
     size_t offset = 0;
     size_t rawOffset = 0;
     bool rawOffsetBound = false;
+    std::optional<uint64_t> matchedTotal;
     size_t limit = DefaultPageSize;
     std::string binding;
 };
@@ -726,18 +727,25 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
         const auto parts = Split( Base64UrlDecode( params["cursor"].get<std::string>() ), '|' );
         const bool legacy = parts.size() == 7 && parts[0] == "v1";
         const bool current = parts.size() == 8 && parts[0] == "v2";
-        if( ( !legacy && !current ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
+        const bool counted = parts.size() == 9 && parts[0] == "v3" && method == "gpu.resource.search";
+        if( ( !legacy && !current && !counted ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
         {
             throw QueryError( "STALE_CURSOR", "cursor does not match the trace, revision, method, or filters" );
         }
         try
         {
             page.offset = size_t( std::stoull( parts[5] ) );
-            if( current )
+            if( current || counted )
             {
                 page.rawOffset = size_t( std::stoull( parts[6] ) );
                 page.rawOffsetBound = true;
-                if( parts[7] != "stable" ) throw std::invalid_argument( "tie breaker" );
+                if( counted ) {
+                    size_t consumed=0;
+                    if(parts[7].empty() || parts[7][0]=='-') throw std::invalid_argument("total");
+                    page.matchedTotal=std::stoull(parts[7],&consumed);
+                    if(consumed!=parts[7].size() || *page.matchedTotal<page.offset) throw std::invalid_argument("total");
+                }
+                if( parts[counted ? 8 : 7] != "stable" ) throw std::invalid_argument( "tie breaker" );
             }
             else if( parts[6] != "stable" ) throw std::invalid_argument( "tie breaker" );
         }
@@ -762,6 +770,15 @@ std::string NextCursorAt( const PageRequest& page, const std::string& method, co
     if( !hasMore ) return {};
     const std::string value = "v2|" + trace.id + '|' + Decimal( trace.revision ) + '|' + method + '|' + page.binding + '|' + std::to_string( nextOffset ) + '|' + std::to_string( nextRawOffset ) + "|stable";
     return Base64UrlEncode( value );
+}
+
+std::string NextResourceCursor( const PageRequest& page, const std::string& method,
+    const TraceSessionSnapshot& trace, size_t returned, size_t nextRawOffset, uint64_t total )
+{
+    const auto nextOffset=page.offset+returned;
+    if(nextOffset>=total) return {};
+    return Base64UrlEncode("v3|"+trace.id+'|'+Decimal(trace.revision)+'|'+method+'|'+page.binding+'|'+
+        std::to_string(nextOffset)+'|'+std::to_string(nextRawOffset)+'|'+std::to_string(total)+"|stable");
 }
 
 json PageJson( const PageRequest& page, size_t returned, const std::string& nextCursor, bool truncated = false )
@@ -5783,21 +5800,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const bool requireAssociations = requireMeshParts || requireRanges || requireLogicalBindings ||
                     requireAliasGroup || requireSharedAllocation;
                 const auto count = catalogResourceSource->GetQueryCatalogResourceCount();
+                const bool unfiltered=nameFilter.empty() && kindFilter.empty() && classFilter.empty() && !requireAssociations;
+                const auto knownTotal=unfiltered ? std::optional<uint64_t>(count) : page.matchedTotal;
+                if(page.matchedTotal && (*page.matchedTotal>count || (unfiltered && *page.matchedTotal!=count)))
+                    throw QueryError("STALE_CURSOR","cursor total does not match the resource index");
                 if( page.rawOffsetBound && page.rawOffset > count )
                     throw QueryError( "STALE_CURSOR", "cursor raw offset is outside the resource index" );
-                const uint64_t start = page.rawOffsetBound ? page.rawOffset : 0;
-                uint64_t matched = page.rawOffsetBound ? page.offset : 0;
+                if(knownTotal && (*knownTotal>count || page.offset>*knownTotal ||
+                    (unfiltered && page.rawOffsetBound && page.rawOffset!=page.offset)))
+                    throw QueryError("STALE_CURSOR","cursor count is outside the resource index");
+                const uint64_t start = page.rawOffsetBound ? page.rawOffset : unfiltered ? page.offset : 0;
+                uint64_t matched = page.rawOffsetBound || unfiltered ? page.offset : 0;
                 size_t returned = 0;
                 size_t nextRawOffset = size_t( start );
-                bool hasMore = false;
                 json values = json::array();
                 for( uint64_t ordinal = start; ordinal < count; ordinal++ )
                 {
+                    if(knownTotal && (returned>=page.limit || page.offset+returned>=*knownTotal)) break;
                     const auto state = catalogResourceSource->GetQueryCatalogResourceStateAt( ordinal );
                     const auto& value = state.latest;
-                    const auto nameValue = catalogResourceSource->GetQueryCatalogResourceName( state.generation, value.nameId );
-                    const std::string name = nameValue.value_or( std::string() );
-                    if( !nameFilter.empty() && name.find( nameFilter ) == std::string::npos ) continue;
+                    std::string name;
+                    if( !nameFilter.empty() ) {
+                        name=catalogResourceSource->GetQueryCatalogResourceName(state.generation,value.nameId).value_or(std::string());
+                        if(name.find(nameFilter)==std::string::npos) continue;
+                    }
                     if( !kindFilter.empty() && kindFilter != GpuPrimaryKindName( value.primaryKind ) ) continue;
                     if( !classFilter.empty() && classFilter != GpuResourceClassName( value.resourceClass ) ) continue;
                     QueryCatalogResourceAssociationData associations {};
@@ -5813,13 +5839,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         if( requireSharedAllocation && associations.allocationResourceCount <= 1 ) continue;
                     }
                     const auto logicalPosition = matched++;
-                    if( !page.rawOffsetBound && logicalPosition < page.offset ) continue;
-                    if( returned >= page.limit )
-                    {
-                        if( !hasMore ) nextRawOffset = size_t( ordinal );
-                        hasMore = true;
-                        continue;
-                    }
+                    if( !page.rawOffsetBound && !unfiltered && logicalPosition < page.offset ) continue;
+                    if( returned >= page.limit ) continue;
+                    if(nameFilter.empty()) name=catalogResourceSource->GetQueryCatalogResourceName(state.generation,value.nameId).value_or(std::string());
                     json result = {
                         { "ref", source->MakeEntityRef( "gpu-resource", value.resourceId ) },
                         { "resource_id", Decimal( value.resourceId ) }, { "generation", Decimal( state.generation ) },
@@ -5850,9 +5872,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     returned++;
                     nextRawOffset = size_t( ordinal + 1 );
                 }
-                const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, nextRawOffset, hasMore );
+                const auto total=knownTotal.value_or(matched);
+                if(knownTotal && returned<page.limit && page.offset+returned!=total)
+                    throw QueryError("STALE_CURSOR","cursor resource count no longer matches the index");
+                const auto cursor = NextResourceCursor( page, method, trace, returned, nextRawOffset, total );
                 return Success( id, { { "present", true }, { "resources", std::move( values ) },
-                    { "total", Decimal( matched ) } }, trace, PageJson( page, returned, cursor ) );
+                    { "total", Decimal( total ) } }, trace, PageJson( page, returned, cursor ) );
             }
             if( method == "gpu.memory.by_type" )
             {

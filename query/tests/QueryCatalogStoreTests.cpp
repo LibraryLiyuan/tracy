@@ -714,6 +714,34 @@ int main()
         fs::remove_all( gpuSummaryRoot, ignored );
         fs::remove_all( metadataSortRoot, ignored );
         fs::remove_all( associationRoot, ignored );
+        {
+            const auto namesRoot=fs::temp_directory_path()/"query-catalog-name-cache";
+            fs::remove_all(namesRoot,ignored);
+            analysis::PagedRecordOptions options;
+            options.blockBytes=4096;
+            options.workspace=std::make_shared<analysis::AnalysisWorkspaceBudget>(64ull<<20,32ull<<20);
+            QueryCatalogStoreWriter names(namesRoot,identity,options);
+            names.SetMetadata({1,1,JnGpuCatalogSchemaVersion,JnGpuDetailedEvidenceSchemaVersion});
+            names.BeginStrings(1024);
+            for(uint32_t i=0;i<1024;++i) {
+                const auto text=std::string("name-")+std::to_string(i);
+                JnGpuCatalogStringRecordHeaderV1 h{};
+                h.stringId=i+1;h.byteLength=uint16_t(text.size());h.originalLength=uint32_t(text.size());
+                h.hash=JnGpuCatalogChecksum64(text.data(),text.size());
+                names.CatalogString(i,9,h,text.data());
+            }
+            names.EndStrings();names.Finish();
+            {
+                QueryCatalogStoreReader lookup(namesRoot,identity,options);
+                lookup.BuildResourceIndex(namesRoot/"scratch");
+                for(unsigned i=0;i<100;++i) {
+                    Require(lookup.ResourceName(9,1)==std::optional<std::string>("name-0") &&
+                        lookup.ResourceName(9,1024)==std::optional<std::string>("name-1023"),"name cache changed facts");
+                }
+                Require(lookup.ResourceNameLookupDecodedBytes()<=65536,"name point queries repeatedly decoded the search spine");
+            }
+            fs::remove_all(namesRoot,ignored);
+        }
         std::cout << "query Catalog store passed\n";
         return 0;
 #endif
