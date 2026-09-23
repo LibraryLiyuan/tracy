@@ -889,12 +889,8 @@ public:
         if( index >= JnDomainCount || recordBytes != JnRecordBytes( domain ) ) throw std::runtime_error( "JN index domain layout mismatch" );
         m_jnStarted[index] = true;
         m_jnExpected[index] = count;
-        if( domain == JnDomain::GpuReferenceUse )
-            m_gpuReferenceUseWriter = std::make_unique<analysis::PagedRecordWriter>( m_jnPaths[index],
-                PagedSectionIdentity( m_sourceFingerprint, JnSectionKind( domain ) ), recordBytes, m_storageOptions );
-        else
-            m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), count, recordBytes,
-                m_sourceFingerprint, m_storageOptions.disk );
+        m_jnPagedWriters[index] = std::make_unique<analysis::PagedRecordWriter>( m_jnPaths[index],
+            PagedSectionIdentity( m_sourceFingerprint, JnSectionKind( domain ) ), recordBytes, m_storageOptions );
     }
     void JnRecordsBlock( JnDomain domain, uint64_t offset, const void* records, uint64_t count, uint32_t recordBytes ) override
     {
@@ -912,13 +908,8 @@ public:
         const auto index = size_t( domain );
         if( index >= JnDomainCount || recordBytes != JnRecordBytes( domain ) || offset != m_jnSeen[index] || count > m_jnExpected[index] - offset )
             throw std::runtime_error( "JN index block is out of sequence" );
-        if( domain == JnDomain::GpuReferenceUse )
-        {
-            if( !m_gpuReferenceUseWriter ) throw std::runtime_error( "GPU Use paged writer is not open" );
-            m_gpuReferenceUseWriter->Append( records, count );
-        }
-        else if( count != 0 )
-            std::memcpy( m_jn[index].Record( offset ), records, size_t( count * recordBytes ) );
+        if( !m_jnPagedWriters[index] ) throw std::runtime_error( "JN paged writer is not open" );
+        m_jnPagedWriters[index]->Append( records, count );
         m_jnSeen[index] += count;
     }
     void JnRecordsEnd( JnDomain domain ) override
@@ -935,13 +926,9 @@ public:
         }
         const auto index = size_t( domain );
         if( m_jnSeen[index] != m_jnExpected[index] ) throw std::runtime_error( "JN index count mismatch" );
-        if( domain == JnDomain::GpuReferenceUse )
-        {
-            if( !m_gpuReferenceUseWriter ) throw std::runtime_error( "GPU Use paged writer is not open" );
-            m_gpuReferenceUseWriter->Commit();
-            m_gpuReferenceUseWriter.reset();
-        }
-        else m_jn[index].Close( m_jnSeen[index] );
+        if( !m_jnPagedWriters[index] ) throw std::runtime_error( "JN paged writer is not open" );
+        m_jnPagedWriters[index]->Commit();
+        m_jnPagedWriters[index].reset();
     }
 
     uint64_t ExtraCount() const { return m_seenExtras; }
@@ -971,19 +958,10 @@ public:
             if( index == size_t( JnDomain::JobStage ) ) continue;
             if( m_jnStarted[index] ) continue;
             const auto domain = JnDomain( index );
-            if( domain == JnDomain::GpuReferenceUse )
-            {
-                analysis::PagedRecordWriter use( m_jnPaths[index],
-                    PagedSectionIdentity( m_sourceFingerprint, JnSectionKind( domain ) ),
-                    JnRecordBytes( domain ), m_storageOptions );
-                use.Commit();
-            }
-            else
-            {
-                m_jn[index].Open( m_jnPaths[index], JnSectionKind( domain ), 0,
-                    JnRecordBytes( domain ), m_sourceFingerprint, m_storageOptions.disk );
-                m_jn[index].Close( 0 );
-            }
+            analysis::PagedRecordWriter empty( m_jnPaths[index],
+                PagedSectionIdentity( m_sourceFingerprint, JnSectionKind( domain ) ),
+                JnRecordBytes( domain ), m_storageOptions );
+            empty.Commit();
         }
     }
     void BuildJobIndexes() { m_jobs.BuildIndexes( m_stringPath ); }
@@ -1055,8 +1033,7 @@ private:
     analysis::PagedRecordOptions m_storageOptions;
     std::shared_ptr<QueryResourceContext> m_resources;
     MappedSection m_extras, m_cpu, m_gpu;
-    std::array<MappedSection, JnDomainCount> m_jn;
-    std::unique_ptr<analysis::PagedRecordWriter> m_gpuReferenceUseWriter;
+    std::array<std::unique_ptr<analysis::PagedRecordWriter>, JnDomainCount> m_jnPagedWriters;
     std::array<uint64_t, JnDomainCount> m_jnExpected {};
     std::array<uint64_t, JnDomainCount> m_jnSeen {};
     std::array<bool, JnDomainCount> m_jnStarted {};
@@ -3989,19 +3966,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         // Mutable build extents are closed before compression. Publication
         // names are generation-specific, so existing readers retain their
         // immutable files until their own analysis is released.
-        const auto packSection=[&](std::filesystem::path& temporary,QueryIndexSection& section,ZoneSectionKind kind) {
-            auto packed=temporary; packed+=".pages";
-            packedScratch.push_back(packed);
-            PackClosedZoneSection( temporary, kind, section.count, section.recordBytes,
-                result.sourceFingerprint, storageOptions );
-            section.bytes=SectionBytes(temporary); section.fingerprint=SectionFingerprint(temporary);
-        };
-        for(size_t index=1;index<temporaryJn.size();++index)
-        {
-            if( index == size_t( SerializedZoneSink::JnDomain::GpuReferenceUse ) ) continue;
-            packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
-        }
-
         {
             const auto passIndex = size_t( SerializedZoneSink::JnDomain::GpuReferencePass );
             const auto useIndex = size_t( SerializedZoneSink::JnDomain::GpuReferenceUse );
