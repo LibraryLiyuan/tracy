@@ -1,5 +1,7 @@
 #include "TracyQueryGpuReferenceStore.hpp"
 #include "TracyQueryCatalogStore.hpp"
+#include "TracyOfflineCatalog.hpp"
+#include "TracyQueue.hpp"
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
@@ -47,8 +49,9 @@ public:
 class GeneratedInput final : public tracy::query::QueryGpuReferenceInput
 {
 public:
-    GeneratedInput( uint64_t useCount, uint64_t resourceCount )
-        : m_uses( useCount ), m_resources( resourceCount ) {}
+    GeneratedInput( uint64_t useCount, uint64_t resourceCount,
+        const tracy::query::QueryCatalogStoreReader* catalog = nullptr )
+        : m_uses( useCount ), m_resources( resourceCount ), m_catalog( catalog ) {}
 
     uint64_t PassCount() const override { return ( m_uses + 31 ) / 32; }
     uint64_t UseCount() const override { return m_uses; }
@@ -63,16 +66,17 @@ public:
     }
     tracy::JnGpuReferenceEndData End( uint64_t ordinal ) const override
     { return { int64_t( ordinal * 100 + 99 ), ordinal + 1, 0, 1, 32, 0, 0 }; }
-    uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t ) const override
-    { return pointerToken; }
+    uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
+    { return m_catalog ? m_catalog->ResolveResourcePointer( pointerToken, time ) : pointerToken; }
 
 private:
     uint64_t m_uses;
     uint64_t m_resources;
+    const tracy::query::QueryCatalogStoreReader* m_catalog;
 };
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false )
+    bool inventory = false, bool realCatalog = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
@@ -103,6 +107,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             nextSample = current + ( 16ull << 20 );
             const auto scratch = root / "reverse-scratch";
             uint64_t source = 0, sorted = 0, runs = 0, other = 0;
+            std::string active;
             if( fs::exists( scratch ) )
                 for( const auto& item : fs::directory_iterator( scratch ) )
                 {
@@ -113,14 +118,65 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     else if( name.ends_with( "-sorted.work" ) ) sorted += bytes;
                     else if( name.find( "-run-" ) != std::string::npos ) runs += bytes;
                     else other += bytes;
+                    if( bytes != 0 && ( name.ends_with( "-source.work" ) ||
+                        name.ends_with( "-sorted.work" ) ) ) active += name + ',';
                 }
             std::ostringstream line;
-            line << "gpu_reference_inventory ledger=" << current << " source=" << source
-                << " sorted=" << sorted << " runs=" << runs << " other=" << other;
+            line << "gpu_reference_inventory elapsed_ms=" <<
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - started ).count()
+                << " ledger=" << current << " source=" << source
+                << " sorted=" << sorted << " runs=" << runs << " other=" << other
+                << " active=" << active;
             inventoryRows.emplace_back( line.str() );
         };
-        GeneratedInput input( useCount, resourceCount );
         const std::string identity( 64, 'g' );
+        std::unique_ptr<QueryCatalogStoreReader> catalog;
+        uint64_t catalogBuildMs = 0;
+        if( realCatalog )
+        {
+            const auto catalogStarted = std::chrono::steady_clock::now();
+            {
+                QueryCatalogStoreWriter writer( root / "catalog", identity, options );
+                writer.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
+                writer.Begin( OfflineCatalogDomain::CatalogResource, resourceCount,
+                    sizeof( JnGpuCatalogResourceRecordV1 ) );
+                std::array<JnGpuCatalogResourceRecordV1, 4096> rows {};
+                for( uint64_t offset = 0; offset < resourceCount; )
+                {
+                    const auto take = std::min<uint64_t>( rows.size(), resourceCount - offset );
+                    for( uint64_t index = 0; index < take; ++index )
+                    {
+                        auto& row = rows[size_t( index )];
+                        row = {};
+                        row.resourceId = offset + index + 1;
+                        row.pointerToken = row.resourceId;
+                        row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
+                        row.capacityBytes = 64;
+                    }
+                    writer.Append( OfflineCatalogDomain::CatalogResource, offset, rows.data(), take,
+                        sizeof( rows[0] ) );
+                    offset += take;
+                }
+                writer.End( OfflineCatalogDomain::CatalogResource );
+                JnGpuCatalogBatchData batch {};
+                batch.generation = 1;
+                batch.kind = uint8_t( JnGpuCatalogBatchKind::Resource );
+                batch.recordCount = resourceCount;
+                writer.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( batch ) );
+                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, &batch, 1, sizeof( batch ) );
+                writer.End( OfflineCatalogDomain::CatalogBatch );
+                writer.Finish();
+            }
+            catalog = std::make_unique<QueryCatalogStoreReader>( root / "catalog", identity, options );
+            catalog->BuildResourceIndex( root / "catalog" / "resource-index-scratch" );
+            if( !catalog->PreparePointerResolutionFastPath() )
+                throw std::runtime_error( "GPU reference capacity Catalog pointer fast path unavailable" );
+            catalogBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - catalogStarted ).count();
+        }
+        const auto sourceBytes = usage->Snapshot().currentBytes;
+        GeneratedInput input( useCount, resourceCount, catalog.get() );
         const auto buildStarted = std::chrono::steady_clock::now();
         QueryGpuReferenceStore::Build( root, identity, input, options );
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -140,11 +196,14 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         }
         const auto observed = usage->Snapshot();
         std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
-            << " resource_keys=" << resourceCount << " peak_bytes=" << observed.peakBytes
+            << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
+            << " catalog_build_ms=" << catalogBuildMs << " source_bytes=" << sourceBytes
+            << " peak_bytes=" << observed.peakBytes
             << " final_bytes=" << observed.currentBytes
             << " build_elapsed_ms=" << buildMilliseconds << '\n';
         if( inventory )
             for( const auto& line : inventoryRows ) std::cout << line << '\n';
+        catalog.reset();
         std::error_code cleanup;
         fs::remove_all( root, cleanup );
         if( cleanup ) throw std::runtime_error( "GPU reference capacity cleanup: " + cleanup.message() );
@@ -167,6 +226,10 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ) );
     if( argc == 5 && std::string_view( argv[1] ) == "--capacity-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-inventory" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true, true );
     try
     {
         namespace fs = std::filesystem;
