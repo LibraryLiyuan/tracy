@@ -5690,7 +5690,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto usePage = gpuPassResourceSource->GetQueryGpuPassUses(
                     passId, page.offset, page.limit );
                 const auto evidencePage = gpuPassResourceSource->GetQueryGpuPassEvidenceIds(
-                    passId, 0, DefaultPageSize );
+                    passId, page.offset, page.limit );
                 json evidenceIds = json::array();
                 for( const auto value : evidencePage.values ) evidenceIds.push_back( Decimal( value ) );
                 json ranges = json::array();
@@ -5727,13 +5727,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         { "resolution", resourceId == 0 ? "unresolved_logical_resource" : "pointer_lifetime_exact" }
                     } );
                 }
-                const auto returned = std::max( ranges.size(), uses.size() );
+                const auto returned = std::max( { ranges.size(), uses.size(), evidenceIds.size() } );
                 const bool hasMore = page.offset + ranges.size() < rangePage.total ||
-                    page.offset + uses.size() < usePage.total;
+                    page.offset + uses.size() < usePage.total ||
+                    page.offset + evidenceIds.size() < evidencePage.total;
                 const auto cursor = NextCursor( page, method, trace, returned, hasMore );
                 return Success( id, { { "present", true }, { "pass_id", Decimal( passId ) },
                     { "evidence_pass_ids", std::move( evidenceIds ) },
-                    { "evidence_pass_ids_truncated", evidencePage.total > evidencePage.values.size() },
+                    { "evidence_pass_ids_truncated", page.offset + evidencePage.values.size() < evidencePage.total },
                     { "sample_status", "continuous_exact" },
                     { "resource_count", Decimal( summary.resourceCount ) },
                     { "allocation_count", Decimal( summary.allocationCount ) },
@@ -12775,7 +12776,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         {
             addFinding( "warning", "TRUNCATED_STREAM_TAIL", "the selected committed stream revision has an incomplete or truncated tail; results are bounded to the last readable records", 1 );
         }
-        if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
+        if( const auto* indexedCatalog = dynamic_cast<const QueryCatalogStatusSource*>( source.get() ) )
+        {
+            const auto& validation = indexedCatalog->GetQueryCatalogValidation();
+            if( !validation.complete )
+                throw QueryError( "INDEX_NOT_READY", "GPU Catalog semantic validation is not complete" );
+            if( validation.present )
+            {
+                const auto status = indexedCatalog->GetQueryCatalogStatus( 0, 0 );
+                if( !validation.originalValid || ( !validation.healthy && validation.findings.empty() ) )
+                    addFinding( "error", "GPU_CATALOG_INVALID_CORE",
+                        "N27 GPU Catalog Core is invalid or disk semantic validation failed", 1 );
+                if( status.unresolvedCount )
+                    addFinding( "error", "GPU_CATALOG_UNRESOLVED_RESOURCE",
+                        "completed GPU Catalog lifetimes contain unresolved pointer-token evidence",
+                        status.unresolvedCount );
+                for( const auto& finding : validation.findings )
+                {
+                    const auto code = finding.code == "CATALOG_TRANSPORT_CHECKSUM_MISSING" ||
+                        finding.code == "CATALOG_STORED_CHECKSUM" ? "GPU_CATALOG_CHECKSUM_FAILURE" :
+                        finding.code == "CATALOG_SEQUENCE" ? "GPU_CATALOG_SEQUENCE_GAP" :
+                        finding.code == "CATALOG_BATCH_RANGE" ? "GPU_CATALOG_INVALID_BATCH" :
+                        finding.code.c_str();
+                    addFinding( "error", code, "GPU Catalog disk validation: " + finding.code, finding.count );
+                }
+            }
+        }
+        else if( const auto catalog = source->GetGpuCatalogData(); catalog && catalog->gpuCatalogPresent )
         {
             uint64_t invalidBatches = 0, checksumFailures = 0, sequenceGaps = 0, unresolved = 0;
             std::map<uint64_t, std::vector<uint32_t>> sequences;

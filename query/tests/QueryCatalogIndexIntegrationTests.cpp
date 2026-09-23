@@ -165,6 +165,21 @@ int main( int argc, char** argv )
         catch( const analysis::TraceLoadError& error )
         { rejectedUnboundCompact = error.code == analysis::TraceLoadErrorCode::Corrupt; }
         Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
+        query::QueryResourceContextOptions reducedProfile;
+        reducedProfile.expectedTraceBytes = manifest.sourceBytes;
+        reducedProfile.expectedFinalDiskLimit = 1;
+        reducedProfile.expectedPeakDiskLimit = manifest.sourceBytes * 16;
+        reducedProfile.diagnosticDiskReserveBytes = 0;
+        const auto reducedResources = query::QueryIndex::CreateResourceContext( input, reducedProfile );
+        bool rejectedOversizedPublishedIndex = false;
+        try { auto overFinal = query::QueryIndex::Open( manifest, {}, {}, reducedResources ); }
+        catch( const query::QueryResourceError& error )
+        {
+            rejectedOversizedPublishedIndex = error.Code() == "RESOURCE_LIMIT" &&
+                error.Reason() == "analysis_final_disk_ratio";
+        }
+        Require( rejectedOversizedPublishedIndex,
+            "hot open accepted a published index above the reduced final Profile limit" );
         auto indexed = query::QueryIndex::Open( manifest );
         auto indexedPeer = query::QueryIndex::Open( manifest );
         Require( indexed->CatalogDerivedDataReady(),

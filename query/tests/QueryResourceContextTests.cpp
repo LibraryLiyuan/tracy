@@ -1,4 +1,5 @@
 #include "TracyQueryResourceContext.hpp"
+#include "TracyQueryIndex.hpp"
 #include "TracyFileWrite.hpp"
 
 #include <nlohmann/json.hpp>
@@ -245,6 +246,65 @@ void ReusedDiskRoots( const std::filesystem::path& root )
     Require( context.Snapshot().disk.currentBytes == 120,
         "rejected reused roots changed the admitted disk ledger" );
 }
+
+void ReducedProfileDiskLimits( const std::filesystem::path& root )
+{
+    QueryResourceContextOptions options;
+    options.traceBytes = 10;
+    options.expectedTraceBytes = 10;
+    options.expectedFinalDiskLimit = 40;
+    options.expectedPeakDiskLimit = 80;
+    options.derivedRoots = { root };
+    options.diagnosticDiskReserveBytes = 0;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+
+    QueryResourceContext context( options );
+    context.ValidateTraceIdentity( 10, {} );
+    const auto limits = context.Snapshot().disk;
+    Require( limits.finalLimitBytes == 40 && limits.peakLimitBytes == 80,
+        "reduced Profile limits were not applied to the shared disk ledger" );
+    context.Disk()->Grow( 40 );
+    context.CheckFinalDisk();
+    context.Disk()->Grow( 1 );
+    Reject( [&] { context.CheckFinalDisk(); }, "final_disk_ratio" );
+    context.Disk()->Grow( 39 );
+    Reject( [&] { context.Disk()->Grow( 1 ); }, "disk_budget" );
+
+    QueryResourceContextOptions invalid = options;
+    invalid.expectedPeakDiskLimit = 0;
+    Reject( [&] { QueryResourceContext ignored( invalid ); }, "query_resource_configuration" );
+    invalid = options;
+    invalid.expectedFinalDiskLimit = 81;
+    Reject( [&] { QueryResourceContext ignored( invalid ); }, "query_resource_configuration" );
+
+    const auto existing = root / "existing-over-limit";
+    std::filesystem::create_directories( existing );
+    std::ofstream( existing / "index.bin", std::ios::binary ).write( std::string( 81, 'x' ).data(), 81 );
+    invalid = options;
+    invalid.derivedRoots = { existing };
+    Reject( [&] { QueryResourceContext ignored( invalid ); }, "disk_peak_limit" );
+}
+
+void ReducedProfileAcceptedAtTraceEntry( const std::filesystem::path& root )
+{
+    std::filesystem::create_directories( root );
+    const auto trace = root / "small.tracy";
+    std::ofstream( trace, std::ios::binary ).write( "0123456789", 10 );
+    QueryResourceContextOptions options;
+    options.expectedTraceBytes = 10;
+    options.expectedFinalDiskLimit = 40;
+    options.expectedPeakDiskLimit = 80;
+    options.diagnosticDiskReserveBytes = 0;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+
+    const auto context = QueryIndex::CreateResourceContext( trace, options );
+    const auto disk = context->Snapshot().disk;
+    Require( disk.finalLimitBytes == 40 && disk.peakLimitBytes == 80,
+        "trace entry did not retain the lower Profile limits" );
+    options.expectedTraceBytes = 11;
+    Reject( [&] { QueryIndex::CreateResourceContext( trace, options ); },
+        "query_resource_profile_identity_mismatch" );
+}
 }
 
 int main( int argc, char** argv )
@@ -260,6 +320,8 @@ int main( int argc, char** argv )
         FileWriteAccounting( base / "file-write" );
         ReservedFailureDiagnostic( base / "diagnostic" );
         ReusedDiskRoots( base / "reused-roots" );
+        ReducedProfileDiskLimits( base / "reduced-profile" );
+        ReducedProfileAcceptedAtTraceEntry( base / "trace-entry" );
         std::filesystem::remove_all( base, ignored );
         std::cout << "query resource context tests passed\n";
         return 0;

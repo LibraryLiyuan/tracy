@@ -5,6 +5,7 @@
 #include "FakeTraceSource.hpp"
 
 #include <cassert>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <filesystem>
@@ -338,9 +339,9 @@ public:
     {
         QueryGpuPassIdPage page;
         if( passId != 200 ) return page;
-        const uint64_t values[2] { 300, 301 };
-        page.total = 2;
-        for( uint64_t index = offset; index < std::min<uint64_t>( 2, offset + limit ); index++ )
+        const uint64_t values[3] { 300, 301, 302 };
+        page.total = 3;
+        for( uint64_t index = offset; index < std::min<uint64_t>( 3, offset + limit ); index++ )
             page.values.emplace_back( values[index] );
         return page;
     }
@@ -481,7 +482,8 @@ int main()
         passResources.at( "data" ).at( "allocation_count" ) == "1" &&
         passResources.at( "data" ).at( "direct_range_bytes" ) == "3072" &&
         passResources.at( "data" ).at( "referenced_physical_bytes" ) == "4096" &&
-        passResources.at( "data" ).at( "evidence_pass_ids" ).size() == 2 &&
+        passResources.at( "data" ).at( "evidence_pass_ids" ) == nlohmann::json::array( { "300" } ) &&
+        passResources.at( "data" ).at( "evidence_pass_ids_truncated" ) == true &&
         passResources.at( "data" ).at( "ranges" ).size() == 1 &&
         passResources.at( "data" ).at( "resource_set_uses" ).size() == 1 &&
         passResources.at( "data" ).at( "resource_set_uses" )[0].at( "catalog_resource_id" ) == "100" &&
@@ -492,7 +494,18 @@ int main()
     } ) );
     assert( passResourcesNext.at( "ok" ) && passResourcesNext.at( "data" ).at( "ranges" ).size() == 1 &&
         passResourcesNext.at( "data" ).at( "resource_set_uses" ).size() == 1 &&
-        passResourcesNext.at( "page" ).at( "next_cursor" ).is_null() );
+        passResourcesNext.at( "data" ).at( "evidence_pass_ids" ) == nlohmann::json::array( { "301" } ) &&
+        passResourcesNext.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto passResourcesEvidenceTail = service.Execute( Request( 33, "gpu.pass.resources", {
+        { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 },
+        { "cursor", passResourcesNext.at( "page" ).at( "next_cursor" ) }
+    } ) );
+    assert( passResourcesEvidenceTail.at( "ok" ) &&
+        passResourcesEvidenceTail.at( "data" ).at( "ranges" ).empty() &&
+        passResourcesEvidenceTail.at( "data" ).at( "resource_set_uses" ).empty() &&
+        passResourcesEvidenceTail.at( "data" ).at( "evidence_pass_ids" ) == nlohmann::json::array( { "302" } ) &&
+        passResourcesEvidenceTail.at( "data" ).at( "evidence_pass_ids_truncated" ) == false &&
+        passResourcesEvidenceTail.at( "page" ).at( "next_cursor" ).is_null() );
     const auto memoryByPass = service.Execute( Request( 32, "gpu.memory.by_pass", {
         { "trace_id", traceId }, { "pass_id", "200" }, { "limit", 1 }
     } ) );
@@ -577,6 +590,14 @@ int main()
         validation.at( "data" ).at( "transport" ).at( "sequence_duplicates" ).is_null() &&
         validation.at( "data" ).at( "unresolved_breakdown" ).at( "total" ) == "5" &&
         !validation.at( "data" ).at( "diagnostic_details_available" ).get<bool>() );
+    const auto healthyIndexedValidationRun = service.Execute( Request( 24, "validation.run", {
+        { "trace_id", traceId }, { "max_cpu_ms", 60000 }, { "max_scan_events", 100000000 }
+    } ) );
+    assert( healthyIndexedValidationRun.at( "ok" ) );
+    const auto& healthyIndexedFindings = healthyIndexedValidationRun.at( "data" ).at( "findings" );
+    assert( std::any_of( healthyIndexedFindings.begin(), healthyIndexedFindings.end(), []( const auto& finding ) {
+        return finding.at( "code" ) == "GPU_CATALOG_UNRESOLVED_RESOURCE" && finding.at( "count" ) == "5";
+    } ) && "validation.run dropped Indexed Catalog unresolved-resource evidence" );
 
     assert( catalogSource != nullptr );
     catalogSource->SetInvalidValidation();
@@ -600,6 +621,16 @@ int main()
         invalidValidation.at( "data" ).at( "unresolved_breakdown" ).at( "total" ) == "5" &&
         invalidValidation.at( "data" ).at( "unresolved_breakdown" ).at( "detail_status" ) == "not_persisted" &&
         !invalidValidation.at( "data" ).at( "diagnostic_details_available" ).get<bool>() );
+
+    const auto indexedValidationRun = service.Execute( Request( 23, "validation.run", {
+        { "trace_id", traceId }, { "max_cpu_ms", 60000 }, { "max_scan_events", 100000000 }
+    } ) );
+    assert( indexedValidationRun.at( "ok" ) );
+    const auto& indexedFindings = indexedValidationRun.at( "data" ).at( "findings" );
+    assert( !indexedValidationRun.at( "data" ).at( "valid" ).get<bool>() &&
+        std::any_of( indexedFindings.begin(), indexedFindings.end(), []( const auto& finding ) {
+            return finding.at( "code" ) == "GPU_CATALOG_CHECKSUM_FAILURE";
+        } ) && "validation.run ignored an indexed Catalog checksum failure" );
 
     assert( service.Execute( Request( 22, "trace.close", { { "trace_id", traceId } } ) ).at( "ok" ) );
     fs::remove_all( root, ignored );

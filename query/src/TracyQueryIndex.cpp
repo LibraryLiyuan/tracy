@@ -4555,6 +4555,7 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
         if( !leasedManifest.readerLease ) throw std::runtime_error( leaseError );
     }
     resources->ValidateTraceIdentity(leasedManifest.sourceBytes,leasedManifest.sourceFingerprint);
+    resources->CheckFinalDisk();
     resources->SetPhase("compact-open");
     resources->SetLiveWorkers(1);
     resources->CheckMemory();
@@ -4583,10 +4584,7 @@ std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const st
 {
     const auto tracePath=analysis::AnalysisIoPath(inputTracePath);
     const auto actualBytes=std::filesystem::file_size(tracePath);
-    const auto limits=analysis::AnalysisDiskBudget::ForTrace(actualBytes);
-    if((options.expectedTraceBytes && options.expectedTraceBytes!=actualBytes) ||
-        (options.expectedFinalDiskLimit && options.expectedFinalDiskLimit!=limits.finalBytes) ||
-        (options.expectedPeakDiskLimit && options.expectedPeakDiskLimit!=limits.peakBytes))
+    if(options.expectedTraceBytes && options.expectedTraceBytes!=actualBytes)
         throw std::runtime_error("query_resource_profile_identity_mismatch");
     options.traceBytes=actualBytes;
     options.derivedRoots=ExistingDerivedPaths(tracePath);

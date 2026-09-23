@@ -22,6 +22,17 @@ std::string ErrorMessage(const std::string& category,const std::string& reason)
 {
     return "query_resource_"+category+":"+reason;
 }
+analysis::AnalysisDiskBudget::TraceLimits ProfileDiskLimits(const QueryResourceContextOptions& options)
+{
+    const auto defaults=analysis::AnalysisDiskBudget::ForTrace(options.traceBytes);
+    if(!options.expectedFinalDiskLimit && !options.expectedPeakDiskLimit) return defaults;
+    if(!options.expectedFinalDiskLimit || !options.expectedPeakDiskLimit ||
+        options.expectedFinalDiskLimit>options.expectedPeakDiskLimit ||
+        options.expectedFinalDiskLimit>defaults.finalBytes ||
+        options.expectedPeakDiskLimit>defaults.peakBytes)
+        throw std::runtime_error("query_resource_configuration");
+    return {options.expectedFinalDiskLimit,options.expectedPeakDiskLimit};
+}
 }
 
 struct QueryResourceContext::State
@@ -47,7 +58,7 @@ QueryResourceError::QueryResourceError(std::string category,std::string reason,
 {}
 
 QueryResourceContext::QueryResourceContext(QueryResourceContextOptions options)
-    :m_options(std::move(options)),m_limits(analysis::AnalysisDiskBudget::ForTrace(m_options.traceBytes)),
+    :m_options(std::move(options)),m_limits(ProfileDiskLimits(m_options)),
     m_state(std::make_shared<State>())
 {
     if(m_options.derivedRoots.empty() || !m_options.privateBytesSoftTarget ||
@@ -104,6 +115,12 @@ QueryResourceContext::QueryResourceContext(QueryResourceContextOptions options)
             value->requestedBytes=requested;
         }
     };
+    try { m_disk->Grow(0); }
+    catch(const std::exception&)
+    {
+        RecordFailure("disk_peak_limit");
+        throw QueryResourceError("disk","disk_peak_limit");
+    }
 }
 
 QueryResourceContext::~QueryResourceContext()
