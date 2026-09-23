@@ -11695,9 +11695,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             throw QueryError( "INDEX_NOT_READY", "sample ghost-zone index has not been built" );
         const auto page = ParsePage( params, method, trace );
         const std::string threadRef = params.value( "thread_ref", "" );
+        const auto time = ScanRangeFrom( params, 0, 1 );
         auto scanPage = ScanFiltered<analysis::GhostZoneDto>( *source, params, page,
-            []( const auto& item, const auto& range ) { return item.ScanGhostZones( range ); },
-            [&]( const auto& zone ) { return ( threadRef.empty() || zone.threadRef == threadRef ) && TextMatches( zone.name + " " + zone.file, params ); }, GhostZoneJson );
+            []( const auto& item, const auto& range ) { return item.ScanGhostZonesRaw( range ); },
+            [&]( const auto& zone ) { return zone.startNs < time.endNs && zone.endNs > time.startNs &&
+                ( threadRef.empty() || zone.threadRef == threadRef ) &&
+                TextMatches( zone.name + " " + zone.file, params ); }, GhostZoneJson );
         const auto returned = scanPage.values.size();
         const auto cursor = NextCursorAt( page, method, trace, scanPage.nextOffset, scanPage.nextRawOffset, scanPage.hasMore );
         return Success( id, { { "ready", true }, { "ghost_zones", std::move( scanPage.values ) } }, trace, PageJson( page, returned, cursor ) );

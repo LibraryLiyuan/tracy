@@ -96,6 +96,17 @@ int main( int argc, char** argv )
                 actualZone.childCount == expectedZone.childCount && actualZone.inlineFrame == expectedZone.inlineFrame,
                 "indexed ghost zone changed" );
         }
+        for( size_t offset = 0; offset < expectedGhostZones.size(); ++offset )
+        {
+            auto physicalRange = range;
+            physicalRange.offset = offset;
+            physicalRange.limit = 1;
+            physicalRange.startNs = std::numeric_limits<int64_t>::max() - 2;
+            physicalRange.endNs = std::numeric_limits<int64_t>::max();
+            const auto page = indexed->ScanGhostZonesRaw( physicalRange );
+            Require( page.size() == 1 && page.front().ref == expectedGhostZones[offset].ref,
+                "indexed physical Ghost cursor lost an ordinal or applied time filtering twice" );
+        }
         if( expectedGhostZones.size() >= 2 )
         {
             auto pageRange = range;

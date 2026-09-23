@@ -2320,7 +2320,16 @@ public:
     }
     std::vector<analysis::GhostZoneDto> ScanGhostZones( const analysis::ScanRange& range ) const override
     {
-        const auto rows = m_ghostZones.Scan( range.startNs, range.endNs, range.offset, range.limit );
+        return ConvertGhostRows( m_ghostZones.Scan( range.startNs, range.endNs, range.offset, range.limit ) );
+    }
+    std::vector<analysis::GhostZoneDto> ScanGhostZonesRaw( const analysis::ScanRange& range ) const override
+    {
+        return ConvertGhostRows( m_ghostZones.ScanOrdinals(
+            range.offset, range.limit, range.startNs, range.endNs ) );
+    }
+    std::vector<analysis::GhostZoneDto> ConvertGhostRows(
+        const std::vector<QueryGhostZoneRow>& rows ) const
+    {
         std::vector<analysis::GhostZoneDto> result;
         result.reserve( rows.size() );
         for( const auto& row : rows )

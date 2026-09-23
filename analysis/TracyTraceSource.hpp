@@ -1136,6 +1136,15 @@ public:
     virtual std::vector<SampleDto> ScanSampleEvents( const ScanRange& ) const { return {}; }
     virtual bool SampleDerivedDataReady() const { return true; }
     virtual std::vector<GhostZoneDto> ScanGhostZones( const ScanRange& ) const { return {}; }
+    // Cursor offsets are physical Ghost ordinals. Rows outside the requested
+    // time range may omit resolved strings; callers must filter time first.
+    virtual std::vector<GhostZoneDto> ScanGhostZonesRaw( const ScanRange& range ) const
+    {
+        auto all = range;
+        all.startNs = std::numeric_limits<int64_t>::min();
+        all.endNs = std::numeric_limits<int64_t>::max();
+        return ScanGhostZones( all );
+    }
     virtual std::vector<HardwareSampleDto> GetHardwareSamples() const { return {}; }
     virtual std::vector<HardwareSampleEventDto> GetHardwareSampleEvents( uint64_t, std::string_view, size_t, size_t ) const { return {}; }
     virtual std::vector<LockEventDto> ScanLockEvents( const ScanRange& ) const { return {}; }

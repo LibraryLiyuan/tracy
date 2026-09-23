@@ -2,10 +2,12 @@
 #define __TRACYQUERYGHOSTZONESTORE_HPP__
 
 #include "TracyQueryStringStore.hpp"
+#include "TracyPagedRecordStore.hpp"
 #include "TracyTraceSource.hpp"
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -85,6 +87,10 @@ public:
 
     uint64_t Count() const;
     std::vector<QueryGhostZoneRow> Scan( int64_t startNs, int64_t endNs, uint64_t offset, size_t limit ) const;
+    std::vector<QueryGhostZoneRow> ScanOrdinals( uint64_t offset, size_t limit,
+        int64_t startNs = std::numeric_limits<int64_t>::min(),
+        int64_t endNs = std::numeric_limits<int64_t>::max() ) const;
+    analysis::PagedRecordReader::ReadStats ReadStatistics() const;
     void ValidateAll();
 
 private:

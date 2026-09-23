@@ -660,6 +660,24 @@ int main()
     assert( openBaseline.at( "ok" ) );
     const auto baselineId = openBaseline.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( baselineId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const nlohmann::json ghostFilter = { { "trace_id", baselineId }, { "start_ns", "20" },
+        { "end_ns", "65" }, { "limit", 2 } };
+    const auto ghostFirst = service.Execute( Request( 10003, "sample.ghost_zones", ghostFilter ) );
+    assert( ghostFirst.at( "ok" ) && ghostFirst.at( "data" ).at( "ghost_zones" ).size() == 2 &&
+        ghostFirst.at( "data" ).at( "ghost_zones" )[0].at( "start_ns" ) == "20" &&
+        ghostFirst.at( "data" ).at( "ghost_zones" )[1].at( "start_ns" ) == "30" );
+    const auto ghostSecond = service.Execute( Request( 10004, "sample.ghost_zones", nlohmann::json {
+        { "trace_id", baselineId }, { "start_ns", "20" }, { "end_ns", "65" }, { "limit", 2 },
+        { "cursor", ghostFirst.at( "page" ).at( "next_cursor" ) } } ) );
+    assert( ghostSecond.at( "ok" ) && ghostSecond.at( "data" ).at( "ghost_zones" ).size() == 2 &&
+        ghostSecond.at( "data" ).at( "ghost_zones" )[0].at( "start_ns" ) == "40" &&
+        ghostSecond.at( "data" ).at( "ghost_zones" )[1].at( "start_ns" ) == "50" );
+    const auto ghostThird = service.Execute( Request( 10005, "sample.ghost_zones", nlohmann::json {
+        { "trace_id", baselineId }, { "start_ns", "20" }, { "end_ns", "65" }, { "limit", 2 },
+        { "cursor", ghostSecond.at( "page" ).at( "next_cursor" ) } } ) );
+    assert( ghostThird.at( "ok" ) && ghostThird.at( "data" ).at( "ghost_zones" ).size() == 1 &&
+        ghostThird.at( "data" ).at( "ghost_zones" )[0].at( "start_ns" ) == "60" &&
+        ghostThird.at( "page" ).at( "next_cursor" ).is_null() );
     const auto openCandidate = service.Execute( Request( 101, "trace.open", { { "path", files.candidate.string() } } ) );
     assert( openCandidate.at( "ok" ) );
     const auto candidateId = openCandidate.at( "data" ).at( "trace_id" ).get<std::string>();

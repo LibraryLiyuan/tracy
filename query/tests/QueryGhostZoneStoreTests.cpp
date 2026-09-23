@@ -369,6 +369,20 @@ int main( int argc, char** argv )
                     row.endNs == row.startNs + 5 && row.depth == ordinal % 2 &&
                     ( ordinal % 2 ? row.parent == ordinal - 1 : !row.parent ), "batched Ghost record semantics changed" );
             }
+            const auto readsBefore = batchReader.ReadStatistics().blockLoads;
+            for( uint64_t page = 0; page < 100; ++page )
+            {
+                const auto physical = batchReader.ScanOrdinals( page * 10, 10 );
+                Require( physical.size() == 10 && physical.front().ordinal == page * 10 &&
+                    physical.back().ordinal == page * 10 + 9,
+                    "Ghost physical pagination lost or repeated ordinals" );
+            }
+            Require( batchReader.ReadStatistics().blockLoads - readsBefore < 100,
+                "Ghost physical pagination reread every earlier block" );
+            const auto skipped = batchReader.ScanOrdinals( 0, 2, 1000000, 1000010 );
+            Require( skipped.size() == 2 && skipped[0].ordinal == 0 && skipped[1].ordinal == 1 &&
+                skipped[0].name.empty() && skipped[1].file.empty(),
+                "Ghost time-window cursor resolved strings for unrelated physical records" );
             batchReader.ValidateAll();
         }
     }

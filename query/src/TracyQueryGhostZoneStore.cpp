@@ -454,10 +454,9 @@ struct QueryGhostZoneStoreReader::Impl
         return strings.ReadOrdinal( ordinal, 1 << 20 );
     }
 
-    QueryGhostZoneRow Read( uint64_t ordinal ) const
+    QueryGhostZoneRow Read( uint64_t ordinal, const StoredGhostZone& record,
+        bool resolveStrings = true ) const
     {
-        StoredGhostZone record;
-        records.Read( ordinal, &record, 1 );
         CheckRecord( ordinal, record );
         QueryGhostZoneRow result;
         result.ordinal = ordinal;
@@ -465,8 +464,11 @@ struct QueryGhostZoneStoreReader::Impl
         if( record.parent != NoParent ) result.parent = record.parent;
         result.startNs = record.startNs;
         result.endNs = record.endNs;
-        result.name = ReadString( record.name );
-        result.file = ReadString( record.file );
+        if( resolveStrings )
+        {
+            result.name = ReadString( record.name );
+            result.file = ReadString( record.file );
+        }
         result.line = record.line;
         std::ostringstream address; address << "0x" << std::hex << record.address;
         result.address = address.str();
@@ -504,10 +506,37 @@ std::vector<QueryGhostZoneRow> QueryGhostZoneStoreReader::Scan( int64_t startNs,
         m_impl->records.Read( ordinal, &record, 1 );
         if( record.startNs >= endNs || record.endNs <= startNs ) continue;
         if( offset != 0 ) { offset--; continue; }
-        result.emplace_back( m_impl->Read( ordinal ) );
+        result.emplace_back( m_impl->Read( ordinal, record ) );
         if( result.size() == limit ) break;
     }
     return result;
+}
+
+std::vector<QueryGhostZoneRow> QueryGhostZoneStoreReader::ScanOrdinals( uint64_t offset, size_t limit,
+    int64_t startNs, int64_t endNs ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    if( limit > 4096 ) throw QueryResourceError( "response", "ghost_zone_page_limit", limit );
+    std::vector<QueryGhostZoneRow> result;
+    const auto total = m_impl->records.Count();
+    if( offset >= total || limit == 0 ) return result;
+    const auto take = size_t( std::min<uint64_t>( limit, total - offset ) );
+    result.reserve( take );
+    for( size_t index = 0; index < take; ++index )
+    {
+        const auto ordinal = offset + index;
+        StoredGhostZone record {};
+        m_impl->records.Read( ordinal, &record, 1 );
+        result.emplace_back( m_impl->Read( ordinal, record,
+            record.startNs < endNs && record.endNs > startNs ) );
+    }
+    return result;
+}
+
+analysis::PagedRecordReader::ReadStats QueryGhostZoneStoreReader::ReadStatistics() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->records.Statistics();
 }
 
 void QueryGhostZoneStoreReader::ValidateAll()
