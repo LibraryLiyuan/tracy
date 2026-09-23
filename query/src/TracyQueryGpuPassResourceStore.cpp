@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <fstream>
 #include <limits>
 #include <list>
@@ -134,8 +135,16 @@ private:
 
 void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
     std::string sourceFingerprint, const QueryGpuPassResourceInput& input,
-    analysis::PagedRecordOptions options )
+    analysis::PagedRecordOptions options, QueryGpuPassResourceBuildStatistics* statistics )
 {
+    if( statistics ) *statistics = {};
+    auto phaseStarted = std::chrono::steady_clock::now();
+    const auto finishPhase = [&]( uint64_t QueryGpuPassResourceBuildStatistics::*field ) {
+        const auto now = std::chrono::steady_clock::now();
+        if( statistics ) statistics->*field = uint64_t( std::chrono::duration_cast<
+            std::chrono::milliseconds>( now - phaseStarted ).count() );
+        phaseStarted = now;
+    };
     if( sourceFingerprint.size() != 64 ) throw std::runtime_error( "GPU pass resource identity must be SHA-256" );
     const auto summaryOutput = SummaryPath( root );
     const auto rangeLookupOutput = RangeLookupPath( root );
@@ -247,17 +256,21 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         mappings.flush(); facts.flush();
         if( !mappings || !facts ) throw std::runtime_error( "GPU pass resource source flush failed" );
         mappings.close(); facts.close();
+        finishPhase( &QueryGpuPassResourceBuildStatistics::inputMs );
         std::string sortError;
         if( !analysis::SortAnalysisUInt64Pairs( mappingSource, mappingSorted, scratch,
                 "gpu-pass-resource-mapping", mappingCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass mapping sort failed: " + sortError );
         removeConsumed( mappingSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::mappingSortMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( factSource, factSorted, scratch,
                 "gpu-pass-resource-facts", factCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->factSort : nullptr ) )
             throw std::runtime_error( "GPU pass resource fact sort failed: " + sortError );
         removeConsumed( factSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::factSortMs );
 
         uint64_t evidenceLookupCount = 0;
         {
@@ -269,8 +282,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             analysis::AnalysisUInt64Pair previous {};
             bool havePrevious = false;
             analysis::AnalysisUInt64Pair row {};
+            uint64_t mappedRows = 0;
             while( mappingInput.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) )
             {
+                if( ( mappedRows++ & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                    throw std::runtime_error( "GPU pass resource index cancelled" );
                 if( havePrevious && row.key == previous.key && row.value == previous.value ) continue;
                 analysis::AnalysisKeyMetadataRecord inverted {};
                 inverted.keyHigh = row.value;
@@ -288,9 +304,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         }
         if( !analysis::SortAnalysisKeyMetadataRecords( evidenceSource, evidenceSorted, scratch,
                 "gpu-pass-resource-evidence", evidenceLookupCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->evidenceSort : nullptr ) )
             throw std::runtime_error( "GPU pass evidence mapping sort failed: " + sortError );
         removeConsumed( evidenceSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::evidenceSortMs );
 
         std::ifstream sortedFacts( analysis::AnalysisIoPath( factSorted ), std::ios::binary );
         std::ifstream replayFacts( analysis::AnalysisIoPath( factSorted ), std::ios::binary );
@@ -330,6 +348,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                     if( !replayFacts ) throw std::runtime_error( "GPU pass fact replay seek failed" );
                     for( uint64_t index = 0; index < groupCount; index++ )
                     {
+                        if( ( index & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                            throw std::runtime_error( "GPU pass resource index cancelled" );
                         analysis::AnalysisKeyMetadataRecord source {};
                         replayFacts.read( reinterpret_cast<char*>( &source ), sizeof( source ) );
                         if( !replayFacts || source.keyHigh != evidencePassId )
@@ -363,6 +383,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         sortedFacts.close(); replayFacts.close(); sortedMappings.close();
         removeConsumed( mappingSorted );
         removeConsumed( factSorted );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::expansionMs );
         const auto publishLookup = [&]( const std::filesystem::path& sorted,
             const std::filesystem::path& output, std::string_view kind, uint64_t expectedCount ) {
             analysis::PagedRecordWriter writer( output, Identity( sourceFingerprint, kind ),
@@ -373,6 +394,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             uint64_t written = 0;
             while( inputFile )
             {
+                if( options.cancelled && options.cancelled() )
+                    throw std::runtime_error( "GPU pass resource index cancelled" );
                 inputFile.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
                 const auto bytes = size_t( inputFile.gcount() );
                 if( bytes % sizeof( buffer[0] ) != 0 ) throw std::runtime_error( "GPU pass detail lookup is truncated" );
@@ -386,14 +409,18 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         };
         if( !analysis::SortAnalysisKeyMetadataRecords( expandedSource, expandedSorted, scratch,
                 "gpu-pass-resource-expanded", expandedCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->expandedSort : nullptr ) )
             throw std::runtime_error( "GPU pass expanded index sort failed: " + sortError );
         removeConsumed( expandedSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::expandedSortMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( rangeSource, rangeSorted, scratch,
                 "gpu-pass-resource-ranges", rangeLookupCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->rangeSort : nullptr ) )
             throw std::runtime_error( "GPU pass range index sort failed: " + sortError );
         removeConsumed( rangeSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::rangeSortMs );
         if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( useSorted, scratch,
                 "gpu-pass-resource-uses", 512 * 1024,
                 [&]( const auto& emit ) {
@@ -413,10 +440,12 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                     }
                     if( !source.eof() || source.gcount() != 0 || generated != useLookupCount )
                         throw std::runtime_error( "GPU pass generated use lookup count mismatch" );
-                }, sortError, options.disk, options.workspace, options.cancelled ) )
+                }, sortError, options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->useSort : nullptr ) )
             throw std::runtime_error( "GPU pass use index sort failed: " + sortError );
         publishLookup( useSorted, useLookupOutput, "pass-resource-uses", useLookupCount );
         removeConsumed( useSorted );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::useSortMs );
 
         std::ifstream expandedFacts( analysis::AnalysisIoPath( expandedSorted ), std::ios::binary );
         std::ofstream baseSummaries( analysis::AnalysisIoPath( baseSummarySource ), std::ios::binary | std::ios::trunc );
@@ -456,8 +485,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             haveSummary = false;
         };
         analysis::AnalysisKeyMetadataRecord expandedFact {};
+        uint64_t summarizedFacts = 0;
         while( expandedFacts.read( reinterpret_cast<char*>( &expandedFact ), sizeof( expandedFact ) ) )
         {
+            if( ( summarizedFacts++ & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                throw std::runtime_error( "GPU pass resource index cancelled" );
             if( !haveSummary || summary.passId != expandedFact.keyHigh )
             {
                 flushSummary();
@@ -492,11 +524,14 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         resourceAllocations.Clear();
         std::vector<uint64_t> {}.swap( rangeLengths );
         rangeMemory.Resize( 0 );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::summaryMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( allocationSource, allocationSorted, scratch,
                 "gpu-pass-resource-allocations", allocationPairCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->allocationSort : nullptr ) )
             throw std::runtime_error( "GPU pass allocation sort failed: " + sortError );
         removeConsumed( allocationSource );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::allocationSortMs );
 
         std::ifstream sortedAllocations( analysis::AnalysisIoPath( allocationSorted ), std::ios::binary );
         std::ofstream allocationAggregates( analysis::AnalysisIoPath( allocationAggregateSource ),
@@ -514,8 +549,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             haveAggregate = false;
         };
         analysis::AnalysisKeyMetadataRecord allocationPair {};
+        uint64_t aggregatedPairs = 0;
         while( sortedAllocations.read( reinterpret_cast<char*>( &allocationPair ), sizeof( allocationPair ) ) )
         {
+            if( ( aggregatedPairs++ & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                throw std::runtime_error( "GPU pass resource index cancelled" );
             if( !haveAggregate || aggregate.passId != allocationPair.keyHigh )
             {
                 flushAggregate();
@@ -538,6 +576,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         allocationAggregates.close(); sortedAllocations.close();
         removeConsumed( allocationSorted );
         allocationEndBytes.Clear();
+        finishPhase( &QueryGpuPassResourceBuildStatistics::allocationAggregateMs );
 
         analysis::PagedRecordWriter summaries( summaryOutput,
             Identity( sourceFingerprint, "pass-resource-summary" ), sizeof( QueryGpuPassResourceSummary ), options );
@@ -548,6 +587,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         bool haveNextAggregate = bool( aggregateInput.read( reinterpret_cast<char*>( &nextAggregate ), sizeof( nextAggregate ) ) );
         for( uint64_t index = 0; index < summaryCount; index++ )
         {
+            if( ( index & 4095 ) == 0 && options.cancelled && options.cancelled() )
+                throw std::runtime_error( "GPU pass resource index cancelled" );
             QueryGpuPassResourceSummary row {};
             baseInput.read( reinterpret_cast<char*>( &row ), sizeof( row ) );
             if( !baseInput ) throw std::runtime_error( "GPU pass base summary read failed" );
@@ -572,6 +613,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         removeConsumed( evidenceSorted );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( "GPU pass resource scratch cleanup failed: " + cleanupError );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::publishMs );
     }
     catch( ... )
     {

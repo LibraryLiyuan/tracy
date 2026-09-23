@@ -3,9 +3,11 @@
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyQueue.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -91,7 +93,28 @@ private:
 class GeneratedPassInput final : public QueryGpuPassResourceInput
 {
 public:
-    GeneratedPassInput( uint64_t uses, uint64_t resources ) : m_uses( uses ), m_resources( resources ) {}
+    GeneratedPassInput( uint64_t uses, uint64_t resources,
+        const QueryCatalogStoreReader* catalog = nullptr,
+        std::shared_ptr<tracy::analysis::AnalysisWorkspaceBudget> workspace = {} )
+        : m_uses( uses ), m_resources( resources ), m_catalog( catalog ), m_resourceMemory( std::move( workspace ) )
+    {
+        if( !m_catalog ) return;
+        const auto count = m_catalog->ResourceIndexCount();
+        if( count > SIZE_MAX / sizeof( std::pair<uint64_t, uint64_t> ) )
+            throw std::runtime_error( "GPU pass probe resource fast path exceeds address space" );
+        m_resourceMemory.Resize( count * sizeof( std::pair<uint64_t, uint64_t> ) );
+        m_resourceAllocations.reserve( size_t( count ) );
+        uint64_t previousId = 0;
+        for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+        {
+            const auto state = m_catalog->ResourceStateAt( ordinal );
+            if( state.latest.resourceId == 0 || ( ordinal != 0 && state.latest.resourceId <= previousId ) )
+                throw std::runtime_error( "GPU pass probe resource fast path order changed" );
+            m_resourceAllocations.emplace_back( state.latest.resourceId, state.latest.allocationId );
+            previousId = state.latest.resourceId;
+        }
+        m_resourceMemory.Resize( m_resourceAllocations.capacity() * sizeof( m_resourceAllocations[0] ) );
+    }
     uint64_t MappingCount() const override { return ( m_uses + 31 ) / 32; }
     QueryGpuPassMapping Mapping( uint64_t ordinal ) const override { return { ordinal + 1, ordinal + 1 }; }
     uint64_t RangeCount() const override { return 0; }
@@ -107,16 +130,28 @@ public:
         row.usageMask = 1;
         return row;
     }
-    uint64_t ResolveCatalogResource( uint64_t token, int64_t ) const override { return token; }
-    uint64_t ResourceAllocation( uint64_t resourceId ) const override { return resourceId; }
+    uint64_t ResolveCatalogResource( uint64_t token, int64_t time ) const override
+    { return m_catalog ? m_catalog->ResolveResourcePointer( token, time ) : token; }
+    uint64_t ResourceAllocation( uint64_t resourceId ) const override
+    {
+        resourceAllocationCalls++;
+        if( !m_catalog ) return resourceId;
+        const auto found = std::lower_bound( m_resourceAllocations.begin(), m_resourceAllocations.end(),
+            resourceId, []( const auto& row, uint64_t key ) { return row.first < key; } );
+        return found != m_resourceAllocations.end() && found->first == resourceId ? found->second : 0;
+    }
     uint64_t AllocationBytesAtEnd( uint64_t ) const override { return 64; }
+    mutable uint64_t resourceAllocationCalls = 0;
 private:
     uint64_t m_uses;
     uint64_t m_resources;
+    const QueryCatalogStoreReader* m_catalog;
+    tracy::analysis::AnalysisWorkspaceReservation m_resourceMemory;
+    std::vector<std::pair<uint64_t, uint64_t>> m_resourceAllocations;
 };
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false )
+    bool inventory = false, bool realCatalog = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy::analysis;
@@ -164,19 +199,98 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 << details.str();
             inventoryRows.emplace_back( line.str() );
         };
-        GeneratedPassInput input( useCount, resourceCount );
+        const std::string identity( 64, 'a' );
+        std::unique_ptr<QueryCatalogStoreReader> catalog;
+        uint64_t catalogBuildMs = 0;
+        if( realCatalog )
+        {
+            const auto catalogStarted = std::chrono::steady_clock::now();
+            {
+                QueryCatalogStoreWriter writer( root / "catalog", identity, options );
+                writer.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
+                writer.Begin( OfflineCatalogDomain::CatalogResource, resourceCount,
+                    sizeof( JnGpuCatalogResourceRecordV1 ) );
+                AnalysisWorkspaceReservation resourceRowsMemory( options.workspace,
+                    4096 * sizeof( JnGpuCatalogResourceRecordV1 ) );
+                std::vector<JnGpuCatalogResourceRecordV1> rows( 4096 );
+                for( uint64_t offset = 0; offset < resourceCount; )
+                {
+                    const auto take = std::min<uint64_t>( rows.size(), resourceCount - offset );
+                    for( uint64_t index = 0; index < take; index++ )
+                    {
+                        auto& row = rows[size_t( index )];
+                        row = {};
+                        row.resourceId = offset + index + 1;
+                        row.pointerToken = row.resourceId;
+                        row.allocationId = row.resourceId;
+                        row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
+                        row.capacityBytes = 64;
+                    }
+                    writer.Append( OfflineCatalogDomain::CatalogResource, offset, rows.data(), take,
+                        sizeof( rows[0] ) );
+                    offset += take;
+                }
+                writer.End( OfflineCatalogDomain::CatalogResource );
+                JnGpuCatalogBatchData batch {};
+                batch.generation = 1;
+                batch.kind = uint8_t( JnGpuCatalogBatchKind::Resource );
+                batch.recordCount = resourceCount;
+                writer.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( batch ) );
+                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, &batch, 1, sizeof( batch ) );
+                writer.End( OfflineCatalogDomain::CatalogBatch );
+                writer.Finish();
+            }
+            catalog = std::make_unique<QueryCatalogStoreReader>( root / "catalog", identity, options );
+            catalog->BuildResourceIndex( root / "catalog" / "resource-index-scratch" );
+            if( !catalog->PreparePointerResolutionFastPath() )
+                throw std::runtime_error( "GPU pass capacity Catalog pointer fast path unavailable" );
+            catalogBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - catalogStarted ).count();
+        }
+        const auto sourceBytes = usage->Snapshot().currentBytes;
+        const auto fastPathStarted = std::chrono::steady_clock::now();
+        GeneratedPassInput input( useCount, resourceCount, catalog.get(), options.workspace );
+        const auto fastPathBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - fastPathStarted ).count();
         const auto buildStarted = std::chrono::steady_clock::now();
-        QueryGpuPassResourceStore::Build( root, std::string( 64, 'a' ), input, options );
+        QueryGpuPassResourceBuildStatistics stages;
+        QueryGpuPassResourceStore::Build( root, identity, input, options, &stages );
         const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();
+        Require( stages.factSort.inputRecords == useCount &&
+            stages.expandedSort.inputRecords == useCount &&
+            stages.useSort.inputRecords == useCount &&
+            stages.allocationSort.inputRecords != 0 &&
+            stages.inputMs + stages.factSortMs + stages.expansionMs +
+                stages.expandedSortMs + stages.allocationSortMs <= uint64_t( buildMs ),
+            "GPU Pass/Resource build telemetry lost facts or exceeded wall time" );
         Require( !fs::exists( root / "pass-resource-scratch" ),
             "GPU pass capacity probe retained scratch" );
         const auto observed = usage->Snapshot();
         std::cout << "gpu_pass_uses=" << useCount << " passes=" << input.MappingCount()
-            << " resource_keys=" << resourceCount << " peak_bytes=" << observed.peakBytes
-            << " final_bytes=" << observed.currentBytes << " build_elapsed_ms=" << buildMs << '\n';
+            << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
+            << " catalog_build_ms=" << catalogBuildMs << " fast_path_ms=" << fastPathBuildMs
+            << " source_bytes=" << sourceBytes
+            << " peak_bytes=" << observed.peakBytes
+            << " final_bytes=" << observed.currentBytes << " build_elapsed_ms=" << buildMs
+            << " input_ms=" << stages.inputMs
+            << " mapping_sort_ms=" << stages.mappingSortMs
+            << " fact_sort_ms=" << stages.factSortMs
+            << " expansion_ms=" << stages.expansionMs
+            << " expanded_sort_ms=" << stages.expandedSortMs
+            << " use_sort_ms=" << stages.useSortMs
+            << " summary_ms=" << stages.summaryMs
+            << " allocation_sort_ms=" << stages.allocationSortMs
+            << " allocation_aggregate_ms=" << stages.allocationAggregateMs
+            << " fact_runs=" << stages.factSort.initialRuns
+            << " fact_merges=" << stages.factSort.mergePasses
+            << " expanded_runs=" << stages.expandedSort.initialRuns
+            << " expanded_merges=" << stages.expandedSort.mergePasses
+            << " allocation_runs=" << stages.allocationSort.initialRuns
+            << " allocation_merges=" << stages.allocationSort.mergePasses << '\n';
         if( inventory )
             for( const auto& line : inventoryRows ) std::cout << line << '\n';
+        catalog.reset();
         std::error_code cleanup;
         fs::remove_all( root, cleanup );
         if( cleanup ) throw std::runtime_error( "GPU pass capacity cleanup: " + cleanup.message() );
@@ -199,6 +313,8 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ) );
     if( argc == 5 && std::string_view( argv[1] ) == "--capacity-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), false, true );
     if( argc != 1 ) return 2;
     try
     {
@@ -331,6 +447,21 @@ int main( int argc, char** argv )
         Require( readAfter.rangeBlockLoads - readBefore.rangeBlockLoads < 100 &&
             readAfter.useBlockLoads - readBefore.useBlockLoads < 100,
             "GPU pass deep validation repeatedly decoded lookup pages" );
+        {
+            const auto cancelRoot = root / "cancelled-summary";
+            GeneratedPassInput cancelInput( 100000, 10000 );
+            analysis::PagedRecordOptions cancelOptions;
+            cancelOptions.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+                256ull << 20, 128ull << 20 );
+            cancelOptions.cancelled = [&] { return cancelInput.resourceAllocationCalls >= 10; };
+            bool cancelled = false;
+            try { QueryGpuPassResourceStore::Build( cancelRoot, identity, cancelInput, cancelOptions ); }
+            catch( const std::exception& error )
+            { cancelled = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos; }
+            Require( cancelled && cancelInput.resourceAllocationCalls < 5000 &&
+                !fs::exists( cancelRoot / "pass-resource-scratch" ),
+                "GPU pass summary ignored cancellation until after a full fact-table scan" );
+        }
         fs::remove_all( root, ignored );
         std::cout << "query GPU pass resource store passed\n";
         return 0;

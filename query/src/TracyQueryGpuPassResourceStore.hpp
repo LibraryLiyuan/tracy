@@ -3,6 +3,7 @@
 
 #include "TracyJnData.hpp"
 #include "TracyJnGpuCatalog.hpp"
+#include "TracyAnalysisExternalSort.hpp"
 #include "TracyPagedRecordStore.hpp"
 #include "TracyQueryGpuReferenceStore.hpp"
 
@@ -34,6 +35,28 @@ public:
     virtual uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const = 0;
     virtual uint64_t ResourceAllocation( uint64_t resourceId ) const = 0;
     virtual uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const = 0;
+};
+
+struct QueryGpuPassResourceBuildStatistics
+{
+    analysis::AnalysisExternalSortStatistics factSort;
+    analysis::AnalysisExternalSortStatistics evidenceSort;
+    analysis::AnalysisExternalSortStatistics expandedSort;
+    analysis::AnalysisExternalSortStatistics rangeSort;
+    analysis::AnalysisExternalSortStatistics useSort;
+    analysis::AnalysisExternalSortStatistics allocationSort;
+    uint64_t inputMs = 0;
+    uint64_t mappingSortMs = 0;
+    uint64_t factSortMs = 0;
+    uint64_t evidenceSortMs = 0;
+    uint64_t expansionMs = 0;
+    uint64_t expandedSortMs = 0;
+    uint64_t rangeSortMs = 0;
+    uint64_t useSortMs = 0;
+    uint64_t summaryMs = 0;
+    uint64_t allocationSortMs = 0;
+    uint64_t allocationAggregateMs = 0;
+    uint64_t publishMs = 0;
 };
 
 struct QueryGpuPassResourceSummary
@@ -94,7 +117,8 @@ class QueryGpuPassResourceStore
 {
 public:
     static void Build( const std::filesystem::path& root, std::string sourceFingerprint,
-        const QueryGpuPassResourceInput& input, analysis::PagedRecordOptions options = {} );
+        const QueryGpuPassResourceInput& input, analysis::PagedRecordOptions options = {},
+        QueryGpuPassResourceBuildStatistics* statistics = nullptr );
 };
 
 class QueryGpuPassResourceStoreReader

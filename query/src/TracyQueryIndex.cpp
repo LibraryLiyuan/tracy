@@ -4015,6 +4015,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             check.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
                 return catalog.ResolveResourcePointer( pointerToken, time );
             }, referenceValidationScratch );
+            resources->SetPhase( "gpu-pass-resource-input" );
             const auto linkIndex = size_t( SerializedZoneSink::JnDomain::GfxLink );
             auto linkManifest = result.gfxLinks; linkManifest.path = temporaryJn[linkIndex];
             ReadOnlyZoneSection links( linkManifest, ZoneSectionKind::GfxLink,
