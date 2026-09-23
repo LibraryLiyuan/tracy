@@ -2747,6 +2747,24 @@ std::optional<QueryCatalogAllocationData> QueryCatalogStoreReader::AllocationSta
     return result;
 }
 
+void QueryCatalogStoreReader::VisitRawAllocations(
+    const std::function<void( uint64_t, const JnGpuCatalogAllocationRecordV1& )>& visit ) const
+{
+    if( !visit ) throw std::invalid_argument( "Catalog allocation visitor is empty" );
+    std::lock_guard lock( m_impl->mutex );
+    m_impl->EnsureResourceIndex();
+    uint64_t ordinal = 0;
+    m_impl->rawAllocations->VisitValidated( [&]( const void* data, uint64_t count ) {
+        const auto* bytes = static_cast<const char*>( data );
+        for( uint64_t index = 0; index < count; index++, ordinal++ )
+        {
+            JnGpuCatalogAllocationRecordV1 row {};
+            std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+            visit( ordinal, row );
+        }
+    } );
+}
+
 uint64_t QueryCatalogStoreReader::AllocationSummaryCount() const
 {
     std::lock_guard lock( m_impl->mutex );

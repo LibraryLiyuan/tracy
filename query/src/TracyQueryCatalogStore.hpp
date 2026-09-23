@@ -6,6 +6,7 @@
 #include "TracyQueryGpuReferenceStore.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -328,6 +329,9 @@ public:
     uint64_t RangeCount() const;
     QueryCatalogRangeData RangeAt( uint64_t ordinal ) const;
     std::optional<QueryCatalogAllocationData> AllocationState( uint64_t allocationId ) const;
+    // Visits raw allocation facts in original ordinal order. The callback must not re-enter this reader.
+    void VisitRawAllocations(
+        const std::function<void( uint64_t, const JnGpuCatalogAllocationRecordV1& )>& visit ) const;
     std::optional<std::string> ResourceName( uint64_t generation, uint32_t stringId ) const;
     uint64_t ResourceNameLookupDecodedBytes() const;
     uint64_t ResourcePointerLookupDecodedBytes() const;

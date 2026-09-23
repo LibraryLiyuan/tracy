@@ -50,6 +50,12 @@ struct QueryGpuPassResourceSummary
 
 static_assert( sizeof( QueryGpuPassResourceSummary ) == 64 );
 
+struct QueryGpuPassResourceReadStats
+{
+    uint64_t rangeBlockLoads = 0;
+    uint64_t useBlockLoads = 0;
+};
+
 struct QueryGpuPassRangeData
 {
     JnGpuRangeSetRecordV1 record {};
@@ -107,6 +113,7 @@ public:
     QueryGpuPassRangePage Ranges( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassUsePage Uses( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassIdPage EvidencePassIds( uint64_t passId, uint64_t offset, size_t limit ) const;
+    QueryGpuPassResourceReadStats ReadStatistics() const;
     void ValidateAll() const;
 
 private:

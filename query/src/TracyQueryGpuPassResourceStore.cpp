@@ -9,7 +9,9 @@
 #include <array>
 #include <fstream>
 #include <limits>
+#include <list>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace tracy::query
 {
@@ -24,6 +26,33 @@ struct AllocationAggregate
 };
 
 static_assert( sizeof( AllocationAggregate ) == 24 );
+
+class SequentialLookup
+{
+public:
+    explicit SequentialLookup( analysis::PagedRecordReader& reader )
+        : m_reader( reader ), m_total( reader.Count() ) {}
+
+    bool Next( analysis::AnalysisKeyMetadataRecord& row )
+    {
+        if( m_position == m_available )
+        {
+            if( m_nextOrdinal == m_total ) return false;
+            m_available = size_t( std::min<uint64_t>( m_buffer.size(), m_total - m_nextOrdinal ) );
+            m_reader.Read( m_nextOrdinal, m_buffer.data(), m_available );
+            m_nextOrdinal += m_available;
+            m_position = 0;
+        }
+        row = m_buffer[m_position++];
+        return true;
+    }
+
+private:
+    analysis::PagedRecordReader& m_reader;
+    uint64_t m_total = 0, m_nextOrdinal = 0;
+    std::array<analysis::AnalysisKeyMetadataRecord, 1024> m_buffer;
+    size_t m_position = 0, m_available = 0;
+};
 
 std::string Identity( std::string_view source, std::string_view kind )
 {
@@ -46,6 +75,60 @@ void CheckedAdd( uint64_t& target, uint64_t value, const char* label )
         throw std::runtime_error( std::string( label ) + " overflow" );
     target += value;
 }
+
+class BuildLookupCache
+{
+public:
+    explicit BuildLookupCache( std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace )
+        : m_memory( std::move( workspace ) ) {}
+
+    template<typename Loader>
+    uint64_t Resolve( uint64_t key, Loader&& load )
+    {
+        const auto found = m_values.find( key );
+        if( found != m_values.end() )
+        {
+            m_recent.splice( m_recent.end(), m_recent, found->second.recent );
+            return found->second.value;
+        }
+        const auto value = load( key );
+        if( m_values.size() == MaximumEntries )
+        {
+            m_values.erase( m_recent.front() );
+            m_recent.pop_front();
+            m_memory.Resize( m_memory.Bytes() - AccountedBytesPerEntry );
+        }
+        m_memory.Add( AccountedBytesPerEntry );
+        try
+        {
+            m_recent.emplace_back( key );
+            try { m_values.emplace( key, Entry { value, std::prev( m_recent.end() ) } ); }
+            catch( ... ) { m_recent.pop_back(); throw; }
+        }
+        catch( ... )
+        {
+            m_memory.Resize( m_memory.Bytes() - AccountedBytesPerEntry );
+            throw;
+        }
+        return value;
+    }
+
+    void Clear()
+    {
+        decltype( m_values ) {}.swap( m_values );
+        m_recent.clear();
+        m_memory.Resize( 0 );
+    }
+
+private:
+    static constexpr size_t MaximumEntries = 1 << 20;
+    // Includes map nodes, buckets, list nodes and transient rehash overhead.
+    static constexpr uint64_t AccountedBytesPerEntry = 128;
+    struct Entry { uint64_t value; std::list<uint64_t>::iterator recent; };
+    analysis::AnalysisWorkspaceReservation m_memory;
+    std::list<uint64_t> m_recent;
+    std::unordered_map<uint64_t, Entry> m_values;
+};
 
 }
 
@@ -95,6 +178,15 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
     };
     try
     {
+        BuildLookupCache resourceAllocations( options.workspace );
+        BuildLookupCache allocationEndBytes( options.workspace );
+        const auto rangeCount = input.RangeCount();
+        if( rangeCount > ( SIZE_MAX - 4096 ) / sizeof( uint64_t ) )
+            throw std::runtime_error( "GPU pass range length fast path exceeds address space" );
+        analysis::AnalysisWorkspaceReservation rangeMemory( options.workspace,
+            rangeCount * sizeof( uint64_t ) + 4096 );
+        std::vector<uint64_t> rangeLengths;
+        rangeLengths.reserve( size_t( rangeCount ) );
         std::ofstream mappings( analysis::AnalysisIoPath( mappingSource ), std::ios::binary | std::ios::trunc );
         std::ofstream facts( analysis::AnalysisIoPath( factSource ), std::ios::binary | std::ios::trunc );
         if( !mappings || !facts ) throw std::runtime_error( "GPU pass resource sources cannot be opened" );
@@ -114,10 +206,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             const auto row = input.Mapping( ordinal );
             appendMapping( row.evidencePassId, row.queryPassId );
         }
-        for( uint64_t ordinal = 0; ordinal < input.RangeCount(); ordinal++ )
+        for( uint64_t ordinal = 0; ordinal < rangeCount; ordinal++ )
         {
             if( options.cancelled && options.cancelled() ) throw std::runtime_error( "GPU pass resource index cancelled" );
             const auto range = input.Range( ordinal );
+            rangeLengths.emplace_back( range.lengthBytes );
             if( range.passInstanceId == 0 || range.resourceId == 0 ) continue;
             appendMapping( range.passInstanceId, range.passInstanceId );
             analysis::AnalysisKeyMetadataRecord fact {};
@@ -283,7 +376,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             if( !haveResource ) return;
             summary.resourceCount++;
             if( resourceRanged ) summary.rangedResourceCount++;
-            const auto allocationId = input.ResourceAllocation( activeResource );
+            const auto allocationId = resourceAllocations.Resolve( activeResource,
+                [&]( uint64_t resourceId ) { return input.ResourceAllocation( resourceId ); } );
             if( allocationId != 0 )
             {
                 analysis::AnalysisKeyMetadataRecord pair {};
@@ -324,8 +418,10 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             }
             if( expandedFact.kind == 1 )
             {
-                const auto range = input.Range( expandedFact.metadata );
-                CheckedAdd( summary.directRangeBytes, range.lengthBytes, "GPU pass direct range bytes" );
+                if( expandedFact.metadata >= rangeLengths.size() )
+                    throw std::runtime_error( "GPU pass range ordinal mismatch" );
+                CheckedAdd( summary.directRangeBytes, rangeLengths[size_t( expandedFact.metadata )],
+                    "GPU pass direct range bytes" );
                 summary.rangeCount++;
                 resourceRanged = true;
             }
@@ -337,6 +433,9 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         baseSummaries.flush(); allocations.flush();
         if( !baseSummaries || !allocations ) throw std::runtime_error( "GPU pass summary flush failed" );
         baseSummaries.close(); allocations.close(); expandedFacts.close();
+        resourceAllocations.Clear();
+        std::vector<uint64_t> {}.swap( rangeLengths );
+        rangeMemory.Resize( 0 );
         if( !analysis::SortAnalysisKeyMetadataRecords( allocationSource, allocationSorted, scratch,
                 "gpu-pass-resource-allocations", allocationPairCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
@@ -371,7 +470,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             if( allocationPair.keyLow == previousAllocation ) continue;
             previousAllocation = allocationPair.keyLow;
             aggregate.allocationCount++;
-            CheckedAdd( aggregate.physicalBytes, input.AllocationBytesAtEnd( allocationPair.keyLow ),
+            CheckedAdd( aggregate.physicalBytes, allocationEndBytes.Resolve( allocationPair.keyLow,
+                [&]( uint64_t allocationId ) { return input.AllocationBytesAtEnd( allocationId ); } ),
                 "GPU pass referenced physical bytes" );
         }
         if( !sortedAllocations.eof() ) throw std::runtime_error( "GPU pass allocation pair read failed" );
@@ -379,6 +479,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         allocationAggregates.flush();
         if( !allocationAggregates ) throw std::runtime_error( "GPU pass allocation aggregate flush failed" );
         allocationAggregates.close(); sortedAllocations.close();
+        allocationEndBytes.Clear();
 
         analysis::PagedRecordWriter summaries( summaryOutput,
             Identity( sourceFingerprint, "pass-resource-summary" ), sizeof( QueryGpuPassResourceSummary ), options );
@@ -613,12 +714,32 @@ QueryGpuPassIdPage QueryGpuPassResourceStoreReader::EvidencePassIds(
     return result;
 }
 
+QueryGpuPassResourceReadStats QueryGpuPassResourceStoreReader::ReadStatistics() const
+{
+    return { m_impl->ranges.Statistics().blockLoads, m_impl->uses.Statistics().blockLoads };
+}
+
 void QueryGpuPassResourceStoreReader::ValidateAll() const
 {
     m_impl->summaries.ValidateAll();
     m_impl->ranges.ValidateAll();
     m_impl->uses.ValidateAll();
     m_impl->evidence.ValidateAll();
+    SequentialLookup ranges( m_impl->ranges ), uses( m_impl->uses );
+    analysis::AnalysisKeyMetadataRecord range {}, use {}, previousRange {}, previousUse {};
+    bool haveRange = ranges.Next( range ), haveUse = uses.Next( use );
+    uint64_t rangeOrdinal = 0, useOrdinal = 0;
+    const auto rawRangeCount = m_impl->catalog.RangeCount();
+    const auto rawUseCount = m_impl->gpuReferences.UseCount();
+    const auto checkOrder = []( const analysis::AnalysisKeyMetadataRecord& current,
+        const analysis::AnalysisKeyMetadataRecord& previous, uint64_t ordinal, uint64_t rawCount,
+        const char* label ) {
+        if( current.keyHigh == 0 || current.metadata >= rawCount ||
+            ( ordinal != 0 && ( current.keyHigh < previous.keyHigh ||
+                ( current.keyHigh == previous.keyHigh && ( current.keyLow < previous.keyLow ||
+                    ( current.keyLow == previous.keyLow && current.metadata < previous.metadata ) ) ) ) ) )
+            throw std::runtime_error( std::string( label ) + " lookup order mismatch" );
+    };
     uint64_t previousPass = 0;
     for( uint64_t index = 0; index < m_impl->summaries.Count(); index++ )
     {
@@ -627,28 +748,30 @@ void QueryGpuPassResourceStoreReader::ValidateAll() const
         if( row.passId == 0 || ( index != 0 && row.passId <= previousPass ) ||
             row.rangedResourceCount > row.resourceCount )
             throw std::runtime_error( "GPU pass resource summary order mismatch" );
-        if( Ranges( row.passId, 0, 1 ).total != row.rangeCount ||
-            Uses( row.passId, 0, 1 ).total != row.useCount )
+        if( ( haveRange && range.keyHigh < row.passId ) ||
+            ( haveUse && use.keyHigh < row.passId ) )
+            throw std::runtime_error( "GPU pass resource lookup has no summary" );
+        uint64_t rangeCount = 0, useCount = 0;
+        while( haveRange && range.keyHigh == row.passId )
+        {
+            checkOrder( range, previousRange, rangeOrdinal++, rawRangeCount, "GPU pass range" );
+            previousRange = range;
+            rangeCount++;
+            haveRange = ranges.Next( range );
+        }
+        while( haveUse && use.keyHigh == row.passId )
+        {
+            checkOrder( use, previousUse, useOrdinal++, rawUseCount, "GPU pass use" );
+            previousUse = use;
+            useCount++;
+            haveUse = uses.Next( use );
+        }
+        if( rangeCount != row.rangeCount || useCount != row.useCount )
             throw std::runtime_error( "GPU pass resource summary detail count mismatch" );
         previousPass = row.passId;
     }
-    const auto validateLookup = [&]( analysis::PagedRecordReader& lookup, uint64_t rawCount,
-        std::string_view label ) {
-        analysis::AnalysisKeyMetadataRecord previous {};
-        for( uint64_t index = 0; index < lookup.Count(); index++ )
-        {
-            analysis::AnalysisKeyMetadataRecord row {};
-            lookup.Read( index, &row, 1 );
-            if( row.keyHigh == 0 || row.metadata >= rawCount ||
-                ( index != 0 && ( row.keyHigh < previous.keyHigh ||
-                    ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
-                        ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
-                throw std::runtime_error( std::string( label ) + " lookup order mismatch" );
-            previous = row;
-        }
-    };
-    validateLookup( m_impl->ranges, m_impl->catalog.RangeCount(), "GPU pass range" );
-    validateLookup( m_impl->uses, m_impl->gpuReferences.UseCount(), "GPU pass use" );
+    if( haveRange || haveUse )
+        throw std::runtime_error( "GPU pass resource lookup has no summary" );
     analysis::AnalysisKeyMetadataRecord previousEvidence {};
     for( uint64_t index = 0; index < m_impl->evidence.Count(); index++ )
     {

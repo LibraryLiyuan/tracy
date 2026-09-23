@@ -3973,8 +3973,57 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             {
             public:
                 PassResourceInput( const ReadOnlyZoneSection& passes, const ReadOnlyZoneSection& links,
-                    const QueryCatalogStoreReader& catalog, const QueryGpuReferenceStoreReader& references )
-                    : m_passes( passes ), m_links( links ), m_catalog( catalog ), m_references( references ) {}
+                    const QueryCatalogStoreReader& catalog, const QueryGpuReferenceStoreReader& references,
+                    std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace )
+                    : m_passes( passes ), m_links( links ), m_catalog( catalog ), m_references( references )
+                    , m_resourceAllocationMemory( workspace ), m_allocationEndMemory( std::move( workspace ) )
+                {
+                    const auto count = m_catalog.ResourceIndexCount();
+                    if( count > SIZE_MAX / sizeof( ResourceAllocationEntry ) )
+                        throw std::runtime_error( "GPU pass resource allocation fast path exceeds address space" );
+                    m_resourceAllocationMemory.Resize( count * sizeof( ResourceAllocationEntry ) );
+                    m_resourceAllocations.reserve( size_t( count ) );
+                    uint64_t previousId = 0;
+                    for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+                    {
+                        const auto state = m_catalog.ResourceStateAt( ordinal );
+                        const auto resourceId = state.latest.resourceId;
+                        if( resourceId == 0 || ( ordinal != 0 && resourceId <= previousId ) )
+                            throw std::runtime_error( "GPU pass resource allocation fast path order mismatch" );
+                        m_resourceAllocations.emplace_back( resourceId, state.latest.allocationId );
+                        previousId = resourceId;
+                    }
+
+                    // The summary omits IDs with no definition; raw history is the safe upper bound.
+                    const auto allocationCount = m_catalog.Count( OfflineCatalogDomain::CatalogAllocation );
+                    constexpr uint64_t AccountedAllocationBytes = 160;
+                    if( allocationCount > SIZE_MAX / AccountedAllocationBytes )
+                        throw std::runtime_error( "GPU pass allocation end fast path exceeds address space" );
+                    m_allocationEndMemory.Resize( allocationCount * AccountedAllocationBytes );
+                    {
+                        std::unordered_map<uint64_t, AllocationLatest> latest;
+                        latest.reserve( size_t( allocationCount ) );
+                        m_catalog.VisitRawAllocations( [&]( uint64_t ordinal,
+                            const JnGpuCatalogAllocationRecordV1& row ) {
+                            if( row.allocationId == 0 ) return;
+                            auto [found, inserted] = latest.try_emplace( row.allocationId );
+                            if( inserted || row.time > found->second.time ||
+                                ( row.time == found->second.time && ordinal >= found->second.ordinal ) )
+                                found->second = { row.time, ordinal, row.sizeBytes, row.operation };
+                            if( latest.size() > allocationCount )
+                                throw std::runtime_error( "GPU pass allocation end fast path count mismatch" );
+                        } );
+                        m_allocationEndBytes.reserve( latest.size() );
+                        for( const auto& [allocationId, state] : latest )
+                            m_allocationEndBytes.emplace_back( allocationId,
+                                state.operation == uint8_t( JnGpuCatalogRecordOperation::Destroy ) ? 0 : state.bytes );
+                    }
+                    std::sort( m_allocationEndBytes.begin(), m_allocationEndBytes.end(),
+                        []( const AllocationEndEntry& lhs, const AllocationEndEntry& rhs ) {
+                            return lhs.first < rhs.first;
+                        } );
+                    m_allocationEndMemory.Resize( m_allocationEndBytes.capacity() * sizeof( AllocationEndEntry ) );
+                }
                 uint64_t MappingCount() const override { return m_passes.Count() + m_links.Count(); }
                 QueryGpuPassMapping Mapping( uint64_t ordinal ) const override
                 {
@@ -3997,21 +4046,37 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
                 uint64_t ResourceAllocation( uint64_t resourceId ) const override
                 {
-                    const auto state = m_catalog.ResourceState( resourceId );
-                    return state ? state->latest.allocationId : 0;
+                    const auto found = std::lower_bound( m_resourceAllocations.begin(),
+                        m_resourceAllocations.end(), resourceId,
+                        []( const ResourceAllocationEntry& row, uint64_t key ) { return row.first < key; } );
+                    return found != m_resourceAllocations.end() && found->first == resourceId ? found->second : 0;
                 }
                 uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const override
                 {
-                    const auto state = m_catalog.AllocationState( allocationId );
-                    return state && state->record.operation != uint8_t( JnGpuCatalogRecordOperation::Destroy ) ?
-                        state->record.sizeBytes : 0;
+                    const auto found = std::lower_bound( m_allocationEndBytes.begin(),
+                        m_allocationEndBytes.end(), allocationId,
+                        []( const AllocationEndEntry& row, uint64_t key ) { return row.first < key; } );
+                    return found != m_allocationEndBytes.end() && found->first == allocationId ? found->second : 0;
                 }
             private:
                 const ReadOnlyZoneSection& m_passes;
                 const ReadOnlyZoneSection& m_links;
                 const QueryCatalogStoreReader& m_catalog;
                 const QueryGpuReferenceStoreReader& m_references;
-            } passResourceInput( passes, links, catalog, check );
+                using ResourceAllocationEntry = std::pair<uint64_t, uint64_t>;
+                using AllocationEndEntry = std::pair<uint64_t, uint64_t>;
+                struct AllocationLatest
+                {
+                    int64_t time = 0;
+                    uint64_t ordinal = 0;
+                    uint64_t bytes = 0;
+                    uint8_t operation = 0;
+                };
+                analysis::AnalysisWorkspaceReservation m_resourceAllocationMemory;
+                std::vector<ResourceAllocationEntry> m_resourceAllocations;
+                analysis::AnalysisWorkspaceReservation m_allocationEndMemory;
+                std::vector<AllocationEndEntry> m_allocationEndBytes;
+            } passResourceInput( passes, links, catalog, check, storageOptions.workspace );
             resources->SetPhase( "gpu-pass-resource-index" );
             QueryGpuPassResourceStore::Build( temporaryJn[useIndex], result.sourceFingerprint,
                 passResourceInput, storageOptions );
