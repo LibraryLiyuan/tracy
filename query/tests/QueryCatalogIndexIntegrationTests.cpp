@@ -94,7 +94,16 @@ int main( int argc, char** argv )
             if( latest != nullptr && latest->allocationId != 0 ) ++allocationResourceCounts[latest->allocationId];
         original.reset(); catalog.reset();
 
-        const auto manifest = query::QueryIndex::Build( input );
+        auto buildResources = query::QueryIndex::CreateResourceContext( input );
+        const auto manifest = query::QueryIndex::Build( input, {}, buildResources );
+        const auto phases = buildResources->Snapshot().phaseHistory;
+        const auto loaded = std::find_if( phases.rbegin(), phases.rend(), []( const auto& phase ) {
+            return phase.phase == "worker-load:unknown";
+        } );
+        Require( loaded != phases.rend() && loaded->diskCurrentBytes < 49000,
+            "completed CPU/GPU zones remained raw through Worker load" );
+        Require( query::QueryIndex::Validate( input, true ).manifest.has_value(),
+            "early-packed CPU/GPU zones failed deep index validation" );
         std::ifstream manifestInput( manifest.manifestPath );
         const auto json = nlohmann::json::parse( manifestInput );
         manifestInput.close();

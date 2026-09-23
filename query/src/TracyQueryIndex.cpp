@@ -512,6 +512,53 @@ private:
     std::shared_ptr<QueryStringStoreReader> m_store;
 };
 
+std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind);
+
+void PackClosedZoneSection( std::filesystem::path& path, ZoneSectionKind kind, uint64_t count,
+    uint32_t recordBytes, std::string_view sourceFingerprint, const analysis::PagedRecordOptions& options )
+{
+    const auto raw = path;
+    auto packed = raw;
+    packed += ".pages";
+    if( std::filesystem::exists( packed ) ) throw std::runtime_error( "index packed scratch already exists" );
+    std::ifstream input( analysis::AnalysisIoPath( raw ), std::ios::binary );
+    ZoneSectionHeader header {};
+    input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+    if( !input || sourceFingerprint.size() != 64 ||
+        std::memcmp( header.magic, "JNIDXZ1", 7 ) || header.schemaVersion != QueryIndexSchemaVersion ||
+        header.count != count || header.recordBytes != recordBytes || header.kind != uint32_t( kind ) ||
+        std::memcmp( header.sourceFingerprint, sourceFingerprint.data(), 64 ) )
+        throw std::runtime_error( "index compression input mismatch" );
+    const uint64_t perBlock = uint64_t( options.blockBytes ) / recordBytes;
+    if( perBlock == 0 ) throw std::runtime_error( "index compression block is smaller than record" );
+    analysis::AnalysisWorkspaceReservation bufferMemory( options.workspace, perBlock * recordBytes );
+    std::vector<char> buffer( size_t( perBlock * recordBytes ) );
+    {
+        analysis::PagedRecordWriter output( packed, PagedSectionIdentity( sourceFingerprint, kind ),
+            recordBytes, options );
+        for( uint64_t ordinal = 0; ordinal < count; )
+        {
+            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "index compression cancelled" );
+            const auto take = std::min( perBlock, count - ordinal );
+            input.read( buffer.data(), std::streamsize( take * recordBytes ) );
+            if( !input ) throw std::runtime_error( "index compression input truncated" );
+            output.Append( buffer.data(), take );
+            ordinal += take;
+        }
+        output.Commit();
+    }
+    {
+        analysis::PagedRecordReader check( packed, PagedSectionIdentity( sourceFingerprint, kind ),
+            recordBytes, options );
+        check.ValidateAll();
+    }
+    input.close();
+    std::error_code error;
+    analysis::AnalysisDiskRemove( raw, options.disk, error );
+    if( error ) throw std::runtime_error( "cannot remove packed raw index section: " + error.message() );
+    path = packed;
+}
+
 class QuerySerializedCallstackSource final : public SerializedCallstackSource
 {
 public:
@@ -543,11 +590,13 @@ public:
         std::filesystem::path samples, std::filesystem::path catalog, std::filesystem::path strings,
         std::filesystem::path callstacks, std::filesystem::path callstackFrames,
         std::array<std::filesystem::path, JnDomainCount> jnPaths,
-        std::string sourceFingerprint, analysis::PagedRecordOptions storageOptions = {} )
+        std::string sourceFingerprint, analysis::PagedRecordOptions storageOptions = {},
+        std::shared_ptr<QueryResourceContext> resources = {} )
         : m_extraPath( std::move( extras ) ), m_cpuPath( std::move( cpu ) ), m_gpuPath( std::move( gpu ) )
         , m_samplePath( std::move( samples ) ), m_stringPath( std::move( strings ) ), m_callstackPath( std::move( callstacks ) ), m_callstackFramePath( std::move( callstackFrames ) ), m_jnPaths( std::move( jnPaths ) )
         , m_sourceFingerprint( std::move( sourceFingerprint ) )
         , m_storageOptions( std::move( storageOptions ) )
+        , m_resources( std::move( resources ) )
         , m_samples( m_samplePath, m_sourceFingerprint, m_storageOptions )
         , m_jobs( m_jnPaths[0], m_sourceFingerprint, m_storageOptions )
         , m_catalog( std::move( catalog ), m_sourceFingerprint, m_storageOptions )
@@ -627,7 +676,14 @@ public:
         m_extraNameResolved[size_t( index )] = QueryIndexZoneExtraNameResolved( flags );
         m_seenExtras++;
     }
-    void ZoneExtrasEnd() override { if( m_seenExtras != m_expectedExtras ) throw std::runtime_error( "zone extra index count mismatch" ); m_extras.Close(); }
+    void ZoneExtrasEnd() override
+    {
+        if( m_seenExtras != m_expectedExtras ) throw std::runtime_error( "zone extra index count mismatch" );
+        m_extras.Close();
+        if( m_resources ) m_resources->SetPhase( "worker-pack:zone-extras" );
+        PackClosedZoneSection( m_extraPath, ZoneSectionKind::Extra, m_seenExtras,
+            sizeof( ZoneExtraIndexRecord ), m_sourceFingerprint, m_storageOptions );
+    }
 
     void CpuZonesBegin( uint64_t count ) override
     {
@@ -663,6 +719,7 @@ public:
     }
     void CpuZonesEnd() override
     {
+        if( m_resources ) m_resources->SetPhase( "worker-sort:cpu-zones" );
         auto spans = m_cpuSpans;
         std::sort( spans.begin(), spans.end(), []( const auto& lhs, const auto& rhs ) {
             return lhs.thread != rhs.thread ? lhs.thread < rhs.thread : lhs.start < rhs.start;
@@ -727,6 +784,9 @@ public:
             analysis::AnalysisDiskRemove(sortedPath,m_storageOptions.disk,ignored);
             throw;
         }
+        if( m_resources ) m_resources->SetPhase( "worker-pack:cpu-zones" );
+        PackClosedZoneSection( m_cpuPath, ZoneSectionKind::Cpu, m_seenCpu,
+            sizeof( CpuZoneIndexRecord ), m_sourceFingerprint, m_storageOptions );
     }
 
     void GpuZonesBegin( uint64_t count ) override
@@ -753,7 +813,13 @@ public:
         if( record->parent != std::numeric_limits<uint64_t>::max() && gpuEnd >= record->gpuStart )
             reinterpret_cast<GpuZoneIndexRecord*>( m_gpu.Record( record->parent ) )->childGpuTime += gpuEnd - record->gpuStart;
     }
-    void GpuZonesEnd() override { m_gpu.Close( m_seenGpu ); }
+    void GpuZonesEnd() override
+    {
+        m_gpu.Close( m_seenGpu );
+        if( m_resources ) m_resources->SetPhase( "worker-pack:gpu-zones" );
+        PackClosedZoneSection( m_gpuPath, ZoneSectionKind::Gpu, m_seenGpu,
+            sizeof( GpuZoneIndexRecord ), m_sourceFingerprint, m_storageOptions );
+    }
 
     bool WantsSamples() const override { return true; }
     void SamplesBegin( uint64_t thread, uint8_t kind, uint64_t count ) override
@@ -864,6 +930,9 @@ public:
     uint64_t ExtraCount() const { return m_seenExtras; }
     uint64_t CpuCount() const { return m_seenCpu; }
     uint64_t GpuCount() const { return m_seenGpu; }
+    const std::filesystem::path& ExtraPath() const { return m_extraPath; }
+    const std::filesystem::path& CpuPath() const { return m_cpuPath; }
+    const std::filesystem::path& GpuPath() const { return m_gpuPath; }
     uint64_t DeclaredExtraCount() const { return m_expectedExtras; }
     uint64_t DeclaredCpuCount() const { return m_expectedCpu; }
     uint64_t DeclaredGpuCount() const { return m_expectedGpu; }
@@ -956,6 +1025,7 @@ private:
     std::array<std::filesystem::path, JnDomainCount> m_jnPaths;
     std::string m_sourceFingerprint;
     analysis::PagedRecordOptions m_storageOptions;
+    std::shared_ptr<QueryResourceContext> m_resources;
     MappedSection m_extras, m_cpu, m_gpu;
     std::array<MappedSection, JnDomainCount> m_jn;
     std::array<uint64_t, JnDomainCount> m_jnExpected {};
@@ -3532,10 +3602,19 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();
+        for( const auto& raw : { temporaryExtras, temporaryCpu, temporaryGpu } )
+        {
+            auto packed = raw;
+            packed += ".pages";
+            packedScratch.push_back( packed );
+        }
         ZoneIndexWriter writer( temporaryExtras, temporaryCpu, temporaryGpu, temporarySamples, temporaryCatalog, temporaryStrings, temporaryCallstacks, temporaryCallstackFrames,
-            temporaryJn, result.sourceFingerprint, storageOptions );
+            temporaryJn, result.sourceFingerprint, storageOptions, resources );
         auto source = analysis::WorkerTraceSource::Open( tracePath, std::move( stateCallback ), result.sourceFingerprint,
             analysis::WorkerTraceLoadMode::CompactIndex, &writer, ResourceReadHooks(resources,"worker-load:" ) );
+        temporaryExtras = writer.ExtraPath();
+        temporaryCpu = writer.CpuPath();
+        temporaryGpu = writer.GpuPath();
         writer.FinishMissingJnDomains();
         resources->SetPhase( "job-index" );
         writer.BuildJobIndexes();
@@ -3618,17 +3697,17 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         }
         result.cpuZonesByThread = writer.CpuZonesByThread();
         result.gpuZonesByContext = writer.GpuZonesByContext();
-        result.zoneExtras.bytes = std::filesystem::file_size( temporaryExtras );
-        result.cpuZones.bytes = std::filesystem::file_size( temporaryCpu );
-        result.gpuZones.bytes = std::filesystem::file_size( temporaryGpu );
+        result.zoneExtras.bytes = SectionBytes( temporaryExtras );
+        result.cpuZones.bytes = SectionBytes( temporaryCpu );
+        result.gpuZones.bytes = SectionBytes( temporaryGpu );
         {
             resources->SetPhase("zone-validation:cpu");
             QueryIndexSection temporaryCpuSection = result.cpuZones; temporaryCpuSection.path = temporaryCpu;
             QueryIndexSection temporaryExtraSection = result.zoneExtras; temporaryExtraSection.path = temporaryExtras;
             QueryIndexSection temporaryGpuSection = result.gpuZones; temporaryGpuSection.path = temporaryGpu;
-            ReadOnlyZoneSection cpuSection( temporaryCpuSection, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), result.sourceFingerprint );
-            ReadOnlyZoneSection extraSection( temporaryExtraSection, ZoneSectionKind::Extra, sizeof( ZoneExtraIndexRecord ), result.sourceFingerprint );
-            ReadOnlyZoneSection gpuSection( temporaryGpuSection, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), result.sourceFingerprint );
+            ReadOnlyZoneSection cpuSection( temporaryCpuSection, ZoneSectionKind::Cpu, sizeof( CpuZoneIndexRecord ), result.sourceFingerprint, storageOptions );
+            ReadOnlyZoneSection extraSection( temporaryExtraSection, ZoneSectionKind::Extra, sizeof( ZoneExtraIndexRecord ), result.sourceFingerprint, storageOptions );
+            ReadOnlyZoneSection gpuSection( temporaryGpuSection, ZoneSectionKind::Gpu, sizeof( GpuZoneIndexRecord ), result.sourceFingerprint, storageOptions );
             analysis::ZoneValidationSummaryDto zoneValidation;
             std::unordered_map<std::string_view, size_t> validationIssueByCode;
             const auto noteValidation = [&]( const char* severity, const char* code, const char* message, const auto& makeRef ) {
@@ -3851,9 +3930,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             analysis::AnalysisDiskRemove(temporaryValidation,storageOptions.disk,validationCleanup,true);
             if(validationCleanup) throw std::runtime_error("cannot clean validation scratch: "+validationCleanup.message());
         }
-        result.zoneExtras.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryExtras );
-        result.cpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryCpu );
-        result.gpuZones.fingerprint = analysis::WorkerTraceSource::ComputeFingerprint( temporaryGpu );
+        result.zoneExtras.fingerprint = SectionFingerprint( temporaryExtras );
+        result.cpuZones.fingerprint = SectionFingerprint( temporaryCpu );
+        result.gpuZones.fingerprint = SectionFingerprint( temporaryGpu );
         result.cpuZoneIndex = true;
         result.gpuZoneIndex = true;
 
@@ -3881,38 +3960,12 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         // names are generation-specific, so existing readers retain their
         // immutable files until their own analysis is released.
         const auto packSection=[&](std::filesystem::path& temporary,QueryIndexSection& section,ZoneSectionKind kind) {
-            const auto raw=temporary;
             auto packed=temporary; packed+=".pages";
-            if(std::filesystem::exists(packed)) throw std::runtime_error("index packed scratch already exists");
             packedScratch.push_back(packed);
-            std::ifstream input(raw,std::ios::binary);
-            ZoneSectionHeader header{}; input.read(reinterpret_cast<char*>(&header),sizeof(header));
-            if(!input || std::memcmp(header.magic,"JNIDXZ1",7) || header.count!=section.count ||
-                header.recordBytes!=section.recordBytes || header.kind!=uint32_t(kind))
-                throw std::runtime_error("index compression input mismatch");
-            auto options=storageOptions;
-            const auto identity=PagedSectionIdentity(result.sourceFingerprint,kind);
-            analysis::PagedRecordWriter output(packed,identity,section.recordBytes,options);
-            const uint64_t perBlock=options.blockBytes/section.recordBytes;
-            std::vector<char> buffer(size_t(perBlock*section.recordBytes));
-            for(uint64_t ordinal=0;ordinal<section.count;) {
-                const auto count=std::min(perBlock,section.count-ordinal),bytes=count*section.recordBytes;
-                input.read(buffer.data(),std::streamsize(bytes));
-                if(!input) throw std::runtime_error("index compression input truncated");
-                output.Append(buffer.data(),count); ordinal+=count;
-            }
-            output.Commit();
-            analysis::PagedRecordReader check(packed,identity,section.recordBytes,options); check.ValidateAll();
-            input.close();
-            // Only this invocation's known raw scratch file is reclaimed.
-            std::error_code removeError;
-            analysis::AnalysisDiskRemove(raw,storageOptions.disk,removeError);
-            if(removeError) throw std::runtime_error("cannot remove packed raw index section: "+removeError.message());
-            temporary=packed; section.bytes=SectionBytes(packed); section.fingerprint=SectionFingerprint(packed);
+            PackClosedZoneSection( temporary, kind, section.count, section.recordBytes,
+                result.sourceFingerprint, storageOptions );
+            section.bytes=SectionBytes(temporary); section.fingerprint=SectionFingerprint(temporary);
         };
-        packSection(temporaryExtras,result.zoneExtras,ZoneSectionKind::Extra);
-        packSection(temporaryCpu,result.cpuZones,ZoneSectionKind::Cpu);
-        packSection(temporaryGpu,result.gpuZones,ZoneSectionKind::Gpu);
         for(size_t index=1;index<temporaryJn.size();++index)
             packSection(temporaryJn[index],*jnSections[index],ZoneIndexWriter::JnSectionKind(SerializedZoneSink::JnDomain(index)));
 

@@ -29,7 +29,9 @@ int main(int argc,char** argv)
         if(!denied) throw std::runtime_error("QueryIndex bypassed the injected shared disk limit");
         auto failurePath=tracy::query::QueryIndex::ManifestPath(input); failurePath+=".failure.json";
         for(const auto& entry:std::filesystem::directory_iterator(root))
-            if(entry.path()!=input && entry.path()!=failurePath) throw std::runtime_error("resource-denied QueryIndex left a candidate behind");
+            if(!std::filesystem::equivalent(entry.path(),input) &&
+                !std::filesystem::equivalent(entry.path(),failurePath))
+                throw std::runtime_error("resource-denied QueryIndex left a candidate behind: "+entry.path().string());
         std::ifstream failureInput(failurePath,std::ios::binary);
         const auto failure=nlohmann::json::parse(failureInput);
         if(failure.at("failure_reason") != "disk_peak_limit" || failure.at("requested_bytes").is_null() ||

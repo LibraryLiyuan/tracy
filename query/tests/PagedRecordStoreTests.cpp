@@ -4,11 +4,98 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <cstring>
+#include <string_view>
 #if __has_include("TracyPagedRecordStore.hpp")
 #include "TracyPagedRecordStore.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 #include "TracyPolicyFrameSeries.hpp"
 using namespace tracy::analysis;
 static void Require(bool ok,const char* reason) { if(!ok) throw std::runtime_error(reason); }
+static int ZoneReadCapacity(uint64_t count,bool incompressible=false)
+{
+    namespace fs=std::filesystem;
+    if(count<100000 || count>10000000) return 2;
+    const auto root=fs::temp_directory_path()/
+        ("query-zone-read-capacity-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    try
+    {
+        fs::create_directories(root);
+        const std::string identity(64,'a');
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<fs::path>{root});
+        PagedRecordOptions options;
+        options.workspace=std::make_shared<AnalysisWorkspaceBudget>(4ull<<30,2ull<<30);
+        options.disk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{usage,20ull<<30,{}});
+        const auto started=std::chrono::steady_clock::now();
+        options.cancelled=[started] { return std::chrono::steady_clock::now()-started>std::chrono::minutes(10); };
+        constexpr size_t width=52;
+        std::array<std::array<uint8_t,width>,4096> rows{};
+        const auto writeStarted=std::chrono::steady_clock::now();
+        {
+            PagedRecordWriter writer(root/"zones",identity,width,options);
+            for(uint64_t offset=0;offset<count;)
+            {
+                const auto take=std::min<uint64_t>(rows.size(),count-offset);
+                for(uint64_t i=0;i<take;++i)
+                {
+                    const uint64_t ordinal=offset+i;
+                    std::memcpy(rows[size_t(i)].data(),&ordinal,sizeof(ordinal));
+                    const uint64_t parent=ordinal?ordinal-1:UINT64_MAX;
+                    std::memcpy(rows[size_t(i)].data()+8,&parent,sizeof(parent));
+                    if(incompressible)
+                    {
+                        uint64_t bits=ordinal+0x9E3779B97F4A7C15ull;
+                        for(size_t byte=8;byte<width;++byte)
+                        {
+                            bits^=bits<<13;bits^=bits>>7;bits^=bits<<17;
+                            rows[size_t(i)][byte]=uint8_t(bits);
+                        }
+                    }
+                }
+                writer.Append(rows.data(),take);
+                offset+=take;
+            }
+            writer.Commit();
+        }
+        const auto writeMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-writeStarted).count();
+        const auto readStarted=std::chrono::steady_clock::now();
+        uint64_t blockLoads=0,decodedBytes=0;
+        {
+            PagedRecordReader reader(root/"zones",identity,width,options);
+            std::array<uint8_t,width> row{};
+            for(uint64_t ordinal=0;ordinal<count;++ordinal)
+            {
+                reader.Read(ordinal,row.data(),1);
+                uint64_t restored=UINT64_MAX;
+                std::memcpy(&restored,row.data(),sizeof(restored));
+                Require(restored==ordinal,"zone read probe lost ordinal");
+            }
+            const auto statistics=reader.Statistics();
+            blockLoads=statistics.blockLoads;
+            decodedBytes=statistics.decodedBytes;
+        }
+        const auto readMs=std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-readStarted).count();
+        const auto disk=usage->Snapshot();
+        std::cout<<"zone_read_records="<<count<<" incompressible="<<incompressible
+            <<" raw_bytes="<<count*width
+            <<" final_bytes="<<disk.currentBytes<<" peak_bytes="<<disk.peakBytes
+            <<" write_ms="<<writeMs<<" read_ms="<<readMs
+            <<" block_loads="<<blockLoads<<" decoded_bytes="<<decodedBytes<<'\n';
+        std::error_code cleanup;
+        fs::remove_all(root,cleanup);
+        if(cleanup) throw std::runtime_error("zone read capacity cleanup: "+cleanup.message());
+        return 0;
+    }
+    catch(const std::exception& error)
+    {
+        std::cerr<<error.what()<<'\n';
+        std::error_code ignored;
+        fs::remove_all(root,ignored);
+        return 1;
+    }
+}
 template<class Marker,class Context> static auto RestoreSeries(const std::filesystem::path& path,const Context& context,const std::string& identity)
 { return ReadPolicyFrameSeries(path,context,1024*1024,{},identity); }
 template<class Writer> static void FrameSeries(const std::filesystem::path& root,PagedRecordOptions options)
@@ -109,6 +196,12 @@ static void Run()
 }
 #else
 static void Run() { throw std::runtime_error("bounded compressed ordinal store is missing"); }
+static int ZoneReadCapacity(uint64_t,bool=false) { throw std::runtime_error("bounded compressed ordinal store is missing"); }
 #endif
-int main() { try { Run(); std::cout<<"paged record store passed\n"; return 0; }
+int main(int argc,char** argv) { try {
+    if(argc==3 && std::string_view(argv[1])=="--zone-read-capacity") return ZoneReadCapacity(std::stoull(argv[2]));
+    if(argc==4 && std::string_view(argv[1])=="--zone-read-capacity" &&
+        std::string_view(argv[3])=="incompressible") return ZoneReadCapacity(std::stoull(argv[2]),true);
+    if(argc!=1) return 2;
+    Run(); std::cout<<"paged record store passed\n"; return 0; }
 catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; } }
