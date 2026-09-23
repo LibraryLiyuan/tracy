@@ -5,10 +5,13 @@
 #include "TracyAnalysisWorkspaceBudget.hpp"
 
 #include <chrono>
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -26,10 +29,112 @@ void WriteString( tracy::query::QueryStringStoreWriter& writer, uint64_t ordinal
     writer.StringEnd( ordinal );
 }
 
+int CapacityProbe( uint64_t stageCount )
+{
+    namespace fs = std::filesystem;
+    using namespace tracy;
+    using namespace tracy::analysis;
+    using namespace tracy::query;
+    if( stageCount < 100000 || stageCount > 10000000 ) return 2;
+    const auto root = fs::temp_directory_path() /
+        ( "query-job-capacity-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
+    try
+    {
+        fs::create_directories( root );
+        const std::string fingerprint( 64, 'j' );
+        auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
+        PagedRecordOptions options;
+        options.disk = std::make_shared<AnalysisDiskBudget>(
+            AnalysisDiskBudget{ usage, 20ull * 1024 * 1024 * 1024, {} } );
+        options.workspace = std::make_shared<AnalysisWorkspaceBudget>(
+            4ull * 1024 * 1024 * 1024, 2ull * 1024 * 1024 * 1024 );
+        const auto started = std::chrono::steady_clock::now();
+        options.cancelled = [started] {
+            return std::chrono::steady_clock::now() - started > std::chrono::minutes( 10 );
+        };
+        {
+            QueryStringStoreWriter strings( root / "strings", fingerprint, options );
+            strings.StringsBegin( 1 );
+            WriteString( strings, 0, 100, "Job" );
+            strings.StringsEnd();
+            strings.PointerTableBegin( QueryStringPointerKind::String, 1 );
+            strings.PointerRecord( QueryStringPointerKind::String, 0, 100, 100, 0 );
+            strings.PointerTableEnd( QueryStringPointerKind::String );
+            for( size_t kind = 1; kind < 3; ++kind )
+            {
+                strings.PointerTableBegin( QueryStringPointerKind( kind ), 0 );
+                strings.PointerTableEnd( QueryStringPointerKind( kind ) );
+            }
+            strings.Commit();
+        }
+        {
+        constexpr uint64_t jobs = 1000;
+        QueryJobStoreWriter writer( root / "jobs", fingerprint, options );
+        JnJobTypeData type{}; type.typeId = 1; type.name = 100;
+        writer.Begin( QueryJobDomain::Type, 1 );
+        writer.Append( QueryJobDomain::Type, 0, &type, 1 );
+        writer.End( QueryJobDomain::Type );
+        std::vector<JnJobScheduleData> schedules( jobs );
+        for( uint64_t i = 0; i < jobs; ++i )
+        {
+            schedules[size_t( i )].jobId = i + 1;
+            schedules[size_t( i )].time = int64_t( i );
+        }
+        writer.Begin( QueryJobDomain::Schedule, jobs );
+        writer.Append( QueryJobDomain::Schedule, 0, schedules.data(), jobs );
+        writer.End( QueryJobDomain::Schedule );
+        writer.Begin( QueryJobDomain::Stage, stageCount );
+        std::array<JnJobStageData, 4096> block{};
+        for( uint64_t offset = 0; offset < stageCount; )
+        {
+            const auto count = std::min<uint64_t>( block.size(), stageCount - offset );
+            for( uint64_t index = 0; index < count; ++index )
+            {
+                auto& row = block[size_t( index )];
+                row.jobId = ( offset + index ) % jobs + 1;
+                row.time = int64_t( offset + index );
+                row.stage = uint8_t( JnJobStage::Ready );
+            }
+            writer.Append( QueryJobDomain::Stage, offset, block.data(), count );
+            offset += count;
+        }
+        writer.End( QueryJobDomain::Stage );
+        writer.FinishMissing();
+        const auto sourceBytes = usage->Snapshot().currentBytes;
+        const auto buildStarted = std::chrono::steady_clock::now();
+        const auto statistics = writer.BuildIndexes( root / "strings" );
+        const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - buildStarted ).count();
+        QueryJobStoreReader reader( root / "jobs", root / "strings", fingerprint, options );
+        Require( reader.GetJobCount() == jobs && !fs::exists( root / "jobs" / "build-scratch" ),
+            "Job capacity probe did not publish and clean its index" );
+        const auto observed = usage->Snapshot();
+        std::cout << "job_stage_records=" << stageCount << " source_bytes=" << sourceBytes
+            << " peak_bytes=" << observed.peakBytes << " final_bytes=" << observed.currentBytes
+            << " build_elapsed_ms=" << buildMilliseconds
+            << " mapped_fact_reads=" << statistics.aggregationMappedFactReads << '\n';
+        }
+        std::error_code cleanup;
+        fs::remove_all( root, cleanup );
+        if( cleanup ) throw std::runtime_error( "Job capacity probe cleanup: " + cleanup.message() );
+        return 0;
+    }
+    catch( const std::exception& error )
+    {
+        std::cerr << error.what() << '\n';
+        std::error_code ignored;
+        fs::remove_all( root, ignored );
+        return 1;
+    }
 }
 
-int main()
+}
+
+int main( int argc, char** argv )
 {
+    if( argc == 3 && std::string( argv[1] ) == "--capacity" )
+        return CapacityProbe( std::stoull( argv[2] ) );
+    if( argc != 1 ) return 2;
     try
     {
         namespace fs = std::filesystem;

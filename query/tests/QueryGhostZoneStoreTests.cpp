@@ -179,14 +179,18 @@ int main( int argc, char** argv )
             << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - start ).count() << '\n';
         return 0;
     }
-    if( argc != 1 ) return 2;
+    const bool capacityProbe = ( argc == 3 || argc == 4 ) && std::string( argv[1] ) == "--peak-capacity";
+    if( argc != 1 && !capacityProbe ) return 2;
+    const uint64_t capacitySamples = argc == 4 ? std::stoull( argv[3] ) : 5000;
+    if( capacityProbe && ( capacitySamples < 5000 || capacitySamples > 5000000 ) ) return 2;
 
     const auto root = fs::temp_directory_path() /
         ( "query-ghost-zone-store-test-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
     fs::create_directories( root );
     const std::string fingerprint( 64, 'g' );
     auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
-    auto disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{ usage, 64 * 1024 * 1024, {} } );
+    auto disk = std::make_shared<AnalysisDiskBudget>( AnalysisDiskBudget{
+        usage, capacityProbe ? 20ull * 1024 * 1024 * 1024 : 64ull * 1024 * 1024, {} } );
     auto workspace = std::make_shared<AnalysisWorkspaceBudget>( 64 * 1024 * 1024, 32 * 1024 * 1024 );
     PagedRecordOptions options;
     options.blockBytes = 4096;
@@ -325,25 +329,48 @@ int main( int argc, char** argv )
             "missing Frame definitions changed Ghost Zone tree boundaries" );
         unresolvedReader.ValidateAll();
         QuerySampleStoreWriter batchSamples( root / "batch-samples", fingerprint, options );
-        batchSamples.Begin( 77, QuerySampleKind::Main, 5000 );
-        for( uint64_t i = 0; i < 5000; ++i ) batchSamples.Append( i, 5 + i * 5, 1 );
+        batchSamples.Begin( 77, QuerySampleKind::Main, capacitySamples );
+        for( uint64_t i = 0; i < capacitySamples; ++i ) batchSamples.Append( i, 5 + i * 5, 1 );
         batchSamples.End(); batchSamples.Commit();
+        auto batchUsage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root / "batch-ghost" } );
+        auto batchOptions = options;
+        batchOptions.disk = std::make_shared<AnalysisDiskBudget>(
+            AnalysisDiskBudget{ batchUsage, 20ull * 1024 * 1024 * 1024, {} } );
+        const auto batchStarted = std::chrono::steady_clock::now();
+        batchOptions.cancelled = [&] {
+            return std::chrono::steady_clock::now() - batchStarted > std::chrono::minutes( 10 );
+        };
         QueryGhostZoneBuildStatistics batchStats;
         Require( BuildQueryGhostZoneStore( root / "batch-ghost", root / "batch-samples", root / "callstacks",
-            root / "unresolved-frames", root / "strings", fingerprint, 5, options, &batchStats ) == 10000,
+            root / "unresolved-frames", root / "strings", fingerprint, 5, batchOptions, &batchStats ) == 2 * capacitySamples,
             "batched Ghost write lost records" );
-        Require( batchStats.scratchWriteCalls < 10, "batched Ghost writes retained per-record system calls" );
-        QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, root / "strings", options );
-        const auto boundary = batchReader.Scan( 0, 100000, 8190, 6 );
-        Require( boundary.size() == 6, "batch boundary page is incomplete" );
-        for( size_t i = 0; i < boundary.size(); ++i ) {
-            const auto ordinal = 8190 + i;
-            const auto& row = boundary[i];
-            Require( row.ordinal == ordinal && row.startNs == int64_t( 5 + ( ordinal / 2 ) * 5 ) &&
-                row.endNs == row.startNs + 5 && row.depth == ordinal % 2 &&
-                ( ordinal % 2 ? row.parent == ordinal - 1 : !row.parent ), "batched Ghost record semantics changed" );
+        if( capacityProbe )
+        {
+            const auto observed = batchUsage->Snapshot();
+            std::cout << "samples=" << capacitySamples << " ghost_records=" << 2 * capacitySamples
+                << " peak_bytes=" << observed.peakBytes << " final_bytes=" << observed.currentBytes
+                << " build_elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - batchStarted ).count()
+                << " scratch_write_calls=" << batchStats.scratchWriteCalls << '\n';
+            if( observed.peakBytes > std::stoull( argv[2] ) )
+                throw std::runtime_error( "ghost scratch exceeded the stage capacity target" );
         }
-        batchReader.ValidateAll();
+        if( !capacityProbe )
+            Require( batchStats.scratchWriteCalls < 10, "batched Ghost writes retained per-record system calls" );
+        if( !capacityProbe )
+        {
+            QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, root / "strings", options );
+            const auto boundary = batchReader.Scan( 0, 100000, 8190, 6 );
+            Require( boundary.size() == 6, "batch boundary page is incomplete" );
+            for( size_t i = 0; i < boundary.size(); ++i ) {
+                const auto ordinal = 8190 + i;
+                const auto& row = boundary[i];
+                Require( row.ordinal == ordinal && row.startNs == int64_t( 5 + ( ordinal / 2 ) * 5 ) &&
+                    row.endNs == row.startNs + 5 && row.depth == ordinal % 2 &&
+                    ( ordinal % 2 ? row.parent == ordinal - 1 : !row.parent ), "batched Ghost record semantics changed" );
+            }
+            batchReader.ValidateAll();
+        }
     }
     catch( const std::exception& error )
     {
