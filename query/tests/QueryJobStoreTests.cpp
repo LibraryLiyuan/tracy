@@ -9,6 +9,7 @@
 #include <array>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -29,13 +30,14 @@ void WriteString( tracy::query::QueryStringStoreWriter& writer, uint64_t ordinal
     writer.StringEnd( ordinal );
 }
 
-int CapacityProbe( uint64_t stageCount )
+int CapacityProbe( uint64_t stageCount, uint64_t jobCount, bool inventory )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
     using namespace tracy::analysis;
     using namespace tracy::query;
-    if( stageCount < 100000 || stageCount > 10000000 ) return 2;
+    if( stageCount < 100000 || stageCount > 10000000 ||
+        jobCount == 0 || jobCount > std::min<uint64_t>( stageCount, 1000000 ) ) return 2;
     const auto root = fs::temp_directory_path() /
         ( "query-job-capacity-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
     try
@@ -68,13 +70,14 @@ int CapacityProbe( uint64_t stageCount )
             strings.Commit();
         }
         {
-        constexpr uint64_t jobs = 1000;
+        const auto jobs = jobCount;
         QueryJobStoreWriter writer( root / "jobs", fingerprint, options );
         JnJobTypeData type{}; type.typeId = 1; type.name = 100;
         writer.Begin( QueryJobDomain::Type, 1 );
         writer.Append( QueryJobDomain::Type, 0, &type, 1 );
         writer.End( QueryJobDomain::Type );
-        std::vector<JnJobScheduleData> schedules( jobs );
+        AnalysisWorkspaceReservation scheduleMemory( options.workspace, jobs * sizeof( JnJobScheduleData ) );
+        std::vector<JnJobScheduleData> schedules( static_cast<size_t>( jobs ) );
         for( uint64_t i = 0; i < jobs; ++i )
         {
             schedules[size_t( i )].jobId = i + 1;
@@ -101,6 +104,35 @@ int CapacityProbe( uint64_t stageCount )
         writer.End( QueryJobDomain::Stage );
         writer.FinishMissing();
         const auto sourceBytes = usage->Snapshot().currentBytes;
+        std::vector<std::string> inventoryRows;
+        uint64_t nextSample = sourceBytes + 8 * 1024 * 1024;
+        if( inventory )
+        {
+            options.disk->checkSpace = [&] {
+                const auto current = usage->Current();
+                if( current < nextSample ) return;
+                nextSample = current + 8 * 1024 * 1024;
+                const auto scratch = root / "jobs" / "build-scratch";
+                uint64_t raw = 0, source = 0, sorted = 0, runs = 0, other = 0;
+                if( fs::exists( scratch ) )
+                    for( const auto& item : fs::directory_iterator( scratch ) )
+                    {
+                        if( !item.is_regular_file() ) continue;
+                        const auto bytes = item.file_size();
+                        const auto name = item.path().filename().string();
+                        if( name.ends_with( ".raw" ) ) raw += bytes;
+                        else if( name == "jobs-source.work" ) source += bytes;
+                        else if( name == "jobs-sorted.work" ) sorted += bytes;
+                        else if( name.starts_with( "jobs-run-" ) ) runs += bytes;
+                        else other += bytes;
+                    }
+                std::ostringstream line;
+                line << "job_inventory ledger=" << current << " raw=" << raw
+                    << " source=" << source << " sorted=" << sorted
+                    << " runs=" << runs << " other=" << other;
+                inventoryRows.emplace_back( line.str() );
+            };
+        }
         const auto buildStarted = std::chrono::steady_clock::now();
         const auto statistics = writer.BuildIndexes( root / "strings" );
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -109,10 +141,11 @@ int CapacityProbe( uint64_t stageCount )
         Require( reader.GetJobCount() == jobs && !fs::exists( root / "jobs" / "build-scratch" ),
             "Job capacity probe did not publish and clean its index" );
         const auto observed = usage->Snapshot();
-        std::cout << "job_stage_records=" << stageCount << " source_bytes=" << sourceBytes
+        std::cout << "job_stage_records=" << stageCount << " jobs=" << jobs << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes << " final_bytes=" << observed.currentBytes
             << " build_elapsed_ms=" << buildMilliseconds
             << " mapped_fact_reads=" << statistics.aggregationMappedFactReads << '\n';
+        for( const auto& line : inventoryRows ) std::cout << line << '\n';
         }
         std::error_code cleanup;
         fs::remove_all( root, cleanup );
@@ -133,7 +166,11 @@ int CapacityProbe( uint64_t stageCount )
 int main( int argc, char** argv )
 {
     if( argc == 3 && std::string( argv[1] ) == "--capacity" )
-        return CapacityProbe( std::stoull( argv[2] ) );
+        return CapacityProbe( std::stoull( argv[2] ), 1000, false );
+    if( argc == 4 && std::string( argv[1] ) == "--capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), false );
+    if( argc == 3 && std::string( argv[1] ) == "--capacity-inventory" )
+        return CapacityProbe( std::stoull( argv[2] ), 1000, true );
     if( argc != 1 ) return 2;
     try
     {
