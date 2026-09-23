@@ -45,6 +45,11 @@ struct AnalysisExternalSortStatistics
     uint64_t mergeWriteBytes = 0;
 };
 
+// Choose a bounded run length that aims for one 64-way merge while leaving
+// at least half of the currently available shared workspace for other users.
+uint64_t ChooseAnalysisExternalSortBufferRecords( uint64_t inputRecords, uint32_t recordBytes,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
+
 bool SortAnalysisUInt64Pairs(
     const std::filesystem::path& source,
     const std::filesystem::path& output,

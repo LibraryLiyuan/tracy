@@ -439,6 +439,84 @@ int main( int argc, char** argv )
                 "source external sort failed" );
             checkOutput( sourceOutput );
             checkStats( sourceStats, bytes );
+            auto generous = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+            const auto wideRun = tracy::analysis::ChooseAnalysisExternalSortBufferRecords(
+                34000000, sizeof( AnalysisKeyMetadataRecord ), generous );
+            Require( wideRun >= 531250 && wideRun <= ( 512ull << 20 ) / sizeof( AnalysisKeyMetadataRecord ),
+                "sort run selection did not avoid the second 64-way merge" );
+            auto tight = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>( 64ull << 20, 64ull << 20 );
+            tracy::analysis::AnalysisWorkspaceReservation occupied( tight, 56ull << 20 );
+            const auto narrowRun = tracy::analysis::ChooseAnalysisExternalSortBufferRecords(
+                34000000, sizeof( AnalysisKeyMetadataRecord ), tight );
+            Require( narrowRun > 0 && narrowRun <= ( 4ull << 20 ) / sizeof( AnalysisKeyMetadataRecord ),
+                "sort run selection ignored other shared workspace users" );
+        }
+        {
+            const auto sortRoot = root / "sort-batched-growth";
+            fs::create_directories( sortRoot );
+            auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                std::vector<fs::path>{ sortRoot } );
+            auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                tracy::analysis::AnalysisDiskBudget{ usage, 2ull << 20, {} } );
+            uint64_t growthChecks = 0;
+            disk->checkSpace = [&] { growthChecks++; };
+            auto workspace = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>(
+                1ull << 20, 1ull << 20 );
+            std::string error;
+            tracy::analysis::AnalysisExternalSortStatistics stats;
+            const auto output = sortRoot / "sorted.work";
+            Require( tracy::analysis::SortAnalysisKeyMetadataRecordsGenerated( output, sortRoot,
+                "batched-growth", 512,
+                [&]( const auto& emit ) {
+                    for( uint64_t index = 0; index < 10000; index++ )
+                    {
+                        tracy::analysis::AnalysisKeyMetadataRecord row {};
+                        row.keyHigh = 10000 - index;
+                        row.metadata = index;
+                        emit( row );
+                    }
+                }, error, disk, workspace, {}, &stats ), "batched-growth external sort failed" );
+            Require( stats.initialRuns == 20 && stats.mergePasses == 1 &&
+                fs::file_size( output ) == 10000 * sizeof( tracy::analysis::AnalysisKeyMetadataRecord ),
+                "batched-growth sort count or output changed" );
+            Require( usage->Snapshot().currentBytes == fs::file_size( output ),
+                "batched-growth sort disk ledger changed" );
+            Require( growthChecks < 100,
+                "external merge still requests disk growth for every output record" );
+        }
+        {
+            const auto sortRoot = root / "sort-batched-refusal";
+            fs::create_directories( sortRoot );
+            auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                std::vector<fs::path>{ sortRoot } );
+            auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                tracy::analysis::AnalysisDiskBudget{ usage, 2ull << 20, {} } );
+            uint64_t growthChecks = 0;
+            disk->checkSpace = [&] {
+                if( ++growthChecks == 22 ) throw std::runtime_error( "injected merge growth refusal" );
+            };
+            auto workspace = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>(
+                1ull << 20, 1ull << 20 );
+            std::string error;
+            bool rejected = false;
+            try
+            {
+                tracy::analysis::SortAnalysisKeyMetadataRecordsGenerated( sortRoot / "sorted.work", sortRoot,
+                    "batched-refusal", 512,
+                    [&]( const auto& emit ) {
+                        for( uint64_t index = 0; index < 10000; index++ )
+                        {
+                            tracy::analysis::AnalysisKeyMetadataRecord row {};
+                            row.keyHigh = 10000 - index;
+                            emit( row );
+                        }
+                    }, error, disk, workspace );
+            }
+            catch( const std::runtime_error& exception )
+            { rejected = std::string_view( exception.what() ) == "injected merge growth refusal"; }
+            Require( rejected && usage->Snapshot().currentBytes ==
+                tracy::analysis::AnalysisDiskUsage::Bytes( sortRoot ),
+                "external merge refusal left unaccounted or overcharged scratch bytes" );
         }
         Input input;
         input.passes = { { 10, 1, 0, 1, 0, 0, 0 }, { 30, 2, 0, 1, 0, 0, 0 } };

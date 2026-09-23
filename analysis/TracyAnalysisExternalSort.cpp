@@ -60,6 +60,39 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
 
     std::ofstream out( output, std::ios::binary | std::ios::trunc );
     if( !out ) { error = std::string( errorPrefix ) + "_merge_output_open_failed"; return false; }
+    uint64_t chargedBytes = 0;
+    struct OutputChargeReconcile
+    {
+        std::ofstream& stream;
+        const std::filesystem::path& path;
+        const std::shared_ptr<AnalysisDiskBudget>& disk;
+        uint64_t& charged;
+        ~OutputChargeReconcile()
+        {
+            stream.close();
+            if( !disk || !disk->usage ) return;
+            try
+            {
+                const auto actual = AnalysisDiskUsage::Bytes( path );
+                if( charged > actual ) disk->usage->Release( charged - actual );
+            }
+            catch( ... ) {} // Retain a conservative charge until the next idle recount.
+        }
+    } reconcile { out, output, disk, chargedBytes };
+    constexpr size_t OutputBatchRecords = 4096;
+    AnalysisWorkspaceReservation outputWorkspace( workspace, OutputBatchRecords * sizeof( Record ) );
+    std::vector<Record> outputBatch;
+    outputBatch.reserve( OutputBatchRecords );
+    const auto flushOutput = [&] {
+        if( outputBatch.empty() ) return true;
+        const auto bytes = outputBatch.size() * sizeof( Record );
+        AnalysisDiskGrow( disk, bytes );
+        chargedBytes += bytes;
+        out.write( reinterpret_cast<const char*>( outputBatch.data() ), std::streamsize( bytes ) );
+        if( !out ) { error = std::string( errorPrefix ) + "_merge_write_failed"; return false; }
+        outputBatch.clear();
+        return true;
+    };
     std::vector<Cursor> cursors( inputs.size() );
     std::priority_queue<Head, std::vector<Head>, Greater> heap( Greater { less } );
     for( size_t index = 0; index < inputs.size(); ++index )
@@ -83,9 +116,8 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
         { error = std::string( errorPrefix ) + "_cancelled"; return false; }
         const auto head = heap.top();
         heap.pop();
-        AnalysisDiskGrow(disk,sizeof(head.value));
-        out.write( reinterpret_cast<const char*>( &head.value ), sizeof( head.value ) );
-        if( !out ) { error = std::string( errorPrefix ) + "_merge_write_failed"; return false; }
+        outputBatch.push_back( head.value );
+        if( outputBatch.size() == OutputBatchRecords && !flushOutput() ) return false;
         ++written;
         auto& cursor = cursors[head.run];
         if( cursor.input.read( reinterpret_cast<char*>( &cursor.value ), sizeof( Record ) ) )
@@ -93,6 +125,7 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
         else if( !cursor.input.eof() )
         { error = std::string( errorPrefix ) + "_run_read_failed"; return false; }
     }
+    if( !flushOutput() ) return false;
     out.flush();
     if( !out ) { error = std::string( errorPrefix ) + "_merge_flush_failed"; return false; }
     out.close();
@@ -119,6 +152,27 @@ bool RemoveFiles( const std::vector<std::filesystem::path>& paths, std::string& 
     return true;
 }
 
+}
+
+uint64_t ChooseAnalysisExternalSortBufferRecords( uint64_t inputRecords, uint32_t recordBytes,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+{
+    if( recordBytes == 0 ) throw std::runtime_error( "analysis_metadata_sort_record_width" );
+    constexpr uint64_t DefaultRecords = 512 * 1024;
+    constexpr uint64_t MaximumBufferBytes = 512ull << 20;
+    constexpr uint64_t DesiredRuns = 64;
+    const auto desired = inputRecords / DesiredRuns + ( inputRecords % DesiredRuns != 0 );
+    const auto target = std::min( std::max<uint64_t>( inputRecords, 1 ),
+        std::max( DefaultRecords, desired ) );
+    uint64_t maximumBytes = MaximumBufferBytes;
+    if( workspace )
+    {
+        const auto state = workspace->Snapshot();
+        const auto available = state.maximumBytes > state.currentBytes ?
+            state.maximumBytes - state.currentBytes : 0;
+        maximumBytes = std::min( maximumBytes, available / 2 );
+    }
+    return std::min( target, std::max<uint64_t>( 1, maximumBytes / recordBytes ) );
 }
 
 bool CleanupAnalysisExternalSortFiles( const std::filesystem::path& temporaryRoot,
