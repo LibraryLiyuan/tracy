@@ -157,7 +157,6 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
     const auto expandedSorted = scratch / "expanded-sorted.work";
     const auto rangeSource = scratch / "range-source.work";
     const auto rangeSorted = scratch / "range-sorted.work";
-    const auto useSource = scratch / "use-source.work";
     const auto useSorted = scratch / "use-sorted.work";
     const auto baseSummarySource = scratch / "base-summary.work";
     const auto allocationSource = scratch / "allocation-source.work";
@@ -298,8 +297,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         std::ifstream sortedMappings( analysis::AnalysisIoPath( mappingSorted ), std::ios::binary );
         std::ofstream expanded( analysis::AnalysisIoPath( expandedSource ), std::ios::binary | std::ios::trunc );
         std::ofstream rangeLookups( analysis::AnalysisIoPath( rangeSource ), std::ios::binary | std::ios::trunc );
-        std::ofstream useLookups( analysis::AnalysisIoPath( useSource ), std::ios::binary | std::ios::trunc );
-        if( !sortedFacts || !replayFacts || !sortedMappings || !expanded || !rangeLookups || !useLookups )
+        if( !sortedFacts || !replayFacts || !sortedMappings || !expanded || !rangeLookups )
             throw std::runtime_error( "GPU pass resource expansion files cannot be opened" );
         analysis::AnalysisKeyMetadataRecord fact {};
         bool haveFact = bool( sortedFacts.read( reinterpret_cast<char*>( &fact ), sizeof( fact ) ) );
@@ -344,10 +342,12 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                         detail.keyHigh = queryPassId;
                         detail.keyLow = source.metadata;
                         detail.metadata = source.metadata;
-                        auto& output = source.kind == 1 ? rangeLookups : useLookups;
-                        analysis::AnalysisDiskGrow( options.disk, sizeof( detail ) );
-                        output.write( reinterpret_cast<const char*>( &detail ), sizeof( detail ) );
-                        if( !output ) throw std::runtime_error( "GPU pass detail lookup write failed" );
+                        if( source.kind == 1 )
+                        {
+                            analysis::AnalysisDiskGrow( options.disk, sizeof( detail ) );
+                            rangeLookups.write( reinterpret_cast<const char*>( &detail ), sizeof( detail ) );
+                            if( !rangeLookups ) throw std::runtime_error( "GPU pass detail lookup write failed" );
+                        }
                         source.kind == 1 ? rangeLookupCount++ : useLookupCount++;
                         expandedCount++;
                     }
@@ -357,12 +357,33 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             }
         }
         if( !sortedMappings.eof() && !haveMapping ) throw std::runtime_error( "GPU pass mapping read failed" );
-        expanded.flush(); rangeLookups.flush(); useLookups.flush();
-        if( !expanded || !rangeLookups || !useLookups ) throw std::runtime_error( "GPU pass expansion flush failed" );
-        expanded.close(); rangeLookups.close(); useLookups.close();
+        expanded.flush(); rangeLookups.flush();
+        if( !expanded || !rangeLookups ) throw std::runtime_error( "GPU pass expansion flush failed" );
+        expanded.close(); rangeLookups.close();
         sortedFacts.close(); replayFacts.close(); sortedMappings.close();
         removeConsumed( mappingSorted );
         removeConsumed( factSorted );
+        const auto publishLookup = [&]( const std::filesystem::path& sorted,
+            const std::filesystem::path& output, std::string_view kind, uint64_t expectedCount ) {
+            analysis::PagedRecordWriter writer( output, Identity( sourceFingerprint, kind ),
+                sizeof( analysis::AnalysisKeyMetadataRecord ), options );
+            std::ifstream inputFile( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+            if( !inputFile ) throw std::runtime_error( "GPU pass detail sorted file cannot be opened" );
+            std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
+            uint64_t written = 0;
+            while( inputFile )
+            {
+                inputFile.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
+                const auto bytes = size_t( inputFile.gcount() );
+                if( bytes % sizeof( buffer[0] ) != 0 ) throw std::runtime_error( "GPU pass detail lookup is truncated" );
+                const auto count = bytes / sizeof( buffer[0] );
+                if( count != 0 ) writer.Append( buffer.data(), count );
+                written += count;
+            }
+            if( !inputFile.eof() || written != expectedCount )
+                throw std::runtime_error( "GPU pass detail lookup count mismatch" );
+            writer.Commit();
+        };
         if( !analysis::SortAnalysisKeyMetadataRecords( expandedSource, expandedSorted, scratch,
                 "gpu-pass-resource-expanded", expandedCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
@@ -373,11 +394,29 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass range index sort failed: " + sortError );
         removeConsumed( rangeSource );
-        if( !analysis::SortAnalysisKeyMetadataRecords( useSource, useSorted, scratch,
-                "gpu-pass-resource-uses", useLookupCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+        if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( useSorted, scratch,
+                "gpu-pass-resource-uses", 512 * 1024,
+                [&]( const auto& emit ) {
+                    std::ifstream source( analysis::AnalysisIoPath( expandedSorted ), std::ios::binary );
+                    if( !source ) throw std::runtime_error( "GPU pass sorted facts cannot generate use lookup" );
+                    uint64_t generated = 0;
+                    analysis::AnalysisKeyMetadataRecord fact {};
+                    while( source.read( reinterpret_cast<char*>( &fact ), sizeof( fact ) ) )
+                    {
+                        if( fact.kind != 2 ) continue;
+                        analysis::AnalysisKeyMetadataRecord detail {};
+                        detail.keyHigh = fact.keyHigh;
+                        detail.keyLow = fact.metadata;
+                        detail.metadata = fact.metadata;
+                        emit( detail );
+                        generated++;
+                    }
+                    if( !source.eof() || source.gcount() != 0 || generated != useLookupCount )
+                        throw std::runtime_error( "GPU pass generated use lookup count mismatch" );
+                }, sortError, options.disk, options.workspace, options.cancelled ) )
             throw std::runtime_error( "GPU pass use index sort failed: " + sortError );
-        removeConsumed( useSource );
+        publishLookup( useSorted, useLookupOutput, "pass-resource-uses", useLookupCount );
+        removeConsumed( useSorted );
 
         std::ifstream expandedFacts( analysis::AnalysisIoPath( expandedSorted ), std::ios::binary );
         std::ofstream baseSummaries( analysis::AnalysisIoPath( baseSummarySource ), std::ios::binary | std::ios::trunc );
@@ -527,31 +566,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         removeConsumed( baseSummarySource );
         removeConsumed( allocationAggregateSource );
 
-        const auto publishLookup = [&]( const std::filesystem::path& sorted,
-            const std::filesystem::path& output, std::string_view kind, uint64_t expectedCount ) {
-            analysis::PagedRecordWriter writer( output, Identity( sourceFingerprint, kind ),
-                sizeof( analysis::AnalysisKeyMetadataRecord ), options );
-            std::ifstream inputFile( analysis::AnalysisIoPath( sorted ), std::ios::binary );
-            if( !inputFile ) throw std::runtime_error( "GPU pass detail sorted file cannot be opened" );
-            std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
-            uint64_t written = 0;
-            while( inputFile )
-            {
-                inputFile.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
-                const auto bytes = size_t( inputFile.gcount() );
-                if( bytes % sizeof( buffer[0] ) != 0 ) throw std::runtime_error( "GPU pass detail lookup is truncated" );
-                const auto count = bytes / sizeof( buffer[0] );
-                if( count != 0 ) writer.Append( buffer.data(), count );
-                written += count;
-            }
-            if( !inputFile.eof() || written != expectedCount )
-                throw std::runtime_error( "GPU pass detail lookup count mismatch" );
-            writer.Commit();
-        };
         publishLookup( rangeSorted, rangeLookupOutput, "pass-resource-ranges", rangeLookupCount );
         removeConsumed( rangeSorted );
-        publishLookup( useSorted, useLookupOutput, "pass-resource-uses", useLookupCount );
-        removeConsumed( useSorted );
         publishLookup( evidenceSorted, evidenceLookupOutput, "pass-resource-evidence-ids", evidenceLookupCount );
         removeConsumed( evidenceSorted );
         const auto cleanupError = cleanup( false );

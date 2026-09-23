@@ -1,10 +1,14 @@
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyQueryGpuPassResourceStore.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
 #include "TracyQueue.hpp"
 
+#include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace
@@ -84,10 +88,118 @@ private:
     const QueryGpuReferenceStoreReader& m_references;
 };
 
+class GeneratedPassInput final : public QueryGpuPassResourceInput
+{
+public:
+    GeneratedPassInput( uint64_t uses, uint64_t resources ) : m_uses( uses ), m_resources( resources ) {}
+    uint64_t MappingCount() const override { return ( m_uses + 31 ) / 32; }
+    QueryGpuPassMapping Mapping( uint64_t ordinal ) const override { return { ordinal + 1, ordinal + 1 }; }
+    uint64_t RangeCount() const override { return 0; }
+    JnGpuRangeSetRecordV1 Range( uint64_t ) const override { throw std::runtime_error( "unexpected range" ); }
+    uint64_t UseCount() const override { return m_uses; }
+    QueryGpuReferenceResolvedUseRecord Use( uint64_t ordinal ) const override
+    {
+        QueryGpuReferenceResolvedUseRecord row {};
+        row.passId = ordinal % MappingCount() + 1;
+        row.resourceId = ordinal % m_resources + 1;
+        row.passStart = int64_t( row.passId * 100 );
+        row.passEnd = row.passStart + 99;
+        row.usageMask = 1;
+        return row;
+    }
+    uint64_t ResolveCatalogResource( uint64_t token, int64_t ) const override { return token; }
+    uint64_t ResourceAllocation( uint64_t resourceId ) const override { return resourceId; }
+    uint64_t AllocationBytesAtEnd( uint64_t ) const override { return 64; }
+private:
+    uint64_t m_uses;
+    uint64_t m_resources;
+};
+
+int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
+    bool inventory = false )
+{
+    namespace fs = std::filesystem;
+    using namespace tracy::analysis;
+    if( useCount < 100000 || useCount > 10000000 || resourceCount == 0 ||
+        resourceCount > useCount || maximumBytes == 0 || maximumBytes > ( 20ull << 30 ) ) return 2;
+    const auto root = fs::temp_directory_path() /
+        ( "query-gpu-pass-capacity-" +
+            std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
+    try
+    {
+        fs::create_directories( root );
+        auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
+        PagedRecordOptions options;
+        options.disk = std::make_shared<AnalysisDiskBudget>(
+            AnalysisDiskBudget{ usage, maximumBytes, {} } );
+        options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+        const auto started = std::chrono::steady_clock::now();
+        options.cancelled = [started] {
+            return std::chrono::steady_clock::now() - started > std::chrono::minutes( 10 );
+        };
+        std::vector<std::string> inventoryRows;
+        uint64_t nextSample = 32ull << 20;
+        if( inventory ) options.disk->checkSpace = [&] {
+            const auto current = usage->Current();
+            if( current < nextSample ) return;
+            nextSample = current + ( 32ull << 20 );
+            const auto scratch = root / "pass-resource-scratch";
+            uint64_t source = 0, sorted = 0, runs = 0, other = 0;
+            std::ostringstream details;
+            if( fs::exists( scratch ) )
+                for( const auto& item : fs::directory_iterator( scratch ) )
+                {
+                    if( !item.is_regular_file() ) continue;
+                    const auto bytes = item.file_size();
+                    const auto name = item.path().filename().string();
+                    if( name.ends_with( "-source.work" ) ) source += bytes;
+                    else if( name.ends_with( "-sorted.work" ) ) sorted += bytes;
+                    else if( name.find( "-run-" ) != std::string::npos ) runs += bytes;
+                    else other += bytes;
+                    if( current >= 100000000 && bytes != 0 ) details << ' ' << name << '=' << bytes;
+                }
+            std::ostringstream line;
+            line << "gpu_pass_inventory ledger=" << current << " source=" << source
+                << " sorted=" << sorted << " runs=" << runs << " other=" << other
+                << details.str();
+            inventoryRows.emplace_back( line.str() );
+        };
+        GeneratedPassInput input( useCount, resourceCount );
+        const auto buildStarted = std::chrono::steady_clock::now();
+        QueryGpuPassResourceStore::Build( root, std::string( 64, 'a' ), input, options );
+        const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - buildStarted ).count();
+        Require( !fs::exists( root / "pass-resource-scratch" ),
+            "GPU pass capacity probe retained scratch" );
+        const auto observed = usage->Snapshot();
+        std::cout << "gpu_pass_uses=" << useCount << " passes=" << input.MappingCount()
+            << " resource_keys=" << resourceCount << " peak_bytes=" << observed.peakBytes
+            << " final_bytes=" << observed.currentBytes << " build_elapsed_ms=" << buildMs << '\n';
+        if( inventory )
+            for( const auto& line : inventoryRows ) std::cout << line << '\n';
+        std::error_code cleanup;
+        fs::remove_all( root, cleanup );
+        if( cleanup ) throw std::runtime_error( "GPU pass capacity cleanup: " + cleanup.message() );
+        return 0;
+    }
+    catch( const std::exception& error )
+    {
+        std::cerr << error.what() << '\n';
+        std::error_code ignored;
+        fs::remove_all( root, ignored );
+        return 1;
+    }
 }
 
-int main()
+}
+
+int main( int argc, char** argv )
 {
+    if( argc == 5 && std::string_view( argv[1] ) == "--capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ) );
+    if( argc == 5 && std::string_view( argv[1] ) == "--capacity-inventory" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
+    if( argc != 1 ) return 2;
     try
     {
         namespace fs = std::filesystem;
