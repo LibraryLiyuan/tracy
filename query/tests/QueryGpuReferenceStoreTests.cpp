@@ -131,6 +131,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             inventoryRows.emplace_back( line.str() );
         };
         bool sawUsePassSource = false;
+        bool sawCatalogResourceSource = false;
         uint64_t diskGrowthChecks = 0;
         const auto inventoryCheck = options.disk->checkSpace;
         options.disk->checkSpace = [&] {
@@ -138,6 +139,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             if( ( ++diskGrowthChecks & 4095 ) == 0 &&
                 fs::exists( root / "reverse-scratch" / "use-pass-source.work" ) )
                 sawUsePassSource = true;
+            if( ( diskGrowthChecks & 4095 ) == 0 &&
+                fs::exists( root / "reverse-scratch" / "catalog-resource-source.work" ) )
+                sawCatalogResourceSource = true;
         };
         const std::string identity( 64, 'g' );
         std::unique_ptr<QueryCatalogStoreReader> catalog;
@@ -191,6 +195,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         QueryGpuReferenceStore::Build( root, identity, input, options, &stages );
         Require( !sawUsePassSource,
             "GPU reference use/pass sorting still writes a complete source copy" );
+        Require( !sawCatalogResourceSource,
+            "GPU reference Catalog sorting still writes a complete source copy" );
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();
         const auto measuredStages = stages.passEventSortMs + stages.passTimePublishMs +

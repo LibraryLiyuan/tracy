@@ -115,7 +115,6 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
     const auto usePassSorted = scratch / "use-pass-sorted.work";
     const auto resourceSource = scratch / "resource-source.work";
     const auto resourceSorted = scratch / "resource-sorted.work";
-    const auto catalogResourceSource = scratch / "catalog-resource-source.work";
     const auto catalogResourceSorted = scratch / "catalog-resource-sorted.work";
     const auto cleanup = [&]( bool outputs ) {
         std::string failure;
@@ -300,62 +299,61 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         finishPhase( &QueryGpuReferenceBuildStatistics::resourcePublishMs );
 
         uint64_t catalogResourceLookupCount = 0;
-        {
-            std::ifstream source( analysis::AnalysisIoPath( resourceSource ), std::ios::binary );
-            std::ofstream catalogLookup( analysis::AnalysisIoPath( catalogResourceSource ),
-                std::ios::binary | std::ios::trunc );
-            if( !source || !catalogLookup )
-                throw std::runtime_error( "GPU reference Catalog lookup source cannot be opened" );
-            analysis::PagedRecordReader uses( usesOutput, Identity( sourceFingerprint, "resolved-uses" ),
-                sizeof( QueryGpuReferenceResolvedUseRecord ), options );
-            uint64_t ordinal = 0;
-            analysis::AnalysisKeyMetadataRecord lookup {};
-            while( source.read( reinterpret_cast<char*>( &lookup ), sizeof( lookup ) ) )
-            {
-                if( options.cancelled && options.cancelled() ) throw std::runtime_error( "GPU reference index cancelled" );
-                if( lookup.metadata != ordinal )
-                    throw std::runtime_error( "GPU reference resource source ordinal changed" );
-                QueryGpuReferenceResolvedUseRecord resolved {};
-                uses.Read( ordinal++, &resolved, 1 );
-                if( lookup.keyHigh != resolved.resourceId )
-                    throw std::runtime_error( "GPU reference resource source identity changed" );
-                const auto catalogResourceId = input.ResolveCatalogResource( resolved.resourceId, resolved.passEnd );
-                if( catalogResourceId == 0 ) continue;
-                lookup.keyHigh = catalogResourceId;
-                analysis::AnalysisDiskGrow( options.disk, sizeof( lookup ) );
-                catalogLookup.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );
-                if( !catalogLookup )
-                    throw std::runtime_error( "GPU reference Catalog resource lookup write failed" );
-                catalogResourceLookupCount++;
-            }
-            if( !source.eof() || source.gcount() != 0 || ordinal != resourceLookupCount )
-                throw std::runtime_error( "GPU reference resource source count changed" );
-            catalogLookup.flush();
-            if( !catalogLookup ) throw std::runtime_error( "GPU reference Catalog resource lookup flush failed" );
-        }
-        removeConsumed( resourceSource );
-        finishPhase( &QueryGpuReferenceBuildStatistics::catalogReplayMs );
-        if( !analysis::SortAnalysisKeyMetadataRecords( catalogResourceSource, catalogResourceSorted, scratch,
-                "gpu-reference-uses-by-catalog-resource", catalogResourceLookupCount, 512 * 1024,
-                sortError, options.disk, options.workspace ) )
+        if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( catalogResourceSorted, scratch,
+                "gpu-reference-uses-by-catalog-resource", 512 * 1024,
+                [&]( const auto& emit ) {
+                    std::ifstream source( analysis::AnalysisIoPath( resourceSource ), std::ios::binary );
+                    if( !source ) throw std::runtime_error( "GPU reference resource source cannot be reopened" );
+                    analysis::PagedRecordReader uses( usesOutput, Identity( sourceFingerprint, "resolved-uses" ),
+                        sizeof( QueryGpuReferenceResolvedUseRecord ), options );
+                    uint64_t ordinal = 0;
+                    analysis::AnalysisKeyMetadataRecord lookup {};
+                    while( source.read( reinterpret_cast<char*>( &lookup ), sizeof( lookup ) ) )
+                    {
+                        if( options.cancelled && options.cancelled() )
+                            throw std::runtime_error( "GPU reference index cancelled" );
+                        if( lookup.metadata != ordinal )
+                            throw std::runtime_error( "GPU reference resource source ordinal changed" );
+                        QueryGpuReferenceResolvedUseRecord resolved {};
+                        uses.Read( ordinal++, &resolved, 1 );
+                        if( lookup.keyHigh != resolved.resourceId )
+                            throw std::runtime_error( "GPU reference resource source identity changed" );
+                        const auto catalogResourceId = input.ResolveCatalogResource(
+                            resolved.resourceId, resolved.passEnd );
+                        if( catalogResourceId == 0 ) continue;
+                        lookup.keyHigh = catalogResourceId;
+                        emit( lookup );
+                        catalogResourceLookupCount++;
+                    }
+                    if( !source.eof() || source.gcount() != 0 || ordinal != resourceLookupCount )
+                        throw std::runtime_error( "GPU reference resource source count changed" );
+                    finishPhase( &QueryGpuReferenceBuildStatistics::catalogReplayMs );
+                }, sortError, options.disk, options.workspace, options.cancelled ) )
             throw std::runtime_error( "GPU reference Catalog resource lookup sort failed: " + sortError );
-        removeConsumed( catalogResourceSource );
+        removeConsumed( resourceSource );
         finishPhase( &QueryGpuReferenceBuildStatistics::catalogSortMs );
         analysis::PagedRecordWriter catalogLookupWriter( catalogLookupOutput,
             Identity( sourceFingerprint, "by-catalog-resource" ), sizeof( analysis::AnalysisKeyMetadataRecord ), options );
         std::ifstream sortedCatalogResources( analysis::AnalysisIoPath( catalogResourceSorted ), std::ios::binary );
         if( !sortedCatalogResources )
             throw std::runtime_error( "GPU reference sorted Catalog resource lookup cannot be opened" );
+        uint64_t catalogRowsWritten = 0;
         while( sortedCatalogResources )
         {
             sortedCatalogResources.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
             const auto bytes = size_t( sortedCatalogResources.gcount() );
             if( bytes % sizeof( buffer[0] ) != 0 )
                 throw std::runtime_error( "GPU reference Catalog lookup is truncated" );
-            if( bytes != 0 ) catalogLookupWriter.Append( buffer.data(), bytes / sizeof( buffer[0] ) );
+            if( bytes != 0 )
+            {
+                catalogLookupWriter.Append( buffer.data(), bytes / sizeof( buffer[0] ) );
+                catalogRowsWritten += bytes / sizeof( buffer[0] );
+            }
         }
         if( !sortedCatalogResources.eof() )
             throw std::runtime_error( "GPU reference Catalog resource lookup read failed" );
+        if( catalogRowsWritten != catalogResourceLookupCount )
+            throw std::runtime_error( "GPU reference sorted Catalog resource lookup count changed" );
         catalogLookupWriter.Commit();
         sortedCatalogResources.close();
         removeConsumed( catalogResourceSorted );
