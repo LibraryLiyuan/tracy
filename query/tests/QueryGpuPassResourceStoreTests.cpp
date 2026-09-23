@@ -55,6 +55,14 @@ public:
     { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
     uint64_t ResourceAllocation( uint64_t resourceId ) const override
     {
+        if( !scratchRoot.empty() )
+        {
+            for( const auto* obsolete : { "mapping-source.work", "mapping-sorted.work",
+                    "fact-source.work", "fact-sorted.work", "evidence-source.work",
+                    "expanded-source.work", "range-source.work", "use-source.work" } )
+                Require( !std::filesystem::exists( scratchRoot / obsolete ),
+                    "GPU pass build retained consumed scratch during summary" );
+        }
         resourceAllocationCalls++;
         const auto state = m_catalog.ResourceState( resourceId );
         return state ? state->latest.allocationId : 0;
@@ -70,6 +78,7 @@ public:
     mutable uint64_t resourceAllocationCalls = 0;
     mutable uint64_t allocationBytesCalls = 0;
     mutable uint64_t rangeCalls = 0;
+    std::filesystem::path scratchRoot;
 private:
     const QueryCatalogStoreReader& m_catalog;
     const QueryGpuReferenceStoreReader& m_references;
@@ -146,6 +155,7 @@ int main()
         QueryGpuReferenceStore::Build( referenceRoot, identity, referenceInput );
         QueryGpuReferenceStoreReader references( referenceRoot, identity );
         PassInput input( catalog, references );
+        input.scratchRoot = passRoot / "pass-resource-scratch";
         auto workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
             256ull * 1024 * 1024, 128ull * 1024 * 1024 );
         analysis::PagedRecordOptions budgeted;
@@ -189,7 +199,17 @@ int main()
         analysis::PagedRecordOptions smallPages;
         smallPages.blockBytes = 4096;
         const auto manyPassRoot = root / "many-passes";
+        auto diskUsage = std::make_shared<analysis::AnalysisDiskUsage>(
+            std::vector<fs::path> { manyPassRoot } );
+        auto diskBudget = std::make_shared<analysis::AnalysisDiskBudget>();
+        diskBudget->usage = diskUsage;
+        diskBudget->maximumBytes = 150000;
+        smallPages.disk = diskBudget;
         QueryGpuPassResourceStore::Build( manyPassRoot, identity, manyPasses, smallPages );
+        Require( diskUsage->Snapshot().peakBytes <= diskBudget->maximumBytes &&
+            diskUsage->Snapshot().rejectedGrowths == 0 &&
+            diskUsage->Snapshot().currentBytes == analysis::AnalysisDiskUsage::Bytes( manyPassRoot ),
+            "GPU pass build retained consumed scratch beyond the shared disk budget" );
         QueryGpuPassResourceStoreReader manyPassReader( manyPassRoot, catalogRoot, referenceRoot,
             identity, smallPages );
         Require( manyPassReader.SummaryCount() == 514, "GPU pass fixture did not span pages" );

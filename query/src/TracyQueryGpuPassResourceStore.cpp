@@ -176,6 +176,12 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         if( outputs ) { remove( summaryOutput ); remove( rangeLookupOutput ); remove( useLookupOutput ); remove( evidenceLookupOutput ); }
         return failure;
     };
+    const auto removeConsumed = [&]( const std::filesystem::path& path ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, options.disk, error );
+        if( error ) throw std::runtime_error( "GPU pass resource scratch cleanup failed: " +
+            path.filename().string() + ": " + error.message() );
+    };
     try
     {
         BuildLookupCache resourceAllocations( options.workspace );
@@ -247,10 +253,12 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                 "gpu-pass-resource-mapping", mappingCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass mapping sort failed: " + sortError );
+        removeConsumed( mappingSource );
         if( !analysis::SortAnalysisKeyMetadataRecords( factSource, factSorted, scratch,
                 "gpu-pass-resource-facts", factCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass resource fact sort failed: " + sortError );
+        removeConsumed( factSource );
 
         uint64_t evidenceLookupCount = 0;
         {
@@ -283,6 +291,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                 "gpu-pass-resource-evidence", evidenceLookupCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass evidence mapping sort failed: " + sortError );
+        removeConsumed( evidenceSource );
 
         std::ifstream sortedFacts( analysis::AnalysisIoPath( factSorted ), std::ios::binary );
         std::ifstream replayFacts( analysis::AnalysisIoPath( factSorted ), std::ios::binary );
@@ -352,16 +361,23 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         if( !expanded || !rangeLookups || !useLookups ) throw std::runtime_error( "GPU pass expansion flush failed" );
         expanded.close(); rangeLookups.close(); useLookups.close();
         sortedFacts.close(); replayFacts.close(); sortedMappings.close();
+        removeConsumed( mappingSorted );
+        removeConsumed( factSorted );
         if( !analysis::SortAnalysisKeyMetadataRecords( expandedSource, expandedSorted, scratch,
                 "gpu-pass-resource-expanded", expandedCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) ||
-            !analysis::SortAnalysisKeyMetadataRecords( rangeSource, rangeSorted, scratch,
-                "gpu-pass-resource-ranges", rangeLookupCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) ||
-            !analysis::SortAnalysisKeyMetadataRecords( useSource, useSorted, scratch,
-                "gpu-pass-resource-uses", useLookupCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass expanded index sort failed: " + sortError );
+        removeConsumed( expandedSource );
+        if( !analysis::SortAnalysisKeyMetadataRecords( rangeSource, rangeSorted, scratch,
+                "gpu-pass-resource-ranges", rangeLookupCount, 512 * 1024, sortError,
+                options.disk, options.workspace ) )
+            throw std::runtime_error( "GPU pass range index sort failed: " + sortError );
+        removeConsumed( rangeSource );
+        if( !analysis::SortAnalysisKeyMetadataRecords( useSource, useSorted, scratch,
+                "gpu-pass-resource-uses", useLookupCount, 512 * 1024, sortError,
+                options.disk, options.workspace ) )
+            throw std::runtime_error( "GPU pass use index sort failed: " + sortError );
+        removeConsumed( useSource );
 
         std::ifstream expandedFacts( analysis::AnalysisIoPath( expandedSorted ), std::ios::binary );
         std::ofstream baseSummaries( analysis::AnalysisIoPath( baseSummarySource ), std::ios::binary | std::ios::trunc );
@@ -433,6 +449,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         baseSummaries.flush(); allocations.flush();
         if( !baseSummaries || !allocations ) throw std::runtime_error( "GPU pass summary flush failed" );
         baseSummaries.close(); allocations.close(); expandedFacts.close();
+        removeConsumed( expandedSorted );
         resourceAllocations.Clear();
         std::vector<uint64_t> {}.swap( rangeLengths );
         rangeMemory.Resize( 0 );
@@ -440,6 +457,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                 "gpu-pass-resource-allocations", allocationPairCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass allocation sort failed: " + sortError );
+        removeConsumed( allocationSource );
 
         std::ifstream sortedAllocations( analysis::AnalysisIoPath( allocationSorted ), std::ios::binary );
         std::ofstream allocationAggregates( analysis::AnalysisIoPath( allocationAggregateSource ),
@@ -479,6 +497,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         allocationAggregates.flush();
         if( !allocationAggregates ) throw std::runtime_error( "GPU pass allocation aggregate flush failed" );
         allocationAggregates.close(); sortedAllocations.close();
+        removeConsumed( allocationSorted );
         allocationEndBytes.Clear();
 
         analysis::PagedRecordWriter summaries( summaryOutput,
@@ -505,6 +524,8 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         }
         summaries.Commit();
         baseInput.close(); aggregateInput.close();
+        removeConsumed( baseSummarySource );
+        removeConsumed( allocationAggregateSource );
 
         const auto publishLookup = [&]( const std::filesystem::path& sorted,
             const std::filesystem::path& output, std::string_view kind, uint64_t expectedCount ) {
@@ -528,8 +549,11 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             writer.Commit();
         };
         publishLookup( rangeSorted, rangeLookupOutput, "pass-resource-ranges", rangeLookupCount );
+        removeConsumed( rangeSorted );
         publishLookup( useSorted, useLookupOutput, "pass-resource-uses", useLookupCount );
+        removeConsumed( useSorted );
         publishLookup( evidenceSorted, evidenceLookupOutput, "pass-resource-evidence-ids", evidenceLookupCount );
+        removeConsumed( evidenceSorted );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( "GPU pass resource scratch cleanup failed: " + cleanupError );
     }

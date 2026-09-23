@@ -363,15 +363,19 @@ int RunBuildIndex( const Arguments& args )
         const auto view = streamSource->RefreshView();
         if( view ) streamRevision = view->revision;
         resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
-        validation = QueryIndex::Validate( indexedPath, true, resources );
+        resources->RunResourceBoundary( [&] {
+            validation = QueryIndex::Validate( indexedPath, true, resources );
+        } );
         if( !validation.manifest ) throw std::runtime_error( "stream query index validation failed: " + validation.reason );
         index = *validation.manifest;
     }
     else
     {
         resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
-        index = QueryIndex::Build( indexedPath, {}, resources );
-        validation = QueryIndex::Validate( indexedPath, true, resources );
+        resources->RunResourceBoundary( [&] {
+            index = QueryIndex::Build( indexedPath, {}, resources );
+            validation = QueryIndex::Validate( indexedPath, true, resources );
+        } );
     }
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
     const auto resourceSnapshot = resources->Snapshot();
@@ -461,6 +465,11 @@ int main( int argc, char** argv )
             return server.Run( std::cin, std::cout );
         }
         return 1;
+    }
+    catch( const QueryResourceError& error )
+    {
+        std::cerr << error.Code() << ": " << error.what() << '\n';
+        return 2;
     }
     catch( const QueryError& error )
     {
