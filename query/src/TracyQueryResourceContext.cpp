@@ -43,6 +43,7 @@ struct QueryResourceContext::State
     std::filesystem::path statisticsTemporaryRoot;
     std::string phase;
     std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now(),nextProgressLog=started;
+    uint64_t phaseStartedMs=0;
     uint64_t progressCurrent=0,progressTotal=0;
     uint32_t liveWorkers=0;
     std::string failureReason;
@@ -50,6 +51,8 @@ struct QueryResourceContext::State
     bool softPressureActive=false;
     std::unordered_map<std::string,uint64_t> fileBytes;
     std::unordered_map<std::string,std::pair<uint64_t,uint64_t>> containers;
+    std::vector<QueryResourcePhaseSnapshot> phaseHistory;
+    bool phaseHistoryTruncated=false;
 };
 
 QueryResourceError::QueryResourceError(std::string category,std::string reason,
@@ -162,14 +165,51 @@ std::filesystem::path QueryResourceContext::StatisticsTemporaryRoot()
 
 void QueryResourceContext::SetPhase(std::string phase)
 {
-    int64_t elapsed=0;
     {
         std::lock_guard lock(m_state->mutex);
         if(m_state->phase==phase)return;
-        m_state->phase=phase;
-        elapsed=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-m_state->started).count();
     }
-    std::fprintf(stderr,"Query phase=%.*s elapsed_ms=%lld\n",128,phase.c_str(),(long long)elapsed);
+    const auto disk=m_usage->Snapshot();
+    const auto workspace=m_workspace->Snapshot();
+    const auto memory=m_memory->Snapshot();
+    std::optional<QueryResourcePhaseSnapshot> ended;
+    uint64_t elapsed=0;
+    {
+        std::lock_guard lock(m_state->mutex);
+        if(m_state->phase==phase)return;
+        elapsed=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-m_state->started).count());
+        if(!m_state->phase.empty())
+        {
+            QueryResourcePhaseSnapshot value;
+            value.phase=m_state->phase;
+            value.startMs=m_state->phaseStartedMs;
+            value.endMs=elapsed;
+            value.durationMs=elapsed-value.startMs;
+            value.progressCurrent=m_state->progressCurrent;
+            value.progressTotal=m_state->progressTotal;
+            value.diskCurrentBytes=disk.currentBytes;
+            value.diskPeakBytes=disk.peakBytes;
+            value.workspaceCurrentBytes=workspace.currentBytes;
+            value.workspacePeakBytes=workspace.peakBytes;
+            value.privateBytes=memory.privateBytes;
+            value.peakPrivateBytes=memory.peakPrivateBytes;
+            value.complete=true;
+            ended=value;
+            if(m_state->phaseHistory.size()<256) m_state->phaseHistory.emplace_back(std::move(value));
+            else m_state->phaseHistoryTruncated=true;
+        }
+        m_state->phase=phase;
+        m_state->phaseStartedMs=elapsed;
+        m_state->progressCurrent=0;
+        m_state->progressTotal=0;
+        m_state->nextProgressLog=std::chrono::steady_clock::now();
+    }
+    if(ended)
+        std::fprintf(stderr,"Query phase-end=%.*s duration_ms=%llu disk_current_bytes=%llu disk_peak_bytes=%llu\n",
+            128,ended->phase.c_str(),(unsigned long long)ended->durationMs,
+            (unsigned long long)ended->diskCurrentBytes,(unsigned long long)ended->diskPeakBytes);
+    std::fprintf(stderr,"Query phase=%.*s elapsed_ms=%llu\n",128,phase.c_str(),(unsigned long long)elapsed);
 }
 
 void QueryResourceContext::SetProgress(uint64_t current,uint64_t total)
@@ -305,6 +345,19 @@ void QueryResourceContext::WriteDiagnostic(const std::filesystem::path& path)
     nlohmann::json containers=nlohmann::json::array();
     for(const auto& value:snapshot.containers) containers.push_back({
         {"name",value.name},{"size",std::to_string(value.size)},{"capacity",std::to_string(value.capacity)}});
+    nlohmann::json phases=nlohmann::json::array();
+    for(const auto& value:snapshot.phaseHistory) phases.push_back({
+        {"phase",value.phase},{"start_ms",value.startMs},{"end_ms",value.endMs},
+        {"duration_ms",value.durationMs},{"progress_current",std::to_string(value.progressCurrent)},
+        {"progress_total",std::to_string(value.progressTotal)},
+        {"disk_current_bytes",std::to_string(value.diskCurrentBytes)},
+        {"disk_peak_bytes",std::to_string(value.diskPeakBytes)},
+        {"workspace_current_bytes",std::to_string(value.workspaceCurrentBytes)},
+        {"workspace_peak_bytes",std::to_string(value.workspacePeakBytes)},
+        {"private_bytes",std::to_string(value.privateBytes)},
+        {"peak_private_bytes",std::to_string(value.peakPrivateBytes)},
+        {"complete",value.complete}
+    });
     nlohmann::json report={
         {"schema",1},
         {"phase",snapshot.phase},
@@ -314,6 +367,8 @@ void QueryResourceContext::WriteDiagnostic(const std::filesystem::path& path)
         {"failure_reason",snapshot.failureReason},
         {"requested_bytes",snapshot.requestedBytesKnown?nlohmann::json(std::to_string(snapshot.requestedBytes)):nlohmann::json(nullptr)},
         {"containers",std::move(containers)},
+        {"phase_history",std::move(phases)},
+        {"phase_history_truncated",snapshot.phaseHistoryTruncated},
         {"memory",{
             {"private_bytes",std::to_string(snapshot.memory.privateBytes)},
             {"peak_private_bytes",std::to_string(snapshot.memory.peakPrivateBytes)},
@@ -424,6 +479,7 @@ void QueryResourceContext::RunResourceBoundary(const std::function<void()>& oper
 QueryResourceSnapshot QueryResourceContext::Snapshot() const
 {
     QueryResourceSnapshot result;
+    uint64_t phaseStartedMs=0;
     {
         std::lock_guard lock(m_state->mutex);
         result.phase=m_state->phase;
@@ -433,6 +489,9 @@ QueryResourceSnapshot QueryResourceContext::Snapshot() const
         result.failureReason=m_state->failureReason;
         result.requestedBytesKnown=m_state->requestedBytes.has_value();
         result.requestedBytes=m_state->requestedBytes.value_or(0);
+        result.phaseHistory=m_state->phaseHistory;
+        result.phaseHistoryTruncated=m_state->phaseHistoryTruncated;
+        phaseStartedMs=m_state->phaseStartedMs;
         for(const auto& [name,value]:m_state->containers)
             result.containers.push_back({name,value.first,value.second});
     }
@@ -441,6 +500,24 @@ QueryResourceSnapshot QueryResourceContext::Snapshot() const
     result.workspace=m_workspace->Snapshot();
     const auto disk=m_usage->Snapshot();
     result.disk={disk.currentBytes,disk.peakBytes,m_limits.finalBytes,m_limits.peakBytes,disk.rejectedGrowths};
+    if(!result.phase.empty())
+    {
+        QueryResourcePhaseSnapshot value;
+        value.phase=result.phase;
+        value.startMs=phaseStartedMs;
+        value.endMs=uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now()-m_state->started).count());
+        value.durationMs=value.endMs-value.startMs;
+        value.progressCurrent=result.progressCurrent;
+        value.progressTotal=result.progressTotal;
+        value.diskCurrentBytes=disk.currentBytes;
+        value.diskPeakBytes=disk.peakBytes;
+        value.workspaceCurrentBytes=result.workspace.currentBytes;
+        value.workspacePeakBytes=result.workspace.peakBytes;
+        value.privateBytes=result.memory.privateBytes;
+        value.peakPrivateBytes=result.memory.peakPrivateBytes;
+        result.phaseHistory.emplace_back(std::move(value));
+    }
     return result;
 }
 }

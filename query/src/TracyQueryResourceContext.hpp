@@ -61,6 +61,17 @@ struct QueryResourceContainerSnapshot
     uint64_t size=0,capacity=0;
 };
 
+struct QueryResourcePhaseSnapshot
+{
+    std::string phase;
+    uint64_t startMs=0,endMs=0,durationMs=0;
+    uint64_t progressCurrent=0,progressTotal=0;
+    uint64_t diskCurrentBytes=0,diskPeakBytes=0;
+    uint64_t workspaceCurrentBytes=0,workspacePeakBytes=0;
+    uint64_t privateBytes=0,peakPrivateBytes=0;
+    bool complete=false;
+};
+
 struct QueryResourceSnapshot
 {
     std::string phase;
@@ -70,6 +81,8 @@ struct QueryResourceSnapshot
     analysis::AnalysisWorkspaceSnapshot workspace;
     QueryResourceDiskSnapshot disk;
     std::vector<QueryResourceContainerSnapshot> containers;
+    std::vector<QueryResourcePhaseSnapshot> phaseHistory;
+    bool phaseHistoryTruncated=false;
     std::string failureReason;
     bool requestedBytesKnown=false;
     uint64_t requestedBytes=0;

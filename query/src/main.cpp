@@ -377,12 +377,32 @@ int RunBuildIndex( const Arguments& args )
             validation = QueryIndex::Validate( indexedPath, true, resources );
         } );
     }
+    resources->SetPhase("complete");
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>( std::chrono::steady_clock::now() - started ).count();
     const auto resourceSnapshot = resources->Snapshot();
+    json phaseHistory=json::array();
+    for(const auto& phase:resourceSnapshot.phaseHistory)
+    {
+        if(!phase.complete) continue;
+        phaseHistory.push_back({
+            {"phase",phase.phase},{"start_ms",phase.startMs},{"end_ms",phase.endMs},
+            {"duration_ms",phase.durationMs},
+            {"progress_current",std::to_string(phase.progressCurrent)},
+            {"progress_total",std::to_string(phase.progressTotal)},
+            {"disk_current_bytes",std::to_string(phase.diskCurrentBytes)},
+            {"disk_peak_bytes",std::to_string(phase.diskPeakBytes)},
+            {"workspace_current_bytes",std::to_string(phase.workspaceCurrentBytes)},
+            {"workspace_peak_bytes",std::to_string(phase.workspacePeakBytes)},
+            {"private_bytes",std::to_string(phase.privateBytes)},
+            {"peak_private_bytes",std::to_string(phase.peakPrivateBytes)}
+        });
+    }
     const json result = {
         { "program", "tracy-query" }, { "protocol", QueryProtocol }, { "schema_version", QuerySchemaVersion },
         { "operation", "build-index" }, { "ok", validation.manifest.has_value() },
         { "elapsed_ms", std::to_string( elapsed ) },
+        { "phase_history", std::move(phaseHistory) },
+        { "phase_history_truncated", resourceSnapshot.phaseHistoryTruncated },
         { "resources", {
             { "disk_current_bytes", std::to_string( resourceSnapshot.disk.currentBytes ) },
             { "disk_peak_bytes", std::to_string( resourceSnapshot.disk.peakBytes ) },

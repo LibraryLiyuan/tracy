@@ -305,6 +305,40 @@ void ReducedProfileAcceptedAtTraceEntry( const std::filesystem::path& root )
     Reject( [&] { QueryIndex::CreateResourceContext( trace, options ); },
         "query_resource_profile_identity_mismatch" );
 }
+
+void PhaseBoundaryTelemetry( const std::filesystem::path& root )
+{
+    QueryResourceContextOptions options;
+    options.traceBytes = 1024;
+    options.derivedRoots = { root };
+    options.diagnosticDiskReserveBytes = 4096;
+    options.memorySample = [] { return AnalysisProcessMemorySample { true, 1, 1 }; };
+    QueryResourceContext context( options );
+    context.SetPhase( "worker-load" );
+    context.Disk()->Grow( 37 );
+    context.SetProgress( 5, 10 );
+    context.SetPhase( "job-index" );
+    context.Disk()->Grow( 13 );
+    const auto report = root / "phase-diagnostic.json";
+    std::filesystem::create_directories( root );
+    context.WriteDiagnostic( report );
+    std::ifstream input( report, std::ios::binary );
+    const auto parsed = nlohmann::json::parse( input );
+    const auto& phases = parsed.at( "phase_history" );
+    Require( phases.size() == 2 && phases[0].at( "phase" ) == "worker-load" &&
+        phases[0].at( "disk_current_bytes" ) == "37" &&
+        phases[0].at( "progress_current" ) == "5" &&
+        phases[0].at( "complete" ) == true &&
+        phases[1].at( "phase" ) == "job-index" &&
+        phases[1].at( "disk_current_bytes" ) == "50" &&
+        phases[1].at( "progress_current" ) == "0" &&
+        phases[1].at( "progress_total" ) == "0" &&
+        phases[1].at( "complete" ) == false,
+        "phase telemetry lost completed or active stage resource boundaries" );
+    Require( phases[0].at( "duration_ms" ).get<uint64_t>() <=
+        phases[1].at( "end_ms" ).get<uint64_t>(),
+        "phase duration used a different clock from the build timeline" );
+}
 }
 
 int main( int argc, char** argv )
@@ -322,6 +356,7 @@ int main( int argc, char** argv )
         ReusedDiskRoots( base / "reused-roots" );
         ReducedProfileDiskLimits( base / "reduced-profile" );
         ReducedProfileAcceptedAtTraceEntry( base / "trace-entry" );
+        PhaseBoundaryTelemetry( base / "phase-telemetry" );
         std::filesystem::remove_all( base, ignored );
         std::cout << "query resource context tests passed\n";
         return 0;
