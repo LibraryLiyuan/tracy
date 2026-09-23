@@ -167,7 +167,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         std::string sortError;
         if( !analysis::SortAnalysisKeyMetadataRecords( passEventsSource, passEventsSorted, scratch,
                 "gpu-reference-pass-events", passEventCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->passEventSort : nullptr ) )
             throw std::runtime_error( "GPU reference pass event sort failed: " + sortError );
         removeConsumed( passEventsSource );
         finishPhase( &QueryGpuReferenceBuildStatistics::passEventSortMs );
@@ -218,7 +219,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                         row.metadata = ordinal;
                         emit( row );
                     }
-                }, sortError, options.disk, options.workspace, options.cancelled ) )
+                }, sortError, options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->usePassSort : nullptr ) )
             throw std::runtime_error( "GPU reference use sort failed: " + sortError );
         finishPhase( &QueryGpuReferenceBuildStatistics::usePassSortMs );
 
@@ -276,7 +278,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         finishPhase( &QueryGpuReferenceBuildStatistics::resolveUsesMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( resourceSource, resourceSorted, scratch,
                 "gpu-reference-uses-by-resource", resourceLookupCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->resourceSort : nullptr ) )
             throw std::runtime_error( "GPU reference resource lookup sort failed: " + sortError );
         finishPhase( &QueryGpuReferenceBuildStatistics::resourceSortMs );
         std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
@@ -328,7 +331,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                     if( !source.eof() || source.gcount() != 0 || ordinal != resourceLookupCount )
                         throw std::runtime_error( "GPU reference resource source count changed" );
                     finishPhase( &QueryGpuReferenceBuildStatistics::catalogReplayMs );
-                }, sortError, options.disk, options.workspace, options.cancelled ) )
+                }, sortError, options.disk, options.workspace, options.cancelled,
+                statistics ? &statistics->catalogSort : nullptr ) )
             throw std::runtime_error( "GPU reference Catalog resource lookup sort failed: " + sortError );
         removeConsumed( resourceSource );
         finishPhase( &QueryGpuReferenceBuildStatistics::catalogSortMs );

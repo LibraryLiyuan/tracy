@@ -31,6 +31,20 @@ struct AnalysisKeyMetadataRecord
 
 static_assert( sizeof( AnalysisKeyMetadataRecord ) == 32 );
 
+// Logical bytes processed by this sort, not operating-system physical I/O.
+// On failure, only completed phases are reflected in these counters.
+struct AnalysisExternalSortStatistics
+{
+    uint64_t inputRecords = 0;
+    uint64_t initialRuns = 0;
+    uint64_t mergePasses = 0;
+    uint64_t mergedGroups = 0;
+    uint64_t sourceReadBytes = 0;
+    uint64_t initialRunWriteBytes = 0;
+    uint64_t mergeReadBytes = 0;
+    uint64_t mergeWriteBytes = 0;
+};
+
 bool SortAnalysisUInt64Pairs(
     const std::filesystem::path& source,
     const std::filesystem::path& output,
@@ -50,7 +64,8 @@ bool SortAnalysisKeyMetadataRecords(
     uint64_t maximumBufferedRecords,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
-    const std::function<bool()>& cancelled = {} );
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
 
 // Generate sorted runs as records arrive, avoiding a complete unsorted source
 // file for high-volume joins. The producer must call emit exactly once per
@@ -63,7 +78,8 @@ bool SortAnalysisKeyMetadataRecordsGenerated(
     const std::function<void(const std::function<void(const AnalysisKeyMetadataRecord&)>& emit)>& produce,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
-    const std::function<bool()>& cancelled = {} );
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
 
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,

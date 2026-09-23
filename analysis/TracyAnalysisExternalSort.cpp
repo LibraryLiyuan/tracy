@@ -247,7 +247,8 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
     const std::string& prefix, uint64_t expectedCount, std::string& error,
     const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
-    const std::function<bool()>& cancelled )
+    const std::function<bool()>& cancelled,
+    AnalysisExternalSortStatistics* statistics )
 {
     using Record = AnalysisKeyMetadataRecord;
     std::error_code ec;
@@ -265,6 +266,7 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
     {
         if( cancelled && cancelled() )
         { error = "analysis_metadata_sort_cancelled"; return false; }
+        if( statistics ) statistics->mergePasses++;
         std::vector<std::filesystem::path> next;
         for( size_t first = 0; first < runs.size(); first += MergeFanIn )
         {
@@ -285,6 +287,12 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
             }
             if( written != expected )
             { error = "analysis_metadata_sort_merge_count_mismatch"; return false; }
+            if( statistics )
+            {
+                statistics->mergedGroups++;
+                statistics->mergeReadBytes += expected * sizeof( Record );
+                statistics->mergeWriteBytes += written * sizeof( Record );
+            }
             if( !RemoveFiles( group, error,disk ) ) return false;
             next.emplace_back( merged );
         }
@@ -309,10 +317,12 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,
     std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
-    const std::function<bool()>& cancelled )
+    const std::function<bool()>& cancelled,
+    AnalysisExternalSortStatistics* statistics )
 {
     using Record = AnalysisKeyMetadataRecord;
     error.clear();
+    if( statistics ) *statistics = {};
     if( maximumBufferedRecords == 0 ) maximumBufferedRecords = 1;
     maximumBufferedRecords = std::min<uint64_t>( maximumBufferedRecords,
         std::numeric_limits<size_t>::max() );
@@ -354,8 +364,15 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
         remaining -= take;
     }
     in.close();
+    if( statistics )
+    {
+        statistics->inputRecords = expectedCount;
+        statistics->initialRuns = runs.size();
+        statistics->sourceReadBytes = bytes;
+        statistics->initialRunWriteBytes = expectedCount * sizeof( Record );
+    }
     return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
-        expectedCount, error, disk, workspace, cancelled );
+        expectedCount, error, disk, workspace, cancelled, statistics );
 }
 
 bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& output,
@@ -364,10 +381,12 @@ bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& outpu
     const std::function<void(const std::function<void(const AnalysisKeyMetadataRecord&)>& emit)>& produce,
     std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
-    const std::function<bool()>& cancelled )
+    const std::function<bool()>& cancelled,
+    AnalysisExternalSortStatistics* statistics )
 {
     using Record = AnalysisKeyMetadataRecord;
     error.clear();
+    if( statistics ) *statistics = {};
     if( !produce || !maximumBufferedRecords || maximumBufferedRecords > SIZE_MAX / sizeof( Record ) )
     { error = "analysis_metadata_sort_generated_configuration"; return false; }
     if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error, disk ) ) return false;
@@ -405,8 +424,14 @@ bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& outpu
     flush();
     std::vector<Record>().swap( values );
     bufferWorkspace.Resize( 0 );
+    if( statistics )
+    {
+        statistics->inputRecords = count;
+        statistics->initialRuns = runs.size();
+        statistics->initialRunWriteBytes = count * sizeof( Record );
+    }
     return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
-        count, error, disk, workspace, cancelled );
+        count, error, disk, workspace, cancelled, statistics );
 }
 
 }

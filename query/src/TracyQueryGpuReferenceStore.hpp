@@ -2,6 +2,7 @@
 #define __TRACYQUERYGPUREFERENCESTORE_HPP__
 
 #include "TracyJnData.hpp"
+#include "TracyAnalysisExternalSort.hpp"
 #include "TracyPagedRecordStore.hpp"
 
 #include <cstdint>
@@ -56,6 +57,10 @@ struct QueryGpuReferenceValidationStats
 
 struct QueryGpuReferenceBuildStatistics
 {
+    analysis::AnalysisExternalSortStatistics passEventSort;
+    analysis::AnalysisExternalSortStatistics usePassSort;
+    analysis::AnalysisExternalSortStatistics resourceSort;
+    analysis::AnalysisExternalSortStatistics catalogSort;
     uint64_t passEventSortMs = 0;
     uint64_t passTimePublishMs = 0;
     uint64_t usePassSortMs = 0;

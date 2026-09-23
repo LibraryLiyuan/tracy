@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -82,7 +83,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
     using namespace tracy;
     using namespace tracy::analysis;
     using namespace tracy::query;
-    if( useCount < 100000 || useCount > 10000000 || resourceCount == 0 ||
+    if( useCount < 100000 || useCount > 34000000 || resourceCount == 0 ||
         resourceCount > useCount || maximumBytes == 0 || maximumBytes > ( 20ull << 30 ) ) return 2;
     const auto root = fs::temp_directory_path() /
         ( "query-gpu-reference-capacity-" +
@@ -154,7 +155,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 writer.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
                 writer.Begin( OfflineCatalogDomain::CatalogResource, resourceCount,
                     sizeof( JnGpuCatalogResourceRecordV1 ) );
-                std::array<JnGpuCatalogResourceRecordV1, 4096> rows {};
+                AnalysisWorkspaceReservation resourceRowsMemory( options.workspace,
+                    4096 * sizeof( JnGpuCatalogResourceRecordV1 ) );
+                std::vector<JnGpuCatalogResourceRecordV1> rows( 4096 );
                 for( uint64_t offset = 0; offset < resourceCount; )
                 {
                     const auto take = std::min<uint64_t>( rows.size(), resourceCount - offset );
@@ -205,6 +208,13 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             stages.catalogPublishMs;
         Require( measuredStages != 0 && measuredStages <= uint64_t( buildMilliseconds ),
             "GPU reference capacity phase times do not reconcile with Build wall time" );
+        Require( stages.passEventSort.inputRecords == 2 * input.PassCount() &&
+            stages.usePassSort.inputRecords == useCount &&
+            stages.resourceSort.inputRecords == useCount &&
+            stages.catalogSort.inputRecords == useCount &&
+            stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ) &&
+            stages.catalogSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ),
+            "GPU reference sort telemetry lost or double-counted logical facts" );
         {
             QueryGpuReferenceStoreReader reader( root, identity, options );
             Require( reader.UseCount() == useCount, "GPU reference capacity use count changed" );
@@ -233,7 +243,25 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " resource_publish_ms=" << stages.resourcePublishMs
             << " catalog_replay_ms=" << stages.catalogReplayMs
             << " catalog_sort_ms=" << stages.catalogSortMs
-            << " catalog_publish_ms=" << stages.catalogPublishMs << '\n';
+            << " catalog_publish_ms=" << stages.catalogPublishMs
+            << " use_sort_runs=" << stages.usePassSort.initialRuns
+            << " use_sort_merge_passes=" << stages.usePassSort.mergePasses
+            << " use_sort_source_read_bytes=" << stages.usePassSort.sourceReadBytes
+            << " use_sort_run_write_bytes=" << stages.usePassSort.initialRunWriteBytes
+            << " use_sort_merge_read_bytes=" << stages.usePassSort.mergeReadBytes
+            << " use_sort_merge_write_bytes=" << stages.usePassSort.mergeWriteBytes
+            << " resource_sort_runs=" << stages.resourceSort.initialRuns
+            << " resource_sort_merge_passes=" << stages.resourceSort.mergePasses
+            << " resource_sort_source_read_bytes=" << stages.resourceSort.sourceReadBytes
+            << " resource_sort_run_write_bytes=" << stages.resourceSort.initialRunWriteBytes
+            << " resource_sort_merge_read_bytes=" << stages.resourceSort.mergeReadBytes
+            << " resource_sort_merge_write_bytes=" << stages.resourceSort.mergeWriteBytes
+            << " catalog_sort_runs=" << stages.catalogSort.initialRuns
+            << " catalog_sort_merge_passes=" << stages.catalogSort.mergePasses
+            << " catalog_sort_source_read_bytes=" << stages.catalogSort.sourceReadBytes
+            << " catalog_sort_run_write_bytes=" << stages.catalogSort.initialRunWriteBytes
+            << " catalog_sort_merge_read_bytes=" << stages.catalogSort.mergeReadBytes
+            << " catalog_sort_merge_write_bytes=" << stages.catalogSort.mergeWriteBytes << '\n';
         if( inventory )
             for( const auto& line : inventoryRows ) std::cout << line << '\n';
         catalog.reset();
@@ -353,6 +381,65 @@ int main( int argc, char** argv )
         std::error_code ignored;
         fs::remove_all( root, ignored );
         fs::create_directories( root );
+        {
+            using tracy::analysis::AnalysisExternalSortStatistics;
+            using tracy::analysis::AnalysisKeyMetadataRecord;
+            const auto sortRoot = root / "sort-telemetry";
+            fs::create_directories( sortRoot );
+            constexpr uint64_t recordCount = 65;
+            constexpr uint64_t bytes = recordCount * sizeof( AnalysisKeyMetadataRecord );
+            const auto makeRow = []( uint64_t ordinal ) {
+                AnalysisKeyMetadataRecord row {};
+                row.keyHigh = recordCount - 1 - ordinal;
+                row.metadata = ordinal;
+                return row;
+            };
+            const auto checkOutput = [&]( const fs::path& path ) {
+                std::ifstream file( path, std::ios::binary );
+                for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ )
+                {
+                    AnalysisKeyMetadataRecord row {};
+                    file.read( reinterpret_cast<char*>( &row ), sizeof( row ) );
+                    Require( bool( file ) && row.keyHigh == ordinal && row.metadata == recordCount - 1 - ordinal,
+                        "external sort changed key or source ordinal" );
+                }
+                Require( file.peek() == std::char_traits<char>::eof(), "external sort appended a record" );
+            };
+            const auto checkStats = [&]( const AnalysisExternalSortStatistics& stats, uint64_t sourceReadBytes ) {
+                Require( stats.inputRecords == recordCount && stats.initialRuns == recordCount &&
+                    stats.mergePasses == 2 && stats.mergedGroups == 3 &&
+                    stats.sourceReadBytes == sourceReadBytes && stats.initialRunWriteBytes == bytes &&
+                    stats.mergeReadBytes == 2 * bytes && stats.mergeWriteBytes == 2 * bytes,
+                    "external sort run and logical I/O statistics do not match its 65-record merge" );
+            };
+            std::string sortError;
+            AnalysisExternalSortStatistics generatedStats;
+            const auto generatedOutput = sortRoot / "generated.work";
+            Require( tracy::analysis::SortAnalysisKeyMetadataRecordsGenerated( generatedOutput, sortRoot,
+                "generated-telemetry", 1,
+                [&]( const auto& emit ) {
+                    for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ ) emit( makeRow( ordinal ) );
+                }, sortError, {}, {}, {}, &generatedStats ),
+                "generated external sort failed" );
+            checkOutput( generatedOutput );
+            checkStats( generatedStats, 0 );
+            const auto source = sortRoot / "source.work";
+            {
+                std::ofstream file( source, std::ios::binary );
+                for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ )
+                {
+                    const auto row = makeRow( ordinal );
+                    file.write( reinterpret_cast<const char*>( &row ), sizeof( row ) );
+                }
+            }
+            AnalysisExternalSortStatistics sourceStats;
+            const auto sourceOutput = sortRoot / "source-sorted.work";
+            Require( tracy::analysis::SortAnalysisKeyMetadataRecords( source, sourceOutput, sortRoot,
+                "source-telemetry", recordCount, 1, sortError, {}, {}, {}, &sourceStats ),
+                "source external sort failed" );
+            checkOutput( sourceOutput );
+            checkStats( sourceStats, bytes );
+        }
         Input input;
         input.passes = { { 10, 1, 0, 1, 0, 0, 0 }, { 30, 2, 0, 1, 0, 0, 0 } };
         input.ends = { { 20, 1, 0, 1, 0, 0, 0 } };
