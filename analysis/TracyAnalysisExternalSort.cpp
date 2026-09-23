@@ -242,57 +242,15 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     return true;
 }
 
-bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
+static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
-    const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,
-    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::string& prefix, uint64_t expectedCount, std::string& error,
+    const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
     const std::function<bool()>& cancelled )
 {
     using Record = AnalysisKeyMetadataRecord;
-    error.clear();
-    if( maximumBufferedRecords == 0 ) maximumBufferedRecords = 1;
-    maximumBufferedRecords = std::min<uint64_t>( maximumBufferedRecords,
-        std::numeric_limits<size_t>::max() );
     std::error_code ec;
-    const auto bytes = std::filesystem::file_size( source, ec );
-    if( ec ) { error = "analysis_metadata_sort_source_size_failed:" + ec.message(); return false; }
-    if( expectedCount > std::numeric_limits<uint64_t>::max() / sizeof( Record ) ||
-        bytes != expectedCount * sizeof( Record ) )
-    { error = "analysis_metadata_sort_source_size_mismatch"; return false; }
-    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error,disk ) ) return false;
-
-    std::ifstream in( source, std::ios::binary );
-    if( !in ) { error = "analysis_metadata_sort_source_open_failed"; return false; }
-    std::vector<std::filesystem::path> runs;
-    uint64_t remaining = expectedCount;
-    size_t runIndex = 0;
-    while( remaining != 0 )
-    {
-        if( cancelled && cancelled() )
-        { error = "analysis_metadata_sort_cancelled"; return false; }
-        const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedRecords ) );
-        AnalysisWorkspaceReservation runWorkspace( workspace, uint64_t( take ) * sizeof( Record ) );
-        std::vector<Record> values( take );
-        in.read( reinterpret_cast<char*>( values.data() ),
-            std::streamsize( values.size() * sizeof( Record ) ) );
-        if( !in ) { error = "analysis_metadata_sort_source_truncated"; return false; }
-        std::sort( values.begin(), values.end(), MetadataLess );
-        const auto run = temporaryRoot / ( prefix + "-run-0-" +
-            std::to_string( runIndex++ ) + ".work" );
-        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
-        std::ofstream out( run, std::ios::binary | std::ios::trunc );
-        if( !out ) { error = "analysis_metadata_sort_run_write_open_failed"; return false; }
-        out.write( reinterpret_cast<const char*>( values.data() ),
-            std::streamsize( values.size() * sizeof( Record ) ) );
-        out.flush();
-        if( !out ) { error = "analysis_metadata_sort_run_write_failed"; return false; }
-        out.close();
-        runs.emplace_back( run );
-        remaining -= take;
-    }
-    in.close();
-
     if( runs.empty() )
     {
         const auto previous = disk && disk->usage ? AnalysisDiskUsage::Bytes( output ) : 0;
@@ -344,6 +302,111 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     if( ec || outputBytes != expectedCount * sizeof( Record ) )
     { error = "analysis_metadata_sort_output_size_mismatch"; return false; }
     return true;
+}
+
+bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
+    const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
+    const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    const std::function<bool()>& cancelled )
+{
+    using Record = AnalysisKeyMetadataRecord;
+    error.clear();
+    if( maximumBufferedRecords == 0 ) maximumBufferedRecords = 1;
+    maximumBufferedRecords = std::min<uint64_t>( maximumBufferedRecords,
+        std::numeric_limits<size_t>::max() );
+    std::error_code ec;
+    const auto bytes = std::filesystem::file_size( source, ec );
+    if( ec ) { error = "analysis_metadata_sort_source_size_failed:" + ec.message(); return false; }
+    if( expectedCount > std::numeric_limits<uint64_t>::max() / sizeof( Record ) ||
+        bytes != expectedCount * sizeof( Record ) )
+    { error = "analysis_metadata_sort_source_size_mismatch"; return false; }
+    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error,disk ) ) return false;
+
+    std::ifstream in( source, std::ios::binary );
+    if( !in ) { error = "analysis_metadata_sort_source_open_failed"; return false; }
+    std::vector<std::filesystem::path> runs;
+    uint64_t remaining = expectedCount;
+    size_t runIndex = 0;
+    while( remaining != 0 )
+    {
+        if( cancelled && cancelled() )
+        { error = "analysis_metadata_sort_cancelled"; return false; }
+        const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedRecords ) );
+        AnalysisWorkspaceReservation runWorkspace( workspace, uint64_t( take ) * sizeof( Record ) );
+        std::vector<Record> values( take );
+        in.read( reinterpret_cast<char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        if( !in ) { error = "analysis_metadata_sort_source_truncated"; return false; }
+        std::sort( values.begin(), values.end(), MetadataLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" +
+            std::to_string( runIndex++ ) + ".work" );
+        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
+        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        if( !out ) { error = "analysis_metadata_sort_run_write_open_failed"; return false; }
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) { error = "analysis_metadata_sort_run_write_failed"; return false; }
+        out.close();
+        runs.emplace_back( run );
+        remaining -= take;
+    }
+    in.close();
+    return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
+        expectedCount, error, disk, workspace, cancelled );
+}
+
+bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot, const std::string& prefix,
+    uint64_t maximumBufferedRecords,
+    const std::function<void(const std::function<void(const AnalysisKeyMetadataRecord&)>& emit)>& produce,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    const std::function<bool()>& cancelled )
+{
+    using Record = AnalysisKeyMetadataRecord;
+    error.clear();
+    if( !produce || !maximumBufferedRecords || maximumBufferedRecords > SIZE_MAX / sizeof( Record ) )
+    { error = "analysis_metadata_sort_generated_configuration"; return false; }
+    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error, disk ) ) return false;
+    AnalysisWorkspaceReservation bufferWorkspace( workspace, maximumBufferedRecords * sizeof( Record ) );
+    std::vector<Record> values;
+    values.reserve( size_t( maximumBufferedRecords ) );
+    std::vector<std::filesystem::path> runs;
+    uint64_t count = 0;
+    const auto flush = [&] {
+        if( values.empty() ) return;
+        if( cancelled && cancelled() ) throw std::runtime_error( "analysis_metadata_sort_cancelled" );
+        std::sort( values.begin(), values.end(), MetadataLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" + std::to_string( runs.size() ) + ".work" );
+        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
+        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_open_failed" );
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_failed" );
+        out.close();
+        runs.emplace_back( run );
+        values.clear();
+    };
+    const std::function<void(const Record&)> emit = [&]( const Record& value ) {
+        if( count >= UINT64_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_metadata_sort_generated_count" );
+        if( ( count & 4095 ) == 0 && cancelled && cancelled() )
+            throw std::runtime_error( "analysis_metadata_sort_cancelled" );
+        values.emplace_back( value );
+        ++count;
+        if( values.size() == maximumBufferedRecords ) flush();
+    };
+    produce( emit );
+    flush();
+    std::vector<Record>().swap( values );
+    bufferWorkspace.Resize( 0 );
+    return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
+        count, error, disk, workspace, cancelled );
 }
 
 }

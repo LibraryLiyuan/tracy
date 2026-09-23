@@ -575,7 +575,6 @@ QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem
         throw std::runtime_error( "Job index already exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratch ) );
 
-    const auto jobSource = scratch / "jobs-source.work";
     const auto jobSorted = scratch / "jobs-sorted.work";
     const auto reverseSource = scratch / "reverse-source.work";
     const auto reverseSorted = scratch / "reverse-sorted.work";
@@ -611,23 +610,23 @@ QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem
             statistics.mappedFactBytes += bytes;
         }
 
-        std::ofstream jobs( analysis::AnalysisIoPath( jobSource ), std::ios::binary | std::ios::trunc );
         std::ofstream reverse( analysis::AnalysisIoPath( reverseSource ), std::ios::binary | std::ios::trunc );
         std::ofstream completions( analysis::AnalysisIoPath( completionSource ), std::ios::binary | std::ios::trunc );
         std::ofstream dependencyCompletionRequests( analysis::AnalysisIoPath( dependencyCompletionRequestSource ), std::ios::binary | std::ios::trunc );
         std::ofstream types( analysis::AnalysisIoPath( typeSource ), std::ios::binary | std::ios::trunc );
         std::ofstream frames( analysis::AnalysisIoPath( frameSource ), std::ios::binary | std::ios::trunc );
         std::ofstream callsites( analysis::AnalysisIoPath( callsiteSource ), std::ios::binary | std::ios::trunc );
-        if( !jobs || !reverse || !completions || !dependencyCompletionRequests || !types || !frames || !callsites )
+        if( !reverse || !completions || !dependencyCompletionRequests || !types || !frames || !callsites )
             throw std::runtime_error( "Job index scratch open" );
-        uint64_t jobCount = 0, reverseCount = 0, completionCount = 0, dependencyCompletionRequestCount = 0;
+        uint64_t reverseCount = 0, completionCount = 0, dependencyCompletionRequestCount = 0;
         uint64_t typeCount = 0, frameCount = 0, callsiteCount = 0;
+        const auto generateJobs = [&]( const std::function<void(const analysis::AnalysisKeyMetadataRecord&)>& append ) {
         const auto emitJob = [&]( uint64_t jobId, QueryJobDomain domain, uint64_t ordinal ) {
             analysis::AnalysisKeyMetadataRecord value;
             value.keyHigh = jobId;
             value.kind = uint8_t( domain );
             value.metadata = ordinal;
-            AppendMetadata( jobs, jobSource, value, jobCount, state.options );
+            append( value );
         };
         for( uint64_t ordinal = 0; ordinal < facts[size_t( QueryJobDomain::Type )]->Count(); ordinal++ )
         {
@@ -675,13 +674,16 @@ QueryJobBuildStatistics QueryJobStoreWriter::BuildIndexes( const std::filesystem
             item.keyHigh = value.callsiteId; item.keyLow = ordinal; item.metadata = ordinal;
             AppendMetadata( callsites, callsiteSource, item, callsiteCount, state.options );
         }
-        for( auto* output : { &jobs, &reverse, &completions, &dependencyCompletionRequests, &types, &frames, &callsites } )
+        };
+        std::string error;
+        if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( jobSorted, scratch, "jobs", 128 * 1024,
+                generateJobs, error, state.options.disk, state.options.workspace, state.options.cancelled ) )
+            throw std::runtime_error( "Job index sort: " + error );
+        for( auto* output : { &reverse, &completions, &dependencyCompletionRequests, &types, &frames, &callsites } )
         { output->flush(); if( !*output ) throw std::runtime_error( "Job index scratch flush" ); output->close(); }
         for( auto& mapping : flatFacts ) mapping.reset();
 
-        std::string error;
-        if( !analysis::SortAnalysisKeyMetadataRecords( jobSource, jobSorted, scratch, "jobs", jobCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
-            !analysis::SortAnalysisUInt64Pairs( reverseSource, reverseSorted, scratch, "job-reverse", reverseCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
+        if( !analysis::SortAnalysisUInt64Pairs( reverseSource, reverseSorted, scratch, "job-reverse", reverseCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisKeyMetadataRecords( completionSource, completionSorted, scratch, "job-completion", completionCount, 128 * 1024, error, state.options.disk, state.options.workspace ) ||
             !analysis::SortAnalysisUInt64Pairs( dependencyCompletionRequestSource, dependencyCompletionRequestSorted, scratch,
                 "job-dependency-completion-request", dependencyCompletionRequestCount, 128 * 1024, error,

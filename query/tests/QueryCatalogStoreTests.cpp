@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -733,6 +734,43 @@ int main( int argc, char** argv )
                 previous = current;
             }
         }
+        Require( analysis::SortAnalysisKeyMetadataRecordsGenerated(
+                metadataSortRoot / "generated.work", metadataSortRoot, "metadata-generated-test", 2,
+                [&]( const auto& emit ) { for( const auto& value : unsortedMetadata ) emit( value ); },
+                metadataSortError ),
+            "generated metadata multi-run sort failed" );
+        {
+            std::ifstream expected( metadataSortRoot / "sorted.work", std::ios::binary );
+            std::ifstream actual( metadataSortRoot / "generated.work", std::ios::binary );
+            for( size_t index = 0; index < std::size( unsortedMetadata ); index++ )
+            {
+                analysis::AnalysisKeyMetadataRecord lhs {}, rhs {};
+                expected.read( reinterpret_cast<char*>( &lhs ), sizeof( lhs ) );
+                actual.read( reinterpret_cast<char*>( &rhs ), sizeof( rhs ) );
+                Require( expected.good() && actual.good() &&
+                    std::memcmp( &lhs, &rhs, sizeof( lhs ) ) == 0,
+                    "generated metadata sort changed ordering or payload" );
+            }
+        }
+        bool cancelGenerated = false, rejectedGenerated = false;
+        try
+        {
+            analysis::SortAnalysisKeyMetadataRecordsGenerated(
+                metadataSortRoot / "cancelled.work", metadataSortRoot, "metadata-cancel-test", 2,
+                [&]( const auto& emit ) {
+                    emit( unsortedMetadata[0] ); emit( unsortedMetadata[1] );
+                    cancelGenerated = true; emit( unsortedMetadata[2] );
+                }, metadataSortError, {}, {}, [&] { return cancelGenerated; } );
+        }
+        catch( const std::runtime_error& error )
+        {
+            rejectedGenerated = std::string( error.what() ).find( "cancelled" ) != std::string::npos;
+        }
+        Require( rejectedGenerated && !fs::exists( metadataSortRoot / "cancelled.work" ),
+            "generated metadata sorter published after cancellation" );
+        Require( analysis::CleanupAnalysisExternalSortFiles(
+                metadataSortRoot, "metadata-cancel-test-run-", metadataSortError ),
+            "generated metadata cancellation left unowned run files" );
 
         bool identityRejected = false;
         try { QueryCatalogStoreReader mismatch( root, std::string( 64, 'e' ) ); }

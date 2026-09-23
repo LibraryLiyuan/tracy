@@ -52,6 +52,19 @@ bool SortAnalysisKeyMetadataRecords(
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
     const std::function<bool()>& cancelled = {} );
 
+// Generate sorted runs as records arrive, avoiding a complete unsorted source
+// file for high-volume joins. The producer must call emit exactly once per
+// record; exceptions propagate so the owner can clean its scratch directory.
+bool SortAnalysisKeyMetadataRecordsGenerated(
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t maximumBufferedRecords,
+    const std::function<void(const std::function<void(const AnalysisKeyMetadataRecord&)>& emit)>& produce,
+    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {} );
+
 bool CleanupAnalysisExternalSortFiles(
     const std::filesystem::path& temporaryRoot,
     const std::string& prefix,

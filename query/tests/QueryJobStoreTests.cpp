@@ -30,13 +30,15 @@ void WriteString( tracy::query::QueryStringStoreWriter& writer, uint64_t ordinal
     writer.StringEnd( ordinal );
 }
 
-int CapacityProbe( uint64_t stageCount, uint64_t jobCount, bool inventory )
+int CapacityProbe( uint64_t stageCount, uint64_t jobCount, bool inventory,
+    uint64_t maximumBytes = 20ull * 1024 * 1024 * 1024 )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
     using namespace tracy::analysis;
     using namespace tracy::query;
-    if( stageCount < 100000 || stageCount > 10000000 ||
+    if( stageCount < 100000 || stageCount > 10000000 || maximumBytes == 0 ||
+        maximumBytes > 20ull * 1024 * 1024 * 1024 ||
         jobCount == 0 || jobCount > std::min<uint64_t>( stageCount, 1000000 ) ) return 2;
     const auto root = fs::temp_directory_path() /
         ( "query-job-capacity-" + std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
@@ -47,7 +49,7 @@ int CapacityProbe( uint64_t stageCount, uint64_t jobCount, bool inventory )
         auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
         PagedRecordOptions options;
         options.disk = std::make_shared<AnalysisDiskBudget>(
-            AnalysisDiskBudget{ usage, 20ull * 1024 * 1024 * 1024, {} } );
+            AnalysisDiskBudget{ usage, maximumBytes, {} } );
         options.workspace = std::make_shared<AnalysisWorkspaceBudget>(
             4ull * 1024 * 1024 * 1024, 2ull * 1024 * 1024 * 1024 );
         const auto started = std::chrono::steady_clock::now();
@@ -140,6 +142,16 @@ int CapacityProbe( uint64_t stageCount, uint64_t jobCount, bool inventory )
         QueryJobStoreReader reader( root / "jobs", root / "strings", fingerprint, options );
         Require( reader.GetJobCount() == jobs && !fs::exists( root / "jobs" / "build-scratch" ),
             "Job capacity probe did not publish and clean its index" );
+        for( const auto jobId : { uint64_t( 1 ), jobs / 2, jobs } )
+        {
+            const auto page = reader.ScanJobs( size_t( jobId - 1 ), 1 );
+            Require( page.size() == 1 && page.front().jobId == jobId &&
+                page.front().scheduleNs == int64_t( jobId - 1 ) &&
+                page.front().readyNs == int64_t( jobId - 1 ) &&
+                !page.front().stages.empty(),
+                "Job capacity probe changed sorted Job identity or Stage aggregation" );
+        }
+        if( stageCount <= 1000000 ) reader.ValidateAll();
         const auto observed = usage->Snapshot();
         std::cout << "job_stage_records=" << stageCount << " jobs=" << jobs << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes << " final_bytes=" << observed.currentBytes
@@ -169,6 +181,8 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), 1000, false );
     if( argc == 4 && std::string( argv[1] ) == "--capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), false );
+    if( argc == 5 && std::string( argv[1] ) == "--capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), false, std::stoull( argv[4] ) );
     if( argc == 3 && std::string( argv[1] ) == "--capacity-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), 1000, true );
     if( argc != 1 ) return 2;
