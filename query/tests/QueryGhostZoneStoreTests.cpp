@@ -260,7 +260,8 @@ int main( int argc, char** argv )
             "active Ghost Zones must stay in memory and be written to scratch once" );
         Require( buildStatistics.scratchWriteCalls == 1, "adjacent finalized Ghost records must share one write" );
         if( count != 2 ) throw std::runtime_error( "streamed Ghost Zone count changed: " + std::to_string( count ) );
-        Require( !fs::exists( root / "ghost" / "build-scratch.bin" ), "Ghost Zone scratch was not removed" );
+        Require( !fs::exists( root / "ghost" / "build-patches.bin" ) &&
+            !fs::exists( root / "ghost" / "build-static" ), "Ghost Zone build scratch was not removed" );
         Require( !fs::exists( root / "ghost" / "strings" ), "Ghost records must reuse the global dictionary instead of duplicating three strings per zone" );
 
         QueryGhostZoneStoreReader reader( root / "ghost", fingerprint, root / "strings", options );
@@ -344,6 +345,8 @@ int main( int argc, char** argv )
         Require( BuildQueryGhostZoneStore( root / "batch-ghost", root / "batch-samples", root / "callstacks",
             root / "unresolved-frames", root / "strings", fingerprint, 5, batchOptions, &batchStats ) == 2 * capacitySamples,
             "batched Ghost write lost records" );
+        Require( !fs::exists( root / "batch-ghost" / "build-patches.bin" ) &&
+            !fs::exists( root / "batch-ghost" / "build-static" ), "batched Ghost build scratch was not removed" );
         if( capacityProbe )
         {
             const auto observed = batchUsage->Snapshot();
@@ -368,6 +371,15 @@ int main( int argc, char** argv )
                 Require( row.ordinal == ordinal && row.startNs == int64_t( 5 + ( ordinal / 2 ) * 5 ) &&
                     row.endNs == row.startNs + 5 && row.depth == ordinal % 2 &&
                     ( ordinal % 2 ? row.parent == ordinal - 1 : !row.parent ), "batched Ghost record semantics changed" );
+            }
+            for( uint64_t ordinal = 0; ordinal < 2 * capacitySamples; ordinal += 113 )
+            {
+                const auto row = batchReader.ScanOrdinals( ordinal, 1 );
+                Require( row.size() == 1 && row[0].ordinal == ordinal &&
+                    row[0].startNs == int64_t( 5 + ( ordinal / 2 ) * 5 ) &&
+                    row[0].endNs == row[0].startNs + 5 && row[0].depth == ordinal % 2 &&
+                    ( ordinal % 2 ? row[0].parent == ordinal - 1 : !row[0].parent ),
+                    "Ghost static/patch join changed a sampled physical record" );
             }
             const auto readsBefore = batchReader.ReadStatistics().blockLoads;
             for( uint64_t page = 0; page < 100; ++page )

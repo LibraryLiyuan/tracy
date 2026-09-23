@@ -130,6 +130,15 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 << " active=" << active;
             inventoryRows.emplace_back( line.str() );
         };
+        bool sawUsePassSource = false;
+        uint64_t diskGrowthChecks = 0;
+        const auto inventoryCheck = options.disk->checkSpace;
+        options.disk->checkSpace = [&] {
+            if( inventoryCheck ) inventoryCheck();
+            if( ( ++diskGrowthChecks & 4095 ) == 0 &&
+                fs::exists( root / "reverse-scratch" / "use-pass-source.work" ) )
+                sawUsePassSource = true;
+        };
         const std::string identity( 64, 'g' );
         std::unique_ptr<QueryCatalogStoreReader> catalog;
         uint64_t catalogBuildMs = 0;
@@ -178,9 +187,18 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         const auto sourceBytes = usage->Snapshot().currentBytes;
         GeneratedInput input( useCount, resourceCount, catalog.get() );
         const auto buildStarted = std::chrono::steady_clock::now();
-        QueryGpuReferenceStore::Build( root, identity, input, options );
+        QueryGpuReferenceBuildStatistics stages;
+        QueryGpuReferenceStore::Build( root, identity, input, options, &stages );
+        Require( !sawUsePassSource,
+            "GPU reference use/pass sorting still writes a complete source copy" );
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();
+        const auto measuredStages = stages.passEventSortMs + stages.passTimePublishMs +
+            stages.usePassSortMs + stages.resolveUsesMs + stages.resourceSortMs +
+            stages.resourcePublishMs + stages.catalogReplayMs + stages.catalogSortMs +
+            stages.catalogPublishMs;
+        Require( measuredStages != 0 && measuredStages <= uint64_t( buildMilliseconds ),
+            "GPU reference capacity phase times do not reconcile with Build wall time" );
         {
             QueryGpuReferenceStoreReader reader( root, identity, options );
             Require( reader.UseCount() == useCount, "GPU reference capacity use count changed" );
@@ -200,7 +218,16 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " catalog_build_ms=" << catalogBuildMs << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
             << " final_bytes=" << observed.currentBytes
-            << " build_elapsed_ms=" << buildMilliseconds << '\n';
+            << " build_elapsed_ms=" << buildMilliseconds
+            << " pass_sort_ms=" << stages.passEventSortMs
+            << " pass_publish_ms=" << stages.passTimePublishMs
+            << " use_sort_ms=" << stages.usePassSortMs
+            << " resolve_ms=" << stages.resolveUsesMs
+            << " resource_sort_ms=" << stages.resourceSortMs
+            << " resource_publish_ms=" << stages.resourcePublishMs
+            << " catalog_replay_ms=" << stages.catalogReplayMs
+            << " catalog_sort_ms=" << stages.catalogSortMs
+            << " catalog_publish_ms=" << stages.catalogPublishMs << '\n';
         if( inventory )
             for( const auto& line : inventoryRows ) std::cout << line << '\n';
         catalog.reset();

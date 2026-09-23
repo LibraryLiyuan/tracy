@@ -85,6 +85,15 @@ struct ScratchGhostZone
 
 static_assert( sizeof( ScratchGhostZone ) == 72 );
 
+#pragma pack( push, 1 )
+struct ScratchGhostPatch
+{
+    int64_t endNs = 0;
+    uint32_t childCount = 0;
+};
+#pragma pack( pop )
+static_assert( sizeof( ScratchGhostPatch ) == 12 );
+
 uint64_t CanonicalPointer( CallstackFrameId id )
 {
     return ( id.idx & 0x3FFFFFFFFFFFFFFF ) | ( ( id.idx & 0x3000000000000000 ) << 2 );
@@ -134,11 +143,14 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     std::string sourceFingerprint, int64_t samplingPeriodNs, analysis::PagedRecordOptions options,
     QueryGhostZoneBuildStatistics* outputStatistics )
 {
-    const auto scratchPath = output / "build-scratch.bin";
+    const auto scratchPath = output / "build-patches.bin";
+    const auto stagingPath = output / "build-static";
     std::filesystem::create_directories( analysis::AnalysisIoPath( output ) );
     GrowScratch( options, scratchPath, 0, 0 );
     std::fstream scratch( analysis::AnalysisIoPath( scratchPath ), std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc );
     if( !scratch ) throw std::runtime_error( "ghost-zone scratch open" );
+    const auto stagingIdentity = Identity( sourceFingerprint, "query-ghost-build-static-v1" );
+    analysis::PagedRecordWriter staging( stagingPath, stagingIdentity, sizeof( StoredGhostZone ), options );
 
     QuerySampleStoreReader samples( samplesPath, sourceFingerprint, options );
     auto dictionaryOptions = options;
@@ -213,12 +225,12 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         }
         return uncached;
     };
-    struct FinalizedRecord { uint64_t ordinal; ScratchGhostZone value; };
+    struct FinalizedRecord { uint64_t ordinal; ScratchGhostPatch value; };
     constexpr size_t writeBatchRecords = 8192;
     analysis::AnalysisWorkspaceReservation batchMemory( options.workspace,
-        writeBatchRecords * ( sizeof( FinalizedRecord ) + sizeof( ScratchGhostZone ) ) + 4096 );
+        writeBatchRecords * ( sizeof( FinalizedRecord ) + sizeof( ScratchGhostPatch ) ) + 4096 );
     std::vector<FinalizedRecord> pending;
-    std::vector<ScratchGhostZone> serialized;
+    std::vector<ScratchGhostPatch> serialized;
     pending.reserve( writeBatchRecords ); serialized.reserve( writeBatchRecords );
     const auto flushPending = [&] {
         std::sort( pending.begin(), pending.end(), []( const auto& a, const auto& b ) { return a.ordinal < b.ordinal; } );
@@ -228,8 +240,8 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
             while( end < pending.size() && pending[end].ordinal == pending[end - 1].ordinal + 1 ) ++end;
             serialized.clear();
             for( size_t i = first; i < end; ++i ) serialized.push_back( pending[i].value );
-            scratch.seekp( std::streamoff( pending[first].ordinal * sizeof( ScratchGhostZone ) ) );
-            scratch.write( reinterpret_cast<const char*>( serialized.data() ), std::streamsize( serialized.size() * sizeof( ScratchGhostZone ) ) );
+            scratch.seekp( std::streamoff( pending[first].ordinal * sizeof( ScratchGhostPatch ) ) );
+            scratch.write( reinterpret_cast<const char*>( serialized.data() ), std::streamsize( serialized.size() * sizeof( ScratchGhostPatch ) ) );
             if( !scratch ) throw std::runtime_error( "ghost-zone scratch record write" );
             ++statistics.scratchWriteCalls;
             first = end;
@@ -237,7 +249,7 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         pending.clear();
     };
     const auto writeRecord = [&]( uint64_t ordinal, const ScratchGhostZone& value ) {
-        pending.push_back( { ordinal, value } );
+        pending.push_back( { ordinal, { value.endNs, value.childCount } } );
         ++statistics.scratchRecordWrites;
         if( pending.size() == writeBatchRecords ) flushPending();
     };
@@ -319,8 +331,12 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
                 record.file = frame.file;
                 if( record.parent != NoParent )
                     active.back().record.childCount++;
-                GrowScratch( options, scratchPath, sizeof( ScratchGhostZone ),
-                    ( count + 1 ) * sizeof( ScratchGhostZone ) );
+                GrowScratch( options, scratchPath, sizeof( ScratchGhostPatch ),
+                    ( count + 1 ) * sizeof( ScratchGhostPatch ) );
+                const StoredGhostZone staticRecord { record.startNs, record.endNs, record.thread,
+                    record.parent, record.name, record.file, record.symAddr, record.line,
+                    record.depth, 0, record.inlineFrame, {} };
+                staging.Append( &staticRecord, 1 );
                 active.push_back( { count++, record } );
             }
         }
@@ -328,35 +344,46 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
     }
     flushPending();
     reportProgress();
+    staging.Commit();
     scratch.flush();
     if( !scratch ) throw std::runtime_error( "ghost-zone scratch flush" );
     scratch.close();
 
-    QueryGhostZoneStoreWriter writer( output, sourceFingerprint, options );
-    writer.Begin( count );
-    std::ifstream recordsInput( analysis::AnalysisIoPath( scratchPath ), std::ios::binary );
-    if( !recordsInput ) throw std::runtime_error( "ghost-zone scratch reopen" );
-    for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
     {
-        if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
-        ScratchGhostZone record;
-        recordsInput.read( reinterpret_cast<char*>( &record ), sizeof( record ) );
-        if( !recordsInput ) throw std::runtime_error( "ghost-zone scratch sequential read" );
-        QueryGhostZoneFact value;
-        value.thread = record.thread;
-        value.parent = record.parent;
-        value.startNs = record.startNs; value.endNs = record.endNs; value.line = record.line;
-        value.depth = record.depth; value.childCount = record.childCount; value.inlineFrame = record.inlineFrame != 0;
-        value.name = record.name;
-        value.file = record.file;
-        value.address = record.symAddr;
-        writer.Append( ordinal, value );
+        analysis::PagedRecordReader staticRows( stagingPath, stagingIdentity,
+            sizeof( StoredGhostZone ), options );
+        if( staticRows.Count() != count ) throw std::runtime_error( "ghost-zone static count mismatch" );
+        std::ifstream patches( analysis::AnalysisIoPath( scratchPath ), std::ios::binary );
+        if( !patches ) throw std::runtime_error( "ghost-zone patch scratch reopen" );
+        QueryGhostZoneStoreWriter writer( output, sourceFingerprint, options );
+        writer.Begin( count );
+        for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+        {
+            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
+            StoredGhostZone staticRecord {};
+            staticRows.Read( ordinal, &staticRecord, 1 );
+            ScratchGhostPatch patch {};
+            patches.read( reinterpret_cast<char*>( &patch ), sizeof( patch ) );
+            if( !patches ) throw std::runtime_error( "ghost-zone patch scratch sequential read" );
+            QueryGhostZoneFact value;
+            value.thread = staticRecord.thread;
+            value.parent = staticRecord.parent;
+            value.startNs = staticRecord.startNs; value.endNs = patch.endNs;
+            value.line = staticRecord.line;
+            value.depth = staticRecord.depth; value.childCount = patch.childCount;
+            value.inlineFrame = staticRecord.inlineFrame != 0;
+            value.name = staticRecord.name;
+            value.file = staticRecord.file;
+            value.address = staticRecord.address;
+            writer.Append( ordinal, value );
+        }
+        writer.Commit();
     }
-    writer.Commit();
-    recordsInput.close();
     std::error_code error;
     analysis::AnalysisDiskRemove( scratchPath, options.disk, error );
-    if( error ) throw std::runtime_error( "ghost-zone scratch remove: " + error.message() );
+    if( error ) throw std::runtime_error( "ghost-zone patch scratch remove: " + error.message() );
+    analysis::AnalysisDiskRemove( stagingPath, options.disk, error, true );
+    if( error ) throw std::runtime_error( "ghost-zone static scratch remove: " + error.message() );
     return count;
 }
 

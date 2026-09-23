@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -85,8 +86,17 @@ private:
 }
 
 void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::string sourceFingerprint,
-    const QueryGpuReferenceInput& input, analysis::PagedRecordOptions options )
+    const QueryGpuReferenceInput& input, analysis::PagedRecordOptions options,
+    QueryGpuReferenceBuildStatistics* statistics )
 {
+    if( statistics ) *statistics = {};
+    auto phaseStarted = std::chrono::steady_clock::now();
+    const auto finishPhase = [&]( uint64_t QueryGpuReferenceBuildStatistics::*field ) {
+        const auto now = std::chrono::steady_clock::now();
+        if( statistics ) statistics->*field = uint64_t( std::chrono::duration_cast<
+            std::chrono::milliseconds>( now - phaseStarted ).count() );
+        phaseStarted = now;
+    };
     if( sourceFingerprint.size() != 64 ) throw std::runtime_error( "GPU reference source identity must be SHA-256" );
     const auto lookupOutput = ResourceLookupPath( root );
     const auto catalogLookupOutput = CatalogResourceLookupPath( root );
@@ -102,7 +112,6 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratch ) );
     const auto passEventsSource = scratch / "pass-events-source.work";
     const auto passEventsSorted = scratch / "pass-events-sorted.work";
-    const auto usePassSource = scratch / "use-pass-source.work";
     const auto usePassSorted = scratch / "use-pass-sorted.work";
     const auto resourceSource = scratch / "resource-source.work";
     const auto resourceSorted = scratch / "resource-sorted.work";
@@ -162,6 +171,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference pass event sort failed: " + sortError );
         removeConsumed( passEventsSource );
+        finishPhase( &QueryGpuReferenceBuildStatistics::passEventSortMs );
 
         analysis::PagedRecordWriter passTimes( passTimesOutput,
             Identity( sourceFingerprint, "pass-times" ), sizeof( QueryGpuReferencePassTimeRecord ), options );
@@ -193,31 +203,25 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         passTimes.Commit();
         sortedPassEvents.close();
         removeConsumed( passEventsSorted );
+        finishPhase( &QueryGpuReferenceBuildStatistics::passTimePublishMs );
 
-        std::ofstream usePasses( analysis::AnalysisIoPath( usePassSource ), std::ios::binary | std::ios::trunc );
-        if( !usePasses ) throw std::runtime_error( "GPU reference use source cannot be opened" );
-        uint64_t usePassCount = 0;
-        for( uint64_t ordinal = 0; ordinal < input.UseCount(); ordinal++ )
-        {
-            if( options.cancelled && options.cancelled() ) throw std::runtime_error( "GPU reference index cancelled" );
-            const auto use = input.Use( ordinal );
-            if( use.passId == 0 || use.resourceId == 0 ) continue;
-            analysis::AnalysisKeyMetadataRecord row {};
-            row.keyHigh = use.passId;
-            row.metadata = ordinal;
-            analysis::AnalysisDiskGrow( options.disk, sizeof( row ) );
-            usePasses.write( reinterpret_cast<const char*>( &row ), sizeof( row ) );
-            if( !usePasses ) throw std::runtime_error( "GPU reference use source write failed" );
-            usePassCount++;
-        }
-        usePasses.flush();
-        if( !usePasses ) throw std::runtime_error( "GPU reference use source flush failed" );
-        usePasses.close();
-        if( !analysis::SortAnalysisKeyMetadataRecords( usePassSource, usePassSorted, scratch,
-                "gpu-reference-uses-by-pass", usePassCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+        if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( usePassSorted, scratch,
+                "gpu-reference-uses-by-pass", 512 * 1024,
+                [&]( const auto& emit ) {
+                    for( uint64_t ordinal = 0; ordinal < input.UseCount(); ordinal++ )
+                    {
+                        if( options.cancelled && options.cancelled() )
+                            throw std::runtime_error( "GPU reference index cancelled" );
+                        const auto use = input.Use( ordinal );
+                        if( use.passId == 0 || use.resourceId == 0 ) continue;
+                        analysis::AnalysisKeyMetadataRecord row {};
+                        row.keyHigh = use.passId;
+                        row.metadata = ordinal;
+                        emit( row );
+                    }
+                }, sortError, options.disk, options.workspace, options.cancelled ) )
             throw std::runtime_error( "GPU reference use sort failed: " + sortError );
-        removeConsumed( usePassSource );
+        finishPhase( &QueryGpuReferenceBuildStatistics::usePassSortMs );
 
         analysis::PagedRecordReader passTimeReader( passTimesOutput,
             Identity( sourceFingerprint, "pass-times" ), sizeof( QueryGpuReferencePassTimeRecord ), options );
@@ -270,10 +274,12 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( !resourceLookup )
             throw std::runtime_error( "GPU reference resource lookup flush failed" );
         resourceLookup.close();
+        finishPhase( &QueryGpuReferenceBuildStatistics::resolveUsesMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( resourceSource, resourceSorted, scratch,
                 "gpu-reference-uses-by-resource", resourceLookupCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference resource lookup sort failed: " + sortError );
+        finishPhase( &QueryGpuReferenceBuildStatistics::resourceSortMs );
         std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
         {
             analysis::PagedRecordWriter writer( lookupOutput,
@@ -291,6 +297,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             writer.Commit();
         }
         removeConsumed( resourceSorted );
+        finishPhase( &QueryGpuReferenceBuildStatistics::resourcePublishMs );
 
         uint64_t catalogResourceLookupCount = 0;
         {
@@ -327,11 +334,13 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             if( !catalogLookup ) throw std::runtime_error( "GPU reference Catalog resource lookup flush failed" );
         }
         removeConsumed( resourceSource );
+        finishPhase( &QueryGpuReferenceBuildStatistics::catalogReplayMs );
         if( !analysis::SortAnalysisKeyMetadataRecords( catalogResourceSource, catalogResourceSorted, scratch,
                 "gpu-reference-uses-by-catalog-resource", catalogResourceLookupCount, 512 * 1024,
                 sortError, options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference Catalog resource lookup sort failed: " + sortError );
         removeConsumed( catalogResourceSource );
+        finishPhase( &QueryGpuReferenceBuildStatistics::catalogSortMs );
         analysis::PagedRecordWriter catalogLookupWriter( catalogLookupOutput,
             Identity( sourceFingerprint, "by-catalog-resource" ), sizeof( analysis::AnalysisKeyMetadataRecord ), options );
         std::ifstream sortedCatalogResources( analysis::AnalysisIoPath( catalogResourceSorted ), std::ios::binary );
@@ -352,6 +361,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         removeConsumed( catalogResourceSorted );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( "GPU reference scratch cleanup failed: " + cleanupError );
+        finishPhase( &QueryGpuReferenceBuildStatistics::catalogPublishMs );
     }
     catch( ... )
     {

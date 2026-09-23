@@ -54,11 +54,25 @@ struct QueryGpuReferenceValidationStats
     uint64_t sortedReferenceCount = 0;
 };
 
+struct QueryGpuReferenceBuildStatistics
+{
+    uint64_t passEventSortMs = 0;
+    uint64_t passTimePublishMs = 0;
+    uint64_t usePassSortMs = 0;
+    uint64_t resolveUsesMs = 0;
+    uint64_t resourceSortMs = 0;
+    uint64_t resourcePublishMs = 0;
+    uint64_t catalogReplayMs = 0;
+    uint64_t catalogSortMs = 0;
+    uint64_t catalogPublishMs = 0;
+};
+
 class QueryGpuReferenceStore
 {
 public:
     static void Build( const std::filesystem::path& root, std::string sourceFingerprint,
-        const QueryGpuReferenceInput& input, analysis::PagedRecordOptions options = {} );
+        const QueryGpuReferenceInput& input, analysis::PagedRecordOptions options = {},
+        QueryGpuReferenceBuildStatistics* statistics = nullptr );
 };
 
 class QueryGpuReferenceStoreReader
