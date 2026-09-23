@@ -119,6 +119,12 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( outputs ) { remove( lookupOutput ); remove( catalogLookupOutput ); remove( passTimesOutput ); remove( usesOutput ); }
         return failure;
     };
+    const auto removeConsumed = [&]( const std::filesystem::path& path ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, options.disk, error );
+        if( error ) throw std::runtime_error( "GPU reference scratch cleanup failed: " +
+            path.filename().string() + ": " + error.message() );
+    };
     try
     {
         std::ofstream passEvents( analysis::AnalysisIoPath( passEventsSource ), std::ios::binary | std::ios::trunc );
@@ -155,6 +161,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 "gpu-reference-pass-events", passEventCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference pass event sort failed: " + sortError );
+        removeConsumed( passEventsSource );
 
         analysis::PagedRecordWriter passTimes( passTimesOutput,
             Identity( sourceFingerprint, "pass-times" ), sizeof( QueryGpuReferencePassTimeRecord ), options );
@@ -185,6 +192,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         }
         passTimes.Commit();
         sortedPassEvents.close();
+        removeConsumed( passEventsSorted );
 
         std::ofstream usePasses( analysis::AnalysisIoPath( usePassSource ), std::ios::binary | std::ios::trunc );
         if( !usePasses ) throw std::runtime_error( "GPU reference use source cannot be opened" );
@@ -209,6 +217,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 "gpu-reference-uses-by-pass", usePassCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference use sort failed: " + sortError );
+        removeConsumed( usePassSource );
 
         analysis::PagedRecordReader passTimeReader( passTimesOutput,
             Identity( sourceFingerprint, "pass-times" ), sizeof( QueryGpuReferencePassTimeRecord ), options );
@@ -268,6 +277,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( !sortedUses.eof() ) throw std::runtime_error( "GPU reference sorted use read failed" );
         resolvedUses.Commit();
         sortedUses.close();
+        removeConsumed( usePassSorted );
         resourceLookup.flush();
         catalogResourceLookup.flush();
         if( !resourceLookup || !catalogResourceLookup )
@@ -278,10 +288,12 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 "gpu-reference-uses-by-resource", resourceLookupCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference resource lookup sort failed: " + sortError );
+        removeConsumed( resourceSource );
         if( !analysis::SortAnalysisKeyMetadataRecords( catalogResourceSource, catalogResourceSorted, scratch,
                 "gpu-reference-uses-by-catalog-resource", catalogResourceLookupCount, 512 * 1024,
                 sortError, options.disk, options.workspace ) )
             throw std::runtime_error( "GPU reference Catalog resource lookup sort failed: " + sortError );
+        removeConsumed( catalogResourceSource );
         analysis::PagedRecordWriter lookupWriter( lookupOutput,
             Identity( sourceFingerprint, "by-resource" ), sizeof( analysis::AnalysisKeyMetadataRecord ), options );
         std::ifstream sortedResources( analysis::AnalysisIoPath( resourceSorted ), std::ios::binary );
@@ -297,6 +309,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( !sortedResources.eof() ) throw std::runtime_error( "GPU reference resource lookup read failed" );
         lookupWriter.Commit();
         sortedResources.close();
+        removeConsumed( resourceSorted );
         analysis::PagedRecordWriter catalogLookupWriter( catalogLookupOutput,
             Identity( sourceFingerprint, "by-catalog-resource" ), sizeof( analysis::AnalysisKeyMetadataRecord ), options );
         std::ifstream sortedCatalogResources( analysis::AnalysisIoPath( catalogResourceSorted ), std::ios::binary );
@@ -314,6 +327,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             throw std::runtime_error( "GPU reference Catalog resource lookup read failed" );
         catalogLookupWriter.Commit();
         sortedCatalogResources.close();
+        removeConsumed( catalogResourceSorted );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( "GPU reference scratch cleanup failed: " + cleanupError );
     }

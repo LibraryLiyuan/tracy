@@ -1,6 +1,8 @@
 #include "TracyQueryGpuReferenceStore.hpp"
 #include "TracyQueryCatalogStore.hpp"
 #include "TracyAnalysisExternalSort.hpp"
+#include "TracyAnalysisDiskBudget.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyHash.hpp"
 #include "TracyPagedRecordStore.hpp"
 
@@ -9,6 +11,7 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -41,10 +44,129 @@ public:
     std::vector<tracy::JnGpuReferenceEndData> ends;
 };
 
+class GeneratedInput final : public tracy::query::QueryGpuReferenceInput
+{
+public:
+    GeneratedInput( uint64_t useCount, uint64_t resourceCount )
+        : m_uses( useCount ), m_resources( resourceCount ) {}
+
+    uint64_t PassCount() const override { return ( m_uses + 31 ) / 32; }
+    uint64_t UseCount() const override { return m_uses; }
+    uint64_t EndCount() const override { return PassCount(); }
+    tracy::JnGpuReferencePassData Pass( uint64_t ordinal ) const override
+    { return { int64_t( ordinal * 100 ), ordinal + 1, ordinal, 1, 1, 0, 0 }; }
+    tracy::JnGpuReferenceUseData Use( uint64_t ordinal ) const override
+    {
+        const auto passId = ordinal % PassCount() + 1;
+        return { int64_t( ( passId - 1 ) * 100 + 1 ), passId,
+            ordinal % m_resources + 1, 1, 1, 1, 0, 1 };
+    }
+    tracy::JnGpuReferenceEndData End( uint64_t ordinal ) const override
+    { return { int64_t( ordinal * 100 + 99 ), ordinal + 1, 0, 1, 32, 0, 0 }; }
+    uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t ) const override
+    { return pointerToken; }
+
+private:
+    uint64_t m_uses;
+    uint64_t m_resources;
+};
+
+int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
+    bool inventory = false )
+{
+    namespace fs = std::filesystem;
+    using namespace tracy;
+    using namespace tracy::analysis;
+    using namespace tracy::query;
+    if( useCount < 100000 || useCount > 10000000 || resourceCount == 0 ||
+        resourceCount > useCount || maximumBytes == 0 || maximumBytes > ( 20ull << 30 ) ) return 2;
+    const auto root = fs::temp_directory_path() /
+        ( "query-gpu-reference-capacity-" +
+            std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
+    try
+    {
+        fs::create_directories( root );
+        auto usage = std::make_shared<AnalysisDiskUsage>( std::vector<fs::path>{ root } );
+        PagedRecordOptions options;
+        options.disk = std::make_shared<AnalysisDiskBudget>(
+            AnalysisDiskBudget{ usage, maximumBytes, {} } );
+        options.workspace = std::make_shared<AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+        const auto started = std::chrono::steady_clock::now();
+        options.cancelled = [started] {
+            return std::chrono::steady_clock::now() - started > std::chrono::minutes( 10 );
+        };
+        std::vector<std::string> inventoryRows;
+        uint64_t nextSample = 16ull << 20;
+        if( inventory ) options.disk->checkSpace = [&] {
+            const auto current = usage->Current();
+            if( current < nextSample ) return;
+            nextSample = current + ( 16ull << 20 );
+            const auto scratch = root / "reverse-scratch";
+            uint64_t source = 0, sorted = 0, runs = 0, other = 0;
+            if( fs::exists( scratch ) )
+                for( const auto& item : fs::directory_iterator( scratch ) )
+                {
+                    if( !item.is_regular_file() ) continue;
+                    const auto bytes = item.file_size();
+                    const auto name = item.path().filename().string();
+                    if( name.ends_with( "-source.work" ) ) source += bytes;
+                    else if( name.ends_with( "-sorted.work" ) ) sorted += bytes;
+                    else if( name.find( "-run-" ) != std::string::npos ) runs += bytes;
+                    else other += bytes;
+                }
+            std::ostringstream line;
+            line << "gpu_reference_inventory ledger=" << current << " source=" << source
+                << " sorted=" << sorted << " runs=" << runs << " other=" << other;
+            inventoryRows.emplace_back( line.str() );
+        };
+        GeneratedInput input( useCount, resourceCount );
+        const std::string identity( 64, 'g' );
+        const auto buildStarted = std::chrono::steady_clock::now();
+        QueryGpuReferenceStore::Build( root, identity, input, options );
+        const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - buildStarted ).count();
+        {
+            QueryGpuReferenceStoreReader reader( root, identity, options );
+            Require( reader.UseCount() == useCount, "GPU reference capacity use count changed" );
+            const auto first = reader.UsesByPass( 1, 0, 1 );
+            const auto last = reader.UsesByPass( input.PassCount(), 0, 1 );
+            Require( first.total != 0 && last.total != 0 &&
+                first.values.front().passId == 1 && last.values.front().passId == input.PassCount(),
+                "GPU reference capacity pass identity changed" );
+            if( useCount <= 1000000 )
+                reader.ValidateAll( [&]( uint64_t token, int64_t time ) {
+                    return input.ResolveCatalogResource( token, time );
+                } );
+        }
+        const auto observed = usage->Snapshot();
+        std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
+            << " resource_keys=" << resourceCount << " peak_bytes=" << observed.peakBytes
+            << " final_bytes=" << observed.currentBytes
+            << " build_elapsed_ms=" << buildMilliseconds << '\n';
+        if( inventory )
+            for( const auto& line : inventoryRows ) std::cout << line << '\n';
+        std::error_code cleanup;
+        fs::remove_all( root, cleanup );
+        if( cleanup ) throw std::runtime_error( "GPU reference capacity cleanup: " + cleanup.message() );
+        return 0;
+    }
+    catch( const std::exception& error )
+    {
+        std::cerr << error.what() << '\n';
+        std::error_code ignored;
+        fs::remove_all( root, ignored );
+        return 1;
+    }
+}
+
 }
 
 int main( int argc, char** argv )
 {
+    if( argc == 5 && std::string_view( argv[1] ) == "--capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ) );
+    if( argc == 5 && std::string_view( argv[1] ) == "--capacity-inventory" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
     try
     {
         namespace fs = std::filesystem;
