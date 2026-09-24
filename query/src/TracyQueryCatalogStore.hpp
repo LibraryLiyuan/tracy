@@ -38,6 +38,11 @@ struct QueryCatalogResourceIndexReadStatistics
     uint64_t resourceDecodedBytes = 0;
     uint64_t generationBlockLoads = 0;
     uint64_t generationDecodedBytes = 0;
+    uint64_t allocationCacheBytes = 0;
+    uint64_t allocationBlockLoads = 0;
+    uint64_t allocationDecodedBytes = 0;
+    uint64_t allocationGenerationBlockLoads = 0;
+    uint64_t allocationGenerationDecodedBytes = 0;
 };
 
 struct QueryCatalogStatusData

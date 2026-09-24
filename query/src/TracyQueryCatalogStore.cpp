@@ -732,45 +732,55 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         const auto resourcePath = DomainPath( m_impl->root, OfflineCatalogDomain::CatalogResource );
         const auto resourceIdentity = CatalogIdentity( m_impl->sourceFingerprint,
             OfflineCatalogDomain::CatalogResource );
-        uint64_t resourceCount = 0;
-        {
-            analysis::PagedRecordReader countReader( resourcePath, resourceIdentity,
-                sizeof( JnGpuCatalogResourceRecordV1 ), m_impl->options );
-            resourceCount = countReader.Count();
-        }
-        auto resourceReadOptions = m_impl->options;
-        // Resource-ID order can be unrelated to capture ordinal. Both summary and pointer
-        // passes revisit compressed Resource pages in that order, as does the generation join.
-        // Keep those pages resident only when the shared target leaves room for other readers.
-        if( resourceCount != 0 && m_impl->options.workspace &&
-            resourceCount <= ( std::numeric_limits<uint64_t>::max() - resourceReadOptions.blockBytes ) /
-                sizeof( JnGpuCatalogResourceRecordV1 ) )
-        {
-            const auto budget = m_impl->options.workspace->Snapshot();
-            const auto block = uint64_t( resourceReadOptions.blockBytes );
-            const auto roundBlocks = [&]( uint64_t bytes ) { return ( bytes + block - 1 ) / block * block; };
-            const auto resourceBytes = roundBlocks( resourceCount * sizeof( JnGpuCatalogResourceRecordV1 ) );
-            const auto generationBytes = resourceCount <= ( std::numeric_limits<uint64_t>::max() - block ) /
-                sizeof( uint64_t ) ? roundBlocks( resourceCount * sizeof( uint64_t ) ) : block;
+        const auto chooseReadOptions = [&]( uint64_t count, uint64_t width ) {
+            auto selected = m_impl->options;
+            if( count == 0 || !selected.workspace || width == 0 || width > selected.blockBytes )
+                return selected;
+            const auto budget = selected.workspace->Snapshot();
+            const auto block = uint64_t( selected.blockBytes );
+            const auto recordBlocks = count / ( block / width ) +
+                ( count % ( block / width ) != 0 );
+            const auto generationBlocks = count / ( block / sizeof( uint64_t ) ) +
+                ( count % ( block / sizeof( uint64_t ) ) != 0 );
+            if( recordBlocks > std::numeric_limits<uint64_t>::max() / block ||
+                generationBlocks > std::numeric_limits<uint64_t>::max() / block )
+                return selected;
+            const auto recordBytes = recordBlocks * block;
+            const auto generationBytes = generationBlocks * block;
+            if( generationBytes >= budget.targetBytes ) return selected;
             const auto available = budget.targetBytes > budget.currentBytes ?
                 budget.targetBytes - budget.currentBytes : 0;
             constexpr uint64_t otherReadersReserve = 256ull << 20;
             if( available > otherReadersReserve + generationBytes + block )
             {
                 const auto cap = available - otherReadersReserve - generationBytes - block;
-                resourceReadOptions.readerCacheBytes = std::max<uint64_t>(
-                    resourceReadOptions.readerCacheBytes, std::min( resourceBytes, cap ) );
+                selected.readerCacheBytes = std::max<uint64_t>( selected.readerCacheBytes,
+                    std::min( recordBytes, cap ) );
             }
+            return selected;
+        };
+        uint64_t resourceCount = 0;
+        {
+            analysis::PagedRecordReader countReader( resourcePath, resourceIdentity,
+                sizeof( JnGpuCatalogResourceRecordV1 ), m_impl->options );
+            resourceCount = countReader.Count();
         }
+        // Resource-ID order can be unrelated to capture ordinal. Both summary and pointer
+        // passes revisit compressed Resource pages in that order, as does the generation join.
+        // Keep those pages resident only when the shared target leaves room for other readers.
+        auto resourceReadOptions = chooseReadOptions( resourceCount,
+            sizeof( JnGpuCatalogResourceRecordV1 ) );
         if( readStatistics ) readStatistics->resourceCacheBytes = resourceReadOptions.readerCacheBytes;
-        analysis::PagedRecordReader resourceRows( resourcePath, resourceIdentity,
-            sizeof( JnGpuCatalogResourceRecordV1 ), resourceReadOptions );
+        auto resourceRows = std::make_unique<analysis::PagedRecordReader>( resourcePath,
+            resourceIdentity, uint32_t( sizeof( JnGpuCatalogResourceRecordV1 ) ), resourceReadOptions );
         analysis::PagedRecordReader batches( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogBatch ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogBatch ),
             sizeof( JnGpuCatalogBatchData ), m_impl->options );
-        analysis::PagedRecordReader allocationRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogAllocation ),
-            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogAllocation ),
-            sizeof( JnGpuCatalogAllocationRecordV1 ), m_impl->options );
+        const auto allocationPath = DomainPath( m_impl->root, OfflineCatalogDomain::CatalogAllocation );
+        const auto allocationIdentity = CatalogIdentity( m_impl->sourceFingerprint,
+            OfflineCatalogDomain::CatalogAllocation );
+        auto allocationRows = std::make_unique<analysis::PagedRecordReader>( allocationPath,
+            allocationIdentity, uint32_t( sizeof( JnGpuCatalogAllocationRecordV1 ) ), m_impl->options );
         analysis::PagedRecordReader viewRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogView ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogView ),
             sizeof( JnGpuCatalogViewRecordV1 ), m_impl->options );
@@ -803,8 +813,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 JnGpuCatalogBatchData batch {};
                 batches.Read( index, &batch, 1 );
                 if( batch.kind != uint8_t( JnGpuCatalogBatchKind::Resource ) ) continue;
-                if( batch.firstRecordIndex != expectedResourceOrdinal || batch.firstRecordIndex > resourceRows.Count() ||
-                    batch.recordCount > resourceRows.Count() - batch.firstRecordIndex )
+                if( batch.firstRecordIndex != expectedResourceOrdinal || batch.firstRecordIndex > resourceRows->Count() ||
+                    batch.recordCount > resourceRows->Count() - batch.firstRecordIndex )
                     throw std::runtime_error( "Catalog resource generation coverage mismatch" );
                 generationBuffer.fill( batch.generation );
                 uint64_t remaining = batch.recordCount;
@@ -816,7 +826,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 }
                 expectedResourceOrdinal += batch.recordCount;
             }
-            if( expectedResourceOrdinal != resourceRows.Count() )
+            if( expectedResourceOrdinal != resourceRows->Count() )
                 throw std::runtime_error( "Catalog resource generation coverage mismatch" );
             resourceGenerations.Commit();
         }
@@ -832,8 +842,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 batches.Read( index, &batch, 1 );
                 if( batch.kind != uint8_t( JnGpuCatalogBatchKind::Allocation ) ) continue;
                 if( batch.firstRecordIndex != expectedAllocationOrdinal ||
-                    batch.firstRecordIndex > allocationRows.Count() ||
-                    batch.recordCount > allocationRows.Count() - batch.firstRecordIndex )
+                    batch.firstRecordIndex > allocationRows->Count() ||
+                    batch.recordCount > allocationRows->Count() - batch.firstRecordIndex )
                     throw std::runtime_error( "Catalog allocation generation coverage mismatch" );
                 generationBuffer.fill( batch.generation );
                 uint64_t remaining = batch.recordCount;
@@ -845,7 +855,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 }
                 expectedAllocationOrdinal += batch.recordCount;
             }
-            if( expectedAllocationOrdinal != allocationRows.Count() )
+            if( expectedAllocationOrdinal != allocationRows->Count() )
                 throw std::runtime_error( "Catalog allocation generation coverage mismatch" );
             allocationGenerations.Commit();
         }
@@ -896,12 +906,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
         uint64_t resourcePairCount = 0;
-        for( uint64_t ordinal = 0; ordinal < resourceRows.Count(); ordinal++ )
+        for( uint64_t ordinal = 0; ordinal < resourceRows->Count(); ordinal++ )
         {
             if( m_impl->options.cancelled && m_impl->options.cancelled() )
                 throw std::runtime_error( "Catalog resource index cancelled" );
             JnGpuCatalogResourceRecordV1 row {};
-            resourceRows.Read( ordinal, &row, 1 );
+            resourceRows->Read( ordinal, &row, 1 );
             if( row.resourceId == 0 ) continue;
             const analysis::AnalysisUInt64Pair pair { row.resourceId, ordinal };
             analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
@@ -960,7 +970,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 }
                 JnGpuCatalogResourceRecordV1 row {};
                 uint64_t generation = 0;
-                resourceRows.Read( pair.value, &row, 1 );
+                resourceRows->Read( pair.value, &row, 1 );
                 generations.Read( pair.value, &generation, 1 );
                 const auto operation = JnGpuCatalogRecordOperation( row.operation );
                 const bool definition = operation == JnGpuCatalogRecordOperation::Create ||
@@ -1058,7 +1068,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                     activeResource = pair.key;
                 }
                 JnGpuCatalogResourceRecordV1 row {};
-                resourceRows.Read( pair.value, &row, 1 );
+                resourceRows->Read( pair.value, &row, 1 );
                 if( row.resourceId != pair.key || row.pointerToken == 0 ) continue;
                 const auto operation = JnGpuCatalogRecordOperation( row.operation );
                 if( operation == JnGpuCatalogRecordOperation::Create ||
@@ -1089,10 +1099,11 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         }
         if( readStatistics )
         {
-            const auto observed = resourceRows.Statistics();
+            const auto observed = resourceRows->Statistics();
             readStatistics->resourceBlockLoads = observed.blockLoads;
             readStatistics->resourceDecodedBytes = observed.decodedBytes;
         }
+        resourceRows.reset();
 
         setPhase( "allocation-pair-sort" );
         if( !analysis::SortAnalysisUInt64Pairs( allocationPairsSource, allocationPairsSorted, scratchRoot,
@@ -1362,17 +1373,24 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         sortedAssociations.close();
 
         setPhase( "allocation-lookup" );
+        const auto allocationCount = allocationRows->Count();
+        allocationRows.reset();
+        auto allocationReadOptions = chooseReadOptions( allocationCount,
+            sizeof( JnGpuCatalogAllocationRecordV1 ) );
+        if( readStatistics ) readStatistics->allocationCacheBytes = allocationReadOptions.readerCacheBytes;
+        allocationRows = std::make_unique<analysis::PagedRecordReader>( allocationPath,
+            allocationIdentity, uint32_t( sizeof( JnGpuCatalogAllocationRecordV1 ) ), allocationReadOptions );
         std::ofstream allocationLookupSourceStream( analysis::AnalysisIoPath( allocationLookupSource ),
             std::ios::binary | std::ios::trunc );
         if( !allocationLookupSourceStream )
             throw std::runtime_error( "Catalog allocation lookup source cannot be opened" );
         uint64_t allocationLookupCount = 0;
-        for( uint64_t ordinal = 0; ordinal < allocationRows.Count(); ordinal++ )
+        for( uint64_t ordinal = 0; ordinal < allocationRows->Count(); ordinal++ )
         {
             if( m_impl->options.cancelled && m_impl->options.cancelled() )
                 throw std::runtime_error( "Catalog resource index cancelled" );
             JnGpuCatalogAllocationRecordV1 row {};
-            allocationRows.Read( ordinal, &row, 1 );
+            allocationRows->Read( ordinal, &row, 1 );
             if( row.allocationId == 0 ) continue;
             analysis::AnalysisKeyMetadataRecord lookup {};
             lookup.keyHigh = row.allocationId;
@@ -1416,7 +1434,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         {
             analysis::PagedRecordReader generations( allocationGenerationOutput,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-allocation-generations-v1" ),
-                sizeof( uint64_t ), m_impl->options );
+                sizeof( uint64_t ), allocationReadOptions );
             analysis::PagedRecordWriter summaries( allocationSummaryOutput,
                 CatalogIdentity( m_impl->sourceFingerprint, "allocation-summary-v1" ),
                 sizeof( QueryCatalogAllocationSummaryData ), m_impl->options );
@@ -1446,11 +1464,11 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 uint64_t lifecycleOrdinal = 0;
                 while( haveRecord && record.keyHigh == allocationId )
                 {
-                    if( record.metadata >= allocationRows.Count() || record.metadata >= generations.Count() )
+                    if( record.metadata >= allocationRows->Count() || record.metadata >= generations.Count() )
                         throw std::runtime_error( "Catalog allocation summary ordinal mismatch" );
                     JnGpuCatalogAllocationRecordV1 row {};
                     uint64_t generation = 0;
-                    allocationRows.Read( record.metadata, &row, 1 );
+                    allocationRows->Read( record.metadata, &row, 1 );
                     generations.Read( record.metadata, &generation, 1 );
                     if( row.allocationId != allocationId )
                         throw std::runtime_error( "Catalog allocation summary identity mismatch" );
@@ -1513,6 +1531,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             }
             if( !history.eof() || ( !haveResourcePair && !resources.eof() ) )
                 throw std::runtime_error( "Catalog allocation summary input read failed" );
+            if( readStatistics )
+            {
+                const auto observed = generations.Statistics();
+                readStatistics->allocationGenerationBlockLoads = observed.blockLoads;
+                readStatistics->allocationGenerationDecodedBytes = observed.decodedBytes;
+            }
             summaries.Commit();
             history.close();
             resources.close();
@@ -1525,12 +1549,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             std::ofstream timeline( analysis::AnalysisIoPath( allocationTimelineSource ),
                 std::ios::binary | std::ios::trunc );
             if( !timeline ) throw std::runtime_error( "Catalog allocation timeline source cannot be opened" );
-            for( uint64_t ordinal = 0; ordinal < allocationRows.Count(); ordinal++ )
+            for( uint64_t ordinal = 0; ordinal < allocationRows->Count(); ordinal++ )
             {
                 if( m_impl->options.cancelled && m_impl->options.cancelled() )
                     throw std::runtime_error( "Catalog GPU memory summary cancelled" );
                 JnGpuCatalogAllocationRecordV1 row {};
-                allocationRows.Read( ordinal, &row, 1 );
+                allocationRows->Read( ordinal, &row, 1 );
                 if( row.allocationId == 0 ) continue;
                 const auto operation = JnGpuCatalogRecordOperation( row.operation );
                 if( operation == JnGpuCatalogRecordOperation::Create ||
@@ -1594,10 +1618,10 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                     allocationId = record.keyHigh;
                     liveSize = 0;
                 }
-                if( record.metadata >= allocationRows.Count() )
+                if( record.metadata >= allocationRows->Count() )
                     throw std::runtime_error( "Catalog allocation timeline ordinal is invalid" );
                 JnGpuCatalogAllocationRecordV1 row {};
-                allocationRows.Read( record.metadata, &row, 1 );
+                allocationRows->Read( record.metadata, &row, 1 );
                 if( row.allocationId != record.keyHigh || SortableSignedTime( row.time ) != record.keyLow )
                     throw std::runtime_error( "Catalog allocation timeline identity changed" );
                 if( row.parentAllocationId != 0 ) continue;
@@ -1629,6 +1653,13 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             events.flush();
             if( !events ) throw std::runtime_error( "Catalog physical memory event flush failed" );
         }
+        if( readStatistics )
+        {
+            const auto observed = allocationRows->Statistics();
+            readStatistics->allocationBlockLoads = observed.blockLoads;
+            readStatistics->allocationDecodedBytes = observed.decodedBytes;
+        }
+        allocationRows.reset();
         if( !analysis::SortAnalysisKeyMetadataRecords( physicalEventSource, physicalEventSorted,
                 scratchRoot, "catalog-physical-memory-events", physicalEventCount, 512 * 1024,
                 sortError, m_impl->options.disk, m_impl->options.workspace ) )

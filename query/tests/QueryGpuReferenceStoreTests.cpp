@@ -78,7 +78,8 @@ private:
 };
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false, bool realCatalog = false, bool shuffledCatalog = false )
+    bool inventory = false, bool realCatalog = false, bool shuffledCatalog = false,
+    bool shuffledAllocation = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
@@ -174,6 +175,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                             ( ( offset + index ) * shuffleMultiplier ) % resourceCount + 1 :
                             offset + index + 1;
                         row.pointerToken = row.resourceId;
+                        row.allocationId = shuffledAllocation ? row.resourceId : 0;
                         row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
                         row.capacityBytes = 64;
                     }
@@ -182,12 +184,45 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     offset += take;
                 }
                 writer.End( OfflineCatalogDomain::CatalogResource );
-                JnGpuCatalogBatchData batch {};
-                batch.generation = 1;
-                batch.kind = uint8_t( JnGpuCatalogBatchKind::Resource );
-                batch.recordCount = resourceCount;
-                writer.Begin( OfflineCatalogDomain::CatalogBatch, 1, sizeof( batch ) );
-                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, &batch, 1, sizeof( batch ) );
+                if( shuffledAllocation )
+                {
+                    writer.Begin( OfflineCatalogDomain::CatalogAllocation, resourceCount,
+                        sizeof( JnGpuCatalogAllocationRecordV1 ) );
+                    AnalysisWorkspaceReservation allocationRowsMemory( options.workspace,
+                        4096 * sizeof( JnGpuCatalogAllocationRecordV1 ) );
+                    std::vector<JnGpuCatalogAllocationRecordV1> allocations( 4096 );
+                    for( uint64_t offset = 0; offset < resourceCount; )
+                    {
+                        const auto take = std::min<uint64_t>( allocations.size(), resourceCount - offset );
+                        for( uint64_t index = 0; index < take; index++ )
+                        {
+                            auto& row = allocations[size_t( index )];
+                            row = {};
+                            row.allocationId = ( ( offset + index ) * shuffleMultiplier ) % resourceCount + 1;
+                            row.pointerToken = row.allocationId;
+                            row.sizeBytes = 64;
+                            row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
+                        }
+                        writer.Append( OfflineCatalogDomain::CatalogAllocation, offset,
+                            allocations.data(), take, sizeof( allocations[0] ) );
+                        offset += take;
+                    }
+                    writer.End( OfflineCatalogDomain::CatalogAllocation );
+                }
+                JnGpuCatalogBatchData batches[2] {};
+                batches[0].generation = 1;
+                batches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
+                batches[0].recordCount = resourceCount;
+                if( shuffledAllocation )
+                {
+                    batches[1].generation = 1;
+                    batches[1].kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
+                    batches[1].recordCount = resourceCount;
+                }
+                const auto batchCount = shuffledAllocation ? 2 : 1;
+                writer.Begin( OfflineCatalogDomain::CatalogBatch, batchCount, sizeof( batches[0] ) );
+                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches, batchCount,
+                    sizeof( batches[0] ) );
                 writer.End( OfflineCatalogDomain::CatalogBatch );
                 writer.Finish();
             }
@@ -199,7 +234,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 if( currentPhase.empty() ) return;
                 std::cout << "catalog_index_phase=" << currentPhase << " elapsed_ms=" <<
                     std::chrono::duration_cast<std::chrono::milliseconds>( now - phaseStarted ).count()
-                    << " disk_current_bytes=" << usage->Current() << '\n';
+                    << " disk_current_bytes=" << usage->Current() << std::endl;
             };
             catalog->BuildResourceIndex( root / "catalog" / "resource-index-scratch",
                 [&]( std::string_view phase ) {
@@ -223,6 +258,34 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 Require( catalogReads.resourceBlockLoads <= resourceBlocks + 1 &&
                     catalogReads.generationBlockLoads <= generationBlocks + 1,
                     "shuffled Catalog resource index reread compressed pages by key" );
+            }
+            if( shuffledAllocation && resourceCount <= 1000000 )
+            {
+                const auto allocationBlocks =
+                    ( resourceCount * sizeof( JnGpuCatalogAllocationRecordV1 ) + options.blockBytes - 1 ) /
+                    options.blockBytes;
+                const auto generationBlocks =
+                    ( resourceCount * sizeof( uint64_t ) + options.blockBytes - 1 ) /
+                    options.blockBytes;
+                Require( catalogReads.allocationBlockLoads <= allocationBlocks + 1 &&
+                    catalogReads.allocationGenerationBlockLoads <= generationBlocks + 1,
+                    "shuffled Catalog allocation index reread compressed pages by key" );
+                Require( catalog->AllocationSummaryCount() == resourceCount,
+                    "shuffled Catalog allocation summaries lost a key" );
+                for( const auto id : { uint64_t( 1 ), resourceCount } )
+                {
+                    const auto state = catalog->AllocationState( id );
+                    const auto page = catalog->ResourceAllocations( id, 0, 1 );
+                    Require( state && state->record.allocationId == id &&
+                        state->record.sizeBytes == 64 && page.total == 1 &&
+                        page.values.size() == 1 && page.values.front().record.allocationId == id,
+                        "shuffled Catalog allocation lookup changed identity or association" );
+                }
+                const auto memory = catalog->GpuMemorySummary();
+                Require( memory.livePhysicalBytes == resourceCount * 64 &&
+                    memory.peakPhysicalBytes == resourceCount * 64 &&
+                    memory.allocationCreateCount == resourceCount,
+                    "shuffled Catalog allocation memory summary changed" );
             }
             if( !catalog->PreparePointerResolutionFastPath() )
                 throw std::runtime_error( "GPU reference capacity Catalog pointer fast path unavailable" );
@@ -270,12 +333,20 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
             << " shuffled_catalog=" << shuffledCatalog
+            << " shuffled_allocation=" << shuffledAllocation
             << " catalog_resource_cache_bytes=" << catalogReads.resourceCacheBytes
             << " catalog_build_ms=" << catalogBuildMs << " catalog_index_ms=" << catalogIndexMs
             << " catalog_resource_block_loads=" << catalogReads.resourceBlockLoads
             << " catalog_resource_decoded_bytes=" << catalogReads.resourceDecodedBytes
             << " catalog_generation_block_loads=" << catalogReads.generationBlockLoads
             << " catalog_generation_decoded_bytes=" << catalogReads.generationDecodedBytes
+            << " catalog_allocation_cache_bytes=" << catalogReads.allocationCacheBytes
+            << " catalog_allocation_block_loads=" << catalogReads.allocationBlockLoads
+            << " catalog_allocation_decoded_bytes=" << catalogReads.allocationDecodedBytes
+            << " catalog_allocation_generation_block_loads=" <<
+                catalogReads.allocationGenerationBlockLoads
+            << " catalog_allocation_generation_decoded_bytes=" <<
+                catalogReads.allocationGenerationDecodedBytes
             << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
             << " final_bytes=" << observed.currentBytes
@@ -337,6 +408,9 @@ int main( int argc, char** argv )
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-shuffled-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
             false, true, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-allocation-shuffled-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, false, true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true, true );
     try
