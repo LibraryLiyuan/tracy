@@ -168,7 +168,6 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
     const auto rangeSorted = scratch / "range-sorted.work";
     const auto useSorted = scratch / "use-sorted.work";
     const auto baseSummarySource = scratch / "base-summary.work";
-    const auto allocationSource = scratch / "allocation-source.work";
     const auto allocationSorted = scratch / "allocation-sorted.work";
     const auto allocationAggregateSource = scratch / "allocation-aggregate.work";
     const auto evidenceSource = scratch / "evidence-source.work";
@@ -449,13 +448,16 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
 
         std::ifstream expandedFacts( analysis::AnalysisIoPath( expandedSorted ), std::ios::binary );
         std::ofstream baseSummaries( analysis::AnalysisIoPath( baseSummarySource ), std::ios::binary | std::ios::trunc );
-        std::ofstream allocations( analysis::AnalysisIoPath( allocationSource ), std::ios::binary | std::ios::trunc );
-        if( !expandedFacts || !baseSummaries || !allocations )
+        analysis::AnalysisKeyMetadataRunCollector allocationRuns( allocationSorted, scratch,
+            "gpu-pass-resource-allocations", 512 * 1024, options.disk,
+            options.workspace, options.cancelled,
+            statistics ? &statistics->allocationSort : nullptr );
+        if( !expandedFacts || !baseSummaries )
             throw std::runtime_error( "GPU pass summary files cannot be opened" );
         QueryGpuPassResourceSummary summary {};
         uint64_t activeResource = 0;
         bool haveSummary = false, haveResource = false, resourceRanged = false;
-        uint64_t allocationPairCount = 0, summaryCount = 0;
+        uint64_t summaryCount = 0;
         const auto flushResource = [&] {
             if( !haveResource ) return;
             summary.resourceCount++;
@@ -467,10 +469,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
                 analysis::AnalysisKeyMetadataRecord pair {};
                 pair.keyHigh = summary.passId;
                 pair.keyLow = allocationId;
-                analysis::AnalysisDiskGrow( options.disk, sizeof( pair ) );
-                allocations.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
-                if( !allocations ) throw std::runtime_error( "GPU pass allocation pair write failed" );
-                allocationPairCount++;
+                allocationRuns.Emit( pair );
             }
             haveResource = false;
             resourceRanged = false;
@@ -517,20 +516,16 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         }
         if( !expandedFacts.eof() ) throw std::runtime_error( "GPU pass expanded fact read failed" );
         flushSummary();
-        baseSummaries.flush(); allocations.flush();
-        if( !baseSummaries || !allocations ) throw std::runtime_error( "GPU pass summary flush failed" );
-        baseSummaries.close(); allocations.close(); expandedFacts.close();
+        baseSummaries.flush();
+        if( !baseSummaries ) throw std::runtime_error( "GPU pass summary flush failed" );
+        baseSummaries.close(); expandedFacts.close();
         removeConsumed( expandedSorted );
         resourceAllocations.Clear();
         std::vector<uint64_t> {}.swap( rangeLengths );
         rangeMemory.Resize( 0 );
         finishPhase( &QueryGpuPassResourceBuildStatistics::summaryMs );
-        if( !analysis::SortAnalysisKeyMetadataRecords( allocationSource, allocationSorted, scratch,
-                "gpu-pass-resource-allocations", allocationPairCount, 512 * 1024, sortError,
-                options.disk, options.workspace, options.cancelled,
-                statistics ? &statistics->allocationSort : nullptr ) )
+        if( !allocationRuns.Finish( sortError ) )
             throw std::runtime_error( "GPU pass allocation sort failed: " + sortError );
-        removeConsumed( allocationSource );
         finishPhase( &QueryGpuPassResourceBuildStatistics::allocationSortMs );
 
         std::ifstream sortedAllocations( analysis::AnalysisIoPath( allocationSorted ), std::ios::binary );

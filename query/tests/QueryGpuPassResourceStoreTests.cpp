@@ -65,7 +65,8 @@ public:
         {
             for( const auto* obsolete : { "mapping-source.work", "mapping-sorted.work",
                     "fact-source.work", "fact-sorted.work", "evidence-source.work",
-                    "expanded-source.work", "range-source.work", "use-source.work" } )
+                    "expanded-source.work", "range-source.work", "use-source.work",
+                    "allocation-source.work" } )
                 Require( !std::filesystem::exists( scratchRoot / obsolete ),
                     "GPU pass build retained consumed scratch during summary" );
         }
