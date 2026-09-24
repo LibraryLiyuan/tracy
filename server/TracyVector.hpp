@@ -6,6 +6,7 @@
 #include <limits>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <type_traits>
 
 #include "../public/common/TracyForceInline.hpp"
@@ -305,7 +306,13 @@ private:
 
     void Realloc()
     {
+        if( CapacityNoNullptrCheck() > std::numeric_limits<size_t>::max() / sizeof(T) ) abort();
         T* ptr = (T*)malloc( sizeof( T ) * CapacityNoNullptrCheck() );
+        if( !ptr )
+        {
+            fprintf(stderr,"Tracy vector allocation failed: %zu bytes\n",sizeof(T)*size_t(CapacityNoNullptrCheck()));
+            abort();
+        }
         if( m_size != 0 )
         {
             if( std::is_trivially_copyable<T>() )

@@ -36,6 +36,8 @@ public:
     }
 
     float GetHeight() const { return m_height; }
+    void ScrollToItem( const void* key ) { m_reportFocusKey = key; }
+    bool IsItemHeaderVisible( const void* key ) const;
     const unordered_flat_map<const void*, std::unique_ptr<TimelineItem>>& GetItemMap() const { return m_itemMap; }
 
     tracy_force_inline TimelineItem& GetItem( const void* data )
@@ -54,6 +56,8 @@ private:
 
     float m_height;
     float m_scroll;
+    const void* m_reportFocusKey = nullptr;
+    float m_reportViewportHeight = 0;
 
     const void* m_centerItemkey;
     int m_centerItemOffsetY;

@@ -260,12 +260,21 @@ void Backend::NewFrame( int& w, int& h )
         s_scaleChanged( scale );
     }
 
+    #ifdef TRACY_LOCAL_REPORT_VIEWER
+    w = EM_ASM_INT( { return Module.canvas.parentElement.clientWidth; } ) * scale;
+    h = EM_ASM_INT( { return Module.canvas.parentElement.clientHeight; } ) * scale;
+    #else
     w = EM_ASM_INT( { return window.innerWidth; } ) * scale;
     h = EM_ASM_INT( { return window.innerHeight; } ) * scale;
+    #endif
 
     if( s_width != w || s_height != h )
     {
+        #ifdef TRACY_LOCAL_REPORT_VIEWER
+        EM_ASM( Module.canvas.style.width = Module.canvas.parentElement.clientWidth + 'px'; Module.canvas.style.height = Module.canvas.parentElement.clientHeight + 'px' );
+        #else
         EM_ASM( Module.canvas.style.width = window.innerWidth + 'px'; Module.canvas.style.height = window.innerHeight + 'px' );
+        #endif
         EM_ASM( Module.canvas.width = $0; Module.canvas.height = $1, w, h );
 
         s_width = w;

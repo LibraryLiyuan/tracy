@@ -173,6 +173,12 @@ public:
 
     bool IsBackgroundDone() const { return m_worker.IsBackgroundDone(); }
 
+    nlohmann::json ReportNavigate( const nlohmann::json& request );
+    nlohmann::json ReportState() const;
+    bool ReportSelectEvent();
+    bool ReportCaptureMatches( const char* filename ) const { return m_filename == filename; }
+    void ReportViewTick();
+
     void AddLlmAttachment( const nlohmann::json& json );
     void AddLlmQuery( const char* query );
 
@@ -674,6 +680,13 @@ private:
     KeyboardNavigation m_kbNavCtrl;
 
     const ZoneEvent* m_zoneInfoWindow = nullptr;
+    const ZoneEvent* m_reportEvent = nullptr;
+    const ThreadData* m_reportFocusThread = nullptr;
+    std::vector<const ThreadData*> m_reportThreads;
+    nlohmann::json m_reportNavigation;
+    uint64_t m_reportDrawCount = 0;
+    uint64_t m_reportRevision = 0;
+    int m_reportLayoutFrames = 0;
     const ZoneEvent* m_zoneHighlight;
     DecayValue<int16_t> m_zoneSrcLocHighlight = 0;
     LockHighlight m_lockHighlight { -1 };
