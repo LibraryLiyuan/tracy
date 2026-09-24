@@ -60,6 +60,17 @@ bool SortAnalysisUInt64Pairs(
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
 
+bool SortAnalysisUInt64PairsGenerated(
+    const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot,
+    const std::string& prefix,
+    uint64_t maximumBufferedPairs,
+    const std::function<void(const std::function<void(const AnalysisUInt64Pair&)>& emit)>& produce,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {},
+    AnalysisExternalSortStatistics* statistics = nullptr );
+
 bool SortAnalysisKeyMetadataRecords(
     const std::filesystem::path& source,
     const std::filesystem::path& output,

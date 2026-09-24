@@ -296,21 +296,21 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     return true;
 }
 
-static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
+template<typename Record, typename Less>
+static bool FinishGeneratedRuns( std::vector<std::filesystem::path> runs,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, std::string& error,
     const std::shared_ptr<AnalysisDiskBudget>& disk,
     const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
     const std::function<bool()>& cancelled,
-    AnalysisExternalSortStatistics* statistics )
+    AnalysisExternalSortStatistics* statistics, Less less, std::string_view errorPrefix )
 {
-    using Record = AnalysisKeyMetadataRecord;
     std::error_code ec;
     if( runs.empty() )
     {
         const auto previous = disk && disk->usage ? AnalysisDiskUsage::Bytes( output ) : 0;
         std::ofstream out( output, std::ios::binary | std::ios::trunc );
-        if( !out ) { error = "analysis_metadata_sort_output_open_failed"; return false; }
+        if( !out ) { error = std::string( errorPrefix ) + "_output_open_failed"; return false; }
         if( disk && disk->usage ) disk->usage->Release( previous );
         return true;
     }
@@ -319,7 +319,7 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
     while( runs.size() > 1 )
     {
         if( cancelled && cancelled() )
-        { error = "analysis_metadata_sort_cancelled"; return false; }
+        { error = std::string( errorPrefix ) + "_cancelled"; return false; }
         if( statistics ) statistics->mergePasses++;
         std::vector<std::filesystem::path> next;
         for( size_t first = 0; first < runs.size(); first += MergeFanIn )
@@ -330,17 +330,17 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
             if( !MergeRuns<Record>( group, merged, written, error, disk, workspace,
-                    MetadataLess, "analysis_metadata_sort", cancelled ) ) return false;
+                    less, errorPrefix, cancelled ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {
                 const auto size = std::filesystem::file_size( path, ec );
                 if( ec || size % sizeof( Record ) != 0 )
-                { error = "analysis_metadata_sort_run_size_invalid"; return false; }
+                { error = std::string( errorPrefix ) + "_run_size_invalid"; return false; }
                 expected += size / sizeof( Record );
             }
             if( written != expected )
-            { error = "analysis_metadata_sort_merge_count_mismatch"; return false; }
+            { error = std::string( errorPrefix ) + "_merge_count_mismatch"; return false; }
             if( statistics )
             {
                 statistics->mergedGroups++;
@@ -355,14 +355,14 @@ static bool FinishMetadataRuns( std::vector<std::filesystem::path> runs,
     }
 
     if( cancelled && cancelled() )
-    { error = "analysis_metadata_sort_cancelled"; return false; }
+    { error = std::string( errorPrefix ) + "_cancelled"; return false; }
     AnalysisDiskRemove( output, disk, ec );
     ec.clear();
     std::filesystem::rename( runs.front(), output, ec );
-    if( ec ) { error = "analysis_metadata_sort_publish_failed:" + ec.message(); return false; }
+    if( ec ) { error = std::string( errorPrefix ) + "_publish_failed:" + ec.message(); return false; }
     const auto outputBytes = std::filesystem::file_size( output, ec );
     if( ec || outputBytes != expectedCount * sizeof( Record ) )
-    { error = "analysis_metadata_sort_output_size_mismatch"; return false; }
+    { error = std::string( errorPrefix ) + "_output_size_mismatch"; return false; }
     return true;
 }
 
@@ -425,8 +425,9 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
         statistics->sourceReadBytes = bytes;
         statistics->initialRunWriteBytes = expectedCount * sizeof( Record );
     }
-    return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
-        expectedCount, error, disk, workspace, cancelled, statistics );
+    return FinishGeneratedRuns<Record>( std::move( runs ), output, temporaryRoot, prefix,
+        expectedCount, error, disk, workspace, cancelled, statistics,
+        MetadataLess, "analysis_metadata_sort" );
 }
 
 bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& output,
@@ -484,8 +485,69 @@ bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& outpu
         statistics->initialRuns = runs.size();
         statistics->initialRunWriteBytes = count * sizeof( Record );
     }
-    return FinishMetadataRuns( std::move( runs ), output, temporaryRoot, prefix,
-        count, error, disk, workspace, cancelled, statistics );
+    return FinishGeneratedRuns<Record>( std::move( runs ), output, temporaryRoot, prefix,
+        count, error, disk, workspace, cancelled, statistics,
+        MetadataLess, "analysis_metadata_sort" );
+}
+
+bool SortAnalysisUInt64PairsGenerated( const std::filesystem::path& output,
+    const std::filesystem::path& temporaryRoot, const std::string& prefix,
+    uint64_t maximumBufferedPairs,
+    const std::function<void(const std::function<void(const AnalysisUInt64Pair&)>& emit)>& produce,
+    std::string& error, const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    const std::function<bool()>& cancelled,
+    AnalysisExternalSortStatistics* statistics )
+{
+    using Record = AnalysisUInt64Pair;
+    error.clear();
+    if( statistics ) *statistics = {};
+    if( !produce || !maximumBufferedPairs || maximumBufferedPairs > SIZE_MAX / sizeof( Record ) )
+    { error = "analysis_pair_sort_generated_configuration"; return false; }
+    if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error, disk ) ) return false;
+    AnalysisWorkspaceReservation bufferWorkspace( workspace, maximumBufferedPairs * sizeof( Record ) );
+    std::vector<Record> values;
+    values.reserve( size_t( maximumBufferedPairs ) );
+    std::vector<std::filesystem::path> runs;
+    uint64_t count = 0;
+    const auto flush = [&] {
+        if( values.empty() ) return;
+        if( cancelled && cancelled() ) throw std::runtime_error( "analysis_pair_sort_cancelled" );
+        std::sort( values.begin(), values.end(), PairLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" + std::to_string( runs.size() ) + ".work" );
+        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
+        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_open_failed" );
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_failed" );
+        out.close();
+        runs.emplace_back( run );
+        values.clear();
+    };
+    const std::function<void(const Record&)> emit = [&]( const Record& value ) {
+        if( count >= UINT64_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_pair_sort_generated_count" );
+        if( ( count & 4095 ) == 0 && cancelled && cancelled() )
+            throw std::runtime_error( "analysis_pair_sort_cancelled" );
+        values.emplace_back( value );
+        ++count;
+        if( values.size() == maximumBufferedPairs ) flush();
+    };
+    produce( emit );
+    flush();
+    std::vector<Record>().swap( values );
+    bufferWorkspace.Resize( 0 );
+    if( statistics )
+    {
+        statistics->inputRecords = count;
+        statistics->initialRuns = runs.size();
+        statistics->initialRunWriteBytes = count * sizeof( Record );
+    }
+    return FinishGeneratedRuns<Record>( std::move( runs ), output, temporaryRoot, prefix,
+        count, error, disk, workspace, cancelled, statistics,
+        PairLess, "analysis_pair_sort" );
 }
 
 }

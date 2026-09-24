@@ -207,10 +207,10 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         removeConsumed( passEventsSorted );
         finishPhase( &QueryGpuReferenceBuildStatistics::passTimePublishMs );
 
-        if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( usePassSorted, scratch,
+        if( !analysis::SortAnalysisUInt64PairsGenerated( usePassSorted, scratch,
                 "gpu-reference-uses-by-pass",
                 analysis::ChooseAnalysisExternalSortBufferRecords( input.UseCount(),
-                    sizeof( analysis::AnalysisKeyMetadataRecord ), options.workspace ),
+                    sizeof( analysis::AnalysisUInt64Pair ), options.workspace ),
                 [&]( const auto& emit ) {
                     for( uint64_t ordinal = 0; ordinal < input.UseCount(); ordinal++ )
                     {
@@ -218,10 +218,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                             throw std::runtime_error( "GPU reference index cancelled" );
                         const auto use = input.Use( ordinal );
                         if( use.passId == 0 || use.resourceId == 0 ) continue;
-                        analysis::AnalysisKeyMetadataRecord row {};
-                        row.keyHigh = use.passId;
-                        row.metadata = ordinal;
-                        emit( row );
+                        emit( analysis::AnalysisUInt64Pair { use.passId, ordinal } );
                     }
                 }, sortError, options.disk, options.workspace, options.cancelled,
                 statistics ? &statistics->usePassSort : nullptr ) )
@@ -240,18 +237,18 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         uint64_t passTimeOrdinal = 0;
         uint64_t resolvedOrdinal = 0;
         uint64_t resourceLookupCount = 0;
-        analysis::AnalysisKeyMetadataRecord useIndex {};
+        analysis::AnalysisUInt64Pair useIndex {};
         while( sortedUses.read( reinterpret_cast<char*>( &useIndex ), sizeof( useIndex ) ) )
         {
             QueryGpuReferencePassTimeRecord passTime {};
             while( passTimeOrdinal < passTimeReader.Count() )
             {
                 passTimeReader.Read( passTimeOrdinal, &passTime, 1 );
-                if( passTime.passId >= useIndex.keyHigh ) break;
+                if( passTime.passId >= useIndex.key ) break;
                 passTimeOrdinal++;
             }
-            if( passTimeOrdinal >= passTimeReader.Count() || passTime.passId != useIndex.keyHigh ) continue;
-            const auto use = input.Use( useIndex.metadata );
+            if( passTimeOrdinal >= passTimeReader.Count() || passTime.passId != useIndex.key ) continue;
+            const auto use = input.Use( useIndex.value );
             QueryGpuReferenceResolvedUseRecord resolved {};
             resolved.resourceId = use.resourceId;
             resolved.passId = use.passId;
@@ -264,7 +261,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             resolvedUses.Append( &resolved, 1 );
             analysis::AnalysisKeyMetadataRecord lookup {};
             lookup.keyHigh = resolved.resourceId;
-            lookup.keyLow = useIndex.metadata;
+            lookup.keyLow = useIndex.value;
             lookup.metadata = resolvedOrdinal++;
             analysis::AnalysisDiskGrow( options.disk, sizeof( lookup ) );
             resourceLookup.write( reinterpret_cast<const char*>( &lookup ), sizeof( lookup ) );

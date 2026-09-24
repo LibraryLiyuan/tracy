@@ -437,7 +437,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             stages.usePassSort.inputRecords == useCount &&
             stages.resourceSort.inputRecords == useCount &&
             stages.catalogSort.inputRecords == useCount &&
-            stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ) &&
+            stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisUInt64Pair ) &&
             stages.catalogSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ),
             "GPU reference sort telemetry lost or double-counted logical facts" );
         {
@@ -673,6 +673,79 @@ int main( int argc, char** argv )
                 "generated external sort failed" );
             checkOutput( generatedOutput );
             checkStats( generatedStats, 0 );
+            const auto pairOutput = sortRoot / "generated-pairs.work";
+            AnalysisExternalSortStatistics pairStats;
+            Require( tracy::analysis::SortAnalysisUInt64PairsGenerated( pairOutput, sortRoot,
+                "generated-pairs", 1,
+                [&]( const auto& emit ) {
+                    for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ )
+                        emit( tracy::analysis::AnalysisUInt64Pair {
+                            ( recordCount - 1 - ordinal ) % 5, ordinal } );
+                }, sortError, {}, {}, {}, &pairStats ),
+                "generated pair multi-run sort failed" );
+            {
+                std::ifstream input( pairOutput, std::ios::binary );
+                tracy::analysis::AnalysisUInt64Pair previous {};
+                for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ )
+                {
+                    tracy::analysis::AnalysisUInt64Pair current {};
+                    input.read( reinterpret_cast<char*>( &current ), sizeof( current ) );
+                    Require( bool( input ) && current.key < 5 && current.value < recordCount &&
+                        ( ordinal == 0 || previous.key < current.key ||
+                            ( previous.key == current.key && previous.value < current.value ) ),
+                        "generated pair sort lost duplicate-key ordinal order" );
+                    previous = current;
+                }
+                Require( input.peek() == std::char_traits<char>::eof(),
+                    "generated pair sort appended a record" );
+            }
+            const auto pairBytes = recordCount * sizeof( tracy::analysis::AnalysisUInt64Pair );
+            Require( pairStats.inputRecords == recordCount && pairStats.initialRuns == recordCount &&
+                pairStats.mergePasses == 2 && pairStats.mergedGroups == 3 &&
+                pairStats.sourceReadBytes == 0 && pairStats.initialRunWriteBytes == pairBytes &&
+                pairStats.mergeReadBytes == 2 * pairBytes &&
+                pairStats.mergeWriteBytes == 2 * pairBytes,
+                "generated pair sort logical I/O accounting is wrong" );
+            bool cancelPairs = false, pairsCancelled = false;
+            try
+            {
+                tracy::analysis::SortAnalysisUInt64PairsGenerated(
+                    sortRoot / "cancelled-pairs.work", sortRoot, "cancelled-pairs", 2,
+                    [&]( const auto& emit ) {
+                        emit( { 2, 0 } ); emit( { 1, 1 } );
+                        cancelPairs = true; emit( { 1, 2 } );
+                    }, sortError, {}, {}, [&] { return cancelPairs; } );
+            }
+            catch( const std::runtime_error& error )
+            { pairsCancelled = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos; }
+            Require( pairsCancelled && !fs::exists( sortRoot / "cancelled-pairs.work" ),
+                "generated pair sorter published after cancellation" );
+            Require( tracy::analysis::CleanupAnalysisExternalSortFiles( sortRoot,
+                "cancelled-pairs-run-", sortError ),
+                "generated pair cancellation left run files" );
+            const auto pairRefusalRoot = root / "pair-refusal";
+            fs::create_directories( pairRefusalRoot );
+            auto pairUsage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                std::vector<fs::path> { pairRefusalRoot } );
+            auto pairDisk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                tracy::analysis::AnalysisDiskBudget { pairUsage, sizeof( tracy::analysis::AnalysisUInt64Pair ), {} } );
+            bool pairRejected = false;
+            try
+            {
+                tracy::analysis::SortAnalysisUInt64PairsGenerated(
+                    pairRefusalRoot / "sorted.work", pairRefusalRoot, "pair-refusal", 1,
+                    [&]( const auto& emit ) { emit( { 2, 0 } ); emit( { 1, 1 } ); },
+                    sortError, pairDisk );
+            }
+            catch( const std::runtime_error& error )
+            { pairRejected = std::string_view( error.what() ).find( "disk_budget" ) != std::string_view::npos; }
+            Require( pairRejected && !fs::exists( pairRefusalRoot / "sorted.work" ) &&
+                pairUsage->Snapshot().currentBytes ==
+                    tracy::analysis::AnalysisDiskUsage::Bytes( pairRefusalRoot ),
+                "generated pair sorter exceeded write-before-growth budget" );
+            Require( tracy::analysis::CleanupAnalysisExternalSortFiles( pairRefusalRoot,
+                "pair-refusal-run-", sortError, pairDisk ) && pairUsage->Snapshot().currentBytes == 0,
+                "generated pair refusal did not release owned run bytes" );
             const auto source = sortRoot / "source.work";
             {
                 std::ofstream file( source, std::ios::binary );
