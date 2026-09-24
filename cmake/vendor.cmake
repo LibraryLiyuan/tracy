@@ -134,14 +134,17 @@ target_include_directories(TracyGetOpt PUBLIC ${GETOPT_DIR})
 
 # ImGui
 
+set(TRACY_IMGUI_PATCHES "${CMAKE_CURRENT_LIST_DIR}/imgui-emscripten.patch" "${CMAKE_CURRENT_LIST_DIR}/imgui-loader.patch")
+if(TRACY_LOCAL_REPORT_VIEWER AND TRACY_REPORT_PREPATCHED_DEPS)
+    set(TRACY_IMGUI_PATCHES "")
+endif()
+
 CPMAddPackage(
     NAME ImGui
     GITHUB_REPOSITORY ocornut/imgui
     GIT_TAG v1.92.5-docking
     DOWNLOAD_ONLY TRUE
-    PATCHES
-        "${CMAKE_CURRENT_LIST_DIR}/imgui-emscripten.patch"
-        "${CMAKE_CURRENT_LIST_DIR}/imgui-loader.patch"
+    PATCHES ${TRACY_IMGUI_PATCHES}
 )
 
 set(IMGUI_SOURCES
@@ -192,12 +195,16 @@ endif()
 
 # PPQSort
 
+set(TRACY_PPQSORT_PATCHES "${CMAKE_CURRENT_LIST_DIR}/ppqsort-nodebug.patch")
+if(TRACY_LOCAL_REPORT_VIEWER AND TRACY_REPORT_PREPATCHED_DEPS)
+    set(TRACY_PPQSORT_PATCHES "")
+endif()
+
 CPMAddPackage(
     NAME PPQSort
     GITHUB_REPOSITORY GabTux/PPQSort
     VERSION 1.0.6
-    PATCHES
-        "${CMAKE_CURRENT_LIST_DIR}/ppqsort-nodebug.patch"
+    PATCHES ${TRACY_PPQSORT_PATCHES}
     EXCLUDE_FROM_ALL TRUE
 )
 

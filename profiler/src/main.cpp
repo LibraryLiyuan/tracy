@@ -85,6 +85,37 @@ enum class ViewShutdown { False, True, Join };
 static tracy::unordered_flat_map<uint64_t, ClientData> clients;
 static std::unique_ptr<tracy::View> view;
 static tracy::BadVersionState badVer;
+#ifdef TRACY_LOCAL_REPORT_VIEWER
+static std::string reportCaptureIdentity;
+static std::string reportResponse;
+extern "C" int tracyReportBindCapture( const char* identity )
+{
+    if( view || !reportCaptureIdentity.empty() || !identity || strlen(identity)!=64 ) return 0;
+    for( const char* p=identity; *p; ++p ) if( !((*p>='0'&&*p<='9')||(*p>='a'&&*p<='f')) ) return 0;
+    reportCaptureIdentity=identity;
+    return 1;
+}
+extern "C" const char* tracyReportState()
+{
+    auto state=view ? view->ReportState() : nlohmann::json{{"api_version","0.1.0"},{"has_data",false},{"background_done",false},{"layout_ready",false}};
+    state["capture_sha256"]=!view || view->ReportCaptureMatches("/report.tracy") ? reportCaptureIdentity : std::string{};
+    state["load_error"]=int(badVer.state);
+    reportResponse=state.dump();return reportResponse.c_str();
+}
+extern "C" const char* tracyReportNavigate( const char* request )
+{
+    nlohmann::json parsed(nlohmann::json::value_t::discarded);
+    if(request && strlen(request)<=65536) parsed=nlohmann::json::parse(request,nullptr,false);
+    nlohmann::json result;
+    if( parsed.is_discarded() || !parsed.is_object() ) result={{"ok",false},{"error","invalid_json"}};
+    else if( !parsed.contains("trace_sha256") || !parsed["trace_sha256"].is_string() || reportCaptureIdentity.empty() || parsed["trace_sha256"].get<std::string>()!=reportCaptureIdentity ) result={{"ok",false},{"error","trace_identity_mismatch"}};
+    else if( !view ) result={{"ok",false},{"error","not_ready"}};
+    else if( !view->ReportCaptureMatches("/report.tracy") ) result={{"ok",false},{"error","capture_changed_outside_report"}};
+    else result=view->ReportNavigate(parsed);
+    reportResponse=result.dump();return reportResponse.c_str();
+}
+extern "C" int tracyReportSelectEvent() { return view && view->ReportSelectEvent() ? 1 : 0; }
+#endif
 static uint16_t port = 8086;
 static const char* connectTo = nullptr;
 static char title[128];
@@ -224,7 +255,7 @@ int main( int argc, char** argv )
     sprintf( title, "JN Unity GUI Preview - Tracy Profiler %i.%i.%i", tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch );
 
     std::unique_ptr<tracy::FileRead> initFileOpen;
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && !defined(TRACY_LOCAL_REPORT_VIEWER)
     initFileOpen = std::unique_ptr<tracy::FileRead>( tracy::FileRead::Open( "embed.tracy" ) );
 #endif
     if( argc == 2 )
