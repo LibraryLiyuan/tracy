@@ -9,6 +9,7 @@
 #include "TracyPagedRecordStore.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -79,7 +80,7 @@ private:
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
     bool inventory = false, bool realCatalog = false, bool shuffledCatalog = false,
-    bool shuffledAllocation = false )
+    bool shuffledAllocation = false, bool multiDomain = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
@@ -154,28 +155,35 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         if( realCatalog )
         {
             const auto catalogStarted = std::chrono::steady_clock::now();
+            const auto rawResourceCount = multiDomain ? useCount : resourceCount;
+            const auto rawAllocationCount = multiDomain ? rawResourceCount * 359 / 1000 : resourceCount;
+            const auto viewCount = multiDomain ? rawResourceCount * 224 / 1000 : 0;
+            const auto relationCount = multiDomain ? rawResourceCount * 1111 / 1000 : 0;
+            const auto rangeCount = multiDomain ? rawResourceCount * 928 / 1000 : 0;
             {
                 QueryCatalogStoreWriter writer( root / "catalog", identity, options );
                 writer.SetMetadata( { 1, 1, JnGpuCatalogSchemaVersion, JnGpuDetailedEvidenceSchemaVersion } );
-                writer.Begin( OfflineCatalogDomain::CatalogResource, resourceCount,
+                writer.Begin( OfflineCatalogDomain::CatalogResource, rawResourceCount,
                     sizeof( JnGpuCatalogResourceRecordV1 ) );
                 AnalysisWorkspaceReservation resourceRowsMemory( options.workspace,
                     4096 * sizeof( JnGpuCatalogResourceRecordV1 ) );
                 std::vector<JnGpuCatalogResourceRecordV1> rows( 4096 );
                 uint64_t shuffleMultiplier = resourceCount / 2 + 1;
                 while( std::gcd( shuffleMultiplier, resourceCount ) != 1 ) shuffleMultiplier++;
-                for( uint64_t offset = 0; offset < resourceCount; )
+                for( uint64_t offset = 0; offset < rawResourceCount; )
                 {
-                    const auto take = std::min<uint64_t>( rows.size(), resourceCount - offset );
+                    const auto take = std::min<uint64_t>( rows.size(), rawResourceCount - offset );
                     for( uint64_t index = 0; index < take; ++index )
                     {
                         auto& row = rows[size_t( index )];
                         row = {};
-                        row.resourceId = shuffledCatalog ?
+                        row.resourceId = multiDomain ? ( offset + index ) % resourceCount + 1 :
+                            shuffledCatalog ?
                             ( ( offset + index ) * shuffleMultiplier ) % resourceCount + 1 :
                             offset + index + 1;
                         row.pointerToken = row.resourceId;
-                        row.allocationId = shuffledAllocation ? row.resourceId : 0;
+                        row.allocationId = ( shuffledAllocation || multiDomain ) ? row.resourceId : 0;
+                        row.time = multiDomain ? int64_t( offset + index ) : 0;
                         row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
                         row.capacityBytes = 64;
                     }
@@ -184,22 +192,23 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     offset += take;
                 }
                 writer.End( OfflineCatalogDomain::CatalogResource );
-                if( shuffledAllocation )
+                if( shuffledAllocation || multiDomain )
                 {
-                    writer.Begin( OfflineCatalogDomain::CatalogAllocation, resourceCount,
+                    writer.Begin( OfflineCatalogDomain::CatalogAllocation, rawAllocationCount,
                         sizeof( JnGpuCatalogAllocationRecordV1 ) );
                     AnalysisWorkspaceReservation allocationRowsMemory( options.workspace,
                         4096 * sizeof( JnGpuCatalogAllocationRecordV1 ) );
                     std::vector<JnGpuCatalogAllocationRecordV1> allocations( 4096 );
-                    for( uint64_t offset = 0; offset < resourceCount; )
+                    for( uint64_t offset = 0; offset < rawAllocationCount; )
                     {
-                        const auto take = std::min<uint64_t>( allocations.size(), resourceCount - offset );
+                        const auto take = std::min<uint64_t>( allocations.size(), rawAllocationCount - offset );
                         for( uint64_t index = 0; index < take; index++ )
                         {
                             auto& row = allocations[size_t( index )];
                             row = {};
                             row.allocationId = ( ( offset + index ) * shuffleMultiplier ) % resourceCount + 1;
                             row.pointerToken = row.allocationId;
+                            row.time = multiDomain ? int64_t( offset + index ) : 0;
                             row.sizeBytes = 64;
                             row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
                         }
@@ -209,19 +218,105 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     }
                     writer.End( OfflineCatalogDomain::CatalogAllocation );
                 }
-                JnGpuCatalogBatchData batches[2] {};
+                if( multiDomain )
+                {
+                    writer.Begin( OfflineCatalogDomain::CatalogView, viewCount,
+                        sizeof( JnGpuCatalogViewRecordV1 ) );
+                    AnalysisWorkspaceReservation viewMemory( options.workspace,
+                        4096 * sizeof( JnGpuCatalogViewRecordV1 ) );
+                    std::vector<JnGpuCatalogViewRecordV1> views( 4096 );
+                    for( uint64_t offset = 0; offset < viewCount; )
+                    {
+                        const auto take = std::min<uint64_t>( views.size(), viewCount - offset );
+                        for( uint64_t index = 0; index < take; index++ )
+                        {
+                            auto& row = views[size_t( index )];
+                            row = {};
+                            row.time = int64_t( offset + index );
+                            row.viewId = offset + index + 1;
+                            row.resourceId = ( offset + index ) % resourceCount + 1;
+                            row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
+                        }
+                        writer.Append( OfflineCatalogDomain::CatalogView, offset,
+                            views.data(), take, sizeof( views[0] ) );
+                        offset += take;
+                    }
+                    writer.End( OfflineCatalogDomain::CatalogView );
+
+                    writer.Begin( OfflineCatalogDomain::CatalogRelation, relationCount,
+                        sizeof( JnGpuCatalogRelationRecordV1 ) );
+                    AnalysisWorkspaceReservation relationMemory( options.workspace,
+                        4096 * sizeof( JnGpuCatalogRelationRecordV1 ) );
+                    std::vector<JnGpuCatalogRelationRecordV1> relations( 4096 );
+                    for( uint64_t offset = 0; offset < relationCount; )
+                    {
+                        const auto take = std::min<uint64_t>( relations.size(), relationCount - offset );
+                        for( uint64_t index = 0; index < take; index++ )
+                        {
+                            auto& row = relations[size_t( index )];
+                            row = {};
+                            row.time = int64_t( offset + index );
+                            row.sourceId = ( offset + index ) % resourceCount + 1;
+                            row.targetId = ( offset + index + 1 ) % resourceCount + 1;
+                            row.operation = uint8_t( JnGpuCatalogRecordOperation::Bind );
+                            row.relation = uint8_t( JnGpuCatalogRelationKind::RtasUses );
+                        }
+                        writer.Append( OfflineCatalogDomain::CatalogRelation, offset,
+                            relations.data(), take, sizeof( relations[0] ) );
+                        offset += take;
+                    }
+                    writer.End( OfflineCatalogDomain::CatalogRelation );
+
+                    writer.Begin( OfflineCatalogDomain::CatalogRangeSet, rangeCount,
+                        sizeof( JnGpuRangeSetRecordV1 ) );
+                    AnalysisWorkspaceReservation rangeMemory( options.workspace,
+                        4096 * sizeof( JnGpuRangeSetRecordV1 ) );
+                    std::vector<JnGpuRangeSetRecordV1> ranges( 4096 );
+                    for( uint64_t offset = 0; offset < rangeCount; )
+                    {
+                        const auto take = std::min<uint64_t>( ranges.size(), rangeCount - offset );
+                        for( uint64_t index = 0; index < take; index++ )
+                        {
+                            auto& row = ranges[size_t( index )];
+                            row = {};
+                            row.passInstanceId = ( offset + index ) / 32 + 1;
+                            row.resourceId = ( offset + index ) % resourceCount + 1;
+                            row.pointerToken = row.resourceId;
+                            row.lengthBytes = 64;
+                        }
+                        writer.Append( OfflineCatalogDomain::CatalogRangeSet, offset,
+                            ranges.data(), take, sizeof( ranges[0] ) );
+                        offset += take;
+                    }
+                    writer.End( OfflineCatalogDomain::CatalogRangeSet );
+                }
+                std::array<JnGpuCatalogBatchData, 5> batches {};
                 batches[0].generation = 1;
                 batches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
-                batches[0].recordCount = resourceCount;
-                if( shuffledAllocation )
+                batches[0].recordCount = rawResourceCount;
+                if( shuffledAllocation || multiDomain )
                 {
                     batches[1].generation = 1;
                     batches[1].kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
-                    batches[1].recordCount = resourceCount;
+                    batches[1].recordCount = rawAllocationCount;
                 }
-                const auto batchCount = shuffledAllocation ? 2 : 1;
+                if( multiDomain )
+                {
+                    const std::array<std::pair<JnGpuCatalogBatchKind, uint64_t>, 3> otherBatches {{
+                        { JnGpuCatalogBatchKind::View, viewCount },
+                        { JnGpuCatalogBatchKind::Relation, relationCount },
+                        { JnGpuCatalogBatchKind::RangeSet, rangeCount }
+                    }};
+                    for( size_t index = 0; index < otherBatches.size(); index++ )
+                    {
+                        batches[index + 2].generation = 1;
+                        batches[index + 2].kind = uint8_t( otherBatches[index].first );
+                        batches[index + 2].recordCount = otherBatches[index].second;
+                    }
+                }
+                const auto batchCount = multiDomain ? 5 : shuffledAllocation ? 2 : 1;
                 writer.Begin( OfflineCatalogDomain::CatalogBatch, batchCount, sizeof( batches[0] ) );
-                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches, batchCount,
+                writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches.data(), batchCount,
                     sizeof( batches[0] ) );
                 writer.End( OfflineCatalogDomain::CatalogBatch );
                 writer.Finish();
@@ -287,6 +382,35 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     memory.allocationCreateCount == resourceCount,
                     "shuffled Catalog allocation memory summary changed" );
             }
+            if( multiDomain )
+            {
+                Require( catalog->ResourceIndexCount() == resourceCount &&
+                    catalog->AllocationSummaryCount() == resourceCount,
+                    "multi-domain Catalog index lost Resource or Allocation keys" );
+                const auto observed = usage->Snapshot();
+                // This distribution exceeded 900 bytes per Resource row when all sort
+                // intermediates survived until the final cleanup.
+                Require( observed.peakBytes <= useCount * 500,
+                    "multi-domain Catalog index retained completed sort intermediates" );
+                std::cout << "catalog_multidomain_resource_rows=" << rawResourceCount
+                    << " resource_keys=" << resourceCount
+                    << " allocation_rows=" << rawAllocationCount
+                    << " view_rows=" << viewCount
+                    << " relation_rows=" << relationCount
+                    << " range_rows=" << rangeCount
+                    << " catalog_index_ms=" << catalogIndexMs
+                    << " resource_cache_bytes=" << catalogReads.resourceCacheBytes
+                    << " resource_block_loads=" << catalogReads.resourceBlockLoads
+                    << " allocation_cache_bytes=" << catalogReads.allocationCacheBytes
+                    << " allocation_block_loads=" << catalogReads.allocationBlockLoads
+                    << " peak_bytes=" << observed.peakBytes
+                    << " final_bytes=" << observed.currentBytes << '\n';
+                catalog.reset();
+                std::error_code cleanup;
+                fs::remove_all( root, cleanup );
+                if( cleanup ) throw std::runtime_error( "Catalog multi-domain cleanup: " + cleanup.message() );
+                return 0;
+            }
             if( !catalog->PreparePointerResolutionFastPath() )
                 throw std::runtime_error( "GPU reference capacity Catalog pointer fast path unavailable" );
             catalogBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -334,6 +458,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
             << " shuffled_catalog=" << shuffledCatalog
             << " shuffled_allocation=" << shuffledAllocation
+            << " multi_domain=" << multiDomain
             << " catalog_resource_cache_bytes=" << catalogReads.resourceCacheBytes
             << " catalog_build_ms=" << catalogBuildMs << " catalog_index_ms=" << catalogIndexMs
             << " catalog_resource_block_loads=" << catalogReads.resourceBlockLoads
@@ -411,6 +536,9 @@ int main( int argc, char** argv )
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-allocation-shuffled-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
             false, true, false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-multidomain-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, false, false, true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true, true );
     try

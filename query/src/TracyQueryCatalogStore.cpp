@@ -726,6 +726,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         }
         return failure;
     };
+    const auto removeScratch = [&]( const std::filesystem::path& path, std::string_view label,
+        bool recursive = false ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, m_impl->options.disk, error, recursive );
+        if( error ) throw std::runtime_error( std::string( label ) + ": " + error.message() );
+    };
     try
     {
         setPhase( "generations" );
@@ -927,6 +933,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 "catalog-resource-index", resourcePairCount, 1024 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource pair sort failed: " + sortError );
+        removeScratch( resourcePairsSource, "Catalog resource pair source cleanup failed" );
 
         setPhase( "resource-summary" );
         uint64_t allocationPairCount = 0;
@@ -1016,6 +1023,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             if( !allocationPairs ) throw std::runtime_error( "Catalog allocation pair source flush failed" );
             allocationPairs.close();
         }
+        removeScratch( resourceGenerationsPath, "Catalog resource generation scratch cleanup failed", true );
 
         setPhase( "pointer-intervals" );
         uint64_t pointerByPointerCount = 0;
@@ -1104,12 +1112,14 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             readStatistics->resourceDecodedBytes = observed.decodedBytes;
         }
         resourceRows.reset();
+        removeScratch( resourcePairsSorted, "Catalog sorted resource pair cleanup failed" );
 
         setPhase( "allocation-pair-sort" );
         if( !analysis::SortAnalysisUInt64Pairs( allocationPairsSource, allocationPairsSorted, scratchRoot,
                 "catalog-resource-allocations", allocationPairCount, 1024 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource allocation sort failed: " + sortError );
+        removeScratch( allocationPairsSource, "Catalog allocation pair source cleanup failed" );
 
         setPhase( "association-source" );
         std::ofstream associationFacts( analysis::AnalysisIoPath( associationSource ),
@@ -1232,6 +1242,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                     "catalog-resource-logical-bindings", bindingCount, 1024 * 1024, sortError,
                     m_impl->options.disk, m_impl->options.workspace ) )
                 throw std::runtime_error( "Catalog logical association sort failed: " + sortError );
+            removeScratch( logicalAliasesSource, "Catalog logical alias source cleanup failed" );
+            removeScratch( logicalBindingsSource, "Catalog logical binding source cleanup failed" );
             std::ifstream aliases( analysis::AnalysisIoPath( logicalAliasesSorted ), std::ios::binary );
             std::ifstream bindings( analysis::AnalysisIoPath( logicalBindingsSorted ), std::ios::binary );
             if( !aliases || !bindings )
@@ -1270,6 +1282,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             }
             aliases.close();
             bindings.close();
+            removeScratch( logicalAliasesSorted, "Catalog sorted logical alias cleanup failed" );
+            removeScratch( logicalBindingsSorted, "Catalog sorted logical binding cleanup failed" );
         }
         {
             std::ifstream sortedAllocations( analysis::AnalysisIoPath( allocationPairsSorted ), std::ios::binary );
@@ -1317,6 +1331,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 "catalog-resource-associations", associationFactCount, 512 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource association sort failed: " + sortError );
+        removeScratch( associationSource, "Catalog association source cleanup failed" );
 
         setPhase( "association-publish" );
         analysis::PagedRecordReader completedSummaries( resourceOutput,
@@ -1371,6 +1386,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         }
         associations.Commit();
         sortedAssociations.close();
+        removeScratch( associationSorted, "Catalog sorted association cleanup failed" );
 
         setPhase( "allocation-lookup" );
         const auto allocationCount = allocationRows->Count();
@@ -1409,6 +1425,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 "catalog-resource-allocation-lookup", allocationLookupCount, 512 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog allocation lookup sort failed: " + sortError );
+        removeScratch( allocationLookupSource, "Catalog allocation lookup source cleanup failed" );
         analysis::PagedRecordWriter allocationLookup( allocationLookupOutput,
             CatalogIdentity( m_impl->sourceFingerprint, "resource-allocation-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -1541,6 +1558,8 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             history.close();
             resources.close();
         }
+        removeScratch( allocationLookupSorted, "Catalog sorted allocation lookup cleanup failed" );
+        removeScratch( allocationPairsSorted, "Catalog sorted allocation pair cleanup failed" );
 
         QueryCatalogGpuMemorySummary gpuMemorySummary {};
         setPhase( "gpu-memory-timeline" );
@@ -1579,6 +1598,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 scratchRoot, "catalog-allocation-timeline", allocationTimelineCount, 512 * 1024,
                 sortError, m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog allocation timeline sort failed: " + sortError );
+        removeScratch( allocationTimelineSource, "Catalog allocation timeline source cleanup failed" );
 
         setPhase( "gpu-memory-events" );
         uint64_t physicalEventCount = 0;
@@ -1653,6 +1673,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             events.flush();
             if( !events ) throw std::runtime_error( "Catalog physical memory event flush failed" );
         }
+        removeScratch( allocationTimelineSorted, "Catalog sorted allocation timeline cleanup failed" );
         if( readStatistics )
         {
             const auto observed = allocationRows->Statistics();
@@ -1664,6 +1685,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 scratchRoot, "catalog-physical-memory-events", physicalEventCount, 512 * 1024,
                 sortError, m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog physical memory event sort failed: " + sortError );
+        removeScratch( physicalEventSource, "Catalog physical event source cleanup failed" );
         setPhase( "gpu-memory-summary" );
         {
             std::ifstream events( analysis::AnalysisIoPath( physicalEventSorted ), std::ios::binary );
@@ -1701,6 +1723,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             sizeof( QueryCatalogGpuMemorySummary ), m_impl->options );
         gpuSummaryWriter.Append( &gpuMemorySummary, 1 );
         gpuSummaryWriter.Commit();
+        removeScratch( physicalEventSorted, "Catalog sorted physical event cleanup failed" );
 
         setPhase( "lookup-sources" );
         const auto writeLookupSource = [&]( const std::filesystem::path& path, uint64_t count,
@@ -1850,6 +1873,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             if( !analysis::SortAnalysisKeyMetadataRecords( source, sorted, scratchRoot,
                     prefix, count, 512 * 1024, sortError, m_impl->options.disk, m_impl->options.workspace ) )
                 throw std::runtime_error( std::string( label ) + " lookup sort failed: " + sortError );
+            removeScratch( source, std::string( label ) + " lookup source cleanup failed" );
             analysis::PagedRecordWriter writer( output,
                 CatalogIdentity( m_impl->sourceFingerprint, identity ),
                 sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -1867,6 +1891,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             if( !input.eof() ) throw std::runtime_error( std::string( label ) + " sorted lookup read failed" );
             writer.Commit();
             input.close();
+            removeScratch( sorted, std::string( label ) + " sorted lookup cleanup failed" );
         };
         publishLookup( viewLookupSource, viewLookupSorted, viewLookupOutput,
             "catalog-resource-view-lookup", "resource-view-lookup-v1", viewLookupCount, "Catalog view" );
@@ -1936,6 +1961,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 "catalog-string-lookup", stringRecordCount, 512 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog string lookup sort failed: " + sortError );
+        removeScratch( stringSource, "Catalog string lookup source cleanup failed" );
         analysis::PagedRecordWriter stringLookup( stringOutput,
             CatalogIdentity( m_impl->sourceFingerprint, "resource-string-lookup-v1" ),
             sizeof( analysis::AnalysisKeyMetadataRecord ), m_impl->options );
@@ -1954,6 +1980,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         if( !sortedStrings.eof() ) throw std::runtime_error( "Catalog sorted string lookup read failed" );
         stringLookup.Commit();
         sortedStrings.close();
+        removeScratch( stringSorted, "Catalog sorted string lookup cleanup failed" );
         setPhase( "cleanup" );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( cleanupError );
