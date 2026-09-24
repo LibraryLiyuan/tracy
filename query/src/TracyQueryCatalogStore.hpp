@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tracy::query
@@ -28,6 +29,15 @@ struct QueryCatalogValidationResult
     bool originalValid = false;
     bool healthy = false;
     std::vector<QueryCatalogValidationFinding> findings;
+};
+
+struct QueryCatalogResourceIndexReadStatistics
+{
+    uint64_t resourceCacheBytes = 0;
+    uint64_t resourceBlockLoads = 0;
+    uint64_t resourceDecodedBytes = 0;
+    uint64_t generationBlockLoads = 0;
+    uint64_t generationDecodedBytes = 0;
 };
 
 struct QueryCatalogStatusData
@@ -301,7 +311,9 @@ public:
     QueryCatalogStatusData Status( size_t generationLimit, size_t evidenceLimit ) const;
     void ValidateAll() const;
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
-    void BuildResourceIndex( const std::filesystem::path& scratchRoot ) const;
+    void BuildResourceIndex( const std::filesystem::path& scratchRoot,
+        const std::function<void( std::string_view )>& phase = {},
+        QueryCatalogResourceIndexReadStatistics* readStatistics = nullptr ) const;
     bool ResourceIndexReady() const;
     uint64_t ResourceIndexCount() const;
     QueryCatalogResourceStateData ResourceStateAt( uint64_t ordinal ) const;

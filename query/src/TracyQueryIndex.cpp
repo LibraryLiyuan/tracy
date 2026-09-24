@@ -3680,7 +3680,11 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             resources->SetPhase( "catalog-validation" );
             result.catalogValidation = catalog.ValidateSemantics( temporaryCatalog / "semantic-validation" );
             resources->SetPhase( "catalog-resource-index" );
-            catalog.BuildResourceIndex( temporaryCatalog / "resource-index-scratch" );
+            catalog.BuildResourceIndex( temporaryCatalog / "resource-index-scratch",
+                [&]( std::string_view phase ) {
+                    resources->SetPhase( "catalog-resource-index:" + std::string( phase ) );
+                } );
+            resources->SetPhase( "catalog-resource-index:postbuild" );
             if( !catalog.ResourceIndexReady() ) throw std::runtime_error( "Catalog resource index is not ready" );
             uint64_t count = 0;
             for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )

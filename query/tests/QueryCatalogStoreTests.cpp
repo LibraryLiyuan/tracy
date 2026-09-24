@@ -205,7 +205,25 @@ int main( int argc, char** argv )
         Require( semantic.complete && semantic.healthy && semantic.findings.empty(),
             "healthy Catalog failed semantic validation" );
         Require( !reader.ResourceIndexReady(), "raw Catalog unexpectedly claimed a resource index" );
-        reader.BuildResourceIndex( root / "resource-index-scratch" );
+        std::vector<std::string> indexPhases;
+        reader.BuildResourceIndex( root / "resource-index-scratch",
+            [&]( std::string_view phase ) { indexPhases.emplace_back( phase ); } );
+        const std::vector<std::string> expectedIndexPhases {
+            "generations", "resource-source", "resource-sort", "resource-summary",
+            "pointer-intervals", "allocation-pair-sort", "association-source",
+            "association-sort", "association-publish", "allocation-lookup",
+            "allocation-summary", "gpu-memory-timeline", "gpu-memory-events",
+            "gpu-memory-summary", "lookup-sources", "catalog-resource-view-lookup",
+            "catalog-pointer-interval-by-pointer", "string-lookup", "cleanup"
+        };
+        size_t phasePosition = 0;
+        for( const auto& expected : expectedIndexPhases )
+        {
+            while( phasePosition < indexPhases.size() && indexPhases[phasePosition] != expected )
+                phasePosition++;
+            Require( phasePosition < indexPhases.size(), "Catalog resource index phase telemetry is incomplete" );
+            phasePosition++;
+        }
         Require( fs::is_directory( root / "resource-associations" ),
             "Catalog resource index did not publish bounded association summaries" );
         Require( fs::is_directory( root / "resource-allocation-lookup" ) &&

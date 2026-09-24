@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -77,7 +78,7 @@ private:
 };
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false, bool realCatalog = false )
+    bool inventory = false, bool realCatalog = false, bool shuffledCatalog = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
@@ -147,6 +148,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         const std::string identity( 64, 'g' );
         std::unique_ptr<QueryCatalogStoreReader> catalog;
         uint64_t catalogBuildMs = 0;
+        uint64_t catalogIndexMs = 0;
+        QueryCatalogResourceIndexReadStatistics catalogReads;
         if( realCatalog )
         {
             const auto catalogStarted = std::chrono::steady_clock::now();
@@ -158,6 +161,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 AnalysisWorkspaceReservation resourceRowsMemory( options.workspace,
                     4096 * sizeof( JnGpuCatalogResourceRecordV1 ) );
                 std::vector<JnGpuCatalogResourceRecordV1> rows( 4096 );
+                uint64_t shuffleMultiplier = resourceCount / 2 + 1;
+                while( std::gcd( shuffleMultiplier, resourceCount ) != 1 ) shuffleMultiplier++;
                 for( uint64_t offset = 0; offset < resourceCount; )
                 {
                     const auto take = std::min<uint64_t>( rows.size(), resourceCount - offset );
@@ -165,7 +170,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                     {
                         auto& row = rows[size_t( index )];
                         row = {};
-                        row.resourceId = offset + index + 1;
+                        row.resourceId = shuffledCatalog ?
+                            ( ( offset + index ) * shuffleMultiplier ) % resourceCount + 1 :
+                            offset + index + 1;
                         row.pointerToken = row.resourceId;
                         row.operation = uint8_t( JnGpuCatalogRecordOperation::Create );
                         row.capacityBytes = 64;
@@ -185,7 +192,38 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 writer.Finish();
             }
             catalog = std::make_unique<QueryCatalogStoreReader>( root / "catalog", identity, options );
-            catalog->BuildResourceIndex( root / "catalog" / "resource-index-scratch" );
+            const auto indexStarted = std::chrono::steady_clock::now();
+            auto phaseStarted = indexStarted;
+            std::string currentPhase;
+            const auto endPhase = [&]( std::chrono::steady_clock::time_point now ) {
+                if( currentPhase.empty() ) return;
+                std::cout << "catalog_index_phase=" << currentPhase << " elapsed_ms=" <<
+                    std::chrono::duration_cast<std::chrono::milliseconds>( now - phaseStarted ).count()
+                    << " disk_current_bytes=" << usage->Current() << '\n';
+            };
+            catalog->BuildResourceIndex( root / "catalog" / "resource-index-scratch",
+                [&]( std::string_view phase ) {
+                    const auto now = std::chrono::steady_clock::now();
+                    endPhase( now );
+                    currentPhase = phase;
+                    phaseStarted = now;
+                }, &catalogReads );
+            const auto indexEnded = std::chrono::steady_clock::now();
+            endPhase( indexEnded );
+            catalogIndexMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                indexEnded - indexStarted ).count();
+            if( shuffledCatalog && resourceCount <= 2528691 )
+            {
+                const auto resourceBlocks =
+                    ( resourceCount * sizeof( JnGpuCatalogResourceRecordV1 ) + options.blockBytes - 1 ) /
+                    options.blockBytes;
+                const auto generationBlocks =
+                    ( resourceCount * sizeof( uint64_t ) + options.blockBytes - 1 ) /
+                    options.blockBytes;
+                Require( catalogReads.resourceBlockLoads <= resourceBlocks + 1 &&
+                    catalogReads.generationBlockLoads <= generationBlocks + 1,
+                    "shuffled Catalog resource index reread compressed pages by key" );
+            }
             if( !catalog->PreparePointerResolutionFastPath() )
                 throw std::runtime_error( "GPU reference capacity Catalog pointer fast path unavailable" );
             catalogBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -231,7 +269,14 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         const auto observed = usage->Snapshot();
         std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
-            << " catalog_build_ms=" << catalogBuildMs << " source_bytes=" << sourceBytes
+            << " shuffled_catalog=" << shuffledCatalog
+            << " catalog_resource_cache_bytes=" << catalogReads.resourceCacheBytes
+            << " catalog_build_ms=" << catalogBuildMs << " catalog_index_ms=" << catalogIndexMs
+            << " catalog_resource_block_loads=" << catalogReads.resourceBlockLoads
+            << " catalog_resource_decoded_bytes=" << catalogReads.resourceDecodedBytes
+            << " catalog_generation_block_loads=" << catalogReads.generationBlockLoads
+            << " catalog_generation_decoded_bytes=" << catalogReads.generationDecodedBytes
+            << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
             << " final_bytes=" << observed.currentBytes
             << " build_elapsed_ms=" << buildMilliseconds
@@ -289,6 +334,9 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-shuffled-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-inventory" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true, true );
     try

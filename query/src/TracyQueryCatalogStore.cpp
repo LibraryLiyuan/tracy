@@ -573,9 +573,13 @@ bool QueryCatalogStoreReader::ResourceIndexReady() const
     catch( ... ) { return false; }
 }
 
-void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& scratchRoot ) const
+void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& scratchRoot,
+    const std::function<void( std::string_view )>& phase,
+    QueryCatalogResourceIndexReadStatistics* readStatistics ) const
 {
     std::lock_guard lock( m_impl->mutex );
+    const auto setPhase = [&]( std::string_view name ) { if( phase ) phase( name ); };
+    if( readStatistics ) *readStatistics = {};
     const auto resourceOutput = ResourceSummaryPath( m_impl->root );
     const auto associationOutput = ResourceAssociationPath( m_impl->root );
     const auto allocationSummaryOutput = AllocationSummaryPath( m_impl->root );
@@ -724,9 +728,43 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
     };
     try
     {
-        analysis::PagedRecordReader resourceRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogResource ),
-            CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogResource ),
-            sizeof( JnGpuCatalogResourceRecordV1 ), m_impl->options );
+        setPhase( "generations" );
+        const auto resourcePath = DomainPath( m_impl->root, OfflineCatalogDomain::CatalogResource );
+        const auto resourceIdentity = CatalogIdentity( m_impl->sourceFingerprint,
+            OfflineCatalogDomain::CatalogResource );
+        uint64_t resourceCount = 0;
+        {
+            analysis::PagedRecordReader countReader( resourcePath, resourceIdentity,
+                sizeof( JnGpuCatalogResourceRecordV1 ), m_impl->options );
+            resourceCount = countReader.Count();
+        }
+        auto resourceReadOptions = m_impl->options;
+        // Resource-ID order can be unrelated to capture ordinal. Both summary and pointer
+        // passes revisit compressed Resource pages in that order, as does the generation join.
+        // Keep those pages resident only when the shared target leaves room for other readers.
+        if( resourceCount != 0 && m_impl->options.workspace &&
+            resourceCount <= ( std::numeric_limits<uint64_t>::max() - resourceReadOptions.blockBytes ) /
+                sizeof( JnGpuCatalogResourceRecordV1 ) )
+        {
+            const auto budget = m_impl->options.workspace->Snapshot();
+            const auto block = uint64_t( resourceReadOptions.blockBytes );
+            const auto roundBlocks = [&]( uint64_t bytes ) { return ( bytes + block - 1 ) / block * block; };
+            const auto resourceBytes = roundBlocks( resourceCount * sizeof( JnGpuCatalogResourceRecordV1 ) );
+            const auto generationBytes = resourceCount <= ( std::numeric_limits<uint64_t>::max() - block ) /
+                sizeof( uint64_t ) ? roundBlocks( resourceCount * sizeof( uint64_t ) ) : block;
+            const auto available = budget.targetBytes > budget.currentBytes ?
+                budget.targetBytes - budget.currentBytes : 0;
+            constexpr uint64_t otherReadersReserve = 256ull << 20;
+            if( available > otherReadersReserve + generationBytes + block )
+            {
+                const auto cap = available - otherReadersReserve - generationBytes - block;
+                resourceReadOptions.readerCacheBytes = std::max<uint64_t>(
+                    resourceReadOptions.readerCacheBytes, std::min( resourceBytes, cap ) );
+            }
+        }
+        if( readStatistics ) readStatistics->resourceCacheBytes = resourceReadOptions.readerCacheBytes;
+        analysis::PagedRecordReader resourceRows( resourcePath, resourceIdentity,
+            sizeof( JnGpuCatalogResourceRecordV1 ), resourceReadOptions );
         analysis::PagedRecordReader batches( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogBatch ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogBatch ),
             sizeof( JnGpuCatalogBatchData ), m_impl->options );
@@ -854,6 +892,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         buildGenerations( JnGpuCatalogBatchKind::Logical, logicalRows.Count(), logicalGenerationOutput,
             "logical-generations-v1", "Catalog logical" );
 
+        setPhase( "resource-source" );
         std::ofstream resourcePairs( analysis::AnalysisIoPath( resourcePairsSource ), std::ios::binary | std::ios::trunc );
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source cannot be opened" );
         uint64_t resourcePairCount = 0;
@@ -873,16 +912,18 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         resourcePairs.flush();
         if( !resourcePairs ) throw std::runtime_error( "Catalog resource pair source flush failed" );
         resourcePairs.close();
+        setPhase( "resource-sort" );
         if( !analysis::SortAnalysisUInt64Pairs( resourcePairsSource, resourcePairsSorted, scratchRoot,
                 "catalog-resource-index", resourcePairCount, 1024 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource pair sort failed: " + sortError );
 
+        setPhase( "resource-summary" );
         uint64_t allocationPairCount = 0;
         {
             analysis::PagedRecordReader generations( resourceGenerationsPath,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-generations-v1" ),
-                sizeof( uint64_t ), m_impl->options );
+                sizeof( uint64_t ), resourceReadOptions );
             analysis::PagedRecordWriter summaries( resourceOutput,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
                 sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
@@ -953,6 +994,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             }
             if( !sortedPairs.eof() ) throw std::runtime_error( "Catalog sorted resource pair read failed" );
             flushState();
+            if( readStatistics )
+            {
+                const auto observed = generations.Statistics();
+                readStatistics->generationBlockLoads = observed.blockLoads;
+                readStatistics->generationDecodedBytes = observed.decodedBytes;
+            }
             summaries.Commit();
             sortedPairs.close();
             allocationPairs.flush();
@@ -960,6 +1007,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             allocationPairs.close();
         }
 
+        setPhase( "pointer-intervals" );
         uint64_t pointerByPointerCount = 0;
         uint64_t pointerByResourceCount = 0;
         {
@@ -1039,12 +1087,20 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             if( !byPointer || !byResource )
                 throw std::runtime_error( "Catalog pointer lifetime lookup flush failed" );
         }
+        if( readStatistics )
+        {
+            const auto observed = resourceRows.Statistics();
+            readStatistics->resourceBlockLoads = observed.blockLoads;
+            readStatistics->resourceDecodedBytes = observed.decodedBytes;
+        }
 
+        setPhase( "allocation-pair-sort" );
         if( !analysis::SortAnalysisUInt64Pairs( allocationPairsSource, allocationPairsSorted, scratchRoot,
                 "catalog-resource-allocations", allocationPairCount, 1024 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource allocation sort failed: " + sortError );
 
+        setPhase( "association-source" );
         std::ofstream associationFacts( analysis::AnalysisIoPath( associationSource ),
             std::ios::binary | std::ios::trunc );
         if( !associationFacts ) throw std::runtime_error( "Catalog resource association source cannot be opened" );
@@ -1245,11 +1301,13 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         associationFacts.flush();
         if( !associationFacts ) throw std::runtime_error( "Catalog resource association flush failed" );
         associationFacts.close();
+        setPhase( "association-sort" );
         if( !analysis::SortAnalysisKeyMetadataRecords( associationSource, associationSorted, scratchRoot,
                 "catalog-resource-associations", associationFactCount, 512 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog resource association sort failed: " + sortError );
 
+        setPhase( "association-publish" );
         analysis::PagedRecordReader completedSummaries( resourceOutput,
             CatalogIdentity( m_impl->sourceFingerprint, "resource-summary-v1" ),
             sizeof( QueryCatalogResourceSummaryRecord ), m_impl->options );
@@ -1303,6 +1361,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         associations.Commit();
         sortedAssociations.close();
 
+        setPhase( "allocation-lookup" );
         std::ofstream allocationLookupSourceStream( analysis::AnalysisIoPath( allocationLookupSource ),
             std::ios::binary | std::ios::trunc );
         if( !allocationLookupSourceStream )
@@ -1353,6 +1412,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         allocationLookup.Commit();
         sortedAllocationLookup.close();
 
+        setPhase( "allocation-summary" );
         {
             analysis::PagedRecordReader generations( allocationGenerationOutput,
                 CatalogIdentity( m_impl->sourceFingerprint, "resource-allocation-generations-v1" ),
@@ -1459,6 +1519,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         }
 
         QueryCatalogGpuMemorySummary gpuMemorySummary {};
+        setPhase( "gpu-memory-timeline" );
         uint64_t allocationTimelineCount = 0;
         {
             std::ofstream timeline( analysis::AnalysisIoPath( allocationTimelineSource ),
@@ -1495,6 +1556,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 sortError, m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog allocation timeline sort failed: " + sortError );
 
+        setPhase( "gpu-memory-events" );
         uint64_t physicalEventCount = 0;
         {
             std::ifstream timeline( analysis::AnalysisIoPath( allocationTimelineSorted ), std::ios::binary );
@@ -1571,6 +1633,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 scratchRoot, "catalog-physical-memory-events", physicalEventCount, 512 * 1024,
                 sortError, m_impl->options.disk, m_impl->options.workspace ) )
             throw std::runtime_error( "Catalog physical memory event sort failed: " + sortError );
+        setPhase( "gpu-memory-summary" );
         {
             std::ifstream events( analysis::AnalysisIoPath( physicalEventSorted ), std::ios::binary );
             if( !events ) throw std::runtime_error( "Catalog sorted physical memory events cannot be opened" );
@@ -1608,6 +1671,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         gpuSummaryWriter.Append( &gpuMemorySummary, 1 );
         gpuSummaryWriter.Commit();
 
+        setPhase( "lookup-sources" );
         const auto writeLookupSource = [&]( const std::filesystem::path& path, uint64_t count,
             const auto& readRecord, const auto& includeRecord, const auto& keyFor,
             std::string_view label ) {
@@ -1751,6 +1815,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         const auto publishLookup = [&]( const std::filesystem::path& source,
             const std::filesystem::path& sorted, const std::filesystem::path& output,
             const char* prefix, std::string_view identity, uint64_t count, std::string_view label ) {
+            setPhase( prefix );
             if( !analysis::SortAnalysisKeyMetadataRecords( source, sorted, scratchRoot,
                     prefix, count, 512 * 1024, sortError, m_impl->options.disk, m_impl->options.workspace ) )
                 throw std::runtime_error( std::string( label ) + " lookup sort failed: " + sortError );
@@ -1810,6 +1875,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
             "catalog-logical-definition-lookup", "logical-definition-lookup-v1",
             logicalDefinitionLookupCount, "Catalog logical definition" );
 
+        setPhase( "string-lookup" );
         analysis::PagedRecordReader stringRows( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
             sizeof( OfflineCatalogString ), m_impl->options );
@@ -1857,6 +1923,7 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
         if( !sortedStrings.eof() ) throw std::runtime_error( "Catalog sorted string lookup read failed" );
         stringLookup.Commit();
         sortedStrings.close();
+        setPhase( "cleanup" );
         const auto cleanupError = cleanup( false );
         if( !cleanupError.empty() ) throw std::runtime_error( cleanupError );
     }
