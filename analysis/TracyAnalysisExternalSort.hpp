@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include "TracyAnalysisDiskBudget.hpp"
 #include "TracyAnalysisWorkspaceBudget.hpp"
@@ -43,6 +44,28 @@ struct AnalysisExternalSortStatistics
     uint64_t initialRunWriteBytes = 0;
     uint64_t mergeReadBytes = 0;
     uint64_t mergeWriteBytes = 0;
+};
+
+// Keeps sorted runs for one metadata stream while the caller emits records.
+// Multiple collectors can share one producer and the same workspace budget.
+class AnalysisKeyMetadataRunCollector
+{
+public:
+    AnalysisKeyMetadataRunCollector( std::filesystem::path output,
+        std::filesystem::path temporaryRoot, std::string prefix,
+        uint64_t maximumBufferedRecords,
+        std::shared_ptr<AnalysisDiskBudget> disk = {},
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace = {},
+        std::function<bool()> cancelled = {},
+        AnalysisExternalSortStatistics* statistics = nullptr );
+    ~AnalysisKeyMetadataRunCollector();
+    AnalysisKeyMetadataRunCollector( const AnalysisKeyMetadataRunCollector& ) = delete;
+    AnalysisKeyMetadataRunCollector& operator=( const AnalysisKeyMetadataRunCollector& ) = delete;
+    void Emit( const AnalysisKeyMetadataRecord& value );
+    bool Finish( std::string& error );
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 // Choose a bounded run length that aims for one 64-way merge while leaving

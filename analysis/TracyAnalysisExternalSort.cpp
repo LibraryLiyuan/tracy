@@ -366,6 +366,137 @@ static bool FinishGeneratedRuns( std::vector<std::filesystem::path> runs,
     return true;
 }
 
+struct AnalysisKeyMetadataRunCollector::Impl
+{
+    using Record = AnalysisKeyMetadataRecord;
+
+    Impl( std::filesystem::path result, std::filesystem::path temporary,
+        std::string name, uint64_t buffered,
+        std::shared_ptr<AnalysisDiskBudget> diskBudget,
+        std::shared_ptr<AnalysisWorkspaceBudget> workspaceBudget,
+        std::function<bool()> cancellation,
+        AnalysisExternalSortStatistics* measurements )
+        : output( std::move( result ) )
+        , temporaryRoot( std::move( temporary ) )
+        , prefix( std::move( name ) )
+        , maximumBufferedRecords( buffered )
+        , disk( std::move( diskBudget ) )
+        , workspace( std::move( workspaceBudget ) )
+        , cancelled( std::move( cancellation ) )
+        , statistics( measurements )
+        , bufferWorkspace( workspace )
+    {
+        if( !maximumBufferedRecords || maximumBufferedRecords > SIZE_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_metadata_sort_collector_configuration" );
+        std::string error;
+        if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error, disk ) )
+            throw std::runtime_error( error );
+        bufferWorkspace.Resize( maximumBufferedRecords * sizeof( Record ) );
+        values.reserve( size_t( maximumBufferedRecords ) );
+        if( statistics ) *statistics = {};
+    }
+
+    void Flush()
+    {
+        if( values.empty() ) return;
+        if( cancelled && cancelled() ) throw std::runtime_error( "analysis_metadata_sort_cancelled" );
+        std::sort( values.begin(), values.end(), MetadataLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" +
+            std::to_string( runs.size() ) + ".work" );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( Record );
+        AnalysisDiskGrow( disk, charged );
+        struct ChargeReconcile
+        {
+            std::ofstream& stream;
+            const std::filesystem::path& path;
+            const std::shared_ptr<AnalysisDiskBudget>& budget;
+            uint64_t chargedBytes;
+            ~ChargeReconcile()
+            {
+                stream.close();
+                if( !budget || !budget->usage ) return;
+                try
+                {
+                    const auto actual = AnalysisDiskUsage::Bytes( path );
+                    if( chargedBytes > actual ) budget->usage->Release( chargedBytes - actual );
+                }
+                catch( ... ) {} // Retain a conservative charge until the next idle recount.
+            }
+        } reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
+        if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_open_failed" );
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_failed" );
+        runs.emplace_back( run );
+        values.clear();
+    }
+
+    void Emit( const Record& value )
+    {
+        if( finished || count >= UINT64_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_metadata_sort_collector_count" );
+        if( ( count & 4095 ) == 0 && cancelled && cancelled() )
+            throw std::runtime_error( "analysis_metadata_sort_cancelled" );
+        values.emplace_back( value );
+        ++count;
+        if( values.size() == maximumBufferedRecords ) Flush();
+    }
+
+    bool Finish( std::string& error )
+    {
+        if( finished ) throw std::runtime_error( "analysis_metadata_sort_collector_finished" );
+        error.clear();
+        Flush();
+        std::vector<Record>().swap( values );
+        bufferWorkspace.Resize( 0 );
+        if( statistics )
+        {
+            statistics->inputRecords = count;
+            statistics->initialRuns = runs.size();
+            statistics->initialRunWriteBytes = count * sizeof( Record );
+        }
+        finished = true;
+        return FinishGeneratedRuns<Record>( std::move( runs ), output, temporaryRoot,
+            prefix, count, error, disk, workspace, cancelled, statistics,
+            MetadataLess, "analysis_metadata_sort" );
+    }
+
+    std::filesystem::path output;
+    std::filesystem::path temporaryRoot;
+    std::string prefix;
+    uint64_t maximumBufferedRecords;
+    std::shared_ptr<AnalysisDiskBudget> disk;
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    std::function<bool()> cancelled;
+    AnalysisExternalSortStatistics* statistics;
+    AnalysisWorkspaceReservation bufferWorkspace;
+    std::vector<Record> values;
+    std::vector<std::filesystem::path> runs;
+    uint64_t count = 0;
+    bool finished = false;
+};
+
+AnalysisKeyMetadataRunCollector::AnalysisKeyMetadataRunCollector(
+    std::filesystem::path output, std::filesystem::path temporaryRoot,
+    std::string prefix, uint64_t maximumBufferedRecords,
+    std::shared_ptr<AnalysisDiskBudget> disk,
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace,
+    std::function<bool()> cancelled, AnalysisExternalSortStatistics* statistics )
+    : m_impl( std::make_unique<Impl>( std::move( output ), std::move( temporaryRoot ),
+        std::move( prefix ), maximumBufferedRecords, std::move( disk ),
+        std::move( workspace ), std::move( cancelled ), statistics ) ) {}
+
+AnalysisKeyMetadataRunCollector::~AnalysisKeyMetadataRunCollector() = default;
+
+void AnalysisKeyMetadataRunCollector::Emit( const AnalysisKeyMetadataRecord& value )
+{ m_impl->Emit( value ); }
+
+bool AnalysisKeyMetadataRunCollector::Finish( std::string& error )
+{ return m_impl->Finish( error ); }
+
 bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedRecords,

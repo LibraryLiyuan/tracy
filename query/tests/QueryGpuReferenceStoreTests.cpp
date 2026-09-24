@@ -135,6 +135,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             inventoryRows.emplace_back( line.str() );
         };
         bool sawUsePassSource = false;
+        bool sawResourceSource = false;
         bool sawCatalogResourceSource = false;
         uint64_t diskGrowthChecks = 0;
         const auto inventoryCheck = options.disk->checkSpace;
@@ -143,6 +144,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             if( ( ++diskGrowthChecks & 4095 ) == 0 &&
                 fs::exists( root / "reverse-scratch" / "use-pass-source.work" ) )
                 sawUsePassSource = true;
+            if( ( diskGrowthChecks & 4095 ) == 0 &&
+                fs::exists( root / "reverse-scratch" / "resource-source.work" ) )
+                sawResourceSource = true;
             if( ( diskGrowthChecks & 4095 ) == 0 &&
                 fs::exists( root / "reverse-scratch" / "catalog-resource-source.work" ) )
                 sawCatalogResourceSource = true;
@@ -423,6 +427,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         QueryGpuReferenceStore::Build( root, identity, input, options, &stages );
         Require( !sawUsePassSource,
             "GPU reference use/pass sorting still writes a complete source copy" );
+        Require( !sawResourceSource,
+            "GPU reference Resource and Catalog sorting still replay a complete source copy" );
         Require( !sawCatalogResourceSource,
             "GPU reference Catalog sorting still writes a complete source copy" );
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -673,6 +679,52 @@ int main( int argc, char** argv )
                 "generated external sort failed" );
             checkOutput( generatedOutput );
             checkStats( generatedStats, 0 );
+            AnalysisExternalSortStatistics simultaneousStats;
+            tracy::analysis::AnalysisKeyMetadataRunCollector simultaneous(
+                sortRoot / "simultaneous.work", sortRoot, "simultaneous", 1,
+                {}, {}, {}, &simultaneousStats );
+            for( uint64_t ordinal = 0; ordinal < recordCount; ordinal++ )
+                simultaneous.Emit( makeRow( ordinal ) );
+            Require( simultaneous.Finish( sortError ), "incremental metadata run collector failed" );
+            checkOutput( sortRoot / "simultaneous.work" );
+            checkStats( simultaneousStats, 0 );
+            {
+                auto shared = std::make_shared<tracy::analysis::AnalysisWorkspaceBudget>(
+                    sizeof( AnalysisKeyMetadataRecord ), sizeof( AnalysisKeyMetadataRecord ) );
+                tracy::analysis::AnalysisKeyMetadataRunCollector first(
+                    sortRoot / "shared-first.work", sortRoot, "shared-first", 1, {}, shared );
+                bool secondRejected = false;
+                try
+                {
+                    tracy::analysis::AnalysisKeyMetadataRunCollector second(
+                        sortRoot / "shared-second.work", sortRoot, "shared-second", 1, {}, shared );
+                }
+                catch( const std::runtime_error& error )
+                { secondRejected = std::string_view( error.what() ) == "analysis_workspace_budget"; }
+                Require( secondRejected && shared->Snapshot().currentBytes ==
+                    sizeof( AnalysisKeyMetadataRecord ),
+                    "simultaneous sort collectors obtained separate workspace budgets" );
+            }
+            {
+                const auto refusalRoot = root / "collector-open-failure";
+                fs::create_directories( refusalRoot );
+                auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                    std::vector<fs::path> { refusalRoot } );
+                auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                    tracy::analysis::AnalysisDiskBudget { usage, 2 * sizeof( AnalysisKeyMetadataRecord ), {} } );
+                tracy::analysis::AnalysisKeyMetadataRunCollector collector(
+                    refusalRoot / "output.work", refusalRoot, "collector-open-failure", 1, disk );
+                const auto blockedRun = refusalRoot / "collector-open-failure-run-0-0.work";
+                fs::create_directory( blockedRun );
+                bool refused = false;
+                try { collector.Emit( makeRow( 0 ) ); }
+                catch( const std::runtime_error& error )
+                { refused = std::string_view( error.what() ) == "analysis_metadata_sort_run_write_open_failed"; }
+                Require( refused && usage->Snapshot().currentBytes ==
+                    tracy::analysis::AnalysisDiskUsage::Bytes( refusalRoot ),
+                    "metadata collector kept unwritten run bytes charged after open failure" );
+                fs::remove( blockedRun );
+            }
             const auto pairOutput = sortRoot / "generated-pairs.work";
             AnalysisExternalSortStatistics pairStats;
             Require( tracy::analysis::SortAnalysisUInt64PairsGenerated( pairOutput, sortRoot,
