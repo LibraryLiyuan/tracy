@@ -79,6 +79,21 @@ struct QueryGpuPassResourceReadStats
     uint64_t useBlockLoads = 0;
 };
 
+struct QueryGpuPassResourceValidationStats
+{
+    uint64_t summaryBlockLoads = 0;
+    uint64_t rangeBlockLoads = 0;
+    uint64_t useBlockLoads = 0;
+    uint64_t evidenceBlockLoads = 0;
+    uint64_t summaryDecodedBytes = 0;
+    uint64_t rangeDecodedBytes = 0;
+    uint64_t useDecodedBytes = 0;
+    uint64_t evidenceDecodedBytes = 0;
+    uint64_t pagedRecordsMs = 0;
+    uint64_t semanticCompareMs = 0;
+    uint64_t totalMs = 0;
+};
+
 struct QueryGpuPassRangeData
 {
     JnGpuRangeSetRecordV1 record {};
@@ -138,7 +153,7 @@ public:
     QueryGpuPassUsePage Uses( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassIdPage EvidencePassIds( uint64_t passId, uint64_t offset, size_t limit ) const;
     QueryGpuPassResourceReadStats ReadStatistics() const;
-    void ValidateAll() const;
+    QueryGpuPassResourceValidationStats ValidateAll() const;
 
 private:
     struct Impl;

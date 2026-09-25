@@ -453,11 +453,16 @@ int main( int argc, char** argv )
             identity, smallPages );
         Require( manyPassReader.SummaryCount() == 514, "GPU pass fixture did not span pages" );
         const auto readBefore = manyPassReader.ReadStatistics();
-        manyPassReader.ValidateAll();
+        const auto validationStats = manyPassReader.ValidateAll();
         const auto readAfter = manyPassReader.ReadStatistics();
-        Require( readAfter.rangeBlockLoads - readBefore.rangeBlockLoads < 100 &&
+        Require( validationStats.totalMs >= validationStats.pagedRecordsMs +
+                validationStats.semanticCompareMs &&
+            validationStats.rangeBlockLoads == readAfter.rangeBlockLoads - readBefore.rangeBlockLoads &&
+            validationStats.useBlockLoads == readAfter.useBlockLoads - readBefore.useBlockLoads &&
+            validationStats.rangeDecodedBytes != 0 && validationStats.useDecodedBytes != 0 &&
+            readAfter.rangeBlockLoads - readBefore.rangeBlockLoads < 100 &&
             readAfter.useBlockLoads - readBefore.useBlockLoads < 100,
-            "GPU pass deep validation repeatedly decoded lookup pages" );
+            "GPU pass deep validation telemetry or bounded lookup reads changed" );
         {
             const auto cancelRoot = root / "cancelled-summary";
             GeneratedPassInput cancelInput( 100000, 10000 );

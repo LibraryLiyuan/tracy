@@ -50,9 +50,20 @@ struct QueryGpuReferenceUsePage
 
 struct QueryGpuReferenceValidationStats
 {
+    analysis::AnalysisExternalSortStatistics resourceSort;
+    analysis::AnalysisExternalSortStatistics catalogSort;
     uint64_t useBlockLoads = 0;
     uint64_t useDecodedBytes = 0;
     uint64_t sortedReferenceCount = 0;
+    uint64_t passAndUseValidationMs = 0;
+    uint64_t resourceSourceMs = 0;
+    uint64_t resourceSortMs = 0;
+    uint64_t resourceCompareMs = 0;
+    uint64_t catalogSourceMs = 0;
+    uint64_t catalogSortMs = 0;
+    uint64_t catalogCompareMs = 0;
+    uint64_t cleanupMs = 0;
+    uint64_t totalMs = 0;
 };
 
 struct QueryGpuReferenceBuildStatistics

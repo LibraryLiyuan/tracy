@@ -522,6 +522,15 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
     const std::filesystem::path& scratchRoot ) const
 {
     using Record = analysis::AnalysisKeyMetadataRecord;
+    QueryGpuReferenceValidationStats result;
+    const auto validationStarted = std::chrono::steady_clock::now();
+    auto phaseStarted = validationStarted;
+    const auto finishPhase = [&]( uint64_t QueryGpuReferenceValidationStats::*field ) {
+        const auto now = std::chrono::steady_clock::now();
+        result.*field = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - phaseStarted ).count() );
+        phaseStarted = now;
+    };
     const auto scratch = scratchRoot.empty() ? m_impl->root / "validation-scratch" : scratchRoot;
     if( std::filesystem::exists( analysis::AnalysisIoPath( scratch ) ) )
         throw std::runtime_error( "GPU reference validation scratch already exists" );
@@ -566,6 +575,7 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
                 previousPass = row.passId;
             }
         } );
+        finishPhase( &QueryGpuReferenceValidationStats::passAndUseValidationMs );
 
         const auto writeByUseOrdinal = [&]( analysis::PagedRecordReader& source,
             const std::filesystem::path& path, const char* orderError ) {
@@ -601,11 +611,12 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
             if( !output ) throw std::runtime_error( "GPU reference validation source flush failed" );
         };
         const auto sortByUseOrdinal = [&]( const std::filesystem::path& source,
-            const std::filesystem::path& sorted, const char* prefix, uint64_t count ) {
+            const std::filesystem::path& sorted, const char* prefix, uint64_t count,
+            analysis::AnalysisExternalSortStatistics& statistics ) {
             std::string error;
             if( !analysis::SortAnalysisKeyMetadataRecords( source, sorted, scratch, prefix, count,
                     512 * 1024, error, m_impl->options.disk, m_impl->options.workspace,
-                    m_impl->options.cancelled ) )
+                    m_impl->options.cancelled, &statistics ) )
                 throw std::runtime_error( "GPU reference validation sort failed: " + error );
             removeFile( source );
         };
@@ -613,8 +624,10 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
         const auto resourceSource = scratch / "resource-source.work";
         const auto resourceSorted = scratch / "resource-sorted.work";
         writeByUseOrdinal( m_impl->lookup, resourceSource, "GPU reference resource lookup order mismatch" );
+        finishPhase( &QueryGpuReferenceValidationStats::resourceSourceMs );
         sortByUseOrdinal( resourceSource, resourceSorted, "gpu-reference-validation-resource",
-            m_impl->lookup.Count() );
+            m_impl->lookup.Count(), result.resourceSort );
+        finishPhase( &QueryGpuReferenceValidationStats::resourceSortMs );
         {
             ValidationSortedRows sorted( resourceSorted, m_impl->options.workspace );
             uint64_t ordinal = 0;
@@ -637,13 +650,16 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
             if( sorted.Next( extra ) ) throw std::runtime_error( "GPU reference resource lookup duplicate ordinal" );
         }
         removeFile( resourceSorted );
+        finishPhase( &QueryGpuReferenceValidationStats::resourceCompareMs );
 
         const auto catalogSource = scratch / "catalog-source.work";
         const auto catalogSorted = scratch / "catalog-sorted.work";
         writeByUseOrdinal( m_impl->catalogLookup, catalogSource,
             "GPU reference Catalog resource lookup order mismatch" );
+        finishPhase( &QueryGpuReferenceValidationStats::catalogSourceMs );
         sortByUseOrdinal( catalogSource, catalogSorted, "gpu-reference-validation-catalog",
-            m_impl->catalogLookup.Count() );
+            m_impl->catalogLookup.Count(), result.catalogSort );
+        finishPhase( &QueryGpuReferenceValidationStats::catalogSortMs );
         {
             ValidationSortedRows sorted( catalogSorted, m_impl->options.workspace );
             Record next {};
@@ -676,12 +692,15 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
             if( haveNext ) throw std::runtime_error( "GPU reference Catalog lookup ordinal out of range" );
         }
         removeFile( catalogSorted );
+        finishPhase( &QueryGpuReferenceValidationStats::catalogCompareMs );
         cleanup();
+        finishPhase( &QueryGpuReferenceValidationStats::cleanupMs );
         const auto after = m_impl->uses.Statistics();
-        QueryGpuReferenceValidationStats result;
         result.useBlockLoads = after.blockLoads - before.blockLoads;
         result.useDecodedBytes = after.decodedBytes - before.decodedBytes;
         result.sortedReferenceCount = m_impl->lookup.Count() + m_impl->catalogLookup.Count();
+        result.totalMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - validationStarted ).count() );
         return result;
     }
     catch( ... )

@@ -787,12 +787,23 @@ QueryGpuPassResourceReadStats QueryGpuPassResourceStoreReader::ReadStatistics() 
     return { m_impl->ranges.Statistics().blockLoads, m_impl->uses.Statistics().blockLoads };
 }
 
-void QueryGpuPassResourceStoreReader::ValidateAll() const
+QueryGpuPassResourceValidationStats QueryGpuPassResourceStoreReader::ValidateAll() const
 {
+    const auto started = std::chrono::steady_clock::now();
+    auto phaseStarted = started;
+    const auto summaryBefore = m_impl->summaries.Statistics();
+    const auto rangeBefore = m_impl->ranges.Statistics();
+    const auto useBefore = m_impl->uses.Statistics();
+    const auto evidenceBefore = m_impl->evidence.Statistics();
     m_impl->summaries.ValidateAll();
     m_impl->ranges.ValidateAll();
     m_impl->uses.ValidateAll();
     m_impl->evidence.ValidateAll();
+    QueryGpuPassResourceValidationStats result;
+    auto now = std::chrono::steady_clock::now();
+    result.pagedRecordsMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - phaseStarted ).count() );
+    phaseStarted = now;
     SequentialLookup ranges( m_impl->ranges ), uses( m_impl->uses );
     analysis::AnalysisKeyMetadataRecord range {}, use {}, previousRange {}, previousUse {};
     bool haveRange = ranges.Next( range ), haveUse = uses.Next( use );
@@ -851,6 +862,24 @@ void QueryGpuPassResourceStoreReader::ValidateAll() const
             throw std::runtime_error( "GPU pass evidence lookup order mismatch" );
         previousEvidence = row;
     }
+    now = std::chrono::steady_clock::now();
+    result.semanticCompareMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - phaseStarted ).count() );
+    result.totalMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - started ).count() );
+    const auto summaryAfter = m_impl->summaries.Statistics();
+    const auto rangeAfter = m_impl->ranges.Statistics();
+    const auto useAfter = m_impl->uses.Statistics();
+    const auto evidenceAfter = m_impl->evidence.Statistics();
+    result.summaryBlockLoads = summaryAfter.blockLoads - summaryBefore.blockLoads;
+    result.rangeBlockLoads = rangeAfter.blockLoads - rangeBefore.blockLoads;
+    result.useBlockLoads = useAfter.blockLoads - useBefore.blockLoads;
+    result.evidenceBlockLoads = evidenceAfter.blockLoads - evidenceBefore.blockLoads;
+    result.summaryDecodedBytes = summaryAfter.decodedBytes - summaryBefore.decodedBytes;
+    result.rangeDecodedBytes = rangeAfter.decodedBytes - rangeBefore.decodedBytes;
+    result.useDecodedBytes = useAfter.decodedBytes - useBefore.decodedBytes;
+    result.evidenceDecodedBytes = evidenceAfter.decodedBytes - evidenceBefore.decodedBytes;
+    return result;
 }
 
 }

@@ -425,6 +425,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         const auto buildStarted = std::chrono::steady_clock::now();
         QueryGpuReferenceBuildStatistics stages;
         QueryGpuReferenceStore::Build( root, identity, input, options, &stages );
+        const auto buildObserved = usage->Snapshot();
         Require( !sawUsePassSource,
             "GPU reference use/pass sorting still writes a complete source copy" );
         Require( !sawResourceSource,
@@ -446,6 +447,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisUInt64Pair ) &&
             stages.catalogSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ),
             "GPU reference sort telemetry lost or double-counted logical facts" );
+        QueryGpuReferenceValidationStats validationStats;
+        tracy::analysis::AnalysisDiskUsageSnapshot validationObserved {};
+        bool validationComplete = false;
         {
             QueryGpuReferenceStoreReader reader( root, identity, options );
             Require( reader.UseCount() == useCount, "GPU reference capacity use count changed" );
@@ -455,9 +459,22 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 first.values.front().passId == 1 && last.values.front().passId == input.PassCount(),
                 "GPU reference capacity pass identity changed" );
             if( useCount <= 1000000 )
-                reader.ValidateAll( [&]( uint64_t token, int64_t time ) {
+            {
+                const auto validationScratch = root / "capacity-validation-scratch";
+                auto validationUsage = std::make_shared<AnalysisDiskUsage>(
+                    std::vector<fs::path> { validationScratch } );
+                auto validationOptions = options;
+                validationOptions.disk = std::make_shared<AnalysisDiskBudget>(
+                    AnalysisDiskBudget { validationUsage, maximumBytes, {} } );
+                QueryGpuReferenceStoreReader validationReader( root, identity, validationOptions );
+                validationStats = validationReader.ValidateAll( [&]( uint64_t token, int64_t time ) {
                     return input.ResolveCatalogResource( token, time );
-                } );
+                }, validationScratch );
+                validationObserved = validationUsage->Snapshot();
+                validationComplete = true;
+                Require( validationObserved.currentBytes == 0 && !fs::exists( validationScratch ),
+                    "GPU reference capacity validation retained scratch" );
+            }
         }
         const auto observed = usage->Snapshot();
         std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
@@ -480,8 +497,32 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 catalogReads.allocationGenerationDecodedBytes
             << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
+            << " build_peak_bytes=" << buildObserved.peakBytes
             << " final_bytes=" << observed.currentBytes
             << " build_elapsed_ms=" << buildMilliseconds
+            << " validation_complete=" << validationComplete
+            << " validation_elapsed_ms=" << validationStats.totalMs
+            << " validation_scratch_peak_bytes=" << validationObserved.peakBytes
+            << " validation_pass_use_ms=" << validationStats.passAndUseValidationMs
+            << " validation_resource_source_ms=" << validationStats.resourceSourceMs
+            << " validation_resource_sort_ms=" << validationStats.resourceSortMs
+            << " validation_resource_compare_ms=" << validationStats.resourceCompareMs
+            << " validation_catalog_source_ms=" << validationStats.catalogSourceMs
+            << " validation_catalog_sort_ms=" << validationStats.catalogSortMs
+            << " validation_catalog_compare_ms=" << validationStats.catalogCompareMs
+            << " validation_cleanup_ms=" << validationStats.cleanupMs
+            << " validation_resource_sort_runs=" << validationStats.resourceSort.initialRuns
+            << " validation_resource_sort_merge_passes=" << validationStats.resourceSort.mergePasses
+            << " validation_resource_sort_source_read_bytes=" << validationStats.resourceSort.sourceReadBytes
+            << " validation_resource_sort_run_write_bytes=" << validationStats.resourceSort.initialRunWriteBytes
+            << " validation_resource_sort_merge_read_bytes=" << validationStats.resourceSort.mergeReadBytes
+            << " validation_resource_sort_merge_write_bytes=" << validationStats.resourceSort.mergeWriteBytes
+            << " validation_catalog_sort_runs=" << validationStats.catalogSort.initialRuns
+            << " validation_catalog_sort_merge_passes=" << validationStats.catalogSort.mergePasses
+            << " validation_catalog_sort_source_read_bytes=" << validationStats.catalogSort.sourceReadBytes
+            << " validation_catalog_sort_run_write_bytes=" << validationStats.catalogSort.initialRunWriteBytes
+            << " validation_catalog_sort_merge_read_bytes=" << validationStats.catalogSort.mergeReadBytes
+            << " validation_catalog_sort_merge_write_bytes=" << validationStats.catalogSort.mergeWriteBytes
             << " pass_sort_ms=" << stages.passEventSortMs
             << " pass_publish_ms=" << stages.passTimePublishMs
             << " use_sort_ms=" << stages.usePassSortMs
@@ -575,9 +616,30 @@ int main( int argc, char** argv )
             const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start ).count();
             std::cout << "gpu_reference_real_validation elapsed_ms=" << milliseconds
+                << " telemetry_total_ms=" << stats.totalMs
+                << " pass_use_ms=" << stats.passAndUseValidationMs
+                << " resource_source_ms=" << stats.resourceSourceMs
+                << " resource_sort_ms=" << stats.resourceSortMs
+                << " resource_compare_ms=" << stats.resourceCompareMs
+                << " catalog_source_ms=" << stats.catalogSourceMs
+                << " catalog_sort_ms=" << stats.catalogSortMs
+                << " catalog_compare_ms=" << stats.catalogCompareMs
+                << " cleanup_ms=" << stats.cleanupMs
                 << " use_block_loads=" << stats.useBlockLoads
                 << " use_decoded_bytes=" << stats.useDecodedBytes
                 << " sorted_references=" << stats.sortedReferenceCount
+                << " resource_sort_runs=" << stats.resourceSort.initialRuns
+                << " resource_sort_merge_passes=" << stats.resourceSort.mergePasses
+                << " resource_sort_source_read_bytes=" << stats.resourceSort.sourceReadBytes
+                << " resource_sort_run_write_bytes=" << stats.resourceSort.initialRunWriteBytes
+                << " resource_sort_merge_read_bytes=" << stats.resourceSort.mergeReadBytes
+                << " resource_sort_merge_write_bytes=" << stats.resourceSort.mergeWriteBytes
+                << " catalog_sort_runs=" << stats.catalogSort.initialRuns
+                << " catalog_sort_merge_passes=" << stats.catalogSort.mergePasses
+                << " catalog_sort_source_read_bytes=" << stats.catalogSort.sourceReadBytes
+                << " catalog_sort_run_write_bytes=" << stats.catalogSort.initialRunWriteBytes
+                << " catalog_sort_merge_read_bytes=" << stats.catalogSort.mergeReadBytes
+                << " catalog_sort_merge_write_bytes=" << stats.catalogSort.mergeWriteBytes
                 << " scratch_peak_bytes=" << options.disk->usage->Snapshot().peakBytes
                 << " scratch_remaining_bytes=" << options.disk->usage->Snapshot().currentBytes << '\n';
             return 0;
@@ -1056,10 +1118,18 @@ int main( int argc, char** argv )
             return scaleInput.ResolveCatalogResource( pointerToken, time );
         }, scaleScratch );
         Require( validation.sortedReferenceCount == scaleInput.uses.size() + scaleInput.uses.size() / 8 &&
+            validation.resourceSort.inputRecords == scaleInput.uses.size() &&
+            validation.resourceSort.sourceReadBytes == scaleInput.uses.size() *
+                sizeof( tracy::analysis::AnalysisKeyMetadataRecord ) &&
+            validation.catalogSort.inputRecords == scaleInput.uses.size() / 8 &&
+            validation.totalMs >= validation.passAndUseValidationMs +
+                validation.resourceSourceMs + validation.resourceSortMs + validation.resourceCompareMs +
+                validation.catalogSourceMs + validation.catalogSortMs + validation.catalogCompareMs +
+                validation.cleanupMs &&
             validation.useDecodedBytes <= scaleInput.uses.size() *
                 sizeof( tracy::query::QueryGpuReferenceResolvedUseRecord ) * 5 &&
             !fs::exists( scaleScratch ),
-            "GPU reference deep validation repeated compressed random reads or retained scratch" );
+            "GPU reference deep validation telemetry, reads, or scratch cleanup changed" );
         const auto deniedScratch = root.parent_path() / "tracy-query-gpu-reference-validation-denied";
         fs::remove_all( deniedScratch, ignored );
         auto deniedOptions = scaleOptions;
