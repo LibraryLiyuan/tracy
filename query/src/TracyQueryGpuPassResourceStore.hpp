@@ -36,6 +36,8 @@ public:
     virtual uint64_t ResourceAllocation( uint64_t resourceId ) const = 0;
     virtual uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const = 0;
     virtual uint64_t ResourceOrdinalCount() const { return 0; }
+    virtual std::optional<uint32_t> FindResourceOrdinal( uint64_t ) const
+    { return std::nullopt; }
     virtual std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t, int64_t ) const
     { return std::nullopt; }
     virtual uint64_t ResourceIdAtOrdinal( uint32_t ) const { return 0; }
@@ -136,9 +138,17 @@ public:
 class QueryGpuPassResourceStore
 {
 public:
+    enum class BuildMode
+    {
+        Automatic,
+        Legacy,
+        Fused
+    };
+
     static void Build( const std::filesystem::path& root, std::string sourceFingerprint,
         const QueryGpuPassResourceInput& input, analysis::PagedRecordOptions options = {},
-        QueryGpuPassResourceBuildStatistics* statistics = nullptr );
+        QueryGpuPassResourceBuildStatistics* statistics = nullptr,
+        BuildMode mode = BuildMode::Automatic );
 };
 
 class QueryGpuPassResourceStoreReader

@@ -4761,7 +4761,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                     const QueryCatalogStoreReader& catalog, const QueryGpuReferenceStoreReader& references,
                     std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace )
                     : m_passes( passes ), m_links( links ), m_catalog( catalog ), m_references( references )
-                    , m_resourceAllocationMemory( workspace ), m_allocationEndMemory( std::move( workspace ) )
+                    , m_resourceAllocationMemory( workspace ), m_resourceOrdinalMemory( workspace )
+                    , m_allocationEndMemory( workspace ), m_allocationEndLookupMemory( std::move( workspace ) )
                 {
                     const auto count = m_catalog.ResourceIndexCount();
                     if( count > uint64_t( std::numeric_limits<uint32_t>::max() ) )
@@ -4770,6 +4771,15 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                         throw std::runtime_error( "GPU pass resource allocation fast path exceeds address space" );
                     m_resourceAllocationMemory.Resize( count * sizeof( ResourceAllocationEntry ) );
                     m_resourceAllocations.reserve( size_t( count ) );
+                    size_t ordinalCapacity = 1;
+                    while( ordinalCapacity < size_t( count ) * 2 )
+                    {
+                        if( ordinalCapacity > std::numeric_limits<size_t>::max() / 2 )
+                            throw std::runtime_error( "GPU pass Resource ordinal hash exceeds address space" );
+                        ordinalCapacity *= 2;
+                    }
+                    m_resourceOrdinalMemory.Resize( uint64_t( ordinalCapacity ) * sizeof( ResourceOrdinalEntry ) );
+                    m_resourceOrdinals.resize( ordinalCapacity );
                     uint64_t previousId = 0;
                     for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
                     {
@@ -4778,6 +4788,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                         if( resourceId == 0 || ( ordinal != 0 && resourceId <= previousId ) )
                             throw std::runtime_error( "GPU pass resource allocation fast path order mismatch" );
                         m_resourceAllocations.emplace_back( resourceId, state.latest.allocationId );
+                        InsertResourceOrdinal( resourceId, uint32_t( ordinal ) );
                         previousId = resourceId;
                     }
 
@@ -4810,6 +4821,20 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                             return lhs.first < rhs.first;
                         } );
                     m_allocationEndMemory.Resize( m_allocationEndBytes.capacity() * sizeof( AllocationEndEntry ) );
+                    size_t allocationCapacity = 1;
+                    while( allocationCapacity < m_allocationEndBytes.size() * 2 )
+                    {
+                        if( allocationCapacity > std::numeric_limits<size_t>::max() / 2 )
+                            throw std::runtime_error( "GPU pass Allocation end hash exceeds address space" );
+                        allocationCapacity *= 2;
+                    }
+                    m_allocationEndLookupMemory.Resize(
+                        uint64_t( allocationCapacity ) * sizeof( AllocationEndLookupEntry ) );
+                    m_allocationEndLookup.resize( allocationCapacity );
+                    for( const auto& [allocationId, bytes] : m_allocationEndBytes )
+                        InsertAllocationEnd( allocationId, bytes );
+                    std::vector<AllocationEndEntry>().swap( m_allocationEndBytes );
+                    m_allocationEndMemory.Resize( 0 );
                 }
                 uint64_t MappingCount() const override { return m_passes.Count() + m_links.Count(); }
                 QueryGpuPassMapping Mapping( uint64_t ordinal ) const override
@@ -4833,15 +4858,24 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
                 uint64_t ResourceOrdinalCount() const override
                 { return m_resourceAllocations.size(); }
+                std::optional<uint32_t> FindResourceOrdinal( uint64_t resourceId ) const override
+                {
+                    if( resourceId == 0 ) return std::nullopt;
+                    const auto mask = m_resourceOrdinals.size() - 1;
+                    auto slot = size_t( MixResourceId( resourceId ) ) & mask;
+                    while( m_resourceOrdinals[slot].resourceId != 0 )
+                    {
+                        if( m_resourceOrdinals[slot].resourceId == resourceId )
+                            return m_resourceOrdinals[slot].ordinal;
+                        slot = ( slot + 1 ) & mask;
+                    }
+                    return std::nullopt;
+                }
                 std::optional<uint32_t> ResolveCatalogResourceOrdinal(
                     uint64_t pointerToken, int64_t time ) const override
                 {
                     const auto resourceId = ResolveCatalogResource( pointerToken, time );
-                    if( resourceId == 0 ) return std::nullopt;
-                    const auto found = FindResource( resourceId );
-                    if( found == m_resourceAllocations.end() || found->first != resourceId )
-                        return std::nullopt;
-                    return uint32_t( std::distance( m_resourceAllocations.begin(), found ) );
+                    return FindResourceOrdinal( resourceId );
                 }
                 uint64_t ResourceIdAtOrdinal( uint32_t ordinal ) const override
                 {
@@ -4860,10 +4894,16 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 }
                 uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const override
                 {
-                    const auto found = std::lower_bound( m_allocationEndBytes.begin(),
-                        m_allocationEndBytes.end(), allocationId,
-                        []( const AllocationEndEntry& row, uint64_t key ) { return row.first < key; } );
-                    return found != m_allocationEndBytes.end() && found->first == allocationId ? found->second : 0;
+                    if( allocationId == 0 ) return 0;
+                    const auto mask = m_allocationEndLookup.size() - 1;
+                    auto slot = size_t( MixResourceId( allocationId ) ) & mask;
+                    while( m_allocationEndLookup[slot].allocationId != 0 )
+                    {
+                        if( m_allocationEndLookup[slot].allocationId == allocationId )
+                            return m_allocationEndLookup[slot].bytes;
+                        slot = ( slot + 1 ) & mask;
+                    }
+                    return 0;
                 }
             private:
                 const ReadOnlyZoneSection& m_passes;
@@ -4871,7 +4911,18 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 const QueryCatalogStoreReader& m_catalog;
                 const QueryGpuReferenceStoreReader& m_references;
                 using ResourceAllocationEntry = std::pair<uint64_t, uint64_t>;
+                struct ResourceOrdinalEntry
+                {
+                    uint64_t resourceId = 0;
+                    uint32_t ordinal = 0;
+                    uint32_t reserved = 0;
+                };
                 using AllocationEndEntry = std::pair<uint64_t, uint64_t>;
+                struct AllocationEndLookupEntry
+                {
+                    uint64_t allocationId = 0;
+                    uint64_t bytes = 0;
+                };
                 struct AllocationLatest
                 {
                     int64_t time = 0;
@@ -4885,10 +4936,49 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                         m_resourceAllocations.end(), resourceId,
                         []( const ResourceAllocationEntry& row, uint64_t key ) { return row.first < key; } );
                 }
+                static uint64_t MixResourceId( uint64_t value )
+                {
+                    value ^= value >> 30;
+                    value *= 0xbf58476d1ce4e5b9ull;
+                    value ^= value >> 27;
+                    value *= 0x94d049bb133111ebull;
+                    return value ^ ( value >> 31 );
+                }
+                void InsertResourceOrdinal( uint64_t resourceId, uint32_t ordinal )
+                {
+                    const auto mask = m_resourceOrdinals.size() - 1;
+                    auto slot = size_t( MixResourceId( resourceId ) ) & mask;
+                    while( m_resourceOrdinals[slot].resourceId != 0 )
+                    {
+                        if( m_resourceOrdinals[slot].resourceId == resourceId )
+                            throw std::runtime_error( "GPU pass Resource ordinal hash contains a duplicate" );
+                        slot = ( slot + 1 ) & mask;
+                    }
+                    m_resourceOrdinals[slot].resourceId = resourceId;
+                    m_resourceOrdinals[slot].ordinal = ordinal;
+                }
+                void InsertAllocationEnd( uint64_t allocationId, uint64_t bytes )
+                {
+                    if( allocationId == 0 ) return;
+                    const auto mask = m_allocationEndLookup.size() - 1;
+                    auto slot = size_t( MixResourceId( allocationId ) ) & mask;
+                    while( m_allocationEndLookup[slot].allocationId != 0 )
+                    {
+                        if( m_allocationEndLookup[slot].allocationId == allocationId )
+                            throw std::runtime_error( "GPU pass Allocation end hash contains a duplicate" );
+                        slot = ( slot + 1 ) & mask;
+                    }
+                    m_allocationEndLookup[slot].allocationId = allocationId;
+                    m_allocationEndLookup[slot].bytes = bytes;
+                }
                 analysis::AnalysisWorkspaceReservation m_resourceAllocationMemory;
                 std::vector<ResourceAllocationEntry> m_resourceAllocations;
+                analysis::AnalysisWorkspaceReservation m_resourceOrdinalMemory;
+                std::vector<ResourceOrdinalEntry> m_resourceOrdinals;
                 analysis::AnalysisWorkspaceReservation m_allocationEndMemory;
                 std::vector<AllocationEndEntry> m_allocationEndBytes;
+                analysis::AnalysisWorkspaceReservation m_allocationEndLookupMemory;
+                std::vector<AllocationEndLookupEntry> m_allocationEndLookup;
             } passResourceInput( passes, links, catalog, check, storageOptions.workspace );
             resources->SetPhase( "gpu-pass-resource-index" );
             QueryGpuPassResourceStore::Build( temporaryJn[useIndex], result.sourceFingerprint,

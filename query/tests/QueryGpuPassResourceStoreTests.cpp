@@ -24,6 +24,14 @@ void Require( bool condition, const char* message )
     if( !condition ) throw std::runtime_error( message );
 }
 
+uint64_t MixGenerated( uint64_t value )
+{
+    value += 0x9e3779b97f4a7c15ull;
+    value = ( value ^ ( value >> 30 ) ) * 0xbf58476d1ce4e5b9ull;
+    value = ( value ^ ( value >> 27 ) ) * 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
 class ReferenceInput final : public QueryGpuReferenceInput
 {
 public:
@@ -65,6 +73,28 @@ public:
     }
     uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
     { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
+    uint64_t ResourceOrdinalCount() const override { return m_catalog.ResourceIndexCount(); }
+    std::optional<uint32_t> FindResourceOrdinal( uint64_t resourceId ) const override
+    {
+        uint64_t first = 0, length = m_catalog.ResourceIndexCount();
+        while( length != 0 )
+        {
+            const auto half = length / 2;
+            const auto middle = first + half;
+            if( m_catalog.ResourceStateAt( middle ).latest.resourceId < resourceId )
+            { first = middle + 1; length -= half + 1; }
+            else length = half;
+        }
+        if( first >= m_catalog.ResourceIndexCount() ||
+            m_catalog.ResourceStateAt( first ).latest.resourceId != resourceId ) return std::nullopt;
+        return uint32_t( first );
+    }
+    std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t token, int64_t time ) const override
+    { return FindResourceOrdinal( ResolveCatalogResource( token, time ) ); }
+    uint64_t ResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return m_catalog.ResourceStateAt( ordinal ).latest.resourceId; }
+    uint64_t ResourceAllocationAtOrdinal( uint32_t ordinal ) const override
+    { return m_catalog.ResourceStateAt( ordinal ).latest.allocationId; }
     uint64_t ResourceAllocation( uint64_t resourceId ) const override
     {
         if( !scratchRoot.empty() )
@@ -102,8 +132,10 @@ class GeneratedPassInput final : public QueryGpuPassResourceInput
 public:
     GeneratedPassInput( uint64_t uses, uint64_t resources,
         const QueryCatalogStoreReader* catalog = nullptr,
-        std::shared_ptr<tracy::analysis::AnalysisWorkspaceBudget> workspace = {} )
-        : m_uses( uses ), m_resources( resources ), m_catalog( catalog ), m_resourceMemory( std::move( workspace ) )
+        std::shared_ptr<tracy::analysis::AnalysisWorkspaceBudget> workspace = {},
+        bool mixedHighFanout = false )
+        : m_uses( uses ), m_resources( resources ), m_catalog( catalog )
+        , m_mixedHighFanout( mixedHighFanout ), m_resourceMemory( std::move( workspace ) )
     {
         if( !m_catalog ) return;
         const auto count = m_catalog->ResourceIndexCount();
@@ -122,16 +154,36 @@ public:
         }
         m_resourceMemory.Resize( m_resourceAllocations.capacity() * sizeof( m_resourceAllocations[0] ) );
     }
-    uint64_t MappingCount() const override { return ( m_uses + 31 ) / 32; }
-    QueryGpuPassMapping Mapping( uint64_t ordinal ) const override { return { ordinal + 1, ordinal + 1 }; }
-    uint64_t RangeCount() const override { return 0; }
-    JnGpuRangeSetRecordV1 Range( uint64_t ) const override { throw std::runtime_error( "unexpected range" ); }
+    uint64_t MappingCount() const override
+    {
+        const auto base = BasePassCount();
+        return base + ( m_mixedHighFanout ? ( base + 15 ) / 16 : 0 );
+    }
+    QueryGpuPassMapping Mapping( uint64_t ordinal ) const override
+    {
+        const auto base = BasePassCount();
+        if( ordinal < base ) return { ordinal + 1, ordinal + 1 };
+        const auto fanoutOrdinal = ordinal - base;
+        return { fanoutOrdinal * 16 + 1, base + fanoutOrdinal + 1 };
+    }
+    uint64_t RangeCount() const override { return m_mixedHighFanout ? m_uses / 10 : 0; }
+    JnGpuRangeSetRecordV1 Range( uint64_t ordinal ) const override
+    {
+        if( ordinal >= RangeCount() ) throw std::runtime_error( "unexpected range" );
+        JnGpuRangeSetRecordV1 row {};
+        row.passInstanceId = ordinal % BasePassCount() + 1;
+        row.resourceId = MixGenerated( ordinal ^ 0x8877665544332211ull ) % m_resources + 1;
+        row.lengthBytes = 64;
+        return row;
+    }
     uint64_t UseCount() const override { return m_uses; }
     QueryGpuReferenceResolvedUseRecord Use( uint64_t ordinal ) const override
     {
         QueryGpuReferenceResolvedUseRecord row {};
-        row.passId = ordinal % MappingCount() + 1;
-        row.resourceId = ordinal % m_resources + 1;
+        row.passId = ordinal % BasePassCount() + 1;
+        row.resourceId = m_mixedHighFanout ?
+            MixGenerated( ordinal ^ 0x1020304050607080ull ) % m_resources + 1 :
+            ordinal % m_resources + 1;
         row.passStart = int64_t( row.passId * 100 );
         row.passEnd = row.passStart + 99;
         row.usageMask = 1;
@@ -150,6 +202,11 @@ public:
     uint64_t AllocationBytesAtEnd( uint64_t ) const override
     { allocationEndCalls++; return 64; }
     uint64_t ResourceOrdinalCount() const override { return m_resources; }
+    std::optional<uint32_t> FindResourceOrdinal( uint64_t resourceId ) const override
+    {
+        return resourceId != 0 && resourceId <= m_resources ?
+            std::optional<uint32_t>( uint32_t( resourceId - 1 ) ) : std::nullopt;
+    }
     std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t token, int64_t time ) const override
     {
         const auto resourceId = ResolveCatalogResource( token, time );
@@ -163,9 +220,11 @@ public:
     mutable uint64_t resourceAllocationCalls = 0;
     mutable uint64_t allocationEndCalls = 0;
 private:
+    uint64_t BasePassCount() const { return ( m_uses + 31 ) / 32; }
     uint64_t m_uses;
     uint64_t m_resources;
     const QueryCatalogStoreReader* m_catalog;
+    bool m_mixedHighFanout = false;
     tracy::analysis::AnalysisWorkspaceReservation m_resourceMemory;
     std::vector<std::pair<uint64_t, uint64_t>> m_resourceAllocations;
 };
@@ -200,7 +259,8 @@ private:
 };
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false, bool realCatalog = false, bool validate = false )
+    bool inventory = false, bool realCatalog = false, bool validate = false,
+    bool fused = false, bool mixedHighFanout = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy::analysis;
@@ -313,7 +373,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 std::chrono::steady_clock::now() - referenceStarted ).count();
         }
         const auto fastPathStarted = std::chrono::steady_clock::now();
-        GeneratedPassInput input( useCount, resourceCount, catalog.get(), options.workspace );
+        GeneratedPassInput input( useCount, resourceCount, catalog.get(), options.workspace,
+            mixedHighFanout );
         const auto fastPathBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - fastPathStarted ).count();
         const auto buildStarted = std::chrono::steady_clock::now();
@@ -322,16 +383,24 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             input.ResolveCatalogResourceOrdinal( 1, 0 ) == 0 &&
             input.ResourceIdAtOrdinal( 0 ) == 1 && input.ResourceAllocationAtOrdinal( 0 ) == 1,
             "GPU Pass fused Resource ordinal contract changed" );
-        QueryGpuPassResourceStore::Build( root, identity, input, options, &stages );
+        QueryGpuPassResourceStore::Build( root, identity, input, options, &stages,
+            fused ? QueryGpuPassResourceStore::BuildMode::Fused :
+                QueryGpuPassResourceStore::BuildMode::Legacy );
         const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();
-        Require( stages.factSort.inputRecords == useCount &&
-            stages.expandedSort.inputRecords == useCount &&
-            stages.useSort.inputRecords == useCount &&
-            stages.allocationSort.inputRecords != 0 &&
-            stages.inputMs + stages.factSortMs + stages.expansionMs +
-                stages.expandedSortMs + stages.allocationSortMs <= uint64_t( buildMs ),
-            "GPU Pass/Resource build telemetry lost facts or exceeded wall time" );
+        if( fused )
+            Require( stages.factSort.inputRecords == useCount + input.RangeCount() &&
+                stages.inputMs + stages.mappingSortMs + stages.factSortMs +
+                    stages.evidenceSortMs + stages.expansionMs + stages.summaryMs <= uint64_t( buildMs ),
+                "GPU Pass fused build telemetry lost facts or exceeded wall time" );
+        else
+            Require( stages.factSort.inputRecords == useCount &&
+                stages.expandedSort.inputRecords == useCount &&
+                stages.useSort.inputRecords == useCount &&
+                stages.allocationSort.inputRecords != 0 &&
+                stages.inputMs + stages.factSortMs + stages.expansionMs +
+                    stages.expandedSortMs + stages.allocationSortMs <= uint64_t( buildMs ),
+                "GPU Pass/Resource build telemetry lost facts or exceeded wall time" );
         Require( !fs::exists( root / "pass-resource-scratch" ),
             "GPU pass capacity probe retained scratch" );
         QueryGpuPassResourceValidationStats validationStats;
@@ -346,12 +415,15 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 std::chrono::steady_clock::now() - validationStarted ).count();
         }
         const auto observed = usage->Snapshot();
+        const auto observedWorkspace = options.workspace->Snapshot();
         std::cout << "gpu_pass_uses=" << useCount << " passes=" << input.MappingCount()
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
+            << " fused=" << fused << " mixed_high_fanout=" << mixedHighFanout
             << " catalog_build_ms=" << catalogBuildMs << " fast_path_ms=" << fastPathBuildMs
             << " reference_fixture_ms=" << referenceFixtureMs
             << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
+            << " workspace_peak_bytes=" << observedWorkspace.peakBytes
             << " final_bytes=" << observed.currentBytes << " build_elapsed_ms=" << buildMs
             << " input_ms=" << stages.inputMs
             << " mapping_sort_ms=" << stages.mappingSortMs
@@ -417,6 +489,15 @@ int main( int argc, char** argv )
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity-validated" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
             false, true, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--fused-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, false, false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--fused-capacity-high-fanout" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, false, false, true, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--fused-catalog-capacity" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, false, true );
     if( argc != 1 ) return 2;
     try
     {
@@ -449,18 +530,19 @@ int main( int argc, char** argv )
             writer.Begin( OfflineCatalogDomain::CatalogAllocation, 3, sizeof( allocations[0] ) );
             writer.Append( OfflineCatalogDomain::CatalogAllocation, 0, allocations, 3, sizeof( allocations[0] ) );
             writer.End( OfflineCatalogDomain::CatalogAllocation );
-            JnGpuRangeSetRecordV1 ranges[2] {};
+            JnGpuRangeSetRecordV1 ranges[3] {};
             ranges[0].passInstanceId = 10; ranges[0].resourceId = 100; ranges[0].lengthBytes = 64;
             ranges[1].passInstanceId = 20; ranges[1].resourceId = 102; ranges[1].lengthBytes = 128;
-            writer.Begin( OfflineCatalogDomain::CatalogRangeSet, 2, sizeof( ranges[0] ) );
-            writer.Append( OfflineCatalogDomain::CatalogRangeSet, 0, ranges, 2, sizeof( ranges[0] ) );
+            ranges[2].passInstanceId = 10; ranges[2].resourceId = 999; ranges[2].lengthBytes = 32;
+            writer.Begin( OfflineCatalogDomain::CatalogRangeSet, 3, sizeof( ranges[0] ) );
+            writer.Append( OfflineCatalogDomain::CatalogRangeSet, 0, ranges, 3, sizeof( ranges[0] ) );
             writer.End( OfflineCatalogDomain::CatalogRangeSet );
             JnGpuCatalogBatchData batches[3] {};
             batches[0].generation = 1; batches[0].recordCount = 2;
             batches[0].kind = uint8_t( JnGpuCatalogBatchKind::Resource );
             batches[1].generation = 2; batches[1].recordCount = 3;
             batches[1].kind = uint8_t( JnGpuCatalogBatchKind::Allocation );
-            batches[2].generation = 3; batches[2].recordCount = 2;
+            batches[2].generation = 3; batches[2].recordCount = 3;
             batches[2].kind = uint8_t( JnGpuCatalogBatchKind::RangeSet );
             writer.Begin( OfflineCatalogDomain::CatalogBatch, 3, sizeof( batches[0] ) );
             writer.Append( OfflineCatalogDomain::CatalogBatch, 0, batches, 3, sizeof( batches[0] ) );
@@ -490,10 +572,11 @@ int main( int argc, char** argv )
             256ull * 1024 * 1024, 128ull * 1024 * 1024 );
         analysis::PagedRecordOptions budgeted;
         budgeted.workspace = workspace;
-        QueryGpuPassResourceStore::Build( passRoot, identity, input, budgeted );
+        QueryGpuPassResourceStore::Build( passRoot, identity, input, budgeted, nullptr,
+            QueryGpuPassResourceStore::BuildMode::Legacy );
         Require( workspace->Snapshot().currentBytes == 0 && workspace->Snapshot().peakBytes != 0,
             "GPU pass build leaked or skipped shared workspace accounting" );
-        Require( input.resourceAllocationCalls == 2 && input.allocationBytesCalls == 2 &&
+        Require( input.resourceAllocationCalls == 3 && input.allocationBytesCalls == 2 &&
             input.rangeCalls == input.RangeCount(),
             "GPU pass resource build repeated identical Catalog state lookups" );
         Require( !fs::exists( passRoot / "pass-resource-scratch" ),
@@ -504,24 +587,65 @@ int main( int argc, char** argv )
             reader.SummaryAt( 1 ).passId == 20 && reader.SummaryAt( 2 ).passId == 1000,
             "GPU pass summary ordinal scan changed count or order" );
         const auto summary = reader.Summary( 1000 );
-        Require( summary && summary->resourceCount == 2 && summary->allocationCount == 2 &&
-            summary->directRangeBytes == 192 && summary->referencedPhysicalBytes == 2000 &&
-            summary->rangedResourceCount == 2 && summary->rangeCount == 2 && summary->useCount == 2,
+        Require( summary && summary->resourceCount == 3 && summary->allocationCount == 2 &&
+            summary->directRangeBytes == 224 && summary->referencedPhysicalBytes == 2000 &&
+            summary->rangedResourceCount == 3 && summary->rangeCount == 3 && summary->useCount == 2,
             "GPU pass aggregate summary changed" );
         const auto ranges = reader.Ranges( 1000, 0, 10 );
         const auto uses = reader.Uses( 1000, 0, 10 );
         const auto evidence = reader.EvidencePassIds( 1000, 0, 10 );
-        Require( ranges.total == 2 && ranges.values.size() == 2 &&
+        Require( ranges.total == 3 && ranges.values.size() == 3 &&
             ranges.values[0].record.passInstanceId == 10 && ranges.values[1].record.passInstanceId == 20 &&
+            ranges.values[2].record.resourceId == 999 &&
             uses.total == 2 && uses.values.size() == 2 && uses.values[0].passId == 10 &&
             uses.values[1].passId == 20 && evidence.total == 2 && evidence.values.size() == 2 &&
             evidence.values[0] == 10 && evidence.values[1] == 20 &&
             reader.Summary( 999 ) == std::nullopt,
             "GPU pass range/use expansion or missing-key semantics changed" );
         const auto direct = reader.Summary( 10 );
-        Require( direct && direct->resourceCount == 1 && direct->directRangeBytes == 64 &&
+        Require( direct && direct->resourceCount == 2 && direct->directRangeBytes == 96 &&
             direct->referencedPhysicalBytes == 0,
             "GPU reference pass identity mapping changed" );
+        const auto fusedRoot = root / "passes-fused";
+        QueryGpuPassResourceStore::Build( fusedRoot, identity, input, budgeted, nullptr,
+            QueryGpuPassResourceStore::BuildMode::Fused );
+        QueryGpuPassResourceStoreReader fusedReader( fusedRoot, catalogRoot, referenceRoot, identity );
+        fusedReader.ValidateAll();
+        Require( fusedReader.SummaryCount() == reader.SummaryCount(),
+            "GPU pass fused summary count changed" );
+        for( uint64_t ordinal = 0; ordinal < reader.SummaryCount(); ordinal++ )
+        {
+            const auto expected = reader.SummaryAt( ordinal );
+            const auto actual = fusedReader.SummaryAt( ordinal );
+            Require( expected.passId == actual.passId &&
+                expected.resourceCount == actual.resourceCount &&
+                expected.allocationCount == actual.allocationCount &&
+                expected.directRangeBytes == actual.directRangeBytes &&
+                expected.referencedPhysicalBytes == actual.referencedPhysicalBytes &&
+                expected.rangedResourceCount == actual.rangedResourceCount &&
+                expected.rangeCount == actual.rangeCount && expected.useCount == actual.useCount,
+                "GPU pass fused summary semantics changed" );
+            const auto expectedRanges = reader.Ranges( expected.passId, 0, 1024 );
+            const auto actualRanges = fusedReader.Ranges( expected.passId, 0, 1024 );
+            const auto expectedUses = reader.Uses( expected.passId, 0, 1024 );
+            const auto actualUses = fusedReader.Uses( expected.passId, 0, 1024 );
+            const auto expectedEvidence = reader.EvidencePassIds( expected.passId, 0, 1024 );
+            const auto actualEvidence = fusedReader.EvidencePassIds( expected.passId, 0, 1024 );
+            Require( expectedRanges.total == actualRanges.total &&
+                expectedUses.total == actualUses.total &&
+                expectedEvidence.values == actualEvidence.values,
+                "GPU pass fused detail count or evidence semantics changed" );
+            for( size_t index = 0; index < expectedRanges.values.size(); index++ )
+                Require( expectedRanges.values[index].record.passInstanceId ==
+                    actualRanges.values[index].record.passInstanceId &&
+                    expectedRanges.values[index].record.resourceId ==
+                    actualRanges.values[index].record.resourceId,
+                    "GPU pass fused range order changed" );
+            for( size_t index = 0; index < expectedUses.values.size(); index++ )
+                Require( expectedUses.values[index].passId == actualUses.values[index].passId &&
+                    expectedUses.values[index].resourceId == actualUses.values[index].resourceId,
+                    "GPU pass fused use order changed" );
+        }
         PassInput manyPasses( catalog, references );
         manyPasses.mappings.clear();
         for( uint64_t index = 0; index < 512; index++ )
@@ -555,6 +679,71 @@ int main( int argc, char** argv )
             readAfter.useBlockLoads - readBefore.useBlockLoads < 100,
             "GPU pass deep validation telemetry or bounded lookup reads changed" );
         {
+            const auto fusedCancelRoot = root / "fused-cancelled";
+            GeneratedPassInput cancelInput( 100000, 10000 );
+            analysis::PagedRecordOptions cancelOptions;
+            cancelOptions.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+                256ull << 20, 128ull << 20 );
+            uint64_t cancellationPolls = 0;
+            cancelOptions.cancelled = [&] { return ++cancellationPolls > 12; };
+            bool cancelled = false;
+            try
+            {
+                QueryGpuPassResourceStore::Build( fusedCancelRoot, identity, cancelInput,
+                    cancelOptions, nullptr, QueryGpuPassResourceStore::BuildMode::Fused );
+            }
+            catch( const std::exception& error )
+            { cancelled = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos; }
+            Require( cancelled && !fs::exists( fusedCancelRoot / "pass-resource-scratch" ) &&
+                !fs::exists( fusedCancelRoot / "pass-resource-summary" ),
+                "GPU pass fused cancellation retained scratch or published output" );
+            fs::remove_all( fusedCancelRoot, ignored );
+        }
+        {
+            const auto fusedWorkspaceRoot = root / "fused-workspace-refusal";
+            GeneratedPassInput refusalInput( 100000, 100000 );
+            analysis::PagedRecordOptions refusalOptions;
+            refusalOptions.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+                64ull << 10, 32ull << 10 );
+            bool refused = false;
+            try
+            {
+                QueryGpuPassResourceStore::Build( fusedWorkspaceRoot, identity, refusalInput,
+                    refusalOptions, nullptr, QueryGpuPassResourceStore::BuildMode::Fused );
+            }
+            catch( const std::exception& ) { refused = true; }
+            Require( refused && refusalOptions.workspace->Snapshot().rejectedReservations != 0 &&
+                refusalOptions.workspace->Snapshot().currentBytes == 0 &&
+                !fs::exists( fusedWorkspaceRoot / "pass-resource-scratch" ) &&
+                !fs::exists( fusedWorkspaceRoot / "pass-resource-summary" ),
+                "GPU pass fused workspace refusal was late or leaked state" );
+            fs::remove_all( fusedWorkspaceRoot, ignored );
+        }
+        {
+            const auto fusedDiskRoot = root / "fused-disk-refusal";
+            GeneratedPassInput refusalInput( 100000, 10000 );
+            auto refusalUsage = std::make_shared<analysis::AnalysisDiskUsage>(
+                std::vector<fs::path>{ fusedDiskRoot } );
+            analysis::PagedRecordOptions refusalOptions;
+            refusalOptions.disk = std::make_shared<analysis::AnalysisDiskBudget>(
+                analysis::AnalysisDiskBudget { refusalUsage, 4096, {} } );
+            refusalOptions.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>(
+                256ull << 20, 128ull << 20 );
+            bool refused = false;
+            try
+            {
+                QueryGpuPassResourceStore::Build( fusedDiskRoot, identity, refusalInput,
+                    refusalOptions, nullptr, QueryGpuPassResourceStore::BuildMode::Fused );
+            }
+            catch( const std::exception& ) { refused = true; }
+            Require( refused && refusalUsage->Snapshot().rejectedGrowths != 0 &&
+                refusalUsage->Snapshot().currentBytes == 0 &&
+                !fs::exists( fusedDiskRoot / "pass-resource-scratch" ) &&
+                !fs::exists( fusedDiskRoot / "pass-resource-summary" ),
+                "GPU pass fused disk refusal was late or leaked state" );
+            fs::remove_all( fusedDiskRoot, ignored );
+        }
+        {
             const auto cancelRoot = root / "cancelled-summary";
             GeneratedPassInput cancelInput( 100000, 10000 );
             analysis::PagedRecordOptions cancelOptions;
@@ -562,7 +751,11 @@ int main( int argc, char** argv )
                 256ull << 20, 128ull << 20 );
             cancelOptions.cancelled = [&] { return cancelInput.resourceAllocationCalls >= 10; };
             bool cancelled = false;
-            try { QueryGpuPassResourceStore::Build( cancelRoot, identity, cancelInput, cancelOptions ); }
+            try
+            {
+                QueryGpuPassResourceStore::Build( cancelRoot, identity, cancelInput, cancelOptions,
+                    nullptr, QueryGpuPassResourceStore::BuildMode::Legacy );
+            }
             catch( const std::exception& error )
             { cancelled = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos; }
             Require( cancelled && cancelInput.resourceAllocationCalls < 5000 &&

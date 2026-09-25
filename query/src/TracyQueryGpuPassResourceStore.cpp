@@ -28,6 +28,28 @@ struct AllocationAggregate
 
 static_assert( sizeof( AllocationAggregate ) == 24 );
 
+constexpr uint32_t FusedPartitionCount = 32;
+constexpr size_t FusedWriteBufferRecords = 4096;
+constexpr uint32_t FusedRangeBit = uint32_t( 1 ) << 31;
+
+#pragma pack( push, 1 )
+struct FusedPassResourceFact
+{
+    uint32_t passOrdinal = 0;
+    uint32_t resourceOrdinal = 0;
+    uint32_t sourceOrdinalAndKind = 0;
+};
+#pragma pack( pop )
+
+static_assert( sizeof( FusedPassResourceFact ) == 12 );
+
+uint32_t FusedPartition( uint32_t passOrdinal, uint64_t passCount )
+{
+    if( passCount == 0 ) throw std::runtime_error( "GPU pass fused partition has no Pass dictionary" );
+    return uint32_t( std::min<uint64_t>( FusedPartitionCount - 1,
+        uint64_t( passOrdinal ) * FusedPartitionCount / passCount ) );
+}
+
 class SequentialLookup
 {
 public:
@@ -65,6 +87,11 @@ std::string Identity( std::string_view source, std::string_view kind )
     return hash.FinalHex();
 }
 
+std::string FusedPartitionIdentity( std::string_view source, uint32_t partition )
+{
+    return Identity( source, "pass-resource-fused-partition-" + std::to_string( partition ) );
+}
+
 std::filesystem::path SummaryPath( const std::filesystem::path& root ) { return root / "pass-resource-summary"; }
 std::filesystem::path RangeLookupPath( const std::filesystem::path& root ) { return root / "pass-resource-ranges"; }
 std::filesystem::path UseLookupPath( const std::filesystem::path& root ) { return root / "pass-resource-uses"; }
@@ -75,6 +102,25 @@ void CheckedAdd( uint64_t& target, uint64_t value, const char* label )
     if( value > std::numeric_limits<uint64_t>::max() - target )
         throw std::runtime_error( std::string( label ) + " overflow" );
     target += value;
+}
+
+template<typename T>
+void AppendTracked( std::vector<T>& values, analysis::AnalysisWorkspaceReservation& memory,
+    T value, const char* label )
+{
+    if( values.size() == values.capacity() )
+    {
+        const auto previousBytes = memory.Bytes();
+        const auto maximum = std::numeric_limits<size_t>::max() / sizeof( T );
+        if( values.capacity() >= maximum ) throw std::runtime_error( std::string( label ) + " exceeds address space" );
+        const auto doubled = values.capacity() > maximum / 2 ? maximum : values.capacity() * 2;
+        const auto next = std::max<size_t>( 64, doubled );
+        memory.Resize( uint64_t( next ) * sizeof( T ) );
+        try { values.reserve( next ); }
+        catch( ... ) { memory.Resize( previousBytes ); throw; }
+        memory.Resize( uint64_t( values.capacity() ) * sizeof( T ) );
+    }
+    values.emplace_back( value );
 }
 
 class BuildLookupCache
@@ -133,7 +179,7 @@ private:
 
 }
 
-void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
+static void BuildGpuPassResourceLegacy( const std::filesystem::path& root,
     std::string sourceFingerprint, const QueryGpuPassResourceInput& input,
     analysis::PagedRecordOptions options, QueryGpuPassResourceBuildStatistics* statistics )
 {
@@ -608,6 +654,513 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         if( !cleanupError.empty() ) throw std::runtime_error( "GPU pass resource cleanup failed: " + cleanupError );
         std::rethrow_exception( failure );
     }
+}
+
+static void BuildGpuPassResourceFused( const std::filesystem::path& root,
+    const std::string& sourceFingerprint, const QueryGpuPassResourceInput& input,
+    analysis::PagedRecordOptions options, QueryGpuPassResourceBuildStatistics* statistics )
+{
+    if( statistics ) *statistics = {};
+    auto phaseStarted = std::chrono::steady_clock::now();
+    const auto finishPhase = [&]( uint64_t QueryGpuPassResourceBuildStatistics::*field ) {
+        const auto now = std::chrono::steady_clock::now();
+        if( statistics ) statistics->*field = uint64_t( std::chrono::duration_cast<
+            std::chrono::milliseconds>( now - phaseStarted ).count() );
+        phaseStarted = now;
+    };
+    if( sourceFingerprint.size() != 64 ) throw std::runtime_error( "GPU pass resource identity must be SHA-256" );
+    const auto catalogResourceCount = input.ResourceOrdinalCount();
+    if( catalogResourceCount == 0 || catalogResourceCount > uint64_t( std::numeric_limits<uint32_t>::max() ) )
+        throw std::runtime_error( "GPU pass fused Resource ordinal contract is unavailable" );
+    const auto rangeCount = input.RangeCount();
+    const auto useCount = input.UseCount();
+    if( rangeCount >= FusedRangeBit || useCount >= FusedRangeBit )
+        throw std::runtime_error( "GPU pass fused source ordinal exceeds 31-bit capacity" );
+
+    const auto summaryOutput = SummaryPath( root );
+    const auto rangeLookupOutput = RangeLookupPath( root );
+    const auto useLookupOutput = UseLookupPath( root );
+    const auto evidenceLookupOutput = EvidenceLookupPath( root );
+    const auto scratch = root / "pass-resource-scratch";
+    const auto partitionsRoot = scratch / "fused-partitions";
+    if( std::filesystem::exists( analysis::AnalysisIoPath( summaryOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( rangeLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( useLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( evidenceLookupOutput ) ) ||
+        std::filesystem::exists( analysis::AnalysisIoPath( scratch ) ) )
+        throw std::runtime_error( "GPU pass resource index already exists" );
+    std::filesystem::create_directories( analysis::AnalysisIoPath( partitionsRoot ) );
+    const auto mappingSorted = scratch / "fused-mapping-sorted.work";
+    const auto passSorted = scratch / "fused-pass-sorted.work";
+    const auto missingResourceSorted = scratch / "fused-missing-resource-sorted.work";
+    const auto factSorted = scratch / "fused-fact-sorted.work";
+    const auto evidenceSorted = scratch / "fused-evidence-sorted.work";
+    const auto cleanup = [&]( bool outputs ) {
+        std::string failure;
+        const auto remove = [&]( const std::filesystem::path& path ) {
+            std::error_code error;
+            analysis::AnalysisDiskRemove( path, options.disk, error, true );
+            if( error && failure.empty() ) failure = error.message();
+        };
+        remove( scratch );
+        if( outputs )
+        {
+            remove( summaryOutput ); remove( rangeLookupOutput );
+            remove( useLookupOutput ); remove( evidenceLookupOutput );
+        }
+        return failure;
+    };
+    const auto removeConsumed = [&]( const std::filesystem::path& path, bool recursive = false ) {
+        std::error_code error;
+        analysis::AnalysisDiskRemove( path, options.disk, error, recursive );
+        if( error ) throw std::runtime_error( "GPU pass fused scratch cleanup failed: " +
+            path.filename().string() + ": " + error.message() );
+    };
+    const auto cancelled = [&] {
+        if( options.cancelled && options.cancelled() )
+            throw std::runtime_error( "GPU pass resource index cancelled" );
+    };
+
+    try
+    {
+        analysis::AnalysisWorkspaceReservation rangeMemory( options.workspace );
+        std::vector<uint64_t> rangeLengths;
+        if( rangeCount > SIZE_MAX / sizeof( uint64_t ) )
+            throw std::runtime_error( "GPU pass fused Range directory exceeds address space" );
+        rangeMemory.Resize( rangeCount * sizeof( uint64_t ) );
+        rangeLengths.reserve( size_t( rangeCount ) );
+        rangeMemory.Resize( uint64_t( rangeLengths.capacity() ) * sizeof( uint64_t ) );
+
+        std::string sortError;
+        {
+            analysis::AnalysisUInt64PairRunCollector mappings( mappingSorted, scratch,
+                "gpu-pass-fused-mapping", 256 * 1024, options.disk, options.workspace,
+                options.cancelled );
+            analysis::AnalysisUInt64PairRunCollector passes( passSorted, scratch,
+                "gpu-pass-fused-passes", 256 * 1024, options.disk, options.workspace,
+                options.cancelled );
+            analysis::AnalysisUInt64PairRunCollector missingResources( missingResourceSorted, scratch,
+                "gpu-pass-fused-missing-resources", 256 * 1024, options.disk,
+                options.workspace, options.cancelled );
+            const auto appendMapping = [&]( uint64_t evidencePassId, uint64_t queryPassId ) {
+                if( evidencePassId == 0 || queryPassId == 0 ) return;
+                mappings.Emit( { evidencePassId, queryPassId } );
+                passes.Emit( { queryPassId, 0 } );
+            };
+            for( uint64_t ordinal = 0; ordinal < input.MappingCount(); ordinal++ )
+            {
+                if( ( ordinal & 4095 ) == 0 ) cancelled();
+                const auto row = input.Mapping( ordinal );
+                appendMapping( row.evidencePassId, row.queryPassId );
+            }
+            for( uint64_t ordinal = 0; ordinal < rangeCount; ordinal++ )
+            {
+                if( ( ordinal & 4095 ) == 0 ) cancelled();
+                const auto range = input.Range( ordinal );
+                rangeLengths.emplace_back( range.lengthBytes );
+                if( range.passInstanceId == 0 || range.resourceId == 0 ) continue;
+                appendMapping( range.passInstanceId, range.passInstanceId );
+                if( !input.FindResourceOrdinal( range.resourceId ) )
+                {
+                    missingResources.Emit( { range.resourceId, 0 } );
+                }
+            }
+            if( !mappings.Finish( sortError ) )
+                throw std::runtime_error( "GPU pass fused Mapping sort failed: " + sortError );
+            if( !passes.Finish( sortError ) )
+                throw std::runtime_error( "GPU pass fused Pass sort failed: " + sortError );
+            if( !missingResources.Finish( sortError ) )
+                throw std::runtime_error( "GPU pass fused missing Resource sort failed: " + sortError );
+        }
+        finishPhase( &QueryGpuPassResourceBuildStatistics::inputMs );
+
+        analysis::AnalysisWorkspaceReservation passMemory( options.workspace );
+        analysis::AnalysisWorkspaceReservation missingResourceMemory( options.workspace );
+        std::vector<uint64_t> passIds, missingResourceIds;
+        const auto readUniqueKeys = [&]( const std::filesystem::path& path,
+            std::vector<uint64_t>& values, analysis::AnalysisWorkspaceReservation& memory,
+            const char* label ) {
+            std::ifstream source( analysis::AnalysisIoPath( path ), std::ios::binary );
+            if( !source ) throw std::runtime_error( std::string( label ) + " cannot be opened" );
+            analysis::AnalysisUInt64Pair row {};
+            uint64_t previous = 0, rows = 0;
+            bool havePrevious = false;
+            while( source.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) )
+            {
+                if( ( rows++ & 4095 ) == 0 ) cancelled();
+                if( row.key == 0 ) throw std::runtime_error( std::string( label ) + " contains a zero key" );
+                if( havePrevious && row.key < previous )
+                    throw std::runtime_error( std::string( label ) + " order mismatch" );
+                if( !havePrevious || row.key != previous )
+                    AppendTracked( values, memory, row.key, label );
+                previous = row.key;
+                havePrevious = true;
+            }
+            if( !source.eof() ) throw std::runtime_error( std::string( label ) + " read failed" );
+        };
+        readUniqueKeys( passSorted, passIds, passMemory, "GPU pass fused Pass dictionary" );
+        readUniqueKeys( missingResourceSorted, missingResourceIds, missingResourceMemory,
+            "GPU pass fused missing Resource dictionary" );
+        removeConsumed( passSorted );
+        removeConsumed( missingResourceSorted );
+        if( passIds.size() > std::numeric_limits<uint32_t>::max() )
+            throw std::runtime_error( "GPU pass fused Pass ordinal exceeds 32-bit capacity" );
+        if( missingResourceIds.size() > uint64_t( std::numeric_limits<uint32_t>::max() ) - catalogResourceCount )
+            throw std::runtime_error( "GPU pass fused Resource ordinal exceeds 32-bit capacity" );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::mappingSortMs );
+
+        uint64_t evidenceLookupCount = 0;
+        {
+            analysis::AnalysisKeyMetadataRunCollector evidence( evidenceSorted, scratch,
+                "gpu-pass-fused-evidence", 256 * 1024, options.disk, options.workspace,
+                options.cancelled, statistics ? &statistics->evidenceSort : nullptr );
+            std::ifstream mappings( analysis::AnalysisIoPath( mappingSorted ), std::ios::binary );
+            if( !mappings ) throw std::runtime_error( "GPU pass fused Mapping cannot be opened for Evidence" );
+            analysis::AnalysisUInt64Pair row {}, previous {};
+            bool havePrevious = false;
+            uint64_t rows = 0;
+            while( mappings.read( reinterpret_cast<char*>( &row ), sizeof( row ) ) )
+            {
+                if( ( rows++ & 4095 ) == 0 ) cancelled();
+                if( havePrevious && row.key == previous.key && row.value == previous.value ) continue;
+                analysis::AnalysisKeyMetadataRecord inverted {};
+                inverted.keyHigh = row.value;
+                inverted.keyLow = row.key;
+                evidence.Emit( inverted );
+                previous = row;
+                havePrevious = true;
+                evidenceLookupCount++;
+            }
+            if( !mappings.eof() ) throw std::runtime_error( "GPU pass fused Mapping Evidence read failed" );
+            if( !evidence.Finish( sortError ) )
+                throw std::runtime_error( "GPU pass fused Evidence sort failed: " + sortError );
+        }
+
+        const auto publishLookup = [&]( const std::filesystem::path& sorted,
+            const std::filesystem::path& output, std::string_view kind, uint64_t expectedCount ) {
+            analysis::PagedRecordWriter writer( output, Identity( sourceFingerprint, kind ),
+                sizeof( analysis::AnalysisKeyMetadataRecord ), options );
+            std::ifstream inputFile( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+            if( !inputFile ) throw std::runtime_error( "GPU pass fused lookup cannot be opened" );
+            std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
+            uint64_t written = 0;
+            while( inputFile )
+            {
+                cancelled();
+                inputFile.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
+                const auto bytes = size_t( inputFile.gcount() );
+                if( bytes % sizeof( buffer[0] ) != 0 )
+                    throw std::runtime_error( "GPU pass fused lookup is truncated" );
+                const auto count = bytes / sizeof( buffer[0] );
+                if( count != 0 ) writer.Append( buffer.data(), count );
+                written += count;
+            }
+            if( !inputFile.eof() || written != expectedCount )
+                throw std::runtime_error( "GPU pass fused lookup count mismatch" );
+            writer.Commit();
+        };
+        publishLookup( evidenceSorted, evidenceLookupOutput, "pass-resource-evidence-ids",
+            evidenceLookupCount );
+        removeConsumed( evidenceSorted );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::evidenceSortMs );
+
+        {
+            analysis::AnalysisUInt64PairRunCollector facts( factSorted, scratch,
+                "gpu-pass-fused-facts", 512 * 1024, options.disk, options.workspace,
+                options.cancelled, statistics ? &statistics->factSort : nullptr );
+            for( uint64_t ordinal = 0; ordinal < rangeCount; ordinal++ )
+            {
+                if( ( ordinal & 4095 ) == 0 ) cancelled();
+                const auto range = input.Range( ordinal );
+                if( range.passInstanceId == 0 || range.resourceId == 0 ) continue;
+                auto resourceOrdinal = input.FindResourceOrdinal( range.resourceId );
+                if( !resourceOrdinal )
+                {
+                    const auto found = std::lower_bound( missingResourceIds.begin(),
+                        missingResourceIds.end(), range.resourceId );
+                    if( found == missingResourceIds.end() || *found != range.resourceId )
+                        throw std::runtime_error( "GPU pass fused missing Resource identity changed" );
+                    resourceOrdinal = uint32_t( catalogResourceCount +
+                        uint64_t( std::distance( missingResourceIds.begin(), found ) ) );
+                }
+                facts.Emit( { range.passInstanceId,
+                    uint64_t( *resourceOrdinal ) << 32 | ( FusedRangeBit | uint32_t( ordinal ) ) } );
+            }
+            for( uint64_t ordinal = 0; ordinal < useCount; ordinal++ )
+            {
+                if( ( ordinal & 4095 ) == 0 ) cancelled();
+                const auto use = input.Use( ordinal );
+                const auto resourceOrdinal = input.ResolveCatalogResourceOrdinal( use.resourceId, use.passEnd );
+                if( use.passId == 0 ) continue;
+                if( !resourceOrdinal )
+                {
+                    if( input.ResolveCatalogResource( use.resourceId, use.passEnd ) != 0 )
+                        throw std::runtime_error( "GPU pass fused resolved Resource lacks an ordinal" );
+                    continue;
+                }
+                facts.Emit( { use.passId,
+                    uint64_t( *resourceOrdinal ) << 32 | uint32_t( ordinal ) } );
+            }
+            if( !facts.Finish( sortError ) )
+                throw std::runtime_error( "GPU pass fused Fact sort failed: " + sortError );
+        }
+        finishPhase( &QueryGpuPassResourceBuildStatistics::factSortMs );
+
+        auto partitionOptions = options;
+        partitionOptions.blockBytes = 1024 * 1024;
+        std::array<std::unique_ptr<analysis::PagedRecordWriter>, FusedPartitionCount> partitionWriters;
+        std::array<std::vector<FusedPassResourceFact>, FusedPartitionCount> partitionBuffers;
+        analysis::AnalysisWorkspaceReservation partitionBufferMemory( options.workspace,
+            uint64_t( FusedPartitionCount ) * FusedWriteBufferRecords * sizeof( FusedPassResourceFact ) );
+        for( uint32_t partition = 0; partition < FusedPartitionCount; partition++ )
+        {
+            partitionBuffers[partition].reserve( FusedWriteBufferRecords );
+            partitionWriters[partition] = std::make_unique<analysis::PagedRecordWriter>(
+                partitionsRoot / std::to_string( partition ),
+                FusedPartitionIdentity( sourceFingerprint, partition ),
+                uint32_t( sizeof( FusedPassResourceFact ) ), partitionOptions );
+        }
+        const auto flushPartition = [&]( uint32_t partition ) {
+            auto& values = partitionBuffers[partition];
+            if( values.empty() ) return;
+            partitionWriters[partition]->Append( values.data(), values.size() );
+            values.clear();
+        };
+        uint64_t expandedFactCount = 0;
+        {
+            std::ifstream facts( analysis::AnalysisIoPath( factSorted ), std::ios::binary );
+            std::ifstream mappings( analysis::AnalysisIoPath( mappingSorted ), std::ios::binary );
+            if( !facts || !mappings ) throw std::runtime_error( "GPU pass fused merge inputs cannot be opened" );
+            analysis::AnalysisUInt64Pair fact {}, mapping {};
+            bool haveFact = bool( facts.read( reinterpret_cast<char*>( &fact ), sizeof( fact ) ) );
+            bool haveMapping = bool( mappings.read( reinterpret_cast<char*>( &mapping ), sizeof( mapping ) ) );
+            std::vector<uint32_t> queryPassOrdinals;
+            analysis::AnalysisWorkspaceReservation queryPassMemory( options.workspace );
+            while( haveFact )
+            {
+                cancelled();
+                const auto evidencePassId = fact.key;
+                while( haveMapping && mapping.key < evidencePassId )
+                    haveMapping = bool( mappings.read( reinterpret_cast<char*>( &mapping ), sizeof( mapping ) ) );
+                queryPassOrdinals.clear();
+                uint64_t previousQueryPassId = 0;
+                while( haveMapping && mapping.key == evidencePassId )
+                {
+                    if( mapping.value != previousQueryPassId )
+                    {
+                        const auto found = std::lower_bound( passIds.begin(), passIds.end(), mapping.value );
+                        if( found == passIds.end() || *found != mapping.value )
+                            throw std::runtime_error( "GPU pass fused Mapping references an unknown Pass" );
+                        AppendTracked( queryPassOrdinals, queryPassMemory,
+                            uint32_t( std::distance( passIds.begin(), found ) ),
+                            "GPU pass fused fanout" );
+                        previousQueryPassId = mapping.value;
+                    }
+                    haveMapping = bool( mappings.read( reinterpret_cast<char*>( &mapping ), sizeof( mapping ) ) );
+                }
+                do
+                {
+                    const auto resourceOrdinal = uint32_t( fact.value >> 32 );
+                    const auto sourceOrdinalAndKind = uint32_t( fact.value );
+                    for( const auto queryPassOrdinal : queryPassOrdinals )
+                    {
+                        const auto partition = FusedPartition( queryPassOrdinal, passIds.size() );
+                        partitionBuffers[partition].push_back(
+                            { queryPassOrdinal, resourceOrdinal, sourceOrdinalAndKind } );
+                        if( partitionBuffers[partition].size() == FusedWriteBufferRecords )
+                            flushPartition( partition );
+                        expandedFactCount++;
+                    }
+                    haveFact = bool( facts.read( reinterpret_cast<char*>( &fact ), sizeof( fact ) ) );
+                }
+                while( haveFact && fact.key == evidencePassId );
+            }
+            if( !facts.eof() || ( !mappings.eof() && !haveMapping ) )
+                throw std::runtime_error( "GPU pass fused merge input read failed" );
+        }
+        for( uint32_t partition = 0; partition < FusedPartitionCount; partition++ )
+        {
+            flushPartition( partition );
+            partitionWriters[partition]->Commit();
+            partitionWriters[partition].reset();
+            std::vector<FusedPassResourceFact>().swap( partitionBuffers[partition] );
+        }
+        partitionBufferMemory.Resize( 0 );
+        removeConsumed( factSorted );
+        removeConsumed( mappingSorted );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::expansionMs );
+
+        uint64_t emittedFacts = 0;
+        {
+            analysis::PagedRecordWriter summaries( summaryOutput,
+                Identity( sourceFingerprint, "pass-resource-summary" ),
+                sizeof( QueryGpuPassResourceSummary ), options );
+            analysis::PagedRecordWriter ranges( rangeLookupOutput,
+                Identity( sourceFingerprint, "pass-resource-ranges" ),
+                sizeof( analysis::AnalysisKeyMetadataRecord ), options );
+            analysis::PagedRecordWriter uses( useLookupOutput,
+                Identity( sourceFingerprint, "pass-resource-uses" ),
+                sizeof( analysis::AnalysisKeyMetadataRecord ), options );
+            std::array<analysis::AnalysisKeyMetadataRecord, FusedWriteBufferRecords> outputBuffer;
+            const auto appendOrdinals = [&]( analysis::PagedRecordWriter& writer,
+                uint64_t passId, const std::vector<uint32_t>& ordinals ) {
+                for( size_t begin = 0; begin < ordinals.size(); )
+                {
+                    const auto count = std::min( outputBuffer.size(), ordinals.size() - begin );
+                    for( size_t index = 0; index < count; index++ )
+                    {
+                        auto& row = outputBuffer[index];
+                        row = {};
+                        row.keyHigh = passId;
+                        row.keyLow = ordinals[begin + index];
+                        row.metadata = ordinals[begin + index];
+                    }
+                    writer.Append( outputBuffer.data(), count );
+                    begin += count;
+                }
+            };
+            for( uint32_t partition = 0; partition < FusedPartitionCount; partition++ )
+            {
+                cancelled();
+                const auto path = partitionsRoot / std::to_string( partition );
+                std::vector<FusedPassResourceFact> facts;
+                analysis::AnalysisWorkspaceReservation factMemory( options.workspace );
+                {
+                    analysis::PagedRecordReader reader( path,
+                        FusedPartitionIdentity( sourceFingerprint, partition ),
+                        sizeof( FusedPassResourceFact ), partitionOptions );
+                    if( reader.Count() > SIZE_MAX / sizeof( FusedPassResourceFact ) )
+                        throw std::runtime_error( "GPU pass fused partition exceeds address space" );
+                    factMemory.Resize( reader.Count() * sizeof( FusedPassResourceFact ) );
+                    facts.resize( size_t( reader.Count() ) );
+                    if( !facts.empty() ) reader.Read( 0, facts.data(), facts.size() );
+                }
+                std::sort( facts.begin(), facts.end(), []( const auto& lhs, const auto& rhs ) {
+                    if( lhs.passOrdinal != rhs.passOrdinal ) return lhs.passOrdinal < rhs.passOrdinal;
+                    if( lhs.resourceOrdinal != rhs.resourceOrdinal ) return lhs.resourceOrdinal < rhs.resourceOrdinal;
+                    return lhs.sourceOrdinalAndKind < rhs.sourceOrdinalAndKind;
+                } );
+                for( size_t passBegin = 0; passBegin < facts.size(); )
+                {
+                    cancelled();
+                    size_t passEnd = passBegin + 1;
+                    while( passEnd < facts.size() &&
+                        facts[passEnd].passOrdinal == facts[passBegin].passOrdinal ) passEnd++;
+                    const auto passOrdinal = facts[passBegin].passOrdinal;
+                    if( passOrdinal >= passIds.size() )
+                        throw std::runtime_error( "GPU pass fused partition Pass ordinal mismatch" );
+                    const auto passId = passIds[passOrdinal];
+                    const auto groupCount = passEnd - passBegin;
+                    if( groupCount > SIZE_MAX / 16 )
+                        throw std::runtime_error( "GPU pass fused Pass group exceeds address space" );
+                    analysis::AnalysisWorkspaceReservation groupMemory( options.workspace,
+                        uint64_t( groupCount ) * 16 );
+                    std::vector<uint32_t> useOrdinals, rangeOrdinals;
+                    std::vector<uint64_t> allocationIds;
+                    useOrdinals.reserve( groupCount );
+                    rangeOrdinals.reserve( groupCount );
+                    allocationIds.reserve( groupCount );
+                    groupMemory.Resize( uint64_t( useOrdinals.capacity() ) * sizeof( uint32_t ) +
+                        uint64_t( rangeOrdinals.capacity() ) * sizeof( uint32_t ) +
+                        uint64_t( allocationIds.capacity() ) * sizeof( uint64_t ) );
+                    QueryGpuPassResourceSummary summary {};
+                    summary.passId = passId;
+                    for( size_t resourceBegin = passBegin; resourceBegin < passEnd; )
+                    {
+                        size_t resourceEnd = resourceBegin + 1;
+                        while( resourceEnd < passEnd && facts[resourceEnd].resourceOrdinal ==
+                            facts[resourceBegin].resourceOrdinal ) resourceEnd++;
+                        const auto resourceOrdinal = facts[resourceBegin].resourceOrdinal;
+                        const auto totalResourceCount = catalogResourceCount + missingResourceIds.size();
+                        if( resourceOrdinal >= totalResourceCount )
+                            throw std::runtime_error( "GPU pass fused partition Resource ordinal mismatch" );
+                        summary.resourceCount++;
+                        if( resourceOrdinal < catalogResourceCount )
+                        {
+                            const auto allocationId = input.ResourceAllocationAtOrdinal( resourceOrdinal );
+                            if( allocationId != 0 ) allocationIds.emplace_back( allocationId );
+                        }
+                        bool ranged = false;
+                        for( size_t index = resourceBegin; index < resourceEnd; index++ )
+                        {
+                            const auto packed = facts[index].sourceOrdinalAndKind;
+                            if( ( packed & FusedRangeBit ) != 0 )
+                            {
+                                const auto sourceOrdinal = packed & ~FusedRangeBit;
+                                if( sourceOrdinal >= rangeLengths.size() )
+                                    throw std::runtime_error( "GPU pass fused Range ordinal mismatch" );
+                                CheckedAdd( summary.directRangeBytes, rangeLengths[sourceOrdinal],
+                                    "GPU pass direct range bytes" );
+                                summary.rangeCount++;
+                                ranged = true;
+                                rangeOrdinals.emplace_back( sourceOrdinal );
+                            }
+                            else
+                            {
+                                summary.useCount++;
+                                useOrdinals.emplace_back( packed );
+                            }
+                        }
+                        if( ranged ) summary.rangedResourceCount++;
+                        resourceBegin = resourceEnd;
+                    }
+                    std::sort( useOrdinals.begin(), useOrdinals.end() );
+                    std::sort( rangeOrdinals.begin(), rangeOrdinals.end() );
+                    std::sort( allocationIds.begin(), allocationIds.end() );
+                    allocationIds.erase( std::unique( allocationIds.begin(), allocationIds.end() ),
+                        allocationIds.end() );
+                    summary.allocationCount = allocationIds.size();
+                    for( const auto allocationId : allocationIds )
+                        CheckedAdd( summary.referencedPhysicalBytes,
+                            input.AllocationBytesAtEnd( allocationId ),
+                            "GPU pass referenced physical bytes" );
+                    appendOrdinals( uses, passId, useOrdinals );
+                    appendOrdinals( ranges, passId, rangeOrdinals );
+                    summaries.Append( &summary, 1 );
+                    emittedFacts += summary.useCount + summary.rangeCount;
+                    passBegin = passEnd;
+                }
+                std::vector<FusedPassResourceFact>().swap( facts );
+                factMemory.Resize( 0 );
+                removeConsumed( path, true );
+            }
+            if( emittedFacts != expandedFactCount )
+                throw std::runtime_error( "GPU pass fused expanded Fact count mismatch" );
+            summaries.Commit();
+            ranges.Commit();
+            uses.Commit();
+        }
+        std::vector<uint64_t>().swap( rangeLengths ); rangeMemory.Resize( 0 );
+        std::vector<uint64_t>().swap( passIds ); passMemory.Resize( 0 );
+        std::vector<uint64_t>().swap( missingResourceIds ); missingResourceMemory.Resize( 0 );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::summaryMs );
+        const auto cleanupError = cleanup( false );
+        if( !cleanupError.empty() )
+            throw std::runtime_error( "GPU pass fused scratch cleanup failed: " + cleanupError );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::publishMs );
+    }
+    catch( ... )
+    {
+        const auto failure = std::current_exception();
+        const auto cleanupError = cleanup( true );
+        if( !cleanupError.empty() )
+            throw std::runtime_error( "GPU pass fused cleanup failed: " + cleanupError );
+        std::rethrow_exception( failure );
+    }
+}
+
+void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
+    std::string sourceFingerprint, const QueryGpuPassResourceInput& input,
+    analysis::PagedRecordOptions options, QueryGpuPassResourceBuildStatistics* statistics,
+    BuildMode mode )
+{
+    const auto fusedAvailable = input.ResourceOrdinalCount() != 0 &&
+        input.RangeCount() < FusedRangeBit && input.UseCount() < FusedRangeBit;
+    if( mode == BuildMode::Fused || ( mode == BuildMode::Automatic && fusedAvailable ) )
+        return BuildGpuPassResourceFused( root, sourceFingerprint, input,
+            std::move( options ), statistics );
+    BuildGpuPassResourceLegacy( root, std::move( sourceFingerprint ), input,
+        std::move( options ), statistics );
 }
 
 struct QueryGpuPassResourceStoreReader::Impl
