@@ -42,19 +42,19 @@ std::filesystem::path CatalogResourceLookupPath( const std::filesystem::path& ro
 std::filesystem::path PassTimesPath( const std::filesystem::path& root ) { return root / "pass-times"; }
 std::filesystem::path ResolvedUsesPath( const std::filesystem::path& root ) { return root / "resolved-uses"; }
 
-class ValidationSortedRows
+class ValidationSortedPairs
 {
 public:
-    ValidationSortedRows( const std::filesystem::path& path,
+    ValidationSortedPairs( const std::filesystem::path& path,
         const std::shared_ptr<analysis::AnalysisWorkspaceBudget>& workspace )
-        : m_memory( workspace, sizeof( analysis::AnalysisKeyMetadataRecord ) * 4096 )
+        : m_memory( workspace, sizeof( analysis::AnalysisUInt64Pair ) * 4096 )
         , m_rows( 4096 )
         , m_input( analysis::AnalysisIoPath( path ), std::ios::binary )
     {
         if( !m_input ) throw std::runtime_error( "GPU reference validation sort output cannot be opened" );
     }
 
-    bool Next( analysis::AnalysisKeyMetadataRecord& row )
+    bool Next( analysis::AnalysisUInt64Pair& row )
     {
         if( m_position == m_count )
         {
@@ -77,7 +77,7 @@ public:
 
 private:
     analysis::AnalysisWorkspaceReservation m_memory;
-    std::vector<analysis::AnalysisKeyMetadataRecord> m_rows;
+    std::vector<analysis::AnalysisUInt64Pair> m_rows;
     std::ifstream m_input;
     size_t m_position = 0;
     size_t m_count = 0;
@@ -577,59 +577,45 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
         } );
         finishPhase( &QueryGpuReferenceValidationStats::passAndUseValidationMs );
 
-        const auto writeByUseOrdinal = [&]( analysis::PagedRecordReader& source,
-            const std::filesystem::path& path, const char* orderError ) {
-            std::ofstream output( analysis::AnalysisIoPath( path ), std::ios::binary | std::ios::trunc );
-            if( !output ) throw std::runtime_error( "GPU reference validation source cannot be opened" );
-            analysis::AnalysisWorkspaceReservation memory( m_impl->options.workspace,
-                uint64_t( m_impl->options.blockBytes ) + 4096 );
-            std::vector<Record> reordered;
-            Record previous {};
-            uint64_t ordinal = 0;
-            source.VisitValidated( [&]( const void* data, uint64_t count ) {
-                const auto* bytes = static_cast<const char*>( data );
-                reordered.resize( size_t( count ) );
-                for( uint64_t index = 0; index < count; index++, ordinal++ )
-                {
-                    Record row {};
-                    std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
-                    if( row.keyHigh == 0 || row.metadata >= m_impl->uses.Count() ||
-                        ( ordinal != 0 && ( row.keyHigh < previous.keyHigh ||
-                            ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
-                                ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
-                        throw std::runtime_error( orderError );
-                    reordered[size_t( index )].keyHigh = row.metadata;
-                    reordered[size_t( index )].metadata = row.keyHigh;
-                    previous = row;
-                }
-                const auto length = count * sizeof( Record );
-                analysis::AnalysisDiskGrow( m_impl->options.disk, length );
-                output.write( reinterpret_cast<const char*>( reordered.data() ), std::streamsize( length ) );
-                if( !output ) throw std::runtime_error( "GPU reference validation source write failed" );
-            } );
-            output.flush();
-            if( !output ) throw std::runtime_error( "GPU reference validation source flush failed" );
-        };
-        const auto sortByUseOrdinal = [&]( const std::filesystem::path& source,
-            const std::filesystem::path& sorted, const char* prefix, uint64_t count,
+        const auto sortByUseOrdinal = [&]( analysis::PagedRecordReader& source,
+            const std::filesystem::path& sorted, const char* prefix, const char* orderError,
             analysis::AnalysisExternalSortStatistics& statistics ) {
             std::string error;
-            if( !analysis::SortAnalysisKeyMetadataRecords( source, sorted, scratch, prefix, count,
-                    512 * 1024, error, m_impl->options.disk, m_impl->options.workspace,
+            const auto count = source.Count();
+            if( !analysis::SortAnalysisUInt64PairsGenerated( sorted, scratch, prefix,
+                    analysis::ChooseAnalysisExternalSortBufferRecords( count,
+                        sizeof( analysis::AnalysisUInt64Pair ), m_impl->options.workspace ),
+                    [&]( const auto& emit ) {
+                        Record previous {};
+                        uint64_t ordinal = 0;
+                        source.VisitValidated( [&]( const void* data, uint64_t blockCount ) {
+                            const auto* bytes = static_cast<const char*>( data );
+                            for( uint64_t index = 0; index < blockCount; index++, ordinal++ )
+                            {
+                                Record row {};
+                                std::memcpy( &row, bytes + index * sizeof( row ), sizeof( row ) );
+                                if( row.keyHigh == 0 || row.metadata >= m_impl->uses.Count() ||
+                                    ( ordinal != 0 && ( row.keyHigh < previous.keyHigh ||
+                                        ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
+                                            ( row.keyLow == previous.keyLow &&
+                                                row.metadata < previous.metadata ) ) ) ) ) )
+                                    throw std::runtime_error( orderError );
+                                emit( analysis::AnalysisUInt64Pair { row.metadata, row.keyHigh } );
+                                previous = row;
+                            }
+                        } );
+                    }, error, m_impl->options.disk, m_impl->options.workspace,
                     m_impl->options.cancelled, &statistics ) )
                 throw std::runtime_error( "GPU reference validation sort failed: " + error );
-            removeFile( source );
         };
 
-        const auto resourceSource = scratch / "resource-source.work";
         const auto resourceSorted = scratch / "resource-sorted.work";
-        writeByUseOrdinal( m_impl->lookup, resourceSource, "GPU reference resource lookup order mismatch" );
         finishPhase( &QueryGpuReferenceValidationStats::resourceSourceMs );
-        sortByUseOrdinal( resourceSource, resourceSorted, "gpu-reference-validation-resource",
-            m_impl->lookup.Count(), result.resourceSort );
+        sortByUseOrdinal( m_impl->lookup, resourceSorted, "gpu-reference-validation-resource",
+            "GPU reference resource lookup order mismatch", result.resourceSort );
         finishPhase( &QueryGpuReferenceValidationStats::resourceSortMs );
         {
-            ValidationSortedRows sorted( resourceSorted, m_impl->options.workspace );
+            ValidationSortedPairs sorted( resourceSorted, m_impl->options.workspace );
             uint64_t ordinal = 0;
             m_impl->uses.VisitValidated( [&]( const void* data, uint64_t count ) {
                 const auto* bytes = static_cast<const char*>( data );
@@ -637,32 +623,29 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
                 {
                     if( ( ordinal & 4095 ) == 0 && m_impl->options.cancelled && m_impl->options.cancelled() )
                         throw std::runtime_error( "GPU reference validation cancelled" );
-                    Record lookup {};
-                    if( !sorted.Next( lookup ) || lookup.keyHigh != ordinal )
+                    analysis::AnalysisUInt64Pair lookup {};
+                    if( !sorted.Next( lookup ) || lookup.key != ordinal )
                         throw std::runtime_error( "GPU reference resource lookup ordinal mismatch" );
                     QueryGpuReferenceResolvedUseRecord use {};
                     std::memcpy( &use, bytes + index * sizeof( use ), sizeof( use ) );
-                    if( lookup.metadata != use.resourceId )
+                    if( lookup.value != use.resourceId )
                         throw std::runtime_error( "GPU reference resource lookup identity mismatch" );
                 }
             } );
-            Record extra {};
+            analysis::AnalysisUInt64Pair extra {};
             if( sorted.Next( extra ) ) throw std::runtime_error( "GPU reference resource lookup duplicate ordinal" );
         }
         removeFile( resourceSorted );
         finishPhase( &QueryGpuReferenceValidationStats::resourceCompareMs );
 
-        const auto catalogSource = scratch / "catalog-source.work";
         const auto catalogSorted = scratch / "catalog-sorted.work";
-        writeByUseOrdinal( m_impl->catalogLookup, catalogSource,
-            "GPU reference Catalog resource lookup order mismatch" );
         finishPhase( &QueryGpuReferenceValidationStats::catalogSourceMs );
-        sortByUseOrdinal( catalogSource, catalogSorted, "gpu-reference-validation-catalog",
-            m_impl->catalogLookup.Count(), result.catalogSort );
+        sortByUseOrdinal( m_impl->catalogLookup, catalogSorted, "gpu-reference-validation-catalog",
+            "GPU reference Catalog resource lookup order mismatch", result.catalogSort );
         finishPhase( &QueryGpuReferenceValidationStats::catalogSortMs );
         {
-            ValidationSortedRows sorted( catalogSorted, m_impl->options.workspace );
-            Record next {};
+            ValidationSortedPairs sorted( catalogSorted, m_impl->options.workspace );
+            analysis::AnalysisUInt64Pair next {};
             bool haveNext = sorted.Next( next );
             uint64_t ordinal = 0;
             m_impl->uses.VisitValidated( [&]( const void* data, uint64_t count ) {
@@ -675,14 +658,14 @@ QueryGpuReferenceValidationStats QueryGpuReferenceStoreReader::ValidateAll(
                     std::memcpy( &use, bytes + index * sizeof( use ), sizeof( use ) );
                     const auto expected = resolveCatalogResource ?
                         resolveCatalogResource( use.resourceId, use.passEnd ) : 0;
-                    if( haveNext && next.keyHigh < ordinal )
+                    if( haveNext && next.key < ordinal )
                         throw std::runtime_error( "GPU reference Catalog lookup ordinal mismatch" );
-                    if( haveNext && next.keyHigh == ordinal )
+                    if( haveNext && next.key == ordinal )
                     {
-                        if( next.metadata == 0 || ( resolveCatalogResource && next.metadata != expected ) )
+                        if( next.value == 0 || ( resolveCatalogResource && next.value != expected ) )
                             throw std::runtime_error( "GPU reference Catalog resource lookup identity mismatch" );
                         haveNext = sorted.Next( next );
-                        if( haveNext && next.keyHigh == ordinal )
+                        if( haveNext && next.key == ordinal )
                             throw std::runtime_error( "GPU reference Catalog lookup duplicate ordinal" );
                     }
                     else if( resolveCatalogResource && expected != 0 )

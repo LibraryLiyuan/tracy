@@ -1128,9 +1128,13 @@ int main( int argc, char** argv )
         }, scaleScratch );
         Require( validation.sortedReferenceCount == scaleInput.uses.size() + scaleInput.uses.size() / 8 &&
             validation.resourceSort.inputRecords == scaleInput.uses.size() &&
-            validation.resourceSort.sourceReadBytes == scaleInput.uses.size() *
-                sizeof( tracy::analysis::AnalysisKeyMetadataRecord ) &&
+            validation.resourceSort.sourceReadBytes == 0 &&
+            validation.resourceSort.initialRunWriteBytes == scaleInput.uses.size() *
+                sizeof( tracy::analysis::AnalysisUInt64Pair ) &&
             validation.catalogSort.inputRecords == scaleInput.uses.size() / 8 &&
+            validation.catalogSort.sourceReadBytes == 0 &&
+            validation.catalogSort.initialRunWriteBytes == scaleInput.uses.size() / 8 *
+                sizeof( tracy::analysis::AnalysisUInt64Pair ) &&
             validation.totalMs >= validation.passAndUseValidationMs +
                 validation.resourceSourceMs + validation.resourceSortMs + validation.resourceCompareMs +
                 validation.catalogSourceMs + validation.catalogSortMs + validation.catalogCompareMs +
@@ -1160,13 +1164,8 @@ int main( int argc, char** argv )
         const auto cancelledScratch = root.parent_path() / "tracy-query-gpu-reference-validation-cancelled";
         fs::remove_all( cancelledScratch, ignored );
         auto cancelledOptions = scaleOptions;
-        cancelledOptions.cancelled = [&]() {
-            std::error_code error;
-            const auto source = cancelledScratch / "resource-source.work";
-            return fs::exists( source, error ) && !error &&
-                fs::file_size( source, error ) == scaleInput.uses.size() *
-                    sizeof( tracy::analysis::AnalysisKeyMetadataRecord );
-        };
+        uint64_t validationCancellationChecks = 0;
+        cancelledOptions.cancelled = [&] { return ++validationCancellationChecks >= 2; };
         bool cancelledDuringSort = false;
         try
         {
@@ -1174,7 +1173,7 @@ int main( int argc, char** argv )
             cancelled.ValidateAll( {}, cancelledScratch );
         }
         catch( const std::exception& error )
-        { cancelledDuringSort = std::string_view( error.what() ).find( "analysis_metadata_sort_cancelled" ) != std::string_view::npos; }
+        { cancelledDuringSort = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos; }
         Require( cancelledDuringSort && !fs::exists( cancelledScratch ),
             "GPU reference validation did not cancel external sorting and clean scratch" );
         const auto corruptedRoot = root.parent_path() / "tracy-query-gpu-reference-validation-corrupt";
