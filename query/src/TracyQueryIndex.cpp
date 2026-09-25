@@ -2275,6 +2275,10 @@ public:
         return result;
     }
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override { return m_jobs.GetCorrelatedFrameEvents(); }
+    uint64_t GetCorrelatedFrameEventCount() const override { return m_jobs.GetCorrelatedFrameEventCount(); }
+    std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override
+    { return m_jobs.ScanCorrelatedFrameEvents( offset, limit ); }
     std::vector<analysis::RelationDto> GetRelations() const override { return ScanRelations( 0, size_t( m_relations.Count() ) ); }
     uint64_t GetRelationCount() const override { return m_relations.Count(); }
     std::vector<analysis::RelationDto> ScanRelations( size_t offset, size_t limit ) const override

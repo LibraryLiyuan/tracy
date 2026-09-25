@@ -117,6 +117,9 @@ public:
     uint64_t GetGfxLinkCount() const override;
     std::vector<GfxLinkDto> ScanGfxLinks( size_t offset, size_t limit ) const override;
     std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    uint64_t GetCorrelatedFrameEventCount() const override;
+    std::vector<CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override;
     std::vector<RelationDto> GetRelations() const override;
     uint64_t GetRelationCount() const override;
     std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const override;

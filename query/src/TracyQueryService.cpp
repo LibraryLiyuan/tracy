@@ -9836,11 +9836,28 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     {
         if( !source->JobDerivedDataReady() )
             throw QueryError( "INDEX_NOT_READY", "bounded Job aggregation has not been built" );
-        const auto frameEvents = source->GetCorrelatedFrameEvents();
-        if( frameEvents.empty() )
+        const auto frameEventCount = source->GetCorrelatedFrameEventCount();
+        if( frameEventCount == 0 )
             return Success( id, { { "present", false }, { "complete", false },
                 { "reason", "trace predates or does not contain JN FrameIdentity evidence" },
                 { "evidence_kind", "unavailable" } }, trace );
+        std::vector<analysis::CorrelatedFrameEventDto> frameEvents;
+        for( uint64_t offset = 0; offset < frameEventCount; )
+        {
+            checkDirectedJobRead();
+            const auto requested = size_t( std::min<uint64_t>( 256, frameEventCount - offset ) );
+            const auto allowed = BudgetScanAllowance( requested );
+            if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                "Frame correlation scan budget exhausted", true );
+            auto page = source->ScanCorrelatedFrameEvents( size_t( offset ), allowed );
+            checkDirectedJobRead();
+            if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY",
+                "Frame correlation page is incomplete" );
+            BudgetScanned( page.size(), requested, allowed );
+            frameEvents.insert( frameEvents.end(), std::make_move_iterator( page.begin() ),
+                std::make_move_iterator( page.end() ) );
+            offset += page.size();
+        }
 
         uint64_t frameId = 0;
         if( params.contains( "ref" ) )
@@ -10635,7 +10652,30 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {
-        auto frameEvents = source->GetCorrelatedFrameEvents();
+        const auto readBoundedRows = [&]( uint64_t total, const auto& read, const char* label ) {
+            using Rows = decltype( read( size_t( 0 ), size_t( 0 ) ) );
+            Rows result;
+            for( uint64_t offset = 0; offset < total; )
+            {
+                checkDirectedJobRead();
+                const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    std::string( label ) + " scan budget exhausted", true );
+                auto page = read( size_t( offset ), allowed );
+                checkDirectedJobRead();
+                if( page.empty() || page.size() > allowed ) throw QueryError( "INDEX_NOT_READY",
+                    std::string( label ) + " page is incomplete" );
+                BudgetScanned( page.size(), requested, allowed );
+                result.insert( result.end(), std::make_move_iterator( page.begin() ),
+                    std::make_move_iterator( page.end() ) );
+                offset += page.size();
+            }
+            return result;
+        };
+        auto frameEvents = readBoundedRows( source->GetCorrelatedFrameEventCount(),
+            [&]( size_t offset, size_t limit ) { return source->ScanCorrelatedFrameEvents( offset, limit ); },
+            "Frame correlation" );
         if( frameEvents.empty() )
             return Success( id, { { "present", false }, { "reason", "trace predates or does not contain JN frame correlation" }, { "identities", json::array() } }, trace );
 
@@ -10700,13 +10740,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         }
 
         const bool frameSlice = method == "timeline.correlated_slice";
-        const auto jobs = frameSlice ? source->GetEvidenceJobs( parseFrame(), checkDirectedJobRead ) : source->GetJobs();
+        const auto jobs = frameSlice ? source->GetEvidenceJobs( parseFrame(), checkDirectedJobRead ) :
+            readBoundedRows( source->GetJobCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanJobs( offset, limit ); }, "Job" );
         std::vector<uint64_t> sliceSeeds;
         if( frameSlice ) for( const auto& job : jobs ) sliceSeeds.emplace_back( job.jobId );
         const auto gfxSlice = frameSlice ? source->GetEvidenceGfx( parseFrame(), sliceSeeds ) : analysis::GfxEvidenceSlice{};
-        const auto dispatches = frameSlice ? gfxSlice.dispatches : source->GetGfxDispatches();
-        const auto entities = frameSlice ? gfxSlice.entities : source->GetGfxEntities();
-        const auto gfxLinks = frameSlice ? gfxSlice.links : source->GetGfxLinks();
+        const auto dispatches = frameSlice ? gfxSlice.dispatches :
+            readBoundedRows( source->GetGfxDispatchCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxDispatches( offset, limit ); },
+                "Gfx dispatch" );
+        const auto entities = frameSlice ? gfxSlice.entities :
+            readBoundedRows( source->GetGfxEntityCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxEntities( offset, limit ); },
+                "Gfx entity" );
+        const auto gfxLinks = frameSlice ? gfxSlice.links :
+            readBoundedRows( source->GetGfxLinkCount(),
+                [&]( size_t offset, size_t limit ) { return source->ScanGfxLinks( offset, limit ); },
+                "Gfx link" );
         std::unordered_map<uint64_t, std::string> jobRefs;
         std::unordered_map<uint64_t, std::string> dispatchRefs;
         std::unordered_map<uint64_t, std::string> entityRefs;
@@ -10722,6 +10773,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         json relations = json::array();
         const auto addRelation = [&]( std::string sourceRef, std::string targetRef, const char* relation, uint64_t originFrameId ) {
             if( frameSlice ) checkDirectedJobRead();
+            if( !BudgetConsumeEdge() )
+                throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
             relations.push_back( {
                 { "ref", source->MakeEntityRef( "correlation", relations.size() + 1 ) },
                 { "source_ref", sourceRef }, { "target_ref", targetRef }, { "relation", relation },

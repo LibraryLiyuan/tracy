@@ -1096,6 +1096,14 @@ public:
         return result;
     }
     virtual std::vector<CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const { return {}; }
+    virtual uint64_t GetCorrelatedFrameEventCount() const { return GetCorrelatedFrameEvents().size(); }
+    virtual std::vector<CorrelatedFrameEventDto> ScanCorrelatedFrameEvents( size_t offset, size_t limit ) const
+    {
+        const auto values = GetCorrelatedFrameEvents();
+        if( limit == 0 || offset >= values.size() ) return {};
+        const auto end = offset + std::min( limit, values.size() - offset );
+        return { values.begin() + offset, values.begin() + end };
+    }
     virtual std::vector<RelationDto> GetRelations() const { return {}; }
     virtual uint64_t GetRelationCount() const { return GetRelations().size(); }
     virtual std::vector<RelationDto> ScanRelations( size_t offset, size_t limit ) const

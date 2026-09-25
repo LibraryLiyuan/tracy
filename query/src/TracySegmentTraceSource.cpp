@@ -876,6 +876,9 @@ TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanLocks, const analysis::Sca
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanContextSwitches, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD1( std::vector<std::string>, ScanSamples, const analysis::ScanRange&, range )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::CorrelatedFrameEventDto>, GetCorrelatedFrameEvents )
+TRACY_SEGMENT_FORWARD0( uint64_t, GetCorrelatedFrameEventCount )
+TRACY_SEGMENT_FORWARD2( std::vector<analysis::CorrelatedFrameEventDto>, ScanCorrelatedFrameEvents,
+    size_t, offset, size_t, limit )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::JobDto>, GetJobs )
 TRACY_SEGMENT_FORWARD0( uint64_t, GetJobCount )
 TRACY_SEGMENT_FORWARD2( std::vector<analysis::JobDto>, ScanJobs, size_t, offset, size_t, limit )

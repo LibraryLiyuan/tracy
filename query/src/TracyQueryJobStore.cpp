@@ -1303,11 +1303,26 @@ std::vector<analysis::GfxDispatchDto> QueryJobStoreReader::GetGfxDispatches() co
 
 std::vector<analysis::CorrelatedFrameEventDto> QueryJobStoreReader::GetCorrelatedFrameEvents() const
 {
+    return ScanCorrelatedFrameEvents( 0, size_t( std::min<uint64_t>(
+        GetCorrelatedFrameEventCount(), std::numeric_limits<size_t>::max() ) ) );
+}
+
+uint64_t QueryJobStoreReader::GetCorrelatedFrameEventCount() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->facts[size_t( QueryJobDomain::Frame )]->Count();
+}
+
+std::vector<analysis::CorrelatedFrameEventDto> QueryJobStoreReader::ScanCorrelatedFrameEvents(
+    size_t offset, size_t limit ) const
+{
     std::lock_guard lock( m_impl->mutex );
     auto& facts = *m_impl->facts[size_t( QueryJobDomain::Frame )];
+    const auto begin = std::min<uint64_t>( offset, facts.Count() );
+    const auto end = begin + std::min<uint64_t>( limit, facts.Count() - begin );
     std::vector<analysis::CorrelatedFrameEventDto> result;
-    result.reserve( size_t( std::min<uint64_t>( facts.Count(), std::numeric_limits<size_t>::max() ) ) );
-    for( uint64_t ordinal = 0; ordinal < facts.Count(); ordinal++ )
+    result.reserve( size_t( end - begin ) );
+    for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
     {
         const auto value = ReadFact<JnFrameData>( facts, ordinal );
         result.push_back( { Ref( m_impl->source, "frame-identity-event", ordinal ), value.frameId,

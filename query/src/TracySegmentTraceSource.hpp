@@ -50,6 +50,9 @@ public:
     std::vector<std::string> ScanSamples( const analysis::ScanRange& range ) const override;
     uint32_t NativeBoundedScanVersion() const override;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override;
+    uint64_t GetCorrelatedFrameEventCount() const override;
+    std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override;
     std::vector<analysis::JobDto> GetJobs() const override;
     uint64_t GetJobCount() const override;
     std::vector<analysis::JobDto> ScanJobs( size_t offset, size_t limit ) const override;

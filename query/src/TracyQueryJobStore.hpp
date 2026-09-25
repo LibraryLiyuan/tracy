@@ -92,6 +92,9 @@ public:
     uint64_t GetGfxDispatchCount() const;
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const;
     std::vector<analysis::GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const;
+    uint64_t GetCorrelatedFrameEventCount() const;
+    std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const;
     uint64_t GetCallsiteCount() const;
     std::vector<analysis::CallsiteDto> GetCallsites() const;

@@ -2675,11 +2675,26 @@ std::vector<GfxLinkDto> WorkerTraceSource::ScanGfxLinks( size_t offset, size_t l
 
 std::vector<CorrelatedFrameEventDto> WorkerTraceSource::GetCorrelatedFrameEvents() const
 {
+    return ScanCorrelatedFrameEvents( 0, size_t( std::min<uint64_t>(
+        GetCorrelatedFrameEventCount(), std::numeric_limits<size_t>::max() ) ) );
+}
+
+uint64_t WorkerTraceSource::GetCorrelatedFrameEventCount() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->worker->GetJnTraceData().frames.size();
+}
+
+std::vector<CorrelatedFrameEventDto> WorkerTraceSource::ScanCorrelatedFrameEvents(
+    size_t offset, size_t limit ) const
+{
     std::lock_guard lock( m_impl->readMutex );
     const auto& values = m_impl->worker->GetJnTraceData().frames;
+    const auto begin = std::min( offset, values.size() );
+    const auto end = begin + std::min( limit, values.size() - begin );
     std::vector<CorrelatedFrameEventDto> result;
-    result.reserve( values.size() );
-    for( size_t index = 0; index < values.size(); index++ )
+    result.reserve( end - begin );
+    for( size_t index = begin; index < end; index++ )
     {
         const auto& value = values[index];
         result.push_back( { m_impl->MakeRef( "frame-identity-event", index ), value.frameId, value.domainIndex,

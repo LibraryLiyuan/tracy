@@ -71,6 +71,21 @@ public:
         return std::nullopt;
     }
     mutable std::vector<size_t> searchOffsets;
+    std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override
+    { ++reads["all_frame_events"]; return FakeTraceSource::GetCorrelatedFrameEvents(); }
+    uint64_t GetCorrelatedFrameEventCount() const override
+    { return FakeTraceSource::GetCorrelatedFrameEvents().size(); }
+    std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
+        size_t offset, size_t limit ) const override
+    {
+        ++reads["frame_events_page"];
+        Require( limit <= 256, "Frame correlation requested an oversized page" );
+        if( duringJobRead ) duringJobRead();
+        const auto values = FakeTraceSource::GetCorrelatedFrameEvents();
+        if( offset >= values.size() ) return {};
+        return { values.begin() + offset,
+            values.begin() + offset + std::min( limit, values.size() - offset ) };
+    }
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const override
     { ++reads["all_gfx_Dispatches"]; return FakeTraceSource::GetGfxDispatches(); }
     uint64_t GetGfxDispatchCount() const override { return FakeTraceSource::GetGfxDispatches().size(); }
@@ -238,6 +253,57 @@ int main()
             else Require(!directed.at("data").at("jobs").empty(), "frame Job list missing");
         }
         Require(failures == 0, "directed Job queries must select before materialization");
+        for( const auto* method : { "entity.related", "correlation.chain" } )
+        {
+            observed->reads.clear();
+            const auto related = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 20},
+                {"method", method}, {"params", {{"trace_id", opened.id},
+                    {"ref", "fake:frame-identity:281474976710657"},
+                    {"max_scan_events", 10000}, {"max_nodes", 2}, {"max_edges", 2000}}}} );
+            Require( related.at("ok"), "bounded correlation query failed" );
+            Require( observed->reads["all_frame_events"] == 0 &&
+                observed->reads["all_jobs"] == 0 &&
+                observed->reads["all_gfx_Dispatches"] == 0 &&
+                observed->reads["all_gfx_Entities"] == 0 &&
+                observed->reads["all_gfx_Links"] == 0,
+                "correlation query materialized a complete indexed table" );
+            Require( observed->reads["frame_events_page"] != 0 &&
+                observed->reads["job_page"] != 0 &&
+                observed->reads["gfx_Dispatches_page"] != 0 &&
+                observed->reads["gfx_Entities_page"] != 0 &&
+                observed->reads["gfx_Links_page"] != 0,
+                "correlation query did not use bounded indexed pages" );
+        }
+        observed->statisticsFixture = observed->GetJobs();
+        for( uint64_t index = 0; index < 1000; index++ )
+        {
+            analysis::JobDto unrelated;
+            unrelated.jobId = 10000 + index;
+            unrelated.ref = "fake:job:" + std::to_string( unrelated.jobId );
+            observed->statisticsFixture->push_back( std::move( unrelated ) );
+        }
+        const auto frameBudget = observed->GetCorrelatedFrameEventCount();
+        observed->reads.clear();
+        const auto limitedCorrelation = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 21},
+            {"method", "correlation.chain"}, {"params", {{"trace_id", opened.id},
+                {"ref", "fake:frame-identity:281474976710657"},
+                {"max_scan_events", frameBudget + 1}, {"max_nodes", 2}, {"max_edges", 20}}}} );
+        Require( !limitedCorrelation.at("ok") &&
+            limitedCorrelation.at("error").at("code") == "RESOURCE_LIMIT" &&
+            observed->reads["all_frame_events"] == 0 && observed->reads["all_jobs"] == 0 &&
+            observed->reads["all_gfx_Dispatches"] == 0 &&
+            observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0 &&
+            observed->reads["job_page"] == 1,
+            "correlation query exceeded its explicit scan budget or used a full-table getter" );
+        observed->statisticsFixture.reset();
+        observed->reads.clear();
+        const auto edgeLimitedCorrelation = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 22},
+            {"method", "correlation.chain"}, {"params", {{"trace_id", opened.id},
+                {"ref", "fake:frame-identity:281474976710657"},
+                {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 1}}}} );
+        Require( !edgeLimitedCorrelation.at("ok") &&
+            edgeLimitedCorrelation.at("error").at("code") == "RESOURCE_LIMIT",
+            "correlation query ignored its edge budget" );
         const json controlledRequest = {{"protocol", "tracy-query/1"}, {"id", 3}, {"method", "evidence.graph"},
             {"params", {{"trace_id", opened.id}, {"frame_id", "281474976710657"},
                 {"domains", json::array({"job", "wait"})}}}};
@@ -246,7 +312,8 @@ int main()
         observed->duringJobRead = [&] { cancel.request_stop(); };
         const auto cancelled = service.Execute(controlledRequest, std::nullopt, cancel.get_token());
         Require(!cancelled.at("ok") && cancelled.at("error").at("code") == "CANCELLED", "source cancellation ignored");
-        Require(observed->reads.empty(), "cancelled source materialized data");
+        Require(observed->reads.size() == 1 && observed->reads["frame_events_page"] == 1,
+            "cancelled source continued after its bounded Frame page" );
         observed->duringJobRead = [] { std::this_thread::sleep_for(std::chrono::milliseconds(10)); };
         auto deadlineRequest = controlledRequest; deadlineRequest["params"]["max_cpu_ms"] = 1;
         const auto expired = service.Execute(deadlineRequest);
