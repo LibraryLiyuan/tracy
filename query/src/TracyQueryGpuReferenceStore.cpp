@@ -13,6 +13,7 @@
 #include <future>
 #include <limits>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace tracy::query
 {
@@ -35,18 +36,17 @@ constexpr uint64_t ReferenceUseTargetPartitionRecords = 4ull * 1024 * 1024;
 #pragma pack( push, 1 )
 struct QueryGpuReferencePartitionUse
 {
-    uint64_t resourceId = 0;
     uint32_t passOrdinal = 0;
     uint32_t sourceUseOrdinal = 0;
+    uint32_t resourceOrdinal = 0;
     uint32_t usageMask = 0;
     uint32_t resourceSetId = 0;
     uint8_t flags = 0;
     uint8_t encoding = 0;
-    uint32_t resourceOrdinal = std::numeric_limits<uint32_t>::max();
 };
 #pragma pack( pop )
 
-static_assert( sizeof( QueryGpuReferencePartitionUse ) == 30 );
+static_assert( sizeof( QueryGpuReferencePartitionUse ) == 22 );
 
 #pragma pack( push, 1 )
 struct QueryGpuReferenceLookupPartitionFact
@@ -340,8 +340,30 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             values.clear();
         };
         uint64_t partitionRecords = 0;
-        bool referenceOrdinalsComplete = input.ReferenceResourceOrdinalCount() != 0 &&
-            input.ReferenceResourceOrdinalCount() <= std::numeric_limits<uint32_t>::max();
+        const auto referenceResourceCount = input.ReferenceResourceOrdinalCount();
+        const auto baseReferenceResourceCount = referenceResourceCount != 0 &&
+            referenceResourceCount <= std::numeric_limits<uint32_t>::max() ?
+            uint32_t( referenceResourceCount ) : 0;
+        analysis::AnalysisWorkspaceReservation extraResourceMemory( options.workspace );
+        std::unordered_map<uint64_t, uint32_t> extraResourceOrdinals;
+        std::vector<uint64_t> extraResourceIds;
+        const auto resolveReferenceOrdinal = [&]( uint64_t resourceId ) {
+            if( baseReferenceResourceCount != 0 )
+            {
+                const auto found = input.FindReferenceResourceOrdinal( resourceId );
+                if( found ) return *found;
+            }
+            const auto found = extraResourceOrdinals.find( resourceId );
+            if( found != extraResourceOrdinals.end() ) return found->second;
+            if( extraResourceIds.size() >= uint64_t( std::numeric_limits<uint32_t>::max() ) -
+                baseReferenceResourceCount )
+                throw std::runtime_error( "GPU reference extended Resource ordinal exceeds 32-bit capacity" );
+            extraResourceMemory.Add( 160 );
+            const auto ordinal = baseReferenceResourceCount + uint32_t( extraResourceIds.size() );
+            extraResourceIds.emplace_back( resourceId );
+            extraResourceOrdinals.emplace( resourceId, ordinal );
+            return ordinal;
+        };
         for( uint64_t ordinal = 0; ordinal < input.UseCount(); ordinal++ )
         {
             if( ( ordinal & 4095 ) == 0 && options.cancelled && options.cancelled() )
@@ -350,14 +372,11 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             if( use.passId == 0 || use.resourceId == 0 ) continue;
             const auto passOrdinal = findPassOrdinal( use.passId );
             if( !passOrdinal ) continue;
-            const auto resourceOrdinal = referenceOrdinalsComplete ?
-                input.FindReferenceResourceOrdinal( use.resourceId ) : std::nullopt;
-            if( referenceOrdinalsComplete && !resourceOrdinal ) referenceOrdinalsComplete = false;
+            const auto resourceOrdinal = resolveReferenceOrdinal( use.resourceId );
             const auto partition = passTimeRows.empty() ? 0 : uint32_t( std::min<uint64_t>(
                 partitionCount - 1, uint64_t( *passOrdinal ) * partitionCount / passTimeRows.size() ) );
-            partitionBuffers[partition].push_back( { use.resourceId, *passOrdinal,
-                uint32_t( ordinal ), use.usageMask, use.resourceSetId, use.flags, use.encoding,
-                resourceOrdinal.value_or( std::numeric_limits<uint32_t>::max() ) } );
+            partitionBuffers[partition].push_back( { *passOrdinal, uint32_t( ordinal ),
+                resourceOrdinal, use.usageMask, use.resourceSetId, use.flags, use.encoding } );
             if( partitionBuffers[partition].size() == ReferenceUseWriteBufferRecords )
                 flushPartition( partition );
             partitionRecords++;
@@ -375,6 +394,19 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( statistics ) statistics->usePartitionRecords = partitionRecords;
         finishPhase( &QueryGpuReferenceBuildStatistics::usePartitionWriteMs );
 
+        analysis::AnalysisWorkspaceReservation referenceIdMemory( options.workspace,
+            uint64_t( baseReferenceResourceCount ) * sizeof( uint64_t ) );
+        std::vector<uint64_t> referenceResourceIds( baseReferenceResourceCount );
+        uint64_t previousReferenceId = 0;
+        for( uint32_t ordinal = 0; ordinal < baseReferenceResourceCount; ordinal++ )
+        {
+            const auto resourceId = input.ReferenceResourceIdAtOrdinal( ordinal );
+            if( resourceId == 0 || ( ordinal != 0 && resourceId <= previousReferenceId ) )
+                throw std::runtime_error( "GPU reference Resource ordinal dictionary order changed" );
+            referenceResourceIds[ordinal] = resourceId;
+            previousReferenceId = resourceId;
+        }
+
         analysis::PagedRecordWriter resolvedUses( usesOutput,
             Identity( sourceFingerprint, "resolved-uses" ), sizeof( QueryGpuReferenceResolvedUseRecord ), options );
         analysis::AnalysisWorkspaceReservation resolvedBufferMemory( options.workspace,
@@ -386,9 +418,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             resolvedUses.Append( resolvedBuffer.data(), resolvedBuffer.size() );
             resolvedBuffer.clear();
         };
-        const auto referenceResourceCount = input.ReferenceResourceOrdinalCount();
         const auto catalogResourceCount = input.CatalogResourceOrdinalCount();
-        const bool ordinalLookups = referenceOrdinalsComplete &&
+        const bool ordinalLookups = extraResourceIds.empty() &&
             referenceResourceCount != 0 && catalogResourceCount != 0 &&
             referenceResourceCount <= std::numeric_limits<uint32_t>::max() &&
             catalogResourceCount <= std::numeric_limits<uint32_t>::max();
@@ -513,8 +544,14 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 if( use.passOrdinal >= passTimeRows.size() )
                     throw std::runtime_error( "GPU reference Use partition Pass ordinal mismatch" );
                 const auto& passTime = passTimeRows[use.passOrdinal];
+                const auto resourceId = use.resourceOrdinal < baseReferenceResourceCount ?
+                    referenceResourceIds[use.resourceOrdinal] :
+                    use.resourceOrdinal - baseReferenceResourceCount < extraResourceIds.size() ?
+                        extraResourceIds[use.resourceOrdinal - baseReferenceResourceCount] : 0;
+                if( resourceId == 0 )
+                    throw std::runtime_error( "GPU reference Use partition Resource ordinal mismatch" );
                 QueryGpuReferenceResolvedUseRecord resolved {};
-                resolved.resourceId = use.resourceId;
+                resolved.resourceId = resourceId;
                 resolved.passId = passTime.passId;
                 resolved.passStart = passTime.start;
                 resolved.passEnd = passTime.end;
@@ -649,7 +686,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                                 activeResourceOrdinal = fact.resourceOrdinal;
                                 activeResourceId = catalog ?
                                     input.CatalogResourceIdAtOrdinal( fact.resourceOrdinal ) :
-                                    input.ReferenceResourceIdAtOrdinal( fact.resourceOrdinal );
+                                    referenceResourceIds[fact.resourceOrdinal];
                             }
                             auto& row = outputBuffer[index];
                             row = {};
