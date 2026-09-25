@@ -601,7 +601,8 @@ QueryCorrelationCandidatePage QueryCorrelationStoreReader::ReadCandidates(
     return result;
 }
 
-void QueryCorrelationStoreReader::ValidateAll()
+void QueryCorrelationStoreReader::ValidateAll(
+    const std::function<void( QueryCorrelationEndpointTag, uint64_t )>& validate )
 {
     auto& value = *m_impl;
     Check( value.options );
@@ -624,9 +625,12 @@ void QueryCorrelationStoreReader::ValidateAll()
         for( uint64_t index = 0; index < count; index++ )
         {
             Check( value.options );
-            if( uint8_t( rows[index] >> 61 ) >= uint8_t( QueryCorrelationEndpointTag::Count ) )
+            const auto tag = uint8_t( rows[index] >> 61 );
+            if( tag >= uint8_t( QueryCorrelationEndpointTag::Count ) )
                 throw std::runtime_error( "query_correlation_tag" );
-            tagCounts[size_t( rows[index] >> 61 )]++;
+            const auto ordinal = rows[index] & OrdinalMask;
+            if( validate ) validate( QueryCorrelationEndpointTag( tag ), ordinal );
+            tagCounts[size_t( tag )]++;
         }
     } );
     if( tagCounts != value.header.tagCounts )

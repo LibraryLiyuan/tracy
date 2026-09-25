@@ -140,7 +140,7 @@ public:
     std::vector<uint64_t> ReadExplicitPassOrdinals( uint64_t offset, size_t limit ) const;
     uint64_t CandidateCount( uint64_t nodeId ) const;
     QueryCorrelationCandidatePage ReadCandidates( uint64_t nodeId, uint64_t offset, size_t limit ) const;
-    void ValidateAll();
+    void ValidateAll( const std::function<void( QueryCorrelationEndpointTag, uint64_t )>& validate = {} );
 
 private:
     struct Impl;
