@@ -80,7 +80,7 @@ private:
 
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
     bool inventory = false, bool realCatalog = false, bool shuffledCatalog = false,
-    bool shuffledAllocation = false, bool multiDomain = false )
+    bool shuffledAllocation = false, bool multiDomain = false, bool validate = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy;
@@ -458,7 +458,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             Require( first.total != 0 && last.total != 0 &&
                 first.values.front().passId == 1 && last.values.front().passId == input.PassCount(),
                 "GPU reference capacity pass identity changed" );
-            if( useCount <= 1000000 )
+            if( validate || useCount <= 1000000 )
             {
                 const auto validationScratch = root / "capacity-validation-scratch";
                 auto validationUsage = std::make_shared<AnalysisDiskUsage>(
@@ -477,6 +477,10 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             }
         }
         const auto observed = usage->Snapshot();
+        const auto validationCombinedPeak = validationObserved.peakBytes > UINT64_MAX - observed.currentBytes ?
+            UINT64_MAX : observed.currentBytes + validationObserved.peakBytes;
+        const auto buildPlusValidationPeak = validationComplete ?
+            std::max( buildObserved.peakBytes, validationCombinedPeak ) : buildObserved.peakBytes;
         std::cout << "gpu_reference_uses=" << useCount << " passes=" << input.PassCount()
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
             << " shuffled_catalog=" << shuffledCatalog
@@ -498,8 +502,10 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
             << " build_peak_bytes=" << buildObserved.peakBytes
+            << " build_plus_validation_peak_bytes=" << buildPlusValidationPeak
             << " final_bytes=" << observed.currentBytes
             << " build_elapsed_ms=" << buildMilliseconds
+            << " validation_requested=" << validate
             << " validation_complete=" << validationComplete
             << " validation_elapsed_ms=" << validationStats.totalMs
             << " validation_scratch_peak_bytes=" << validationObserved.peakBytes
@@ -577,6 +583,9 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity-validated" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, false, false, false, true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-shuffled-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
             false, true, true );
