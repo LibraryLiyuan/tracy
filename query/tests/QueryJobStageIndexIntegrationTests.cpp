@@ -186,6 +186,7 @@ int main( int argc, char** argv )
             nlohmann::json related = nullptr;
             nlohmann::json chain = nullptr;
             nlohmann::json frameIdentity = nullptr;
+            nlohmann::json frameIdentityList = nullptr;
             nlohmann::json evidence = nullptr;
             nlohmann::json gpuPasses = nullptr;
             if( !expectedFrames.empty() )
@@ -196,6 +197,11 @@ int main( int argc, char** argv )
                 const auto frameResponse = service.Execute( request );
                 Require( frameResponse.at("ok"), "real Frame identity query failed" );
                 frameIdentity = frameResponse.at("data");
+                request["params"] = {{"trace_id", session.id}, {"limit", 100},
+                    {"max_scan_events", 10000}};
+                const auto frameListResponse = service.Execute( request );
+                Require( frameListResponse.at("ok"), "real Frame identity list failed" );
+                frameIdentityList = frameListResponse.at("data");
                 request["method"] = "entity.related";
                 request["params"] = {{"trace_id", session.id}, {"ref", expectedFrameIdentityRef},
                     {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
@@ -225,6 +231,7 @@ int main( int argc, char** argv )
             return nlohmann::json{{"jobs", jobs}, {"gfx_statistics", statistics.at("data")},
                 {"job_statistics", jobStatistics.at("data")}, {"related", std::move( related )},
                 {"chain", std::move( chain )}, {"frame_identity", std::move( frameIdentity )},
+                {"frame_identity_list", std::move( frameIdentityList )},
                 {"evidence", std::move( evidence )}, {"gpu_passes", std::move( gpuPasses )}};
         };
         const auto workerJson = searchPages( false );

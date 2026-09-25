@@ -397,6 +397,29 @@ bool QuerySpillUInt64Set::Contains( uint64_t value ) const
     return current == value;
 }
 
+void QuerySpillUInt64Set::VisitValues( const std::function<bool( uint64_t )>& visit ) const
+{
+    if( !m_finished ) throw std::logic_error( "spill set is not finished" );
+    if( !visit || m_sorted.empty() ) return;
+    std::ifstream input( m_sorted, std::ios::binary );
+    if( !input ) throw std::runtime_error( "spill set sorted open failed" );
+    std::array<uint64_t, 4096> buffer;
+    uint64_t visited = 0;
+    while( visited < m_uniqueCount )
+    {
+        Check();
+        const auto take = size_t( std::min<uint64_t>( buffer.size(), m_uniqueCount - visited ) );
+        input.read( reinterpret_cast<char*>( buffer.data() ),
+            std::streamsize( take * sizeof( uint64_t ) ) );
+        if( !input ) throw std::runtime_error( "spill set sorted read failed" );
+        for( size_t index = 0; index < take; index++ )
+            if( !visit( buffer[index] ) ) return;
+        visited += take;
+    }
+    if( input.peek() != std::ifstream::traits_type::eof() )
+        throw std::runtime_error( "spill set sorted size mismatch" );
+}
+
 QuerySpillUInt64Graph::QuerySpillUInt64Graph( const std::filesystem::path& temporaryRoot,
     std::shared_ptr<analysis::AnalysisDiskBudget> disk,
     std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace,

@@ -58,6 +58,7 @@ public:
     void Finish();
     uint64_t Count() const;
     bool Contains( uint64_t value ) const;
+    void VisitValues( const std::function<bool( uint64_t )>& visit ) const;
 
 private:
     void Check() const;

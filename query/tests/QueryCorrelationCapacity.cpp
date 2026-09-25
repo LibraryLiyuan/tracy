@@ -67,6 +67,7 @@ int main( int argc, char** argv )
                     query::QueryCorrelationEndpointTag( ordinal %
                         uint8_t( query::QueryCorrelationEndpointTag::Count ) ), ordinal );
                 if( ordinal % 5 == 0 ) writer.AppendExplicitPass( ordinal );
+                if( ordinal % 1000 == 0 ) writer.AppendFrameIdentity( ordinal );
             }
             statistics = writer.Commit();
         }
@@ -108,6 +109,7 @@ int main( int argc, char** argv )
             { "temporary_logical_bytes", statistics.temporaryBytes },
             { "peak_partition_records", statistics.peakPartitionRecords },
             { "explicit_passes", statistics.explicitPasses },
+            { "frame_identities", statistics.frameIdentities },
             { "final_physical_bytes", finalBytes },
             { "disk_peak_bytes", afterBuild.peakBytes },
             { "workspace_peak_bytes", workspaceSnapshot.peakBytes },

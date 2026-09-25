@@ -10,6 +10,7 @@
 #include "TracyQuerySampleDerivedStore.hpp"
 #include "TracyQueryJobStore.hpp"
 #include "TracyQueryCorrelationStore.hpp"
+#include "TracyQuerySpillStatistics.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
 #include "TracyFileHeader.hpp"
@@ -2267,6 +2268,26 @@ public:
         }
         return result;
     }
+    uint64_t GetIndexedFrameIdentityCount() const override
+    {
+        return m_correlations.FrameIdentityCount();
+    }
+    std::vector<uint64_t> ScanIndexedFrameIdentityIds( uint64_t offset, size_t limit,
+        const QueryCorrelationReadControl& control ) const override
+    {
+        if( control.check ) control.check();
+        const auto requested = std::min<uint64_t>( limit,
+            offset < m_correlations.FrameIdentityCount() ?
+                m_correlations.FrameIdentityCount() - offset : 0 );
+        if( requested == 0 ) return {};
+        const auto allowed = control.allowance ? control.allowance( size_t( requested ) ) : size_t( requested );
+        if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+        auto result = m_correlations.ReadFrameIdentityIds( offset,
+            std::min<size_t>( size_t( requested ), allowed ) );
+        if( control.check ) control.check();
+        if( control.scanned ) control.scanned( result.size(), size_t( requested ), allowed );
+        return result;
+    }
     QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
         const std::vector<uint64_t>& seedIds, const QueryCorrelationReadControl& control ) const override
     {
@@ -4127,16 +4148,31 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 result.sourceFingerprint, expectedEndpoints, storageOptions );
             constexpr size_t pageSize = 4096;
             const auto frameCount = jobs.Count( QueryJobDomain::Frame );
-            for( uint64_t offset = 0; offset < frameCount; offset += pageSize )
+            uint64_t frameIdentityCount = 0;
             {
-                resources->SetProgress( offset, expectedEndpoints );
-                const auto page = jobs.ScanCorrelatedFrameEvents( size_t( offset ),
-                    size_t( std::min<uint64_t>( pageSize, frameCount - offset ) ) );
-                if( page.size() != std::min<uint64_t>( pageSize, frameCount - offset ) )
-                    throw std::runtime_error( "Correlation Frame page is incomplete" );
-                for( size_t index = 0; index < page.size(); index++ )
-                    correlations.Append( page[index].frameId,
-                        QueryCorrelationEndpointTag::FrameEvent, offset + index );
+                QuerySpillUInt64Set frameIdentities( resources->StatisticsTemporaryRoot(),
+                    resources->Disk(), resources->Workspace(),
+                    [&] { resources->CheckMemory( false ); } );
+                for( uint64_t offset = 0; offset < frameCount; offset += pageSize )
+                {
+                    resources->SetProgress( offset, expectedEndpoints );
+                    const auto page = jobs.ScanCorrelatedFrameEvents( size_t( offset ),
+                        size_t( std::min<uint64_t>( pageSize, frameCount - offset ) ) );
+                    if( page.size() != std::min<uint64_t>( pageSize, frameCount - offset ) )
+                        throw std::runtime_error( "Correlation Frame page is incomplete" );
+                    for( size_t index = 0; index < page.size(); index++ )
+                    {
+                        correlations.Append( page[index].frameId,
+                            QueryCorrelationEndpointTag::FrameEvent, offset + index );
+                        frameIdentities.Append( page[index].frameId );
+                    }
+                }
+                frameIdentities.Finish();
+                frameIdentityCount = frameIdentities.Count();
+                frameIdentities.VisitValues( [&]( uint64_t frameId ) {
+                    correlations.AppendFrameIdentity( frameId );
+                    return true;
+                } );
             }
             const auto dispatchCount = jobs.Count( QueryJobDomain::GfxDispatch );
             for( uint64_t offset = 0; offset < dispatchCount; offset += pageSize )
@@ -4197,7 +4233,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 tag( QueryCorrelationEndpointTag::EntityParent ) != parentCount ||
                 tag( QueryCorrelationEndpointTag::LinkSource ) != links.Count() ||
                 tag( QueryCorrelationEndpointTag::LinkTarget ) != links.Count() ||
-                stats.explicitPasses != explicitPassCount )
+                stats.explicitPasses != explicitPassCount ||
+                stats.frameIdentities != frameIdentityCount )
                 throw std::runtime_error( "Correlation endpoint tag count mismatch" );
             QueryCorrelationStoreReader check(
                 temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "correlation",

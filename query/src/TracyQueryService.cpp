@@ -10707,20 +10707,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["conclusion_contract"] = "all conclusions must cite returned node/edge refs; absent domains are not real zero";
         return Success( id, std::move( result ), trace );
     }
-    if( method == "frame.identity" && ( params.contains( "ref" ) || params.contains( "frame_id" ) ) )
+    if( method == "frame.identity" )
     {
         if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
         {
-            uint64_t frameId = 0;
-            if( params.contains( "ref" ) )
-            {
-                if( !params["ref"].is_string() )
-                    throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
-                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "frame-identity" );
-                if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref from this trace" );
-                frameId = *parsed;
-            }
-            else frameId = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
             QueryCorrelationReadControl control;
             control.check = checkDirectedJobRead;
             control.allowance = [&]( size_t requested ) {
@@ -10732,42 +10722,72 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
                 BudgetScanned( actual, requested, allowed );
             };
-            auto events = indexed->GetIndexedFrameEvents( frameId, control );
-            if( events.empty() )
+            const auto identityJson = [&]( uint64_t frameId ) {
+                auto events = indexed->GetIndexedFrameEvents( frameId, control );
+                if( events.empty() )
+                    throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
+                std::sort( events.begin(), events.end(), []( const auto& lhs, const auto& rhs ) {
+                    return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
+                } );
+                int64_t begin = std::numeric_limits<int64_t>::max();
+                int64_t end = std::numeric_limits<int64_t>::min();
+                bool canonicalBegin = false;
+                bool canonicalEnd = false;
+                std::set<std::string> domains;
+                json eventValues = json::array();
+                for( const auto& event : events )
+                {
+                    begin = std::min( begin, event.timeNs );
+                    end = std::max( end, event.timeNs );
+                    domains.emplace( CorrelatedFrameDomainName( event.domain ) );
+                    canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
+                    canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
+                    eventValues.push_back( CorrelatedFrameEventJson( *source, event ) );
+                }
+                return json {
+                    { "ref", source->MakeEntityRef( "frame-identity", frameId ) },
+                    { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
+                    { "sequence", uint32_t( frameId ) }, { "begin_ns", Decimal( begin ) },
+                    { "end_ns", Decimal( end ) }, { "duration_ns", Decimal( std::max<int64_t>( 0, end - begin ) ) },
+                    { "complete", canonicalBegin && canonicalEnd }, { "domains", domains },
+                    { "events", std::move( eventValues ) }, { "evidence_kind", "exact" }
+                };
+            };
+            if( params.contains( "ref" ) || params.contains( "frame_id" ) )
             {
-                if( source->GetTraceInfo().counts.correlatedFrameEvents == 0 )
+                uint64_t frameId = 0;
+                if( params.contains( "ref" ) )
+                {
+                    if( !params["ref"].is_string() )
+                        throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
+                    const auto parsed = source->ParseEntityRef(
+                        params["ref"].get<std::string>(), "frame-identity" );
+                    if( !parsed ) throw QueryError( "INVALID_PARAMS",
+                        "ref must be a FrameIdentity ref from this trace" );
+                    frameId = *parsed;
+                }
+                else frameId = UnsignedParameter( params, "frame_id", 0,
+                    std::numeric_limits<uint64_t>::max() );
+                if( indexed->GetIndexedFrameIdentityCount() == 0 )
                     return Success( id, { { "present", false },
                         { "reason", "trace predates or does not contain JN frame correlation" },
                         { "identities", json::array() } }, trace );
-                throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
+                return Success( id, { { "present", true },
+                    { "identity", identityJson( frameId ) } }, trace );
             }
-            std::sort( events.begin(), events.end(), []( const auto& lhs, const auto& rhs ) {
-                return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
-            } );
-            int64_t begin = std::numeric_limits<int64_t>::max();
-            int64_t end = std::numeric_limits<int64_t>::min();
-            bool canonicalBegin = false;
-            bool canonicalEnd = false;
-            std::set<std::string> domains;
-            json eventValues = json::array();
-            for( const auto& event : events )
-            {
-                begin = std::min( begin, event.timeNs );
-                end = std::max( end, event.timeNs );
-                domains.emplace( CorrelatedFrameDomainName( event.domain ) );
-                canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
-                canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
-                eventValues.push_back( CorrelatedFrameEventJson( *source, event ) );
-            }
-            json identity = {
-                { "ref", source->MakeEntityRef( "frame-identity", frameId ) },
-                { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
-                { "sequence", uint32_t( frameId ) }, { "begin_ns", Decimal( begin ) },
-                { "end_ns", Decimal( end ) }, { "duration_ns", Decimal( std::max<int64_t>( 0, end - begin ) ) },
-                { "complete", canonicalBegin && canonicalEnd }, { "domains", domains },
-                { "events", std::move( eventValues ) }, { "evidence_kind", "exact" }
-            };
-            return Success( id, { { "present", true }, { "identity", std::move( identity ) } }, trace );
+            const auto total = indexed->GetIndexedFrameIdentityCount();
+            if( total == 0 )
+                return Success( id, { { "present", false },
+                    { "reason", "trace predates or does not contain JN frame correlation" },
+                    { "identities", json::array() } }, trace );
+            const auto page = ParsePage( params, method, trace );
+            const auto frameIds = indexed->ScanIndexedFrameIdentityIds( page.offset, page.limit, control );
+            json identities = json::array();
+            for( const auto frameId : frameIds ) identities.push_back( identityJson( frameId ) );
+            const bool hasMore = page.offset + frameIds.size() < total;
+            const auto cursor = NextCursor( page, method, trace, frameIds.size(), hasMore );
+            return Success( id, { { "present", true }, { "identities", std::move( identities ) } },
+                trace, PageJson( page, frameIds.size(), cursor ) );
         }
     }
     if( ( method == "entity.related" || method == "correlation.chain" ) )

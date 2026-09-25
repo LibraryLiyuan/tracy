@@ -58,6 +58,7 @@ public:
     std::function<void()> duringJobRead;
     std::function<void()> duringGfxRead;
     std::optional<std::vector<analysis::GfxEntityDto>> gfxEntityFixture;
+    std::optional<std::vector<analysis::CorrelatedFrameEventDto>> frameFixture;
     mutable std::vector<size_t> gfxEntityOffsets;
     bool indexedJobLookup = true;
     std::optional<std::vector<analysis::JobDto>> statisticsFixture;
@@ -74,16 +75,16 @@ public:
     }
     mutable std::vector<size_t> searchOffsets;
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override
-    { ++reads["all_frame_events"]; return FakeTraceSource::GetCorrelatedFrameEvents(); }
+    { ++reads["all_frame_events"]; return frameFixture ? *frameFixture : FakeTraceSource::GetCorrelatedFrameEvents(); }
     uint64_t GetCorrelatedFrameEventCount() const override
-    { return FakeTraceSource::GetCorrelatedFrameEvents().size(); }
+    { return frameFixture ? frameFixture->size() : FakeTraceSource::GetCorrelatedFrameEvents().size(); }
     std::vector<analysis::CorrelatedFrameEventDto> ScanCorrelatedFrameEvents(
         size_t offset, size_t limit ) const override
     {
         ++reads["frame_events_page"];
         Require( limit <= 256, "Frame correlation requested an oversized page" );
         if( duringJobRead ) duringJobRead();
-        const auto values = FakeTraceSource::GetCorrelatedFrameEvents();
+        const auto values = frameFixture ? *frameFixture : FakeTraceSource::GetCorrelatedFrameEvents();
         if( offset >= values.size() ) return {};
         return { values.begin() + offset,
             values.begin() + offset + std::min( limit, values.size() - offset ) };
@@ -183,12 +184,37 @@ public:
         const query::QueryCorrelationReadControl& control ) const override
     {
         ++reads["indexed_frame_events"];
-        auto values = FakeTraceSource::GetCorrelatedFrameEvents();
+        auto values = frameFixture ? *frameFixture : FakeTraceSource::GetCorrelatedFrameEvents();
         std::erase_if( values, [&]( const auto& value ) { return value.frameId != frameId; } );
         const auto requested = values.size();
         const auto allowed = control.allowance ? control.allowance( requested ) : requested;
         if( allowed == 0 && !values.empty() ) throw std::runtime_error( "indexed Frame scan budget exhausted" );
         if( values.size() > allowed ) values.resize( allowed );
+        if( control.scanned ) control.scanned( values.size(), requested, allowed );
+        return values;
+    }
+    uint64_t GetIndexedFrameIdentityCount() const override
+    {
+        ++reads["indexed_frame_identity_count"];
+        std::set<uint64_t> identities;
+        for( const auto& value : frameFixture ? *frameFixture : FakeTraceSource::GetCorrelatedFrameEvents() )
+            identities.emplace( value.frameId );
+        return identities.size();
+    }
+    std::vector<uint64_t> ScanIndexedFrameIdentityIds( uint64_t offset, size_t limit,
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_frame_identity_page"];
+        std::set<uint64_t> identities;
+        for( const auto& value : frameFixture ? *frameFixture : FakeTraceSource::GetCorrelatedFrameEvents() )
+            identities.emplace( value.frameId );
+        std::vector<uint64_t> values( identities.begin(), identities.end() );
+        if( offset >= values.size() ) return {};
+        const auto requested = std::min<size_t>( limit, values.size() - size_t( offset ) );
+        const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+        if( allowed == 0 ) throw std::runtime_error( "indexed Frame identity scan budget exhausted" );
+        values = { values.begin() + size_t( offset ),
+            values.begin() + size_t( offset ) + std::min( requested, allowed ) };
         if( control.scanned ) control.scanned( values.size(), requested, allowed );
         return values;
     }
@@ -337,6 +363,37 @@ int main()
         Require( indexedFrame.at("ok") && observed->reads["indexed_frame_events"] == 1 &&
             observed->reads["all_frame_events"] == 0 && observed->reads["frame_events_page"] == 0,
             "Frame identity point lookup ignored the indexed Frame backend" );
+        observed->frameFixture = static_cast<const query::test::FakeTraceSource&>( *observed )
+            .GetCorrelatedFrameEvents();
+        const auto framePrototype = observed->frameFixture->front();
+        for( uint64_t index = 1; index <= 1000; index++ )
+        {
+            auto unrelated = framePrototype;
+            unrelated.frameId += index;
+            unrelated.ref = "fake:frame-identity-event:" + std::to_string( 1000 + index );
+            unrelated.timeNs += int64_t( index );
+            observed->frameFixture->push_back( std::move( unrelated ) );
+        }
+        observed->reads.clear();
+        auto frameListRequest = nlohmann::json( {{"protocol", "tracy-query/1"}, {"id", 190},
+            {"method", "frame.identity"}, {"params", {{"trace_id", opened.id},
+                {"limit", 1}, {"max_scan_events", 100}}}} );
+        const auto indexedFrameList = service.Execute( frameListRequest );
+        Require( !indexedFrameList.at("page").at("next_cursor").is_null(),
+            "Frame identity list did not return a continuation cursor" );
+        frameListRequest["params"]["cursor"] = indexedFrameList.at("page").at("next_cursor");
+        const auto indexedFrameList2 = service.Execute( frameListRequest );
+        Require( indexedFrameList.at("ok") &&
+            indexedFrameList.at("data").at("identities").size() == 1 &&
+            indexedFrameList2.at("ok") &&
+            indexedFrameList2.at("data").at("identities").size() == 1 &&
+            indexedFrameList.at("data").at("identities")[0].at("frame_id") !=
+                indexedFrameList2.at("data").at("identities")[0].at("frame_id") &&
+            observed->reads["indexed_frame_identity_count"] != 0 &&
+            observed->reads["indexed_frame_identity_page"] == 2 &&
+            observed->reads["indexed_frame_events"] == 2 &&
+            observed->reads["all_frame_events"] == 0 && observed->reads["frame_events_page"] == 0,
+            "Frame identity pagination ignored the indexed directory or repeated a row" );
         observed->reads.clear();
         const auto indexedPasses = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 191},
             {"method", "gpu.pass.search"}, {"params", {{"trace_id", opened.id}, {"limit", 10},

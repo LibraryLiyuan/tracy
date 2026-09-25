@@ -92,6 +92,13 @@ int main()
                 Require( values.Contains( value ), "spill set lost an inserted ID" );
             Require( !values.Contains( 5003 ) && !values.Contains( UINT64_MAX ),
                 "spill set reported an absent ID" );
+            std::vector<uint64_t> ordered;
+            values.VisitValues( [&]( uint64_t value ) {
+                ordered.push_back( value );
+                return value < 9;
+            } );
+            Require( ordered == std::vector<uint64_t>{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+                "spill set ordered visitor changed" );
             Require( setWorkspace->Snapshot().peakBytes <= 1024 * sizeof( uint64_t ) + 131072,
                 "spill set workspace grew with the input count" );
         }

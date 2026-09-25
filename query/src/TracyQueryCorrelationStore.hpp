@@ -48,6 +48,7 @@ struct QueryCorrelationBuildStatistics
     uint64_t temporaryBytes = 0;
     uint64_t peakPartitionRecords = 0;
     uint64_t explicitPasses = 0;
+    uint64_t frameIdentities = 0;
     std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
 };
 
@@ -90,6 +91,9 @@ public:
     virtual ~QueryCorrelationSource() = default;
     virtual std::vector<analysis::CorrelatedFrameEventDto> GetIndexedFrameEvents(
         uint64_t frameId, const QueryCorrelationReadControl& control ) const = 0;
+    virtual uint64_t GetIndexedFrameIdentityCount() const = 0;
+    virtual std::vector<uint64_t> ScanIndexedFrameIdentityIds(
+        uint64_t offset, size_t limit, const QueryCorrelationReadControl& control ) const = 0;
     virtual QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
         const std::vector<uint64_t>& seedIds, const QueryCorrelationReadControl& control ) const = 0;
     virtual QueryIndexedGfxEvidence GetIndexedExplicitGpuPassEvidence(
@@ -110,6 +114,7 @@ public:
     QueryCorrelationStoreWriter& operator=( const QueryCorrelationStoreWriter& ) = delete;
 
     void Append( uint64_t nodeId, QueryCorrelationEndpointTag tag, uint64_t ordinal );
+    void AppendFrameIdentity( uint64_t frameId );
     void AppendExplicitPass( uint64_t entityOrdinal );
     QueryCorrelationBuildStatistics Commit();
 
@@ -129,6 +134,8 @@ public:
 
     uint64_t Count() const;
     uint64_t BucketCount() const;
+    uint64_t FrameIdentityCount() const;
+    std::vector<uint64_t> ReadFrameIdentityIds( uint64_t offset, size_t limit ) const;
     uint64_t ExplicitPassCount() const;
     std::vector<uint64_t> ReadExplicitPassOrdinals( uint64_t offset, size_t limit ) const;
     uint64_t CandidateCount( uint64_t nodeId ) const;

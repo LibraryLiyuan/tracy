@@ -67,6 +67,8 @@ int main()
             writer.Append( collidingLeft, query::QueryCorrelationEndpointTag::EntityParent, 11 );
             writer.Append( collidingRight, query::QueryCorrelationEndpointTag::LinkTarget, 9 );
             writer.Append( 999, query::QueryCorrelationEndpointTag::FrameEvent, ( uint64_t( 1 ) << 60 ) + 3 );
+            writer.AppendFrameIdentity( 7 );
+            writer.AppendFrameIdentity( 281474976710657ull );
             writer.AppendExplicitPass( 3 );
             writer.AppendExplicitPass( 9 );
             statistics = writer.Commit();
@@ -86,6 +88,12 @@ int main()
         {
             query::QueryCorrelationStoreReader reader( store, fingerprint, Options( disk, workspace ) );
             reader.ValidateAll();
+            Require( reader.FrameIdentityCount() == 2 &&
+                reader.ReadFrameIdentityIds( 0, 10 ) ==
+                    std::vector<uint64_t>{ 7, 281474976710657ull } &&
+                reader.ReadFrameIdentityIds( 1, 1 ) ==
+                    std::vector<uint64_t>{ 281474976710657ull },
+                "Frame identity directory changed" );
             Require( reader.ExplicitPassCount() == 2 &&
                 reader.ReadExplicitPassOrdinals( 0, 10 ) == std::vector<uint64_t>{ 3, 9 },
                 "explicit Pass ordinal directory changed" );

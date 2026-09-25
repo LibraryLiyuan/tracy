@@ -38,7 +38,7 @@ struct BucketRecord
 struct StoreHeader
 {
     char magic[8] { 'J', 'N', 'C', 'O', 'R', 'R', '1', 0 };
-    uint32_t version = 4;
+    uint32_t version = 5;
     uint8_t bucketBits = 0;
     uint8_t partitionBits = 0;
     uint8_t tagBits = 3;
@@ -46,6 +46,7 @@ struct StoreHeader
     uint64_t buckets = 0;
     uint64_t records = 0;
     uint64_t explicitPasses = 0;
+    uint64_t frameIdentities = 0;
     std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
     char sourceFingerprint[64] {};
 };
@@ -176,6 +177,7 @@ struct QueryCorrelationStoreWriter::Impl
     uint64_t temporaryBytes = 0;
     uint64_t peakPartitionRecords = 0;
     std::unique_ptr<analysis::PagedRecordWriter> explicitPasses;
+    std::unique_ptr<analysis::PagedRecordWriter> frameIdentities;
 
     Impl( std::filesystem::path value, std::string source, uint64_t expected,
         analysis::PagedRecordOptions config, uint8_t overrideBits )
@@ -195,6 +197,8 @@ struct QueryCorrelationStoreWriter::Impl
         std::filesystem::create_directories( analysis::AnalysisIoPath( root / "partitions" ) );
         explicitPasses = std::make_unique<analysis::PagedRecordWriter>( root / "explicit-passes",
             Identity( sourceFingerprint, "correlation-explicit-passes-v1" ), sizeof( uint64_t ), options );
+        frameIdentities = std::make_unique<analysis::PagedRecordWriter>( root / "frame-identities",
+            Identity( sourceFingerprint, "correlation-frame-identities-v1" ), sizeof( uint64_t ), options );
         partitionBytes.resize( size_t( partitionCount ) );
         streams.resize( size_t( partitionCount ) );
     }
@@ -203,6 +207,7 @@ struct QueryCorrelationStoreWriter::Impl
     {
         CloseStreams( false );
         explicitPasses.reset();
+        frameIdentities.reset();
         if( committed ) return;
         std::error_code error;
         analysis::AnalysisDiskRemove( root, options.disk, error, true );
@@ -295,6 +300,15 @@ void QueryCorrelationStoreWriter::Append( uint64_t nodeId, QueryCorrelationEndpo
         if( value.options.disk && value.options.disk->usage ) value.options.disk->usage->Release( sizeof( record ) );
         throw;
     }
+}
+
+void QueryCorrelationStoreWriter::AppendFrameIdentity( uint64_t frameId )
+{
+    auto& value = *m_impl;
+    if( value.committed ) throw std::runtime_error( "query_correlation_writer_closed" );
+    Check( value.options );
+    value.frameIdentities->Append( &frameId, 1 );
+    value.header.frameIdentities++;
 }
 
 void QueryCorrelationStoreWriter::AppendExplicitPass( uint64_t entityOrdinal )
@@ -449,6 +463,7 @@ QueryCorrelationBuildStatistics QueryCorrelationStoreWriter::Commit()
     buckets.Commit();
     ordinals.Commit();
     value.explicitPasses->Commit();
+    value.frameIdentities->Commit();
     if( buckets.Count() != value.header.buckets || ordinals.Count() != value.header.records )
         throw std::runtime_error( "query_correlation_commit_count" );
     WriteHeader( value.root / "header.bin", value.header, value.options );
@@ -458,6 +473,7 @@ QueryCorrelationBuildStatistics QueryCorrelationStoreWriter::Commit()
     value.committed = true;
     return { value.header.records, value.header.buckets, value.partitionCount,
         value.temporaryBytes, value.peakPartitionRecords, value.header.explicitPasses,
+        value.header.frameIdentities,
         value.header.tagCounts };
 }
 
@@ -470,6 +486,7 @@ struct QueryCorrelationStoreReader::Impl
     analysis::PagedRecordReader buckets;
     analysis::PagedRecordReader ordinals;
     analysis::PagedRecordReader explicitPasses;
+    analysis::PagedRecordReader frameIdentities;
 
     Impl( std::filesystem::path value, std::string source, analysis::PagedRecordOptions config )
         : root( std::move( value ) )
@@ -482,14 +499,17 @@ struct QueryCorrelationStoreReader::Impl
             sizeof( uint64_t ), options )
         , explicitPasses( root / "explicit-passes", Identity( sourceFingerprint,
             "correlation-explicit-passes-v1" ), sizeof( uint64_t ), options )
+        , frameIdentities( root / "frame-identities", Identity( sourceFingerprint,
+            "correlation-frame-identities-v1" ), sizeof( uint64_t ), options )
     {
-        if( std::memcmp( header.magic, "JNCORR1", 7 ) != 0 || header.version != 4 ||
+        if( std::memcmp( header.magic, "JNCORR1", 7 ) != 0 || header.version != 5 ||
             header.tagBits != 3 || header.bucketBits < MinimumBucketBits ||
             header.bucketBits > MaximumBucketBits || header.partitionBits > header.bucketBits ||
             header.buckets != ( uint64_t( 1 ) << header.bucketBits ) ||
             std::string( header.sourceFingerprint, 64 ) != sourceFingerprint ||
             buckets.Count() != header.buckets || ordinals.Count() != header.records ||
-            explicitPasses.Count() != header.explicitPasses )
+            explicitPasses.Count() != header.explicitPasses ||
+            frameIdentities.Count() != header.frameIdentities )
             throw std::runtime_error( "query_correlation_header" );
     }
 };
@@ -504,7 +524,23 @@ QueryCorrelationStoreReader::~QueryCorrelationStoreReader() = default;
 
 uint64_t QueryCorrelationStoreReader::Count() const { return m_impl->header.records; }
 uint64_t QueryCorrelationStoreReader::BucketCount() const { return m_impl->header.buckets; }
+uint64_t QueryCorrelationStoreReader::FrameIdentityCount() const { return m_impl->header.frameIdentities; }
 uint64_t QueryCorrelationStoreReader::ExplicitPassCount() const { return m_impl->header.explicitPasses; }
+
+std::vector<uint64_t> QueryCorrelationStoreReader::ReadFrameIdentityIds(
+    uint64_t offset, size_t limit ) const
+{
+    auto& value = *m_impl;
+    Check( value.options );
+    if( limit > MaximumCandidatePage ) throw std::runtime_error( "query_correlation_page_limit" );
+    if( limit == 0 || offset >= value.header.frameIdentities ) return {};
+    const auto take = std::min<uint64_t>( limit, value.header.frameIdentities - offset );
+    analysis::AnalysisWorkspaceReservation memory( value.options.workspace,
+        take * sizeof( uint64_t ) + 4096 );
+    std::vector<uint64_t> result( size_t( take ), uint64_t( 0 ) );
+    value.frameIdentities.Read( offset, result.data(), take );
+    return result;
+}
 
 std::vector<uint64_t> QueryCorrelationStoreReader::ReadExplicitPassOrdinals(
     uint64_t offset, size_t limit ) const
@@ -595,6 +631,19 @@ void QueryCorrelationStoreReader::ValidateAll()
     } );
     if( tagCounts != value.header.tagCounts )
         throw std::runtime_error( "query_correlation_tag_count" );
+    uint64_t previousFrame = 0;
+    bool firstFrame = true;
+    value.frameIdentities.VisitValidated( [&]( const void* data, uint64_t count ) {
+        const auto* rows = static_cast<const uint64_t*>( data );
+        for( uint64_t index = 0; index < count; index++ )
+        {
+            Check( value.options );
+            if( !firstFrame && rows[index] <= previousFrame )
+                throw std::runtime_error( "query_correlation_frame_identity_order" );
+            previousFrame = rows[index];
+            firstFrame = false;
+        }
+    } );
     uint64_t previous = 0;
     bool first = true;
     value.explicitPasses.VisitValidated( [&]( const void* data, uint64_t count ) {
