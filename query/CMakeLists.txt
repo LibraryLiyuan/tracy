@@ -197,6 +197,10 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-correlation-capacity PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-correlation-capacity)
 
+    add_executable(tracy-query-explicit-pass-capacity tests/QueryExplicitPassCapacity.cpp)
+    target_link_libraries(tracy-query-explicit-pass-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-capacity)
+
     add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
     target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-sample-view-tests)
