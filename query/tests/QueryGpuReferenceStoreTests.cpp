@@ -679,6 +679,33 @@ int main( int argc, char** argv )
                 "generated external sort failed" );
             checkOutput( generatedOutput );
             checkStats( generatedStats, 0 );
+            {
+                const auto failureRoot = root / "generated-metadata-open-failure";
+                fs::create_directories( failureRoot );
+                auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                    std::vector<fs::path> { failureRoot } );
+                auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                    tracy::analysis::AnalysisDiskBudget { usage,
+                        2 * sizeof( AnalysisKeyMetadataRecord ), {} } );
+                const auto blockedRun = failureRoot / "generated-metadata-open-failure-run-0-0.work";
+                bool refused = false;
+                try
+                {
+                    tracy::analysis::SortAnalysisKeyMetadataRecordsGenerated(
+                        failureRoot / "output.work", failureRoot,
+                        "generated-metadata-open-failure", 1,
+                        [&]( const auto& emit ) {
+                            fs::create_directory( blockedRun );
+                            emit( makeRow( 0 ) );
+                        }, sortError, disk );
+                }
+                catch( const std::runtime_error& error )
+                { refused = std::string_view( error.what() ) == "analysis_metadata_sort_run_write_open_failed"; }
+                Require( refused && usage->Snapshot().currentBytes ==
+                    tracy::analysis::AnalysisDiskUsage::Bytes( failureRoot ),
+                    "generated metadata sorter kept unwritten run bytes charged after open failure" );
+                if( fs::exists( blockedRun ) ) fs::remove( blockedRun );
+            }
             AnalysisExternalSortStatistics simultaneousStats;
             tracy::analysis::AnalysisKeyMetadataRunCollector simultaneous(
                 sortRoot / "simultaneous.work", sortRoot, "simultaneous", 1,
@@ -758,6 +785,14 @@ int main( int argc, char** argv )
                 pairStats.mergeReadBytes == 2 * pairBytes &&
                 pairStats.mergeWriteBytes == 2 * pairBytes,
                 "generated pair sort logical I/O accounting is wrong" );
+            uint64_t sourcePairCancelChecks = 0;
+            Require( !tracy::analysis::SortAnalysisUInt64Pairs( pairOutput,
+                    sortRoot / "cancelled-source-pairs.work", sortRoot,
+                    "cancelled-source-pairs", recordCount, 1, sortError, {}, {},
+                    [&] { return ++sourcePairCancelChecks > recordCount; } ) &&
+                    sortError == "analysis_pair_sort_cancelled" &&
+                    !fs::exists( sortRoot / "cancelled-source-pairs.work" ),
+                "source pair sorter ignored cancellation before merging runs" );
             bool cancelPairs = false, pairsCancelled = false;
             try
             {
@@ -798,6 +833,54 @@ int main( int argc, char** argv )
             Require( tracy::analysis::CleanupAnalysisExternalSortFiles( pairRefusalRoot,
                 "pair-refusal-run-", sortError, pairDisk ) && pairUsage->Snapshot().currentBytes == 0,
                 "generated pair refusal did not release owned run bytes" );
+            {
+                const auto failureRoot = root / "generated-pair-open-failure";
+                fs::create_directories( failureRoot );
+                auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                    std::vector<fs::path> { failureRoot } );
+                auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>(
+                    tracy::analysis::AnalysisDiskBudget { usage,
+                        2 * sizeof( tracy::analysis::AnalysisUInt64Pair ), {} } );
+                const auto blockedRun = failureRoot / "generated-pair-open-failure-run-0-0.work";
+                bool refused = false;
+                try
+                {
+                    tracy::analysis::SortAnalysisUInt64PairsGenerated(
+                        failureRoot / "output.work", failureRoot,
+                        "generated-pair-open-failure", 1,
+                        [&]( const auto& emit ) {
+                            fs::create_directory( blockedRun );
+                            emit( { 1, 2 } );
+                        }, sortError, disk );
+                }
+                catch( const std::runtime_error& error )
+                { refused = std::string_view( error.what() ) == "analysis_pair_sort_run_write_open_failed"; }
+                Require( refused && usage->Snapshot().currentBytes ==
+                    tracy::analysis::AnalysisDiskUsage::Bytes( failureRoot ),
+                    "generated pair sorter kept unwritten run bytes charged after open failure" );
+                if( fs::exists( blockedRun ) ) fs::remove( blockedRun );
+            }
+            {
+                const auto failureRoot = root / "source-pair-open-failure";
+                fs::create_directories( failureRoot );
+                const auto blockedRun = failureRoot / "source-pair-open-failure-run-0-0.work";
+                auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                    std::vector<fs::path> { failureRoot } );
+                auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+                disk->usage = usage;
+                disk->maximumBytes = 2 * pairBytes;
+                disk->checkSpace = [&] {
+                    if( !fs::exists( blockedRun ) ) fs::create_directory( blockedRun );
+                };
+                Require( !tracy::analysis::SortAnalysisUInt64Pairs( pairOutput,
+                        failureRoot / "output.work", failureRoot,
+                        "source-pair-open-failure", recordCount, 1, sortError, disk ) &&
+                        sortError == "analysis_pair_sort_run_write_open_failed" &&
+                        usage->Snapshot().currentBytes ==
+                            tracy::analysis::AnalysisDiskUsage::Bytes( failureRoot ),
+                    "source pair sorter kept unwritten run bytes charged after open failure" );
+                fs::remove( blockedRun );
+            }
             const auto source = sortRoot / "source.work";
             {
                 std::ofstream file( source, std::ios::binary );
@@ -806,6 +889,27 @@ int main( int argc, char** argv )
                     const auto row = makeRow( ordinal );
                     file.write( reinterpret_cast<const char*>( &row ), sizeof( row ) );
                 }
+            }
+            {
+                const auto failureRoot = root / "source-metadata-open-failure";
+                fs::create_directories( failureRoot );
+                const auto blockedRun = failureRoot / "source-metadata-open-failure-run-0-0.work";
+                auto usage = std::make_shared<tracy::analysis::AnalysisDiskUsage>(
+                    std::vector<fs::path> { failureRoot } );
+                auto disk = std::make_shared<tracy::analysis::AnalysisDiskBudget>();
+                disk->usage = usage;
+                disk->maximumBytes = 2 * bytes;
+                disk->checkSpace = [&] {
+                    if( !fs::exists( blockedRun ) ) fs::create_directory( blockedRun );
+                };
+                Require( !tracy::analysis::SortAnalysisKeyMetadataRecords( source,
+                        failureRoot / "output.work", failureRoot,
+                        "source-metadata-open-failure", recordCount, 1, sortError, disk ) &&
+                        sortError == "analysis_metadata_sort_run_write_open_failed" &&
+                        usage->Snapshot().currentBytes ==
+                            tracy::analysis::AnalysisDiskUsage::Bytes( failureRoot ),
+                    "source metadata sorter kept unwritten run bytes charged after open failure" );
+                fs::remove( blockedRun );
             }
             AnalysisExternalSortStatistics sourceStats;
             const auto sourceOutput = sortRoot / "source-sorted.work";

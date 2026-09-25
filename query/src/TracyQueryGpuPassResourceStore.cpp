@@ -257,7 +257,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         finishPhase( &QueryGpuPassResourceBuildStatistics::factSortMs );
         if( !analysis::SortAnalysisUInt64Pairs( mappingSource, mappingSorted, scratch,
                 "gpu-pass-resource-mapping", mappingCount, 512 * 1024, sortError,
-                options.disk, options.workspace ) )
+                options.disk, options.workspace, options.cancelled ) )
             throw std::runtime_error( "GPU pass mapping sort failed: " + sortError );
         removeConsumed( mappingSource );
         finishPhase( &QueryGpuPassResourceBuildStatistics::mappingSortMs );

@@ -81,7 +81,8 @@ bool SortAnalysisUInt64Pairs(
     uint64_t expectedCount,
     uint64_t maximumBufferedPairs,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk = {},
-    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {} );
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace = {},
+    const std::function<bool()>& cancelled = {} );
 
 bool SortAnalysisUInt64PairsGenerated(
     const std::filesystem::path& output,

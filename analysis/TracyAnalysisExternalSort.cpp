@@ -29,6 +29,26 @@ bool MetadataLess( const AnalysisKeyMetadataRecord& lhs, const AnalysisKeyMetada
     return lhs.auxiliary < rhs.auxiliary;
 }
 
+struct FileChargeReconcile
+{
+    std::ofstream& stream;
+    const std::filesystem::path& path;
+    const std::shared_ptr<AnalysisDiskBudget>& disk;
+    const uint64_t& charged;
+
+    ~FileChargeReconcile()
+    {
+        stream.close();
+        if( !disk || !disk->usage ) return;
+        try
+        {
+            const auto actual = AnalysisDiskUsage::Bytes( path );
+            if( charged > actual ) disk->usage->Release( charged - actual );
+        }
+        catch( ... ) {} // Retain a conservative charge until the next idle recount.
+    }
+};
+
 template<typename Record, typename Less>
 bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     const std::filesystem::path& output, uint64_t& written, std::string& error,
@@ -61,24 +81,7 @@ bool MergeRuns( const std::vector<std::filesystem::path>& inputs,
     std::ofstream out( output, std::ios::binary | std::ios::trunc );
     if( !out ) { error = std::string( errorPrefix ) + "_merge_output_open_failed"; return false; }
     uint64_t chargedBytes = 0;
-    struct OutputChargeReconcile
-    {
-        std::ofstream& stream;
-        const std::filesystem::path& path;
-        const std::shared_ptr<AnalysisDiskBudget>& disk;
-        uint64_t& charged;
-        ~OutputChargeReconcile()
-        {
-            stream.close();
-            if( !disk || !disk->usage ) return;
-            try
-            {
-                const auto actual = AnalysisDiskUsage::Bytes( path );
-                if( charged > actual ) disk->usage->Release( charged - actual );
-            }
-            catch( ... ) {} // Retain a conservative charge until the next idle recount.
-        }
-    } reconcile { out, output, disk, chargedBytes };
+    FileChargeReconcile reconcile { out, output, disk, chargedBytes };
     constexpr size_t OutputBatchRecords = 4096;
     AnalysisWorkspaceReservation outputWorkspace( workspace, OutputBatchRecords * sizeof( Record ) );
     std::vector<Record> outputBatch;
@@ -204,7 +207,8 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     const std::filesystem::path& output, const std::filesystem::path& temporaryRoot,
     const std::string& prefix, uint64_t expectedCount, uint64_t maximumBufferedPairs,
     std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk,
-    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+    const std::shared_ptr<AnalysisWorkspaceBudget>& workspace,
+    const std::function<bool()>& cancelled )
 {
     error.clear();
     if( maximumBufferedPairs == 0 ) maximumBufferedPairs = 1;
@@ -225,6 +229,8 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     size_t runIndex = 0;
     while( remaining != 0 )
     {
+        if( cancelled && cancelled() )
+        { error = "analysis_pair_sort_cancelled"; return false; }
         const auto take = size_t( std::min<uint64_t>( remaining, maximumBufferedPairs ) );
         AnalysisWorkspaceReservation runWorkspace(workspace,uint64_t(take)*sizeof(AnalysisUInt64Pair));
         std::vector<AnalysisUInt64Pair> values( take );
@@ -234,8 +240,11 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
         std::sort( values.begin(), values.end(), PairLess );
         const auto run = temporaryRoot / ( prefix + "-run-0-" +
             std::to_string( runIndex++ ) + ".work" );
-        AnalysisDiskGrow(disk,uint64_t(values.size())*sizeof(AnalysisUInt64Pair));
-        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( AnalysisUInt64Pair );
+        AnalysisDiskGrow( disk, charged );
+        FileChargeReconcile reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "analysis_pair_sort_run_write_open_failed"; return false; }
         out.write( reinterpret_cast<const char*>( values.data() ),
             std::streamsize( values.size() * sizeof( AnalysisUInt64Pair ) ) );
@@ -259,6 +268,8 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
     size_t pass = 1;
     while( runs.size() > 1 )
     {
+        if( cancelled && cancelled() )
+        { error = "analysis_pair_sort_cancelled"; return false; }
         std::vector<std::filesystem::path> next;
         for( size_t first = 0; first < runs.size(); first += MergeFanIn )
         {
@@ -268,7 +279,7 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
                 std::to_string( pass ) + "-" + std::to_string( next.size() ) + ".work" );
             uint64_t written = 0;
             if( !MergeRuns<AnalysisUInt64Pair>( group, merged, written, error,disk,workspace,
-                    PairLess, "analysis_pair_sort" ) ) return false;
+                    PairLess, "analysis_pair_sort", cancelled ) ) return false;
             uint64_t expected = 0;
             for( const auto& path : group )
             {
@@ -286,6 +297,8 @@ bool SortAnalysisUInt64Pairs( const std::filesystem::path& source,
         ++pass;
     }
 
+    if( cancelled && cancelled() )
+    { error = "analysis_pair_sort_cancelled"; return false; }
     AnalysisDiskRemove(output,disk,ec);
     ec.clear();
     std::filesystem::rename( runs.front(), output, ec );
@@ -406,24 +419,7 @@ struct AnalysisKeyMetadataRunCollector::Impl
         std::ofstream out;
         const auto charged = uint64_t( values.size() ) * sizeof( Record );
         AnalysisDiskGrow( disk, charged );
-        struct ChargeReconcile
-        {
-            std::ofstream& stream;
-            const std::filesystem::path& path;
-            const std::shared_ptr<AnalysisDiskBudget>& budget;
-            uint64_t chargedBytes;
-            ~ChargeReconcile()
-            {
-                stream.close();
-                if( !budget || !budget->usage ) return;
-                try
-                {
-                    const auto actual = AnalysisDiskUsage::Bytes( path );
-                    if( chargedBytes > actual ) budget->usage->Release( chargedBytes - actual );
-                }
-                catch( ... ) {} // Retain a conservative charge until the next idle recount.
-            }
-        } reconcile { out, run, disk, charged };
+        FileChargeReconcile reconcile { out, run, disk, charged };
         out.open( run, std::ios::binary | std::ios::trunc );
         if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_open_failed" );
         out.write( reinterpret_cast<const char*>( values.data() ),
@@ -537,14 +533,16 @@ bool SortAnalysisKeyMetadataRecords( const std::filesystem::path& source,
         std::sort( values.begin(), values.end(), MetadataLess );
         const auto run = temporaryRoot / ( prefix + "-run-0-" +
             std::to_string( runIndex++ ) + ".work" );
-        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
-        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( Record );
+        AnalysisDiskGrow( disk, charged );
+        FileChargeReconcile reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
         if( !out ) { error = "analysis_metadata_sort_run_write_open_failed"; return false; }
         out.write( reinterpret_cast<const char*>( values.data() ),
             std::streamsize( values.size() * sizeof( Record ) ) );
         out.flush();
         if( !out ) { error = "analysis_metadata_sort_run_write_failed"; return false; }
-        out.close();
         runs.emplace_back( run );
         remaining -= take;
     }
@@ -586,14 +584,16 @@ bool SortAnalysisKeyMetadataRecordsGenerated( const std::filesystem::path& outpu
         if( cancelled && cancelled() ) throw std::runtime_error( "analysis_metadata_sort_cancelled" );
         std::sort( values.begin(), values.end(), MetadataLess );
         const auto run = temporaryRoot / ( prefix + "-run-0-" + std::to_string( runs.size() ) + ".work" );
-        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
-        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( Record );
+        AnalysisDiskGrow( disk, charged );
+        FileChargeReconcile reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
         if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_open_failed" );
         out.write( reinterpret_cast<const char*>( values.data() ),
             std::streamsize( values.size() * sizeof( Record ) ) );
         out.flush();
         if( !out ) throw std::runtime_error( "analysis_metadata_sort_run_write_failed" );
-        out.close();
         runs.emplace_back( run );
         values.clear();
     };
@@ -646,14 +646,16 @@ bool SortAnalysisUInt64PairsGenerated( const std::filesystem::path& output,
         if( cancelled && cancelled() ) throw std::runtime_error( "analysis_pair_sort_cancelled" );
         std::sort( values.begin(), values.end(), PairLess );
         const auto run = temporaryRoot / ( prefix + "-run-0-" + std::to_string( runs.size() ) + ".work" );
-        AnalysisDiskGrow( disk, uint64_t( values.size() ) * sizeof( Record ) );
-        std::ofstream out( run, std::ios::binary | std::ios::trunc );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( Record );
+        AnalysisDiskGrow( disk, charged );
+        FileChargeReconcile reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
         if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_open_failed" );
         out.write( reinterpret_cast<const char*>( values.data() ),
             std::streamsize( values.size() * sizeof( Record ) ) );
         out.flush();
         if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_failed" );
-        out.close();
         runs.emplace_back( run );
         values.clear();
     };
