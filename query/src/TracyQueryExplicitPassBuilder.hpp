@@ -43,6 +43,7 @@ struct QueryExplicitPassBuildInput
     uint64_t entityCount = 0;
     uint64_t linkCount = 0;
     uint64_t gpuZoneCount = 0;
+    std::vector<uint32_t> taxonomyIds;
     std::function<std::vector<QueryExplicitPassEntityFact>( uint64_t, size_t )> scanEntities;
     std::function<std::vector<QueryExplicitPassLinkFact>( uint64_t, size_t )> scanLinks;
     std::function<std::vector<QueryExplicitPassGpuZoneFact>( uint64_t, size_t )> scanGpuZones;

@@ -728,7 +728,8 @@ PageRequest ParsePage( const json& params, const std::string& method, const Trac
         const auto parts = Split( Base64UrlDecode( params["cursor"].get<std::string>() ), '|' );
         const bool legacy = parts.size() == 7 && parts[0] == "v1";
         const bool current = parts.size() == 8 && parts[0] == "v2";
-        const bool counted = parts.size() == 9 && parts[0] == "v3" && method == "gpu.resource.search";
+        const bool counted = parts.size() == 9 && parts[0] == "v3" &&
+            ( method == "gpu.resource.search" || method == "gpu.pass.search" );
         if( ( !legacy && !current && !counted ) || parts[1] != trace.id || parts[2] != Decimal( trace.revision ) || parts[3] != method || parts[4] != page.binding )
         {
             throw QueryError( "STALE_CURSOR", "cursor does not match the trace, revision, method, or filters" );
@@ -3056,6 +3057,49 @@ ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source,
     std::optional<QueryIndexedGfxEvidence> indexedEvidence;
     if( !entityOverride && !linkOverride )
     {
+        if( const auto* indexed = dynamic_cast<const QueryExplicitPassSource*>( &source ) )
+        {
+            QueryCorrelationReadControl control;
+            control.check = [] { if( ActiveBudget ) ActiveBudget->CheckCancelled(); };
+            control.allowance = []( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass projection scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = []( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto total = indexed->GetIndexedExplicitPassCount();
+            for( uint64_t offset = 0; offset < total; )
+            {
+                const auto page = indexed->ScanIndexedExplicitPasses( offset,
+                    size_t( std::min<uint64_t>( 256, total - offset ) ), control );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "Explicit GPU Pass projection page is incomplete" );
+                for( const auto& value : page )
+                {
+                    ExplicitGpuPassMatch match;
+                    match.pass = value.pass;
+                    match.segment = value.segment;
+                    match.zone = value.zone;
+                    match.commandListId = value.commandListId;
+                    match.frameId = value.frameId;
+                    match.cameraId = value.cameraId;
+                    match.viewId = value.viewId;
+                    match.referenceToken = value.referenceToken;
+                    match.taxonomyId = value.taxonomyId;
+                    match.taxonomyStableId = value.taxonomyStableId;
+                    result.matches.emplace_back( std::move( match ) );
+                }
+                offset += page.size();
+            }
+            for( size_t index = 0; index < result.matches.size(); index++ )
+                if( result.matches[index].segment )
+                    result.byGpuQuery[ExplicitGpuQueryKey( result.matches[index].segment->gpuContext,
+                        result.matches[index].segment->gpuQueryId )].emplace_back( index );
+            return result;
+        }
         if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( &source ) )
         {
             QueryCorrelationReadControl control;
@@ -3166,6 +3210,22 @@ void MatchExplicitGpuPassZone( const analysis::TraceSource& source, ExplicitGpuP
         match.bestDistance = distance;
         match.zone = zone;
     }
+}
+
+ExplicitGpuPassMatch IndexedExplicitGpuPassMatch( const QueryIndexedExplicitPass& value )
+{
+    ExplicitGpuPassMatch result;
+    result.pass = value.pass;
+    result.segment = value.segment;
+    result.zone = value.zone;
+    result.commandListId = value.commandListId;
+    result.frameId = value.frameId;
+    result.cameraId = value.cameraId;
+    result.viewId = value.viewId;
+    result.referenceToken = value.referenceToken;
+    result.taxonomyId = value.taxonomyId;
+    result.taxonomyStableId = value.taxonomyStableId;
+    return result;
 }
 
 json ExplicitGpuPassJson( const analysis::TraceSource& source, const ExplicitGpuPassMatch& match,
@@ -7666,6 +7726,252 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
     if( method == "gpu.pass.search" || method == "gpu.pass.get" )
     {
+        if( const auto* indexed = dynamic_cast<const QueryExplicitPassSource*>( source.get() ) )
+        {
+            const auto taxonomy = GpuTaxonomyCatalogJson( info() );
+            std::map<uint32_t, json> taxonomyDefinitions;
+            if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
+                for( const auto& definition : taxonomy["definitions"] )
+                {
+                    const auto taxonomyId = definition.contains( "taxonomy_id" ) ?
+                        DecimalStringValue( definition["taxonomy_id"] ) : std::nullopt;
+                    if( taxonomyId && *taxonomyId <= UINT32_MAX )
+                        taxonomyDefinitions.emplace( uint32_t( *taxonomyId ), definition );
+                }
+            QueryCorrelationReadControl control;
+            control.check = checkCancelled;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass projection scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto toMatch = [&]( const QueryIndexedExplicitPass& value ) {
+                ExplicitGpuPassMatch result;
+                result.pass = value.pass;
+                result.segment = value.segment;
+                result.zone = value.zone;
+                result.commandListId = value.commandListId;
+                result.frameId = value.frameId;
+                result.cameraId = value.cameraId;
+                result.viewId = value.viewId;
+                result.referenceToken = value.referenceToken;
+                result.taxonomyId = value.taxonomyId;
+                result.taxonomyStableId = value.taxonomyStableId;
+                return result;
+            };
+
+            const auto coverage = CaptureCoverageJson( info() );
+            json nativeProducer = nullptr, managedProducer = nullptr;
+            if( coverage.value( "present", false ) ) for( const auto& value : coverage["producers"] )
+            {
+                if( value.value( "key", "" ) == "gpu.pass.explicit" ) nativeProducer = value;
+                else if( value.value( "key", "" ) == "gpu.pass.managed" ) managedProducer = value;
+            }
+            const auto passCount = indexed->GetIndexedExplicitPassCount();
+            const auto managedPassCount = indexed->GetIndexedManagedExplicitPassCount();
+            const auto nativePassCount = passCount - managedPassCount;
+            const auto missingGpuZoneCount = indexed->GetIndexedExplicitPassMissingGpuZoneCount();
+            const auto unresolvedTaxonomyCount = indexed->GetIndexedExplicitPassUnresolvedTaxonomyCount();
+            const bool hasProducer = nativeProducer.is_object() || managedProducer.is_object();
+            const bool present = hasProducer || passCount != 0;
+            const bool effective = hasProducer ?
+                ( ( nativeProducer.is_object() && nativeProducer.value( "effective", false ) ) ||
+                  ( managedProducer.is_object() && managedProducer.value( "effective", false ) ) ) : passCount != 0;
+            std::string producerState = passCount == 0 ? "absent" : "persisted_entities_without_producer_record";
+            if( nativeProducer.is_object() && managedProducer.is_object() )
+            {
+                const auto nativeState = nativeProducer.value( "state", "unknown" );
+                const auto managedState = managedProducer.value( "state", "unknown" );
+                producerState = nativeState == managedState ? nativeState : "mixed";
+            }
+            else if( nativeProducer.is_object() ) producerState = nativeProducer.value( "state", "unknown" );
+            else if( managedProducer.is_object() ) producerState = managedProducer.value( "state", "unknown" );
+            const std::string aggregateSourceMode = nativePassCount != 0 && managedPassCount != 0 ? "mixed" :
+                ( managedPassCount != 0 ? "managed-command-buffer" :
+                  ( nativePassCount != 0 ? "cpp-marker-command-list" :
+                    ( nativeProducer.is_object() && managedProducer.is_object() ? "mixed" :
+                      ( managedProducer.is_object() ? "managed-command-buffer" : "cpp-marker-command-list" ) ) ) );
+            const bool aggregateComplete = present && taxonomy.value( "present", false ) && !BudgetPartial() &&
+                missingGpuZoneCount == 0 && unresolvedTaxonomyCount == 0 &&
+                ( !nativeProducer.is_object() || nativeProducer.value( "complete", false ) ) &&
+                ( !managedProducer.is_object() || managedProducer.value( "complete", false ) );
+            const auto base = [&]() {
+                json producers = json::array();
+                if( nativeProducer.is_object() ) producers.emplace_back( nativeProducer );
+                if( managedProducer.is_object() ) producers.emplace_back( managedProducer );
+                return json {
+                    { "present", present }, { "complete", aggregateComplete }, { "effective", effective },
+                    { "producer_state", producerState },
+                    { "reason", present ? ( aggregateComplete ? json( nullptr ) : json( "GPU pass evidence is incomplete" ) ) :
+                        json( "GPU pass producers and persisted explicit pass entities are absent" ) },
+                    { "source_mode", aggregateSourceMode },
+                    { "source_modes", {
+                        { "cpp-marker-command-list", { { "instance_count", Decimal( nativePassCount ) }, { "producer", nativeProducer } } },
+                        { "managed-command-buffer", { { "instance_count", Decimal( managedPassCount ) }, { "producer", managedProducer } } }
+                    } },
+                    { "producer", nativeProducer.is_object() ? nativeProducer : managedProducer },
+                    { "producers", std::move( producers ) }, { "scan_complete", !BudgetPartial() },
+                    { "instance_count", Decimal( passCount ) },
+                    { "missing_gpu_zone_count", Decimal( missingGpuZoneCount ) },
+                    { "unresolved_taxonomy_count", Decimal( unresolvedTaxonomyCount ) },
+                    { "taxonomy_catalog_complete", taxonomy.value( "complete", false ) },
+                    { "taxonomy_catalog_reason", taxonomy.value( "reason", json( nullptr ) ) },
+                    { "trust", { { "input", "untrusted_trace_data" },
+                        { "evidence", "persisted_gfx_entity_link_plus_gpu_timestamp_zone" } } }
+                };
+            };
+
+            if( method == "gpu.pass.get" )
+            {
+                if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "ref is required" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "gfx-entity" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a GPU Pass ref from this trace" );
+                const auto found = indexed->FindIndexedExplicitPass( *parsed, control );
+                if( !found ) throw QueryError( "ENTITY_NOT_FOUND", "explicit GPU pass ref was not found" );
+                auto result = base();
+                result["pass"] = ExplicitGpuPassJson( *source, toMatch( *found ), taxonomyDefinitions );
+                return Success( id, std::move( result ), trace );
+            }
+
+            const auto page = ParsePage( params, method, trace );
+            std::optional<bool> managedFilter;
+            if( params.contains( "source_mode" ) )
+            {
+                if( !params["source_mode"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "source_mode must be a string" );
+                const auto mode = params["source_mode"].get<std::string>();
+                if( mode == "managed-command-buffer" ) managedFilter = true;
+                else if( mode == "cpp-marker-command-list" ) managedFilter = false;
+                else throw QueryError( "INVALID_PARAMS",
+                    "source_mode must be cpp-marker-command-list or managed-command-buffer" );
+            }
+            const bool sourceFilterProvided = params.contains( "pass_source_id" );
+            const bool taxonomyFilterProvided = params.contains( "taxonomy_id" );
+            const auto sourceFilter = sourceFilterProvided ?
+                DecimalStringValue( params["pass_source_id"] ) : std::nullopt;
+            const auto taxonomyFilter = taxonomyFilterProvided ?
+                DecimalStringValue( params["taxonomy_id"] ) : std::nullopt;
+            std::optional<std::string> nameFilter;
+            if( params.contains( "name" ) )
+            {
+                if( !params["name"].is_string() ) throw QueryError( "INVALID_PARAMS", "name must be a string" );
+                nameFilter = Lower( params["name"].get<std::string>() );
+            }
+            const bool indexedTotal = !sourceFilterProvided && !taxonomyFilterProvided && !nameFilter;
+            uint64_t total = page.matchedTotal.value_or( indexedTotal ?
+                ( managedFilter ? ( *managedFilter ? managedPassCount : nativePassCount ) : passCount ) : 0 );
+            const bool mustCount = !page.matchedTotal && !indexedTotal;
+            uint64_t rawOffset = page.rawOffsetBound ? page.rawOffset : 0;
+            uint64_t matched = page.offset;
+            uint64_t nextRawOffset = rawOffset;
+            json values = json::array();
+            bool pageFilled = false;
+            std::optional<QueryIndexedExplicitPassFilterTag> indexedFilterTag;
+            uint64_t indexedFilterKey = 0;
+            if( sourceFilter && *sourceFilter <= UINT32_MAX )
+            { indexedFilterTag = QueryIndexedExplicitPassFilterTag::PassSource; indexedFilterKey = *sourceFilter; }
+            else if( taxonomyFilter && *taxonomyFilter <= UINT32_MAX )
+            { indexedFilterTag = QueryIndexedExplicitPassFilterTag::Taxonomy; indexedFilterKey = *taxonomyFilter; }
+            const bool impossibleFilter = ( sourceFilterProvided && ( !sourceFilter || *sourceFilter > UINT32_MAX ) ) ||
+                ( taxonomyFilterProvided && ( !taxonomyFilter || *taxonomyFilter > UINT32_MAX ) );
+            while( !impossibleFilter && ( mustCount || !pageFilled ) &&
+                ( indexedFilterTag || rawOffset < passCount ) )
+            {
+                checkCancelled();
+                std::vector<QueryIndexedExplicitPass> batch;
+                if( indexedFilterTag ) batch = indexed->ScanIndexedExplicitPassFilter(
+                    *indexedFilterTag, indexedFilterKey, rawOffset, 256, control );
+                else
+                {
+                    batch = indexed->ScanIndexedExplicitPasses( rawOffset,
+                        size_t( std::min<uint64_t>( 256, passCount - rawOffset ) ), control );
+                    if( batch.empty() ) throw QueryError( "INDEX_NOT_READY",
+                        "Explicit GPU Pass page is incomplete" );
+                    rawOffset += batch.size();
+                }
+                if( batch.empty() ) break;
+                for( const auto& item : batch )
+                {
+                    const auto match = toMatch( item );
+                    bool selected = true;
+                    if( managedFilter && item.managed != *managedFilter ) selected = false;
+                    if( sourceFilterProvided && ( !sourceFilter || *sourceFilter > UINT32_MAX ||
+                        match.pass.gpuQueryId != *sourceFilter ) ) selected = false;
+                    if( taxonomyFilterProvided && ( !taxonomyFilter || *taxonomyFilter > UINT32_MAX ||
+                        match.taxonomyId != *taxonomyFilter ) ) selected = false;
+                    json passJson;
+                    if( selected )
+                    {
+                        passJson = ExplicitGpuPassJson( *source, match, taxonomyDefinitions );
+                        if( nameFilter )
+                        {
+                            const auto name = passJson.contains( "name" ) && passJson["name"].is_string() ?
+                                Lower( passJson["name"].get<std::string>() ) : std::string();
+                            if( name.find( *nameFilter ) == std::string::npos ) selected = false;
+                        }
+                    }
+                    if( selected )
+                    {
+                        if( !pageFilled && matched >= page.offset )
+                        {
+                            values.emplace_back( std::move( passJson ) );
+                            nextRawOffset = item.rawCursorAfter;
+                            if( values.size() == page.limit ) pageFilled = true;
+                        }
+                        matched++;
+                    }
+                }
+            }
+            if( mustCount ) total = matched;
+            const auto returned = values.size();
+            const bool hasMore = page.offset + returned < total;
+            const auto cursor = NextResourceCursor( page, method, trace, returned,
+                size_t( nextRawOffset ), total );
+            auto result = base();
+            if( managedFilter && !sourceFilterProvided && !taxonomyFilterProvided && !nameFilter )
+            {
+                const bool managed = *managedFilter;
+                const json& selectedProducer = managed ? managedProducer : nativeProducer;
+                const auto selectedMissing = managed ? indexed->GetIndexedManagedExplicitPassMissingGpuZoneCount() :
+                    missingGpuZoneCount - indexed->GetIndexedManagedExplicitPassMissingGpuZoneCount();
+                const auto selectedUnresolved = managed ? indexed->GetIndexedManagedExplicitPassUnresolvedTaxonomyCount() :
+                    unresolvedTaxonomyCount - indexed->GetIndexedManagedExplicitPassUnresolvedTaxonomyCount();
+                const bool selectedPresent = selectedProducer.is_object() || total != 0;
+                const bool selectedComplete = selectedPresent && taxonomy.value( "present", false ) &&
+                    selectedMissing == 0 && selectedUnresolved == 0 &&
+                    ( !selectedProducer.is_object() || selectedProducer.value( "complete", false ) );
+                result["present"] = selectedPresent;
+                result["complete"] = selectedComplete;
+                result["effective"] = selectedProducer.is_object() ?
+                    selectedProducer.value( "effective", false ) : total != 0;
+                result["producer_state"] = selectedProducer.is_object() ?
+                    selectedProducer.value( "state", "unknown" ) :
+                    ( total == 0 ? "absent" : "persisted_entities_without_producer_record" );
+                result["reason"] = selectedPresent ?
+                    ( selectedComplete ? json( nullptr ) : json( "Selected GPU pass evidence is incomplete" ) ) :
+                    json( "Selected GPU pass producer and persisted entities are absent" );
+                result["source_mode"] = managed ? "managed-command-buffer" : "cpp-marker-command-list";
+                result["producer"] = selectedProducer;
+                result["producers"] = selectedProducer.is_object() ? json::array( { selectedProducer } ) : json::array();
+                result["instance_count"] = Decimal( total );
+                result["missing_gpu_zone_count"] = Decimal( selectedMissing );
+                result["unresolved_taxonomy_count"] = Decimal( selectedUnresolved );
+            }
+            result["passes"] = std::move( values );
+            result["page"] = { { "offset", page.offset }, { "limit", page.limit },
+                { "returned", returned }, { "total", total }, { "has_more", hasMore } };
+            return Success( id, std::move( result ), trace,
+                PageJson( page, returned, cursor ) );
+        }
+    }
+
+    if( method == "gpu.pass.search" || method == "gpu.pass.get" )
+    {
         auto taxonomy = GpuTaxonomyCatalogJson( info() );
         auto passes = BuildExplicitGpuPassSet( *source, taxonomy );
         size_t scanOffset = 0;
@@ -7894,7 +8200,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto taxonomyId = DecimalStringValue( definition["taxonomy_id"] );
             if( taxonomyId ) definitions.emplace( uint32_t( *taxonomyId ), definition );
         }
-        auto explicitPasses = BuildExplicitGpuPassSet( *source, taxonomy );
+        const auto* indexedPassSource = dynamic_cast<const QueryExplicitPassSource*>( source.get() );
+        auto explicitPasses = indexedPassSource ? ExplicitGpuPassSet{} :
+            BuildExplicitGpuPassSet( *source, taxonomy );
 
         using GpuInterval = std::pair<int64_t, int64_t>;
         struct CompleteGpuZoneInterval
@@ -7929,7 +8237,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             BudgetScanned( zones.size(), chunk, allowed );
             for( const auto& zone : zones )
             {
-                MatchExplicitGpuPassZone( *source, explicitPasses, zone );
+                if( !indexedPassSource ) MatchExplicitGpuPassZone( *source, explicitPasses, zone );
                 if( zone.gpuEndNs && *zone.gpuEndNs >= zone.gpuStartNs )
                 {
                     allGpuIntervals[zone.contextRef].emplace_back( zone.gpuStartNs, *zone.gpuEndNs );
@@ -7969,18 +8277,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         uint64_t explicitPassMissingZoneCount = 0;
         std::set<std::string> explicitPassZoneRefs;
         std::set<std::string> explicitAncestorZoneRefs;
-        for( const auto& pass : explicitPasses.matches )
+        const auto processExplicitPass = [&]( const ExplicitGpuPassMatch& pass )
         {
             if( !pass.zone )
             {
                 explicitPassMissingZoneCount++;
-                continue;
+                return;
             }
             const auto definition = definitions.find( pass.taxonomyId );
             if( definition == definitions.end() )
             {
                 unknownTaxonomyZoneCount++;
-                continue;
+                return;
             }
             explicitPassZoneCount++;
             explicitPassZoneRefs.emplace( pass.zone->ref );
@@ -8003,7 +8311,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( syntheticTaxonomyZoneRefs.contains( *pass.zone->parentRef ) )
                     explicitAncestorZoneRefs.emplace( *pass.zone->parentRef );
             }
+        };
+        if( indexedPassSource )
+        {
+            QueryCorrelationReadControl passControl;
+            passControl.check = checkCancelled;
+            passControl.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "GPU taxonomy Explicit Pass scan budget exhausted", true );
+                return allowed;
+            };
+            passControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+            for( uint64_t passOffset = 0; passOffset < totalPasses; )
+            {
+                const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                    size_t( std::min<uint64_t>( 256, totalPasses - passOffset ) ), passControl );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "GPU taxonomy Explicit Pass page is incomplete" );
+                for( const auto& value : page )
+                    processExplicitPass( IndexedExplicitGpuPassMatch( value ) );
+                passOffset += page.size();
+            }
         }
+        else for( const auto& pass : explicitPasses.matches ) processExplicitPass( pass );
         fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount, explicitAncestorZoneRefs.size() );
         const auto mergeIntervals = []( std::vector<GpuInterval> intervals ) -> std::vector<GpuInterval> {
             if( intervals.empty() ) return {};
@@ -9888,7 +10222,6 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 std::make_move_iterator( page.end() ) );
             offset += page.size();
         }
-
         uint64_t frameId = 0;
         if( params.contains( "ref" ) )
         {
@@ -12723,7 +13056,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         const auto id = DecimalStringValue( definition["taxonomy_id"] );
                         if( id && *id <= std::numeric_limits<uint32_t>::max() ) definitions.emplace( uint32_t( *id ), definition );
                     }
-                auto explicitPasses = BuildExplicitGpuPassSet( item, taxonomy );
+                const auto* indexedPassSource = dynamic_cast<const QueryExplicitPassSource*>( &item );
+                auto explicitPasses = indexedPassSource ? ExplicitGpuPassSet{} :
+                    BuildExplicitGpuPassSet( item, taxonomy );
                 std::vector<analysis::GpuZoneDto> zones;
                 size_t offset = 0;
                 constexpr size_t chunk = 4096;
@@ -12738,17 +13073,17 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     BudgetScanned( values.size(), chunk, allowed );
                     for( const auto& value : values )
                     {
-                        MatchExplicitGpuPassZone( item, explicitPasses, value );
+                        if( !indexedPassSource ) MatchExplicitGpuPassZone( item, explicitPasses, value );
                         zones.emplace_back( value );
                     }
                     offset += values.size();
                     if( values.size() < allowed ) break;
                 }
                 std::set<std::string> explicitlyMatchedZones;
-                for( const auto& pass : explicitPasses.matches )
+                const auto collectPass = [&]( const ExplicitGpuPassMatch& pass )
                 {
-                    if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) continue;
-                    if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) continue;
+                    if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) return;
+                    if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) return;
                     explicitlyMatchedZones.emplace( pass.zone->ref );
                     const auto definition = definitions.find( pass.taxonomyId );
                     const bool stable = pass.taxonomyStableId && definition != definitions.end();
@@ -12762,7 +13097,33 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     group.matchKind = stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback";
                     group.inclusive.emplace_back( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
                     if( pass.zone->selfTimeNs ) group.self.emplace_back( *pass.zone->selfTimeNs );
+                };
+                if( indexedPassSource )
+                {
+                    QueryCorrelationReadControl passControl;
+                    passControl.check = checkCancelled;
+                    passControl.allowance = [&]( size_t requested ) {
+                        const auto allowed = BudgetScanAllowance( requested );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                            "GPU compare Explicit Pass scan budget exhausted", true );
+                        return allowed;
+                    };
+                    passControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                        BudgetScanned( actual, requested, allowed );
+                    };
+                    const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+                    for( uint64_t passOffset = 0; passOffset < totalPasses; )
+                    {
+                        const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                            size_t( std::min<uint64_t>( 256, totalPasses - passOffset ) ), passControl );
+                        if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                            "GPU compare Explicit Pass page is incomplete" );
+                        for( const auto& value : page )
+                            collectPass( IndexedExplicitGpuPassMatch( value ) );
+                        passOffset += page.size();
+                    }
                 }
+                else for( const auto& pass : explicitPasses.matches ) collectPass( pass );
                 for( const auto& zone : zones )
                 {
                     if( explicitlyMatchedZones.contains( zone.ref ) || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) continue;
@@ -13544,6 +13905,22 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     throw QueryError( "METHOD_NOT_FOUND", "unknown method: " + method );
+}
+
+std::vector<uint32_t> QueryGpuTaxonomyIds( const analysis::TraceInfoDto& info )
+{
+    std::vector<uint32_t> result;
+    const auto taxonomy = GpuTaxonomyCatalogJson( info );
+    if( !taxonomy.contains( "definitions" ) || !taxonomy["definitions"].is_array() ) return result;
+    for( const auto& definition : taxonomy["definitions"] )
+    {
+        if( !definition.contains( "taxonomy_id" ) ) continue;
+        const auto value = DecimalStringValue( definition["taxonomy_id"] );
+        if( value && *value != 0 && *value <= UINT32_MAX ) result.emplace_back( uint32_t( *value ) );
+    }
+    std::sort( result.begin(), result.end() );
+    result.erase( std::unique( result.begin(), result.end() ), result.end() );
+    return result;
 }
 
 std::string DumpProtocolJson( const json& value )

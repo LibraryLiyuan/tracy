@@ -15,6 +15,7 @@
 #include "TracyQuerySpillStatistics.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
+#include "TracyQueryService.hpp"
 #include "TracyFileHeader.hpp"
 #include "TracyFileReadHooks.hpp"
 #include "TracyWorker.hpp"
@@ -1594,6 +1595,7 @@ class IndexedTraceSource final : public analysis::TraceSource,
     public QueryCatalogResourceSource,
     public QueryGpuPassResourceSource,
     public QueryCorrelationSource,
+    public QueryExplicitPassSource,
     public QueryResourceContextSource
 {
 public:
@@ -2503,6 +2505,103 @@ public:
         for( auto& value : links ) result.value.links.emplace_back( std::move( value.second ) );
         return result;
     }
+    uint64_t GetIndexedExplicitPassCount() const override { return m_explicitPasses.Count(); }
+    uint64_t GetIndexedManagedExplicitPassCount() const override { return m_explicitPasses.ManagedCount(); }
+    uint64_t GetIndexedExplicitPassMissingGpuZoneCount() const override
+    { return m_explicitPasses.MissingGpuZoneCount(); }
+    uint64_t GetIndexedExplicitPassUnresolvedTaxonomyCount() const override
+    { return m_explicitPasses.UnresolvedTaxonomyCount(); }
+    uint64_t GetIndexedManagedExplicitPassMissingGpuZoneCount() const override
+    { return m_explicitPasses.ManagedMissingGpuZoneCount(); }
+    uint64_t GetIndexedManagedExplicitPassUnresolvedTaxonomyCount() const override
+    { return m_explicitPasses.ManagedUnresolvedTaxonomyCount(); }
+    std::vector<QueryIndexedExplicitPass> ScanIndexedExplicitPasses( uint64_t offset, size_t limit,
+        const QueryCorrelationReadControl& control ) const override
+    {
+        if( control.check ) control.check();
+        const auto requested = size_t( std::min<uint64_t>( limit,
+            offset < m_explicitPasses.Count() ? m_explicitPasses.Count() - offset : 0 ) );
+        if( requested == 0 ) return {};
+        const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+        if( allowed == 0 ) throw std::runtime_error( "query_explicit_pass_scan_budget" );
+        const auto rows = m_explicitPasses.ReadPasses( offset, std::min( requested, allowed ) );
+        if( control.scanned ) control.scanned( rows.size(), requested, allowed );
+        std::vector<QueryIndexedExplicitPass> result;
+        result.reserve( rows.size() );
+        for( size_t index = 0; index < rows.size(); index++ )
+        {
+            auto value = ExplicitPassDto( offset + index, rows[index] );
+            value.rawCursorAfter = offset + index + 1;
+            result.emplace_back( std::move( value ) );
+        }
+        if( control.check ) control.check();
+        return result;
+    }
+    std::vector<QueryIndexedExplicitPass> ScanIndexedExplicitPassFilter(
+        QueryIndexedExplicitPassFilterTag tag, uint64_t key, uint64_t& candidateOffset,
+        size_t limit, const QueryCorrelationReadControl& control ) const override
+    {
+        std::vector<QueryIndexedExplicitPass> result;
+        const auto total = m_explicitPasses.FilterCandidateCount( key );
+        while( candidateOffset < total && result.size() < limit )
+        {
+            if( control.check ) control.check();
+            const auto requested = size_t( std::min<uint64_t>( 256, total - candidateOffset ) );
+            const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+            if( allowed == 0 ) throw std::runtime_error( "query_explicit_pass_filter_budget" );
+            const auto page = m_explicitPasses.ReadFilterCandidates( key, candidateOffset, allowed );
+            if( page.values.empty() ) break;
+            if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+            for( const auto& candidate : page.values )
+            {
+                candidateOffset++;
+                const auto expected = tag == QueryIndexedExplicitPassFilterTag::PassSource ?
+                    QueryExplicitPassFilterTag::PassSource : QueryExplicitPassFilterTag::Taxonomy;
+                if( candidate.tag != expected || candidate.projectionOrdinal >= m_explicitPasses.Count() ) continue;
+                const auto rows = m_explicitPasses.ReadPasses( candidate.projectionOrdinal, 1 );
+                if( rows.size() != 1 ) throw std::runtime_error( "query_explicit_pass_filter_projection" );
+                auto value = ExplicitPassDto( candidate.projectionOrdinal, rows.front() );
+                if( tag == QueryIndexedExplicitPassFilterTag::PassSource )
+                {
+                    if( key > UINT32_MAX || value.pass.gpuQueryId != key ) continue;
+                }
+                else if( key > UINT32_MAX || value.taxonomyId != key ) continue;
+                value.rawCursorAfter = candidateOffset;
+                result.emplace_back( std::move( value ) );
+                if( result.size() == limit ) break;
+            }
+        }
+        return result;
+    }
+    std::optional<QueryIndexedExplicitPass> FindIndexedExplicitPass( uint64_t entityId,
+        const QueryCorrelationReadControl& control ) const override
+    {
+        uint64_t best = std::numeric_limits<uint64_t>::max();
+        const auto total = m_correlations.CandidateCount( entityId );
+        for( uint64_t offset = 0; offset < total; )
+        {
+            if( control.check ) control.check();
+            const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+            const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+            if( allowed == 0 ) throw std::runtime_error( "query_explicit_pass_scan_budget" );
+            const auto page = m_correlations.ReadCandidates( entityId, offset, allowed );
+            if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+            for( const auto& candidate : page.values )
+            {
+                if( candidate.tag != QueryCorrelationEndpointTag::EntitySelf ||
+                    candidate.ordinal >= m_gfxEntities.Count() ) continue;
+                const auto entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                if( entity.entityId == entityId && entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+                    best = std::min( best, candidate.ordinal );
+            }
+            if( page.values.empty() ) break;
+            offset += page.values.size();
+        }
+        if( best == std::numeric_limits<uint64_t>::max() || best > UINT32_MAX ) return std::nullopt;
+        const auto located = m_explicitPasses.FindByEntityOrdinal( uint32_t( best ) );
+        return located ? std::optional<QueryIndexedExplicitPass>(
+            ExplicitPassDto( located->projectionOrdinal, located->record ) ) : std::nullopt;
+    }
     QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
         const QueryCorrelationReadControl& control ) const override
     {
@@ -3372,6 +3471,39 @@ public:
 
 private:
     static bool Intersects( int64_t begin, int64_t end, const analysis::ScanRange& range ) { return begin < range.endNs && end > range.startNs; }
+    QueryIndexedExplicitPass ExplicitPassDto( uint64_t projectionOrdinal,
+        const QueryExplicitPassRecord& record ) const
+    {
+        QueryIndexedExplicitPass result;
+        result.projectionOrdinal = projectionOrdinal;
+        const auto entity = m_gfxEntities.At<JnGfxEntityData>( record.entityOrdinal );
+        if( entity.kind != uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+            throw std::runtime_error( "query_explicit_pass_projection_kind" );
+        result.pass = { MakeEntityRef( "gfx-entity", entity.entityId ), entity.entityId,
+            entity.parentId, entity.time, MakeEntityRef( "thread", entity.thread ),
+            entity.gpuQueryId, entity.gpuContext, entity.kind, entity.flags };
+        if( record.HasSegment() )
+        {
+            const auto segment = m_gfxEntities.At<JnGfxEntityData>( record.SegmentOrdinal() );
+            if( segment.kind != uint8_t( JnGfxEntityKind::GpuSegment ) )
+                throw std::runtime_error( "query_explicit_pass_segment_kind" );
+            result.segment = analysis::GfxEntityDto { MakeEntityRef( "gfx-entity", segment.entityId ),
+                segment.entityId, segment.parentId, segment.time, MakeEntityRef( "thread", segment.thread ),
+                segment.gpuQueryId, segment.gpuContext, segment.kind, segment.flags };
+            const auto zone = m_explicitPasses.FindNearestGpuZone(
+                ( uint64_t( segment.gpuContext ) << 32 ) | segment.gpuQueryId, segment.time );
+            if( zone ) result.zone = GpuDto( *zone );
+        }
+        result.commandListId = record.commandListId;
+        result.frameId = record.frameId;
+        result.cameraId = record.cameraId;
+        result.viewId = record.viewId;
+        result.referenceToken = record.referenceToken;
+        result.taxonomyId = record.taxonomyId;
+        result.taxonomyStableId = record.TaxonomyStable();
+        result.managed = m_explicitPasses.IsManaged( projectionOrdinal );
+        return result;
+    }
     void EnsureGpuRequestScopes() const
     {
         std::call_once( m_gpuRequestScopeOnce, [&] {
@@ -4208,7 +4340,6 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 correlations.Append( entity.entityId, QueryCorrelationEndpointTag::EntitySelf, ordinal );
                 if( entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
                 {
-                    correlations.AppendExplicitPass( ordinal );
                     explicitPassCount++;
                 }
                 if( entity.parentId != 0 )
@@ -4238,7 +4369,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 tag( QueryCorrelationEndpointTag::EntityParent ) != parentCount ||
                 tag( QueryCorrelationEndpointTag::LinkSource ) != links.Count() ||
                 tag( QueryCorrelationEndpointTag::LinkTarget ) != links.Count() ||
-                stats.explicitPasses != explicitPassCount ||
+                stats.explicitPasses != 0 ||
                 stats.frameIdentities != frameIdentityCount )
                 throw std::runtime_error( "Correlation endpoint tag count mismatch" );
             QueryCorrelationStoreReader check(
@@ -4255,6 +4386,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             passInput.entityCount = entities.Count();
             passInput.linkCount = links.Count();
             passInput.gpuZoneCount = gpuZones.Count();
+            passInput.taxonomyIds = QueryGpuTaxonomyIds( source->GetTraceInfo() );
             passInput.scanEntities = [&]( uint64_t offset, size_t limit ) {
                 std::vector<QueryExplicitPassEntityFact> values;
                 const auto end = std::min<uint64_t>( entities.Count(), offset + limit );

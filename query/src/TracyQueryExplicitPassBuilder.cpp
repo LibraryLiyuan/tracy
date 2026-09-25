@@ -3,6 +3,7 @@
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisIoPath.hpp"
 #include "TracyQueryExplicitPassStore.hpp"
+#include "TracyQuerySpillStatistics.hpp"
 #include "TracyQueue.hpp"
 
 #include <algorithm>
@@ -23,7 +24,14 @@ constexpr size_t PageSize = 4096;
 constexpr uint64_t LinkOrdinalMask = ( uint64_t( 1 ) << 56 ) - 1;
 
 #pragma pack( push, 1 )
-struct IdentityRecord { uint64_t entityId; uint32_t ordinal; uint8_t kind; };
+struct IdentityRecord
+{
+    uint64_t entityId;
+    uint32_t ordinal;
+    uint32_t gpuQueryId;
+    uint8_t gpuContext;
+    uint8_t kind;
+};
 struct PassRecord
 {
     uint64_t entityId;
@@ -39,19 +47,26 @@ struct PartialRecord
     uint32_t passSourceId;
     uint8_t legacyTaxonomy;
     uint8_t managed;
+    uint8_t hasGpuZone;
 };
 struct SegmentRequest { uint64_t targetId; uint64_t linkOrdinal; uint32_t passOrdinal; };
-struct ResolvedSegment { uint64_t linkOrdinal; uint32_t passOrdinal; uint32_t segmentOrdinal; };
-struct FilterInput { uint32_t passSourceId; uint32_t taxonomyKey; uint8_t stable; };
+struct ResolvedSegment
+{
+    uint64_t linkOrdinal;
+    uint32_t passOrdinal;
+    uint32_t segmentOrdinal;
+    uint8_t hasGpuZone;
+};
+struct FilterInput { uint32_t passSourceId; uint32_t taxonomyKey; };
 #pragma pack( pop )
 
-static_assert( sizeof( IdentityRecord ) == 13 );
+static_assert( sizeof( IdentityRecord ) == 18 );
 static_assert( sizeof( PassRecord ) == 18 );
 static_assert( sizeof( LinkRecord ) == 24 );
-static_assert( sizeof( PartialRecord ) == 58 );
+static_assert( sizeof( PartialRecord ) == 59 );
 static_assert( sizeof( SegmentRequest ) == 20 );
-static_assert( sizeof( ResolvedSegment ) == 16 );
-static_assert( sizeof( FilterInput ) == 9 );
+static_assert( sizeof( ResolvedSegment ) == 17 );
+static_assert( sizeof( FilterInput ) == 8 );
 
 void Check( const analysis::PagedRecordOptions& options )
 {
@@ -224,12 +239,41 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
         throw std::runtime_error( "query_explicit_pass_entity_ordinal_width" );
     if( input.linkCount > LinkOrdinalMask )
         throw std::runtime_error( "query_explicit_pass_link_ordinal_width" );
+    if( !std::is_sorted( input.taxonomyIds.begin(), input.taxonomyIds.end() ) ||
+        std::adjacent_find( input.taxonomyIds.begin(), input.taxonomyIds.end() ) != input.taxonomyIds.end() )
+        throw std::runtime_error( "query_explicit_pass_taxonomy_order" );
     if( std::filesystem::exists( analysis::AnalysisIoPath( temporaryRoot ) ) )
         throw std::runtime_error( "query_explicit_pass_temporary_exists" );
     std::filesystem::create_directories( analysis::AnalysisIoPath( temporaryRoot ) );
     QueryExplicitPassBuilderStatistics stats;
     try
     {
+        std::vector<uint64_t> gpuZoneQueryKeys;
+        analysis::AnalysisWorkspaceReservation gpuZoneKeyMemory( options.workspace );
+        {
+            QuerySpillUInt64Set zoneKeys( temporaryRoot / "zone-key-set",
+                options.disk, options.workspace, [&] { Check( options ); } );
+            for( uint64_t offset = 0; offset < input.gpuZoneCount; offset += PageSize )
+            {
+                Check( options );
+                const auto take = std::min<uint64_t>( PageSize, input.gpuZoneCount - offset );
+                const auto page = input.scanGpuZones( offset, size_t( take ) );
+                RequirePage( page, take, "explicit Pass GPU Zone key" );
+                for( const auto& zone : page )
+                    zoneKeys.Append( ( uint64_t( zone.context ) << 32 ) | zone.queryId );
+            }
+            zoneKeys.Finish();
+            const auto available = WorkspaceLimit( options );
+            if( available <= 4096 ||
+                zoneKeys.Count() > ( available - 4096 ) / sizeof( uint64_t ) )
+                throw std::runtime_error( "query_explicit_pass_gpu_zone_key_workspace" );
+            gpuZoneKeyMemory.Resize( zoneKeys.Count() * sizeof( uint64_t ) + 4096 );
+            gpuZoneQueryKeys.reserve( size_t( zoneKeys.Count() ) );
+            zoneKeys.VisitValues( [&]( uint64_t key ) {
+                gpuZoneQueryKeys.push_back( key );
+                return true;
+            } );
+        }
         PartitionWriter<IdentityRecord> identities( temporaryRoot, "identity", options );
         PartitionWriter<PassRecord> passes( temporaryRoot, "pass", options );
         PartitionWriter<LinkRecord> links( temporaryRoot, "link", options );
@@ -244,7 +288,8 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
                 if( entity.ordinal != offset + ( &entity - page.data() ) || entity.ordinal > UINT32_MAX )
                     throw std::runtime_error( "query_explicit_pass_entity_ordinal" );
                 const auto partition = Partition( entity.entityId );
-                identities.Append( partition, { entity.entityId, uint32_t( entity.ordinal ), entity.kind } );
+                identities.Append( partition, { entity.entityId, uint32_t( entity.ordinal ),
+                    entity.gpuQueryId, entity.gpuContext, entity.kind } );
                 if( entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
                 {
                     passes.Append( partition, { entity.entityId, uint32_t( entity.ordinal ),
@@ -296,6 +341,8 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
                 PartialRecord row;
                 row.projection.entityOrdinal = pass.ordinal;
                 row.projection.segmentOrdinalAndStable = QueryExplicitPassMissingSegment;
+                if( pass.legacyTaxonomy < input.taxonomyIds.size() )
+                    row.projection.taxonomyId = input.taxonomyIds[pass.legacyTaxonomy];
                 row.passSourceId = pass.passSourceId;
                 row.legacyTaxonomy = pass.legacyTaxonomy;
                 row.managed = pass.managed;
@@ -362,7 +409,9 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
                     found->second.kind != uint8_t( JnGfxEntityKind::GpuSegment ) ||
                     found->second.ordinal >= QueryExplicitPassMissingSegment ) continue;
                 resolved.Append( Partition( request.passOrdinal ),
-                    { request.linkOrdinal, request.passOrdinal, found->second.ordinal } );
+                    { request.linkOrdinal, request.passOrdinal, found->second.ordinal,
+                        uint8_t( std::binary_search( gpuZoneQueryKeys.begin(), gpuZoneQueryKeys.end(),
+                            ( uint64_t( found->second.gpuContext ) << 32 ) | found->second.gpuQueryId ) ) } );
                 stats.resolvedSegments++;
             }
             if( FileBytes( identityPath ) != 0 ) Remove( identityPath, options.disk );
@@ -402,6 +451,7 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
                 const auto stable = partialRows[index].projection.segmentOrdinalAndStable &
                     QueryExplicitPassStableTaxonomyBit;
                 partialRows[index].projection.segmentOrdinalAndStable = stable | segment.segmentOrdinal;
+                partialRows[index].hasGpuZone = segment.hasGpuZone;
             }
             std::sort( partialRows.begin(), partialRows.end(), []( const auto& lhs, const auto& rhs ) {
                 return lhs.projection.entityOrdinal < rhs.projection.entityOrdinal;
@@ -452,11 +502,14 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
             auto head = queue.top(); queue.pop();
             if( !firstProjection && head.row.projection.entityOrdinal <= previousEntity )
                 throw std::runtime_error( "query_explicit_pass_run_order" );
-            store.AppendPass( head.row.projection, head.row.managed != 0 );
+            const bool taxonomyResolved = head.row.projection.taxonomyId != 0 &&
+                std::binary_search( input.taxonomyIds.begin(), input.taxonomyIds.end(),
+                    head.row.projection.taxonomyId );
+            store.AppendPass( head.row.projection, head.row.managed != 0,
+                head.row.hasGpuZone != 0, taxonomyResolved );
             const bool stable = head.row.projection.TaxonomyStable();
-            filterInput.Append( { head.row.passSourceId,
-                stable ? head.row.projection.taxonomyId : uint32_t( head.row.legacyTaxonomy ),
-                uint8_t( stable ) } );
+            (void)stable;
+            filterInput.Append( { head.row.passSourceId, head.row.projection.taxonomyId } );
             previousEntity = head.row.projection.entityOrdinal;
             firstProjection = false;
             projectionOrdinal++;
@@ -489,8 +542,7 @@ QueryExplicitPassBuilderStatistics BuildQueryExplicitPassStore(
                     store.AppendFilter( buffer[index].passSourceId,
                         QueryExplicitPassFilterTag::PassSource, offset + index );
                     store.AppendFilter( buffer[index].taxonomyKey,
-                        buffer[index].stable ? QueryExplicitPassFilterTag::Taxonomy :
-                            QueryExplicitPassFilterTag::LegacyTaxonomy, offset + index );
+                        QueryExplicitPassFilterTag::Taxonomy, offset + index );
                 }
                 offset += take;
             }

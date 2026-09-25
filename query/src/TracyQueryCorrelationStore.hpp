@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,48 @@ struct QueryIndexedGfxEvidence
     analysis::GfxEvidenceSlice value;
     bool edgeLimitExceeded = false;
     bool nodeLimitExceeded = false;
+};
+
+struct QueryIndexedExplicitPass
+{
+    uint64_t projectionOrdinal = 0;
+    uint64_t rawCursorAfter = 0;
+    analysis::GfxEntityDto pass;
+    std::optional<analysis::GfxEntityDto> segment;
+    std::optional<analysis::GpuZoneDto> zone;
+    uint64_t commandListId = 0;
+    uint64_t frameId = 0;
+    uint64_t cameraId = 0;
+    uint64_t viewId = 0;
+    uint64_t referenceToken = 0;
+    uint32_t taxonomyId = 0;
+    bool taxonomyStableId = false;
+    bool managed = false;
+};
+
+enum class QueryIndexedExplicitPassFilterTag : uint8_t
+{
+    PassSource,
+    Taxonomy
+};
+
+class QueryExplicitPassSource
+{
+public:
+    virtual ~QueryExplicitPassSource() = default;
+    virtual uint64_t GetIndexedExplicitPassCount() const = 0;
+    virtual uint64_t GetIndexedManagedExplicitPassCount() const = 0;
+    virtual uint64_t GetIndexedExplicitPassMissingGpuZoneCount() const = 0;
+    virtual uint64_t GetIndexedExplicitPassUnresolvedTaxonomyCount() const = 0;
+    virtual uint64_t GetIndexedManagedExplicitPassMissingGpuZoneCount() const = 0;
+    virtual uint64_t GetIndexedManagedExplicitPassUnresolvedTaxonomyCount() const = 0;
+    virtual std::vector<QueryIndexedExplicitPass> ScanIndexedExplicitPasses(
+        uint64_t offset, size_t limit, const QueryCorrelationReadControl& control ) const = 0;
+    virtual std::vector<QueryIndexedExplicitPass> ScanIndexedExplicitPassFilter(
+        QueryIndexedExplicitPassFilterTag tag, uint64_t key, uint64_t& candidateOffset,
+        size_t limit, const QueryCorrelationReadControl& control ) const = 0;
+    virtual std::optional<QueryIndexedExplicitPass> FindIndexedExplicitPass(
+        uint64_t entityId, const QueryCorrelationReadControl& control ) const = 0;
 };
 
 class QueryCorrelationSource

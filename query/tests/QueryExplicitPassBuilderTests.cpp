@@ -69,6 +69,7 @@ int main()
         input.entityCount = entities.size();
         input.linkCount = links.size();
         input.gpuZoneCount = zones.size();
+        input.taxonomyIds = { 7, 8 };
         input.scanEntities = [&]( uint64_t offset, size_t limit ) { return Page( entities, offset, limit ); };
         input.scanLinks = [&]( uint64_t offset, size_t limit ) { return Page( links, offset, limit ); };
         input.scanGpuZones = [&]( uint64_t offset, size_t limit ) { return Page( zones, offset, limit ); };
@@ -98,6 +99,9 @@ int main()
             query::QueryExplicitPassStoreReader reader(
                 store, fingerprint, entities.size(), zones.size(), options );
             reader.ValidateAll();
+            Require( reader.MissingGpuZoneCount() == 1 &&
+                reader.UnresolvedTaxonomyCount() == 1,
+                "explicit Pass aggregate quality counts changed" );
             const auto values = reader.ReadPasses( 0, 10 );
             Require( values.size() == 3 && values[0].entityOrdinal == 0 &&
                 values[1].entityOrdinal == 3 && values[2].entityOrdinal == 6,
@@ -119,8 +123,8 @@ int main()
             for( const auto& candidate : reader.ReadFilterCandidates( 123, 0, 64 ).values )
                 stable += candidate.tag == query::QueryExplicitPassFilterTag::Taxonomy &&
                     candidate.projectionOrdinal == 0;
-            for( const auto& candidate : reader.ReadFilterCandidates( 1, 0, 64 ).values )
-                legacy += candidate.tag == query::QueryExplicitPassFilterTag::LegacyTaxonomy &&
+            for( const auto& candidate : reader.ReadFilterCandidates( 8, 0, 64 ).values )
+                legacy += candidate.tag == query::QueryExplicitPassFilterTag::Taxonomy &&
                     candidate.projectionOrdinal == 1;
             for( const auto& candidate : reader.ReadFilterCandidates( 10, 0, 64 ).values )
                 source += candidate.tag == query::QueryExplicitPassFilterTag::PassSource;

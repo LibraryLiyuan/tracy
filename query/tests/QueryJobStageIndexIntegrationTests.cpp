@@ -189,6 +189,9 @@ int main( int argc, char** argv )
             nlohmann::json frameIdentityList = nullptr;
             nlohmann::json evidence = nullptr;
             nlohmann::json gpuPasses = nullptr;
+            nlohmann::json gpuPassSourceFilter = nullptr;
+            nlohmann::json gpuPassTaxonomyFilter = nullptr;
+            nlohmann::json gpuPassGet = nullptr;
             if( !expectedFrames.empty() )
             {
                 request["method"] = "frame.identity";
@@ -228,11 +231,36 @@ int main( int argc, char** argv )
             const auto passResponse = service.Execute( request );
             Require( passResponse.at("ok"), "real Explicit GPU Pass search failed" );
             gpuPasses = passResponse.at("data");
+            if( !gpuPasses.at("passes").empty() )
+            {
+                const auto& firstPass = gpuPasses.at("passes")[0];
+                request["params"] = {{"trace_id", session.id}, {"limit", 100},
+                    {"pass_source_id", firstPass.at("pass_source_id")},
+                    {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
+                const auto sourceFiltered = service.Execute( request );
+                Require( sourceFiltered.at("ok"), "real Explicit GPU Pass source filter failed" );
+                gpuPassSourceFilter = sourceFiltered.at("data");
+                request["params"] = {{"trace_id", session.id}, {"limit", 100},
+                    {"taxonomy_id", firstPass.at("taxonomy_id")},
+                    {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
+                const auto taxonomyFiltered = service.Execute( request );
+                Require( taxonomyFiltered.at("ok"), "real Explicit GPU Pass taxonomy filter failed" );
+                gpuPassTaxonomyFilter = taxonomyFiltered.at("data");
+                request["method"] = "gpu.pass.get";
+                request["params"] = {{"trace_id", session.id}, {"ref", firstPass.at("ref")},
+                    {"max_scan_events", 10000}};
+                const auto getPass = service.Execute( request );
+                Require( getPass.at("ok"), "real Explicit GPU Pass get failed" );
+                gpuPassGet = getPass.at("data");
+            }
             return nlohmann::json{{"jobs", jobs}, {"gfx_statistics", statistics.at("data")},
                 {"job_statistics", jobStatistics.at("data")}, {"related", std::move( related )},
                 {"chain", std::move( chain )}, {"frame_identity", std::move( frameIdentity )},
                 {"frame_identity_list", std::move( frameIdentityList )},
-                {"evidence", std::move( evidence )}, {"gpu_passes", std::move( gpuPasses )}};
+                {"evidence", std::move( evidence )}, {"gpu_passes", std::move( gpuPasses )},
+                {"gpu_pass_source_filter", std::move( gpuPassSourceFilter )},
+                {"gpu_pass_taxonomy_filter", std::move( gpuPassTaxonomyFilter )},
+                {"gpu_pass_get", std::move( gpuPassGet )}};
         };
         const auto workerJson = searchPages( false );
         const auto indexedJson = searchPages( true );

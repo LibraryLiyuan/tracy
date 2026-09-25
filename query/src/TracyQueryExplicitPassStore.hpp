@@ -87,6 +87,8 @@ struct QueryExplicitPassBuildStatistics
     uint64_t gpuZoneKeys = 0;
     uint64_t filterRecords = 0;
     uint64_t filterTemporaryBytes = 0;
+    uint64_t missingGpuZones = 0;
+    uint64_t unresolvedTaxonomies = 0;
 };
 
 class QueryExplicitPassStoreWriter
@@ -99,7 +101,8 @@ public:
     QueryExplicitPassStoreWriter( const QueryExplicitPassStoreWriter& ) = delete;
     QueryExplicitPassStoreWriter& operator=( const QueryExplicitPassStoreWriter& ) = delete;
 
-    void AppendPass( const QueryExplicitPassRecord& value, bool managed );
+    void AppendPass( const QueryExplicitPassRecord& value, bool managed,
+        bool hasGpuZone = true, bool taxonomyResolved = true );
     void SealPasses();
     void AppendFilter( uint64_t key, QueryExplicitPassFilterTag tag, uint64_t projectionOrdinal );
     void AppendGpuZoneKey( const QueryExplicitPassGpuZoneKey& value );
@@ -122,6 +125,10 @@ public:
     uint64_t Count() const;
     uint64_t ManagedCount() const;
     uint64_t GpuZoneKeyCount() const;
+    uint64_t MissingGpuZoneCount() const;
+    uint64_t UnresolvedTaxonomyCount() const;
+    uint64_t ManagedMissingGpuZoneCount() const;
+    uint64_t ManagedUnresolvedTaxonomyCount() const;
     std::vector<QueryExplicitPassRecord> ReadPasses( uint64_t offset, size_t limit ) const;
     bool IsManaged( uint64_t projectionOrdinal ) const;
     std::optional<QueryExplicitPassLocated> FindByEntityOrdinal( uint32_t entityOrdinal ) const;

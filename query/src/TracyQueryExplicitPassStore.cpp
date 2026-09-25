@@ -23,7 +23,7 @@ constexpr size_t MaximumPage = 4096;
 struct StoreHeader
 {
     char magic[8] { 'J', 'N', 'P', 'A', 'S', 'S', '1', 0 };
-    uint32_t version = 1;
+    uint32_t version = 3;
     uint32_t projectionRecordBytes = sizeof( QueryExplicitPassRecord );
     uint32_t zoneRecordBytes = sizeof( QueryExplicitPassGpuZoneKey );
     uint32_t reserved = 0;
@@ -33,6 +33,10 @@ struct StoreHeader
     uint64_t managedPasses = 0;
     uint64_t gpuZoneKeys = 0;
     uint64_t filterRecords = 0;
+    uint64_t missingGpuZones = 0;
+    uint64_t unresolvedTaxonomies = 0;
+    uint64_t managedMissingGpuZones = 0;
+    uint64_t managedUnresolvedTaxonomies = 0;
     char sourceFingerprint[64] {};
 };
 #pragma pack( pop )
@@ -197,7 +201,8 @@ QueryExplicitPassStoreWriter::QueryExplicitPassStoreWriter( std::filesystem::pat
 
 QueryExplicitPassStoreWriter::~QueryExplicitPassStoreWriter() = default;
 
-void QueryExplicitPassStoreWriter::AppendPass( const QueryExplicitPassRecord& record, bool managed )
+void QueryExplicitPassStoreWriter::AppendPass( const QueryExplicitPassRecord& record, bool managed,
+    bool hasGpuZone, bool taxonomyResolved )
 {
     auto& value = *m_impl;
     if( value.committed || value.passesSealed ) throw std::runtime_error( "query_explicit_pass_writer_closed" );
@@ -214,6 +219,10 @@ void QueryExplicitPassStoreWriter::AppendPass( const QueryExplicitPassRecord& re
         value.header.managedPasses++;
     }
     value.header.passes++;
+    if( !hasGpuZone ) value.header.missingGpuZones++;
+    if( !taxonomyResolved ) value.header.unresolvedTaxonomies++;
+    if( managed && !hasGpuZone ) value.header.managedMissingGpuZones++;
+    if( managed && !taxonomyResolved ) value.header.managedUnresolvedTaxonomies++;
     if( ( value.header.passes & 7 ) == 0 )
     {
         value.modes->Append( &value.modeByte, 1 );
@@ -274,7 +283,8 @@ QueryExplicitPassBuildStatistics QueryExplicitPassStoreWriter::Commit()
     WriteHeader( value.root / "header.bin", value.header, value.options );
     value.committed = true;
     return { value.header.passes, value.header.managedPasses, value.header.gpuZoneKeys,
-        value.header.filterRecords, filterStats.temporaryBytes };
+        value.header.filterRecords, filterStats.temporaryBytes,
+        value.header.missingGpuZones, value.header.unresolvedTaxonomies };
 }
 
 struct QueryExplicitPassStoreReader::Impl
@@ -300,12 +310,15 @@ struct QueryExplicitPassStoreReader::Impl
             sizeof( QueryExplicitPassGpuZoneKey ), options )
         , filters( root / "filters", fingerprint, options )
     {
-        if( std::memcmp( header.magic, "JNPASS1", 7 ) != 0 || header.version != 1 ||
+        if( std::memcmp( header.magic, "JNPASS1", 7 ) != 0 || header.version != 3 ||
             header.projectionRecordBytes != sizeof( QueryExplicitPassRecord ) ||
             header.zoneRecordBytes != sizeof( QueryExplicitPassGpuZoneKey ) ||
             header.gfxEntityCount != entityCount || header.gpuZoneCount != zoneCount ||
             header.passes != passes.Count() || header.gpuZoneKeys != zones.Count() ||
             modes.Count() != ( header.passes + 7 ) / 8 || header.managedPasses > header.passes ||
+            header.missingGpuZones > header.passes || header.unresolvedTaxonomies > header.passes ||
+            header.managedMissingGpuZones > header.managedPasses ||
+            header.managedUnresolvedTaxonomies > header.managedPasses ||
             std::string( header.sourceFingerprint, 64 ) != fingerprint ||
             filters.Count() != header.filterRecords )
             throw std::runtime_error( "query_explicit_pass_header" );
@@ -346,6 +359,12 @@ QueryExplicitPassStoreReader::~QueryExplicitPassStoreReader() = default;
 uint64_t QueryExplicitPassStoreReader::Count() const { return m_impl->header.passes; }
 uint64_t QueryExplicitPassStoreReader::ManagedCount() const { return m_impl->header.managedPasses; }
 uint64_t QueryExplicitPassStoreReader::GpuZoneKeyCount() const { return m_impl->header.gpuZoneKeys; }
+uint64_t QueryExplicitPassStoreReader::MissingGpuZoneCount() const { return m_impl->header.missingGpuZones; }
+uint64_t QueryExplicitPassStoreReader::UnresolvedTaxonomyCount() const { return m_impl->header.unresolvedTaxonomies; }
+uint64_t QueryExplicitPassStoreReader::ManagedMissingGpuZoneCount() const
+{ return m_impl->header.managedMissingGpuZones; }
+uint64_t QueryExplicitPassStoreReader::ManagedUnresolvedTaxonomyCount() const
+{ return m_impl->header.managedUnresolvedTaxonomies; }
 
 std::vector<QueryExplicitPassRecord> QueryExplicitPassStoreReader::ReadPasses(
     uint64_t offset, size_t limit ) const

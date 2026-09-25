@@ -2,6 +2,8 @@
 #include "TracyQueryResourceContext.hpp"
 #include "TracyQueryCorrelationStore.hpp"
 #include "FakeTraceSource.hpp"
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -9,6 +11,7 @@
 #include <map>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 
 using namespace tracy;
 using nlohmann::json;
@@ -49,7 +52,8 @@ static std::string LegacyCursor( const std::string& cursor )
 // Exercise the real dispatcher against an observable source boundary. Large
 // unrelated reads are cheap fixtures here, but must never be requested.
 class ReadCountingSource final : public query::test::FakeTraceSource,
-    public query::QueryResourceContextSource, public query::QueryCorrelationSource
+    public query::QueryResourceContextSource, public query::QueryCorrelationSource,
+    public query::QueryExplicitPassSource
 {
 public:
     std::shared_ptr<query::QueryResourceContext> resources;
@@ -218,6 +222,29 @@ public:
         if( control.scanned ) control.scanned( values.size(), requested, allowed );
         return values;
     }
+    std::vector<query::QueryIndexedExplicitPass> ScanIndexedExplicitPassFilter(
+        query::QueryIndexedExplicitPassFilterTag tag, uint64_t key, uint64_t& candidateOffset,
+        size_t limit, const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_explicit_pass_filter"];
+        const auto values = IndexedPasses();
+        std::vector<query::QueryIndexedExplicitPass> result;
+        while( candidateOffset < values.size() && result.size() < limit )
+        {
+            const auto& item = values[size_t( candidateOffset++ )];
+            const bool matches = tag == query::QueryIndexedExplicitPassFilterTag::PassSource ?
+                item.pass.gpuQueryId == key : item.taxonomyId == key;
+            if( !matches ) continue;
+            auto value = item;
+            value.rawCursorAfter = candidateOffset;
+            result.emplace_back( std::move( value ) );
+        }
+        if( result.empty() ) return result;
+        const auto allowed = control.allowance ? control.allowance( result.size() ) : result.size();
+        if( allowed < result.size() ) result.resize( allowed );
+        if( control.scanned ) control.scanned( result.size(), result.size(), allowed );
+        return result;
+    }
     query::QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
         const std::vector<uint64_t>& seeds, const query::QueryCorrelationReadControl& control ) const override
     {
@@ -245,6 +272,79 @@ public:
         if( allowed < rows ) throw std::runtime_error( "indexed explicit Pass scan budget exhausted" );
         if( control.scanned ) control.scanned( rows, rows, allowed );
         return result;
+    }
+    std::vector<query::QueryIndexedExplicitPass> IndexedPasses() const
+    {
+        const auto entities = gfxEntityFixture ? *gfxEntityFixture : FakeTraceSource::GetGfxEntities();
+        const auto links = FakeTraceSource::GetGfxLinks();
+        std::unordered_map<uint64_t, analysis::GfxEntityDto> byId;
+        for( const auto& entity : entities ) byId.emplace( entity.entityId, entity );
+        std::vector<query::QueryIndexedExplicitPass> result;
+        for( const auto& entity : entities ) if( entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+        {
+            query::QueryIndexedExplicitPass value;
+            value.projectionOrdinal = result.size();
+            value.pass = entity;
+            value.managed = ( entity.flags & 2 ) != 0;
+            constexpr std::array<uint32_t, 7> taxonomyIds {
+                65537, 268632064, 268763136, 537067521, 537067522, 537198593, 537198595 };
+            if( entity.gpuContext < taxonomyIds.size() ) value.taxonomyId = taxonomyIds[entity.gpuContext];
+            for( const auto& link : links ) if( link.sourceId == entity.entityId ) switch( JnGfxRelation( link.relation ) )
+            {
+            case JnGfxRelation::RunsOnGpu:
+                if( const auto found = byId.find( link.targetId ); found != byId.end() &&
+                    found->second.kind == uint8_t( JnGfxEntityKind::GpuSegment ) ) value.segment = found->second;
+                break;
+            case JnGfxRelation::RecordedOnCommandList: value.commandListId = link.targetId; break;
+            case JnGfxRelation::BelongsToFrame: value.frameId = link.targetId; break;
+            case JnGfxRelation::BelongsToCamera: value.cameraId = link.targetId; break;
+            case JnGfxRelation::BelongsToView: value.viewId = link.targetId; break;
+            case JnGfxRelation::ReferencesResources: value.referenceToken = link.targetId; break;
+            case JnGfxRelation::ClassifiesAsTaxonomy:
+                if( link.targetId != 0 && link.targetId <= UINT32_MAX )
+                { value.taxonomyId = uint32_t( link.targetId ); value.taxonomyStableId = true; }
+                break;
+            default: break;
+            }
+            result.emplace_back( std::move( value ) );
+        }
+        return result;
+    }
+    uint64_t GetIndexedExplicitPassCount() const override { return IndexedPasses().size(); }
+    uint64_t GetIndexedManagedExplicitPassCount() const override
+    {
+        const auto values = IndexedPasses();
+        return std::count_if( values.begin(), values.end(), []( const auto& value ) { return value.managed; } );
+    }
+    uint64_t GetIndexedExplicitPassMissingGpuZoneCount() const override { return IndexedPasses().size(); }
+    uint64_t GetIndexedExplicitPassUnresolvedTaxonomyCount() const override { return 0; }
+    uint64_t GetIndexedManagedExplicitPassMissingGpuZoneCount() const override
+    { return GetIndexedManagedExplicitPassCount(); }
+    uint64_t GetIndexedManagedExplicitPassUnresolvedTaxonomyCount() const override { return 0; }
+    std::vector<query::QueryIndexedExplicitPass> ScanIndexedExplicitPasses( uint64_t offset, size_t limit,
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_explicit_pass_page"];
+        auto values = IndexedPasses();
+        if( offset >= values.size() ) return {};
+        const auto requested = std::min<size_t>( limit, values.size() - size_t( offset ) );
+        const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+        if( allowed == 0 ) throw std::runtime_error( "indexed explicit Pass scan budget exhausted" );
+        values = { values.begin() + size_t( offset ),
+            values.begin() + size_t( offset ) + std::min( requested, allowed ) };
+        for( auto& value : values ) value.rawCursorAfter = ++offset;
+        if( control.scanned ) control.scanned( values.size(), requested, allowed );
+        return values;
+    }
+    std::optional<query::QueryIndexedExplicitPass> FindIndexedExplicitPass( uint64_t entityId,
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_explicit_pass_get"];
+        if( control.check ) control.check();
+        const auto values = IndexedPasses();
+        const auto found = std::find_if( values.begin(), values.end(),
+            [&]( const auto& value ) { return value.pass.entityId == entityId; } );
+        return found == values.end() ? std::nullopt : std::optional<query::QueryIndexedExplicitPass>( *found );
     }
     query::QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
         const query::QueryCorrelationReadControl& control ) const override
@@ -398,9 +498,56 @@ int main()
         const auto indexedPasses = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 191},
             {"method", "gpu.pass.search"}, {"params", {{"trace_id", opened.id}, {"limit", 10},
                 {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}}}} );
-        Require( indexedPasses.at("ok") && observed->reads["indexed_explicit_pass"] == 1 &&
+        Require( indexedPasses.at("ok") && observed->reads["indexed_explicit_pass_page"] == 1 &&
+            observed->reads["indexed_explicit_pass"] == 0 &&
             observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0,
             "Explicit GPU Pass search ignored the indexed Pass directory" );
+        if( !indexedPasses.at("data").at("passes").empty() )
+        {
+            observed->reads.clear();
+            const auto indexedPass = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 192},
+                {"method", "gpu.pass.get"}, {"params", {{"trace_id", opened.id},
+                    {"ref", indexedPasses.at("data").at("passes")[0].at("ref")},
+                    {"max_scan_events", 100}}}} );
+            Require( indexedPass.at("ok") && observed->reads["indexed_explicit_pass_get"] == 1 &&
+                observed->reads["indexed_explicit_pass_page"] == 0 &&
+                observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0,
+                "Explicit GPU Pass get ignored the indexed identity lookup" );
+        }
+        observed->gfxEntityFixture = static_cast<const query::test::FakeTraceSource&>( *observed )
+            .GetGfxEntities();
+        for( uint64_t index = 0; index < 1000; index++ )
+        {
+            analysis::GfxEntityDto pass;
+            pass.entityId = 100000 + index;
+            pass.ref = "fake:gfx-entity:" + std::to_string( pass.entityId );
+            pass.gpuQueryId = uint32_t( 200000 + index );
+            pass.kind = uint8_t( JnGfxEntityKind::ExplicitGpuPass );
+            observed->gfxEntityFixture->push_back( std::move( pass ) );
+        }
+        observed->reads.clear();
+        auto passPageRequest = nlohmann::json( {{"protocol", "tracy-query/1"}, {"id", 193},
+            {"method", "gpu.pass.search"}, {"params", {{"trace_id", opened.id}, {"limit", 1},
+                {"max_scan_events", 100}}}} );
+        const auto passPage1 = service.Execute( passPageRequest );
+        Require( passPage1.at("ok") && !passPage1.at("page").at("next_cursor").is_null(),
+            "Explicit GPU Pass first page did not return a cursor" );
+        passPageRequest["params"]["cursor"] = passPage1.at("page").at("next_cursor");
+        const auto passPage2 = service.Execute( passPageRequest );
+        Require( passPage2.at("ok") && observed->reads["indexed_explicit_pass_page"] == 2 &&
+            passPage1.at("data").at("passes")[0].at("ref") !=
+                passPage2.at("data").at("passes")[0].at("ref"),
+            "Explicit GPU Pass cursor repeated the first projection" );
+        observed->reads.clear();
+        const auto filteredPass = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 194},
+            {"method", "gpu.pass.search"}, {"params", {{"trace_id", opened.id}, {"limit", 1},
+                {"pass_source_id", "200500"}, {"max_scan_events", 10000}}}} );
+        Require( filteredPass.at("ok") && filteredPass.at("data").at("passes").size() == 1 &&
+            filteredPass.at("data").at("passes")[0].at("pass_source_id") == 200500 &&
+            observed->reads["indexed_explicit_pass_filter"] != 0 &&
+            observed->reads["indexed_explicit_pass_page"] == 0,
+            "Explicit GPU Pass structured filter ignored the keyed backend" );
+        observed->gfxEntityFixture.reset();
         for( const auto* method : { "entity.related", "correlation.chain" } )
         {
             observed->reads.clear();
