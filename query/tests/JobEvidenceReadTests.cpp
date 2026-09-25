@@ -59,6 +59,7 @@ public:
     std::shared_ptr<query::QueryResourceContext> resources;
     std::shared_ptr<query::QueryResourceContext> GetQueryResourceContext() const override { return resources; }
     mutable std::map<std::string, size_t> reads;
+    mutable std::vector<std::string> readOrder;
     std::function<void()> duringJobRead;
     std::function<void()> duringGfxRead;
     std::optional<std::vector<analysis::GfxEntityDto>> gfxEntityFixture;
@@ -325,6 +326,7 @@ public:
         const query::QueryCorrelationReadControl& control ) const override
     {
         ++reads["indexed_explicit_pass_page"];
+        readOrder.emplace_back( "explicit-pass" );
         auto values = IndexedPasses();
         if( offset >= values.size() ) return {};
         const auto requested = std::min<size_t>( limit, values.size() - size_t( offset ) );
@@ -383,7 +385,7 @@ public:
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
     { ++reads["cpu"]; return FakeTraceSource::ScanCpuZones( range ); }
     std::vector<analysis::GpuZoneDto> ScanGpuZones( const analysis::ScanRange& range ) const override
-    { ++reads["gpu"]; return FakeTraceSource::ScanGpuZones( range ); }
+    { ++reads["gpu"]; readOrder.emplace_back( "gpu-zone" ); return FakeTraceSource::ScanGpuZones( range ); }
     std::vector<analysis::LockEventDto> ScanLockEvents( const analysis::ScanRange& range ) const override
     { ++reads["lock"]; return FakeTraceSource::ScanLockEvents( range ); }
     std::vector<analysis::ContextSwitchDto> ScanContextSwitchEvents( const analysis::ScanRange& range ) const override
@@ -399,9 +401,13 @@ int main()
         std::ofstream(path).put('\0');
         struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); } } cleanup{path};
         ReadCountingSource* observed = nullptr;
-        query::SessionManager sessions({path.parent_path()}, 1,
+        std::vector<ReadCountingSource*> observedSources;
+        query::SessionManager sessions({path.parent_path()}, 2,
             [&]( const std::filesystem::path&, query::SessionManager::StateCallback ) -> std::unique_ptr<analysis::TraceSource> {
-                auto source = std::make_unique<ReadCountingSource>(); observed = source.get(); return source;
+                auto source = std::make_unique<ReadCountingSource>();
+                observedSources.emplace_back( source.get() );
+                if( !observed ) observed = source.get();
+                return source;
             });
         const auto opened = sessions.Open(path);
         Require(sessions.WaitReady(opened.id, std::chrono::seconds(5)).state == analysis::TraceSourceState::Ready, "source not ready");
@@ -902,6 +908,59 @@ int main()
         const auto emptyStatistics = service.Execute( statisticsRequest );
         Require( emptyStatistics.at("ok") && !emptyStatistics.at("data").at("present").get<bool>() &&
             emptyStatistics.at("data").at("counts").at("jobs") == "0", "empty statistics changed" );
+
+        const auto baselinePath = path.parent_path() / ( path.stem().string() + "-baseline.tracy" );
+        std::ofstream( baselinePath ).put( '\0' );
+        Cleanup baselineCleanup { baselinePath };
+        const auto baselineOpened = sessions.Open( baselinePath );
+        Require( sessions.WaitReady( baselineOpened.id, std::chrono::seconds( 5 ) ).state == analysis::TraceSourceState::Ready,
+            "compare baseline source not ready" );
+        auto* baselineObserved = observedSources.back();
+        analysis::JobDto compareJob;
+        compareJob.jobId = 77; compareJob.ref = observed->MakeEntityRef( "job", 77 );
+        compareJob.name = "CompareJob"; compareJob.scheduleNs = 1; compareJob.firstRunNs = 2;
+        compareJob.executionNs = 3; compareJob.waitNs = 4;
+        observed->statisticsFixture = std::vector<analysis::JobDto>{ compareJob };
+        compareJob.ref = baselineObserved->MakeEntityRef( "job", 77 );
+        baselineObserved->statisticsFixture = std::vector<analysis::JobDto>{ compareJob };
+        observed->reads.clear();
+        baselineObserved->reads.clear();
+        observed->readOrder.clear();
+        baselineObserved->readOrder.clear();
+        const json compareRequest = {{ "protocol", "tracy-query/1" }, { "id", 7 },
+            { "method", "compare.normalized" }, { "params", {
+                { "trace_id", opened.id }, { "baseline_trace_id", baselineOpened.id },
+                { "comparison_mode", "performance" }, { "frame_set", "Frames" },
+                { "warmup_frames", 0 }, { "window_frames", 1 }, { "limit", 20 },
+                { "max_scan_events", 10000 }, { "max_cpu_ms", 10000 }
+            } } };
+        const auto compare = service.Execute( compareRequest );
+        Require( compare.at( "ok" ), "indexed compare failed" );
+        const auto passBeforeZone = []( const std::vector<std::string>& order ) {
+            const auto pass = std::find( order.begin(), order.end(), "explicit-pass" );
+            const auto zone = std::find( order.begin(), order.end(), "gpu-zone" );
+            return pass != order.end() && zone != order.end() && pass < zone;
+        };
+        Require( passBeforeZone( observed->readOrder ) && passBeforeZone( baselineObserved->readOrder ),
+            "indexed compare retained GPU Zone DTOs before consuming Explicit Pass projections" );
+        Require( observed->reads["all_jobs"] == 0 && baselineObserved->reads["all_jobs"] == 0 &&
+            observed->reads["job_page"] != 0 && baselineObserved->reads["job_page"] != 0,
+            "indexed Compare materialized the complete Job table" );
+        query::QueryResourceContextOptions compareLimited;
+        compareLimited.traceBytes = 1;
+        compareLimited.derivedRoots = { path.string() + ".compare-statistics" };
+        compareLimited.diagnosticDiskReserveBytes = 0;
+        observed->resources = std::make_shared<query::QueryResourceContext>( compareLimited );
+        compareLimited.derivedRoots = { baselinePath.string() + ".compare-statistics" };
+        baselineObserved->resources = std::make_shared<query::QueryResourceContext>( compareLimited );
+        const auto limitedCompare = service.Execute( compareRequest );
+        Require( !limitedCompare.at( "ok" ) && limitedCompare.at( "error" ).at( "code" ) == "RESOURCE_LIMIT",
+            "indexed Compare grouped statistics bypassed the shared disk budget" );
+        Require( observed->resources->Snapshot().disk.rejectedGrowths != 0 ||
+            baselineObserved->resources->Snapshot().disk.rejectedGrowths != 0,
+            "indexed Compare did not charge grouped statistics scratch" );
+        observed->resources.reset();
+        baselineObserved->resources.reset();
         std::cout << "Job directed read boundaries and evidence equivalence passed\n";
         return 0;
     }

@@ -46,6 +46,29 @@ struct AnalysisExternalSortStatistics
     uint64_t mergeWriteBytes = 0;
 };
 
+// Streaming counterpart of SortAnalysisUInt64PairsGenerated. Records are
+// emitted once as the producer scans its source; sorted runs stay bounded by
+// the shared workspace and are merged when Finish is called.
+class AnalysisUInt64PairRunCollector
+{
+public:
+    AnalysisUInt64PairRunCollector( std::filesystem::path output,
+        std::filesystem::path temporaryRoot, std::string prefix,
+        uint64_t maximumBufferedPairs,
+        std::shared_ptr<AnalysisDiskBudget> disk = {},
+        std::shared_ptr<AnalysisWorkspaceBudget> workspace = {},
+        std::function<bool()> cancelled = {},
+        AnalysisExternalSortStatistics* statistics = nullptr );
+    ~AnalysisUInt64PairRunCollector();
+    AnalysisUInt64PairRunCollector( const AnalysisUInt64PairRunCollector& ) = delete;
+    AnalysisUInt64PairRunCollector& operator=( const AnalysisUInt64PairRunCollector& ) = delete;
+    void Emit( const AnalysisUInt64Pair& value );
+    bool Finish( std::string& error );
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
+};
+
 // Keeps sorted runs for one metadata stream while the caller emits records.
 // Multiple collectors can share one producer and the same workspace budget.
 class AnalysisKeyMetadataRunCollector

@@ -183,6 +183,31 @@ void DiskStatistics(const std::filesystem::path& root)
             throw std::runtime_error("Replacing a prior sort output with an empty result must release its old disk charge");
         }
     }
+    {
+        const auto streaming=root/"streaming-pair-sort";
+        std::filesystem::create_directories(streaming);
+        auto pairUsage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{streaming});
+        AnalysisDiskActivity pairActivity(pairUsage);
+        auto pairDisk=std::make_shared<AnalysisDiskBudget>(AnalysisDiskBudget{pairUsage,256*1024,{}});
+        auto pairWorkspace=std::make_shared<AnalysisWorkspaceBudget>(256*1024,128*1024);
+        AnalysisExternalSortStatistics statistics;
+        AnalysisUInt64PairRunCollector collector(streaming/"output",streaming,"pairs",2,
+            pairDisk,pairWorkspace,{},&statistics);
+        collector.Emit({2,1}); collector.Emit({1,3}); collector.Emit({1,2});
+        if(!collector.Finish(error)) throw std::runtime_error(error);
+        std::ifstream input(streaming/"output",std::ios::binary);
+        std::vector<AnalysisUInt64Pair> values(3);
+        input.read(reinterpret_cast<char*>(values.data()),std::streamsize(values.size()*sizeof(values[0])));
+        if(!input || values[0].key!=1 || values[0].value!=2 || values[1].key!=1 ||
+            values[1].value!=3 || values[2].key!=2 || values[2].value!=1 ||
+            statistics.inputRecords!=3 || statistics.initialRuns!=2)
+            throw std::runtime_error("Streaming pair collector changed key/value ordering or statistics");
+        input.close();
+        std::error_code cleanupError;
+        AnalysisDiskRemove(streaming,pairDisk,cleanupError,true);
+        if(cleanupError || pairUsage->Current()!=0 || pairWorkspace->Snapshot().currentBytes!=0)
+            throw std::runtime_error("Streaming pair collector did not release its disk/workspace charge");
+    }
 }
 
 }

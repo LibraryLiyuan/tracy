@@ -1,6 +1,7 @@
 #include "TracyQuerySpillStatistics.hpp"
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 
 using namespace tracy;
@@ -76,6 +77,21 @@ int main()
                 result.stddev == 0 && result.truncatedMean == 7, "large bounded distribution changed" );
             Require( workspace->Snapshot().peakBytes <= 65536 * sizeof( int64_t ) + 131072,
                 "statistics workspace grew with input count" );
+        }
+        clean();
+        {
+            const std::vector<int64_t> first { 9, -3, 4, 4, 100, 7 };
+            const std::vector<int64_t> second { INT64_MIN, 0, INT64_MAX };
+            query::QueryGroupedSpillStatistics statistics( root, disk, workspace, {}, 2 );
+            for( const auto value : first ) statistics.Append( 11, 0, value );
+            for( const auto value : second ) statistics.Append( 42, 4, value );
+            std::map<std::pair<uint64_t, uint8_t>, analysis::Statistics> actual;
+            statistics.Finish( [&]( uint64_t group, uint8_t metric, const analysis::Statistics& value ) {
+                actual.emplace( std::pair { group, metric }, value );
+            } );
+            Require( actual.size() == 2, "grouped spill changed group/metric cardinality" );
+            Equal( actual.at( { 11, 0 } ), analysis::ComputeStatistics( first ) );
+            Equal( actual.at( { 42, 4 } ), analysis::ComputeStatistics( second ) );
         }
         clean();
         {

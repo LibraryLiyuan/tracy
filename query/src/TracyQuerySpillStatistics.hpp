@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <vector>
 
 namespace tracy::query
@@ -42,6 +43,24 @@ private:
     uint64_t m_count = 0;
     uint64_t m_nextRun = 0;
     bool m_finished = false;
+};
+
+class QueryGroupedSpillStatistics
+{
+public:
+    QueryGroupedSpillStatistics( const std::filesystem::path& temporaryRoot,
+        std::shared_ptr<analysis::AnalysisDiskBudget> disk,
+        std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace,
+        std::function<void()> check = {}, size_t maximumBufferedValues = 524288 );
+    ~QueryGroupedSpillStatistics();
+    QueryGroupedSpillStatistics( const QueryGroupedSpillStatistics& ) = delete;
+    QueryGroupedSpillStatistics& operator=( const QueryGroupedSpillStatistics& ) = delete;
+    void Append( uint64_t group, uint8_t metric, int64_t value );
+    void Finish( const std::function<void( uint64_t, uint8_t, const analysis::Statistics& )>& visit );
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 class QuerySpillUInt64Set

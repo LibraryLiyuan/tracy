@@ -379,6 +379,120 @@ static bool FinishGeneratedRuns( std::vector<std::filesystem::path> runs,
     return true;
 }
 
+struct AnalysisUInt64PairRunCollector::Impl
+{
+    using Record = AnalysisUInt64Pair;
+
+    Impl( std::filesystem::path result, std::filesystem::path temporary,
+        std::string name, uint64_t buffered,
+        std::shared_ptr<AnalysisDiskBudget> diskBudget,
+        std::shared_ptr<AnalysisWorkspaceBudget> workspaceBudget,
+        std::function<bool()> cancellation,
+        AnalysisExternalSortStatistics* measurements )
+        : output( std::move( result ) )
+        , temporaryRoot( std::move( temporary ) )
+        , prefix( std::move( name ) )
+        , maximumBufferedRecords( buffered )
+        , disk( std::move( diskBudget ) )
+        , workspace( std::move( workspaceBudget ) )
+        , cancelled( std::move( cancellation ) )
+        , statistics( measurements )
+        , bufferWorkspace( workspace )
+    {
+        if( !maximumBufferedRecords || maximumBufferedRecords > SIZE_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_pair_sort_collector_configuration" );
+        std::string error;
+        if( !CleanupAnalysisExternalSortFiles( temporaryRoot, prefix + "-run-", error, disk ) )
+            throw std::runtime_error( error );
+        bufferWorkspace.Resize( maximumBufferedRecords * sizeof( Record ) );
+        values.reserve( size_t( maximumBufferedRecords ) );
+        if( statistics ) *statistics = {};
+    }
+
+    void Flush()
+    {
+        if( values.empty() ) return;
+        if( cancelled && cancelled() ) throw std::runtime_error( "analysis_pair_sort_cancelled" );
+        std::sort( values.begin(), values.end(), PairLess );
+        const auto run = temporaryRoot / ( prefix + "-run-0-" +
+            std::to_string( runs.size() ) + ".work" );
+        std::ofstream out;
+        const auto charged = uint64_t( values.size() ) * sizeof( Record );
+        AnalysisDiskGrow( disk, charged );
+        FileChargeReconcile reconcile { out, run, disk, charged };
+        out.open( run, std::ios::binary | std::ios::trunc );
+        if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_open_failed" );
+        out.write( reinterpret_cast<const char*>( values.data() ),
+            std::streamsize( values.size() * sizeof( Record ) ) );
+        out.flush();
+        if( !out ) throw std::runtime_error( "analysis_pair_sort_run_write_failed" );
+        runs.emplace_back( run );
+        values.clear();
+    }
+
+    void Emit( const Record& value )
+    {
+        if( finished || count >= UINT64_MAX / sizeof( Record ) )
+            throw std::runtime_error( "analysis_pair_sort_collector_count" );
+        if( ( count & 4095 ) == 0 && cancelled && cancelled() )
+            throw std::runtime_error( "analysis_pair_sort_cancelled" );
+        values.emplace_back( value );
+        ++count;
+        if( values.size() == maximumBufferedRecords ) Flush();
+    }
+
+    bool Finish( std::string& error )
+    {
+        if( finished ) throw std::runtime_error( "analysis_pair_sort_collector_finished" );
+        error.clear();
+        Flush();
+        std::vector<Record>().swap( values );
+        bufferWorkspace.Resize( 0 );
+        if( statistics )
+        {
+            statistics->inputRecords = count;
+            statistics->initialRuns = runs.size();
+            statistics->initialRunWriteBytes = count * sizeof( Record );
+        }
+        finished = true;
+        return FinishGeneratedRuns<Record>( std::move( runs ), output, temporaryRoot,
+            prefix, count, error, disk, workspace, cancelled, statistics,
+            PairLess, "analysis_pair_sort" );
+    }
+
+    std::filesystem::path output;
+    std::filesystem::path temporaryRoot;
+    std::string prefix;
+    uint64_t maximumBufferedRecords;
+    std::shared_ptr<AnalysisDiskBudget> disk;
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace;
+    std::function<bool()> cancelled;
+    AnalysisExternalSortStatistics* statistics;
+    AnalysisWorkspaceReservation bufferWorkspace;
+    std::vector<Record> values;
+    std::vector<std::filesystem::path> runs;
+    uint64_t count = 0;
+    bool finished = false;
+};
+
+AnalysisUInt64PairRunCollector::AnalysisUInt64PairRunCollector(
+    std::filesystem::path output, std::filesystem::path temporaryRoot,
+    std::string prefix, uint64_t maximumBufferedPairs,
+    std::shared_ptr<AnalysisDiskBudget> disk,
+    std::shared_ptr<AnalysisWorkspaceBudget> workspace,
+    std::function<bool()> cancelled, AnalysisExternalSortStatistics* statistics )
+    : m_impl( std::make_unique<Impl>( std::move( output ), std::move( temporaryRoot ),
+        std::move( prefix ), maximumBufferedPairs, std::move( disk ),
+        std::move( workspace ), std::move( cancelled ), statistics ) ) {}
+
+AnalysisUInt64PairRunCollector::~AnalysisUInt64PairRunCollector() = default;
+
+void AnalysisUInt64PairRunCollector::Emit( const AnalysisUInt64Pair& value )
+{ m_impl->Emit( value ); }
+
+bool AnalysisUInt64PairRunCollector::Finish( std::string& error )
+{ return m_impl->Finish( error ); }
+
 struct AnalysisKeyMetadataRunCollector::Impl
 {
     using Record = AnalysisKeyMetadataRecord;

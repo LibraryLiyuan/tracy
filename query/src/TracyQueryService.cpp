@@ -12973,6 +12973,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
 
             struct MetricGroup
             {
+                uint64_t ordinal = 0;
                 std::string key;
                 std::string name;
                 std::string matchKind;
@@ -12981,6 +12982,8 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 std::vector<int64_t> running;
                 std::vector<int64_t> latency;
                 std::vector<int64_t> wait;
+                std::array<analysis::Statistics, 5> spilled;
+                uint8_t spilledMask = 0;
             };
             using MetricMap = std::map<std::string, MetricGroup>;
             const auto buildCatalogMaps = []( const json& catalog ) {
@@ -13012,6 +13015,39 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto collectCpu = [&]( const analysis::TraceSource& item, analysis::ScanRange selectedRange,
                 const std::map<std::string, std::string>& sourceKeys ) {
                 MetricMap groups;
+                const bool indexed = dynamic_cast<const QueryExplicitPassSource*>( &item ) != nullptr;
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                if( indexed )
+                {
+                    std::shared_ptr<QueryResourceContext> resources;
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
+                }
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "CPU compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key; group.name = name; group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
                 size_t offset = 0;
                 constexpr size_t chunk = 4096;
                 while( true )
@@ -13031,17 +13067,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         const auto stable = sourceKeys.find( sourceMatch );
                         const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName + '|' + zone.function;
                         const auto key = stable == sourceKeys.end() ? "fallback:cpu:" + fallback : "stable:" + stable->second;
-                        auto& group = groups[key];
-                        group.key = key;
-                        group.name = displayName;
-                        group.matchKind = stable == sourceKeys.end() ? "legacy_source_fallback" : "catalog_definition_key";
-                        group.inclusive.emplace_back( *zone.endNs - zone.startNs );
-                        if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
-                        if( zone.runningTimeNs ) group.running.emplace_back( *zone.runningTimeNs );
+                        auto& group = metricGroup( key, displayName,
+                            stable == sourceKeys.end() ? "legacy_source_fallback" : "catalog_definition_key" );
+                        appendMetric( group, 0, *zone.endNs - zone.startNs, group.inclusive );
+                        if( zone.selfTimeNs ) appendMetric( group, 1, *zone.selfTimeNs, group.self );
+                        if( zone.runningTimeNs ) appendMetric( group, 2, *zone.runningTimeNs, group.running );
                     }
                     offset += values.size();
                     if( values.size() < allowed ) break;
                 }
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "CPU compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
@@ -13059,44 +13101,76 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 const auto* indexedPassSource = dynamic_cast<const QueryExplicitPassSource*>( &item );
                 auto explicitPasses = indexedPassSource ? ExplicitGpuPassSet{} :
                     BuildExplicitGpuPassSet( item, taxonomy );
-                std::vector<analysis::GpuZoneDto> zones;
-                size_t offset = 0;
-                constexpr size_t chunk = 4096;
-                while( true )
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                std::shared_ptr<QueryResourceContext> resources;
+                if( indexedPassSource )
                 {
-                    checkCancelled();
-                    const auto allowed = BudgetScanAllowance( chunk );
-                    if( allowed == 0 ) break;
-                    selectedRange.offset = offset;
-                    selectedRange.limit = allowed;
-                    auto values = item.ScanGpuZones( selectedRange );
-                    BudgetScanned( values.size(), chunk, allowed );
-                    for( const auto& value : values )
-                    {
-                        if( !indexedPassSource ) MatchExplicitGpuPassZone( item, explicitPasses, value );
-                        zones.emplace_back( value );
-                    }
-                    offset += values.size();
-                    if( values.size() < allowed ) break;
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
                 }
-                std::set<std::string> explicitlyMatchedZones;
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "GPU compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key;
+                        group.name = name;
+                        group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
+                analysis::AnalysisWorkspaceReservation matchedZoneWorkspace(
+                    resources ? resources->Workspace() : nullptr );
+                std::vector<uint8_t> explicitlyMatchedZoneBits;
+                if( indexedPassSource )
+                {
+                    const auto zoneCount = itemInfo.counts.gpuZones;
+                    const auto bytes64 = zoneCount / 8 + ( zoneCount % 8 != 0 );
+                    if( bytes64 > SIZE_MAX )
+                        throw QueryError( "RESOURCE_LIMIT", "GPU compare matched-Zone bitset is too large", true );
+                    const auto bytes = size_t( bytes64 );
+                    matchedZoneWorkspace.Resize( bytes );
+                    explicitlyMatchedZoneBits.assign( bytes, 0 );
+                }
+                std::set<std::string> workerMatchedZoneRefs;
                 const auto collectPass = [&]( const ExplicitGpuPassMatch& pass )
                 {
                     if( !pass.zone || !pass.zone->gpuEndNs || *pass.zone->gpuEndNs < pass.zone->gpuStartNs ) return;
                     if( pass.zone->gpuStartNs < selectedRange.startNs || pass.zone->gpuStartNs >= selectedRange.endNs ) return;
-                    explicitlyMatchedZones.emplace( pass.zone->ref );
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = item.ParseEntityRef( pass.zone->ref, "gpu-zone" );
+                        if( !ordinal || *ordinal >= itemInfo.counts.gpuZones )
+                            throw QueryError( "INDEX_NOT_READY", "GPU compare Explicit Pass references an invalid GPU Zone" );
+                        explicitlyMatchedZoneBits[size_t( *ordinal / 8 )] |= uint8_t( 1u << ( *ordinal & 7 ) );
+                    }
+                    else workerMatchedZoneRefs.emplace( pass.zone->ref );
                     const auto definition = definitions.find( pass.taxonomyId );
                     const bool stable = pass.taxonomyStableId && definition != definitions.end();
                     const auto displayName = stable ? definition->second.value( "canonical_name", pass.zone->name ) :
                         ( pass.zone->name.empty() ? pass.zone->function : pass.zone->name );
                     const auto fallback = NormalizeSourceKey( pass.zone->file ) + ':' + std::to_string( pass.zone->line ) + '|' + displayName;
                     const auto key = stable ? "stable:gpu-taxonomy:" + std::to_string( pass.taxonomyId ) : "fallback:gpu:" + fallback;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = displayName;
-                    group.matchKind = stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback";
-                    group.inclusive.emplace_back( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
-                    if( pass.zone->selfTimeNs ) group.self.emplace_back( *pass.zone->selfTimeNs );
+                    auto& group = metricGroup( key, displayName,
+                        stable ? "gpu_taxonomy_stable_id" : "legacy_source_fallback" );
+                    appendMetric( group, 0, *pass.zone->gpuEndNs - pass.zone->gpuStartNs, group.inclusive );
+                    if( pass.zone->selfTimeNs ) appendMetric( group, 1, *pass.zone->selfTimeNs, group.self );
                 };
                 if( indexedPassSource )
                 {
@@ -13123,43 +13197,148 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                         passOffset += page.size();
                     }
                 }
-                else for( const auto& pass : explicitPasses.matches ) collectPass( pass );
-                for( const auto& zone : zones )
+
+                const auto collectZone = [&]( const analysis::GpuZoneDto& zone )
                 {
-                    if( explicitlyMatchedZones.contains( zone.ref ) || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) continue;
+                    bool matched = false;
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = item.ParseEntityRef( zone.ref, "gpu-zone" );
+                        if( !ordinal || *ordinal >= itemInfo.counts.gpuZones )
+                            throw QueryError( "INDEX_NOT_READY", "GPU compare scanned an invalid GPU Zone identity" );
+                        matched = ( explicitlyMatchedZoneBits[size_t( *ordinal / 8 )] & uint8_t( 1u << ( *ordinal & 7 ) ) ) != 0;
+                    }
+                    else matched = workerMatchedZoneRefs.contains( zone.ref );
+                    if( matched || !zone.gpuEndNs || *zone.gpuEndNs < zone.gpuStartNs ) return;
                     const auto displayName = zone.name.empty() ? zone.function : zone.name;
                     const auto fallback = NormalizeSourceKey( zone.file ) + ':' + std::to_string( zone.line ) + '|' + displayName;
                     const auto key = "fallback:gpu:" + fallback;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = displayName;
-                    group.matchKind = "legacy_source_fallback";
-                    group.inclusive.emplace_back( *zone.gpuEndNs - zone.gpuStartNs );
-                    if( zone.selfTimeNs ) group.self.emplace_back( *zone.selfTimeNs );
+                    auto& group = metricGroup( key, displayName, "legacy_source_fallback" );
+                    appendMetric( group, 0, *zone.gpuEndNs - zone.gpuStartNs, group.inclusive );
+                    if( zone.selfTimeNs ) appendMetric( group, 1, *zone.selfTimeNs, group.self );
+                };
+                std::vector<analysis::GpuZoneDto> workerZones;
+                size_t offset = 0;
+                constexpr size_t chunk = 4096;
+                while( true )
+                {
+                    checkCancelled();
+                    const auto allowed = BudgetScanAllowance( chunk );
+                    if( allowed == 0 ) break;
+                    selectedRange.offset = offset;
+                    selectedRange.limit = allowed;
+                    auto values = item.ScanGpuZones( selectedRange );
+                    BudgetScanned( values.size(), chunk, allowed );
+                    for( const auto& value : values )
+                    {
+                        if( indexedPassSource ) collectZone( value );
+                        else
+                        {
+                            MatchExplicitGpuPassZone( item, explicitPasses, value );
+                            workerZones.emplace_back( value );
+                        }
+                    }
+                    offset += values.size();
+                    if( values.size() < allowed ) break;
                 }
+                if( !indexedPassSource )
+                {
+                    for( const auto& pass : explicitPasses.matches ) collectPass( pass );
+                    for( const auto& zone : workerZones ) collectZone( zone );
+                }
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "GPU compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
-            const auto collectJobs = []( const analysis::TraceSource& item, const analysis::ScanRange& range,
+            const auto collectJobs = [&]( const analysis::TraceSource& item, const analysis::ScanRange& range,
                 const std::map<std::string, std::string>& jobKeys ) {
                 MetricMap groups;
-                for( const auto& job : item.GetJobs() )
+                const bool indexed = item.HasJobIdentityIndex();
+                std::unique_ptr<QueryGroupedSpillStatistics> metricSpill;
+                std::vector<MetricGroup*> metricGroups;
+                if( indexed )
                 {
-                    if( job.scheduleNs < range.startNs || job.scheduleNs >= range.endNs ) continue;
+                    std::shared_ptr<QueryResourceContext> resources;
+                    if( const auto owner = dynamic_cast<const QueryResourceContextSource*>( &item ) )
+                        resources = owner->GetQueryResourceContext();
+                    const auto temporaryRoot = resources ? resources->StatisticsTemporaryRoot() :
+                        std::filesystem::temp_directory_path() / "tracy-query-statistics";
+                    metricSpill = std::make_unique<QueryGroupedSpillStatistics>( temporaryRoot,
+                        resources ? resources->Disk() : nullptr, resources ? resources->Workspace() : nullptr,
+                        checkCancelled );
+                }
+                const auto metricGroup = [&]( const std::string& key, const std::string& name,
+                    const char* matchKind ) -> MetricGroup& {
+                    const auto [found, inserted] = groups.try_emplace( key );
+                    auto& group = found->second;
+                    if( inserted )
+                    {
+                        if( !BudgetConsumeGroup() ) throw QueryError( "RESOURCE_LIMIT",
+                            "Job compare metric group budget exhausted", true );
+                        group.ordinal = metricGroups.size();
+                        group.key = key; group.name = name; group.matchKind = matchKind;
+                        metricGroups.emplace_back( &group );
+                    }
+                    return group;
+                };
+                const auto appendMetric = [&]( MetricGroup& group, uint8_t metric, int64_t value,
+                    std::vector<int64_t>& fallback ) {
+                    if( metricSpill ) metricSpill->Append( group.ordinal, metric, value );
+                    else fallback.emplace_back( value );
+                };
+                const auto collectJob = [&]( const analysis::JobDto& job ) {
+                    if( job.scheduleNs < range.startNs || job.scheduleNs >= range.endNs ) return;
                     const auto stable = jobKeys.find( job.name );
                     const auto key = stable == jobKeys.end() ? "fallback:job:" + job.name : "stable:" + stable->second;
-                    auto& group = groups[key];
-                    group.key = key;
-                    group.name = job.name;
-                    group.matchKind = stable == jobKeys.end() ? "job_name_fallback" : "catalog_definition_key";
-                    group.inclusive.emplace_back( job.executionNs );
-                    group.wait.emplace_back( job.waitNs );
-                    if( job.firstRunNs ) group.latency.emplace_back( *job.firstRunNs - job.scheduleNs );
+                    auto& group = metricGroup( key, job.name,
+                        stable == jobKeys.end() ? "job_name_fallback" : "catalog_definition_key" );
+                    appendMetric( group, 0, job.executionNs, group.inclusive );
+                    appendMetric( group, 4, job.waitNs, group.wait );
+                    if( job.firstRunNs ) appendMetric( group, 3, *job.firstRunNs - job.scheduleNs, group.latency );
+                };
+                if( indexed )
+                {
+                    const auto total = item.GetJobCount();
+                    for( size_t offset = 0; offset < total; )
+                    {
+                        checkCancelled();
+                        const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                        const auto allowed = BudgetScanAllowance( requested );
+                        if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                            "Job compare scan budget exhausted", true );
+                        const auto values = item.ScanJobs( offset, allowed );
+                        BudgetScanned( values.size(), requested, allowed );
+                        if( values.empty() ) throw QueryError( "INDEX_NOT_READY",
+                            "Job compare page is incomplete" );
+                        for( const auto& job : values ) collectJob( job );
+                        offset += values.size();
+                    }
                 }
+                else for( const auto& job : item.GetJobs() ) collectJob( job );
+                if( metricSpill ) metricSpill->Finish( [&]( uint64_t groupOrdinal, uint8_t metric,
+                    const analysis::Statistics& statistics ) {
+                    if( groupOrdinal >= metricGroups.size() || metric >= metricGroups[groupOrdinal]->spilled.size() )
+                        throw std::runtime_error( "Job compare grouped statistics key mismatch" );
+                    auto& group = *metricGroups[groupOrdinal];
+                    group.spilled[metric] = statistics;
+                    group.spilledMask |= uint8_t( 1u << metric );
+                } );
                 return groups;
             };
 
             const auto compareMetricMaps = [&]( const MetricMap& left, const MetricMap& right, size_t frameCount ) {
+                const auto metricStatistics = []( const MetricGroup& group, size_t metric,
+                    const std::vector<int64_t>& values ) {
+                    return ( group.spilledMask & uint8_t( 1u << metric ) ) != 0 ?
+                        group.spilled[metric] : analysis::ComputeStatistics( values );
+                };
                 std::set<std::string> keys;
                 for( const auto& [key, value] : left ) keys.emplace( key );
                 for( const auto& [key, value] : right ) keys.emplace( key );
@@ -13176,16 +13355,16 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     else if( key.rfind( "stable:", 0 ) == 0 ) stableMatches++;
                     else fallbackMatches++;
                     const analysis::Statistics empty;
-                    const auto beforeInclusive = before == left.end() ? empty : analysis::ComputeStatistics( before->second.inclusive );
-                    const auto afterInclusive = after == right.end() ? empty : analysis::ComputeStatistics( after->second.inclusive );
-                    const auto beforeSelf = before == left.end() ? empty : analysis::ComputeStatistics( before->second.self );
-                    const auto afterSelf = after == right.end() ? empty : analysis::ComputeStatistics( after->second.self );
-                    const auto beforeRunning = before == left.end() ? empty : analysis::ComputeStatistics( before->second.running );
-                    const auto afterRunning = after == right.end() ? empty : analysis::ComputeStatistics( after->second.running );
-                    const auto beforeLatency = before == left.end() ? empty : analysis::ComputeStatistics( before->second.latency );
-                    const auto afterLatency = after == right.end() ? empty : analysis::ComputeStatistics( after->second.latency );
-                    const auto beforeWait = before == left.end() ? empty : analysis::ComputeStatistics( before->second.wait );
-                    const auto afterWait = after == right.end() ? empty : analysis::ComputeStatistics( after->second.wait );
+                    const auto beforeInclusive = before == left.end() ? empty : metricStatistics( before->second, 0, before->second.inclusive );
+                    const auto afterInclusive = after == right.end() ? empty : metricStatistics( after->second, 0, after->second.inclusive );
+                    const auto beforeSelf = before == left.end() ? empty : metricStatistics( before->second, 1, before->second.self );
+                    const auto afterSelf = after == right.end() ? empty : metricStatistics( after->second, 1, after->second.self );
+                    const auto beforeRunning = before == left.end() ? empty : metricStatistics( before->second, 2, before->second.running );
+                    const auto afterRunning = after == right.end() ? empty : metricStatistics( after->second, 2, after->second.running );
+                    const auto beforeLatency = before == left.end() ? empty : metricStatistics( before->second, 3, before->second.latency );
+                    const auto afterLatency = after == right.end() ? empty : metricStatistics( after->second, 3, after->second.latency );
+                    const auto beforeWait = before == left.end() ? empty : metricStatistics( before->second, 4, before->second.wait );
+                    const auto afterWait = after == right.end() ? empty : metricStatistics( after->second, 4, after->second.wait );
                     const double deltaPerFrame = frameCount == 0 ? 0 : double( afterInclusive.total - beforeInclusive.total ) / double( frameCount );
                     const double deltaP95 = afterInclusive.p95 - beforeInclusive.p95;
                     ranked.push_back( { std::max( std::abs( deltaPerFrame ), std::abs( deltaP95 ) ), key, {

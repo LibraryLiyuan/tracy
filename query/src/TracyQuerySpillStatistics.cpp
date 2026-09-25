@@ -225,6 +225,240 @@ analysis::Statistics QuerySpillStatistics::Finish()
     return result;
 }
 
+struct QueryGroupedSpillStatistics::Impl
+{
+    struct Quantile
+    {
+        double fraction = 0;
+        uint64_t low = 0;
+        uint64_t high = 0;
+        int64_t lowValue = 0;
+        int64_t highValue = 0;
+    };
+
+    struct Span
+    {
+        uint64_t key = 0;
+        uint64_t count = 0;
+        analysis::Statistics statistics;
+        std::array<Quantile, 4> quantiles {{ { 0.50 }, { 0.90 }, { 0.95 }, { 0.99 } }};
+        long double squaredDeviation = 0;
+        long double truncatedTotal = 0;
+        uint64_t truncatedCount = 0;
+    };
+
+    Impl( const std::filesystem::path& temporaryRoot,
+        std::shared_ptr<analysis::AnalysisDiskBudget> diskBudget,
+        std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspaceBudget,
+        std::function<void()> cancellation, size_t maximumBufferedValues )
+        : disk( std::move( diskBudget ) )
+        , workspace( std::move( workspaceBudget ) )
+        , check( std::move( cancellation ) )
+    {
+        if( maximumBufferedValues == 0 )
+            throw std::invalid_argument( "Grouped statistics spill buffer must be positive" );
+        Check();
+        std::filesystem::create_directories( temporaryRoot );
+        static std::atomic<uint64_t> sequence { 0 };
+        for( size_t attempt = 0; attempt < 100; attempt++ )
+        {
+            const auto candidate = temporaryRoot / ( "grouped-statistics-" +
+                std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) + "-" +
+                std::to_string( sequence.fetch_add( 1 ) ) );
+            if( std::filesystem::create_directory( candidate ) )
+            {
+                root = candidate;
+                sorted = root / "values.sorted";
+                collector = std::make_unique<analysis::AnalysisUInt64PairRunCollector>(
+                    sorted, root, "values", maximumBufferedValues, disk, workspace,
+                    [this] { Check(); return false; } );
+                return;
+            }
+        }
+        throw std::runtime_error( "Grouped statistics temporary directory collision" );
+    }
+
+    ~Impl()
+    {
+        collector.reset();
+        if( root.empty() ) return;
+        std::error_code error;
+        analysis::AnalysisDiskRemove( root, disk, error, true );
+    }
+
+    void Check() const
+    {
+        if( check ) check();
+    }
+
+    static int64_t Decode( uint64_t value )
+    {
+        return int64_t( value ^ ( uint64_t( 1 ) << 63 ) );
+    }
+
+    void Append( uint64_t group, uint8_t metric, int64_t value )
+    {
+        if( finished ) throw std::logic_error( "Grouped statistics already finished" );
+        if( group > ( UINT64_MAX >> 3 ) || metric >= 8 )
+            throw std::overflow_error( "Grouped statistics key overflow" );
+        Check();
+        collector->Emit( { ( group << 3 ) | metric,
+            uint64_t( value ) ^ ( uint64_t( 1 ) << 63 ) } );
+        if( count == UINT64_MAX ) throw std::overflow_error( "Grouped statistics count overflow" );
+        count++;
+    }
+
+    template<typename Visitor>
+    void Scan( Visitor&& visit )
+    {
+        std::ifstream input( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+        if( !input ) throw std::runtime_error( "Grouped statistics sorted open failed" );
+        std::array<analysis::AnalysisUInt64Pair, 4096> values;
+        uint64_t offset = 0;
+        while( offset < count )
+        {
+            Check();
+            const auto take = size_t( std::min<uint64_t>( values.size(), count - offset ) );
+            input.read( reinterpret_cast<char*>( values.data() ),
+                std::streamsize( take * sizeof( values[0] ) ) );
+            if( !input ) throw std::runtime_error( "Grouped statistics sorted read failed" );
+            for( size_t index = 0; index < take; index++ ) visit( values[index] );
+            offset += take;
+        }
+    }
+
+    void Finish( const std::function<void( uint64_t, uint8_t, const analysis::Statistics& )>& visit )
+    {
+        if( finished ) throw std::logic_error( "Grouped statistics already finished" );
+        finished = true;
+        Check();
+        std::string error;
+        if( !collector->Finish( error ) ) throw std::runtime_error( error );
+        collector.reset();
+        if( count == 0 ) return;
+
+        analysis::AnalysisWorkspaceReservation spanWorkspace( workspace );
+        std::vector<Span> spans;
+        const auto appendSpan = [&]( uint64_t key, int64_t value ) -> Span& {
+            if( spans.size() == spans.capacity() )
+            {
+                const auto capacity = std::max<size_t>( 16, spans.capacity() * 2 );
+                spanWorkspace.Resize( capacity * sizeof( Span ) );
+                spans.reserve( capacity );
+            }
+            spans.emplace_back();
+            auto& span = spans.back();
+            span.key = key;
+            span.statistics.min = value;
+            span.statistics.max = value;
+            return span;
+        };
+
+        Span* current = nullptr;
+        Scan( [&]( const analysis::AnalysisUInt64Pair& record ) {
+            const auto value = Decode( record.value );
+            if( !current || current->key != record.key ) current = &appendSpan( record.key, value );
+            auto& statistics = current->statistics;
+            if( ( value > 0 && statistics.total > INT64_MAX - value ) ||
+                ( value < 0 && statistics.total < INT64_MIN - value ) )
+                throw std::overflow_error( "Grouped statistics total overflow" );
+            statistics.total += value;
+            statistics.min = std::min( statistics.min, value );
+            statistics.max = std::max( statistics.max, value );
+            current->count++;
+        } );
+        for( auto& span : spans )
+        {
+            span.statistics.count = span.count;
+            span.statistics.mean = double( span.statistics.total ) / double( span.count );
+            for( auto& quantile : span.quantiles )
+            {
+                const auto position = quantile.fraction * double( span.count - 1 );
+                quantile.low = uint64_t( std::floor( position ) );
+                quantile.high = std::min( quantile.low + 1, span.count - 1 );
+            }
+        }
+
+        size_t spanIndex = 0;
+        uint64_t valueIndex = 0;
+        Scan( [&]( const analysis::AnalysisUInt64Pair& record ) {
+            while( spans[spanIndex].key != record.key ) { spanIndex++; valueIndex = 0; }
+            auto& span = spans[spanIndex];
+            const auto value = Decode( record.value );
+            for( auto& quantile : span.quantiles )
+            {
+                if( valueIndex == quantile.low ) quantile.lowValue = value;
+                if( valueIndex == quantile.high ) quantile.highValue = value;
+            }
+            const long double delta = static_cast<long double>( value ) - span.statistics.mean;
+            span.squaredDeviation += delta * delta;
+            valueIndex++;
+        } );
+        for( auto& span : spans )
+        {
+            const auto value = []( const Quantile& quantile, uint64_t count ) {
+                const auto position = quantile.fraction * double( count - 1 );
+                return double( quantile.lowValue ) +
+                    ( double( quantile.highValue ) - double( quantile.lowValue ) ) *
+                    ( position - double( quantile.low ) );
+            };
+            span.statistics.median = span.statistics.p50 = value( span.quantiles[0], span.count );
+            span.statistics.p90 = value( span.quantiles[1], span.count );
+            span.statistics.p95 = value( span.quantiles[2], span.count );
+            span.statistics.p99 = value( span.quantiles[3], span.count );
+            span.statistics.stddev = std::sqrt( double( span.squaredDeviation / span.count ) );
+        }
+
+        spanIndex = 0;
+        Scan( [&]( const analysis::AnalysisUInt64Pair& record ) {
+            while( spans[spanIndex].key != record.key ) spanIndex++;
+            auto& span = spans[spanIndex];
+            const auto value = Decode( record.value );
+            if( double( value ) <= span.statistics.p90 )
+            {
+                span.truncatedTotal += value;
+                span.truncatedCount++;
+            }
+        } );
+        for( auto& span : spans )
+        {
+            span.statistics.truncatedMean = span.truncatedCount == 0 ? 0 :
+                double( span.truncatedTotal / span.truncatedCount );
+            visit( span.key >> 3, uint8_t( span.key & 7 ), span.statistics );
+        }
+
+        std::error_code cleanupError;
+        analysis::AnalysisDiskRemove( sorted, disk, cleanupError );
+        if( cleanupError ) throw std::runtime_error( "Grouped statistics sorted cleanup failed: " + cleanupError.message() );
+    }
+
+    std::filesystem::path root;
+    std::filesystem::path sorted;
+    std::shared_ptr<analysis::AnalysisDiskBudget> disk;
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace;
+    std::function<void()> check;
+    std::unique_ptr<analysis::AnalysisUInt64PairRunCollector> collector;
+    uint64_t count = 0;
+    bool finished = false;
+};
+
+QueryGroupedSpillStatistics::QueryGroupedSpillStatistics(
+    const std::filesystem::path& temporaryRoot,
+    std::shared_ptr<analysis::AnalysisDiskBudget> disk,
+    std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace,
+    std::function<void()> check, size_t maximumBufferedValues )
+    : m_impl( std::make_unique<Impl>( temporaryRoot, std::move( disk ),
+        std::move( workspace ), std::move( check ), maximumBufferedValues ) ) {}
+
+QueryGroupedSpillStatistics::~QueryGroupedSpillStatistics() = default;
+
+void QueryGroupedSpillStatistics::Append( uint64_t group, uint8_t metric, int64_t value )
+{ m_impl->Append( group, metric, value ); }
+
+void QueryGroupedSpillStatistics::Finish(
+    const std::function<void( uint64_t, uint8_t, const analysis::Statistics& )>& visit )
+{ m_impl->Finish( visit ); }
+
 QuerySpillUInt64Set::QuerySpillUInt64Set( const std::filesystem::path& temporaryRoot,
     std::shared_ptr<analysis::AnalysisDiskBudget> disk,
     std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace,
