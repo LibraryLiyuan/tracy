@@ -98,6 +98,8 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         phaseStarted = now;
     };
     if( sourceFingerprint.size() != 64 ) throw std::runtime_error( "GPU reference source identity must be SHA-256" );
+    if( input.UseCount() > std::numeric_limits<uint32_t>::max() )
+        throw std::runtime_error( "GPU reference compact lookup exceeds 32-bit Use ordinal capacity" );
     const auto lookupOutput = ResourceLookupPath( root );
     const auto catalogLookupOutput = CatalogResourceLookupPath( root );
     const auto passTimesOutput = PassTimesPath( root );
@@ -228,16 +230,16 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             Identity( sourceFingerprint, "pass-times" ), sizeof( QueryGpuReferencePassTimeRecord ), options );
         analysis::PagedRecordWriter resolvedUses( usesOutput,
             Identity( sourceFingerprint, "resolved-uses" ), sizeof( QueryGpuReferenceResolvedUseRecord ), options );
-        analysis::AnalysisKeyMetadataRunCollector resourceRuns( resourceSorted, scratch,
+        analysis::AnalysisUInt64PairRunCollector resourceRuns( resourceSorted, scratch,
             "gpu-reference-uses-by-resource",
             analysis::ChooseAnalysisExternalSortBufferRecords( input.UseCount(),
-                sizeof( analysis::AnalysisKeyMetadataRecord ), options.workspace ),
+                sizeof( QueryGpuReferenceLookupRecord ), options.workspace ),
             options.disk, options.workspace, options.cancelled,
             statistics ? &statistics->resourceSort : nullptr );
-        analysis::AnalysisKeyMetadataRunCollector catalogRuns( catalogResourceSorted, scratch,
+        analysis::AnalysisUInt64PairRunCollector catalogRuns( catalogResourceSorted, scratch,
             "gpu-reference-uses-by-catalog-resource",
             analysis::ChooseAnalysisExternalSortBufferRecords( input.UseCount(),
-                sizeof( analysis::AnalysisKeyMetadataRecord ), options.workspace ),
+                sizeof( QueryGpuReferenceLookupRecord ), options.workspace ),
             options.disk, options.workspace, options.cancelled,
             statistics ? &statistics->catalogSort : nullptr );
         std::ifstream sortedUses( analysis::AnalysisIoPath( usePassSorted ), std::ios::binary );
@@ -268,18 +270,19 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             resolved.flags = use.flags;
             resolved.encoding = use.encoding;
             resolvedUses.Append( &resolved, 1 );
-            analysis::AnalysisKeyMetadataRecord lookup {};
-            lookup.keyHigh = resolved.resourceId;
-            lookup.keyLow = useIndex.value;
-            lookup.metadata = resolvedOrdinal++;
-            resourceRuns.Emit( lookup );
+            if( useIndex.value > std::numeric_limits<uint32_t>::max() ||
+                resolvedOrdinal > std::numeric_limits<uint32_t>::max() )
+                throw std::runtime_error( "GPU reference compact lookup ordinal overflow" );
+            auto lookup = QueryGpuReferenceLookupRecord::Make( resolved.resourceId,
+                uint32_t( useIndex.value ), uint32_t( resolvedOrdinal++ ) );
+            resourceRuns.Emit( { lookup.resourceId, lookup.packedOrdinals } );
             resourceLookupCount++;
             const auto catalogResourceId = input.ResolveCatalogResource(
                 resolved.resourceId, resolved.passEnd );
             if( catalogResourceId != 0 )
             {
-                lookup.keyHigh = catalogResourceId;
-                catalogRuns.Emit( lookup );
+                lookup.resourceId = catalogResourceId;
+                catalogRuns.Emit( { lookup.resourceId, lookup.packedOrdinals } );
                 catalogResourceLookupCount++;
             }
         }
@@ -291,7 +294,17 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         if( !resourceRuns.Finish( sortError ) )
             throw std::runtime_error( "GPU reference resource lookup sort failed: " + sortError );
         finishPhase( &QueryGpuReferenceBuildStatistics::resourceSortMs );
-        std::array<analysis::AnalysisKeyMetadataRecord, 4096> buffer;
+        std::array<QueryGpuReferenceLookupRecord, 4096> compactBuffer;
+        std::array<analysis::AnalysisKeyMetadataRecord, 4096> publishBuffer;
+        const auto expandLookup = [&]( size_t count ) {
+            for( size_t index = 0; index < count; index++ )
+            {
+                publishBuffer[index] = {};
+                publishBuffer[index].keyHigh = compactBuffer[index].resourceId;
+                publishBuffer[index].keyLow = compactBuffer[index].SourceUseOrdinal();
+                publishBuffer[index].metadata = compactBuffer[index].ResolvedUseOrdinal();
+            }
+        };
         {
             analysis::PagedRecordWriter writer( lookupOutput,
                 Identity( sourceFingerprint, "by-resource" ), sizeof( analysis::AnalysisKeyMetadataRecord ), options );
@@ -300,13 +313,15 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
             uint64_t resourceRowsWritten = 0;
             while( sorted )
             {
-                sorted.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
+                sorted.read( reinterpret_cast<char*>( compactBuffer.data() ), std::streamsize( sizeof( compactBuffer ) ) );
                 const auto bytes = size_t( sorted.gcount() );
-                if( bytes % sizeof( buffer[0] ) != 0 ) throw std::runtime_error( "GPU reference lookup is truncated" );
+                if( bytes % sizeof( compactBuffer[0] ) != 0 ) throw std::runtime_error( "GPU reference lookup is truncated" );
                 if( bytes != 0 )
                 {
-                    writer.Append( buffer.data(), bytes / sizeof( buffer[0] ) );
-                    resourceRowsWritten += bytes / sizeof( buffer[0] );
+                    const auto count = bytes / sizeof( compactBuffer[0] );
+                    expandLookup( count );
+                    writer.Append( publishBuffer.data(), count );
+                    resourceRowsWritten += count;
                 }
             }
             if( !sorted.eof() ) throw std::runtime_error( "GPU reference resource lookup read failed" );
@@ -328,14 +343,17 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         uint64_t catalogRowsWritten = 0;
         while( sortedCatalogResources )
         {
-            sortedCatalogResources.read( reinterpret_cast<char*>( buffer.data() ), std::streamsize( sizeof( buffer ) ) );
+            sortedCatalogResources.read( reinterpret_cast<char*>( compactBuffer.data() ),
+                std::streamsize( sizeof( compactBuffer ) ) );
             const auto bytes = size_t( sortedCatalogResources.gcount() );
-            if( bytes % sizeof( buffer[0] ) != 0 )
+            if( bytes % sizeof( compactBuffer[0] ) != 0 )
                 throw std::runtime_error( "GPU reference Catalog lookup is truncated" );
             if( bytes != 0 )
             {
-                catalogLookupWriter.Append( buffer.data(), bytes / sizeof( buffer[0] ) );
-                catalogRowsWritten += bytes / sizeof( buffer[0] );
+                const auto count = bytes / sizeof( compactBuffer[0] );
+                expandLookup( count );
+                catalogLookupWriter.Append( publishBuffer.data(), count );
+                catalogRowsWritten += count;
             }
         }
         if( !sortedCatalogResources.eof() )

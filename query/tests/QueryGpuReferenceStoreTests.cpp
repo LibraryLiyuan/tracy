@@ -445,7 +445,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             stages.resourceSort.inputRecords == useCount &&
             stages.catalogSort.inputRecords == useCount &&
             stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisUInt64Pair ) &&
-            stages.catalogSort.initialRunWriteBytes == useCount * sizeof( AnalysisKeyMetadataRecord ),
+            stages.catalogSort.initialRunWriteBytes == useCount *
+                sizeof( tracy::query::QueryGpuReferenceLookupRecord ),
             "GPU reference sort telemetry lost or double-counted logical facts" );
         QueryGpuReferenceValidationStats validationStats;
         tracy::analysis::AnalysisDiskUsageSnapshot validationObserved {};
@@ -1080,6 +1081,16 @@ int main( int argc, char** argv )
         const std::string identity( 64, 'a' );
         tracy::query::QueryGpuReferenceStore::Build( root, identity, input );
         Require( !fs::exists( root / "reverse-scratch" ), "GPU reference scratch was retained" );
+        tracy::analysis::Sha256Builder compactLookupHash;
+        compactLookupHash.Update( identity.data(), identity.size() );
+        constexpr std::string_view compactLookupKind = "by-resource";
+        compactLookupHash.Update( compactLookupKind.data(), compactLookupKind.size() );
+        constexpr std::string_view compactLookupVersion = "query-gpu-reference-v1";
+        compactLookupHash.Update( compactLookupVersion.data(), compactLookupVersion.size() );
+        tracy::analysis::PagedRecordReader compactLookup( root / "by-resource",
+            compactLookupHash.FinalHex(), sizeof( tracy::analysis::AnalysisKeyMetadataRecord ) );
+        Require( compactLookup.Count() == 2,
+            "GPU reference compact Resource lookup count changed" );
         tracy::query::QueryGpuReferenceStoreReader reader( root, identity );
         reader.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
             return input.ResolveCatalogResource( pointerToken, time );

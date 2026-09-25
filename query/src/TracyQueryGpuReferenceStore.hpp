@@ -42,6 +42,22 @@ struct QueryGpuReferenceResolvedUseRecord
 
 static_assert( sizeof( QueryGpuReferenceResolvedUseRecord ) == 48 );
 
+struct QueryGpuReferenceLookupRecord
+{
+    uint64_t resourceId = 0;
+    uint64_t packedOrdinals = 0;
+
+    uint32_t SourceUseOrdinal() const { return uint32_t( packedOrdinals >> 32 ); }
+    uint32_t ResolvedUseOrdinal() const { return uint32_t( packedOrdinals ); }
+    static QueryGpuReferenceLookupRecord Make(
+        uint64_t resourceId, uint32_t sourceUseOrdinal, uint32_t resolvedUseOrdinal )
+    {
+        return { resourceId, uint64_t( sourceUseOrdinal ) << 32 | resolvedUseOrdinal };
+    }
+};
+
+static_assert( sizeof( QueryGpuReferenceLookupRecord ) == 16 );
+
 struct QueryGpuReferenceUsePage
 {
     std::vector<QueryGpuReferenceResolvedUseRecord> values;
