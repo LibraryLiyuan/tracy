@@ -56,7 +56,13 @@ public:
     JnGpuRangeSetRecordV1 Range( uint64_t ordinal ) const override
     { rangeCalls++; return m_catalog.RangeAt( ordinal ).record; }
     uint64_t UseCount() const override { return m_references.UseCount(); }
-    QueryGpuReferenceResolvedUseRecord Use( uint64_t ordinal ) const override { return m_references.UseAt( ordinal ); }
+    QueryGpuReferenceResolvedUseRecord Use( uint64_t ordinal ) const override
+    {
+        if( !scratchRoot.empty() )
+            Require( !std::filesystem::exists( scratchRoot / "fact-source.work" ),
+                "GPU pass input still writes a complete fact source before sorting" );
+        return m_references.UseAt( ordinal );
+    }
     uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
     { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
     uint64_t ResourceAllocation( uint64_t resourceId ) const override
@@ -141,8 +147,10 @@ public:
             resourceId, []( const auto& row, uint64_t key ) { return row.first < key; } );
         return found != m_resourceAllocations.end() && found->first == resourceId ? found->second : 0;
     }
-    uint64_t AllocationBytesAtEnd( uint64_t ) const override { return 64; }
+    uint64_t AllocationBytesAtEnd( uint64_t ) const override
+    { allocationEndCalls++; return 64; }
     mutable uint64_t resourceAllocationCalls = 0;
+    mutable uint64_t allocationEndCalls = 0;
 private:
     uint64_t m_uses;
     uint64_t m_resources;
@@ -283,6 +291,8 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " summary_ms=" << stages.summaryMs
             << " allocation_sort_ms=" << stages.allocationSortMs
             << " allocation_aggregate_ms=" << stages.allocationAggregateMs
+            << " resource_allocation_callback_calls=" << input.resourceAllocationCalls
+            << " allocation_end_callback_calls=" << input.allocationEndCalls
             << " fact_runs=" << stages.factSort.initialRuns
             << " fact_merges=" << stages.factSort.mergePasses
             << " expanded_runs=" << stages.expandedSort.initialRuns

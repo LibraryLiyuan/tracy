@@ -160,7 +160,6 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
     std::filesystem::create_directories( analysis::AnalysisIoPath( scratch ) );
     const auto mappingSource = scratch / "mapping-source.work";
     const auto mappingSorted = scratch / "mapping-sorted.work";
-    const auto factSource = scratch / "fact-source.work";
     const auto factSorted = scratch / "fact-sorted.work";
     const auto expandedSource = scratch / "expanded-source.work";
     const auto expandedSorted = scratch / "expanded-sorted.work";
@@ -201,10 +200,12 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
         std::vector<uint64_t> rangeLengths;
         rangeLengths.reserve( size_t( rangeCount ) );
         std::ofstream mappings( analysis::AnalysisIoPath( mappingSource ), std::ios::binary | std::ios::trunc );
-        std::ofstream facts( analysis::AnalysisIoPath( factSource ), std::ios::binary | std::ios::trunc );
-        if( !mappings || !facts ) throw std::runtime_error( "GPU pass resource sources cannot be opened" );
+        analysis::AnalysisKeyMetadataRunCollector factRuns( factSorted, scratch,
+            "gpu-pass-resource-facts", 512 * 1024, options.disk,
+            options.workspace, options.cancelled,
+            statistics ? &statistics->factSort : nullptr );
+        if( !mappings ) throw std::runtime_error( "GPU pass resource mapping source cannot be opened" );
         uint64_t mappingCount = 0;
-        uint64_t factCount = 0;
         const auto appendMapping = [&]( uint64_t evidencePassId, uint64_t queryPassId ) {
             if( evidencePassId == 0 || queryPassId == 0 ) return;
             const analysis::AnalysisUInt64Pair row { evidencePassId, queryPassId };
@@ -231,10 +232,7 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             fact.keyLow = range.resourceId;
             fact.metadata = ordinal;
             fact.kind = 1;
-            analysis::AnalysisDiskGrow( options.disk, sizeof( fact ) );
-            facts.write( reinterpret_cast<const char*>( &fact ), sizeof( fact ) );
-            if( !facts ) throw std::runtime_error( "GPU pass range fact write failed" );
-            factCount++;
+            factRuns.Emit( fact );
         }
         for( uint64_t ordinal = 0; ordinal < input.UseCount(); ordinal++ )
         {
@@ -247,29 +245,22 @@ void QueryGpuPassResourceStore::Build( const std::filesystem::path& root,
             fact.keyLow = resourceId;
             fact.metadata = ordinal;
             fact.kind = 2;
-            analysis::AnalysisDiskGrow( options.disk, sizeof( fact ) );
-            facts.write( reinterpret_cast<const char*>( &fact ), sizeof( fact ) );
-            if( !facts ) throw std::runtime_error( "GPU pass use fact write failed" );
-            factCount++;
+            factRuns.Emit( fact );
         }
-        mappings.flush(); facts.flush();
-        if( !mappings || !facts ) throw std::runtime_error( "GPU pass resource source flush failed" );
-        mappings.close(); facts.close();
+        mappings.flush();
+        if( !mappings ) throw std::runtime_error( "GPU pass mapping source flush failed" );
+        mappings.close();
         finishPhase( &QueryGpuPassResourceBuildStatistics::inputMs );
         std::string sortError;
+        if( !factRuns.Finish( sortError ) )
+            throw std::runtime_error( "GPU pass resource fact sort failed: " + sortError );
+        finishPhase( &QueryGpuPassResourceBuildStatistics::factSortMs );
         if( !analysis::SortAnalysisUInt64Pairs( mappingSource, mappingSorted, scratch,
                 "gpu-pass-resource-mapping", mappingCount, 512 * 1024, sortError,
                 options.disk, options.workspace ) )
             throw std::runtime_error( "GPU pass mapping sort failed: " + sortError );
         removeConsumed( mappingSource );
         finishPhase( &QueryGpuPassResourceBuildStatistics::mappingSortMs );
-        if( !analysis::SortAnalysisKeyMetadataRecords( factSource, factSorted, scratch,
-                "gpu-pass-resource-facts", factCount, 512 * 1024, sortError,
-                options.disk, options.workspace, options.cancelled,
-                statistics ? &statistics->factSort : nullptr ) )
-            throw std::runtime_error( "GPU pass resource fact sort failed: " + sortError );
-        removeConsumed( factSource );
-        finishPhase( &QueryGpuPassResourceBuildStatistics::factSortMs );
 
         uint64_t evidenceLookupCount = 0;
         {
