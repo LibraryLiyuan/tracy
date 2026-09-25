@@ -35,6 +35,11 @@ public:
     virtual uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const = 0;
     virtual uint64_t ResourceAllocation( uint64_t resourceId ) const = 0;
     virtual uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const = 0;
+    virtual uint64_t ResourceOrdinalCount() const { return 0; }
+    virtual std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t, int64_t ) const
+    { return std::nullopt; }
+    virtual uint64_t ResourceIdAtOrdinal( uint32_t ) const { return 0; }
+    virtual uint64_t ResourceAllocationAtOrdinal( uint32_t ) const { return 0; }
 };
 
 struct QueryGpuPassResourceBuildStatistics

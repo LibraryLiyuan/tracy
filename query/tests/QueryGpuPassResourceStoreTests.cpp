@@ -149,6 +149,17 @@ public:
     }
     uint64_t AllocationBytesAtEnd( uint64_t ) const override
     { allocationEndCalls++; return 64; }
+    uint64_t ResourceOrdinalCount() const override { return m_resources; }
+    std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t token, int64_t time ) const override
+    {
+        const auto resourceId = ResolveCatalogResource( token, time );
+        return resourceId != 0 && resourceId <= m_resources ?
+            std::optional<uint32_t>( uint32_t( resourceId - 1 ) ) : std::nullopt;
+    }
+    uint64_t ResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return ordinal < m_resources ? uint64_t( ordinal ) + 1 : 0; }
+    uint64_t ResourceAllocationAtOrdinal( uint32_t ordinal ) const override
+    { return ResourceIdAtOrdinal( ordinal ); }
     mutable uint64_t resourceAllocationCalls = 0;
     mutable uint64_t allocationEndCalls = 0;
 private:
@@ -307,6 +318,10 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             std::chrono::steady_clock::now() - fastPathStarted ).count();
         const auto buildStarted = std::chrono::steady_clock::now();
         QueryGpuPassResourceBuildStatistics stages;
+        Require( input.ResourceOrdinalCount() == resourceCount &&
+            input.ResolveCatalogResourceOrdinal( 1, 0 ) == 0 &&
+            input.ResourceIdAtOrdinal( 0 ) == 1 && input.ResourceAllocationAtOrdinal( 0 ) == 1,
+            "GPU Pass fused Resource ordinal contract changed" );
         QueryGpuPassResourceStore::Build( root, identity, input, options, &stages );
         const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();

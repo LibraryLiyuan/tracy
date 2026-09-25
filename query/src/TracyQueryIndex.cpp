@@ -4764,6 +4764,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                     , m_resourceAllocationMemory( workspace ), m_allocationEndMemory( std::move( workspace ) )
                 {
                     const auto count = m_catalog.ResourceIndexCount();
+                    if( count > uint64_t( std::numeric_limits<uint32_t>::max() ) )
+                        throw std::runtime_error( "GPU pass Resource ordinal exceeds 32-bit capacity" );
                     if( count > SIZE_MAX / sizeof( ResourceAllocationEntry ) )
                         throw std::runtime_error( "GPU pass resource allocation fast path exceeds address space" );
                     m_resourceAllocationMemory.Resize( count * sizeof( ResourceAllocationEntry ) );
@@ -4829,11 +4831,31 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 { return m_references.UseAt( ordinal ); }
                 uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
                 { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
+                uint64_t ResourceOrdinalCount() const override
+                { return m_resourceAllocations.size(); }
+                std::optional<uint32_t> ResolveCatalogResourceOrdinal(
+                    uint64_t pointerToken, int64_t time ) const override
+                {
+                    const auto resourceId = ResolveCatalogResource( pointerToken, time );
+                    if( resourceId == 0 ) return std::nullopt;
+                    const auto found = FindResource( resourceId );
+                    if( found == m_resourceAllocations.end() || found->first != resourceId )
+                        return std::nullopt;
+                    return uint32_t( std::distance( m_resourceAllocations.begin(), found ) );
+                }
+                uint64_t ResourceIdAtOrdinal( uint32_t ordinal ) const override
+                {
+                    return ordinal < m_resourceAllocations.size() ?
+                        m_resourceAllocations[ordinal].first : 0;
+                }
+                uint64_t ResourceAllocationAtOrdinal( uint32_t ordinal ) const override
+                {
+                    return ordinal < m_resourceAllocations.size() ?
+                        m_resourceAllocations[ordinal].second : 0;
+                }
                 uint64_t ResourceAllocation( uint64_t resourceId ) const override
                 {
-                    const auto found = std::lower_bound( m_resourceAllocations.begin(),
-                        m_resourceAllocations.end(), resourceId,
-                        []( const ResourceAllocationEntry& row, uint64_t key ) { return row.first < key; } );
+                    const auto found = FindResource( resourceId );
                     return found != m_resourceAllocations.end() && found->first == resourceId ? found->second : 0;
                 }
                 uint64_t AllocationBytesAtEnd( uint64_t allocationId ) const override
@@ -4857,6 +4879,12 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                     uint64_t bytes = 0;
                     uint8_t operation = 0;
                 };
+                std::vector<ResourceAllocationEntry>::const_iterator FindResource( uint64_t resourceId ) const
+                {
+                    return std::lower_bound( m_resourceAllocations.begin(),
+                        m_resourceAllocations.end(), resourceId,
+                        []( const ResourceAllocationEntry& row, uint64_t key ) { return row.first < key; } );
+                }
                 analysis::AnalysisWorkspaceReservation m_resourceAllocationMemory;
                 std::vector<ResourceAllocationEntry> m_resourceAllocations;
                 analysis::AnalysisWorkspaceReservation m_allocationEndMemory;
