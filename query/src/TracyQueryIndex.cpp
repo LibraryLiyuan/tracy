@@ -10,6 +10,8 @@
 #include "TracyQuerySampleDerivedStore.hpp"
 #include "TracyQueryJobStore.hpp"
 #include "TracyQueryCorrelationStore.hpp"
+#include "TracyQueryExplicitPassBuilder.hpp"
+#include "TracyQueryExplicitPassStore.hpp"
 #include "TracyQuerySpillStatistics.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
@@ -1614,6 +1616,8 @@ public:
         , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_jobs( m_manifest.jobStages.path, m_manifest.globalStrings.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_correlations( m_manifest.jobStages.path / "correlation", m_manifest.sourceFingerprint, m_storageOptions )
+        , m_explicitPasses( m_manifest.jobStages.path / "explicit-pass", m_manifest.sourceFingerprint,
+            m_manifest.gfxEntities.count, m_manifest.gpuZones.count, m_storageOptions )
         , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_relations( m_manifest.relations, ZoneSectionKind::Relation, sizeof( JnRelationData ), m_manifest.sourceFingerprint, m_storageOptions )
@@ -3497,6 +3501,7 @@ private:
     QueryCatalogStoreReader m_catalog;
     QueryJobStoreReader m_jobs;
     QueryCorrelationStoreReader m_correlations;
+    QueryExplicitPassStoreReader m_explicitPasses;
     ReadOnlyZoneSection m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     QueryGpuReferenceStoreReader m_gpuReferenceIndex;
@@ -4240,6 +4245,60 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "correlation",
                 result.sourceFingerprint, storageOptions );
             check.ValidateAll();
+            resources->SetPhase( "explicit-pass-index" );
+            auto gpuManifest = result.gpuZones;
+            gpuManifest.path = temporaryGpu;
+            gpuManifest.bytes = SectionBytes( temporaryGpu );
+            ReadOnlyZoneSection gpuZones( gpuManifest, ZoneSectionKind::Gpu,
+                sizeof( GpuZoneIndexRecord ), result.sourceFingerprint, storageOptions );
+            QueryExplicitPassBuildInput passInput;
+            passInput.entityCount = entities.Count();
+            passInput.linkCount = links.Count();
+            passInput.gpuZoneCount = gpuZones.Count();
+            passInput.scanEntities = [&]( uint64_t offset, size_t limit ) {
+                std::vector<QueryExplicitPassEntityFact> values;
+                const auto end = std::min<uint64_t>( entities.Count(), offset + limit );
+                values.reserve( size_t( end - offset ) );
+                for( uint64_t ordinal = offset; ordinal < end; ordinal++ )
+                {
+                    const auto entity = entities.At<JnGfxEntityData>( ordinal );
+                    values.push_back( { entity.entityId, ordinal, entity.gpuQueryId,
+                        entity.gpuContext, entity.kind, entity.flags } );
+                }
+                return values;
+            };
+            passInput.scanLinks = [&]( uint64_t offset, size_t limit ) {
+                std::vector<QueryExplicitPassLinkFact> values;
+                const auto end = std::min<uint64_t>( links.Count(), offset + limit );
+                values.reserve( size_t( end - offset ) );
+                for( uint64_t ordinal = offset; ordinal < end; ordinal++ )
+                {
+                    const auto link = links.At<JnGfxLinkData>( ordinal );
+                    values.push_back( { link.sourceId, link.targetId, ordinal, link.relation } );
+                }
+                return values;
+            };
+            passInput.scanGpuZones = [&]( uint64_t offset, size_t limit ) {
+                std::vector<QueryExplicitPassGpuZoneFact> values;
+                const auto end = std::min<uint64_t>( gpuZones.Count(), offset + limit );
+                values.reserve( size_t( end - offset ) );
+                for( uint64_t ordinal = offset; ordinal < end; ordinal++ )
+                {
+                    const auto zone = gpuZones.At<GpuZoneIndexRecord>( ordinal );
+                    values.push_back( { ordinal, zone.context, zone.queryId, zone.cpuStart } );
+                }
+                return values;
+            };
+            const auto passStats = BuildQueryExplicitPassStore(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "explicit-pass",
+                resources->StatisticsTemporaryRoot() / "explicit-pass-builder",
+                result.sourceFingerprint, passInput, storageOptions );
+            if( passStats.passes != explicitPassCount || passStats.gpuZoneKeys != gpuZones.Count() )
+                throw std::runtime_error( "Explicit Pass builder count mismatch" );
+            QueryExplicitPassStoreReader passCheck(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "explicit-pass",
+                result.sourceFingerprint, entities.Count(), gpuZones.Count(), storageOptions );
+            passCheck.ValidateAll();
             result.jobStages.bytes = SectionBytes(
                 temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] );
             result.jobStages.fingerprint = SectionFingerprint(
@@ -5092,6 +5151,12 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             QueryCorrelationStoreReader correlations( manifest.jobStages.path / "correlation",
                 manifest.sourceFingerprint, storageOptions );
             if( deep ) correlations.ValidateAll();
+        }
+        {
+            QueryExplicitPassStoreReader passes( manifest.jobStages.path / "explicit-pass",
+                manifest.sourceFingerprint, manifest.gfxEntities.count,
+                manifest.gpuZones.count, storageOptions );
+            if( deep ) passes.ValidateAll();
         }
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
         validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link",ZoneSectionKind::GfxLink );

@@ -57,7 +57,8 @@ static_assert( sizeof( QueryExplicitPassGpuZoneKey ) == 24 );
 enum class QueryExplicitPassFilterTag : uint8_t
 {
     PassSource,
-    Taxonomy
+    Taxonomy,
+    LegacyTaxonomy
 };
 
 struct QueryExplicitPassFilterCandidate
@@ -99,6 +100,7 @@ public:
     QueryExplicitPassStoreWriter& operator=( const QueryExplicitPassStoreWriter& ) = delete;
 
     void AppendPass( const QueryExplicitPassRecord& value, bool managed );
+    void SealPasses();
     void AppendFilter( uint64_t key, QueryExplicitPassFilterTag tag, uint64_t projectionOrdinal );
     void AppendGpuZoneKey( const QueryExplicitPassGpuZoneKey& value );
     QueryExplicitPassBuildStatistics Commit();

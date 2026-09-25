@@ -114,6 +114,7 @@ QueryCorrelationEndpointTag FilterTag( QueryExplicitPassFilterTag tag )
     {
     case QueryExplicitPassFilterTag::PassSource: return QueryCorrelationEndpointTag::LinkSource;
     case QueryExplicitPassFilterTag::Taxonomy: return QueryCorrelationEndpointTag::LinkTarget;
+    case QueryExplicitPassFilterTag::LegacyTaxonomy: return QueryCorrelationEndpointTag::EntitySelf;
     }
     throw std::runtime_error( "query_explicit_pass_filter_tag" );
 }
@@ -122,6 +123,7 @@ QueryExplicitPassFilterTag FilterTag( QueryCorrelationEndpointTag tag )
 {
     if( tag == QueryCorrelationEndpointTag::LinkSource ) return QueryExplicitPassFilterTag::PassSource;
     if( tag == QueryCorrelationEndpointTag::LinkTarget ) return QueryExplicitPassFilterTag::Taxonomy;
+    if( tag == QueryCorrelationEndpointTag::EntitySelf ) return QueryExplicitPassFilterTag::LegacyTaxonomy;
     throw std::runtime_error( "query_explicit_pass_filter_tag" );
 }
 
@@ -148,6 +150,7 @@ struct QueryExplicitPassStoreWriter::Impl
     bool haveZone = false;
     QueryExplicitPassGpuZoneKey lastZone;
     bool committed = false;
+    bool passesSealed = false;
 
     Impl( std::filesystem::path value, std::string source, uint64_t entityCount,
         uint64_t zoneCount, uint64_t expectedPasses, uint64_t expectedFilters,
@@ -197,7 +200,7 @@ QueryExplicitPassStoreWriter::~QueryExplicitPassStoreWriter() = default;
 void QueryExplicitPassStoreWriter::AppendPass( const QueryExplicitPassRecord& record, bool managed )
 {
     auto& value = *m_impl;
-    if( value.committed ) throw std::runtime_error( "query_explicit_pass_writer_closed" );
+    if( value.committed || value.passesSealed ) throw std::runtime_error( "query_explicit_pass_writer_closed" );
     Check( value.options );
     const auto segment = record.SegmentOrdinal();
     if( record.entityOrdinal >= value.header.gfxEntityCount ||
@@ -218,6 +221,18 @@ void QueryExplicitPassStoreWriter::AppendPass( const QueryExplicitPassRecord& re
     }
     value.lastEntityOrdinal = record.entityOrdinal;
     value.havePass = true;
+}
+
+void QueryExplicitPassStoreWriter::SealPasses()
+{
+    auto& value = *m_impl;
+    if( value.committed || value.passesSealed )
+        throw std::runtime_error( "query_explicit_pass_writer_closed" );
+    Check( value.options );
+    if( ( value.header.passes & 7 ) != 0 ) value.modes->Append( &value.modeByte, 1 );
+    value.passes->Commit();
+    value.modes->Commit();
+    value.passesSealed = true;
 }
 
 void QueryExplicitPassStoreWriter::AppendFilter( uint64_t key, QueryExplicitPassFilterTag tag,
@@ -251,9 +266,7 @@ QueryExplicitPassBuildStatistics QueryExplicitPassStoreWriter::Commit()
     auto& value = *m_impl;
     if( value.committed ) throw std::runtime_error( "query_explicit_pass_writer_closed" );
     Check( value.options );
-    if( ( value.header.passes & 7 ) != 0 ) value.modes->Append( &value.modeByte, 1 );
-    value.passes->Commit();
-    value.modes->Commit();
+    if( !value.passesSealed ) SealPasses();
     value.zones->Commit();
     const auto filterStats = value.filters->Commit();
     if( filterStats.records != value.header.filterRecords )

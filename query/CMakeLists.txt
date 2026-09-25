@@ -91,6 +91,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQueryCorrelationStore.hpp
     src/TracyQueryExplicitPassStore.cpp
     src/TracyQueryExplicitPassStore.hpp
+    src/TracyQueryExplicitPassBuilder.cpp
+    src/TracyQueryExplicitPassBuilder.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
     src/TracyQueryStringStore.cpp
@@ -199,6 +201,11 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-explicit-pass-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-explicit-pass-store-tests)
     add_test(NAME tracy-query-explicit-pass-store COMMAND tracy-query-explicit-pass-store-tests)
+
+    add_executable(tracy-query-explicit-pass-builder-tests tests/QueryExplicitPassBuilderTests.cpp)
+    target_link_libraries(tracy-query-explicit-pass-builder-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-explicit-pass-builder-tests)
+    add_test(NAME tracy-query-explicit-pass-builder COMMAND tracy-query-explicit-pass-builder-tests)
 
     add_executable(tracy-query-correlation-capacity tests/QueryCorrelationCapacity.cpp)
     target_link_libraries(tracy-query-correlation-capacity PRIVATE TracyQueryProtocol)
