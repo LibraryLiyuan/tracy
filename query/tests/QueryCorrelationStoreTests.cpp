@@ -72,6 +72,11 @@ int main()
         Require( statistics.records == 5 && statistics.bucketCount == 16 &&
             statistics.partitionCount <= statistics.bucketCount,
             "correlation build statistics changed" );
+        Require( statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::LinkSource )] == 2 &&
+            statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::EntityParent )] == 1 &&
+            statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::LinkTarget )] == 1 &&
+            statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::FrameEvent )] == 1,
+            "correlation tag counts changed" );
         Require( workspace->Snapshot().currentBytes == 0, "correlation writer leaked workspace" );
         const auto healthyDiskBytes = usage->Current();
 

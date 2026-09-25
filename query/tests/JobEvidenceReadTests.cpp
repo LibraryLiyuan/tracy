@@ -1,5 +1,6 @@
 #include "TracyQueryService.hpp"
 #include "TracyQueryResourceContext.hpp"
+#include "TracyQueryCorrelationStore.hpp"
 #include "FakeTraceSource.hpp"
 #include <chrono>
 #include <filesystem>
@@ -47,7 +48,8 @@ static std::string LegacyCursor( const std::string& cursor )
 
 // Exercise the real dispatcher against an observable source boundary. Large
 // unrelated reads are cheap fixtures here, but must never be requested.
-class ReadCountingSource final : public query::test::FakeTraceSource, public query::QueryResourceContextSource
+class ReadCountingSource final : public query::test::FakeTraceSource,
+    public query::QueryResourceContextSource, public query::QueryCorrelationSource
 {
 public:
     std::shared_ptr<query::QueryResourceContext> resources;
@@ -177,6 +179,38 @@ public:
     { ++reads["io"]; return FakeTraceSource::GetIoRequests(); }
     analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frame, const std::vector<uint64_t>& seeds ) const override
     { ++reads["gfx"]; return FakeTraceSource::GetEvidenceGfx( frame, seeds ); }
+    query::QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_correlation"];
+        if( control.check ) control.check();
+        query::QueryCorrelationNeighborhood result;
+        result.known = true;
+        if( ref == "fake:frame-identity:281474976710657" )
+        {
+            const std::array<query::QueryCorrelationEdge, 2> edges {{
+                { ref, "fake:job:1", "schedules", 281474976710657ull, 0, 0 },
+                { ref, "fake:gfx-dispatch:10", "dispatches", 281474976710657ull, 1, 0 }
+            }};
+            size_t offset = 0;
+            while( offset < edges.size() )
+            {
+                const auto requested = edges.size() - offset;
+                const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+                if( allowed == 0 ) throw std::runtime_error( "indexed correlation scan budget exhausted" );
+                const auto take = std::min( allowed, requested );
+                if( control.scanned ) control.scanned( take, requested, allowed );
+                for( size_t index = 0; index < take; index++ )
+                {
+                    if( result.edges.size() >= control.maximumEdges )
+                    { result.edgeLimitExceeded = true; return result; }
+                    result.edges.push_back( edges[offset + index] );
+                }
+                offset += take;
+            }
+        }
+        return result;
+    }
     analysis::GpuMemoryEvidenceSlice GetGpuMemoryEvidence( const std::vector<uint64_t>& passes, size_t limit ) const override
     { ++reads["gpu_memory"]; return FakeTraceSource::GetGpuMemoryEvidence( passes, limit ); }
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
@@ -261,18 +295,20 @@ int main()
                     {"ref", "fake:frame-identity:281474976710657"},
                     {"max_scan_events", 10000}, {"max_nodes", 2}, {"max_edges", 2000}}}} );
             Require( related.at("ok"), "bounded correlation query failed" );
+            Require( observed->reads["indexed_correlation"] != 0,
+                "correlation query ignored the indexed root-neighborhood backend" );
             Require( observed->reads["all_frame_events"] == 0 &&
                 observed->reads["all_jobs"] == 0 &&
                 observed->reads["all_gfx_Dispatches"] == 0 &&
                 observed->reads["all_gfx_Entities"] == 0 &&
                 observed->reads["all_gfx_Links"] == 0,
                 "correlation query materialized a complete indexed table" );
-            Require( observed->reads["frame_events_page"] != 0 &&
-                observed->reads["job_page"] != 0 &&
-                observed->reads["gfx_Dispatches_page"] != 0 &&
-                observed->reads["gfx_Entities_page"] != 0 &&
-                observed->reads["gfx_Links_page"] != 0,
-                "correlation query did not use bounded indexed pages" );
+            Require( observed->reads["frame_events_page"] == 0 &&
+                observed->reads["job_page"] == 0 &&
+                observed->reads["gfx_Dispatches_page"] == 0 &&
+                observed->reads["gfx_Entities_page"] == 0 &&
+                observed->reads["gfx_Links_page"] == 0,
+                "correlation query scanned global indexed pages after selecting the root backend" );
         }
         observed->statisticsFixture = observed->GetJobs();
         for( uint64_t index = 0; index < 1000; index++ )
@@ -282,19 +318,17 @@ int main()
             unrelated.ref = "fake:job:" + std::to_string( unrelated.jobId );
             observed->statisticsFixture->push_back( std::move( unrelated ) );
         }
-        const auto frameBudget = observed->GetCorrelatedFrameEventCount();
         observed->reads.clear();
         const auto limitedCorrelation = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 21},
             {"method", "correlation.chain"}, {"params", {{"trace_id", opened.id},
                 {"ref", "fake:frame-identity:281474976710657"},
-                {"max_scan_events", frameBudget + 1}, {"max_nodes", 2}, {"max_edges", 20}}}} );
+                {"max_scan_events", 1}, {"max_nodes", 2}, {"max_edges", 20}}}} );
         Require( !limitedCorrelation.at("ok") &&
             limitedCorrelation.at("error").at("code") == "RESOURCE_LIMIT" &&
             observed->reads["all_frame_events"] == 0 && observed->reads["all_jobs"] == 0 &&
             observed->reads["all_gfx_Dispatches"] == 0 &&
-            observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0 &&
-            observed->reads["job_page"] == 1,
-            "correlation query exceeded its explicit scan budget or used a full-table getter" );
+            observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0,
+            "indexed correlation query exceeded its explicit scan budget or used a full-table getter" );
         observed->statisticsFixture.reset();
         observed->reads.clear();
         const auto edgeLimitedCorrelation = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 22},

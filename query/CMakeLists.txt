@@ -20,6 +20,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/config.cmake)
+option(TRACY_QUERY_DEV_NO_LTO "Disable Query link-time optimization for iterative local tests" OFF)
+if(TRACY_QUERY_DEV_NO_LTO)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "Build zstd programs" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "Build zstd tests" FORCE)
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/vendor.cmake)
@@ -108,6 +112,9 @@ target_include_directories(TracyQueryProtocol PUBLIC src ${CMAKE_CURRENT_BINARY_
 target_include_directories(TracyQueryProtocol PRIVATE ${glfw_SOURCE_DIR}/deps)
 target_link_libraries(TracyQueryProtocol PUBLIC TracyAnalysis TracyServer TracyStreamCore nlohmann_json::nlohmann_json)
 target_compile_features(TracyQueryProtocol PUBLIC cxx_std_20)
+if(MSVC)
+    target_compile_options(TracyQueryProtocol PRIVATE /bigobj)
+endif()
 
 add_executable(tracy-query src/main.cpp)
 target_link_libraries(tracy-query PRIVATE TracyQueryProtocol)
@@ -235,6 +242,7 @@ if(BUILD_TESTING)
 
     add_executable(tracy-job-evidence-read-tests tests/JobEvidenceReadTests.cpp)
     target_link_libraries(tracy-job-evidence-read-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-job-evidence-read-tests)
     add_test(NAME tracy-job-evidence-read COMMAND tracy-job-evidence-read-tests)
 
     add_executable(tracy-query-spill-statistics-tests tests/QuerySpillStatisticsTests.cpp)

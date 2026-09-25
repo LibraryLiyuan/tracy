@@ -9,6 +9,7 @@
 #include "TracyQueryGhostZoneStore.hpp"
 #include "TracyQuerySampleDerivedStore.hpp"
 #include "TracyQueryJobStore.hpp"
+#include "TracyQueryCorrelationStore.hpp"
 #include "TracyQueryStringStore.hpp"
 #include "TracyQueryValidationStore.hpp"
 #include "TracyFileHeader.hpp"
@@ -511,6 +512,15 @@ public:
 private:
     std::shared_ptr<QueryStringStoreReader> m_store;
 };
+
+const char* CorrelationGfxRelationName( uint8_t relation )
+{
+    static constexpr const char* names[] = { "parent", "dispatches", "executes", "produces", "submits",
+        "runs_on_gpu", "depends_on", "recorded_on_command_list", "belongs_to_frame", "belongs_to_camera",
+        "belongs_to_view", "references_resources", "classifies_as_taxonomy",
+        "gpu_segment_references_resources", "range_evidence_complete" };
+    return relation < std::size( names ) ? names[relation] : "unknown";
+}
 
 std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind);
 
@@ -1580,6 +1590,7 @@ class IndexedTraceSource final : public analysis::TraceSource,
     public QueryCatalogStatusSource,
     public QueryCatalogResourceSource,
     public QueryGpuPassResourceSource,
+    public QueryCorrelationSource,
     public QueryResourceContextSource
 {
 public:
@@ -1601,6 +1612,7 @@ public:
         , m_sampleDerived( m_manifest.samples.path / "derived", m_manifest.sourceFingerprint, m_storageOptions )
         , m_catalog( m_manifest.gpuCatalog.path, m_manifest.sourceFingerprint, m_storageOptions )
         , m_jobs( m_manifest.jobStages.path, m_manifest.globalStrings.path, m_manifest.sourceFingerprint, m_storageOptions )
+        , m_correlations( m_manifest.jobStages.path / "correlation", m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxEntities( m_manifest.gfxEntities, ZoneSectionKind::GfxEntity, sizeof( JnGfxEntityData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gfxLinks( m_manifest.gfxLinks, ZoneSectionKind::GfxLink, sizeof( JnGfxLinkData ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_relations( m_manifest.relations, ZoneSectionKind::Relation, sizeof( JnRelationData ), m_manifest.sourceFingerprint, m_storageOptions )
@@ -2226,6 +2238,174 @@ public:
             result.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId,
                 value.time, MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
         }
+        return result;
+    }
+    QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
+        const QueryCorrelationReadControl& control ) const override
+    {
+        enum class RootKind { Frame, Job, Dispatch, Entity, External };
+        std::optional<uint64_t> rootId;
+        RootKind rootKind = RootKind::External;
+        for( const auto& [kind, value] : std::array<std::pair<const char*, RootKind>, 5> {{
+            { "frame-identity", RootKind::Frame }, { "job", RootKind::Job },
+            { "gfx-dispatch", RootKind::Dispatch }, { "gfx-entity", RootKind::Entity },
+            { "gfx-external", RootKind::External }
+        }} )
+        {
+            if( const auto parsed = ParseEntityRef( ref, kind ) )
+            { rootId = *parsed; rootKind = value; break; }
+        }
+        QueryCorrelationNeighborhood result;
+        if( !rootId ) return result;
+        const auto check = [&] { if( control.check ) control.check(); };
+        const auto visitCandidates = [&]( uint64_t nodeId, const auto& visitor ) {
+            const auto total = m_correlations.CandidateCount( nodeId );
+            for( uint64_t offset = 0; offset < total; )
+            {
+                check();
+                const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+                if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+                const auto page = m_correlations.ReadCandidates( nodeId, offset, allowed );
+                check();
+                if( page.values.empty() || page.values.size() > allowed )
+                    throw std::runtime_error( "query_correlation_candidate_page" );
+                if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+                for( const auto& candidate : page.values ) visitor( candidate );
+                offset += page.values.size();
+            }
+        };
+        std::unordered_map<uint64_t, std::string> resolvedRefs;
+        const auto resolveRef = [&]( uint64_t id ) -> std::string {
+            if( const auto found = resolvedRefs.find( id ); found != resolvedRefs.end() ) return found->second;
+            if( const auto job = m_jobs.FindJobRef( id, control.check ) )
+                return resolvedRefs.emplace( id, *job ).first->second;
+            std::optional<std::string> dispatchRef;
+            std::optional<std::string> entityRef;
+            visitCandidates( id, [&]( const QueryCorrelationCandidate& candidate ) {
+                if( candidate.tag == QueryCorrelationEndpointTag::DispatchSelf && !dispatchRef )
+                {
+                    const auto values = m_jobs.ScanGfxDispatches( size_t( candidate.ordinal ), 1 );
+                    if( values.size() == 1 && values.front().dispatchId == id ) dispatchRef = values.front().ref;
+                }
+                else if( candidate.tag == QueryCorrelationEndpointTag::EntitySelf && !entityRef &&
+                    candidate.ordinal < m_gfxEntities.Count() )
+                {
+                    const auto& entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                    if( entity.entityId == id ) entityRef = MakeEntityRef( "gfx-entity", id );
+                }
+            } );
+            auto value = dispatchRef ? *dispatchRef : entityRef ? *entityRef : MakeEntityRef( "gfx-external", id );
+            return resolvedRefs.emplace( id, std::move( value ) ).first->second;
+        };
+        std::set<std::pair<uint8_t, uint64_t>> seen;
+        const auto addEdge = [&]( QueryCorrelationEdge edge ) {
+            if( !seen.emplace( edge.orderDomain, edge.ordinal ).second ) return;
+            if( result.edges.size() >= control.maximumEdges )
+            { result.edgeLimitExceeded = true; return; }
+            result.edges.emplace_back( std::move( edge ) );
+        };
+
+        if( rootKind == RootKind::Job )
+        {
+            const auto jobs = m_jobs.GetDirectedJobs( *rootId, true, control.check );
+            for( const auto& job : jobs )
+            {
+                if( job.jobId == *rootId )
+                {
+                    result.known = true;
+                    if( job.originFrameId != 0 ) addEdge( {
+                        MakeEntityRef( "frame-identity", job.originFrameId ), job.ref,
+                        "schedules", job.originFrameId, 0, job.jobId } );
+                }
+                for( const auto& dependency : job.dependencies )
+                    if( job.jobId == *rootId || dependency.prerequisiteJobId == *rootId )
+                        addEdge( { MakeEntityRef( "job", dependency.prerequisiteJobId ), job.ref,
+                            "dependency_precedes", job.originFrameId, 0, job.jobId } );
+            }
+        }
+        else if( rootKind == RootKind::Frame )
+        {
+            const auto jobs = m_jobs.GetEvidenceJobs( *rootId, control.check );
+            for( const auto& job : jobs ) if( job.originFrameId == *rootId )
+            {
+                result.known = true;
+                addEdge( { ref, job.ref, "schedules", *rootId, 0, job.jobId } );
+            }
+        }
+
+        const auto canonicalRootRef = rootKind == RootKind::Frame ? std::string() : resolveRef( *rootId );
+        visitCandidates( *rootId, [&]( const QueryCorrelationCandidate& candidate ) {
+            check();
+            switch( candidate.tag )
+            {
+            case QueryCorrelationEndpointTag::FrameEvent:
+                if( rootKind == RootKind::Frame )
+                {
+                    const auto values = m_jobs.ScanCorrelatedFrameEvents( size_t( candidate.ordinal ), 1 );
+                    result.known |= values.size() == 1 && values.front().frameId == *rootId;
+                }
+                break;
+            case QueryCorrelationEndpointTag::DispatchSelf:
+                if( rootKind == RootKind::Dispatch )
+                {
+                    const auto values = m_jobs.ScanGfxDispatches( size_t( candidate.ordinal ), 1 );
+                    result.known |= values.size() == 1 && values.front().dispatchId == *rootId;
+                }
+                break;
+            case QueryCorrelationEndpointTag::DispatchFrame:
+                if( rootKind == RootKind::Frame )
+                {
+                    const auto values = m_jobs.ScanGfxDispatches( size_t( candidate.ordinal ), 1 );
+                    if( values.size() == 1 && values.front().frameIndex == *rootId )
+                    {
+                        result.known = true;
+                        addEdge( { ref, values.front().ref, "dispatches", *rootId, 1, candidate.ordinal } );
+                    }
+                }
+                break;
+            case QueryCorrelationEndpointTag::EntitySelf:
+                if( rootKind == RootKind::Entity && candidate.ordinal < m_gfxEntities.Count() )
+                {
+                    const auto& entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                    if( entity.entityId == *rootId )
+                    {
+                        result.known = true;
+                        if( entity.parentId != 0 ) addEdge( { resolveRef( entity.parentId ),
+                            MakeEntityRef( "gfx-entity", entity.entityId ), "parent", 0, 2, candidate.ordinal } );
+                    }
+                }
+                break;
+            case QueryCorrelationEndpointTag::EntityParent:
+                if( canonicalRootRef == ref && candidate.ordinal < m_gfxEntities.Count() )
+                {
+                    const auto& entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                    if( entity.parentId == *rootId )
+                    {
+                        result.known = true;
+                        addEdge( { resolveRef( entity.parentId ), MakeEntityRef( "gfx-entity", entity.entityId ),
+                            "parent", 0, 2, candidate.ordinal } );
+                    }
+                }
+                break;
+            case QueryCorrelationEndpointTag::LinkSource:
+            case QueryCorrelationEndpointTag::LinkTarget:
+                if( canonicalRootRef == ref && candidate.ordinal < m_gfxLinks.Count() )
+                {
+                    const auto& link = m_gfxLinks.At<JnGfxLinkData>( candidate.ordinal );
+                    const bool matches = candidate.tag == QueryCorrelationEndpointTag::LinkSource ?
+                        link.sourceId == *rootId : link.targetId == *rootId;
+                    if( matches )
+                    {
+                        result.known = true;
+                        addEdge( { resolveRef( link.sourceId ), resolveRef( link.targetId ),
+                            CorrelationGfxRelationName( link.relation ), 0, 3, candidate.ordinal } );
+                    }
+                }
+                break;
+            default: break;
+            }
+        } );
         return result;
     }
     analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
@@ -3086,6 +3266,7 @@ private:
     QuerySampleDerivedStoreReader m_sampleDerived;
     QueryCatalogStoreReader m_catalog;
     QueryJobStoreReader m_jobs;
+    QueryCorrelationStoreReader m_correlations;
     ReadOnlyZoneSection m_gfxEntities, m_gfxLinks, m_relations;
     ReadOnlyZoneSection m_gpuReferencePasses, m_gpuReferenceUses, m_gpuReferenceEnds;
     QueryGpuReferenceStoreReader m_gpuReferenceIndex;
@@ -3709,6 +3890,107 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             jnSections[index]->declaredCount = jnSections[index]->count;
             jnSections[index]->bytes = SectionBytes( temporaryJn[index] );
             jnSections[index]->fingerprint = SectionFingerprint( temporaryJn[index] );
+        }
+        {
+            resources->SetPhase( "correlation-index" );
+            QueryJobStoreReader jobs( temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )],
+                temporaryStrings, result.sourceFingerprint, storageOptions );
+            auto entityManifest = result.gfxEntities;
+            entityManifest.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GfxEntity )];
+            ReadOnlyZoneSection entities( entityManifest, ZoneSectionKind::GfxEntity,
+                sizeof( JnGfxEntityData ), result.sourceFingerprint, storageOptions );
+            auto linkManifest = result.gfxLinks;
+            linkManifest.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GfxLink )];
+            ReadOnlyZoneSection links( linkManifest, ZoneSectionKind::GfxLink,
+                sizeof( JnGfxLinkData ), result.sourceFingerprint, storageOptions );
+            const auto addExpected = []( uint64_t& total, uint64_t count, uint64_t factor ) {
+                if( count > ( std::numeric_limits<uint64_t>::max() - total ) / factor )
+                    throw std::runtime_error( "Correlation endpoint count overflow" );
+                total += count * factor;
+            };
+            uint64_t expectedEndpoints = 0;
+            addExpected( expectedEndpoints, jobs.Count( QueryJobDomain::Frame ), 1 );
+            addExpected( expectedEndpoints, jobs.Count( QueryJobDomain::GfxDispatch ), 2 );
+            addExpected( expectedEndpoints, entities.Count(), 2 );
+            addExpected( expectedEndpoints, links.Count(), 2 );
+            QueryCorrelationStoreWriter correlations(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "correlation",
+                result.sourceFingerprint, expectedEndpoints, storageOptions );
+            constexpr size_t pageSize = 4096;
+            const auto frameCount = jobs.Count( QueryJobDomain::Frame );
+            for( uint64_t offset = 0; offset < frameCount; offset += pageSize )
+            {
+                resources->SetProgress( offset, expectedEndpoints );
+                const auto page = jobs.ScanCorrelatedFrameEvents( size_t( offset ),
+                    size_t( std::min<uint64_t>( pageSize, frameCount - offset ) ) );
+                if( page.size() != std::min<uint64_t>( pageSize, frameCount - offset ) )
+                    throw std::runtime_error( "Correlation Frame page is incomplete" );
+                for( size_t index = 0; index < page.size(); index++ )
+                    correlations.Append( page[index].frameId,
+                        QueryCorrelationEndpointTag::FrameEvent, offset + index );
+            }
+            const auto dispatchCount = jobs.Count( QueryJobDomain::GfxDispatch );
+            for( uint64_t offset = 0; offset < dispatchCount; offset += pageSize )
+            {
+                const auto page = jobs.ScanGfxDispatches( size_t( offset ),
+                    size_t( std::min<uint64_t>( pageSize, dispatchCount - offset ) ) );
+                if( page.size() != std::min<uint64_t>( pageSize, dispatchCount - offset ) )
+                    throw std::runtime_error( "Correlation Gfx Dispatch page is incomplete" );
+                for( size_t index = 0; index < page.size(); index++ )
+                {
+                    correlations.Append( page[index].dispatchId,
+                        QueryCorrelationEndpointTag::DispatchSelf, offset + index );
+                    correlations.Append( page[index].frameIndex,
+                        QueryCorrelationEndpointTag::DispatchFrame, offset + index );
+                }
+            }
+            uint64_t parentCount = 0;
+            for( uint64_t ordinal = 0; ordinal < entities.Count(); ordinal++ )
+            {
+                if( ( ordinal & 0xfffff ) == 0 )
+                {
+                    resources->SetProgress( frameCount + dispatchCount + ordinal,
+                        expectedEndpoints );
+                    resources->CheckMemory( false );
+                }
+                const auto& entity = entities.At<JnGfxEntityData>( ordinal );
+                correlations.Append( entity.entityId, QueryCorrelationEndpointTag::EntitySelf, ordinal );
+                if( entity.parentId != 0 )
+                {
+                    correlations.Append( entity.parentId, QueryCorrelationEndpointTag::EntityParent, ordinal );
+                    parentCount++;
+                }
+            }
+            for( uint64_t ordinal = 0; ordinal < links.Count(); ordinal++ )
+            {
+                if( ( ordinal & 0xfffff ) == 0 )
+                {
+                    resources->SetProgress( frameCount + dispatchCount + entities.Count() + parentCount + ordinal * 2,
+                        expectedEndpoints );
+                    resources->CheckMemory( false );
+                }
+                const auto& link = links.At<JnGfxLinkData>( ordinal );
+                correlations.Append( link.sourceId, QueryCorrelationEndpointTag::LinkSource, ordinal );
+                correlations.Append( link.targetId, QueryCorrelationEndpointTag::LinkTarget, ordinal );
+            }
+            const auto stats = correlations.Commit();
+            const auto tag = [&]( QueryCorrelationEndpointTag value ) { return stats.tagCounts[size_t( value )]; };
+            if( tag( QueryCorrelationEndpointTag::FrameEvent ) != frameCount ||
+                tag( QueryCorrelationEndpointTag::DispatchSelf ) != dispatchCount ||
+                tag( QueryCorrelationEndpointTag::DispatchFrame ) != dispatchCount ||
+                tag( QueryCorrelationEndpointTag::EntitySelf ) != entities.Count() ||
+                tag( QueryCorrelationEndpointTag::EntityParent ) != parentCount ||
+                tag( QueryCorrelationEndpointTag::LinkSource ) != links.Count() ||
+                tag( QueryCorrelationEndpointTag::LinkTarget ) != links.Count() )
+                throw std::runtime_error( "Correlation endpoint tag count mismatch" );
+            QueryCorrelationStoreReader check(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "correlation",
+                result.sourceFingerprint, storageOptions );
+            check.ValidateAll();
+            result.jobStages.bytes = SectionBytes(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] );
+            result.jobStages.fingerprint = SectionFingerprint(
+                temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] );
         }
         result.cpuZonesByThread = writer.CpuZonesByThread();
         result.gpuZonesByContext = writer.GpuZonesByContext();
@@ -4552,6 +4834,11 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             if( jobs.Count( QueryJobDomain::Stage ) != manifest.jobStages.count )
                 throw std::runtime_error( "Job store stage count mismatch" );
             if( deep ) jobs.ValidateAll();
+        }
+        {
+            QueryCorrelationStoreReader correlations( manifest.jobStages.path / "correlation",
+                manifest.sourceFingerprint, storageOptions );
+            if( deep ) correlations.ValidateAll();
         }
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
         validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link",ZoneSectionKind::GfxLink );

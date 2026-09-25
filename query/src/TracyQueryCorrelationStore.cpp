@@ -38,13 +38,14 @@ struct BucketRecord
 struct StoreHeader
 {
     char magic[8] { 'J', 'N', 'C', 'O', 'R', 'R', '1', 0 };
-    uint32_t version = 1;
+    uint32_t version = 3;
     uint8_t bucketBits = 0;
     uint8_t partitionBits = 0;
     uint8_t tagBits = 3;
     uint8_t reserved = 0;
     uint64_t buckets = 0;
     uint64_t records = 0;
+    std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
     char sourceFingerprint[64] {};
 };
 #pragma pack( pop )
@@ -282,6 +283,7 @@ void QueryCorrelationStoreWriter::Append( uint64_t nodeId, QueryCorrelationEndpo
         value.partitionBytes[partition] += sizeof( record );
         value.temporaryBytes += sizeof( record );
         value.header.records++;
+        value.header.tagCounts[tagValue]++;
     }
     catch( ... )
     {
@@ -439,7 +441,7 @@ QueryCorrelationBuildStatistics QueryCorrelationStoreWriter::Commit()
     if( cleanupError ) throw std::runtime_error( "query_correlation_partition_root_cleanup" );
     value.committed = true;
     return { value.header.records, value.header.buckets, value.partitionCount,
-        value.temporaryBytes, value.peakPartitionRecords };
+        value.temporaryBytes, value.peakPartitionRecords, value.header.tagCounts };
 }
 
 struct QueryCorrelationStoreReader::Impl
@@ -461,7 +463,7 @@ struct QueryCorrelationStoreReader::Impl
         , ordinals( root / "ordinals", Identity( sourceFingerprint, "correlation-ordinals-v1" ),
             sizeof( uint64_t ), options )
     {
-        if( std::memcmp( header.magic, "JNCORR1", 7 ) != 0 || header.version != 1 ||
+        if( std::memcmp( header.magic, "JNCORR1", 7 ) != 0 || header.version != 3 ||
             header.tagBits != 3 || header.bucketBits < MinimumBucketBits ||
             header.bucketBits > MaximumBucketBits || header.partitionBits > header.bucketBits ||
             header.buckets != ( uint64_t( 1 ) << header.bucketBits ) ||
@@ -481,6 +483,17 @@ QueryCorrelationStoreReader::~QueryCorrelationStoreReader() = default;
 
 uint64_t QueryCorrelationStoreReader::Count() const { return m_impl->header.records; }
 uint64_t QueryCorrelationStoreReader::BucketCount() const { return m_impl->header.buckets; }
+
+uint64_t QueryCorrelationStoreReader::CandidateCount( uint64_t nodeId ) const
+{
+    auto& value = *m_impl;
+    Check( value.options );
+    BucketRecord bucket;
+    value.buckets.Read( Bucket( nodeId, value.header.bucketBits ), &bucket, 1 );
+    if( bucket.first > value.header.records || bucket.count > value.header.records - bucket.first )
+        throw std::runtime_error( "query_correlation_bucket_range" );
+    return bucket.count;
+}
 
 QueryCorrelationCandidatePage QueryCorrelationStoreReader::ReadCandidates(
     uint64_t nodeId, uint64_t offset, size_t limit ) const
@@ -532,6 +545,7 @@ void QueryCorrelationStoreReader::ValidateAll()
     } );
     if( expectedFirst != value.header.records )
         throw std::runtime_error( "query_correlation_bucket_coverage" );
+    std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
     value.ordinals.VisitValidated( [&]( const void* data, uint64_t count ) {
         const auto* rows = static_cast<const uint64_t*>( data );
         for( uint64_t index = 0; index < count; index++ )
@@ -539,8 +553,11 @@ void QueryCorrelationStoreReader::ValidateAll()
             Check( value.options );
             if( uint8_t( rows[index] >> 61 ) >= uint8_t( QueryCorrelationEndpointTag::Count ) )
                 throw std::runtime_error( "query_correlation_tag" );
+            tagCounts[size_t( rows[index] >> 61 )]++;
         }
     } );
+    if( tagCounts != value.header.tagCounts )
+        throw std::runtime_error( "query_correlation_tag_count" );
 }
 
 }

@@ -1,4 +1,5 @@
 #include "TracyQueryService.hpp"
+#include "TracyQueryCorrelationStore.hpp"
 #include "TracyQuerySpillStatistics.hpp"
 #include <array>
 #include "TracyQueryCatalogStore.hpp"
@@ -10649,6 +10650,118 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["analysis_confidence"] = confidence;
         result["conclusion_contract"] = "all conclusions must cite returned node/edge refs; absent domains are not real zero";
         return Success( id, std::move( result ), trace );
+    }
+    if( ( method == "entity.related" || method == "correlation.chain" ) )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+        {
+            if( !params.contains( "ref" ) || !params["ref"].is_string() )
+                throw QueryError( "INVALID_PARAMS", "ref is required" );
+            const auto rootRef = params["ref"].get<std::string>();
+            QueryCorrelationReadControl control;
+            control.check = checkDirectedJobRead;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Correlation index scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            control.maximumEdges = size_t( UnsignedParameter(
+                params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+            const auto edgeJson = [&]( const QueryCorrelationEdge& edge, uint64_t ordinal ) {
+                return json {
+                    { "ref", source->MakeEntityRef( "correlation", ordinal + 1 ) },
+                    { "source_ref", edge.sourceRef }, { "target_ref", edge.targetRef },
+                    { "relation", edge.relation }, { "correlation_id", edge.targetRef },
+                    { "parent_span_id", edge.sourceRef },
+                    { "origin_frame_id", edge.originFrameId == 0 ? json( nullptr ) : json( Decimal( edge.originFrameId ) ) },
+                    { "origin_frame_ref", edge.originFrameId == 0 ? json( nullptr ) :
+                        json( source->MakeEntityRef( "frame-identity", edge.originFrameId ) ) },
+                    { "evidence_kind", "exact" }
+                };
+            };
+            const auto orderEdges = []( auto& edges ) {
+                std::stable_sort( edges.begin(), edges.end(), []( const auto& lhs, const auto& rhs ) {
+                    if( lhs.orderDomain != rhs.orderDomain ) return lhs.orderDomain < rhs.orderDomain;
+                    if( lhs.ordinal != rhs.ordinal ) return lhs.ordinal < rhs.ordinal;
+                    if( lhs.sourceRef != rhs.sourceRef ) return lhs.sourceRef < rhs.sourceRef;
+                    if( lhs.targetRef != rhs.targetRef ) return lhs.targetRef < rhs.targetRef;
+                    return lhs.relation < rhs.relation;
+                } );
+            };
+            if( method == "entity.related" )
+            {
+                auto neighborhood = indexed->GetIndexedCorrelationNeighbors( rootRef, control );
+                if( neighborhood.edgeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                if( !neighborhood.known ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
+                orderEdges( neighborhood.edges );
+                json relations = json::array();
+                std::set<std::tuple<std::string, std::string, std::string, uint64_t, uint8_t, uint64_t>> seen;
+                for( const auto& edge : neighborhood.edges )
+                {
+                    const auto key = std::make_tuple( edge.sourceRef, edge.targetRef, edge.relation,
+                        edge.originFrameId, edge.orderDomain, edge.ordinal );
+                    if( !seen.emplace( key ).second ) continue;
+                    if( !BudgetConsumeEdge() )
+                        throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                    relations.push_back( edgeJson( edge, relations.size() ) );
+                }
+                return Success( id, { { "present", true }, { "root_ref", rootRef },
+                    { "relations", std::move( relations ) }, { "evidence_kind", "exact" } }, trace );
+            }
+
+            const auto maxNodes = size_t( UnsignedParameter( params, "max_nodes", 10000, 100000 ) );
+            std::set<std::string> visited { rootRef };
+            std::queue<std::string> frontier;
+            frontier.push( rootRef );
+            BudgetConsumeNode();
+            bool rootKnown = false;
+            bool truncated = false;
+            std::vector<QueryCorrelationEdge> edges;
+            std::set<std::tuple<std::string, std::string, std::string, uint64_t, uint8_t, uint64_t>> seen;
+            while( !frontier.empty() && !truncated )
+            {
+                checkDirectedJobRead();
+                const auto current = frontier.front();
+                frontier.pop();
+                const auto neighborhood = indexed->GetIndexedCorrelationNeighbors( current, control );
+                if( neighborhood.edgeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                if( current == rootRef ) rootKnown = neighborhood.known;
+                for( const auto& edge : neighborhood.edges )
+                {
+                    const auto key = std::make_tuple( edge.sourceRef, edge.targetRef, edge.relation,
+                        edge.originFrameId, edge.orderDomain, edge.ordinal );
+                    if( seen.emplace( key ).second )
+                    {
+                        if( !BudgetConsumeEdge() )
+                            throw QueryError( "RESOURCE_LIMIT", "Correlation edge budget exhausted", true );
+                        edges.emplace_back( edge );
+                    }
+                    std::string next;
+                    if( edge.sourceRef == current ) next = edge.targetRef;
+                    else if( edge.targetRef == current ) next = edge.sourceRef;
+                    if( next.empty() || visited.contains( next ) ) continue;
+                    if( visited.size() >= maxNodes || !BudgetConsumeNode() )
+                    { truncated = true; break; }
+                    visited.emplace( next );
+                    frontier.push( next );
+                }
+            }
+            if( !rootKnown ) throw QueryError( "ENTITY_NOT_FOUND", "correlated entity ref was not found" );
+            orderEdges( edges );
+            json relations = json::array();
+            for( const auto& edge : edges )
+                if( visited.contains( edge.sourceRef ) && visited.contains( edge.targetRef ) )
+                    relations.push_back( edgeJson( edge, relations.size() ) );
+            return Success( id, { { "present", true }, { "root_ref", rootRef },
+                { "nodes", visited }, { "relations", std::move( relations ) },
+                { "truncated", truncated }, { "evidence_kind", "exact" } }, trace );
+        }
     }
     if( method == "frame.identity" || method == "entity.related" || method == "correlation.chain" || method == "timeline.correlated_slice" )
     {

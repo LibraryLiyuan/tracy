@@ -1,8 +1,10 @@
 #include "TracyQueryIndex.hpp"
 #include "TracyWorkerTraceSource.hpp"
 #include "TracyQueryService.hpp"
+#include "TracyQueryCorrelationStore.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 
@@ -79,12 +81,26 @@ int main( int argc, char** argv )
         Require( expectedStages != 0, "fixture has no Job stages" );
         const auto expectedJobs = original->GetJobs();
         const auto expectedDispatches = original->GetGfxDispatches();
+        const auto expectedEntities = original->GetGfxEntities();
+        const auto expectedLinks = original->GetGfxLinks();
         const auto expectedFrames = original->GetCorrelatedFrameEvents();
+        const auto expectedFrameIdentityRef = expectedFrames.empty() ? std::string() :
+            original->MakeEntityRef( "frame-identity", expectedFrames.front().frameId );
         const auto expectedCallsites = original->GetCallsites();
         original.reset();
 
         const auto manifest = tracy::query::QueryIndex::Build( input );
         Require( manifest.jobStages.count == expectedStages, "Job-stage sidecar count changed" );
+        {
+            tracy::query::QueryCorrelationStoreReader correlations(
+                manifest.jobStages.path / "correlation", manifest.sourceFingerprint );
+            correlations.ValidateAll();
+            const auto parents = std::count_if( expectedEntities.begin(), expectedEntities.end(),
+                []( const auto& value ) { return value.parentId != 0; } );
+            Require( correlations.Count() == expectedFrames.size() + expectedDispatches.size() * 2 +
+                expectedEntities.size() + parents + expectedLinks.size() * 2,
+                "schema44 correlation endpoint count changed" );
+        }
         const auto validation = tracy::query::QueryIndex::Validate( input, true );
         Require( validation.manifest.has_value(), "Job schedule deep validation failed" );
         bool rejectedUnboundCompact = false;
@@ -167,10 +183,33 @@ int main( int argc, char** argv )
             request["method"] = "job.statistics";
             const auto jobStatistics = service.Execute( request );
             Require( jobStatistics.at("ok"), "real Job statistics failed" );
+            nlohmann::json related = nullptr;
+            nlohmann::json chain = nullptr;
+            if( !expectedFrames.empty() )
+            {
+                request["method"] = "entity.related";
+                request["params"] = {{"trace_id", session.id}, {"ref", expectedFrameIdentityRef},
+                    {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
+                const auto response = service.Execute( request );
+                Require( response.at("ok"), "real Frame related query failed" );
+                related = response.at("data");
+                request["method"] = "correlation.chain";
+                const auto chainResponse = service.Execute( request );
+                Require( chainResponse.at("ok"), "real Frame correlation chain failed" );
+                chain = chainResponse.at("data");
+            }
             return nlohmann::json{{"jobs", jobs}, {"gfx_statistics", statistics.at("data")},
-                {"job_statistics", jobStatistics.at("data")}};
+                {"job_statistics", jobStatistics.at("data")}, {"related", std::move( related )},
+                {"chain", std::move( chain )}};
         };
-        Require( searchPages( false ) == searchPages( true ), "indexed Job search JSON differs from Worker" );
+        const auto workerJson = searchPages( false );
+        const auto indexedJson = searchPages( true );
+        if( workerJson != indexedJson )
+        {
+            std::ofstream( root / "worker-query.json" ) << workerJson.dump( 2 );
+            std::ofstream( root / "indexed-query.json" ) << indexedJson.dump( 2 );
+            throw std::runtime_error( "indexed Job search JSON differs from Worker" );
+        }
         std::cout << "Job index integration passed jobs=" << actualJobs.size() << " stages=" << expectedStages << '\n';
         return 0;
     }

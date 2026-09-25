@@ -3,8 +3,10 @@
 
 #include "TracyPagedRecordStore.hpp"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -19,6 +21,7 @@ enum class QueryCorrelationEndpointTag : uint8_t
     EntitySelf,
     EntityParent,
     DispatchSelf,
+    DispatchFrame,
     FrameEvent,
     Count
 };
@@ -43,6 +46,40 @@ struct QueryCorrelationBuildStatistics
     uint64_t partitionCount = 0;
     uint64_t temporaryBytes = 0;
     uint64_t peakPartitionRecords = 0;
+    std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
+};
+
+struct QueryCorrelationEdge
+{
+    std::string sourceRef;
+    std::string targetRef;
+    std::string relation;
+    uint64_t originFrameId = 0;
+    uint8_t orderDomain = 0;
+    uint64_t ordinal = 0;
+};
+
+struct QueryCorrelationNeighborhood
+{
+    bool known = false;
+    bool edgeLimitExceeded = false;
+    std::vector<QueryCorrelationEdge> edges;
+};
+
+struct QueryCorrelationReadControl
+{
+    std::function<void()> check;
+    std::function<size_t( size_t )> allowance;
+    std::function<void( size_t, size_t, size_t )> scanned;
+    size_t maximumEdges = 200000;
+};
+
+class QueryCorrelationSource
+{
+public:
+    virtual ~QueryCorrelationSource() = default;
+    virtual QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors(
+        const std::string& ref, const QueryCorrelationReadControl& control ) const = 0;
 };
 
 uint64_t QueryCorrelationBucketForTesting( uint64_t nodeId, uint8_t bucketBits );
@@ -75,6 +112,7 @@ public:
 
     uint64_t Count() const;
     uint64_t BucketCount() const;
+    uint64_t CandidateCount( uint64_t nodeId ) const;
     QueryCorrelationCandidatePage ReadCandidates( uint64_t nodeId, uint64_t offset, size_t limit ) const;
     void ValidateAll();
 
