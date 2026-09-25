@@ -83,6 +83,8 @@ add_library(TracyQueryProtocol STATIC
     src/TracyQuerySampleDerivedStore.hpp
     src/TracyQueryJobStore.cpp
     src/TracyQueryJobStore.hpp
+    src/TracyQueryCorrelationStore.cpp
+    src/TracyQueryCorrelationStore.hpp
     src/TracyQuerySampleView.cpp
     src/TracyQuerySampleView.hpp
     src/TracyQueryStringStore.cpp
@@ -178,6 +180,15 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-job-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-job-store-tests)
     add_test(NAME tracy-query-job-store COMMAND tracy-query-job-store-tests)
+
+    add_executable(tracy-query-correlation-store-tests tests/QueryCorrelationStoreTests.cpp)
+    target_link_libraries(tracy-query-correlation-store-tests PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-correlation-store-tests)
+    add_test(NAME tracy-query-correlation-store COMMAND tracy-query-correlation-store-tests)
+
+    add_executable(tracy-query-correlation-capacity tests/QueryCorrelationCapacity.cpp)
+    target_link_libraries(tracy-query-correlation-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-correlation-capacity)
 
     add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
     target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
