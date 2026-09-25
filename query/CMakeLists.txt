@@ -223,6 +223,10 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-query-gpu-aggregation-capacity PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-gpu-aggregation-capacity)
 
+    add_executable(tracy-query-gpu-pass-fused-capacity tests/QueryGpuPassFusedCapacity.cpp)
+    target_link_libraries(tracy-query-gpu-pass-fused-capacity PRIVATE TracyQueryProtocol)
+    tracy_query_enable_assertions(tracy-query-gpu-pass-fused-capacity)
+
     add_executable(tracy-query-sample-view-tests tests/QuerySampleViewTests.cpp)
     target_link_libraries(tracy-query-sample-view-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-sample-view-tests)
