@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <stdexcept>
 #include <thread>
@@ -309,6 +310,27 @@ public:
             }
             result.emplace_back( std::move( value ) );
         }
+        analysis::ScanRange fullGpuRange;
+        fullGpuRange.startNs = std::numeric_limits<int64_t>::min();
+        fullGpuRange.endNs = std::numeric_limits<int64_t>::max();
+        fullGpuRange.limit = std::numeric_limits<size_t>::max();
+        const auto zones = FakeTraceSource::ScanGpuZones( fullGpuRange );
+        for( auto& value : result )
+        {
+            if( !value.segment ) continue;
+            uint64_t bestDistance = UINT64_MAX;
+            for( const auto& zone : zones )
+            {
+                const auto context = ParseEntityRef( zone.contextRef, "gpu-context" );
+                if( !context || *context != value.segment->gpuContext || zone.queryId != value.segment->gpuQueryId ) continue;
+                const auto distance = zone.cpuStartNs >= value.segment->timeNs ?
+                    uint64_t( zone.cpuStartNs - value.segment->timeNs ) :
+                    uint64_t( value.segment->timeNs - zone.cpuStartNs );
+                if( distance >= bestDistance ) continue;
+                bestDistance = distance;
+                value.zone = zone;
+            }
+        }
         return result;
     }
     uint64_t GetIndexedExplicitPassCount() const override { return IndexedPasses().size(); }
@@ -402,8 +424,10 @@ int main()
         struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ec; std::filesystem::remove(path, ec); } } cleanup{path};
         ReadCountingSource* observed = nullptr;
         std::vector<ReadCountingSource*> observedSources;
-        query::SessionManager sessions({path.parent_path()}, 2,
-            [&]( const std::filesystem::path&, query::SessionManager::StateCallback ) -> std::unique_ptr<analysis::TraceSource> {
+        query::SessionManager sessions({path.parent_path()}, 3,
+            [&]( const std::filesystem::path& openedPath, query::SessionManager::StateCallback ) -> std::unique_ptr<analysis::TraceSource> {
+                if( openedPath.filename().string().find( "-worker" ) != std::string::npos )
+                    return std::make_unique<query::test::FakeTraceSource>();
                 auto source = std::make_unique<ReadCountingSource>();
                 observedSources.emplace_back( source.get() );
                 if( !observed ) observed = source.get();
@@ -961,6 +985,40 @@ int main()
             "indexed Compare did not charge grouped statistics scratch" );
         observed->resources.reset();
         baselineObserved->resources.reset();
+
+        const auto workerPath = path.parent_path() / ( path.stem().string() + "-worker.tracy" );
+        std::ofstream( workerPath ).put( '\0' );
+        Cleanup workerCleanup { workerPath };
+        const auto workerOpened = sessions.Open( workerPath );
+        Require( sessions.WaitReady( workerOpened.id, std::chrono::seconds( 5 ) ).state == analysis::TraceSourceState::Ready,
+            "taxonomy Worker source not ready" );
+        json taxonomyRequest = {{ "protocol", "tracy-query/1" }, { "id", 8 },
+            { "method", "gpu.taxonomy.coverage" }, { "params", {
+                { "trace_id", workerOpened.id }, { "max_scan_events", 10000 }, { "max_cpu_ms", 10000 }
+            } } };
+        const auto workerTaxonomy = service.Execute( taxonomyRequest );
+        taxonomyRequest["params"]["trace_id"] = opened.id;
+        observed->reads.clear();
+        const auto indexedTaxonomy = service.Execute( taxonomyRequest );
+        Require( workerTaxonomy.at( "ok" ) && indexedTaxonomy.at( "ok" ) &&
+            workerTaxonomy.at( "data" ) == indexedTaxonomy.at( "data" ),
+            "bounded Indexed taxonomy changed Worker coverage semantics" );
+        Require( observed->reads["indexed_explicit_pass_page"] >= 2 &&
+            observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0,
+            "Indexed taxonomy did not use bounded Pass pages for aggregation and parent edges" );
+        query::QueryResourceContextOptions taxonomyLimited;
+        taxonomyLimited.traceBytes = 1;
+        taxonomyLimited.derivedRoots = { path.string() + ".taxonomy-workspace" };
+        taxonomyLimited.workspaceMaximumBytes = 64;
+        taxonomyLimited.workspaceTargetBytes = 64;
+        taxonomyLimited.diagnosticMemoryReserveBytes = 0;
+        taxonomyLimited.diagnosticDiskReserveBytes = 0;
+        observed->resources = std::make_shared<query::QueryResourceContext>( taxonomyLimited );
+        const auto limitedTaxonomy = service.Execute( taxonomyRequest );
+        Require( !limitedTaxonomy.at( "ok" ) && limitedTaxonomy.at( "error" ).at( "code" ) == "RESOURCE_LIMIT" &&
+            observed->resources->Snapshot().workspace.rejectedReservations != 0,
+            "Indexed taxonomy allocated interval state outside the shared workspace budget" );
+        observed->resources.reset();
         std::cout << "Job directed read boundaries and evidence equivalence passed\n";
         return 0;
     }

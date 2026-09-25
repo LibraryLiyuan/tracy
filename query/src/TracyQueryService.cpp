@@ -8215,13 +8215,65 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             int64_t begin = 0;
             int64_t end = 0;
         };
+        struct IndexedCompleteGpuZoneInterval
+        {
+            uint64_t ordinal = 0;
+            uint64_t contextOrdinal = 0;
+            int64_t begin = 0;
+            int64_t end = 0;
+        };
         std::map<std::string, std::vector<GpuInterval>> allGpuIntervals;
+        std::map<std::string, std::vector<GpuInterval>> leafGpuIntervals;
         std::map<std::string, std::vector<GpuInterval>> explicitGpuIntervals;
         std::vector<CompleteGpuZoneInterval> completeGpuZones;
+        std::vector<IndexedCompleteGpuZoneInterval> indexedCompleteGpuZones;
         std::set<std::string> gpuParentZoneRefs;
         std::unordered_map<std::string, uint32_t> taxonomyByZoneRef;
         std::set<std::string> syntheticTaxonomyZoneRefs;
         std::vector<std::pair<uint32_t, std::string>> pendingParents;
+        std::shared_ptr<QueryResourceContext> taxonomyResources;
+        if( indexedPassSource )
+            if( const auto owner = std::dynamic_pointer_cast<QueryResourceContextSource>( source ) )
+                taxonomyResources = owner->GetQueryResourceContext();
+        analysis::AnalysisWorkspaceReservation taxonomyWorkspace(
+            taxonomyResources ? taxonomyResources->Workspace() : nullptr );
+        const uint64_t indexedZoneCount = indexedPassSource ? source->GetTraceInfo().counts.gpuZones : 0;
+        std::vector<uint32_t> indexedTaxonomyByZone;
+        std::vector<uint64_t> indexedParentByZone;
+        std::vector<uint8_t> indexedParentBits;
+        std::vector<uint8_t> indexedExplicitBits;
+        std::vector<uint8_t> indexedSyntheticBits;
+        std::vector<uint8_t> indexedExplicitAncestorBits;
+        std::map<uint64_t, std::string> indexedContextRefs;
+        if( indexedPassSource )
+        {
+            constexpr uint64_t perZoneBytes = sizeof( IndexedCompleteGpuZoneInterval ) +
+                sizeof( uint32_t ) + sizeof( uint64_t ) + 3 * sizeof( GpuInterval ) + 1;
+            if( indexedZoneCount > SIZE_MAX / perZoneBytes )
+                throw QueryError( "RESOURCE_LIMIT", "GPU taxonomy interval workspace is too large", true );
+            taxonomyWorkspace.Resize( size_t( indexedZoneCount * perZoneBytes ) );
+            indexedCompleteGpuZones.reserve( size_t( indexedZoneCount ) );
+            indexedTaxonomyByZone.assign( size_t( indexedZoneCount ), 0 );
+            indexedParentByZone.assign( size_t( indexedZoneCount ), UINT64_MAX );
+            const auto bitBytes = size_t( indexedZoneCount / 8 + ( indexedZoneCount % 8 != 0 ) );
+            indexedParentBits.assign( bitBytes, 0 );
+            indexedExplicitBits.assign( bitBytes, 0 );
+            indexedSyntheticBits.assign( bitBytes, 0 );
+            indexedExplicitAncestorBits.assign( bitBytes, 0 );
+            for( const auto& context : source->GetGpuContexts() )
+            {
+                indexedContextRefs.emplace( context.index, context.ref );
+                allGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+                leafGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+                explicitGpuIntervals[context.ref].reserve( size_t( context.zoneCount ) );
+            }
+        }
+        const auto setIndexedBit = []( std::vector<uint8_t>& bits, uint64_t ordinal ) {
+            bits[size_t( ordinal / 8 )] |= uint8_t( 1u << ( ordinal & 7 ) );
+        };
+        const auto indexedBit = []( const std::vector<uint8_t>& bits, uint64_t ordinal ) {
+            return ( bits[size_t( ordinal / 8 )] & uint8_t( 1u << ( ordinal & 7 ) ) ) != 0;
+        };
         std::map<std::pair<uint32_t, uint32_t>, uint64_t> observedEdges;
         uint64_t taxonomyZoneCount = 0;
         uint64_t unknownTaxonomyZoneCount = 0;
@@ -8241,10 +8293,31 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 if( zone.gpuEndNs && *zone.gpuEndNs >= zone.gpuStartNs )
                 {
                     allGpuIntervals[zone.contextRef].emplace_back( zone.gpuStartNs, *zone.gpuEndNs );
-                    completeGpuZones.emplace_back( CompleteGpuZoneInterval {
-                        zone.ref, zone.contextRef, zone.name, zone.file, zone.line,
-                        zone.gpuStartNs, *zone.gpuEndNs } );
-                    if( zone.parentRef ) gpuParentZoneRefs.emplace( *zone.parentRef );
+                    if( indexedPassSource )
+                    {
+                        const auto ordinal = source->ParseEntityRef( zone.ref, "gpu-zone" );
+                        const auto contextOrdinal = source->ParseEntityRef( zone.contextRef, "gpu-context" );
+                        if( !ordinal || *ordinal >= indexedZoneCount || !contextOrdinal )
+                            throw QueryError( "INDEX_NOT_READY", "GPU taxonomy scanned an invalid GPU Zone identity" );
+                        indexedCompleteGpuZones.emplace_back( IndexedCompleteGpuZoneInterval {
+                            *ordinal, *contextOrdinal, zone.gpuStartNs, *zone.gpuEndNs } );
+                        indexedContextRefs.emplace( *contextOrdinal, zone.contextRef );
+                        if( zone.parentRef )
+                        {
+                            const auto parent = source->ParseEntityRef( *zone.parentRef, "gpu-zone" );
+                            if( !parent || *parent >= indexedZoneCount )
+                                throw QueryError( "INDEX_NOT_READY", "GPU taxonomy scanned an invalid parent GPU Zone" );
+                            indexedParentByZone[size_t( *ordinal )] = *parent;
+                            setIndexedBit( indexedParentBits, *parent );
+                        }
+                    }
+                    else
+                    {
+                        completeGpuZones.emplace_back( CompleteGpuZoneInterval {
+                            zone.ref, zone.contextRef, zone.name, zone.file, zone.line,
+                            zone.gpuStartNs, *zone.gpuEndNs } );
+                        if( zone.parentRef ) gpuParentZoneRefs.emplace( *zone.parentRef );
+                    }
                 }
                 const auto file = Lower( zone.file );
                 if( file.find( "jntracygputaxonomy.h" ) == std::string::npos ) continue;
@@ -8256,7 +8329,23 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     continue;
                 }
                 taxonomyZoneCount++;
-                syntheticTaxonomyZoneRefs.emplace( zone.ref );
+                if( indexedPassSource )
+                {
+                    const auto ordinal = source->ParseEntityRef( zone.ref, "gpu-zone" );
+                    if( !ordinal || *ordinal >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy marker has an invalid GPU Zone identity" );
+                    if( indexedTaxonomyByZone[size_t( *ordinal )] == 0 )
+                        indexedTaxonomyByZone[size_t( *ordinal )] = taxonomyId;
+                    setIndexedBit( indexedSyntheticBits, *ordinal );
+                    if( zone.parentRef && indexedParentByZone[size_t( *ordinal )] == UINT64_MAX )
+                    {
+                        const auto parent = source->ParseEntityRef( *zone.parentRef, "gpu-zone" );
+                        if( !parent || *parent >= indexedZoneCount )
+                            throw QueryError( "INDEX_NOT_READY", "GPU taxonomy marker has an invalid parent GPU Zone" );
+                        indexedParentByZone[size_t( *ordinal )] = *parent;
+                    }
+                }
+                else syntheticTaxonomyZoneRefs.emplace( zone.ref );
                 auto& stats = execution[taxonomyId];
                 stats.count++;
                 stats.contexts.emplace( zone.contextRef );
@@ -8267,8 +8356,11 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 }
                 else stats.incomplete++;
                 if( definition->second.value( "level", 0 ) > 0 ) fallbackZoneCount++;
-                taxonomyByZoneRef.emplace( zone.ref, taxonomyId );
-                if( zone.parentRef ) pendingParents.emplace_back( taxonomyId, *zone.parentRef );
+                if( !indexedPassSource )
+                {
+                    taxonomyByZoneRef.emplace( zone.ref, taxonomyId );
+                    if( zone.parentRef ) pendingParents.emplace_back( taxonomyId, *zone.parentRef );
+                }
             }
             offset += zones.size();
             if( zones.size() < allowed ) break;
@@ -8291,7 +8383,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 return;
             }
             explicitPassZoneCount++;
-            explicitPassZoneRefs.emplace( pass.zone->ref );
+            std::optional<uint64_t> indexedZoneOrdinal;
+            if( indexedPassSource )
+            {
+                indexedZoneOrdinal = source->ParseEntityRef( pass.zone->ref, "gpu-zone" );
+                if( !indexedZoneOrdinal || *indexedZoneOrdinal >= indexedZoneCount )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass references an invalid GPU Zone" );
+                setIndexedBit( indexedExplicitBits, *indexedZoneOrdinal );
+                if( indexedTaxonomyByZone[size_t( *indexedZoneOrdinal )] == 0 )
+                    indexedTaxonomyByZone[size_t( *indexedZoneOrdinal )] = pass.taxonomyId;
+                if( pass.zone->parentRef && indexedParentByZone[size_t( *indexedZoneOrdinal )] == UINT64_MAX )
+                {
+                    const auto parent = source->ParseEntityRef( *pass.zone->parentRef, "gpu-zone" );
+                    if( !parent || *parent >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass references an invalid parent GPU Zone" );
+                    indexedParentByZone[size_t( *indexedZoneOrdinal )] = *parent;
+                }
+            }
+            else explicitPassZoneRefs.emplace( pass.zone->ref );
             taxonomyZoneCount++;
             auto& stats = execution[pass.taxonomyId];
             stats.count++;
@@ -8300,12 +8409,12 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             {
                 stats.complete++;
                 stats.totalNs += uint64_t( *pass.zone->gpuEndNs - pass.zone->gpuStartNs );
-                explicitGpuIntervals[pass.zone->contextRef].emplace_back(
+                if( !indexedPassSource ) explicitGpuIntervals[pass.zone->contextRef].emplace_back(
                     pass.zone->gpuStartNs, *pass.zone->gpuEndNs );
             }
             else stats.incomplete++;
-            taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
-            if( pass.zone->parentRef )
+            if( !indexedPassSource ) taxonomyByZoneRef.emplace( pass.zone->ref, pass.taxonomyId );
+            if( !indexedPassSource && pass.zone->parentRef )
             {
                 pendingParents.emplace_back( pass.taxonomyId, *pass.zone->parentRef );
                 if( syntheticTaxonomyZoneRefs.contains( *pass.zone->parentRef ) )
@@ -8329,7 +8438,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( uint64_t passOffset = 0; passOffset < totalPasses; )
             {
                 const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
-                    size_t( std::min<uint64_t>( 256, totalPasses - passOffset ) ), passControl );
+                    size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), passControl );
                 if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
                     "GPU taxonomy Explicit Pass page is incomplete" );
                 for( const auto& value : page )
@@ -8338,13 +8447,73 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
         }
         else for( const auto& pass : explicitPasses.matches ) processExplicitPass( pass );
-        fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount, explicitAncestorZoneRefs.size() );
+        uint64_t indexedExplicitAncestorCount = 0;
+        if( indexedPassSource )
+        {
+            for( const auto& zone : indexedCompleteGpuZones )
+            {
+                const auto context = indexedContextRefs.find( zone.contextOrdinal );
+                if( context == indexedContextRefs.end() )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy context identity is unresolved" );
+                if( indexedBit( indexedExplicitBits, zone.ordinal ) )
+                    explicitGpuIntervals[context->second].emplace_back( zone.begin, zone.end );
+                const auto parent = indexedParentByZone[size_t( zone.ordinal )];
+                if( indexedBit( indexedExplicitBits, zone.ordinal ) && parent != UINT64_MAX &&
+                    indexedBit( indexedSyntheticBits, parent ) && !indexedBit( indexedExplicitAncestorBits, parent ) )
+                {
+                    setIndexedBit( indexedExplicitAncestorBits, parent );
+                    indexedExplicitAncestorCount++;
+                }
+            }
+            for( uint64_t ordinal = 0; ordinal < indexedZoneCount; ordinal++ )
+            {
+                if( !indexedBit( indexedSyntheticBits, ordinal ) ) continue;
+                const auto child = indexedTaxonomyByZone[size_t( ordinal )];
+                const auto parentOrdinal = indexedParentByZone[size_t( ordinal )];
+                if( child == 0 || parentOrdinal == UINT64_MAX ) continue;
+                const auto parent = indexedTaxonomyByZone[size_t( parentOrdinal )];
+                if( parent != 0 ) observedEdges[{ parent, child }]++;
+            }
+
+            QueryCorrelationReadControl edgeControl;
+            edgeControl.check = checkCancelled;
+            edgeControl.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "GPU taxonomy Explicit Pass edge scan budget exhausted", true );
+                return allowed;
+            };
+            edgeControl.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            const auto totalPasses = indexedPassSource->GetIndexedExplicitPassCount();
+            for( uint64_t passOffset = 0; passOffset < totalPasses; )
+            {
+                const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
+                    size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), edgeControl );
+                if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
+                    "GPU taxonomy Explicit Pass edge page is incomplete" );
+                for( const auto& value : page )
+                {
+                    if( !value.zone || definitions.find( value.taxonomyId ) == definitions.end() ||
+                        !value.zone->parentRef ) continue;
+                    const auto parentOrdinal = source->ParseEntityRef( *value.zone->parentRef, "gpu-zone" );
+                    if( !parentOrdinal || *parentOrdinal >= indexedZoneCount )
+                        throw QueryError( "INDEX_NOT_READY", "GPU taxonomy Explicit Pass edge parent is invalid" );
+                    const auto parent = indexedTaxonomyByZone[size_t( *parentOrdinal )];
+                    if( parent != 0 ) observedEdges[{ parent, value.taxonomyId }]++;
+                }
+                passOffset += page.size();
+            }
+        }
+        fallbackZoneCount -= std::min<uint64_t>( fallbackZoneCount,
+            indexedPassSource ? indexedExplicitAncestorCount : uint64_t( explicitAncestorZoneRefs.size() ) );
         const auto mergeIntervals = []( std::vector<GpuInterval> intervals ) -> std::vector<GpuInterval> {
             if( intervals.empty() ) return {};
             std::sort( intervals.begin(), intervals.end() );
             int64_t begin = intervals.front().first;
             int64_t end = intervals.front().second;
-            std::vector<GpuInterval> merged;
+            size_t written = 0;
             for( size_t index = 1; index < intervals.size(); ++index )
             {
                 if( intervals[index].first <= end )
@@ -8352,21 +8521,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     end = std::max( end, intervals[index].second );
                     continue;
                 }
-                merged.emplace_back( begin, end );
+                intervals[written++] = { begin, end };
                 begin = intervals[index].first;
                 end = intervals[index].second;
             }
-            merged.emplace_back( begin, end );
-            return merged;
+            intervals[written++] = { begin, end };
+            intervals.resize( written );
+            return intervals;
         };
         const auto mergedDuration = []( const std::vector<GpuInterval>& intervals ) -> uint64_t {
             uint64_t duration = 0;
             for( const auto& interval : intervals ) duration += uint64_t( interval.second - interval.first );
             return duration;
         };
-        const auto subtractIntervals = []( const std::vector<GpuInterval>& envelope,
-                                           const std::vector<GpuInterval>& covered ) {
-            std::vector<GpuInterval> gaps;
+        const auto visitSubtractedIntervals = []( const std::vector<GpuInterval>& envelope,
+            const std::vector<GpuInterval>& covered, const auto& visit ) {
             size_t coveredIndex = 0;
             for( const auto& span : envelope )
             {
@@ -8376,14 +8545,13 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 while( index < covered.size() && covered[index].first < span.second )
                 {
                     if( covered[index].first > cursor )
-                        gaps.emplace_back( cursor, std::min( span.second, covered[index].first ) );
+                        visit( GpuInterval { cursor, std::min( span.second, covered[index].first ) } );
                     cursor = std::max( cursor, covered[index].second );
                     if( cursor >= span.second ) break;
                     index++;
                 }
-                if( cursor < span.second ) gaps.emplace_back( cursor, span.second );
+                if( cursor < span.second ) visit( GpuInterval { cursor, span.second } );
             }
-            return gaps;
         };
         const auto intersectionDuration = []( const std::vector<GpuInterval>& lhs,
                                               const std::vector<GpuInterval>& rhs ) -> uint64_t {
@@ -8400,8 +8568,18 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             }
             return duration;
         };
-        std::map<std::string, std::vector<GpuInterval>> leafGpuIntervals;
-        for( const auto& zone : completeGpuZones )
+        if( indexedPassSource )
+        {
+            for( const auto& zone : indexedCompleteGpuZones )
+            {
+                if( zone.end <= zone.begin || indexedBit( indexedParentBits, zone.ordinal ) ) continue;
+                const auto context = indexedContextRefs.find( zone.contextOrdinal );
+                if( context == indexedContextRefs.end() )
+                    throw QueryError( "INDEX_NOT_READY", "GPU taxonomy leaf context is unresolved" );
+                leafGpuIntervals[context->second].emplace_back( zone.begin, zone.end );
+            }
+        }
+        else for( const auto& zone : completeGpuZones )
             if( zone.end > zone.begin && !gpuParentZoneRefs.contains( zone.ref ) )
                 leafGpuIntervals[zone.contextRef].emplace_back( zone.begin, zone.end );
 
@@ -8413,6 +8591,24 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         struct UncoveredGpuInterval { std::string contextRef; int64_t begin = 0; int64_t end = 0; };
         std::vector<UncoveredGpuInterval> uncoveredGpuIntervals;
         std::vector<UncoveredGpuInterval> timelineUncoveredGpuIntervals;
+        uint64_t uncoveredGpuIntervalCount = 0;
+        uint64_t timelineUncoveredGpuIntervalCount = 0;
+        constexpr size_t maxUncoveredIntervals = 32;
+        const auto recordUncovered = [&]( std::vector<UncoveredGpuInterval>& top, uint64_t& count,
+            const std::string& context, const GpuInterval& gap ) {
+            if( gap.second <= gap.first ) return;
+            count++;
+            top.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            if( top.size() <= maxUncoveredIntervals ) return;
+            std::sort( top.begin(), top.end(), []( const auto& lhs, const auto& rhs ) {
+                const auto lhsDuration = lhs.end - lhs.begin;
+                const auto rhsDuration = rhs.end - rhs.begin;
+                if( lhsDuration != rhsDuration ) return lhsDuration > rhsDuration;
+                if( lhs.contextRef != rhs.contextRef ) return lhs.contextRef < rhs.contextRef;
+                return lhs.begin < rhs.begin;
+            } );
+            top.resize( maxUncoveredIntervals );
+        };
         std::set<std::string> gpuContexts;
         for( const auto& [context, unused] : allGpuIntervals ) gpuContexts.emplace( context );
         for( const auto& [context, unused] : leafGpuIntervals ) gpuContexts.emplace( context );
@@ -8422,19 +8618,21 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto leafFound = leafGpuIntervals.find( context );
             const auto explicitFound = explicitGpuIntervals.find( context );
             const auto mergedAll = allFound == allGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( allFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( allFound->second ) );
             const auto mergedLeaf = leafFound == leafGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( leafFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( leafFound->second ) );
             const auto mergedExplicit = explicitFound == explicitGpuIntervals.end() ?
-                std::vector<GpuInterval>() : mergeIntervals( explicitFound->second );
+                std::vector<GpuInterval>() : mergeIntervals( std::move( explicitFound->second ) );
             const uint64_t totalNs = mergedDuration( mergedLeaf );
             const uint64_t explicitNs = intersectionDuration( mergedLeaf, mergedExplicit );
             const uint64_t envelopeNs = mergedDuration( mergedAll );
             const uint64_t explicitEnvelopeNs = intersectionDuration( mergedAll, mergedExplicit );
-            for( const auto& gap : subtractIntervals( mergedLeaf, mergedExplicit ) )
-                if( gap.second > gap.first ) uncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
-            for( const auto& gap : subtractIntervals( mergedAll, mergedExplicit ) )
-                if( gap.second > gap.first ) timelineUncoveredGpuIntervals.emplace_back( UncoveredGpuInterval { context, gap.first, gap.second } );
+            visitSubtractedIntervals( mergedLeaf, mergedExplicit, [&]( const GpuInterval& gap ) {
+                recordUncovered( uncoveredGpuIntervals, uncoveredGpuIntervalCount, context, gap );
+            } );
+            visitSubtractedIntervals( mergedAll, mergedExplicit, [&]( const GpuInterval& gap ) {
+                recordUncovered( timelineUncoveredGpuIntervals, timelineUncoveredGpuIntervalCount, context, gap );
+            } );
             totalGpuBusyNs += totalNs;
             explicitGpuBusyNs += explicitNs;
             timelineEnvelopeNs += envelopeNs;
@@ -8459,10 +8657,48 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 return lhs.begin < rhs.begin;
             } );
             json values = json::array();
-            constexpr size_t maxUncoveredIntervals = 32;
             for( size_t gapIndex = 0; gapIndex < std::min( maxUncoveredIntervals, gaps.size() ); ++gapIndex )
             {
                 const auto& gap = gaps[gapIndex];
+                if( indexedPassSource )
+                {
+                    const auto contextOrdinal = source->ParseEntityRef( gap.contextRef, "gpu-context" );
+                    if( !contextOrdinal ) throw QueryError( "INDEX_NOT_READY",
+                        "GPU taxonomy uncovered interval has an invalid context" );
+                    const IndexedCompleteGpuZoneInterval* containing = nullptr;
+                    const IndexedCompleteGpuZoneInterval* previousExplicit = nullptr;
+                    const IndexedCompleteGpuZoneInterval* nextExplicit = nullptr;
+                    for( const auto& zone : indexedCompleteGpuZones )
+                    {
+                        if( zone.contextOrdinal != *contextOrdinal ) continue;
+                        const bool explicitZone = indexedBit( indexedExplicitBits, zone.ordinal );
+                        if( !explicitZone && zone.begin <= gap.begin && zone.end >= gap.end &&
+                            ( !containing || zone.end - zone.begin < containing->end - containing->begin ) )
+                            containing = &zone;
+                        if( !explicitZone ) continue;
+                        if( zone.end <= gap.begin && ( !previousExplicit || zone.end > previousExplicit->end ) )
+                            previousExplicit = &zone;
+                        if( zone.begin >= gap.end && ( !nextExplicit || zone.begin < nextExplicit->begin ) )
+                            nextExplicit = &zone;
+                    }
+                    const auto zoneJson = [&]( const IndexedCompleteGpuZoneInterval* zone ) -> json {
+                        if( !zone ) return nullptr;
+                        const auto value = source->GetGpuZone( source->MakeEntityRef( "gpu-zone", zone->ordinal ) );
+                        if( !value ) throw QueryError( "INDEX_NOT_READY",
+                            "GPU taxonomy uncovered interval evidence is missing" );
+                        return { { "ref", value->ref }, { "name", value->name }, { "file", value->file },
+                            { "line", value->line }, { "gpu_start_ns", Decimal( zone->begin ) },
+                            { "gpu_end_ns", Decimal( zone->end ) } };
+                    };
+                    values.push_back( {
+                        { "context_ref", gap.contextRef }, { "gpu_start_ns", Decimal( gap.begin ) },
+                        { "gpu_end_ns", Decimal( gap.end ) }, { "duration_ns", Decimal( gap.end - gap.begin ) },
+                        { "containing_non_explicit_zone", zoneJson( containing ) },
+                        { "previous_explicit_pass", zoneJson( previousExplicit ) },
+                        { "next_explicit_pass", zoneJson( nextExplicit ) }
+                    } );
+                    continue;
+                }
                 const CompleteGpuZoneInterval* containing = nullptr;
                 const CompleteGpuZoneInterval* previousExplicit = nullptr;
                 const CompleteGpuZoneInterval* nextExplicit = nullptr;
@@ -8503,7 +8739,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             std::min( timelineEnvelopeNs, explicitTimelineEnvelopeNs );
         const double explicitTimelineEnvelopeRatio = timelineEnvelopeNs == 0 ?
             0.0 : double( explicitTimelineEnvelopeNs ) / double( timelineEnvelopeNs );
-        for( const auto& [childId, parentRef] : pendingParents )
+        if( !indexedPassSource ) for( const auto& [childId, parentRef] : pendingParents )
         {
             const auto parent = taxonomyByZoneRef.find( parentRef );
             if( parent != taxonomyByZoneRef.end() ) observedEdges[{ parent->second, childId }]++;
@@ -8643,14 +8879,14 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 { "required_explicit_ratio", 0.95 }, { "maximum_fallback_or_unclassified_ratio", 0.05 },
                 { "missing_gpu_zone_count", Decimal( explicitPassMissingZoneCount ) },
                 { "contexts", std::move( gpuBusyContexts ) },
-                { "uncovered_interval_count", Decimal( uncoveredGpuIntervals.size() ) },
+                { "uncovered_interval_count", Decimal( uncoveredGpuIntervalCount ) },
                 { "top_uncovered_intervals", std::move( topUncoveredGpuIntervals ) },
                 { "timeline_envelope", {
                     { "total_ns", Decimal( timelineEnvelopeNs ) },
                     { "explicit_ns", Decimal( explicitTimelineEnvelopeNs ) },
                     { "non_explicit_ns", Decimal( nonExplicitTimelineEnvelopeNs ) },
                     { "explicit_coverage_ratio", explicitTimelineEnvelopeRatio },
-                    { "uncovered_interval_count", Decimal( timelineUncoveredGpuIntervals.size() ) },
+                    { "uncovered_interval_count", Decimal( timelineUncoveredGpuIntervalCount ) },
                     { "top_uncovered_intervals", std::move( topTimelineUncoveredGpuIntervals ) },
                     { "evidence_kind", "parent_gpu_zone_timeline_envelope" },
                     { "used_for_gate", false }
@@ -13189,7 +13425,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                     for( uint64_t passOffset = 0; passOffset < totalPasses; )
                     {
                         const auto page = indexedPassSource->ScanIndexedExplicitPasses( passOffset,
-                            size_t( std::min<uint64_t>( 256, totalPasses - passOffset ) ), passControl );
+                            size_t( std::min<uint64_t>( 4096, totalPasses - passOffset ) ), passControl );
                         if( page.empty() ) throw QueryError( "INDEX_NOT_READY",
                             "GPU compare Explicit Pass page is incomplete" );
                         for( const auto& value : page )
