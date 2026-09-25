@@ -456,34 +456,56 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
         uint64_t resolvedOrdinal = 0;
         uint64_t resourceLookupCount = 0;
         uint64_t catalogResourceLookupCount = 0;
-        for( uint32_t partition = 0; partition < partitionCount; partition++ )
+        struct LoadedUsePartition
         {
-            const auto path = usePartitions / std::to_string( partition );
+            explicit LoadedUsePartition( std::shared_ptr<analysis::AnalysisWorkspaceBudget> workspace )
+                : memory( std::move( workspace ) ) {}
+            analysis::AnalysisWorkspaceReservation memory;
             std::vector<QueryGpuReferencePartitionUse> uses;
-            analysis::AnalysisWorkspaceReservation useMemory( options.workspace );
-            auto substageStarted = std::chrono::steady_clock::now();
+            uint64_t readMs = 0;
+            uint64_t sortMs = 0;
+        };
+        const auto loadUsePartition = [&]( uint32_t partition ) {
+            LoadedUsePartition result( options.workspace );
+            const auto path = usePartitions / std::to_string( partition );
+            auto started = std::chrono::steady_clock::now();
             {
                 analysis::PagedRecordReader reader( path,
                     UsePartitionIdentity( sourceFingerprint, partition ),
                     sizeof( QueryGpuReferencePartitionUse ), partitionOptions );
                 if( reader.Count() > SIZE_MAX / sizeof( QueryGpuReferencePartitionUse ) )
                     throw std::runtime_error( "GPU reference Use partition exceeds address space" );
-                useMemory.Resize( reader.Count() * sizeof( QueryGpuReferencePartitionUse ) );
-                uses.resize( size_t( reader.Count() ) );
-                if( !uses.empty() ) reader.Read( 0, uses.data(), uses.size() );
+                result.memory.Resize( reader.Count() * sizeof( QueryGpuReferencePartitionUse ) );
+                result.uses.resize( size_t( reader.Count() ) );
+                if( !result.uses.empty() ) reader.Read( 0, result.uses.data(), result.uses.size() );
             }
-            if( statistics ) statistics->usePartitionReadMs += uint64_t(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - substageStarted ).count() );
-            substageStarted = std::chrono::steady_clock::now();
-            std::sort( uses.begin(), uses.end(), []( const auto& lhs, const auto& rhs ) {
+            result.readMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started ).count() );
+            started = std::chrono::steady_clock::now();
+            std::sort( result.uses.begin(), result.uses.end(), []( const auto& lhs, const auto& rhs ) {
                 if( lhs.passOrdinal != rhs.passOrdinal ) return lhs.passOrdinal < rhs.passOrdinal;
                 return lhs.sourceUseOrdinal < rhs.sourceUseOrdinal;
             } );
-            if( statistics ) statistics->usePartitionSortMs += uint64_t(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - substageStarted ).count() );
-            substageStarted = std::chrono::steady_clock::now();
+            result.sortMs = uint64_t( std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started ).count() );
+            return result;
+        };
+        std::future<LoadedUsePartition> prefetched;
+        if( partitionCount > 1 )
+            prefetched = std::async( std::launch::async, loadUsePartition, 0 );
+        for( uint32_t partition = 0; partition < partitionCount; partition++ )
+        {
+            const auto path = usePartitions / std::to_string( partition );
+            auto loaded = partitionCount == 1 ? loadUsePartition( partition ) : prefetched.get();
+            if( partition + 1 < partitionCount )
+                prefetched = std::async( std::launch::async, loadUsePartition, partition + 1 );
+            if( statistics )
+            {
+                statistics->usePartitionReadMs += loaded.readMs;
+                statistics->usePartitionSortMs += loaded.sortMs;
+            }
+            auto& uses = loaded.uses;
+            auto substageStarted = std::chrono::steady_clock::now();
             for( const auto& use : uses )
             {
                 if( ( resolvedOrdinal & 4095 ) == 0 && options.cancelled && options.cancelled() )
@@ -544,7 +566,7 @@ void QueryGpuReferenceStore::Build( const std::filesystem::path& root, std::stri
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - substageStarted ).count() );
             std::vector<QueryGpuReferencePartitionUse>().swap( uses );
-            useMemory.Resize( 0 );
+            loaded.memory.Resize( 0 );
             std::error_code removeError;
             analysis::AnalysisDiskRemove( path, options.disk, removeError, true );
             if( removeError ) throw std::runtime_error( "GPU reference Use partition cleanup failed: " +
