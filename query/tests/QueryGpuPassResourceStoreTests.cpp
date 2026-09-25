@@ -159,8 +159,37 @@ private:
     std::vector<std::pair<uint64_t, uint64_t>> m_resourceAllocations;
 };
 
+class GeneratedReferenceInput final : public QueryGpuReferenceInput
+{
+public:
+    GeneratedReferenceInput( uint64_t uses, uint64_t resources,
+        const QueryCatalogStoreReader* catalog )
+        : m_uses( uses ), m_resources( resources ), m_catalog( catalog ) {}
+
+    uint64_t PassCount() const override { return ( m_uses + 31 ) / 32; }
+    uint64_t UseCount() const override { return m_uses; }
+    uint64_t EndCount() const override { return PassCount(); }
+    JnGpuReferencePassData Pass( uint64_t ordinal ) const override
+    { return { int64_t( ( ordinal + 1 ) * 100 ), ordinal + 1, ordinal, 1, 1, 0, 0 }; }
+    JnGpuReferenceUseData Use( uint64_t ordinal ) const override
+    {
+        const auto passId = ordinal % PassCount() + 1;
+        return { int64_t( passId * 100 + 1 ), passId,
+            ordinal % m_resources + 1, 1, 1, 1, 0, 1 };
+    }
+    JnGpuReferenceEndData End( uint64_t ordinal ) const override
+    { return { int64_t( ( ordinal + 1 ) * 100 + 99 ), ordinal + 1, 0, 1, 32, 0, 0 }; }
+    uint64_t ResolveCatalogResource( uint64_t token, int64_t time ) const override
+    { return m_catalog ? m_catalog->ResolveResourcePointer( token, time ) : token; }
+
+private:
+    uint64_t m_uses;
+    uint64_t m_resources;
+    const QueryCatalogStoreReader* m_catalog;
+};
+
 int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBytes,
-    bool inventory = false, bool realCatalog = false )
+    bool inventory = false, bool realCatalog = false, bool validate = false )
 {
     namespace fs = std::filesystem;
     using namespace tracy::analysis;
@@ -169,6 +198,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
     const auto root = fs::temp_directory_path() /
         ( "query-gpu-pass-capacity-" +
             std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() ) );
+    auto referenceRoot = root; referenceRoot += "-references";
     try
     {
         fs::create_directories( root );
@@ -257,6 +287,20 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
                 std::chrono::steady_clock::now() - catalogStarted ).count();
         }
         const auto sourceBytes = usage->Snapshot().currentBytes;
+        uint64_t referenceFixtureMs = 0;
+        if( validate )
+        {
+            const auto referenceStarted = std::chrono::steady_clock::now();
+            auto referenceOptions = options;
+            auto referenceUsage = std::make_shared<AnalysisDiskUsage>(
+                std::vector<fs::path>{ referenceRoot } );
+            referenceOptions.disk = std::make_shared<AnalysisDiskBudget>(
+                AnalysisDiskBudget{ referenceUsage, maximumBytes, {} } );
+            GeneratedReferenceInput referenceInput( useCount, resourceCount, catalog.get() );
+            QueryGpuReferenceStore::Build( referenceRoot, identity, referenceInput, referenceOptions );
+            referenceFixtureMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - referenceStarted ).count();
+        }
         const auto fastPathStarted = std::chrono::steady_clock::now();
         GeneratedPassInput input( useCount, resourceCount, catalog.get(), options.workspace );
         const auto fastPathBuildMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -275,10 +319,22 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             "GPU Pass/Resource build telemetry lost facts or exceeded wall time" );
         Require( !fs::exists( root / "pass-resource-scratch" ),
             "GPU pass capacity probe retained scratch" );
+        QueryGpuPassResourceValidationStats validationStats;
+        uint64_t validationMs = 0;
+        if( validate )
+        {
+            QueryGpuPassResourceStoreReader validationReader( root, root / "catalog", referenceRoot,
+                identity, options );
+            const auto validationStarted = std::chrono::steady_clock::now();
+            validationStats = validationReader.ValidateAll();
+            validationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - validationStarted ).count();
+        }
         const auto observed = usage->Snapshot();
         std::cout << "gpu_pass_uses=" << useCount << " passes=" << input.MappingCount()
             << " resource_keys=" << resourceCount << " real_catalog=" << realCatalog
             << " catalog_build_ms=" << catalogBuildMs << " fast_path_ms=" << fastPathBuildMs
+            << " reference_fixture_ms=" << referenceFixtureMs
             << " source_bytes=" << sourceBytes
             << " peak_bytes=" << observed.peakBytes
             << " final_bytes=" << observed.currentBytes << " build_elapsed_ms=" << buildMs
@@ -291,6 +347,19 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " summary_ms=" << stages.summaryMs
             << " allocation_sort_ms=" << stages.allocationSortMs
             << " allocation_aggregate_ms=" << stages.allocationAggregateMs
+            << " validation_requested=" << validate
+            << " validation_elapsed_ms=" << validationMs
+            << " validation_telemetry_total_ms=" << validationStats.totalMs
+            << " validation_paged_records_ms=" << validationStats.pagedRecordsMs
+            << " validation_semantic_compare_ms=" << validationStats.semanticCompareMs
+            << " validation_summary_block_loads=" << validationStats.summaryBlockLoads
+            << " validation_range_block_loads=" << validationStats.rangeBlockLoads
+            << " validation_use_block_loads=" << validationStats.useBlockLoads
+            << " validation_evidence_block_loads=" << validationStats.evidenceBlockLoads
+            << " validation_summary_decoded_bytes=" << validationStats.summaryDecodedBytes
+            << " validation_range_decoded_bytes=" << validationStats.rangeDecodedBytes
+            << " validation_use_decoded_bytes=" << validationStats.useDecodedBytes
+            << " validation_evidence_decoded_bytes=" << validationStats.evidenceDecodedBytes
             << " resource_allocation_callback_calls=" << input.resourceAllocationCalls
             << " allocation_end_callback_calls=" << input.allocationEndCalls
             << " fact_runs=" << stages.factSort.initialRuns
@@ -305,6 +374,9 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         std::error_code cleanup;
         fs::remove_all( root, cleanup );
         if( cleanup ) throw std::runtime_error( "GPU pass capacity cleanup: " + cleanup.message() );
+        cleanup.clear();
+        fs::remove_all( referenceRoot, cleanup );
+        if( cleanup ) throw std::runtime_error( "GPU pass reference fixture cleanup: " + cleanup.message() );
         return 0;
     }
     catch( const std::exception& error )
@@ -312,6 +384,7 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         std::cerr << error.what() << '\n';
         std::error_code ignored;
         fs::remove_all( root, ignored );
+        fs::remove_all( referenceRoot, ignored );
         return 1;
     }
 }
@@ -326,6 +399,9 @@ int main( int argc, char** argv )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), true );
     if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity" )
         return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ), false, true );
+    if( argc == 5 && std::string_view( argv[1] ) == "--catalog-capacity-validated" )
+        return CapacityProbe( std::stoull( argv[2] ), std::stoull( argv[3] ), std::stoull( argv[4] ),
+            false, true, true );
     if( argc != 1 ) return 2;
     try
     {
