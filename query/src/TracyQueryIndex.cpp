@@ -4731,6 +4731,19 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 { return m_ends.At<JnGpuReferenceEndData>( ordinal ); }
                 uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
                 { return m_catalog.ResolveResourcePointer( pointerToken, time ); }
+                uint64_t ReferenceResourceOrdinalCount() const override
+                { return m_catalog.PointerResolutionKeyCount(); }
+                std::optional<uint32_t> FindReferenceResourceOrdinal( uint64_t pointerToken ) const override
+                { return m_catalog.FindPointerResolutionKeyOrdinal( pointerToken ); }
+                uint64_t ReferenceResourceIdAtOrdinal( uint32_t ordinal ) const override
+                { return m_catalog.PointerResolutionKeyAtOrdinal( ordinal ); }
+                uint64_t CatalogResourceOrdinalCount() const override
+                { return m_catalog.ResourceIndexCount(); }
+                std::optional<uint32_t> ResolveCatalogResourceOrdinal(
+                    uint64_t pointerToken, int64_t time ) const override
+                { return m_catalog.ResolveResourcePointerOrdinal( pointerToken, time ); }
+                uint64_t CatalogResourceIdAtOrdinal( uint32_t ordinal ) const override
+                { return m_catalog.FastResourceIdAtOrdinal( ordinal ); }
             private:
                 const ReadOnlyZoneSection& m_passes;
                 const ReadOnlyZoneSection& m_uses;

@@ -895,7 +895,14 @@ int main( int argc, char** argv )
                     pointers.ResourcePointerIntervalDecodedBytes()<=131072,
                     "Catalog pointer lookup repeatedly decoded its binary-search pages");
                 Require(pointers.PreparePointerResolutionFastPath() &&
-                    pointers.PointerResolutionFastPathBytes()<=uint64_t(64)<<20,
+                    pointers.PointerResolutionFastPathBytes()<=uint64_t(64)<<20 &&
+                    pointers.PointerResolutionFastPathHashSlots()>=2048 &&
+                    pointers.PointerResolutionKeyCount()==1024 &&
+                    pointers.FindPointerResolutionKeyOrdinal(1000)==0 &&
+                    pointers.PointerResolutionKeyAtOrdinal(1023)==2023 &&
+                    pointers.ResolveResourcePointerOrdinal(1000,1)==0 &&
+                    pointers.ResolveResourcePointerOrdinal(2023,1)==1023 &&
+                    pointers.FastResourceIdAtOrdinal(1023)==2023,
                     "Catalog pointer fast path exceeded the shared small-workspace cap");
                 const auto before=pointers.ResourcePointerLookupDecodedBytes()+
                     pointers.ResourcePointerIntervalDecodedBytes();

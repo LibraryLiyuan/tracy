@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -25,6 +26,14 @@ public:
     virtual JnGpuReferenceUseData Use( uint64_t ordinal ) const = 0;
     virtual JnGpuReferenceEndData End( uint64_t ordinal ) const = 0;
     virtual uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const = 0;
+    virtual uint64_t ReferenceResourceOrdinalCount() const { return 0; }
+    virtual std::optional<uint32_t> FindReferenceResourceOrdinal( uint64_t ) const
+    { return std::nullopt; }
+    virtual uint64_t ReferenceResourceIdAtOrdinal( uint32_t ) const { return 0; }
+    virtual uint64_t CatalogResourceOrdinalCount() const { return 0; }
+    virtual std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t, int64_t ) const
+    { return std::nullopt; }
+    virtual uint64_t CatalogResourceIdAtOrdinal( uint32_t ) const { return 0; }
 };
 
 struct QueryGpuReferenceResolvedUseRecord
@@ -91,6 +100,14 @@ struct QueryGpuReferenceBuildStatistics
     uint64_t passEventSortMs = 0;
     uint64_t passTimePublishMs = 0;
     uint64_t usePassSortMs = 0;
+    uint64_t usePartitionRecords = 0;
+    uint64_t usePartitionWriteMs = 0;
+    uint64_t usePartitionReadMs = 0;
+    uint64_t usePartitionSortMs = 0;
+    uint64_t useResolveEmitMs = 0;
+    uint64_t lookupPartitionRecords = 0;
+    uint64_t lookupPartitionWriteMs = 0;
+    uint64_t lookupPartitionPublishMs = 0;
     uint64_t resolveUsesMs = 0;
     uint64_t resourceSortMs = 0;
     uint64_t resourcePublishMs = 0;

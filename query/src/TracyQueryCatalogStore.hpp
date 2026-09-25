@@ -355,6 +355,12 @@ public:
     uint64_t ResourcePointerIntervalDecodedBytes() const;
     bool PreparePointerResolutionFastPath();
     uint64_t PointerResolutionFastPathBytes() const;
+    uint64_t PointerResolutionFastPathHashSlots() const;
+    uint64_t PointerResolutionKeyCount() const;
+    std::optional<uint32_t> FindPointerResolutionKeyOrdinal( uint64_t pointerToken ) const;
+    uint64_t PointerResolutionKeyAtOrdinal( uint32_t ordinal ) const;
+    std::optional<uint32_t> ResolveResourcePointerOrdinal( uint64_t pointerToken, int64_t time ) const;
+    uint64_t FastResourceIdAtOrdinal( uint32_t ordinal ) const;
 
 private:
     struct Impl;

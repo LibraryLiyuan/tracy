@@ -26,6 +26,15 @@ namespace tracy::query
 namespace
 {
 
+uint64_t MixCatalogLookupKey( uint64_t value )
+{
+    value ^= value >> 30;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27;
+    value *= 0x94d049bb133111ebull;
+    return value ^ ( value >> 31 );
+}
+
 std::string CatalogIdentity( std::string_view sourceFingerprint, std::string_view domain )
 {
     if( sourceFingerprint.size() != 64 ) throw std::runtime_error( "Catalog store source identity must be SHA-256" );
@@ -314,6 +323,25 @@ struct QueryCatalogStoreReader::Impl
     analysis::AnalysisWorkspaceReservation pointerFastWorkspace;
     std::vector<analysis::AnalysisKeyMetadataRecord> pointerFastLookup;
     std::vector<QueryCatalogResourcePointerInterval> pointerFastIntervals;
+    struct PointerFastHashEntry
+    {
+        uint64_t pointerToken = 0;
+        uint32_t begin = 0;
+        uint32_t count = 0;
+        uint32_t keyOrdinal = 0;
+        uint32_t reserved = 0;
+    };
+    std::vector<PointerFastHashEntry> pointerFastHash;
+    std::vector<uint64_t> pointerFastKeys;
+    std::vector<uint32_t> pointerFastIntervalResourceOrdinals;
+    struct ResourceFastHashEntry
+    {
+        uint64_t resourceId = 0;
+        uint32_t ordinal = 0;
+        uint32_t reserved = 0;
+    };
+    std::vector<ResourceFastHashEntry> resourceFastHash;
+    std::vector<uint64_t> resourceFastIds;
     bool pointerFastReady = false;
     mutable std::unique_ptr<analysis::PagedRecordReader> pointerIntervalByResource;
     mutable std::unique_ptr<analysis::PagedRecordReader> resourceRangeLookup;
@@ -2576,28 +2604,125 @@ bool QueryCatalogStoreReader::PreparePointerResolutionFastPath()
     if( m_impl->pointerFastReady ) return true;
     const auto lookupCount = m_impl->pointerIntervalByPointer->Count();
     const auto intervalCount = m_impl->resourcePointerIntervals->Count();
+    const auto resourceCount = m_impl->resourceSummaries->Count();
     if( lookupCount > SIZE_MAX / sizeof( analysis::AnalysisKeyMetadataRecord ) ||
-        intervalCount > SIZE_MAX / sizeof( QueryCatalogResourcePointerInterval ) ) return false;
+        intervalCount > SIZE_MAX / sizeof( QueryCatalogResourcePointerInterval ) ||
+        lookupCount > std::numeric_limits<uint32_t>::max() ||
+        intervalCount > std::numeric_limits<uint32_t>::max() ||
+        resourceCount > std::numeric_limits<uint32_t>::max() ) return false;
+    size_t hashCapacity = 1;
+    while( hashCapacity < size_t( lookupCount ) * 2 )
+    {
+        if( hashCapacity > std::numeric_limits<size_t>::max() / 2 ) return false;
+        hashCapacity *= 2;
+    }
+    size_t resourceHashCapacity = 1;
+    while( resourceHashCapacity < size_t( resourceCount ) * 2 )
+    {
+        if( resourceHashCapacity > std::numeric_limits<size_t>::max() / 2 ) return false;
+        resourceHashCapacity *= 2;
+    }
     const auto lookupBytes = lookupCount * sizeof( analysis::AnalysisKeyMetadataRecord );
     const auto intervalBytes = intervalCount * sizeof( QueryCatalogResourcePointerInterval );
+    const auto hashBytes = uint64_t( hashCapacity ) * sizeof( QueryCatalogStoreReader::Impl::PointerFastHashEntry );
+    const auto keyBytes = lookupCount * sizeof( uint64_t );
+    const auto intervalOrdinalBytes = intervalCount * sizeof( uint32_t );
+    const auto resourceIdBytes = resourceCount * sizeof( uint64_t );
+    const auto resourceHashBytes = uint64_t( resourceHashCapacity ) *
+        sizeof( QueryCatalogStoreReader::Impl::ResourceFastHashEntry );
+    const auto resourceReadBytes = uint64_t( 4096 ) * sizeof( QueryCatalogResourceSummaryRecord );
     const auto cap = m_impl->options.workspace ?
         std::min<uint64_t>( 1ull << 30, m_impl->options.workspace->Snapshot().maximumBytes / 4 ) : 1ull << 30;
-    if( lookupBytes > cap || intervalBytes > cap - lookupBytes ||
-        lookupBytes + intervalBytes > UINT64_MAX - 4096 ) return false;
-    analysis::AnalysisWorkspaceReservation reservation( m_impl->options.workspace,
-        lookupBytes + intervalBytes + 4096 );
+    uint64_t totalBytes = 4096;
+    if( totalBytes > cap ) return false;
+    const auto addBytes = [&]( uint64_t bytes ) {
+        if( bytes > cap - totalBytes ) return false;
+        totalBytes += bytes;
+        return true;
+    };
+    if( !addBytes( lookupBytes ) || !addBytes( intervalBytes ) || !addBytes( hashBytes ) ||
+        !addBytes( keyBytes ) || !addBytes( intervalOrdinalBytes ) ||
+        !addBytes( resourceIdBytes ) || !addBytes( resourceHashBytes ) ||
+        !addBytes( resourceReadBytes ) ) return false;
+    analysis::AnalysisWorkspaceReservation reservation( m_impl->options.workspace, totalBytes );
     std::vector<analysis::AnalysisKeyMetadataRecord> lookup;
     std::vector<QueryCatalogResourcePointerInterval> intervals;
+    std::vector<QueryCatalogStoreReader::Impl::PointerFastHashEntry> hash;
+    std::vector<uint64_t> keys;
+    std::vector<uint32_t> intervalResourceOrdinals;
+    std::vector<uint64_t> resourceIds;
+    std::vector<QueryCatalogStoreReader::Impl::ResourceFastHashEntry> resourceHash;
     lookup.resize( size_t( lookupCount ) );
     intervals.resize( size_t( intervalCount ) );
+    hash.resize( hashCapacity );
+    keys.reserve( size_t( lookupCount ) );
+    intervalResourceOrdinals.resize( size_t( intervalCount ) );
+    resourceIds.resize( size_t( resourceCount ) );
+    resourceHash.resize( resourceHashCapacity );
     for( uint64_t ordinal = 0; ordinal < lookupCount; ordinal += 4096 )
         m_impl->pointerIntervalByPointer->Read( ordinal, lookup.data() + size_t( ordinal ),
             std::min<uint64_t>( 4096, lookupCount - ordinal ) );
     for( uint64_t ordinal = 0; ordinal < intervalCount; ordinal += 4096 )
         m_impl->resourcePointerIntervals->Read( ordinal, intervals.data() + size_t( ordinal ),
             std::min<uint64_t>( 4096, intervalCount - ordinal ) );
+    std::vector<QueryCatalogResourceSummaryRecord> resourceBuffer( 4096 );
+    uint64_t previousResourceId = 0;
+    for( uint64_t begin = 0; begin < resourceCount; begin += resourceBuffer.size() )
+    {
+        const auto count = size_t( std::min<uint64_t>( resourceBuffer.size(), resourceCount - begin ) );
+        m_impl->resourceSummaries->Read( begin, resourceBuffer.data(), count );
+        for( size_t index = 0; index < count; index++ )
+        {
+            const auto resourceId = resourceBuffer[index].latest.resourceId;
+            const auto ordinal = uint32_t( begin + index );
+            if( resourceId == 0 || ( ordinal != 0 && resourceId <= previousResourceId ) ) return false;
+            resourceIds[ordinal] = resourceId;
+            const auto mask = resourceHash.size() - 1;
+            auto slot = size_t( MixCatalogLookupKey( resourceId ) ) & mask;
+            while( resourceHash[slot].resourceId != 0 )
+            {
+                if( resourceHash[slot].resourceId == resourceId ) return false;
+                slot = ( slot + 1 ) & mask;
+            }
+            resourceHash[slot] = { resourceId, ordinal, 0 };
+            previousResourceId = resourceId;
+        }
+    }
+    for( uint32_t ordinal = 0; ordinal < intervals.size(); ordinal++ )
+    {
+        const auto resourceId = intervals[ordinal].resourceId;
+        const auto mask = resourceHash.size() - 1;
+        auto slot = size_t( MixCatalogLookupKey( resourceId ) ) & mask;
+        while( resourceHash[slot].resourceId != 0 &&
+            resourceHash[slot].resourceId != resourceId ) slot = ( slot + 1 ) & mask;
+        if( resourceHash[slot].resourceId == 0 ) return false;
+        intervalResourceOrdinals[ordinal] = resourceHash[slot].ordinal;
+    }
+    for( uint32_t begin = 0; begin < lookup.size(); )
+    {
+        const auto pointerToken = lookup[begin].keyHigh;
+        uint32_t end = begin + 1;
+        while( end < lookup.size() && lookup[end].keyHigh == pointerToken ) end++;
+        if( pointerToken == 0 ) return false;
+        const auto mask = hash.size() - 1;
+        auto slot = size_t( MixCatalogLookupKey( pointerToken ) ) & mask;
+        while( hash[slot].pointerToken != 0 )
+        {
+            if( hash[slot].pointerToken == pointerToken ) return false;
+            slot = ( slot + 1 ) & mask;
+        }
+        const auto keyOrdinal = uint32_t( keys.size() );
+        keys.emplace_back( pointerToken );
+        hash[slot] = { pointerToken, begin, end - begin, keyOrdinal, 0 };
+        begin = end;
+    }
     m_impl->pointerFastLookup.swap( lookup );
     m_impl->pointerFastIntervals.swap( intervals );
+    m_impl->pointerFastHash.swap( hash );
+    m_impl->pointerFastKeys.swap( keys );
+    m_impl->pointerFastIntervalResourceOrdinals.swap( intervalResourceOrdinals );
+    m_impl->resourceFastHash.swap( resourceHash );
+    m_impl->resourceFastIds.swap( resourceIds );
     m_impl->pointerFastWorkspace = std::move( reservation );
     m_impl->pointerFastReady = true;
     return true;
@@ -2609,6 +2734,82 @@ uint64_t QueryCatalogStoreReader::PointerResolutionFastPathBytes() const
     return m_impl->pointerFastReady ? m_impl->pointerFastWorkspace.Bytes() : 0;
 }
 
+uint64_t QueryCatalogStoreReader::PointerResolutionFastPathHashSlots() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->pointerFastReady ? m_impl->pointerFastHash.size() : 0;
+}
+
+uint64_t QueryCatalogStoreReader::PointerResolutionKeyCount() const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->pointerFastReady ? m_impl->pointerFastKeys.size() : 0;
+}
+
+std::optional<uint32_t> QueryCatalogStoreReader::FindPointerResolutionKeyOrdinal(
+    uint64_t pointerToken ) const
+{
+    if( pointerToken == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    if( !m_impl->pointerFastReady ) return std::nullopt;
+    const auto& hash = m_impl->pointerFastHash;
+    const auto mask = hash.size() - 1;
+    auto slot = size_t( MixCatalogLookupKey( pointerToken ) ) & mask;
+    while( hash[slot].pointerToken != 0 && hash[slot].pointerToken != pointerToken )
+        slot = ( slot + 1 ) & mask;
+    return hash[slot].pointerToken == pointerToken ?
+        std::optional<uint32_t>( hash[slot].keyOrdinal ) : std::nullopt;
+}
+
+uint64_t QueryCatalogStoreReader::PointerResolutionKeyAtOrdinal( uint32_t ordinal ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->pointerFastReady && ordinal < m_impl->pointerFastKeys.size() ?
+        m_impl->pointerFastKeys[ordinal] : 0;
+}
+
+std::optional<uint32_t> QueryCatalogStoreReader::ResolveResourcePointerOrdinal(
+    uint64_t pointerToken, int64_t time ) const
+{
+    if( pointerToken == 0 ) return std::nullopt;
+    std::lock_guard lock( m_impl->mutex );
+    if( !m_impl->pointerFastReady ) return std::nullopt;
+    const auto& hash = m_impl->pointerFastHash;
+    const auto mask = hash.size() - 1;
+    auto slot = size_t( MixCatalogLookupKey( pointerToken ) ) & mask;
+    while( hash[slot].pointerToken != 0 && hash[slot].pointerToken != pointerToken )
+        slot = ( slot + 1 ) & mask;
+    if( hash[slot].pointerToken == 0 ) return std::nullopt;
+    const auto begin = hash[slot].begin;
+    const auto end = uint64_t( begin ) + hash[slot].count;
+    std::optional<uint32_t> resolved;
+    for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
+    {
+        if( ( ordinal & 4095 ) == 0 &&
+            m_impl->options.cancelled && m_impl->options.cancelled() )
+            throw std::runtime_error( "Catalog pointer resolution cancelled" );
+        const auto& row = m_impl->pointerFastLookup[size_t( ordinal )];
+        if( row.keyHigh != pointerToken || row.metadata >= m_impl->pointerFastIntervals.size() ||
+            row.metadata >= m_impl->pointerFastIntervalResourceOrdinals.size() )
+            throw std::runtime_error( "Catalog pointer interval ordinal mismatch" );
+        const auto& interval = m_impl->pointerFastIntervals[size_t( row.metadata )];
+        if( interval.pointerToken != pointerToken )
+            throw std::runtime_error( "Catalog pointer interval identity mismatch" );
+        if( time < interval.begin || time > interval.end ) continue;
+        const auto resourceOrdinal = m_impl->pointerFastIntervalResourceOrdinals[size_t( row.metadata )];
+        if( resolved && *resolved != resourceOrdinal ) return std::nullopt;
+        resolved = resourceOrdinal;
+    }
+    return resolved;
+}
+
+uint64_t QueryCatalogStoreReader::FastResourceIdAtOrdinal( uint32_t ordinal ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    return m_impl->pointerFastReady && ordinal < m_impl->resourceFastIds.size() ?
+        m_impl->resourceFastIds[ordinal] : 0;
+}
+
 uint64_t QueryCatalogStoreReader::ResolveResourcePointer( uint64_t pointerToken, int64_t time ) const
 {
     if( pointerToken == 0 ) return 0;
@@ -2617,19 +2818,24 @@ uint64_t QueryCatalogStoreReader::ResolveResourcePointer( uint64_t pointerToken,
     if( m_impl->pointerFastReady )
     {
         const auto& lookup = m_impl->pointerFastLookup;
-        const auto begin = std::lower_bound( lookup.begin(), lookup.end(), pointerToken,
-            []( const analysis::AnalysisKeyMetadataRecord& row, uint64_t token ) {
-                return row.keyHigh < token;
-            } );
+        const auto& hash = m_impl->pointerFastHash;
+        const auto mask = hash.size() - 1;
+        auto slot = size_t( MixCatalogLookupKey( pointerToken ) ) & mask;
+        while( hash[slot].pointerToken != 0 && hash[slot].pointerToken != pointerToken )
+            slot = ( slot + 1 ) & mask;
+        if( hash[slot].pointerToken == 0 ) return 0;
+        const auto begin = hash[slot].begin;
+        const auto end = uint64_t( begin ) + hash[slot].count;
         uint64_t resolved = 0;
-        for( auto row = begin; row != lookup.end() && row->keyHigh == pointerToken; ++row )
+        for( uint64_t ordinal = begin; ordinal < end; ordinal++ )
         {
-            if( ( size_t( row - lookup.begin() ) & 4095 ) == 0 &&
+            if( ( ordinal & 4095 ) == 0 &&
                 m_impl->options.cancelled && m_impl->options.cancelled() )
                 throw std::runtime_error( "Catalog pointer resolution cancelled" );
-            if( row->metadata >= m_impl->pointerFastIntervals.size() )
+            const auto& row = lookup[size_t( ordinal )];
+            if( row.keyHigh != pointerToken || row.metadata >= m_impl->pointerFastIntervals.size() )
                 throw std::runtime_error( "Catalog pointer interval ordinal mismatch" );
-            const auto& interval = m_impl->pointerFastIntervals[size_t( row->metadata )];
+            const auto& interval = m_impl->pointerFastIntervals[size_t( row.metadata )];
             if( interval.pointerToken != pointerToken )
                 throw std::runtime_error( "Catalog pointer interval identity mismatch" );
             if( time < interval.begin || time > interval.end ) continue;

@@ -43,6 +43,20 @@ public:
         if( pointerToken != 100 ) return 0;
         return time <= 20 ? 200 : 201;
     }
+    uint64_t ReferenceResourceOrdinalCount() const override { return 1; }
+    std::optional<uint32_t> FindReferenceResourceOrdinal( uint64_t id ) const override
+    { return id == 100 ? std::optional<uint32_t>( 0 ) : std::nullopt; }
+    uint64_t ReferenceResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return ordinal == 0 ? 100 : 0; }
+    uint64_t CatalogResourceOrdinalCount() const override { return 2; }
+    std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t id, int64_t time ) const override
+    {
+        const auto resourceId = ResolveCatalogResource( id, time );
+        return resourceId == 200 ? std::optional<uint32_t>( 0 ) :
+            resourceId == 201 ? std::optional<uint32_t>( 1 ) : std::nullopt;
+    }
+    uint64_t CatalogResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return ordinal == 0 ? 200 : ordinal == 1 ? 201 : 0; }
 
     std::vector<tracy::JnGpuReferencePassData> passes;
     std::vector<tracy::JnGpuReferenceUseData> uses;
@@ -71,6 +85,20 @@ public:
     { return { int64_t( ordinal * 100 + 99 ), ordinal + 1, 0, 1, 32, 0, 0 }; }
     uint64_t ResolveCatalogResource( uint64_t pointerToken, int64_t time ) const override
     { return m_catalog ? m_catalog->ResolveResourcePointer( pointerToken, time ) : pointerToken; }
+    uint64_t ReferenceResourceOrdinalCount() const override { return m_resources; }
+    std::optional<uint32_t> FindReferenceResourceOrdinal( uint64_t id ) const override
+    { return id != 0 && id <= m_resources ? std::optional<uint32_t>( uint32_t( id - 1 ) ) : std::nullopt; }
+    uint64_t ReferenceResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return ordinal < m_resources ? uint64_t( ordinal ) + 1 : 0; }
+    uint64_t CatalogResourceOrdinalCount() const override { return m_resources; }
+    std::optional<uint32_t> ResolveCatalogResourceOrdinal( uint64_t id, int64_t time ) const override
+    {
+        const auto resourceId = ResolveCatalogResource( id, time );
+        return resourceId != 0 && resourceId <= m_resources ?
+            std::optional<uint32_t>( uint32_t( resourceId - 1 ) ) : std::nullopt;
+    }
+    uint64_t CatalogResourceIdAtOrdinal( uint32_t ordinal ) const override
+    { return ordinal < m_resources ? uint64_t( ordinal ) + 1 : 0; }
 
 private:
     uint64_t m_uses;
@@ -435,18 +463,17 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
         const auto buildMilliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - buildStarted ).count();
         const auto measuredStages = stages.passEventSortMs + stages.passTimePublishMs +
-            stages.usePassSortMs + stages.resolveUsesMs + stages.resourceSortMs +
+            stages.usePassSortMs + stages.usePartitionWriteMs + stages.resolveUsesMs + stages.resourceSortMs +
             stages.resourcePublishMs + stages.catalogReplayMs + stages.catalogSortMs +
+            stages.lookupPartitionPublishMs +
             stages.catalogPublishMs;
         Require( measuredStages != 0 && measuredStages <= uint64_t( buildMilliseconds ),
             "GPU reference capacity phase times do not reconcile with Build wall time" );
         Require( stages.passEventSort.inputRecords == 2 * input.PassCount() &&
-            stages.usePassSort.inputRecords == useCount &&
-            stages.resourceSort.inputRecords == useCount &&
-            stages.catalogSort.inputRecords == useCount &&
-            stages.usePassSort.initialRunWriteBytes == useCount * sizeof( AnalysisUInt64Pair ) &&
-            stages.catalogSort.initialRunWriteBytes == useCount *
-                sizeof( tracy::query::QueryGpuReferenceLookupRecord ),
+            stages.usePassSort.inputRecords == 0 &&
+            stages.usePartitionRecords == useCount && stages.usePartitionWriteMs != 0 &&
+            stages.resourceSort.inputRecords == 0 && stages.catalogSort.inputRecords == 0 &&
+            stages.lookupPartitionRecords == 2 * useCount && stages.lookupPartitionPublishMs != 0,
             "GPU reference sort telemetry lost or double-counted logical facts" );
         QueryGpuReferenceValidationStats validationStats;
         tracy::analysis::AnalysisDiskUsageSnapshot validationObserved {};
@@ -533,6 +560,14 @@ int CapacityProbe( uint64_t useCount, uint64_t resourceCount, uint64_t maximumBy
             << " pass_sort_ms=" << stages.passEventSortMs
             << " pass_publish_ms=" << stages.passTimePublishMs
             << " use_sort_ms=" << stages.usePassSortMs
+            << " use_partition_records=" << stages.usePartitionRecords
+            << " use_partition_write_ms=" << stages.usePartitionWriteMs
+            << " use_partition_read_ms=" << stages.usePartitionReadMs
+            << " use_partition_sort_ms=" << stages.usePartitionSortMs
+            << " use_resolve_emit_ms=" << stages.useResolveEmitMs
+            << " lookup_partition_records=" << stages.lookupPartitionRecords
+            << " lookup_partition_write_ms=" << stages.lookupPartitionWriteMs
+            << " lookup_partition_publish_ms=" << stages.lookupPartitionPublishMs
             << " resolve_ms=" << stages.resolveUsesMs
             << " resource_sort_ms=" << stages.resourceSortMs
             << " resource_publish_ms=" << stages.resourcePublishMs
@@ -1075,6 +1110,7 @@ int main( int argc, char** argv )
         input.uses = {
             { 30, 2, 100, 1, 5, 8, 0, 1 },
             { 10, 1, 100, 1, 3, 7, 0, 2 },
+            { 10, 1, 999, 1, 9, 0, 0, 1 },
             { 10, 1, 0, 1, 1, 0, 0, 1 },
             { 40, 999, 100, 1, 1, 0, 0, 1 }
         };
@@ -1089,7 +1125,7 @@ int main( int argc, char** argv )
         compactLookupHash.Update( compactLookupVersion.data(), compactLookupVersion.size() );
         tracy::analysis::PagedRecordReader compactLookup( root / "by-resource",
             compactLookupHash.FinalHex(), sizeof( tracy::analysis::AnalysisKeyMetadataRecord ) );
-        Require( compactLookup.Count() == 2,
+        Require( compactLookup.Count() == 3,
             "GPU reference compact Resource lookup count changed" );
         tracy::query::QueryGpuReferenceStoreReader reader( root, identity );
         reader.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
@@ -1105,8 +1141,8 @@ int main( int argc, char** argv )
             second.values[0].passStart == 10 && second.values[0].passEnd == 20 &&
             second.values[0].encoding == 2,
             "GPU reference continuation or open pass boundary changed" );
-        Require( reader.UsesByResource( 999, 0, 10 ).total == 0,
-            "GPU reference missing resource behavior changed" );
+        Require( reader.UsesByResource( 999, 0, 10 ).total == 1,
+            "GPU reference unknown Pointer fallback behavior changed" );
         const auto catalog200 = reader.UsesByCatalogResource( 200, 0, 10 );
         const auto catalog201 = reader.UsesByCatalogResource( 201, 0, 10 );
         Require( catalog200.total == 1 && catalog200.values.size() == 1 &&
@@ -1116,7 +1152,7 @@ int main( int argc, char** argv )
             "GPU reference Catalog resource lifetime resolution changed" );
         const auto pass1 = reader.UsesByPass( 1, 0, 10 );
         const auto pass2 = reader.UsesByPass( 2, 0, 10 );
-        Require( pass1.total == 1 && pass1.values.size() == 1 && pass1.values[0].passId == 1 &&
+        Require( pass1.total == 2 && pass1.values.size() == 2 && pass1.values[0].passId == 1 &&
             pass2.total == 1 && pass2.values.size() == 1 && pass2.values[0].passId == 2 &&
             reader.UsesByPass( 999, 0, 10 ).total == 0,
             "GPU reference pass paging changed" );
