@@ -1247,6 +1247,48 @@ std::vector<analysis::JobDto> QueryJobStoreReader::GetDirectedJobs( uint64_t job
     return result;
 }
 
+std::vector<analysis::JobDto> QueryJobStoreReader::GetDirectedJobsBounded( uint64_t jobId,
+    size_t limit, bool& limitExceeded, const std::function<void()>& check ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    CheckCancelled( m_impl->options );
+    if( check ) check();
+    limitExceeded = false;
+    std::set<uint64_t> selected;
+    const auto select = [&]( uint64_t id ) {
+        if( selected.contains( id ) ) return true;
+        if( selected.size() >= limit ) { limitExceeded = true; return false; }
+        selected.emplace( id );
+        return true;
+    };
+    if( !select( jobId ) ) return {};
+    const auto found = m_impl->FindJob( jobId );
+    if( !found ) return {};
+    const auto job = m_impl->BuildJob( found->first, found->second, check );
+    for( const auto& dependency : job.dependencies )
+        if( dependency.prerequisiteJobId != 0 && !select( dependency.prerequisiteJobId ) ) break;
+    if( !limitExceeded )
+    {
+        if( const auto span = FindSpan( m_impl->reverseSpans, jobId ) )
+            for( uint64_t index = 0; index < span->count; index++ )
+            {
+                if( check ) check();
+                analysis::AnalysisUInt64Pair pair;
+                m_impl->reverseRecords.Read( span->first + index, &pair, 1 );
+                if( !select( pair.value ) ) break;
+            }
+    }
+    std::vector<analysis::JobDto> result;
+    result.reserve( selected.size() );
+    for( const auto id : selected )
+    {
+        if( check ) check();
+        if( const auto value = m_impl->FindJob( id ) )
+            result.emplace_back( m_impl->BuildJob( value->first, value->second, check ) );
+    }
+    return result;
+}
+
 std::vector<analysis::JobDto> QueryJobStoreReader::GetEvidenceJobs( uint64_t frameId,
     const std::function<void()>& check ) const
 {
@@ -1269,6 +1311,30 @@ std::vector<analysis::JobDto> QueryJobStoreReader::GetEvidenceJobs( uint64_t fra
     }
     std::vector<analysis::JobDto> result;
     for( const auto id : selected ) if( const auto value = m_impl->FindJob( id ) ) result.emplace_back( m_impl->BuildJob( value->first, value->second, check ) );
+    return result;
+}
+
+std::vector<analysis::JobDto> QueryJobStoreReader::GetJobsByOriginFrame( uint64_t frameId,
+    size_t limit, bool& limitExceeded, const std::function<void()>& check ) const
+{
+    std::lock_guard lock( m_impl->mutex );
+    CheckCancelled( m_impl->options );
+    if( check ) check();
+    limitExceeded = false;
+    std::vector<analysis::JobDto> result;
+    const auto span = FindSpan( m_impl->evidenceSpans, frameId );
+    if( !span ) return result;
+    const auto take = std::min<uint64_t>( span->count, limit );
+    limitExceeded = take < span->count;
+    result.reserve( size_t( take ) );
+    for( uint64_t index = 0; index < take; index++ )
+    {
+        if( check ) check();
+        analysis::AnalysisUInt64Pair pair;
+        m_impl->evidenceRecords.Read( span->first + index, &pair, 1 );
+        if( const auto value = m_impl->FindJob( pair.value ) )
+            result.emplace_back( m_impl->BuildJob( value->first, value->second, check ) );
+    }
     return result;
 }
 

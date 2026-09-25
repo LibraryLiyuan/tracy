@@ -2,6 +2,7 @@
 #define __TRACYQUERYCORRELATIONSTORE_HPP__
 
 #include "TracyPagedRecordStore.hpp"
+#include "TracyTraceSource.hpp"
 
 #include <array>
 #include <cstdint>
@@ -46,6 +47,7 @@ struct QueryCorrelationBuildStatistics
     uint64_t partitionCount = 0;
     uint64_t temporaryBytes = 0;
     uint64_t peakPartitionRecords = 0;
+    uint64_t explicitPasses = 0;
     std::array<uint64_t, size_t( QueryCorrelationEndpointTag::Count )> tagCounts {};
 };
 
@@ -72,12 +74,26 @@ struct QueryCorrelationReadControl
     std::function<size_t( size_t )> allowance;
     std::function<void( size_t, size_t, size_t )> scanned;
     size_t maximumEdges = 200000;
+    size_t maximumNodes = 100000;
+};
+
+struct QueryIndexedGfxEvidence
+{
+    analysis::GfxEvidenceSlice value;
+    bool edgeLimitExceeded = false;
+    bool nodeLimitExceeded = false;
 };
 
 class QueryCorrelationSource
 {
 public:
     virtual ~QueryCorrelationSource() = default;
+    virtual std::vector<analysis::CorrelatedFrameEventDto> GetIndexedFrameEvents(
+        uint64_t frameId, const QueryCorrelationReadControl& control ) const = 0;
+    virtual QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds, const QueryCorrelationReadControl& control ) const = 0;
+    virtual QueryIndexedGfxEvidence GetIndexedExplicitGpuPassEvidence(
+        const QueryCorrelationReadControl& control ) const = 0;
     virtual QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors(
         const std::string& ref, const QueryCorrelationReadControl& control ) const = 0;
 };
@@ -94,6 +110,7 @@ public:
     QueryCorrelationStoreWriter& operator=( const QueryCorrelationStoreWriter& ) = delete;
 
     void Append( uint64_t nodeId, QueryCorrelationEndpointTag tag, uint64_t ordinal );
+    void AppendExplicitPass( uint64_t entityOrdinal );
     QueryCorrelationBuildStatistics Commit();
 
 private:
@@ -112,6 +129,8 @@ public:
 
     uint64_t Count() const;
     uint64_t BucketCount() const;
+    uint64_t ExplicitPassCount() const;
+    std::vector<uint64_t> ReadExplicitPassOrdinals( uint64_t offset, size_t limit ) const;
     uint64_t CandidateCount( uint64_t nodeId ) const;
     QueryCorrelationCandidatePage ReadCandidates( uint64_t nodeId, uint64_t offset, size_t limit ) const;
     void ValidateAll();

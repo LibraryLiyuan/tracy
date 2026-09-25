@@ -179,6 +179,47 @@ public:
     { ++reads["io"]; return FakeTraceSource::GetIoRequests(); }
     analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frame, const std::vector<uint64_t>& seeds ) const override
     { ++reads["gfx"]; return FakeTraceSource::GetEvidenceGfx( frame, seeds ); }
+    std::vector<analysis::CorrelatedFrameEventDto> GetIndexedFrameEvents( uint64_t frameId,
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_frame_events"];
+        auto values = FakeTraceSource::GetCorrelatedFrameEvents();
+        std::erase_if( values, [&]( const auto& value ) { return value.frameId != frameId; } );
+        const auto requested = values.size();
+        const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+        if( allowed == 0 && !values.empty() ) throw std::runtime_error( "indexed Frame scan budget exhausted" );
+        if( values.size() > allowed ) values.resize( allowed );
+        if( control.scanned ) control.scanned( values.size(), requested, allowed );
+        return values;
+    }
+    query::QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
+        const std::vector<uint64_t>& seeds, const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_gfx_evidence"];
+        if( control.check ) control.check();
+        if( duringGfxRead ) duringGfxRead();
+        query::QueryIndexedGfxEvidence result;
+        result.value = FakeTraceSource::GetEvidenceGfx( frameId, seeds );
+        const auto rows = result.value.dispatches.size() + result.value.entities.size() + result.value.links.size();
+        const auto allowed = control.allowance ? control.allowance( rows ) : rows;
+        if( allowed < rows ) throw std::runtime_error( "indexed Gfx evidence scan budget exhausted" );
+        if( control.scanned ) control.scanned( rows, rows, allowed );
+        return result;
+    }
+    query::QueryIndexedGfxEvidence GetIndexedExplicitGpuPassEvidence(
+        const query::QueryCorrelationReadControl& control ) const override
+    {
+        ++reads["indexed_explicit_pass"];
+        if( control.check ) control.check();
+        query::QueryIndexedGfxEvidence result;
+        result.value.entities = FakeTraceSource::GetGfxEntities();
+        result.value.links = FakeTraceSource::GetGfxLinks();
+        const auto rows = result.value.entities.size() + result.value.links.size();
+        const auto allowed = control.allowance ? control.allowance( rows ) : rows;
+        if( allowed < rows ) throw std::runtime_error( "indexed explicit Pass scan budget exhausted" );
+        if( control.scanned ) control.scanned( rows, rows, allowed );
+        return result;
+    }
     query::QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
         const query::QueryCorrelationReadControl& control ) const override
     {
@@ -248,6 +289,8 @@ int main()
         // exact Job subgraph as a differential oracle, not its incidental IDs.
         const auto full = request(json::array());
         Require(full.at("ok"), "all-domain evidence failed");
+        Require( observed->reads["indexed_gfx_evidence"] == 1,
+            "evidence graph ignored the indexed Gfx frontier backend" );
         observed->reads.clear();
         const auto result = request(json::array({"frame", "job", "wait"}));
         Require(result.at("ok"), "job evidence failed");
@@ -287,6 +330,20 @@ int main()
             else Require(!directed.at("data").at("jobs").empty(), "frame Job list missing");
         }
         Require(failures == 0, "directed Job queries must select before materialization");
+        observed->reads.clear();
+        const auto indexedFrame = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 19},
+            {"method", "frame.identity"}, {"params", {{"trace_id", opened.id},
+                {"ref", "fake:frame-identity:281474976710657"}, {"max_scan_events", 100}}}} );
+        Require( indexedFrame.at("ok") && observed->reads["indexed_frame_events"] == 1 &&
+            observed->reads["all_frame_events"] == 0 && observed->reads["frame_events_page"] == 0,
+            "Frame identity point lookup ignored the indexed Frame backend" );
+        observed->reads.clear();
+        const auto indexedPasses = service.Execute( {{"protocol", "tracy-query/1"}, {"id", 191},
+            {"method", "gpu.pass.search"}, {"params", {{"trace_id", opened.id}, {"limit", 10},
+                {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}}}} );
+        Require( indexedPasses.at("ok") && observed->reads["indexed_explicit_pass"] == 1 &&
+            observed->reads["all_gfx_Entities"] == 0 && observed->reads["all_gfx_Links"] == 0,
+            "Explicit GPU Pass search ignored the indexed Pass directory" );
         for( const auto* method : { "entity.related", "correlation.chain" } )
         {
             observed->reads.clear();

@@ -62,9 +62,12 @@ int main( int argc, char** argv )
         {
             query::QueryCorrelationStoreWriter writer( root, fingerprint, count, options );
             for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+            {
                 writer.Append( ordinal * multiplier,
                     query::QueryCorrelationEndpointTag( ordinal %
                         uint8_t( query::QueryCorrelationEndpointTag::Count ) ), ordinal );
+                if( ordinal % 5 == 0 ) writer.AppendExplicitPass( ordinal );
+            }
             statistics = writer.Commit();
         }
         const auto buildMs = Milliseconds( buildStarted );
@@ -104,6 +107,7 @@ int main( int argc, char** argv )
             { "partition_count", statistics.partitionCount },
             { "temporary_logical_bytes", statistics.temporaryBytes },
             { "peak_partition_records", statistics.peakPartitionRecords },
+            { "explicit_passes", statistics.explicitPasses },
             { "final_physical_bytes", finalBytes },
             { "disk_peak_bytes", afterBuild.peakBytes },
             { "workspace_peak_bytes", workspaceSnapshot.peakBytes },

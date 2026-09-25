@@ -67,11 +67,14 @@ int main()
             writer.Append( collidingLeft, query::QueryCorrelationEndpointTag::EntityParent, 11 );
             writer.Append( collidingRight, query::QueryCorrelationEndpointTag::LinkTarget, 9 );
             writer.Append( 999, query::QueryCorrelationEndpointTag::FrameEvent, ( uint64_t( 1 ) << 60 ) + 3 );
+            writer.AppendExplicitPass( 3 );
+            writer.AppendExplicitPass( 9 );
             statistics = writer.Commit();
         }
         Require( statistics.records == 5 && statistics.bucketCount == 16 &&
             statistics.partitionCount <= statistics.bucketCount,
             "correlation build statistics changed" );
+        Require( statistics.explicitPasses == 2, "explicit Pass build count changed" );
         Require( statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::LinkSource )] == 2 &&
             statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::EntityParent )] == 1 &&
             statistics.tagCounts[size_t( query::QueryCorrelationEndpointTag::LinkTarget )] == 1 &&
@@ -83,6 +86,9 @@ int main()
         {
             query::QueryCorrelationStoreReader reader( store, fingerprint, Options( disk, workspace ) );
             reader.ValidateAll();
+            Require( reader.ExplicitPassCount() == 2 &&
+                reader.ReadExplicitPassOrdinals( 0, 10 ) == std::vector<uint64_t>{ 3, 9 },
+                "explicit Pass ordinal directory changed" );
             const auto first = reader.ReadCandidates( collidingLeft, 0, 10 );
             Require( first.total == 4 && first.values.size() == 4 && !first.hasMore,
                 "collision bucket candidate count changed" );

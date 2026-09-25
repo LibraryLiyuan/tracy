@@ -2240,6 +2240,244 @@ public:
         }
         return result;
     }
+    std::vector<analysis::CorrelatedFrameEventDto> GetIndexedFrameEvents( uint64_t frameId,
+        const QueryCorrelationReadControl& control ) const override
+    {
+        std::vector<analysis::CorrelatedFrameEventDto> result;
+        const auto total = m_correlations.CandidateCount( frameId );
+        for( uint64_t offset = 0; offset < total; )
+        {
+            if( control.check ) control.check();
+            const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+            const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+            if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+            const auto page = m_correlations.ReadCandidates( frameId, offset, allowed );
+            if( control.check ) control.check();
+            if( page.values.empty() || page.values.size() > allowed )
+                throw std::runtime_error( "query_correlation_candidate_page" );
+            if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+            for( const auto& candidate : page.values )
+            {
+                if( candidate.tag != QueryCorrelationEndpointTag::FrameEvent ) continue;
+                const auto values = m_jobs.ScanCorrelatedFrameEvents( size_t( candidate.ordinal ), 1 );
+                if( values.size() == 1 && values.front().frameId == frameId )
+                    result.emplace_back( std::move( values.front() ) );
+            }
+            offset += page.values.size();
+        }
+        return result;
+    }
+    QueryIndexedGfxEvidence GetIndexedGfxEvidence( uint64_t frameId,
+        const std::vector<uint64_t>& seedIds, const QueryCorrelationReadControl& control ) const override
+    {
+        QueryIndexedGfxEvidence result;
+        const auto check = [&] { if( control.check ) control.check(); };
+        const auto visitCandidates = [&]( uint64_t nodeId, const auto& visitor ) {
+            const auto total = m_correlations.CandidateCount( nodeId );
+            for( uint64_t offset = 0; offset < total; )
+            {
+                check();
+                const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+                if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+                const auto page = m_correlations.ReadCandidates( nodeId, offset, allowed );
+                check();
+                if( page.values.empty() || page.values.size() > allowed )
+                    throw std::runtime_error( "query_correlation_candidate_page" );
+                if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+                for( const auto& candidate : page.values ) visitor( candidate );
+                offset += page.values.size();
+            }
+        };
+        std::unordered_set<uint64_t> reachable;
+        std::queue<uint64_t> pending;
+        const auto enqueue = [&]( uint64_t value ) {
+            if( reachable.contains( value ) ) return true;
+            if( reachable.size() >= control.maximumNodes )
+            { result.nodeLimitExceeded = true; return false; }
+            reachable.emplace( value ); pending.push( value ); return true;
+        };
+        for( const auto value : seedIds ) if( !enqueue( value ) ) return result;
+        using OrderedDispatch = std::pair<uint64_t, analysis::GfxDispatchDto>;
+        using OrderedEntity = std::pair<uint64_t, analysis::GfxEntityDto>;
+        using OrderedLink = std::pair<uint64_t, analysis::GfxLinkDto>;
+        std::vector<OrderedDispatch> dispatches;
+        std::vector<OrderedEntity> entities;
+        std::vector<OrderedLink> links;
+        std::unordered_set<uint64_t> seenDispatches, seenEntities, seenLinks;
+        const auto canAppend = [&] {
+            if( dispatches.size() + entities.size() + links.size() >= control.maximumEdges )
+            { result.edgeLimitExceeded = true; return false; }
+            return true;
+        };
+        visitCandidates( frameId, [&]( const QueryCorrelationCandidate& candidate ) {
+            if( result.edgeLimitExceeded || result.nodeLimitExceeded ) return;
+            if( candidate.tag == QueryCorrelationEndpointTag::DispatchFrame )
+            {
+                const auto values = m_jobs.ScanGfxDispatches( size_t( candidate.ordinal ), 1 );
+                if( values.size() == 1 && values.front().frameIndex == frameId &&
+                    seenDispatches.emplace( candidate.ordinal ).second )
+                {
+                    if( !canAppend() || !enqueue( values.front().dispatchId ) ) return;
+                    dispatches.emplace_back( candidate.ordinal, values.front() );
+                }
+            }
+            else if( candidate.tag == QueryCorrelationEndpointTag::LinkTarget &&
+                candidate.ordinal < m_gfxLinks.Count() )
+            {
+                const auto& link = m_gfxLinks.At<JnGfxLinkData>( candidate.ordinal );
+                if( link.relation == uint8_t( JnGfxRelation::BelongsToFrame ) && link.targetId == frameId )
+                    enqueue( link.sourceId );
+            }
+        } );
+        while( !pending.empty() && !result.edgeLimitExceeded && !result.nodeLimitExceeded )
+        {
+            check();
+            const auto current = pending.front(); pending.pop();
+            visitCandidates( current, [&]( const QueryCorrelationCandidate& candidate ) {
+                if( result.edgeLimitExceeded || result.nodeLimitExceeded ) return;
+                if( candidate.tag == QueryCorrelationEndpointTag::EntitySelf &&
+                    candidate.ordinal < m_gfxEntities.Count() )
+                {
+                    const auto& entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                    if( entity.entityId == current && seenEntities.emplace( candidate.ordinal ).second )
+                    {
+                        if( !canAppend() ) return;
+                        entities.emplace_back( candidate.ordinal, analysis::GfxEntityDto {
+                            MakeEntityRef( "gfx-entity", entity.entityId ), entity.entityId, entity.parentId,
+                            entity.time, MakeEntityRef( "thread", entity.thread ), entity.gpuQueryId,
+                            entity.gpuContext, entity.kind, entity.flags } );
+                    }
+                }
+                else if( candidate.tag == QueryCorrelationEndpointTag::EntityParent &&
+                    candidate.ordinal < m_gfxEntities.Count() )
+                {
+                    const auto& entity = m_gfxEntities.At<JnGfxEntityData>( candidate.ordinal );
+                    if( entity.parentId == current ) enqueue( entity.entityId );
+                }
+                else if( candidate.tag == QueryCorrelationEndpointTag::LinkSource &&
+                    candidate.ordinal < m_gfxLinks.Count() )
+                {
+                    const auto& link = m_gfxLinks.At<JnGfxLinkData>( candidate.ordinal );
+                    if( link.sourceId == current && seenLinks.emplace( candidate.ordinal ).second )
+                    {
+                        if( !canAppend() || !enqueue( link.targetId ) ) return;
+                        links.emplace_back( candidate.ordinal, analysis::GfxLinkDto {
+                            MakeEntityRef( "gfx-link", candidate.ordinal ), link.sourceId, link.targetId,
+                            link.time, MakeEntityRef( "thread", link.thread ), link.relation, link.flags } );
+                    }
+                }
+            } );
+        }
+        const auto ordinalOrder = []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; };
+        std::sort( dispatches.begin(), dispatches.end(), ordinalOrder );
+        std::sort( entities.begin(), entities.end(), ordinalOrder );
+        std::sort( links.begin(), links.end(), ordinalOrder );
+        result.value.dispatches.reserve( dispatches.size() );
+        result.value.entities.reserve( entities.size() );
+        result.value.links.reserve( links.size() );
+        for( auto& value : dispatches ) result.value.dispatches.emplace_back( std::move( value.second ) );
+        for( auto& value : entities ) result.value.entities.emplace_back( std::move( value.second ) );
+        for( auto& value : links ) result.value.links.emplace_back( std::move( value.second ) );
+        return result;
+    }
+    QueryIndexedGfxEvidence GetIndexedExplicitGpuPassEvidence(
+        const QueryCorrelationReadControl& control ) const override
+    {
+        QueryIndexedGfxEvidence result;
+        const auto check = [&] { if( control.check ) control.check(); };
+        const auto visitCandidates = [&]( uint64_t nodeId, const auto& visitor ) {
+            const auto total = m_correlations.CandidateCount( nodeId );
+            for( uint64_t offset = 0; offset < total; )
+            {
+                check();
+                const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+                const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+                if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+                const auto page = m_correlations.ReadCandidates( nodeId, offset, allowed );
+                check();
+                if( page.values.empty() || page.values.size() > allowed )
+                    throw std::runtime_error( "query_correlation_candidate_page" );
+                if( control.scanned ) control.scanned( page.values.size(), requested, allowed );
+                for( const auto& candidate : page.values ) visitor( candidate );
+                offset += page.values.size();
+            }
+        };
+        using OrderedEntity = std::pair<uint64_t, analysis::GfxEntityDto>;
+        using OrderedLink = std::pair<uint64_t, analysis::GfxLinkDto>;
+        std::vector<OrderedEntity> entities;
+        std::vector<OrderedLink> links;
+        std::unordered_set<uint64_t> seenEntities, seenLinks, passIds;
+        const auto canAppend = [&] {
+            if( entities.size() + links.size() >= control.maximumEdges )
+            { result.edgeLimitExceeded = true; return false; }
+            return true;
+        };
+        const auto appendEntity = [&]( uint64_t ordinal ) {
+            if( ordinal >= m_gfxEntities.Count() || seenEntities.contains( ordinal ) ) return;
+            const auto& entity = m_gfxEntities.At<JnGfxEntityData>( ordinal );
+            if( !canAppend() ) return;
+            seenEntities.emplace( ordinal );
+            entities.emplace_back( ordinal, analysis::GfxEntityDto {
+                MakeEntityRef( "gfx-entity", entity.entityId ), entity.entityId, entity.parentId,
+                entity.time, MakeEntityRef( "thread", entity.thread ), entity.gpuQueryId,
+                entity.gpuContext, entity.kind, entity.flags } );
+        };
+        const auto total = m_correlations.ExplicitPassCount();
+        for( uint64_t offset = 0; offset < total && !result.edgeLimitExceeded && !result.nodeLimitExceeded; )
+        {
+            check();
+            const auto requested = size_t( std::min<uint64_t>( 256, total - offset ) );
+            const auto allowed = control.allowance ? control.allowance( requested ) : requested;
+            if( allowed == 0 ) throw std::runtime_error( "query_correlation_scan_budget" );
+            const auto page = m_correlations.ReadExplicitPassOrdinals( offset, allowed );
+            if( page.empty() || page.size() > allowed )
+                throw std::runtime_error( "query_correlation_explicit_pass_page" );
+            if( control.scanned ) control.scanned( page.size(), requested, allowed );
+            for( const auto ordinal : page )
+            {
+                if( ordinal >= m_gfxEntities.Count() )
+                    throw std::runtime_error( "query_correlation_explicit_pass_ordinal" );
+                const auto& pass = m_gfxEntities.At<JnGfxEntityData>( ordinal );
+                if( pass.kind != uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+                    throw std::runtime_error( "query_correlation_explicit_pass_kind" );
+                if( !passIds.contains( pass.entityId ) && passIds.size() >= control.maximumNodes )
+                { result.nodeLimitExceeded = true; break; }
+                passIds.emplace( pass.entityId );
+                appendEntity( ordinal );
+                if( result.edgeLimitExceeded ) break;
+                visitCandidates( pass.entityId, [&]( const QueryCorrelationCandidate& candidate ) {
+                    if( result.edgeLimitExceeded ) return;
+                    if( candidate.tag != QueryCorrelationEndpointTag::LinkSource ||
+                        candidate.ordinal >= m_gfxLinks.Count() || seenLinks.contains( candidate.ordinal ) ) return;
+                    const auto& link = m_gfxLinks.At<JnGfxLinkData>( candidate.ordinal );
+                    if( link.sourceId != pass.entityId ) return;
+                    if( !canAppend() ) return;
+                    seenLinks.emplace( candidate.ordinal );
+                    links.emplace_back( candidate.ordinal, analysis::GfxLinkDto {
+                        MakeEntityRef( "gfx-link", candidate.ordinal ), link.sourceId, link.targetId,
+                        link.time, MakeEntityRef( "thread", link.thread ), link.relation, link.flags } );
+                    if( link.relation == uint8_t( JnGfxRelation::RunsOnGpu ) )
+                        visitCandidates( link.targetId, [&]( const QueryCorrelationCandidate& target ) {
+                            if( target.tag != QueryCorrelationEndpointTag::EntitySelf ||
+                                target.ordinal >= m_gfxEntities.Count() ) return;
+                            const auto& entity = m_gfxEntities.At<JnGfxEntityData>( target.ordinal );
+                            if( entity.entityId == link.targetId &&
+                                entity.kind == uint8_t( JnGfxEntityKind::GpuSegment ) ) appendEntity( target.ordinal );
+                        } );
+                } );
+            }
+            offset += page.size();
+        }
+        const auto ordinalOrder = []( const auto& lhs, const auto& rhs ) { return lhs.first < rhs.first; };
+        std::sort( entities.begin(), entities.end(), ordinalOrder );
+        std::sort( links.begin(), links.end(), ordinalOrder );
+        result.value.entities.reserve( entities.size() );
+        result.value.links.reserve( links.size() );
+        for( auto& value : entities ) result.value.entities.emplace_back( std::move( value.second ) );
+        for( auto& value : links ) result.value.links.emplace_back( std::move( value.second ) );
+        return result;
+    }
     QueryCorrelationNeighborhood GetIndexedCorrelationNeighbors( const std::string& ref,
         const QueryCorrelationReadControl& control ) const override
     {
@@ -2308,7 +2546,10 @@ public:
 
         if( rootKind == RootKind::Job )
         {
-            const auto jobs = m_jobs.GetDirectedJobs( *rootId, true, control.check );
+            bool limitExceeded = false;
+            const auto jobs = m_jobs.GetDirectedJobsBounded(
+                *rootId, control.maximumEdges, limitExceeded, control.check );
+            result.edgeLimitExceeded |= limitExceeded;
             for( const auto& job : jobs )
             {
                 if( job.jobId == *rootId )
@@ -2326,7 +2567,10 @@ public:
         }
         else if( rootKind == RootKind::Frame )
         {
-            const auto jobs = m_jobs.GetEvidenceJobs( *rootId, control.check );
+            bool limitExceeded = false;
+            const auto jobs = m_jobs.GetJobsByOriginFrame(
+                *rootId, control.maximumEdges, limitExceeded, control.check );
+            result.edgeLimitExceeded |= limitExceeded;
             for( const auto& job : jobs ) if( job.originFrameId == *rootId )
             {
                 result.known = true;
@@ -2411,48 +2655,13 @@ public:
     analysis::GfxEvidenceSlice GetEvidenceGfx( uint64_t frameId,
         const std::vector<uint64_t>& seedIds ) const override
     {
-        analysis::GfxEvidenceSlice result;
-        std::unordered_set<uint64_t> reachable( seedIds.begin(), seedIds.end() );
-        for( const auto& dispatch : m_source->GetGfxDispatches() ) if( dispatch.frameIndex == frameId )
-        {
-            result.dispatches.emplace_back( dispatch );
-            reachable.emplace( dispatch.dispatchId );
-        }
-        for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
-        {
-            const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
-            if( value.relation == 8 && value.targetId == frameId ) reachable.emplace( value.sourceId );
-        }
-        bool changed = true;
-        while( changed )
-        {
-            changed = false;
-            for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
-            {
-                const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
-                if( value.parentId != 0 && reachable.contains( value.parentId ) ) changed |= reachable.emplace( value.entityId ).second;
-            }
-            for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
-            {
-                const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
-                if( reachable.contains( value.sourceId ) ) changed |= reachable.emplace( value.targetId ).second;
-            }
-        }
-        for( uint64_t index = 0; index < m_gfxEntities.Count(); index++ )
-        {
-            const auto& value = m_gfxEntities.At<JnGfxEntityData>( index );
-            if( !reachable.contains( value.entityId ) ) continue;
-            result.entities.push_back( { MakeEntityRef( "gfx-entity", value.entityId ), value.entityId, value.parentId, value.time,
-                MakeEntityRef( "thread", value.thread ), value.gpuQueryId, value.gpuContext, value.kind, value.flags } );
-        }
-        for( uint64_t index = 0; index < m_gfxLinks.Count(); index++ )
-        {
-            const auto& value = m_gfxLinks.At<JnGfxLinkData>( index );
-            if( !reachable.contains( value.sourceId ) ) continue;
-            result.links.push_back( { MakeEntityRef( "gfx-link", index ), value.sourceId, value.targetId, value.time,
-                MakeEntityRef( "thread", value.thread ), value.relation, value.flags } );
-        }
-        return result;
+        QueryCorrelationReadControl control;
+        control.maximumEdges = 200000;
+        control.maximumNodes = 100000;
+        auto result = GetIndexedGfxEvidence( frameId, seedIds, control );
+        if( result.edgeLimitExceeded || result.nodeLimitExceeded )
+            throw std::runtime_error( "workspace_budget: indexed Gfx evidence exceeds direct TraceSource limits" );
+        return std::move( result.value );
     }
     std::vector<analysis::CorrelatedFrameEventDto> GetCorrelatedFrameEvents() const override { return m_jobs.GetCorrelatedFrameEvents(); }
     uint64_t GetCorrelatedFrameEventCount() const override { return m_jobs.GetCorrelatedFrameEventCount(); }
@@ -3945,6 +4154,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 }
             }
             uint64_t parentCount = 0;
+            uint64_t explicitPassCount = 0;
             for( uint64_t ordinal = 0; ordinal < entities.Count(); ordinal++ )
             {
                 if( ( ordinal & 0xfffff ) == 0 )
@@ -3955,6 +4165,11 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 }
                 const auto& entity = entities.At<JnGfxEntityData>( ordinal );
                 correlations.Append( entity.entityId, QueryCorrelationEndpointTag::EntitySelf, ordinal );
+                if( entity.kind == uint8_t( JnGfxEntityKind::ExplicitGpuPass ) )
+                {
+                    correlations.AppendExplicitPass( ordinal );
+                    explicitPassCount++;
+                }
                 if( entity.parentId != 0 )
                 {
                     correlations.Append( entity.parentId, QueryCorrelationEndpointTag::EntityParent, ordinal );
@@ -3981,7 +4196,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 tag( QueryCorrelationEndpointTag::EntitySelf ) != entities.Count() ||
                 tag( QueryCorrelationEndpointTag::EntityParent ) != parentCount ||
                 tag( QueryCorrelationEndpointTag::LinkSource ) != links.Count() ||
-                tag( QueryCorrelationEndpointTag::LinkTarget ) != links.Count() )
+                tag( QueryCorrelationEndpointTag::LinkTarget ) != links.Count() ||
+                stats.explicitPasses != explicitPassCount )
                 throw std::runtime_error( "Correlation endpoint tag count mismatch" );
             QueryCorrelationStoreReader check(
                 temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )] / "correlation",

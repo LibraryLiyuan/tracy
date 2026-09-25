@@ -3053,6 +3053,35 @@ ExplicitGpuPassSet BuildExplicitGpuPassSet( const analysis::TraceSource& source,
     const std::vector<analysis::GfxLinkDto>* linkOverride = nullptr )
 {
     ExplicitGpuPassSet result;
+    std::optional<QueryIndexedGfxEvidence> indexedEvidence;
+    if( !entityOverride && !linkOverride )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( &source ) )
+        {
+            QueryCorrelationReadControl control;
+            control.check = [] { if( ActiveBudget ) ActiveBudget->CheckCancelled(); };
+            control.allowance = []( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Explicit GPU Pass index scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = []( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            if( ActiveBudget )
+            {
+                control.maximumEdges = size_t( ActiveBudget->maxEdges );
+                control.maximumNodes = size_t( ActiveBudget->maxNodes );
+            }
+            indexedEvidence = indexed->GetIndexedExplicitGpuPassEvidence( control );
+            if( indexedEvidence->edgeLimitExceeded || indexedEvidence->nodeLimitExceeded )
+                throw QueryError( "RESOURCE_LIMIT", indexedEvidence->edgeLimitExceeded ?
+                    "Explicit GPU Pass edge budget exhausted" : "Explicit GPU Pass node budget exhausted", true );
+            entityOverride = &indexedEvidence->value.entities;
+            linkOverride = &indexedEvidence->value.links;
+        }
+    }
     std::vector<uint32_t> taxonomyIds;
     if( taxonomy.contains( "definitions" ) && taxonomy["definitions"].is_array() )
     {
@@ -10256,7 +10285,34 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         std::vector<uint64_t> gfxSeeds;
         gfxSeeds.reserve( selectedJobIds.size() );
         for( const auto jobId : selectedJobIds ) gfxSeeds.emplace_back( jobId );
-        const auto gfxEvidence = readGfx ? source->GetEvidenceGfx( frameId, gfxSeeds ) : analysis::GfxEvidenceSlice{};
+        analysis::GfxEvidenceSlice gfxEvidence;
+        if( readGfx )
+        {
+            if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+            {
+                QueryCorrelationReadControl control;
+                control.check = checkDirectedJobRead;
+                control.allowance = [&]( size_t requested ) {
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Gfx evidence index scan budget exhausted", true );
+                    return allowed;
+                };
+                control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                    BudgetScanned( actual, requested, allowed );
+                };
+                control.maximumEdges = size_t( UnsignedParameter(
+                    params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+                control.maximumNodes = size_t( UnsignedParameter(
+                    params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) );
+                auto bounded = indexed->GetIndexedGfxEvidence( frameId, gfxSeeds, control );
+                if( bounded.edgeLimitExceeded || bounded.nodeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", bounded.edgeLimitExceeded ?
+                        "Gfx evidence edge budget exhausted" : "Gfx evidence node budget exhausted", true );
+                gfxEvidence = std::move( bounded.value );
+            }
+            else gfxEvidence = source->GetEvidenceGfx( frameId, gfxSeeds );
+        }
         const auto& dispatches = gfxEvidence.dispatches;
         const auto& entities = gfxEvidence.entities;
         const auto& gfxLinks = gfxEvidence.links;
@@ -10651,6 +10707,69 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         result["conclusion_contract"] = "all conclusions must cite returned node/edge refs; absent domains are not real zero";
         return Success( id, std::move( result ), trace );
     }
+    if( method == "frame.identity" && ( params.contains( "ref" ) || params.contains( "frame_id" ) ) )
+    {
+        if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+        {
+            uint64_t frameId = 0;
+            if( params.contains( "ref" ) )
+            {
+                if( !params["ref"].is_string() )
+                    throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref" );
+                const auto parsed = source->ParseEntityRef( params["ref"].get<std::string>(), "frame-identity" );
+                if( !parsed ) throw QueryError( "INVALID_PARAMS", "ref must be a FrameIdentity ref from this trace" );
+                frameId = *parsed;
+            }
+            else frameId = UnsignedParameter( params, "frame_id", 0, std::numeric_limits<uint64_t>::max() );
+            QueryCorrelationReadControl control;
+            control.check = checkDirectedJobRead;
+            control.allowance = [&]( size_t requested ) {
+                const auto allowed = BudgetScanAllowance( requested );
+                if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                    "Frame correlation scan budget exhausted", true );
+                return allowed;
+            };
+            control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                BudgetScanned( actual, requested, allowed );
+            };
+            auto events = indexed->GetIndexedFrameEvents( frameId, control );
+            if( events.empty() )
+            {
+                if( source->GetTraceInfo().counts.correlatedFrameEvents == 0 )
+                    return Success( id, { { "present", false },
+                        { "reason", "trace predates or does not contain JN frame correlation" },
+                        { "identities", json::array() } }, trace );
+                throw QueryError( "ENTITY_NOT_FOUND", "FrameIdentity ref was not found" );
+            }
+            std::sort( events.begin(), events.end(), []( const auto& lhs, const auto& rhs ) {
+                return lhs.timeNs != rhs.timeNs ? lhs.timeNs < rhs.timeNs : lhs.ref < rhs.ref;
+            } );
+            int64_t begin = std::numeric_limits<int64_t>::max();
+            int64_t end = std::numeric_limits<int64_t>::min();
+            bool canonicalBegin = false;
+            bool canonicalEnd = false;
+            std::set<std::string> domains;
+            json eventValues = json::array();
+            for( const auto& event : events )
+            {
+                begin = std::min( begin, event.timeNs );
+                end = std::max( end, event.timeNs );
+                domains.emplace( CorrelatedFrameDomainName( event.domain ) );
+                canonicalBegin |= event.phase == 0 && ( event.flags & 1 ) != 0;
+                canonicalEnd |= event.phase == 1 && ( event.flags & 1 ) != 0;
+                eventValues.push_back( CorrelatedFrameEventJson( *source, event ) );
+            }
+            json identity = {
+                { "ref", source->MakeEntityRef( "frame-identity", frameId ) },
+                { "frame_id", Decimal( frameId ) }, { "connection_generation", uint16_t( frameId >> 48 ) },
+                { "sequence", uint32_t( frameId ) }, { "begin_ns", Decimal( begin ) },
+                { "end_ns", Decimal( end ) }, { "duration_ns", Decimal( std::max<int64_t>( 0, end - begin ) ) },
+                { "complete", canonicalBegin && canonicalEnd }, { "domains", domains },
+                { "events", std::move( eventValues ) }, { "evidence_kind", "exact" }
+            };
+            return Success( id, { { "present", true }, { "identity", std::move( identity ) } }, trace );
+        }
+    }
     if( ( method == "entity.related" || method == "correlation.chain" ) )
     {
         if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
@@ -10858,7 +10977,35 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 [&]( size_t offset, size_t limit ) { return source->ScanJobs( offset, limit ); }, "Job" );
         std::vector<uint64_t> sliceSeeds;
         if( frameSlice ) for( const auto& job : jobs ) sliceSeeds.emplace_back( job.jobId );
-        const auto gfxSlice = frameSlice ? source->GetEvidenceGfx( parseFrame(), sliceSeeds ) : analysis::GfxEvidenceSlice{};
+        analysis::GfxEvidenceSlice gfxSlice;
+        if( frameSlice )
+        {
+            const auto frameId = parseFrame();
+            if( const auto* indexed = dynamic_cast<const QueryCorrelationSource*>( source.get() ) )
+            {
+                QueryCorrelationReadControl control;
+                control.check = checkDirectedJobRead;
+                control.allowance = [&]( size_t requested ) {
+                    const auto allowed = BudgetScanAllowance( requested );
+                    if( allowed == 0 ) throw QueryError( "RESOURCE_LIMIT",
+                        "Gfx evidence index scan budget exhausted", true );
+                    return allowed;
+                };
+                control.scanned = [&]( size_t actual, size_t requested, size_t allowed ) {
+                    BudgetScanned( actual, requested, allowed );
+                };
+                control.maximumEdges = size_t( UnsignedParameter(
+                    params, "max_edges", DefaultMaxEdges, MaximumMaxEdges ) );
+                control.maximumNodes = size_t( UnsignedParameter(
+                    params, "max_nodes", DefaultMaxNodes, MaximumMaxNodes ) );
+                auto bounded = indexed->GetIndexedGfxEvidence( frameId, sliceSeeds, control );
+                if( bounded.edgeLimitExceeded || bounded.nodeLimitExceeded )
+                    throw QueryError( "RESOURCE_LIMIT", bounded.edgeLimitExceeded ?
+                        "Gfx evidence edge budget exhausted" : "Gfx evidence node budget exhausted", true );
+                gfxSlice = std::move( bounded.value );
+            }
+            else gfxSlice = source->GetEvidenceGfx( frameId, sliceSeeds );
+        }
         const auto dispatches = frameSlice ? gfxSlice.dispatches :
             readBoundedRows( source->GetGfxDispatchCount(),
                 [&]( size_t offset, size_t limit ) { return source->ScanGfxDispatches( offset, limit ); },

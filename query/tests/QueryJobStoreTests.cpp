@@ -291,9 +291,20 @@ int main( int argc, char** argv )
         const auto directed = reader.GetDirectedJobs( 2, true, {} );
         Require( directed.size() == 2 && directed[0].jobId == 1 && directed[1].jobId == 2,
             "Job dependency direction index changed" );
+        bool directedLimitExceeded = false;
+        const auto boundedDirected = reader.GetDirectedJobsBounded( 2, 1, directedLimitExceeded, {} );
+        Require( directedLimitExceeded && boundedDirected.size() == 1 && boundedDirected.front().jobId == 2,
+            "bounded Job dependency lookup grew past its root limit" );
         const auto evidence = reader.GetEvidenceJobs( frameId, {} );
         Require( evidence.size() == 2 && evidence[0].jobId == 1 && evidence[1].jobId == 2,
             "Job Frame evidence closure changed" );
+        bool frameLimitExceeded = false;
+        const auto frameJobs = reader.GetJobsByOriginFrame( frameId, 1, frameLimitExceeded, {} );
+        Require( !frameLimitExceeded && frameJobs.size() == 1 && frameJobs.front().jobId == 2,
+            "direct Frame Job lookup changed or expanded dependencies" );
+        const auto noFrameJobs = reader.GetJobsByOriginFrame( frameId, 0, frameLimitExceeded, {} );
+        Require( frameLimitExceeded && noFrameJobs.empty(),
+            "Frame Job lookup ignored its zero-sized collection limit" );
         const auto dispatches = reader.GetGfxDispatches();
         Require( dispatches.size() == 1 && dispatches[0].dispatchId == 50 && dispatches[0].frameIndex == frameId,
             "Job Gfx dispatch changed" );

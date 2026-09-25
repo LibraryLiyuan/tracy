@@ -185,8 +185,17 @@ int main( int argc, char** argv )
             Require( jobStatistics.at("ok"), "real Job statistics failed" );
             nlohmann::json related = nullptr;
             nlohmann::json chain = nullptr;
+            nlohmann::json frameIdentity = nullptr;
+            nlohmann::json evidence = nullptr;
+            nlohmann::json gpuPasses = nullptr;
             if( !expectedFrames.empty() )
             {
+                request["method"] = "frame.identity";
+                request["params"] = {{"trace_id", session.id}, {"ref", expectedFrameIdentityRef},
+                    {"max_scan_events", 10000}};
+                const auto frameResponse = service.Execute( request );
+                Require( frameResponse.at("ok"), "real Frame identity query failed" );
+                frameIdentity = frameResponse.at("data");
                 request["method"] = "entity.related";
                 request["params"] = {{"trace_id", session.id}, {"ref", expectedFrameIdentityRef},
                     {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
@@ -197,10 +206,26 @@ int main( int argc, char** argv )
                 const auto chainResponse = service.Execute( request );
                 Require( chainResponse.at("ok"), "real Frame correlation chain failed" );
                 chain = chainResponse.at("data");
+                request["method"] = "evidence.graph";
+                request["params"] = {{"trace_id", session.id}, {"frame_id", expectedFrames.front().frameId},
+                    {"domains", nlohmann::json::array({"frame", "gfx"})},
+                    {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
+                const auto evidenceResponse = service.Execute( request );
+                Require( evidenceResponse.at("ok"), "real Frame evidence graph failed" );
+                evidence = evidenceResponse.at("data");
+                evidence["source_read_cost"].erase( "job_dto_count" );
+                evidence["source_read_cost"].erase( "job_read_ms" );
             }
+            request["method"] = "gpu.pass.search";
+            request["params"] = {{"trace_id", session.id}, {"limit", 100},
+                {"max_scan_events", 10000}, {"max_nodes", 1000}, {"max_edges", 2000}};
+            const auto passResponse = service.Execute( request );
+            Require( passResponse.at("ok"), "real Explicit GPU Pass search failed" );
+            gpuPasses = passResponse.at("data");
             return nlohmann::json{{"jobs", jobs}, {"gfx_statistics", statistics.at("data")},
                 {"job_statistics", jobStatistics.at("data")}, {"related", std::move( related )},
-                {"chain", std::move( chain )}};
+                {"chain", std::move( chain )}, {"frame_identity", std::move( frameIdentity )},
+                {"evidence", std::move( evidence )}, {"gpu_passes", std::move( gpuPasses )}};
         };
         const auto workerJson = searchPages( false );
         const auto indexedJson = searchPages( true );

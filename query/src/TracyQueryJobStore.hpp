@@ -87,8 +87,12 @@ public:
         const std::function<void()>& check ) const;
     std::vector<analysis::JobDto> GetDirectedJobs( uint64_t jobId, bool includeNeighbors,
         const std::function<void()>& check ) const;
+    std::vector<analysis::JobDto> GetDirectedJobsBounded( uint64_t jobId, size_t limit,
+        bool& limitExceeded, const std::function<void()>& check ) const;
     std::vector<analysis::JobDto> GetEvidenceJobs( uint64_t frameId,
         const std::function<void()>& check ) const;
+    std::vector<analysis::JobDto> GetJobsByOriginFrame( uint64_t frameId, size_t limit,
+        bool& limitExceeded, const std::function<void()>& check ) const;
     uint64_t GetGfxDispatchCount() const;
     std::vector<analysis::GfxDispatchDto> GetGfxDispatches() const;
     std::vector<analysis::GfxDispatchDto> ScanGfxDispatches( size_t offset, size_t limit ) const;
