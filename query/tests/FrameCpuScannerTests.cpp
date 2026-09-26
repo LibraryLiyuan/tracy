@@ -484,6 +484,39 @@ int main()
     assert( largeResult.exactSignatureHashCount == 1 );
     assert( largeResult.frameBoundaryProbeCount < 4096 * 16 );
 
+    // Per-occurrence extra names are raw evidence, not stable policy identity.
+    // Canonical logical paths retain the source/function and aggregate every
+    // dynamic label without changing the source DTOs.
+    CpuTreeSource dynamicNames;
+    const auto dynamicTemplate = dynamicNames.zones.front();
+    dynamicNames.zones.assign( 10000, dynamicTemplate );
+    for( size_t index = 0; index < dynamicNames.zones.size(); ++index )
+    {
+        auto& zone = dynamicNames.zones[index];
+        zone.ref = "dynamic:" + std::to_string( index );
+        zone.parentRef.reset();
+        zone.sourceLocationRef = "source:dynamic";
+        zone.name = "Resource tag:" + std::to_string( index );
+        zone.extraName = zone.name;
+        zone.function = "StableResourceSite";
+    }
+    CpuFrameScanOptions canonicalLogical;
+    canonicalLogical.includeExactSignatures = false;
+    canonicalLogical.includeLogicalSignatures = true;
+    canonicalLogical.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+    canonicalLogical.canonicalizeLogicalDynamicNames = true;
+    canonicalLogical.includeLogicalThreadRole = true;
+    uint64_t dynamicRuns = 0;
+    const auto dynamicResult = ExactFrameCpuScanner( dynamicNames, 128 ).Scan(
+        [&]( const CpuSignatureFrameRun& ) { ++dynamicRuns; return true; }, canonicalLogical );
+    assert( dynamicRuns == 10000 );
+    assert( dynamicResult.signatures.size() == 1 );
+    assert( dynamicResult.signatures.front().logical );
+    assert( dynamicResult.signatures.front().name == "StableResourceSite" );
+    assert( dynamicResult.signatures.front().path == "StableResourceSite" );
+    assert( dynamicResult.signatures.front().threadRef == "Main" );
+    assert( dynamicResult.logicalSignatureHashCount == 1 );
+
     // The policy scan consumes the stable logical rollup only.  Physical
     // thread/path occurrences remain available from TraceSource for targeted
     // evidence queries and must not explode the aggregate signature set.

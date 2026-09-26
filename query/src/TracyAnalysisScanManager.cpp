@@ -503,9 +503,15 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         CpuFrameScanOptions cpuOptions;
         cpuOptions.cancelled = cancelled;
         cpuOptions.workspace = workspace;
-        cpuOptions.includeExactSignatures = true;
-        cpuOptions.includeLogicalSignatures = false;
+        // Native policy analysis groups CPU work by stable logical path. Raw
+        // Zone DTOs retain physical thread identity and every dynamic extra
+        // name for point evidence; carrying instance tags into whole-trace
+        // ranking creates one signature per GPU resource allocation.
+        cpuOptions.includeExactSignatures = false;
+        cpuOptions.includeLogicalSignatures = true;
         cpuOptions.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+        cpuOptions.canonicalizeLogicalDynamicNames = true;
+        cpuOptions.includeLogicalThreadRole = true;
         const auto cpuZoneTotal = request.source->GetTraceInfoMetadata().counts.cpuZones;
         const auto cpuProgressStarted = std::chrono::steady_clock::now();
         auto cpuProgressReportedAt = cpuProgressStarted;
@@ -566,10 +572,14 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
                 }
                 if( !statistics.AddRegisteredRun( found->second, uint64_t( run.frameIndex ),
                     run.inclusiveNs, run.exclusiveNs, wait ? run.inclusiveNs : 0, 0,
-                    run.occurrenceCount, run.exact, false ) )
+                    run.occurrenceCount, run.exact, true ) )
                     throw std::runtime_error( "neutral_cpu_run_ingest_failed" );
                 return true;
             }, cpuOptions );
+        if( cpu.inputZoneCount >= 1'000'000 )
+            std::cerr << "Query scan-cpu-signatures logical_hashes=" << cpu.logicalSignatureHashCount
+                << " exact_hashes=" << cpu.exactSignatureHashCount
+                << " denominator_rows=" << cpu.denominators.size() << '\n';
         if( cancelled() ) return false;
         cpuDefinitionOutput->Commit();
         cpuDefinitionOutput.reset();

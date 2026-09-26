@@ -48,7 +48,6 @@ struct WorkingZone
 {
     AnalysisWorkspaceReservation workspace;
     std::string ref;
-    std::string logicalSignature;
     uint32_t exactSignatureOrdinal = 0;
     uint32_t logicalSignatureOrdinal = 0;
     std::string threadRef;
@@ -75,7 +74,7 @@ struct WorkingStack
     }
 };
 
-struct ExactSignatureCacheKey
+struct SignatureCacheKey
 {
     uint32_t parentOrdinalPlusOne = 0;
     std::string threadIdentity;
@@ -86,7 +85,7 @@ struct ExactSignatureCacheKey
     uint32_t line = 0;
 };
 
-struct ExactSignatureCacheView
+struct SignatureCacheView
 {
     uint32_t parentOrdinalPlusOne = 0;
     std::string_view threadIdentity;
@@ -97,17 +96,17 @@ struct ExactSignatureCacheView
     uint32_t line = 0;
 };
 
-struct ExactSignatureCacheHash
+struct SignatureCacheHash
 {
     using is_transparent = void;
 
-    size_t operator()( const ExactSignatureCacheKey& key ) const noexcept
+    size_t operator()( const SignatureCacheKey& key ) const noexcept
     {
         return Hash( { key.parentOrdinalPlusOne, key.threadIdentity, key.sourceLocationRef,
             key.name, key.function, key.file, key.line } );
     }
 
-    size_t operator()( const ExactSignatureCacheView& key ) const noexcept { return Hash( key ); }
+    size_t operator()( const SignatureCacheView& key ) const noexcept { return Hash( key ); }
 
 private:
     static void Combine( size_t& seed, size_t value ) noexcept
@@ -115,7 +114,7 @@ private:
         seed ^= value + size_t( 0x9e3779b9 ) + ( seed << 6 ) + ( seed >> 2 );
     }
 
-    static size_t Hash( const ExactSignatureCacheView& key ) noexcept
+    static size_t Hash( const SignatureCacheView& key ) noexcept
     {
         size_t seed = std::hash<uint32_t> {}( key.parentOrdinalPlusOne );
         Combine( seed, std::hash<std::string_view> {}( key.threadIdentity ) );
@@ -128,26 +127,26 @@ private:
     }
 };
 
-struct ExactSignatureCacheEqual
+struct SignatureCacheEqual
 {
     using is_transparent = void;
 
-    bool operator()( const ExactSignatureCacheKey& lhs,
-        const ExactSignatureCacheKey& rhs ) const noexcept
+    bool operator()( const SignatureCacheKey& lhs,
+        const SignatureCacheKey& rhs ) const noexcept
     {
         return Equal( lhs, { rhs.parentOrdinalPlusOne, rhs.threadIdentity,
             rhs.sourceLocationRef, rhs.name, rhs.function, rhs.file, rhs.line } );
     }
 
-    bool operator()( const ExactSignatureCacheKey& lhs,
-        const ExactSignatureCacheView& rhs ) const noexcept { return Equal( lhs, rhs ); }
+    bool operator()( const SignatureCacheKey& lhs,
+        const SignatureCacheView& rhs ) const noexcept { return Equal( lhs, rhs ); }
 
-    bool operator()( const ExactSignatureCacheView& lhs,
-        const ExactSignatureCacheKey& rhs ) const noexcept { return Equal( rhs, lhs ); }
+    bool operator()( const SignatureCacheView& lhs,
+        const SignatureCacheKey& rhs ) const noexcept { return Equal( rhs, lhs ); }
 
 private:
-    static bool Equal( const ExactSignatureCacheKey& lhs,
-        const ExactSignatureCacheView& rhs ) noexcept
+    static bool Equal( const SignatureCacheKey& lhs,
+        const SignatureCacheView& rhs ) noexcept
     {
         return lhs.parentOrdinalPlusOne == rhs.parentOrdinalPlusOne &&
             lhs.threadIdentity == rhs.threadIdentity &&
@@ -228,7 +227,8 @@ void HashString( Sha256Builder& hash, std::string_view value )
 }
 
 std::string SignatureId( bool logical, std::string_view threadIdentity,
-    std::string_view parent, const CpuZoneDto& zone, bool stableSite = false )
+    std::string_view parent, const CpuZoneDto& zone, std::string_view signatureName,
+    bool stableSite = false )
 {
     Sha256Builder hash;
     const uint8_t kind = logical ? 1 : 0;
@@ -238,7 +238,7 @@ std::string SignatureId( bool logical, std::string_view threadIdentity,
     HashString( hash, zone.sourceLocationRef );
     if( !stableSite || zone.sourceLocationRef.empty() )
     {
-        HashString( hash, zone.name );
+        HashString( hash, signatureName );
         HashString( hash, zone.function );
         HashString( hash, zone.file );
         hash.Update( &zone.line, sizeof( zone.line ) );
@@ -486,8 +486,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     };
     std::map<std::string_view, uint32_t, std::less<>> signatureIndex;
     std::vector<SignatureEntry> signatureEntries;
-    std::unordered_map<ExactSignatureCacheKey, uint32_t,
-        ExactSignatureCacheHash, ExactSignatureCacheEqual> exactSignatureCache;
+    std::unordered_map<SignatureCacheKey, uint32_t,
+        SignatureCacheHash, SignatureCacheEqual> exactSignatureCache;
+    std::unordered_map<SignatureCacheKey, uint32_t,
+        SignatureCacheHash, SignatureCacheEqual> logicalSignatureCache;
     std::map<RunKey, size_t> runIndex;
     std::unordered_set<uint64_t> streamedPresence;
     std::unordered_map<std::string, WorkingStack> stacks;
@@ -511,7 +513,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     };
 
     auto ensureDefinition = [&]( const CpuZoneDto& zone, bool logical, std::string_view id,
-        std::string_view parent, const std::string& role, uint32_t depth,
+        std::string_view parent, std::string_view definitionName, const std::string& role, uint32_t depth,
         AnalysisDictionary::PathId parentPath ) -> uint32_t {
         checkCancelled();
         const auto found = signatureIndex.find( id );
@@ -521,17 +523,18 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         signatureWorkspace.Add(256); // map node plus transient vector growth
         const auto ordinal = uint32_t( signatureEntries.size() );
         const auto signature = dictionary.Intern( id );
-        const auto leaf = dictionary.Intern( zone.name.empty() ? zone.function : zone.name );
+        const auto leaf = dictionary.Intern( definitionName.empty() ? zone.function : definitionName );
         const auto path = dictionary.AppendPath( parentPath, leaf );
         AnalysisWorkspaceReservation definitionWorkspace( options.workspace, 2048 + 8ull *
-            ( id.size() + parent.size() + zone.name.size() + zone.sourceLocationRef.size() +
+            ( id.size() + parent.size() + definitionName.size() + zone.sourceLocationRef.size() +
               zone.function.size() + zone.file.size() + zone.threadRef.size() + role.size() ) );
         const auto workClass = Classify( zone );
         signatureEntries.push_back( { signature, path, workClass } );
         signatureIndex.emplace( dictionary.Text( signature ), ordinal );
         auto resolved = dictionary.ResolvePath( path );
-        CpuSignatureDefinition definition { std::string( id ), std::string( parent ), zone.name, zone.sourceLocationRef,
-            zone.function, zone.file, zone.line, logical ? std::string {} : zone.threadRef,
+        CpuSignatureDefinition definition { std::string( id ), std::string( parent ), std::string( definitionName ), zone.sourceLocationRef,
+            zone.function, zone.file, zone.line, logical ?
+                ( options.includeLogicalThreadRole ? role : std::string {} ) : zone.threadRef,
             role, std::move( resolved.text ), depth, workClass, logical };
         if( options.definitionSink )
         {
@@ -629,7 +632,8 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     zone.exactSignatureOrdinal,
                     contribution, childUnion, exact, zone.ref );
             if( options.includeLogicalSignatures )
-                updateRun( zone.logicalSignature, zone.logicalSignatureOrdinal,
+                updateRun( dictionary.Text( signatureEntries[zone.logicalSignatureOrdinal].signature ),
+                    zone.logicalSignatureOrdinal,
                     contribution, childUnion, exact, zone.ref );
         }
     };
@@ -705,10 +709,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 options.logicalSignatureMode == CpuLogicalSignatureMode::StableSite;
             const auto parentLogical = options.includeLogicalSignatures && !stableLogicalSite &&
                 !stack.empty() && zone.parentRef && parentResolved ?
-                stack.back().logicalSignature : std::string {};
+                dictionary.Text( signatureEntries[stack.back().logicalSignatureOrdinal].signature ) : std::string_view {};
             const auto parentExactOrdinalPlusOne = options.includeExactSignatures && !stack.empty() &&
                 zone.parentRef && parentResolved ? stack.back().exactSignatureOrdinal + 1 : 0;
-            const ExactSignatureCacheView exactCacheKey { parentExactOrdinalPlusOne,
+            const SignatureCacheView exactCacheKey { parentExactOrdinalPlusOne,
                 zone.threadRef, zone.sourceLocationRef, zone.name, zone.function, zone.file, zone.line };
             std::string exactIdStorage;
             std::string_view exactId;
@@ -725,57 +729,99 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 }
                 else
                 {
-                    exactIdStorage = SignatureId( false, zone.threadRef, parentExact, zone );
+                    exactIdStorage = SignatureId( false, zone.threadRef, parentExact, zone, zone.name );
                     exactId = exactIdStorage;
                     ++result.exactSignatureHashCount;
                 }
             }
-            std::string logicalId;
+            const auto logicalName = options.canonicalizeLogicalDynamicNames && zone.extraName &&
+                !zone.function.empty() ? std::string_view( zone.function ) : std::string_view( zone.name );
+            const auto parentLogicalOrdinalPlusOne = options.includeLogicalSignatures && !stableLogicalSite &&
+                !stack.empty() && zone.parentRef && parentResolved ? stack.back().logicalSignatureOrdinal + 1 : 0;
+            const SignatureCacheView logicalCacheKey { parentLogicalOrdinalPlusOne,
+                role, zone.sourceLocationRef, logicalName, zone.function, zone.file, zone.line };
+            std::string logicalIdStorage;
+            std::string_view logicalId;
+            uint32_t logicalSignatureOrdinal = 0;
+            bool logicalSignatureCached = false;
             if( options.includeLogicalSignatures )
             {
                 if( stableLogicalSite && !zone.sourceLocationRef.empty() )
                 {
                     auto& cache = stableLogicalSignatures[roleCacheIndex];
                     const auto found = cache.find( zone.sourceLocationRef );
-                    if( found != cache.end() ) logicalId = found->second;
+                    if( found != cache.end() )
+                    {
+                        logicalId = found->second;
+                        logicalSignatureOrdinal = signatureIndex.at( logicalId );
+                        logicalSignatureCached = true;
+                    }
                     else
                     {
-                        logicalId = SignatureId( true, role, parentLogical, zone, true );
+                        logicalIdStorage = SignatureId( true, role, parentLogical, zone, logicalName, true );
+                        logicalId = logicalIdStorage;
+                        ++result.logicalSignatureHashCount;
                         signatureWorkspace.Add(128+4ull*(zone.sourceLocationRef.size()+logicalId.size()));
                         cache.emplace( zone.sourceLocationRef, logicalId );
                     }
                 }
-                else logicalId = SignatureId( true, role, parentLogical, zone, stableLogicalSite );
+                else
+                {
+                    const auto found = logicalSignatureCache.find( logicalCacheKey );
+                    if( found != logicalSignatureCache.end() )
+                    {
+                        logicalSignatureCached = true;
+                        logicalSignatureOrdinal = found->second;
+                        logicalId = dictionary.Text( signatureEntries[logicalSignatureOrdinal].signature );
+                    }
+                    else
+                    {
+                        logicalIdStorage = SignatureId( true, role, parentLogical, zone, logicalName, stableLogicalSite );
+                        logicalId = logicalIdStorage;
+                        ++result.logicalSignatureHashCount;
+                    }
+                }
             }
             const auto depth = zone.parentRef && parentResolved && !stack.empty() ? uint32_t( stack.size() ) : 0u;
             result.maximumDepth = std::max( result.maximumDepth, size_t( depth ) );
             const auto exactParentPath = parentExactOrdinalPlusOne == 0 ? 0 :
                 signatureEntries[parentExactOrdinalPlusOne - 1].path;
-            const auto logicalParentPath = parentLogical.empty() ? 0 :
-                signatureEntries[signatureIndex.at(parentLogical)].path;
-            uint32_t logicalSignatureOrdinal = 0;
+            const auto logicalParentPath = parentLogicalOrdinalPlusOne == 0 ? 0 :
+                signatureEntries[parentLogicalOrdinalPlusOne - 1].path;
             if( options.includeExactSignatures && !exactSignatureCached )
             {
-                exactSignatureOrdinal = ensureDefinition( zone, false, exactId, parentExact, role, depth,
+                exactSignatureOrdinal = ensureDefinition( zone, false, exactId, parentExact, zone.name, role, depth,
                     exactParentPath );
                 signatureWorkspace.Add( 256 + 4ull * ( zone.threadRef.size() +
                     zone.sourceLocationRef.size() + zone.name.size() + zone.function.size() + zone.file.size() ) );
                 const auto [cacheIt, inserted] = exactSignatureCache.emplace(
-                    ExactSignatureCacheKey { parentExactOrdinalPlusOne, zone.threadRef,
+                    SignatureCacheKey { parentExactOrdinalPlusOne, zone.threadRef,
                         zone.sourceLocationRef, zone.name, zone.function, zone.file, zone.line },
                     exactSignatureOrdinal );
                 if( !inserted && cacheIt->second != exactSignatureOrdinal )
                     throw BoundedScanError( "frame_cpu_scan_exact_signature_cache_conflict" );
             }
-            if( options.includeLogicalSignatures )
-                logicalSignatureOrdinal = ensureDefinition( zone, true, logicalId, parentLogical, role, depth,
+            if( options.includeLogicalSignatures && !logicalSignatureCached )
+            {
+                logicalSignatureOrdinal = ensureDefinition( zone, true, logicalId, parentLogical, logicalName, role, depth,
                     stableLogicalSite ? 0 : logicalParentPath );
+                if( !stableLogicalSite )
+                {
+                    signatureWorkspace.Add( 256 + 4ull * ( role.size() + zone.sourceLocationRef.size() +
+                        logicalName.size() + zone.function.size() + zone.file.size() ) );
+                    const auto [cacheIt, inserted] = logicalSignatureCache.emplace(
+                        SignatureCacheKey { parentLogicalOrdinalPlusOne, role,
+                            zone.sourceLocationRef, std::string( logicalName ), zone.function, zone.file, zone.line },
+                        logicalSignatureOrdinal );
+                    if( !inserted && cacheIt->second != logicalSignatureOrdinal )
+                        throw BoundedScanError( "frame_cpu_scan_logical_signature_cache_conflict" );
+                }
+            }
 
             WorkingZone active;
             active.workspace = AnalysisWorkspaceReservation( options.workspace, 2048 + 8 *
-                ( zone.ref.size() + zone.threadRef.size() + logicalId.size() ) );
+                ( zone.ref.size() + zone.threadRef.size() ) );
             active.ref = zone.ref;
-            active.logicalSignature = logicalId;
             active.exactSignatureOrdinal = exactSignatureOrdinal;
             active.logicalSignatureOrdinal = logicalSignatureOrdinal;
             active.threadRef = zone.threadRef;

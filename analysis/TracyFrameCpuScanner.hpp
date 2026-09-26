@@ -98,6 +98,7 @@ struct CpuFrameScanResult
     size_t maximumBatchObserved = 0;
     uint64_t frameBoundaryProbeCount = 0;
     uint64_t exactSignatureHashCount = 0;
+    uint64_t logicalSignatureHashCount = 0;
     bool qualityComplete = true;
     std::vector<CpuSignatureDefinition> signatures;
     std::vector<CpuSignatureFrameRun> runs;
@@ -142,6 +143,11 @@ struct CpuFrameScanOptions
     bool includeExactSignatures = true;
     bool includeLogicalSignatures = true;
     CpuLogicalSignatureMode logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+    // Policy scans may collapse per-occurrence extra names (for example GPU
+    // resource tags) onto their static function/site while retaining the full
+    // parent path. Raw Zone DTOs and names remain available from TraceSource.
+    bool canonicalizeLogicalDynamicNames = false;
+    bool includeLogicalThreadRole = false;
     std::function<void( const std::string&, uint64_t, int64_t, int64_t )> completeFrameSink;
     // When supplied, emit each exact/logical definition once before its first
     // frame run, and do not retain full definitions in the result. The view is

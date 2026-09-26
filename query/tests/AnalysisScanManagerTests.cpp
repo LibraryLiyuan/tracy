@@ -264,6 +264,7 @@ public:
     bool wideNames = false;
     size_t wideSignatureCount = 0;
     bool compactScaleNames = false;
+    bool dynamicCpuNames = false;
     int gpuFrameScopeProbe = 0;
     bool gpuProbeLongCosts = false;
     size_t wideGpuSignatureCount = 0;
@@ -307,8 +308,10 @@ public:
                 CpuZoneDto zone;
                 zone.ref=MakeEntityRef("cpu-zone",index);
                 zone.threadRef=MakeEntityRef("thread",1);
-                zone.sourceLocationRef="source:wide-"+std::to_string(index);
-                zone.name=compactScaleNames?"ScaleCpu":"Wide"+std::string(64*1024,'x');
+                zone.sourceLocationRef=dynamicCpuNames?"source:dynamic":"source:wide-"+std::to_string(index);
+                zone.name=dynamicCpuNames?"Resource tag:"+std::to_string(index):
+                    compactScaleNames?"ScaleCpu":"Wide"+std::string(64*1024,'x');
+                if(dynamicCpuNames) { zone.extraName=zone.name; zone.function="StableResourceSite"; }
                 zone.startNs=1; zone.endNs=2; zone.complete=true; zone.timingValid=true;
                 values.push_back(std::move(zone));
             }
@@ -1205,6 +1208,28 @@ int main(int argc,char** argv)
             });
             assert(cpuCount==256); // 128 distinct source identities in two independent FrameSets.
             assert(bounded.workspace->Snapshot().peakBytes<=128*1024*1024);
+        }
+        {
+            testStage="dynamic CPU policy identity";
+            auto dynamic=std::make_shared<SourceDegradedTrace>();
+            dynamic->wideSignatureCount=128; dynamic->dynamicCpuNames=true;
+            auto bounded=request; bounded.source=dynamic; bounded.temporaryRoot=root/"default-cpu-dynamic-policy";
+            bounded.workspace=std::make_shared<AnalysisWorkspaceBudget>(128*1024*1024,64*1024*1024);
+            AnalysisScanProducts streamed;
+            if(!ExecuteDefaultAnalysisScan(bounded,stop.get_token(),[](ScanState,uint64_t,uint64_t,std::string_view){},streamed,scanError))
+                throw std::runtime_error("Dynamic CPU policy fixture must complete: "+scanError);
+            NeutralStatisticsCacheReader reader(streamed.neutralCachePath,streamed.neutralCacheIdentity);
+            uint64_t cpuCount=0;
+            reader.VisitSignatureContexts([&](const NeutralSignatureAggregate* aggregate,const PolicySignatureContext& context) {
+                if(context.domain!="cpu" || context.frameRoot) return;
+                ++cpuCount;
+                if(!aggregate || !aggregate->logical || context.name!="StableResourceSite" ||
+                    context.path!="StableResourceSite" || context.threadOrQueue!="Main")
+                    throw std::runtime_error("Native Scan did not use canonical logical CPU policy identity: logical="+
+                        std::to_string(aggregate?aggregate->logical:false)+" name="+context.name+" path="+
+                        context.path+" thread="+context.threadOrQueue);
+            });
+            if(cpuCount!=2) throw std::runtime_error("Dynamic CPU names created unbounded policy signatures");
         }
         testStage="default producer";
         if( !ExecuteDefaultAnalysisScan( request, stop.get_token(),
