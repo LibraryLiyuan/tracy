@@ -485,16 +485,17 @@ int main( int argc, char** argv )
             "Catalog allocation summary changed unique allocation state" );
         Require( associations100 && associations100->meshPartCount == 2 && associations100->rangeCount == 1 &&
             associations100->partCount == 2 && associations100->viewCount == 2 &&
-            associations100->relationCount == 3 && associations100->vgRecordCount == 2 &&
+            associations100->relationCount == 2 && associations100->vgRecordCount == 2 &&
             associations100->logicalBindingCount == 1 && associations100->hasAliasGroup &&
             associations100->allocationResourceCount == 2,
             "Catalog resource association index changed mesh/range/logical/alias/shared-allocation counts" );
         Require( associations101 && associations101->meshPartCount == 0 && associations101->rangeCount == 0 &&
             associations101->logicalBindingCount == 1 && !associations101->hasAliasGroup &&
-            associations101->allocationResourceCount == 2,
+            associations101->allocationResourceCount == 2 && associations101->relationCount == 1,
             "Catalog resource association index changed non-mesh/shared-allocation semantics" );
         Require( associations102 && associations102->rangeCount == 1 &&
-            associations102->allocationResourceCount == 1 && recreated102 && recreated102->aliveAtEnd &&
+            associations102->allocationResourceCount == 1 && associations102->relationCount == 0 &&
+            recreated102 && recreated102->aliveAtEnd &&
             recreated102->destroyTime == 0 && !associationReader.ResourceAssociations( 999 ),
             "Catalog resource association index changed unique-allocation or missing-key semantics" );
         Require( pointer102.total == 2 && pointer102.values.size() == 2 &&
@@ -513,7 +514,7 @@ int main( int argc, char** argv )
             "Catalog RangeSet resource/pass lookup changed paging or generation semantics" );
         Require( allParts101.total == 1 && allParts101.values.size() == 1 &&
             allParts101.values[0].record.partKind == uint8_t( JnGpuCatalogPartKind::BufferRange ) &&
-            allRelations100.total == 3 && allRelations100.values.size() == 3 &&
+            allRelations100.total == 2 && allRelations100.values.size() == 2 &&
             logicals100.total == 1 && logicals100.values.size() == 1 &&
             logicals100.values[0].generation == 17 && logical700 &&
             logical700->record.stableKey == 99 && logical700->generation == 17 &&
@@ -566,9 +567,8 @@ int main( int argc, char** argv )
             "Catalog resource VG history paging changed" );
         Require( rtas100.total == 1 && rtas100.values.size() == 1 &&
             rtas100.values[0].record.targetId == 102 && rtas100.values[0].generation == 14 &&
-            rtas101.total == 1 && rtas101.values.size() == 1 &&
-            rtas101.values[0].record.sourceId == 100,
-            "Catalog RTAS relation history resolved-endpoint filtering changed" );
+            rtas101.total == 0 && rtas101.values.empty(),
+            "Catalog RTAS relation history did not keep resource association on the source endpoint" );
         const auto evidence200First = associationReader.PassEvidence( 200, 0, 1 );
         const auto evidence200Second = associationReader.PassEvidence( 200, 1, 1 );
         const auto evidence201 = associationReader.PassEvidence( 201, 0, 10 );
@@ -733,6 +733,36 @@ int main( int argc, char** argv )
             []( const auto& sample ) { return sample.code == "CATALOG_NAME_REFERENCE_LENGTH_MISMATCH" &&
                 sample.generation == 9 && sample.id == 7 && sample.expectedLength == 4 && sample.actualLength == 3; } ),
             "Catalog name length diagnostic sample was not preserved" );
+
+        const auto optionalNameMetadataRoot = root.parent_path() / "tracy-query-catalog-semantic-optional-name-metadata";
+        writeVariant( optionalNameMetadataRoot, []( auto* variantResources, auto*, auto*, auto* variantBatches, auto&, auto& ) {
+            variantResources[0].nameHash = 0;
+            variantResources[0].nameOriginalLength = 12;
+            variantBatches[0].storedChecksum = JnGpuCatalogChecksum64( variantResources,
+                sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
+        } );
+        QueryCatalogStoreReader optionalNameMetadataReader( optionalNameMetadataRoot, identity );
+        const auto optionalNameMetadataValidation = optionalNameMetadataReader.ValidateSemanticsDetailed(
+            optionalNameMetadataRoot / "semantic-validation" );
+        Require( optionalNameMetadataValidation.complete && optionalNameMetadataValidation.healthy &&
+            !hasFinding( optionalNameMetadataValidation, "CATALOG_NAME_METADATA" ),
+            "Catalog rejected unavailable optional name hash/length metadata" );
+
+        const auto rtasEnrichmentRoot = root.parent_path() / "tracy-query-catalog-semantic-rtas-enrichment";
+        writeVariant( rtasEnrichmentRoot, []( auto*, auto* variantRelations, auto*, auto* variantBatches, auto&, auto& ) {
+            variantRelations[0].sourceId = 100;
+            variantRelations[0].targetId = 0x74000000000046EFull;
+            variantRelations[0].operation = uint8_t( JnGpuCatalogRecordOperation::Create );
+            variantRelations[0].flags = 0;
+            variantBatches[2].storedChecksum = JnGpuCatalogChecksum64( variantRelations,
+                sizeof( JnGpuCatalogRelationRecordV1 ) );
+        } );
+        QueryCatalogStoreReader rtasEnrichmentReader( rtasEnrichmentRoot, identity );
+        const auto rtasEnrichmentValidation = rtasEnrichmentReader.ValidateSemanticsDetailed(
+            rtasEnrichmentRoot / "semantic-validation" );
+        Require( rtasEnrichmentValidation.complete && rtasEnrichmentValidation.healthy &&
+            !hasFinding( rtasEnrichmentValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
+            "Catalog treated the RTAS enrichment target as a Resource reference" );
 
         const auto relationReferenceRoot = root.parent_path() / "tracy-query-catalog-semantic-relation-reference";
         writeVariant( relationReferenceRoot, []( auto*, auto* variantRelations, auto*, auto* variantBatches, auto&, auto& ) {

@@ -332,6 +332,9 @@ struct JnGpuCatalogPartRecordV1
 
 struct JnGpuCatalogRelationRecordV1
 {
+    // flags bit 0/1 marks an unresolved source/target resource pointer.  A
+    // resolved RtasUses source is a Resource id; its target may be an RTAS
+    // enrichment identity and is not required to exist in the Resource table.
     int64_t time;
     uint64_t sourceId;
     uint64_t targetId;

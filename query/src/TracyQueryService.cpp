@@ -7274,7 +7274,10 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             for( size_t index = 0; index < catalog->gpuCatalogRelations.size(); ++index )
             {
                 const auto& value = catalog->gpuCatalogRelations[index];
-                if( value.sourceId != resourceId && value.targetId != resourceId ) continue;
+                const bool sourceMatch = ( value.flags & 1 ) == 0 && value.sourceId == resourceId;
+                const bool targetMatch = value.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
+                    ( value.flags & 2 ) == 0 && value.targetId == resourceId;
+                if( !sourceMatch && !targetMatch ) continue;
                 ++total;
                 if( values.size() >= limit ) continue;
                 values.push_back( {
@@ -7408,8 +7411,9 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
             const auto page = ParsePage( params, method, trace );
             json relations = json::array();
             size_t total = 0;
-            for( const auto& value : catalog->gpuCatalogRelations ) if( value.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
-                ( value.sourceId == resourceId || value.targetId == resourceId ) )
+            for( const auto& value : catalog->gpuCatalogRelations ) if(
+                value.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
+                ( value.flags & 1 ) == 0 && value.sourceId == resourceId )
             {
                 const auto position = total++;
                 if( position < page.offset || relations.size() >= page.limit ) continue;

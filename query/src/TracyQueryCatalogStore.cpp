@@ -142,6 +142,20 @@ bool IsCatalogDefinition( JnGpuCatalogRecordOperation operation )
         operation == JnGpuCatalogRecordOperation::Snapshot;
 }
 
+bool CatalogRtasRelationMatchesResource( const JnGpuCatalogRelationRecordV1& row, uint64_t resourceId )
+{
+    return row.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
+        ( row.flags & 1 ) == 0 && row.sourceId == resourceId;
+}
+
+bool CatalogRelationMatchesResource( const JnGpuCatalogRelationRecordV1& row, uint64_t resourceId )
+{
+    if( CatalogRtasRelationMatchesResource( row, resourceId ) ) return true;
+    if( row.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) ) return false;
+    return ( ( row.flags & 1 ) == 0 && row.sourceId == resourceId ) ||
+        ( ( row.flags & 2 ) == 0 && row.targetId == resourceId );
+}
+
 enum class ResourceAssociationKind : uint8_t
 {
     MeshPart = 1,
@@ -1196,8 +1210,9 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 throw std::runtime_error( "Catalog resource index cancelled" );
             JnGpuCatalogRelationRecordV1 row {};
             relationRows.Read( ordinal, &row, 1 );
-            appendAssociation( row.sourceId, ResourceAssociationKind::Relation );
-            if( row.targetId != row.sourceId )
+            if( CatalogRelationMatchesResource( row, row.sourceId ) )
+                appendAssociation( row.sourceId, ResourceAssociationKind::Relation );
+            if( row.targetId != row.sourceId && CatalogRelationMatchesResource( row, row.targetId ) )
                 appendAssociation( row.targetId, ResourceAssociationKind::Relation );
         }
         for( uint64_t ordinal = 0; ordinal < vgRows.Count(); ordinal++ )
@@ -1850,12 +1865,12 @@ void QueryCatalogStoreReader::BuildResourceIndex( const std::filesystem::path& s
                 throw std::runtime_error( "Catalog resource index cancelled" );
             JnGpuCatalogRelationRecordV1 row {};
             relationRows.Read( ordinal, &row, 1 );
-            appendResourceRelation( row.sourceId, ordinal );
-            if( row.targetId != row.sourceId ) appendResourceRelation( row.targetId, ordinal );
-            if( row.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) ) continue;
-            if( ( row.flags & 1 ) == 0 ) appendRtasRelation( row.sourceId, ordinal );
-            if( row.targetId != row.sourceId && ( row.flags & 2 ) == 0 )
-                appendRtasRelation( row.targetId, ordinal );
+            if( CatalogRelationMatchesResource( row, row.sourceId ) )
+                appendResourceRelation( row.sourceId, ordinal );
+            if( row.targetId != row.sourceId && CatalogRelationMatchesResource( row, row.targetId ) )
+                appendResourceRelation( row.targetId, ordinal );
+            if( CatalogRtasRelationMatchesResource( row, row.sourceId ) )
+                appendRtasRelation( row.sourceId, ordinal );
         }
         rtasRelationSource.flush();
         resourceRelationSource.flush();
@@ -2383,10 +2398,7 @@ QueryCatalogRelationPage QueryCatalogStoreReader::ResourceRtasRelations(
         QueryCatalogRelationData value {};
         m_impl->rawRelations->Read( row.metadata, &value.record, 1 );
         m_impl->resourceRelationGenerations->Read( row.metadata, &value.generation, 1 );
-        const bool sourceMatch = value.record.sourceId == resourceId && ( value.record.flags & 1 ) == 0;
-        const bool targetMatch = value.record.targetId == resourceId && ( value.record.flags & 2 ) == 0;
-        if( value.record.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) ||
-            ( !sourceMatch && !targetMatch ) )
+        if( !CatalogRtasRelationMatchesResource( value.record, resourceId ) )
             throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
         result.values.emplace_back( value );
     }
@@ -2431,7 +2443,7 @@ QueryCatalogRelationPage QueryCatalogStoreReader::ResourceRelations(
         QueryCatalogRelationData value {};
         m_impl->rawRelations->Read( row.metadata, &value.record, 1 );
         m_impl->resourceRelationGenerations->Read( row.metadata, &value.generation, 1 );
-        if( value.record.sourceId != resourceId && value.record.targetId != resourceId )
+        if( !CatalogRelationMatchesResource( value.record, resourceId ) )
             throw std::runtime_error( "Catalog resource relation identity mismatch" );
         result.values.emplace_back( value );
     }
@@ -3792,10 +3804,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     throw std::runtime_error( "Catalog RTAS relation lookup order mismatch" );
                 JnGpuCatalogRelationRecordV1 raw {};
                 rawRelations.Read( row.metadata, &raw, 1 );
-                const bool sourceMatch = raw.sourceId == row.keyHigh && ( raw.flags & 1 ) == 0;
-                const bool targetMatch = raw.targetId == row.keyHigh && ( raw.flags & 2 ) == 0;
-                if( raw.relation != uint8_t( JnGpuCatalogRelationKind::RtasUses ) ||
-                    ( !sourceMatch && !targetMatch ) )
+                if( !CatalogRtasRelationMatchesResource( raw, row.keyHigh ) )
                     throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
                 previousRtas = row;
             }
@@ -3807,10 +3816,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 [&]( uint64_t ordinal ) { JnGpuCatalogRelationRecordV1 row {};
                     rawRelations.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t key, uint64_t ) {
-                    const bool sourceMatch = raw.sourceId == key && ( raw.flags & 1 ) == 0;
-                    const bool targetMatch = raw.targetId == key && ( raw.flags & 2 ) == 0;
-                    return raw.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) &&
-                        ( sourceMatch || targetMatch );
+                    return CatalogRtasRelationMatchesResource( raw, key );
                 }, "Catalog RTAS relation", "rtas-relation-lookup" );
         }
         if( scratchRoot.empty() )
@@ -3827,7 +3833,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                     throw std::runtime_error( "Catalog resource relation lookup order mismatch" );
                 JnGpuCatalogRelationRecordV1 raw {};
                 rawRelations.Read( row.metadata, &raw, 1 );
-                if( raw.sourceId != row.keyHigh && raw.targetId != row.keyHigh )
+                if( !CatalogRelationMatchesResource( raw, row.keyHigh ) )
                     throw std::runtime_error( "Catalog resource relation lookup identity mismatch" );
                 previousRelation = row;
             }
@@ -3839,7 +3845,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 [&]( uint64_t ordinal ) { JnGpuCatalogRelationRecordV1 row {};
                     rawRelations.Read( ordinal, &row, 1 ); return row; },
                 []( const auto& raw, uint64_t key, uint64_t ) {
-                    return raw.sourceId == key || raw.targetId == key;
+                    return CatalogRelationMatchesResource( raw, key );
                 }, "Catalog resource relation", "resource-relation-lookup" );
         }
         if( scratchRoot.empty() )
@@ -4155,8 +4161,6 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemanticsImpl(
                     {
                         if( ( row.flags & 1 ) == 0 )
                             appendRelationResourceReference( false, row.operation, generation, row.sourceId );
-                        if( ( row.flags & 2 ) == 0 )
-                            appendRelationResourceReference( true, row.operation, generation, row.targetId );
                     }
                 } );
                 break;
@@ -4517,7 +4521,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemanticsImpl(
                     haveDefinition = true;
                 }
             }
-            else if( haveDefinition &&
+            else if( haveDefinition && record.metadata != 0 &&
                 ( record.metadata != definitionHash || record.auxiliary != definitionLength ) )
             {
                 note( "CATALOG_NAME_METADATA" );
