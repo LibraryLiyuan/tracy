@@ -217,6 +217,62 @@ int main( int argc, char** argv )
     const auto temporary = TemporaryRoot();
     std::filesystem::create_directories( temporary );
 
+    {
+        const auto compressedRoot = temporary / "compressed-multiblock-run";
+        NeutralStatisticsStreamBuilder source( compressedRoot, 64, 5000 );
+        const auto token = source.RegisterSignature( "cpu", "compressed", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        for( uint64_t frame = 0; frame < 5000; frame++ )
+            assert( source.AddRegisteredRun( token, frame, int64_t( frame % 17 ), int64_t( frame % 13 ),
+                int64_t( frame % 5 ), int64_t( frame % 7 ), 1, true, false ) );
+        source.AddDenominator( { "cpu", "compressed", "Player.Frame", 5000 } );
+        source.AddDomainAudit( { "cpu", true, "complete", 5000, 5000, 1,
+            std::string( 64, 'a' ), std::string( 64, 'a' ), true, {} } );
+        const auto run = *std::filesystem::directory_iterator( compressedRoot );
+        std::ifstream header( run.path(), std::ios::binary );
+        char magic[8] {};
+        header.read( magic, sizeof( magic ) );
+        const auto runBytes = std::filesystem::file_size( run.path() );
+        if( header.gcount() != sizeof( magic ) || std::memcmp( magic, "JNNRUN2", 8 ) != 0 ||
+            runBytes >= 64 + 5000 * 56 / 2 )
+        {
+            std::cerr << "Neutral run is not the bounded compressed v2 format: bytes=" << runBytes << '\n';
+            return 1;
+        }
+        size_t sinkCalls = 0;
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        if( !source.FinishToSink( summary, error, [&]( const auto& aggregate, const auto& frames ) {
+                ++sinkCalls;
+                assert( aggregate.signatureId == "compressed" && frames.size() == 5000 );
+            } ) || sinkCalls != 1 )
+        {
+            std::cerr << "Compressed multi-block run failed: " << error << '\n';
+            return 1;
+        }
+    }
+    {
+        NeutralStatisticsStreamBuilder source( temporary / "compressed-multilevel-merge", 64, 64 );
+        const auto token = source.RegisterSignature( "cpu", "multilevel", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        for( uint64_t frame = 0; frame < 5000; frame++ )
+            assert( source.AddRegisteredRun( token, frame, int64_t( frame ), int64_t( frame ),
+                0, 0, 1, true, false ) );
+        source.AddDenominator( { "cpu", "multilevel", "Player.Frame", 5000 } );
+        source.AddDomainAudit( { "cpu", true, "complete", 5000, 5000, 1,
+            std::string( 64, 'b' ), std::string( 64, 'b' ), true, {} } );
+        size_t frameCount = 0;
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        if( !source.FinishToSink( summary, error, [&]( const auto&, const auto& frames ) {
+                frameCount += frames.size();
+            } ) || frameCount != 5000 )
+        {
+            std::cerr << "Compressed 32-way multi-level merge failed: " << error << '\n';
+            return 1;
+        }
+    }
+
     const auto rejectDamagedRun = [&]( std::string_view label, const auto& damage,
         std::string_view expectedError ) {
         const auto root = temporary / std::string( label );
@@ -351,13 +407,13 @@ int main( int argc, char** argv )
 
     {
         bool allRejected = true;
-        auto workspace = std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+        auto workspace = std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
         if(!BudgetRejected([&] { auto source = BudgetedBuilder(temporary / "budget-raw",workspace,65536); }))
         { std::cerr << "Statistics raw buffers bypassed shared workspace budget\n"; allRejected = false; }
         assert(workspace->Snapshot().currentBytes == 0);
         {
             auto source = BudgetedBuilder(temporary / "budget-denominator",workspace);
-            AnalysisWorkspaceReservation occupied(workspace,1024*1024-workspace->Snapshot().currentBytes-128);
+            AnalysisWorkspaceReservation occupied(workspace,2*1024*1024-workspace->Snapshot().currentBytes-128);
             if(!BudgetRejected([&] { source.AddDenominator(Denominator(std::string(1024,'d').c_str(),5)); }))
             { std::cerr << "Statistics denominators bypassed shared workspace budget\n"; allRejected = false; }
             if(!BudgetRejected([&] { source.AddDomainAudit({std::string(1024,'a'),true,"complete"}); }))
@@ -365,8 +421,8 @@ int main( int argc, char** argv )
         }
         assert(workspace->Snapshot().currentBytes == 0);
         {
-            // One large signature must not bypass the budget just because
-            // its raw input was externally merged in small batches.
+            // A streaming finish must not bypass the budget just because its
+            // raw input was externally merged in small batches.
             auto source = BudgetedBuilder(temporary / "budget-merged-frames",workspace,256);
             const auto token = source.RegisterSignature("cpu","large","Player.Frame");
             for(uint64_t frame=0; frame<8192; ++frame)
@@ -383,7 +439,7 @@ int main( int argc, char** argv )
                     throw std::runtime_error(error);
             });
             if(!rejected || emitted != 0)
-            { std::cerr << "Per-signature statistics workspace bypassed budget\n"; allRejected = false; }
+            { std::cerr << "Streaming statistics finish bypassed workspace budget\n"; allRejected = false; }
         }
         assert(workspace->Snapshot().currentBytes == 0);
         if(!allRejected) return 1;
@@ -392,11 +448,11 @@ int main( int argc, char** argv )
     {
         // Shared scope text must not be copied into every registry and
         // denominator key. Removing dictionary use breaks this bounded scan.
-        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(2*1024*1024,1024*1024);
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(8*1024*1024,4*1024*1024);
         const char* dictionaryStage="construct"; uint64_t insertedKeys=0;
         try {
             // This test isolates registry/string retention. Four-record raw
-            // batches would create 256 runs and legitimately exceed 2 MiB
+            // batches would create 256 runs and legitimately exceed 8 MiB
             // when opening 32 merge readers; use bounded 64-record batches.
             auto source=BudgetedBuilder(temporary/"dictionary-scope-sharing",workspace,64);
             const std::string scope="Frame-"+std::string(64*1024,'x');

@@ -4,6 +4,9 @@
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisDictionary.hpp"
 
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cctype>
@@ -839,18 +842,37 @@ struct PackedNeutralRun
 static_assert( std::is_trivially_copyable_v<PackedNeutralRun> );
 static_assert( sizeof( PackedNeutralRun ) == 56 );
 
+constexpr uint32_t NeutralRunBlockRecords = ( 256 * 1024 ) / sizeof( PackedNeutralRun );
+constexpr uint32_t NeutralRunBlockBytes = NeutralRunBlockRecords * sizeof( PackedNeutralRun );
+
 struct NeutralRunHeader
 {
-    char magic[8] { 'J', 'N', 'N', 'R', 'U', 'N', '1', '\0' };
-    uint32_t version = 1;
+    char magic[8] { 'J', 'N', 'N', 'R', 'U', 'N', '2', '\0' };
+    uint32_t version = 2;
     uint32_t recordBytes = sizeof( PackedNeutralRun );
     uint64_t recordCount = 0;
     uint64_t checksum = 14695981039346656037ull;
-    uint64_t reserved[4] {};
+    uint64_t blockCount = 0;
+    uint64_t storedBytes = 0;
+    uint64_t blockRecordCapacity = NeutralRunBlockRecords;
+    uint64_t reserved = 0;
 };
 
 static_assert( std::is_trivially_copyable_v<NeutralRunHeader> );
 static_assert( sizeof( NeutralRunHeader ) == 64 );
+
+struct NeutralRunBlockHeader
+{
+    uint32_t recordCount = 0;
+    uint32_t flags = 0;
+    uint32_t storedBytes = 0;
+    uint32_t rawBytes = 0;
+    uint64_t checksum = 14695981039346656037ull;
+    uint64_t reserved = 0;
+};
+
+static_assert( std::is_trivially_copyable_v<NeutralRunBlockHeader> );
+static_assert( sizeof( NeutralRunBlockHeader ) == 32 );
 
 uint64_t NeutralRunChecksumUpdate( uint64_t checksum, const void* data, size_t size )
 {
@@ -1047,30 +1069,95 @@ struct NeutralStatisticsStreamBuilder::Impl
     {
         return root / ( std::string( label ) + "-" + std::to_string( fileOrdinal++ ) + ".work" );
     }
-    bool BeginRun( std::ofstream& output, NeutralRunHeader& header )
+    struct RunWriter
     {
-        AnalysisDiskGrow( disk, sizeof( header ) );
-        output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
-        if( !output ) { error = "neutral_run_header_write_failed"; return false; }
-        return true;
-    }
-    bool WriteRunRecord( std::ofstream& output, NeutralRunHeader& header, const PackedNeutralRun& value )
-    {
-        AnalysisDiskGrow( disk, sizeof( value ) );
-        output.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
-        if( !output ) { error = "neutral_run_write_failed"; return false; }
-        header.recordCount++;
-        header.checksum = NeutralRunChecksumUpdate( header.checksum, &value, sizeof( value ) );
-        return true;
-    }
-    bool FinishRun( std::ofstream& output, const NeutralRunHeader& header )
-    {
-        output.seekp( 0 );
-        output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
-        output.flush();
-        if( !output ) { error = "neutral_run_flush_failed"; return false; }
-        return true;
-    }
+        Impl& owner;
+        std::ofstream& output;
+        AnalysisWorkspaceReservation budget;
+        NeutralRunHeader header;
+        std::vector<PackedNeutralRun> block;
+        std::vector<char> compressed;
+        ZSTD_CCtx* context = nullptr;
+
+        RunWriter( Impl& value, std::ofstream& stream )
+            : owner( value ), output( stream ), budget( value.workspace,
+                65536 + NeutralRunBlockBytes + ZSTD_compressBound( NeutralRunBlockBytes ) +
+                ZSTD_estimateCCtxSize( 1 ) )
+        {
+            block.reserve( NeutralRunBlockRecords );
+            compressed.resize( ZSTD_compressBound( NeutralRunBlockBytes ) );
+            context = ZSTD_createCCtx();
+            if( context == nullptr ) owner.error = "neutral_run_compression_context_failed";
+        }
+
+        ~RunWriter()
+        {
+            if( context != nullptr ) ZSTD_freeCCtx( context );
+        }
+
+        bool Begin()
+        {
+            if( context == nullptr ) return false;
+            AnalysisDiskGrow( owner.disk, sizeof( header ) );
+            output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+            if( !output ) { owner.error = "neutral_run_header_write_failed"; return false; }
+            return true;
+        }
+
+        bool FlushBlock()
+        {
+            if( block.empty() ) return true;
+            const auto rawBytes = block.size() * sizeof( PackedNeutralRun );
+            const auto compressedBytes = ZSTD_compressCCtx( context, compressed.data(), compressed.size(),
+                block.data(), rawBytes, 1 );
+            if( ZSTD_isError( compressedBytes ) )
+            { owner.error = "neutral_run_compress_failed"; return false; }
+            const bool useCompressed = compressedBytes < rawBytes;
+            const auto payloadBytes = useCompressed ? compressedBytes : rawBytes;
+            if( payloadBytes > std::numeric_limits<uint32_t>::max() ||
+                rawBytes > std::numeric_limits<uint32_t>::max() ||
+                header.storedBytes > std::numeric_limits<uint64_t>::max() -
+                    sizeof( NeutralRunBlockHeader ) - payloadBytes )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            NeutralRunBlockHeader blockHeader;
+            blockHeader.recordCount = uint32_t( block.size() );
+            blockHeader.flags = useCompressed ? 1u : 0u;
+            blockHeader.storedBytes = uint32_t( payloadBytes );
+            blockHeader.rawBytes = uint32_t( rawBytes );
+            blockHeader.checksum = NeutralRunChecksumUpdate( blockHeader.checksum, block.data(), rawBytes );
+            AnalysisDiskGrow( owner.disk, sizeof( blockHeader ) + payloadBytes );
+            output.write( reinterpret_cast<const char*>( &blockHeader ), sizeof( blockHeader ) );
+            if( useCompressed ) output.write( compressed.data(), std::streamsize( payloadBytes ) );
+            else output.write( reinterpret_cast<const char*>( block.data() ), std::streamsize( payloadBytes ) );
+            if( !output ) { owner.error = "neutral_run_write_failed"; return false; }
+            if( header.blockCount == std::numeric_limits<uint64_t>::max() )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            header.blockCount++;
+            header.storedBytes += sizeof( blockHeader ) + payloadBytes;
+            block.clear();
+            return true;
+        }
+
+        bool Write( const PackedNeutralRun& value )
+        {
+            if( header.recordCount == std::numeric_limits<uint64_t>::max() )
+            { owner.error = "neutral_run_size_overflow"; return false; }
+            block.push_back( value );
+            header.recordCount++;
+            header.checksum = NeutralRunChecksumUpdate( header.checksum, &value, sizeof( value ) );
+            return block.size() < NeutralRunBlockRecords || FlushBlock();
+        }
+
+        bool Finish()
+        {
+            if( !FlushBlock() ) return false;
+            output.seekp( 0 );
+            output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+            output.flush();
+            if( !output ) { owner.error = "neutral_run_flush_failed"; return false; }
+            return true;
+        }
+    };
     bool WriteCompacted( std::vector<PackedNeutralRun>& values, const std::filesystem::path& path )
     {
         std::sort( values.begin(), values.end(), [&]( const auto& left, const auto& right ) {
@@ -1078,20 +1165,20 @@ struct NeutralStatisticsStreamBuilder::Impl
         } );
         std::ofstream output( path, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_run_open_failed"; return false; }
-        NeutralRunHeader header;
-        if( !BeginRun( output, header ) ) return false;
+        RunWriter writer( *this, output );
+        if( !writer.Begin() ) return false;
         std::optional<PackedNeutralRun> pending;
         for( const auto& value : values )
         {
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
+                if( pending && !writer.Write( *pending ) ) return false;
                 pending = value;
             }
         }
-        if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
-        return FinishRun( output, header );
+        if( pending && !writer.Write( *pending ) ) return false;
+        return writer.Finish();
     }
     bool Flush()
     {
@@ -1110,9 +1197,16 @@ struct NeutralStatisticsStreamBuilder::Impl
     struct Reader
     {
         std::ifstream input;
+        AnalysisWorkspaceReservation budget;
         PackedNeutralRun value {};
         NeutralRunHeader header {};
+        std::vector<PackedNeutralRun> block;
+        std::vector<char> stored;
+        ZSTD_DCtx* context = nullptr;
+        size_t blockIndex = 0;
         uint64_t remaining = 0;
+        uint64_t blocksRemaining = 0;
+        uint64_t storedRemaining = 0;
         uint64_t checksum = 14695981039346656037ull;
         uint64_t signatureLimit = 0;
         uint32_t previousSignature = 0;
@@ -1121,39 +1215,114 @@ struct NeutralStatisticsStreamBuilder::Impl
         bool valid = false;
         bool havePrevious = false;
         std::string error;
-        explicit Reader( const std::filesystem::path& path, uint64_t signatures )
-            : input( path, std::ios::binary ), signatureLimit( signatures )
+
+        Reader( Reader&& other ) noexcept
+            : input( std::move( other.input ) ), budget( std::move( other.budget ) ),
+            value( other.value ), header( other.header ),
+            block( std::move( other.block ) ), stored( std::move( other.stored ) ),
+            context( std::exchange( other.context, nullptr ) ), blockIndex( other.blockIndex ),
+            remaining( other.remaining ), blocksRemaining( other.blocksRemaining ),
+            storedRemaining( other.storedRemaining ), checksum( other.checksum ),
+            signatureLimit( other.signatureLimit ), previousSignature( other.previousSignature ),
+            previousFrame( other.previousFrame ), opened( other.opened ), valid( other.valid ),
+            havePrevious( other.havePrevious ), error( std::move( other.error ) )
+        {}
+        Reader& operator=( Reader&& ) = delete;
+        Reader( const Reader& ) = delete;
+        Reader& operator=( const Reader& ) = delete;
+
+        explicit Reader( const std::filesystem::path& path, uint64_t signatures,
+            const std::shared_ptr<AnalysisWorkspaceBudget>& workspace )
+            : input( path, std::ios::binary ), budget( workspace,
+                65536 + ZSTD_estimateDCtxSize() ), signatureLimit( signatures )
         {
             opened = input.is_open();
             if( !opened ) return;
             input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
             if( input.gcount() != sizeof( header ) ) { error = "neutral_run_header_truncated"; return; }
-            if( std::memcmp( header.magic, "JNNRUN1", 8 ) != 0 || header.version != 1 ||
-                header.recordBytes != sizeof( PackedNeutralRun ) )
+            if( std::memcmp( header.magic, "JNNRUN2", 8 ) != 0 || header.version != 2 ||
+                header.recordBytes != sizeof( PackedNeutralRun ) ||
+                header.blockRecordCapacity != NeutralRunBlockRecords || header.reserved != 0 )
             { error = "neutral_run_header_invalid"; return; }
-            if( header.recordCount > ( std::numeric_limits<uint64_t>::max() - sizeof( header ) ) /
-                sizeof( PackedNeutralRun ) )
+            const auto expectedBlocks = header.recordCount == 0 ? 0 :
+                1 + ( header.recordCount - 1 ) / NeutralRunBlockRecords;
+            if( header.blockCount != expectedBlocks ||
+                header.storedBytes > std::numeric_limits<uint64_t>::max() - sizeof( header ) )
             { error = "neutral_run_header_invalid"; return; }
             std::error_code sizeError;
             const auto actualBytes = std::filesystem::file_size( path, sizeError );
             if( sizeError ) { error = "neutral_run_size_failed"; return; }
-            const auto expectedBytes = sizeof( header ) + header.recordCount * sizeof( PackedNeutralRun );
+            const auto expectedBytes = sizeof( header ) + header.storedBytes;
             if( actualBytes < expectedBytes ) { error = "neutral_run_truncated"; return; }
             if( actualBytes > expectedBytes ) { error = "neutral_run_extra_data"; return; }
+            context = ZSTD_createDCtx();
+            if( context == nullptr ) { error = "neutral_run_decompression_context_failed"; return; }
             remaining = header.recordCount;
+            blocksRemaining = header.blockCount;
+            storedRemaining = header.storedBytes;
             Advance();
         }
+
+        ~Reader()
+        {
+            if( context != nullptr ) ZSTD_freeDCtx( context );
+        }
+
+        bool LoadBlock()
+        {
+            block.clear();
+            blockIndex = 0;
+            if( blocksRemaining == 0 || storedRemaining < sizeof( NeutralRunBlockHeader ) )
+            { error = "neutral_run_truncated"; return false; }
+            NeutralRunBlockHeader blockHeader;
+            input.read( reinterpret_cast<char*>( &blockHeader ), sizeof( blockHeader ) );
+            if( input.gcount() != sizeof( blockHeader ) )
+            { error = "neutral_run_truncated"; return false; }
+            storedRemaining -= sizeof( blockHeader );
+            if( blockHeader.recordCount == 0 || blockHeader.recordCount > NeutralRunBlockRecords ||
+                blockHeader.rawBytes != blockHeader.recordCount * sizeof( PackedNeutralRun ) ||
+                blockHeader.storedBytes == 0 || blockHeader.storedBytes > storedRemaining ||
+                ( blockHeader.flags & ~1u ) != 0 || blockHeader.reserved != 0 ||
+                ( blockHeader.flags == 0 && blockHeader.storedBytes != blockHeader.rawBytes ) ||
+                ( blockHeader.flags == 1 && blockHeader.storedBytes >= blockHeader.rawBytes ) ||
+                blockHeader.recordCount > remaining )
+            { error = "neutral_run_block_header_invalid"; return false; }
+            budget.Resize( 65536 + ZSTD_estimateDCtxSize() +
+                blockHeader.rawBytes + blockHeader.storedBytes );
+            stored.resize( blockHeader.storedBytes );
+            input.read( stored.data(), std::streamsize( stored.size() ) );
+            if( input.gcount() != std::streamsize( stored.size() ) )
+            { error = "neutral_run_truncated"; return false; }
+            storedRemaining -= stored.size();
+            block.resize( blockHeader.recordCount );
+            if( blockHeader.flags == 0 ) std::memcpy( block.data(), stored.data(), stored.size() );
+            else
+            {
+                const auto decoded = ZSTD_decompressDCtx( context, block.data(), blockHeader.rawBytes,
+                    stored.data(), stored.size() );
+                if( ZSTD_isError( decoded ) || decoded != blockHeader.rawBytes )
+                { error = "neutral_run_checksum_mismatch"; return false; }
+            }
+            auto blockChecksum = uint64_t( 14695981039346656037ull );
+            blockChecksum = NeutralRunChecksumUpdate( blockChecksum, block.data(), blockHeader.rawBytes );
+            if( blockChecksum != blockHeader.checksum )
+            { error = "neutral_run_checksum_mismatch"; return false; }
+            --blocksRemaining;
+            return true;
+        }
+
         void Advance()
         {
             valid = false;
             if( !error.empty() ) return;
             if( remaining == 0 )
             {
-                if( checksum != header.checksum ) error = "neutral_run_checksum_mismatch";
+                if( blocksRemaining != 0 || storedRemaining != 0 ) error = "neutral_run_block_count_mismatch";
+                else if( checksum != header.checksum ) error = "neutral_run_checksum_mismatch";
                 return;
             }
-            input.read( reinterpret_cast<char*>( &value ), sizeof( value ) );
-            if( input.gcount() != sizeof( value ) ) { error = "neutral_run_read_failed"; return; }
+            if( blockIndex == block.size() && !LoadBlock() ) return;
+            value = block[blockIndex++];
             remaining--;
             checksum = NeutralRunChecksumUpdate( checksum, &value, sizeof( value ) );
             if( value.signature >= signatureLimit || ( value.flags & ~3u ) != 0 )
@@ -1176,7 +1345,7 @@ struct NeutralStatisticsStreamBuilder::Impl
         readers.reserve( source.size() );
         for( const auto& path : source )
         {
-            readers.emplace_back( path, signatures.size() );
+            readers.emplace_back( path, signatures.size(), workspace );
             if( !readers.back().opened ) { error = "neutral_run_read_open_failed"; return false; }
             if( !readers.back().error.empty() ) { error = readers.back().error; return false; }
         }
@@ -1187,8 +1356,8 @@ struct NeutralStatisticsStreamBuilder::Impl
         for( size_t index = 0; index < readers.size(); ++index ) if( readers[index].valid ) queue.push( index );
         std::ofstream output( outputPath, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_merge_open_failed"; return false; }
-        NeutralRunHeader header;
-        if( !BeginRun( output, header ) ) return false;
+        RunWriter writer( *this, output );
+        if( !writer.Begin() ) return false;
         std::optional<PackedNeutralRun> pending;
         uint64_t processed = 0;
         while( !queue.empty() )
@@ -1203,12 +1372,12 @@ struct NeutralStatisticsStreamBuilder::Impl
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
+                if( pending && !writer.Write( *pending ) ) return false;
                 pending = value;
             }
         }
-        if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
-        return FinishRun( output, header );
+        if( pending && !writer.Write( *pending ) ) return false;
+        return writer.Finish();
     }
 
     bool Consolidate( const std::function<bool()>& cancelled )
@@ -1507,7 +1676,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     if( !m_impl->runs.empty() )
     {
-        Impl::Reader reader( m_impl->runs.front(), m_impl->signatures.size() );
+        Impl::Reader reader( m_impl->runs.front(), m_impl->signatures.size(), m_impl->workspace );
         if( !reader.opened ) { error = "neutral_final_run_open_failed"; return false; }
         if( !reader.error.empty() ) { error = reader.error; return false; }
         uint32_t currentSignature = 0;

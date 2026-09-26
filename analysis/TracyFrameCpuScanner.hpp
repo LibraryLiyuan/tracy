@@ -146,6 +146,9 @@ struct CpuFrameScanOptions
     // frame run, and do not retain full definitions in the result. The view is
     // valid only during the callback; false cancels the scan explicitly.
     std::function<bool( const CpuSignatureDefinition& )> definitionSink;
+    // Throttling belongs to the caller. The scanner reports once per bounded
+    // source page and once after closing the final thread stacks.
+    std::function<void( uint64_t inputZones, uint64_t emittedRuns )> progress;
     // Shared analysis-owned metadata, signatures, active stacks and returned
     // result storage. Source pages are charged once returned; constructing a
     // native source DTO is not protected by an absolute allocator limit.

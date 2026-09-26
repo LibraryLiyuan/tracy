@@ -22,6 +22,7 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <set>
@@ -497,6 +498,23 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         cpuOptions.includeExactSignatures = true;
         cpuOptions.includeLogicalSignatures = false;
         cpuOptions.logicalSignatureMode = CpuLogicalSignatureMode::FullPath;
+        const auto cpuZoneTotal = request.source->GetTraceInfoMetadata().counts.cpuZones;
+        const auto cpuProgressStarted = std::chrono::steady_clock::now();
+        auto cpuProgressReportedAt = cpuProgressStarted;
+        uint64_t cpuProgressReportedZones = 0;
+        cpuOptions.progress = [&]( uint64_t inputZones, uint64_t emittedRuns ) {
+            const auto now = std::chrono::steady_clock::now();
+            if( inputZones != cpuZoneTotal && inputZones - cpuProgressReportedZones < 1'000'000 &&
+                now - cpuProgressReportedAt < std::chrono::seconds( 5 ) ) return;
+            cpuProgressReportedAt = now;
+            cpuProgressReportedZones = inputZones;
+            const auto total = std::max<uint64_t>( cpuZoneTotal, inputZones );
+            progress( ScanState::Scanning, inputZones, total, "cpu_frame_zone_scan" );
+            std::cerr << "Query scan-progress stage=cpu_frame_zone_scan input_zones=" << inputZones
+                << " total_zones=" << total << " emitted_runs=" << emittedRuns
+                << " elapsed_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - cpuProgressStarted ).count() << '\n';
+        };
         auto cpuDefinitionOutput = std::make_unique<AnalysisCacheSortedWriter>( cpuDefinitionsPath,
             products.neutralCacheIdentity, "cpu-definitions-v1", cacheOptions.table );
         cpuOptions.definitionSink = [&]( const CpuSignatureDefinition& definition ) {

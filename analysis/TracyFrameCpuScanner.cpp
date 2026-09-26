@@ -230,6 +230,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     if( !options.includeExactSignatures && !options.includeLogicalSignatures )
         throw BoundedScanError( "frame_cpu_scan_signature_mode_empty" );
     CpuFrameScanResult result( options.workspace );
+    uint64_t emittedRunCount = 0;
     AnalysisWorkspaceReservation metadataWorkspace( options.workspace ), frameWorkspace( options.workspace ),
         signatureWorkspace( options.workspace ), presenceWorkspace( options.workspace ), runWorkspace( options.workspace );
     BoundedTraceScanner scanner( m_source );
@@ -493,6 +494,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                 accepted = ( *sink )( run );
             }
             if( !accepted ) throw std::runtime_error( "frame_cpu_scan_sink_cancelled" );
+            ++emittedRunCount;
             checkCancelled();
             const auto presence = ( uint64_t( signatureOrdinal ) << 32 ) | contribution.frame->frameSetOrdinal;
             if( !streamedPresence.contains( presence ) )
@@ -725,12 +727,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
             storage.ReserveNext();
             stack.emplace_back( std::move( active ) );
         }
+        if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
         if( batch.cursor.complete ) break;
         zoneRequest.cursor = batch.cursor;
     }
 
     for( auto& [thread, storage] : stacks )
         while( !storage.zones.empty() ) closeTop( storage.zones );
+    if( options.progress ) options.progress( result.inputZoneCount, emittedRunCount );
 
     if( sink || viewSink )
     {

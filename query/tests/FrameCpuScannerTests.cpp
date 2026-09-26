@@ -518,12 +518,18 @@ int main()
         assert(definitions.emplace(definition.signatureId,definition).second);
         return true;
     };
+    uint64_t progressCalls=0,progressZones=0,progressRuns=0;
+    streamedOptions.progress=[&](uint64_t zones,uint64_t runs) {
+        assert(zones>=progressZones && runs>=progressRuns);
+        ++progressCalls; progressZones=zones; progressRuns=runs;
+    };
     uint64_t definitionStreamRuns=0;
     const auto definitionStream=scanner.ScanView([&](const CpuSignatureFrameRunView& run) {
         assert(definitions.contains(std::string(run.signatureId)));
         ++definitionStreamRuns; return true;
     },streamedOptions);
     assert(definitionStreamRuns>0 && definitionStream.signatures.empty() && definitionStream.runs.empty());
+    assert(progressCalls>1 && progressZones==definitionStream.inputZoneCount && progressRuns==definitionStreamRuns);
     assert(definitions.size()==result.signatures.size());
     for(const auto& expected:result.signatures)
     {
