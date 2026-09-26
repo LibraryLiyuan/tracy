@@ -5971,13 +5971,14 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "global callstack frame section count mismatch" );
             if( deep ) frames.ValidateAll();
         }
-        if( deep ) resources->SetPhase( "index-validate:deep:catalog" );
+        if( deep ) resources->SetPhase( "index-validate:deep:catalog-hash" );
         if( manifest.gpuCatalog.recordBytes != 0 || !std::filesystem::is_directory( manifest.gpuCatalog.path ) ||
             SectionBytes( manifest.gpuCatalog.path ) != manifest.gpuCatalog.bytes )
             throw std::runtime_error( "GPU Catalog section identity mismatch" );
         if( deep && SectionFingerprint( manifest.gpuCatalog.path ) != manifest.gpuCatalog.fingerprint )
             throw std::runtime_error( "GPU Catalog section hash mismatch" );
         {
+            if( deep ) resources->SetPhase( "index-validate:deep:catalog-open" );
             QueryCatalogStoreReader catalog( manifest.gpuCatalog.path, manifest.sourceFingerprint, storageOptions );
             if( !catalog.ResourceIndexReady() ) throw std::runtime_error( "GPU Catalog resource index is not ready" );
             uint64_t count = 0;
@@ -5992,7 +5993,9 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "GPU Catalog section count mismatch" );
             if( deep )
             {
+                resources->SetPhase( "index-validate:deep:catalog-structure" );
                 catalog.ValidateAll();
+                resources->SetPhase( "index-validate:deep:catalog-semantics" );
                 auto semanticScratch = manifest.gpuCatalog.path;
                 semanticScratch += ".semantic-validation." + std::to_string(
                     std::chrono::steady_clock::now().time_since_epoch().count() );

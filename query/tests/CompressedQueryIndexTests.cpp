@@ -95,6 +95,8 @@ int main(int argc,char** argv)
         bool reusedGpuDerivedValidation=false;
         bool phasedSampleValidation=false;
         bool phasedJobValidation=false;
+        bool phasedCatalogStructure=false;
+        bool phasedCatalogSemantics=false;
         for(const auto& phase:freshResources->Snapshot().phaseHistory)
         {
             if(phase.phase=="index-validate:deep:gpu-derived-reused")
@@ -103,11 +105,17 @@ int main(int argc,char** argv)
                 phasedSampleValidation=true;
             else if(phase.phase=="index-validate:deep:jobs")
                 phasedJobValidation=true;
+            else if(phase.phase=="index-validate:deep:catalog-structure")
+                phasedCatalogStructure=true;
+            else if(phase.phase=="index-validate:deep:catalog-semantics")
+                phasedCatalogSemantics=true;
         }
         if(!reusedGpuDerivedValidation)
             throw std::runtime_error("fresh build repeated GPU derived deep validation");
         if(!phasedSampleValidation || !phasedJobValidation)
             throw std::runtime_error("deep validation did not expose per-domain phase telemetry");
+        if(!phasedCatalogStructure || !phasedCatalogSemantics)
+            throw std::runtime_error("Catalog deep validation did not expose structure and semantic phases");
         auto mismatchedReceipt=freshManifest;
         mismatchedReceipt.gpuReferenceUses.bytes++;
         const auto fallbackResources=tracy::query::QueryIndex::CreateResourceContext(freshInput);
