@@ -357,25 +357,38 @@ uint64_t BuildQueryGhostZoneStoreImpl( std::filesystem::path output,
         if( !patches ) throw std::runtime_error( "ghost-zone patch scratch reopen" );
         QueryGhostZoneStoreWriter writer( output, sourceFingerprint, options );
         writer.Begin( count );
-        for( uint64_t ordinal = 0; ordinal < count; ordinal++ )
+        constexpr size_t finalJoinRecords = 8192;
+        analysis::AnalysisWorkspaceReservation finalJoinMemory( options.workspace,
+            finalJoinRecords * ( sizeof( StoredGhostZone ) + sizeof( ScratchGhostPatch ) +
+                sizeof( QueryGhostZoneFact ) ) + 4096 );
+        std::vector<StoredGhostZone> staticRecords( finalJoinRecords );
+        std::vector<ScratchGhostPatch> patchRecords( finalJoinRecords );
+        std::vector<QueryGhostZoneFact> facts( finalJoinRecords );
+        for( uint64_t ordinal = 0; ordinal < count; ordinal += finalJoinRecords )
         {
             if( options.cancelled && options.cancelled() ) throw std::runtime_error( "ghost-zone build cancelled" );
-            StoredGhostZone staticRecord {};
-            staticRows.Read( ordinal, &staticRecord, 1 );
-            ScratchGhostPatch patch {};
-            patches.read( reinterpret_cast<char*>( &patch ), sizeof( patch ) );
+            const auto take = size_t( std::min<uint64_t>( finalJoinRecords, count - ordinal ) );
+            staticRows.Read( ordinal, staticRecords.data(), take );
+            patches.read( reinterpret_cast<char*>( patchRecords.data() ),
+                std::streamsize( take * sizeof( ScratchGhostPatch ) ) );
             if( !patches ) throw std::runtime_error( "ghost-zone patch scratch sequential read" );
-            QueryGhostZoneFact value;
-            value.thread = staticRecord.thread;
-            value.parent = staticRecord.parent;
-            value.startNs = staticRecord.startNs; value.endNs = patch.endNs;
-            value.line = staticRecord.line;
-            value.depth = staticRecord.depth; value.childCount = patch.childCount;
-            value.inlineFrame = staticRecord.inlineFrame != 0;
-            value.name = staticRecord.name;
-            value.file = staticRecord.file;
-            value.address = staticRecord.address;
-            writer.Append( ordinal, value );
+            for( size_t index = 0; index < take; index++ )
+            {
+                const auto& staticRecord = staticRecords[index];
+                const auto& patch = patchRecords[index];
+                auto& value = facts[index];
+                value.thread = staticRecord.thread;
+                value.parent = staticRecord.parent;
+                value.startNs = staticRecord.startNs; value.endNs = patch.endNs;
+                value.line = staticRecord.line;
+                value.depth = staticRecord.depth; value.childCount = patch.childCount;
+                value.inlineFrame = staticRecord.inlineFrame != 0;
+                value.name = staticRecord.name;
+                value.file = staticRecord.file;
+                value.address = staticRecord.address;
+            }
+            writer.AppendBatch( ordinal, facts.data(), take );
+            statistics.finalJoinBatches++;
         }
         writer.Commit();
     }
@@ -405,12 +418,15 @@ struct QueryGhostZoneStoreWriter::Impl
     Impl( std::filesystem::path output, std::string identity, analysis::PagedRecordOptions storage )
         : root( std::move( output ) ), source( std::move( identity ) ), options( std::move( storage ) )
         , records( root / "records", Identity( source, "query-ghost-zones-v2-global-records" ), sizeof( StoredGhostZone ), options )
+        , batchMemory( options.workspace )
     {}
 
     std::filesystem::path root;
     std::string source;
     analysis::PagedRecordOptions options;
     analysis::PagedRecordWriter records;
+    analysis::AnalysisWorkspaceReservation batchMemory;
+    std::vector<StoredGhostZone> batch;
     uint64_t expected = 0;
     uint64_t seen = 0;
     bool begun = false;
@@ -435,14 +451,32 @@ void QueryGhostZoneStoreWriter::Begin( uint64_t count )
 
 void QueryGhostZoneStoreWriter::Append( uint64_t ordinal, const QueryGhostZoneFact& dto )
 {
+    AppendBatch( ordinal, &dto, 1 );
+}
+
+void QueryGhostZoneStoreWriter::AppendBatch( uint64_t ordinal, const QueryGhostZoneFact* values, size_t count )
+{
     auto& value = *m_impl;
-    if( !value.begun || value.committed || ordinal != value.seen || ordinal >= value.expected )
+    if( !value.begun || value.committed || ordinal != value.seen || count > value.expected - value.seen ||
+        ( count != 0 && values == nullptr ) )
         throw std::runtime_error( "ghost-zone store append order" );
-    if( dto.parent != NoParent && dto.parent >= ordinal ) throw std::runtime_error( "ghost-zone parent ordinal" );
-    StoredGhostZone record { dto.startNs, dto.endNs, dto.thread, dto.parent, dto.name, dto.file,
-        dto.address, dto.line, dto.depth, dto.childCount, uint8_t( dto.inlineFrame ), {} };
-    value.records.Append( &record, 1 );
-    value.seen++;
+    if( count > value.batch.capacity() )
+    {
+        value.batchMemory.Resize( uint64_t( value.batch.capacity() + count ) * sizeof( StoredGhostZone ) );
+        value.batch.reserve( count );
+        value.batchMemory.Resize( uint64_t( value.batch.capacity() ) * sizeof( StoredGhostZone ) );
+    }
+    value.batch.clear();
+    for( size_t index = 0; index < count; index++ )
+    {
+        const auto& dto = values[index];
+        if( dto.parent != NoParent && dto.parent >= ordinal + index )
+            throw std::runtime_error( "ghost-zone parent ordinal" );
+        value.batch.push_back( { dto.startNs, dto.endNs, dto.thread, dto.parent, dto.name, dto.file,
+            dto.address, dto.line, dto.depth, dto.childCount, uint8_t( dto.inlineFrame ), {} } );
+    }
+    value.records.Append( value.batch.data(), count );
+    value.seen += count;
 }
 
 void QueryGhostZoneStoreWriter::Commit()

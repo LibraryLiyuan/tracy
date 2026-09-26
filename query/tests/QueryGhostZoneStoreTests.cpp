@@ -361,6 +361,8 @@ int main( int argc, char** argv )
         if( !capacityProbe )
             Require( batchStats.scratchWriteCalls < 10, "batched Ghost writes retained per-record system calls" );
         if( !capacityProbe )
+            Require( batchStats.finalJoinBatches < 10, "Ghost final join retained per-record page operations" );
+        if( !capacityProbe )
         {
             QueryGhostZoneStoreReader batchReader( root / "batch-ghost", fingerprint, root / "strings", options );
             const auto boundary = batchReader.Scan( 0, 100000, 8190, 6 );
