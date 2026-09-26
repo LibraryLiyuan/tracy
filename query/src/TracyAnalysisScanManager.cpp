@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -131,7 +132,8 @@ bool ReplaceFile( const std::filesystem::path& from, const std::filesystem::path
 }
 
 bool WriteJson( const std::filesystem::path& path, const json& value, std::string& error,
-    const std::shared_ptr<AnalysisDiskUsage>& disk={},uint64_t limit=UINT64_MAX )
+    const std::shared_ptr<AnalysisDiskUsage>& disk={},uint64_t limit=UINT64_MAX,
+    bool respectControlReserve=true )
 {
     std::error_code ec;
     std::filesystem::create_directories( path.parent_path(), ec );
@@ -143,7 +145,7 @@ bool WriteJson( const std::filesystem::path& path, const json& value, std::strin
     const auto replaced=disk?AnalysisDiskUsage::Bytes(path):0;
     // State/checkpoint writes can use the control space reserved by Run. They
     // are still counted; profiles and publication pointers supply a hard limit.
-    if(disk) disk->Grow(payload.size(),limit,limit!=UINT64_MAX);
+    if(disk) disk->Grow(payload.size(),limit,respectControlReserve && limit!=UINT64_MAX);
     std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
     if( !output ) { error = "analysis_scan_open_failed"; return false; }
     if(disk) disk->Release(oldTemporary);
@@ -302,6 +304,77 @@ bool GenerationName( const std::string& value )
 {
     return value.starts_with( "gen-" ) && value.size()>4 &&
         std::all_of( value.begin()+4,value.end(),[](char c){return c>='0' && c<='9';} );
+}
+
+void RetireUnpublishedGenerations( const std::filesystem::path& generationsRoot,
+    const std::filesystem::path& receiptPath, std::string_view identity,
+    std::string_view scanId, std::string_view kind, AnalysisCacheTableOptions options )
+{
+    if( !std::filesystem::exists( generationsRoot ) ) return;
+    AnalysisWorkspaceReservation cleanupWorkspace( options.workspace, 65536 );
+    std::vector<std::filesystem::path> paths;
+    for( const auto& entry : std::filesystem::directory_iterator( generationsRoot ) )
+    {
+        cleanupWorkspace.Add( 1024 + 8ull * entry.path().native().size() );
+        paths.push_back( entry.path() );
+    }
+    std::sort( paths.begin(), paths.end() );
+    json candidates = json::array();
+    uint64_t removedBytes = 0;
+    bool preflightComplete = true;
+    for( const auto& path : paths )
+    {
+        const std::filesystem::directory_entry entry( path );
+        cleanupWorkspace.Add( 4096 + 32ull * path.native().size() );
+        json candidate = { { "name", path.filename().string() },
+            { "bytes", "0" }, { "removed_bytes", "0" }, { "removed", false },
+            { "error", nullptr } };
+        try
+        {
+            if( !entry.is_directory() || !GenerationName( path.filename().string() ) )
+                throw std::runtime_error( "analysis_generation_cleanup_unowned" );
+            CheckCleanupPath( generationsRoot, path );
+            candidate["bytes"] = std::to_string( AnalysisDiskUsage::Bytes( path ) );
+        }
+        catch( const std::exception& failure )
+        {
+            candidate["error"] = failure.what();
+            preflightComplete = false;
+        }
+        candidates.push_back( std::move( candidate ) );
+    }
+    if( candidates.empty() ) return;
+    const auto limit = options.disk ? options.disk->maximumBytes : UINT64_MAX;
+    const auto writeReceipt = [&]( std::string_view state ) {
+        const json receipt = { { "schema", 1 }, { "identity", identity }, { "scan_id", scanId },
+            { "kind", kind }, { "state", state }, { "removed_bytes", std::to_string( removedBytes ) },
+            { "candidates", candidates } };
+        std::string writeError;
+        if( !WriteJson( receiptPath, receipt, writeError,
+            options.disk ? options.disk->usage : nullptr, limit, false ) )
+            throw std::runtime_error( "analysis_generation_cleanup_report_failed:" + writeError );
+    };
+    writeReceipt( preflightComplete ? "pending" : "failed" );
+    if( !preflightComplete ) throw std::runtime_error( "analysis_generation_cleanup_failed" );
+    bool complete = true;
+    for( size_t index = 0; index < paths.size(); index++ )
+    {
+        const auto before = std::stoull( candidates[index].at( "bytes" ).get<std::string>() );
+        std::error_code removeError;
+        AnalysisDiskRemove( paths[index], options.disk, removeError, true );
+        const auto remaining = AnalysisDiskUsage::Bytes( paths[index] );
+        const auto removed = before >= remaining ? before - remaining : 0;
+        candidates[index]["removed_bytes"] = std::to_string( removed );
+        candidates[index]["removed"] = !removeError && remaining == 0 &&
+            !std::filesystem::exists( paths[index] );
+        if( removeError ) candidates[index]["error"] = removeError.message();
+        else if( !candidates[index]["removed"].get<bool>() )
+            candidates[index]["error"] = "analysis_generation_cleanup_incomplete";
+        removedBytes += removed;
+        complete = complete && candidates[index]["removed"].get<bool>();
+    }
+    writeReceipt( complete ? "done" : "failed" );
+    if( !complete ) throw std::runtime_error( "analysis_generation_cleanup_failed" );
 }
 
 std::filesystem::path AnalysisPath( const std::filesystem::path& value )
@@ -1265,6 +1338,9 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         if(!reused) reused=loadCurrent();
         if(!reused)
         {
+        RetireUnpublishedGenerations( entry->aggregateRoot / "generations",
+            entry->scanRoot / "neutral-generation-cleanup.json", identity,
+            entry->snapshot.scanId, "neutral", options );
         products = {};
         auto source = entry->request.source;
         if( !source && m_resolver ) source = m_resolver( entry->request.tracePath, stopToken );
@@ -1323,6 +1399,16 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     if( stopToken.stop_requested() )
     { Update( entry, ScanState::CancelledResumable, 2, 4, "cancelled", "cancelled" ); return; }
     memory.Check();
+    AnalysisWriterLease policyLease;
+    while( !AcquireAnalysisWriterLease( entry->scanRoot, policyLease, error ) )
+    {
+        if( stopToken.stop_requested() )
+        { Update( entry, ScanState::CancelledResumable, 2, 4, "cancelled", "cancelled" ); return; }
+        std::this_thread::sleep_for( std::chrono::milliseconds( 25 ) );
+    }
+    RetireUnpublishedGenerations( entry->scanRoot / "policy-generations",
+        entry->scanRoot / "policy-generation-cleanup.json", identity,
+        entry->snapshot.scanId, "policy", options );
     Update( entry, ScanState::EvaluatingPolicy, 3, 4, "evaluating_candidate_policy" );
     CandidatePolicyInput policy;
     policy.aggregateIdentity = identity;

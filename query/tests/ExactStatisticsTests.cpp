@@ -217,6 +217,65 @@ int main( int argc, char** argv )
     const auto temporary = TemporaryRoot();
     std::filesystem::create_directories( temporary );
 
+    const auto rejectDamagedRun = [&]( std::string_view label, const auto& damage,
+        std::string_view expectedError ) {
+        const auto root = temporary / std::string( label );
+        NeutralStatisticsStreamBuilder source( root, 4, 2 );
+        const auto token = source.RegisterSignature( "cpu", "damaged", "Player.Frame" );
+        assert( token != NeutralStatisticsStreamBuilder::InvalidSignatureToken );
+        assert( source.AddRegisteredRun( token, 0, 1, 1, 0, 0, 1, true, false ) );
+        assert( source.AddRegisteredRun( token, 1, 2, 2, 0, 0, 1, true, false ) );
+        const auto run = *std::filesystem::directory_iterator( root );
+        damage( run.path() );
+        NeutralStatisticsStreamSummary summary;
+        std::string error;
+        const auto ok = source.FinishToSink( summary, error, []( const auto&, const auto& ) {} );
+        if( ok || error != expectedError )
+        {
+            std::cerr << "Damaged neutral run was accepted: case=" << label << " ok=" << ok <<
+                " error=" << error << " expected=" << expectedError << '\n';
+            return false;
+        }
+        return true;
+    };
+    if( !rejectDamagedRun( "truncated-neutral-run", []( const auto& path ) {
+            const auto bytes = std::filesystem::file_size( path );
+            assert( bytes > 1 );
+            std::filesystem::resize_file( path, bytes - 1 );
+        }, "neutral_run_truncated" ) ||
+        !rejectDamagedRun( "missing-record-neutral-run", []( const auto& path ) {
+            const auto bytes = std::filesystem::file_size( path );
+            assert( bytes > 64 + 56 );
+            std::filesystem::resize_file( path, bytes - 56 );
+        }, "neutral_run_truncated" ) ||
+        !rejectDamagedRun( "extra-data-neutral-run", []( const auto& path ) {
+            std::ofstream output( path, std::ios::binary | std::ios::app );
+            output.put( '\x01' );
+        }, "neutral_run_extra_data" ) ||
+        !rejectDamagedRun( "header-neutral-run", []( const auto& path ) {
+            std::fstream file( path, std::ios::binary | std::ios::in | std::ios::out );
+            file.seekp( 0 );
+            file.put( 'X' );
+            file.flush();
+        }, "neutral_run_header_invalid" ) ||
+        !rejectDamagedRun( "checksum-neutral-run", []( const auto& path ) {
+            std::fstream file( path, std::ios::binary | std::ios::in | std::ios::out );
+            file.seekg( -1, std::ios::end );
+            char value = 0;
+            file.read( &value, 1 );
+            value ^= char( 0x80 );
+            file.seekp( -1, std::ios::end );
+            file.write( &value, 1 );
+            file.flush();
+        }, "neutral_run_checksum_mismatch" ) ||
+        !rejectDamagedRun( "missing-neutral-run", []( const auto& path ) {
+            std::filesystem::remove( path );
+        }, "neutral_final_run_open_failed" ) ) return 1;
+    {
+        if( argc > 1 && std::string( argv[1] ) == "--run-integrity-only" )
+        { std::filesystem::remove_all( temporary ); return 0; }
+    }
+
     if(argc == 3 && std::string(argv[1]) == "--scale-streamed")
     {
         const auto count = std::stoull(argv[2]);

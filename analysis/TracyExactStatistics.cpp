@@ -837,6 +837,31 @@ struct PackedNeutralRun
 };
 
 static_assert( std::is_trivially_copyable_v<PackedNeutralRun> );
+static_assert( sizeof( PackedNeutralRun ) == 56 );
+
+struct NeutralRunHeader
+{
+    char magic[8] { 'J', 'N', 'N', 'R', 'U', 'N', '1', '\0' };
+    uint32_t version = 1;
+    uint32_t recordBytes = sizeof( PackedNeutralRun );
+    uint64_t recordCount = 0;
+    uint64_t checksum = 14695981039346656037ull;
+    uint64_t reserved[4] {};
+};
+
+static_assert( std::is_trivially_copyable_v<NeutralRunHeader> );
+static_assert( sizeof( NeutralRunHeader ) == 64 );
+
+uint64_t NeutralRunChecksumUpdate( uint64_t checksum, const void* data, size_t size )
+{
+    const auto* bytes = static_cast<const uint8_t*>( data );
+    for( size_t index = 0; index < size; index++ )
+    {
+        checksum ^= bytes[index];
+        checksum *= 1099511628211ull;
+    }
+    return checksum;
+}
 
 void FinalizeRankingsAndAudit( NeutralStatisticsResult& result,
     const std::vector<NeutralDomainAuditInput>& audits,
@@ -1022,6 +1047,30 @@ struct NeutralStatisticsStreamBuilder::Impl
     {
         return root / ( std::string( label ) + "-" + std::to_string( fileOrdinal++ ) + ".work" );
     }
+    bool BeginRun( std::ofstream& output, NeutralRunHeader& header )
+    {
+        AnalysisDiskGrow( disk, sizeof( header ) );
+        output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+        if( !output ) { error = "neutral_run_header_write_failed"; return false; }
+        return true;
+    }
+    bool WriteRunRecord( std::ofstream& output, NeutralRunHeader& header, const PackedNeutralRun& value )
+    {
+        AnalysisDiskGrow( disk, sizeof( value ) );
+        output.write( reinterpret_cast<const char*>( &value ), sizeof( value ) );
+        if( !output ) { error = "neutral_run_write_failed"; return false; }
+        header.recordCount++;
+        header.checksum = NeutralRunChecksumUpdate( header.checksum, &value, sizeof( value ) );
+        return true;
+    }
+    bool FinishRun( std::ofstream& output, const NeutralRunHeader& header )
+    {
+        output.seekp( 0 );
+        output.write( reinterpret_cast<const char*>( &header ), sizeof( header ) );
+        output.flush();
+        if( !output ) { error = "neutral_run_flush_failed"; return false; }
+        return true;
+    }
     bool WriteCompacted( std::vector<PackedNeutralRun>& values, const std::filesystem::path& path )
     {
         std::sort( values.begin(), values.end(), [&]( const auto& left, const auto& right ) {
@@ -1029,21 +1078,20 @@ struct NeutralStatisticsStreamBuilder::Impl
         } );
         std::ofstream output( path, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_run_open_failed"; return false; }
+        NeutralRunHeader header;
+        if( !BeginRun( output, header ) ) return false;
         std::optional<PackedNeutralRun> pending;
         for( const auto& value : values )
         {
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
+                if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
                 pending = value;
             }
-            if( !output ) { error = "neutral_run_write_failed"; return false; }
         }
-        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
-        output.flush();
-        if( !output ) { error = "neutral_run_flush_failed"; return false; }
-        return true;
+        if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
+        return FinishRun( output, header );
     }
     bool Flush()
     {
@@ -1062,14 +1110,61 @@ struct NeutralStatisticsStreamBuilder::Impl
     struct Reader
     {
         std::ifstream input;
-        PackedNeutralRun value;
+        PackedNeutralRun value {};
+        NeutralRunHeader header {};
+        uint64_t remaining = 0;
+        uint64_t checksum = 14695981039346656037ull;
+        uint64_t signatureLimit = 0;
+        uint32_t previousSignature = 0;
+        uint64_t previousFrame = 0;
+        bool opened = false;
         bool valid = false;
-        explicit Reader( const std::filesystem::path& path ) : input( path, std::ios::binary ) { Advance(); }
+        bool havePrevious = false;
+        std::string error;
+        explicit Reader( const std::filesystem::path& path, uint64_t signatures )
+            : input( path, std::ios::binary ), signatureLimit( signatures )
+        {
+            opened = input.is_open();
+            if( !opened ) return;
+            input.read( reinterpret_cast<char*>( &header ), sizeof( header ) );
+            if( input.gcount() != sizeof( header ) ) { error = "neutral_run_header_truncated"; return; }
+            if( std::memcmp( header.magic, "JNNRUN1", 8 ) != 0 || header.version != 1 ||
+                header.recordBytes != sizeof( PackedNeutralRun ) )
+            { error = "neutral_run_header_invalid"; return; }
+            if( header.recordCount > ( std::numeric_limits<uint64_t>::max() - sizeof( header ) ) /
+                sizeof( PackedNeutralRun ) )
+            { error = "neutral_run_header_invalid"; return; }
+            std::error_code sizeError;
+            const auto actualBytes = std::filesystem::file_size( path, sizeError );
+            if( sizeError ) { error = "neutral_run_size_failed"; return; }
+            const auto expectedBytes = sizeof( header ) + header.recordCount * sizeof( PackedNeutralRun );
+            if( actualBytes < expectedBytes ) { error = "neutral_run_truncated"; return; }
+            if( actualBytes > expectedBytes ) { error = "neutral_run_extra_data"; return; }
+            remaining = header.recordCount;
+            Advance();
+        }
         void Advance()
         {
+            valid = false;
+            if( !error.empty() ) return;
+            if( remaining == 0 )
+            {
+                if( checksum != header.checksum ) error = "neutral_run_checksum_mismatch";
+                return;
+            }
             input.read( reinterpret_cast<char*>( &value ), sizeof( value ) );
-            valid = input.gcount() == sizeof( value );
-            if( !valid && !input.eof() ) input.setstate( std::ios::failbit );
+            if( input.gcount() != sizeof( value ) ) { error = "neutral_run_read_failed"; return; }
+            remaining--;
+            checksum = NeutralRunChecksumUpdate( checksum, &value, sizeof( value ) );
+            if( value.signature >= signatureLimit || ( value.flags & ~3u ) != 0 )
+            { error = "neutral_run_record_invalid"; return; }
+            if( havePrevious && ( value.signature < previousSignature ||
+                ( value.signature == previousSignature && value.frame < previousFrame ) ) )
+            { error = "neutral_run_order_invalid"; return; }
+            previousSignature = value.signature;
+            previousFrame = value.frame;
+            havePrevious = true;
+            valid = true;
         }
     };
 
@@ -1081,8 +1176,9 @@ struct NeutralStatisticsStreamBuilder::Impl
         readers.reserve( source.size() );
         for( const auto& path : source )
         {
-            readers.emplace_back( path );
-            if( !readers.back().input ) { error = "neutral_run_read_open_failed"; return false; }
+            readers.emplace_back( path, signatures.size() );
+            if( !readers.back().opened ) { error = "neutral_run_read_open_failed"; return false; }
+            if( !readers.back().error.empty() ) { error = readers.back().error; return false; }
         }
         const auto later = [&]( size_t left, size_t right ) {
             return Less( readers[right].value, readers[left].value );
@@ -1091,6 +1187,8 @@ struct NeutralStatisticsStreamBuilder::Impl
         for( size_t index = 0; index < readers.size(); ++index ) if( readers[index].valid ) queue.push( index );
         std::ofstream output( outputPath, std::ios::binary | std::ios::trunc );
         if( !output ) { error = "neutral_merge_open_failed"; return false; }
+        NeutralRunHeader header;
+        if( !BeginRun( output, header ) ) return false;
         std::optional<PackedNeutralRun> pending;
         uint64_t processed = 0;
         while( !queue.empty() )
@@ -1100,21 +1198,17 @@ struct NeutralStatisticsStreamBuilder::Impl
             const auto index = queue.top(); queue.pop();
             const auto value = readers[index].value;
             readers[index].Advance();
-            if( !readers[index].valid && !readers[index].input.eof() )
-            { error = "neutral_merge_read_failed"; return false; }
+            if( !readers[index].error.empty() ) { error = readers[index].error; return false; }
             if( readers[index].valid ) queue.push( index );
             if( pending && SameFrame( *pending, value ) ) Merge( *pending, value );
             else
             {
-                if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
+                if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
                 pending = value;
             }
-            if( !output ) { error = "neutral_merge_write_failed"; return false; }
         }
-        if( pending ) { AnalysisDiskGrow(disk,sizeof(*pending)); output.write( reinterpret_cast<const char*>( &*pending ), sizeof( *pending ) ); }
-        output.flush();
-        if( !output ) { error = "neutral_merge_flush_failed"; return false; }
-        return true;
+        if( pending && !WriteRunRecord( output, header, *pending ) ) return false;
+        return FinishRun( output, header );
     }
 
     bool Consolidate( const std::function<bool()>& cancelled )
@@ -1413,8 +1507,9 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     if( !m_impl->runs.empty() )
     {
-        Impl::Reader reader( m_impl->runs.front() );
-        if( !reader.input ) { error = "neutral_final_run_open_failed"; return false; }
+        Impl::Reader reader( m_impl->runs.front(), m_impl->signatures.size() );
+        if( !reader.opened ) { error = "neutral_final_run_open_failed"; return false; }
+        if( !reader.error.empty() ) { error = reader.error; return false; }
         uint32_t currentSignature = 0;
         bool haveSignature = false;
         AnalysisWorkspaceReservation frameBudget(m_impl->workspace);
@@ -1426,7 +1521,7 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             { error = "cancelled"; return false; }
             const auto value = reader.value;
             reader.Advance();
-            if( !reader.valid && !reader.input.eof() ) { error = "neutral_final_run_read_failed"; return false; }
+            if( !reader.error.empty() ) { error = reader.error; return false; }
             if( haveSignature && value.signature != currentSignature )
             {
                 if(cancelled && cancelled()) { error = "cancelled"; return false; }

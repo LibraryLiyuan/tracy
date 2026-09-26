@@ -1792,11 +1792,19 @@ int main(int argc,char** argv)
     auto source = std::make_shared<tracy::query::test::FakeTraceSource>();
     std::atomic<uint32_t> executions = 0;
     std::atomic<bool> release = false;
+    std::shared_ptr<AnalysisDiskBudget> attemptDisk;
     AnalysisScanExecutor executor = [&]( const AnalysisScanExecutionRequest& request,
         std::stop_token stopToken, const AnalysisScanProgressCallback& progress,
         AnalysisScanProducts& products, std::string& error ) {
-        ++executions;
+        const auto attempt = ++executions;
+        attemptDisk = request.disk;
         progress( ScanState::Scanning, 1, 4, "fixture_scan" );
+        if( attempt == 1 )
+        {
+            AnalysisDiskGrow( request.disk, 4096 );
+            std::ofstream partial( request.temporaryRoot / "partial-neutral-run.bin", std::ios::binary );
+            partial << std::string( 4096, 'p' );
+        }
         while( !release.load() && !stopToken.stop_requested() ) std::this_thread::sleep_for( 2ms );
         if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
         progress( ScanState::Aggregating, 3, 4, "fixture_aggregate" );
@@ -1834,13 +1842,91 @@ int main(int argc,char** argv)
         const auto cancelled = WaitFor( manager, scanId, ScanState::CancelledResumable );
         assert( std::chrono::steady_clock::now() - cancelAt < 2s );
         assert( cancelled.resumable && !cancelled.completed );
+        json pausedState;
+        { std::ifstream input( root / "scans" / scanId / "scan-state.json" ); input >> pausedState; }
+        const auto neutralGenerations = std::filesystem::path(
+            pausedState.at( "aggregate_root" ).get<std::string>() ) / "generations";
+        size_t pausedGenerations = 0;
+        std::filesystem::path pausedGeneration;
+        for( const auto& candidate : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+            if( candidate.is_directory() )
+            {
+                pausedGenerations++;
+                pausedGeneration = candidate.path();
+                assert( std::filesystem::exists( candidate.path() / "partial-neutral-run.bin" ) );
+            }
+        assert( pausedGenerations == 1 );
+        const auto stalePolicy = root / "scans" / scanId /
+            "policy-generations" / "gen-1" / "policy-cache";
+        AnalysisDiskGrow( attemptDisk, 3072 );
+        std::filesystem::create_directories( stalePolicy );
+        { std::ofstream partial( stalePolicy / "partial-policy.bin", std::ios::binary );
+          partial << std::string( 3072, 'q' ); }
 
         release = true;
+        const auto foreignGeneration = neutralGenerations / "foreign";
+        std::filesystem::create_directories( foreignGeneration );
+        { std::ofstream held( foreignGeneration / "held.bin", std::ios::binary ); held << "foreign"; }
+        manager.Resume( scanId );
+        const auto unsafeCleanup = WaitFor( manager, scanId, ScanState::Failed );
+        assert( unsafeCleanup.error.find( "analysis_generation_cleanup_failed" ) != std::string::npos &&
+            std::filesystem::exists( foreignGeneration ) &&
+            std::filesystem::exists( pausedGeneration / "partial-neutral-run.bin" ) && executions == 1 );
+        json blockedCleanup;
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> blockedCleanup; }
+        assert( blockedCleanup.at( "state" ) == "failed" &&
+            blockedCleanup.at( "removed_bytes" ) == "0" );
+        std::filesystem::remove_all( foreignGeneration );
+#ifdef _WIN32
+        const auto heldCandidate = CreateFileW( ( pausedGeneration / "partial-neutral-run.bin" ).c_str(),
+            GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr );
+        assert( heldCandidate != INVALID_HANDLE_VALUE );
+        manager.Resume( scanId );
+        const auto cleanupBlocked = WaitFor( manager, scanId, ScanState::Failed );
+        assert( cleanupBlocked.error.find( "analysis_generation_cleanup_failed" ) != std::string::npos );
+        size_t blockedGenerations = 0;
+        for( const auto& candidate : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+            if( candidate.is_directory() ) blockedGenerations++;
+        assert( blockedGenerations == 1 && executions == 1 );
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> blockedCleanup; }
+        assert( blockedCleanup.at( "state" ) == "failed" &&
+            blockedCleanup.at( "removed_bytes" ) == "0" );
+        CloseHandle( heldCandidate );
+#endif
         const auto resumed = manager.Resume( scanId );
         assert( resumed.scanId == scanId );
         const auto complete = WaitFor( manager, scanId, ScanState::Complete );
         assert( complete.completed && complete.progressCompleted == complete.progressTotal );
         assert( executions == 2 );
+        size_t completedGenerations = 0;
+        for( const auto& generation : std::filesystem::directory_iterator( AnalysisIoPath( neutralGenerations ) ) )
+        {
+            if( !generation.is_directory() ) continue;
+            completedGenerations++;
+            assert( !std::filesystem::exists( generation.path() / "partial-neutral-run.bin" ) );
+        }
+        if( completedGenerations != 1 )
+            throw std::runtime_error( "Resume retained an unpublished neutral generation beside the replacement" );
+        json cleanup;
+        { std::ifstream input( root / "scans" / scanId / "neutral-generation-cleanup.json" ); input >> cleanup; }
+        if( cleanup.at( "state" ) != "done" || cleanup.at( "candidates" ).size() != 1 ||
+            cleanup.at( "removed_bytes" ) != "4096" )
+            throw std::runtime_error( "Resume did not preserve the neutral generation cleanup receipt" );
+        const auto policyGenerations = root / "scans" / scanId / "policy-generations";
+        size_t completedPolicyGenerations = 0;
+        for( const auto& generation : std::filesystem::directory_iterator( AnalysisIoPath( policyGenerations ) ) )
+        {
+            if( !generation.is_directory() ) continue;
+            completedPolicyGenerations++;
+            assert( !std::filesystem::exists(
+                generation.path() / "policy-cache" / "partial-policy.bin" ) );
+        }
+        if( completedPolicyGenerations != 1 )
+            throw std::runtime_error( "Resume retained an unpublished policy generation beside the replacement" );
+        { std::ifstream input( root / "scans" / scanId / "policy-generation-cleanup.json" ); input >> cleanup; }
+        if( cleanup.at( "state" ) != "done" || cleanup.at( "candidates" ).size() != 1 ||
+            cleanup.at( "removed_bytes" ) != "3072" )
+            throw std::runtime_error( "Resume did not preserve the policy generation cleanup receipt" );
 
         const auto summary = manager.Summary( scanId );
         assert( summary.at( "quality" ).at( "complete" ) == true );
