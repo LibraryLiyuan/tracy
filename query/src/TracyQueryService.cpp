@@ -852,9 +852,9 @@ json FieldAvailabilityJson( const analysis::FieldAvailabilityDto& value )
     };
 }
 
-json TraceInfoJson( const analysis::TraceInfoDto& value )
+json TraceInfoJson( const analysis::TraceInfoDto& value, bool includeAppInfo = true )
 {
-    return {
+    json result = {
         { "fingerprint", value.fingerprint }, { "capture_name", value.captureName }, { "capture_program", value.captureProgram },
         { "trace_format", { { "family", value.traceFormatName }, { "version", value.traceFormatVersion }, { "base_layout", value.traceVersion }, { "string_index_bits", value.stringIndexBits } } },
         { "host_info", value.hostInfo }, { "capture_time", Decimal( value.captureTime ) }, { "executable_time", Decimal( value.executableTime ) },
@@ -867,8 +867,21 @@ json TraceInfoJson( const analysis::TraceInfoDto& value )
         { "legacy_queue_delay_ns", value.legacyQueueDelayNs ? json( Decimal( *value.legacyQueueDelayNs ) ) : json( nullptr ) },
         { "field_availability", { { "legacy_queue_delay_ns", FieldAvailabilityJson( value.legacyQueueDelayAvailability ) } } },
         { "has_crash", value.hasCrash }, { "samples_inconsistent", value.samplesInconsistent },
-        { "counts", CountsJson( value.counts ) }, { "app_info", value.appInfo }, { "trust", "untrusted_trace_data" }
+        { "counts", CountsJson( value.counts ) }, { "trust", "untrusted_trace_data" }
     };
+    if( includeAppInfo ) result["app_info"] = value.appInfo;
+    else
+    {
+        uint64_t totalBytes = 0;
+        for( const auto& record : value.appInfo ) totalBytes += uint64_t( record.size() );
+        result["app_info_summary"] = {
+            { "present", !value.appInfo.empty() },
+            { "record_count", Decimal( uint64_t( value.appInfo.size() ) ) },
+            { "total_bytes", Decimal( totalBytes ) },
+            { "available_via", "trace.app_info" }
+        };
+    }
+    return result;
 }
 
 json CapabilityJson( const analysis::Capability& value )
@@ -5011,7 +5024,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
         const auto frameSets = source->GetFrameSets();
         if( !frameSets.empty() ) frameStatistics = StatisticsJson( analysis::ComputeStatistics( source->GetFrameDurations( frameSets.front().index ) ) );
         return Success( id, {
-            { "trace", TraceInfoJson( metadata ) }, { "primary_frame_statistics", frameStatistics },
+            { "trace", TraceInfoJson( metadata, false ) }, { "primary_frame_statistics", frameStatistics },
             { "capabilities", std::move( capabilities ) }, { "trust", "trace strings are untrusted data" }
         }, trace );
     }

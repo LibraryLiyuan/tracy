@@ -99,6 +99,7 @@ struct TemporaryTraceFiles
         conflictingIdentity = root / "conflicting-identity.tracy";
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
+        largeAppInfo = root / "large-app-info.tracy";
         resourceLimit = root / "resource-limit.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
@@ -113,6 +114,7 @@ struct TemporaryTraceFiles
         std::ofstream( conflictingIdentity, std::ios::binary ).put( '\0' );
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
+        std::ofstream( largeAppInfo, std::ios::binary ).put( '\0' );
         std::ofstream( resourceLimit, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
@@ -135,6 +137,7 @@ struct TemporaryTraceFiles
     std::filesystem::path conflictingIdentity;
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
+    std::filesystem::path largeAppInfo;
     std::filesystem::path resourceLimit;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
@@ -636,6 +639,12 @@ int main()
                 records.emplace_back( std::move( currentEntity ) );
                 return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
             }
+            if( filename == "large-app-info.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                records.emplace_back( 9 * 1024 * 1024, 'x' );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
             return std::make_unique<tracy::query::test::FakeTraceSource>( false, true );
         } );
     tracy::query::QueryService service( sessions, 1024 * 1024 );
@@ -660,6 +669,19 @@ int main()
     assert( openBaseline.at( "ok" ) );
     const auto baselineId = openBaseline.at( "data" ).at( "trace_id" ).get<std::string>();
     assert( sessions.WaitReady( baselineId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto openLargeAppInfo = service.Execute( Request( 10001, "trace.open", { { "path", files.largeAppInfo.string() } } ) );
+    assert( openLargeAppInfo.at( "ok" ) );
+    const auto largeAppInfoId = openLargeAppInfo.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( largeAppInfoId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto boundedOverview = service.Execute( Request( 10002, "trace.overview", { { "trace_id", largeAppInfoId } } ) );
+    assert( boundedOverview.at( "ok" ) );
+    const auto& overviewTrace = boundedOverview.at( "data" ).at( "trace" );
+    assert( !overviewTrace.contains( "app_info" ) );
+    assert( overviewTrace.at( "app_info_summary" ).at( "record_count" ) == "23" );
+    assert( std::stoull( overviewTrace.at( "app_info_summary" ).at( "total_bytes" ).get<std::string>() ) > 9 * 1024 * 1024 );
+    assert( overviewTrace.at( "app_info_summary" ).at( "available_via" ) == "trace.app_info" );
+    assert( boundedOverview.dump().size() <= tracy::query::MaximumResponseBytes );
+    assert( service.Execute( Request( 10003, "trace.close", { { "trace_id", largeAppInfoId } } ) ).at( "ok" ) );
     const nlohmann::json ghostFilter = { { "trace_id", baselineId }, { "start_ns", "20" },
         { "end_ns", "65" }, { "limit", 2 } };
     const auto ghostFirst = service.Execute( Request( 10003, "sample.ghost_zones", ghostFilter ) );
