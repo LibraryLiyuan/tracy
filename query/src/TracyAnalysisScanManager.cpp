@@ -1188,7 +1188,7 @@ AnalysisScanSnapshot AnalysisScanManager::Start( const AnalysisScanStartRequest&
     // Even the resumable state journal must fit before any namespace is
     // published. There is deliberately no fixed-size floor overriding 16*S.
     if(traceLimits.peakBytes<65536) throw std::runtime_error("analysis_scan_cache_disk_budget");
-    const auto traceStrongId = request.source->GetTraceInfo().fingerprint;
+    const auto traceStrongId = request.source->GetTraceInfoMetadata().fingerprint;
     if( traceStrongId.empty() ) throw std::invalid_argument( "analysis_scan_trace_identity_missing" );
     NeutralAggregateIdentity aggregateIdentity { traceStrongId, m_queryExecutableSha256,
         "1.35.0", NeutralScanAlgorithmId, NeutralAggregateSchemaVersion };

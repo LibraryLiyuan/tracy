@@ -860,6 +860,9 @@ std::vector<analysis::Capability> SegmentTraceSource::GetCapabilities() const
 #define TRACY_SEGMENT_FORWARD5( Return, Name, T1, A1, T2, A2, T3, A3, T4, A4, T5, A5 ) Return SegmentTraceSource::Name( T1 A1, T2 A2, T3 A3, T4 A4, T5 A5 ) const { return m_source->Name( A1, A2, A3, A4, A5 ); }
 
 TRACY_SEGMENT_FORWARD0( analysis::TraceInfoDto, GetTraceInfo )
+TRACY_SEGMENT_FORWARD0( analysis::TraceInfoDto, GetTraceInfoMetadata )
+TRACY_SEGMENT_FORWARD0( analysis::AppInfoSummaryDto, GetAppInfoSummary )
+TRACY_SEGMENT_FORWARD3( analysis::AppInfoPageDto, ReadAppInfo, uint64_t, offset, size_t, limit, uint64_t, maximumBytes )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::ThreadDto>, GetThreads )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::FrameSetDto>, GetFrameSets )
 TRACY_SEGMENT_FORWARD0( std::vector<analysis::GpuContextDto>, GetGpuContexts )

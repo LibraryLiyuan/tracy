@@ -33,6 +33,9 @@ public:
     std::vector<analysis::Capability> GetCapabilities() const override;
     analysis::TraceReadView AcquireReadView() const override;
     analysis::TraceInfoDto GetTraceInfo() const override;
+    analysis::TraceInfoDto GetTraceInfoMetadata() const override;
+    analysis::AppInfoSummaryDto GetAppInfoSummary() const override;
+    analysis::AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const override;
     std::vector<analysis::ThreadDto> GetThreads() const override;
     std::vector<analysis::FrameSetDto> GetFrameSets() const override;
     std::vector<analysis::GpuContextDto> GetGpuContexts() const override;

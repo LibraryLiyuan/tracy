@@ -1687,7 +1687,7 @@ public:
         , m_gpuMemoryCpuZones( m_manifest.gpuMemoryCpuZones, ZoneSectionKind::GpuMemoryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
         , m_gpuMemorySummaryCpuZones( m_manifest.gpuMemorySummaryCpuZones, ZoneSectionKind::GpuMemorySummaryCpuZone, sizeof( uint64_t ), m_manifest.sourceFingerprint, m_storageOptions )
     {
-        m_gpuQueryIdAvailable = m_source->GetTraceInfo().traceVersion >= FileVersion( 0, 12, 4 );
+        m_gpuQueryIdAvailable = m_source->GetTraceInfoMetadata().traceVersion >= FileVersion( 0, 12, 4 );
         const auto locations = m_source->GetSourceLocations();
         for( const auto& location : locations ) m_locations.emplace( location.nativeId, location );
         if( m_manifest.gpuMemorySummary.count == 1 )
@@ -1761,7 +1761,27 @@ public:
 
     analysis::TraceInfoDto GetTraceInfo() const override
     {
-        auto result = m_source->GetTraceInfo();
+        return ApplyIndexedCounts( m_source->GetTraceInfo() );
+    }
+
+    analysis::TraceInfoDto GetTraceInfoMetadata() const override
+    {
+        return ApplyIndexedCounts( m_source->GetTraceInfoMetadata() );
+    }
+
+    analysis::AppInfoSummaryDto GetAppInfoSummary() const override
+    {
+        return m_source->GetAppInfoSummary();
+    }
+
+    analysis::AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const override
+    {
+        return m_source->ReadAppInfo( offset, limit, maximumBytes );
+    }
+
+private:
+    analysis::TraceInfoDto ApplyIndexedCounts( analysis::TraceInfoDto result ) const
+    {
         result.counts.cpuZones = m_cpu.Count();
         result.counts.gpuZones = m_gpu.Count();
         result.counts.samples = m_samples.MainCount();
@@ -1784,6 +1804,8 @@ public:
         result.counts.gpuReferenceEnds = m_gpuReferenceEnds.Count();
         return result;
     }
+
+public:
 
     std::shared_ptr<const tracy::JnTraceData> GetGpuCatalogData() const override
     {
@@ -3181,7 +3203,7 @@ public:
             exact.emplace( *position ); selected[*position].pass.gpuZoneIndex = index; selected[*position].pass.gpuThread = zone.thread;
             const auto* source = Source( zone.sourceLocation ); if( source ) selected[*position].pass.name = source->name.empty() ? source->function : source->name;
         }
-        const auto captureEnd = m_source->GetTraceInfo().lastTimeNs;
+        const auto captureEnd = m_source->GetTraceInfoMetadata().lastTimeNs;
         for( size_t index = 0; index < selected.size(); index++ )
         {
             auto& item = selected[index]; auto& pass = item.pass;
@@ -3460,7 +3482,7 @@ public:
         result.passQualityAggregated = true;
         result.aggregatedWorkingSetCount = workingSets.size();
         uint64_t missingPairings = 0;
-        const auto captureEnd = m_source->GetTraceInfo().lastTimeNs;
+        const auto captureEnd = m_source->GetTraceInfoMetadata().lastTimeNs;
         for( const auto& input : passes )
         {
             const bool nearHead = input.begin.frameIndex <= earliestFrame + 1;
@@ -4728,7 +4750,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         resources->SetPhase( "sample-ghost-zones" );
         BuildQueryGhostZoneStore( temporarySamples / "ghost", temporarySamples, temporaryCallstacks,
             temporaryCallstackFrames, temporaryStrings, result.sourceFingerprint,
-            source->GetTraceInfo().samplingPeriodNs, storageOptions );
+            source->GetTraceInfoMetadata().samplingPeriodNs, storageOptions );
         resources->SetPhase( "sample-symbol-statistics" );
         BuildQuerySampleDerivedStore( temporarySamples / "derived", temporarySamples, temporaryCallstacks,
             temporaryCallstackFrames, result.sourceFingerprint, storageOptions );

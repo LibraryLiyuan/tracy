@@ -363,6 +363,11 @@ public:
     mutable std::vector<uint64_t> ioScanIds;
     mutable bool jobScanIdsReady = false;
     mutable bool ioScanIdsReady = false;
+    mutable std::optional<AppInfoSummaryDto> appInfoSummary;
+    mutable bool appInfoHasCapture = false;
+    mutable bool appInfoHasCatalog = false;
+    mutable bool appInfoHasScriptStack = false;
+    mutable bool appInfoHasStructuredGc = false;
 
     // Called under readMutex. Allocation pagination must not resolve the
     // unrelated Pass/ResourceSet graph or keep its working sets resident.
@@ -399,6 +404,27 @@ public:
         const auto parsed = std::from_chars( begin, end, value, 16 );
         if( parsed.ec != std::errc() || parsed.ptr != end ) return std::nullopt;
         return value;
+    }
+
+    const AppInfoSummaryDto& AppInfoSummary() const
+    {
+        if( appInfoSummary ) return *appInfoSummary;
+        AppInfoSummaryDto result;
+        result.recordCount = worker->GetAppInfo().size();
+        for( const auto& value : worker->GetAppInfo() )
+        {
+            const std::string_view record = Safe( worker->GetString( value ) );
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.totalBytes += record.size();
+            result.maximumRecordBytes = std::max<uint64_t>( result.maximumRecordBytes, record.size() );
+            if( record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" ) ) appInfoHasCapture = true;
+            if( record.starts_with( "JNCAT1|" ) ) appInfoHasCatalog = true;
+            if( record.starts_with( "JNSTK1|" ) ) appInfoHasScriptStack = true;
+            if( record.starts_with( "JNGC1|" ) ) appInfoHasStructuredGc = true;
+        }
+        appInfoSummary = result;
+        return *appInfoSummary;
     }
 
     SourceLocationDto SourceLocation( int16_t id ) const
@@ -1394,7 +1420,7 @@ TraceReadView WorkerTraceSource::AcquireReadView() const
 
 std::vector<Capability> WorkerTraceSource::GetCapabilities() const
 {
-    const auto info = GetTraceInfo();
+    const auto info = GetTraceInfoMetadata();
     const auto memoryPools = GetMemoryPools();
     const bool hasGpuMemory = std::any_of( memoryPools.begin(), memoryPools.end(), []( const auto& pool ) { return pool.gpuD3D12; } );
     const bool hasJnTrace = m_impl->worker->HasJnTraceData();
@@ -1406,19 +1432,20 @@ std::vector<Capability> WorkerTraceSource::GetCapabilities() const
         return Capability { std::move( domain ), present, present, indexed && present, std::move( reason ), std::move( methods ) };
     };
     const bool hasCpu = !GetCpuTopology().empty() || info.counts.contextSwitches != 0;
-    const bool hasCapture = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNCTX1|" ) || record.starts_with( "JNQ1|" );
-    } );
-    const bool hasCatalog = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNCAT1|" );
-    } );
+    bool hasCapture = false;
+    bool hasCatalog = false;
+    bool hasScriptStackAppInfo = false;
+    bool hasStructuredGc = false;
+    {
+        std::lock_guard lock( m_impl->readMutex );
+        (void)m_impl->AppInfoSummary();
+        hasCapture = m_impl->appInfoHasCapture;
+        hasCatalog = m_impl->appInfoHasCatalog;
+        hasScriptStackAppInfo = m_impl->appInfoHasScriptStack;
+        hasStructuredGc = m_impl->appInfoHasStructuredGc;
+    }
     const bool hasScriptStack = jnTrace.schemaVersion >= 6 && ( !jnTrace.scriptFrames.empty() || !jnTrace.scriptStacks.empty() ) ||
-        std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNSTK1|" );
-    } );
-    const bool hasStructuredGc = std::any_of( info.appInfo.begin(), info.appInfo.end(), []( const auto& record ) {
-        return record.starts_with( "JNGC1|" );
-    } );
+        hasScriptStackAppInfo;
     const bool hasGpuCatalog = jnTrace.gpuCatalogPresent;
     const std::vector<std::string> gpuCatalogMethods = {
         "gpu.catalog.status", "gpu.catalog.validation", "gpu.resource.search", "gpu.resource.get",
@@ -1544,6 +1571,16 @@ uint64_t GetContextSwitchSampleCount( Worker& worker )
 
 TraceInfoDto WorkerTraceSource::GetTraceInfo() const
 {
+    return GetTraceInfoImpl( true );
+}
+
+TraceInfoDto WorkerTraceSource::GetTraceInfoMetadata() const
+{
+    return GetTraceInfoImpl( false );
+}
+
+TraceInfoDto WorkerTraceSource::GetTraceInfoImpl( bool includeAppInfo ) const
+{
     std::lock_guard lock( m_impl->readMutex );
     auto& worker = *m_impl->worker;
     TraceInfoDto result;
@@ -1638,7 +1675,44 @@ TraceInfoDto WorkerTraceSource::GetTraceInfo() const
     counts.gpuReferenceUses = jn.gpuReferenceUses.size();
     counts.gpuReferenceEnds = jn.gpuReferenceEnds.size();
     counts.callsites = jn.callsites.size();
-    for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
+    if( includeAppInfo )
+        for( const auto& value : worker.GetAppInfo() ) result.appInfo.emplace_back( Safe( worker.GetString( value ) ) );
+    return result;
+}
+
+AppInfoSummaryDto WorkerTraceSource::GetAppInfoSummary() const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    return m_impl->AppInfoSummary();
+}
+
+AppInfoPageDto WorkerTraceSource::ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const
+{
+    std::lock_guard lock( m_impl->readMutex );
+    auto& worker = *m_impl->worker;
+    AppInfoPageDto result;
+    result.offset = offset;
+    result.summary = m_impl->AppInfoSummary();
+    uint64_t selectedBytes = 0;
+    bool selectionStopped = false;
+    for( uint64_t ordinal = offset; ordinal < worker.GetAppInfo().size(); ordinal++ )
+    {
+        const std::string_view record = Safe( worker.GetString( worker.GetAppInfo()[size_t( ordinal )] ) );
+        if( selectionStopped || result.records.size() >= limit ) break;
+        if( record.size() > maximumBytes )
+        {
+            if( result.records.empty() ) result.oversizedRecordBytes = record.size();
+            selectionStopped = true;
+            continue;
+        }
+        if( record.size() > maximumBytes - selectedBytes )
+        {
+            selectionStopped = true;
+            continue;
+        }
+        selectedBytes += record.size();
+        result.records.emplace_back( record );
+    }
     return result;
 }
 

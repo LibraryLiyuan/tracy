@@ -320,7 +320,7 @@ void SessionManager::RefreshSegmentSession( const std::shared_ptr<Session>& sess
             auto replacement = SegmentTraceSource::OpenRevision( current->Store(), view, {}, current->PreferIndex() );
             auto shared = std::shared_ptr<analysis::TraceSource>( std::move( replacement ) );
             const auto sourceView = shared->AcquireReadView();
-            const auto fingerprint = shared->GetTraceInfo().fingerprint;
+            const auto fingerprint = shared->GetTraceInfoMetadata().fingerprint;
             std::lock_guard lock( m_mutex );
             if( session->state == analysis::TraceSourceState::Ready && sourceView.revision > session->revision )
             {
@@ -398,7 +398,7 @@ void SessionManager::LoaderLoop( std::stop_token stopToken )
             else
             {
                 session->source = std::shared_ptr<analysis::TraceSource>( std::move( source ) );
-                session->fingerprint = session->source->GetTraceInfo().fingerprint;
+                session->fingerprint = session->source->GetTraceInfoMetadata().fingerprint;
                 const auto view = session->source->AcquireReadView();
                 session->sourceKind = view.sourceKind;
                 session->revision = view.revision;

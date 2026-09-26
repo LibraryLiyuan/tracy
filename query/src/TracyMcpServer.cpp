@@ -605,7 +605,7 @@ bool McpServer::ShouldRunAsync( const std::string& name, const json& arguments )
     }
     const auto eventCount = [&]( const std::string& traceId ) -> uint64_t {
         if( traceId.empty() ) return 0;
-        const auto counts = m_sessions.GetReadySource( traceId )->GetTraceInfo().counts;
+        const auto counts = m_sessions.GetReadySource( traceId )->GetTraceInfoMetadata().counts;
         return counts.cpuZones + counts.gpuZones + counts.memoryEvents + counts.contextSwitches + counts.samples + counts.contextSwitchSamples + counts.messages + counts.frames;
     };
     uint64_t total = 0;

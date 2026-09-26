@@ -303,7 +303,7 @@ int RunDoctor( const Arguments& args )
                 resources->SetPhase("doctor:compact-load"); resources->SetLiveWorkers(1);
                 const auto source = tracy::analysis::WorkerTraceSource::Open( path, {}, {},
                     tracy::analysis::WorkerTraceLoadMode::CompactIndex,nullptr,resources->CreateFileReadHooks() );
-                const auto info = source->GetTraceInfo();
+                const auto info = source->GetTraceInfoMetadata();
                 resources->ValidateTraceIdentity(std::filesystem::file_size(path),info.fingerprint);
                 result["checks"]["trace_loader"] = "ok";
                 result["checks"]["load_mode"] = "compact_index";

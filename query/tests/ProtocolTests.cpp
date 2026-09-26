@@ -100,6 +100,7 @@ struct TemporaryTraceFiles
         mismatchedConnection = root / "mismatched-connection.tracy";
         reconnectCatalog = root / "reconnect-catalog.tracy";
         largeAppInfo = root / "large-app-info.tracy";
+        oversizedAppInfo = root / "oversized-app-info.tracy";
         resourceLimit = root / "resource-limit.tracy";
         outsideRoot = std::filesystem::temp_directory_path() / ( "tracy-query-outside-" + suffix );
         std::filesystem::create_directories( outsideRoot );
@@ -115,6 +116,7 @@ struct TemporaryTraceFiles
         std::ofstream( mismatchedConnection, std::ios::binary ).put( '\0' );
         std::ofstream( reconnectCatalog, std::ios::binary ).put( '\0' );
         std::ofstream( largeAppInfo, std::ios::binary ).put( '\0' );
+        std::ofstream( oversizedAppInfo, std::ios::binary ).put( '\0' );
         std::ofstream( resourceLimit, std::ios::binary ).put( '\0' );
         std::ofstream( outside, std::ios::binary ).put( '\0' );
     }
@@ -138,6 +140,7 @@ struct TemporaryTraceFiles
     std::filesystem::path mismatchedConnection;
     std::filesystem::path reconnectCatalog;
     std::filesystem::path largeAppInfo;
+    std::filesystem::path oversizedAppInfo;
     std::filesystem::path resourceLimit;
     std::filesystem::path outsideRoot;
     std::filesystem::path outside;
@@ -642,6 +645,17 @@ int main()
             if( filename == "large-app-info.tracy" )
             {
                 auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
+                for( size_t index = 0; index < 19; index++ )
+                    records.emplace_back( 512 * 1024, char( 'a' + index ) );
+                std::string escaped;
+                escaped.reserve( 600000 );
+                for( size_t index = 0; index < 100000; index++ ) escaped += "\"\\\n\xE5\xA4\x9A";
+                records.emplace_back( std::move( escaped ) );
+                return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
+            }
+            if( filename == "oversized-app-info.tracy" )
+            {
+                auto records = tracy::query::test::FakeTraceSource::DefaultIdentityAppInfo();
                 records.emplace_back( 9 * 1024 * 1024, 'x' );
                 return std::make_unique<tracy::query::test::FakeTraceSource>( std::move( records ) );
             }
@@ -677,11 +691,53 @@ int main()
     assert( boundedOverview.at( "ok" ) );
     const auto& overviewTrace = boundedOverview.at( "data" ).at( "trace" );
     assert( !overviewTrace.contains( "app_info" ) );
-    assert( overviewTrace.at( "app_info_summary" ).at( "record_count" ) == "23" );
+    assert( overviewTrace.at( "app_info_summary" ).at( "record_count" ) == "42" );
     assert( std::stoull( overviewTrace.at( "app_info_summary" ).at( "total_bytes" ).get<std::string>() ) > 9 * 1024 * 1024 );
     assert( overviewTrace.at( "app_info_summary" ).at( "available_via" ) == "trace.app_info" );
     assert( boundedOverview.dump().size() <= tracy::query::MaximumResponseBytes );
+    const auto boundedInfo = service.Execute( Request( 10003, "trace.info", { { "trace_id", largeAppInfoId } } ) );
+    assert( boundedInfo.at( "ok" ) && !boundedInfo.at( "data" ).contains( "app_info" ) &&
+        boundedInfo.at( "data" ).at( "app_info_summary" ).at( "record_count" ) == "42" &&
+        boundedInfo.dump().size() <= tracy::query::MaximumResponseBytes );
+    uint64_t appInfoRecords = 0;
+    std::string appInfoCursor;
+    do
+    {
+        nlohmann::json request = { { "trace_id", largeAppInfoId }, { "limit", 3 } };
+        if( !appInfoCursor.empty() ) request["cursor"] = appInfoCursor;
+        const auto page = service.Execute( Request( 10004 + int( appInfoRecords ), "trace.app_info", request ) );
+        assert( page.at( "ok" ) && page.at( "data" ).at( "app_info" ).size() <= 3 &&
+            page.dump().size() <= tracy::query::MaximumResponseBytes );
+        for( size_t index = 0; index < page.at( "data" ).at( "app_info" ).size(); index++ )
+        {
+            const auto ordinal = appInfoRecords + index;
+            if( ordinal < 22 ) continue;
+            const auto& record = page.at( "data" ).at( "app_info" )[index].get_ref<const std::string&>();
+            if( ordinal < 41 ) assert( record.size() == 512 * 1024 && record.front() == char( 'a' + ordinal - 22 ) );
+            else assert( record.starts_with( "\"\\\n\xE5\xA4\x9A" ) && record.find( '\n' ) != std::string::npos );
+        }
+        appInfoRecords += page.at( "data" ).at( "app_info" ).size();
+        appInfoCursor = page.at( "page" ).at( "next_cursor" ).is_null() ? std::string() :
+            page.at( "page" ).at( "next_cursor" ).get<std::string>();
+    } while( !appInfoCursor.empty() );
+    assert( appInfoRecords == 42 );
     assert( service.Execute( Request( 10003, "trace.close", { { "trace_id", largeAppInfoId } } ) ).at( "ok" ) );
+    const auto openOversizedAppInfo = service.Execute( Request( 10090, "trace.open", {
+        { "path", files.oversizedAppInfo.string() } } ) );
+    assert( openOversizedAppInfo.at( "ok" ) );
+    const auto oversizedAppInfoId = openOversizedAppInfo.at( "data" ).at( "trace_id" ).get<std::string>();
+    assert( sessions.WaitReady( oversizedAppInfoId, std::chrono::seconds( 5 ) ).state == TraceSourceState::Ready );
+    const auto oversizedPrefix = service.Execute( Request( 10091, "trace.app_info", {
+        { "trace_id", oversizedAppInfoId }, { "limit", 1000 } } ) );
+    assert( oversizedPrefix.at( "ok" ) && oversizedPrefix.at( "data" ).at( "app_info" ).size() == 22 &&
+        oversizedPrefix.at( "page" ).at( "next_cursor" ).is_string() );
+    const auto oversizedRecord = service.Execute( Request( 10092, "trace.app_info", {
+        { "trace_id", oversizedAppInfoId }, { "limit", 1 },
+        { "cursor", oversizedPrefix.at( "page" ).at( "next_cursor" ) } } ) );
+    if( oversizedRecord.at( "ok" ) || oversizedRecord.at( "error" ).at( "code" ) != "RESOURCE_LIMIT" )
+        std::cerr << "oversized AppInfo response: " << oversizedRecord.dump() << '\n';
+    assert( !oversizedRecord.at( "ok" ) && oversizedRecord.at( "error" ).at( "code" ) == "RESOURCE_LIMIT" );
+    assert( service.Execute( Request( 10093, "trace.close", { { "trace_id", oversizedAppInfoId } } ) ).at( "ok" ) );
     const nlohmann::json ghostFilter = { { "trace_id", baselineId }, { "start_ns", "20" },
         { "end_ns", "65" }, { "limit", 2 } };
     const auto ghostFirst = service.Execute( Request( 10003, "sample.ghost_zones", ghostFilter ) );
@@ -1081,12 +1137,17 @@ int main()
     assert( boundedSourceCompare.at( "data" ).at( "inconclusive" )[0].at( "compared_bytes" ) == "15" );
 
     const auto traceFields = service.Execute( Request( requestId++, "trace.info", { { "trace_id", candidateId } } ) ).at( "data" );
+    assert( traceFields.contains( "app_info" ) && traceFields.at( "app_info" ).size() == 22 );
     assert( traceFields.at( "timer_multiplier" ) == 0.5 );
     assert( traceFields.at( "frame_offset" ) == "17" );
     assert( traceFields.at( "sampling_period_ns" ) == "1000" );
     assert( traceFields.at( "on_demand" ) == true );
     assert( traceFields.at( "legacy_queue_delay_ns" ).is_null() );
     assert( traceFields.at( "field_availability" ).at( "legacy_queue_delay_ns" ).at( "available" ) == false );
+    const auto smallAppInfo = service.Execute( Request( requestId++, "trace.app_info", {
+        { "trace_id", candidateId } } ) );
+    assert( smallAppInfo.at( "ok" ) && smallAppInfo.at( "data" ).at( "app_info" ).size() == 22 &&
+        smallAppInfo.at( "page" ).at( "next_cursor" ).is_null() );
 
     const auto captureIdentity = service.Execute( Request( requestId++, "trace.identity", { { "trace_id", candidateId } } ) ).at( "data" );
     assert( captureIdentity.at( "present" ) == true );

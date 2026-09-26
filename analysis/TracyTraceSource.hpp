@@ -14,6 +14,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -149,6 +150,21 @@ struct TraceInfoDto
     bool onDemand = false;
     std::optional<int64_t> legacyQueueDelayNs;
     FieldAvailabilityDto legacyQueueDelayAvailability;
+};
+
+struct AppInfoSummaryDto
+{
+    uint64_t recordCount = 0;
+    uint64_t totalBytes = 0;
+    uint64_t maximumRecordBytes = 0;
+};
+
+struct AppInfoPageDto
+{
+    std::vector<std::string> records;
+    AppInfoSummaryDto summary;
+    uint64_t offset = 0;
+    uint64_t oversizedRecordBytes = 0;
 };
 
 struct ThreadDto
@@ -897,6 +913,55 @@ public:
     virtual std::vector<Capability> GetCapabilities() const = 0;
     virtual TraceReadView AcquireReadView() const = 0;
     virtual TraceInfoDto GetTraceInfo() const = 0;
+    virtual TraceInfoDto GetTraceInfoMetadata() const
+    {
+        auto result = GetTraceInfo();
+        result.appInfo.clear();
+        return result;
+    }
+    virtual AppInfoSummaryDto GetAppInfoSummary() const
+    {
+        AppInfoSummaryDto result;
+        const auto info = GetTraceInfo();
+        result.recordCount = info.appInfo.size();
+        for( const auto& record : info.appInfo )
+        {
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.totalBytes += record.size();
+            result.maximumRecordBytes = std::max<uint64_t>( result.maximumRecordBytes, record.size() );
+        }
+        return result;
+    }
+    virtual AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const
+    {
+        AppInfoPageDto result;
+        result.offset = offset;
+        const auto info = GetTraceInfo();
+        result.summary.recordCount = info.appInfo.size();
+        for( const auto& record : info.appInfo )
+        {
+            if( record.size() > std::numeric_limits<uint64_t>::max() - result.summary.totalBytes )
+                throw std::runtime_error( "trace_app_info_size_overflow" );
+            result.summary.totalBytes += record.size();
+            result.summary.maximumRecordBytes = std::max<uint64_t>(
+                result.summary.maximumRecordBytes, record.size() );
+        }
+        uint64_t selectedBytes = 0;
+        for( uint64_t ordinal = offset; ordinal < info.appInfo.size() && result.records.size() < limit; ordinal++ )
+        {
+            const auto bytes = uint64_t( info.appInfo[size_t( ordinal )].size() );
+            if( bytes > maximumBytes )
+            {
+                if( result.records.empty() ) result.oversizedRecordBytes = bytes;
+                break;
+            }
+            if( bytes > maximumBytes - selectedBytes ) break;
+            selectedBytes += bytes;
+            result.records.emplace_back( info.appInfo[size_t( ordinal )] );
+        }
+        return result;
+    }
     virtual std::vector<ThreadDto> GetThreads() const = 0;
     virtual std::vector<FrameSetDto> GetFrameSets() const = 0;
     virtual std::vector<GpuContextDto> GetGpuContexts() const = 0;

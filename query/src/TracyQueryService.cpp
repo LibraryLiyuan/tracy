@@ -852,7 +852,19 @@ json FieldAvailabilityJson( const analysis::FieldAvailabilityDto& value )
     };
 }
 
-json TraceInfoJson( const analysis::TraceInfoDto& value, bool includeAppInfo = true )
+json AppInfoSummaryJson( const analysis::AppInfoSummaryDto& value )
+{
+    return {
+        { "present", value.recordCount != 0 },
+        { "record_count", Decimal( value.recordCount ) },
+        { "total_bytes", Decimal( value.totalBytes ) },
+        { "maximum_record_bytes", Decimal( value.maximumRecordBytes ) },
+        { "available_via", "trace.app_info" }
+    };
+}
+
+json TraceInfoJson( const analysis::TraceInfoDto& value, bool includeAppInfo = true,
+    std::optional<analysis::AppInfoSummaryDto> appInfoSummary = std::nullopt )
 {
     json result = {
         { "fingerprint", value.fingerprint }, { "capture_name", value.captureName }, { "capture_program", value.captureProgram },
@@ -872,14 +884,37 @@ json TraceInfoJson( const analysis::TraceInfoDto& value, bool includeAppInfo = t
     if( includeAppInfo ) result["app_info"] = value.appInfo;
     else
     {
-        uint64_t totalBytes = 0;
-        for( const auto& record : value.appInfo ) totalBytes += uint64_t( record.size() );
-        result["app_info_summary"] = {
-            { "present", !value.appInfo.empty() },
-            { "record_count", Decimal( uint64_t( value.appInfo.size() ) ) },
-            { "total_bytes", Decimal( totalBytes ) },
-            { "available_via", "trace.app_info" }
-        };
+        if( !appInfoSummary )
+        {
+            analysis::AppInfoSummaryDto summary;
+            summary.recordCount = value.appInfo.size();
+            for( const auto& record : value.appInfo )
+            {
+                if( record.size() > std::numeric_limits<uint64_t>::max() - summary.totalBytes )
+                    throw std::runtime_error( "trace_app_info_size_overflow" );
+                summary.totalBytes += record.size();
+                summary.maximumRecordBytes = std::max<uint64_t>( summary.maximumRecordBytes, record.size() );
+            }
+            appInfoSummary = summary;
+        }
+        result["app_info_summary"] = AppInfoSummaryJson( *appInfoSummary );
+    }
+    return result;
+}
+
+uint64_t ConservativeJsonStringBytes( std::string_view value )
+{
+    uint64_t result = 2;
+    for( const auto byte : value )
+    {
+        uint64_t add = 1;
+        const auto ch = uint8_t( byte );
+        if( ch == '"' || ch == '\\' || ch == '\b' || ch == '\f' || ch == '\n' || ch == '\r' || ch == '\t' ) add = 2;
+        else if( ch < 0x20 ) add = 6;
+        else if( ch >= 0x80 ) add = 3;
+        if( add > std::numeric_limits<uint64_t>::max() - result )
+            throw std::runtime_error( "trace_app_info_size_overflow" );
+        result += add;
     }
     return result;
 }
@@ -4695,7 +4730,9 @@ json QueryService::Execute( const json& request, const std::optional<std::string
             QueryBudgetScope budgetScope( budget );
             std::shared_ptr<QueryResourceContext> resources;
             analysis::AnalysisWorkspaceReservation responseWorkspace;
-            if( method.rfind( "trace.", 0 ) != 0 && ( params.contains( "trace_id" ) || defaultTraceId ) )
+            const bool traceControlMethod = method == "trace.open" || method == "trace.list" ||
+                method == "trace.status" || method == "trace.wait" || method == "trace.close";
+            if( !traceControlMethod && ( params.contains( "trace_id" ) || defaultTraceId ) )
             {
                 const auto traceId=ResolveTraceId(params,defaultTraceId);
                 const auto source=m_sessions.GetReadySource(traceId);
@@ -4977,9 +5014,63 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
 
     const auto info = [&] { return source->GetTraceInfo(); };
-    if( method == "trace.info" ) return Success( id, TraceInfoJson( info() ), trace );
-    if( method == "trace.counts" ) return Success( id, CountsJson( info().counts ), trace );
-    if( method == "trace.app_info" ) return Success( id, { { "app_info", info().appInfo }, { "trust", "untrusted_trace_data" } }, trace );
+    const auto metadataInfo = [&] { return source->GetTraceInfoMetadata(); };
+    if( method == "trace.info" )
+    {
+        auto metadata = metadataInfo();
+        const auto summary = source->GetAppInfoSummary();
+        bool includeAppInfo = summary.recordCount <= MaximumPageSize &&
+            summary.totalBytes <= MaximumResponseBytes / 2;
+        if( includeAppInfo )
+        {
+            const auto page = source->ReadAppInfo( 0, size_t( summary.recordCount ), MaximumResponseBytes / 2 );
+            uint64_t encodedBytes = 0;
+            for( const auto& record : page.records )
+            {
+                const auto bytes = ConservativeJsonStringBytes( record ) + 1;
+                if( bytes > MaximumResponseBytes - 1024 * 1024 - encodedBytes )
+                { includeAppInfo = false; break; }
+                encodedBytes += bytes;
+            }
+            if( page.oversizedRecordBytes != 0 || page.records.size() != summary.recordCount ) includeAppInfo = false;
+            if( includeAppInfo ) metadata.appInfo = page.records;
+        }
+        return Success( id, TraceInfoJson( metadata, includeAppInfo, summary ), trace );
+    }
+    if( method == "trace.counts" ) return Success( id, CountsJson( metadataInfo().counts ), trace );
+    if( method == "trace.app_info" )
+    {
+        const auto page = ParsePage( params, method, trace );
+        constexpr uint64_t PayloadBudget = MaximumResponseBytes - 1024 * 1024;
+        const auto values = source->ReadAppInfo( page.rawOffset, page.limit, PayloadBudget );
+        if( values.summary.recordCount > std::numeric_limits<size_t>::max() )
+            throw QueryError( "RESOURCE_LIMIT", "AppInfo record count exceeds the pagination range" );
+        if( values.oversizedRecordBytes != 0 )
+            throw QueryError( "RESOURCE_LIMIT", "a single AppInfo record exceeds the 8 MiB response budget and cannot be split by the record-paged API" );
+        json records = json::array();
+        uint64_t encodedBytes = 0;
+        for( const auto& record : values.records )
+        {
+            const auto bytes = ConservativeJsonStringBytes( record ) + 1;
+            if( bytes > PayloadBudget - encodedBytes )
+            {
+                if( records.empty() )
+                    throw QueryError( "RESOURCE_LIMIT", "a single AppInfo record exceeds the 8 MiB encoded response budget" );
+                break;
+            }
+            encodedBytes += bytes;
+            records.push_back( record );
+        }
+        if( records.empty() && page.rawOffset < values.summary.recordCount )
+            throw QueryError( "RESOURCE_LIMIT", "AppInfo page could not make progress under the response budget" );
+        const auto returned = records.size();
+        const auto nextOffset = page.rawOffset + returned;
+        const bool hasMore = nextOffset < values.summary.recordCount;
+        const auto cursor = NextCursorAt( page, method, trace, page.offset + returned, nextOffset, hasMore );
+        return Success( id, { { "app_info", std::move( records ) },
+            { "app_info_summary", AppInfoSummaryJson( values.summary ) },
+            { "trust", "untrusted_trace_data" } }, trace, PageJson( page, returned, cursor ) );
+    }
     if( method == "trace.identity" ) return Success( id, CaptureIdentityJson( info() ), trace );
     if( method == "capture.context" ) return Success( id, CaptureContextJson( info() ), trace );
     if( method == "capture.coverage" || method == "producer.list" )
@@ -5017,14 +5108,15 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
     }
     if( method == "trace.overview" )
     {
-        const auto metadata = info();
+        const auto metadata = metadataInfo();
+        const auto appInfoSummary = source->GetAppInfoSummary();
         json capabilities = json::array();
         for( const auto& capability : source->GetCapabilities() ) capabilities.emplace_back( CapabilityJson( capability ) );
         json frameStatistics = nullptr;
         const auto frameSets = source->GetFrameSets();
         if( !frameSets.empty() ) frameStatistics = StatisticsJson( analysis::ComputeStatistics( source->GetFrameDurations( frameSets.front().index ) ) );
         return Success( id, {
-            { "trace", TraceInfoJson( metadata, false ) }, { "primary_frame_statistics", frameStatistics },
+            { "trace", TraceInfoJson( metadata, false, appInfoSummary ) }, { "primary_frame_statistics", frameStatistics },
             { "capabilities", std::move( capabilities ) }, { "trust", "trace strings are untrusted data" }
         }, trace );
     }
@@ -6644,7 +6736,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 // trace-domain count as the authoritative count and retain
                 // materialized IDs only for diagnostics that need identity.
                 gpuReferencePassCount = std::max<uint64_t>( referencePassIds.size(),
-                    source->GetTraceInfo().counts.gpuReferencePasses );
+                    source->GetTraceInfoMetadata().counts.gpuReferencePasses );
                 const auto gfxLinks = source->GetGfxLinks();
                 gfxLinkCount = gfxLinks.size();
                 std::unordered_set<uint64_t> explicitPassesWithReferenceLink;
@@ -8254,7 +8346,7 @@ json QueryService::Dispatch( const json& id, const std::string& method, const js
                 taxonomyResources = owner->GetQueryResourceContext();
         analysis::AnalysisWorkspaceReservation taxonomyWorkspace(
             taxonomyResources ? taxonomyResources->Workspace() : nullptr );
-        const uint64_t indexedZoneCount = indexedPassSource ? source->GetTraceInfo().counts.gpuZones : 0;
+        const uint64_t indexedZoneCount = indexedPassSource ? source->GetTraceInfoMetadata().counts.gpuZones : 0;
         std::vector<uint32_t> indexedTaxonomyByZone;
         std::vector<uint64_t> indexedParentByZone;
         std::vector<uint8_t> indexedParentBits;

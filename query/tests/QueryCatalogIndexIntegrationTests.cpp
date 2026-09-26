@@ -52,6 +52,14 @@ int main( int argc, char** argv )
         const auto expectedFirstResourceCapacity = catalog->gpuCatalogResources.front().capacityBytes;
         const auto* originalGpuScan = dynamic_cast<const analysis::GpuCatalogBoundedScanSource*>( original.get() );
         Require( originalGpuScan != nullptr, "fixture has no bounded GPU scan source" );
+        const auto originalInfo = original->GetTraceInfo();
+        const auto originalMetadata = original->GetTraceInfoMetadata();
+        const auto originalAppInfoSummary = original->GetAppInfoSummary();
+        Require( originalMetadata.appInfo.empty() && originalMetadata.fingerprint == originalInfo.fingerprint &&
+            originalMetadata.counts.cpuZones == originalInfo.counts.cpuZones &&
+            originalMetadata.counts.gpuReferenceUses == originalInfo.counts.gpuReferenceUses &&
+            originalAppInfoSummary.recordCount == originalInfo.appInfo.size(),
+            "metadata-only trace info changed identity, counts, or AppInfo summary" );
         const auto expectedGpuResourceCount = originalGpuScan->GetGpuCatalogResourceCountBounded();
         const auto expectedGpuAllocationCount = originalGpuScan->GetGpuCatalogAllocationCountBounded();
         const auto expectedGpuPassCount = originalGpuScan->GetGpuCatalogPassCountBounded();

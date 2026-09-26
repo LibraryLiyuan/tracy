@@ -79,6 +79,9 @@ public:
     std::vector<Capability> GetCapabilities() const override;
     TraceReadView AcquireReadView() const override;
     TraceInfoDto GetTraceInfo() const override;
+    TraceInfoDto GetTraceInfoMetadata() const override;
+    AppInfoSummaryDto GetAppInfoSummary() const override;
+    AppInfoPageDto ReadAppInfo( uint64_t offset, size_t limit, uint64_t maximumBytes ) const override;
     std::vector<ThreadDto> GetThreads() const override;
     std::vector<FrameSetDto> GetFrameSets() const override;
     std::vector<GpuContextDto> GetGpuContexts() const override;
@@ -199,6 +202,7 @@ public:
     BinaryResourceChunkDto ReadFrameImageBc1( size_t imageId, size_t offset, size_t maxBytes ) const override;
 
 private:
+    TraceInfoDto GetTraceInfoImpl( bool includeAppInfo ) const;
     std::vector<JobDto> BuildJobs( std::optional<uint64_t> evidenceFrameId,
         const std::unordered_set<uint64_t>* explicitJobIds = nullptr,
         const std::function<void()>& check = {} ) const;
