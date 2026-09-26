@@ -314,7 +314,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
     uint64_t emittedRunCount = 0;
     AnalysisWorkspaceReservation metadataWorkspace( options.workspace ), frameWorkspace( options.workspace ),
         signatureWorkspace( options.workspace ), presenceWorkspace( options.workspace ), runWorkspace( options.workspace );
-    BoundedTraceScanner scanner( m_source );
+    BoundedTraceScanner scanner( m_source, options.canonicalizeLogicalDynamicNames );
 
     const auto sourceFrameSets = m_source.GetFrameSets();
     checkCancelled();
@@ -734,8 +734,7 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
                     ++result.exactSignatureHashCount;
                 }
             }
-            const auto logicalName = options.canonicalizeLogicalDynamicNames && zone.extraName &&
-                !zone.function.empty() ? std::string_view( zone.function ) : std::string_view( zone.name );
+            const auto logicalName = std::string_view( zone.name );
             const auto parentLogicalOrdinalPlusOne = options.includeLogicalSignatures && !stableLogicalSite &&
                 !stack.empty() && zone.parentRef && parentResolved ? stack.back().logicalSignatureOrdinal + 1 : 0;
             const SignatureCacheView logicalCacheKey { parentLogicalOrdinalPlusOne,

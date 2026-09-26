@@ -101,11 +101,17 @@ public:
         }
         return Page( matching, range );
     }
+    std::vector<CpuZoneDto> ScanCpuZonesForPolicy( const ScanRange& range ) const override
+    {
+        ++policyReads;
+        return TraceSource::ScanCpuZonesForPolicy( range );
+    }
 
     std::string cancelAt;
     std::function<void( std::string_view )> readHook;
     mutable bool cancellationRequested = false;
     mutable size_t readsAfterCancel = 0;
+    mutable size_t policyReads = 0;
     void ReadBoundary( std::string_view domain ) const
     {
         if( readHook ) readHook( domain );
@@ -516,6 +522,7 @@ int main()
     assert( dynamicResult.signatures.front().path == "StableResourceSite" );
     assert( dynamicResult.signatures.front().threadRef == "Main" );
     assert( dynamicResult.logicalSignatureHashCount == 1 );
+    assert( dynamicNames.policyReads > 0 );
 
     // The policy scan consumes the stable logical rollup only.  Physical
     // thread/path occurrences remain available from TraceSource for targeted

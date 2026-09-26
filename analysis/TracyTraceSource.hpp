@@ -970,6 +970,22 @@ public:
     virtual std::vector<LockDto> GetLocks() const = 0;
 
     virtual std::vector<CpuZoneDto> ScanCpuZones( const ScanRange& range ) const = 0;
+    // Native policy scans may request the same facts without optional dynamic
+    // text payloads. The default preserves compatibility for other sources.
+    virtual std::vector<CpuZoneDto> ScanCpuZonesForPolicy( const ScanRange& range ) const
+    {
+        auto zones = ScanCpuZones( range );
+        for( auto& zone : zones )
+        {
+            if( zone.extraName && !zone.function.empty() ) zone.name = zone.function;
+            zone.extraName.reset();
+            zone.extraText.reset();
+            zone.extraColor = 0;
+            zone.callstack = 0;
+            zone.callstackRef.reset();
+        }
+        return zones;
+    }
     virtual std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const = 0;
     virtual std::vector<FrameDto> ScanFrames( const ScanRange& range ) const = 0;
     virtual std::vector<MemoryEventDto> ScanMemoryEvents( const ScanRange& range ) const = 0;

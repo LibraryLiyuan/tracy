@@ -109,7 +109,7 @@ size_t BoundedScanBatch::Count() const
     return std::visit( []( const auto& values ) { return SizeOf( values ); }, records );
 }
 
-BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source )
+BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source, bool cpuPolicyProjection )
     : m_source( source )
     , m_bounded( [&]() -> const NativeBoundedTraceSource& {
         const auto* bounded = dynamic_cast<const NativeBoundedTraceSource*>( &source );
@@ -118,6 +118,7 @@ BoundedTraceScanner::BoundedTraceScanner( const TraceSource& source )
         return *bounded;
     }() )
     , m_gpu( dynamic_cast<const GpuCatalogBoundedScanSource*>( &source ) )
+    , m_cpuPolicyProjection( cpuPolicyProjection )
 {}
 
 BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) const
@@ -158,7 +159,9 @@ BoundedScanBatch BoundedTraceScanner::Read( const BoundedScanRequest& request ) 
     switch( request.domain )
     {
     case BoundedScanDomain::Frame: records = m_source.ScanFrames( RangeFor( cursor, request.limit ) ); break;
-    case BoundedScanDomain::CpuZone: records = m_source.ScanCpuZones( RangeFor( cursor, request.limit ) ); break;
+    case BoundedScanDomain::CpuZone: records = m_cpuPolicyProjection ?
+        m_source.ScanCpuZonesForPolicy( RangeFor( cursor, request.limit ) ) :
+        m_source.ScanCpuZones( RangeFor( cursor, request.limit ) ); break;
     case BoundedScanDomain::GpuZone: records = m_source.ScanGpuZones( RangeFor( cursor, request.limit ) ); break;
     case BoundedScanDomain::Job: records = m_source.ScanJobs( offset, request.limit ); break;
     case BoundedScanDomain::Relation: records = m_source.ScanRelations( offset, request.limit ); break;

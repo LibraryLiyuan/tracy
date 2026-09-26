@@ -141,13 +141,14 @@ public:
 class BoundedTraceScanner
 {
 public:
-    explicit BoundedTraceScanner( const TraceSource& source );
+    explicit BoundedTraceScanner( const TraceSource& source, bool cpuPolicyProjection = false );
     BoundedScanBatch Read( const BoundedScanRequest& request ) const;
 
 private:
     const TraceSource& m_source;
     const NativeBoundedTraceSource& m_bounded;
     const GpuCatalogBoundedScanSource* m_gpu = nullptr;
+    bool m_cpuPolicyProjection = false;
 };
 
 const char* BoundedScanDomainName( BoundedScanDomain domain );

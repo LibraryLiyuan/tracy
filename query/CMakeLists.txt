@@ -168,6 +168,10 @@ if(BUILD_TESTING)
     target_link_libraries(tracy-compressed-query-index-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-compressed-query-index-tests)
 
+    add_executable(tracy-cpu-policy-projection-probe tests/CpuPolicyProjectionProbe.cpp)
+    target_link_libraries(tracy-cpu-policy-projection-probe PRIVATE TracyQueryProtocol nlohmann_json::nlohmann_json)
+    tracy_query_enable_assertions(tracy-cpu-policy-projection-probe)
+
     add_executable(tracy-query-sample-store-tests tests/QuerySampleStoreTests.cpp)
     target_link_libraries(tracy-query-sample-store-tests PRIVATE TracyQueryProtocol)
     tracy_query_enable_assertions(tracy-query-sample-store-tests)

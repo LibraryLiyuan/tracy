@@ -2087,6 +2087,17 @@ public:
 
     std::vector<analysis::CpuZoneDto> ScanCpuZones( const analysis::ScanRange& range ) const override
     {
+        return ScanCpuZonesImpl( range, false );
+    }
+
+    std::vector<analysis::CpuZoneDto> ScanCpuZonesForPolicy( const analysis::ScanRange& range ) const override
+    {
+        return ScanCpuZonesImpl( range, true );
+    }
+
+    std::vector<analysis::CpuZoneDto> ScanCpuZonesImpl(
+        const analysis::ScanRange& range, bool policyProjection ) const
+    {
         std::vector<analysis::CpuZoneDto> result;
         if( range.limit == 0 ) return result;
         if( range.startNs == std::numeric_limits<int64_t>::min() && range.endNs == std::numeric_limits<int64_t>::max() )
@@ -2094,7 +2105,8 @@ public:
             const auto begin = std::min<uint64_t>( range.offset, m_cpu.Count() );
             const auto end = std::min<uint64_t>( begin + range.limit, m_cpu.Count() );
             result.reserve( size_t( end - begin ) );
-            for( uint64_t index = begin; index < end; index++ ) result.emplace_back( CpuDto( index ) );
+            for( uint64_t index = begin; index < end; index++ )
+                result.emplace_back( CpuDto( index, policyProjection ) );
             return result;
         }
         size_t skipped = 0;
@@ -2104,7 +2116,7 @@ public:
             const auto end = zone.flags & 1 ? zone.end : zone.start;
             if( !Intersects( zone.start, end, range ) ) continue;
             if( skipped++ < range.offset ) continue;
-            result.emplace_back( CpuDto( index ) );
+            result.emplace_back( CpuDto( index, policyProjection ) );
             if( result.size() >= range.limit ) break;
         }
         return result;
@@ -3649,7 +3661,7 @@ private:
         const auto found = m_locations.find( id );
         return found == m_locations.end() ? nullptr : &found->second;
     }
-    analysis::CpuZoneDto CpuDto( uint64_t index ) const
+    analysis::CpuZoneDto CpuDto( uint64_t index, bool policyProjection = false ) const
     {
         const auto& zone = m_cpu.At<CpuZoneIndexRecord>( index );
         const auto* source = Source( zone.sourceLocation );
@@ -3659,7 +3671,8 @@ private:
         dto.sourceLocationRef = source ? source->ref : m_source->MakeEntityRef( "source", uint16_t( zone.sourceLocation ) );
         dto.extraIndex = zone.extra;
         std::optional<ZoneExtraIndexRecord> extra;
-        if(zone.extra<m_extras.Count()) extra=m_extras.At<ZoneExtraIndexRecord>(zone.extra);
+        if( !policyProjection && zone.extra<m_extras.Count() )
+            extra=m_extras.At<ZoneExtraIndexRecord>(zone.extra);
         if( extra )
         {
             dto.extraColor = extra->color;
@@ -3667,8 +3680,9 @@ private:
             if( extra->flags & 2 ) dto.extraName = m_source->ResolveStringIndex( extra->name );
             if( extra->flags & 1 ) dto.extraText = m_source->ResolveStringIndex( extra->text );
         }
-        else if( zone.extra != 0 ) { dto.extraValid = false; dto.nameResolved = false; }
-        dto.name = dto.extraName.value_or( source ? ( source->name.empty() ? source->function : source->name ) : std::string() );
+        else if( !policyProjection && zone.extra != 0 ) { dto.extraValid = false; dto.nameResolved = false; }
+        const auto staticName = source ? ( source->name.empty() ? source->function : source->name ) : std::string();
+        dto.name = policyProjection ? staticName : dto.extraName.value_or( staticName );
         dto.nameResolved = dto.nameResolved && !dto.name.empty();
         if( source ) { dto.function = source->function; dto.file = source->file; dto.line = source->line; }
         if( zone.parent != std::numeric_limits<uint64_t>::max() ) dto.parentRef = m_source->MakeEntityRef( "cpu-zone", zone.parent );
