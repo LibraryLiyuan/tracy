@@ -478,6 +478,10 @@ int main()
     // the single physical path and single logical site remain two definitions.
     // Cache partitioning must never "fix" cardinality by merging other paths.
     assert( largeResult.signatures.size() == 2 );
+    // All 4096 root occurrences have the same exact identity.  The externally
+    // visible SHA remains unchanged, but it must be computed once per unique
+    // exact definition rather than once per occurrence.
+    assert( largeResult.exactSignatureHashCount == 1 );
     assert( largeResult.frameBoundaryProbeCount < 4096 * 16 );
 
     // The policy scan consumes the stable logical rollup only.  Physical

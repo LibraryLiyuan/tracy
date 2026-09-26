@@ -97,6 +97,7 @@ struct CpuFrameScanResult
     size_t maximumDepth = 0;
     size_t maximumBatchObserved = 0;
     uint64_t frameBoundaryProbeCount = 0;
+    uint64_t exactSignatureHashCount = 0;
     bool qualityComplete = true;
     std::vector<CpuSignatureDefinition> signatures;
     std::vector<CpuSignatureFrameRun> runs;
