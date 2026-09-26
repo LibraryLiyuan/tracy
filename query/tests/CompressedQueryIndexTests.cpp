@@ -93,11 +93,21 @@ int main(int argc,char** argv)
             freshInput,true,freshResources,&freshManifest);
         if(!freshValidation.manifest) throw std::runtime_error(freshValidation.reason);
         bool reusedGpuDerivedValidation=false;
+        bool phasedSampleValidation=false;
+        bool phasedJobValidation=false;
         for(const auto& phase:freshResources->Snapshot().phaseHistory)
+        {
             if(phase.phase=="index-validate:deep:gpu-derived-reused")
                 reusedGpuDerivedValidation=true;
+            else if(phase.phase=="index-validate:deep:samples")
+                phasedSampleValidation=true;
+            else if(phase.phase=="index-validate:deep:jobs")
+                phasedJobValidation=true;
+        }
         if(!reusedGpuDerivedValidation)
             throw std::runtime_error("fresh build repeated GPU derived deep validation");
+        if(!phasedSampleValidation || !phasedJobValidation)
+            throw std::runtime_error("deep validation did not expose per-domain phase telemetry");
         auto mismatchedReceipt=freshManifest;
         mismatchedReceipt.gpuReferenceUses.bytes++;
         const auto fallbackResources=tracy::query::QueryIndex::CreateResourceContext(freshInput);

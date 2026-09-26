@@ -5871,6 +5871,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             sameSection( manifest.gpuReferenceUses, freshBuildValidationReceipt->gpuReferenceUses ) &&
             sameSection( manifest.gpuReferenceEnds, freshBuildValidationReceipt->gpuReferenceEnds );
 
+        if( deep ) resources->SetPhase( "index-validate:deep:source" );
         if( std::filesystem::file_size( tracePath ) != manifest.sourceBytes || WriteTime( tracePath ) != manifest.sourceWriteTime )
         {
             result.reason = "source_identity_mismatch";
@@ -5881,6 +5882,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             result.reason = "source_hash_mismatch";
             return result;
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:data" );
         if( !std::filesystem::is_regular_file( manifest.dataPath ) || std::filesystem::file_size( manifest.dataPath ) != manifest.dataBytes )
         {
             result.reason = "data_identity_mismatch";
@@ -5908,9 +5910,11 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             if( deep && analysis::WorkerTraceSource::ComputeFingerprint( section.path ) != section.fingerprint )
                 throw std::runtime_error( std::string( name ) + " section hash mismatch" );
         };
+        if( deep ) resources->SetPhase( "index-validate:deep:zones" );
         validateSection( manifest.zoneExtras, sizeof( ZoneExtraIndexRecord ), "zone-extra" );
         validateSection( manifest.cpuZones, sizeof( CpuZoneIndexRecord ), "CPU-zone",ZoneSectionKind::Cpu );
         validateSection( manifest.gpuZones, sizeof( GpuZoneIndexRecord ), "GPU-zone",ZoneSectionKind::Gpu );
+        if( deep ) resources->SetPhase( "index-validate:deep:samples" );
         if( manifest.samples.recordBytes != QuerySampleStoreRecordBytes ||
             !std::filesystem::is_directory( manifest.samples.path ) ||
             SectionBytes( manifest.samples.path ) != manifest.samples.bytes ||
@@ -5928,6 +5932,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             QuerySampleDerivedStoreReader sampleDerived( manifest.samples.path / "derived", manifest.sourceFingerprint, storageOptions );
             if( deep ) { samples.ValidateAll(); ghostZones.ValidateAll(); sampleDerived.ValidateAll(); }
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:strings" );
         if( manifest.globalStrings.recordBytes != 0 || !std::filesystem::is_directory( manifest.globalStrings.path ) ||
             SectionBytes( manifest.globalStrings.path ) != manifest.globalStrings.bytes )
             throw std::runtime_error( "global string section identity mismatch" );
@@ -5940,6 +5945,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "global string section count mismatch" );
             if( deep ) strings.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:callstacks" );
         if( manifest.globalCallstacks.recordBytes != 0 || !std::filesystem::is_directory( manifest.globalCallstacks.path ) ||
             SectionBytes( manifest.globalCallstacks.path ) != manifest.globalCallstacks.bytes )
             throw std::runtime_error( "global callstack section identity mismatch" );
@@ -5952,6 +5958,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "global callstack section count mismatch" );
             if( deep ) callstacks.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:callstack-frames" );
         if( manifest.globalCallstackFrames.recordBytes != 0 || !std::filesystem::is_directory( manifest.globalCallstackFrames.path ) ||
             SectionBytes( manifest.globalCallstackFrames.path ) != manifest.globalCallstackFrames.bytes )
             throw std::runtime_error( "global callstack frame section identity mismatch" );
@@ -5964,6 +5971,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "global callstack frame section count mismatch" );
             if( deep ) frames.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:catalog" );
         if( manifest.gpuCatalog.recordBytes != 0 || !std::filesystem::is_directory( manifest.gpuCatalog.path ) ||
             SectionBytes( manifest.gpuCatalog.path ) != manifest.gpuCatalog.bytes )
             throw std::runtime_error( "GPU Catalog section identity mismatch" );
@@ -6007,6 +6015,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 if( !same ) throw std::runtime_error( "GPU Catalog semantic validation mismatch" );
             }
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:jobs" );
         if( manifest.jobStages.recordBytes != 0 || !std::filesystem::is_directory( manifest.jobStages.path ) ||
             SectionBytes( manifest.jobStages.path ) != manifest.jobStages.bytes )
             throw std::runtime_error( "Job store section identity mismatch" );
@@ -6019,17 +6028,20 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 throw std::runtime_error( "Job store stage count mismatch" );
             if( deep ) jobs.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:correlations" );
         {
             QueryCorrelationStoreReader correlations( manifest.jobStages.path / "correlation",
                 manifest.sourceFingerprint, storageOptions );
             if( deep ) correlations.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:explicit-pass" );
         {
             QueryExplicitPassStoreReader passes( manifest.jobStages.path / "explicit-pass",
                 manifest.sourceFingerprint, manifest.gfxEntities.count,
                 manifest.gpuZones.count, storageOptions );
             if( deep ) passes.ValidateAll();
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:jn-sections" );
         validateSection( manifest.gfxEntities, sizeof( JnGfxEntityData ), "gfx-entity",ZoneSectionKind::GfxEntity );
         validateSection( manifest.gfxLinks, sizeof( JnGfxLinkData ), "gfx-link",ZoneSectionKind::GfxLink );
         validateSection( manifest.relations, sizeof( JnRelationData ), "relation",ZoneSectionKind::Relation );
@@ -6064,6 +6076,7 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 }
             }
         }
+        if( deep ) resources->SetPhase( "index-validate:deep:gpu-memory" );
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );
         validateSection( manifest.gpuMemorySummaryCpuZones, sizeof( uint64_t ), "GPU-memory-summary-CPU-zone",ZoneSectionKind::GpuMemorySummaryCpuZone );
         validateSection( manifest.gpuMemorySummary, 0, "GPU-memory-summary" );
