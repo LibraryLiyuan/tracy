@@ -559,6 +559,13 @@ int main( int argc, char** argv )
             std::find( validationPhases.begin(), validationPhases.end(),
                 "cross-check:pointer-by-resource-ordinal" ) != validationPhases.end(),
             "Catalog pointer cross-check did not use and clean the ordinal join scratch" );
+        Require( std::find( validationPhases.begin(), validationPhases.end(),
+                "cross-check:allocation-lookup-ordinal" ) != validationPhases.end() &&
+            std::find( validationPhases.begin(), validationPhases.end(),
+                "cross-check:views" ) != validationPhases.end() &&
+            std::find( validationPhases.begin(), validationPhases.end(),
+                "cross-check:strings-ordinal" ) != validationPhases.end(),
+            "Catalog metadata lookup cross-check did not use the ordinal join" );
         bool cancelValidation = false;
         analysis::PagedRecordOptions cancelledValidationOptions;
         cancelledValidationOptions.cancelled = [&] { return cancelValidation; };
