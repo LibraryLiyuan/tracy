@@ -243,6 +243,9 @@ private:
 using nlohmann::json;
 constexpr const char* IndexMagic = "JNTRACY-QUERY-INDEX";
 constexpr uint64_t MaximumManifestBytes = 1024 * 1024;
+constexpr const char* PostCompactCheckpointMagic = "JNTRACY-QUERY-CHECKPOINT";
+constexpr uint32_t PostCompactCheckpointSchema = 1;
+constexpr uint64_t MaximumCheckpointBytes = 1024 * 1024;
 constexpr uint64_t MaximumGpuMemorySummaryBytes = 256 * 1024 * 1024;
 
 uint64_t UnsignedProtocolField( std::string_view line, std::string_view key )
@@ -1082,7 +1085,8 @@ std::string PagedSectionIdentity(std::string_view source,ZoneSectionKind kind)
 }
 
 bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view identityPrefix,
-    const std::shared_ptr<analysis::AnalysisDiskBudget>& disk, std::string& error )
+    const std::shared_ptr<analysis::AnalysisDiskBudget>& disk, std::string& error,
+    const std::unordered_set<std::string>& protectedCandidates = {} )
 {
     error.clear();
     std::error_code ec;
@@ -1099,6 +1103,8 @@ bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view
         const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( entry->path() ).c_str() );
         if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
 #endif
+        const auto normalized = std::filesystem::absolute( entry->path() ).lexically_normal().generic_string();
+        if( protectedCandidates.contains( normalized ) ) continue;
         candidates.emplace_back( entry->path() );
     }
     if( ec ) { error = "Query stale candidate scan failed: " + ec.message(); return false; }
@@ -1116,6 +1122,55 @@ bool CleanupStaleCandidates( const std::filesystem::path& root, std::string_view
         ec.clear();
         analysis::AnalysisDiskRemove( candidate, disk, ec, true );
         if( ec ) { error = "Query stale candidate cleanup failed: " + candidate.string() + ": " + ec.message(); return false; }
+    }
+    return true;
+}
+
+bool CleanupStaleControlFiles( const std::filesystem::path& manifestPath,
+    const std::filesystem::path& checkpointPath,
+    const std::shared_ptr<analysis::AnalysisDiskBudget>& disk, std::string& error )
+{
+    error.clear();
+    const auto root = manifestPath.parent_path();
+    const std::array prefixes = {
+        manifestPath.filename().string() + ".tmp.",
+        checkpointPath.filename().string() + ".tmp."
+    };
+    std::vector<std::filesystem::path> candidates;
+    std::error_code ec;
+    for( std::filesystem::directory_iterator entry( root, ec ), end; entry != end && !ec; entry.increment( ec ) )
+    {
+        const auto name = entry->path().filename().string();
+        if( std::none_of( prefixes.begin(), prefixes.end(),
+                [&]( const std::string& prefix ) { return name.starts_with( prefix ); } ) ) continue;
+        const auto status = std::filesystem::symlink_status( entry->path(), ec );
+        if( ec ) break;
+        if( std::filesystem::is_symlink( status ) ) continue;
+#ifdef _WIN32
+        const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( entry->path() ).c_str() );
+        if( attributes != INVALID_FILE_ATTRIBUTES && ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) continue;
+#endif
+        candidates.emplace_back( entry->path() );
+    }
+    if( ec ) { error = "Query stale control scan failed: " + ec.message(); return false; }
+    try
+    {
+        if( disk && disk->usage ) disk->usage->AddRoots( candidates );
+    }
+    catch( const std::exception& failure )
+    {
+        error = std::string( "Query stale control accounting failed: " ) + failure.what();
+        return false;
+    }
+    for( const auto& candidate : candidates )
+    {
+        ec.clear();
+        analysis::AnalysisDiskRemove( candidate, disk, ec, true );
+        if( ec )
+        {
+            error = "Query stale control cleanup failed: " + candidate.string() + ": " + ec.message();
+            return false;
+        }
     }
     return true;
 }
@@ -3889,24 +3944,384 @@ int64_t ParseSigned( const json& value, const char* field )
     return result;
 }
 
+std::filesystem::path PostCompactCheckpointPath( const std::filesystem::path& manifestPath )
+{
+    auto path = manifestPath;
+    path += ".checkpoint.json";
+    return path;
+}
+
+void SetGenerationPaths( QueryIndexManifest& value, const std::filesystem::path& root,
+    std::string_view baseName )
+{
+    const auto path = [&]( std::string_view suffix ) {
+        return root / ( std::string( baseName ) + std::string( suffix ) );
+    };
+    value.dataPath = path( ".jnidx.data" );
+    value.zoneExtras.path = path( ".jnidx.zextra" );
+    value.cpuZones.path = path( ".jnidx.cpu" );
+    value.gpuZones.path = path( ".jnidx.gpu" );
+    value.samples.path = path( ".jnidx.sample" );
+    value.globalStrings.path = path( ".jnidx.string" );
+    value.globalCallstacks.path = path( ".jnidx.callstack" );
+    value.globalCallstackFrames.path = path( ".jnidx.callstack-frame" );
+    value.gpuCatalog.path = path( ".jnidx.gpu-catalog" );
+    value.jobStages.path = path( ".jnidx.job-stage" );
+    value.gfxEntities.path = path( ".jnidx.gfx-entity" );
+    value.gfxLinks.path = path( ".jnidx.gfx-link" );
+    value.relations.path = path( ".jnidx.relation" );
+    value.gpuReferencePasses.path = path( ".jnidx.gpu-ref-pass" );
+    value.gpuReferenceUses.path = path( ".jnidx.gpu-ref-use" );
+    value.gpuReferenceEnds.path = path( ".jnidx.gpu-ref-end" );
+    value.gpuMemoryCpuZones.path = path( ".jnidx.gpu-memory-cpu-zone" );
+    value.gpuMemorySummaryCpuZones.path = path( ".jnidx.gpu-memory-summary-cpu-zone" );
+    value.gpuMemorySummary.path = path( ".jnidx.gpu-memory-summary.json" );
+}
+
+QueryIndexManifest ParseManifestDescription( const json& parsed, const std::filesystem::path& root )
+{
+    if( parsed.value( "magic", "" ) != IndexMagic ||
+        parsed.value( "schema_version", 0u ) != QueryIndexSchemaVersion )
+        throw std::runtime_error( "checkpoint index schema mismatch" );
+    QueryIndexManifest manifest;
+    const auto& source = parsed.at( "source" );
+    const auto& data = parsed.at( "data" );
+    manifest.sourceFingerprint = source.at( "sha256" ).get<std::string>();
+    manifest.sourceBytes = ParseUnsigned( source, "bytes" );
+    manifest.sourceWriteTime = ParseSigned( source, "write_time" );
+    manifest.dataFingerprint = data.at( "sha256" ).get<std::string>();
+    manifest.dataBytes = ParseUnsigned( data, "bytes" );
+    const auto resolve = [&]( const json& description ) {
+        const auto file = std::filesystem::path( description.at( "file" ).get<std::string>() );
+        if( file.empty() || file != file.filename() )
+            throw std::runtime_error( "checkpoint contains an invalid candidate path" );
+        return root / file;
+    };
+    manifest.dataPath = resolve( data );
+    manifest.cpuZoneIndex = parsed.at( "domains" ).value( "cpu_zone_index", false );
+    manifest.gpuZoneIndex = parsed.at( "domains" ).value( "gpu_zone_index", false );
+    manifest.gpuMemoryProtocol2 = parsed.at( "domains" ).at( "gpu_memory_protocol2" ).get<bool>();
+    const auto& counts = parsed.at( "counts" );
+    for( const auto& [thread, count] : counts.at( "cpu_zones_by_thread" ).items() )
+        manifest.cpuZonesByThread.emplace( std::stoull( thread ), std::stoull( count.get<std::string>() ) );
+    for( const auto& [context, count] : counts.at( "gpu_zones_by_context" ).items() )
+        manifest.gpuZonesByContext.emplace( uint32_t( std::stoul( context ) ), std::stoull( count.get<std::string>() ) );
+    manifest.sampleMainCount = ParseUnsigned( counts, "samples" );
+    manifest.sampleContextSwitchCount = ParseUnsigned( counts, "context_switch_samples" );
+    const auto& zoneValidation = parsed.at( "zone_validation" );
+    manifest.zoneValidationPrecomputed = zoneValidation.value( "precomputed", false );
+    manifest.zoneValidation.complete = zoneValidation.value( "complete", false );
+    manifest.zoneValidation.scanned = ParseUnsigned( zoneValidation, "scanned" );
+    for( const auto& finding : zoneValidation.at( "findings" ) )
+    {
+        analysis::ZoneValidationFindingDto value;
+        value.severity = finding.at( "severity" ).get<std::string>();
+        value.code = finding.at( "code" ).get<std::string>();
+        value.message = finding.at( "message" ).get<std::string>();
+        value.count = ParseUnsigned( finding, "count" );
+        value.refs = finding.at( "refs" ).get<std::vector<std::string>>();
+        manifest.zoneValidation.findings.emplace_back( std::move( value ) );
+    }
+    const auto& catalogValidation = parsed.at( "catalog_validation" );
+    manifest.catalogValidation.complete = catalogValidation.value( "complete", false );
+    manifest.catalogValidation.present = catalogValidation.value( "present", false );
+    manifest.catalogValidation.originalValid = catalogValidation.value( "original_valid", false );
+    manifest.catalogValidation.healthy = catalogValidation.value( "healthy", false );
+    for( const auto& finding : catalogValidation.at( "findings" ) )
+        manifest.catalogValidation.findings.push_back( {
+            finding.at( "code" ).get<std::string>(), ParseUnsigned( finding, "count" ) } );
+    const auto parseSection = [&]( const char* name, QueryIndexSection& output ) {
+        const auto& section = parsed.at( "sections" ).at( name );
+        output.path = resolve( section );
+        output.fingerprint = section.at( "sha256" ).get<std::string>();
+        output.bytes = ParseUnsigned( section, "bytes" );
+        output.count = ParseUnsigned( section, "count" );
+        output.declaredCount = ParseUnsigned( section, "declared_count" );
+        output.recordBytes = section.at( "record_bytes" ).get<uint32_t>();
+    };
+    parseSection( "zone_extra", manifest.zoneExtras );
+    parseSection( "cpu_zone", manifest.cpuZones );
+    parseSection( "gpu_zone", manifest.gpuZones );
+    parseSection( "sample", manifest.samples );
+    parseSection( "global_string", manifest.globalStrings );
+    parseSection( "global_callstack", manifest.globalCallstacks );
+    parseSection( "global_callstack_frame", manifest.globalCallstackFrames );
+    parseSection( "gpu_catalog", manifest.gpuCatalog );
+    parseSection( "job_stage", manifest.jobStages );
+    parseSection( "gfx_entity", manifest.gfxEntities );
+    parseSection( "gfx_link", manifest.gfxLinks );
+    parseSection( "relation", manifest.relations );
+    parseSection( "gpu_reference_pass", manifest.gpuReferencePasses );
+    parseSection( "gpu_reference_use", manifest.gpuReferenceUses );
+    parseSection( "gpu_reference_end", manifest.gpuReferenceEnds );
+    parseSection( "gpu_memory_cpu_zone", manifest.gpuMemoryCpuZones );
+    parseSection( "gpu_memory_summary_cpu_zone", manifest.gpuMemorySummaryCpuZones );
+    parseSection( "gpu_memory_summary", manifest.gpuMemorySummary );
+    return manifest;
+}
+
+struct PostCompactCheckpoint
+{
+    std::string generationBase;
+    std::string profileIdentity;
+    QueryIndexManifest candidate;
+};
+
+std::vector<std::filesystem::path> CheckpointCandidatePaths( const QueryIndexManifest& value )
+{
+    return {
+        value.dataPath, value.zoneExtras.path, value.cpuZones.path, value.gpuZones.path,
+        value.samples.path, value.globalStrings.path, value.globalCallstacks.path,
+        value.globalCallstackFrames.path, value.gpuCatalog.path, value.jobStages.path,
+        value.gfxEntities.path, value.gfxLinks.path, value.relations.path,
+        value.gpuReferencePasses.path, value.gpuReferenceUses.path, value.gpuReferenceEnds.path,
+        value.gpuMemoryCpuZones.path, value.gpuMemorySummaryCpuZones.path
+    };
+}
+
+std::optional<PostCompactCheckpoint> ReadPostCompactCheckpoint(
+    const std::filesystem::path& path, const std::filesystem::path& root )
+{
+    std::error_code ec;
+    if( !std::filesystem::exists( path, ec ) )
+    {
+        if( ec ) throw std::runtime_error( "cannot inspect Query checkpoint: " + ec.message() );
+        return std::nullopt;
+    }
+    if( !std::filesystem::is_regular_file( path, ec ) || ec )
+        throw std::runtime_error( "Query checkpoint is not a regular file" );
+    const auto parsed = json::parse( ReadManifest( path, MaximumCheckpointBytes ) );
+    if( parsed.value( "magic", "" ) != PostCompactCheckpointMagic ||
+        parsed.value( "checkpoint_schema", 0u ) != PostCompactCheckpointSchema ||
+        parsed.value( "index_schema", 0u ) != QueryIndexSchemaVersion ||
+        parsed.value( "stage", "" ) != "post-compact" )
+        throw std::runtime_error( "Query checkpoint schema mismatch" );
+    PostCompactCheckpoint result;
+    result.generationBase = parsed.at( "generation" ).get<std::string>();
+    result.profileIdentity = parsed.at( "profile_sha256" ).get<std::string>();
+    result.candidate = ParseManifestDescription( parsed.at( "candidate_manifest" ), root );
+    return result;
+}
+
+void WritePostCompactCheckpoint( const std::filesystem::path& path, std::string_view generationBase,
+    std::string_view profileIdentity, const QueryIndexManifest& candidate,
+    const std::shared_ptr<QueryResourceContext>& resources,
+    const std::function<bool()>& cancelled )
+{
+    const auto payload = json {
+        { "magic", PostCompactCheckpointMagic },
+        { "checkpoint_schema", PostCompactCheckpointSchema },
+        { "index_schema", QueryIndexSchemaVersion },
+        { "stage", "post-compact" },
+        { "generation", generationBase },
+        { "profile_sha256", profileIdentity },
+        { "candidate_manifest", ManifestJson( candidate ) }
+    }.dump( 2 );
+    if( payload.size() > MaximumCheckpointBytes )
+        throw std::runtime_error( "Query checkpoint exceeds bounded size" );
+    auto temporary = path;
+    temporary += ".tmp." + std::to_string( ProcessId() ) + "." +
+        std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+    const auto previous = resources && resources->Disk() && resources->Disk()->usage &&
+        std::filesystem::is_regular_file( path ) ? analysis::AnalysisDiskUsage::Bytes( path ) : 0;
+    try
+    {
+        if( resources ) resources->BeforeFileGrowth( temporary, payload.size() );
+        std::ofstream output( temporary, std::ios::binary | std::ios::trunc );
+        if( !output ) throw std::runtime_error( "cannot create Query checkpoint" );
+        output.write( payload.data(), std::streamsize( payload.size() ) );
+        output.flush();
+        if( !output ) throw std::runtime_error( "cannot flush Query checkpoint" );
+        output.close();
+        std::string error;
+        if( !AtomicReplace( temporary, path, error, cancelled ) )
+            throw std::runtime_error( "cannot publish Query checkpoint: " + error );
+        if( previous && resources && resources->Disk() && resources->Disk()->usage )
+            resources->Disk()->usage->Release( previous );
+    }
+    catch( ... )
+    {
+        std::error_code ignored;
+        analysis::AnalysisDiskRemove( temporary, resources ? resources->Disk() : nullptr, ignored );
+        throw;
+    }
+}
+
+bool SafeOwnedCandidatePath( const std::filesystem::path& path, const std::filesystem::path& root,
+    std::string_view expectedPublishedName )
+{
+    const auto absoluteRoot = std::filesystem::absolute( root ).lexically_normal();
+    const auto absolutePath = std::filesystem::absolute( path ).lexically_normal();
+    if( absolutePath.parent_path() != absoluteRoot ) return false;
+    const auto name = absolutePath.filename().string();
+    const auto prefix = std::string( expectedPublishedName ) + ".tmp.";
+    if( !name.starts_with( prefix ) || name.size() == prefix.size() ) return false;
+    auto cursor = prefix.size();
+    while( cursor < name.size() && name[cursor] >= '0' && name[cursor] <= '9' ) cursor++;
+    if( cursor == prefix.size() || ( cursor != name.size() && name.substr( cursor ) != ".pages" ) )
+        return false;
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status( absolutePath, ec );
+    if( ec || !std::filesystem::exists( status ) || std::filesystem::is_symlink( status ) ) return false;
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( absolutePath ).c_str() );
+    if( attributes == INVALID_FILE_ATTRIBUTES || ( attributes & FILE_ATTRIBUTE_REPARSE_POINT ) ) return false;
+#endif
+    return true;
+}
+
+void ResetPostCompactDerivedOutputs( const QueryIndexManifest& candidate,
+    const std::shared_ptr<analysis::AnalysisDiskBudget>& disk )
+{
+    static constexpr std::array<std::string_view, 10> Children = {
+        "by-resource", "by-catalog-resource", "pass-times", "resolved-uses", "reverse-scratch",
+        "validation-scratch", "pass-resource-summary", "pass-resource-ranges",
+        "pass-resource-uses", "pass-resource-evidence-ids"
+    };
+    const auto remove = [&]( const std::filesystem::path& path, bool recursive ) {
+        std::error_code ec;
+        if( !std::filesystem::exists( path, ec ) )
+        {
+            if( ec ) throw std::runtime_error( "cannot inspect checkpoint derived output: " + ec.message() );
+            return;
+        }
+        const auto status = std::filesystem::symlink_status( path, ec );
+        if( ec ) throw std::runtime_error( "cannot inspect checkpoint derived output: " + ec.message() );
+        if( std::filesystem::is_symlink( status ) )
+            throw std::runtime_error( "checkpoint derived output is a symbolic link" );
+#ifdef _WIN32
+        const auto attributes = GetFileAttributesW( analysis::AnalysisIoPath( path ).c_str() );
+        if( attributes == INVALID_FILE_ATTRIBUTES )
+            throw std::runtime_error( "cannot inspect checkpoint derived output attributes" );
+        if( attributes & FILE_ATTRIBUTE_REPARSE_POINT )
+            throw std::runtime_error( "checkpoint derived output is a reparse point" );
+#endif
+        ec.clear();
+        analysis::AnalysisDiskRemove( path, disk, ec, recursive );
+        if( ec ) throw std::runtime_error( "cannot reset checkpoint derived output: " + ec.message() );
+    };
+    for( const auto child : Children )
+        remove( candidate.gpuReferenceUses.path / child, true );
+    remove( candidate.gpuReferenceUses.path / "pass-resource-scratch", true );
+    remove( candidate.gpuMemorySummary.path, false );
+}
+
+void ValidatePostCompactCheckpointOwnership( const PostCompactCheckpoint& checkpoint,
+    const std::filesystem::path& root, std::string_view identityPrefix )
+{
+    if( !checkpoint.generationBase.starts_with( identityPrefix ) ||
+        std::filesystem::path( checkpoint.generationBase ).filename().string() != checkpoint.generationBase )
+        throw std::runtime_error( "Query checkpoint generation mismatch" );
+    const auto generation = std::string_view( checkpoint.generationBase ).substr( identityPrefix.size() );
+    if( generation.empty() || !std::all_of( generation.begin(), generation.end(),
+            []( char value ) { return value >= '0' && value <= '9'; } ) )
+        throw std::runtime_error( "Query checkpoint generation mismatch" );
+    QueryIndexManifest published = checkpoint.candidate;
+    SetGenerationPaths( published, root, checkpoint.generationBase );
+    const auto candidates = CheckpointCandidatePaths( checkpoint.candidate );
+    const auto targets = CheckpointCandidatePaths( published );
+    if( candidates.size() != targets.size() ) throw std::runtime_error( "Query checkpoint path count mismatch" );
+    for( size_t index = 0; index < candidates.size(); index++ )
+        if( !SafeOwnedCandidatePath( candidates[index], root, targets[index].filename().string() ) )
+            throw std::runtime_error( "Query checkpoint candidate ownership mismatch: " +
+                candidates[index].filename().string() + " expected " +
+                targets[index].filename().string() + ".tmp.<pid>" );
+    const auto summaryName = published.gpuMemorySummary.path.filename().string();
+    const auto candidateSummaryName = checkpoint.candidate.gpuMemorySummary.path.filename().string();
+    if( checkpoint.candidate.gpuMemorySummary.path.parent_path() != root ||
+        !candidateSummaryName.starts_with( summaryName + ".tmp." ) ||
+        checkpoint.candidate.gpuMemorySummary.bytes != 0 ||
+        !checkpoint.candidate.gpuMemorySummary.fingerprint.empty() )
+        throw std::runtime_error( "Query checkpoint deferred summary ownership mismatch" );
+}
+
+void ValidatePostCompactCheckpoint( const PostCompactCheckpoint& checkpoint,
+    const std::filesystem::path& root, std::string_view identityPrefix,
+    uint64_t sourceBytes, int64_t sourceWriteTime, std::string_view sourceFingerprint,
+    std::string_view profileIdentity )
+{
+    const auto& value = checkpoint.candidate;
+    if( checkpoint.profileIdentity != profileIdentity || checkpoint.profileIdentity.size() != 64 )
+        throw std::runtime_error( "Query checkpoint resource profile mismatch" );
+    ValidatePostCompactCheckpointOwnership( checkpoint, root, identityPrefix );
+    if( value.sourceBytes != sourceBytes || value.sourceWriteTime != sourceWriteTime ||
+        value.sourceFingerprint != sourceFingerprint )
+        throw std::runtime_error( "Query checkpoint source identity mismatch" );
+    if( !value.cpuZoneIndex || !value.gpuZoneIndex || !value.zoneValidationPrecomputed ||
+        !value.zoneValidation.complete || !value.catalogValidation.complete )
+        throw std::runtime_error( "Query checkpoint completed-stage metadata is incomplete" );
+    if( !std::filesystem::is_regular_file( value.dataPath ) ||
+        std::filesystem::file_size( value.dataPath ) != value.dataBytes ||
+        analysis::WorkerTraceSource::ComputeFingerprint( value.dataPath ) != value.dataFingerprint )
+        throw std::runtime_error( "Query checkpoint compact identity mismatch" );
+    const auto verify = [&]( const QueryIndexSection& section, const char* name ) {
+        if( SectionBytes( section.path ) != section.bytes ||
+            SectionFingerprint( section.path ) != section.fingerprint )
+            throw std::runtime_error( std::string( "Query checkpoint section mismatch: " ) + name );
+    };
+    verify( value.zoneExtras, "zone-extra" );
+    verify( value.cpuZones, "cpu-zone" );
+    verify( value.gpuZones, "gpu-zone" );
+    verify( value.samples, "sample" );
+    verify( value.globalStrings, "global-string" );
+    verify( value.globalCallstacks, "global-callstack" );
+    verify( value.globalCallstackFrames, "global-callstack-frame" );
+    verify( value.gpuCatalog, "gpu-catalog" );
+    verify( value.jobStages, "job-stage" );
+    verify( value.gfxEntities, "gfx-entity" );
+    verify( value.gfxLinks, "gfx-link" );
+    verify( value.relations, "relation" );
+    verify( value.gpuReferencePasses, "gpu-reference-pass" );
+    verify( value.gpuReferenceUses, "gpu-reference-use" );
+    verify( value.gpuReferenceEnds, "gpu-reference-end" );
+    verify( value.gpuMemoryCpuZones, "gpu-memory-cpu-zone" );
+    verify( value.gpuMemorySummaryCpuZones, "gpu-memory-summary-cpu-zone" );
+}
+
 std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::path& tracePath)
 {
     auto manifestPath=tracePath; manifestPath+=".jnidx";
     auto failurePath=manifestPath; failurePath+=".failure.json";
     auto cleanupPath=manifestPath; cleanupPath+=".cleanup.json";
-    std::vector<std::filesystem::path> result{manifestPath,failurePath,cleanupPath};
+    const auto checkpointPath=PostCompactCheckpointPath(manifestPath);
+    std::vector<std::filesystem::path> result{manifestPath,failurePath,cleanupPath,checkpointPath};
+    const auto append=[&](const json& value,const char* field) {
+        const auto name=std::filesystem::path(value.at(field).get<std::string>());
+        if(name.empty() || name!=name.filename()) throw std::runtime_error("invalid index resource path");
+        result.emplace_back(tracePath.parent_path()/name);
+    };
     try
     {
-        if(!std::filesystem::is_regular_file(manifestPath)) return result;
-        const auto parsed=json::parse(ReadManifest(manifestPath));
-        if(parsed.value("magic","")!=IndexMagic || parsed.value("schema_version",0u)!=QueryIndexSchemaVersion) return result;
-        const auto append=[&](const json& value,const char* field) {
-            const auto name=std::filesystem::path(value.at(field).get<std::string>());
-            if(name.empty() || name!=name.filename()) throw std::runtime_error("invalid index resource path");
-            result.emplace_back(tracePath.parent_path()/name);
-        };
-        append(parsed.at("data"),"file");
-        for(const auto& [_,section]:parsed.at("sections").items()) append(section,"file");
+        if(std::filesystem::is_regular_file(manifestPath))
+        {
+            const auto parsed=json::parse(ReadManifest(manifestPath));
+            if(parsed.value("magic","")==IndexMagic && parsed.value("schema_version",0u)==QueryIndexSchemaVersion)
+            {
+                append(parsed.at("data"),"file");
+                for(const auto& [_,section]:parsed.at("sections").items()) append(section,"file");
+            }
+        }
+    }
+    catch(...) {}
+    try
+    {
+        if(std::filesystem::is_regular_file(checkpointPath))
+        {
+            const auto parsed=json::parse(ReadManifest(checkpointPath,MaximumCheckpointBytes));
+            if(parsed.value("magic","")==PostCompactCheckpointMagic &&
+                parsed.value("checkpoint_schema",0u)==PostCompactCheckpointSchema &&
+                parsed.value("index_schema",0u)==QueryIndexSchemaVersion)
+            {
+                const auto& candidate=parsed.at("candidate_manifest");
+                append(candidate.at("data"),"file");
+                for(const auto& [_,section]:candidate.at("sections").items())
+                {
+                    if(section.at("file").get<std::string>().find("gpu-memory-summary.json")!=std::string::npos &&
+                        ParseUnsigned(section,"bytes")==0) continue;
+                    append(section,"file");
+                }
+            }
+        }
     }
     catch(...) {}
     return result;
@@ -4033,7 +4448,8 @@ std::filesystem::path QueryIndex::ManifestPath( const std::filesystem::path& tra
 }
 
 QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePath,
-    analysis::WorkerTraceSource::StateCallback stateCallback, std::shared_ptr<QueryResourceContext> resources )
+    analysis::WorkerTraceSource::StateCallback stateCallback, std::shared_ptr<QueryResourceContext> resources,
+    const std::function<void(std::string_view)>& phaseHook )
 {
     EnsureQueryStreamCapacity();
     const auto tracePath = analysis::AnalysisIoPath( inputTracePath );
@@ -4052,28 +4468,9 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
     // section identity within the trace directory.
     const auto identityPrefix = std::string( "jnidx." ) + result.sourceFingerprint.substr( 0, 16 ) +
         ".s" + std::to_string( QueryIndexSchemaVersion ) + ".g";
-    const auto baseName = identityPrefix +
+    auto baseName = identityPrefix +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
-    const auto dataName = baseName + ".jnidx.data";
-    result.dataPath = tracePath.parent_path() / dataName;
-    result.zoneExtras.path = tracePath.parent_path() / ( baseName + ".jnidx.zextra" );
-    result.cpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.cpu" );
-    result.gpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu" );
-    result.samples.path = tracePath.parent_path() / ( baseName + ".jnidx.sample" );
-    result.globalStrings.path = tracePath.parent_path() / ( baseName + ".jnidx.string" );
-    result.globalCallstacks.path = tracePath.parent_path() / ( baseName + ".jnidx.callstack" );
-    result.globalCallstackFrames.path = tracePath.parent_path() / ( baseName + ".jnidx.callstack-frame" );
-    result.gpuCatalog.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-catalog" );
-    result.jobStages.path = tracePath.parent_path() / ( baseName + ".jnidx.job-stage" );
-    result.gfxEntities.path = tracePath.parent_path() / ( baseName + ".jnidx.gfx-entity" );
-    result.gfxLinks.path = tracePath.parent_path() / ( baseName + ".jnidx.gfx-link" );
-    result.relations.path = tracePath.parent_path() / ( baseName + ".jnidx.relation" );
-    result.gpuReferencePasses.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-ref-pass" );
-    result.gpuReferenceUses.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-ref-use" );
-    result.gpuReferenceEnds.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-ref-end" );
-    result.gpuMemoryCpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-memory-cpu-zone" );
-    result.gpuMemorySummaryCpuZones.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-memory-summary-cpu-zone" );
-    result.gpuMemorySummary.path = tracePath.parent_path() / ( baseName + ".jnidx.gpu-memory-summary.json" );
+    SetGenerationPaths( result, tracePath.parent_path(), baseName );
     result.zoneExtras.recordBytes = sizeof( ZoneExtraIndexRecord );
     result.cpuZones.recordBytes = sizeof( CpuZoneIndexRecord );
     result.gpuZones.recordBytes = sizeof( GpuZoneIndexRecord );
@@ -4118,9 +4515,38 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
     auto temporaryValidation = tracePath.parent_path() / ( baseName + ".jnidx.validation" + suffix );
     auto failureDiagnostic = result.manifestPath; failureDiagnostic += ".failure.json";
     auto cleanupDiagnostic = result.manifestPath; cleanupDiagnostic += ".cleanup.json";
+    const auto checkpointPath = PostCompactCheckpointPath( result.manifestPath );
     auto ownerLockPath = result.manifestPath; ownerLockPath += ".owner.lock";
     std::vector<std::filesystem::path> packedScratch;
     std::vector<std::filesystem::path> publishedCandidates;
+    bool checkpointPublished = false;
+    const auto checkpointCandidate = [&] {
+        QueryIndexManifest candidate = result;
+        candidate.dataPath = temporaryData;
+        candidate.zoneExtras.path = temporaryExtras;
+        candidate.cpuZones.path = temporaryCpu;
+        candidate.gpuZones.path = temporaryGpu;
+        candidate.samples.path = temporarySamples;
+        candidate.globalStrings.path = temporaryStrings;
+        candidate.globalCallstacks.path = temporaryCallstacks;
+        candidate.globalCallstackFrames.path = temporaryCallstackFrames;
+        candidate.gpuCatalog.path = temporaryCatalog;
+        candidate.jobStages.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::JobStage )];
+        candidate.gfxEntities.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GfxEntity )];
+        candidate.gfxLinks.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GfxLink )];
+        candidate.relations.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::Relation )];
+        candidate.gpuReferencePasses.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GpuReferencePass )];
+        candidate.gpuReferenceUses.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GpuReferenceUse )];
+        candidate.gpuReferenceEnds.path = temporaryJn[size_t( SerializedZoneSink::JnDomain::GpuReferenceEnd )];
+        candidate.gpuMemoryCpuZones.path = temporaryGpuMemoryCpuZones;
+        candidate.gpuMemorySummaryCpuZones.path = temporaryGpuMemorySummaryCpuZones;
+        candidate.gpuMemorySummary.path = temporaryGpuMemorySummary;
+        candidate.gpuMemorySummary.bytes = 0;
+        candidate.gpuMemorySummary.count = 0;
+        candidate.gpuMemorySummary.declaredCount = 0;
+        candidate.gpuMemorySummary.fingerprint.clear();
+        return candidate;
+    };
 
     if( !resources ) resources=CreateResourceContext(tracePath);
     resources->ValidateTraceIdentity(result.sourceBytes,result.sourceFingerprint);
@@ -4129,16 +4555,94 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         result.samples.path,result.globalStrings.path,result.globalCallstacks.path,result.globalCallstackFrames.path,result.gpuCatalog.path,result.jobStages.path,result.gfxEntities.path,result.gfxLinks.path,
         result.relations.path,result.gpuReferencePasses.path,result.gpuReferenceUses.path,result.gpuReferenceEnds.path,
         result.gpuMemoryCpuZones.path,result.gpuMemorySummaryCpuZones.path,result.gpuMemorySummary.path,
-        failureDiagnostic,cleanupDiagnostic,temporaryValidation,ownerLockPath
+        failureDiagnostic,cleanupDiagnostic,checkpointPath,temporaryValidation,ownerLockPath
     });
     const auto storageOptions = ResourceStorageOptions( resources );
 
     try
     {
         QueryIndexOwnerLease ownerLease( ownerLockPath );
-        resources->SetPhase( "cleanup-stale-candidates" );
         std::string cleanupError;
-        if( !CleanupStaleCandidates( tracePath.parent_path(), identityPrefix, storageOptions.disk, cleanupError ) )
+        resources->SetPhase( "cleanup-stale-control-files" );
+        if( !CleanupStaleControlFiles( result.manifestPath, checkpointPath,
+                storageOptions.disk, cleanupError ) )
+            throw std::runtime_error( cleanupError );
+        bool resumedPostCompact = false;
+        std::unordered_set<std::string> protectedCandidates;
+        std::string checkpointIdentityPrefix;
+        try
+        {
+            auto checkpoint = ReadPostCompactCheckpoint( checkpointPath, tracePath.parent_path() );
+            if( checkpoint )
+            {
+                if( checkpoint->candidate.sourceFingerprint.size() != 64 )
+                    throw std::runtime_error( "Query checkpoint source fingerprint is invalid" );
+                checkpointIdentityPrefix = std::string( "jnidx." ) +
+                    checkpoint->candidate.sourceFingerprint.substr( 0, 16 ) + ".s" +
+                    std::to_string( QueryIndexSchemaVersion ) + ".g";
+                ValidatePostCompactCheckpointOwnership( *checkpoint, tracePath.parent_path(),
+                    checkpointIdentityPrefix );
+                ResetPostCompactDerivedOutputs( checkpoint->candidate, storageOptions.disk );
+                ValidatePostCompactCheckpoint( *checkpoint, tracePath.parent_path(), identityPrefix,
+                    result.sourceBytes, result.sourceWriteTime, result.sourceFingerprint,
+                    resources->ProfileIdentity() );
+                const auto candidate = checkpoint->candidate;
+                baseName = checkpoint->generationBase;
+                result = candidate;
+                result.manifestPath = ManifestPath( tracePath );
+                SetGenerationPaths( result, tracePath.parent_path(), baseName );
+                temporaryData = candidate.dataPath;
+                temporaryExtras = candidate.zoneExtras.path;
+                temporaryCpu = candidate.cpuZones.path;
+                temporaryGpu = candidate.gpuZones.path;
+                temporarySamples = candidate.samples.path;
+                temporaryStrings = candidate.globalStrings.path;
+                temporaryCallstacks = candidate.globalCallstacks.path;
+                temporaryCallstackFrames = candidate.globalCallstackFrames.path;
+                temporaryCatalog = candidate.gpuCatalog.path;
+                temporaryJn = {
+                    candidate.jobStages.path, candidate.gfxEntities.path, candidate.gfxLinks.path,
+                    candidate.relations.path, candidate.gpuReferencePasses.path,
+                    candidate.gpuReferenceUses.path, candidate.gpuReferenceEnds.path
+                };
+                temporaryGpuMemoryCpuZones = candidate.gpuMemoryCpuZones.path;
+                temporaryGpuMemorySummaryCpuZones = candidate.gpuMemorySummaryCpuZones.path;
+                temporaryGpuMemorySummary = candidate.gpuMemorySummary.path;
+                temporaryValidation = tracePath.parent_path() /
+                    ( baseName + ".jnidx.validation" + suffix );
+                const auto paths = CheckpointCandidatePaths( candidate );
+                resources->IncludeDiskRoots( paths );
+                for( const auto& path : paths )
+                    protectedCandidates.emplace(
+                        std::filesystem::absolute( path ).lexically_normal().generic_string() );
+                checkpointPublished = true;
+                resumedPostCompact = true;
+                resources->SetPhase( "post-compact-resume" );
+                if( phaseHook ) phaseHook( "post-compact-resume" );
+            }
+        }
+        catch( const std::exception& checkpointFailure )
+        {
+            std::cerr << "Query post-compact checkpoint rejected: " << checkpointFailure.what() << '\n';
+            std::error_code checkpointCleanup;
+            analysis::AnalysisDiskRemove( checkpointPath, storageOptions.disk, checkpointCleanup );
+            if( checkpointCleanup )
+                throw std::runtime_error( "cannot discard invalid Query checkpoint: " +
+                    checkpointCleanup.message() );
+            checkpointPublished = false;
+            resumedPostCompact = false;
+            protectedCandidates.clear();
+            if( !checkpointIdentityPrefix.empty() )
+            {
+                std::string staleCheckpointError;
+                if( !CleanupStaleCandidates( tracePath.parent_path(), checkpointIdentityPrefix,
+                        storageOptions.disk, staleCheckpointError ) )
+                    throw std::runtime_error( staleCheckpointError );
+            }
+        }
+        resources->SetPhase( "cleanup-stale-candidates" );
+        if( !CleanupStaleCandidates( tracePath.parent_path(), identityPrefix, storageOptions.disk,
+                cleanupError, protectedCandidates ) )
             throw std::runtime_error( cleanupError );
         const auto currentGeneration = CurrentPublishedGenerationBase(
             result.manifestPath, identityPrefix, result.sourceFingerprint );
@@ -4166,6 +4670,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             for( const auto& path : retained )
                 fprintf( stderr, "Query generation retained before build: %s\n", path.string().c_str() );
         }
+        if( !resumedPostCompact )
+        {
         resources->SetPhase( "worker-load" );
         resources->SetLiveWorkers( 1 );
         resources->CheckMemory();
@@ -4685,6 +5191,12 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         source.reset();
         writer.ReleaseExternalSources();
         resources->SetLiveWorkers( 0 );
+        resources->SetPhase( "post-compact-checkpoint" );
+        WritePostCompactCheckpoint( checkpointPath, baseName, resources->ProfileIdentity(),
+            checkpointCandidate(), resources, storageOptions.cancelled );
+        checkpointPublished = true;
+        if( phaseHook ) phaseHook( "post-compact-checkpoint" );
+        }
         {
             resources->SetPhase( "gpu-memory-summary-deferred" );
             resources->BeforeFileGrowth( temporaryGpuMemorySummary, 0 );
@@ -5013,6 +5525,14 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             if( !output ) throw std::runtime_error( "cannot flush index manifest" );
         }
 
+        {
+            std::error_code checkpointCleanup;
+            analysis::AnalysisDiskRemove( checkpointPath, storageOptions.disk, checkpointCleanup );
+            if( checkpointCleanup )
+                throw std::runtime_error( "cannot retire Query checkpoint before publication: " +
+                    checkpointCleanup.message() );
+            checkpointPublished = false;
+        }
         resources->SetPhase( "publish" );
         resources->CheckMemory();
         resources->CheckFinalDisk();
@@ -5094,6 +5614,23 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         const auto failure=std::current_exception();
         resources->SetLiveWorkers( 0 );
         std::error_code ignored;
+        if( checkpointPublished )
+        {
+            try { ResetPostCompactDerivedOutputs( checkpointCandidate(), storageOptions.disk ); }
+            catch( const std::exception& cleanupFailure )
+            {
+                fprintf( stderr, "Query checkpoint derived cleanup deferred: %s\n", cleanupFailure.what() );
+            }
+            analysis::AnalysisDiskRemove( temporaryManifest, storageOptions.disk, ignored );
+            analysis::AnalysisDiskRemove( temporaryValidation, storageOptions.disk, ignored, true );
+            try { resources->RunResourceBoundary([&] { std::rethrow_exception(failure); }); }
+            catch(...)
+            {
+                try { resources->WriteDiagnostic(failureDiagnostic); } catch(...) {}
+                throw;
+            }
+            std::rethrow_exception(failure);
+        }
         for( auto candidate = publishedCandidates.rbegin(); candidate != publishedCandidates.rend(); ++candidate )
         {
             ignored.clear();

@@ -1,6 +1,7 @@
 #include "TracyQueryIndex.hpp"
 #include "../../analysis/TracyWorkerTraceSource.hpp"
 #include <chrono>
+#include <array>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -37,11 +38,83 @@ int main(int argc,char** argv)
         if(failure.at("failure_reason") != "disk_peak_limit" || failure.at("requested_bytes").is_null() ||
             failure.at("phase").get<std::string>().empty())
             throw std::runtime_error("resource-denied QueryIndex did not retain an actionable diagnostic");
-        const auto manifest=tracy::query::QueryIndex::Build(input);
+        auto checkpointPath=tracy::query::QueryIndex::ManifestPath(input);
+        checkpointPath+=".checkpoint.json";
+        bool checkpointFaultObserved=false;
+        try {
+            tracy::query::QueryIndex::Build(input,{}, {}, [&](std::string_view phase) {
+                if(phase=="post-compact-checkpoint") {
+                    checkpointFaultObserved=true;
+                    throw std::runtime_error("injected post-compact checkpoint stop");
+                }
+            });
+        } catch(const std::exception& error) {
+            if(std::string_view(error.what())!="injected post-compact checkpoint stop") throw;
+        }
+        if(!checkpointFaultObserved || !std::filesystem::is_regular_file(checkpointPath) ||
+            std::filesystem::exists(tracy::query::QueryIndex::ManifestPath(input)))
+            throw std::runtime_error("post-compact checkpoint failure was not retained transactionally");
+        {
+            std::ifstream checkpointInput(checkpointPath,std::ios::binary);
+            const auto checkpoint=nlohmann::json::parse(checkpointInput);
+            const auto useName=checkpoint.at("candidate_manifest").at("sections")
+                .at("gpu_reference_use").at("file").get<std::string>();
+            const auto interruptedOutput=root/useName/"by-resource";
+            std::filesystem::create_directories(interruptedOutput);
+            std::ofstream(interruptedOutput/"partial")<<"interrupted";
+        }
+        auto staleManifestControl=tracy::query::QueryIndex::ManifestPath(input);
+        staleManifestControl+=".tmp.999";
+        auto staleCheckpointControl=checkpointPath;
+        staleCheckpointControl+=".tmp.999.1";
+        std::ofstream(staleManifestControl)<<"stale";
+        std::ofstream(staleCheckpointControl)<<"stale";
+        size_t resumedWorkerStates=0;
+        bool resumedPhaseObserved=false;
+        const auto manifest=tracy::query::QueryIndex::Build(input,
+            [&](tracy::analysis::TraceSourceState) { resumedWorkerStates++; }, {},
+            [&](std::string_view phase) {
+                if(phase=="post-compact-resume") resumedPhaseObserved=true;
+            });
+        if(!resumedPhaseObserved || resumedWorkerStates!=0 || std::filesystem::exists(checkpointPath) ||
+            std::filesystem::exists(staleManifestControl) || std::filesystem::exists(staleCheckpointControl))
+            throw std::runtime_error("QueryIndex did not resume exclusively from the post-compact checkpoint");
         if(manifest.gpuMemorySummary.count!=0)
             throw std::runtime_error("cold QueryIndex still built the full GPU-memory attribution summary");
         const auto validation=tracy::query::QueryIndex::Validate(input,true);
         if(!validation.manifest) throw std::runtime_error(validation.reason);
+        const auto freshRoot=root/"fresh";
+        std::filesystem::create_directories(freshRoot);
+        const auto freshInput=freshRoot/"fixture.tracy";
+        std::filesystem::copy_file(argv[1],freshInput);
+        const auto freshManifest=tracy::query::QueryIndex::Build(freshInput);
+        const auto freshValidation=tracy::query::QueryIndex::Validate(freshInput,true);
+        if(!freshValidation.manifest) throw std::runtime_error(freshValidation.reason);
+        // The compact Tracy container carries writer metadata that is not byte-stable
+        // across independent builds.  Both copies are deep-validated separately;
+        // all deterministic Query sidecars must remain hash-identical.
+        if(manifest.sampleMainCount!=freshManifest.sampleMainCount ||
+            manifest.sampleContextSwitchCount!=freshManifest.sampleContextSwitchCount)
+            throw std::runtime_error("resumed compact output differs from a fresh cold build");
+        const std::array resumedSections={
+            &manifest.zoneExtras,&manifest.cpuZones,&manifest.gpuZones,&manifest.samples,
+            &manifest.globalStrings,&manifest.globalCallstacks,&manifest.globalCallstackFrames,
+            &manifest.gpuCatalog,&manifest.jobStages,&manifest.gfxEntities,&manifest.gfxLinks,
+            &manifest.relations,&manifest.gpuReferencePasses,&manifest.gpuReferenceUses,
+            &manifest.gpuReferenceEnds,&manifest.gpuMemoryCpuZones,
+            &manifest.gpuMemorySummaryCpuZones,&manifest.gpuMemorySummary};
+        const std::array freshSections={
+            &freshManifest.zoneExtras,&freshManifest.cpuZones,&freshManifest.gpuZones,&freshManifest.samples,
+            &freshManifest.globalStrings,&freshManifest.globalCallstacks,&freshManifest.globalCallstackFrames,
+            &freshManifest.gpuCatalog,&freshManifest.jobStages,&freshManifest.gfxEntities,&freshManifest.gfxLinks,
+            &freshManifest.relations,&freshManifest.gpuReferencePasses,&freshManifest.gpuReferenceUses,
+            &freshManifest.gpuReferenceEnds,&freshManifest.gpuMemoryCpuZones,
+            &freshManifest.gpuMemorySummaryCpuZones,&freshManifest.gpuMemorySummary};
+        for(size_t index=0;index<resumedSections.size();index++)
+            if(resumedSections[index]->fingerprint!=freshSections[index]->fingerprint ||
+                resumedSections[index]->bytes!=freshSections[index]->bytes ||
+                resumedSections[index]->count!=freshSections[index]->count)
+                throw std::runtime_error("resumed section differs from a fresh cold build");
         if(!manifest.cpuZones.count || manifest.cpuZones.bytes>=manifest.cpuZones.count*52/2)
             throw std::runtime_error("CPU sidecar did not compress the repeated real fixture records");
         auto source=tracy::query::QueryIndex::Open(manifest);
@@ -52,6 +125,80 @@ int main(int argc,char** argv)
         tracy::analysis::ScanRange range; range.limit=10;
         const auto zones=source->ScanCpuZones(range);
         if(zones.empty()) throw std::runtime_error("compressed indexed trace lost its zones");
+        source.reset();
+
+        const auto rejectRoot=root/"reject";
+        std::filesystem::create_directories(rejectRoot);
+        const auto rejectInput=rejectRoot/"fixture.tracy";
+        std::filesystem::copy_file(argv[1],rejectInput);
+        auto rejectCheckpoint=tracy::query::QueryIndex::ManifestPath(rejectInput);
+        rejectCheckpoint+=".checkpoint.json";
+        try {
+            tracy::query::QueryIndex::Build(rejectInput,{}, {}, [](std::string_view phase) {
+                if(phase=="post-compact-checkpoint") throw std::runtime_error("reject checkpoint stop");
+            });
+        } catch(const std::exception& error) {
+            if(std::string_view(error.what())!="reject checkpoint stop") throw;
+        }
+        std::ifstream rejectCheckpointInput(rejectCheckpoint,std::ios::binary);
+        const auto checkpoint=nlohmann::json::parse(rejectCheckpointInput);
+        rejectCheckpointInput.close();
+        const auto compactName=checkpoint.at("candidate_manifest").at("data").at("file").get<std::string>();
+        std::ofstream(rejectRoot/compactName,std::ios::binary|std::ios::app)<<"corrupt";
+        size_t rejectedWorkerStates=0; bool rejectedResumed=false;
+        const auto rebuilt=tracy::query::QueryIndex::Build(rejectInput,
+            [&](tracy::analysis::TraceSourceState) { rejectedWorkerStates++; }, {},
+            [&](std::string_view phase) { if(phase=="post-compact-resume") rejectedResumed=true; });
+        if(rejectedResumed || rejectedWorkerStates==0 || std::filesystem::exists(rejectCheckpoint))
+            throw std::runtime_error("corrupted post-compact checkpoint was not rejected and rebuilt");
+        const auto rebuiltValidation=tracy::query::QueryIndex::Validate(rejectInput,true);
+        if(!rebuiltValidation.manifest) throw std::runtime_error(rebuiltValidation.reason);
+        for(const auto& entry:std::filesystem::directory_iterator(rejectRoot))
+            if(entry.path().filename().string().find(".tmp.")!=std::string::npos)
+                throw std::runtime_error("checkpoint rejection left an owned temporary candidate");
+
+        const auto profileRoot=root/"profile-mismatch";
+        std::filesystem::create_directories(profileRoot);
+        const auto profileInput=profileRoot/"fixture.tracy";
+        std::filesystem::copy_file(argv[1],profileInput);
+        tracy::query::QueryResourceContextOptions profileOptions;
+        profileOptions.privateBytesSoftTarget=15ull*1024*1024*1024;
+        auto profileResources=tracy::query::QueryIndex::CreateResourceContext(profileInput,profileOptions);
+        try {
+            tracy::query::QueryIndex::Build(profileInput,{},profileResources,[](std::string_view phase) {
+                if(phase=="post-compact-checkpoint") throw std::runtime_error("profile checkpoint stop");
+            });
+        } catch(const std::exception& error) {
+            if(std::string_view(error.what())!="profile checkpoint stop") throw;
+        }
+        profileResources.reset();
+        size_t profileWorkerStates=0; bool profileResumed=false;
+        tracy::query::QueryIndex::Build(profileInput,
+            [&](tracy::analysis::TraceSourceState) { profileWorkerStates++; }, {},
+            [&](std::string_view phase) { if(phase=="post-compact-resume") profileResumed=true; });
+        if(profileResumed || profileWorkerStates==0)
+            throw std::runtime_error("resource-profile-mismatched checkpoint was reused");
+
+        const auto identityRoot=root/"source-mismatch";
+        std::filesystem::create_directories(identityRoot);
+        const auto identityInput=identityRoot/"fixture.tracy";
+        std::filesystem::copy_file(argv[1],identityInput);
+        try {
+            tracy::query::QueryIndex::Build(identityInput,{}, {}, [](std::string_view phase) {
+                if(phase=="post-compact-checkpoint") throw std::runtime_error("identity checkpoint stop");
+            });
+        } catch(const std::exception& error) {
+            if(std::string_view(error.what())!="identity checkpoint stop") throw;
+        }
+        std::filesystem::last_write_time(identityInput,
+            std::filesystem::last_write_time(identityInput)+std::chrono::seconds(1));
+        size_t identityWorkerStates=0; bool identityResumed=false;
+        tracy::query::QueryIndex::Build(identityInput,
+            [&](tracy::analysis::TraceSourceState) { identityWorkerStates++; }, {},
+            [&](std::string_view phase) { if(phase=="post-compact-resume") identityResumed=true; });
+        if(identityResumed || identityWorkerStates==0)
+            throw std::runtime_error("source-identity-mismatched checkpoint was reused");
+
         std::cout<<"compressed index passed cpu="<<manifest.cpuZones.count<<" stored="<<manifest.cpuZones.bytes<<'\n';
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n'; return 1; }

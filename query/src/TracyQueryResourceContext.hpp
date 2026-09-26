@@ -113,6 +113,7 @@ public:
     void WriteDiagnostic(const std::filesystem::path& path);
     void RunResourceBoundary(const std::function<void()>& operation);
     QueryResourceSnapshot Snapshot() const;
+    std::string ProfileIdentity() const;
 
 private:
     struct State;

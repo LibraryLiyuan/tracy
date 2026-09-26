@@ -1,6 +1,7 @@
 #include "TracyQueryResourceContext.hpp"
 #include "TracyFileReadHooks.hpp"
 #include "TracyFileWriteHooks.hpp"
+#include "TracyHash.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -519,5 +520,23 @@ QueryResourceSnapshot QueryResourceContext::Snapshot() const
         result.phaseHistory.emplace_back(std::move(value));
     }
     return result;
+}
+
+std::string QueryResourceContext::ProfileIdentity() const
+{
+    const auto canonical=nlohmann::json {
+        {"private_bytes_soft_target",std::to_string(m_options.privateBytesSoftTarget)},
+        {"process_commit_hard_limit",std::to_string(m_options.processCommitHardLimit)},
+        {"workspace_maximum_bytes",std::to_string(m_options.workspaceMaximumBytes)},
+        {"workspace_target_bytes",std::to_string(m_options.workspaceTargetBytes)},
+        {"final_disk_limit",std::to_string(m_limits.finalBytes)},
+        {"peak_live_disk_limit",std::to_string(m_limits.peakBytes)},
+        {"diagnostic_memory_reserve_bytes",std::to_string(m_options.diagnosticMemoryReserveBytes)},
+        {"diagnostic_disk_reserve_bytes",std::to_string(m_options.diagnosticDiskReserveBytes)},
+        {"sample_period_ms",std::to_string(m_options.sampleInterval.count())}
+    }.dump();
+    analysis::Sha256Builder hash;
+    hash.Update(canonical.data(),canonical.size());
+    return hash.FinalHex();
 }
 }
