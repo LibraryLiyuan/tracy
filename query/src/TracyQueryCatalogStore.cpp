@@ -3161,7 +3161,8 @@ uint64_t QueryCatalogStoreReader::ResourcePointerIntervalDecodedBytes() const
     return m_impl->resourcePointerIntervals ? m_impl->resourcePointerIntervals->Statistics().decodedBytes : 0;
 }
 
-void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string_view )>& phase ) const
+void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string_view )>& phase,
+    const std::filesystem::path& scratchRoot ) const
 {
     std::lock_guard lock( m_impl->mutex );
     const auto setPhase = [&]( std::string_view name ) { if( phase ) phase( name ); };
@@ -3366,7 +3367,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
         setPhase( "relation-generations" ); relationGenerations.ValidateAll();
         setPhase( "pass-evidence-lookup" ); passEvidenceLookup.ValidateAll();
         setPhase( "detailed-evidence-generations" ); detailedEvidenceGenerations.ValidateAll();
-        setPhase( "cross-checks" );
+        setPhase( "cross-check:counts" );
         if( allocationGenerations.Count() != rawAllocations.Count() )
             throw std::runtime_error( "Catalog allocation generation count mismatch" );
         if( gpuMemorySummary.Count() != 1 )
@@ -3382,7 +3383,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
             throw std::runtime_error( "Catalog RangeSet generation count mismatch" );
         if( logicalGenerations.Count() != rawLogicals.Count() )
             throw std::runtime_error( "Catalog logical generation count mismatch" );
-        const auto validatePointerLookup = [&]( analysis::PagedRecordReader& lookup,
+        const auto validatePointerLookupLegacy = [&]( analysis::PagedRecordReader& lookup,
             bool byPointer, std::string_view label ) {
             analysis::AnalysisKeyMetadataRecord previous {};
             for( uint64_t index = 0; index < lookup.Count(); index++ )
@@ -3403,14 +3404,137 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 previous = row;
             }
         };
-        validatePointerLookup( pointerByPointer, true, "Catalog pointer interval" );
-        validatePointerLookup( pointerByResource, false, "Catalog resource pointer interval" );
+        const auto validatePointerLookupOrdinal = [&]( analysis::PagedRecordReader& lookup,
+            bool byPointer, std::string_view label, std::string_view scratchName ) {
+            constexpr size_t Batch = 4096;
+            const auto sorted = scratchRoot / ( std::string( scratchName ) + ".sorted" );
+            std::string sortError;
+            analysis::AnalysisWorkspaceReservation sourceMemory( m_impl->options.workspace,
+                65536 + uint64_t( Batch ) * sizeof( analysis::AnalysisKeyMetadataRecord ) );
+            std::vector<analysis::AnalysisKeyMetadataRecord> rows( Batch );
+            analysis::AnalysisKeyMetadataRecord previous {};
+            uint64_t ordinal = 0;
+            if( !analysis::SortAnalysisKeyMetadataRecordsGenerated( sorted, scratchRoot,
+                    std::string( scratchName ), 256 * 1024,
+                    [&]( const auto& emit ) {
+                        while( ordinal < lookup.Count() )
+                        {
+                            if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                                throw std::runtime_error( std::string( label ) + " validation cancelled" );
+                            const auto count = size_t( std::min<uint64_t>( Batch, lookup.Count() - ordinal ) );
+                            lookup.Read( ordinal, rows.data(), count );
+                            for( size_t index = 0; index < count; index++ )
+                            {
+                                const auto& row = rows[index];
+                                const auto current = ordinal + index;
+                                if( row.keyHigh == 0 || row.metadata >= pointerIntervals.Count() ||
+                                    ( current != 0 && ( row.keyHigh < previous.keyHigh ||
+                                        ( row.keyHigh == previous.keyHigh && ( row.keyLow < previous.keyLow ||
+                                            ( row.keyLow == previous.keyLow && row.metadata < previous.metadata ) ) ) ) ) )
+                                    throw std::runtime_error( std::string( label ) + " order mismatch" );
+                                emit( { row.metadata, row.keyHigh, row.keyLow } );
+                                previous = row;
+                            }
+                            ordinal += count;
+                        }
+                    }, sortError, m_impl->options.disk, m_impl->options.workspace,
+                    m_impl->options.cancelled ) )
+                throw std::runtime_error( std::string( label ) + " ordinal sort failed: " + sortError );
+            rows.clear(); rows.shrink_to_fit(); sourceMemory.Resize( 0 );
+
+            if( lookup.Count() > std::numeric_limits<uint64_t>::max() /
+                    sizeof( analysis::AnalysisKeyMetadataRecord ) )
+                throw std::runtime_error( std::string( label ) + " ordinal sort size overflow" );
+            const auto expectedBytes = lookup.Count() * sizeof( analysis::AnalysisKeyMetadataRecord );
+            if( std::filesystem::file_size( analysis::AnalysisIoPath( sorted ) ) != expectedBytes )
+                throw std::runtime_error( std::string( label ) + " ordinal sort size mismatch" );
+            analysis::AnalysisWorkspaceReservation compareMemory( m_impl->options.workspace,
+                65536 + uint64_t( Batch ) * ( sizeof( analysis::AnalysisKeyMetadataRecord ) +
+                    sizeof( QueryCatalogResourcePointerInterval ) ) );
+            std::vector<analysis::AnalysisKeyMetadataRecord> facts( Batch );
+            std::vector<QueryCatalogResourcePointerInterval> intervals( Batch );
+            std::ifstream input( analysis::AnalysisIoPath( sorted ), std::ios::binary );
+            if( !input ) throw std::runtime_error( std::string( label ) + " ordinal sort cannot be opened" );
+            for( uint64_t offset = 0; offset < lookup.Count(); )
+            {
+                if( m_impl->options.cancelled && m_impl->options.cancelled() )
+                    throw std::runtime_error( std::string( label ) + " validation cancelled" );
+                const auto count = size_t( std::min<uint64_t>( Batch, lookup.Count() - offset ) );
+                input.read( reinterpret_cast<char*>( facts.data() ),
+                    std::streamsize( count * sizeof( facts[0] ) ) );
+                if( !input ) throw std::runtime_error( std::string( label ) + " ordinal sort read failed" );
+                pointerIntervals.Read( offset, intervals.data(), count );
+                for( size_t index = 0; index < count; index++ )
+                {
+                    const auto expectedOrdinal = offset + index;
+                    const auto& fact = facts[index];
+                    const auto& interval = intervals[index];
+                    const auto key = byPointer ? interval.pointerToken : interval.resourceId;
+                    if( fact.keyHigh != expectedOrdinal || fact.keyLow != key ||
+                        fact.metadata != SortableSignedTime( interval.begin ) ||
+                        interval.pointerToken == 0 || interval.resourceId == 0 || interval.end < interval.begin )
+                        throw std::runtime_error( std::string( label ) + " identity mismatch" );
+                }
+                offset += count;
+            }
+            if( input.peek() != std::char_traits<char>::eof() )
+                throw std::runtime_error( std::string( label ) + " ordinal sort contains trailing data" );
+            input.close();
+            std::error_code removeError;
+            analysis::AnalysisDiskRemove( sorted, m_impl->options.disk, removeError );
+            if( removeError ) throw std::runtime_error( std::string( label ) +
+                " ordinal sort cleanup failed: " + removeError.message() );
+        };
+        if( scratchRoot.empty() )
+        {
+            setPhase( "cross-check:pointer-by-pointer-legacy" );
+            validatePointerLookupLegacy( pointerByPointer, true, "Catalog pointer interval" );
+            setPhase( "cross-check:pointer-by-resource-legacy" );
+            validatePointerLookupLegacy( pointerByResource, false, "Catalog resource pointer interval" );
+        }
+        else
+        {
+            if( std::filesystem::exists( analysis::AnalysisIoPath( scratchRoot ) ) )
+                throw std::runtime_error( "Catalog validation scratch already exists" );
+            std::filesystem::create_directories( analysis::AnalysisIoPath( scratchRoot ) );
+            try
+            {
+                setPhase( "cross-check:pointer-by-pointer-ordinal" );
+                validatePointerLookupOrdinal( pointerByPointer, true,
+                    "Catalog pointer interval", "pointer-by-pointer" );
+                setPhase( "cross-check:pointer-by-resource-ordinal" );
+                validatePointerLookupOrdinal( pointerByResource, false,
+                    "Catalog resource pointer interval", "pointer-by-resource" );
+            }
+            catch( ... )
+            {
+                const auto failure = std::current_exception();
+                std::error_code cleanupError;
+                analysis::AnalysisDiskRemove( scratchRoot, m_impl->options.disk, cleanupError, true );
+                if( cleanupError )
+                {
+                    try { std::rethrow_exception( failure ); }
+                    catch( const std::exception& error )
+                    { throw std::runtime_error( std::string( error.what() ) +
+                        "; Catalog validation scratch cleanup failed: " + cleanupError.message() ); }
+                    catch( ... )
+                    { throw std::runtime_error( "Catalog validation scratch cleanup failed: " +
+                        cleanupError.message() ); }
+                }
+                std::rethrow_exception( failure );
+            }
+            std::error_code cleanupError;
+            analysis::AnalysisDiskRemove( scratchRoot, m_impl->options.disk, cleanupError, true );
+            if( cleanupError ) throw std::runtime_error( "Catalog validation scratch cleanup failed: " +
+                cleanupError.message() );
+        }
         if( viewGenerations.Count() != rawViews.Count() || partGenerations.Count() != rawParts.Count() )
             throw std::runtime_error( "Catalog resource detail generation count mismatch" );
         if( vgGenerations.Count() != rawVg.Count() || relationGenerations.Count() != rawRelations.Count() )
             throw std::runtime_error( "Catalog resource relation generation count mismatch" );
         if( detailedEvidenceGenerations.Count() != rawDetailedEvidence.Count() )
             throw std::runtime_error( "Catalog detailed evidence generation count mismatch" );
+        setPhase( "cross-check:resources" );
         if( associations.Count() != resources.Count() )
             throw std::runtime_error( "Catalog resource association count mismatch" );
         uint64_t previousResource = 0;
@@ -3426,6 +3550,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 throw std::runtime_error( "Catalog resource index order mismatch" );
             previousResource = row.latest.resourceId;
         }
+        setPhase( "cross-check:allocation-lookup" );
         analysis::AnalysisKeyMetadataRecord previousAllocation {};
         for( uint64_t index = 0; index < allocationLookup.Count(); index++ )
         {
@@ -3441,6 +3566,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 throw std::runtime_error( "Catalog allocation lookup identity mismatch" );
             previousAllocation = row;
         }
+        setPhase( "cross-check:allocation-summary" );
         uint64_t previousAllocationSummary = 0;
         for( uint64_t index = 0; index < allocationSummaries.Count(); index++ )
         {
@@ -3470,10 +3596,12 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 previous = row;
             }
         };
+        setPhase( "cross-check:views" );
         validateLookup( viewLookup, rawViews.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogViewRecordV1 row {}; rawViews.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog view" );
+        setPhase( "cross-check:mesh-parts" );
         validateLookup( meshPartLookup, rawParts.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogPartRecordV1 row {}; rawParts.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
@@ -3482,26 +3610,32 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 return row.resourceId != 0 && ( kind == JnGpuCatalogPartKind::MeshVertexStream ||
                     kind == JnGpuCatalogPartKind::MeshIndex );
             }, "Catalog mesh-part" );
+        setPhase( "cross-check:parts" );
         validateLookup( partLookup, rawParts.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogPartRecordV1 row {}; rawParts.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog part" );
+        setPhase( "cross-check:vg" );
         validateLookup( vgLookup, rawVg.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogVgRecordV1 row {}; rawVg.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog VG" );
+        setPhase( "cross-check:resource-ranges" );
         validateLookup( resourceRangeLookup, rawRanges.Count(),
             [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rawRanges.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog resource RangeSet" );
+        setPhase( "cross-check:pass-ranges" );
         validateLookup( passRangeLookup, rawRanges.Count(),
             [&]( uint64_t ordinal ) { JnGpuRangeSetRecordV1 row {}; rawRanges.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.passInstanceId; },
             []( const auto& row ) { return row.passInstanceId != 0; }, "Catalog pass RangeSet" );
+        setPhase( "cross-check:resource-logicals" );
         validateLookup( resourceLogicalLookup, rawLogicals.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; rawLogicals.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.resourceId; },
             []( const auto& row ) { return row.resourceId != 0; }, "Catalog resource logical" );
+        setPhase( "cross-check:logical-definitions" );
         validateLookup( logicalDefinitionLookup, rawLogicals.Count(),
             [&]( uint64_t ordinal ) { JnGpuCatalogLogicalRecordV1 row {}; rawLogicals.Read( ordinal, &row, 1 ); return row; },
             []( const auto& row ) { return row.logicalResourceId; },
@@ -3509,6 +3643,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 return row.logicalResourceId != 0 &&
                     IsCatalogDefinition( JnGpuCatalogRecordOperation( row.operation ) );
             }, "Catalog logical definition" );
+        setPhase( "cross-check:rtas-relations" );
         analysis::AnalysisKeyMetadataRecord previousRtas {};
         for( uint64_t index = 0; index < rtasRelationLookup.Count(); index++ )
         {
@@ -3527,6 +3662,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 throw std::runtime_error( "Catalog RTAS relation lookup identity mismatch" );
             previousRtas = row;
         }
+        setPhase( "cross-check:relations" );
         analysis::AnalysisKeyMetadataRecord previousRelation {};
         for( uint64_t index = 0; index < resourceRelationLookup.Count(); index++ )
         {
@@ -3542,6 +3678,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 throw std::runtime_error( "Catalog resource relation lookup identity mismatch" );
             previousRelation = row;
         }
+        setPhase( "cross-check:evidence" );
         analysis::AnalysisKeyMetadataRecord previousEvidence {};
         for( uint64_t index = 0; index < passEvidenceLookup.Count(); index++ )
         {
@@ -3557,6 +3694,7 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
                 throw std::runtime_error( "Catalog pass evidence lookup identity mismatch" );
             previousEvidence = row;
         }
+        setPhase( "cross-check:strings" );
         analysis::PagedRecordReader rawStrings( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogString ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogString ),
             sizeof( OfflineCatalogString ), m_impl->options );

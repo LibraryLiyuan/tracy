@@ -5994,9 +5994,13 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
             if( deep )
             {
                 resources->SetPhase( "index-validate:deep:catalog-structure" );
+                auto structureScratch = manifest.gpuCatalog.path;
+                structureScratch += ".structure-validation." + std::to_string(
+                    std::chrono::steady_clock::now().time_since_epoch().count() );
+                resources->IncludeDiskRoots( { structureScratch } );
                 catalog.ValidateAll( [&]( std::string_view phase ) {
                     resources->SetPhase( "index-validate:deep:catalog-structure:" + std::string( phase ) );
-                } );
+                }, structureScratch );
                 resources->SetPhase( "index-validate:deep:catalog-semantics" );
                 auto semanticScratch = manifest.gpuCatalog.path;
                 semanticScratch += ".semantic-validation." + std::to_string(

@@ -548,7 +548,36 @@ int main( int argc, char** argv )
             evidence201.total == 1 && evidence201.values.size() == 1 &&
             evidence201.values[0].record.requestId == 1,
             "Catalog pass evidence lookup paging or duplicate-key semantics changed" );
-        associationReader.ValidateAll();
+        const auto validationScratch = associationRoot / "validation-scratch";
+        std::vector<std::string> validationPhases;
+        associationReader.ValidateAll( [&]( std::string_view phase ) {
+            validationPhases.emplace_back( phase );
+        }, validationScratch );
+        Require( !fs::exists( validationScratch ) &&
+            std::find( validationPhases.begin(), validationPhases.end(),
+                "cross-check:pointer-by-pointer-ordinal" ) != validationPhases.end() &&
+            std::find( validationPhases.begin(), validationPhases.end(),
+                "cross-check:pointer-by-resource-ordinal" ) != validationPhases.end(),
+            "Catalog pointer cross-check did not use and clean the ordinal join scratch" );
+        bool cancelValidation = false;
+        analysis::PagedRecordOptions cancelledValidationOptions;
+        cancelledValidationOptions.cancelled = [&] { return cancelValidation; };
+        QueryCatalogStoreReader cancelledValidationReader(
+            associationRoot, identity, cancelledValidationOptions );
+        const auto cancelledValidationScratch = associationRoot / "cancelled-validation-scratch";
+        bool validationCancelled = false;
+        try
+        {
+            cancelledValidationReader.ValidateAll( [&]( std::string_view phase ) {
+                if( phase == "cross-check:pointer-by-pointer-ordinal" ) cancelValidation = true;
+            }, cancelledValidationScratch );
+        }
+        catch( const std::exception& error )
+        {
+            validationCancelled = std::string_view( error.what() ).find( "cancelled" ) != std::string_view::npos;
+        }
+        Require( validationCancelled && !fs::exists( cancelledValidationScratch ),
+            "cancelled Catalog ordinal validation retained scratch or lost cancellation" );
         const auto status = reader.Status( 8, 8 );
         Require( status.metadata[0] == 1 && status.metadata[1] == 1 && !status.generationsTruncated &&
             status.generations.size() == 1 && status.generations[0].generation == 9 &&
