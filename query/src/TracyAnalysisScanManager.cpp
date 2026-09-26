@@ -548,10 +548,21 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         };
         std::map<std::string, std::vector<PolicyFrameEvidence>> frameTimelines;
         cpuOptions.completeFrameSink = [&]( const auto& scope, uint64_t index, int64_t begin, int64_t end ) {
-            // Timeline capacity and the frame-root Context copy coexist until
-            // neutral publication. Keep ownership of the surviving Timeline.
-            products.metadataWorkspace.Add(1024+8ull*scope.size());
-            frameTimelines[scope].push_back( { index, end-begin, {}, {}, true } );
+            auto found=frameTimelines.find(scope);
+            if(found==frameTimelines.end()) {
+                products.metadataWorkspace.Add(512+4ull*scope.size());
+                found=frameTimelines.emplace(scope,std::vector<PolicyFrameEvidence>{}).first;
+            }
+            auto& frames=found->second;
+            if(frames.size()==frames.capacity()) {
+                const auto current=frames.capacity();
+                const auto next=std::max<size_t>(1,current>SIZE_MAX/2?SIZE_MAX:current*2);
+                if(next<=current || next>UINT64_MAX/sizeof(PolicyFrameEvidence))
+                    throw std::runtime_error("analysis_workspace_budget");
+                products.metadataWorkspace.Add(uint64_t(next-current)*sizeof(PolicyFrameEvidence));
+                frames.reserve(next);
+            }
+            frames.push_back( { index, end-begin, {}, {}, true } );
         };
         const auto cpu = ExactFrameCpuScanner( *request.source ).ScanView(
             [&]( const CpuSignatureFrameRunView& run ) {
@@ -580,17 +591,25 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             std::cerr << "Query scan-cpu-signatures logical_hashes=" << cpu.logicalSignatureHashCount
                 << " exact_hashes=" << cpu.exactSignatureHashCount
                 << " denominator_rows=" << cpu.denominators.size() << '\n';
+        {
+            const auto state=workspace->Snapshot();
+            std::cerr << "Query scan-workspace stage=cpu_scan_complete current_bytes=" << state.currentBytes
+                << " peak_bytes=" << state.peakBytes << " rejections=" << state.rejectedReservations << '\n';
+        }
         if( cancelled() ) return false;
         cpuDefinitionOutput->Commit();
         cpuDefinitionOutput.reset();
+        {
+            const auto state=workspace->Snapshot();
+            std::cerr << "Query scan-workspace stage=cpu_definitions_committed current_bytes=" << state.currentBytes
+                << " peak_bytes=" << state.peakBytes << " rejections=" << state.rejectedReservations << '\n';
+        }
         for( const auto& set : cpu.frameSetDenominators )
         {
             products.metadataWorkspace.Add(1024+8ull*(set.frameSetRef.size()+set.name.size()));
             products.frameTimelines.push_back( { set.frameSetRef, set.name, std::move( frameTimelines[set.frameSetRef] ) } );
-            auto& root = ensureContext( "cpu", "frame-wall:" + set.frameSetRef, "frame-wall:" + set.frameSetRef,
+            ensureContext( "cpu", "frame-wall:" + set.frameSetRef, "frame-wall:" + set.frameSetRef,
                 {}, set.name, set.name, set.frameSetRef, "inclusive", true, false );
-            root.frames = products.frameTimelines.back().frames;
-            root.frameSeriesComplete = true;
         }
         {
         AnalysisCacheTableReader cpuDefinitions( cpuDefinitionsPath,
@@ -887,6 +906,12 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         seriesOptions.disk=request.disk; seriesOptions.cancelled=cancelled;
         PagedRecordWriter seriesOutput(products.frameSeriesPath,ComputeNeutralAggregateIdentity(request.aggregateIdentity),
             sizeof(PolicySeriesRecord),seriesOptions);
+        for(auto& context:products.signatureContexts) if(context.frameRoot) {
+            const auto timeline=std::find_if(products.frameTimelines.begin(),products.frameTimelines.end(),
+                [&](const auto& value){return value.frameScope==context.frameScope;});
+            if(timeline==products.frameTimelines.end()) throw std::runtime_error("neutral_frame_root_timeline_missing");
+            WritePolicyFrameSeries(seriesOutput,context,timeline->frames,request.disk);
+        }
         const auto selectEvidence = [&]( const NeutralSignatureAggregate& aggregate,
             const std::vector<NeutralMergedFrameValues>& frames, PolicySignatureContext& context ) {
             if( frames.empty() ) return;
@@ -1045,6 +1070,12 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
     catch( const std::exception& exception )
     {
         if( stopToken.stop_requested() ) { error = "cancelled"; return false; }
+        if(request.workspace) {
+            const auto state=request.workspace->Snapshot();
+            std::cerr << "Query scan-workspace stage=executor_failure current_bytes=" << state.currentBytes
+                << " peak_bytes=" << state.peakBytes << " rejections=" << state.rejectedReservations
+                << " error=" << exception.what() << '\n';
+        }
         error = "analysis_scan_executor_failed:" + std::string( exception.what() );
         return false;
     }

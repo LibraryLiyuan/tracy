@@ -268,6 +268,7 @@ public:
     int gpuFrameScopeProbe = 0;
     bool gpuProbeLongCosts = false;
     size_t wideGpuSignatureCount = 0;
+    size_t syntheticFrameCount = 0;
     bool wideCorrelatedPayload = false;
     std::function<void( std::string_view )> readHook;
     std::vector<GfxEntityDto> ScanGfxEntities( size_t offset, size_t limit ) const override
@@ -391,6 +392,10 @@ public:
     std::vector<FrameSetDto> GetFrameSets() const override
     {
         if( readHook ) readHook( "frame_set_metadata" );
+        if( syntheticFrameCount ) return {
+            { MakeEntityRef( "frame-set", 0 ), 0, "Player.Frame", false,
+                syntheticFrameCount, syntheticFrameCount }
+        };
         return {
             { MakeEntityRef( "frame-set", 0 ), 0, "Player.Frame", true, 2, 2 },
             { MakeEntityRef( "frame-set", 1 ), 1, "Render.Frame", false, 1, 1 }
@@ -399,6 +404,17 @@ public:
     std::vector<FrameDto> ScanFrames( const ScanRange& range ) const override
     {
         if( readHook ) readHook( "frame" );
+        if( syntheticFrameCount )
+        {
+            std::vector<FrameDto> values;
+            const auto first = std::min( range.offset, syntheticFrameCount );
+            const auto last = first + std::min( range.limit, syntheticFrameCount - first );
+            values.reserve( last - first );
+            for( auto index = first; index < last; ++index ) values.push_back( {
+                MakeEntityRef( "frame", index ), MakeEntityRef( "frame-set", 0 ), index,
+                int64_t( index * 100 ), int64_t( ( index + 1 ) * 100 ), {}, true } );
+            return values;
+        }
         const std::vector<FrameDto> values = {
             { MakeEntityRef( "frame", 0 ), MakeEntityRef( "frame-set", 0 ), 0, 0, 100, {}, true },
             // This second FrameMark proves the first continuous Player frame;
@@ -438,6 +454,40 @@ public:
         return values;
     }
 };
+
+void FrameTimelineWorkspace(const std::filesystem::path& root)
+{
+    constexpr uint64_t FrameCount = 65'536;
+    auto source=std::make_shared<SourceDegradedTrace>(); source->syntheticFrameCount=FrameCount;
+    const auto validation=ValidateAndNormalizeAnalysisProfile(Profile());
+    if(!validation.valid) throw std::runtime_error("Frame Timeline test profile invalid");
+    AnalysisScanExecutionRequest request;
+    request.source=source;
+    request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),
+        "1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+    request.temporaryRoot=root/"frame-timeline-workspace";
+    request.normalizedProfile=validation.normalized;
+    request.profileIdentity=validation.profileSha256;
+    request.workspace=std::make_shared<AnalysisWorkspaceBudget>(96*1024*1024,48*1024*1024);
+    AnalysisScanProducts products; std::string error;
+    if(!ExecuteDefaultAnalysisScan(request,std::stop_token{},[](auto,auto,auto,auto){},products,error))
+        throw std::runtime_error("Frame Timeline must fit its actual ownership under 96 MiB: "+error);
+    NeutralStatisticsCacheReader neutral(products.neutralCachePath,products.neutralCacheIdentity);
+    const auto frameScope=source->GetFrameSets().front().ref;
+    bool found=false;
+    neutral.VisitSignatureContexts([&](const NeutralSignatureAggregate*,const PolicySignatureContext& context) {
+        if(!context.frameRoot || context.frameScope!=frameScope) return;
+        found=true;
+        if(!context.frames.empty() || context.seriesCount!=FrameCount)
+            throw std::runtime_error("Frame Root must reference the disk series without retaining a duplicate");
+        const auto frames=ReadPolicyFrameSeries(products.frameSeriesPath,context,64*1024*1024,{},products.neutralCacheIdentity);
+        if(frames.size()!=FrameCount || frames.front().frameIndex!=0 || frames.back().frameIndex!=FrameCount-1)
+            throw std::runtime_error("Frame Root disk series changed identity or extent");
+    });
+    if(!found) throw std::runtime_error("Frame Root context missing");
+    const auto snapshot=request.workspace->Snapshot();
+    if(snapshot.peakBytes>96*1024*1024) throw std::runtime_error("Frame Timeline exceeded its workspace contract");
+}
 
 // Removing control-document ownership must fail cold Status and new Start
 // under pressure; neither may silently report a missing scan or lose profile
@@ -1030,6 +1080,10 @@ int main(int argc,char** argv)
     // Other tests use an injected source; its physical fixture must have
     // sufficient capacity for the cache they intentionally construct.
     std::filesystem::resize_file(tracePath,16*1024*1024);
+    if(argc==2 && std::string(argv[1])=="--frame-timeline-workspace-only") {
+        FrameTimelineWorkspace(root); RemoveTestRoot(root);
+        std::cout<<"frame timeline workspace passed\n"; return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--publication-lock-only") {
 #ifdef _WIN32
         for(const bool transient : {true,false}) {
@@ -1090,6 +1144,7 @@ int main(int argc,char** argv)
     }
     testStage="bundle metadata"; BundleMetadata(root);
     testStage="bundle JSON workspace"; BundleJsonWorkspace(root);
+    testStage="frame timeline workspace"; FrameTimelineWorkspace(root);
     if(argc==2 && std::string(argv[1])=="--bundle-json-only") {
         RemoveTestRoot(root); return 0;
     }

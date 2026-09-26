@@ -60,6 +60,26 @@ inline void WritePolicyFrameSeries( PagedRecordWriter& output, PolicySignatureCo
     context.seriesSha256=hash.FinalHex(); context.frameSeriesComplete=true;
 }
 
+// Frame-root timelines already own one complete PolicyFrameEvidence vector.
+// Persist that vector directly so the root Context can reference the same
+// immutable series without retaining a second in-memory copy.
+inline void WritePolicyFrameSeries( PagedRecordWriter& output, PolicySignatureContext& context,
+    const std::vector<PolicyFrameEvidence>& frames,
+    const std::shared_ptr<AnalysisDiskBudget>& = {} )
+{
+    if(output.Count()>UINT64_MAX/sizeof(PolicySeriesRecord)) throw std::runtime_error("frame_series_position_failed");
+    context.seriesOffset=output.Count()*sizeof(PolicySeriesRecord);
+    context.seriesCount=frames.size();
+    Sha256Builder hash;
+    for(const auto& frame:frames) {
+        if(frame.exact && frame.valueNs<0) throw std::runtime_error("frame_series_value_invalid");
+        const auto value=frame.exact?uint64_t(frame.valueNs):0;
+        const PolicySeriesRecord row{frame.frameIndex,value,value,0,0,1,frame.exact?1ULL:0ULL};
+        output.Append(row.data(),1); hash.Update(row.data(),sizeof(row));
+    }
+    context.seriesSha256=hash.FinalHex(); context.frameSeriesComplete=true;
+}
+
 inline std::vector<PolicyFrameEvidence> ReadPolicyFrameSeries( const std::filesystem::path& path,
     const PolicySignatureContext& context, uint64_t memoryBudgetBytes,
     const std::function<bool()>& cancelled = {}, const std::string& identity = {} )

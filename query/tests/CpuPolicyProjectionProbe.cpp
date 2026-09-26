@@ -43,18 +43,22 @@ int main( int argc, char** argv )
         const auto count = std::stoull( argv[3] );
         if( count == 0 || count > NativeBoundedScanMaximumBatch )
             throw std::runtime_error( "probe_count_out_of_range" );
-        const auto validated = QueryIndex::Validate( tracePath, false );
+        auto resources = QueryIndex::CreateResourceContext( tracePath );
+        const auto validated = QueryIndex::Validate( tracePath, false, resources );
         if( !validated.manifest ) throw std::runtime_error( validated.reason );
-        auto source = QueryIndex::Open( *validated.manifest );
+        auto source = QueryIndex::Open( *validated.manifest, {}, {}, resources );
+        const auto openedWorkspace = resources->Snapshot().workspace;
         ScanRange range;
         range.offset = size_t( start );
         range.limit = size_t( count );
         auto began = std::chrono::steady_clock::now();
         const auto policy = source->ScanCpuZonesForPolicy( range );
         const auto policyMs = ElapsedMs( began );
+        const auto policyWorkspace = resources->Snapshot().workspace;
         began = std::chrono::steady_clock::now();
         const auto raw = source->ScanCpuZones( range );
         const auto rawMs = ElapsedMs( began );
+        const auto rawWorkspace = resources->Snapshot().workspace;
         if( policy.size() != count || raw.size() != count || policy.size() != raw.size() )
             throw std::runtime_error( "cpu_policy_projection_count" );
         uint64_t dynamicNames = 0;
@@ -68,6 +72,10 @@ int main( int argc, char** argv )
             { "start", std::to_string( start ) }, { "count", std::to_string( count ) },
             { "dynamic_names", std::to_string( dynamicNames ) },
             { "policy_ms", std::to_string( policyMs ) }, { "raw_ms", std::to_string( rawMs ) },
+            { "workspace_open_current", std::to_string( openedWorkspace.currentBytes ) },
+            { "workspace_policy_current", std::to_string( policyWorkspace.currentBytes ) },
+            { "workspace_raw_current", std::to_string( rawWorkspace.currentBytes ) },
+            { "workspace_peak", std::to_string( rawWorkspace.peakBytes ) },
             { "facts_equal", true }, { "dynamic_payload_omitted", true }
         }.dump() << '\n';
         return 0;

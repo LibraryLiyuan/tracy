@@ -351,6 +351,14 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         if( options.completeFrameSink ) options.completeFrameSink(
             frame.frameSetRef, frame.index, frame.beginNs, frame.endNs );
         checkCancelled();
+        if( completeFrames.size() == completeFrames.capacity() )
+        {
+            const auto current = completeFrames.capacity();
+            if( current > SIZE_MAX / 2 ) throw BoundedScanError( "frame_cpu_scan_workspace_budget" );
+            const auto next = std::max<size_t>( 1, current * 2 );
+            frameWorkspace.Add( uint64_t( next - current ) * sizeof( FrameBoundary ) );
+            completeFrames.reserve( next );
+        }
         ++completeFramesBySet[frame.frameSetRef];
         ++result.completeFrameCount;
         completeFrames.emplace_back( std::move( frame ) );
@@ -375,9 +383,10 @@ CpuFrameScanResult ExactFrameCpuScanner::ScanInternal( const CpuSignatureFrameSi
         {
             checkCancelled();
             const auto valid = frame.complete && frame.endNs && *frame.endNs > frame.beginNs;
-            // Every valid frame remains either a completed boundary or the
-            // pending continuous tail. Includes indexes and vector growth.
-            if( valid ) frameWorkspace.Add( 1024 + 8 * ( frame.ref.size() + frame.frameSetRef.size() ) );
+            // Charge the two retained strings before either the pending map or
+            // a FrameBoundary temporary copies them. Vector object storage is
+            // charged separately immediately before capacity growth.
+            if( valid ) frameWorkspace.Add( 64 + 2ull * ( frame.ref.size() + frame.frameSetRef.size() ) );
             if( continuousFrameSets.contains( frame.frameSetRef ) )
             {
                 // A continuous FrameSet's previous frame is proven complete by
