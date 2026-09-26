@@ -129,7 +129,8 @@ public:
         std::shared_ptr<QueryResourceContext> resources = {},
         const std::function<void(std::string_view)>& phaseHook = {} );
     static QueryIndexValidation Validate( const std::filesystem::path& tracePath, bool deep = false,
-        std::shared_ptr<QueryResourceContext> resources = {} );
+        std::shared_ptr<QueryResourceContext> resources = {},
+        const QueryIndexManifest* freshBuildValidationReceipt = nullptr );
     static std::unique_ptr<analysis::TraceSource> Open( const QueryIndexManifest& manifest,
         analysis::WorkerTraceSource::StateCallback stateCallback = {}, std::string fingerprintOverride = {},
         std::shared_ptr<QueryResourceContext> resources = {} );

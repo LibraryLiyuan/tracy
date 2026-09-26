@@ -5726,7 +5726,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
 }
 
 QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTracePath, bool deep,
-    std::shared_ptr<QueryResourceContext> resources )
+    std::shared_ptr<QueryResourceContext> resources,
+    const QueryIndexManifest* freshBuildValidationReceipt )
 {
     const auto tracePath = analysis::AnalysisIoPath( inputTracePath );
     QueryIndexValidation result;
@@ -5841,6 +5842,34 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
         parseSection( "gpu_memory_cpu_zone", manifest.gpuMemoryCpuZones );
         parseSection( "gpu_memory_summary_cpu_zone", manifest.gpuMemorySummaryCpuZones );
         parseSection( "gpu_memory_summary", manifest.gpuMemorySummary );
+
+        const auto samePath = []( const std::filesystem::path& lhs,
+            const std::filesystem::path& rhs ) {
+            return std::filesystem::absolute( lhs ).lexically_normal() ==
+                std::filesystem::absolute( rhs ).lexically_normal();
+        };
+        const auto sameSection = [&]( const QueryIndexSection& lhs,
+            const QueryIndexSection& rhs ) {
+            return samePath( lhs.path, rhs.path ) &&
+                lhs.fingerprint == rhs.fingerprint && lhs.bytes == rhs.bytes &&
+                lhs.count == rhs.count && lhs.declaredCount == rhs.declaredCount &&
+                lhs.recordBytes == rhs.recordBytes;
+        };
+        // Build validated these candidate stores before hashing them, and AtomicReplace
+        // preserves their bytes.  The receipt only suppresses the duplicate semantic scan
+        // after every published section has independently matched the recorded fingerprint.
+        const bool reuseGpuDerivedValidation = deep && freshBuildValidationReceipt &&
+            samePath( manifest.manifestPath, freshBuildValidationReceipt->manifestPath ) &&
+            manifest.sourceFingerprint == freshBuildValidationReceipt->sourceFingerprint &&
+            manifest.sourceBytes == freshBuildValidationReceipt->sourceBytes &&
+            manifest.sourceWriteTime == freshBuildValidationReceipt->sourceWriteTime &&
+            manifest.dataFingerprint == freshBuildValidationReceipt->dataFingerprint &&
+            manifest.dataBytes == freshBuildValidationReceipt->dataBytes &&
+            sameSection( manifest.gpuCatalog, freshBuildValidationReceipt->gpuCatalog ) &&
+            sameSection( manifest.gfxLinks, freshBuildValidationReceipt->gfxLinks ) &&
+            sameSection( manifest.gpuReferencePasses, freshBuildValidationReceipt->gpuReferencePasses ) &&
+            sameSection( manifest.gpuReferenceUses, freshBuildValidationReceipt->gpuReferenceUses ) &&
+            sameSection( manifest.gpuReferenceEnds, freshBuildValidationReceipt->gpuReferenceEnds );
 
         if( std::filesystem::file_size( tracePath ) != manifest.sourceBytes || WriteTime( tracePath ) != manifest.sourceWriteTime )
         {
@@ -6012,21 +6041,27 @@ QueryIndexValidation QueryIndex::Validate( const std::filesystem::path& inputTra
                 manifest.sourceFingerprint, storageOptions );
             if( deep )
             {
-                QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
-                    manifest.sourceFingerprint, storageOptions );
-                if( !catalog.PreparePointerResolutionFastPath() )
-                    std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap during validation; using paged lookup\n";
-                auto referenceValidationScratch = manifest.gpuReferenceUses.path;
-                referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
-                    std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
-                resources->IncludeDiskRoots( { referenceValidationScratch } );
-                gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
-                    return catalog.ResolveResourcePointer( pointerToken, time );
-                }, referenceValidationScratch );
-                QueryGpuPassResourceStoreReader passResources( manifest.gpuReferenceUses.path,
-                    manifest.gpuCatalog.path, manifest.gpuReferenceUses.path,
-                    manifest.sourceFingerprint, storageOptions );
-                passResources.ValidateAll();
+                if( reuseGpuDerivedValidation )
+                    resources->SetPhase( "index-validate:deep:gpu-derived-reused" );
+                else
+                {
+                    resources->SetPhase( "index-validate:deep:gpu-derived" );
+                    QueryCatalogStoreReader catalog( manifest.gpuCatalog.path,
+                        manifest.sourceFingerprint, storageOptions );
+                    if( !catalog.PreparePointerResolutionFastPath() )
+                        std::cerr << "Query GPU pointer fast path exceeds its shared workspace cap during validation; using paged lookup\n";
+                    auto referenceValidationScratch = manifest.gpuReferenceUses.path;
+                    referenceValidationScratch += ".validation.tmp." + std::to_string( ProcessId() ) + "." +
+                        std::to_string( std::chrono::steady_clock::now().time_since_epoch().count() );
+                    resources->IncludeDiskRoots( { referenceValidationScratch } );
+                    gpuReferences.ValidateAll( [&]( uint64_t pointerToken, int64_t time ) {
+                        return catalog.ResolveResourcePointer( pointerToken, time );
+                    }, referenceValidationScratch );
+                    QueryGpuPassResourceStoreReader passResources( manifest.gpuReferenceUses.path,
+                        manifest.gpuCatalog.path, manifest.gpuReferenceUses.path,
+                        manifest.sourceFingerprint, storageOptions );
+                    passResources.ValidateAll();
+                }
             }
         }
         validateSection( manifest.gpuMemoryCpuZones, sizeof( uint64_t ), "GPU-memory-CPU-zone",ZoneSectionKind::GpuMemoryCpuZone );

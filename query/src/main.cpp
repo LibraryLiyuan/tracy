@@ -356,6 +356,7 @@ int RunBuildIndex( const Arguments& args )
     QueryIndexManifest index;
     QueryIndexValidation validation;
     std::shared_ptr<QueryResourceContext> resources;
+    bool builtIndex = false;
     if( streamInput )
     {
         streamSource = SegmentTraceSource::Open( path, {}, true );
@@ -375,14 +376,22 @@ int RunBuildIndex( const Arguments& args )
         resources->RunResourceBoundary( [&] {
             const auto checkpoint = QueryIndex::CheckpointPath( indexedPath );
             if( std::filesystem::is_regular_file( checkpoint ) )
+            {
                 index = QueryIndex::Build( indexedPath, {}, resources );
+                builtIndex = true;
+            }
             else
             {
                 const auto published = QueryIndex::Validate( indexedPath, false, resources );
                 if( published.manifest ) index = *published.manifest;
-                else index = QueryIndex::Build( indexedPath, {}, resources );
+                else
+                {
+                    index = QueryIndex::Build( indexedPath, {}, resources );
+                    builtIndex = true;
+                }
             }
-            validation = QueryIndex::Validate( indexedPath, true, resources );
+            validation = QueryIndex::Validate( indexedPath, true, resources,
+                builtIndex ? &index : nullptr );
         } );
     }
     resources->SetPhase("complete");

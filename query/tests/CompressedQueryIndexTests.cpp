@@ -88,8 +88,28 @@ int main(int argc,char** argv)
         const auto freshInput=freshRoot/"fixture.tracy";
         std::filesystem::copy_file(argv[1],freshInput);
         const auto freshManifest=tracy::query::QueryIndex::Build(freshInput);
-        const auto freshValidation=tracy::query::QueryIndex::Validate(freshInput,true);
+        const auto freshResources=tracy::query::QueryIndex::CreateResourceContext(freshInput);
+        const auto freshValidation=tracy::query::QueryIndex::Validate(
+            freshInput,true,freshResources,&freshManifest);
         if(!freshValidation.manifest) throw std::runtime_error(freshValidation.reason);
+        bool reusedGpuDerivedValidation=false;
+        for(const auto& phase:freshResources->Snapshot().phaseHistory)
+            if(phase.phase=="index-validate:deep:gpu-derived-reused")
+                reusedGpuDerivedValidation=true;
+        if(!reusedGpuDerivedValidation)
+            throw std::runtime_error("fresh build repeated GPU derived deep validation");
+        auto mismatchedReceipt=freshManifest;
+        mismatchedReceipt.gpuReferenceUses.bytes++;
+        const auto fallbackResources=tracy::query::QueryIndex::CreateResourceContext(freshInput);
+        const auto fallbackValidation=tracy::query::QueryIndex::Validate(
+            freshInput,true,fallbackResources,&mismatchedReceipt);
+        if(!fallbackValidation.manifest) throw std::runtime_error(fallbackValidation.reason);
+        bool validatedGpuDerived=false;
+        for(const auto& phase:fallbackResources->Snapshot().phaseHistory)
+            if(phase.phase=="index-validate:deep:gpu-derived")
+                validatedGpuDerived=true;
+        if(!validatedGpuDerived)
+            throw std::runtime_error("mismatched build receipt bypassed GPU derived deep validation");
         // The compact Tracy container carries writer metadata that is not byte-stable
         // across independent builds.  Both copies are deep-validated separately;
         // all deterministic Query sidecars must remain hash-identical.
