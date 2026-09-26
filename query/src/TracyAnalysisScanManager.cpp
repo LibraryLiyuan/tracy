@@ -93,7 +93,8 @@ private:
 std::string_view DiskBudgetReason(std::string_view error)
 {
     for(const std::string_view reason:{"analysis_scan_minimum_free_disk",
-        "analysis_scan_disk_space_unavailable","analysis_scan_cache_disk_budget"})
+        "analysis_scan_disk_space_unavailable","analysis_scan_cache_disk_budget",
+        "analysis_final_disk_ratio"})
         if(error.find(reason)!=std::string_view::npos) return reason;
     return {};
 }
@@ -1367,9 +1368,9 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     if( stopToken.stop_requested() )
     { Update( entry, ScanState::CancelledResumable, 3, 4, "cancelled", "cancelled" ); return; }
     memory.Check();
-    Update( entry, ScanState::Complete, 4, 4, "complete" );
-    { std::lock_guard lock(entry->mutex); if(!entry->snapshot.completed) return; }
     CleanupPublishedTables(candidateRoot,policyIdentity,true,true,options);
+    if( entry->request.resourceContext ) entry->request.resourceContext->CheckFinalDisk();
+    Update( entry, ScanState::Complete, 4, 4, "complete" );
 }
 
 std::shared_ptr<AnalysisScanManager::Entry> AnalysisScanManager::LoadEntry( const std::string& scanId ) const
@@ -1591,10 +1592,15 @@ void AnalysisScanManager::EnsureReaders( const std::shared_ptr<Entry>& entry ) c
     entry->signatureQuery.reset(); entry->candidateQuery.reset();
     entry->neutralReader=std::move(neutral); entry->policyReader=std::move(policy);
     const auto n=entry->neutralReader.get(); const auto p=entry->policyReader.get();
+    const auto finalDiskCheck=[resources=entry->request.resourceContext] {
+        if(resources) resources->CheckFinalDisk();
+    };
     entry->signatureQuery=std::make_unique<AnalysisCacheQuery>(entry->scanRoot/"signature-query-indexes",
-        n->ContentSha256(),n->SignatureCount(),[n](uint64_t i){return n->SignatureAt(i);},options);
+        n->ContentSha256(),n->SignatureCount(),[n](uint64_t i){return n->SignatureAt(i);},options,
+        AnalysisScanPagePayloadBudgetBytes,finalDiskCheck);
     entry->candidateQuery=std::make_unique<AnalysisCacheQuery>(policyRoot/"candidate-query-indexes",
-        p->ContentSha256(),summary.at("backlog").at("total").get<uint64_t>(),[p](uint64_t i){return p->CandidateAt(i);},options);
+        p->ContentSha256(),summary.at("backlog").at("total").get<uint64_t>(),[p](uint64_t i){return p->CandidateAt(i);},options,
+        AnalysisScanPagePayloadBudgetBytes,finalDiskCheck);
 }
 
 json PaginateAnalysisScanItems( const json& source, size_t limit, const std::string& cursor,

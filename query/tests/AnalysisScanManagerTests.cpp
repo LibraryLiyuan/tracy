@@ -1375,6 +1375,8 @@ int main(int argc,char** argv)
         AnalysisWorkspaceReservation blockManagerWorkspace(managerWorkspace,1024*1024);
         QueryResourceContextOptions resourceOptions;
         resourceOptions.traceBytes=1024ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
         resourceOptions.derivedRoots={root/"resource-manager",cache/"resource-manager"};
         resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
         resourceOptions.workspaceTargetBytes=512ull*1024*1024;
@@ -1396,6 +1398,101 @@ int main(int argc,char** argv)
         const auto started=manager.Start(request);
         WaitFor(manager,started.scanId,ScanState::Complete,6s);
         if(!shared) throw std::runtime_error("Scan did not reuse the indexed Trace resource context");
+        const auto completedDisk=resources->Snapshot().disk;
+        if(completedDisk.currentBytes>=completedDisk.finalLimitBytes)
+            throw std::runtime_error("Small completed Scan unexpectedly exhausted its final disk allowance");
+        const auto fillerBytes=completedDisk.finalLimitBytes-completedDisk.currentBytes-1;
+        resources->Disk()->Grow(fillerBytes);
+        const auto filler=root/"resource-manager"/"final-limit-filler.bin";
+        { std::ofstream out(filler,std::ios::binary); out.put('a'); out.seekp(fillerBytes-1); out.put('z'); }
+        const auto beforeFilter=resources->Snapshot().disk.currentBytes;
+        bool rejected=false;
+        try { (void)manager.Signatures(started.scanId,1,"",{},{{"domain","cpu"}}); }
+        catch(const std::exception& error) { rejected=std::string_view(error.what()).find("final_disk_ratio")!=std::string_view::npos; }
+        if(!rejected || resources->Snapshot().disk.currentBytes!=beforeFilter)
+            throw std::runtime_error("A post-Complete filter index must respect and roll back the cumulative final disk gate");
+    }
+    {
+        testStage="manager Query final disk gate";
+        const auto stateRoot=root/"resource-final",cacheRoot=cache/"resource-final";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor finalOverLimit=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string&) {
+            constexpr uint64_t survivorBytes=5ull*1024*1024;
+            const auto survivor=stateRoot/"survives-publication.bin";
+            execution.disk->Grow(survivorBytes);
+            { std::ofstream out(survivor,std::ios::binary); out.put('a'); out.seekp(survivorBytes-1); out.put('z'); }
+            progress(ScanState::Aggregating,3,4,"final_disk_fixture");
+            products=Products(execution.temporaryRoot);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},finalOverLimit);
+        auto profile=Profile(); profile["limits"]["cache_max_bytes"]=16ull*1024*1024;
+        const auto finalProfile=ValidateAndNormalizeAnalysisProfile(profile); assert(finalProfile.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-final"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=finalProfile.normalized; request.profileIdentity=finalProfile.profileSha256;
+        const auto started=manager.Start(request);
+        const auto paused=WaitFor(manager,started.scanId,ScanState::CancelledResumable,6s);
+        if(paused.completed || !paused.resumable || paused.stage!="disk_budget" ||
+            paused.error!="analysis_final_disk_ratio")
+            throw std::runtime_error("A Scan above the cumulative final disk limit must not publish Complete");
+        const auto disk=resources->Snapshot().disk;
+        if(disk.currentBytes<=disk.finalLimitBytes || disk.currentBytes>disk.peakLimitBytes)
+            throw std::runtime_error("Final disk rejection must occur between the final and peak limits");
+    }
+    {
+        testStage="manager Query transient disk allowance";
+        const auto stateRoot=root/"resource-transient",cacheRoot=cache/"resource-transient";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=1024ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=512ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor transientOverFinal=[&](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback& progress,
+            AnalysisScanProducts& products,std::string&) {
+            constexpr uint64_t scratchBytes=5ull*1024*1024;
+            const auto scratch=stateRoot/"transient-build.work";
+            execution.disk->Grow(scratchBytes);
+            { std::ofstream out(scratch,std::ios::binary); out.put('a'); out.seekp(scratchBytes-1); out.put('z'); }
+            std::error_code cleanupError;
+            AnalysisDiskRemove(scratch,execution.disk,cleanupError);
+            if(cleanupError) throw std::runtime_error("Transient disk fixture cleanup failed");
+            progress(ScanState::Aggregating,3,4,"transient_disk_fixture");
+            products=Products(execution.temporaryRoot);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},transientOverFinal);
+        auto profile=Profile(); profile["limits"]["cache_max_bytes"]=16ull*1024*1024;
+        const auto transientProfile=ValidateAndNormalizeAnalysisProfile(profile); assert(transientProfile.valid);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-transient"; request.tracePath=tracePath; request.source=native;
+        request.resourceContext=resources;
+        request.normalizedProfile=transientProfile.normalized; request.profileIdentity=transientProfile.profileSha256;
+        const auto started=manager.Start(request);
+        WaitFor(manager,started.scanId,ScanState::Complete,6s);
+        const auto disk=resources->Snapshot().disk;
+        if(disk.peakBytes<=disk.finalLimitBytes || disk.currentBytes>disk.finalLimitBytes)
+            throw std::runtime_error("Transient build bytes may use the peak allowance but final files must fit the final limit");
     }
     {
         testStage="manager response workspace";

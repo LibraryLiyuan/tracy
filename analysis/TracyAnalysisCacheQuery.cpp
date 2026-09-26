@@ -32,20 +32,20 @@ uint64_t Number(const std::string& value)
 }
 std::string Hash(std::string_view value)
 { Sha256Builder h; h.Update(value.data(),value.size()); return h.FinalHex(); }
-void Publish(const std::filesystem::path& temporary,const std::filesystem::path& target)
+bool Publish(const std::filesystem::path& temporary,const std::filesystem::path& target)
 {
     // A completed table is nonempty and immutable. A concurrent builder may
     // have published the same source/filter first; never replace its table.
     if(std::filesystem::exists(target)) {
-        if(std::filesystem::exists(target/"manifest.json")) return;
+        if(std::filesystem::exists(target/"manifest.json")) return false;
         Fail("filter_target_incomplete");
     }
 #ifdef _WIN32
     const auto deadline=std::chrono::steady_clock::now()+std::chrono::milliseconds(500);
     for(;;) {
-        if(MoveFileExW(temporary.c_str(),target.c_str(),MOVEFILE_WRITE_THROUGH)) return;
+        if(MoveFileExW(temporary.c_str(),target.c_str(),MOVEFILE_WRITE_THROUGH)) return true;
         const auto code=GetLastError();
-        if(std::filesystem::exists(target/"manifest.json")) return;
+        if(std::filesystem::exists(target/"manifest.json")) return false;
         const bool transient=code==ERROR_ACCESS_DENIED || code==ERROR_SHARING_VIOLATION ||
             code==ERROR_LOCK_VIOLATION || code==ERROR_ALREADY_EXISTS;
         if(!transient || std::chrono::steady_clock::now()>=deadline)
@@ -57,10 +57,12 @@ void Publish(const std::filesystem::path& temporary,const std::filesystem::path&
     std::error_code ec;
     std::filesystem::rename(temporary,target,ec);
     if(ec && !std::filesystem::exists(target/"manifest.json")) Fail("filter_publish_failed");
+    const bool published=!ec;
     const auto directory=open(target.parent_path().c_str(),O_RDONLY | O_DIRECTORY);
     if(directory<0) Fail("filter_directory_flush_failed");
     const auto flushed=fsync(directory); close(directory);
     if(flushed!=0) Fail("filter_directory_flush_failed");
+    return published;
 #endif
 }
 }
@@ -70,12 +72,14 @@ struct AnalysisCacheQuery::Impl
     std::string identity,currentFilter;
     uint64_t records,responseBytes;
     std::function<AnalysisCacheRecord(uint64_t)> read;
+    std::function<void()> finalDiskCheck;
     AnalysisCacheTableOptions options;
     std::unique_ptr<AnalysisCacheTableReader> index;
     Impl(std::filesystem::path path,std::string id,uint64_t count,
-        std::function<AnalysisCacheRecord(uint64_t)> getter,AnalysisCacheTableOptions config,uint64_t bytes)
+        std::function<AnalysisCacheRecord(uint64_t)> getter,AnalysisCacheTableOptions config,uint64_t bytes,
+        std::function<void()> finalCheck)
         :root(AnalysisIoPath(path)),identity(std::move(id)),records(count),responseBytes(bytes),
-        read(std::move(getter)),options(std::move(config))
+        read(std::move(getter)),finalDiskCheck(std::move(finalCheck)),options(std::move(config))
     {
         if(root.empty() || identity.size()!=64 || !read || bytes<2 || bytes>16*1024*1024) Fail("invalid_query_configuration");
         Check();
@@ -125,7 +129,26 @@ struct AnalysisCacheQuery::Impl
                 AnalysisCacheTableReader verify(temporary,id,"analysis-query-filter-v2",options);
                 if(verify.RecordCount()!=matches) Fail("filter_index_count");
             }
-            Check(); Publish(temporary,path);
+            Check();
+            try { if(finalDiskCheck) finalDiskCheck(); }
+            catch(...) {
+                std::error_code cleanupError;
+                AnalysisDiskRemove(temporary.parent_path(),options.disk,cleanupError,true);
+                throw;
+            }
+            const bool published=Publish(temporary,path);
+            if(!published) {
+                std::error_code cleanupError;
+                AnalysisDiskRemove(temporary.parent_path(),options.disk,cleanupError,true);
+            }
+            try { if(finalDiskCheck) finalDiskCheck(); }
+            catch(...) {
+                if(published) {
+                    std::error_code cleanupError;
+                    AnalysisDiskRemove(path,options.disk,cleanupError,true);
+                }
+                throw;
+            }
         }
         index=std::make_unique<AnalysisCacheTableReader>(path,id,"analysis-query-filter-v2",options);
         if(index->RecordCount()>records) Fail("filter_index_count");
@@ -171,12 +194,14 @@ struct AnalysisCacheQuery::Impl
     }
 };
 AnalysisCacheQuery::AnalysisCacheQuery(std::filesystem::path root,std::string identity,uint64_t records,
-    std::function<AnalysisCacheRecord(uint64_t)> read,AnalysisCacheTableOptions options,uint64_t bytes)
-    :m_impl(std::make_unique<Impl>(std::move(root),std::move(identity),records,std::move(read),std::move(options),bytes)) {}
+    std::function<AnalysisCacheRecord(uint64_t)> read,AnalysisCacheTableOptions options,uint64_t bytes,
+    std::function<void()> finalDiskCheck)
+    :m_impl(std::make_unique<Impl>(std::move(root),std::move(identity),records,std::move(read),
+        std::move(options),bytes,std::move(finalDiskCheck))) {}
 AnalysisCacheQuery::~AnalysisCacheQuery()=default;
 void AnalysisCacheQuery::PublishFilterForTesting(const std::filesystem::path& temporary,
     const std::filesystem::path& target)
-{ Publish(temporary,target); }
+{ (void)Publish(temporary,target); }
 nlohmann::json AnalysisCacheQuery::Page(size_t limit,const std::string& cursor,
     const std::vector<std::string>& fields,const nlohmann::json& filter)
 { return m_impl->Page(limit,cursor,fields,filter); }
