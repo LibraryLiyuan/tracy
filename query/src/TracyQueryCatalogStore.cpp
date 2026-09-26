@@ -3161,15 +3161,19 @@ uint64_t QueryCatalogStoreReader::ResourcePointerIntervalDecodedBytes() const
     return m_impl->resourcePointerIntervals ? m_impl->resourcePointerIntervals->Statistics().decodedBytes : 0;
 }
 
-void QueryCatalogStoreReader::ValidateAll() const
+void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string_view )>& phase ) const
 {
     std::lock_guard lock( m_impl->mutex );
+    const auto setPhase = [&]( std::string_view name ) { if( phase ) phase( name ); };
+    setPhase( "metadata" );
     analysis::PagedRecordReader metadataReader( m_impl->root / "metadata",
         CatalogIdentity( m_impl->sourceFingerprint, "metadata" ), sizeof( OfflineCatalogQuality ), m_impl->options );
     metadataReader.ValidateAll();
     for( size_t index = 0; index < OfflineCatalogDomainCount; index++ )
     {
         const auto domain = OfflineCatalogDomain( index );
+        const auto phaseName = "raw:" + std::string( OfflineCatalogInfo( domain ).name );
+        setPhase( phaseName );
         analysis::PagedRecordReader records( DomainPath( m_impl->root, domain ),
             CatalogIdentity( m_impl->sourceFingerprint, domain ), OfflineCatalogInfo( domain ).width, m_impl->options );
         records.ValidateAll();
@@ -3334,34 +3338,35 @@ void QueryCatalogStoreReader::ValidateAll() const
         analysis::PagedRecordReader rawDetailedEvidence( DomainPath( m_impl->root, OfflineCatalogDomain::CatalogDetailedEvidence ),
             CatalogIdentity( m_impl->sourceFingerprint, OfflineCatalogDomain::CatalogDetailedEvidence ),
             sizeof( JnGpuDetailedEvidenceRecordV1 ), m_impl->options );
-        resources.ValidateAll();
-        strings.ValidateAll();
-        associations.ValidateAll();
-        allocationSummaries.ValidateAll();
-        allocationLookup.ValidateAll();
-        allocationGenerations.ValidateAll();
-        gpuMemorySummary.ValidateAll();
-        pointerIntervals.ValidateAll();
-        pointerByPointer.ValidateAll();
-        pointerByResource.ValidateAll();
-        resourceRangeLookup.ValidateAll();
-        passRangeLookup.ValidateAll();
-        rangeGenerations.ValidateAll();
-        resourceLogicalLookup.ValidateAll();
-        logicalDefinitionLookup.ValidateAll();
-        logicalGenerations.ValidateAll();
-        viewLookup.ValidateAll();
-        viewGenerations.ValidateAll();
-        meshPartLookup.ValidateAll();
-        partLookup.ValidateAll();
-        partGenerations.ValidateAll();
-        vgLookup.ValidateAll();
-        vgGenerations.ValidateAll();
-        rtasRelationLookup.ValidateAll();
-        resourceRelationLookup.ValidateAll();
-        relationGenerations.ValidateAll();
-        passEvidenceLookup.ValidateAll();
-        detailedEvidenceGenerations.ValidateAll();
+        setPhase( "resource-summary" ); resources.ValidateAll();
+        setPhase( "string-lookup" ); strings.ValidateAll();
+        setPhase( "associations" ); associations.ValidateAll();
+        setPhase( "allocation-summary" ); allocationSummaries.ValidateAll();
+        setPhase( "allocation-lookup" ); allocationLookup.ValidateAll();
+        setPhase( "allocation-generations" ); allocationGenerations.ValidateAll();
+        setPhase( "gpu-memory-summary" ); gpuMemorySummary.ValidateAll();
+        setPhase( "pointer-intervals" ); pointerIntervals.ValidateAll();
+        setPhase( "pointer-by-pointer" ); pointerByPointer.ValidateAll();
+        setPhase( "pointer-by-resource" ); pointerByResource.ValidateAll();
+        setPhase( "resource-range-lookup" ); resourceRangeLookup.ValidateAll();
+        setPhase( "pass-range-lookup" ); passRangeLookup.ValidateAll();
+        setPhase( "range-generations" ); rangeGenerations.ValidateAll();
+        setPhase( "resource-logical-lookup" ); resourceLogicalLookup.ValidateAll();
+        setPhase( "logical-definition-lookup" ); logicalDefinitionLookup.ValidateAll();
+        setPhase( "logical-generations" ); logicalGenerations.ValidateAll();
+        setPhase( "view-lookup" ); viewLookup.ValidateAll();
+        setPhase( "view-generations" ); viewGenerations.ValidateAll();
+        setPhase( "mesh-part-lookup" ); meshPartLookup.ValidateAll();
+        setPhase( "part-lookup" ); partLookup.ValidateAll();
+        setPhase( "part-generations" ); partGenerations.ValidateAll();
+        setPhase( "vg-lookup" ); vgLookup.ValidateAll();
+        setPhase( "vg-generations" ); vgGenerations.ValidateAll();
+        setPhase( "rtas-relation-lookup" ); rtasRelationLookup.ValidateAll();
+        setPhase( "resource-relation-lookup" ); resourceRelationLookup.ValidateAll();
+        setPhase( "relation-generations" ); relationGenerations.ValidateAll();
+        setPhase( "pass-evidence-lookup" ); passEvidenceLookup.ValidateAll();
+        setPhase( "detailed-evidence-generations" ); detailedEvidenceGenerations.ValidateAll();
+        setPhase( "cross-checks" );
         if( allocationGenerations.Count() != rawAllocations.Count() )
             throw std::runtime_error( "Catalog allocation generation count mismatch" );
         if( gpuMemorySummary.Count() != 1 )

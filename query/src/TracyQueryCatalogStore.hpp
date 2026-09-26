@@ -314,7 +314,7 @@ public:
     void Read( OfflineCatalogDomain domain, uint64_t ordinal, void* output, uint64_t count, uint32_t recordBytes ) const;
     JnGpuCatalogStringData String( uint64_t ordinal ) const;
     QueryCatalogStatusData Status( size_t generationLimit, size_t evidenceLimit ) const;
-    void ValidateAll() const;
+    void ValidateAll( const std::function<void( std::string_view )>& phase = {} ) const;
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
     void BuildResourceIndex( const std::filesystem::path& scratchRoot,
         const std::function<void( std::string_view )>& phase = {},
