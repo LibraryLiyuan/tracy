@@ -110,9 +110,22 @@ std::string BlockName(uint64_t ordinal)
 }
 void CheckContained(const std::filesystem::path& root, const std::filesystem::path& path)
 {
-    const auto relative = std::filesystem::weakly_canonical(path).lexically_relative(std::filesystem::weakly_canonical(root));
+    std::error_code error;
+    const auto absoluteRoot = std::filesystem::weakly_canonical(AnalysisIoPath(root),error);
+    if(error) Fail("path_escape");
+    auto absolutePath = std::filesystem::weakly_canonical(AnalysisIoPath(path.parent_path()),error);
+    if(error) Fail("path_escape");
+    absolutePath /= path.filename();
+    const auto relative = absolutePath.lexically_relative(absoluteRoot);
     if(relative.empty() || relative.is_absolute()) Fail("path_escape");
     for(const auto& part : relative) if(part == "..") Fail("path_escape");
+#ifdef _WIN32
+    const auto attributes=GetFileAttributesW(AnalysisIoPath(path).c_str());
+    if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT)) Fail("path_escape");
+#else
+    const auto status=std::filesystem::symlink_status(path,error);
+    if(!error && std::filesystem::is_symlink(status)) Fail("path_escape");
+#endif
 }
 void DurableRename(const std::filesystem::path& temporary, const std::filesystem::path& target)
 {
