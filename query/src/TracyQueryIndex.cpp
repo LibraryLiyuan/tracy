@@ -4062,14 +4062,16 @@ QueryIndexManifest ParseManifestDescription( const json& parsed, const std::file
 
 struct PostCompactCheckpoint
 {
+    enum class Stage { PostCompact, PostDerived } stage = Stage::PostCompact;
     std::string generationBase;
     std::string profileIdentity;
     QueryIndexManifest candidate;
 };
 
-std::vector<std::filesystem::path> CheckpointCandidatePaths( const QueryIndexManifest& value )
+std::vector<std::filesystem::path> CheckpointCandidatePaths( const QueryIndexManifest& value,
+    bool includeDeferredSummary = false )
 {
-    return {
+    std::vector<std::filesystem::path> result = {
         value.dataPath, value.zoneExtras.path, value.cpuZones.path, value.gpuZones.path,
         value.samples.path, value.globalStrings.path, value.globalCallstacks.path,
         value.globalCallstackFrames.path, value.gpuCatalog.path, value.jobStages.path,
@@ -4077,6 +4079,13 @@ std::vector<std::filesystem::path> CheckpointCandidatePaths( const QueryIndexMan
         value.gpuReferencePasses.path, value.gpuReferenceUses.path, value.gpuReferenceEnds.path,
         value.gpuMemoryCpuZones.path, value.gpuMemorySummaryCpuZones.path
     };
+    if( includeDeferredSummary ) result.emplace_back( value.gpuMemorySummary.path );
+    return result;
+}
+
+const char* CheckpointStageName( PostCompactCheckpoint::Stage stage )
+{
+    return stage == PostCompactCheckpoint::Stage::PostDerived ? "post-derived" : "post-compact";
 }
 
 std::optional<PostCompactCheckpoint> ReadPostCompactCheckpoint(
@@ -4094,9 +4103,12 @@ std::optional<PostCompactCheckpoint> ReadPostCompactCheckpoint(
     if( parsed.value( "magic", "" ) != PostCompactCheckpointMagic ||
         parsed.value( "checkpoint_schema", 0u ) != PostCompactCheckpointSchema ||
         parsed.value( "index_schema", 0u ) != QueryIndexSchemaVersion ||
-        parsed.value( "stage", "" ) != "post-compact" )
+        ( parsed.value( "stage", "" ) != "post-compact" &&
+            parsed.value( "stage", "" ) != "post-derived" ) )
         throw std::runtime_error( "Query checkpoint schema mismatch" );
     PostCompactCheckpoint result;
+    result.stage = parsed.at( "stage" ).get<std::string>() == "post-derived" ?
+        PostCompactCheckpoint::Stage::PostDerived : PostCompactCheckpoint::Stage::PostCompact;
     result.generationBase = parsed.at( "generation" ).get<std::string>();
     result.profileIdentity = parsed.at( "profile_sha256" ).get<std::string>();
     result.candidate = ParseManifestDescription( parsed.at( "candidate_manifest" ), root );
@@ -4106,13 +4118,14 @@ std::optional<PostCompactCheckpoint> ReadPostCompactCheckpoint(
 void WritePostCompactCheckpoint( const std::filesystem::path& path, std::string_view generationBase,
     std::string_view profileIdentity, const QueryIndexManifest& candidate,
     const std::shared_ptr<QueryResourceContext>& resources,
-    const std::function<bool()>& cancelled )
+    const std::function<bool()>& cancelled,
+    PostCompactCheckpoint::Stage stage = PostCompactCheckpoint::Stage::PostCompact )
 {
     const auto payload = json {
         { "magic", PostCompactCheckpointMagic },
         { "checkpoint_schema", PostCompactCheckpointSchema },
         { "index_schema", QueryIndexSchemaVersion },
-        { "stage", "post-compact" },
+        { "stage", CheckpointStageName( stage ) },
         { "generation", generationBase },
         { "profile_sha256", profileIdentity },
         { "candidate_manifest", ManifestJson( candidate ) }
@@ -4218,21 +4231,25 @@ void ValidatePostCompactCheckpointOwnership( const PostCompactCheckpoint& checkp
         throw std::runtime_error( "Query checkpoint generation mismatch" );
     QueryIndexManifest published = checkpoint.candidate;
     SetGenerationPaths( published, root, checkpoint.generationBase );
-    const auto candidates = CheckpointCandidatePaths( checkpoint.candidate );
-    const auto targets = CheckpointCandidatePaths( published );
+    const bool postDerived = checkpoint.stage == PostCompactCheckpoint::Stage::PostDerived;
+    const auto candidates = CheckpointCandidatePaths( checkpoint.candidate, postDerived );
+    const auto targets = CheckpointCandidatePaths( published, postDerived );
     if( candidates.size() != targets.size() ) throw std::runtime_error( "Query checkpoint path count mismatch" );
     for( size_t index = 0; index < candidates.size(); index++ )
         if( !SafeOwnedCandidatePath( candidates[index], root, targets[index].filename().string() ) )
             throw std::runtime_error( "Query checkpoint candidate ownership mismatch: " +
                 candidates[index].filename().string() + " expected " +
                 targets[index].filename().string() + ".tmp.<pid>" );
-    const auto summaryName = published.gpuMemorySummary.path.filename().string();
-    const auto candidateSummaryName = checkpoint.candidate.gpuMemorySummary.path.filename().string();
-    if( checkpoint.candidate.gpuMemorySummary.path.parent_path() != root ||
-        !candidateSummaryName.starts_with( summaryName + ".tmp." ) ||
-        checkpoint.candidate.gpuMemorySummary.bytes != 0 ||
-        !checkpoint.candidate.gpuMemorySummary.fingerprint.empty() )
-        throw std::runtime_error( "Query checkpoint deferred summary ownership mismatch" );
+    if( !postDerived )
+    {
+        const auto summaryName = published.gpuMemorySummary.path.filename().string();
+        const auto candidateSummaryName = checkpoint.candidate.gpuMemorySummary.path.filename().string();
+        if( checkpoint.candidate.gpuMemorySummary.path.parent_path() != root ||
+            !candidateSummaryName.starts_with( summaryName + ".tmp." ) ||
+            checkpoint.candidate.gpuMemorySummary.bytes != 0 ||
+            !checkpoint.candidate.gpuMemorySummary.fingerprint.empty() )
+            throw std::runtime_error( "Query checkpoint deferred summary ownership mismatch" );
+    }
 }
 
 void ValidatePostCompactCheckpoint( const PostCompactCheckpoint& checkpoint,
@@ -4276,6 +4293,8 @@ void ValidatePostCompactCheckpoint( const PostCompactCheckpoint& checkpoint,
     verify( value.gpuReferenceEnds, "gpu-reference-end" );
     verify( value.gpuMemoryCpuZones, "gpu-memory-cpu-zone" );
     verify( value.gpuMemorySummaryCpuZones, "gpu-memory-summary-cpu-zone" );
+    if( checkpoint.stage == PostCompactCheckpoint::Stage::PostDerived )
+        verify( value.gpuMemorySummary, "gpu-memory-summary" );
 }
 
 std::vector<std::filesystem::path> ExistingDerivedPaths(const std::filesystem::path& tracePath)
@@ -4520,7 +4539,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
     std::vector<std::filesystem::path> packedScratch;
     std::vector<std::filesystem::path> publishedCandidates;
     bool checkpointPublished = false;
-    const auto checkpointCandidate = [&] {
+    bool checkpointPostDerived = false;
+    const auto checkpointCandidate = [&]( bool deferredSummary ) {
         QueryIndexManifest candidate = result;
         candidate.dataPath = temporaryData;
         candidate.zoneExtras.path = temporaryExtras;
@@ -4541,10 +4561,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         candidate.gpuMemoryCpuZones.path = temporaryGpuMemoryCpuZones;
         candidate.gpuMemorySummaryCpuZones.path = temporaryGpuMemorySummaryCpuZones;
         candidate.gpuMemorySummary.path = temporaryGpuMemorySummary;
-        candidate.gpuMemorySummary.bytes = 0;
-        candidate.gpuMemorySummary.count = 0;
-        candidate.gpuMemorySummary.declaredCount = 0;
-        candidate.gpuMemorySummary.fingerprint.clear();
+        if( deferredSummary )
+        {
+            candidate.gpuMemorySummary.bytes = 0;
+            candidate.gpuMemorySummary.count = 0;
+            candidate.gpuMemorySummary.declaredCount = 0;
+            candidate.gpuMemorySummary.fingerprint.clear();
+        }
         return candidate;
     };
 
@@ -4568,6 +4591,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 storageOptions.disk, cleanupError ) )
             throw std::runtime_error( cleanupError );
         bool resumedPostCompact = false;
+        bool resumedPostDerived = false;
         std::unordered_set<std::string> protectedCandidates;
         std::string checkpointIdentityPrefix;
         try
@@ -4582,7 +4606,8 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                     std::to_string( QueryIndexSchemaVersion ) + ".g";
                 ValidatePostCompactCheckpointOwnership( *checkpoint, tracePath.parent_path(),
                     checkpointIdentityPrefix );
-                ResetPostCompactDerivedOutputs( checkpoint->candidate, storageOptions.disk );
+                if( checkpoint->stage == PostCompactCheckpoint::Stage::PostCompact )
+                    ResetPostCompactDerivedOutputs( checkpoint->candidate, storageOptions.disk );
                 ValidatePostCompactCheckpoint( *checkpoint, tracePath.parent_path(), identityPrefix,
                     result.sourceBytes, result.sourceWriteTime, result.sourceFingerprint,
                     resources->ProfileIdentity() );
@@ -4610,15 +4635,17 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 temporaryGpuMemorySummary = candidate.gpuMemorySummary.path;
                 temporaryValidation = tracePath.parent_path() /
                     ( baseName + ".jnidx.validation" + suffix );
-                const auto paths = CheckpointCandidatePaths( candidate );
+                resumedPostDerived = checkpoint->stage == PostCompactCheckpoint::Stage::PostDerived;
+                const auto paths = CheckpointCandidatePaths( candidate, resumedPostDerived );
                 resources->IncludeDiskRoots( paths );
                 for( const auto& path : paths )
                     protectedCandidates.emplace(
                         std::filesystem::absolute( path ).lexically_normal().generic_string() );
                 checkpointPublished = true;
+                checkpointPostDerived = resumedPostDerived;
                 resumedPostCompact = true;
-                resources->SetPhase( "post-compact-resume" );
-                if( phaseHook ) phaseHook( "post-compact-resume" );
+                resources->SetPhase( resumedPostDerived ? "post-derived-resume" : "post-compact-resume" );
+                if( phaseHook ) phaseHook( resumedPostDerived ? "post-derived-resume" : "post-compact-resume" );
             }
         }
         catch( const std::exception& checkpointFailure )
@@ -4630,6 +4657,7 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
                 throw std::runtime_error( "cannot discard invalid Query checkpoint: " +
                     checkpointCleanup.message() );
             checkpointPublished = false;
+            checkpointPostDerived = false;
             resumedPostCompact = false;
             protectedCandidates.clear();
             if( !checkpointIdentityPrefix.empty() )
@@ -5193,10 +5221,13 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         resources->SetLiveWorkers( 0 );
         resources->SetPhase( "post-compact-checkpoint" );
         WritePostCompactCheckpoint( checkpointPath, baseName, resources->ProfileIdentity(),
-            checkpointCandidate(), resources, storageOptions.cancelled );
+            checkpointCandidate( true ), resources, storageOptions.cancelled );
         checkpointPublished = true;
+        checkpointPostDerived = false;
         if( phaseHook ) phaseHook( "post-compact-checkpoint" );
         }
+        if( !resumedPostDerived )
+        {
         {
             resources->SetPhase( "gpu-memory-summary-deferred" );
             resources->BeforeFileGrowth( temporaryGpuMemorySummary, 0 );
@@ -5514,6 +5545,14 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
             result.gpuReferenceUses.bytes = SectionBytes( temporaryJn[useIndex] );
             result.gpuReferenceUses.fingerprint = SectionFingerprint( temporaryJn[useIndex] );
         }
+        resources->SetPhase( "post-derived-checkpoint" );
+        WritePostCompactCheckpoint( checkpointPath, baseName, resources->ProfileIdentity(),
+            checkpointCandidate( false ), resources, storageOptions.cancelled,
+            PostCompactCheckpoint::Stage::PostDerived );
+        checkpointPublished = true;
+        checkpointPostDerived = true;
+        if( phaseHook ) phaseHook( "post-derived-checkpoint" );
+        }
 
         {
             const auto payload = ManifestJson( result ).dump( 2 );
@@ -5616,7 +5655,11 @@ QueryIndexManifest QueryIndex::Build( const std::filesystem::path& inputTracePat
         std::error_code ignored;
         if( checkpointPublished )
         {
-            try { ResetPostCompactDerivedOutputs( checkpointCandidate(), storageOptions.disk ); }
+            try
+            {
+                if( !checkpointPostDerived )
+                    ResetPostCompactDerivedOutputs( checkpointCandidate( true ), storageOptions.disk );
+            }
             catch( const std::exception& cleanupFailure )
             {
                 fprintf( stderr, "Query checkpoint derived cleanup deferred: %s\n", cleanupFailure.what() );
@@ -6041,6 +6084,11 @@ std::unique_ptr<analysis::TraceSource> QueryIndex::Open( const QueryIndexManifes
     resources->SetPhase("ready");
     resources->CheckMemory();
     return result;
+}
+
+std::filesystem::path QueryIndex::CheckpointPath( const std::filesystem::path& tracePath )
+{
+    return PostCompactCheckpointPath( ManifestPath( tracePath ) );
 }
 
 std::shared_ptr<QueryResourceContext> QueryIndex::CreateResourceContext(const std::filesystem::path& inputTracePath,

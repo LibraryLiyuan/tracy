@@ -115,6 +115,30 @@ int main(int argc,char** argv)
                 resumedSections[index]->bytes!=freshSections[index]->bytes ||
                 resumedSections[index]->count!=freshSections[index]->count)
                 throw std::runtime_error("resumed section differs from a fresh cold build");
+
+        const auto derivedRoot=root/"derived-resume";
+        std::filesystem::create_directories(derivedRoot);
+        const auto derivedInput=derivedRoot/"fixture.tracy";
+        std::filesystem::copy_file(argv[1],derivedInput);
+        auto derivedCheckpoint=tracy::query::QueryIndex::ManifestPath(derivedInput);
+        derivedCheckpoint+=".checkpoint.json";
+        try {
+            tracy::query::QueryIndex::Build(derivedInput,{}, {}, [](std::string_view phase) {
+                if(phase=="post-derived-checkpoint") throw std::runtime_error("derived checkpoint stop");
+            });
+        } catch(const std::exception& error) {
+            if(std::string_view(error.what())!="derived checkpoint stop") throw;
+        }
+        size_t derivedWorkerStates=0; bool derivedResumed=false;
+        const auto derivedManifest=tracy::query::QueryIndex::Build(derivedInput,
+            [&](tracy::analysis::TraceSourceState) { derivedWorkerStates++; }, {},
+            [&](std::string_view phase) { if(phase=="post-derived-resume") derivedResumed=true; });
+        if(!derivedResumed || derivedWorkerStates!=0 || std::filesystem::exists(derivedCheckpoint))
+            throw std::runtime_error("post-derived checkpoint did not skip all completed build stages");
+        const auto derivedValidation=tracy::query::QueryIndex::Validate(derivedInput,true);
+        if(!derivedValidation.manifest ||
+            derivedManifest.gpuReferenceUses.fingerprint!=freshManifest.gpuReferenceUses.fingerprint)
+            throw std::runtime_error("post-derived checkpoint changed final Query data");
         if(!manifest.cpuZones.count || manifest.cpuZones.bytes>=manifest.cpuZones.count*52/2)
             throw std::runtime_error("CPU sidecar did not compress the repeated real fixture records");
         auto source=tracy::query::QueryIndex::Open(manifest);

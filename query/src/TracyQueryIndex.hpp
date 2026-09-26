@@ -121,6 +121,7 @@ public:
         std::string_view identityPrefix, std::string_view currentBaseName,
         std::vector<std::filesystem::path>& retained, std::string& error );
     static std::filesystem::path ManifestPath( const std::filesystem::path& tracePath );
+    static std::filesystem::path CheckpointPath( const std::filesystem::path& tracePath );
     static std::shared_ptr<QueryResourceContext> CreateResourceContext( const std::filesystem::path& tracePath,
         QueryResourceContextOptions options = {} );
     static QueryIndexManifest Build( const std::filesystem::path& tracePath,

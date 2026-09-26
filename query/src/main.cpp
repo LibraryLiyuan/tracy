@@ -373,7 +373,15 @@ int RunBuildIndex( const Arguments& args )
     {
         resources=QueryIndex::CreateResourceContext(indexedPath,args.resourceOptions);
         resources->RunResourceBoundary( [&] {
-            index = QueryIndex::Build( indexedPath, {}, resources );
+            const auto checkpoint = QueryIndex::CheckpointPath( indexedPath );
+            if( std::filesystem::is_regular_file( checkpoint ) )
+                index = QueryIndex::Build( indexedPath, {}, resources );
+            else
+            {
+                const auto published = QueryIndex::Validate( indexedPath, false, resources );
+                if( published.manifest ) index = *published.manifest;
+                else index = QueryIndex::Build( indexedPath, {}, resources );
+            }
             validation = QueryIndex::Validate( indexedPath, true, resources );
         } );
     }
