@@ -655,6 +655,8 @@ void NativeContextReadLocality(const std::filesystem::path& root)
     const auto profile=ValidateAndNormalizeAnalysisProfile(Profile()); assert(profile.valid);
     request.normalizedProfile=profile.normalized; request.profileIdentity=profile.profileSha256;
     request.workspace=std::make_shared<AnalysisWorkspaceBudget>();
+    uint64_t diskChecks=0;
+    request.checkDiskSpace=[&]{++diskChecks;};
     const auto before=readBytes();
     AnalysisScanProducts products; std::string error;
     if(!ExecuteDefaultAnalysisScan(request,std::stop_token{},[](auto,auto,auto,auto){},products,error))
@@ -663,9 +665,12 @@ void NativeContextReadLocality(const std::filesystem::path& root)
     const auto bytes=AnalysisDiskUsage::Bytes(request.temporaryRoot);
     NeutralStatisticsCacheReader neutral(products.neutralCachePath,products.neutralCacheIdentity);
     if(neutral.SignatureCount()!=132) throw std::runtime_error("native I/O fixture must preserve both CPU FrameSets and fixed other domains");
-    std::cerr<<"native context locality: read_bytes="<<transferred<<" cache_bytes="<<bytes<<'\n';
+    std::cerr<<"native context locality: read_bytes="<<transferred<<" cache_bytes="<<bytes
+        <<" disk_checks="<<diskChecks<<'\n';
     if(transferred>128*1024*1024+8*bytes)
         throw std::runtime_error("native statistics must not reread wide Context blocks once per source signature");
+    if(diskChecks==0 || diskChecks>1024)
+        throw std::runtime_error("native inner cancellation checks must not lock the disk-space sampler per record");
 #endif
 }
 

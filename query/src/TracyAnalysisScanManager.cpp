@@ -428,14 +428,22 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
     products = {};
     error.clear();
     if( !request.source ) { error = "trace_source_unavailable"; return false; }
+    uint64_t cooperativeCheckCount = 0;
     const auto cancelled = [&] {
-        if(request.checkDiskSpace) request.checkDiskSpace();
+        // Inner scanners check cancellation for every Zone, frame overlap and
+        // merge contribution. Sampling free space at each of those points
+        // turns the throttled DiskSpaceCheck mutex/clock into a hot-path lock.
+        // Keep stop-token latency unchanged and sample disk at a bounded
+        // cadence; every disk growth and Manager progress boundary also checks.
+        if( ( ++cooperativeCheckCount & 0x3fff ) == 0 && request.checkDiskSpace )
+            request.checkDiskSpace();
         if( !stopToken.stop_requested() ) return false;
         error = "cancelled";
         return true;
     };
     try
     {
+        if( request.checkDiskSpace ) request.checkDiskSpace();
         const auto workspace=request.workspace ? request.workspace : std::make_shared<AnalysisWorkspaceBudget>();
         products.metadataWorkspace=AnalysisWorkspaceReservation(workspace);
         products.contextWorkspace=AnalysisWorkspaceReservation(workspace);
