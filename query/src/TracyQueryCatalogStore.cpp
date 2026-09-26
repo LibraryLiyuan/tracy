@@ -3908,6 +3908,17 @@ void QueryCatalogStoreReader::ValidateAll( const std::function<void( std::string
 
 QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const std::filesystem::path& scratchRoot ) const
 {
+    return ValidateSemanticsImpl( scratchRoot, false );
+}
+
+QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemanticsDetailed( const std::filesystem::path& scratchRoot ) const
+{
+    return ValidateSemanticsImpl( scratchRoot, true );
+}
+
+QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemanticsImpl(
+    const std::filesystem::path& scratchRoot, bool detailed ) const
+{
     std::lock_guard lock( m_impl->mutex );
     QueryCatalogValidationResult result;
     result.present = m_impl->metadata[0] != 0;
@@ -3918,6 +3929,14 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( finding.code == code ) { finding.count += count; return; }
         }
         result.findings.push_back( { std::string( code ), count } );
+    };
+    const auto sample = [&]( std::string_view code, std::string_view source,
+        uint64_t generation, uint64_t id, uint64_t expectedHash = 0,
+        uint64_t actualHash = 0, uint32_t expectedLength = 0, uint32_t actualLength = 0 ) {
+        if( !detailed || std::count_if( result.samples.begin(), result.samples.end(),
+            [&]( const auto& value ) { return value.code == code; } ) >= 16 ) return;
+        result.samples.push_back( { std::string( code ), std::string( source ), generation, id,
+            expectedHash, actualHash, expectedLength, actualLength } );
     };
     if( !result.present ) note( "CATALOG_ABSENT" );
     if( !result.originalValid ) note( "CATALOG_ORIGINAL_INVALID" );
@@ -3933,10 +3952,37 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
     enum class ReferenceKind : size_t { Resource, Allocation, Logical, String, Count };
     constexpr size_t ReferenceKindCount = size_t( ReferenceKind::Count );
     const std::array<const char*, ReferenceKindCount> referenceNames { "resource", "allocation", "logical", "string" };
+    const std::array<const char*, ReferenceKindCount> referenceFindingCodes {
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE", "CATALOG_CROSS_TABLE_REFERENCE_ALLOCATION",
+        "CATALOG_CROSS_TABLE_REFERENCE_LOGICAL", "CATALOG_CROSS_TABLE_REFERENCE_STRING" };
+    enum class ResourceReferenceOrigin : size_t
+    { View, Logical, Part, RelationSource, RelationTarget, Vg, Range, Count };
+    constexpr size_t ResourceReferenceOriginCount = size_t( ResourceReferenceOrigin::Count );
+    const std::array<const char*, ResourceReferenceOriginCount> resourceOriginNames {
+        "view", "logical", "part", "relation-source", "relation-target", "vg", "range" };
+    const std::array<const char*, ResourceReferenceOriginCount> resourceOriginFindingCodes {
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_VIEW",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_LOGICAL",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_PART",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RELATION_SOURCE",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RELATION_TARGET",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_VG",
+        "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RANGE" };
     std::array<std::filesystem::path, ReferenceKindCount> definitionSources, referenceSources;
     std::array<std::filesystem::path, ReferenceKindCount> definitionSorted, referenceSorted;
     std::array<std::ofstream, ReferenceKindCount> definitionOutputs, referenceOutputs;
     std::array<uint64_t, ReferenceKindCount> definitionCounts {}, referenceCounts {};
+    std::array<std::filesystem::path, ResourceReferenceOriginCount> resourceOriginSources, resourceOriginSorted;
+    std::array<std::ofstream, ResourceReferenceOriginCount> resourceOriginOutputs;
+    std::array<uint64_t, ResourceReferenceOriginCount> resourceOriginCounts {};
+    constexpr size_t RelationEndpointCount = 2;
+    constexpr size_t RelationOperationCount = size_t( JnGpuCatalogRecordOperation::Snapshot ) + 1;
+    constexpr size_t RelationOperationSourceCount = RelationEndpointCount * RelationOperationCount;
+    const std::array<const char*, RelationOperationCount> relationOperationNames {
+        "CREATE", "UPDATE", "DESTROY", "BIND", "UNBIND", "OPEN", "CLOSE", "SNAPSHOT" };
+    std::array<std::filesystem::path, RelationOperationSourceCount> relationOperationSources, relationOperationSorted;
+    std::array<std::ofstream, RelationOperationSourceCount> relationOperationOutputs;
+    std::array<uint64_t, RelationOperationSourceCount> relationOperationCounts {};
     std::ofstream nameMetadataOutput;
     uint64_t nameMetadataCount = 0;
     for( size_t index = 0; index < ReferenceKindCount; index++ )
@@ -3945,6 +3991,22 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
         referenceSources[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-reference-source.work" );
         definitionSorted[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-definition-sorted.work" );
         referenceSorted[index] = scratchRoot / ( std::string( referenceNames[index] ) + "-reference-sorted.work" );
+    }
+    for( size_t index = 0; index < ResourceReferenceOriginCount; index++ )
+    {
+        resourceOriginSources[index] = scratchRoot /
+            ( std::string( "resource-origin-" ) + resourceOriginNames[index] + "-source.work" );
+        resourceOriginSorted[index] = scratchRoot /
+            ( std::string( "resource-origin-" ) + resourceOriginNames[index] + "-sorted.work" );
+    }
+    for( size_t index = 0; index < RelationOperationSourceCount; index++ )
+    {
+        const auto endpoint = index / RelationOperationCount;
+        const auto operation = index % RelationOperationCount;
+        const auto label = std::string( endpoint == 0 ? "relation-source-" : "relation-target-" ) +
+            relationOperationNames[operation];
+        relationOperationSources[index] = scratchRoot / ( label + "-source.work" );
+        relationOperationSorted[index] = scratchRoot / ( label + "-sorted.work" );
     }
     std::string sortError;
     const auto cleanup = [&]() -> std::string {
@@ -3974,6 +4036,18 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( !definitionOutputs[index] || !referenceOutputs[index] )
                 throw std::runtime_error( "Catalog reference scratch cannot be opened" );
         }
+        if( detailed ) for( size_t index = 0; index < ResourceReferenceOriginCount; index++ )
+        {
+            resourceOriginOutputs[index].open( resourceOriginSources[index], std::ios::binary | std::ios::trunc );
+            if( !resourceOriginOutputs[index] )
+                throw std::runtime_error( "Catalog detailed resource reference scratch cannot be opened" );
+        }
+        if( detailed ) for( size_t index = 0; index < RelationOperationSourceCount; index++ )
+        {
+            relationOperationOutputs[index].open( relationOperationSources[index], std::ios::binary | std::ios::trunc );
+            if( !relationOperationOutputs[index] )
+                throw std::runtime_error( "Catalog detailed relation operation scratch cannot be opened" );
+        }
         nameMetadataOutput.open( nameMetadataSource, std::ios::binary | std::ios::trunc );
         if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch cannot be opened" );
         const auto appendReferencePair = [&]( ReferenceKind kind, bool definition, uint64_t generation, uint64_t id ) {
@@ -3987,7 +4061,32 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( definition ) definitionCounts[index]++;
             else referenceCounts[index]++;
         };
-        const auto appendNameMetadata = [&]( bool definition, uint64_t generation, uint32_t id,
+        const auto appendResourceReference = [&]( ResourceReferenceOrigin origin,
+            uint64_t generation, uint64_t id ) {
+            appendReferencePair( ReferenceKind::Resource, false, generation, id );
+            if( !detailed || id == 0 ) return;
+            const analysis::AnalysisUInt64Pair pair { generation, id };
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
+            const auto index = size_t( origin );
+            resourceOriginOutputs[index].write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+            if( !resourceOriginOutputs[index] )
+                throw std::runtime_error( "Catalog detailed resource reference scratch write failed" );
+            resourceOriginCounts[index]++;
+        };
+        const auto appendRelationResourceReference = [&]( bool target, uint8_t operation,
+            uint64_t generation, uint64_t id ) {
+            appendResourceReference( target ? ResourceReferenceOrigin::RelationTarget :
+                ResourceReferenceOrigin::RelationSource, generation, id );
+            if( !detailed || id == 0 || operation >= RelationOperationCount ) return;
+            const analysis::AnalysisUInt64Pair pair { generation, id };
+            analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( pair ) );
+            const auto index = size_t( target ) * RelationOperationCount + operation;
+            relationOperationOutputs[index].write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
+            if( !relationOperationOutputs[index] )
+                throw std::runtime_error( "Catalog detailed relation operation scratch write failed" );
+            relationOperationCounts[index]++;
+        };
+        const auto appendNameMetadata = [&]( uint8_t kind, uint64_t generation, uint32_t id,
             uint64_t hash, uint32_t originalLength ) {
             if( id == 0 ) return;
             analysis::AnalysisKeyMetadataRecord record;
@@ -3995,7 +4094,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             record.keyLow = id;
             record.metadata = hash;
             record.auxiliary = originalLength;
-            record.kind = definition ? 0 : 1;
+            record.kind = kind;
             analysis::AnalysisDiskGrow( m_impl->options.disk, sizeof( record ) );
             nameMetadataOutput.write( reinterpret_cast<const char*>( &record ), sizeof( record ) );
             if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch write failed" );
@@ -4019,7 +4118,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                     appendReferencePair( ReferenceKind::Resource, true, generation, row.resourceId );
                     appendReferencePair( ReferenceKind::Allocation, false, generation, row.allocationId );
                     appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
-                    appendNameMetadata( false, generation, row.nameId, row.nameHash, row.nameOriginalLength );
+                    appendNameMetadata( 1, generation, row.nameId, row.nameHash, row.nameOriginalLength );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogAllocation:
@@ -4029,20 +4128,20 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                 break;
             case OfflineCatalogDomain::CatalogView:
                 visit( JnGpuCatalogViewRecordV1 {}, [&]( const auto& row ) {
-                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendResourceReference( ResourceReferenceOrigin::View, generation, row.resourceId );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogLogical:
                 visit( JnGpuCatalogLogicalRecordV1 {}, [&]( const auto& row ) {
                     appendReferencePair( ReferenceKind::Logical, true, generation, row.logicalResourceId );
-                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendResourceReference( ResourceReferenceOrigin::Logical, generation, row.resourceId );
                     appendReferencePair( ReferenceKind::String, false, generation, row.nameId );
-                    appendNameMetadata( false, generation, row.nameId, row.nameHash, row.nameOriginalLength );
+                    appendNameMetadata( 2, generation, row.nameId, row.nameHash, row.nameOriginalLength );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogPart:
                 visit( JnGpuCatalogPartRecordV1 {}, [&]( const auto& row ) {
-                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendResourceReference( ResourceReferenceOrigin::Part, generation, row.resourceId );
                     appendReferencePair( ReferenceKind::Logical, false, generation, row.logicalResourceId );
                 } );
                 break;
@@ -4055,20 +4154,20 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                     if( row.relation == uint8_t( JnGpuCatalogRelationKind::RtasUses ) )
                     {
                         if( ( row.flags & 1 ) == 0 )
-                            appendReferencePair( ReferenceKind::Resource, false, generation, row.sourceId );
+                            appendRelationResourceReference( false, row.operation, generation, row.sourceId );
                         if( ( row.flags & 2 ) == 0 )
-                            appendReferencePair( ReferenceKind::Resource, false, generation, row.targetId );
+                            appendRelationResourceReference( true, row.operation, generation, row.targetId );
                     }
                 } );
                 break;
             case OfflineCatalogDomain::CatalogVg:
                 visit( JnGpuCatalogVgRecordV1 {}, [&]( const auto& row ) {
-                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendResourceReference( ResourceReferenceOrigin::Vg, generation, row.resourceId );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogRangeSet:
                 visit( JnGpuRangeSetRecordV1 {}, [&]( const auto& row ) {
-                    appendReferencePair( ReferenceKind::Resource, false, generation, row.resourceId );
+                    appendResourceReference( ResourceReferenceOrigin::Range, generation, row.resourceId );
                 } );
                 break;
             case OfflineCatalogDomain::CatalogDetailedEvidence:
@@ -4187,7 +4286,7 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                           JnGpuCatalogChecksum64( row.bytes.data(), row.header.byteLength ) != row.header.hash ) )
                         note( "CATALOG_STRING_HASH" );
                     appendReferencePair( ReferenceKind::String, true, row.generation, row.header.stringId );
-                    appendNameMetadata( true, row.generation, row.header.stringId,
+                    appendNameMetadata( 0, row.generation, row.header.stringId,
                         row.header.hash, row.header.originalLength );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, &row.header, sizeof( row.header ) );
                     storedChecksum = JnGpuCatalogChecksum64Update( storedChecksum, row.bytes.data(), row.header.byteLength );
@@ -4225,6 +4324,20 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                 throw std::runtime_error( "Catalog reference scratch flush failed" );
             definitionOutputs[index].close();
             referenceOutputs[index].close();
+        }
+        if( detailed ) for( size_t index = 0; index < ResourceReferenceOriginCount; index++ )
+        {
+            resourceOriginOutputs[index].flush();
+            if( !resourceOriginOutputs[index] )
+                throw std::runtime_error( "Catalog detailed resource reference scratch flush failed" );
+            resourceOriginOutputs[index].close();
+        }
+        if( detailed ) for( size_t index = 0; index < RelationOperationSourceCount; index++ )
+        {
+            relationOperationOutputs[index].flush();
+            if( !relationOperationOutputs[index] )
+                throw std::runtime_error( "Catalog detailed relation operation scratch flush failed" );
+            relationOperationOutputs[index].close();
         }
         nameMetadataOutput.flush();
         if( !nameMetadataOutput ) throw std::runtime_error( "Catalog name metadata scratch flush failed" );
@@ -4287,6 +4400,29 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
         const auto pairLess = []( const analysis::AnalysisUInt64Pair& lhs, const analysis::AnalysisUInt64Pair& rhs ) {
             return lhs.key < rhs.key || ( lhs.key == rhs.key && lhs.value < rhs.value );
         };
+        const auto countMissingReferences = [&]( const std::filesystem::path& definitionsPath,
+            const std::filesystem::path& referencesPath, std::string_view findingCode,
+            std::string_view source ) {
+            std::ifstream definitions( definitionsPath, std::ios::binary );
+            std::ifstream references( referencesPath, std::ios::binary );
+            if( !definitions || !references ) throw std::runtime_error( "Catalog reference join cannot be opened" );
+            analysis::AnalysisUInt64Pair definition {}, reference {};
+            bool haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
+            uint64_t missing = 0;
+            while( references.read( reinterpret_cast<char*>( &reference ), sizeof( reference ) ) )
+            {
+                while( haveDefinition && pairLess( definition, reference ) )
+                    haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
+                if( !haveDefinition || pairLess( reference, definition ) )
+                {
+                    missing++;
+                    sample( findingCode, source, reference.key, reference.value );
+                }
+            }
+            if( !references.eof() || ( !haveDefinition && !definitions.eof() ) )
+                throw std::runtime_error( "Catalog reference join read failed" );
+            return missing;
+        };
         for( size_t index = 0; index < ReferenceKindCount; index++ )
         {
             const auto prefix = std::string( "catalog-reference-" ) + referenceNames[index];
@@ -4298,23 +4434,44 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
                 prefix + "-reference", referenceCounts[index], 1024 * 1024, sortError,
                 m_impl->options.disk, m_impl->options.workspace ) )
                 throw std::runtime_error( "Catalog reference sort failed: " + sortError );
-            std::ifstream definitions( definitionSorted[index], std::ios::binary );
-            std::ifstream references( referenceSorted[index], std::ios::binary );
-            if( !definitions || !references ) throw std::runtime_error( "Catalog reference join cannot be opened" );
-            analysis::AnalysisUInt64Pair definition {}, reference {};
-            bool haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
-            uint64_t missing = 0;
-            while( references.read( reinterpret_cast<char*>( &reference ), sizeof( reference ) ) )
+            const auto missing = countMissingReferences( definitionSorted[index], referenceSorted[index],
+                referenceFindingCodes[index], referenceNames[index] );
+            if( missing != 0 )
             {
-                while( haveDefinition && pairLess( definition, reference ) )
-                    haveDefinition = bool( definitions.read( reinterpret_cast<char*>( &definition ), sizeof( definition ) ) );
-                if( !haveDefinition || pairLess( reference, definition ) ) missing++;
+                note( "CATALOG_CROSS_TABLE_REFERENCE", missing );
+                if( detailed ) note( referenceFindingCodes[index], missing );
             }
-            if( !references.eof() || ( !haveDefinition && !definitions.eof() ) )
-                throw std::runtime_error( "Catalog reference join read failed" );
-            definitions.close();
-            references.close();
-            if( missing != 0 ) note( "CATALOG_CROSS_TABLE_REFERENCE", missing );
+        }
+        if( detailed ) for( size_t index = 0; index < ResourceReferenceOriginCount; index++ )
+        {
+            if( resourceOriginCounts[index] == 0 ) continue;
+            const auto prefix = std::string( "catalog-resource-origin-" ) + resourceOriginNames[index];
+            if( !analysis::SortAnalysisUInt64Pairs( resourceOriginSources[index], resourceOriginSorted[index],
+                scratchRoot, prefix, resourceOriginCounts[index], 1024 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+                throw std::runtime_error( "Catalog detailed resource reference sort failed: " + sortError );
+            const auto missing = countMissingReferences(
+                definitionSorted[size_t( ReferenceKind::Resource )], resourceOriginSorted[index],
+                resourceOriginFindingCodes[index], resourceOriginNames[index] );
+            if( missing != 0 ) note( resourceOriginFindingCodes[index], missing );
+        }
+        if( detailed ) for( size_t index = 0; index < RelationOperationSourceCount; index++ )
+        {
+            if( relationOperationCounts[index] == 0 ) continue;
+            const auto endpoint = index / RelationOperationCount;
+            const auto operation = index % RelationOperationCount;
+            const auto source = std::string( endpoint == 0 ? "relation-source" : "relation-target" );
+            const auto code = std::string( "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_" ) +
+                ( endpoint == 0 ? "RELATION_SOURCE_OP_" : "RELATION_TARGET_OP_" ) +
+                relationOperationNames[operation];
+            if( !analysis::SortAnalysisUInt64Pairs( relationOperationSources[index], relationOperationSorted[index],
+                scratchRoot, "catalog-" + source + "-operation-" + std::to_string( operation ),
+                relationOperationCounts[index], 1024 * 1024, sortError,
+                m_impl->options.disk, m_impl->options.workspace ) )
+                throw std::runtime_error( "Catalog detailed relation operation sort failed: " + sortError );
+            const auto missing = countMissingReferences(
+                definitionSorted[size_t( ReferenceKind::Resource )], relationOperationSorted[index], code, source );
+            if( missing != 0 ) note( code, missing );
         }
         if( !analysis::SortAnalysisKeyMetadataRecords( nameMetadataSource, nameMetadataSorted, scratchRoot,
                 "catalog-name-metadata", nameMetadataCount, 512 * 1024, sortError,
@@ -4343,7 +4500,16 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             if( record.kind == 0 )
             {
                 if( haveDefinition && ( record.metadata != definitionHash || record.auxiliary != definitionLength ) )
+                {
                     note( "CATALOG_NAME_METADATA" );
+                    if( detailed )
+                    {
+                        note( "CATALOG_NAME_DEFINITION_CONFLICT" );
+                        sample( "CATALOG_NAME_DEFINITION_CONFLICT", "string", record.keyHigh,
+                            record.keyLow, definitionHash, record.metadata,
+                            definitionLength, record.auxiliary );
+                    }
+                }
                 else if( !haveDefinition )
                 {
                     definitionHash = record.metadata;
@@ -4353,7 +4519,44 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
             }
             else if( haveDefinition &&
                 ( record.metadata != definitionHash || record.auxiliary != definitionLength ) )
+            {
                 note( "CATALOG_NAME_METADATA" );
+                if( detailed )
+                {
+                    note( "CATALOG_NAME_REFERENCE_MISMATCH" );
+                    if( record.metadata != definitionHash )
+                    {
+                        const auto code = record.metadata == 0 ?
+                            "CATALOG_NAME_REFERENCE_HASH_MISSING" : "CATALOG_NAME_REFERENCE_HASH_MISMATCH";
+                        note( code );
+                        sample( code, record.kind == 1 ? "resource" : "logical",
+                            record.keyHigh, record.keyLow, definitionHash, record.metadata,
+                            definitionLength, record.auxiliary );
+                    }
+                    if( record.auxiliary != definitionLength )
+                    {
+                        note( "CATALOG_NAME_REFERENCE_LENGTH_MISMATCH" );
+                        sample( "CATALOG_NAME_REFERENCE_LENGTH_MISMATCH",
+                            record.kind == 1 ? "resource" : "logical",
+                            record.keyHigh, record.keyLow, definitionHash, record.metadata,
+                            definitionLength, record.auxiliary );
+                    }
+                    if( record.kind == 1 )
+                    {
+                        note( "CATALOG_NAME_REFERENCE_MISMATCH_FROM_RESOURCE" );
+                        sample( "CATALOG_NAME_REFERENCE_MISMATCH_FROM_RESOURCE", "resource",
+                            record.keyHigh, record.keyLow, definitionHash, record.metadata,
+                            definitionLength, record.auxiliary );
+                    }
+                    else if( record.kind == 2 )
+                    {
+                        note( "CATALOG_NAME_REFERENCE_MISMATCH_FROM_LOGICAL" );
+                        sample( "CATALOG_NAME_REFERENCE_MISMATCH_FROM_LOGICAL", "logical",
+                            record.keyHigh, record.keyLow, definitionHash, record.metadata,
+                            definitionLength, record.auxiliary );
+                    }
+                }
+            }
         }
         if( !nameMetadata.eof() ) throw std::runtime_error( "Catalog sorted name metadata read failed" );
         nameMetadata.close();
@@ -4368,6 +4571,8 @@ QueryCatalogValidationResult QueryCatalogStoreReader::ValidateSemantics( const s
         const auto failure = std::current_exception();
         for( auto& output : definitionOutputs ) if( output.is_open() ) output.close();
         for( auto& output : referenceOutputs ) if( output.is_open() ) output.close();
+        for( auto& output : resourceOriginOutputs ) if( output.is_open() ) output.close();
+        for( auto& output : relationOperationOutputs ) if( output.is_open() ) output.close();
         if( nameMetadataOutput.is_open() ) nameMetadataOutput.close();
         if( const auto cleanupError = cleanup(); !cleanupError.empty() )
             throw std::runtime_error( "Catalog semantic validation scratch cleanup failed: " + cleanupError );

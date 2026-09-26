@@ -22,6 +22,18 @@ struct QueryCatalogValidationFinding
     uint64_t count = 0;
 };
 
+struct QueryCatalogValidationSample
+{
+    std::string code;
+    std::string source;
+    uint64_t generation = 0;
+    uint64_t id = 0;
+    uint64_t expectedHash = 0;
+    uint64_t actualHash = 0;
+    uint32_t expectedLength = 0;
+    uint32_t actualLength = 0;
+};
+
 struct QueryCatalogValidationResult
 {
     bool complete = false;
@@ -29,6 +41,7 @@ struct QueryCatalogValidationResult
     bool originalValid = false;
     bool healthy = false;
     std::vector<QueryCatalogValidationFinding> findings;
+    std::vector<QueryCatalogValidationSample> samples;
 };
 
 struct QueryCatalogResourceIndexReadStatistics
@@ -317,6 +330,7 @@ public:
     void ValidateAll( const std::function<void( std::string_view )>& phase = {},
         const std::filesystem::path& scratchRoot = {} ) const;
     QueryCatalogValidationResult ValidateSemantics( const std::filesystem::path& scratchRoot ) const;
+    QueryCatalogValidationResult ValidateSemanticsDetailed( const std::filesystem::path& scratchRoot ) const;
     void BuildResourceIndex( const std::filesystem::path& scratchRoot,
         const std::function<void( std::string_view )>& phase = {},
         QueryCatalogResourceIndexReadStatistics* readStatistics = nullptr ) const;
@@ -364,6 +378,8 @@ public:
     uint64_t FastResourceIdAtOrdinal( uint32_t ordinal ) const;
 
 private:
+    QueryCatalogValidationResult ValidateSemanticsImpl(
+        const std::filesystem::path& scratchRoot, bool detailed ) const;
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

@@ -1,12 +1,14 @@
 #include "TracyOfflineCatalog.hpp"
 #include "TracyQueue.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -42,6 +44,34 @@ int main( int argc, char** argv )
         namespace fs = std::filesystem;
         using namespace tracy;
         using namespace tracy::query;
+        if( argc == 5 && std::string_view( argv[1] ) == "--semantic-diagnose" )
+        {
+            analysis::PagedRecordOptions options;
+            options.readerCacheBytes = uint64_t( 96 ) << 20;
+            options.workspace = std::make_shared<analysis::AnalysisWorkspaceBudget>( 4ull << 30, 2ull << 30 );
+            QueryCatalogStoreReader catalog( fs::path( argv[2] ), argv[3], options );
+            const auto begin = std::chrono::steady_clock::now();
+            const auto validation = catalog.ValidateSemanticsDetailed( fs::path( argv[4] ) );
+            nlohmann::json findings = nlohmann::json::array();
+            for( const auto& finding : validation.findings ) findings.push_back( {
+                { "code", finding.code }, { "count", std::to_string( finding.count ) } } );
+            nlohmann::json samples = nlohmann::json::array();
+            for( const auto& sample : validation.samples ) samples.push_back( {
+                { "code", sample.code }, { "source", sample.source },
+                { "generation", std::to_string( sample.generation ) }, { "id", std::to_string( sample.id ) },
+                { "expected_hash", std::to_string( sample.expectedHash ) },
+                { "actual_hash", std::to_string( sample.actualHash ) },
+                { "expected_length", sample.expectedLength }, { "actual_length", sample.actualLength } } );
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - begin ).count();
+            std::cout << nlohmann::json {
+                { "complete", validation.complete }, { "present", validation.present },
+                { "original_valid", validation.originalValid }, { "healthy", validation.healthy },
+                { "elapsed_ms", elapsed }, { "findings", std::move( findings ) },
+                { "samples", std::move( samples ) }
+            }.dump() << '\n';
+            return 0;
+        }
         if( argc == 6 && ( std::string_view( argv[1] ) == "--pointer-probe" ||
             std::string_view( argv[1] ) == "--pointer-fast-probe" ) )
         {
@@ -666,10 +696,15 @@ int main( int argc, char** argv )
                 sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
         } );
         QueryCatalogStoreReader crossReferenceReader( crossReferenceRoot, identity );
-        const auto crossReferenceValidation = crossReferenceReader.ValidateSemantics( crossReferenceRoot / "semantic-validation" );
+        const auto crossReferenceValidation = crossReferenceReader.ValidateSemanticsDetailed( crossReferenceRoot / "semantic-validation" );
         Require( crossReferenceValidation.complete && !crossReferenceValidation.healthy &&
-            hasFinding( crossReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
+            hasFinding( crossReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ) &&
+            hasFinding( crossReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE_ALLOCATION" ),
             "Catalog cross-table reference corruption was accepted" );
+        Require( std::any_of( crossReferenceValidation.samples.begin(), crossReferenceValidation.samples.end(),
+            []( const auto& sample ) { return sample.code == "CATALOG_CROSS_TABLE_REFERENCE_ALLOCATION" &&
+                sample.generation == 9 && sample.id == 999; } ),
+            "Catalog allocation reference diagnostic sample was not preserved" );
 
         const auto nameMetadataRoot = root.parent_path() / "tracy-query-catalog-semantic-name-metadata";
         writeVariant( nameMetadataRoot, []( auto* variantResources, auto*, auto*, auto* variantBatches, auto&, auto& ) {
@@ -681,10 +716,23 @@ int main( int argc, char** argv )
                 sizeof( JnGpuCatalogResourceRecordV1 ) * 3 );
         } );
         QueryCatalogStoreReader nameMetadataReader( nameMetadataRoot, identity );
-        const auto nameMetadataValidation = nameMetadataReader.ValidateSemantics( nameMetadataRoot / "semantic-validation" );
+        const auto nameMetadataValidation = nameMetadataReader.ValidateSemanticsDetailed( nameMetadataRoot / "semantic-validation" );
         Require( nameMetadataValidation.complete && !nameMetadataValidation.healthy &&
-            hasFinding( nameMetadataValidation, "CATALOG_NAME_METADATA" ),
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_METADATA" ) &&
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_REFERENCE_MISMATCH" ) &&
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_REFERENCE_MISMATCH_FROM_RESOURCE" ) &&
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_REFERENCE_HASH_MISMATCH" ) &&
+            hasFinding( nameMetadataValidation, "CATALOG_NAME_REFERENCE_LENGTH_MISMATCH" ),
             "Catalog name hash/length corruption was accepted" );
+        Require( std::any_of( nameMetadataValidation.samples.begin(), nameMetadataValidation.samples.end(),
+            [&]( const auto& sample ) { return sample.code == "CATALOG_NAME_REFERENCE_MISMATCH_FROM_RESOURCE" &&
+                sample.generation == 9 && sample.id == 7 &&
+                ( sample.actualHash != header.hash || sample.actualLength != header.originalLength ); } ),
+            "Catalog name metadata diagnostic sample was not preserved" );
+        Require( std::any_of( nameMetadataValidation.samples.begin(), nameMetadataValidation.samples.end(),
+            []( const auto& sample ) { return sample.code == "CATALOG_NAME_REFERENCE_LENGTH_MISMATCH" &&
+                sample.generation == 9 && sample.id == 7 && sample.expectedLength == 4 && sample.actualLength == 3; } ),
+            "Catalog name length diagnostic sample was not preserved" );
 
         const auto relationReferenceRoot = root.parent_path() / "tracy-query-catalog-semantic-relation-reference";
         writeVariant( relationReferenceRoot, []( auto*, auto* variantRelations, auto*, auto* variantBatches, auto&, auto& ) {
@@ -693,11 +741,20 @@ int main( int argc, char** argv )
                 sizeof( JnGpuCatalogRelationRecordV1 ) );
         } );
         QueryCatalogStoreReader relationReferenceReader( relationReferenceRoot, identity );
-        const auto relationReferenceValidation = relationReferenceReader.ValidateSemantics(
+        const auto relationReferenceValidation = relationReferenceReader.ValidateSemanticsDetailed(
             relationReferenceRoot / "semantic-validation" );
         Require( relationReferenceValidation.complete && !relationReferenceValidation.healthy &&
-            hasFinding( relationReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ),
+            hasFinding( relationReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE" ) &&
+            hasFinding( relationReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE" ) &&
+            hasFinding( relationReferenceValidation, "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RELATION_SOURCE" ) &&
+            hasFinding( relationReferenceValidation,
+                "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RELATION_SOURCE_OP_BIND" ),
             "Catalog RTAS relation resource corruption was accepted" );
+        Require( std::any_of( relationReferenceValidation.samples.begin(), relationReferenceValidation.samples.end(),
+            []( const auto& sample ) { return sample.code ==
+                "CATALOG_CROSS_TABLE_REFERENCE_RESOURCE_FROM_RELATION_SOURCE" &&
+                sample.source == "relation-source" && sample.generation == 9 && sample.id == 999; } ),
+            "Catalog relation reference diagnostic sample was not preserved" );
 
         const auto evidenceRecordRoot = root.parent_path() / "tracy-query-catalog-semantic-evidence-record";
         writeVariant( evidenceRecordRoot, []( auto*, auto*, auto* variantEvidence, auto* variantBatches, auto&, auto& ) {
