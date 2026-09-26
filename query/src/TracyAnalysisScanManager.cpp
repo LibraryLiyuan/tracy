@@ -1501,6 +1501,10 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
     };
     const auto generation=NewGeneration(entry->scanRoot/"policy-generations");
     CandidatePolicyCacheOptions policyOptions; policyOptions.table=options;
+    // Long captures can legitimately contain hundreds of thousands of frame
+    // boundaries. This remains inside the shared 4 GiB workspace contract;
+    // it only lifts the policy subsystem's smaller legacy admission ceiling.
+    policyOptions.frameWorkspaceBytes=512*1024*1024;
     const auto candidateRoot=entry->scanRoot/"policy-generations"/generation/"policy-cache";
     const auto policyIdentity=BuildCandidatePolicyCache(candidateRoot,neutral,policy,policyOptions);
     ValidateFinalTables(candidateRoot,policyIdentity,true,options);

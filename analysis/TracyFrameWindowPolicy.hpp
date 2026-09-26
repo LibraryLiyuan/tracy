@@ -210,10 +210,23 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
     };
     if( input.cancelled && input.cancelled() ) throw std::runtime_error( "cancelled" );
     if( !c.frameSeriesComplete ) return {};
-    auto series = input.readFrameSeries ? input.readFrameSeries( c ) : c.frames;
+    const auto t = timelines.find( c.frameScope );
+    std::vector<PolicyFrameEvidence> loadedSeries;
+    const std::vector<PolicyFrameEvidence>* seriesView = nullptr;
+    // Frame roots describe the same complete sequence as the supplied
+    // Timeline. Borrow its already sorted copy instead of loading another
+    // whole-capture vector from the per-signature series store.
+    if( c.frameRoot && t != timelines.end() ) seriesView = &t->second.frames;
+    else
+    {
+        loadedSeries = input.readFrameSeries ? input.readFrameSeries( c ) : c.frames;
+        std::sort( loadedSeries.begin(), loadedSeries.end(), []( const auto& a, const auto& b ) {
+            return a.frameIndex < b.frameIndex; } );
+        seriesView = &loadedSeries;
+    }
+    const auto& series = *seriesView;
     if(checkSeries) checkSeries(series);
     if( series.empty() ) return {};
-    std::sort( series.begin(), series.end(), []( const auto& a, const auto& b ) { return a.frameIndex < b.frameIndex; } );
     for( size_t i = 1; i < series.size(); ++i )
         if( series[i].frameIndex == series[i-1].frameIndex ) throw std::runtime_error( "duplicate_signature_frame" );
     const auto at = [&]( uint64_t frame ) {
@@ -221,7 +234,6 @@ std::vector<Signal> ScanContext(const CandidatePolicyInput& input,size_t ci,cons
             []( const auto& x, uint64_t index ) { return x.frameIndex < index; } );
         return it != series.end() && it->frameIndex == frame ? *it : PolicyFrameEvidence { frame, 0, {}, {}, true };
     };
-    const auto t = timelines.find( c.frameScope );
     if( c.frameRoot )
     {
         std::vector<PolicyFrameEvidence> bad;

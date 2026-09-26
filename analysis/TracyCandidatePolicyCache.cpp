@@ -155,6 +155,24 @@ NeutralRankingEntry Entry(const json& j)
     e.cumulativeContribution=std::stod(j.at("cumulative_contribution").get<std::string>());
     return e;
 }
+uint64_t FrameStorageBytes(const std::vector<PolicyFrameEvidence>& frames)
+{
+    const auto add=[&](uint64_t& bytes,uint64_t count,uint64_t width) {
+        if(width && count>(UINT64_MAX-bytes)/width) Fail("frame_workspace_budget");
+        bytes+=count*width;
+    };
+    uint64_t bytes=0;
+    add(bytes,frames.capacity(),sizeof(PolicyFrameEvidence));
+    for(const auto& f:frames) {
+        // The PolicyFrameEvidence object already contains the vector/string
+        // control blocks. Capacities cover only their separately allocated
+        // storage; counting SSO capacity as well is deliberately conservative.
+        add(bytes,f.structureKey.capacity(),1);
+        add(bytes,f.eventRefs.capacity(),sizeof(std::string));
+        for(const auto& ref:f.eventRefs) add(bytes,ref.capacity(),1);
+    }
+    return bytes;
+}
 uint64_t FrameBytes(const std::vector<PolicyFrameEvidence>& frames)
 {
     uint64_t bytes=frames.size()*256;
@@ -264,7 +282,7 @@ struct Builder
         std::set<std::string> supplied;
         for(const auto& t:input.frameTimelines) {
             timelineWorkspace.Add(2048+8ull*(t.frameScope.size()+t.name.size()+t.observationUnit.size()));
-            supplied.insert(t.frameScope); timelineBytes+=FrameBytes(t.frames);
+            supplied.insert(t.frameScope); timelineBytes+=FrameStorageBytes(t.frames);
         }
         if(timelineBytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
         std::map<std::string,PolicySignatureContext> roots;
@@ -304,7 +322,9 @@ struct Builder
             if(FrameBytes(c.frames)>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
             const auto key=SignatureKey(c);
             AnalysisWorkspaceReservation seriesWorkspace(options.table.workspace);
-            if(c.frameSeriesComplete) {
+            const auto timeline=state.timelines.find(c.frameScope);
+            const bool borrowedRoot=c.frameRoot && timeline!=state.timelines.end();
+            if(c.frameSeriesComplete && !borrowedRoot) {
                 // The native extent has a known row count, so reject before
                 // ReadPolicyFrameSeries allocates. Opaque callbacks are checked
                 // immediately on return, before the policy makes any copies.
@@ -320,7 +340,7 @@ struct Builder
                     auto payload=TopJson(item); payload["group"]=Hex(groupKey);
                     topInput->Append(groupKey+Unsigned(item.context),payload.dump());
                 },[&](const std::vector<PolicyFrameEvidence>& series) {
-                    const auto bytes=FrameBytes(series);
+                    const auto bytes=borrowedRoot?FrameStorageBytes(series):FrameBytes(series);
                     if(bytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
                     uint64_t largest=256;
                     for(const auto& frame:series) {
@@ -330,10 +350,11 @@ struct Builder
                     }
                     // Qualified/typical/window copies, ranges/quantile arrays,
                     // and returned Signal JSON stay covered through spooling.
-                    seriesWorkspace.Resize(8192+32*bytes+16ull*key.size());
-                    const auto timeline=state.timelines.find(c.frameScope);
-                    if(timeline!=state.timelines.end()) {
-                        seriesWorkspace.Add(4*FrameBytes(timeline->second.frames));
+                    const auto copies=c.frameRoot?4ull:32ull;
+                    if(bytes>(UINT64_MAX-8192-16ull*key.size())/copies) Fail("frame_workspace_budget");
+                    seriesWorkspace.Resize(8192+copies*bytes+16ull*key.size());
+                    if(timeline!=state.timelines.end() && !borrowedRoot) {
+                        seriesWorkspace.Add(4*FrameStorageBytes(timeline->second.frames));
                         const auto windows=state.windows.at(c.frameScope).size();
                         const auto perWindow=8192+64*largest;
                         if(windows>UINT64_MAX/perWindow) Fail("frame_workspace_budget");

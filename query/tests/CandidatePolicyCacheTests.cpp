@@ -241,6 +241,44 @@ void SharedTimelineWorkspace(const std::filesystem::path& root)
     CandidatePolicyCacheReader result(root/"small",id,options);
     Require(!result.Candidates(0,1,65536).records.empty(),"bounded Timeline preserves candidate availability");
 }
+
+void LargeFrameTimeline(const std::filesystem::path& root)
+{
+    constexpr uint64_t FrameCount=300'000;
+    CandidatePolicyInput input; input.aggregateIdentity=Identity;
+    input.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},{"module_budgets",json::array()},
+        {"resource_budgets",json::object()},{"user_focus",json::array()},
+        {"candidate_policy",{{"top_n",1},{"local_top_n",1},{"cumulative_contribution",0.8},
+            {"per_domain_limit",10},{"absolute_frame_cost_ms",10.0},{"priorities",{"P0","P1","P2","P3","P4"}}}}};
+    input.profileIdentity=Sha(input.normalizedProfile);
+    PolicySignatureContext rootContext; rootContext.domain="cpu"; rootContext.signatureId="frame-root";
+    rootContext.frameScope="Player"; rootContext.name="Player"; rootContext.frameRoot=true;
+    rootContext.frameSeriesComplete=true; rootContext.seriesCount=FrameCount; rootContext.sourceOrdinal=0;
+    input.signatures.push_back(rootContext);
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    timeline.frames.reserve(FrameCount);
+    for(uint64_t frame=0;frame<FrameCount;++frame)
+        timeline.frames.push_back({frame,frame==FrameCount/2?20'000'000:12'000'000,{},"",true});
+    input.frameTimelines.push_back(std::move(timeline));
+    NeutralStatisticsStreamSummary summary; summary.qualityComplete=true;
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.blockBytes=65536;
+    { NeutralStatisticsCacheWriter writer(root/"neutral",Identity,neutralOptions);
+      writer.AppendContext(SerializePolicySignatureContextRecord(rootContext)); writer.Commit(summary); }
+    NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
+    input.signatures.clear(); input.aggregate.qualityComplete=true;
+    input.aggregate.contentSha256=neutral.ContentSha256(); uint64_t seriesReads=0;
+    input.readFrameSeries=[&](const auto&){++seriesReads; throw std::runtime_error("duplicate_root_series_read");
+        return std::vector<PolicyFrameEvidence>{};};
+    CandidatePolicyCacheOptions options; options.table.blockBytes=65536; options.sortBufferBytes=262144;
+    options.frameWorkspaceBytes=512*1024*1024;
+    options.table.workspace=std::make_shared<AnalysisWorkspaceBudget>();
+    const auto identity=BuildCandidatePolicyCache(root/"policy",neutral,input,options);
+    Require(seriesReads==0,"a supplied Frame Root Timeline must not load a duplicate full series");
+    CandidatePolicyCacheReader result(root/"policy",identity,options);
+    Require(!result.Candidates(0,10,1024*1024).records.empty(),"large Frame Timeline preserves root policy findings");
+    Require(options.table.workspace->Snapshot().peakBytes<=4ull*1024*1024*1024,
+        "large Frame Timeline exceeded the shared workspace contract");
+}
 void SharedContextDecodeWorkspace(const std::filesystem::path& root)
 {
     const auto input=Fixture(root);
@@ -757,6 +795,6 @@ int main(int argc,char** argv)
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
         CandidateJoinWorkspace(root/"candidate-join");
-        LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
+        LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); LargeFrameTimeline(root/"large-timeline"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\nfixture: "<<root<<'\n'; return 1; }
 }
