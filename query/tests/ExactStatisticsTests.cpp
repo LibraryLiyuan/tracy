@@ -490,6 +490,12 @@ int main( int argc, char** argv )
         // A disk consumer receives one signature at a time. Completed result
         // objects must not also accumulate behind that consumer's back.
         NeutralStatisticsStreamBuilder streamed(temporary / "sink-output", 64, 64);
+        bool mergeProgress = false, reduceProgress = false;
+        streamed.SetProgress([&](std::string_view stage,uint64_t completed,uint64_t total) {
+            assert(completed<=total);
+            mergeProgress = mergeProgress || stage.starts_with("neutral_statistics_merge_pass_");
+            reduceProgress = reduceProgress || stage=="neutral_statistics_reduce";
+        });
         constexpr uint64_t Count = 256;
         for(uint64_t i = 0; i < Count; ++i)
         {
@@ -518,7 +524,7 @@ int main( int argc, char** argv )
             key.insert(0, 20-key.size(), '0');
             cache.Append(key, SerializeNeutralSignatureRecord(signature));
         });
-        if(!ok || received != Count || summary.signatureCount != Count ||
+        if(!ok || received != Count || summary.signatureCount != Count || !mergeProgress || !reduceProgress ||
             !summary.qualityComplete || summary.materializedResultPeak != 0)
         { std::cerr << "Sink output still retains complete signature results: " << summary.materializedResultPeak << '\n'; return 1; }
         assert(summary.domains.size() == 1 && summary.domains[0].actualOutputCount == Count);

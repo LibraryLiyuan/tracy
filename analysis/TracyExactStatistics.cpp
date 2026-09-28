@@ -1010,6 +1010,7 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::vector<Denominator> denominators;
     std::vector<NeutralDomainAuditInput> audits;
     CompleteFrameFilter completeFrameFilter;
+    std::function<void( std::string_view, uint64_t, uint64_t )> progress;
     std::string error;
     bool finished = false;
 
@@ -1338,7 +1339,8 @@ struct NeutralStatisticsStreamBuilder::Impl
     };
 
     bool MergeGroup( const std::vector<std::filesystem::path>& source,
-        const std::filesystem::path& outputPath, const std::function<bool()>& cancelled )
+        const std::filesystem::path& outputPath, std::string_view stage,
+        const std::function<bool()>& cancelled )
     {
         AnalysisWorkspaceReservation mergeBudget(workspace,65536+source.size()*16384ull);
         std::vector<Reader> readers;
@@ -1349,6 +1351,15 @@ struct NeutralStatisticsStreamBuilder::Impl
             if( !readers.back().opened ) { error = "neutral_run_read_open_failed"; return false; }
             if( !readers.back().error.empty() ) { error = readers.back().error; return false; }
         }
+        uint64_t expected = 0;
+        for( const auto& reader : readers )
+        {
+            if( reader.header.recordCount > UINT64_MAX - expected )
+            { error = "neutral_run_size_overflow"; return false; }
+            expected += reader.header.recordCount;
+        }
+        auto reportedAt = std::chrono::steady_clock::now();
+        if( progress ) progress( stage, 0, expected );
         const auto later = [&]( size_t left, size_t right ) {
             return Less( readers[right].value, readers[left].value );
         };
@@ -1362,8 +1373,14 @@ struct NeutralStatisticsStreamBuilder::Impl
         uint64_t processed = 0;
         while( !queue.empty() )
         {
-            if( ( ++processed & 0x3fff ) == 0 && cancelled && cancelled() )
-            { error = "cancelled"; return false; }
+            ++processed;
+            if( ( processed & 0x3fff ) == 0 )
+            {
+                if( cancelled && cancelled() ) { error = "cancelled"; return false; }
+                const auto now = std::chrono::steady_clock::now();
+                if( progress && now - reportedAt >= std::chrono::seconds( 5 ) )
+                { reportedAt = now; progress( stage, processed, expected ); }
+            }
             const auto index = queue.top(); queue.pop();
             const auto value = readers[index].value;
             readers[index].Advance();
@@ -1377,12 +1394,15 @@ struct NeutralStatisticsStreamBuilder::Impl
             }
         }
         if( pending && !writer.Write( *pending ) ) return false;
-        return writer.Finish();
+        if( !writer.Finish() ) return false;
+        if( progress ) progress( stage, processed, expected );
+        return true;
     }
 
     bool Consolidate( const std::function<bool()>& cancelled )
     {
         constexpr size_t FanIn = 32;
+        size_t pass = 0;
         while( runs.size() > 1 )
         {
             std::vector<std::filesystem::path> next;
@@ -1391,12 +1411,15 @@ struct NeutralStatisticsStreamBuilder::Impl
                 const auto last = std::min( first + FanIn, runs.size() );
                 std::vector<std::filesystem::path> group( runs.begin() + first, runs.begin() + last );
                 const auto output = NextPath( "neutral-merge" );
-                if( !MergeGroup( group, output, cancelled ) ) return false;
+                const auto stage = "neutral_statistics_merge_pass_" + std::to_string( pass ) +
+                    "_group_" + std::to_string( first / FanIn );
+                if( !MergeGroup( group, output, stage, cancelled ) ) return false;
                 next.push_back( output );
                 for( const auto& path : group ) RemoveQuietly( path,disk );
             }
             runs = std::move( next );
             runBudget.Resize(runs.size()*(1024+8ull*root.native().size()));
+            ++pass;
         }
         return true;
     }
@@ -1512,6 +1535,13 @@ void NeutralStatisticsStreamBuilder::SetCompleteFrameFilter(CompleteFrameFilter 
     m_impl->completeFrameFilter=std::move(filter);
 }
 
+void NeutralStatisticsStreamBuilder::SetProgress(
+    std::function<void( std::string_view, uint64_t, uint64_t )> progress )
+{
+    if( !m_impl || m_impl->finished ) throw std::runtime_error( "neutral_progress_after_finish" );
+    m_impl->progress = std::move( progress );
+}
+
 bool NeutralStatisticsStreamBuilder::FinishToSink( NeutralStatisticsStreamSummary& summary,
     std::string& error, const NeutralSignatureFramesSink& signatureSink,
     const std::function<bool()>& cancelled )
@@ -1569,6 +1599,9 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
 
     std::map<std::string,uint64_t> streamedOutputs;
     size_t ordinal = 0;
+    auto reduceReportedAt = std::chrono::steady_clock::now();
+    if( m_impl->progress )
+        m_impl->progress( "neutral_statistics_reduce", 0, m_impl->signatures.size() );
     auto finishSignature = [&]( uint32_t signatureIndex,
         std::vector<NeutralMergedFrameValues>& frames ) {
         if( frames.empty() ) return;
@@ -1667,6 +1700,13 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         if( signatureSink ) signatureSink( aggregate, frames );
         ++streamedOutputs[aggregate.domain];
         ++m_impl->outputSignatureCount;
+        const auto progressNow = std::chrono::steady_clock::now();
+        if( m_impl->progress && progressNow - reduceReportedAt >= std::chrono::seconds( 5 ) )
+        {
+            reduceReportedAt = progressNow;
+            m_impl->progress( "neutral_statistics_reduce", m_impl->outputSignatureCount,
+                m_impl->signatures.size() );
+        }
         if(retainResults)
         {
             result.signatures.push_back( std::move( aggregate ) );
@@ -1717,6 +1757,8 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         RemoveQuietly( m_impl->runs.front(),m_impl->disk );
         m_impl->runs.clear();
     }
+    if( m_impl->progress ) m_impl->progress( "neutral_statistics_reduce",
+        m_impl->outputSignatureCount, m_impl->signatures.size() );
 
     // Numeric external sorting follows first-observation registry order.
     // Restore the public, input-order-independent lexical order before

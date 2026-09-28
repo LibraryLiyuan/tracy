@@ -451,6 +451,11 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         const auto statisticsRoot = temporaryRoot / "statistics";
         std::filesystem::create_directories( statisticsRoot );
         NeutralStatisticsStreamBuilder statistics( statisticsRoot, 65536, 65536, workspace, request.disk );
+        statistics.SetProgress( [&]( std::string_view stage, uint64_t completed, uint64_t total ) {
+            progress( ScanState::Aggregating, completed, total, stage );
+            std::cerr << "Query scan-progress stage=" << stage << " completed=" << completed <<
+                " total=" << total << '\n';
+        } );
         NeutralStatisticsCacheOptions cacheOptions;
         cacheOptions.table.cancelled = cancelled;
         cacheOptions.table.workspace = workspace;

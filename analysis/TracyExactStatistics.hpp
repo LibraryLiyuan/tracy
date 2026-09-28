@@ -241,6 +241,7 @@ public:
     using CompleteFrameFilter = std::function<bool(std::string_view domain,
         std::string_view frameScope, uint64_t frameIndex)>;
     void SetCompleteFrameFilter( CompleteFrameFilter filter );
+    void SetProgress( std::function<void( std::string_view, uint64_t, uint64_t )> progress );
     void AddDomainAudit( const NeutralDomainAuditInput& value );
     bool Finish( NeutralStatisticsResult& result, std::string& error,
         const NeutralSignatureFramesSink& signatureSink = {},
