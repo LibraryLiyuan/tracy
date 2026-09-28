@@ -252,9 +252,18 @@ struct MemoryIoSamplingTelemetryScanResult
 class MemoryIoSamplingTelemetryScanner
 {
 public:
+    struct Progress
+    {
+        std::string stage;
+        uint64_t processed = 0;
+        std::optional<uint64_t> total;
+        uint64_t elapsedMs = 0;
+        bool complete = false;
+    };
+    using ProgressCallback = std::function<void( const Progress& )>;
     explicit MemoryIoSamplingTelemetryScanner( const TraceSource& source,
         size_t batchSize = 4096, int64_t transientLifetimeNs = 1'000'000,
-        int64_t leakCandidateAgeNs = 10'000'000'000 );
+        int64_t leakCandidateAgeNs = 10'000'000'000, ProgressCallback progress = {} );
     MemoryIoSamplingTelemetryScanResult Scan( const std::function<bool()>& cancelled = {} ) const;
     // Same source audit and capacity/quality facts; omit IO, sample-leaf and
     // scheduling detail vectors unused by the default Query analysis path.
@@ -268,6 +277,7 @@ private:
     size_t m_batchSize;
     int64_t m_transientLifetimeNs;
     int64_t m_leakCandidateAgeNs;
+    ProgressCallback m_progress;
 };
 
 const char* CpuMemoryClassificationName( CpuMemoryClassification value );

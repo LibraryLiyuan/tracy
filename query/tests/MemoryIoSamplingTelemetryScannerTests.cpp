@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <iostream>
+#include <map>
 
 using namespace tracy;
 using namespace tracy::analysis;
@@ -339,6 +340,30 @@ auto ScanCompact( Scanner& scanner, std::shared_ptr<AnalysisWorkspaceBudget> wor
 
 int main()
 {
+    {
+        MemoryIoSamplingSource source;
+        std::map<std::string, uint64_t> completed;
+        MemoryIoSamplingTelemetryScanner scanner( source, 2, 2, 20,
+            [&]( const auto& event ) {
+                if( event.complete ) completed[event.stage] = event.processed;
+                if( event.total && event.processed > *event.total )
+                    throw std::runtime_error( "system progress exceeded total" );
+            } );
+        const auto result = scanner.ScanSummary( {}, std::make_shared<AnalysisWorkspaceBudget>() );
+        for( const auto& [stage, count] : std::vector<std::pair<std::string,uint64_t>> {
+            { "memory_read", 6 }, { "gpu_allocation_read", 2 }, { "gpu_resource_read", 3 },
+            { "gpu_pass_read", 1 }, { "gpu_range_read", 1 }, { "io_request_read", 4 },
+            { "sample_read", 4 }, { "context_switch_read", 2 }, { "telemetry_read", 2 } } )
+            if( !completed.contains( stage ) || completed.at( stage ) != count )
+            { std::cerr << "System progress omitted completed facts for " << stage << '\n'; return 1; }
+        bool propagated = false;
+        try {
+            MemoryIoSamplingTelemetryScanner fail( source, 2, 2, 20,
+                []( const auto& ) { throw std::runtime_error( "progress_sink_failed" ); } );
+            (void)fail.Scan();
+        } catch( const std::runtime_error& error ) { propagated = std::string_view(error.what()) == "progress_sink_failed"; }
+        if( !propagated ) { std::cerr << "System progress callback failure was swallowed\n"; return 1; }
+    }
     bool cancellationTestsPassed = true;
     for( const auto* domain : { "pre_cancelled", "memory", "gpu_allocation", "gpu_resource",
         "gpu_pass", "gpu_range", "io", "sample", "callstack", "context_switch" } )

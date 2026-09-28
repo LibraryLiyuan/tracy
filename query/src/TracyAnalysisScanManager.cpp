@@ -804,7 +804,16 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
             statistics.AddDenominator( { "job", signature, "Player.Frame", jobPlayerFrameDenominator } );
 
         progress( ScanState::Scanning, 2, 4, "memory_io_sampling_telemetry_scan" );
-        const auto system = MemoryIoSamplingTelemetryScanner( *request.source ).ScanSummary(
+        const auto systemProgress = [&]( const MemoryIoSamplingTelemetryScanner::Progress& value ) {
+            progress( ScanState::Scanning, value.processed, value.total.value_or( 0 ), value.stage );
+            std::cerr << "Query system-progress " << json {
+                { "stage", value.stage }, { "processed", std::to_string( value.processed ) },
+                { "total", value.total ? json( std::to_string( *value.total ) ) : json( nullptr ) },
+                { "elapsed_ms", value.elapsedMs }, { "complete", value.complete }
+            }.dump() << '\n';
+        };
+        const auto system = MemoryIoSamplingTelemetryScanner( *request.source, 4096,
+            1'000'000, 10'000'000'000, systemProgress ).ScanSummary(
             cancelled, workspace );
         if( cancelled() ) return false;
 
