@@ -89,6 +89,12 @@ struct MetricPoint
     int64_t value = 0;
 };
 
+struct StatisticsCancelled {};
+void CheckStatisticsCancelled(const std::function<bool()>& cancelled)
+{
+    if(cancelled && cancelled()) throw StatisticsCancelled{};
+}
+
 bool AddChecked( int64_t& target, int64_t value )
 {
     if( value < 0 || target < 0 || value > std::numeric_limits<int64_t>::max() - target )
@@ -132,25 +138,6 @@ void RemoveQuietly( const std::filesystem::path& path,const std::shared_ptr<Anal
 {
     std::error_code ignored;
     AnalysisDiskRemove(path,disk,ignored);
-}
-
-bool WritePairs( const std::filesystem::path& path, const std::vector<int64_t>& values,
-    std::string& error,const std::shared_ptr<AnalysisDiskBudget>& disk )
-{
-    AnalysisDiskGrow(disk,uint64_t(values.size())*sizeof(AnalysisUInt64Pair));
-    std::ofstream output( path, std::ios::binary | std::ios::trunc );
-    if( !output ) { error = "exact_statistics_source_open_failed"; return false; }
-    uint64_t ordinal = 0;
-    for( const auto value : values )
-    {
-        if( value < 0 ) { error = "negative_duration_not_supported"; return false; }
-        const AnalysisUInt64Pair pair { uint64_t( value ), ordinal++ };
-        output.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
-        if( !output ) { error = "exact_statistics_source_write_failed"; return false; }
-    }
-    output.flush();
-    if( !output ) { error = "exact_statistics_source_flush_failed"; return false; }
-    return true;
 }
 
 class SortedPairs
@@ -370,22 +357,33 @@ std::string Sha256Text( const std::string& value )
 
 NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
     uint64_t completeFrames, const std::filesystem::path& root, const std::string& prefix,
-    uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk={} )
+    uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk={},
+    const std::function<bool()>& cancelled={} )
 {
     NeutralMetricAggregate result;
     std::vector<int64_t> values;
     values.reserve( points.size() );
-    for( const auto& point : points ) values.push_back( point.value );
+    for( const auto& point : points )
+    {
+        if((values.size()&4095)==0) CheckStatisticsCancelled(cancelled);
+        values.push_back( point.value );
+    }
     result.whenPresent = ComputeExactDistributionExternal( values, 0, root,
-        prefix + "-present", maximumBufferedValues,disk );
+        prefix + "-present", maximumBufferedValues,disk,cancelled );
+    if(result.whenPresent.unavailableReason=="cancelled") throw StatisticsCancelled{};
+    CheckStatisticsCancelled(cancelled);
     if( completeFrames < points.size() )
     {
         result.perCompleteFrame.exact = false;
         result.perCompleteFrame.unavailableReason = "complete_frame_denominator_smaller_than_present_frames";
         return result;
     }
-    result.perCompleteFrame = ComputeExactDistributionExternal( values,
-        completeFrames - points.size(), root, prefix + "-complete", maximumBufferedValues,disk );
+    // With no implicit zero frames the two populations are identical.
+    result.perCompleteFrame = completeFrames==points.size() ? result.whenPresent :
+        ComputeExactDistributionExternal( values, completeFrames - points.size(), root,
+            prefix + "-complete", maximumBufferedValues,disk,cancelled );
+    if(result.perCompleteFrame.unavailableReason=="cancelled") throw StatisticsCancelled{};
+    CheckStatisticsCancelled(cancelled);
     if( !result.perCompleteFrame.exact || !result.whenPresent.exact ) return result;
 
     const auto median = result.perCompleteFrame.median;
@@ -428,8 +426,10 @@ NeutralMetricAggregate BuildMetric( const std::vector<MetricPoint>& points,
         }
     };
 
+    uint64_t checkedPoints=0;
     for( const auto& point : points )
     {
+        if((checkedPoints++&4095)==0) CheckStatisticsCancelled(cancelled);
         if( double( point.value ) <= threshold ) continue;
         const AnomalyInstance anomaly { point.frame, point.value,
             double( point.value ) - median };
@@ -550,7 +550,7 @@ uint64_t UnixTimeNs()
 }
 
 ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& explicitValues,
-    uint64_t implicitZeros )
+    uint64_t implicitZeros, const std::function<bool()>& cancelled )
 {
     ExactDistribution result;
     if( explicitValues.size() > std::numeric_limits<uint64_t>::max() - implicitZeros )
@@ -569,6 +569,7 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     int64_t total = 0;
     for( const auto value : explicitValues )
     {
+        if((values.size()&4095)==0) CheckStatisticsCancelled(cancelled);
         if( value < 0 )
         {
             result.exact = false;
@@ -584,7 +585,12 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
         }
         values.emplace_back( uint64_t( value ) );
     }
-    std::sort( values.begin(), values.end() );
+    uint64_t comparisons=0;
+    const auto less=[&](uint64_t left,uint64_t right) {
+        if((comparisons++&4095)==0) CheckStatisticsCancelled(cancelled);
+        return left<right;
+    };
+    std::sort( values.begin(), values.end(),less );
 
     const auto reader = [&]( uint64_t index, uint64_t& value ) {
         if( index < implicitZeros )
@@ -630,10 +636,11 @@ ExactDistribution ComputeExactDistributionBounded( const std::vector<int64_t>& e
     deviations.reserve( values.size() );
     for( const auto value : values )
     {
+        if((deviations.size()&4095)==0) CheckStatisticsCancelled(cancelled);
         const auto value2 = value * 2;
         deviations.emplace_back( value2 >= median2 ? value2 - median2 : median2 - value2 );
     }
-    std::sort( deviations.begin(), deviations.end() );
+    std::sort( deviations.begin(), deviations.end(),less );
     const auto insertion = uint64_t( std::lower_bound(
         deviations.begin(), deviations.end(), median2 ) - deviations.begin() );
     const auto deviationReader = [&]( uint64_t index, uint64_t& value ) {
@@ -680,11 +687,53 @@ const char* AnomalyPatternName( AnomalyPattern pattern )
 
 ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& explicitValues,
     uint64_t implicitZeros, const std::filesystem::path& temporaryRoot,
-    const std::string& rawPrefix, uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk )
+    const std::string& rawPrefix, uint64_t maximumBufferedValues,const std::shared_ptr<AnalysisDiskBudget>& disk,
+    const std::function<bool()>& cancelled )
+try
 {
+    CheckStatisticsCancelled(cancelled);
+    const auto cancelSort=[&]() { CheckStatisticsCancelled(cancelled); return false; };
+    // Wait/critical metrics commonly contain only zeros. More generally a
+    // constant explicit population plus implicit zeros has at most two values;
+    // exact weighted order statistics need neither sorting nor scratch files.
+    bool constant=!explicitValues.empty() && explicitValues.front()>=0;
+    for(size_t i=1;constant && i<explicitValues.size();++i) {
+        if((i&4095)==0) CheckStatisticsCancelled(cancelled);
+        constant=explicitValues[i]==explicitValues.front();
+    }
+    if(constant) {
+        ExactDistribution result;
+        if(explicitValues.size()>UINT64_MAX-implicitZeros) {
+            result.exact=false; result.unavailableReason="statistics_count_overflow"; return result;
+        }
+        const auto value=uint64_t(explicitValues.front());
+        result.count=uint64_t(explicitValues.size())+implicitZeros;
+        result.zeroCount=value==0?result.count:implicitZeros;
+        if(value!=0 && explicitValues.size()>uint64_t(INT64_MAX)/value) {
+            result.exact=false; result.unavailableReason="statistics_total_overflow"; return result;
+        }
+        result.total=int64_t(value*explicitValues.size());
+        result.min=implicitZeros?0:int64_t(value); result.max=int64_t(value);
+        result.mean=double(result.total)/double(result.count);
+        const auto reader=[&](uint64_t index,uint64_t& output) {output=index<implicitZeros?0:value;return index<result.count;};
+        ExactPercentile(result.count,0.50,reader,result.median); result.p50=result.median;
+        ExactPercentile(result.count,0.90,reader,result.p90);
+        ExactPercentile(result.count,0.95,reader,result.p95);
+        ExactPercentile(result.count,0.99,reader,result.p99);
+        uint64_t low=0,high=0; reader((result.count-1)/2,low);reader(result.count/2,high);
+        const auto median2=low+high;
+        const auto explicitDeviation=value*2>=median2?value*2-median2:median2-value*2;
+        const bool zeroFirst=median2<=explicitDeviation;
+        const auto firstCount=zeroFirst?implicitZeros:uint64_t(explicitValues.size());
+        const auto deviationReader=[&](uint64_t index,uint64_t& output) {
+            output=(index<firstCount)==zeroFirst?median2:explicitDeviation; return index<result.count;
+        };
+        double mad2=0; ExactPercentile(result.count,0.50,deviationReader,mad2);result.mad=mad2/2;
+        return result;
+    }
     if( maximumBufferedValues == 0 ) maximumBufferedValues = 1;
     if( explicitValues.size() <= maximumBufferedValues )
-        return ComputeExactDistributionBounded( explicitValues, implicitZeros );
+        return ComputeExactDistributionBounded( explicitValues, implicitZeros,cancelled );
 
     ExactDistribution result;
     if( explicitValues.size() > std::numeric_limits<uint64_t>::max() - implicitZeros )
@@ -715,9 +764,19 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     };
     cleanup();
 
+    // Readers declared below close before this guard runs, including on a
+    // resource rejection thrown while generating a sorted run.
+    struct CleanupGuard
+    {
+        std::function<void()> action;
+        ~CleanupGuard() { try { action(); } catch(...) {} }
+    } guard { cleanup };
+
     int64_t total = 0;
+    uint64_t validated=0;
     for( const auto value : explicitValues )
     {
+        if((validated++&4095)==0) CheckStatisticsCancelled(cancelled);
         if( value < 0 )
         {
             result.exact = false; result.unavailableReason = "negative_duration_not_supported";
@@ -734,9 +793,11 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     result.mean = double( total ) / double( result.count );
 
     std::string error;
-    if( !WritePairs( source, explicitValues, error,disk ) ||
-        !SortAnalysisUInt64Pairs( source, sorted, temporaryRoot, prefix + "-values",
-            explicitValues.size(), maximumBufferedValues, error,disk ) )
+    if( !SortAnalysisUInt64PairsGenerated( sorted, temporaryRoot, prefix + "-values",
+        maximumBufferedValues, [&](const auto& emit) {
+            for(uint64_t index=0;index<explicitValues.size();++index)
+                emit(AnalysisUInt64Pair{uint64_t(explicitValues[size_t(index)]),index});
+        }, error,disk,{},cancelSort ) )
     {
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
     }
@@ -771,30 +832,14 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
         result.exact = false; result.unavailableReason = "statistics_median_read_failed"; cleanup(); return result;
     }
     const uint64_t median2 = medianLow + medianHigh;
-    AnalysisDiskGrow(disk,uint64_t(explicitValues.size())*sizeof(AnalysisUInt64Pair));
-    std::ofstream deviations( deviationSource, std::ios::binary | std::ios::trunc );
-    if( !deviations )
-    {
-        accessor.Close();
-        result.exact = false; result.unavailableReason = "statistics_deviation_open_failed"; cleanup(); return result;
-    }
-    for( uint64_t index = 0; index < explicitValues.size(); ++index )
-    {
-        const uint64_t value2 = uint64_t( explicitValues[size_t( index )] ) * 2;
-        const AnalysisUInt64Pair pair {
-            value2 >= median2 ? value2 - median2 : median2 - value2, index
-        };
-        deviations.write( reinterpret_cast<const char*>( &pair ), sizeof( pair ) );
-        if( !deviations )
-        {
-            result.exact = false; result.unavailableReason = "statistics_deviation_write_failed";
-            deviations.close(); accessor.Close(); cleanup(); return result;
-        }
-    }
-    deviations.flush();
-    deviations.close();
-    if( !SortAnalysisUInt64Pairs( deviationSource, deviationSorted, temporaryRoot,
-        prefix + "-deviation", explicitValues.size(), maximumBufferedValues, error,disk ) )
+    if( !SortAnalysisUInt64PairsGenerated( deviationSorted, temporaryRoot,
+        prefix + "-deviation", maximumBufferedValues, [&](const auto& emit) {
+            for(uint64_t index=0;index<explicitValues.size();++index)
+            {
+                const uint64_t value2=uint64_t(explicitValues[size_t(index)])*2;
+                emit(AnalysisUInt64Pair{value2>=median2?value2-median2:median2-value2,index});
+            }
+        }, error,disk,{},cancelSort ) )
     {
         accessor.Close();
         result.exact = false; result.unavailableReason = error; cleanup(); return result;
@@ -823,6 +868,10 @@ ExactDistribution ComputeExactDistributionExternal( const std::vector<int64_t>& 
     deviationAccessor.Close();
     cleanup();
     return result;
+}
+catch(const StatisticsCancelled&)
+{
+    ExactDistribution result; result.exact=false; result.unavailableReason="cancelled"; return result;
 }
 
 namespace
@@ -1578,6 +1627,7 @@ bool NeutralStatisticsStreamBuilder::Finish( NeutralStatisticsResult& result, st
 
 bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result, std::string& error,
     const NeutralSignatureFramesSink& signatureSink, const std::function<bool()>& cancelled, bool retainResults )
+try
 {
     result = {};
     result.qualityComplete = true;
@@ -1646,8 +1696,10 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
             return !m_impl->completeFrameFilter || m_impl->completeFrameFilter(signature.domain,signature.frameScope,index);
         };
         uint64_t unknownCompleteFrames=0;
+        uint64_t checkedFrames=0;
         for( const auto& frame : frames )
         {
+            if((checkedFrames++&127)==0) CheckStatisticsCancelled(cancelled);
             aggregate.logical = aggregate.logical || frame.logical;
             const auto complete=completeFrame(frame.frameIndex);
             if(!complete) ++aggregate.outsideCompleteFrameCount;
@@ -1666,15 +1718,24 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
         const auto buildMetric=[&](const std::vector<MetricPoint>& points,const char* suffix) {
             const auto prefix=itemPrefix+suffix;
             if(aggregate.outsideCompleteFrameCount==0)
-                return BuildMetric(points,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+                return BuildMetric(points,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk,cancelled);
             AnalysisWorkspaceReservation subsetBudget(m_impl->workspace,65536+64ull*points.size());
             std::vector<MetricPoint> eligible; eligible.reserve(points.size());
-            for(const auto& point:points) if(completeFrame(point.frame)) eligible.push_back(point);
-            auto metric=BuildMetric(eligible,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk);
+            uint64_t checked=0;
+            for(const auto& point:points) {
+                if((checked++&127)==0) CheckStatisticsCancelled(cancelled);
+                if(completeFrame(point.frame)) eligible.push_back(point);
+            }
+            auto metric=BuildMetric(eligible,knownFrameCount,m_impl->root,prefix,m_impl->maximumBufferedValues,m_impl->disk,cancelled);
             std::vector<int64_t> present; present.reserve(points.size());
-            for(const auto& point:points) present.push_back(point.value);
+            for(const auto& point:points) {
+                if((present.size()&4095)==0) CheckStatisticsCancelled(cancelled);
+                present.push_back(point.value);
+            }
             metric.whenPresent=ComputeExactDistributionExternal(present,0,m_impl->root,
-                prefix+"-all-present",m_impl->maximumBufferedValues,m_impl->disk);
+                prefix+"-all-present",m_impl->maximumBufferedValues,m_impl->disk,cancelled);
+            if(metric.whenPresent.unavailableReason=="cancelled") throw StatisticsCancelled{};
+            CheckStatisticsCancelled(cancelled);
             return metric;
         };
         aggregate.inclusive=buildMetric(inclusive,"-inclusive");
@@ -1783,6 +1844,10 @@ bool NeutralStatisticsStreamBuilder::FinishImpl( NeutralStatisticsResult& result
     // per-domain count audit is returned here; it is a distinct public type.
     FinalizeRankingsAndAudit( result, m_impl->audits, retainResults ? nullptr : &streamedOutputs );
     return true;
+}
+catch(const StatisticsCancelled&)
+{
+    error="cancelled"; result.qualityComplete=false; return false;
 }
 
 NeutralStatisticsResult BuildNeutralStatistics( const NeutralStatisticsInput& input )

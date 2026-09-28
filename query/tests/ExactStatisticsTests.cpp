@@ -214,6 +214,99 @@ void DiskStatistics(const std::filesystem::path& root)
 
 int main( int argc, char** argv )
 {
+    if(argc>1 && std::string_view(argv[1])=="--constant-distribution-only")
+    {
+        const auto root=TemporaryRoot(); auto disk=std::make_shared<AnalysisDiskBudget>();
+        disk->checkSpace=[] {throw std::runtime_error("constant distribution wrote sort scratch");};
+        try {
+            for(const int64_t value:{0,3,9}) for(const uint64_t zeros:{0,7,4096,6000}) {
+                const std::vector<int64_t> values(4096,value);
+                const auto actual=ComputeExactDistributionExternal(values,zeros,root,"constant",128,disk);
+                AssertDistribution(actual,DistributionOracle(values,zeros));
+            }
+            const auto maximum=std::numeric_limits<int64_t>::max();
+            const auto large=ComputeExactDistributionExternal({maximum},1,root,"large",1,disk);
+            assert(large.exact && large.total==maximum && large.median==double(maximum)/2 && large.mad==double(maximum)/2);
+            const auto overflow=ComputeExactDistributionExternal({maximum,maximum},0,root,"overflow",1,disk);
+            assert(!overflow.exact && overflow.unavailableReason=="statistics_total_overflow");
+            assert(!std::filesystem::exists(root)); return 0;
+        } catch(const std::exception& e) {std::cerr<<e.what()<<std::endl;return 1;}
+    }
+    if(argc>1 && std::string_view(argv[1])=="--equal-distribution-only")
+    {
+        const auto root=TemporaryRoot();
+        auto disk=std::make_shared<AnalysisDiskBudget>(); uint64_t writes=0;
+        disk->checkSpace=[&]{++writes;};
+        std::vector<int64_t> values(512);
+        for(size_t i=0;i<values.size();++i) values[i]=(i*47)%1009;
+        const auto expected=ComputeExactDistributionExternal(values,0,root,"oracle",128,disk);
+        const auto singleWrites=writes;
+        NeutralStatisticsStreamBuilder stream(root/"stream",128,512,{},disk);
+        for(size_t i=0;i<values.size();++i) assert(stream.AddRun(Input("equal",i,values[i],values[i],values[i],values[i])));
+        stream.AddDenominator(Denominator("equal",values.size()));
+        writes=0; NeutralStatisticsStreamSummary summary; std::string error; uint64_t outputs=0;
+        assert(stream.FinishToSink(summary,error,[&](const auto& stat,const auto&) {
+            ++outputs;
+            for(const auto* metric:{&stat.inclusive,&stat.exclusive,&stat.wait,&stat.criticalPath}) {
+                AssertDistribution(metric->whenPresent,expected); AssertDistribution(metric->perCompleteFrame,expected);
+            }
+        }));
+        assert(outputs==1);
+        if(writes>4*singleWrites)
+        {std::cerr<<"identical complete/present distributions sorted twice: writes="<<writes<<" single="<<singleWrites<<std::endl;return 1;}
+        std::filesystem::remove_all(root); return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--distribution-cancel-only")
+    {
+        const auto root=TemporaryRoot();
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+        AnalysisDiskActivity activity(usage);
+        auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage;
+        std::vector<int64_t> values(8192);
+        for(size_t i=0;i<values.size();++i) values[i]=(i*47)%1009;
+        for(const uint64_t buffer:{128,65536})
+        {
+            size_t checks=0;
+            const auto result=ComputeExactDistributionExternal(values,7,root,"cancel",buffer,disk,[&]{return ++checks==16;});
+            if(result.exact || result.unavailableReason!="cancelled" || checks!=16)
+            {std::cerr<<"distribution failed cancellation buffer="<<buffer<<" checks="<<checks<<std::endl;return 1;}
+            assert(usage->Snapshot().currentBytes==0 && AnalysisDiskUsage::Bytes(root)==0);
+        }
+        std::filesystem::remove_all(root); return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--reduce-cancel-only")
+    {
+        const auto root=TemporaryRoot();
+        NeutralStatisticsStreamBuilder stream(root,128,1024);
+        for(uint64_t i=0;i<256;++i) assert(stream.AddRun(Input("cancel",i,i,i)));
+        stream.AddDenominator(Denominator("cancel",256));
+        bool cancel=false; uint64_t outputs=0, classified=0;
+        stream.SetCompleteFrameFilter([&](auto,auto,auto){ ++classified; cancel=true; return true; });
+        NeutralStatisticsStreamSummary result; std::string error;
+        const auto ok=stream.FinishToSink(result,error,[&](auto&,auto&){++outputs;},[&]{return cancel;});
+        if(ok || error!="cancelled" || outputs!=0 || classified>128)
+        { std::cerr<<"reduce ignored cancellation inside one signature: outputs="<<outputs<<" classified="<<classified<<std::endl;return 1; }
+        std::filesystem::remove_all(root);
+        return 0;
+    }
+    if(argc>1 && std::string_view(argv[1])=="--distribution-disk-only")
+    {
+        const auto root=TemporaryRoot();
+        auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+        AnalysisDiskActivity activity(usage);
+        auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage;
+        std::vector<int64_t> values;
+        for(int i=0;i<4096;++i) values.push_back((i*47)%1009);
+        const auto actual=ComputeExactDistributionExternal(values,701,root,"bounded",128,disk);
+        AssertDistribution(actual,DistributionOracle(values,701));
+        const auto state=usage->Snapshot();
+        std::cout<<"distribution_disk_peak="<<state.peakBytes<<" remaining="<<state.currentBytes<<'\n';
+        if(state.peakBytes>3*values.size()*sizeof(AnalysisUInt64Pair))
+        { std::cerr<<"distribution retains redundant unsorted source files; peak="<<state.peakBytes<<std::endl; return 1; }
+        assert(state.currentBytes==0 && AnalysisDiskUsage::Bytes(root)==0);
+        std::filesystem::remove_all(root);
+        return 0;
+    }
     const auto temporary = TemporaryRoot();
     {
         constexpr uint64_t Count=1025;

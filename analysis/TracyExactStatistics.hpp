@@ -267,7 +267,8 @@ ExactDistribution ComputeExactDistributionExternal(
     const std::filesystem::path& temporaryRoot,
     const std::string& prefix,
     uint64_t maximumBufferedValues,
-    const std::shared_ptr<AnalysisDiskBudget>& disk = {} );
+    const std::shared_ptr<AnalysisDiskBudget>& disk = {},
+    const std::function<bool()>& cancelled = {} );
 
 NeutralStatisticsResult BuildNeutralStatistics( const NeutralStatisticsInput& input );
 

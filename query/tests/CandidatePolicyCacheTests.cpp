@@ -1,5 +1,6 @@
 #include "TracyCandidatePolicyCache.hpp"
 #include "TracyHash.hpp"
+#include "TracyPolicyFrameSeries.hpp"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -673,8 +674,17 @@ void Scale(const std::filesystem::path& root,uint64_t count)
 {
     Require(count>0 && count<=2000000,"scale count range");
     const auto start=std::chrono::steady_clock::now(); NeutralStatisticsStreamSummary summary;
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(256ull<<20,128ull<<20);
+    auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+    AnalysisDiskActivity activity(usage);
+    auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage; disk->maximumBytes=512ull<<20;
+    const auto cancelled=[&]{return std::chrono::steady_clock::now()-start>std::chrono::seconds(120);};
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.workspace=workspace;
+    neutralOptions.table.disk=disk; neutralOptions.table.cancelled=cancelled;
+    CandidatePolicyCacheOptions policyOptions; policyOptions.table=neutralOptions.table;
     {
-        NeutralStatisticsStreamBuilder source(root/"runs"); NeutralStatisticsCacheWriter cache(root/"neutral",Identity);
+        NeutralStatisticsStreamBuilder source(root/"runs",65536,65536,workspace,disk);
+        NeutralStatisticsCacheWriter cache(root/"neutral",Identity,neutralOptions);
         for(uint64_t i=0;i<count;++i)
         {
             const auto id=ScaleId(i); const int64_t value=1'000'000+(i%97)*10000;
@@ -690,7 +700,7 @@ void Scale(const std::filesystem::path& root,uint64_t count)
             c.metricPreference="inclusive"; c.sourceOrdinal=ScaleIndex(c.signatureId,count); c.frameSeriesComplete=true;
             c.frames={{0,frames[0].inclusiveNs,{"event:"+c.signatureId},"structure",true}};
             cache.AppendContext(SerializePolicySignatureContextRecord(c));
-        });
+        },cancelled);
         Require(ok,error.c_str()); Require(summary.materializedResultPeak==0,"scale statistics streamed without retaining result vector");
         std::cerr<<"scale statistics emitted; building neutral rankings\n"; cache.Commit(summary);
     }
@@ -707,17 +717,17 @@ void Scale(const std::filesystem::path& root,uint64_t count)
     metadata.frameTimelines.push_back(timeline);
     std::string identity;
     {
-        NeutralStatisticsCacheReader neutral(root/"neutral",Identity);
+        NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
         metadata.aggregate.contentSha256=neutral.ContentSha256();
         std::cerr<<"scale neutral cache ready; building global/local candidate cache\n";
-        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata);
+        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata,policyOptions);
     }
     const auto policyBuilt=std::chrono::steady_clock::now();
     std::cerr<<"scale candidate cache published; reopening and verifying every candidate/ranking\n";
     uint64_t candidateCount=0,rankedCount=0,globalSelected=0,localSelected=0;
     json cacheSummary;
     {
-        CandidatePolicyCacheReader cache(root/"policy",identity);
+        CandidatePolicyCacheReader cache(root/"policy",identity,policyOptions);
         cacheSummary=json::parse(cache.SummaryJson());
         // Verification only: <=2 MB even at the maximum synthetic count.
         std::vector<uint8_t> seen(size_t(count),0);
@@ -784,13 +794,102 @@ void Scale(const std::filesystem::path& root,uint64_t count)
         {"neutral_build_ms",ms(start,neutralBuilt)},{"policy_build_ms",ms(neutralBuilt,policyBuilt)},{"reopen_verify_ms",ms(policyBuilt,end)},
         {"neutral_cache_bytes",DirectoryBytes(root/"neutral")},{"policy_cache_bytes",DirectoryBytes(root/"policy")},
         {"materialized_statistics_peak",summary.materializedResultPeak},{"retained_final_candidate_peak",cacheSummary.at("retained_final_candidate_peak")},
-        {"global_selected",globalSelected},{"local_selected",localSelected},{"verified",true}}.dump()<<'\n';
+        {"global_selected",globalSelected},{"local_selected",localSelected},{"verified",true},
+        {"workspace_peak_bytes",workspace->Snapshot().peakBytes},{"disk_peak_bytes",usage->Snapshot().peakBytes}}.dump()<<'\n';
+}
+
+void DenseSeriesScale(const std::filesystem::path& root)
+{
+    constexpr uint64_t Signatures=32, Frames=4096;
+    const auto started=std::chrono::steady_clock::now();
+    const auto cancelled=[&]{return std::chrono::steady_clock::now()-started>std::chrono::seconds(120);};
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(256ull<<20,128ull<<20);
+    auto usage=std::make_shared<AnalysisDiskUsage>(std::vector<std::filesystem::path>{root});
+    AnalysisDiskActivity activity(usage);
+    auto disk=std::make_shared<AnalysisDiskBudget>(); disk->usage=usage; disk->maximumBytes=512ull<<20;
+    NeutralStatisticsCacheOptions options; options.table.workspace=workspace;
+    options.table.disk=disk; options.table.cancelled=cancelled;
+    PagedRecordOptions seriesOptions; seriesOptions.workspace=workspace;
+    seriesOptions.disk=disk; seriesOptions.cancelled=cancelled;
+    NeutralStatisticsStreamSummary summary;
+    {
+        NeutralStatisticsStreamBuilder builder(root/"runs",1024,65536,workspace,disk);
+        NeutralStatisticsCacheWriter cache(root/"neutral",Identity,options);
+        PagedRecordWriter series(root/"series",Identity,sizeof(PolicySeriesRecord),seriesOptions);
+        for(uint64_t i=0;i<Signatures;++i) {
+            const auto id=ScaleId(i); builder.AddDenominator({"cpu",id,"Player",Frames});
+            for(uint64_t f=0;f<Frames;++f) Require(builder.AddRun({"cpu",id,"Player",f,
+                int64_t(1'000'000+i),int64_t(500'000+i),0,0,1,true,false}),"dense raw input");
+        }
+        builder.AddDomainAudit({"cpu",true,"complete",Signatures*Frames,Signatures*Frames,Signatures,Identity,Identity,true,{}});
+        std::string error;
+        const auto ok=builder.FinishToSink(summary,error,[&](const auto& stat,const auto& frames) {
+            const auto i=ScaleIndex(stat.signatureId,Signatures);
+            Require(frames.size()==Frames && stat.inclusive.perCompleteFrame.count==Frames &&
+                stat.inclusive.perCompleteFrame.median==double(1'000'000+i) &&
+                stat.inclusive.perCompleteFrame.mad==0 &&
+                stat.exclusive.perCompleteFrame.total==int64_t(Frames*(500'000+i)),"dense independent constant-distribution oracle");
+            cache.AppendStatistics(stat);
+            PolicySignatureContext context; context.domain="cpu"; context.signatureId=stat.signatureId;
+            context.frameScope="Player"; context.name="Dense"; context.path="Player/"+stat.signatureId;
+            context.threadOrQueue="thread:1"; context.sourceOrdinal=i; context.metricPreference="exclusive";
+            WritePolicyFrameSeries(series,context,frames);
+            cache.AppendContext(SerializePolicySignatureContextRecord(context));
+        },cancelled);
+        Require(ok,error.c_str()); Require(summary.qualityComplete,"dense reduce quality");
+        series.Commit(); cache.Commit(summary);
+    }
+    const auto reduced=std::chrono::steady_clock::now();
+    CandidatePolicyInput metadata; metadata.aggregateIdentity=Identity; metadata.aggregate.qualityComplete=true;
+    metadata.aggregate.domains=summary.domains;
+    metadata.normalizedProfile={{"frame_budget",{{"frame_ms",16.666667}}},{"module_budgets",json::array()},
+        {"resource_budgets",json::object()},{"user_focus",json::array()},
+        {"candidate_policy",{{"top_n",5},{"cumulative_contribution",0.8},{"per_domain_limit",50},
+            {"priorities",{"P0","P1","P2","P3","P4"}}}}};
+    metadata.profileIdentity=Sha(metadata.normalizedProfile);
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    AnalysisWorkspaceReservation timelineBudget(workspace,Frames*4ull*sizeof(PolicyFrameEvidence));
+    for(uint64_t f=0;f<Frames;++f) timeline.frames.push_back({f,20'000'000,{},"",true});
+    metadata.frameTimelines.push_back(std::move(timeline));
+    uint64_t seriesReads=0;
+    metadata.readFrameSeries=[&](const auto& context) {
+        auto frames=ReadPolicyFrameSeries(root/"series",context,32ull<<20,cancelled,Identity);
+        Require(frames.size()==Frames && frames.front().frameIndex==0 && frames.back().frameIndex==Frames-1,"dense series complete extent");
+        seriesReads+=frames.size(); return frames;
+    };
+    CandidatePolicyCacheOptions policyOptions; policyOptions.table=options.table;
+    std::string identity;
+    {
+        NeutralStatisticsCacheReader neutral(root/"neutral",Identity,options);
+        metadata.aggregate.contentSha256=neutral.ContentSha256();
+        identity=BuildCandidatePolicyCache(root/"policy",neutral,metadata,policyOptions);
+    }
+    const auto policyBuilt=std::chrono::steady_clock::now();
+    uint64_t candidates=0,ranks=0;
+    {
+        CandidatePolicyCacheReader reader(root/"policy",identity,policyOptions);
+        for(uint64_t ordinal=0;;) {const auto page=reader.Candidates(ordinal,7,1<<20);
+            for(const auto& row:page.records) {const auto c=json::parse(row.payload);
+                Require(reader.Candidate(c.at("candidate_id").get<std::string>())->payload==row.payload,"dense point lookup"); ++candidates;}
+            ordinal=page.nextOrdinal; Require(ordinal==candidates,"dense candidate pagination"); if(page.done)break;}
+        for(uint64_t ordinal=0;;) {const auto page=reader.RankedSignatures(ordinal,7,1<<20);
+            ranks+=page.records.size(); ordinal=page.nextOrdinal; Require(ordinal==ranks,"dense rank pagination"); if(page.done)break;}
+        Require(ranks==Signatures*3 && candidates>=Signatures && seriesReads>=Signatures*Frames,"dense complete rankings and frame-series consumption");
+    }
+    const auto ms=[](auto a,auto b){return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count();};
+    std::cout<<json{{"mode","dense-series"},{"signatures",Signatures},{"frames_per_signature",Frames},
+        {"reduce_cache_ms",ms(started,reduced)},{"policy_ms",ms(reduced,policyBuilt)},
+        {"reopen_verify_ms",ms(policyBuilt,std::chrono::steady_clock::now())},{"series_rows_read",seriesReads},
+        {"candidates",candidates},{"ranks",ranks},{"disk_final_bytes",DirectoryBytes(root)},
+        {"disk_peak_bytes",usage->Snapshot().peakBytes},{"workspace_peak_bytes",workspace->Snapshot().peakBytes},
+        {"verified",true}}.dump()<<'\n';
 }
 }
 int main(int argc,char** argv)
 {
     const auto root=std::filesystem::temp_directory_path()/("jn-policy-cache-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     try {
+        if(argc==2 && std::string(argv[1])=="--scale-dense-series") { DenseSeriesScale(root); std::filesystem::remove_all(root); return 0; }
         if(argc==3 && std::string(argv[1])=="--scale-policy") { Scale(root,std::stoull(argv[2])); std::filesystem::remove_all(root); return 0; }
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
