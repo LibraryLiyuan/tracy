@@ -389,9 +389,20 @@ public:
 
     std::string MakeRef( const char* kind, uint64_t id ) const
     {
-        std::ostringstream out;
-        out << "tracy:v1:" << fingerprint.substr( 0, 16 ) << ':' << kind << ':' << std::hex << id;
-        return out.str();
+        const auto fingerprintLength = std::min<size_t>( 16, fingerprint.size() );
+        const auto kindLength = std::strlen( kind );
+        std::string out;
+        out.reserve( 9 + fingerprintLength + 1 + kindLength + 1 + 16 );
+        out.append( "tracy:v1:" );
+        out.append( fingerprint.data(), fingerprintLength );
+        out.push_back( ':' );
+        out.append( kind, kindLength );
+        out.push_back( ':' );
+        char digits[16];
+        const auto result = std::to_chars( digits, digits + sizeof( digits ), id, 16 );
+        if( result.ec != std::errc {} ) throw std::runtime_error( "entity reference formatting failed" );
+        out.append( digits, result.ptr );
+        return out;
     }
 
     std::optional<uint64_t> ParseRef( std::string_view ref, std::string_view kind ) const

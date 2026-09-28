@@ -75,6 +75,12 @@ int main( int argc, char** argv )
         Require( rejectedUnboundCompact, "manifest-bound compact payload opened without its external dictionary" );
 
         auto indexed = tracy::query::QueryIndex::Open( manifest );
+        const auto refPrefix = std::string( "tracy:v1:" ) + manifest.sourceFingerprint.substr( 0, 16 ) + ":cpu-zone:";
+        const uint64_t maximumRefId = ~uint64_t( 0 );
+        Require( indexed->MakeEntityRef( "cpu-zone", 0 ) == refPrefix + "0" &&
+            indexed->MakeEntityRef( "cpu-zone", maximumRefId ) == refPrefix + "ffffffffffffffff" &&
+            indexed->ParseEntityRef( refPrefix + "ffffffffffffffff", "cpu-zone" ) == maximumRefId,
+            "indexed Worker entity reference formatting changed" );
         Require( indexed->SampleDerivedDataReady(),
             "indexed trace did not publish complete Sample derived data" );
         const auto indexedInfo = indexed->GetTraceInfo();
