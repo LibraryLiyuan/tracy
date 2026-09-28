@@ -309,13 +309,15 @@ bool GenerationName( const std::string& value )
 
 void RetireUnpublishedGenerations( const std::filesystem::path& generationsRoot,
     const std::filesystem::path& receiptPath, std::string_view identity,
-    std::string_view scanId, std::string_view kind, AnalysisCacheTableOptions options )
+    std::string_view scanId, std::string_view kind, AnalysisCacheTableOptions options,
+    std::string_view preservedGeneration = {} )
 {
     if( !std::filesystem::exists( generationsRoot ) ) return;
     AnalysisWorkspaceReservation cleanupWorkspace( options.workspace, 65536 );
     std::vector<std::filesystem::path> paths;
     for( const auto& entry : std::filesystem::directory_iterator( generationsRoot ) )
     {
+        if(entry.path().filename().string()==preservedGeneration)continue;
         cleanupWorkspace.Add( 1024 + 8ull * entry.path().native().size() );
         paths.push_back( entry.path() );
     }
@@ -405,6 +407,72 @@ std::string NewGeneration( const std::filesystem::path& parent )
     throw std::runtime_error("analysis_scan_generation_limit");
 }
 
+std::string FindPhaseGeneration(const std::filesystem::path& parent,const std::string& identity,
+    AnalysisCacheTableOptions options)
+{
+    if(!std::filesystem::exists(parent))return {};
+    std::string selected;AnalysisWorkspaceReservation control(options.workspace);
+    for(const auto& entry:std::filesystem::directory_iterator(parent)) {
+        const auto path=entry.path();const auto pointer=path/"phase-current.json";
+        if(!std::filesystem::exists(pointer))continue;
+        if(!GenerationName(path.filename().string()))throw std::runtime_error("analysis_phase_generation_name");
+        CheckCleanupPath(parent,path);
+        const auto owner=ReadJson(path/"phase-owner.json",control),current=ReadJson(pointer,control);
+        if(owner.at("schema")!=1 || owner.at("identity")!=identity || current.at("schema")!=1 || current.at("identity")!=identity)
+            throw std::runtime_error("analysis_phase_generation_identity");
+        const auto phase=current.at("phase").get<unsigned>();
+        if(phase<1 || phase>3)throw std::runtime_error("analysis_phase_generation_version");
+        AnalysisCacheTableReader header(path/("phase-"+std::to_string(phase))/"header",identity,"analysis-phase-header-v1",options);
+        if(header.RecordCount()!=1 || header.Descriptor().contentSha256!=current.at("header_sha").get<std::string>())
+            throw std::runtime_error("analysis_phase_generation_header");
+        if(!selected.empty())throw std::runtime_error("analysis_multiple_phase_generations");
+        selected=path.filename().string();
+    }
+    return selected;
+}
+
+void CleanupPhaseInputs(const std::filesystem::path& root,const std::string& identity,
+    AnalysisCacheTableOptions options)
+{
+    const auto owner=root/"phase-owner.json";
+    if(!std::filesystem::exists(owner))return;
+    CheckCleanupPath(root,owner);AnalysisWorkspaceReservation control(options.workspace);
+    const auto value=ReadJson(owner,control);
+    if(value.at("schema")!=1 || value.at("identity")!=identity)throw std::runtime_error("analysis_phase_cleanup_owner");
+    const auto receipt=root/"phase-cleanup.json";
+    const auto alreadyClean=[&] {
+        if(!std::filesystem::exists(receipt))return false;
+        CheckCleanupPath(root,receipt);const auto prior=ReadJson(receipt,control);
+        if(prior.at("identity")!=identity)throw std::runtime_error("analysis_phase_cleanup_receipt_identity");
+        return prior.at("complete").get<bool>();
+    };
+    if(alreadyClean())return;
+    AnalysisWriterLease lease;std::string error;
+    while(!AcquireAnalysisWriterLease(root,lease,error)) {
+        if(options.cancelled && options.cancelled())throw std::runtime_error("cancelled");
+        if(alreadyClean())return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    if(alreadyClean())return;
+    json files=json::array();uint64_t removed=0;
+    for(const auto* name:{"phase-current.json","phase-1","phase-2","phase-3","statistics",
+        "cpu-definitions-v1","cpu-context-input-v2","gpu-definitions-v1","gpu-context-input-v2","gpu-relation-ambiguity"}) {
+        const auto path=root/name;if(!std::filesystem::exists(path))continue;
+        CheckCleanupPath(root,path);const auto before=AnalysisDiskUsage::Bytes(path);
+        std::error_code ec;AnalysisDiskRemove(path,options.disk,ec,true);
+        const auto remaining=AnalysisDiskUsage::Bytes(path);
+        removed+=before-std::min(before,remaining);
+        files.push_back({{"name",name},{"remaining_bytes",remaining},{"error",ec?json(ec.message()):json(nullptr)}});
+        if(ec || std::filesystem::exists(path)) {
+            WriteJson(root/"phase-cleanup.json",{{"identity",identity},{"complete",false},{"removed_bytes",removed},{"files",files}},error,
+                options.disk?options.disk->usage:nullptr,options.disk?options.disk->maximumBytes:UINT64_MAX);
+            throw std::runtime_error("analysis_phase_cleanup_failed");
+        }
+    }
+    if(!WriteJson(root/"phase-cleanup.json",{{"identity",identity},{"complete",true},{"removed_bytes",removed},{"files",files}},error,
+        options.disk?options.disk->usage:nullptr,options.disk?options.disk->maximumBytes:UINT64_MAX))throw std::runtime_error(error);
+}
+
 void CheckGenerationDiskBudget( const std::filesystem::path& root,uint64_t limit,
     std::stop_token stopToken )
 {
@@ -448,6 +516,8 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         products.metadataWorkspace=AnalysisWorkspaceReservation(workspace);
         products.contextWorkspace=AnalysisWorkspaceReservation(workspace);
         const auto temporaryRoot=AnalysisPath(request.temporaryRoot);
+        if(!request.aggregateRoot.empty() && std::filesystem::exists(temporaryRoot/"bundle-header"/"manifest.json"))
+            throw std::runtime_error("analysis_phase_generation_published");
         const auto statisticsRoot = temporaryRoot / "statistics";
         std::filesystem::create_directories( statisticsRoot );
         NeutralStatisticsStreamBuilder statistics( statisticsRoot, 65536, 65536, workspace, request.disk );
@@ -469,6 +539,106 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         std::unique_ptr<AnalysisCacheTableReader> gpuContextInput;
         uint64_t nextContextOrdinal = 0;
         std::map<std::string, size_t> contexts;
+        // Phase snapshots are internal to an owned generation, never inferred
+        // from leftover work files. Direct diagnostic executors opt in by
+        // supplying aggregateRoot; Manager always supplies it.
+        const bool checkpoints=!request.aggregateRoot.empty();
+        const auto phaseIdentity=products.neutralCacheIdentity;
+        const auto storageIdentity=request.source->GetScanStorageIdentity();
+        AnalysisWriterLease phaseLease;
+        unsigned restoredPhase=0;
+        std::string phaseHeaderSha;
+        const auto phasePath=[&](unsigned phase){return temporaryRoot/("phase-"+std::to_string(phase));};
+        const auto phaseStats=[&](unsigned phase){return statisticsRoot/("checkpoint-"+std::to_string(phase));};
+        const auto contextHash=[&](unsigned phase,bool deep) {
+            json hashes=json::object();
+            for(const auto* name:{"cpu-context-input-v2","gpu-context-input-v2"}) {
+                if(phase<2 && std::string_view(name).starts_with("gpu"))continue;
+                CheckCleanupPath(temporaryRoot,temporaryRoot/name);
+                AnalysisCacheTableReader table(temporaryRoot/name,phaseIdentity,name,cacheOptions.table);
+                if(deep)table.ValidateAll(); hashes[name]=table.Descriptor().contentSha256;
+            }
+            return hashes;
+        };
+        const auto savePhase=[&](unsigned phase) {
+            if(!checkpoints)return;
+            if(cancelled())throw std::runtime_error("cancelled");
+            statistics.SaveCheckpoint(phaseStats(phase),phaseIdentity,cancelled);
+            AnalysisCacheTableReader stats(phaseStats(phase),phaseIdentity,"neutral-statistics-checkpoint-v1",cacheOptions.table);
+            const auto md=SaveAnalysisPhaseMetadata(phasePath(phase)/"metadata",phaseIdentity,products,cacheOptions.table);
+            const json header={{"schema",1},{"phase",phase},{"identity",phaseIdentity},{"storage_identity",storageIdentity},{"parent_sha",phaseHeaderSha},
+                {"next_context",nextContextOrdinal},{"statistics_sha",stats.Descriptor().contentSha256},
+                {"metadata_sha",md.contentSha256},{"contexts",contextHash(phase,false)}};
+            AnalysisCacheTableWriter output(phasePath(phase)/"header",phaseIdentity,"analysis-phase-header-v1",cacheOptions.table);
+            output.Append("header",header.dump()); const auto saved=output.Commit();
+            const auto limit=request.disk?request.disk->maximumBytes:UINT64_MAX;
+            if(!WriteJson(temporaryRoot/"phase-current.json",{{"schema",1},{"identity",phaseIdentity},
+                {"phase",phase},{"header_sha",saved.contentSha256}},error,
+                request.disk?request.disk->usage:nullptr,limit))throw std::runtime_error(error);
+            phaseHeaderSha=saved.contentSha256;
+            std::cerr<<"Query phase-checkpoint saved="<<phase<<" sha="<<phaseHeaderSha<<'\n';
+        };
+        if(checkpoints) {
+            if(!AcquireAnalysisWriterLease(temporaryRoot,phaseLease,error))throw std::runtime_error("analysis_phase_owner_locked:"+error);
+            const auto owner=temporaryRoot/"phase-owner.json";
+            AnalysisWorkspaceReservation control(workspace);
+            if(std::filesystem::exists(owner)) {
+                CheckCleanupPath(temporaryRoot,owner); const auto value=ReadJson(owner,control);
+                if(value.at("schema")!=1 || value.at("identity")!=phaseIdentity)throw std::runtime_error("analysis_phase_owner_identity");
+            } else {
+                if(!WriteJson(owner,{{"schema",1},{"identity",phaseIdentity}},error,
+                    request.disk?request.disk->usage:nullptr,request.disk?request.disk->maximumBytes:UINT64_MAX))throw std::runtime_error(error);
+            }
+            const auto pointer=temporaryRoot/"phase-current.json";
+            if(std::filesystem::exists(pointer)) {
+                CheckCleanupPath(temporaryRoot,pointer); const auto current=ReadJson(pointer,control);
+                if(current.at("schema")!=1 || current.at("identity")!=phaseIdentity)throw std::runtime_error("analysis_phase_identity");
+                restoredPhase=current.at("phase").get<unsigned>();
+                if(restoredPhase<1 || restoredPhase>3)throw std::runtime_error("analysis_phase_version");
+                std::string previous; json header;
+                for(unsigned phase=1;phase<=restoredPhase;++phase) {
+                    CheckCleanupPath(temporaryRoot,phasePath(phase));
+                    AnalysisCacheTableReader table(phasePath(phase)/"header",phaseIdentity,"analysis-phase-header-v1",cacheOptions.table);
+                    if(table.RecordCount()!=1)throw std::runtime_error("analysis_phase_header_count");
+                    const auto row=table.GetAt(0);header=json::parse(row.payload);
+                    if(row.key!="header" || header.at("schema")!=1 || header.at("phase")!=phase ||
+                        header.at("identity")!=phaseIdentity || header.at("parent_sha")!=previous)throw std::runtime_error("analysis_phase_dependency");
+                    previous=table.Descriptor().contentSha256;
+                }
+                if(previous!=current.at("header_sha").get<std::string>())throw std::runtime_error("analysis_phase_header_identity");
+                if(header.at("storage_identity")!=storageIdentity)throw std::runtime_error("analysis_phase_storage_identity");
+                CheckCleanupPath(temporaryRoot,phaseStats(restoredPhase));
+                AnalysisCacheTableReader stats(phaseStats(restoredPhase),phaseIdentity,"neutral-statistics-checkpoint-v1",cacheOptions.table);
+                if(stats.Descriptor().contentSha256!=header.at("statistics_sha").get<std::string>())throw std::runtime_error("analysis_phase_statistics_identity");
+                if(contextHash(restoredPhase,true)!=header.at("contexts"))throw std::runtime_error("analysis_phase_context_identity");
+                statistics.RestoreCheckpoint(phaseStats(restoredPhase),phaseIdentity,cancelled);
+                products=LoadAnalysisPhaseMetadata(phasePath(restoredPhase)/"metadata",phaseIdentity,header.at("metadata_sha").get<std::string>(),cacheOptions.table);
+                products.neutralCacheIdentity=phaseIdentity;nextContextOrdinal=header.at("next_context").get<uint64_t>();
+                phaseHeaderSha=previous;
+                for(size_t i=0;i<products.signatureContexts.size();++i) {
+                    const auto& c=products.signatureContexts[i];
+                    if(!c.sourceOrdinal || *c.sourceOrdinal>=nextContextOrdinal)throw std::runtime_error("analysis_phase_context_ordinal");
+                    const auto key=c.domain+'\n'+c.signatureId+'\n'+c.frameScope;
+                    products.contextWorkspace.Add(1024+4ull*key.size());
+                    if(!contexts.emplace(key,i).second)throw std::runtime_error("analysis_phase_context_duplicate");
+                }
+                const auto retiredRunBytes=statistics.CleanupUnreferencedRuns(cancelled);
+                std::cerr<<"Query phase-retire-runs removed_bytes="<<retiredRunBytes<<'\n';
+                // Only later phase output is retired, under both the aggregate
+                // owner (Manager) and this generation lease. Snapshot runs stay
+                // pinned; NextPath never overwrites a cancelled attempt's file.
+                std::vector<std::filesystem::path> stale={temporaryRoot/"frame-series-v1.bin",temporaryRoot/"neutral-statistics-v1",
+                    temporaryRoot/"metadata",temporaryRoot/"bundle-header"};
+                if(restoredPhase<2) {stale.push_back(gpuDefinitionsPath);stale.push_back(gpuContextsPath);stale.push_back(temporaryRoot/"gpu-relation-ambiguity");}
+                for(unsigned phase=restoredPhase+1;phase<=3;++phase) {stale.push_back(phasePath(phase));stale.push_back(phaseStats(phase));}
+                for(const auto& path:stale) if(std::filesystem::exists(path)) {
+                    CheckCleanupPath(temporaryRoot,path);std::error_code ec;AnalysisDiskRemove(path,request.disk,ec,true);
+                    if(ec || std::filesystem::exists(path))throw std::runtime_error("analysis_phase_cleanup_failed");
+                }
+                progress(ScanState::Scanning,restoredPhase,3,"phase_checkpoint_reused");
+                std::cerr<<"Query phase-checkpoint reused="<<restoredPhase<<'\n';
+            }
+        }
         const auto contextKey = []( std::string_view domain, std::string_view signature,
             std::string_view frameScope ) {
             return std::string( domain ) + '\n' + std::string( signature ) + '\n' +
@@ -501,6 +671,36 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         // needed numeric facts/context have been copied into the bounded store
         // before this scope ends. The source Worker itself remains unchanged.
         {
+        const auto summarizeFindings = []( const auto& findings,
+            std::initializer_list<std::string_view> prefixes ) {
+            std::string summary;
+            for( const auto& finding : findings )
+            {
+                const auto matches = prefixes.size() == 0 || std::any_of( prefixes.begin(), prefixes.end(),
+                    [&]( std::string_view prefix ) { return std::string_view( finding.code ).starts_with( prefix ); } );
+                if( !matches ) continue;
+                if( !summary.empty() ) summary += ';';
+                summary += finding.code + "=" + std::to_string( finding.count );
+            }
+            return summary;
+        };
+        const auto sourceStatus = []( bool present, const std::string& reason ) {
+            return !present ? std::string( "absent" ) :
+                reason.empty() ? std::string( "complete" ) : std::string( "invalid" );
+        };
+        const auto audit = [&]( std::string domain, bool present, std::string status,
+            uint64_t inputCount, uint64_t outputCount, std::string reason = {} ) {
+            const auto checksum = HashText( domain + "\n" + std::to_string( inputCount ) + "\n" +
+                std::to_string( outputCount ) + "\n" + status );
+            // qualityComplete describes this scanner's lossless transfer into
+            // the neutral aggregate. Source-domain degradation is represented
+            // by status=invalid plus an explicit reason, so CandidatePolicy can
+            // retain a quality appendix without publishing corrupt numbers.
+            statistics.AddDomainAudit( { std::move( domain ), present, std::move( status ),
+                inputCount, inputCount, outputCount, checksum, checksum, true, std::move( reason ) } );
+        };
+
+        if(restoredPhase<1) {
         AnalysisWorkspaceReservation scanRegistryWorkspace( workspace );
         std::unordered_map<uint64_t, NeutralStatisticsStreamBuilder::SignatureToken> cpuTokens;
 
@@ -644,14 +844,18 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         }
         cpuContexts.Commit();
         }
+        const auto cpuReason = summarizeFindings( cpu.qualityFindings, {} );
+        audit( "cpu", cpu.inputZoneCount != 0,
+            sourceStatus( cpu.inputZoneCount != 0, cpuReason ),
+            cpu.inputZoneCount, cpuTokens.size(), cpuReason );
+        savePhase(1);
+        }
         cpuContextInput = std::make_unique<AnalysisCacheTableReader>( cpuContextsPath,
             products.neutralCacheIdentity, "cpu-context-input-v2", cacheOptions.table );
 
+        if(restoredPhase<2) {
+        AnalysisWorkspaceReservation scanRegistryWorkspace(workspace);
         progress( ScanState::Scanning, 1, 4, "gpu_job_managed_relation_scan" );
-        uint64_t playerFrameDenominator = 0;
-        for( const auto& frameSet : cpu.frameSetDenominators )
-            if( frameSet.name == "Player.Frame" )
-                playerFrameDenominator += frameSet.completeFrameCount;
         // Job originFrameId is a process-wide correlated frame identity, not
         // an index into the Player.Frame FrameSet. Present, Editor and other
         // canonical domains can therefore allocate valid identities of their
@@ -796,71 +1000,16 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         }
         gpuContexts.Commit();
         }
-        gpuContextInput = std::make_unique<AnalysisCacheTableReader>( gpuContextsPath,
-            products.neutralCacheIdentity, "gpu-context-input-v2", cacheOptions.table );
         for( auto& [_, timeline] : gpuTimelines ) products.frameTimelines.push_back( std::move( timeline ) );
 
         for( const auto& signature : jobPresent )
             statistics.AddDenominator( { "job", signature, "Player.Frame", jobPlayerFrameDenominator } );
 
-        progress( ScanState::Scanning, 2, 4, "memory_io_sampling_telemetry_scan" );
-        const auto systemProgress = [&]( const MemoryIoSamplingTelemetryScanner::Progress& value ) {
-            progress( ScanState::Scanning, value.processed, value.total.value_or( 0 ), value.stage );
-            std::cerr << "Query system-progress " << json {
-                { "stage", value.stage }, { "processed", std::to_string( value.processed ) },
-                { "total", value.total ? json( std::to_string( *value.total ) ) : json( nullptr ) },
-                { "elapsed_ms", value.elapsedMs }, { "complete", value.complete }
-            }.dump() << '\n';
-        };
-        const auto system = MemoryIoSamplingTelemetryScanner( *request.source, 4096,
-            1'000'000, 10'000'000'000, systemProgress ).ScanSummary(
-            cancelled, workspace );
-        if( cancelled() ) return false;
-
-        const auto summarizeFindings = []( const auto& findings,
-            std::initializer_list<std::string_view> prefixes ) {
-            std::string summary;
-            for( const auto& finding : findings )
-            {
-                const auto matches = prefixes.size() == 0 || std::any_of( prefixes.begin(), prefixes.end(),
-                    [&]( std::string_view prefix ) { return std::string_view( finding.code ).starts_with( prefix ); } );
-                if( !matches ) continue;
-                if( !summary.empty() ) summary += ';';
-                summary += finding.code + "=" + std::to_string( finding.count );
-            }
-            return summary;
-        };
-        const auto sourceStatus = []( bool present, const std::string& reason ) {
-            return !present ? std::string( "absent" ) :
-                reason.empty() ? std::string( "complete" ) : std::string( "invalid" );
-        };
-        const auto audit = [&]( std::string domain, bool present, std::string status,
-            uint64_t inputCount, uint64_t outputCount, std::string reason = {} ) {
-            const auto checksum = HashText( domain + "\n" + std::to_string( inputCount ) + "\n" +
-                std::to_string( outputCount ) + "\n" + status );
-            // qualityComplete describes this scanner's lossless transfer into
-            // the neutral aggregate. Source-domain degradation is represented
-            // by status=invalid plus an explicit reason, so CandidatePolicy can
-            // retain a quality appendix without publishing corrupt numbers.
-            statistics.AddDomainAudit( { std::move( domain ), present, std::move( status ),
-                inputCount, inputCount, outputCount, checksum, checksum, true, std::move( reason ) } );
-        };
-        const auto cpuReason = summarizeFindings( cpu.qualityFindings, {} );
         const auto gpuReason = summarizeFindings( gpuJob.qualityFindings,
             { "gpu_", "missing_gpu_", "invalid_gpu_" } );
         const auto jobReason = summarizeFindings( gpuJob.qualityFindings, { "job_" } );
         const auto managedReason = summarizeFindings( gpuJob.qualityFindings, { "script_" } );
         const auto relationReason = summarizeFindings( gpuJob.qualityFindings, { "relation_" } );
-        const auto memoryReason = summarizeFindings( system.qualityFindings, { "cpu_memory_" } );
-        const auto gpuMemoryReason = summarizeFindings( system.qualityFindings, { "gpu_memory_" } );
-        const auto ioReason = summarizeFindings( system.qualityFindings, { "io_" } );
-        const auto samplingReason = summarizeFindings( system.qualityFindings, { "sampling_" } );
-        const auto schedulingReason = summarizeFindings( system.qualityFindings, { "scheduling_" } );
-        const auto telemetryReason = summarizeFindings( system.qualityFindings, { "telemetry_" } );
-
-        audit( "cpu", cpu.inputZoneCount != 0,
-            sourceStatus( cpu.inputZoneCount != 0, cpuReason ),
-            cpu.inputZoneCount, cpuTokens.size(), cpuReason );
         audit( "gpu", gpuJob.gpuZoneCount != 0,
             sourceStatus( gpuJob.gpuZoneCount != 0, gpuReason ),
             gpuJob.gpuZoneCount, gpuPresent.size(), gpuReason );
@@ -877,6 +1026,32 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
         audit( "relation", gpuJob.relationCount != 0,
             sourceStatus( gpuJob.relationCount != 0, relationReason ),
             gpuJob.relationCount, 0, relationReason );
+        savePhase(2);
+        }
+        gpuContextInput = std::make_unique<AnalysisCacheTableReader>( gpuContextsPath,
+            products.neutralCacheIdentity, "gpu-context-input-v2", cacheOptions.table );
+        if(restoredPhase<3) {
+        progress( ScanState::Scanning, 2, 4, "memory_io_sampling_telemetry_scan" );
+        const auto systemProgress = [&]( const MemoryIoSamplingTelemetryScanner::Progress& value ) {
+            progress( ScanState::Scanning, value.processed, value.total.value_or( 0 ), value.stage );
+            std::cerr << "Query system-progress " << json {
+                { "stage", value.stage }, { "processed", std::to_string( value.processed ) },
+                { "total", value.total ? json( std::to_string( *value.total ) ) : json( nullptr ) },
+                { "elapsed_ms", value.elapsedMs }, { "complete", value.complete }
+            }.dump() << '\n';
+        };
+        const auto system = MemoryIoSamplingTelemetryScanner( *request.source, 4096,
+            1'000'000, 10'000'000'000, systemProgress ).ScanSummary(
+            cancelled, workspace );
+        if( cancelled() ) return false;
+
+        const auto memoryReason = summarizeFindings( system.qualityFindings, { "cpu_memory_" } );
+        const auto gpuMemoryReason = summarizeFindings( system.qualityFindings, { "gpu_memory_" } );
+        const auto ioReason = summarizeFindings( system.qualityFindings, { "io_" } );
+        const auto samplingReason = summarizeFindings( system.qualityFindings, { "sampling_" } );
+        const auto schedulingReason = summarizeFindings( system.qualityFindings, { "scheduling_" } );
+        const auto telemetryReason = summarizeFindings( system.qualityFindings, { "telemetry_" } );
+
         // Audit source records, not compact analysis outputs.  A pool, a
         // unique allocation, a scheduling role or a producer is a summary and
         // cannot prove that every source record was consumed.
@@ -930,6 +1105,8 @@ bool ExecuteDefaultAnalysisScan( const AnalysisScanExecutionRequest& request,
                 "Engine-known concurrently live root-allocation peak" } );
         }
 
+        savePhase(3);
+        }
         }
         progress( ScanState::Aggregating, 3, 4, "exact_statistics" );
         products.frameSeriesPath = temporaryRoot / "frame-series-v1.bin";
@@ -1436,9 +1613,10 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         if(!reused) reused=loadCurrent();
         if(!reused)
         {
+        const auto resumableGeneration=FindPhaseGeneration(entry->aggregateRoot/"generations",identity,options);
         RetireUnpublishedGenerations( entry->aggregateRoot / "generations",
             entry->scanRoot / "neutral-generation-cleanup.json", identity,
-            entry->snapshot.scanId, "neutral", options );
+            entry->snapshot.scanId, "neutral", options, resumableGeneration );
         products = {};
         auto source = entry->request.source;
         if( !source && m_resolver ) source = m_resolver( entry->request.tracePath, stopToken );
@@ -1455,7 +1633,7 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         request.workspace=workspace;
         request.checkDiskSpace=[disk]{disk->Check();};
         request.disk=options.disk;
-        const auto generation=NewGeneration(entry->aggregateRoot/"generations");
+        const auto generation=resumableGeneration.empty()?NewGeneration(entry->aggregateRoot/"generations"):resumableGeneration;
         request.temporaryRoot = entry->aggregateRoot/"generations"/generation;
         const auto progress = [this, entry, stopToken,&memory,disk]( ScanState state, uint64_t complete,
             uint64_t total, std::string_view stage ) {
@@ -1463,6 +1641,12 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
             disk->Check(true);
             if( !stopToken.stop_requested() ) Update( entry, state, complete, total, stage );
         };
+        // A crash can occur after the immutable bundle header is flushed but
+        // before current.json is replaced. Validate and publish that bundle;
+        // never send its generation back through the mutable scan executor.
+        const bool preparedBundle=std::filesystem::exists(request.temporaryRoot/"bundle-header"/"manifest.json");
+        std::string sha;
+        if(!preparedBundle) {
         if( !m_executor( request, stopToken, progress, products, error ) )
         {
             if(error.find("analysis_workspace_budget")!=std::string::npos)
@@ -1481,19 +1665,29 @@ void AnalysisScanManager::Run( const std::shared_ptr<Entry>& entry, std::stop_to
         const auto limit=entry->request.normalizedProfile.at("limits").at("cache_max_bytes").get<uint64_t>();
         CheckGenerationDiskBudget(request.temporaryRoot,limit,stopToken);
         disk->Check(true);
-        const auto sha=PublishAnalysisNeutralBundle(request.temporaryRoot,identity,products,options);
+        sha=PublishAnalysisNeutralBundle(request.temporaryRoot,identity,products,options);
+        } else {
+            CheckCleanupPath(entry->aggregateRoot,request.temporaryRoot);
+            AnalysisCacheTableReader header(request.temporaryRoot/"bundle-header",identity,"analysis-neutral-bundle-v1",options);
+            sha=header.Descriptor().contentSha256;
+            products=OpenAnalysisNeutralBundle(request.temporaryRoot,identity,sha,options);
+            Update(entry,ScanState::Aggregating,3,4,"neutral_bundle_recovered");
+        }
         ValidateFinalTables(products.neutralCachePath,identity,false,options);
-        products={}; // Reopen the persisted metadata; never trust only the writer's copy.
-        products=OpenAnalysisNeutralBundle(request.temporaryRoot,identity,sha,options);
+        if(!preparedBundle) {
+            products={}; // Reopen the persisted metadata; never trust only the writer's copy.
+            products=OpenAnalysisNeutralBundle(request.temporaryRoot,identity,sha,options);
+        }
         memory.Check();
         disk->Check(true);
         if(!WriteJson(entry->aggregateRoot/"current.json",{{"schema",1},{"identity",identity},
-            {"generation",generation},{"header_sha256",sha}},error,diskUsage,limit)) throw std::runtime_error(error);
+            {"generation",generation},{"header_sha256",sha}},error,diskUsage,options.disk->maximumBytes)) throw std::runtime_error(error);
         recordNeutral(generation,sha);
         CleanupPublishedTables(products.neutralCachePath,identity,false,true,options);
         }
     }
 
+    CleanupPhaseInputs(products.neutralCachePath.parent_path(),identity,options);
     if( stopToken.stop_requested() )
     { Update( entry, ScanState::CancelledResumable, 2, 4, "cancelled", "cancelled" ); return; }
     memory.Check();

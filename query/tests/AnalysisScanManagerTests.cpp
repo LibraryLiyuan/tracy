@@ -260,6 +260,8 @@ class SourceDegradedTrace final : public tracy::query::test::FakeTraceSource,
 {
 public:
     bool nestedCpu = false;
+    std::string storageIdentity="fixture-generation-1";
+    std::string GetScanStorageIdentity() const {return storageIdentity;}
     bool unknownCpu = false;
     bool wideNames = false;
     size_t wideSignatureCount = 0;
@@ -341,6 +343,7 @@ public:
     }
     std::vector<GpuZoneDto> ScanGpuZones( const ScanRange& range ) const override
     {
+        if(readHook)readHook("gpu");
         if(gpuFrameScopeProbe)
         {
             std::vector<GpuZoneDto> values;
@@ -1070,6 +1073,69 @@ int main(int argc,char** argv)
 
     const auto validation = ValidateAndNormalizeAnalysisProfile( Profile() );
     assert( validation.valid );
+    if(argc==2 && std::string(argv[1])=="--phase-metadata-budget") {
+        constexpr uint64_t Count=65536;const std::string identity(64,'e');
+        auto workspace=std::make_shared<AnalysisWorkspaceBudget>(96ull<<20,48ull<<20);
+        AnalysisCacheTableOptions options;options.workspace=workspace;
+        std::string hash;
+        {
+            AnalysisScanProducts input;input.metadataWorkspace=AnalysisWorkspaceReservation(workspace,Count*2*sizeof(PolicyFrameEvidence));
+            PolicyFrameTimeline timeline;timeline.frameScope="Player";timeline.name="Player";
+            timeline.frames.reserve(Count);
+            for(uint64_t i=0;i<Count;++i)timeline.frames.push_back({i,int64_t(i+1),{},"",true});
+            input.frameTimelines.push_back(std::move(timeline));
+            hash=SaveAnalysisPhaseMetadata(root/"phase-metadata",identity,input,options).contentSha256;
+        }
+        try {
+            const auto restored=LoadAnalysisPhaseMetadata(root/"phase-metadata",identity,hash,options);
+            assert(restored.frameTimelines.size()==1 && restored.frameTimelines[0].frames.size()==Count &&
+                restored.frameTimelines[0].frames.back().valueNs==Count);
+        } catch(const std::exception& e) {std::cerr<<"phase metadata restore exceeds bounded fixture: "<<e.what()<<std::endl;return 1;}
+        assert(workspace->Snapshot().currentBytes==0);
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--phase-storage-identity") {
+        auto source=std::make_shared<SourceDegradedTrace>();AnalysisScanExecutionRequest request;
+        request.source=source;request.aggregateRoot=root/"aggregate";request.temporaryRoot=root/"generation";
+        request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),"1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        std::stop_source stop;AnalysisScanProducts products;std::string error;
+        assert(!ExecuteDefaultAnalysisScan(request,stop.get_token(),[&](auto,auto,auto,auto stage){if(stage=="gpu_job_managed_relation_scan")stop.request_stop();},products,error));
+        source->storageIdentity="fixture-generation-2";
+        const auto ok=ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},products,error);
+        if(ok || error.find("storage_identity")==std::string::npos) {std::cerr<<"phase accepted a different source generation: "<<error<<std::endl;return 1;}
+        source->storageIdentity="fixture-generation-1";
+        assert(ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},products,error));
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--phase-recovery") {
+        auto source=std::make_shared<SourceDegradedTrace>();
+        AnalysisScanExecutionRequest request; request.source=source;
+        request.aggregateIdentity={source->GetTraceInfo().fingerprint,std::string(64,'e'),"1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        request.temporaryRoot=root/"baseline";
+        AnalysisScanProducts baseline;std::string error;
+        if(!ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},baseline,error))throw std::runtime_error(error);
+        std::string expectedHash;
+        {NeutralStatisticsCacheReader expected(baseline.neutralCachePath,baseline.neutralCacheIdentity);expectedHash=expected.ContentSha256();}
+        for(const std::string boundary:{"gpu_job_managed_relation_scan","memory_io_sampling_telemetry_scan","exact_statistics"}) {
+            std::map<std::string,uint64_t> reads;source->readHook=[&](auto domain){++reads[std::string(domain)];};
+            request.aggregateRoot=root/"aggregate";request.temporaryRoot=root/boundary;
+            std::stop_source stop;AnalysisScanProducts interrupted;
+            const auto ok=ExecuteDefaultAnalysisScan(request,stop.get_token(),[&](auto,auto,auto,auto stage){if(stage==boundary)stop.request_stop();},interrupted,error);
+            if(ok || !stop.stop_requested())throw std::runtime_error("phase cancellation boundary not reached");
+            const auto before=reads;interrupted={};AnalysisScanProducts resumed;
+            if(!ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},resumed,error)) {
+                std::cerr<<"phase recovery failed at "<<boundary<<": "<<error<<std::endl;return 1;
+            }
+            if(reads["cpu"]!=before.at("cpu")) {std::cerr<<"phase recovery rescanned completed CPU"<<std::endl;return 1;}
+            if(boundary!="gpu_job_managed_relation_scan" && reads["gpu"]!=before.at("gpu"))throw std::runtime_error("phase recovery rescanned completed GPU");
+            if(boundary=="exact_statistics" && reads["memory"]!=before.at("memory"))throw std::runtime_error("phase recovery rescanned completed System");
+            NeutralStatisticsCacheReader actual(resumed.neutralCachePath,resumed.neutralCacheIdentity);
+            if(actual.ContentSha256()!=expectedHash)throw std::runtime_error("phase recovery changed complete neutral output");
+        }
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--trace-disk-admission") {
         auto source=std::make_shared<SourceDegradedTrace>();
         AnalysisScanManager manager(root/"admission",root/"admission-cache",std::string(64,'d'),
@@ -1087,6 +1153,50 @@ int main(int argc,char** argv)
     // Other tests use an injected source; its physical fixture must have
     // sufficient capacity for the cache they intentionally construct.
     std::filesystem::resize_file(tracePath,16*1024*1024);
+    if(argc==2 && (std::string(argv[1])=="--manager-phase-recovery" || std::string(argv[1])=="--publication-phase-recovery")) {
+        const bool publicationCrash=std::string(argv[1])=="--publication-phase-recovery";
+        auto source=std::make_shared<SourceDegradedTrace>();uint64_t cpuReads=0;bool first=true;
+        AnalysisScanExecutionRequest savedExecution;
+        source->readHook=[&](auto domain){if(domain=="cpu")++cpuReads;};
+        AnalysisScanExecutor execute=[&](const auto& input,auto token,const auto& progress,auto& products,auto& error) {
+            savedExecution=input;
+            if(!first)return ExecuteDefaultAnalysisScan(input,token,progress,products,error);
+            first=false;std::stop_source stop;
+            return ExecuteDefaultAnalysisScan(input,stop.get_token(),[&](auto state,auto done,auto total,auto stage) {
+                progress(state,done,total,stage);if(stage=="gpu_job_managed_relation_scan")stop.request_stop();
+            },products,error);
+        };
+        AnalysisScanStartRequest request;request.traceSessionId="phase";request.tracePath=tracePath;request.source=source;
+        request.normalizedProfile=validation.normalized;request.profileIdentity=validation.profileSha256;
+        std::string scan;uint64_t before=0;
+        {
+            AnalysisScanManager manager(root/"state",root/"phase-cache",std::string(64,'e'),[source](const auto&,auto){return source;},execute);
+            scan=manager.Start(request).scanId;WaitFor(manager,scan,ScanState::CancelledResumable);before=cpuReads;
+        }
+        if(publicationCrash) {
+            AnalysisScanProducts ready;std::string error;
+            assert(ExecuteDefaultAnalysisScan(savedExecution,{},[](auto,auto,auto,auto){},ready,error));
+            AnalysisCacheTableOptions options;options.workspace=savedExecution.workspace;options.disk=savedExecution.disk;
+            PublishAnalysisNeutralBundle(AnalysisIoPath(savedExecution.temporaryRoot),ComputeNeutralAggregateIdentity(savedExecution.aggregateIdentity),ready,options);
+        }
+        {
+            AnalysisScanManager manager(root/"state",root/"phase-cache",std::string(64,'e'),[source](const auto&,auto){return source;},execute);
+            manager.Resume(scan);WaitFor(manager,scan,ScanState::Complete);
+            if(cpuReads!=before) {std::cerr<<"cold Manager discarded a completed CPU phase"<<std::endl;return 1;}
+            assert(!manager.Candidates(scan,100,"",{},json::object()).at("items").empty());
+            const auto cleanup=AnalysisIoPath(savedExecution.temporaryRoot)/"phase-cleanup.json";
+            const auto cleanupHash=Sha256File(cleanup);
+            const auto changed=ValidateAndNormalizeAnalysisProfile(Profile(2));assert(changed.valid);
+            request.normalizedProfile=changed.normalized;request.profileIdentity=changed.profileSha256;
+            WaitFor(manager,manager.Start(request).scanId,ScanState::Complete);
+            if(Sha256File(cleanup)!=cleanupHash) {std::cerr<<"reused neutral cache overwrote the cleanup receipt"<<std::endl;return 1;}
+        }
+        AnalysisScanProducts rejected;std::string error;
+        if(ExecuteDefaultAnalysisScan(savedExecution,{},[](auto,auto,auto,auto){},rejected,error) ||
+            error.find("generation_published")==std::string::npos)
+        {std::cerr<<"phase executor did not reject a published generation: "<<error<<std::endl;return 1;}
+        std::filesystem::remove_all(AnalysisIoPath(root));return 0;
+    }
     if(argc==2 && std::string(argv[1])=="--frame-timeline-workspace-only") {
         FrameTimelineWorkspace(root); RemoveTestRoot(root);
         std::cout<<"frame timeline workspace passed\n"; return 0;

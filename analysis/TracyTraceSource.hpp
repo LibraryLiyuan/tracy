@@ -920,6 +920,9 @@ public:
     virtual std::vector<Capability> GetCapabilities() const = 0;
     virtual TraceReadView AcquireReadView() const = 0;
     virtual TraceInfoDto GetTraceInfo() const = 0;
+    // Internal phase-recovery binding, separate from the immutable Trace SHA.
+    // Indexed sources include their layout version and pinned generation.
+    virtual std::string GetScanStorageIdentity() const {return "worker-memory-v1";}
     virtual TraceInfoDto GetTraceInfoMetadata() const
     {
         auto result = GetTraceInfo();

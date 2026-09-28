@@ -70,6 +70,91 @@ void PersistInjected(const std::filesystem::path& generation,const std::string& 
     std::vector<PolicySignatureContext>().swap(p.signatureContexts);
 }
 }
+AnalysisCacheTableDescriptor SaveAnalysisPhaseMetadata(const std::filesystem::path& path,
+    const std::string& identity,const AnalysisScanProducts& products,AnalysisCacheTableOptions options)
+{
+    AnalysisCacheTableWriter writer(path,identity,"analysis-phase-metadata-v1",options);
+    uint64_t ordinal=0;
+    const auto append=[&](const json& row) {Check(options);writer.Append(cache_key::Unsigned(ordinal++),row.dump());};
+    append({{"type","header"},{"contexts",products.signatureContexts.size()},
+        {"capacity",products.capacityFacts.size()},{"timelines",products.frameTimelines.size()}});
+    for(const auto& context:products.signatureContexts) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(context.path.size()+context.name.size()+context.signatureId.size()+context.frameScope.size()));
+        append({{"type","context"},{"context",SerializePolicySignatureContextRecord(context)}});
+    }
+    for(const auto& f:products.capacityFacts) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(f.description.size()+f.domain.size()+f.signatureId.size()+f.familyId.size()+f.metric.size()));
+        append({{"type","capacity"},{"domain",f.domain},{"signature",f.signatureId},{"family",f.familyId},
+            {"metric",f.metric},{"value",f.valueBytes},{"frame",f.frameIndex?json(*f.frameIndex):json(nullptr)},
+            {"exact",f.exact},{"description",f.description}});
+    }
+    for(const auto& timeline:products.frameTimelines) {
+        AnalysisWorkspaceReservation rowBudget(options.workspace,65536+32ull*(timeline.frameScope.size()+timeline.name.size()+timeline.observationUnit.size()));
+        append({{"type","timeline"},{"scope",timeline.frameScope},{"name",timeline.name},
+            {"unit",timeline.observationUnit},{"count",timeline.frames.size()}});
+        for(const auto& frame:timeline.frames) {
+            AnalysisWorkspaceReservation frameBudget(options.workspace,65536+32ull*frame.structureKey.size());
+            for(const auto& ref:frame.eventRefs)frameBudget.Add(2048+32ull*ref.size());
+            append({{"type","frame"},{"frame",Frame(frame)}});
+        }
+    }
+    return writer.Commit();
+}
+
+AnalysisScanProducts LoadAnalysisPhaseMetadata(const std::filesystem::path& path,
+    const std::string& identity,const std::string& contentSha,AnalysisCacheTableOptions options)
+{
+    AnalysisCacheTableReader reader(path,identity,"analysis-phase-metadata-v1",options);
+    if(reader.Descriptor().contentSha256!=contentSha)Fail("phase_metadata_identity");
+    AnalysisScanProducts products;
+    products.metadataWorkspace=AnalysisWorkspaceReservation(options.workspace);
+    products.contextWorkspace=AnalysisWorkspaceReservation(options.workspace);
+    uint64_t ordinal=0;
+    AnalysisWorkspaceReservation parseBudget(options.workspace);
+    const auto read=[&](std::string_view type) {
+        Check(options);if(ordinal>=reader.RecordCount())Fail("phase_metadata_truncated");
+        const auto row=reader.GetAt(ordinal);
+        if(row.key!=cache_key::Unsigned(ordinal++))Fail("phase_metadata_order");
+        parseBudget.Resize(65536+32ull*row.payload.size());
+        auto value=json::parse(row.payload);
+        if(value.at("type").get<std::string>()!=type)Fail("phase_metadata_type");
+        if(type=="context")products.contextWorkspace.Add(2048+16ull*row.payload.size());
+        else if(type=="frame") {
+            // Fixed frame/vector storage and owned strings survive this read;
+            // the JSON DOM belongs to parseBudget, not every retained frame.
+            products.metadataWorkspace.Add(4ull*sizeof(PolicyFrameEvidence)+4ull*row.payload.size());
+        }
+        else products.metadataWorkspace.Add(2048+16ull*row.payload.size());
+        return value;
+    };
+    const auto header=read("header");
+    for(const auto* field:{"contexts","capacity","timelines"})
+        if(!header.at(field).is_number_unsigned() || header.at(field).get<uint64_t>()>reader.RecordCount())Fail("phase_metadata_count");
+    for(uint64_t i=0;i<header.at("contexts").get<uint64_t>();++i) {
+        const auto row=read("context");PolicySignatureContext context;std::string error;
+        if(!DeserializePolicySignatureContextRecord(row.at("context").get<std::string>(),context,error))Fail("phase_context_invalid");
+        products.signatureContexts.push_back(std::move(context));
+    }
+    for(uint64_t i=0;i<header.at("capacity").get<uint64_t>();++i) {
+        const auto row=read("capacity");PolicyCapacityFact f;
+        f.domain=row.at("domain").get<std::string>();f.signatureId=row.at("signature").get<std::string>();
+        f.familyId=row.at("family").get<std::string>();f.metric=row.at("metric").get<std::string>();
+        f.valueBytes=row.at("value").get<uint64_t>();if(!row.at("frame").is_null())f.frameIndex=row.at("frame").get<uint64_t>();
+        f.exact=row.at("exact").get<bool>();f.description=row.at("description").get<std::string>();
+        products.capacityFacts.push_back(std::move(f));
+    }
+    for(uint64_t i=0;i<header.at("timelines").get<uint64_t>();++i) {
+        const auto row=read("timeline");const auto count=row.at("count").get<uint64_t>();
+        if(count>reader.RecordCount()-ordinal)Fail("phase_frame_count");
+        PolicyFrameTimeline timeline;timeline.frameScope=row.at("scope").get<std::string>();
+        timeline.name=row.at("name").get<std::string>();timeline.observationUnit=row.at("unit").get<std::string>();
+        for(uint64_t f=0;f<count;++f)timeline.frames.push_back(ParseFrame(read("frame").at("frame")));
+        products.frameTimelines.push_back(std::move(timeline));
+    }
+    if(ordinal!=reader.RecordCount())Fail("phase_metadata_extra");
+    reader.ValidateAll();return products;
+}
+
 std::string PublishAnalysisNeutralBundle(const std::filesystem::path& generation,
     const std::string& identity,AnalysisScanProducts& products,AnalysisCacheTableOptions options)
 {

@@ -3,6 +3,11 @@
 #include "TracyHash.hpp"
 #include "TracyAnalysisExternalSort.hpp"
 #include "TracyAnalysisDictionary.hpp"
+#include "TracyAnalysisCacheTable.hpp"
+#include "TracyAnalysisCacheKey.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define ZSTD_STATIC_LINKING_ONLY
 #include <zstd.h>
@@ -14,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <limits>
 #include <locale>
 #include <map>
@@ -1039,7 +1045,7 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::shared_ptr<AnalysisWorkspaceBudget> workspace;
     std::shared_ptr<AnalysisDiskBudget> disk;
     AnalysisWorkspaceReservation registryBudget;
-    AnalysisWorkspaceReservation rawBudget, runBudget, denominatorBudget, auditBudget;
+    AnalysisWorkspaceReservation rawBudget, runBudget, denominatorBudget, auditBudget, pinnedBudget;
     AnalysisDictionary dictionary;
     std::filesystem::path root;
     uint64_t maximumBufferedValues = 1;
@@ -1053,6 +1059,7 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::vector<PackedNeutralRun> buffer;
     std::unordered_map<BufferedKey, size_t, BufferedKeyHash> bufferIndexes;
     std::vector<std::filesystem::path> runs;
+    std::set<std::filesystem::path> pinnedRuns;
     std::map<SignatureKeyView, uint32_t, SignatureKeyLess> signatureIndexes;
     std::vector<SignatureKeyView> signatures;
     struct Denominator { SignatureKeyView key; uint64_t completeFrameCount; };
@@ -1062,11 +1069,12 @@ struct NeutralStatisticsStreamBuilder::Impl
     std::function<void( std::string_view, uint64_t, uint64_t )> progress;
     std::string error;
     bool finished = false;
+    bool restored = false;
 
     Impl( std::filesystem::path temporaryRoot, uint64_t values, size_t rawRuns,
         std::shared_ptr<AnalysisWorkspaceBudget> budget,std::shared_ptr<AnalysisDiskBudget> diskBudget )
         : workspace(std::move(budget)), disk(std::move(diskBudget)), registryBudget(workspace)
-        , rawBudget(workspace), runBudget(workspace), denominatorBudget(workspace), auditBudget(workspace)
+        , rawBudget(workspace), runBudget(workspace), denominatorBudget(workspace), auditBudget(workspace), pinnedBudget(workspace)
         , dictionary(workspace)
         , root( std::move( temporaryRoot ) )
         , maximumBufferedValues( std::max<uint64_t>( values, 1 ) )
@@ -1117,7 +1125,22 @@ struct NeutralStatisticsStreamBuilder::Impl
     }
     std::filesystem::path NextPath( std::string_view label )
     {
-        return root / ( std::string( label ) + "-" + std::to_string( fileOrdinal++ ) + ".work" );
+        // A restored phase can coexist with a cancelled later attempt. Never
+        // overwrite its files (or a checkpoint's still-referenced input).
+        for(;;) {
+            if(fileOrdinal==UINT64_MAX) throw std::runtime_error("neutral_run_path_overflow");
+            auto path=root/(std::string(label)+"-"+std::to_string(fileOrdinal++)+".work");
+            if(!std::filesystem::exists(path)) return path;
+        }
+    }
+    void Pin(const std::filesystem::path& path)
+    {
+        if(pinnedRuns.contains(path)) return;
+        pinnedBudget.Add(1024+8ull*path.native().size()); pinnedRuns.emplace(path);
+    }
+    void RetireRun(const std::filesystem::path& path)
+    {
+        if(!pinnedRuns.contains(path)) RemoveQuietly(path,disk);
     }
     struct RunWriter
     {
@@ -1475,7 +1498,7 @@ struct NeutralStatisticsStreamBuilder::Impl
                     "_group_" + std::to_string( first / fanIn );
                 if( !MergeGroup( group, output, stage, cancelled ) ) return false;
                 next.push_back( output );
-                for( const auto& path : group ) RemoveQuietly( path,disk );
+                for( const auto& path : group ) RetireRun(path);
             }
             runs = std::move( next );
             runBudget.Resize(runs.size()*(1024+8ull*root.native().size()));
@@ -1577,6 +1600,169 @@ void NeutralStatisticsStreamBuilder::AddDomainAudit( const NeutralDomainAuditInp
             value.consumedChecksum.size()+value.unavailableReason.size()));
         m_impl->audits.push_back( value );
     }
+}
+
+namespace
+{
+bool CheckpointRunName(std::string_view name)
+{
+    size_t prefix=0;
+    if(name.starts_with("neutral-run-"))prefix=12;
+    else if(name.starts_with("neutral-merge-"))prefix=14;
+    else return false;
+    if(!name.ends_with(".work") || name.size()<=prefix+5)return false;
+    const auto digits=name.substr(prefix,name.size()-prefix-5);
+    return std::all_of(digits.begin(),digits.end(),[](char c){return c>='0' && c<='9';});
+}
+void CheckSnapshotPath(const std::filesystem::path& path)
+{
+    // Check every existing ancestor, including Windows junctions, before any
+    // file is opened. The generation owner supplies the trusted root.
+    for(auto part=std::filesystem::absolute(path).lexically_normal();!part.empty();) {
+        std::error_code ec; const auto status=std::filesystem::symlink_status(part,ec);
+        if(!ec && std::filesystem::is_symlink(status)) throw std::runtime_error("neutral_checkpoint_link");
+#ifdef _WIN32
+        const auto attributes=GetFileAttributesW(part.c_str());
+        if(attributes!=INVALID_FILE_ATTRIBUTES && (attributes&FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("neutral_checkpoint_reparse_point");
+#endif
+        const auto parent=part.parent_path(); if(parent==part)break; part=parent;
+    }
+}
+}
+
+void NeutralStatisticsStreamBuilder::SaveCheckpoint(const std::filesystem::path& path,
+    const std::string& identity,const std::function<bool()>& cancelled)
+{
+    if(!m_impl || m_impl->finished || !m_impl->error.empty() || m_impl->completeFrameFilter)
+        throw std::runtime_error("neutral_checkpoint_builder_state");
+    if(path.parent_path().lexically_normal()!=m_impl->root.lexically_normal())
+        throw std::runtime_error("neutral_checkpoint_location");
+    CheckSnapshotPath(path);
+    const auto check=[&]{if(cancelled && cancelled())throw std::runtime_error("cancelled");};
+    check(); if(!m_impl->Flush())throw std::runtime_error(m_impl->error);
+    AnalysisCacheTableOptions options; options.workspace=m_impl->workspace;
+    options.disk=m_impl->disk; options.cancelled=cancelled;
+    AnalysisCacheTableWriter writer(path,identity,"neutral-statistics-checkpoint-v1",options);
+    uint64_t ordinal=0;
+    const auto append=[&](const nlohmann::json& row) {check();writer.Append(cache_key::Unsigned(ordinal++),row.dump());};
+    append({{"kind","header"},{"version",1},{"values",m_impl->maximumBufferedValues},
+        {"buffered_runs",m_impl->maximumBufferedRuns},{"input_runs",m_impl->inputRunCount},
+        {"maximum_observed",m_impl->maximumBufferedRunsObserved},{"merge_failures",m_impl->mergeFailures},
+        {"file_ordinal",m_impl->fileOrdinal},{"signatures",m_impl->signatures.size()},
+        {"denominators",m_impl->denominators.size()},{"audits",m_impl->audits.size()},{"runs",m_impl->runs.size()}});
+    for(const auto& key:m_impl->signatures) {
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(key.domain.size()+key.signature.size()+key.frameScope.size()));
+        append({{"kind","signature"},{"domain",key.domain},{"signature",key.signature},{"scope",key.frameScope}});
+    }
+    for(const auto& value:m_impl->denominators) {
+        const auto& key=value.key;
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(key.domain.size()+key.signature.size()+key.frameScope.size()));
+        append({{"kind","denominator"},{"domain",key.domain},{"signature",key.signature},{"scope",key.frameScope},{"count",value.completeFrameCount}});
+    }
+    for(const auto& a:m_impl->audits) {
+        AnalysisWorkspaceReservation rowBudget(m_impl->workspace,65536+32ull*(a.domain.size()+a.status.size()+a.inputChecksum.size()+a.consumedChecksum.size()+a.unavailableReason.size()));
+        append({{"kind","audit"},{"domain",a.domain},{"present",a.present},{"status",a.status},
+            {"input",a.inputCount},{"consumed",a.consumedInputCount},{"output",a.outputCount},
+            {"input_hash",a.inputChecksum},{"consumed_hash",a.consumedChecksum},{"quality",a.qualityComplete},{"reason",a.unavailableReason}});
+    }
+    for(const auto& run:m_impl->runs) {
+        check();CheckSnapshotPath(run);m_impl->Pin(run);
+        append({{"kind","run"},{"name",run.filename().string()},
+            {"bytes",std::filesystem::file_size(run)},{"sha256",Sha256File(run)}});
+    }
+    check();writer.Commit();
+}
+
+void NeutralStatisticsStreamBuilder::RestoreCheckpoint(const std::filesystem::path& path,
+    const std::string& identity,const std::function<bool()>& cancelled)
+{
+    if(!m_impl || m_impl->finished || !m_impl->signatures.empty() || !m_impl->runs.empty() ||
+        !m_impl->denominators.empty() || !m_impl->audits.empty() || !m_impl->error.empty())
+        throw std::runtime_error("neutral_checkpoint_builder_state");
+    try {
+        if(path.parent_path().lexically_normal()!=m_impl->root.lexically_normal())throw std::runtime_error("neutral_checkpoint_location");
+        CheckSnapshotPath(path);
+        const auto check=[&]{if(cancelled && cancelled())throw std::runtime_error("cancelled");};
+        AnalysisCacheTableOptions options;options.workspace=m_impl->workspace;options.disk=m_impl->disk;options.cancelled=cancelled;
+        AnalysisCacheTableReader reader(path,identity,"neutral-statistics-checkpoint-v1",options);
+        uint64_t ordinal=0;
+        AnalysisWorkspaceReservation parseBudget(m_impl->workspace);
+        const auto read=[&](std::string_view kind) {
+            check();if(ordinal>=reader.RecordCount())throw std::runtime_error("neutral_checkpoint_truncated");
+            auto row=reader.GetAt(ordinal);
+            if(row.key!=cache_key::Unsigned(ordinal++))throw std::runtime_error("neutral_checkpoint_order");
+            parseBudget.Resize(65536+32ull*row.payload.size());
+            auto data=nlohmann::json::parse(row.payload);
+            if(data.at("kind").get<std::string>()!=kind)throw std::runtime_error("neutral_checkpoint_kind");
+            return data;
+        };
+        const auto header=read("header");
+        if(header.at("version")!=1 || header.at("values")!=m_impl->maximumBufferedValues ||
+            header.at("buffered_runs")!=m_impl->maximumBufferedRuns)throw std::runtime_error("neutral_checkpoint_configuration");
+        uint64_t expected=1;
+        for(const auto* field:{"signatures","denominators","audits","runs"}) {
+            if(!header.at(field).is_number_unsigned())throw std::runtime_error("neutral_checkpoint_count");
+            const auto count=header.at(field).get<uint64_t>();
+            if(count>reader.RecordCount()-std::min(expected,reader.RecordCount()))throw std::runtime_error("neutral_checkpoint_count");
+            expected+=count;
+        }
+        if(expected!=reader.RecordCount())throw std::runtime_error("neutral_checkpoint_count");
+        for(uint64_t i=0;i<header.at("signatures").get<uint64_t>();++i) {
+            const auto row=read("signature");
+            const auto token=RegisterSignature(row.at("domain").get<std::string>(),row.at("signature").get<std::string>(),row.at("scope").get<std::string>());
+            if(token!=i || token==InvalidSignatureToken)throw std::runtime_error("neutral_checkpoint_signature_order");
+        }
+        for(uint64_t i=0;i<header.at("denominators").get<uint64_t>();++i) {
+            const auto row=read("denominator");
+            AddDenominator({row.at("domain").get<std::string>(),row.at("signature").get<std::string>(),row.at("scope").get<std::string>(),row.at("count").get<uint64_t>()});
+        }
+        for(uint64_t i=0;i<header.at("audits").get<uint64_t>();++i) {
+            const auto a=read("audit");
+            AddDomainAudit({a.at("domain").get<std::string>(),a.at("present").get<bool>(),a.at("status").get<std::string>(),
+                a.at("input").get<uint64_t>(),a.at("consumed").get<uint64_t>(),a.at("output").get<uint64_t>(),
+                a.at("input_hash").get<std::string>(),a.at("consumed_hash").get<std::string>(),a.at("quality").get<bool>(),a.at("reason").get<std::string>()});
+        }
+        for(uint64_t i=0;i<header.at("runs").get<uint64_t>();++i) {
+            const auto row=read("run");const auto name=row.at("name").get<std::string>();
+            const std::filesystem::path filename(name);
+            if(filename.has_parent_path() || filename.filename()!=filename || !CheckpointRunName(name))throw std::runtime_error("neutral_checkpoint_run_path");
+            const auto run=m_impl->root/filename;CheckSnapshotPath(run);
+            if(!std::filesystem::is_regular_file(run) || std::filesystem::file_size(run)!=row.at("bytes").get<uint64_t>() ||
+                Sha256File(run)!=row.at("sha256").get<std::string>())throw std::runtime_error("neutral_checkpoint_run_identity");
+            Impl::Reader verify(run,m_impl->signatures.size(),m_impl->workspace);uint64_t checked=0;
+            while(verify.valid) {if((checked++&16383)==0)check();verify.Advance();}
+            if(!verify.opened || !verify.error.empty())throw std::runtime_error("neutral_checkpoint_run_invalid:"+verify.error);
+            if(m_impl->pinnedRuns.contains(run))throw std::runtime_error("neutral_checkpoint_duplicate_run");
+            m_impl->runBudget.Add(1024+8ull*run.native().size());m_impl->Pin(run);m_impl->runs.push_back(run);
+        }
+        m_impl->inputRunCount=header.at("input_runs").get<uint64_t>();
+        m_impl->maximumBufferedRunsObserved=header.at("maximum_observed").get<size_t>();
+        m_impl->mergeFailures=header.at("merge_failures").get<uint64_t>();
+        m_impl->fileOrdinal=header.at("file_ordinal").get<uint64_t>();
+        check();
+        m_impl->restored=true;
+    } catch(...) {m_impl->error="neutral_checkpoint_restore_failed";throw;}
+}
+
+uint64_t NeutralStatisticsStreamBuilder::CleanupUnreferencedRuns(const std::function<bool()>& cancelled)
+{
+    if(!m_impl || !m_impl->restored || m_impl->finished || !m_impl->error.empty())
+        throw std::runtime_error("neutral_checkpoint_cleanup_state");
+    uint64_t removed=0;
+    for(const auto& entry:std::filesystem::directory_iterator(m_impl->root)) {
+        if(cancelled && cancelled())throw std::runtime_error("cancelled");
+        const auto path=entry.path();
+        if(!CheckpointRunName(path.filename().string()) || m_impl->pinnedRuns.contains(path))continue;
+        CheckSnapshotPath(path);
+        if(!std::filesystem::is_regular_file(path))throw std::runtime_error("neutral_checkpoint_cleanup_type");
+        const auto before=std::filesystem::file_size(path);
+        std::cerr<<"Query phase-retire-run file="<<path.filename().string()<<" bytes="<<before<<'\n';
+        std::error_code ec;AnalysisDiskRemove(path,m_impl->disk,ec);
+        if(ec || std::filesystem::exists(path))throw std::runtime_error("neutral_checkpoint_cleanup_failed");
+        removed+=before;
+    }
+    return removed;
 }
 
 size_t NeutralStatisticsStreamBuilder::MaximumBufferedRunsObserved() const
@@ -1826,7 +2012,7 @@ try
         if( haveSignature ) finishSignature( currentSignature, frames );
         if(cancelled && cancelled()) { error = "cancelled"; return false; }
         reader.input.close();
-        RemoveQuietly( m_impl->runs.front(),m_impl->disk );
+        m_impl->RetireRun(m_impl->runs.front());
         m_impl->runs.clear();
     }
     if( m_impl->progress ) m_impl->progress( "neutral_statistics_reduce",

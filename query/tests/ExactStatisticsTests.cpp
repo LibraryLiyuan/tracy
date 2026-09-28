@@ -210,10 +210,64 @@ void DiskStatistics(const std::filesystem::path& root)
     }
 }
 
+template<class Builder> bool CheckpointRoundTrip(const std::filesystem::path& root)
+{
+    const std::string identity(64,'c');
+    if constexpr(requires(Builder& b) { b.SaveCheckpoint(root,identity); b.RestoreCheckpoint(root,identity); })
+    {
+        const auto populate=[](auto& b,uint64_t first,uint64_t last) {
+            for(uint64_t f=first;f<last;++f) for(const auto* id:{"z","a"})
+                assert(b.AddRun(Input(id,f,int64_t(f+1),int64_t(f))));
+        };
+        const auto metadata=[](auto& b) {
+            for(const auto* id:{"z","a"})b.AddDenominator(Denominator(id,4));
+            b.AddDomainAudit({"cpu",true,"complete",8,8,2,std::string(64,'f'),std::string(64,'f'),true,{}});
+        };
+        NeutralStatisticsResult expected;std::string error;
+        {Builder b(root/"baseline",8,2);populate(b,0,4);metadata(b);assert(b.Finish(expected,error));}
+        {
+            Builder b(root/"resume",8,2);populate(b,0,2);metadata(b);
+            b.SaveCheckpoint(root/"resume"/"checkpoint",identity);
+        }
+        const auto abandoned=root/"resume"/"neutral-run-9999.work";
+        const auto unrelated=root/"resume"/"unrelated.work";
+        {std::ofstream file(abandoned,std::ios::binary);file<<"partial";}
+        {std::ofstream file(unrelated,std::ios::binary);file<<"keep";}
+        for(int attempt=0;attempt<2;++attempt) {
+            Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",identity);
+            if constexpr(requires {b.CleanupUnreferencedRuns();})b.CleanupUnreferencedRuns();
+            if(std::filesystem::exists(abandoned) || !std::filesystem::exists(unrelated))
+            {std::cerr<<"restored phase must retire only abandoned owned runs"<<std::endl;return false;}
+            assert(b.InputRunCount()==4 && b.FindSignatureToken("cpu","z","Player.Frame")==0 &&
+                b.FindSignatureToken("cpu","a","Player.Frame")==1);
+            populate(b,2,4); NeutralStatisticsResult result;assert(b.Finish(result,error));
+            assert(result.qualityComplete && result.contentSha256==expected.contentSha256);
+        }
+        bool wrong=false;
+        try {Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",std::string(64,'d'));}
+        catch(const std::exception&){wrong=true;}
+        assert(wrong);
+        std::filesystem::path run;
+        for(const auto& file:std::filesystem::directory_iterator(root/"resume"))
+            if(file.path().filename().string().starts_with("neutral-run-") && file.path().extension()==".work") {run=file.path();break;}
+        assert(!run.empty()); {std::ofstream output(run,std::ios::binary|std::ios::trunc);output<<'x';}
+        bool corrupt=false;
+        try {Builder b(root/"resume",8,2);b.RestoreCheckpoint(root/"resume"/"checkpoint",identity);}
+        catch(const std::exception&){corrupt=true;}
+        assert(corrupt);return true;
+    }
+    else {std::cerr<<"statistics has no complete resumable checkpoint"<<std::endl;return false;}
+}
+
 }
 
 int main( int argc, char** argv )
 {
+    if(argc>1 && std::string_view(argv[1])=="--checkpoint-only")
+    {
+        const auto root=TemporaryRoot();const auto ok=CheckpointRoundTrip<NeutralStatisticsStreamBuilder>(root);
+        std::filesystem::remove_all(root);return ok?0:1;
+    }
     if(argc>1 && std::string_view(argv[1])=="--constant-distribution-only")
     {
         const auto root=TemporaryRoot(); auto disk=std::make_shared<AnalysisDiskBudget>();

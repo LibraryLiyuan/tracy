@@ -1769,6 +1769,18 @@ public:
         return ApplyIndexedCounts( m_source->GetTraceInfoMetadata() );
     }
 
+    std::string GetScanStorageIdentity() const override
+    {
+        // Use the already pinned manifest, not the mutable manifest pathname
+        // which may now refer to a newer generation held by another Reader.
+        analysis::Sha256Builder hash;
+        const auto generation=m_manifest.dataPath.filename().generic_u8string();
+        hash.Update(generation.data(),generation.size());
+        hash.Update(m_manifest.sourceFingerprint.data(),m_manifest.sourceFingerprint.size());
+        hash.Update(m_manifest.dataFingerprint.data(),m_manifest.dataFingerprint.size());
+        return "query-index-"+std::to_string(QueryIndexSchemaVersion)+":"+hash.FinalHex();
+    }
+
     analysis::AppInfoSummaryDto GetAppInfoSummary() const override
     {
         return m_source->GetAppInfoSummary();

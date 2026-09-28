@@ -2,6 +2,10 @@
 #include "TracyWorkerTraceSource.hpp"
 #include "TracyQueryService.hpp"
 #include "TracySessionManager.hpp"
+#include "TracyAnalysisScanManager.hpp"
+#include "TracyAnalysisProfile.hpp"
+#include "TracyNeutralStatisticsCache.hpp"
+#include "TracyHash.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -24,13 +28,16 @@ int main( int argc, char** argv )
 {
     try
     {
-        if( argc != 3 ) throw std::runtime_error( "expected sample Trace and isolated output directory" );
+        const bool reuse=argc==4 && std::string(argv[3])=="--phase-recovery-reuse-index";
+        if( argc != 3 && !(argc==4 && (std::string(argv[3])=="--phase-recovery" || reuse)) )
+            throw std::runtime_error( "expected sample Trace and isolated output directory [--phase-recovery]" );
         namespace fs = std::filesystem;
         const fs::path root = argv[2];
-        if( fs::exists( root ) ) throw std::runtime_error( "refusing existing output directory" );
+        if( fs::exists( root ) && !reuse ) throw std::runtime_error( "refusing existing output directory" );
         fs::create_directories( root );
         const auto input = root / "sample.tracy";
-        fs::copy_file( argv[1], input );
+        if(!reuse)fs::copy_file( argv[1], input );
+        else Require(tracy::analysis::Sha256File(input)==tracy::analysis::Sha256File(argv[1]),"reused input SHA mismatch");
 
         auto original = tracy::analysis::WorkerTraceSource::Open( input );
         const auto originalInfo = original->GetTraceInfo();
@@ -45,7 +52,9 @@ int main( int argc, char** argv )
         const auto expectedSymbols = original->GetSymbols();
         original.reset();
 
-        const auto manifest = tracy::query::QueryIndex::Build( input );
+        const auto validation=reuse?tracy::query::QueryIndex::Validate(input,true):tracy::query::QueryIndexValidation{};
+        if(reuse && !validation.manifest)throw std::runtime_error(validation.reason);
+        const auto manifest = reuse?*validation.manifest:tracy::query::QueryIndex::Build( input );
         std::ifstream manifestInput( manifest.manifestPath );
         const auto json = nlohmann::json::parse( manifestInput );
         Require( json.at( "sections" ).contains( "sample" ), "Query index did not publish a sample sidecar" );
@@ -203,6 +212,50 @@ int main( int argc, char** argv )
                 actualSymbol.imageName == expectedSymbol.imageName && actualSymbol.callFile == expectedSymbol.callFile &&
                 actualSymbol.callLine == expectedSymbol.callLine && actualSymbol.inlineFrame == expectedSymbol.inlineFrame,
                 "indexed symbol statistics changed" );
+        }
+        if(argc==4) {
+            using namespace tracy::analysis;using namespace tracy::query;
+            const nlohmann::json profile={{"schema_version",1},{"profile_name","native-phase-recovery"},
+                {"frame_budget",{{"target_fps",60.0},{"frame_ms",16.666667}}},
+                {"resource_budgets",{{"cpu_memory",{{"value",16.0},{"unit","GB"},{"status","provisional"}}},
+                    {"gpu_memory",{{"value",6.4},{"unit","GB"},{"status","fixed"}}}}},
+                {"limits",{{"query_memory_target_bytes",17179869184ULL},{"query_memory_hard_bytes",34359738368ULL},
+                    {"cache_max_bytes",49713240852ULL},{"minimum_free_disk_bytes",10737418240ULL}}},
+                {"user_focus",nlohmann::json::array()},
+                {"candidate_policy",{{"top_n",10},{"cumulative_contribution",0.8},{"per_domain_limit",50},
+                    {"priorities",{"P0","P1","P2","P3","P4"}}}}};
+            const auto validated=ValidateAndNormalizeAnalysisProfile(profile);Require(validated.valid,"native recovery profile");
+            AnalysisScanExecutionRequest request;request.source=std::shared_ptr<TraceSource>(std::move(indexed));
+            request.aggregateIdentity={manifest.sourceFingerprint,std::string(64,'a'),"1.35.0",NeutralScanAlgorithmId,NeutralAggregateSchemaVersion};
+            request.normalizedProfile=validated.normalized;request.profileIdentity=validated.profileSha256;
+            request.temporaryRoot=root/"phase-baseline";
+            AnalysisScanProducts baseline;std::string error;
+            const auto baselineOk=ExecuteDefaultAnalysisScan(request,{},[](auto,auto,auto,auto){},baseline,error);
+            if(!baselineOk)throw std::runtime_error("native baseline: "+error);
+            std::string expectedHash;
+            {NeutralStatisticsCacheReader reader(baseline.neutralCachePath,baseline.neutralCacheIdentity);expectedHash=reader.ContentSha256();}
+            const auto storage=request.source->GetScanStorageIdentity();
+            Require(storage.starts_with("query-index-49:"),"indexed recovery lacks schema/generation identity");
+            unsigned verified=0;
+            for(const std::string boundary:{"gpu_job_managed_relation_scan","memory_io_sampling_telemetry_scan","exact_statistics"}) {
+                request.aggregateRoot=root/"phase-owned";request.temporaryRoot=root/("native-"+boundary);
+                std::stop_source stop;AnalysisScanProducts interrupted;
+                const auto first=ExecuteDefaultAnalysisScan(request,stop.get_token(),[&](auto,auto,auto,auto stage){if(stage==boundary)stop.request_stop();},interrupted,error);
+                Require(!first && stop.stop_requested(),"native phase did not cancel at boundary");
+                interrupted={};request.source.reset();
+                request.source=std::shared_ptr<TraceSource>(QueryIndex::Open(manifest));
+                Require(request.source->GetScanStorageIdentity()==storage,"native reopen changed pinned generation");
+                AnalysisScanProducts resumed;bool cpuVisited=false,reused=false;
+                const auto ok=ExecuteDefaultAnalysisScan(request,{},[&](auto,auto,auto,auto stage){
+                    cpuVisited|=stage=="cpu_frame_zone_scan";reused|=stage=="phase_checkpoint_reused";
+                },resumed,error);
+                if(!ok)throw std::runtime_error("native phase recovery: "+error);
+                Require(reused && !cpuVisited,"native phase re-executed completed CPU traversal");
+                NeutralStatisticsCacheReader result(resumed.neutralCachePath,resumed.neutralCacheIdentity);
+                Require(result.ContentSha256()==expectedHash,"native phase recovery changed complete neutral contents");++verified;
+            }
+            std::cout<<"native phase recovery passed boundaries="<<verified<<" cpu_zones="<<originalInfo.counts.cpuZones<<
+                " samples="<<originalInfo.counts.samples<<" gpu_zones="<<originalInfo.counts.gpuZones<<'\n';
         }
         std::cout << "sample index integration passed records=" << actual.size() << '\n';
         return 0;
