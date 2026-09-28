@@ -2063,6 +2063,7 @@ public:
         }
         return result;
     }
+    bool GpuAllocationSummariesUniqueById() const override { return true; }
     std::vector<analysis::GpuPassWorkingSet> ScanGpuCatalogPassesBounded(
         size_t offset, size_t limit ) const override
     {

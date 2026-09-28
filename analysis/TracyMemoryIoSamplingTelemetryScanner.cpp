@@ -515,17 +515,44 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
         if( pool.gpuD3D12 && Contains( lower, "dxgi" ) && Contains( lower, "local" ) )
             result.gpuMemory.dxgiUsageBytes = std::max( result.gpuMemory.dxgiUsageBytes.value_or( 0 ), pool.persistedUsageBytes );
     }
-    if( dynamic_cast<const GpuCatalogBoundedScanSource*>( &m_source ) )
+    if( const auto* catalogSource = dynamic_cast<const GpuCatalogBoundedScanSource*>( &m_source ) )
     {
         {
+        const bool orderedUniqueAllocations = catalogSource->GpuAllocationSummariesUniqueById();
         AnalysisWorkspaceReservation allocationWorkspace( workspace );
+        AnalysisWorkspaceReservation pointWorkspace( workspace );
         std::unordered_set<uint64_t> allocationIds;
+        uint64_t previousAllocationId = 0;
         struct PhysicalPoint { uint64_t time; uint64_t bytes; bool create; };
         std::vector<PhysicalPoint> physicalPoints;
+        const auto appendPhysicalPoint = [&]( PhysicalPoint point ) {
+            if( orderedUniqueAllocations && physicalPoints.size() == physicalPoints.capacity() )
+            {
+                const auto oldCapacity = physicalPoints.capacity();
+                if( oldCapacity > ( std::numeric_limits<size_t>::max() / sizeof( PhysicalPoint ) ) / 2 )
+                    throw std::runtime_error( "GPU physical sweep exceeds address space" );
+                const auto nextCapacity = std::max<size_t>( 1024, oldCapacity * 2 );
+                const auto oldBytes = uint64_t( oldCapacity ) * sizeof( PhysicalPoint );
+                const auto nextBytes = uint64_t( nextCapacity ) * sizeof( PhysicalPoint );
+                if( nextBytes > std::numeric_limits<uint64_t>::max() - oldBytes )
+                    throw std::runtime_error( "GPU physical sweep reservation overflow" );
+                pointWorkspace.Resize( oldBytes + nextBytes );
+                try { physicalPoints.reserve( nextCapacity ); }
+                catch( ... ) { pointWorkspace.Resize( oldBytes ); throw; }
+                pointWorkspace.Resize( uint64_t( physicalPoints.capacity() ) * sizeof( PhysicalPoint ) );
+            }
+            physicalPoints.push_back( point );
+        };
         VisitAll<GpuAllocationAnalysisRecord>( scanner, BoundedScanDomain::GpuAllocation,
             m_batchSize, result.maximumBatchObserved, cancelled, workspace, progress, [&]( const auto& allocation ) {
             checkCancelled();
             result.inputGpuAllocationCount++;
+            if( orderedUniqueAllocations && allocation.allocationId != 0 )
+            {
+                if( allocation.allocationId <= previousAllocationId )
+                    throw std::runtime_error( "gpu_allocation_summary_order_contract" );
+                previousAllocationId = allocation.allocationId;
+            }
             if( allocation.invalid || allocation.allocationId == 0 ||
                 ( allocation.destroyTime != 0 && allocation.destroyTime < allocation.createTime ) )
             {
@@ -533,9 +560,12 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
                 result.gpuMemory.physicalPeakExact = false;
                 return;
             }
-            if( allocationIds.contains( allocation.allocationId ) ) return;
-            allocationWorkspace.Add( 512 ); // identity, buckets and two sweep points including growth peak
-            allocationIds.emplace( allocation.allocationId );
+            if( !orderedUniqueAllocations )
+            {
+                if( allocationIds.contains( allocation.allocationId ) ) return;
+                allocationWorkspace.Add( 512 ); // Generic sources may repeat IDs; includes sweep growth.
+                allocationIds.emplace( allocation.allocationId );
+            }
             result.gpuMemory.allocationCount++;
             // Child placed ranges are already accounted for by their heap.
             if( allocation.parentAllocationId == 0 )
@@ -546,9 +576,9 @@ MemoryIoSamplingTelemetryScanResult MemoryIoSamplingTelemetryScanner::ScanImpl(
                 // A final mutable size cannot reconstruct historical size changes.
                 if( allocation.destroyTime == 0 || allocation.destroyTime > allocation.createTime )
                 {
-                    physicalPoints.push_back( { allocation.createTime, allocation.sizeBytes, true } );
+                    appendPhysicalPoint( { allocation.createTime, allocation.sizeBytes, true } );
                     if( allocation.destroyTime != 0 )
-                        physicalPoints.push_back( { allocation.destroyTime, allocation.sizeBytes, false } );
+                        appendPhysicalPoint( { allocation.destroyTime, allocation.sizeBytes, false } );
                 }
                 if( allocation.destroyTime == 0 )
                     result.gpuMemory.residentBytes = SaturatingAdd( result.gpuMemory.residentBytes, allocation.residentBytes );

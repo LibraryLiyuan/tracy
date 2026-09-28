@@ -32,6 +32,9 @@ class GpuCatalogBoundedScanSource
 {
 public:
     virtual ~GpuCatalogBoundedScanSource() = default;
+    // True only when allocation summary pages form one strictly increasing,
+    // unique allocationId stream. Callers still verify the order while reading.
+    virtual bool GpuAllocationSummariesUniqueById() const { return false; }
     virtual uint64_t GetGpuCatalogResourceCountBounded() const = 0;
     virtual uint64_t GetGpuCatalogAllocationCountBounded() const = 0;
     virtual uint64_t GetGpuCatalogPassCountBounded() const = 0;
