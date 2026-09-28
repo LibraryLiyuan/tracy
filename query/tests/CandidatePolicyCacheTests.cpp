@@ -1,6 +1,7 @@
 #include "TracyCandidatePolicyCache.hpp"
 #include "TracyHash.hpp"
 #include "TracyPolicyFrameSeries.hpp"
+#include "TracyFrameWindowPolicy.hpp"
 #include <chrono>
 #include <iostream>
 #include <fstream>
@@ -280,6 +281,65 @@ void LargeFrameTimeline(const std::filesystem::path& root)
     Require(!result.Candidates(0,10,1024*1024).records.empty(),"large Frame Timeline preserves root policy findings");
     Require(options.table.workspace->Snapshot().peakBytes<=4ull*1024*1024*1024,
         "large Frame Timeline exceeded the shared workspace contract");
+}
+void SparseTimelineWithConcurrentWorkspace(const std::filesystem::path& root)
+{
+    auto input=Fixture(root);
+    NeutralStatisticsCacheOptions neutralOptions; neutralOptions.table.blockBytes=16384;
+    WriteNeutral(root/"neutral",input,neutralOptions);
+    NeutralStatisticsCacheReader neutral(root/"neutral",Identity,neutralOptions);
+    input.signatures.clear(); input.aggregate.signatures.clear(); input.aggregate.rankings.clear();
+    PolicyFrameTimeline timeline; timeline.frameScope="Player"; timeline.name="Player";
+    timeline.frames.reserve(512);
+    for(uint64_t i=0;i<512;++i)
+        timeline.frames.push_back({i,1,{},std::string(8192,'x'),true});
+    input.frameTimelines.push_back(std::move(timeline));
+    CandidatePolicyCacheOptions options;
+    options.table.blockBytes=16384; options.table.manifestBytes=65536;
+    // The Frame data fits two copies in 16 MiB, even though seven speculative
+    // copies (the old scale-based gate) would reject it.
+    options.sortBufferBytes=32768; options.frameWorkspaceBytes=16*1024*1024;
+    options.table.workspace=std::make_shared<AnalysisWorkspaceBudget>(96*1024*1024,48*1024*1024);
+    AnalysisWorkspaceReservation concurrent(options.table.workspace,50*1024*1024);
+    const auto policyId=BuildCandidatePolicyCache(root/"policy",neutral,input,options);
+    Require(options.table.workspace->Snapshot().peakBytes<=96*1024*1024,
+        "sparse Timeline policy exceeded the shared workspace cap");
+    {
+        CandidatePolicyCacheReader result(root/"policy",policyId,options);
+        Require(!result.Candidates(0,1,65536).records.empty(),
+            "sparse Timeline with concurrent workspace retains policy output");
+    }
+    concurrent.Resize(0);
+    Require(options.table.workspace->Snapshot().currentBytes==0,
+        "sparse Timeline releases its shared workspace reservations");
+}
+void WindowGrowthChargesSharedBudget()
+{
+    PolicyFrameTimeline timeline; timeline.frameScope="dense"; timeline.name="dense";
+    for(uint64_t i=0;i<256;++i) timeline.frames.push_back({i,20'000'000,{},"",true});
+    const json config={{"window_sizes",{1}}, {"window_valid_ratio",0.8},
+        {"window_over_budget_ratio",0.8}, {"window_stable_mad_ratio",0.1}};
+    const auto expected=frame_window::Windows(timeline,config,16'666'667);
+    Require(expected.size()==256,"dense single-frame windows remain distinct");
+    auto workspace=std::make_shared<AnalysisWorkspaceBudget>(64*1024,32*1024);
+    {
+        AnalysisWorkspaceReservation retained(workspace);
+        Reject([&]{frame_window::Windows(timeline,config,16'666'667,{},nullptr,&retained,workspace);},
+            "workspace_budget");
+    }
+    Require(workspace->Snapshot().rejectedReservations>0 && workspace->Snapshot().currentBytes==0,
+        "dense window growth rejects before unaccounted allocation and releases reservations");
+    workspace=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);
+    {
+        AnalysisWorkspaceReservation retained(workspace);
+        const auto actual=frame_window::Windows(timeline,config,16'666'667,{},nullptr,&retained,workspace);
+        Require(actual.size()==expected.size(),"window accounting preserves results");
+        for(size_t i=0;i<actual.size();++i)
+            Require(actual[i].begin==expected[i].begin && actual[i].end==expected[i].end &&
+                actual[i].stable==expected[i].stable && actual[i].scales==expected[i].scales,
+                "window accounting preserves every interval and scale");
+    }
+    Require(workspace->Snapshot().currentBytes==0,"dense window accounting releases all reservations");
 }
 void SharedContextDecodeWorkspace(const std::filesystem::path& root)
 {
@@ -895,6 +955,6 @@ int main(int argc,char** argv)
         CandidateValidationWorkspace(root/"candidate-validation");
         CandidatePublicationWorkspace(root/"candidate-publication");
         CandidateJoinWorkspace(root/"candidate-join");
-        LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); LargeFrameTimeline(root/"large-timeline"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
+        WindowGrowthChargesSharedBudget(); LocalSignalDecodeWorkspace(root/"signal-workspace"); RankingDecodeWorkspace(root/"ranking-workspace"); HeaderDecodeWorkspace(root/"header-workspace"); RetainedFamilyWorkspace(root/"family-workspace"); RetainedTopWorkspace(root/"top-workspace"); SharedPolicyDecodeWorkspace(root/"policy-decode"); SharedSeriesWorkspace(root/"shared-series"); SharedContextDecodeWorkspace(root/"shared-decode"); SharedTimelineWorkspace(root/"shared-timeline"); LargeFrameTimeline(root/"large-timeline"); SparseTimelineWithConcurrentWorkspace(root/"sparse-concurrent"); CachedParity(root/"global"); CachedParity(root/"local",true); CachedParity(root/"fallback",true,true); Boundaries(root/"boundaries"); RepeatedLocalTops(root/"repeated-tops"); std::filesystem::remove_all(root); std::cout<<"candidate policy cache tests passed\n"; return 0; }
     catch(const std::exception& e) { std::cerr<<e.what()<<"\nfixture: "<<root<<'\n'; return 1; }
 }

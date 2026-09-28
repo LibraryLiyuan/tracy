@@ -1609,6 +1609,43 @@ int main(int argc,char** argv)
             throw std::runtime_error("Budget-paused scan must complete after capacity becomes available");
     }
     {
+        testStage="manager workspace failure diagnostic";
+        const auto stateRoot=root/"resource-workspace-failure";
+        const auto cacheRoot=cache/"resource-workspace-failure";
+        auto native=std::make_shared<SourceDegradedTrace>();
+        QueryResourceContextOptions resourceOptions;
+        resourceOptions.traceBytes=16ull*1024*1024;
+        resourceOptions.expectedFinalDiskLimit=4ull*1024*1024;
+        resourceOptions.expectedPeakDiskLimit=16ull*1024*1024;
+        resourceOptions.derivedRoots={stateRoot,cacheRoot};
+        resourceOptions.workspaceMaximumBytes=8ull*1024*1024;
+        resourceOptions.workspaceTargetBytes=4ull*1024*1024;
+        resourceOptions.diagnosticDiskReserveBytes=64*1024;
+        auto resources=std::make_shared<QueryResourceContext>(std::move(resourceOptions));
+        AnalysisScanExecutor denyWorkspace=[](const AnalysisScanExecutionRequest& execution,
+            std::stop_token,const AnalysisScanProgressCallback&,AnalysisScanProducts&,std::string&) {
+            AnalysisWorkspaceReservation denied(execution.workspace,
+                execution.workspace->Snapshot().maximumBytes);
+            return true;
+        };
+        AnalysisScanManager manager(stateRoot,cacheRoot,std::string(64,'e'),
+            [native](const auto&,std::stop_token){return native;},denyWorkspace);
+        AnalysisScanStartRequest request;
+        request.traceSessionId="resource-workspace-failure"; request.tracePath=tracePath;
+        request.source=native; request.resourceContext=resources;
+        request.normalizedProfile=validation.normalized; request.profileIdentity=validation.profileSha256;
+        const auto started=manager.Start(request);
+        const auto paused=WaitFor(manager,started.scanId,ScanState::CancelledResumable,6s);
+        const auto diagnostic=stateRoot/"scans"/started.scanId/"resource-diagnostic.json";
+        if(paused.stage!="workspace_budget" || !std::filesystem::exists(diagnostic))
+            throw std::runtime_error("Workspace-paused Scan must save a resource diagnostic");
+        json document; {std::ifstream input(diagnostic); input>>document;}
+        if(document.at("failure_reason")!="workspace_limit" ||
+            document.at("requested_bytes").is_null() ||
+            std::stoull(document.at("workspace").at("rejected_reservations").get<std::string>())==0)
+            throw std::runtime_error("Workspace diagnostic must include exact refusal accounting");
+    }
+    {
         testStage="manager Query resource context";
         auto native=std::make_shared<SourceDegradedTrace>();
         auto managerWorkspace=std::make_shared<AnalysisWorkspaceBudget>(1024*1024,512*1024);

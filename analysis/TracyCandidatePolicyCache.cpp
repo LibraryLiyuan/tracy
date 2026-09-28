@@ -292,7 +292,7 @@ struct Builder
             timelineWorkspace.Add(2048+8ull*(t.frameScope.size()+t.name.size()+t.observationUnit.size()));
             supplied.insert(t.frameScope); timelineBytes+=FrameStorageBytes(t.frames);
         }
-        if(timelineBytes>options.frameWorkspaceBytes/4) Fail("frame_workspace_budget");
+        if(timelineBytes>options.frameWorkspaceBytes/2) Fail("frame_workspace_budget");
         std::map<std::string,PolicySignatureContext> roots;
         const auto count=VisitContexts([&](const PolicySignatureContext& c) {
             contextOrder->Append(Unsigned(*c.sourceOrdinal),SignatureKey(c));
@@ -301,7 +301,7 @@ struct Builder
             if(it!=roots.end() && *it->second.sourceOrdinal<*c.sourceOrdinal) return;
             const auto bytes=FrameBytes(c.frames);
             if(it!=roots.end()) timelineBytes-=FrameBytes(it->second.frames);
-            if(bytes>options.frameWorkspaceBytes/4-timelineBytes) Fail("frame_workspace_budget");
+            if(bytes>options.frameWorkspaceBytes/2-timelineBytes) Fail("frame_workspace_budget");
             const auto previous=it==roots.end()?0:ContextBytes(it->second);
             const auto next=ContextBytes(c);
             rootsWorkspace.Add(next); // Old and replacement coexist during the copy.
@@ -317,13 +317,18 @@ struct Builder
         const auto topN=config.value("local_top_n",uint64_t(5));
         if(topN>1000) Fail("local_top_budget");
         const auto scales=config.value("window_sizes",std::vector<uint64_t>{30,60,120});
-        if(scales.size()>64 || timelineBytes>options.frameWorkspaceBytes/(4+scales.size())) Fail("frame_workspace_budget");
-        // Covers the copied timelines, window vectors/set nodes, their growth
-        // peaks, and median/MAD arrays. Charge before Prepare creates them.
+        if(scales.size()>64 || timelineBytes>options.frameWorkspaceBytes/2) Fail("frame_workspace_budget");
+        // Charge copied timelines before Prepare. Window statistics, actual
+        // window growth and retained index vectors reserve separately there.
         for(const auto& [_,c]:roots)
+        {
             timelineWorkspace.Add(2048+8ull*(c.frameScope.size()+c.name.size()+c.observationUnit.size()));
-        timelineWorkspace.Add(2*timelineBytes*(4+scales.size()));
-        const auto state=frame_window::Prepare(input,[&](const auto& visit){for(const auto& [_,c]:roots) visit(c);});
+        }
+        if(timelineBytes>UINT64_MAX/2) Fail("frame_workspace_budget");
+        timelineWorkspace.Add(2*timelineBytes);
+        const auto state=frame_window::Prepare(input,
+            [&](const auto& visit){for(const auto& [_,c]:roots) visit(c);},
+            &timelineWorkspace,options.table.workspace);
         roots.clear(); rootsWorkspace.Resize(0);
         auto topInput=Sorter("local-top-input"),observations=Sorter("local-observations");
         VisitContexts([&](const PolicySignatureContext& c) {

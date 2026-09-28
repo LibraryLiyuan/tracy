@@ -1537,6 +1537,11 @@ void AnalysisScanManager::StartWorker( const std::shared_ptr<Entry>& entry )
         std::stop_source executionStop;
         std::stop_callback forward(userStop,[&]{executionStop.request_stop();});
         const auto terminal=[&](ScanState state,std::string_view stage,std::string_view error) noexcept {
+            if(entry->request.resourceContext) {
+                try { entry->request.resourceContext->WriteDiagnostic(
+                    entry->scanRoot/"resource-diagnostic.json"); }
+                catch(...) { /* Preserve the original failure and pause state. */ }
+            }
             try { Update(entry,state,0,4,stage,error); }
             catch(...) { /* Update already leaves a non-complete failure snapshot. */ }
         };

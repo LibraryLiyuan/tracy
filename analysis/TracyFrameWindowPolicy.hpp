@@ -2,6 +2,7 @@
 #define __TRACYFRAMEWINDOWPOLICY_HPP__
 
 #include "TracyCandidatePolicy.hpp"
+#include "TracyAnalysisWorkspaceBudget.hpp"
 #include "TracyWindowStatistics.hpp"
 #include <algorithm>
 #include <cmath>
@@ -46,8 +47,11 @@ struct Window
 
 inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
     const nlohmann::json& config, double budgetNs,
-    const std::function<bool()>& cancelled = {}, WindowWork* work = nullptr )
+    const std::function<bool()>& cancelled = {}, WindowWork* work = nullptr,
+    AnalysisWorkspaceReservation* retainedWorkspace = nullptr,
+    std::shared_ptr<AnalysisWorkspaceBudget> budget = {} )
 {
+    AnalysisWorkspaceReservation temporaryWorkspace(budget);
     std::vector<Window> result;
     const auto& frames = timeline.frames;
     if( frames.empty() || timeline.observationUnit != "frame" ) return result;
@@ -57,6 +61,10 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
     const auto scales = config.value( "window_sizes", std::vector<uint64_t> { 30, 60, 120 } );
     const auto check = [&] { if(cancelled && cancelled()) throw std::runtime_error("cancelled"); };
     check();
+    if(budget) {
+        if(frames.size()>(UINT64_MAX-4096)/32) throw std::runtime_error("analysis_workspace_budget");
+        temporaryWorkspace.Add(4096+32ull*frames.size()); // order-statistics arrays and growth
+    }
     WindowStatistics statistics(frames,budgetNs,cancelled,work);
     const auto frameOffset = [&](uint64_t index) { return size_t(std::lower_bound(frames.begin(),frames.end(),index,
         [](const auto& f,uint64_t i){return f.frameIndex<i;})-frames.begin()); };
@@ -73,6 +81,9 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
             double(statistics.Over()) / statistics.Count() < overRatio ) continue;
         const auto median = statistics.Median();
         if( median <= budgetNs ) continue;
+        // Four slots cover vector growth with old/new buffers alive together;
+        // the extra space covers the temporary and its one scale-set node.
+        if(budget) temporaryWorkspace.Add(4*sizeof(Window)+128);
         result.push_back( { begin, end, statistics.Mad(median) / median <= stableRatio, { length } } );
     }
     std::sort( result.begin(), result.end(), [&]( const auto& a, const auto& b ) {
@@ -101,7 +112,12 @@ inline std::vector<Window> Windows( const PolicyFrameTimeline& timeline,
             merged.back().end = std::max( merged.back().end, window.end );
             merged.back().scales.insert( window.scales.begin(), window.scales.end() );
         }
-        else merged.push_back( window );
+        else {
+            // Reserve the destination vector growth and every possible scale
+            // node before copying; merged windows remain live after return.
+            if(retainedWorkspace) retainedWorkspace->Add(4*sizeof(Window)+128+64ull*scales.size());
+            merged.push_back( window );
+        }
     }
     return merged;
 }
@@ -132,7 +148,9 @@ struct TimelineState
     std::map<std::string,std::vector<uint64_t>> normalFrameIndices;
 };
 template<class Visit>
-TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
+TimelineState Prepare(const CandidatePolicyInput& input,Visit visit,
+    AnalysisWorkspaceReservation* retainedWorkspace = nullptr,
+    std::shared_ptr<AnalysisWorkspaceBudget> budget = {})
 {
     const auto& config=input.normalizedProfile.at("candidate_policy");
     const auto budgetNs=input.normalizedProfile.at("frame_budget").at("frame_ms").get<double>()*1e6;
@@ -152,10 +170,15 @@ TimelineState Prepare(const CandidatePolicyInput& input,Visit visit)
             if((++comparisons & 255)==0)check(); return a.frameIndex < b.frameIndex; } );
         for( size_t i = 1; i < t.frames.size(); ++i )
             if( t.frames[i].frameIndex == t.frames[i-1].frameIndex ) throw std::runtime_error( "duplicate_frame_timeline" );
-        windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled ) );
+        windows.emplace( scope, Windows( t, config, budgetNs, input.cancelled, nullptr,
+            retainedWorkspace, budget ) );
         if(t.observationUnit=="frame") {
             auto& valid=state.validFrameIndices[scope];
             auto& normal=state.normalFrameIndices[scope];
+            if(retainedWorkspace) {
+                if(t.frames.size()>(UINT64_MAX-2048)/16) throw std::runtime_error("analysis_workspace_budget");
+                retainedWorkspace->Add(2048+16ull*t.frames.size());
+            }
             valid.reserve(t.frames.size());normal.reserve(t.frames.size());
             for(const auto& frame:t.frames)
                 if(frame.exact) {
